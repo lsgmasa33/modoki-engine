@@ -9,16 +9,16 @@
  *  served/copied at the `~env.hdr` variant URL (mirrors the texture-variant scheme).
  *
  *  Two formats ship: `hdr` (downscaled Radiance, Node-generated) and `ultrahdr`
- *  (UltraHDR gainmap JPEG, browser-encoded in the editor). A compressed KTX2 ASTC-HDR
+ *  (UltraHDR gainmap JPEG, committed next to the source). A compressed KTX2 ASTC-HDR
  *  format is a future `format` value behind the same seams. */
 
 /** Output format.
  *  - `hdr` = downscaled Radiance HDR (universal, Node-generated, decodes via HDRLoader).
  *  - `ultrahdr` = UltraHDR gainmap JPEG (~10× smaller, universal device support —
- *    JPEG-based, HDR gain applied in-shader). Encoded BROWSER-SIDE in the editor
- *    (@monogrid/gainmap-js needs WebGL), so its `~ultrahdr.jpg` variant is COMMITTED
- *    next to the source (the Node build can't regenerate it); decodes via three's
- *    UltraHDRLoader. */
+ *    JPEG-based, HDR gain applied in-shader). Encoded in Node by the environment
+ *    reimport handler (`plugins/env-ultrahdr.ts`, #1314) at SOURCE resolution — `maxSize`
+ *    is `hdr`-only. Its `~ultrahdr.jpg` variant is COMMITTED next to the source and the
+ *    build copies it rather than re-encoding; decodes via three's UltraHDRLoader. */
 export type EnvFormat = 'hdr' | 'ultrahdr';
 
 /** Longest-edge cap for the equirect HDR; downscaled (never upscaled) to fit. */
@@ -44,7 +44,7 @@ export const ENV_MAX_SIZES: EnvMaxSize[] = [256, 512, 1024, 2048, 4096];
  *  cache-served variant (mirrors `variantSuffix` for textures), e.g. `studio.hdr` + `~env.hdr`. */
 export const ENV_VARIANT_SUFFIX = '~env.hdr';
 /** Variant-URL suffix for the `ultrahdr` (gainmap JPEG) format — a COMMITTED file
- *  next to the source (browser-encoded), e.g. `studio.hdr` + `~ultrahdr.jpg`. */
+ *  next to the source (written by the environment reimport handler), e.g. `studio.hdr` + `~ultrahdr.jpg`. */
 export const ULTRAHDR_VARIANT_SUFFIX = '~ultrahdr.jpg';
 
 /** The variant suffix for a given output format. */

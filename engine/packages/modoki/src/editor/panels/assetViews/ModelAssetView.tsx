@@ -588,7 +588,7 @@ function GenerateCollisionMeshRow({ path, name, postprocessor, onDone }: { path:
         { glbPath, glbBase64: bytesToBase64(glb), meshJsonPath, meshName, modelGuid, meshGuid },
         { post: postWriteFile, registerAsset },
         // #874: writeMetaWholesale is the write AND the forget-on-success — one shape shared with
-        // makeTexture2D and EnvironmentAssetView, so a failed write cannot drop a baseline that is
+        // makeTexture2D, so a failed write cannot drop a baseline that is
         // still accurate, and a throw from the `.mesh.json` write that FOLLOWS this cannot skip a
         // forget the meta write had already earned.
         //

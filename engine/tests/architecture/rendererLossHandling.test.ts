@@ -56,15 +56,6 @@ const CONSTRUCT_RE = /\bnew\s+(?:THREE\.)?WebGLRenderer\s*\(|\bnew\s+WebGPURende
 
 const ATTACH_RE = /\battach(?:RendererLossHandling|ContextLossListeners|DeviceLostListener)\s*\(/;
 
-// `editor/panels/assetViews/encodeUltraHDR.ts` is documented here for a HUMAN reader, not this
-// guard: `@monogrid/gainmap-js`'s `encodeAndCompress` constructs its own throwaway WebGLRenderer
-// internally when none is passed, which never appears in this file as a literal `new
-// WebGLRenderer(`/`makeWebGPURenderer(`/etc. — so `CONSTRUCT_RE` can never match it and it can
-// never reach the offenders list either way. It is NOT in `EXEMPT` below (adversarial review
-// of #795 found it there, inert — an allowlist entry a construction-site scan can never even
-// test is not doing the job an allowlist entry implies). `glContextRelease.test.ts` documents the
-// same fact for the same reason.
-
 // Genuinely transient probes — a construction site with no lasting surface to go blank, or one
 // invisible to our own tracking:
 const EXEMPT: ReadonlyArray<{ item: string; count?: number; reason: string }> = [

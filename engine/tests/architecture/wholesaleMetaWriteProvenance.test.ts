@@ -19,7 +19,8 @@
  *  predicate requires `doc !== null` — so it answered `false` for the one state where the panel
  *  holds no document at all. A THROWN `/api/read-meta` leaves `meta` at `null` with every control
  *  live, and Apply encoded a gainmap, committed a multi-MB `~ultrahdr.jpg`, then replaced the
- *  sidecar with an id-less document. The other three writers were safe only because each had
+ *  sidecar with an id-less document. (It left this table in #1314: Apply now converts through
+ *  `/api/reimport` and writes no sidecar of its own.) The other three writers were safe only because each had
  *  independently reached for "did a read land" instead. A guard that is right in three files by
  *  coincidence is what this table converts into one that is checked.
  *
@@ -36,7 +37,6 @@
  *  NAMED in prose cannot be mistaken for one that runs. */
 
 import { describe, it, expect } from 'vitest';
-import { found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -69,12 +69,6 @@ function editorSourceFiles(): string[] {
 type Provenance = 'stamp' | 'loadedRef' | 'early-return' | 'fresh-doc' | 'abort-on-tag';
 
 const WRITERS: Record<string, { provenance: Provenance; why: string }> = {
-  'panels/assetViews/EnvironmentAssetView.tsx': {
-    provenance: 'stamp',
-    why: 'Apply is decided BEFORE the gainmap encode and the ~ultrahdr.jpg write, so a refusal '
-      + 'cannot orphan a multi-MB variant. It asks the provenance question rather than the tag one '
-      + 'because its `meta` is nullable and a thrown read leaves it null — the #890 hole.',
-  },
   'panels/NineSliceEditor.tsx': {
     provenance: 'loadedRef',
     why: 'a modal with its own per-path reset; `metaLoadedRef` is set only from the read\'s `.then`.',
@@ -189,23 +183,6 @@ describe('every wholesale .meta.json writer declares how it knows a read landed 
       }
     }
     expect(wrong, wrong.join('\n')).toEqual([]);
-  });
-
-  /** ⚠️ The `why` on `EnvironmentAssetView` claims PLACEMENT — "decided BEFORE the gainmap encode
-   *  and the ~ultrahdr.jpg write, so a refusal cannot orphan a multi-MB variant" — and that exact
-   *  property was the #880 close-out finding: the first version of that guard checked
-   *  `writeMetaWholesale`'s RETURN, i.e. after `encodeUltraHDR` had run and after `/api/write-file`
-   *  had committed the JPEG. A rule whose whole purpose is turning prose into checks must not leave
-   *  its most load-bearing sentence as prose: moving the guard down would satisfy every other
-   *  assertion in this file. Source ORDER is a crude proxy for control flow and it is the honest
-   *  one available to a scan — it goes red for the move that actually happened once. */
-  it('the environment guard is decided BEFORE anything expensive is spent', () => {
-    const code = read('panels/assetViews/EnvironmentAssetView.tsx');
-    const guard = found(code.indexOf('metaReadPathOf('), 'the provenance guard metaReadPathOf(');
-    for (const spend of ['setImporting(true)', 'flushPendingMetaFor(', 'encodeUltraHDR(', 'writeMetaWholesale(']) {
-      const at = found(code.indexOf(spend), spend);
-      expect(guard, `the provenance guard must precede ${spend} — a refusal after it orphans work`).toBeLessThan(at);
-    }
   });
 
   /** Every entry says WHY in its own words — the field #871 did not exist to make anyone write. */

@@ -3963,11 +3963,11 @@ export function assetScannerPlugin(): Plugin {
           : resolveEnvSettings(meta as { environment?: Partial<EnvImportSettings> });
         try {
           if (settings.format === 'ultrahdr') {
-            // UltraHDR is encoded browser-side (the Node build can't regenerate it), so
-            // the `~ultrahdr.jpg` variant is COMMITTED next to the source — copy it from
-            // the source dir into dist + drop the source. Missing ⇒ throw → ship source.
+            // The `~ultrahdr.jpg` variant is COMMITTED next to the source (written by the
+            // environment reimport handler, #1314) — copy it from the source dir into dist +
+            // drop the source. The build does not re-encode it. Missing ⇒ throw → ship source.
             const committed = srcAbs + ULTRAHDR_VARIANT_SUFFIX;
-            if (!fs.existsSync(committed)) throw new Error('committed ~ultrahdr.jpg variant not found (re-encode in the Environment Inspector)');
+            if (!fs.existsSync(committed)) throw new Error('committed ~ultrahdr.jpg variant not found (re-import the environment: Inspector Apply, Assets-panel re-import, or modoki_reimport_asset)');
             const destPath = path.join(distDir, (virtualPath + ULTRAHDR_VARIANT_SUFFIX).replace(/^\//, ''));
             fs.mkdirSync(path.dirname(destPath), { recursive: true });
             fs.copyFileSync(committed, destPath);

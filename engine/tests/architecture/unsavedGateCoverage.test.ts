@@ -430,6 +430,7 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       { item: 'engine/plugins/backend/wdaLauncher.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/detect-modules.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/env-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/env-ultrahdr.ts', reason: '#1314: reads the source .hdr only (the encoder behind reimport-environment.ts, itself reached only through the gated /api/reimport); writes nothing, touches no sidecar' },
       { item: 'engine/plugins/font-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/font-instance.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/healNativeConfig.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },

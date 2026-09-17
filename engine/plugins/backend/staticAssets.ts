@@ -20,6 +20,7 @@
 import fs from 'fs';
 import path from 'path';
 import { readMetaSidecar } from '../meta-sidecar';
+import { resolveEnvSettings } from '../../packages/modoki/src/runtime/core/environmentSettings';
 import { getCacheDir, cachePathFor } from '../texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from '../audio-cache';
 import { getVideoCacheDir, videoCachePathFor } from '../video-cache';
@@ -425,7 +426,14 @@ export async function serveProjectAsset(
       // Cache miss — auto-import (dev/editor only): re-downscale from the meta
       // settings and serve, healing a checkout that has the committed
       // environmentCache hash but no local converted bytes.
-      const auto = await autoBakeThenServe(ctx, 'environment', sourceUrl, absSource, () => {
+      // ⚠️ Not when the asset is `ultrahdr` on disk (#1314 close-out) — tested as `=== 'ultrahdr'`,
+      // the same predicate the handler, the build and `envVariantSuffix` use, so any other value
+      // still bakes as `hdr` exactly as it is served. The handler converts by the
+      // sidecar's format, so for an `ultrahdr` asset (a renderer still holding a stale `hdr`
+      // manifest entry) this bake would re-encode and rewrite the COMMITTED `~ultrahdr.jpg` and
+      // then 404 anyway — nothing it writes is an `~env.hdr`.
+      const onDiskFormat = resolveEnvSettings(readMetaSidecar(absSource) as { environment?: Record<string, unknown> }).format;
+      const auto = onDiskFormat === 'ultrahdr' ? null : await autoBakeThenServe(ctx, 'environment', sourceUrl, absSource, () => {
         const h = (readMetaSidecar(absSource).environmentCache as { hash?: string } | undefined)?.hash;
         if (!h) return null;
         const c = envCachePathFor(getEnvCacheDir(ctx.projectRoot), sourceUrl, h);

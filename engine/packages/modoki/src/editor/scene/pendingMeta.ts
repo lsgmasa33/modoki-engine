@@ -338,8 +338,8 @@ export function refusalMessageFor(path: string, verdict: MetaParkVerdict): strin
  *  ⚠️ **A refusal that only reaches the console is indistinguishable from a broken control.** The
  *  human toggles Flip Y, the checkbox snaps back, nothing is parked and nothing on screen says
  *  why — measured in #890's own drive, where the destruction and the refusal both happened with
- *  no on-screen signal. `EnvironmentAssetView.apply()` already toasted its own refusal; making
- *  this seam do it means the two refusals behave alike rather than one being the exception.
+ *  no on-screen signal. `EnvironmentAssetView.apply()` already toasted its own refusal (it has none since #1314 — it
+ *  no longer writes the sidecar); making this seam do it meant the two refusals behaved alike.
  *
  *  The store keeps ONE toast slot on a 3.5s timer, so a rapid-fire field (a number input firing
  *  per keystroke) re-shows the same message rather than queueing N of them — no dedupe needed

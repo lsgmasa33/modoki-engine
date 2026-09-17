@@ -133,6 +133,39 @@ describe('serveProjectAsset — auto-import on variant cache-miss (autoConvert)'
   });
 });
 
+describe('serveProjectAsset — ~env.hdr on-demand bake follows the ON-DISK format (#1314)', () => {
+  let bakes = 0;
+  beforeEach(() => {
+    bakes = 0;
+    registerReimportHandler('environment', async () => { bakes += 1; });
+  });
+
+  function writeEnv(format: 'hdr' | 'ultrahdr') {
+    const dir = path.join(root, 'assets', 'env');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'sky.hdr'), Buffer.from('#?RADIANCE'));
+    fs.writeFileSync(path.join(dir, 'sky.hdr.meta.json'), JSON.stringify({
+      environment: { format, maxSize: 1024 }, environmentCache: { hash: 'committedhash0001' },
+    }));
+  }
+
+  it('bakes an hdr asset whose ~env.hdr is missing locally', async () => {
+    writeEnv('hdr');
+    await serveProjectAsset({ ...ctx(), autoConvert: true }, '/assets/env/sky.hdr~env.hdr');
+    expect(bakes).toBe(1);
+  });
+
+  // A stale renderer can ask for ~env.hdr after the asset switched to ultrahdr. Baking then runs
+  // the ultrahdr encode — rewriting the COMMITTED ~ultrahdr.jpg — and 404s regardless.
+  it('does NOT bake an ultrahdr asset, and 404s', async () => {
+    writeEnv('ultrahdr');
+    const res = await serveProjectAsset({ ...ctx(), autoConvert: true }, '/assets/env/sky.hdr~env.hdr');
+    expect(bakes).toBe(0);
+    expect(res!.kind).toBe('raw');
+    expect((res as { status: number }).status).toBe(404);
+  });
+});
+
 describe('serveProjectAsset — converted model variant is revalidatable, NOT immutable', () => {
   // The served URL (`x.glb.processed.glb`) is query-agnostic in dev/editor — the
   // hash lives only in the meta + cache disk path, never the URL. An `immutable`

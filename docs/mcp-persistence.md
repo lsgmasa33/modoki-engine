@@ -344,7 +344,8 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
 
   ⚠️ **There are FOUR doors onto `/api/write-meta`, and the path-keyed flag watched one.** It was consulted on
   the park, so it could not see `writeMetaWholesale` — and `EnvironmentAssetView.apply()`'s UltraHDR
-  branch builds `{...(meta ?? {}), environment, environmentCache}` and writes it without parking,
+  branch built `{...(meta ?? {}), environment, environmentCache}` and wrote it without parking
+  (that door closed in #1314 — Apply now converts through `/api/reimport`),
   with its `loadMeta` dropping the read's `ok` and its Apply button disabled only while `importing`,
   never on a failed load. A 500 on the GET, a switch to UltraHDR, one click, and an id-less document
   reached the route. `makeTexture2D` is the precedent that returns early on `!res.ok`, and
@@ -452,7 +453,9 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   requires `doc !== null` and so answered *false* for the one state where the panel holds no
   document at all — a thrown read. Apply then encoded the gainmap, committed `~ultrahdr.jpg` and
   replaced the sidecar with an id-less document: #890's destruction, through the door the park-seam
-  guard does not watch. It asks `metaReadPathOf(meta) !== path` now. The other three writers were
+  guard does not watch. It asked `metaReadPathOf(meta) !== path` afterwards, and since #1314 it
+  writes no sidecar at all (both formats convert through `/api/reimport`), so it left the table. The
+  other three writers were
   safe only because each had independently reached for *"did a read land"* rather than *"is this
   the tagged fallback"* — three files right by coincidence, which is what the table converts into
   one thing that is checked.
@@ -467,10 +470,10 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
     indistinguishable from a broken control — the field snaps back, nothing is parked, nothing on
     screen says why, which is exactly what #890's drive saw. The store holds ONE toast slot on a
     3.5s timer, so a per-keystroke field re-shows the same message rather than queueing N.
-    ⚠️ **Four of the eight `.meta.json` refusal sites reach the human, four do not** — counted
+    ⚠️ **Three of the seven `.meta.json` refusal sites reach the human, four do not** — counted
     from the `WRITERS` table in `tests/architecture/wholesaleMetaWriteProvenance.test.ts`, which is
     the only enumeration of this population that cannot go stale, plus `parkMetaEdit`'s two
-    branches. Reaching the human: those two branches, `EnvironmentAssetView.apply()`, and
+    branches. Reaching the human: those two branches and
     `scene/modelImport.ts`, whose `ImportWriteAborted` surfaces as an import-failed toast carrying
     the reason. Console-only: `makeTexture2D`, the Sprite and 9-slice editors' Save, and
     `writeMetaConditional` at the endpoint (`grep -c showToast` is 0 in all four files).
@@ -484,10 +487,11 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   - **A control that cannot work is DISABLED in one place and left live in the other.**
     `EnvironmentAssetView`'s Apply is `disabled={importing || meta === null}`; the Inspector's
     postprocessor `<select>` stays enabled after a failed read (its `metaLoaded` is set true in the
-    catch) and relies on the refusal plus the toast. The asymmetry is chosen, not overlooked: Apply
-    spends real work before it can fail (a gainmap encode, a multi-MB file write), so offering it
-    is worse than greying it; a dropdown costs nothing to try, and a greyed control with no
-    explanation is its own dead end. Do not "fix" either one into the other without asking.
+    catch) and relies on the refusal plus the toast. The asymmetry is chosen, not overlooked: until
+    the read lands, Apply's panel shows the DEFAULT format rather than the asset's, so offering a
+    conversion it cannot describe is worse than greying it (it no longer writes the sidecar itself
+    since #1314 — the server converts from disk); a dropdown costs nothing to try, and a greyed
+    control with no explanation is its own dead end. Do not "fix" either one into the other without asking.
 
   ⚠️ **What it does NOT fix: #886/#896** — a failed `.mat.json`/`.rig2d.json`/`.anim.json` read
   represented as a loadable DOCUMENT. That is the emptiness face on the dirty-asset registry, and

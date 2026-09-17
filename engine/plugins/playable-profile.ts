@@ -48,8 +48,8 @@ export function playableTextureSettings(s: TextureImportSettings): TextureImport
 }
 
 /** Override an HDR environment's resolved settings for a playable build: plain downscaled
- *  Radiance (NOT 'ultrahdr' — that needs a committed browser-encoded variant a playable
- *  source won't have) capped at {@link PLAYABLE_ENV_MAX}. */
+ *  Radiance (NOT 'ultrahdr' — that ships the committed full-resolution `~ultrahdr.jpg`, which
+ *  `maxSize` does not reach and a playable source may not have) capped at {@link PLAYABLE_ENV_MAX}. */
 export function playableEnvSettings(s: EnvImportSettings): EnvImportSettings {
   return {
     ...s,

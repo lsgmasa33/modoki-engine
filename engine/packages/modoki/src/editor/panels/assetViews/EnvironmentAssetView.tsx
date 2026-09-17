@@ -13,18 +13,13 @@ import * as THREE from 'three';
 import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
 import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
-import { DEFAULT_ENV_SETTINGS, ENV_MAX_SIZES, ULTRAHDR_VARIANT_SUFFIX, resolveEnvSettings, type EnvImportSettings, type EnvMaxSize, type EnvCacheInfo } from '../../../runtime/core/environmentSettings';
+import { DEFAULT_ENV_SETTINGS, ENV_MAX_SIZES, resolveEnvSettings, type EnvImportSettings, type EnvMaxSize, type EnvCacheInfo } from '../../../runtime/core/environmentSettings';
 import { invalidateEnvironment } from '../../../runtime/loaders/meshTemplateCache';
 import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
-import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
 import { formatBytes, reimportBtnStyle } from './widgets';
-import { encodeUltraHDR, hashBytes, bytesToBase64 } from './encodeUltraHDR';
 import { withCurrentValue } from './importSettingOptions';
-import {
-  parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor, writeMetaWholesale,
-  metaReadPathOf,
-} from '../../scene/pendingMeta';
+import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 import { useMissingLocalStats } from '../useMissingLocalStats';
@@ -100,90 +95,28 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   }, [meta, path]);
 
   const apply = useCallback(async () => {
-    // ⚠️ REFUSE BEFORE THE EXPENSIVE WORK, not after the write (#880 close-out review 3).
-    //
-    // The first version of this guard checked `writeMetaWholesale`'s return, which is the LAST
-    // step: by then `encodeUltraHDR` had run the WebGL gainmap encode and `/api/write-file` had
-    // committed a multi-MB `~ultrahdr.jpg` into the asset tree — so a refusal left that variant
-    // orphaned on disk with nothing in the sidecar pointing at it, and the re-read that followed
-    // snapped the format dropdown back to `hdr`, discarding the user's choice with no toast.
-    // It traded a visible sticky refusal for silent loss, which is worse.
-    //
-    // The answer is decidable here, before anything is spent: if this panel's document did not
-    // come from a read OF THIS PATH it has no `id`, and a wholesale write of it would cost the
-    // asset its GUID.
-    //
-    // ⚠️ **Ask the PROVENANCE question, not the tag question.** This guard read
-    // `metaCameFromFailedRead(meta)` for one release, and that predicate requires `doc !== null` —
-    // so it answered `false` for the one state where the panel has no document at all. A THROWN
-    // `/api/read-meta` (`loadMeta`'s `.catch(() => {})` swallows it, by design) leaves `meta` at
-    // `null`, every control here still live, and `{ ...(meta ?? {}) }` id-less: Apply then encoded
-    // the gainmap, committed `~ultrahdr.jpg`, and replaced the sidecar with a document carrying no
-    // GUID. That is #890's destruction reached through the one door #891's park-seam guard
-    // deliberately does not watch, and this was the only one of the four wholesale writers exposed
-    // to it — the other three ask "did a read land" (`metaLoadedRef`, an early return on `!ok`)
-    // rather than "is this the tagged fallback". `metaReadPathOf` IS that question, and it
-    // subsumes the tag: a `metaReadFallback()` document is unstamped too.
-    if (metaReadPathOf(meta) !== path) {
-      console.error(
-        `[Inspector] not converting ${path} — its .meta.json was never read successfully for this `
-        + 'asset, so writing the result would replace the file with a document missing its GUID. '
-        + 'Reselect the asset to re-read it, then retry.',
-      );
-      useEditorStore.getState().showToast(
-        `Cannot convert ${name} — its import settings could not be read, or have not loaded yet. `
-        + 'Reselect the asset to re-read it, then try again.',
-        'warn',
-      );
-      return;
-    }
+    // BOTH formats convert server-side through `/api/reimport` (#1314) — the same handler the
+    // Assets-panel re-import and `modoki_reimport_asset` reach, so the three entry points cannot
+    // produce different variants or different `environmentCache` blocks. The UltraHDR encode ran
+    // HERE (WebGL) until then, which is also why this callback used to carry a provenance guard:
+    // it wrote the sidecar wholesale from its own `meta`. It writes nothing now — the handler
+    // reads the sidecar off disk — so there is no document of ours that could cost the asset its
+    // GUID.
     setImporting(true);
     try {
-      // #845: both branches below are about to read (the reimport route, off disk) or write (the
-      // ultrahdr route, a full-document merge) this sidecar — flush any still-parked settings edit
-      // first, or the branch would work from a stale doc and a leftover park would overwrite its
-      // own fresh write at the next Cmd+S. See pendingMeta.ts's header.
+      // #845: the reimport route reads this sidecar off disk — flush any still-parked settings
+      // edit first, or it would convert with the pre-edit settings and a leftover park would
+      // overwrite its fresh write at the next Cmd+S. See pendingMeta.ts's header.
       await flushPendingMetaFor(path);
-      if (settings.format === 'ultrahdr') {
-        // Browser-side gainmap encode (needs WebGL) → commit `~ultrahdr.jpg` next to
-        // the source (the Node build can't regenerate it), then write the meta so the
-        // scanner emits the manifest env block.
-        setImportStatus(true, `Encoding UltraHDR for ${name}...`);
-        const jpeg = await encodeUltraHDR(assetUrl(path));
-        const variantPath = path + ULTRAHDR_VARIANT_SUFFIX;
-        const w = await backendFetch('/api/write-file', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: variantPath, content: bytesToBase64(jpeg), encoding: 'base64' }),
-        });
-        if (!w.ok) { console.error('[Inspector] UltraHDR write failed'); return; }
-        const hash = hashBytes(jpeg);
-        const updatedMeta = { ...(meta ?? {}), environment: settings, environmentCache: { hash, bytes: jpeg.length } };
-        setMeta(updatedMeta);
-        // #874: the write AND the forget-on-success, in one call — see writeMetaWholesale.
-        //
-        // ⚠️ The result is CHECKED (#880 close-out review). Discarding it made a refused write —
-        // which is now a real outcome, since `writeMetaWholesale` refuses a document built on a
-        // failed read — look like a completed Apply: the status cleared, the asset list refreshed,
-        // and `~ultrahdr.jpg` sat on disk with nothing in the sidecar pointing at it, explained
-        // only by a `console.error`. `makeTexture2D` returns `false` to its caller and the two
-        // modal editors keep their dialog open; this was the one of the four that swallowed it.
-        // ⚠️ A failed write returns WITHOUT re-reading. The provenance case is refused at the top
-        // of this function now, so the only way to reach this branch is a genuine write failure
-        // (a dev-server blip) — and re-reading there would reseed `settings` from disk and throw
-        // away the user's dropdown choice for a reason that has nothing to do with it. Same rule
-        // the two modal editors follow by keeping their dialog open.
-        if (!await writeMetaWholesale(path, updatedMeta)) return;
-      } else {
-        // Node-side downscale (dependency-free) via the reimport handler.
-        setImportStatus(true, `Downscaling ${name}...`);
-        const res = await backendFetch('/api/reimport', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path }),
-        });
-        const summary = await res.json().catch(() => ({}));
-        if (!res.ok || (summary.errors && summary.errors.length)) {
-          console.error('[Inspector] Environment convert failed:', summary.errors ?? summary);
-        }
+      setImportStatus(true, settings.format === 'ultrahdr' ? `Encoding UltraHDR for ${name}...` : `Downscaling ${name}...`);
+      const res = await backendFetch('/api/reimport', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      });
+      const summary = await res.json().catch(() => ({}));
+      if (!res.ok || (summary.errors && summary.errors.length)) {
+        console.error('[Inspector] Environment convert failed:', summary.errors ?? summary);
+        useEditorStore.getState().showToast(`Converting ${name} failed — see the console.`, 'warn');
       }
       await loadMeta();
       invalidateEnvironment(path);
@@ -194,7 +127,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
       setImporting(false);
       setImportStatus(false);
     }
-  }, [path, name, settings, meta, loadMeta, refreshAssets, setImportStatus]);
+  }, [path, name, settings.format, loadMeta, refreshAssets, setImportStatus]);
 
   // Load + decode the HDR once per asset. FloatType keeps decoding simple
   // (Float32 channels); HalfFloat is handled too via DataUtils for safety.
@@ -303,19 +236,15 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
       )}
       <div style={{ color: '#666', fontSize: 10, margin: '2px 0 4px' }}>
         {settings.format === 'ultrahdr'
-          ? 'UltraHDR gainmap JPEG — ~10× smaller, universal device support, encoded in the editor (needs WebGL); the ~ultrahdr.jpg variant is committed next to the source. NOTE: it is display-referred, so it renders dimmer/muted for scene lighting (IBL) than HDR — the env intensity is auto-boosted to compensate, but prefer HDR when lighting accuracy matters.'
+          ? 'UltraHDR gainmap JPEG — ~10× smaller, universal device support; the ~ultrahdr.jpg variant is committed next to the source. NOTE: it is display-referred, so it renders dimmer/muted for scene lighting (IBL) than HDR — the env intensity is auto-boosted to compensate, but prefer HDR when lighting accuracy matters.'
           : 'Downscales the equirect HDR to the max edge (never upscales). A 2K env is ~6 MB; 1K is ~3× smaller and, since the map feeds a blurred PMREM, the detail loss is largely invisible.'}
       </div>
       <button
         data-ui-id="assetView.environment.apply" data-ui-kind="button" data-ui-label={converted ? 'Re-import' : 'Apply'}
-        // ⚠️ `meta === null` too, not just `importing`. Widening the guard below from the TAG
-        // question to the PROVENANCE question made it refuse one state it used to allow: the
-        // mount read still in flight, where the panel has no document YET. That refusal is
-        // correct for the UltraHDR branch (it would write the sidecar from a document it does
-        // not have) and needlessly conservative for the reimport one — but either way the
-        // honest answer is not to offer the button, because the remedy the toast names
-        // (reselect) is not the one that helps (wait). The guard stays as defence in depth:
-        // this is the UI, not the check.
+        // ⚠️ `meta === null` too, not just `importing`: until the sidecar read lands (or when it
+        // threw), the Format/Max Size controls above show DEFAULT_ENV_SETTINGS rather than this
+        // asset's, so the button would offer a conversion the panel cannot describe. The server
+        // converts from the sidecar on disk either way — this is about not showing a wrong one.
         disabled={importing || meta === null}
         onClick={apply}
         style={{ ...reimportBtnStyle, marginTop: 4, background: importing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${importing ? '#444' : '#27ae60'}`, cursor: importing ? 'wait' : 'pointer' }}

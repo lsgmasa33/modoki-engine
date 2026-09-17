@@ -195,7 +195,8 @@ const READ_FOR_PATH = Symbol.for('modoki.pendingMeta.readForPath');
 export function stampMetaReadPath(doc: Record<string, unknown>, path: string): Record<string, unknown> {
   // ⚠️ A FAILED-READ FALLBACK IS NEVER STAMPED, and this is enforced rather than documented.
   // "Subsumes the tag" is an argument several consumers now lean on — `EnvironmentAssetView.apply`
-  // dropped its own `metaCameFromFailedRead` check on the strength of it — and it holds only
+  // dropped its own `metaCameFromFailedRead` check on the strength of it (before #1314 removed its
+  // sidecar write altogether) — and it holds only
   // because no producer stamps a fallback today. That is a coincidence between two call sites, and
   // this function's own docblock invites the collision: it tells an exempted raw reader to stamp
   // its read exactly as it must call `metaReadFallback()` for its failure, so a reader obeying

@@ -2076,10 +2076,10 @@ wrapper functions #835 replaced (`serialize.ts`'s `writeFileToServer`, this modu
 duplicate, a third copy in `modelImport.ts`, `writeAssetFileOrAbort`, and an inline `post` lambda
 in `ModelAssetView.tsx`) are gone.
 
-**Binary writes (base64) never touch `jsonFileBody`** — appending a newline to a UltraHDR JPEG, an
-extracted PNG texture, or a converted GLB corrupts the asset. Three sites deliberately keep their
+**Binary writes (base64) never touch `jsonFileBody`** — appending a newline to an
+extracted PNG texture, or a converted GLB corrupts the asset. Two sites deliberately keep their
 own raw `backendFetch('/api/write-file', …)` call rather than routing through `writeAssetFile`:
-`assetViews/EnvironmentAssetView.tsx`, `scene/modelImport.ts` (its texture-extraction write only —
+`scene/modelImport.ts` (its texture-extraction write only —
 the material/mesh JSON writers in the same file DO route through the wrapper), and
 `scene/convertToGLB.ts`. `tests/architecture/clientJsonWriteSeam.test.ts` enforces the split: no
 file outside the wrapper reaches the route directly unless it is on that file's EXEMPT ledger,

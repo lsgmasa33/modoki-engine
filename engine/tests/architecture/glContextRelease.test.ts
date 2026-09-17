@@ -21,9 +21,8 @@
  *
  *  Deliberately NOT covered: `makeWebGPURenderer`'s `WebGPURenderer` has no `forceContextLoss`
  *  API — it wraps `dispose` instead (`scene3DSync.ts`'s `makeWebGPURenderer`); PixiJS `Application` teardown in
- *  `ShaderPreview.tsx`; and `@monogrid/gainmap-js` creates its own throwaway renderer internally in
- *  `editor/panels/assetViews/encodeUltraHDR.ts`'s `encodeAndCompress` call, invisible to our tracking and editor-only,
- *  short-lived. The `ShaderPreview.tsx` Pixi `Application` gap named above is now covered by the
+ *  `ShaderPreview.tsx`. (`@monogrid/gainmap-js`'s internal throwaway renderer used to be a third,
+ *  until #1314 moved the UltraHDR encode to Node.) The `ShaderPreview.tsx` Pixi `Application` gap named above is now covered by the
  *  sibling guard, `rendererLossHandling.test.ts` (#795) — RELEASE-on-teardown (this file) and
  *  DETECT-on-construction (that one) are different properties over the same construction sites.
  *  A third joined them in #1000: `pixiApplicationTeardown.test.ts`, which pins that a Pixi

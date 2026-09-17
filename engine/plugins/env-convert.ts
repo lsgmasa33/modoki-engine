@@ -38,7 +38,7 @@ export interface EnvConvertResult {
 /** Decode a Radiance `.hdr` to RGBA Float32 via three's HDRLoader (dynamic-imported
  *  so three isn't pulled into the plugin's top-level bundle — mirrors the rigged
  *  converter's lazy @gltf-transform import). */
-async function decodeHDR(srcBytes: Buffer): Promise<{ data: Float32Array; width: number; height: number }> {
+export async function decodeHDR(srcBytes: Buffer): Promise<{ data: Float32Array; width: number; height: number }> {
   const { HDRLoader } = (await nativeDynamicImport('three/examples/jsm/loaders/HDRLoader.js')) as typeof import('three/examples/jsm/loaders/HDRLoader.js');
   const loader = new HDRLoader();
   (loader as unknown as { type: number }).type = 1015; // THREE.FloatType — decode to float

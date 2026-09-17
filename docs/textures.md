@@ -793,16 +793,44 @@ Two formats ship instead, both selectable per-asset (`EnvImportSettings.format` 
   `HDRLoader`, area-averages down to `maxSize` in linear radiance space, and re-encodes RGBE —
   measured **0.10% mean-luminance error**, and the real download win (2K→1K ≈ 3×, →512 ≈ 12×).
   `env-convert.ts` drives it; `env-cache.ts` content-hashes the result; served as `~env.hdr`.
-- **`ultrahdr` — browser-side gainmap encode.** `@monogrid/gainmap-js` (editor-only, dynamically
-  imported so it never reaches a game bundle) encodes an UltraHDR JPEG with an embedded gainmap
-  (`encodeUltraHDR.ts`: HDRLoader → `findTextureMinMax` → `encodeAndCompress` →
-  `encodeJPEGMetadata`, libultrahdr WASM); the committed `~ultrahdr.jpg` is written via
-  `/api/write-file`. Runtime decode is `UltraHDRLoader` (already vendored). Measured on a real
-  asset: 6.53 MB → 0.53 MB (**~11.7×**), ~183 ms encode, 2048×1024, 14 gainmap/XMP markers
-  confirming a real embedded gainmap. Because the encode needs WebGL +
-  `createImageBitmap`, it isn't auto-testable — it was live-verified via CDP in the running
-  Electron editor rather than in `npm test`. `maxSize` downscale is currently `hdr`-only;
-  `ultrahdr` encodes at source resolution (deferred, see below).
+- **`ultrahdr` — gainmap JPEG, encoded in Node.** `plugins/env-ultrahdr.ts` ports
+  `@monogrid/gainmap-js`'s two WebGL passes to the CPU with the library's defaults — the SDR
+  rendition (ACES filmic, then the sRGB OETF the GPU applied on write) and the gain plane
+  (`log2((hdr+1/64)/(sdr+1/64))` normalised to `[0, log2 maxContentBoost]`, computed against the
+  QUANTIZED SDR the GPU would have sampled back) — compresses both with `sharp` at quality 90, and
+  muxes them with `@monogrid/gainmap-js/libultrahdr`'s `encodeJPEGMetadata` (pure JS in 3.4: MPF +
+  XMP, no WASM, no DOM). `environmentReimportHandler` writes the result as `~ultrahdr.jpg` NEXT TO
+  THE SOURCE — it is committed, and the build copies it rather than re-encoding — and sets
+  `environmentCache` to `{ hash, bytes }` only. Runtime decode is `UltraHDRLoader`. Encodes at
+  SOURCE resolution: `maxSize` is `hdr`-only.
+  - ⚠️ **One encoder, three entry points (#1314).** The encode used to run in the renderer
+    (`encodeUltraHDR.ts`, WebGL), so the Assets-panel re-import and `modoki_reimport_asset` — both
+    Node — had no ultrahdr branch: they ran the `hdr` downscale on an `ultrahdr` asset and stamped
+    `~env.hdr`'s hash, dims and size into `environmentCache`, and only the Inspector's own Apply
+    produced the right block. Apply now posts `/api/reimport` too. Don't reintroduce a
+    format-specific path in the panel.
+  - ⚠️ **The browser encoder's variants rendered UPSIDE DOWN, and the port deliberately does not
+    copy that.** It rendered a `flipY` HDRLoader texture and read it back with `readPixels`, so its
+    planes were stored bottom row first — while `UltraHDRLoader` (`flipY = true`) expects an
+    ordinary top-row-first JPEG. Nothing had ever committed an UltraHDR env, so nobody saw it.
+    Found live on 2026-09-17: a chrome sphere in `games/3d-test` reflecting `wooden_motel_2k` showed
+    the ground overhead under `ultrahdr` and the sky overhead under `hdr`; with the planes stored
+    upright, the two reflections match. A reflection is the check to reach for: a scene's
+    background is usually a solid colour the engine re-applies every frame, so it cannot show this.
+  - **Measured against the browser encoder** (2026-09-17, `rustig_koppie_puresky_2k.hdr`,
+    2048×1024): identical XMP (`GainMapMax=18.398`, offsets 1/64, gamma 1), both planes within JPEG
+    noise once the browser's upside-down planes are turned the right way up (mean |Δ| 0.18 / 0.13
+    levels, max 5), 109 KB vs 110 KB, 653 ms in Node vs 537 ms in WebGL. Bytes are NOT identical and don't need to be — the
+    Chrome canvas JPEG encoder was the other half, and it is gone. Pinned by
+    `tests/plugins/envUltraHdr.test.ts`.
+  - **Costs and limits of running it in Node.** In the packaged editor `/api/reimport` runs in
+    Electron's MAIN process and both passes are synchronous, so Apply stalls the window for the
+    encode — measured by the #1314 review at ~0.2 s for 2K and ~1 s end-to-end for 4K on a loaded
+    Mac (the `hdr` downscale blocks the same way, for less). The output is deterministic on one
+    machine (two runs, identical bytes), but byte identity ACROSS platforms is unmeasured: if
+    Windows' libjpeg-turbo differs, a re-import there rewrites the committed JPEG and its hash.
+    The static server's on-demand `~env.hdr` bake refuses an asset whose on-disk format is
+    `ultrahdr`, so a stale renderer cannot trigger this encode.
 - The scanner's `detectType` excludes the committed `~ultrahdr.jpg` from re-classification as a
   fresh texture (it's a derived file, not a source asset) — build-gen copies the committed variant
   and drops the multi-MB HDR source; the dist verifier checks the per-format variant exists.

@@ -73,12 +73,6 @@ const SANCTIONED = 'engine/packages/modoki/src/editor/backend/editorBackend.ts';
  *  can hide; the reason still has to be true of the one it names. */
 const EXEMPT: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
   {
-    item: 'engine/packages/modoki/src/editor/panels/assetViews/EnvironmentAssetView.tsx',
-    reason: 'Writes a browser-encoded UltraHDR JPEG as base64 (`bytesToBase64(jpeg)`) — binary, '
-      + 'never JSON. `jsonFileBody` must never touch this content or it gains a spurious '
-      + 'trailing byte and corrupts the asset.',
-  },
-  {
     item: 'engine/packages/modoki/src/editor/scene/modelImport.ts',
     reason: 'Writes a PNG texture extracted from the imported model, base64-encoded — binary, '
       + 'never JSON. The two JSON writers in this same file (material/mesh docs, via '
