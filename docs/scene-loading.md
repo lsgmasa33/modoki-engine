@@ -35,6 +35,42 @@ it isn't active), then calls `setCurrentWorld()` to flip it in one statement.
 Renderers (`Scene3D`, `Scene2D`, and the `useUIEntities` selector) subscribe to
 `onWorldSwap` to flush their per-world caches the moment the swap happens.
 
+#### Module state that belongs to one world — `worldScoped(init)` (#1315)
+
+A game's module-level `let` outlives the world it describes. For a long time the only answer was a
+teardown — an `onWorldSwap` listener, Court's `enterWorld`, a game's `teardown` — that resets a
+**hand-maintained list** of such variables. That list is the defect. A variable is reset only if
+someone remembered to list it. A value written **conditionally**, or **captured once**
+(`if (x === null) x = …`), keeps the previous world's value in the next world, because the new
+world's first write sees it already set. This one mechanism produced all of these bugs:
+- Sling's field walls (#1292) and Weaveling's loaders (#1288, #1294).
+- Court's `sceneAuthoredLevelId`: after Stop and a re-authored `CourtConfig.levelId`, the bootstrap's
+  scene-default fallback still named the previous world's id. That fallback is narrow: it applies
+  when the saved level has left the manifest and its track has no next level. This was found by
+  reading the code and pinned by a headless swap test, not observed live.
+- iap-test's Status memo: a new world kept its placeholder text.
+- postfx-demo's captured lighting: a re-lit scene got the old values restored over it.
+
+`worldScoped(init)` (`runtime/core/ecs/worldScoped.ts`, exported from `@modoki/engine/runtime`)
+keys the value **by the world** instead:
+- `get(world?)`, `set(value, world?)` and `reset(world?)` all default to `getCurrentWorld()`.
+- A world that has never been written reads `init()`. So a swap needs **no reset call and no
+  listener**. There is no list to forget, and no window in which another `onWorldSwap` listener
+  reads the old value before a reset listener runs.
+- Old worlds drop their entry via GC. This is the shape `rng.ts`, `sceneLoaded.ts`,
+  `audioSystem.ts` and `canvas2DHost.ts` each hand-roll.
+- Pass `world` explicitly from bind code that runs against a world `SceneManager` has not
+  promoted yet.
+- Keep `reset()` for the resets that are *not* a swap: a game's register/unregister, and a test
+  seam that rebuilds inside one world.
+
+**What does NOT belong in it:** state that describes something other than the world. The host
+canvas's measured size (Court's and Weaveling's `hostCanvasCss`) describes a DOM element that
+survives the swap. The previous world's measurement is the best available value until the next
+frame re-measures, and scoping it per world would swap a near-correct size for 0. Games adopt the
+helper when they next touch their teardown. It is not a sweep, and a game's existing list still
+works for everything already on it.
+
 > koota caps total worlds at 16 (`WORLD_ID_BITS = 4`). `SceneManager` calls `oldWorld.destroy()`
 > after each swap to free the slot; without it the engine breaks after ~16 swaps.
 

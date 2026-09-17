@@ -1229,12 +1229,9 @@ describe('scene3DSync', () => {
     // dedupe (a shared material is cycled ONCE, not once per mesh) and change-on-every
     // -call (so the observer always detects it), all within a tiny drift-free band.
     async function loadHelper() {
+      // mockSceneSyncDeps already mocks meshTemplateCache/primitives/renderUtils. Mocking them again
+      // here would queue a second factory for the same path, and vitest resolves those in parallel (#1357).
       mockSceneSyncDeps();
-      vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
-        registerEnvDisposeHook: vi.fn(), // (#739) envPmrem.ts registers with this at module scope
-      }));
-      vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
-      vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
       const THREE = await import('three');
       const { refreshEnvIntensityObserver } = await import('../../src/runtime/rendering/scene3DSync');
       return { THREE, refreshEnvIntensityObserver };

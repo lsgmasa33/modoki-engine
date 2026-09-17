@@ -1164,6 +1164,7 @@
   "wakeBody3D",
   "wireDomGestureTracking",
   "withCacheBust",
+  "worldScoped",
   "worldToLocal3D",
   "worldToLocalTrs",
   "worldTransforms",

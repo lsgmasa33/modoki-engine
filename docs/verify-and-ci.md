@@ -675,6 +675,25 @@ disk per call: `engine/scripts/repoCorpus.mjs` shells out once to `git ls-files 
 every listed path, memoises by mode in `cachedRawFilesByMode`, and applies each caller's
 `under`/`match`/`exclude` as an in-memory filter.
 
+### ⚠️ Two queued `vi.doMock`s of one path: the factory that wins depends on load (#1357)
+
+`vi.doMock` only QUEUES. vitest (4.1.x) resolves the queue at the next dynamic `import()`, and
+`resolveMocks()` runs consecutive `mock` entries through `Promise.all`. Each entry is applied when
+its own async `resolveId` finishes. So when one path is `doMock`ed twice with no import in between,
+the factory that wins is whichever resolves **last**, and that is decided by machine load.
+`vi.resetModules()` does not clear the queue.
+
+- **The shape:** `beforeEach` mocks `./src/config`, then a test body mocks it again before its
+  `await import(...)`. Also a helper that mocks a path, followed by a caller that mocks it again.
+- **The tell:** red only under a loaded full `verify`, green alone, and the assertion shows the
+  **other** factory's values. Court's `services.test.ts` failed 2 of 3 runs in exactly this way.
+- **The fix:** mock each path once per import. A test that needs a different value writes a holder
+  that the single factory reads when the import runs it. ⚠️ A nested `describe` does **not** fix
+  this, because the outer `beforeEach` still queues its factory first.
+- **Not guarded.** A text scan cannot follow a helper call. The one other site
+  (`scene3DSync.test.ts`'s `loadHelper`) was found by reading 13 files, which is every test file
+  that mocks a path more than once.
+
 ### The corpus cost model — MEASURED, and it closed #1290
 
 Taken 2026-09-16 on `7f288dd5d` with every clone idle (`loadavg` 3.4–5.3), because a loaded box
