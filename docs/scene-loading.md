@@ -1252,6 +1252,12 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   editor-side `applyStructureByRootInstance` maps nested rows to their roots, as the runtime map
   already did, so a refresh or revert rebuild honours the removal. `serializeScene` preloads nested
   row prefabs so the uncached guard does not hide a deletion.
+  Undoing an unpack re-points each entity's `rootInstanceId` at its root's live id, found through a
+  guid ref. The ids a world rebuild reassigns would otherwise leave the restored instance naming a
+  dead root, and the next save would drop it. If the owner no longer resolves, the entity is left
+  plain. That happens under an unanchored (guid-less, scene-root) instance, whose owner guid was
+  minted at move time and re-derived differently by the rebuild. Its stale id may name an unrelated
+  entity, so relinking would make the save drop it.
   Moving a MEMBER that holds an owned nested instance unpacks that instance too, recursively
   (`reparentEntity`'s detach walk). Left linked under a now-plain parent, it would be saved as a
   top-level instance that stores its derived guid, and the reload would re-derive its members from
@@ -1262,7 +1268,8 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   for the root itself. Dropped INSIDE an instance, it still unpacks, because the save cannot
   represent it there. A parent member that owns a row of its prefab makes it read as owned, so it is
   dropped. An `added` reference node carries no nested overrides. Under an owned nested instance,
-  nothing captures it at all (#1358).
+  nothing captures it at all (#1358). Unpacking does not fully cure that last case: the entities
+  survive but reload at the scene root, until #1358 is fixed.
   `rebuildInstance` carries an owned root's `parentLocalId` across the respawn. Without it, a
   refresh left the root unstamped, which the save reads as a user-added instance.
 

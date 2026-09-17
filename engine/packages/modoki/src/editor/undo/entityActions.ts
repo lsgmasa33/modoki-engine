@@ -914,7 +914,10 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // makes it an added child, which the override system already captures. Detach is part
   // of this action's undo/redo so Cmd+Z restores the instance linkage too.
   const piMeta = getTraitByName('PrefabInstance');
-  const detachTargets: { ref: EntityRef; data: Record<string, unknown> }[] = [];
+  // `ownerRef` addresses the instance root by guid (null: the target IS the root): `data.rootInstanceId`
+  // is a bare ecs id, which a world rebuild (Play→Stop) reassigns, and an undo restoring the stale id
+  // left the instance naming a dead root — the next save wrote neither root nor members.
+  const detachTargets: { ref: EntityRef; ownerRef: EntityRef | null; data: Record<string, unknown> }[] = [];
   if (piMeta && parentChanged) {
     const moved = findEntity(entityId);
     if (moved?.has(piMeta.trait)) {
@@ -951,7 +954,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
             const owner = pd.rootInstanceId as number;
             const ownedNestedRoot = owner === id && ((pd.parentLocalId as number) || 0) > 0;
             if (ownedNestedRoot) unpacked.add(id);
-            if (unpacked.has(owner)) detachTargets.push({ ref: entityRef(id), data: { ...pd } });
+            if (unpacked.has(owner)) detachTargets.push({ ref: entityRef(id), ownerRef: owner === id ? null : entityRef(owner), data: { ...pd } });
             else if (owner === id) continue; // a stored nested root: its subtree keeps its linkage
           }
           for (const c of byParent.get(id) || []) stack.push(c);
@@ -967,7 +970,16 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   const undoDetach = () => {
     if (!piMeta) return;
     const idx = buildGuidIndex();
-    for (const t of detachTargets) { const id = resolveWith(t.ref, idx); if (id != null) findEntity(id)?.add(piMeta.trait(t.data)); }
+    for (const t of detachTargets) {
+      const id = resolveWith(t.ref, idx);
+      if (id == null) continue;
+      const owner = t.ownerRef ? resolveWith(t.ownerRef, idx) : id;
+      // An owner that no longer resolves (a derived guid the rebuild re-derived differently) is left
+      // unlinked: its stale id may now name an unrelated entity, and a member naming one is dropped
+      // by the save, whereas a plain entity is written.
+      if (owner == null) continue;
+      findEntity(id)?.add(piMeta.trait({ ...t.data, rootInstanceId: owner }));
+    }
   };
   if (detachTargets.length) applyDetach();
   markStructureDirty();

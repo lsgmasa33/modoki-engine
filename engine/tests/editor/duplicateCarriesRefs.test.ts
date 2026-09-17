@@ -23,6 +23,7 @@ import {
   reparentEntity, deleteEntitiesWithUndo,
 } from '@modoki/engine/editor';
 import { setPrefabCache, captureInstanceStructure, rebuildInstance } from '../../packages/modoki/src/editor/scene/prefab';
+import { undo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -412,6 +413,75 @@ describe('an owned nested instance that leaves its row stays gone after save + r
     await load(await serializeScene() as unknown as SceneData);
     expectUniqueGuids();
     expect([...treePaths().values()].filter((p) => p.includes('Solo'))).toEqual([`${reloadedAt}Solo`, `${reloadedAt}Solo/Leaf`]);
+  });
+
+  // #1355 third review: the unpack's undo stored the numeric rootInstanceId, which a world rebuild
+  // reassigns. Mutation: restore `t.data` as captured in reparentEntity's undoDetach.
+  it('an unpack undone AFTER a world rebuild relinks the instance to its live root, and the save keeps it', async () => {
+    const sc = withShelf() as unknown as { entities: Array<Record<string, unknown>> };
+    sc.entities.push({ id: 4, prefab: INNER, guid: 'bbbbbbbb-0000-4000-8000-0000000000c5', traits: { EntityAttributes: { name: 'InnerRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } });
+    await load(sc as unknown as SceneData);
+    const solo = idAt('InnerRoot');
+    rename(solo, 'Solo');
+    reparentEntity(solo, idAt('Holder/OuterRoot/Panel/Button'));
+    // Rebuild the world with extra entities spawned first, so the ecs ids move (as a Play→Stop revert can).
+    const saved = await serializeScene() as unknown as { entities: unknown[] };
+    const pad = [1, 2, 3, 4, 5].map((i) => ({ id: 100 + i, traits: { EntityAttributes: { name: `Pad${i}`, parentId: 0, guid: `cccccccc-0000-4000-8000-00000000000${i}` } } }));
+    await load({ ...saved, entities: [...pad, ...saved.entities] } as unknown as SceneData);
+    expect(idAt('Holder/OuterRoot/Panel/Button/Solo')).not.toBe(solo); // precondition: the id moved
+    await undo();
+    const root = idAt('Solo');
+    const pi = [...getCurrentWorld().entities].find((e) => e.id() === root)!.get(getTraitByName('PrefabInstance')!.trait) as { rootInstanceId?: number };
+    expect(pi?.rootInstanceId).toBe(root);
+    await load(await serializeScene() as unknown as SceneData);
+    // By guid, not name: the rename's override mark does not survive the unpacked round trip.
+    const soloPath = treePaths().get('bbbbbbbb-0000-4000-8000-0000000000c5');
+    expect(soloPath).toBeDefined();
+    expect([...treePaths().values()].filter((p) => p.startsWith(`${soloPath}`))).toEqual([soloPath, `${soloPath}/Leaf`]);
+  });
+
+  /** Save, then reload with five plain entities spawned first, so every ecs id moves. */
+  const rebuild = async (): Promise<void> => {
+    const saved = await serializeScene() as unknown as { entities: unknown[] };
+    const pad = [1, 2, 3, 4, 5].map((i) => ({ id: 100 + i, traits: { EntityAttributes: { name: `Pad${i}`, parentId: 0, guid: `cccccccc-0000-4000-8000-00000000000${i}` } } }));
+    await load({ ...saved, entities: [...pad, ...saved.entities] } as unknown as SceneData);
+  };
+
+  // #1355 fourth review: a MEMBER's owner is outside the moved subtree. Same mutation as above.
+  it('a MEMBER unpacked, then undone after a world rebuild, rejoins the live instance at its row', async () => {
+    await load(withShelf());
+    const outer = guidAt('Holder/OuterRoot');
+    reparentEntity(idAt('Holder/OuterRoot/Panel/Button'), idAt('Shelf'));
+    await rebuild();
+    await undo();
+    const pi = [...getCurrentWorld().entities].find((e) => e.id() === idAt('Holder/OuterRoot/Panel/Button'))!
+      .get(getTraitByName('PrefabInstance')!.trait) as { rootInstanceId?: number };
+    expect(pi?.rootInstanceId).toBe(idAt('Holder/OuterRoot'));
+    expect(guidAt('Holder/OuterRoot')).toBe(outer);
+    await load(await serializeScene() as unknown as SceneData);
+    expectUniqueGuids();
+    expect([...treePaths().values()].filter((p) => p.endsWith('Button'))).toEqual(['Holder/OuterRoot/Panel/Button']);
+  });
+
+  // #1355 fourth review, finding 1: under an UNANCHORED (guid-less, scene-root) instance the owner's
+  // guid is minted at move time and re-derived differently by the rebuild, so the ref misses. The
+  // stale id then names an unrelated entity; relinking to it made the save drop the moved entity.
+  // Mutation: fall back to `t.data.rootInstanceId` when the owner does not resolve.
+  it('an unpack undone after a rebuild whose owner no longer resolves leaves the entity plain, and the save keeps it', async () => {
+    const sc = withShelf() as unknown as { entities: Array<Record<string, unknown>> };
+    sc.entities[1] = { id: 2, prefab: OUTER, traits: { EntityAttributes: { name: 'OuterRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } };
+    await load(sc as unknown as SceneData);
+    reparentEntity(idAt('OuterRoot/Panel/InnerRoot/Leaf'), idAt('Shelf'));
+    await rebuild();
+    const leaf = guidAt('Shelf/Leaf');
+    expect(await undo()).toBe(true);
+    // Read the WORLD, not the entity-info snapshot, which can lag a structural change.
+    const eaTrait = getTraitByName('EntityAttributes')!.trait;
+    const live = [...getCurrentWorld().entities].filter((x) => x.has(eaTrait) && (x.get(eaTrait) as { guid?: string }).guid === leaf);
+    expect(live).toHaveLength(1);
+    expect(live[0]!.has(getTraitByName('PrefabInstance')!.trait)).toBe(false);
+    await load(await serializeScene() as unknown as SceneData);
+    expect(treePaths().has(leaf)).toBe(true);
   });
 
   // Mutation: let the presence check accept an instance of the row's prefab under ANY parent.
