@@ -8,9 +8,15 @@
  *    regardless of type. Fixed to `getAssetEntry(path)?.type`; the first two cases here are
  *    the regression test that catches the old (broken) behaviour reappearing.
  *  - `set-skin-mode` used to silently no-op on an unrecognised mode (`if (valid) set(...)`,
- *    no `else`), so a typo returned `ok:true` with nothing changed. */
+ *    no `else`), so a typo returned `ok:true` with nothing changed.
+ *
+ *  #1213 made all of these depend on the editor actually being ON SCREEN — the opener waits for its
+ *  editor to mount, and the two setters refuse when it has not. Headless, nothing mounts, so
+ *  `mountEditorsLikeTheRealPanels` below stands in for the panels' own mount effects: it publishes
+ *  exactly what `SkinEditor` / `SpriteEditor` publish, in reaction to the same store fields they
+ *  react to. Each refusal is exercised with that stand-in switched OFF. */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { registerAsset } from '@modoki/engine/runtime';
 import { useEditorStore } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -30,20 +36,59 @@ registerAsset(RIG_GUID, RIG_PATH, 'rig2d');
 
 type OpReply = { ok: boolean; error?: string; [k: string]: unknown };
 
+const SLICES = ['slice-1', 'slice-2'];
+
+/** The panels' mount effects, headless: the Skin editor mounts on whatever `editingSkinAsset` names;
+ *  the texture modal consumes `textureEditorRequest` (as TextureAssetView does) and the Sprite Editor
+ *  publishes its slices. Returns the unsubscribe. */
+function mountEditorsLikeTheRealPanels(): () => void {
+  return useEditorStore.subscribe((st) => {
+    const skin = st.editingSkinAsset?.path ?? null;
+    if (skin && st.editorMounts.skin?.path !== skin) st.setEditorMount('skin', { path: skin });
+    const req = st.textureEditorRequest;
+    if (req) {
+      st.clearTextureEditorRequest();
+      useEditorStore.getState().setEditorMount(req.kind === 'nineslice' ? 'nineslice' : 'sprite',
+        req.kind === 'nineslice' ? { path: req.path } : { path: req.path, slices: SLICES });
+    }
+  });
+}
+
+let unmount: (() => void) | null = null;
 beforeEach(() => {
   useEditorStore.setState({
     spriteEditorSelection: null,
     editingSkinAsset: null,
     skinMode: 'rig',
+    editorMounts: {},
+    textureEditorRequest: null,
   });
+  unmount = mountEditorsLikeTheRealPanels();
 });
+afterEach(() => { unmount?.(); unmount = null; vi.useRealTimers(); });
+
+/** Run an opener with no panel to mount, fast-forwarding its mount wait. */
+async function openWithNothingMounting(op: string, params: unknown): Promise<unknown> {
+  unmount?.(); unmount = null;
+  vi.useFakeTimers();
+  const pending = runAgentOp(op, params).then(() => null, (e: unknown) => e);
+  await vi.advanceTimersByTimeAsync(3_500);
+  return pending;
+}
 
 describe('open-skin-editor', () => {
   it('opens the panel and reports it via editor state', async () => {
     await runAgentOp('open-skin-editor', { path: RIG_PATH });
     expect(useEditorStore.getState().editingSkinAsset?.path).toBe(RIG_PATH);
-    const state = await runAgentOp('editor-state', {}) as { editingSkinAsset?: { path: string } };
+    const state = await runAgentOp('editor-state', {}) as { editingSkinAsset?: { path: string }; openEditors?: Record<string, string> };
     expect(state.editingSkinAsset?.path).toBe(RIG_PATH);
+    expect(state.openEditors?.skin).toBe(RIG_PATH);
+  });
+
+  it('REFUSES when the Skin editor never mounts — the store naming the rig is not the panel showing it (#1213)', async () => {
+    const e = await openWithNothingMounting('open-skin-editor', { path: RIG_PATH });
+    expect(e).toMatchObject({ code: 'NOT_AVAILABLE_HERE' });
+    expect((e as Error).message).toMatch(/did not open/);
   });
 
   // Regression for the dead `requireAssetPath` guard (#373 close-out): opening the Skin
@@ -65,6 +110,8 @@ describe('open-skin-editor', () => {
 });
 
 describe('set-skin-mode', () => {
+  beforeEach(async () => { await runAgentOp('open-skin-editor', { path: RIG_PATH }); });
+
   it('switches between all three modes', async () => {
     for (const mode of ['parts', 'weights', 'rig'] as const) {
       const r = await runAgentOp('set-skin-mode', { mode }) as OpReply;
@@ -92,9 +139,19 @@ describe('set-skin-mode', () => {
     expect(r.ok).toBe(false);
     expect(useEditorStore.getState().skinMode).toBe('weights');
   });
+
+  it('REFUSES a valid mode when no Skin editor is showing (#1213 B-10)', async () => {
+    unmount?.(); unmount = null; // the panel goes away — the store still NAMES the rig
+    useEditorStore.setState({ editorMounts: {} });
+    expect(useEditorStore.getState().editingSkinAsset?.path).toBe(RIG_PATH);
+    await expect(runAgentOp('set-skin-mode', { mode: 'parts' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(useEditorStore.getState().skinMode).toBe('rig');
+  });
 });
 
 describe('select-sprite-slice', () => {
+  beforeEach(async () => { await runAgentOp('open-sprite-editor', { path: TEXTURE_PATH }); });
+
   it('sets the selection and reports it back, including via editor-state', async () => {
     await runAgentOp('select-sprite-slice', { guid: 'slice-1' });
     expect(useEditorStore.getState().spriteEditorSelection).toBe('slice-1');
@@ -105,6 +162,21 @@ describe('select-sprite-slice', () => {
   it('deselects when guid is omitted or null', async () => {
     useEditorStore.getState().setSpriteEditorSelection('slice-1');
     await runAgentOp('select-sprite-slice', {});
+    expect(useEditorStore.getState().spriteEditorSelection).toBeNull();
+  });
+
+  it('REFUSES a guid that is not a slice of the open texture, listing the real slices (#1213 B-1)', async () => {
+    const r = runAgentOp('select-sprite-slice', { guid: 'slice-9' });
+    await expect(r).rejects.toMatchObject({ code: 'REFUSED_BY_OP', options: SLICES });
+    expect(useEditorStore.getState().spriteEditorSelection).toBeNull();
+  });
+
+  it('REFUSES any guid when no Sprite Editor is open — but a deselect still works (#1213 B-1)', async () => {
+    useEditorStore.setState({ editorMounts: {} });
+    await expect(runAgentOp('select-sprite-slice', { guid: 'slice-1' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(useEditorStore.getState().spriteEditorSelection).toBeNull();
+    useEditorStore.setState({ spriteEditorSelection: 'stale' });
+    await expect(runAgentOp('select-sprite-slice', { guid: null })).resolves.toMatchObject({ ok: true });
     expect(useEditorStore.getState().spriteEditorSelection).toBeNull();
   });
 });
@@ -119,6 +191,34 @@ describe('open-sprite-editor resets the prior selection', () => {
     useEditorStore.getState().setSpriteEditorSelection('a-human-selected-this');
     await runAgentOp('open-sprite-editor', { path: TEXTURE_PATH });
     expect(useEditorStore.getState().spriteEditorSelection).toBeNull();
+  });
+
+  it('REFUSES when the modal never opens, and WITHDRAWS the request so it cannot pop up later (#1213)', async () => {
+    const e = await openWithNothingMounting('open-sprite-editor', { path: TEXTURE_PATH });
+    expect(e).toMatchObject({ code: 'NOT_AVAILABLE_HERE' });
+    expect((e as Error).message).toMatch(/pending request was withdrawn/);
+    expect(useEditorStore.getState().textureEditorRequest).toBeNull();
+  });
+
+  it('a request the Inspector CONSUMED is not reported as withdrawn', async () => {
+    unmount?.(); unmount = null;
+    // The Inspector takes the request (clears it) but the modal never publishes — e.g. a slow load.
+    const consume = useEditorStore.subscribe((st) => { if (st.textureEditorRequest) st.clearTextureEditorRequest(); });
+    vi.useFakeTimers();
+    try {
+      const pending = runAgentOp('open-sprite-editor', { path: TEXTURE_PATH }).then(() => null, (e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(3_500);
+      const e = await pending;
+      expect(e).toMatchObject({ code: 'NOT_AVAILABLE_HERE' });
+      expect((e as Error).message).not.toMatch(/withdrawn/);
+    } finally { consume(); }
+  });
+
+  it('open-nine-slice-editor waits for its modal the same way', async () => {
+    await expect(runAgentOp('open-nine-slice-editor', { path: TEXTURE_PATH })).resolves.toMatchObject({ ok: true });
+    useEditorStore.setState({ editorMounts: {} }); // the modal closed
+    const e = await openWithNothingMounting('open-nine-slice-editor', { path: TEXTURE_PATH });
+    expect(e).toMatchObject({ code: 'NOT_AVAILABLE_HERE' });
   });
 
   it('REFUSES a rig2d path — the sprite editor only opens textures', async () => {

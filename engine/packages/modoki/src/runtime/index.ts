@@ -934,7 +934,7 @@ export {
 } from './physics/physicsLayers';
 export type { PhysicsLayersConfig } from './physics/physicsLayers';
 export {
-  type PlayState, getPlayState, setPlayState, onPlayStateChange, isSimRunning,
+  type PlayState, PLAY_STATES, RUN_MODES, getPlayState, setPlayState, onPlayStateChange, isSimRunning,
   type RunMode, getRunMode, setRunMode, isAdvancing, onRunModeChange,
   shouldFireActions, shouldRunSimTier, isPoseOnly, isLiveRender, canEdit, inPreviewSession,
 } from './core/playState';

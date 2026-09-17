@@ -50,6 +50,14 @@ type ParticleAction = UndoAction & { _after: ParticleEffectDef };
 export default function ParticleEditor() {
   const asset = useEditorStore((s) => s.editingParticleAsset);
   const nonce = useEditorStore((s) => s.particleEditNonce);
+  // Publish "mounted, showing this asset" for the agent ops (#1213): the store naming an asset is
+  // not the panel showing it — a tab that was never opened this session does not mount.
+  const setEditorMount = useEditorStore((s) => s.setEditorMount);
+  const mountedAssetPath = asset?.path ?? null;
+  useEffect(() => {
+    setEditorMount('particle', { path: mountedAssetPath });
+    return () => setEditorMount('particle', null, mountedAssetPath);
+  }, [setEditorMount, mountedAssetPath]);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<Awaited<ReturnType<typeof makeWebGPURenderer>> | null>(null);

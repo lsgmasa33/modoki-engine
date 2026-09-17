@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { flatEntityAlias, foldEntityRef, precisionParam } from '../shapes.js';
+import { PROFILER_ACTIONS, PROFILER_READ_ACTIONS } from '../../../shared/profilerActions.js';
 
 export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, editorAction, fail } = ctx;
@@ -275,7 +276,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     {
       action: z.enum(['set', 'delete', 'clear', 'flush'])
         .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),
-      key: z.string().optional().describe('The key, for action set/delete. Ignored by clear/flush.'),
+      key: z.string().optional().describe('The key, for action set/delete. REFUSED on clear/flush — clear removes every key, so a key there is a mistake, not a filter.'),
       value: z.any().optional().describe('The JSON document to store, for action:"set". Any JSON value including null. Omitting it is REFUSED rather than treated as a delete — PlayerPrefs reads undefined as a delete, and that is a different operation here.'),
       confirm: z.boolean().optional().describe('Required (true) for action:"clear" only — it removes every key in the namespace and is not undoable. The refusal lists the keys it would have removed.'),
     },
@@ -335,7 +336,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'device_profiler on the target phone; this is for finding which marker owns the frame, and for ' +
       'editor-side regressions. Read actions are GET, state-changing ones POST.',
     {
-      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset', 'boot', 'boot-reset'])
+      action: z.enum(PROFILER_ACTIONS)
         .optional().describe('Default "read" (the live aggregate). capture-* record/read frames; gpu-* toggle GPU timestamps; reset clears markers + captures; boot reads the boot-phase timeline; boot-reset re-arms it.'),
       markers: z.number().optional().describe('action:read only — how many marker rows to return (default 12).'),
       limit: z.number().optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200).'),
@@ -365,7 +366,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
           options: stray.map((s) => `${s.param} applies only to action:'${s.belongsTo}'`),
         });
       }
-      if (act === 'read' || act === 'capture-read' || act === 'boot') {
+      if ((PROFILER_READ_ACTIONS as readonly string[]).includes(act)) {
         const qs = new URLSearchParams({ action: act });
         if (markers !== undefined) qs.set('markers', String(markers));
         if (limit !== undefined) qs.set('limit', String(limit));

@@ -1583,7 +1583,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_set_animation_view_mode` | POST `/api/editor-action` `set-animation-view-mode` | session | editor | — | `{"mode":"dopesheet"}` |
 | `modoki_set_collider_edit` | POST `/api/editor-action` `set-collider-edit` | session | editor | — | `{"on":true}` |
 | `modoki_set_game_view_device` | POST `/api/editor-action` `set-game-view-device` | session | editor | — | `{"device":"Free"}` |
-| `modoki_set_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
+| `modoki_set_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | `{"mode":"translate"}` |
 | `modoki_set_playhead` | POST `/api/editor-action` `set-playhead` | session | editor | — | `{"t":0}` |
 | `modoki_set_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
 | `modoki_set_selection` | POST `/api/editor-action` `set-selection` | session | editor | entity | *(no args)* |

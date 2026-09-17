@@ -151,6 +151,31 @@ describe('player-prefs ops against a hydrated store', () => {
     expect(PlayerPrefs.keys()).toEqual([]);
   });
 
+  it('clear REFUSES a key rather than wiping the whole namespace it did not name (#1213 B-15)', async () => {
+    await write({ action: 'set', key: 'progress', value: 1 });
+    await write({ action: 'set', key: 'settings', value: 2 });
+    // Reads as "clear that one key" — and, with `key` ignored, removed BOTH.
+    const r = await write({ action: 'clear', key: 'progress', confirm: true });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('UNKNOWN_PARAM');
+    expect(String(r.error)).toMatch(/action:'delete'/);
+    expect(PlayerPrefs.keys().sort()).toEqual(['progress', 'settings']);
+  });
+
+  it('a param another action owns is refused on every action, not only clear (#1213 B-15)', async () => {
+    await write({ action: 'set', key: 'a', value: 1 });
+    for (const bad of [
+      { action: 'delete', key: 'a', value: 2 },
+      { action: 'flush', key: 'a' },
+      { action: 'set', key: 'a', value: 3, confirm: true },
+    ]) {
+      const r = await write(bad);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+      expect(r.code).toBe('UNKNOWN_PARAM');
+    }
+    expect(PlayerPrefs.get('a')).toBe(1);
+  });
+
   it('a missing or unknown action is refused and the real ones are listed', async () => {
     // §1: a tool whose params are all optional and whose {} has a destructive reading is a
     // hazard by construction. `action` is required at the op as well as in the zod schema,

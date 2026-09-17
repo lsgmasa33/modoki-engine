@@ -87,6 +87,21 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     return () => setSelected(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // Publish "open, on this texture, holding these slices" for the agent ops (#1213). The open state
+  // lived only in TextureAssetView's `useState`, so `select-sprite-slice` stored any string with no
+  // modal on screen and `open-sprite-editor` could not tell whether the modal ever opened. Published
+  // only once THIS path's slices have loaded — before that the slice list is the previous texture's
+  // (or empty), and a caller told "open" would be refused a slice that is about to appear. While a
+  // new path loads, the previous path's entry is WITHDRAWN: the component survives a texture swap
+  // (no `key`), and leaving A published would let `select-sprite-slice` accept A's slices over B.
+  const [loadedPath, setLoadedPath] = useState<string | null>(null);
+  const setEditorMount = useEditorStore((s) => s.setEditorMount);
+  const sliceKey = sprites.filter((s) => s.guid !== '__preview__').map((s) => s.guid).join('\n');
+  useEffect(() => {
+    if (loadedPath !== path) { setEditorMount('sprite', null); return; }
+    setEditorMount('sprite', { path, slices: sliceKey ? sliceKey.split('\n') : [] });
+  }, [loadedPath, path, sliceKey, setEditorMount]);
+  useEffect(() => () => setEditorMount('sprite', null), [setEditorMount]);
   const [grid, setGrid] = useState<GridOpts>(DEFAULT_GRID);
   const [alphaThreshold, setAlphaThreshold] = useState(8);
   const initialGuidsRef = useRef<Set<string>>(new Set());
@@ -144,9 +159,14 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     pendingRefAtLoadRef.current = undefined;
     readMetaPreferringPark(path, { signal: ac.signal })
       .then(({ meta: m, pendingRef, ok }) => {
+        // A superseded path's result must not land on the current one: it would set
+        // `metaLoadedRef` and `meta` (with the OLD asset's id) under the new path — the duplicate-GUID
+        // save the reset above exists to prevent (#1213 review).
+        if (ac.signal.aborted) return;
         pendingRefAtLoadRef.current = pendingRef;
         metaLoadedRef.current = ok;
         setMeta(m);
+        setLoadedPath(path);
         const existing = Array.isArray(m.sprites) ? (m.sprites as SpriteSlice[]) : [];
         setSprites(existing.map((s) => ({ ...s, rect: { ...s.rect }, pivot: { ...s.pivot } })));
         initialGuidsRef.current = new Set(existing.map((s) => s.guid));
@@ -162,7 +182,17 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
         }
         if (typeof m.spriteAlphaThreshold === 'number') setAlphaThreshold(m.spriteAlphaThreshold);
       })
-      .catch(() => { /* no meta yet — fresh sheet */ });
+      .catch(() => {
+        /* no meta yet — fresh sheet */
+        // A fresh sheet, literally: the slices on screen were the PREVIOUS texture's (the component
+        // survives a swap), so they are cleared rather than shown — and published — under this one.
+        // A save stays refused by `metaLoadedRef` (false here), so this cannot write an empty list
+        // over the real sidecar. Then the modal counts as open on this path for the agent ops (#1213).
+        if (ac.signal.aborted) return;
+        setSprites([]);
+        initialGuidsRef.current = new Set();
+        setLoadedPath(path);
+      });
     return () => ac.abort();
   }, [path]);
 

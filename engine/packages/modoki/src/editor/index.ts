@@ -38,9 +38,10 @@ export {
 } from './scene/devicePresets';
 export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
-  withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
+  withEditorActor, AGENT_SCOPE_MAX_MS, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
   waitForEditorJournal, type EditorEvent, type WaitForEditResult,
   EDITOR_JOURNAL_SOURCES, isEditorJournalSource, type EditorJournalSource,
+  EDITOR_JOURNAL_TYPES, isEditorJournalType, type EditorJournalType,
 } from './editorJournal';
 export {
   getEditorViewportCamera, setEditorViewportCamera, focusEntityInSceneView,
@@ -111,7 +112,9 @@ export {
   readMetaPreferringPark, metaWrittenToDisk, metaReadFallback, type PreferredMetaRead,
 } from './scene/pendingMeta';
 export { importModel } from './scene/modelImport';
-export { useEditorStore } from './store/editorStore';
+export { useEditorStore, GIZMO_MODES, GIZMO_SPACES, SCENE_VIEW_MODES, ASSET_EDITOR_KINDS } from './store/editorStore';
+export type { AssetEditorKind, AssetEditorMount } from './store/editorStore';
+export { colliderEditBlocker, isColliderEditable } from './scene/colliderEditable';
 export type { SelectedAsset } from './store/editorStore';
 export { upsertKey, findTrack, encodeValue, relativeEntityPath } from './animation/recording';
 // The pose path, extracted out of AnimationEditor.tsx so the `pose-clip` agent op drives the SAME

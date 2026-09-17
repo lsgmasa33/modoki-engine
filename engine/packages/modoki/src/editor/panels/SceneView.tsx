@@ -92,8 +92,9 @@ import { entityRef, journalRefOf } from '../undo/entityRef';
 import { notifyFieldEdited } from '../animation/recording';
 import {
   parseColliderPoints, serializeColliderPoints, moveVertex, insertVertex, removeVertex,
-  nearestEdgeInsertion, minPointsForShape, type Pt,
+  nearestEdgeInsertion, type Pt,
 } from '../../runtime/core/colliderPoints';
+import { isColliderEditable } from '../scene/colliderEditable';
 import { colliderEditInfo, worldPointToLocal, localToWorld, pickVertex, colliderPickHalfExtents } from './colliderEdit2D';
 import { descendantUnionGizmoBox2D, type GizmoBoundsEntity } from './gizmoBounds';
 import { gizmoWorldScale, rotateRingAim, scaleCenterAim, axisPickAim, ROTATE_RING_RADIUS, SCALE_XYZ_HALF_EXTENT, AXIS_PICKER_CENTER } from './gizmo3dAim';
@@ -277,17 +278,8 @@ function ColliderEditButton() {
   const colliderEditMode = useEditorStore((s) => s.colliderEditMode);
   const setColliderEditMode = useEditorStore((s) => s.setColliderEditMode);
   const selectedId = useEditorStore((s) => s.selectedEntityId);
-  let editable = false;
-  if (selectedId != null) {
-    const colMeta = getAllTraits().find((t) => t.name === 'Collider2D');
-    const ent = colMeta ? findEntity(selectedId) : null;
-    if (ent && colMeta && ent.has(colMeta.trait)) {
-      const shape = (ent.get(colMeta.trait) as { shape: string }).shape;
-      // Any point-list shape is editable (polygon/concave = 3, polyline = 2) — use the
-      // single source of truth so new point-shapes never desync from this gate.
-      editable = minPointsForShape(shape) !== null;
-    }
-  }
+  // Shared with the `set-collider-edit` op, so the op refuses exactly what this effect would undo.
+  const editable = isColliderEditable(selectedId);
   useEffect(() => { if (!editable && colliderEditMode) setColliderEditMode(false); }, [editable, colliderEditMode, setColliderEditMode]);
   if (!editable) return null;
   return (

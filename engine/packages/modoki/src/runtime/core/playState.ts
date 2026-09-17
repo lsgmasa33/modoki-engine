@@ -23,8 +23,12 @@
 
 import { notifyListeners } from './notifyListeners';
 
-export type PlayState = 'stopped' | 'playing' | 'paused';
-export type RunMode = 'stopped' | 'scrub' | 'preview' | 'playing';
+/** Tables, not only types, so a caller comparing against them (`wait_for`'s editor condition) can
+ *  refuse a value that can never match instead of polling to its timeout (#1213 B-11). */
+export const PLAY_STATES = ['stopped', 'playing', 'paused'] as const;
+export type PlayState = typeof PLAY_STATES[number];
+export const RUN_MODES = ['stopped', 'scrub', 'preview', 'playing'] as const;
+export type RunMode = typeof RUN_MODES[number];
 
 let _mode: RunMode = 'playing';
 let _advancing = true; // false = frozen frame (Play paused, or paused preview)

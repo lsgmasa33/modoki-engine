@@ -180,11 +180,12 @@ export default function AnimationEditor() {
   // selection (docs/editor.md § Tab mounting latches), so "the Animation tab exists" is not
   // "a view is showing" — the distinction #367 had to learn on the Game panel. Without this, set-animation-view-mode answers ok:true for an
   // editor where neither view's handle provider is registered.
-  const setPanelMounted = useEditorStore((s) => s.setAnimationPanelMounted);
+  const setEditorMount = useEditorStore((s) => s.setEditorMount);
+  const mountedAssetPath = useEditorStore((s) => s.editingAnimationAsset?.path ?? null);
   useEffect(() => {
-    setPanelMounted(true);
-    return () => setPanelMounted(false);
-  }, [setPanelMounted]);
+    setEditorMount('animation', { path: mountedAssetPath });
+    return () => setEditorMount('animation', null, mountedAssetPath);
+  }, [setEditorMount, mountedAssetPath]);
   // Shared horizontal timeline viewport (zoom + pan), used by BOTH the Dopesheet
   // and Curves views so switching views keeps the same zoom. Wheel zooms toward the
   // cursor; right-drag pans (SceneView convention). Reset via Home / 0.

@@ -200,6 +200,21 @@ describe('sim-step (runtime twin)', () => {
     expect(getTimeScale(world)).toBe(0);
   });
 
+  it('REFUSES a frame count or scale it would have had to change, instead of clamping (#1213 C-9)', async () => {
+    game = createTestWorld({});
+    const world = getCurrentWorld();
+    setTimeScale(world, 0);
+    // `frames:'abc'` is the sharp one: it became NaN, which no frame count reaches, so the call sat
+    // out its whole timeout. A refusal answers at once — the short test timeout would catch a wait.
+    for (const params of [{ frames: 601 }, { frames: 0 }, { frames: 2.5 }, { frames: 'abc' }, { scale: -1 }, { scale: 0 }, { timeoutMs: 'soon' }]) {
+      const r = await runAgentOp('sim-step', params) as { ok?: boolean; code?: string; error?: string; stepped?: number };
+      expect(r, JSON.stringify(params)).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+      expect(r.error).toMatch(/Nothing was stepped/);
+      expect(r.stepped).toBeUndefined();
+    }
+    expect(getTimeScale(world)).toBe(0);
+  });
+
   it('refuses to step a RUNNING world, naming how to pause it', async () => {
     game = createTestWorld({});
     // A test world runs at timeScale 1 — stepping it is meaningless, and silently pausing it would

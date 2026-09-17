@@ -621,6 +621,42 @@ Rules:
     inserts nothing — so `type_text {submitKey:'Retrun'}` answered `ok, typed:3` having submitted
     nothing. On the DEVICE side it is worse: `new KeyboardEvent({key:'Excape'})` is well-formed and
     carries the typo, so there is no signal at all and only the table can catch it.
+  - **The table is a RUNTIME value, and the op checks it — a TypeScript union is not a table**
+    (#1213). Thirteen ops held a vocabulary only as a type (`'3d' | 'ui'`), an inline literal or a
+    `switch`, so there was nothing to refuse WITH, and each fell back to "do nothing, answer ok":
+    `set-gizmo` stored and persisted a typo, `set-scene-view-mode` dropped one, `profiler`'s
+    `default:` served an unknown action as a read, `wait-for-edit`'s `type` matched nothing and
+    parked its whole timeout, `resolve-unsaved` filtered out an unknown registry and answered
+    "nothing held", `sim-step` clamped `frames` and turned `'abc'` into a NaN no frame count
+    reaches. The shape now: an `as const` tuple beside the state it describes, the type DERIVED from
+    it, and the op refusing with the tuple as `options` (`refuseUnknownValue` in
+    `agentEditorOps.ts`). Where a compiler can keep the table complete, make it: `editorEmit` takes
+    `EditorJournalType`, so an emit site with a type the table lacks does not build — it caught
+    `!batch` the day it landed. Three corollaries:
+    - **A param the chosen action does not use is refused, not ignored** — above all on the
+      destructive action. `write_player_prefs {action:'clear', key, confirm}` read as "clear that
+      key" and wiped the namespace.
+    - **A number outside the range is refused, not clamped** — a silent clamp answers ok about a run
+      nobody asked for. Two exceptions, both documented on the tool: a clamp the reply REPORTS
+      (`set-playhead`'s `clampedFrom`), and a TIMEOUT budget (`timeoutMs`), which is clamped to its
+      stated range like `modoki_eval`'s, because it bounds the wait rather than choosing the work.
+      A non-finite timeout is still refused (`sim-step`).
+    - **An explicit argument that CONTRADICTS what the op can infer is refused** (`read-asset-def`'s
+      `type` vs the path's suffix), rather than winning and producing a confident wrong negative.
+  - **An op that acts ON an editor refuses when that editor is not showing anything** (#1213). The
+    store naming an asset is not the editor on screen: `select-sprite-slice` stored any guid with no
+    Sprite Editor mounted, `set-skin-mode` answered ok with no Skin editor, and every opener except
+    `open-animation-editor` answered as soon as the store was pointed. Each asset editor now
+    publishes an `AssetEditorMount` into `editorMounts` from its own mount effect (the rule
+    `docs/editor.md` § Tab mounting latches sets for `panelMounted`); `requireEditorOpen(kind)`
+    refuses `NOT_FOUND` naming the opener, and each opener waits for its own mount and refuses
+    `NOT_AVAILABLE_HERE` if it never comes. Where the gate lives in a COMPONENT that undoes the
+    state (SceneView's collider button switching edit mode back off), the gate moves into a shared
+    predicate both call (`colliderEditBlocker`) — otherwise the op answers from before the undo.
+    ⚠️ **Not every editor op needs the gate:** `particle-set`, `anim-set-clip`, `anim-add-key` and
+    the timeline ops write the ASSET and the panel only mirrors it, so they work with nothing open.
+    `set-animation-view-mode` is also exempt on purpose — it is a view preference applied at mount,
+    and its reply already carries `panelNote`.
   - **SWEPT AND CLEARED, so the next sweep does not re-derive it: `modoki_handles`' `editor`/`kind`.**
     They look like the last unrefused vocabulary on this surface — free-form strings that FILTER a
     read, where an unknown value would yield an empty list and the tool's own description says an

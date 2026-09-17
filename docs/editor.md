@@ -626,7 +626,8 @@ zero-area tabset surfaces as `panelMounted: false` instead. Which is why "is it 
 neither direction of the question.
 
 **So mountedness has exactly one source of truth: the panel publishes it from its own mount effect**
-(`gameViewMounted`, `animationPanelMounted`), read back as `panelMounted`. It is **not** derivable
+(`gameViewMounted`, and `editorMounts` for the asset editors — #1213), read back as `panelMounted` /
+`openEditors`. It is **not** derivable
 from `openPanels` — that is every tab NODE in the model with no selection test — and it is not
 derivable from selection. ⚠️ Do not "simplify" `panelMounted` into either; #367 shipped the
 `openPanels` version, which answered `mounted: true` for precisely the case the field exists to

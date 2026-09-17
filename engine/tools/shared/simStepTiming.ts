@@ -16,6 +16,10 @@
 
 export const SIM_STEP_MAX_TIMEOUT_MS = 20000;
 
+/** The most frames one `sim-step` advances. Beyond it the op REFUSES (#1213 C-9) — it used to clamp
+ *  silently — and the derived default budget below is sized so this many fits. */
+export const SIM_STEP_MAX_FRAMES = 600;
+
 /** The default budget for `sim-step`, DERIVED from the frame count rather than flat.
  *
  *  A flat default could not cover the op's own documented maximum: 600 frames is ~10s at 60fps and

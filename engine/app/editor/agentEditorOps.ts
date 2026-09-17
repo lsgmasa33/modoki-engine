@@ -24,7 +24,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, replaySuppressedSceneReloads, setPrefabSourceRefresher, inferAssetDefType, dumpSceneState, whereError } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, dumpSceneState, whereError } from '../debug/agentBridge';
 import { conditionError, waitForCondition, clampWaitTimeout, type WaitCondition, type WaitReaders } from '../debug/waitFor';
 import { getConsoleRingEntries } from '@modoki/engine/runtime/core/consoleRing';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
@@ -33,7 +33,8 @@ import { getGameBootFaults } from './gameBootFaults';
 import { handleEval, clampEvalTimeout, EVAL_ASYNC_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS } from '../debug/bridgeHelpers';
 import { makeEvalApi } from './evalApi';
 import {
-  useEditorStore, type SelectedAsset,
+  useEditorStore, type SelectedAsset, GIZMO_MODES, GIZMO_SPACES, SCENE_VIEW_MODES,
+  type AssetEditorKind, type AssetEditorMount, colliderEditBlocker,
   enterPlay, stopPlay, pausePlay,
   undoStep, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
@@ -58,7 +59,7 @@ import {
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
   getCreatableAssets, createRegisteredAsset,
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
-  waitForEditorJournal, EDITOR_JOURNAL_SOURCES, isEditorJournalSource,
+  waitForEditorJournal, EDITOR_JOURNAL_SOURCES, isEditorJournalSource, EDITOR_JOURNAL_TYPES, isEditorJournalType,
   readMetaPreferringPark, peekPendingMeta, discardPendingMeta, getPendingMetaPaths,
   getResolvedRender3d,
   probeKeyReach,
@@ -234,7 +235,7 @@ function describeGameView() {
  */
 function describeAnimationView() {
   const s = useEditorStore.getState();
-  const mounted = s.animationPanelMounted;
+  const mounted = s.editorMounts.animation !== undefined;
   return {
     mode: s.animationViewMode,
     panelMounted: mounted,
@@ -350,12 +351,15 @@ function readEditorState() {
     // resize/pivot handles only exist for the selected slice, so without this an empty
     // `modoki_handles editor=sprite` list is indistinguishable from "no slices" (#373). Set with
     // `select-sprite-slice`, reset to null on every `open-sprite-editor` call and by the modal's
-    // own mount/unmount — but NOT gated on the modal being open right now: `select-sprite-slice`
-    // will happily set this with no Sprite Editor mounted at all, same as `animationViewMode`
-    // before `animationView.panelMounted` was added to qualify it. So a non-null value here is
-    // NOT proof the modal is open; check `textureEditorRequest`/that a modal-opening call
-    // preceded it, or expect the same class of gap `animationView` was added to close.
+    // own mount/unmount. `select-sprite-slice` refuses unless the modal is open and holds the
+    // slice (#1213), so a non-null value now names a slice of `openEditors.sprite`.
     spriteEditorSelection: s.spriteEditorSelection,
+    // Which asset editors are MOUNTED, and on what — each editor publishes this from its own mount
+    // effect (#1213). The ops that act on an editor refuse when its entry is absent, so this is
+    // what to read before calling them; `editingSkinAsset` below names an asset, not a showing panel.
+    // Only editors SHOWING an asset are listed — a panel mounted with nothing loaded is left out,
+    // so `'skin' in openEditors` agrees with what `requireEditorOpen('skin')` accepts.
+    openEditors: Object.fromEntries(Object.entries(s.editorMounts).filter(([, m]) => m?.path != null).map(([k, m]) => [k, m!.path])),
     // Which .rig2d.json is open in the Skin editor (null = none), and which of its three
     // modes (rig/parts/weights) is active — 'parts' hides every `skin:bone:*` handle. Set
     // with `open-skin-editor` / `set-skin-mode` (#373).
@@ -478,6 +482,71 @@ function setSelectionRaw(entityId: number | null, entityIds: number[]): void {
 
 /** Throw a shared-resolver refusal as the op's own: a coded one as `OpRefusal`, carrying its `options`
  *  and `stale`; an uncoded one (no address at all) as a plain `Error`. */
+/** The `type` filter on the two journal reads matches EXACTLY, so a type outside the table matches
+ *  nothing: `editor-journal` answered an empty read under a filtered framing, and `wait-for-edit`
+ *  parked its whole timeout — "the human did nothing" for `'edit'` typed without its `!` (#1213). */
+/** An op that owns a vocabulary refuses a value outside it, with the table as `options` — never
+ *  stores it, drops it or answers ok (#1072, #1213). `undefined` means "not given" and passes; the
+ *  caller decides whether an absent value is itself a refusal. */
+function refuseUnknownValue<T extends string>(op: string, field: string, value: unknown, table: readonly T[], nothingDone: string): asserts value is T | undefined {
+  if (value === undefined || (table as readonly unknown[]).includes(value)) return;
+  throw new OpRefusal('REFUSED_BY_OP',
+    `${op}: unknown ${field} ${JSON.stringify(value)} — ${nothingDone}. Valid: ${table.join(', ')}.`,
+    { options: [...table] });
+}
+
+/** What each asset editor is called, and the call that opens it — the `options` of every "not open"
+ *  refusal below. */
+const ASSET_EDITORS: Record<AssetEditorKind, { name: string; opener: string }> = {
+  animation: { name: 'Animation editor', opener: 'modoki_open_animation_editor {path}' },
+  particle: { name: 'Particle editor', opener: 'modoki_open_particle_editor {path}' },
+  skin: { name: 'Skin editor', opener: 'modoki_open_skin_editor {path}' },
+  sprite: { name: 'Sprite Editor', opener: 'modoki_open_sprite_editor {path}' },
+  nineslice: { name: 'Nine-slice editor', opener: 'modoki_open_nine_slice_editor {path}' },
+};
+
+/** An op that acts ON an editor refuses when that editor is not showing anything (#1213). The store
+ *  naming an asset is not enough — that is what `select-sprite-slice` and `set-skin-mode` read, and
+ *  both answered ok with no editor on screen. Reads the mount the editor itself publishes. */
+function requireEditorOpen(kind: AssetEditorKind, op: string): AssetEditorMount & { path: string } {
+  const mount = useEditorStore.getState().editorMounts[kind];
+  if (mount && mount.path != null) return mount as AssetEditorMount & { path: string };
+  const { name, opener } = ASSET_EDITORS[kind];
+  throw new OpRefusal('NOT_FOUND',
+    `${op}: the ${name} is not open${mount ? ' (its panel is mounted with nothing loaded)' : ''}, so there is nothing for this to act on — nothing was changed.`,
+    { options: [`${opener} opens it — then retry`, 'modoki_get_editor_state.openEditors shows which editors are open'] });
+}
+
+const EDITOR_MOUNT_WAIT_MS = 3000;
+
+/** An opener waits for its editor to MOUNT on the asset it named, rather than answering once the
+ *  store is pointed (#1213) — the same readiness rule `open-animation-editor` already follows. The
+ *  store field is not the editor: a dockable tab never opened this session does not mount, and a
+ *  texture modal opens only if the texture's Inspector view is on screen to consume the request. */
+async function awaitEditorMount(kind: AssetEditorKind, path: string, op: string, why: string): Promise<void> {
+  const deadline = Date.now() + EDITOR_MOUNT_WAIT_MS;
+  while (useEditorStore.getState().editorMounts[kind]?.path !== path && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const now = useEditorStore.getState().editorMounts[kind];
+  if (now?.path === path) return;
+  const { name } = ASSET_EDITORS[kind];
+  throw new OpRefusal('NOT_AVAILABLE_HERE',
+    `${op}: the ${name} did not open on ${path} within ${EDITOR_MOUNT_WAIT_MS / 1000}s`
+    + `${now?.path ? ` — it is showing ${now.path}` : ''}. ${why}`,
+    { options: [
+      'modoki_get_editor_state.openPanels / openEditors show what is on screen',
+      `retry ${ASSET_EDITORS[kind].opener.replace('{path}', `{path:"${path}"}`)} once the panel is showing`,
+    ] });
+}
+
+function refuseUnknownJournalType(op: string, type: unknown, nothingDone: string): void {
+  if (type === undefined || isEditorJournalType(type)) return;
+  throw new OpRefusal('REFUSED_BY_OP',
+    `${op}: unknown type ${JSON.stringify(type)} — ${nothingDone}. Editor event types all start with '!'; valid: ${EDITOR_JOURNAL_TYPES.join(', ')}.`,
+    { options: [...EDITOR_JOURNAL_TYPES] });
+}
+
 function throwAddressRefusal(r: { code?: ErrorCode; error: string; options?: string[]; stale?: string }): never {
   if (r.code) throw new OpRefusal(r.code, r.error, { options: r.options, stale: r.stale });
   throw new Error(r.error);
@@ -1038,6 +1107,7 @@ export function registerEditorAgentOps(): void {
         `editor-journal: unknown source ${JSON.stringify(p.source)} — nothing was read and nothing was cleared. Valid: ${EDITOR_JOURNAL_SOURCES.join(', ')}.`,
         { options: [...EDITOR_JOURNAL_SOURCES] });
     }
+    refuseUnknownJournalType('editor-journal', p.type, 'nothing was read and nothing was cleared');
     // `editor` is the editor-only view: filtered by type/source and cursored by the
     // editor-local `since` (a `seq`). `timeline` is the single-axis merged view.
     //
@@ -1186,6 +1256,7 @@ export function registerEditorAgentOps(): void {
         `wait-for-edit: unknown source ${JSON.stringify(p.source)} — nothing was waited for. Valid: ${EDITOR_JOURNAL_SOURCES.join(', ')}.`,
         { options: [...EDITOR_JOURNAL_SOURCES] });
     }
+    refuseUnknownJournalType('wait-for-edit', p.type, 'nothing was waited for');
     const requested = typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs) ? p.timeoutMs : WAIT_FOR_EDIT_DEFAULT_MS;
     const timeoutMs = Math.max(WAIT_FOR_EDIT_MIN_MS, Math.min(WAIT_FOR_EDIT_MAX_MS, requested));
     return waitForEditorJournal({ type: p.type, source: p.source ?? 'human', since: p.since }, timeoutMs);
@@ -1238,10 +1309,20 @@ export function registerEditorAgentOps(): void {
 
   // ── Gizmo ──
   registerAgentOp('set-gizmo', (params) => {
-    const p = (params ?? {}) as { mode?: 'translate' | 'rotate' | 'scale'; space?: 'world' | 'local' };
+    const p = (params ?? {}) as { mode?: unknown; space?: unknown };
+    // Both checked before either is applied, so a bad `space` does not leave a good `mode` half-set.
+    // A typo used to be STORED and persisted to localStorage (a truthiness check, #1213 B-8).
+    refuseUnknownValue('set-gizmo', 'mode', p.mode, GIZMO_MODES, 'nothing was changed');
+    refuseUnknownValue('set-gizmo', 'space', p.space, GIZMO_SPACES, 'nothing was changed');
+    if (p.mode === undefined && p.space === undefined) {
+      // B-9: an empty call answered ok for a no-op — `set-game-view-device` refuses the same shape.
+      throw new OpRefusal('REFUSED_BY_OP',
+        `set-gizmo: nothing to set — pass mode (${GIZMO_MODES.join('/')}) and/or space (${GIZMO_SPACES.join('/')}). `
+        + 'A call with neither would report success for a no-op. The current values are gizmoMode/gizmoSpace in modoki_get_editor_state.');
+    }
     const store = useEditorStore.getState();
-    if (p.mode) store.setGizmoMode(p.mode);
-    if (p.space) store.setGizmoSpace(p.space);
+    if (p.mode !== undefined) store.setGizmoMode(p.mode);
+    if (p.space !== undefined) store.setGizmoSpace(p.space);
     return readEditorState();
   });
 
@@ -1250,8 +1331,11 @@ export function registerEditorAgentOps(): void {
   // so expose them as ops. 'ui' mode mounts the 2D overlay where Collider2D vertex
   // editing (and its interaction-handle provider) lives.
   registerAgentOp('set-scene-view-mode', (params) => {
-    const p = (params ?? {}) as { mode?: '3d' | 'ui' };
-    if (p.mode === '3d' || p.mode === 'ui') useEditorStore.getState().setSceneViewMode(p.mode);
+    const p = (params ?? {}) as { mode?: unknown };
+    // A bad or missing mode used to be dropped and answered with a state read that looked like
+    // success (#1213 B-7) — the precedent `set-animation-view-mode` below was written against.
+    refuseUnknownValue('set-scene-view-mode', 'mode', p.mode ?? null, SCENE_VIEW_MODES, 'the view was not changed');
+    useEditorStore.getState().setSceneViewMode(p.mode as typeof SCENE_VIEW_MODES[number]);
     return readEditorState();
   });
 
@@ -1272,8 +1356,8 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('set-animation-view-mode', (params) => {
     const p = (params ?? {}) as { mode?: unknown };
     if (p.mode !== 'dopesheet' && p.mode !== 'curves') {
-      // Refused, not ignored: `set-scene-view-mode` above silently drops a bad mode and returns a
-      // state read that looks like success, which is §0's readiness lie. An agent that typo'd
+      // Refused, not ignored: `set-scene-view-mode` above used to silently drop a bad mode and return
+      // a state read that looked like success, which is §0's readiness lie (fixed in #1213). An agent that typo'd
       // 'curve' would be told nothing and then read an empty handle list as "no tangents".
       return {
         ok: false,
@@ -1474,9 +1558,24 @@ export function registerEditorAgentOps(): void {
     return { ok: true, ...probeKeyReach(p.key, p.modifiers) };
   });
   registerAgentOp('set-collider-edit', (params) => {
-    const p = (params ?? {}) as { on?: boolean };
-    if (typeof p.on === 'boolean') useEditorStore.getState().setColliderEditMode(p.on);
-    return readEditorState();
+    const p = (params ?? {}) as { on?: unknown };
+    if (typeof p.on !== 'boolean') {
+      // A missing or non-boolean `on` used to be dropped, answered with a plain state read (#1213).
+      throw new OpRefusal('REFUSED_BY_OP', `set-collider-edit: on must be true or false — got ${JSON.stringify(p.on)}. Nothing was changed.`,
+        { options: ['true', 'false'] });
+    }
+    if (p.on) {
+      // B-2: SceneView's toolbar button turns the mode straight back off when the selection is not
+      // editable, so setting it here answered `colliderEditMode:true` for a mode that lasted one render.
+      const blocker = colliderEditBlocker(useEditorStore.getState().selectedEntityId);
+      if (blocker) {
+        throw new OpRefusal('REFUSED_BY_OP',
+          `set-collider-edit: cannot enter collider-edit mode — ${blocker}. Only a Collider2D with a point list (polygon, concave, polyline) is vertex-editable.`,
+          { options: ['modoki_set_selection an entity whose Collider2D shape is polygon/concave/polyline, then retry'] });
+      }
+    }
+    useEditorStore.getState().setColliderEditMode(p.on);
+    return { ...readEditorState(), ok: true };
   });
   // Open the Particle Editor dock panel on a .particle.json (normally a double-click in
   // Assets). Mounts CurveEditor/GradientEditor, whose interaction-handle providers then
@@ -1485,16 +1584,35 @@ export function registerEditorAgentOps(): void {
   // only as the unreachable `|| asset.name` arm of two `fileName=` fallbacks in ParticleEditor, so
   // a caller-supplied one had no observable effect. The stem is still computed, because
   // `SelectedAsset` requires a name.
-  registerAgentOp('open-particle-editor', (params) => {
+  registerAgentOp('open-particle-editor', async (params) => {
     const p = (params ?? {}) as { path?: string };
     requireAssetPath(p.path, 'particle', 'open-particle-editor');
     const name = p.path!.split('/').pop()?.replace(/\.particle\.json$/, '') ?? p.path!;
     useEditorStore.getState().openParticleEditor({ path: p.path!, type: 'particle', name });
-    return readEditorState();
+    const path = p.path!;
+    await awaitEditorMount('particle', path, 'open-particle-editor',
+      'The store now names this asset, but the Particle editor tab did not mount to show it.');
+    return { ...readEditorState(), ok: true };
   });
   // Open the Sprite slicer / 9-slice modal on a texture (normally the Texture-Inspector
   // buttons). Selects the texture + requests the modal → its handle providers mount.
-  registerAgentOp('open-sprite-editor', (params) => {
+  /** The texture modals open when the texture's Inspector view consumes `textureEditorRequest`. When
+   *  nothing consumes it, the request is WITHDRAWN on refusal — left pending, it would pop the modal
+   *  open whenever the human next selected that texture, long after this call reported failure. */
+  const awaitTextureModal = async (kind: 'sprite' | 'nineslice', path: string, op: string): Promise<void> => {
+    try {
+      await awaitEditorMount(kind, path, op,
+        'The modal opens from the texture\'s Inspector view, which must be showing to consume the request.');
+    } catch (e) {
+      const st = useEditorStore.getState();
+      // Only a request still PENDING is withdrawn — and only then does the refusal say so. One the
+      // Inspector already consumed is not "withdrawn": the modal may be up on a slow load.
+      if (!(e instanceof OpRefusal) || st.textureEditorRequest?.path !== path || st.textureEditorRequest.kind !== kind) throw e;
+      st.clearTextureEditorRequest();
+      throw new OpRefusal(e.code, `${e.message} The pending request was withdrawn, so the modal will not pop up later.`, { options: e.options });
+    }
+  };
+  registerAgentOp('open-sprite-editor', async (params) => {
     const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'texture', 'open-sprite-editor');
     // The modal's own mount effect resets `spriteEditorSelection` to null, but a call on a path
@@ -1503,33 +1621,55 @@ export function registerEditorAgentOps(): void {
     // already had open would report whatever THEY had selected as if this call selected it.
     useEditorStore.getState().setSpriteEditorSelection(null);
     useEditorStore.getState().requestTextureEditor(p.path!, 'sprite', p.displayName);
-    return readEditorState();
+    const path = p.path!;
+    await awaitTextureModal('sprite', path, 'open-sprite-editor');
+    return { ...readEditorState(), ok: true };
   });
-  registerAgentOp('open-nine-slice-editor', (params) => {
+  registerAgentOp('open-nine-slice-editor', async (params) => {
     const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'texture', 'open-nine-slice-editor');
     useEditorStore.getState().requestTextureEditor(p.path!, 'nineslice', p.displayName);
-    return readEditorState();
+    const path = p.path!;
+    await awaitTextureModal('nineslice', path, 'open-nine-slice-editor');
+    return { ...readEditorState(), ok: true };
   });
   // Select a slice in the currently-open Sprite Editor, so its 8 resize handles + pivot
   // register (`spriteEditorSelection` — #373: the modal opens with nothing selected, and
   // there was no route to change that). `guid: null` (or omitted) deselects.
   registerAgentOp('select-sprite-slice', (params) => {
-    const p = (params ?? {}) as { guid?: string | null };
-    useEditorStore.getState().setSpriteEditorSelection(p.guid ?? null);
-    return readEditorState();
+    const p = (params ?? {}) as { guid?: unknown };
+    // Deselecting needs no open editor — there is nothing it could select wrongly.
+    if (p.guid === undefined || p.guid === null) {
+      useEditorStore.getState().setSpriteEditorSelection(null);
+      return { ...readEditorState(), ok: true };
+    }
+    // #1213 B-1: any string used to be stored as the selection, with or without a Sprite Editor on
+    // screen — then `modoki_handles editor=sprite` came back empty, which reads as "no slices".
+    const mount = requireEditorOpen('sprite', 'select-sprite-slice');
+    const slices = mount.slices ?? [];
+    if (typeof p.guid !== 'string' || !slices.includes(p.guid)) {
+      throw new OpRefusal('REFUSED_BY_OP',
+        `select-sprite-slice: ${JSON.stringify(p.guid)} is not a slice of ${mount.path}, which holds `
+        + `${slices.length ? `${slices.length} slice${slices.length === 1 ? '' : 's'}` : 'no slices'} — nothing was selected.`,
+        { options: [...slices] });
+    }
+    useEditorStore.getState().setSpriteEditorSelection(p.guid);
+    return { ...readEditorState(), ok: true };
   });
   // Open the Skin (2D rig) editor on a .rig2d.json — normally reached from the Assets panel
   // double-click or the Texture Inspector's "Auto Rig". Neither `editingSkinAsset` (which
   // asset is open) nor `skinMode` (rig/parts/weights — `bone-joint` handles are gone in
   // 'parts') had an agent route at all (#373); this is the missing "open the panel" half —
   // once open, the mode buttons carry `data-ui-id="skin.mode.*"` and are chrome-tappable.
-  registerAgentOp('open-skin-editor', (params) => {
+  registerAgentOp('open-skin-editor', async (params) => {
     const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'rig2d', 'open-skin-editor');
     const name = p.displayName ?? p.path!.split('/').pop()?.replace(/\.rig2d\.json$/i, '') ?? p.path!;
     useEditorStore.getState().openSkinEditor({ path: p.path!, type: 'rig2d', name });
-    return readEditorState();
+    const path = p.path!;
+    await awaitEditorMount('skin', path, 'open-skin-editor',
+      'The store now names this rig, but the Skin editor tab did not mount to show it.');
+    return { ...readEditorState(), ok: true };
   });
   registerAgentOp('set-skin-mode', (params) => {
     const p = (params ?? {}) as { mode?: unknown };
@@ -1545,6 +1685,9 @@ export function registerEditorAgentOps(): void {
         skinMode: useEditorStore.getState().skinMode,
       };
     }
+    // #1213 B-10: the mode is a setting OF the open Skin editor — with none showing, the call
+    // answered ok and the caller read the empty `bone-joint` handle list as "no rig".
+    requireEditorOpen('skin', 'set-skin-mode');
     useEditorStore.getState().setSkinMode(p.mode);
     return { ...readEditorState(), ok: true };
   });
@@ -2122,6 +2265,16 @@ export function registerEditorAgentOps(): void {
         options: ['keep `paths` and drop `all` — discards only those', 'keep `all:true` and drop `paths` — discards everything pending'],
       });
     }
+    // #1213 A-12: named paths that match NOTHING pending, while other writes ARE pending, used to
+    // answer ok:true "Nothing was pending" — false while `remaining` in the same reply listed them,
+    // and the next save_all then committed the write the caller meant to drop (a typo'd path).
+    // Refused up front, before anything is dropped, with the real pending paths as the choices.
+    if (p.paths?.length && pending.length && !p.paths.some((x) => pending.includes(x))) {
+      throw new OpRefusal('NOT_FOUND',
+        `discard-asset-edits: none of ${p.paths.map((x) => JSON.stringify(x)).join(', ')} has a pending write — nothing was discarded. `
+        + `Pending now (${pending.length}): ${pending.join(', ')}. Paths match exactly (asset-root URLs, e.g. /assets/fx/a.particle.json).`,
+        { options: choices });
+    }
     const r = discardDirtyAssets(p.all ? undefined : p.paths);
     // ⚠️ This op owns the DIRTY-ASSET registry and not the sidecar one, and `all:true` reads as if
     // it owned both. A parked `.meta.json` import-settings edit survives it untouched, so an agent
@@ -2686,10 +2839,24 @@ export function registerEditorAgentOps(): void {
     // this "drives the live preview" was false: a render taken after it shows the unchanged pose.
     // Say what actually happened instead of implying the rest (§5), and at least clamp the number
     // so it means the same thing it does on the human path.
-    const { t } = (params ?? {}) as { t?: number };
+    const { t } = (params ?? {}) as { t?: unknown };
+    // A non-number used to become 0 (`Number(t) || 0`) and answer ok — `pose-clip` refuses the same input.
+    if (typeof t !== 'number' || !Number.isFinite(t)) {
+      throw new OpRefusal('REFUSED_BY_OP', `set-playhead: t must be a finite number of seconds — got ${JSON.stringify(t)}. The playhead did not move.`);
+    }
     const st = useEditorStore.getState();
     const clip = st.editingAnimationClip as { duration?: number; name?: string } | null | undefined;
-    const asked = Number(t) || 0;
+    // The playhead is SHARED: the Animation editor and the Timeline editor both read it. So "nothing
+    // to drive" means neither has a document loaded.
+    const timeline = st.editingTimelineDoc ? st.editingTimelineAsset?.path ?? '(unsaved timeline)' : null;
+    // #1213: with nothing loaded the value drove nothing, and the op still answered ok (with a note
+    // naming the wrong opener). Refused now, the way `pose-clip` refuses the same state.
+    if (!clip && !timeline) {
+      throw new OpRefusal('NOT_FOUND',
+        'set-playhead: no animation clip or timeline is open in the editor, so the playhead drives nothing — it did not move.',
+        { options: [`${ASSET_EDITORS.animation.opener} opens a clip — then retry`, 'open a timeline in the Timeline editor (a Director\'s timeline field in the Inspector) — then retry'] });
+    }
+    const asked = t;
     const clamped = clip?.duration != null ? Math.max(0, Math.min(clip.duration, asked)) : Math.max(0, asked);
     st.setPlayhead(clamped);
     return {
@@ -2699,9 +2866,8 @@ export function registerEditorAgentOps(): void {
       /** Did anything get POSED? No — this moves the editor's playhead value only. */
       posed: false,
       boundClip: clip?.name ?? null,
-      note: clip
-        ? `Playhead moved to ${clamped}s for clip "${clip.name ?? '(unnamed)'}". This does NOT pose the rig — the value moved, the viewport did not. A render/capture taken now shows the UNCHANGED pose.`
-        : 'Playhead moved, but NO clip is bound to the Animation/Timeline editor — so this value currently drives nothing at all. Open a clip first (modoki_open_particle_editor / the Animation panel).',
+      ...(timeline ? { boundTimeline: timeline } : {}),
+      note: `Playhead moved to ${clamped}s for ${clip ? `clip "${clip.name ?? '(unnamed)'}"` : `timeline ${timeline}`}. This does NOT pose anything — the value moved, the viewport did not. A render/capture taken now shows the UNCHANGED pose.`,
     };
   });
 
@@ -3107,13 +3273,9 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('read-asset-def', (params) => {
     const { path, type } = (params ?? {}) as { path?: string; type?: string };
     if (!path) throw new Error('read-asset-def requires { path }');
-    const kind = type ?? inferAssetDefType(path);
-    if (!kind) {
-      throw new Error(
-        `read-asset-def: cannot tell what kind of asset '${path}' is — pass ` +
-        "type: 'particle' | 'animation' | 'spriteanim' | 'timeline' | 'rig2d' | 'shader' | 'animset'.",
-      );
-    }
+    const resolved = resolveAssetDefKind(path, type);
+    if (!('kind' in resolved)) throw new OpRefusal(resolved.code, resolved.error, { options: resolved.options });
+    const { kind } = resolved;
     if (kind === 'material') {
       // material is NOT genuinely peekable — `materialCache` (meshTemplateCache.ts) holds only the
       // BUILT `THREE.Material` once `fetchMaterial` parses the `.mat.json`; the raw JSON itself is
@@ -3519,6 +3681,22 @@ export function registerEditorAgentOps(): void {
       );
     }
     const list = global ? [] : paths as string[];
+    // An unknown registry name used to be FILTERED OUT, so `['bogus']` asked about nothing and
+    // answered `{holds:[]}` — "nothing is held", the fail-open this op exists to close (#1213).
+    if (registries !== undefined && registries !== null) {
+      if (!Array.isArray(registries)) {
+        throw new OpRefusal('REFUSED_BY_OP',
+          `resolve-unsaved: registries must be a LIST of registry names — got ${JSON.stringify(registries)}. Nothing was checked.`,
+          { options: [...ALL_REGISTRIES] });
+      }
+      const bad = (registries as unknown[]).filter((r) => !(ALL_REGISTRIES as readonly unknown[]).includes(r));
+      if (bad.length) {
+        throw new OpRefusal('REFUSED_BY_OP',
+          `resolve-unsaved: unknown registr${bad.length === 1 ? 'y' : 'ies'} ${bad.map((r) => JSON.stringify(r)).join(', ')} — nothing was checked. `
+          + `Valid: ${ALL_REGISTRIES.join(', ')}; omit registries to check all of them.`,
+          { options: [...ALL_REGISTRIES] });
+      }
+    }
     const asked = new Set<UnsavedRegistry>(
       Array.isArray(registries) && registries.length
         ? (registries as unknown[]).filter((r): r is UnsavedRegistry =>

@@ -155,3 +155,15 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-15,work-qa,modoki_write_asset_meta,167,3027,165057,cccdd9f24
 2026-09-17,work-qa,modoki_delete_asset,-2,3694,172695,e015f6b93
 2026-09-17,work-qa,modoki_exit_pose_envelope,141,1207,172695,e015f6b93
+2026-09-17,work-qa,modoki_editor_journal,47,4702,173915,cffa85bd6
+2026-09-17,work-qa,modoki_open_nine_slice_editor,86,714,173915,cffa85bd6
+2026-09-17,work-qa,modoki_open_particle_editor,122,584,173915,cffa85bd6
+2026-09-17,work-qa,modoki_open_skin_editor,48,1129,173915,cffa85bd6
+2026-09-17,work-qa,modoki_open_sprite_editor,165,1030,173915,cffa85bd6
+2026-09-17,work-qa,modoki_select_sprite_slice,150,625,173915,cffa85bd6
+2026-09-17,work-qa,modoki_set_collider_edit,117,606,173915,cffa85bd6
+2026-09-17,work-qa,modoki_set_gizmo,47,229,173915,cffa85bd6
+2026-09-17,work-qa,modoki_set_playhead,100,859,173915,cffa85bd6
+2026-09-17,work-qa,modoki_set_skin_mode,69,566,173915,cffa85bd6
+2026-09-17,work-qa,modoki_wait_for_edit,85,1485,173915,cffa85bd6
+2026-09-17,work-qa,modoki_write_player_prefs,69,2458,173915,cffa85bd6

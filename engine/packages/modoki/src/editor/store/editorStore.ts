@@ -55,10 +55,39 @@ export function lsBool(key: string, fallback: boolean): boolean {
   const v = localStorage.getItem(key);
   return v === null ? fallback : v === '1';
 }
+function sameSlices(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((g, i) => g === b[i]);
+}
+
 export function lsEnum<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
   if (typeof localStorage === 'undefined') return fallback;
   const v = localStorage.getItem(key);
   return v !== null && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+}
+
+/** The vocabularies of the SceneView toolbar's settings — a table, not only a type, so the agent ops
+ *  that set them can REFUSE an unknown value with the real options instead of storing (and, for the
+ *  gizmo, persisting) a typo or dropping it and answering ok (#1213). */
+export const GIZMO_MODES = ['translate', 'rotate', 'scale'] as const;
+export type GizmoMode = typeof GIZMO_MODES[number];
+export const GIZMO_SPACES = ['world', 'local'] as const;
+export type GizmoSpace = typeof GIZMO_SPACES[number];
+export const SCENE_VIEW_MODES = ['3d', 'ui'] as const;
+export type SceneViewMode = typeof SCENE_VIEW_MODES[number];
+
+/** The asset editors an agent op can address (#1213). Each one publishes an `AssetEditorMount` into
+ *  `editorMounts` from its own mount effect, so an op can tell "the editor is showing" apart from
+ *  "the store names an asset" — which is all an op could see before, and why `select-sprite-slice`,
+ *  `set-skin-mode` and the openers answered ok with no editor on screen. */
+export const ASSET_EDITOR_KINDS = ['animation', 'particle', 'skin', 'sprite', 'nineslice'] as const;
+export type AssetEditorKind = typeof ASSET_EDITOR_KINDS[number];
+export interface AssetEditorMount {
+  /** The asset the mounted editor is showing; null for a panel mounted with nothing loaded. */
+  path: string | null;
+  /** Sprite editor only: the guids of the slices it currently holds (`select-sprite-slice`'s table). */
+  slices?: readonly string[];
 }
 
 export interface SelectedAsset {
@@ -101,9 +130,9 @@ interface EditorState {
    *  selection. When length > 1 and all share a type, the Inspector renders a
    *  batch editor (edit import settings across all at once). */
   selectedAssets: SelectedAsset[];
-  gizmoMode: 'translate' | 'rotate' | 'scale';
+  gizmoMode: GizmoMode;
   /** Coordinate space for gizmo transforms */
-  gizmoSpace: 'world' | 'local';
+  gizmoSpace: GizmoSpace;
   /** Multi-select rotation/scale pivot (Unity's Pivot/Center toggle). Only matters when >1
    *  entity is selected — it chooses WHERE the single pivot point sits; the group rotates/scales
    *  rigidly around it either way. 'pivot' = the active (last-selected) entity's origin (that
@@ -129,7 +158,7 @@ interface EditorState {
   /** SceneView viewport mode: '3d' (Three.js) or 'ui' (2D/UI overlay). Lifted from
    *  SceneView-local state into the store so it's agent-drivable (set-scene-view-mode)
    *  — the mode selector is a native <select> that trusted input can't operate. */
-  sceneViewMode: '3d' | 'ui';
+  sceneViewMode: SceneViewMode;
   /** Which view the Animation editor's timeline area is showing: the Dopesheet (keyframe
    *  TIMING, diamonds) or Curves (keyframe VALUES + easing, a graph). Lifted from
    *  AnimationEditor-local state into the store so it is agent-drivable
@@ -148,17 +177,21 @@ interface EditorState {
    *  being unmounted/reselected within a session, which the local `useState` did not — that is
    *  the same continuity `sceneViewMode` has, and the better behaviour. */
   animationViewMode: 'dopesheet' | 'curves';
-  /** Whether the Animation panel is actually MOUNTED and running its effects.
+  /** Which asset editors are actually MOUNTED and running their effects, and on what — keyed by
+   *  `AssetEditorKind`, absent when not mounted. Written ONLY by each editor's own mount effect (and
+   *  its cleanup), through `setEditorMount`.
    *
-   *  Same requirement, and the same reason, as `gameViewMounted` below: FlexLayout defaults
+   *  For the Animation panel — the first editor to publish this — the reason is the same as
+   *  `gameViewMounted` below: FlexLayout defaults
    *  `tabEnableRenderOnDemand: true`, so an Animation tab that EXISTS in the layout but has never
    *  been selected does not mount — and `openPanels` reports it anyway, which is exactly the
    *  derivation #367 rejected as wrong. Without this the agent surface answers
    *  `animationViewMode:'curves'` for an editor showing no Animation view at all, and neither
    *  view's handle provider is registered, so `modoki_handles editor=curves` is empty for a
-   *  reason the payload cannot express. Written by AnimationEditor's mount effect; nothing else
-   *  may set it. */
-  animationPanelMounted: boolean;
+   *  reason the payload cannot express. The modal editors (sprite, nine-slice) have the stronger
+   *  version of the same problem: their open state lived in `TextureAssetView`'s local `useState`,
+   *  invisible to every op (#1213). */
+  editorMounts: Partial<Record<AssetEditorKind, AssetEditorMount>>;
   /** Which FlexLayout panel owns the keyboard ('scene' | 'hierarchy' | 'animation-editor' | …),
    *  or null when nothing has been engaged yet. Set on capture-phase mousedown (click-to-focus).
    *
@@ -416,8 +449,10 @@ interface EditorState {
   setSceneViewMode: (mode: '3d' | 'ui') => void;
   /** Set the Animation editor's timeline view. No-ops (and does not journal) on a re-set. */
   setAnimationViewMode: (mode: 'dopesheet' | 'curves') => void;
-  /** Set from AnimationEditor's mount effect + its cleanup. Nothing else may call it. */
-  setAnimationPanelMounted: (mounted: boolean) => void;
+  /** Set from an editor's own mount effect (`mount`) and its cleanup (`null`). Nothing else may call
+   *  it. A cleanup clears only its OWN entry: an unmount that lands after a remount on another asset
+   *  must not erase the new mount, so a `null` for a path that is no longer the published one is ignored. */
+  setEditorMount: (kind: AssetEditorKind, mount: AssetEditorMount | null, ownPath?: string | null) => void;
   setFocusedPanel: (panel: string | null) => void;
   setOpenPanels: (ids: string[]) => void;
   setGizmoSpace: (space: 'local' | 'world') => void;
@@ -651,8 +686,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   entityRevealRequest: 0,
   selectedAsset: null,
   selectedAssets: [],
-  gizmoMode: lsEnum('editor:gizmoMode', ['translate', 'rotate', 'scale'] as const, 'translate'),
-  gizmoSpace: lsEnum('editor:gizmoSpace', ['world', 'local'] as const, 'world'),
+  gizmoMode: lsEnum('editor:gizmoMode', GIZMO_MODES, 'translate'),
+  gizmoSpace: lsEnum('editor:gizmoSpace', GIZMO_SPACES, 'world'),
   gizmoPivot: lsEnum('editor:gizmoPivot', ['pivot', 'center'] as const, 'pivot'),
   unlockedGhostSelKey: null,
   colliderEditMode: false,
@@ -660,7 +695,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
   animationViewMode: 'dopesheet',
-  animationPanelMounted: false,
+  editorMounts: {},
   focusedPanel: null,
   openPanels: [],
   particlePreview: lsBool('editor:particlePreview', false),
@@ -829,7 +864,18 @@ export const useEditorStore = create<EditorState>((set, get) => {
     editorEmit('!animationviewmode', { mode });
     set({ animationViewMode: mode });
   },
-  setAnimationPanelMounted: (mounted) => { if (get().animationPanelMounted !== mounted) set({ animationPanelMounted: mounted }); },
+  setEditorMount: (kind, mount, ownPath) => {
+    const cur = get().editorMounts[kind];
+    if (mount === null) {
+      if (!cur || (ownPath !== undefined && cur.path !== ownPath)) return;
+      const next = { ...get().editorMounts };
+      delete next[kind];
+      set({ editorMounts: next });
+      return;
+    }
+    if (cur && cur.path === mount.path && sameSlices(cur.slices, mount.slices)) return;
+    set({ editorMounts: { ...get().editorMounts, [kind]: mount } });
+  },
   /** Click-to-focus. Journals `!focus` on a real SCOPE CHANGE only — a commit point, so the
    *  stream stays sparse (never per-keystroke), and it is what makes "why did my key go there?"
    *  answerable from data instead of a re-run. Focus is NOT undoable: it is transient chrome, and

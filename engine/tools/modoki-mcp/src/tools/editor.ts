@@ -79,8 +79,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_editor_journal',
     'Read the EDITOR-ACTIVITY stream — what is being done in the editor session (Editor Percept); game events are modoki_journal, console output modoki_get_console_logs. ' +
-      'Event TYPES: !edit, !mutate, !select, !create, !delete, !duplicate, !reparent, !transform, ' +
-      '!undo, !redo, !play, !pause, !stop, !scene-load, !save, !gizmo. ' +
+      'Event TYPES include !edit, !mutate, !select, !create, !delete, !duplicate, !reparent, !transform, ' +
+      '!undo, !redo, !play, !pause, !stop, !scene-load, !save, !gizmo; an unknown `type` is refused with the full list as options. ' +
       '⚠️ **!mutate is what YOUR OWN modoki_mutate_scene / modoki_set_transform produce** (label ' +
       '"Mutate Scene (N ops)"); !edit is the HUMAN Inspector-field path. This list omitted !mutate, ' +
       'and a QA case that trusted it asserted !edit and failed against a perfectly healthy engine — ' +
@@ -117,7 +117,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'raise limit=N, or cursor precisely with since=/sinceCap=. ' +
       'Editor-only. This is how you PAIR: see the human\'s edits and line them up against what the game did.',
     {
-      type: z.string().optional().describe('Only editor events of this type: !edit | !select | !create | !delete | !duplicate | !reparent | !transform | !undo | !redo | !play | !pause | !stop | !scene-load | !save | !gizmo. (Filters the `editor` array only.)'),
+      type: z.string().optional().describe('Only editor events of this type, e.g. !edit | !select | !create | !transform | !save — every type starts with `!`; an unknown one is refused, listing them all. (Filters the `editor` array only.)'),
       source: z.enum(['human', 'agent']).optional().describe('Only events by the human at the keyboard, or by the agent (your MCP ops). Omit for both. (Filters the `editor` array only.)'),
       since: z.number().optional().describe('Forward cursor for the `editor` array: returns the OLDEST events with seq greater than this (contiguous, oldest-first) + a `nextSeq` when truncated. Advance with `nextSeq` each poll — a cursored poll NEVER skips events (unlike the bare newest-last call). Does NOT window the merged timeline (use sinceCap).'),
       sinceCap: z.number().optional().describe('Forward cursor for the merged `timeline`: returns the OLDEST interleaved events with cap greater than this (contiguous, oldest-first) + a `nextCap` when truncated. Advance with `nextCap` each poll to fetch newer events with no gap.'),
@@ -206,7 +206,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'call again. This BLOCKS the tool call for up to that long; do not set a short client-side ' +
       'timeout expectation around it.',
     {
-      type: z.string().optional().describe('Only wake for this editor event type, e.g. !edit, !select, !transform. Omit to wake on any type.'),
+      type: z.string().optional().describe('Only wake for this editor event type, e.g. !edit, !select, !transform. Omit to wake on any type. An unknown type (e.g. `edit` without `!`) is refused up front rather than waited on.'),
       source: z.enum(['human', 'agent']).optional().describe('Who must have done it. Defaults to "human" — pass "agent" only if you specifically want to notice your own MCP-driven edits.'),
       since: z.number().optional().describe('Forward cursor (a prior `seq`/`nextSeq`). Omit to wait for the NEXT event from now, not to replay history.'),
       timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}. Default 30000, clamped to [50, 120000].`),
@@ -499,7 +499,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   // ── gizmo / focus ──
   tool(
     'modoki_set_gizmo',
-    'Set the SceneView transform gizmo mode (translate/rotate/scale) and/or space (world/local). Returns editor state; gizmoMode/gizmoSpace in modoki_get_editor_state confirm it.',
+    'Set the SceneView transform gizmo mode (translate/rotate/scale) and/or space (world/local) — at least one; a call with neither is refused. Returns editor state; gizmoMode/gizmoSpace in modoki_get_editor_state confirm it.',
     {
       mode: z.enum(['translate', 'rotate', 'scale']).optional(),
       space: z.enum(['world', 'local']).optional(),
@@ -603,8 +603,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Toggle Collider2D vertex-edit mode (the toolbar "Points" button) for the selected ' +
       "entity. Pair with modoki_set_scene_view_mode 'ui' + a selected entity that has an editable " +
       'collider (polygon/polyline/concave); then modoki_handles editor=collider2d lists its ' +
-      'draggable vertices. Returns editor state; colliderEditMode in modoki_get_editor_state '
-      + 'confirms it — modoki_handles is the NEXT step, not the read-back.',
+      'draggable vertices. on:true with no such collider selected is REFUSED, naming why (the toolbar '
+      + 'would switch the mode straight back off). Returns editor state; colliderEditMode in '
+      + 'modoki_get_editor_state confirms it — modoki_handles is the NEXT step, not the read-back.',
     { on: z.boolean().describe('true enters collider vertex-edit mode on the selected entity, false leaves it.') },
     async ({ on }) => editorAction('set-collider-edit', { on }),
   );
@@ -614,7 +615,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'in Assets). This MOUNTS the Size/Opacity curve editors + the color/alpha gradient editor, ' +
       'so their interaction handles then appear (modoki_handles editor=particle — kinds ' +
       "'curve-point' / 'gradient-stop'). Pass the asset's served path (e.g. " +
-      "'/assets/particles/fire.particle.json'). Returns editor state.",
+      "'/assets/particles/fire.particle.json'). Waits (up to 3s) for the panel to show the asset, and " +
+      'refuses NOT_AVAILABLE_HERE if it does not. Returns editor state; openEditors confirms it.',
     { path: z.string().describe("The asset's served path, e.g. '/assets/particles/fire.particle.json'.") },
     async ({ path }) => editorAction('open-particle-editor', { path }),
   );
@@ -625,7 +627,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       "corner/edge handles + pivot only exist for the SELECTED slice — so modoki_handles " +
       "editor=sprite returns an empty list right after this call; that is the normal case, not " +
       'a bug (#373). Call modoki_select_sprite_slice next. ' +
-      "Pass the texture's served path (e.g. '/assets/textures/sheet.png'). Returns editor state.",
+      "Pass the texture's served path (e.g. '/assets/textures/sheet.png'). Waits (up to 3s) for the " +
+      "modal to open — it opens from the texture's Inspector view — and refuses NOT_AVAILABLE_HERE " +
+      'if it does not. Returns editor state; openEditors.sprite confirms it.',
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
       displayName: displayNameParam() },
     async ({ path, displayName }) => editorAction('open-sprite-editor', { path, displayName }),
@@ -635,16 +639,18 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Select (or deselect) a slice in the currently-open Sprite Editor — normally a click on a ' +
       "rect or its row in the Sprites list. This is what makes a slice's 8 resize handles + " +
       "pivot appear in modoki_handles editor=sprite: the modal opens with nothing selected and " +
-      'had no other route to change that (#373). Returns editor state, which reports the result ' +
-      'as `spriteEditorSelection`.',
-    { guid: z.string().nullable().optional().describe('The slice guid to select (from the Sprite Editor / asset manifest), or omit/null to deselect.') },
+      'had no other route to change that (#373). A guid is REFUSED unless a Sprite Editor is open ' +
+      '(NOT_FOUND) and holds that slice (REFUSED_BY_OP, the slice guids as options); a deselect ' +
+      'always works. Returns editor state, which reports the result as `spriteEditorSelection`.',
+    { guid: z.string().nullable().optional().describe('The slice guid to select (a slice of the open texture\'s sidecar), or omit/null to deselect.') },
     async ({ guid }) => editorAction('select-sprite-slice', { guid: guid ?? null }),
   );
   tool(
     'modoki_open_nine_slice_editor',
     'Open the 9-slice border editor modal on a UI texture (the Texture Inspector "Edit ' +
       'visually…" button — only for type=ui textures). Its 4 guide knobs then appear ' +
-      '(modoki_handles editor=nineslice). Pass the texture\'s served path. Returns editor state.',
+      '(modoki_handles editor=nineslice). Pass the texture\'s served path. Waits (up to 3s) for the ' +
+      'modal to open and refuses NOT_AVAILABLE_HERE if it does not. Returns editor state.',
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
       displayName: displayNameParam() },
     async ({ path, displayName }) => editorAction('open-nine-slice-editor', { path, displayName }),
@@ -655,7 +661,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'double-click or the Texture Inspector "Auto Rig" button. There was previously NO agent ' +
       "route to open this panel at all (#373). Once open, modoki_handles editor=skin lists its " +
       "bone-joint handles in skinMode 'rig' or 'weights' — NOT 'parts' (modoki_set_skin_mode). " +
-      "Pass the rig's served path (e.g. '/assets/characters/hero.rig2d.json'). Returns editor state; editingSkinAsset + openPanels in modoki_get_editor_state confirm it opened.",
+      "Pass the rig's served path (e.g. '/assets/characters/hero.rig2d.json'). Waits (up to 3s) for the panel to show the rig and refuses NOT_AVAILABLE_HERE if it does not. Returns editor state; openEditors.skin confirms it.",
     { path: z.string().describe("The rig's served path, e.g. '/assets/characters/hero.rig2d.json'."),
       displayName: displayNameParam('Here: the Skin panel header. ⚠️ ALSO used as DATA: "Make Prefab" writes it as the root entity name into the generated .prefab.json, so a throwaway label here persists to disk.') },
     async ({ path, displayName }) => editorAction('open-skin-editor', { path, displayName }),
@@ -666,8 +672,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       "(reposition each part's source mesh — NO bone-joint handles), or 'weights' (paint the " +
       "selected bone's per-vertex influence). modoki_handles editor=skin reports bone-joint " +
       "handles in 'rig' AND 'weights' — only 'parts' hides them. The toolbar buttons carry " +
-      '`data-ui-id="skin.mode.*"` and are chrome-tappable too; this is the direct route. Returns '
-      + 'editor state; skinMode in modoki_get_editor_state confirms it.',
+      '`data-ui-id="skin.mode.*"` and are chrome-tappable too; this is the direct route. Refused '
+      + '(NOT_FOUND) when no Skin editor is showing — open one first. Returns editor state; skinMode '
+      + 'in modoki_get_editor_state confirms it.',
     { mode: z.enum(['parts', 'rig', 'weights']) },
     async ({ mode }) => editorAction('set-skin-mode', { mode }),
   );

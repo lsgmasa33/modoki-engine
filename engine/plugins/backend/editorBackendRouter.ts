@@ -224,6 +224,7 @@ import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
 import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
+import { PROFILER_MUTATING_ACTIONS, PROFILER_READ_ACTIONS } from '../../tools/shared/profilerActions';
 import { decodeSceneOpsReply } from './sceneOpsReply';
 import { parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../tools/shared/handlesReply';
 // ASSET_SCHEMA_TYPES is IMPORTED, never restated. This file used to keep its own copy, and it
@@ -2113,15 +2114,15 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     const markers = query.get('markers');
     const limit = query.get('limit');
     const action = query.get('action') ?? 'read';
-    const MUTATING = ['capture-start', 'capture-stop', 'capture-clear', 'gpu-on', 'gpu-off', 'reset', 'boot-reset'];
-    if (action !== 'read' && action !== 'capture-read' && action !== 'boot') {
+    const MUTATING: readonly string[] = PROFILER_MUTATING_ACTIONS;
+    if (!(PROFILER_READ_ACTIONS as readonly string[]).includes(action)) {
       // A mutating action arriving by GET is refused rather than served: obeying it here is exactly
       // the unchecked-failure hole §4 describes. An UNKNOWN action is a DIFFERENT error and must not
       // be told it "mutates" — `?action=Read` (wrong case) used to get that sentence, which is
       // simply false and sends the reader looking for the wrong fix.
       return MUTATING.includes(action)
-        ? json({ error: `profiler action "${action}" MUTATES profiler state, so it must be POSTed to /api/profiler — GET serves only read / capture-read / boot.` }, 405)
-        : json({ error: `unknown profiler action "${action}". GET serves read / capture-read / boot; POST /api/profiler takes ${MUTATING.join(' / ')}.` }, 400);
+        ? json({ error: `profiler action "${action}" MUTATES profiler state, so it must be POSTed to /api/profiler — GET serves only ${PROFILER_READ_ACTIONS.join(' / ')}.` }, 405)
+        : json({ error: `unknown profiler action "${action}". GET serves ${PROFILER_READ_ACTIONS.join(' / ')}; POST /api/profiler takes ${MUTATING.join(' / ')}.`, code: 'REFUSED_BY_OP', options: [...PROFILER_READ_ACTIONS, ...PROFILER_MUTATING_ACTIONS] }, 400);
     }
     const params = {
       action,

@@ -1,6 +1,6 @@
 /** Undo/Redo manager — command stack for all editor actions. */
 
-import { editorEmit } from '../editorJournal';
+import { editorEmit, type EditorJournalType } from '../editorJournal';
 import { markSceneDirty } from '../scene/sceneDirty';
 import { reportUndoThrew } from './undoFailure';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
@@ -58,7 +58,7 @@ export interface UndoAction {
    *  `!create`, `!delete`, `!duplicate`, `!reparent`, `!transform`. Defaults to
    *  `!edit` (or `!select` when `_isSelection`). Only affects the journal sigil; the
    *  undo/redo of this action still emit `!undo`/`!redo`. */
-  kind?: string;
+  kind?: EditorJournalType;
   /** Extra structured journal payload for NON-trait-edit events (structural /
    *  transform) — e.g. `{ entities: [guid] }` for a delete, `{ entity, from, to }`
    *  for a reparent. Merged into the emitted event and snapshot-cloned at emit so the

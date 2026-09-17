@@ -16,6 +16,7 @@ import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMa
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { pushAction, type EditDetail } from './undoManager';
+import type { EditorJournalType } from '../editorJournal';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, journalRefOf, type EntityRef } from './entityRef';
 import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes, markSceneDirty } from '../scene/sceneDirty';
@@ -327,7 +328,7 @@ export function pasteTraitAsNewWithUndo(entityIds: number[], meta: TraitMeta, va
 
 // ── Action callback (for backward compat during migration) ──
 
-type ActionCallback = (action: { label: string; undo: () => void; redo: () => void; coalesceKey?: string; detail?: EditDetail; kind?: string; journalPayload?: Record<string, unknown>; affectedScenes?: string[] }) => void;
+type ActionCallback = (action: { label: string; undo: () => void; redo: () => void; coalesceKey?: string; detail?: EditDetail; kind?: EditorJournalType; journalPayload?: Record<string, unknown>; affectedScenes?: string[] }) => void;
 
 /** GUID for a parent id in a structural journal payload: 'root' for 0, else the
  *  entity's stable guid (`id:<n>` only for an un-guidable entity — see `journalRefOf`). */

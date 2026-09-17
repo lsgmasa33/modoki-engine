@@ -106,13 +106,13 @@ describe('makeEvalApi().call / generated methods', () => {
 
   it('a call is journaled with actor "agent" (withEditorActor wrapping)', async () => {
     registerAgentOp('probe-eval-api-actor', () => {
-      editorEmit('!probe');
+      editorEmit('!focus', { probe: 'eval-api-actor' }); // any real type — the table is closed (#1213)
       return 'ok';
     });
     const api = makeEvalApi();
     await api.call('probe-eval-api-actor', {});
     const events = readEditorJournal();
-    const probe = events.find((e) => e.type === '!probe');
+    const probe = events.find((e) => (e.payload as { probe?: string } | undefined)?.probe === 'eval-api-actor');
     expect(probe?.source).toBe('agent');
   });
 });

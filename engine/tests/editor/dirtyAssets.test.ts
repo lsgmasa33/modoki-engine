@@ -363,6 +363,28 @@ describe('discard-asset-edits — abandoning a parked write', () => {
     expect(getDirtyAssetPaths()).toEqual([B]);
   });
 
+  it('named paths that match NOTHING pending are refused, listing what is — not "nothing was pending" (#1213 A-12)', async () => {
+    markAssetDirty(B, 'particle', def());
+    const typo = '/assets/fx/y.particle'; // the write the caller meant to drop is B
+    const e = await runAgentOp('discard-asset-edits', { paths: [typo] }).catch((x: unknown) => x) as { code?: string; options?: string[]; message?: string };
+    expect(e.code).toBe('NOT_FOUND');
+    expect(e.message).toContain(B);
+    expect(e.options).toContain(`paths:${JSON.stringify([B])}`);
+    expect(getDirtyAssetPaths()).toEqual([B]);
+  });
+
+  it('a partly-matching list still discards what it names, and reports the rest as notPending', async () => {
+    markAssetDirty(A, 'particle', def());
+    const r = await runAgentOp('discard-asset-edits', { paths: [A, '/assets/fx/typo.json'] }) as { ok: boolean; discarded: string[]; notPending: string[] };
+    expect(r).toMatchObject({ ok: true, discarded: [A], notPending: ['/assets/fx/typo.json'] });
+  });
+
+  it('with nothing pending at all, a named path is still a truthful ok "nothing was pending"', async () => {
+    const r = await runAgentOp('discard-asset-edits', { paths: [A] }) as { ok: boolean; note: string };
+    expect(r.ok).toBe(true);
+    expect(r.note).toMatch(/Nothing was pending/);
+  });
+
   it('all:true drops everything', async () => {
     markAssetDirty(A, 'particle', def());
     markAssetDirty(B, 'particle', def());

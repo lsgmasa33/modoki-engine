@@ -3,7 +3,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { setRunMode } from '../../src/runtime/core/playState';
-import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor, waitForEditorJournal } from '../../src/editor/editorJournal';
+import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor, waitForEditorJournal, AGENT_SCOPE_MAX_MS, _clearActorScopes } from '../../src/editor/editorJournal';
 import { pushAction, pushSelectionChange, undo, redo, clearHistory, _setUndoClock } from '../../src/editor/undo/undoManager';
 import { nextCaptureSeq, _resetCaptureSeq } from '../../src/runtime/core/journal';
 
@@ -11,7 +11,7 @@ import { nextCaptureSeq, _resetCaptureSeq } from '../../src/runtime/core/journal
 beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(() => {
-  clearEditorJournal(); setEditorJournalEnabled(true);
+  clearEditorJournal(); setEditorJournalEnabled(true); _clearActorScopes();
   clearHistory(); _setUndoClock(() => performance.now());
   _resetCaptureSeq();
 });
@@ -34,6 +34,41 @@ describe('editorJournal — buffer', () => {
     expect(readEditorJournal({ since: first }).map((e) => e.type)).toEqual(['!select', '!edit']);
   });
 
+  it('overlapping async agent scopes return the actor to human when the LAST settles, in any order (#1213)', async () => {
+    // Save/restore interleaved as: A saves human, B saves agent, A restores human, B restores agent —
+    // leaving every later human edit tagged as the agent's.
+    let finishA!: () => void; let finishB!: () => void;
+    const a = withEditorActor('agent', () => new Promise<void>((r) => { finishA = r; }));
+    const b = withEditorActor('agent', () => new Promise<void>((r) => { finishB = r; }));
+    finishA(); await a;
+    editorEmit('!edit');                                     // B still running → agent
+    finishB(); await b;
+    editorEmit('!select');                                   // nothing running → human
+    const throwing = () => withEditorActor('agent', () => { throw new Error('boom'); });
+    expect(throwing).toThrow('boom');
+    editorEmit('!focus');                                    // a throwing scope released too
+    expect(readEditorJournal().map((e) => [e.type, e.source])).toEqual([['!edit', 'agent'], ['!select', 'human'], ['!focus', 'human']]);
+  });
+
+  it('an agent scope that never settles stops claiming edits after its deadline (#1213)', async () => {
+    vi.useFakeTimers();
+    try {
+      void withEditorActor('agent', () => new Promise<void>(() => { /* never settles */ }));
+      editorEmit('!edit');                                   // inside → agent
+      vi.advanceTimersByTime(AGENT_SCOPE_MAX_MS + 1);
+      editorEmit('!select');                                 // past the deadline → human
+      expect(readEditorJournal().map((e) => e.source)).toEqual(['agent', 'human']);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('the NEWEST live scope decides — a human scope inside an agent one is human, and back', () => {
+    withEditorActor('agent', () => {
+      withEditorActor('human', () => editorEmit('!select'));
+      editorEmit('!edit');
+    });
+    expect(readEditorJournal().map((e) => [e.type, e.source])).toEqual([['!select', 'human'], ['!edit', 'agent']]);
+  });
+
   it('tags source human by default, agent inside withEditorActor', () => {
     editorEmit('!edit');                                  // human (default)
     withEditorActor('agent', () => editorEmit('!edit'));  // agent
@@ -51,22 +86,22 @@ describe('editorJournal — buffer', () => {
   });
 
   it('shares ONE monotonic cap counter with the game journal — the V3 interleave axis', () => {
-    editorEmit('!a');                    // cap 1
+    editorEmit('!focus');                // cap 1
     const gameCap = nextCaptureSeq();    // cap 2 — stands in for a game journal emit
-    editorEmit('!b');                    // cap 3
+    editorEmit('!gizmo');                // cap 3
     const evs = readEditorJournal();
     expect(evs.map((e) => e.cap)).toEqual([1, 3]); // editor caps skip the game emit's 2
     expect(gameCap).toBe(2);
     // Interleaving all three by cap reproduces the true capture order across streams.
     const timeline = [...evs.map((e) => ({ cap: e.cap, t: e.type })), { cap: gameCap, t: '@game' }]
       .sort((a, b) => a.cap - b.cap).map((x) => x.t);
-    expect(timeline).toEqual(['!a', '@game', '!b']);
+    expect(timeline).toEqual(['!focus', '@game', '!gizmo']);
   });
 
   it('editor seq stays contiguous (poll cursor) while cap tracks the global order', () => {
-    editorEmit('!a');                    // cap 1
+    editorEmit('!focus');                // cap 1
     nextCaptureSeq();                    // a game emit bumps cap only
-    editorEmit('!b');                    // cap 3
+    editorEmit('!gizmo');                // cap 3
     const evs = readEditorJournal();
     expect(evs[1].seq).toBe(evs[0].seq + 1);       // seq is editor-local + contiguous (skips the game emit)
     expect(evs.map((e) => e.cap)).toEqual([1, 3]); // cap reflects the interleaved order

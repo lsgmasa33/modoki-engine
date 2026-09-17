@@ -17,11 +17,12 @@ import { createDeviceToolDef, type DeviceToolResult } from './registry.js';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendIdentity } from '../../shared/identity.js';
 // Single-sourced with the DEVICE side (`agentBridge.ts`'s `sim-step` op) so this tool's outbound
 // `timeoutMs` and the device's own internal step budget can never independently drift (#822).
-import { simStepDefaultTimeout } from '../../shared/simStepTiming.js';
+import { simStepDefaultTimeout, SIM_STEP_MAX_FRAMES } from '../../shared/simStepTiming.js';
 import { DEVICE_KEY_MODIFIERS, KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../shared/inputVocabulary.js';
 import { CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, vocabularyProse, type CreateEntityKind } from '../../shared/createEntityVocabulary.js';
 import { ignoredHandleFilter, parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../shared/handlesReply.js';
 import { INVALIDATABLE_ASSET_TYPES } from '../../shared/invalidateAssets.js';
+import { PROFILER_ACTIONS } from '../../shared/profilerActions.js';
 import { z } from 'zod';
 import { writeFileSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { execFile } from 'child_process';
@@ -1152,7 +1153,7 @@ export function registerTools(server: McpServer) {
     {
       action: z.enum(['set', 'delete', 'clear', 'flush'])
         .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),
-      key: z.string().optional().describe('The key, for action set/delete. Ignored by clear/flush.'),
+      key: z.string().optional().describe('The key, for action set/delete. REFUSED on clear/flush — clear removes every key, so a key there is a mistake, not a filter.'),
       value: z.any().optional().describe('The JSON document to store, for action:"set". Any JSON value including null. Omitting it is REFUSED rather than treated as a delete.'),
       confirm: z.boolean().optional().describe('Required (true) for action:"clear" only — it removes every key in the namespace, on a real installed app, and is not undoable. The refusal lists the keys it would have removed.'),
     },
@@ -1985,7 +1986,7 @@ export function registerTools(server: McpServer) {
       'budget; if it is still loading when the budget runs out the step is refused with ' +
       '`physicsLoading: [...]` (retry), and a permanent physics init failure is refused naming it.',
     {
-      frames: z.number().optional().describe('How many real frames to advance (default 1, max 600).'),
+      frames: z.number().int().min(1).max(SIM_STEP_MAX_FRAMES).optional().describe(`How many real frames to advance (default 1, max ${SIM_STEP_MAX_FRAMES}; a value outside that is refused, not clamped).`),
       scale: z.number().optional().describe('timeScale to run at during the step (default 1). Use <1 to advance less sim time per frame.'),
       timeoutMs: z.number().optional().describe('Give up if the frames do not arrive. Default is DERIVED from frames (40ms each + margin, min 3000, max 20000) so the max frames:600 fits its own budget; max 20000. The world is always re-frozen, including on timeout.'),
     },
@@ -2074,7 +2075,7 @@ export function registerTools(server: McpServer) {
       'question — the editor runs on a desktop GPU where the frame is fast regardless, and the boot ' +
       'stall this exists for is a low-end-device fault.',
     {
-      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset', 'boot', 'boot-reset'])
+      action: z.enum(PROFILER_ACTIONS)
         .optional().describe('Default "read" (the live aggregate). capture-* records/reads frames; gpu-* toggles GPU timestamps; reset clears markers + captures; boot reads the boot-phase timeline; boot-reset re-arms it.'),
       markers: z.number().optional().describe('action:read — how many marker rows to return (default 12).'),
       limit: z.number().optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200).'),

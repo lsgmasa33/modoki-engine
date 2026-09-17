@@ -1052,6 +1052,25 @@ their click is byte-identical to the agent's. So this converts "100% of agent in
 human" into "agent input is labeled agent; a human action inside a short, bounded window is
 mislabeled agent" — the same race `withEditorActor` already documents, now with a deadline.
 
+**`withEditorActor` had the flag hazard itself, and its scopes are TRACKED now (#1213).** It
+saved the previous actor and restored it when the op's promise settled — a flag by another name.
+Two overlapping async ops (parallel tool calls are routine) interleaved as *A saves human, B saves
+agent, A restores human, B restores agent*, and the session stayed tagged `agent` until a reload;
+`wait-for-edit {source:'human'}` could then never wake. Measured headless by the #1213 review with
+two overlapping `open-particle-editor` calls. Each scope is its own entry now, so the actor is
+`agent` exactly while one is live, in whatever order they settle — and each carries the lease's
+**deadline** (`AGENT_SCOPE_MAX_MS`, lazy expiry), so an op that never settles cannot hold the label
+for the rest of the session. Two things this deliberately does NOT do:
+- **It does not narrow an op's scope to its synchronous part to spare a human click during a wait.**
+  That was tried for the editor openers (they park up to 3s) and reverted: the editor's REACTION to
+  the agent's open — the tab `selectTab`, the `!focus` it journals — runs in React effects after
+  the synchronous part returns, so the agent's own open was journaled as the human's. A human click
+  inside the wait being tagged `agent` is the accepted race above; the agent's action tagged
+  `human` is the defect this whole section exists to prevent.
+- **It does not make the deadline a timeout.** An op past `AGENT_SCOPE_MAX_MS` keeps running; only
+  its attribution lapses, so its late edits read as the human's. That is the lease's trade, taken
+  for the same reason.
+
 A corollary for tests: a jsdom test is necessary but **not sufficient** for an input change.
 `fireEvent.*` synthesizes straight into React and cannot reproduce the real pipeline — see the
 `PanelFocusHost` case in [editor-input.md](./editor-input.md).

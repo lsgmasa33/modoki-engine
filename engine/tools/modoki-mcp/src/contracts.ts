@@ -464,6 +464,8 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_set_gizmo: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-gizmo', mutating: true, persists: 'session',
+    // Not `{}`: an empty call is REFUSED as a no-op (#1213 B-9), so it is not a valid call at all.
+    minimalArgs: { mode: 'translate' },
   },
   modoki_set_scene_view_mode: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-scene-view-mode', mutating: true, persists: 'session',

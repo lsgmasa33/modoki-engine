@@ -169,6 +169,14 @@ function InlineNameField({ initial, onCommit, onDone, autoFocus, style, uiId }: 
 export default function SkinEditor() {
   const asset = useEditorStore((s) => s.editingSkinAsset);
   const nonce = useEditorStore((s) => s.skinEditNonce);
+  // Publish "mounted, showing this asset" for the agent ops (#1213): the store naming an asset is
+  // not the panel showing it — a tab that was never opened this session does not mount.
+  const setEditorMount = useEditorStore((s) => s.setEditorMount);
+  const mountedAssetPath = asset?.path ?? null;
+  useEffect(() => {
+    setEditorMount('skin', { path: mountedAssetPath });
+    return () => setEditorMount('skin', null, mountedAssetPath);
+  }, [setEditorMount, mountedAssetPath]);
   /** 'failed' = the file exists but could NOT be read. The load effect then leaves
    *  `editingSkinDef` null and `commit` early-returns on that, so the rig shows empty (as the
    *  #423-item-2 ruling requires) AND cannot be parked over the file (#896). A genuinely MISSING

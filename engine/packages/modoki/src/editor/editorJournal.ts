@@ -26,6 +26,24 @@ export function isEditorJournalSource(source: unknown): source is EditorJournalS
   return (EDITOR_JOURNAL_SOURCES as readonly unknown[]).includes(source);
 }
 
+/** Every event type the editor emits — the vocabulary of `EditorEvent.type` and of the `type` filter
+ *  on `editor-journal` / `wait-for-edit` (#1213). `editorEmit` takes this union, so an emit site with
+ *  a type missing from the table does not compile, and the ops can refuse a typo (`'edit'` for
+ *  `'!edit'`) instead of matching nothing — which for `wait-for-edit` meant parking the whole timeout. */
+export const EDITOR_JOURNAL_TYPES = [
+  '!edit', '!select', '!transform', '!create', '!delete', '!duplicate', '!reparent', '!sceneMove',
+  '!mutate', '!batch', '!asset-edit', '!undo', '!redo',
+  '!play', '!pause', '!stop', '!save', '!scene-load',
+  '!focus', '!gizmo', '!sceneviewmode', '!animationviewmode', '!gameviewdevice', '!skinmode',
+  '!spriteeditorselection',
+  '!hmr.discarded-unsaved', '!hmr.stale-game-code',
+] as const;
+export type EditorJournalType = typeof EDITOR_JOURNAL_TYPES[number];
+
+export function isEditorJournalType(type: unknown): type is EditorJournalType {
+  return (EDITOR_JOURNAL_TYPES as readonly unknown[]).includes(type);
+}
+
 export interface EditorEvent {
   /** Editor-local monotonic sequence — the poll cursor (use as `since`). Bumps only
    *  on editor emits, so it stays contiguous within the editor stream. */
@@ -35,8 +53,8 @@ export interface EditorEvent {
   cap: number;
   /** Wall-clock ms (editor code is not determinism-guarded). */
   ts: number;
-  /** `!`-prefixed editor event, e.g. `!edit`, `!select`, `!play`. */
-  type: string;
+  /** `!`-prefixed editor event, e.g. `!edit`, `!select`, `!play` — one of `EDITOR_JOURNAL_TYPES`. */
+  type: EditorJournalType;
   /** Who performed it — the human at the keyboard, or the AGENT via the MCP ops.
    *  So Claude can tell its own edits from the human's (avoids "I see you deleted 3
    *  crates" about crates Claude itself deleted). */
@@ -48,21 +66,55 @@ const MAX_EVENTS = 2000; // ring-drop oldest
 const buffer: EditorEvent[] = [];
 let seq = 0;
 let enabled = true;
-let actor: 'human' | 'agent' = 'human';
-
 /** Run `fn` with editor activity attributed to `who` — sync OR async. agentEditorOps
  *  wraps its mutating ops in this so agent-driven edits are tagged source:'agent'. For
  *  an async `fn`, the attribution holds until the returned promise settles. NOTE: that
- *  window spans the await, so a human action during it is mis-tagged 'agent' — a narrow,
- *  accepted race (agent ops are brief; a human acting mid-op is rare). */
+ *  window spans the await, so a human action during it is mis-tagged 'agent' — the accepted
+ *  race (docs/enact.md § the actor lease). It is accepted on purpose, including for the openers
+ *  that wait up to 3s: the editor's REACTION to an agent's open (a tab selected, `!focus`) runs in
+ *  React effects after the op's synchronous part returns, so narrowing the scope to that part
+ *  tagged the agent's own open as the human's (#1213 review) — the worse error of the two.
+ *
+ *  ⚠️ **Scopes are TRACKED, not saved-and-restored** (#1213 review). With save/restore, two
+ *  overlapping async ops — routine, since parallel tool calls are — interleaved as: A saves
+ *  'human', B saves 'agent', A restores 'human', B restores 'agent', and the session stayed tagged
+ *  'agent' until a reload: every later human edit was journaled as the agent's, and
+ *  `wait-for-edit {source:'human'}` could never wake. Each scope is now its own entry, so the actor
+ *  is 'agent' exactly while one is live, whatever order they settle in — and each entry carries a
+ *  DEADLINE, the lease's rule: an op whose promise never settles must not hold the label for the
+ *  rest of the session. Expiry is lazy (checked at emit), so there is no timer to leak. */
+export const AGENT_SCOPE_MAX_MS = 60_000;
+type Scope = { who: 'human' | 'agent'; deadline: number };
+/** Insertion-ordered, so the last live entry is the newest. Keyed by the scope object itself. */
+const scopes = new Set<Scope>();
+
+/** Test seam: drop every live scope (a test's never-settling scope must not outlive it). */
+export function _clearActorScopes(): void { scopes.clear(); }
+
 export function withEditorActor<T>(who: 'human' | 'agent', fn: () => T): T {
-  const prev = actor; actor = who;
-  const r = fn();
+  const scope: Scope = { who, deadline: Date.now() + AGENT_SCOPE_MAX_MS };
+  scopes.add(scope);
+  const release = (): void => { scopes.delete(scope); };
+  let r: T;
+  try { r = fn(); } catch (e) { release(); throw e; }
   if (r && typeof (r as { then?: unknown }).then === 'function') {
-    return (r as unknown as Promise<unknown>).finally(() => { actor = prev; }) as unknown as T;
+    return (r as unknown as Promise<unknown>).finally(release) as unknown as T;
   }
-  actor = prev;
+  release();
   return r;
+}
+
+/** The ambient actor: the NEWEST live scope wins (so an explicit 'human' scope inside an agent one
+ *  is human, and vice versa); with none live, 'human'. */
+function ambientActor(): 'human' | 'agent' {
+  if (!scopes.size) return 'human';
+  const now = Date.now();
+  let newest: Scope | undefined;
+  for (const sc of scopes) {
+    if (now > sc.deadline) { scopes.delete(sc); continue; }
+    newest = sc;
+  }
+  return newest?.who ?? 'human';
 }
 
 // ── Actor lease — attribution for TRUSTED INPUT ──────────────────────────────
@@ -157,7 +209,7 @@ function currentActor(): 'human' | 'agent' {
     if (Date.now() <= lease.deadline) return lease.who;
     lease = null; // expired — fall back rather than mis-attribute indefinitely
   }
-  return actor;
+  return ambientActor();
 }
 
 // ── Append listeners (#28 — wait_for_edit) ───────────────────────────────────
@@ -180,7 +232,7 @@ function onEditorJournalAppend(cb: JournalListener): () => void {
 
 /** Record an editor activity event, tagged with the current actor. Payloads should
  *  reference entities by GUID. No-op when disabled. */
-export function editorEmit(type: string, payload?: unknown): void {
+export function editorEmit(type: EditorJournalType, payload?: unknown): void {
   if (!enabled) return;
   const event: EditorEvent = { seq: ++seq, cap: nextCaptureSeq(), ts: Date.now(), type, source: currentActor(), payload };
   buffer.push(event);

@@ -50,6 +50,11 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   // `metaLoadedRef` resets and re-reads. Without this the dialog shows asset B under asset A's
   // refusal, which is a notice describing work the human is no longer looking at.
   useEffect(() => { setSaveRefusal(null); }, [path]);
+  // Publish "open, on this texture" for the agent ops (#1213) — the modal's open state is
+  // TextureAssetView-local, so `open-nine-slice-editor` could not otherwise confirm it opened.
+  const setEditorMount = useEditorStore((s) => s.setEditorMount);
+  useEffect(() => { setEditorMount('nineslice', { path }); }, [path, setEditorMount]);
+  useEffect(() => () => setEditorMount('nineslice', null), [setEditorMount]);
   const [border, setBorder] = useState<NineSliceBorder>({ l: 0, r: 0, t: 0, b: 0 });
   const [edgeScale, setEdgeScale] = useState(1);   // edge render scale (CSS px per source px)
   const [zoom, setZoom] = useState(1);

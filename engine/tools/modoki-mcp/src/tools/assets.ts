@@ -178,8 +178,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'IT DOES NOT POSE THE RIG. This moves the editor\'s playhead VALUE; the human scrub path ' +
       'additionally opens a preview session and poses the skeleton, and this op does not. A ' +
       'render_sequence / capture_viewport taken afterwards shows the UNCHANGED pose — the reply ' +
-      'says so (`posed:false`) and names the bound clip, or tells you none is bound. The value is ' +
-      'clamped to the clip duration, like the panel does.\n\n' +
+      'says so (`posed:false`) and names the bound clip. With NO clip or timeline open it is refused ' +
+      '(NOT_FOUND) — the value would drive nothing. The value is clamped to the clip duration, like the panel ' +
+      'does, and the reply says so (`clampedFrom`).\n\n' +
       'modoki_pose_clip is the tool that DOES pose the rig — it moves the playhead too, so reach ' +
       'for it whenever you want the world to change. Use this one only to set the keyframe ' +
       'INSERTION POINT without disturbing the live world.',

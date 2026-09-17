@@ -123,7 +123,7 @@ function showBanner(text: string, actions: BannerAction[], tone: 'warn' | 'info'
 
 /** Fire-and-forget editor-journal emit, so a discarded-work event is visible to
  *  `editor_journal` and not only to whoever was looking at the screen. */
-function journal(type: string, payload: unknown): void {
+function journal(type: '!hmr.discarded-unsaved' | '!hmr.stale-game-code', payload: unknown): void {
   void import('@modoki/engine/editor')
     .then(({ editorEmit }) => editorEmit(type, payload))
     .catch(() => { /* no editor on this route */ });

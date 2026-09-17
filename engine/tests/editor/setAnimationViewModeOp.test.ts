@@ -29,7 +29,7 @@ const setView = (mode?: unknown) =>
   runAgentOp('set-animation-view-mode', mode === undefined ? {} : { mode }) as Promise<Reply>;
 
 beforeEach(() => {
-  useEditorStore.setState({ animationViewMode: 'dopesheet', animationPanelMounted: false });
+  useEditorStore.setState({ animationViewMode: 'dopesheet', editorMounts: {} });
 });
 
 describe('set-animation-view-mode', () => {
@@ -85,7 +85,7 @@ describe('set-animation-view-mode', () => {
     expect(r.animationView?.panelMounted).toBe(false);
     expect(r.animationView?.panelNote).toContain('NOT mounted');
 
-    useEditorStore.getState().setAnimationPanelMounted(true);
+    useEditorStore.getState().setEditorMount('animation', { path: null });
     const r2 = await setView('dopesheet');
     expect(r2.animationView?.panelMounted).toBe(true);
     expect(r2.animationView?.panelNote).toBeUndefined();

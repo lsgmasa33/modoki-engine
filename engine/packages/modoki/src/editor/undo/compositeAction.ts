@@ -36,12 +36,13 @@ import {
   pushAction, beginActionCapture, endActionCapture,
   type UndoAction,
 } from './undoManager';
+import type { EditorJournalType } from '../editorJournal';
 
 export interface CompositeActionOptions {
   /** Menu/journal label for the WHOLE batch, e.g. `Mutate Scene (4 ops)`. */
   label: string;
   /** Editor-journal sigil for the batch. Defaults to `!batch`. */
-  kind?: string;
+  kind?: EditorJournalType;
   /** Extra journal payload, merged OVER the auto-generated batch summary. */
   journalPayload?: Record<string, unknown>;
   /** Almost always omit: a batched command is its own undo step. Only set this if

@@ -17,6 +17,8 @@
  *  attribute, a trait field), and a poll keeps working while `advancing:false` freezes frames —
  *  a frame callback would not. */
 
+import { PLAY_STATES, RUN_MODES, type PlayState, type RunMode } from '@modoki/engine/runtime';
+
 export const WAIT_FOR_DEFAULT_MS = 5_000;
 export const WAIT_FOR_MIN_MS = 50;
 /** Same ceiling as `wait-for-edit`: long enough for a scene load or a human, short enough that a
@@ -59,8 +61,8 @@ export interface ConsoleCondition {
   lookbackMs?: number;
 }
 export interface EditorCondition {
-  playState?: string;
-  runMode?: string;
+  playState?: PlayState;
+  runMode?: RunMode;
   advancing?: boolean;
   scenePath?: string;
 }
@@ -153,6 +155,14 @@ export function conditionError(cond: unknown, readers: Pick<WaitReaders, 'whereE
       return null;
     case 'editor':
       if (!FIELDS.editor.some((f) => b[f] !== undefined)) return `editor needs at least one of ${FIELDS.editor.join(', ')}`;
+      // Compared with `===` every poll, so a value outside the vocabulary (`'Playing'`) can never
+      // match and the wait sat out its whole timeout (#1213 B-11).
+      if (b.playState !== undefined && !(PLAY_STATES as readonly string[]).includes(b.playState as string)) {
+        return `editor.playState must be one of ${PLAY_STATES.join(', ')} — got ${JSON.stringify(b.playState)}`;
+      }
+      if (b.runMode !== undefined && !(RUN_MODES as readonly string[]).includes(b.runMode as string)) {
+        return `editor.runMode must be one of ${RUN_MODES.join(', ')} — got ${JSON.stringify(b.runMode)}`;
+      }
       return null;
   }
 }

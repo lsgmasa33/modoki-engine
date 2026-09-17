@@ -136,7 +136,8 @@ import { makeSchemaPusher } from './schemaPusher';
 // SAME default when a caller omits `timeoutMs`) — see `engine/tools/shared/simStepTiming.ts`
 // (#822). A VALUE import from `tools/shared`, not `import type`: see that file's docblock for why
 // this is a deliberate exception to the app→tools/shared "types only" convention.
-import { SIM_STEP_MAX_TIMEOUT_MS, simStepDefaultTimeout } from '../../tools/shared/simStepTiming';
+import { SIM_STEP_MAX_TIMEOUT_MS, SIM_STEP_MAX_FRAMES, simStepDefaultTimeout } from '../../tools/shared/simStepTiming';
+import { PROFILER_ACTIONS, isProfilerAction } from '../../tools/shared/profilerActions';
 import {
   startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
   resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
@@ -1270,7 +1271,26 @@ registerAgentOp('diagnose', (params) => {
 // the whole capture is still exportable as JSON for the cases that genuinely need it.
 registerAgentOp('profiler', (raw: unknown) => {
   const params = (raw ?? {}) as Record<string, unknown>;
-  const action = String(params.action ?? 'read');
+  const action = params.action ?? 'read';
+  // An unknown action is REFUSED, not served as a read (#1213 B-6): `default: read` answered
+  // `capture-strat` with a live aggregate, so the caller believed a capture had started. The MCP
+  // enum hid it from tool calls; a POST, an eval and a device relay all reached it. Coded, because
+  // this op answers a GET relay too (an uncoded `ok:false` there reads as success).
+  if (!isProfilerAction(action)) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `profiler: unknown action ${JSON.stringify(params.action)} — nothing was read, started or reset.`,
+      options: [...PROFILER_ACTIONS],
+    };
+  }
+  // A count that is not a number used to reach `Math.max(1, NaN)` — which is NaN, so `slice(0, NaN)`
+  // returned nothing and the read looked empty. The GET route strips such values; a POST, an eval and
+  // a device relay did not.
+  for (const k of ['limit', 'markers'] as const) {
+    if (params[k] !== undefined && (typeof params[k] !== 'number' || !Number.isFinite(params[k]))) {
+      return { ok: false, code: 'REFUSED_BY_OP', error: `profiler: ${k} must be a finite number — got ${JSON.stringify(params[k])}. Nothing was read.` };
+    }
+  }
   switch (action) {
     case 'capture-start':
       startCapture();
@@ -1371,8 +1391,7 @@ registerAgentOp('profiler', (raw: unknown) => {
       // destroyed by the routine call an agent makes before measuring anything. `boot-reset`
       // exists for the deliberate case (re-arming across a scene swap).
       return { reset: true };
-    case 'read':
-    default: {
+    case 'read': {
       const result = readPerfProfile({ markers: Number(params.markers ?? 12) }) as Record<string, unknown>;
       // #682: `frame`/`gpu`/`restBreakdown` are all sampled from frames that actually ran — a dead
       // loop stops filling the ring and this would otherwise report the last healthy reading
@@ -1868,6 +1887,18 @@ registerAgentOp('player-prefs-write', async (params) => {
   if (!p.action || !ACTIONS.includes(p.action)) {
     return { ok: false, code: 'REFUSED_BY_OP', error: `player-prefs-write requires action (one of ${ACTIONS.join(', ')}); got ${JSON.stringify(p.action)}`, options: ACTIONS };
   }
+  // A param the action does not use is REFUSED, not ignored (#1213 B-15). The case that made this a
+  // bug: `{action:'clear', key:'progress', confirm:true}` reads as "clear that key" and wiped the
+  // whole namespace — the destructive action was the one that dropped its argument silently.
+  const ACTION_PARAMS: Record<string, readonly string[]> = { set: ['key', 'value'], delete: ['key'], clear: ['confirm'], flush: [] };
+  const stray = (['key', 'value', 'confirm'] as const).filter((k) => p[k] !== undefined && !ACTION_PARAMS[p.action!].includes(k));
+  if (stray.length) {
+    return {
+      ok: false, code: 'UNKNOWN_PARAM',
+      error: `player-prefs-write: action '${p.action}' does not take ${stray.join(' or ')} — nothing was written.`
+        + (p.action === 'clear' && stray.includes('key') ? " clear removes EVERY key in the namespace; to remove one key use action:'delete'." : ''),
+    };
+  }
   const refusal = prefsUnhydrated();
   if (refusal) return refusal;
   // Distinct from `prefsUnhydrated()` above: `isHydrated()` stays `true` for the whole swap
@@ -2173,6 +2204,37 @@ export function inferAssetDefType(path: string): 'material' | 'particle' | 'anim
   return null;
 }
 
+/** The kinds `read-asset-def` can read from the live cache — every inferable kind but `material`,
+ *  whose authored JSON is not retained (both twins refuse it with their own explanation). */
+export const READABLE_ASSET_DEF_TYPES = ['particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset'] as const;
+
+/** `read-asset-def`'s kind, from an explicit `type` or the path's suffix — shared by the runtime and
+ *  editor twins so they refuse the same inputs the same way. An explicit `type` that CONTRADICTS the
+ *  suffix is refused (#1213 C-23): it used to win, peek the wrong cache, and report "nothing in the
+ *  running scene has loaded it" about an asset that was loaded — under the other kind. A path with no
+ *  recognised suffix (a bare shader guid) takes the explicit type as given. */
+export function resolveAssetDefKind(path: string, type: unknown):
+  { kind: string } | { ok: false; code: ErrorCode; error: string; options: string[] } {
+  const inferred = inferAssetDefType(path);
+  if (type !== undefined) {
+    if (type !== 'material' && !(READABLE_ASSET_DEF_TYPES as readonly unknown[]).includes(type)) {
+      return { ok: false, code: 'REFUSED_BY_OP', error: `read-asset-def: unsupported type '${String(type)}' — nothing was read. Valid: ${READABLE_ASSET_DEF_TYPES.join(', ')}.`, options: [...READABLE_ASSET_DEF_TYPES] };
+    }
+    if (inferred && inferred !== type) {
+      return {
+        ok: false, code: 'REFUSED_BY_OP',
+        error: `read-asset-def: type '${String(type)}' contradicts the path — '${path}' is a ${inferred} by its suffix. Nothing was read; omit type, or pass type:'${inferred}'.`,
+        options: [inferred],
+      };
+    }
+    return { kind: type as string };
+  }
+  if (!inferred) {
+    return { ok: false, code: 'REFUSED_BY_OP', error: `read-asset-def: cannot tell what kind of asset '${path}' is — pass type explicitly (${READABLE_ASSET_DEF_TYPES.join(', ')}).`, options: [...READABLE_ASSET_DEF_TYPES] };
+  }
+  return { kind: inferred };
+}
+
 // ── read-asset-def (#166 P7) — what the RUNNING build actually resolved.
 //
 // Runtime twin: reads the live cache and nothing else. The editor replaces this with its own
@@ -2183,14 +2245,9 @@ export function inferAssetDefType(path: string): 'material' | 'particle' | 'anim
 registerAgentOp('read-asset-def', (params) => {
   const { path, type } = (params ?? {}) as { path?: string; type?: string };
   if (!path) return { ok: false, error: 'read-asset-def requires { path }.' };
-  const kind = type ?? inferAssetDefType(path);
-  if (!kind) {
-    return {
-      ok: false,
-      error: `cannot tell what kind of asset '${path}' is — pass type explicitly.`,
-      options: ['particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset'],
-    };
-  }
+  const resolved = resolveAssetDefKind(path, type);
+  if (!('kind' in resolved)) return resolved;
+  const { kind } = resolved;
   // PEEK, don't load. The plain getters treat a miss as "not loaded YET" and kick off a background
   // fetch, so asking about an absent asset would queue a load that can only fail and log into the
   // console — for a question this op then refuses anyway.
@@ -2202,7 +2259,7 @@ registerAgentOp('read-asset-def', (params) => {
     return {
       ok: false,
       error: "read-asset-def: material defs are not readable from the live cache — only the compiled THREE.Material is retained, the authored .mat.json is discarded once built. Read the file directly (it is the authoritative copy; a parked edit shows in modoki_get_editor_state's dirtyAssetPaths).",
-      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'],
+      options: [...READABLE_ASSET_DEF_TYPES],
     };
   }
   const peek = { load: false } as const;
@@ -2228,11 +2285,7 @@ registerAgentOp('read-asset-def', (params) => {
     : kind === 'animset' ? getAnimSet(path, peek)
     : undefined;
   if (def === undefined) {
-    return {
-      ok: false,
-      error: `unsupported type '${kind}'.`,
-      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'],
-    };
+    return { ok: false, error: `unsupported type '${kind}'.`, options: [...READABLE_ASSET_DEF_TYPES] };
   }
   if (def === null) {
     // NOT an empty answer: nothing has loaded this asset into the live cache, so there is no live
@@ -2352,9 +2405,26 @@ registerAgentOp('sim-step', (params) => {
       timeScale: getTimeScale(world),
     });
   }
-  const frames = Math.max(1, Math.min(600, Math.floor(Number(p.frames ?? 1))));
-  const scale = typeof p.scale === 'number' && Number.isFinite(p.scale) && p.scale > 0 ? p.scale : 1;
-  const budgetMs = Math.max(100, Math.min(SIM_STEP_MAX_TIMEOUT_MS, Number(p.timeoutMs ?? simStepDefaultTimeout(frames))));
+  // Refused, not clamped (#1213 C-9): `frames:1000` stepped 600 and `scale:-1` stepped at 1, both
+  // answering ok about a run the caller did not ask for — and `frames:'abc'` became NaN, which no
+  // frame count ever reaches, so the call sat out its whole timeout. `duplicate-entity` refuses a bad
+  // count for the same reason.
+  const bad = (field: string, value: unknown, want: string) => Promise.resolve({
+    ok: false, code: 'REFUSED_BY_OP',
+    error: `sim-step: ${field} must be ${want} — got ${JSON.stringify(value)}. Nothing was stepped.`,
+  });
+  if (p.frames !== undefined && !(Number.isInteger(p.frames) && p.frames >= 1 && p.frames <= SIM_STEP_MAX_FRAMES)) {
+    return bad('frames', p.frames, `an integer from 1 to ${SIM_STEP_MAX_FRAMES}`);
+  }
+  if (p.scale !== undefined && !(typeof p.scale === 'number' && Number.isFinite(p.scale) && p.scale > 0)) {
+    return bad('scale', p.scale, 'a finite number above 0');
+  }
+  if (p.timeoutMs !== undefined && !(typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs))) {
+    return bad('timeoutMs', p.timeoutMs, 'a finite number of milliseconds');
+  }
+  const frames = p.frames ?? 1;
+  const scale = p.scale ?? 1;
+  const budgetMs = Math.max(100, Math.min(SIM_STEP_MAX_TIMEOUT_MS, p.timeoutMs ?? simStepDefaultTimeout(frames)));
 
   // Physics readiness (#1175): a body whose Rapier WASM has not instantiated is SKIPPED by the
   // physics system, so these frames would come back physics-free and read as real. Wait for it like
