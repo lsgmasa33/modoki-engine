@@ -678,3 +678,65 @@ describe('player-prefs-write: a swap landing DURING the op\'s own await is caugh
     expect(result.durability).toBe('unknown');
   });
 });
+
+describe('player-prefs-write clear/delete list a PROTECTED key as something the delete reaches (#1310)', () => {
+  /** One readable key plus one held by an envelope version this build cannot decode. `clear()`
+   *  removes both (#630); `keys()` lists only the readable one. `rejectProtected` makes the
+   *  backend refuse the durable remove of the protected key alone. */
+  async function seed(rejectProtected: boolean): Promise<InMemoryBackend> {
+    resetPlayerPrefsForTest();
+    const backend = new InMemoryBackend();
+    await backend.set('mk:unit-1310:coins', JSON.stringify({ v: 1, d: 10 }));
+    await backend.set('mk:unit-1310:save', JSON.stringify({ v: 999, d: { fromNewerBuild: true } }));
+    if (rejectProtected) {
+      const remove = backend.remove.bind(backend);
+      backend.remove = async (key: string) => {
+        if (key.endsWith(':save')) throw new Error('QuotaExceededError');
+        return remove(key);
+      };
+    }
+    await PlayerPrefs.init({ namespace: 'unit-1310', backend });
+    // The fixture's premise, asserted so a change to the protection rule cannot silently void it.
+    expect(PlayerPrefs.isProtected('save')).toBe(true);
+    expect(PlayerPrefs.keys()).not.toContain('save');
+    return backend;
+  }
+
+  it('the refused preview counts and lists the protected key the clear would destroy', async () => {
+    await seed(false);
+    const r = await write({ action: 'clear' });
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(r.totalCount).toBe(2);
+    expect([...(r.keys as string[])].sort()).toEqual(['coins', 'save']);
+    expect(String(r.error)).toMatch(/remove all 2 key\(s\)/);
+  });
+
+  it('the success report counts the protected key, and the backend really lost it', async () => {
+    const backend = await seed(false);
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.ok).toBe(true);
+    expect(r.cleared).toBe(2);
+    expect([...(r.keys as string[])].sort()).toEqual(['coins', 'save']);
+    expect(Object.keys(await backend.getAll('mk:unit-1310:'))).toEqual([]);
+  });
+
+  it('a rejected remove of the protected key is attributed to THIS clear, not to an earlier one', async () => {
+    const backend = await seed(true);
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.code).toBe('PARTIAL');
+    expect(r.pendingWrites).toEqual(['save']);
+    expect(String(r.error)).toMatch(/for 1 of them: save/);
+    expect(String(r.error)).not.toMatch(/already pending before this clear ran/);
+    expect(String(r.error)).not.toMatch(/every key this clear enumerated was durably removed/);
+    // The report matches the disk: the protected save is still there.
+    expect(Object.keys(await backend.getAll('mk:unit-1310:'))).toContain('mk:unit-1310:save');
+  });
+
+  it("delete NOT_FOUND offers the protected key as an option — it is deletable — while `keys` stays the readable index", async () => {
+    await seed(false);
+    const r = await write({ action: 'delete', key: 'sav' });
+    expect(r.code).toBe('NOT_FOUND');
+    expect(r.options).toEqual(['coins', 'save']);
+    expect(r.keys).toEqual(['coins']);
+  });
+});

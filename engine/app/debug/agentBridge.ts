@@ -1970,7 +1970,13 @@ registerAgentOp('player-prefs-write', async (params) => {
     // installed app holding a real player's save data, namespaced by appId, and this is neither
     // undoable nor journaled as a scene edit. A REQUIRED `action` stops the `{}`-typo hazard; only
     // an explicit acknowledgement stops a deliberate clear aimed at the wrong lease.
-    const keys = PlayerPrefs.keys();
+    // ⚠️ **`keysIncludingProtected()`, never `keys()`** (#1310). This listing describes a DELETE —
+    // the preview the operator acknowledges, the `cleared` count, and the `failed`/`alsoPending`
+    // split below — and `clear()` also removes a key protected by a save this build cannot decode
+    // (#630). `keys()` omits that key, so it went unlisted in the preview and a rejected remove of
+    // it was narrated as "already pending before this clear ran" beside "every key this clear
+    // enumerated was durably removed" — a wipe reporting success over a save still on disk (#1276).
+    const keys = PlayerPrefs.keysIncludingProtected();
     if (p.confirm !== true) {
       return {
         // REFUSED_BY_OP, not REQUIRES_SAVE. §5 documents REQUIRES_SAVE for a world-swapping or
@@ -2061,10 +2067,13 @@ registerAgentOp('player-prefs-write', async (params) => {
         };
       }
       const keys = [...PlayerPrefs.keys()].sort();
+      // `options` are delete TARGETS, and a protected key is one (the check above lets it
+      // through, #630 review finding 4) — so they come from the protected-aware listing (#1310).
+      // `keys` stays the readable index, the same answer `player-prefs-read` gives.
       return {
         ok: false, code: 'NOT_FOUND', namespace, key: p.key, keys,
         error: `no key '${p.key}' in namespace '${namespace}' — nothing was deleted`,
-        options: keys,
+        options: [...PlayerPrefs.keysIncludingProtected()].sort(),
       };
     }
     PlayerPrefs.delete(p.key);

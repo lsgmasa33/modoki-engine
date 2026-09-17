@@ -177,11 +177,20 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   because a background adoption carries no user intent and #630's whole design is that a newer
   build's save is not stomped by a build that cannot read it. The adoption sites also record the
   **cost** that accepts: the undecodable board survives, and `set()` refuses that key until
-  something deletes it BY NAME — a wipe, or (in wordweave, #1286 review) finishing that level, whose
-  clear tail deletes the board. Court's sync site was widened during #1276 and reverted on review;
+  something deletes it BY NAME — a wipe, or finishing that level: wordweave's clear tail deletes the
+  board (#1286 review, observed), and Court's `clearStoredSession()` does the same on solve and on a
+  level reset (#1311, by reading). Court's sync site was widened during #1276 and reverted on review;
   wordweave's was a bare loop with no comment at all, one sweep away from the same "fix". An
   unannotated `keys()` in a delete loop is therefore the same defect as a wrong one, wearing the
   other sign.
+  ⚠️ **The rule covers what DESCRIBES a delete, not only the loop that performs it** (#1310).
+  `player-prefs-write action:'clear'` calls `clear()`, which reaches protected keys, but it took the
+  listing for its confirmation preview, its `cleared` count and its rejected-remove attribution
+  from `keys()`. A protected key was therefore missing from the preview the operator acknowledged,
+  and if its remove was rejected, the error called it "already pending before this clear ran"
+  beside "every key this clear enumerated was durably removed". Both now come from
+  `keysIncludingProtected()`, as does `action:'delete'`'s `NOT_FOUND` option list (a protected key
+  is a valid delete target). Readers (`player-prefs-read`, the debug tab) stay on `keys()`.
 - **Write pipeline.** The cache stores the serialized envelope string per key (so `get()`
   parses a fresh object — no caller can mutate the cache — and the JSON contract is enforced
   at `set()` time). Writes are serialized on a promise chain so `flush()` has a stable point;
@@ -590,9 +599,11 @@ is not proof of a rejection; it's the identical signature an ordinary DEBOUNCED 
   disk". `player-prefs-read` never flushes, so it can't settle which one it is; it only reports the
   ambiguity.
 - **`clear`'s `PARTIAL` separates keys this call enumerated from keys already pending beforehand.**
-  `pendingWrites` is the honest full dirty set; `failed` (keys this clear's own `flush()` retried and
-  saw rejected again) and `alsoPending` (dirty before the clear ran) are reported as separate clauses
-  so the count in the message stays consistent with `cleared`/`keys`.
+  `pendingWrites` is the honest full dirty set; `failed` (keys this clear enumerated whose durable
+  remove the backend rejected) and `alsoPending` (dirty before the clear ran, which this call's own
+  `flush()` retried and saw rejected again) are reported as separate clauses, so the count in the
+  message stays consistent with `cleared`/`keys`. The enumeration is `keysIncludingProtected()`, so a
+  protected key counts as enumerated (#1310).
 
 ## Related
 
