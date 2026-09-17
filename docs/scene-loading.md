@@ -1169,11 +1169,23 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   swapping between the two files spawns it twice. Existing files were deliberately left as they are
   — `qa/cases/**`, `demos/postfx-demo` and Court's tests pin their guids (and postfx-demo's code
   looks entities up by literal guid, so a DUPLICATE of one of its scenes loses those lookups).
-  ⚠️ **Known gap — a stored ref to a prefab MEMBER does not follow.** Members are not stored; they
-  derive `deriveGuid(anchor|path)` from the (now reminted) instance root on load, so the members
-  themselves are fine, but a ref that held a member's derived guid keeps the OLD anchor's value and
-  dangles in the copy. Following it needs the member paths — expanding the prefab chain on the Node
-  side, which nothing there does today. 0 of 56 committed scenes hold such a ref. Tracked in #1324.
+  **A stored ref to a prefab MEMBER follows too (#1324).** Members are not stored; they derive
+  `deriveGuid(anchor|path)` from the (now reminted) anchor on load, so a ref holding a member's
+  derived guid would otherwise keep the OLD anchor's value and dangle in the copy. The duplicate
+  route hands `remintSceneEntityGuids` a prefab reader, and `derivedMemberPaths` walks each
+  reminted anchor's prefab chain — nested rows and user-added nested instances included — to map
+  `deriveGuid(old|p)` → `deriveGuid(new|p)`. Its step rule MIRRORS `deriveInstanceMemberGuids`
+  (a prefab row steps by its `localId`, a user-added nested instance's root by its prefab's root
+  localId, a plain added node by 0), so a change to one must change the other.
+  `engine/tests/plugins/remintPrefabMemberRefs.test.ts` pins the pair by loading the original and
+  the copy through the real loader, never by hand-computing a guid. A prefab the reader cannot
+  resolve maps nothing, so a ref into it still dangles.
+  ⚠️ **The walk mirrors the loader exactly, including the shapes the loader recurses on FOREVER** (a
+  prefab whose file adds a reference leading back to it). Two structural rules for "which shapes
+  are cycles" were each wrong in review, refusing shapes that load or missing ones that do not, so
+  the walk stops on SIZE instead: past 64 instance levels or 100,000 member paths it maps nothing for
+  that anchor. Plain added levels do not count toward the depth. A row whose parent is zero or
+  unknown derives from the SCENE parent and is not followed (#1339).
   A stale runtime guid (#1210) is not reminted (it is no identity), and a BOM-prefixed file is
   parsed past its BOM rather than copied verbatim under the original's asset id.
 

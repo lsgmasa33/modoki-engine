@@ -657,7 +657,11 @@ function makePrefabResolver(ctx: BackendContext): PrefabResolver {
         assetPath = sourceRef;
       }
       const absPath = assetPath ? ctx.resolveAssetPath(assetPath) : null;
-      result = absPath && fs.existsSync(absPath) ? JSON.parse(fs.readFileSync(absPath, 'utf-8')) : undefined;
+      // A leading BOM is stripped as the loader's `res.text()` strips it, so a prefab that loads in
+      // the editor also resolves here (#1324 review — a duplicated scene's member refs did not follow).
+      result = absPath && fs.existsSync(absPath)
+        ? JSON.parse(fs.readFileSync(absPath, 'utf-8').replace(/^\uFEFF/, ''))
+        : undefined;
     } catch {
       result = undefined;
     }
@@ -4474,7 +4478,8 @@ async function describeUnresolvedAgainstLiveWorld(
           + 'PRE-EDIT content while the editor shows the newer version.',
       });
       if (dupRefused) return json(dupRefused.body, dupRefused.status);
-      const newGuid = duplicateAssetFile(absFrom, absTo);
+      // The prefab reader lets a copied scene's refs to prefab MEMBERS follow the reminted root (#1324).
+      const newGuid = duplicateAssetFile(absFrom, absTo, undefined, makePrefabResolver(ctx));
       const manifestRebuilt = rebuildManifestInline(ctx);
       return json({
         ok: true,

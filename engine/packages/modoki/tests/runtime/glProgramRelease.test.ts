@@ -7,7 +7,7 @@
  *  bumps a stats-only `info.destroyProgram`; a pipeline release deletes from `caches`. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { found } from '../helpers/inOrder';
+import { findNodes, parseSource, ts } from '../helpers/sourceAst';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { installGlProgramReleaseHatch } from '../../src/runtime/rendering/glProgramRelease';
@@ -583,12 +583,15 @@ describe('three internals tripwire — the private surface #715 depends on', () 
     // matches ~18 places across it (Bindings, Textures, Attributes, NodeManager, Renderer, and
     // various *Utils classes all assign it too) — asserting that string against the WHOLE bundle
     // would not actually detect a Pipelines-only rename, which is the entire point of this test.
-    // Slice out just the `Pipelines` class body (from its `class Pipelines extends DataMap {`
-    // declaration to the next top-level `class ` declaration) and assert against that instead.
-    const classStart = found(build.indexOf('class Pipelines extends DataMap {'), '`class Pipelines extends DataMap {` in the bundle');
-    const nextClassStart = build.indexOf('\nclass ', classStart + 1);
-    expect(nextClassStart, 'a following top-level class declaration bounds the Pipelines class body').toBeGreaterThan(classStart);
-    const pipelinesClass = build.slice(classStart, nextClassStart);
+    // Take just the `Pipelines` class from the PARSE (#1242) and assert against that instead. It was
+    // sliced from `class Pipelines extends DataMap {` to the next `\nclass `, an edge a reflowed
+    // bundle or a class expression in between would move; parsing the 2.2 MB bundle measured
+    // ~110-200 ms, well inside this suite's budget.
+    const sf = parseSource(build, 'three.webgpu.js');
+    const classes = findNodes(sf, ts.isClassDeclaration).filter((c) => c.name?.text === 'Pipelines');
+    expect(classes, 'exactly one `class Pipelines` in the bundle').toHaveLength(1);
+    const pipelinesClass = classes[0]!.getText(sf);
+    expect(pipelinesClass, 'the Pipelines class still extends DataMap').toMatch(/^class Pipelines extends DataMap \{/);
 
     expect(pipelinesClass).toMatch(/_releaseProgram\(\s*program\s*\)\s*\{/);
     expect(pipelinesClass).toContain('this.programs[ stage ].delete( code )');

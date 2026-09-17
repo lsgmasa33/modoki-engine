@@ -57,17 +57,18 @@ const PLUGIN_PATH = path.join(
 
 const source = fs.readFileSync(PLUGIN_PATH, 'utf8');
 
-/** Extract the body of `private void unpark(PluginCall call) { ... }` by locating the signature
- *  and matching braces — simple counting is enough for one method with no nested string literals
- *  containing braces. */
-function extractUnparkBody(src: string): string {
-  const signature = 'private void unpark(PluginCall call) {';
+/** The body between `signature` (ending in `{`) and its balancing `}`.
+ *
+ *  ⚠️ **Text, and a recorded decision (#1179, #1242): there is no Java parser in this repo.** The edge is
+ *  a brace count, so a `{`/`}` inside a string or char literal in the cut body would move it. Each body
+ *  this file cuts is fixed plugin code with no brace-bearing literal today, and a moved edge fails LOUD
+ *  rather than passing: a cut that runs SHORT drops a statement the exact `toBe(1)` counts below require
+ *  inside it, and one that runs LONG swallows the next member's declaration, which the check here
+ *  refuses — a body cannot hold a member at its own signature's indent. */
+function bracedBody(src: string, signature: string, what: string): string {
   const start = src.indexOf(signature);
   if (start === -1) {
-    throw new Error(
-      `could not find "${signature}" in ModokiIapPlugin.java — has unpark() been renamed or removed? `
-        + 'This guard only makes sense if a single unpark() helper still exists.',
-    );
+    throw new Error(`could not find "${signature}" in ${what} — has it been renamed or removed?`);
   }
   let depth = 1;
   let i = start + signature.length;
@@ -76,11 +77,24 @@ function extractUnparkBody(src: string): string {
     if (src[i] === '{') depth++;
     else if (src[i] === '}') depth--;
   }
-  if (depth !== 0) {
-    throw new Error('unpark() body braces never balanced — malformed source?');
+  if (depth !== 0) throw new Error(`"${signature}" braces never balanced in ${what} — malformed source?`);
+  const body = src.slice(bodyStart, i - 1);
+  // A sibling member sits at the SIGNATURE's own indent. A deeper one is legal inside a body (an
+  // anonymous class's `@Override public void run()`), so only that exact indent is refused.
+  // The LINE's leading whitespace — not whatever precedes the signature, which is `    private ` when
+  // the signature is written from `void …` onward.
+  const indent = /^[ \t]*/.exec(src.slice(src.lastIndexOf('\n', start - 1) + 1, start))![0];
+  const sibling = new RegExp(`^${indent}(?:@\\w+\\s+)*(?:public|private|protected)\\s`, 'm').exec(body);
+  if (sibling) {
+    throw new Error(`"${signature}" in ${what} ran past its own closing brace into a sibling member `
+      + `(${JSON.stringify(sibling[0].trim())}) — a brace inside a literal moved the edge; this cut is text (see bracedBody).`);
   }
-  return src.slice(bodyStart, i - 1);
+  return body;
 }
+
+/** Body of `private void unpark(PluginCall call) { ... }` — the one helper this guard exists for. */
+const extractUnparkBody = (src: string): string =>
+  bracedBody(src, 'private void unpark(PluginCall call) {', 'ModokiIapPlugin.java (a single unpark() helper must still exist)');
 
 const unparkBody = extractUnparkBody(source);
 
@@ -245,37 +259,12 @@ describe('ModokiIapPlugin: a parked purchase() times out instead of waiting fore
    *  timer cancel must live IN here: a settle that lost a race must not cancel the NEWER call's
    *  timer. Asserting against the whole unpark() body cannot tell the two apart. */
   function extractUnparkIdentityGuard(src: string): string {
-    const body = extractUnparkBody(src);
-    const sig = 'if (awaitingPurchase == call) {';
-    const start = body.indexOf(sig);
-    if (start === -1) throw new Error('unpark() has no `if (awaitingPurchase == call) {` guard');
-    let depth = 1;
-    let i = start + sig.length;
-    const bodyStart = i;
-    for (; i < body.length && depth > 0; i++) {
-      if (body[i] === '{') depth++;
-      else if (body[i] === '}') depth--;
-    }
-    if (depth !== 0) throw new Error('unpark() identity-guard braces never balanced');
-    return body.slice(bodyStart, i - 1);
+    return bracedBody(extractUnparkBody(src), 'if (awaitingPurchase == call) {', 'unpark() (its identity guard)');
   }
 
   /** Body of `private void armStrandTimeout(...) { ... }`. */
   function extractArmHelper(src: string): string {
-    const sig = 'private void armStrandTimeout(PluginCall call, String productId) {';
-    const start = src.indexOf(sig);
-    if (start === -1) {
-      throw new Error(`could not find "${sig}" — has the #583 arm helper been renamed or removed?`);
-    }
-    let depth = 1;
-    let i = start + sig.length;
-    const bodyStart = i;
-    for (; i < src.length && depth > 0; i++) {
-      if (src[i] === '{') depth++;
-      else if (src[i] === '}') depth--;
-    }
-    if (depth !== 0) throw new Error('armStrandTimeout braces never balanced');
-    return src.slice(bodyStart, i - 1);
+    return bracedBody(src, 'private void armStrandTimeout(PluginCall call, String productId) {', 'ModokiIapPlugin.java (the #583 arm helper)');
   }
 
   it('arms ONLY from the no-match branch — never at park time', () => {
@@ -463,5 +452,20 @@ describe('ModokiIapPlugin: the reload listener is registered where it actually s
         + ' — registration must come FIRST, or a reload landing in between finds a parked call with'
         + ' no listener, which is the exact window #586 exists to close.',
     ).toBe(true);
+  });
+});
+
+describe('bracedBody — the text cut refuses a run-long edge, and only that (#1242)', () => {
+  const cls = (inner: string) => `class P {\n    private void a() {\n${inner}\n    }\n\n    private void b() {\n        x();\n    }\n}\n`;
+  it('refuses a body that a brace in a literal ran into the next member', () => {
+    expect(() => bracedBody(cls('        String s = "{";'), 'private void a() {', 'fixture')).toThrow(/sibling member/);
+  });
+  it('refuses the same run-long edge when the signature does not start its line', () => {
+    expect(() => bracedBody(cls('        String s = "{";'), 'void a() {', 'fixture')).toThrow(/sibling member/);
+  });
+  it('accepts a deeper member inside the body (an anonymous class)', () => {
+    const body = bracedBody(cls('        post(new Runnable() {\n            @Override public void run() { y(); }\n        });'), 'private void a() {', 'fixture');
+    expect(body).toContain('public void run()');
+    expect(body).not.toContain('void b()');
   });
 });

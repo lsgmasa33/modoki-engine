@@ -786,7 +786,10 @@ type PrefabFileEntry = {
  *  — a scene-assigned guid (e.g. the instance root) is never overwritten.
  *
  *  Anchoring uses a snapshot of guids taken BEFORE deriving, so the result is
- *  independent of iteration order (derived guids never become anchors). */
+ *  independent of iteration order (derived guids never become anchors).
+ *
+ *  ⚠️ The step rule is MIRRORED by `derivedMemberPaths` (engine/plugins/asset-fs-ops.ts), which
+ *  re-derives member guids on the Node side when a scene file is duplicated (#1324) — change both. */
 export function deriveInstanceMemberGuids(world: World): void {
   const piMeta = getTraitByName('PrefabInstance');
   const attrMeta = getTraitByName('EntityAttributes');

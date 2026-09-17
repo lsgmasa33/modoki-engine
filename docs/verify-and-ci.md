@@ -346,15 +346,15 @@ one.
   something that does. Following calls to a fixpoint turned every variable holding a log's TEXT in
   `fileLogWarnings.test.ts` into a "probe": the further a value is from its `existsSync`, the more
   likely it is content rather than presence.
-- **JSX.** The literal blanker is a heuristic, and a closing tag's `/` or an apostrophe in JSX text
-  can make it drop a closing bracket, which shifts nesting for the rest of a `.tsx` file and can
-  hide a gate below it. No `.tsx` test probes the filesystem or imports `repoLayout` today; a real
-  tokenizer measured ~10 s over the corpus against the scan's ~0.2 s, so it is a stated limit.
+- **One alias level.** `const HAS = hasSkills()` is followed; an alias of that alias is not.
 
-The scan reads literal-blanked source (string, template and regex contents replaced by spaces,
-positions kept). #1071's close-out found a bracket inside a string making one declaration's
-"initializer" run on for ~200 lines in three real test files, which is what blanking fixed; an
-earlier version of this paragraph called that a harmless limit because no verdict had changed yet.
+The scan reads the TypeScript parse (#1242), resolving names by the file's own scopes. It used to read
+literal-blanked text, which fixed #1071's case — a bracket inside a string ran one declaration's
+"initializer" on for ~200 lines in three real test files — but left JSX text, a braceless consequent
+holding a brace, and a shadowed name as stated limits. The parse was held off as ~10 s over the
+corpus; measured on 2026-09-17 it is ~0.9 s for all ~2,000 test files, and the scan parses only the
+~230 that a bare-word pre-filter keeps (a superset by construction: a row needs a `repoLayout` import
+or a probe call, and both spell a word the filter matches).
 
 It closes the silence, not the coverage.
 
@@ -2298,6 +2298,25 @@ What else recurred:
   this a `PropertyAssignment` whose initializer is an arrow" is a question about spelling, and a
   partition's members do not owe you one spelling. Related, and empty today: a reader enumerating
   only `function` declarations cannot see a member naming a `const f = (world: World) => …`.
+
+**P5 landed** `layoutConditionalScan.ts` on the parse and recorded the three readers that stay text or
+move. The scanner's population was **identical** old against new (86 rows, every predicate sign and
+gate string), so the change is the REACH, and five fixtures pin it: four the text scanner got wrong
+(a braceless `run({ fast }); else ctx.skip()`, a probe below JSX text, `!(ci && hasX())` read with its
+De Morgan sense, and a test-local that shadows a probing name) and one it got right by accident (an
+unconditional `ctx.skip()` in a test a probing `if` registers — kept flagged on purpose). Two lessons:
+
+- **A stated limit is priced by a measurement, and the measurement ages.** The "a real tokenizer costs
+  ~10 s" line kept a heuristic literal-blanker in place; the parse measured ~0.9 s over the whole corpus
+  when it was finally re-run. A cost that justifies a limit belongs next to the date it was measured.
+- **A text reader's recorded decision needs a check that makes the moved edge LOUD in both
+  directions.** `iapParkedCallRelease`'s Java brace cut failed loudly when a `"}"` cut it short (exact
+  `toBe(1)` counts), but a `"{"` made it run long into the next method and every assertion stayed
+  green. It now refuses a body that contains a member declaration. `glProgramRelease` parses the 2.2 MB
+  three bundle (~150 ms) and takes the ONE `class Pipelines` node — the old slice to the next
+  `\nclass ` could run long, and nothing checked that it had not. The Java refusal matches only a
+  member at the signature's own indent, since an anonymous class's `public void run()` is legal inside a body. `pluginMethodParity`'s Swift half
+  already carried its recorded decision (#1195).
 - **A migration can strand an exemption row in ANOTHER file.** `cellMapDiscipline`'s two `indexOf`
   ordering comparisons were on `indexOrderingAssertions`' in-flight ledger (#1181). Converting them to
   node positions left that row blessing occurrences that no longer exist, and the ledger's

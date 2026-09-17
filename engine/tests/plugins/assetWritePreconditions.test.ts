@@ -32,6 +32,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { readMetaSidecar } from '../../plugins/meta-sidecar';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 
 let projectRoot = '';
 /** Renderer calls, `[op, params]`. */
@@ -381,5 +382,33 @@ describe('A-21: every disk-writing asset route says saved:true (§8)', () => {
       expect(r.body.ok).toBe(true);
       expect(r.body.saved).toBe(true);
     } finally { fs.rmSync(srcDir, { recursive: true, force: true }); }
+  });
+});
+
+describe('/api/duplicate-asset hands the remint a prefab reader (#1324)', () => {
+  // The member-path walk itself is pinned against the real loader in remintPrefabMemberRefs.test.ts;
+  // this is the route's WIRING — without the reader, a ref to a prefab member dangles in the copy.
+  it.each([['plain', ''], ['BOM-prefixed', '\uFEFF']])('a ref to a member of a %s prefab follows the reminted instance root', async (_kind, bom) => {
+    const PREFAB = '33333333-3333-4333-8333-333333333333';
+    const ROOT = '44444444-4444-4444-8444-444444444444';
+    // The BOM row: the loader's `res.text()` strips one, so a BOM prefab loads — the reader must agree.
+    write('/p/panel.prefab.json', bom + JSON.stringify({ id: PREFAB, rootLocalId: 1, entities: [
+      { localId: 1, traits: { EntityAttributes: { name: 'Root', parentId: 0, guid: '' } } },
+      { localId: 2, traits: { EntityAttributes: { name: 'Button', parentId: 1, guid: '' } } },
+    ] }));
+    const oldRef = deriveGuid(`${ROOT}|2`);
+    write('/s/a.scene.json', JSON.stringify({ id: GUID_A, entities: [
+      { id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: 0 } } },
+      { id: 2, traits: { EntityAttributes: { name: 'Ui', parentId: 0, guid: GUID_B }, UIAction: { bindings: [{ target: oldRef }] } } },
+    ] }));
+    const ctx = makeCtx({
+      getManifest: () => ({ version: 2, assets: [{ path: '/p/panel.prefab.json', type: 'prefab', guid: PREFAB }] }) as unknown as Manifest,
+    });
+    const r = await post('/api/duplicate-asset', { from: '/s/a.scene.json', to: '/s/b.scene.json' }, ctx);
+    expect(r.body.ok).toBe(true);
+    const copy = JSON.parse(fs.readFileSync(abs('/s/b.scene.json'), 'utf-8'));
+    const newRoot = copy.entities[0].guid as string;
+    expect(newRoot).not.toBe(ROOT);
+    expect(copy.entities[1].traits.UIAction.bindings[0].target).toBe(deriveGuid(`${newRoot}|2`));
   });
 });
