@@ -1004,6 +1004,8 @@ const HELD_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'rebuilt: reassigned from resolveCanvas2DHost at the top of every frame, before handlePointer resolves a canvas with it; games/space-invader/runtime/systems.ts:231' },
   { item: 'games/space-invader/runtime/systems.ts::State{}.player',
     reason: 'rebuilt: reassigned from world.queryFirst(Player) every frame before any use; games/space-invader/runtime/systems.ts:238' },
+  { item: 'games/wordweave/runtime/celebrationFx.ts::LiveFx.root',
+    reason: 'alive-checked: its only use is the subtree destroy, which drops a root that fails isPackedAlive or belongs to another world; games/wordweave/runtime/celebrationFx.ts:173' },
   { item: 'games/wordweave/runtime/systems.ts::Built.crosswordRoot',
     reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
   { item: 'games/wordweave/runtime/systems.ts::Built.crosswordClip',
