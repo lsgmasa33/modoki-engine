@@ -770,7 +770,7 @@ export {
   setLinvel3D, setAngvel3D, setBodyTranslation3D, resetForces3D, wakeBody3D,
 } from './physics/physics3DSystem';
 export { initRapier3D, isRapier3DReady } from './physics/rapier3DLoader';
-export { ensurePhysicsReady, pendingPhysics, type PhysicsReadiness } from './physics/physicsReady';
+export { ensurePhysicsReady, ensurePhysicsModuleReady, pendingPhysics, type PhysicsReadiness, type PhysicsModuleName } from './physics/physicsReady';
 export { getContactState } from './physics/physicsContactIndex';
 export { zone2DSystem } from './zones/zone2DSystem';
 export { zone3DSystem } from './zones/zone3DSystem';

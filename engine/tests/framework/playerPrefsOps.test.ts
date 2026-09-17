@@ -757,6 +757,44 @@ describe('player-prefs-write clear/delete list a PROTECTED key as something the 
     expect(Object.keys(await backend.getAll('mk:unit-1310:'))).toContain('mk:unit-1310:save');
   });
 
+  it('a CORRUPT entry is counted in the preview and really removed by the confirmed clear (#1317)', async () => {
+    // Not protected (`clear()` reaches it for a different reason), but the same failure shape:
+    // hydrate used to forget the name, so the preview undercounted and the "wiped" report sat
+    // beside a garbage entry still on disk.
+    resetPlayerPrefsForTest();
+    const backend = new InMemoryBackend();
+    await backend.set('mk:unit-1317:coins', JSON.stringify({ v: 1, d: 10 }));
+    await backend.set('mk:unit-1317:session', '{"v":1,"d":{"elapsed');
+    await PlayerPrefs.init({ namespace: 'unit-1317', backend });
+    expect(PlayerPrefs.keys(), 'fixture: the corrupt key is invisible to readers').toEqual(['coins']);
+
+    const preview = await write({ action: 'clear' });
+    expect(preview.totalCount).toBe(2);
+    expect([...(preview.keys as string[])].sort()).toEqual(['coins', 'session']);
+
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.ok).toBe(true);
+    expect(r.cleared).toBe(2);
+    expect(Object.keys(await backend.getAll('mk:unit-1317:'))).toEqual([]);
+  });
+
+  it('delete reaches a CORRUPT key it names — never NOT_FOUND with that key in its own options (#1317 review)', async () => {
+    resetPlayerPrefsForTest();
+    const backend = new InMemoryBackend();
+    await backend.set('mk:unit-1317d:coins', JSON.stringify({ v: 1, d: 10 }));
+    await backend.set('mk:unit-1317d:session', '{"v":1,"d":{"elapsed');
+    await PlayerPrefs.init({ namespace: 'unit-1317d', backend });
+
+    const r = await write({ action: 'delete', key: 'session' });
+    expect(r.ok).toBe(true);
+    expect(r.deleted).toBe(true);
+    expect(Object.keys(await backend.getAll('mk:unit-1317d:'))).toEqual(['mk:unit-1317d:coins']);
+    // Accept side of the widened guard: a key that is on disk under no name at all is still NOT_FOUND.
+    const miss = await write({ action: 'delete', key: 'nope' });
+    expect(miss.code).toBe('NOT_FOUND');
+    expect(miss.options).toEqual(['coins']);
+  });
+
   it("delete NOT_FOUND offers the protected key as an option — it is deletable — while `keys` stays the readable index", async () => {
     await seed(false);
     const r = await write({ action: 'delete', key: 'sav' });

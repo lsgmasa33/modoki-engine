@@ -63,10 +63,42 @@ export class BackendError extends Error {
   }
 }
 
+/** The backend ANSWERED 2xx, but not in a shape this MCP can read (#1313, §9-bis). The editor
+ *  backend versions independently of this process, and a host that does not serve the route can
+ *  answer 200 with an HTML page. Neither case is an empty answer, so it is reported as "could not read", never
+ *  decoded into one. Deliberately NOT a `BackendError`: it has no status to classify. */
+export class BackendShapeError extends Error {
+  path: string;
+  got: string;
+  /** The route RAN: a POST answered with JSON this build cannot read. The request may already have
+   *  changed state, so the refusal must not read as "safe to retry" (§9-bis — `/api/scene-mutate`
+   *  double-applied a write that way). A non-JSON body came from something that is not the route, so
+ *  nothing ran. */
+  mayHaveApplied: boolean;
+  constructor(path: string, got: string, mayHaveApplied: boolean) {
+    super(`the editor answered ${path} with a shape this MCP cannot read (${got})`);
+    this.path = path;
+    this.got = got;
+    this.mayHaveApplied = mayHaveApplied;
+  }
+}
+
 /** Turn a THROWN transport error into an envelope, classified by what actually went wrong.
- *  All three cases used to arrive as the same `Error: <message>` string. */
+ *  They all used to arrive as the same `Error: <message>` string. */
 export function caughtFailure(tool: string, what: string, e: unknown): DeviceResult {
   const msg = e instanceof Error ? e.message : String(e);
+  if (e instanceof BackendShapeError) {
+    return deviceFail({
+      code: 'NOT_AVAILABLE_HERE',
+      tool, what,
+      why: `${msg} — this is NOT an empty answer; nothing could be read.`
+        + (e.mayHaveApplied ? ' The request DID reach the editor, so if this call changes state it may already have applied.' : ''),
+      options: [
+        ...(e.mayHaveApplied ? ['if this call changes state, do not retry blindly — the request reached the editor, so check whether it already applied'] : []),
+        'restart the editor — its backend and this MCP are from different builds',
+      ],
+    });
+  }
   if (/no device connected/i.test(msg)) {
     return deviceFail({
       code: 'NOT_AVAILABLE_HERE',

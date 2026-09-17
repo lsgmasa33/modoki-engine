@@ -572,8 +572,18 @@ through an agent tool it's "could not look" reported as "nothing is there". The 
 first two BEFORE casting, so `ok:true` with `hit:null` genuinely means the query ran and found
 nothing. That required a new exported predicate per dimension, `hasPhysics2D`/`hasPhysics3D`
 (`physics2DSystem.ts`/`physics3DSystem.ts`) — nothing exported could previously answer "does a
-Rapier world exist at all." A world exists only once the physics system has ticked, i.e. while the
-sim is Playing; a stopped editor has none, and a scene with no colliders never builds one.
+Rapier world exist at all." A world exists only once the physics system has ticked over at least
+one `RigidBody2D`/`RigidBody3D`, and it is freed on Stop. The refusal's `reason` says which absence
+it is, because each needs a different fix (#1260; the rule is `classifyWorldAbsence` in
+`engine/app/debug/sceneQueryAbsence.ts`). Three can never be fixed by waiting: `no-bodies` (the
+scene has no bodies of that dimension), `no-physics-module` (the build strips it), and
+`physics-failed` (Rapier gave up loading, so it names the error). `stopped` means start the sim.
+Two are retryable: `physics-loading` (the op waits up to 1.5 s, on THAT dimension's module only via
+`ensurePhysicsModuleReady`, to tell this apart from a failure; a stopped sim does not wait)
+and `not-built-yet` (in play mode, but the system has not ticked since the bodies appeared). #1175's `ensurePhysicsReady` guarantees
+Rapier is *loaded* when Play returns, but not that a *tick* has run, and the first frame after Play
+can be late on a cold or loaded editor. A caller that queries right after Play should retry on the two
+retryable reasons rather than sleep a fixed time; smoke UC12 does exactly that.
 
 Hits report `guid`/`name` beside the raw `entityId` (runtime ids are reassigned on every scene
 reload). `pointQuery` results are not padded with a zeroed distance/normal — same field, same

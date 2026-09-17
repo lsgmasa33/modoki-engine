@@ -18,7 +18,8 @@ import { vi } from 'vitest';
 export const DEVICE_STUB_BACKEND = 'http://device-stub.modoki.test';
 
 export type StubRequest = { method: string; path: string; body: unknown };
-export type StubReply = { status?: number; body?: unknown };
+/** `raw` sends a body verbatim instead of JSON — an editor without a route answers its HTML page. */
+export type StubReply = { status?: number; body?: unknown; raw?: string };
 export type Responder = (req: StubRequest) => StubReply | undefined;
 
 export type DeviceSurface = {
@@ -66,7 +67,7 @@ export async function loadDeviceSurface(responder?: Responder): Promise<DeviceSu
     const reply = responder?.(req) ?? defaultReply(req) ?? {};
     const status = reply.status ?? 200;
     const body = 'body' in reply ? reply.body : { ok: true };
-    return new Response(body === undefined ? '' : JSON.stringify(body), {
+    return new Response(reply.raw ?? (body === undefined ? '' : JSON.stringify(body)), {
       status, headers: { 'Content-Type': 'application/json' },
     });
   });

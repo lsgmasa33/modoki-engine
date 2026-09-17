@@ -69,6 +69,7 @@ import {
   getCurrentWorld,
   pendingPhysics,
   ensurePhysicsReady,
+  ensurePhysicsModuleReady,
   getContactState,
   registerHandleProvider,
   invalidateModel,
@@ -96,6 +97,7 @@ import {
   type JsonValue,
   raycast2D, shapeCast2D, pointQuery2D, hasPhysics2D,
   raycast3D, shapeCast3D, pointQuery3D, hasPhysics3D,
+  RigidBody2D, RigidBody3D, getPlayState,
   findEntityById,
   EntityAttributes,
   makeAssetRefResolver,
@@ -115,6 +117,7 @@ import {
   readInputPresses,
   isUnresolvedPress,
 } from '@modoki/engine/runtime';
+import { classifyWorldAbsence } from './sceneQueryAbsence';
 import { applyLiveMutate } from './liveMutate';
 import { createEntityLive, duplicateEntityLive, deleteEntitiesLive, liveGuidOf } from './liveLifecycle';
 import { resolveEntityAddress, type EntityAddress } from './entityRef';
@@ -1712,6 +1715,10 @@ function resolveExclude(spec: string): { id: number } | { error: string; code: E
   };
 }
 
+/** How long `scene-query` waits on a Rapier module that has not loaded, to tell "still loading" from
+ *  "failed for good" (#1260). Short: the caller is told to retry either way. */
+const SCENE_QUERY_PHYSICS_WAIT_MS = 1500;
+
 registerAgentOp('scene-query', (params) => {
   const p = (params ?? {}) as {
     kind?: QueryKind; dim?: '2d' | '3d';
@@ -1730,17 +1737,39 @@ registerAgentOp('scene-query', (params) => {
   const is2d = p.dim === '2d';
   const n = is2d ? 2 : 3;
 
-  // 1. "There is no physics world" — NOT a miss. A world exists only once the physics system has
-  //    run, i.e. while the sim is PLAYING, so a stopped editor legitimately has none. Answering
-  //    `hit:null` here would tell the agent the ray passed through empty space.
+  // 1. "There is no physics world" — NOT a miss. Answering `hit:null` here would tell the agent the
+  //    ray passed through empty space. `reason` says WHICH absence, because the remedies differ
+  //    (#1260) — the rule lives in `sceneQueryAbsence.ts`.
   if (!(is2d ? hasPhysics2D(world) : hasPhysics3D(world))) {
-    return {
-      ok: false, code: 'NOT_AVAILABLE_HERE', kind: p.kind, dim: p.dim,
-      error: `no ${p.dim.toUpperCase()} physics world exists on this surface, so nothing could be queried — this is NOT "the query missed".`,
-      hint: 'A Rapier world is built by the physics system on its first tick and freed on Stop, so '
-        + 'a STOPPED editor has none. Start the sim (modoki_play_control action:"play"), or check '
-        + `the scene actually has ${p.dim.toUpperCase()} colliders.`,
-    };
+    const refuse = (a: { reason: string; hint: string }) => ({
+      ok: false, code: 'NOT_AVAILABLE_HERE', kind: p.kind, dim: p.dim, reason: a.reason,
+      error: `no ${p.dim!.toUpperCase()} physics world exists on this surface, so nothing could be queried — this is NOT "the query missed".`,
+      hint: a.hint,
+    });
+    const base = {
+      dim: p.dim,
+      hasBodies: world.queryFirst(is2d ? RigidBody2D : RigidBody3D) !== undefined,
+      moduleInBuild: is2d ? __MODOKI_MODULE_PHYSICS2D__ : __MODOKI_MODULE_PHYSICS3D__,
+      playState: getPlayState(),
+    } as const;
+    const moduleName = is2d ? 'physics2D' : 'physics3D';
+    // Nothing to wait for: loaded (or stripped — `pendingPhysics` filters on the same flag), or a
+    // stopped sim, whose answer is "start the sim" whatever Rapier is doing.
+    if (base.playState === 'stopped' || !pendingPhysics(world).some((m) => m.name === moduleName)) {
+      return refuse(classifyWorldAbsence({ ...base, rapier: { state: 'ready' } }));
+    }
+    // Rapier is not loaded. Waiting is what tells "still loading" from "gave up" — the loader
+    // settles a permanent failure fast — bounded so a slow download reads as loading, not a hang.
+    // THIS dimension's module only: the other one's slow load must not mask this one's failure.
+    return (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outOfTime = new Promise<'loading'>((res) => { timer = setTimeout(() => res('loading'), SCENE_QUERY_PHYSICS_WAIT_MS); });
+      const r = await Promise.race([ensurePhysicsModuleReady(moduleName), outOfTime]);
+      clearTimeout(timer);
+      const rapier = r === 'loading' ? { state: 'loading' as const }
+        : r.ok ? { state: 'ready' as const } : { state: 'failed' as const, error: r.error };
+      return refuse(classifyWorldAbsence({ ...base, rapier }));
+    })();
   }
 
   const vec = (v: unknown, what: string): number[] | string => {
@@ -2112,7 +2141,11 @@ registerAgentOp('player-prefs-write', async (params) => {
     // way left to clear a protected key is `action:'clear'`, which wipes the whole namespace.
     // `PlayerPrefs.delete()` itself already treats a protected key like any other (it drops the
     // protection unconditionally), so falling through to the ordinary delete path below is correct.
-    if (!PlayerPrefs.has(p.key) && !PlayerPrefs.isProtected(p.key)) {
+    // #1317 — the same holds for a CORRUPT entry: absent from `has()`, not protected, still on disk.
+    // So the test is the delete listing itself (readable ∪ protected ∪ corrupt), the same one that
+    // builds `options` below — otherwise NOT_FOUND offered a corrupt key as a target and then refused
+    // it again on every retry, leaving `clear` as the only way to remove it.
+    if (!PlayerPrefs.keysIncludingProtected().includes(p.key)) {
       // A key absent from the cache but still DIRTY is not a missing key — but it is NOT proof of
       // a rejection either. `PlayerPrefs.delete()` does `cache.delete; dirty.add; scheduleFlush()`
       // on a 150ms debounce, so an ordinary in-flight delete (the game's own `PlayerPrefs.delete()`,
@@ -2138,8 +2171,8 @@ registerAgentOp('player-prefs-write', async (params) => {
         };
       }
       const keys = [...PlayerPrefs.keys()].sort();
-      // `options` are delete TARGETS, and a protected key is one (the check above lets it
-      // through, #630 review finding 4) — so they come from the protected-aware listing (#1310).
+      // `options` are delete TARGETS, and a protected or corrupt key is one (the check above lets
+      // it through, #630 review finding 4, #1317) — so they come from the same listing (#1310).
       // `keys` stays the readable index, the same answer `player-prefs-read` gives.
       return {
         ok: false, code: 'NOT_FOUND', namespace, key: p.key, keys,

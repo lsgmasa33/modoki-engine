@@ -70,21 +70,38 @@ describe('device MCP status mirror vs DeviceConnectStatus', () => {
     }
   });
 
-  it('no device tool reads a status field through an inline cast that could invent one', () => {
-    // The mechanism, not just the two instances: every `/api/device/status` read must go through
-    // the typed mirror, so a future field can't be conjured by a fresh `as { … }`.
+  it('every /api/device/status read is decoded through the one status decoder', () => {
+    // The mechanism, not just the two instances: every status read goes through `decodeLeaseStatus`,
+    // which returns the typed mirror — so a future field cannot be conjured by a fresh `as { … }`,
+    // and a field that is missing at runtime is a refusal (#1313). Since #1313 the helpers REQUIRE a
+    // decoder, so the second argument is what varies.
     const src = readScannedSource(join(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts')).code;
-    const reads = [...src.matchAll(/backendGet\('\/api\/device\/status'\)\)\s*as\s+([A-Za-z_$][\w$]*|\{[^;\n]*)/g)]
-      .map((m) => m[1].trim());
+    const reads = [...src.matchAll(/backendGet\('\/api\/device\/status',\s*([^)]*)\)/g)].map((m) => m[1].trim());
     expect(reads.length, 'no status reads found — did the route or helper name change?').toBeGreaterThan(0);
-    // The two sanctioned typed mirrors — `sanctioned` on the shared ledger (#1140), so a mirror no
-    // status read uses any more reddens instead of standing as a permitted cast for whatever comes next.
     assertExemptionLedger({
-      label: 'typed status mirrors in deviceStatusShape',
+      label: 'status decoders in deviceStatusShape',
       population: reads.map((t) => ({ item: t, site: t })),
-      sanctioned: ['DeviceStatusReply', 'LeaseStatus'],
+      sanctioned: ['decodeLeaseStatus'],
       floor: 1,
-      fix: 'these reads use an inline object cast; use DeviceStatusReply so an invented field is a compile error',
+      fix: 'read /api/device/status through decodeLeaseStatus (reply.ts), not a decoder of its own',
     });
+  });
+
+  it('no backend reply in the device MCP is cast (§9-bis, #1313)', () => {
+    const src = readScannedSource(join(__dirname, '../../tools/game-debug-mcp/src/mcp-tools.ts')).code;
+    // One level of nested parens covers a payload like `{ ...(ip ? { ip } : {}) }`.
+    // `await backendGet(…) as X` parses as `(await …) as X` too, so the closing paren is optional.
+    const CAST = /backend(?:Get|Post)\((?:[^()]|\([^()]*\))*\)\)?\s*as\s/g;
+    const casts = [...src.matchAll(CAST)].map((m) => m[0].slice(0, 80));
+    expect(casts, 'a backend reply is cast instead of decoded — pass a decoder to backendGet/backendPost').toEqual([]);
+    // Accept side: the pattern matches the shape it exists to catch, including a multi-line payload.
+    const probe = "const s = (await backendPost('/api/device/connect', {\n  ...(ip ? { ip } : {}),\n})) as LeaseStatus;";
+    expect([...probe.matchAll(CAST)]).toHaveLength(1);
+    expect([..."const s = await backendGet('/api/x', d) as X;".matchAll(CAST)]).toHaveLength(1);
+    expect([..."const s = await backendGet('/api/x', d);".matchAll(CAST)]).toHaveLength(0);
+    // And the helpers take the decoder as a REQUIRED parameter — an optional one would let a
+    // call site skip it and get `unknown` back to cast.
+    expect(src).toMatch(/async function backendGet<T>\(path: string, decode: Decoder<T>\): Promise<T>/);
+    expect(src).toMatch(/async function backendPost<T>\(path: string, payload: unknown, decode: Decoder<T>\): Promise<T>/);
   });
 });

@@ -14,7 +14,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createDeviceToolDef, type DeviceToolResult } from './registry.js';
-import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendIdentity } from '../../shared/identity.js';
+import { identityMismatch, tokenMismatchWarning, describeIdentity } from '../../shared/identity.js';
 // Single-sourced with the DEVICE side (`agentBridge.ts`'s `sim-step` op) so this tool's outbound
 // `timeoutMs` and the device's own internal step budget can never independently drift (#822).
 import { simStepDefaultTimeout, SIM_STEP_MAX_FRAMES } from '../../shared/simStepTiming.js';
@@ -32,10 +32,10 @@ import { join } from 'path';
 
 const pExecFile = promisify(execFile);
 import {
-  encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody, codeFromBody, optionsFromBody, BackendError,
+  encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody, codeFromBody, optionsFromBody, BackendError, BackendShapeError,
   deviceFail, caughtFailure, deviceReplyFailure, type DeviceResult,
 } from './result.js';
-import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, parseNativeLogsReply, decodeDeviceListReply, describeClaim, SYNTHETIC_MECHANISM, type LeaseStatus, type DeviceListClaim } from './reply.js';
+import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, parseNativeLogsReply, deviceListDecoder, describeClaim, SYNTHETIC_MECHANISM, decodeLeaseStatus, decodeDeviceRequestReply, decodeIdentity, decodeToolchain, type Decoder, type DeviceRequestReply, type LeaseStatus, type DeviceListClaim } from './reply.js';
 
 const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
 
@@ -244,8 +244,7 @@ async function ensureDeviceIdentity(): Promise<void> {
   _identityProbe = (async () => {
     let identified = false;
     try {
-      const id = (await backendGet('/api/identity')) as BackendIdentity;
-      if (!id || typeof id.repoRoot !== 'string') return;
+      const id = await backendGet('/api/identity', decodeIdentity);
       backendIdentityLine = describeIdentity(id, BACKEND);
       identityWarning = tokenMismatchWarning(id, BACKEND) ?? identityMismatch(id, process.cwd(), BACKEND);
       if (identityWarning) console.error(identityWarning);
@@ -279,34 +278,26 @@ function withIdentityBanner<T extends { content: Array<{ type: string; text?: st
  *  (the device's own `lastScreenInfo` is only set by native `captureScreen`, which Android skips). */
 let adbScreenInfo: { imgW: number; imgH: number; nativeW: number; nativeH: number; lease: string } | null = null;
 
-/** The fields `/api/device/status` actually returns — a local mirror of `DeviceConnectStatus`
- *  (`engine/plugins/backend/deviceConnection.ts`). This MCP is a separate package and cannot import
- *  that type, so the mirror is kept honest by a drift guard: `deviceStatusShape.test.ts` parses the
- *  real interface and fails if the two disagree.
+/** `/api/device/status` is read through `LeaseStatus` (reply.ts), a local mirror of
+ *  `DeviceConnectStatus` (`engine/plugins/backend/deviceConnection.ts`) — this MCP is a separate
+ *  package and cannot import that type. `deviceStatusShape.test.ts` parses the real interface and
+ *  fails if the mirror's `target` keys (below) disagree with it.
  *
  *  WHY A MIRROR AND A GUARD (independent review, 2026-07-30). Two helpers here read fields that do
  *  not exist on the status payload — `target.platform` and `target.serial`/`target.deviceId` — each
  *  inside a `as {…}` cast that invented them. TypeScript cannot object to a cast, so both guards
- *  compiled, shipped, and could never fire, while their comments told every later reader the cases
- *  were covered. Reading the status through THIS type instead means an invented field is a compile
- *  error, and a field that disappears upstream is a red test. */
-type DeviceStatusReply = {
-  state?: string;
-  guid?: string;
-  // `serial` (#149): the adb serial the LEASE resolved at connect time — present only for an
-  // adb-connected target. It exists so a screenshot can be targeted at the SAME phone the lease is
-  // driving (see `adbScreencap`'s `-s` argv below) without this file resolving or guessing one of
-  // its own; guessing would risk photographing a DIFFERENT attached Android while still reporting
-  // success (the same failure class as #142).
-  // `useUsb`/`udid` (#1065): an iOS lease tunnelled over USB — the udid is what tells two of them apart.
-  target?: { host?: string; port?: number; useAdb?: boolean; serial?: string; useUsb?: boolean; udid?: string } | null;
-  lastTarget?: { ip?: string; port?: number; useAdb?: boolean; useUsb?: boolean } | null;
-  detail?: string;
-};
+ *  compiled, shipped, and could never fire. Since #1313 the reply is also DECODED
+ *  (`decodeLeaseStatus`), so a field that goes missing at runtime is a refusal rather than a
+ *  confident "not adb" / "no lease". There was a second mirror here (`DeviceStatusReply`) describing
+ *  the same route; #1313 folded it into `LeaseStatus`. */
 
 /** The `target` keys the mirror above claims. Exported so the drift guard can compare them against
  *  the real interface without re-parsing this file's type declaration. */
-export const DEVICE_STATUS_TARGET_FIELDS = ['host', 'port', 'useAdb', 'serial', 'useUsb', 'udid'] as const;
+export const DEVICE_STATUS_TARGET_FIELDS = ['host', 'port', 'useAdb', 'serial', 'useUsb', 'udid'] as const satisfies readonly LeaseTargetKey[];
+type LeaseTargetKey = keyof NonNullable<LeaseStatus['target']>;
+/** The other direction, at compile time: a key added to `LeaseStatus.target` and missing from the
+ *  list above fails the typecheck here — so the list the drift guard compares IS the mirror. */
+export const DEVICE_STATUS_TARGET_FIELDS_EXHAUSTIVE: [Exclude<LeaseTargetKey, typeof DEVICE_STATUS_TARGET_FIELDS[number]>] extends [never] ? true : never = true;
 
 /** The `type` values `device_read_asset_def` accepts — the 7 of the 9 `ASSET_SCHEMA_TYPES` that
  *  `read-asset-def` (agentBridge.ts) actually serves; `material` is deliberately absent (that op
@@ -320,7 +311,7 @@ export const DEVICE_READ_ASSET_DEF_TYPES = ['particle', 'animation', 'timeline',
 
 // ── GET /api/device/list (#149) ───────────────────────────────────────────
 // A local mirror of the route's reply shape (`editorBackendRouter.ts`'s `/api/device/list` handler,
-// `DeviceClaim` from `deviceConnection.ts` § deviceClaims.ts) — same reason as `DeviceStatusReply`
+// `DeviceClaim` from `deviceConnection.ts` § deviceClaims.ts) — same reason as `LeaseStatus`
 // above: this package cannot import backend types, so the fields are typed here rather than read
 // through an inline `as {…}` cast that could invent one.
 
@@ -347,7 +338,10 @@ export const DEVICE_READ_ASSET_DEF_TYPES = ['particle', 'animation', 'timeline',
  *  resolved at connect time, not what's plugged in right now. A serial-less adb lease (a status
  *  shape that doesn't carry one) degrades to the constant key `'adb:'`, i.e. today's pre-#149
  *  behaviour — no worse than before, just no longer the *only* case. */
-export function statusLeaseKey(s: DeviceStatusReply | null | undefined): string | null {
+/** Only the fields the key is built from — a DECODED status satisfies it, and so does a partial one
+ *  (a test, or a caller that already narrowed). */
+type LeaseKeyInput = { state?: string; target?: Partial<NonNullable<LeaseStatus['target']>> | null };
+export function statusLeaseKey(s: LeaseKeyInput | null | undefined): string | null {
   if (s?.state !== 'connected' || !s.target) return null;
   // A USB iOS lease dials 127.0.0.1:<this clone's host port> whichever phone it tunnels to, so the
   // host:port form would key two different iPhones identically (#1065) — the UDID is what differs.
@@ -360,7 +354,7 @@ export function statusLeaseKey(s: DeviceStatusReply | null | undefined): string 
  *  unreachable. One status fetch; the key shape itself is `statusLeaseKey` above. */
 async function leaseKey(): Promise<string | null> {
   try {
-    return statusLeaseKey((await backendGet('/api/device/status')) as DeviceStatusReply);
+    return statusLeaseKey(await backendGet('/api/device/status', decodeLeaseStatus));
   } catch { return null; }
 }
 
@@ -396,8 +390,8 @@ let adbBinCache: string | undefined;
 async function resolveAdb(): Promise<string> {
   if (adbBinCache) return adbBinCache;
   try {
-    const tc = (await backendGet('/api/toolchain')) as { adb?: { present?: boolean; path?: string } };
-    if (tc?.adb?.present && tc.adb.path) return (adbBinCache = tc.adb.path);
+    const tc = await backendGet('/api/toolchain', decodeToolchain);
+    if (tc.adb.present && tc.adb.path) return (adbBinCache = tc.adb.path);
   } catch { /* backend unreachable → PATH fallback below */ }
   return 'adb'; // uncached: a later probe (once the SDK resolves) can still find the provisioned path
 }
@@ -443,8 +437,8 @@ async function adbScreencap(savePath?: string, inline = false, serial?: string):
   // `-s <serial>` (#149): with two Androids on USB a bare `adb exec-out` refuses outright
   // ("more than one device/emulator") — but the FIX is not "pick one that answers", it is "target
   // the one the LEASE is actually driving". `serial` therefore always comes from the caller reading
-  // `/api/device/status`'s `target.serial`, never resolved here (see the `DeviceStatusReply.target`
-  // comment above) — a locally-guessed serial could capture a different phone than the one every
+  // `/api/device/status`'s `target.serial`, never resolved here (see `LeaseStatus.target`
+  // in reply.ts) — a locally-guessed serial could capture a different phone than the one every
   // other device_* call is proxying through, and report success while doing it.
   const argv = [...(serial ? ['-s', serial] : []), 'exec-out', 'screencap', '-p'];
   const { stdout: pngBuf } = (await pExecFile(await resolveAdb(), argv,
@@ -489,17 +483,17 @@ async function adbScreencap(savePath?: string, inline = false, serial?: string):
  *  If the lease ever reports a platform, this becomes a real test again. */
 async function nativeCaptureMayBeBlank(): Promise<boolean> {
   try {
-    const s = (await backendGet('/api/device/status')) as DeviceStatusReply;
+    const s = await backendGet('/api/device/status', decodeLeaseStatus);
     // An adb lease takes the true-framebuffer path and never gets here; anything else is a native
     // capture on a device whose platform we do not know.
-    return !s?.target?.useAdb;
+    return !s.target?.useAdb;
   } catch { return true; } // could not check → state the caveat rather than suppress it
 }
 
 async function leaseUsesAdb(): Promise<boolean> {
   try {
-    const s = (await backendGet('/api/device/status')) as DeviceStatusReply;
-    return s?.target?.useAdb === true;
+    const s = await backendGet('/api/device/status', decodeLeaseStatus);
+    return s.target?.useAdb === true;
   } catch { return false; }
 }
 
@@ -515,15 +509,36 @@ async function leaseUsesAdb(): Promise<boolean> {
  *  move to a different device). */
 async function leaseAdbTarget(): Promise<{ useAdb: boolean; serial?: string; lease: string | null }> {
   try {
-    const s = (await backendGet('/api/device/status')) as DeviceStatusReply;
-    return { useAdb: s?.target?.useAdb === true, serial: s?.target?.serial, lease: statusLeaseKey(s) };
+    const s = await backendGet('/api/device/status', decodeLeaseStatus);
+    return { useAdb: s.target?.useAdb === true, serial: s.target?.serial, lease: statusLeaseKey(s) };
   } catch { return { useAdb: false, lease: null }; }
 }
 
 // ── Backend HTTP helpers ─────────────────────────────────────
 
 
-async function backendGet(path: string): Promise<unknown> {
+/** A 2xx body that is not JSON. Distinct from `{}`, which used to stand in for it and then decoded
+ *  as an empty answer (#1313). This backend answers a missing route with a JSON 404 (measured
+ *  2026-09-17), but a host in front of it that falls through to the SPA answers 200 with HTML — the
+ *  #648 case on the Vite host — and this helper cannot tell which one `MODOKI_BACKEND` names. */
+const NOT_JSON = Symbol('not JSON');
+
+/** Read a response: a non-2xx is a `BackendError` classified by status; a 2xx is DECODED, and a body
+ *  the decoder cannot read is a `BackendShapeError`. There is no overload without a decoder, so a
+ *  reply cannot be cast (§9-bis). */
+async function readBackendReply<T>(path: string, res: Response, decode: Decoder<T>, isPost: boolean): Promise<T> {
+  const body: unknown = await res.json().catch(() => NOT_JSON);
+  if (!res.ok) {
+    const b = body === NOT_JSON ? {} : body;
+    throw new BackendError(String((b as { error?: string }).error ?? `HTTP ${res.status}`), res.status, b);
+  }
+  if (body === NOT_JSON) throw new BackendShapeError(path, 'a body that is not JSON — e.g. an HTML page from a host that does not serve this route', false);
+  const d = decode(body);
+  if (!d.ok) throw new BackendShapeError(path, d.got, isPost);
+  return d.value;
+}
+
+async function backendGet<T>(path: string, decode: Decoder<T>): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${BACKEND}${path}`);
@@ -533,12 +548,10 @@ async function backendGet(path: string): Promise<unknown> {
         `(${(e as Error).message}). The MCP targets $MODOKI_BACKEND; each clone pins its own port.`,
     );
   }
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new BackendError(String((body as { error?: string }).error ?? `HTTP ${res.status}`), res.status, body);
-  return body;
+  return readBackendReply(path, res, decode, false);
 }
 
-async function backendPost(path: string, payload: unknown): Promise<unknown> {
+async function backendPost<T>(path: string, payload: unknown, decode: Decoder<T>): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${BACKEND}${path}`, {
@@ -552,9 +565,7 @@ async function backendPost(path: string, payload: unknown): Promise<unknown> {
         `(${(e as Error).message}).`,
     );
   }
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new BackendError(String((body as { error?: string }).error ?? `HTTP ${res.status}`), res.status, body);
-  return body;
+  return readBackendReply(path, res, decode, true);
 }
 
 /** Save a decoded capture, open it in Preview (macOS), and render the tool reply.
@@ -591,8 +602,7 @@ function renderScreenshot(
 /** Proxy one data-plane request through Modoki's held lease. Returns the device's `result`
  *  (usually a JSON string — the device `safeStringify`s its replies). */
 async function deviceRequest(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
-  const body = (await backendPost('/api/device/request', { method, params })) as { result?: unknown };
-  return body.result;
+  return (await deviceRequestFull(method, params)).result;
 }
 
 /** As `deviceRequest`, but keeps the SIBLING fields the route sets beside `result`. Most ops have
@@ -600,8 +610,8 @@ async function deviceRequest(method: string, params: Record<string, unknown> = {
  *  carry — a truncated syslog capture is the case that forced this, since silent truncation reads
  *  as "that is all the device logged", which is the "no silent caps" rule this repo already applies
  *  to workflows. */
-async function deviceRequestFull(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-  return (await backendPost('/api/device/request', { method, params })) as Record<string, unknown>;
+async function deviceRequestFull(method: string, params: Record<string, unknown> = {}): Promise<DeviceRequestReply> {
+  return backendPost('/api/device/request', { method, params }, decodeDeviceRequestReply);
 }
 
 /** The `⚠️` caveat line for a host-side reply the router could not tie to the lease
@@ -647,7 +657,7 @@ export function registerTools(server: McpServer) {
     + 'an agent can ask before it acts rather than discover it from a tool description.',
     {}, async () => {
     try {
-      const status = (await backendGet('/api/device/status')) as LeaseStatus;
+      const status = await backendGet('/api/device/status', decodeLeaseStatus);
       const lease = describeLease(status);
       // #32: the backend LIVE-PROBES this whenever a lease is connected — Android CDP
       // reachability, then iOS WebDriverAgent. `pointer`/`type_text` stay synthetic-only
@@ -763,7 +773,7 @@ export function registerTools(server: McpServer) {
           ...(serial ? { serial } : {}),
           ...(udid ? { udid } : {}),
           ...(port !== undefined ? { port } : {}),
-        })) as LeaseStatus;
+        }, decodeLeaseStatus));
         if (s.state !== 'connected') {
           return deviceFail({
             code: 'REFUSED_BY_OP',
@@ -793,7 +803,7 @@ export function registerTools(server: McpServer) {
     async () => {
       try {
         adbScreenInfo = null;
-        return { content: [{ type: 'text' as const, text: describeLease((await backendPost('/api/device/disconnect', {})) as LeaseStatus) }] };
+        return { content: [{ type: 'text' as const, text: describeLease(await backendPost('/api/device/disconnect', {}, decodeLeaseStatus)) }] };
       } catch (e) {
         return caughtFailure('device_disconnect', 'release the Modoki device lease', e);
       }
@@ -818,18 +828,9 @@ export function registerTools(server: McpServer) {
       try {
         // DECODED, not cast (§9-bis, #1211 C-21): the route answers from the editor process, which
         // versions independently of this MCP, and a cast turned a shape it could not read into
-        // "No devices attached" — could-not-look reported as nothing-is-there.
-        const decoded = decodeDeviceListReply(await backendGet('/api/device/list'));
-        if (!decoded.ok) {
-          return deviceFail({
-            code: 'NOT_AVAILABLE_HERE',
-            tool: 'device_list',
-            what: 'enumerate attached devices and their claims',
-            why: `the editor answered /api/device/list with a shape this MCP cannot read (${decoded.got}) — this is NOT "no devices attached"; nobody could look.`,
-            options: ['restart the editor — its backend and this MCP are from different builds'],
-          });
-        }
-        const r = decoded.reply;
+        // "No devices attached" — could-not-look reported as nothing-is-there. A shape the decoder
+        // rejects now throws `BackendShapeError`, which `caughtFailure` reports as NOT_AVAILABLE_HERE.
+        const r = await backendGet('/api/device/list', deviceListDecoder);
         const claimSuffix = (c: DeviceListClaim | null) => describeClaim(c, r.self);
         const lines: string[] = [];
         if (!r.adb.present) {

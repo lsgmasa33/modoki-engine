@@ -51,7 +51,7 @@ PlayerPrefs.set<T>(key, value): void             // sync into cache; atomic dura
 PlayerPrefs.has(key): boolean
 PlayerPrefs.delete(key): void                    // also: set(key, undefined)
 PlayerPrefs.keys(): string[]                      // readable keys — omits a protected one (see Gotchas)
-PlayerPrefs.keysIncludingProtected(): string[]    // for a sweep that DELETES, not a reader (see Gotchas)
+PlayerPrefs.keysIncludingProtected(): string[]    // for a sweep that DELETES — adds protected + corrupt names (see Gotchas)
 PlayerPrefs.clear(): void                         // empties THIS game's namespace
 PlayerPrefs.isHydrated(): boolean                 // true once init() has hydrated the cache
 PlayerPrefs.isSwapInFlight(): boolean             // true while an init() swap is mid-flight (see Gotchas)
@@ -155,6 +155,14 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   was still there. `clear()` had always compensated for this in its own loop (it must mean *every*
   key); a targeted sweep has to ask. Deliberately kept as a separate function rather than folded into
   `keys()`, because every other caller is a reader.
+  ⚠️ **"Every name on disk" includes CORRUPT entries too** (#1317). A corrupt entry (a truncated write,
+  or JSON with no envelope) is not protected — `set()` overwrites it and readers see nothing — but it
+  is still on disk. Hydrate used to drop its name entirely, so `clear()` and `keysIncludingProtected()`
+  both missed it: the agent's `clear` reported the namespace wiped, and Court's / wordweave's session
+  sweeps reported confirmed, over garbage that was still there. The owner's call (2026-09-17): a wipe
+  reaches it, because a cut-off session write can still hold readable player data. Hydrate now keeps
+  those names in a delete-only set (`corrupt` in `playerPrefs.ts`); `isProtected()` stays `false` for
+  them, and the function keeps its older name.
   ⚠️ **That same asymmetry means the durability accessors can disagree with each other** (#630
   review) — `PlayerPrefs.isProtected(key)` is the way to ask "absent, or present-but-unreadable?"
   where `has()` cannot answer. A refused `set()` never touches `cache`/`dirty`/the in-flight

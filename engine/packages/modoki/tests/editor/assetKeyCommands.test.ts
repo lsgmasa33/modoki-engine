@@ -128,6 +128,18 @@ describe('keys that need a selection are consumed even without one', () => {
       .toEqual({ kind: 'rename', path: '/a/banana.png' });
   });
 
+  it('F2 on a flat sprite row is claimed but renames nothing — a sprite has no file (#1257)', () => {
+    const spriteRow = { path: '/a/apple.png#g1', name: 'apple_0', type: 'sprite' } as AssetEntry;
+    const r = resolveAssetKey(key({ key: 'F2', selected: spriteRow.path, assets: [...ASSETS, spriteRow] }));
+    expect(r.command).toEqual({ kind: 'rename', path: null });
+    expect(r.preventDefault).toBe(true);
+  });
+
+  it('F2 on a selection with no listed entry still carries it — only a known non-file row is refused', () => {
+    expect(resolveAssetKey(key({ key: 'F2', selected: '/a/unlisted.png' })).command)
+      .toEqual({ kind: 'rename', path: '/a/unlisted.png' });
+  });
+
   it('Enter opens the selected path', () => {
     expect(resolveAssetKey(key({ key: 'Enter', selected: '/a/cherry.png' })).command)
       .toEqual({ kind: 'open', path: '/a/cherry.png' });

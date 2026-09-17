@@ -733,11 +733,14 @@ await withCleanup(async () => {
 // It spawns its own floor rather than looking for one, plays, casts, stops, and removes it.
 const UC12_FLOOR = 'UC12_floor';
 const UC12_PHYS = 'UC12_physics';
+// A batch reports the step that failed; the whole batch JSON is too long to read in a thrown message
+// (#1260 lost exactly that step to a `.slice(0, 500)`).
+const failedStep = (b) => JSON.stringify(b.steps?.find((s2) => !s2.ok) ?? b).slice(0, 800);
 await withCleanup(async () => {
-  const built = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: {
+  const setup = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: {
     resultDefault: 'none',
     steps: [
-      // A Physics3D config entity is what makes the system build a world at all.
+      // Physics3D only sets the gravity; the RigidBody3D below is what makes the system build a world.
       { tool: 'modoki_mutate_scene', args: { ops: [{ op: 'addEntity', name: UC12_PHYS, parentId: 0,
         traits: { Transform: { x: 0, y: 0, z: 0 }, Physics3D: { gravityX: 0, gravityY: -9.81, gravityZ: 0 } } }] } },
       // A static box centred at y=-500, far below anything the scene already has, so the cast
@@ -750,16 +753,34 @@ await withCleanup(async () => {
           Collider3D: { shape: 'box', halfW: 50, halfH: 1, halfD: 50 },
         } }] } },
       { tool: 'modoki_play_control', args: { action: 'play' } },
-      { tool: 'wait', args: { ms: 400 } },
+    ],
+  } })));
+  if (!setup.ok) throw new Error(`UC12 setup failed at: ${failedStep(setup)}`);
+  // The world is built on the physics system's first TICK after Play, which is a frame, not a fixed
+  // time — a slow first frame on a cold or loaded editor outlasted the 400ms this used to wait
+  // (#1260). So wait for the op to stop saying "not built yet", and fail with its own words if it never does.
+  const down0 = { tool: 'modoki_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, -1, 0], maxDistance: 200 } };
+  for (const deadline = Date.now() + 5000; ;) {
+    const r = await client.callTool({ name: down0.tool, arguments: down0.args });
+    if (!r.isError) break;
+    const lastRefusal = text(r);
+    // The two absences that mean "the world is on its way" (sceneQueryAbsence.ts); any other reason
+    // (physics-failed, no-bodies, …) cannot be waited out.
+    if (!/"reason":\s*"(not-built-yet|physics-loading)"/.test(lastRefusal)) throw new Error(`UC12 the raycast refused for a reason a wait cannot fix: ${lastRefusal.slice(0, 600)}`);
+    if (Date.now() > deadline) throw new Error(`UC12 the physics world was still not built 5s after Play: ${lastRefusal.slice(0, 600)}`);
+    await new Promise((res) => setTimeout(res, 100));
+  }
+  const built = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: {
+    steps: [
       // Straight down from just above the floor's top surface (y = -499).
-      { tool: 'modoki_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, -1, 0], maxDistance: 200 }, result: 'full' },
+      { ...down0, result: 'full' },
       { tool: 'modoki_scene_query', args: { kind: 'point', dim: '3d', point: [0, -500, 0] }, result: 'full' },
       // A cast the same length in the OPPOSITE direction — the distinguishing observation. Without
       // it, a tool that reported a hit unconditionally would pass every assertion above.
       { tool: 'modoki_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, 1, 0], maxDistance: 200 }, result: 'full' },
     ],
   } })));
-  if (!built.ok) throw new Error(`UC12 setup/query batch failed: ${JSON.stringify(built).slice(0, 500)}`);
+  if (!built.ok) throw new Error(`UC12 query batch failed at: ${failedStep(built)}`);
   const [down, pick, up] = built.steps.slice(-3).map((s2) => s2.result);
   if (!down?.ok) throw new Error(`UC12 the raycast did not run: ${JSON.stringify(down).slice(0, 400)}`);
   if (!down.hit) throw new Error(`UC12 the downward ray MISSED a floor directly beneath it — the physics world was not built, or the cast is broken: ${JSON.stringify(down)}`);

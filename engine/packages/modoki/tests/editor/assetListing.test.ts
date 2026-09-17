@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  spritesByTexture, filterAssets, flatAssetTotal, fileActionTargets, groupByType, visibleOrder, ASSETS_SECTION,
+  spritesByTexture, filterAssets, flatAssetTotal, fileActionTargets, fileActionPaths, groupByType, visibleOrder, ASSETS_SECTION,
 } from '../../src/editor/panels/assetListing';
 import { buildFolderTree, type AssetEntry, type FolderNode } from '../../src/editor/utils/assetPaths';
 
@@ -131,6 +131,25 @@ describe('fileActionTargets', () => {
     const picked = [a('/t/a.png'), sprite('/t/a.png#0', 'g'), a('/m/b.glb', 'model')];
     expect(fileActionTargets(picked).map((x) => x.path)).toEqual(['/t/a.png', '/m/b.glb']);
     expect(fileActionTargets([sprite('/t/a.png#0', 'g')])).toEqual([]);
+  });
+});
+
+describe('fileActionPaths (#1257)', () => {
+  const assets = [a('/t/a.png'), sprite('/t/a.png#0', 'g'), sprite('/t/a.png#default', 'g'), a('/m/b.glb', 'model')];
+
+  it('one texture plus its selected sprite rows counts as ONE target — the context menu must not read it as many', () => {
+    // The menu derives `many` from this length; 3 here hid Rename/Re-import/Copy Path/Find References.
+    const selection = new Set(['/t/a.png', '/t/a.png#0', '/t/a.png#default']);
+    expect(fileActionPaths(selection, assets)).toEqual(['/t/a.png']);
+  });
+
+  it('a folder drop keeps the real files in order and drops every sprite path', () => {
+    expect(fileActionPaths(['/t/a.png#0', '/t/a.png', '/t/a.png#default', '/m/b.glb'], assets))
+      .toEqual(['/t/a.png', '/m/b.glb']);
+  });
+
+  it('keeps a path with no listed entry — a folder or an engine built-in is not this filter\'s call', () => {
+    expect(fileActionPaths(['/t', 'engine:/white.hdr', '/t/a.png#0'], assets)).toEqual(['/t', 'engine:/white.hdr']);
   });
 });
 

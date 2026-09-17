@@ -909,6 +909,18 @@ already applied. `/api/scene-mutate` reported the second as a 500, which `contex
 now answers 200 `{ok:false, code:'PARTIAL'}`: `isFailureBody` makes it a failure and `codeFromBody`
 lifts the code, so `PARTIAL` reaches the agent with no new plumbing.
 
+**The device MCP cannot cast at all (#1313).** `backendGet`/`backendPost` in
+`game-debug-mcp/src/mcp-tools.ts` take a decoder as a REQUIRED argument (`Decoder<T>` in `reply.ts`)
+and return what it decoded. A 2xx body the decoder rejects throws `BackendShapeError`, and so does a
+2xx body that is not JSON. That second case used to become `{}` and decode as an empty answer. The
+backend itself answers a missing route with a JSON 404, but a host that falls through to the SPA
+answers 200 with HTML (the case above). `caughtFailure` reports both as
+`NOT_AVAILABLE_HERE`. **When a POST answered JSON, the route RAN**, so the refusal says the request
+may already have applied and must not be retried blindly. That is the remedy rule below, applied at
+the one helper every device tool goes through. The routes share decoders: one `decodeLeaseStatus`
+covers status, connect and disconnect, and one `decodeDeviceRequestReply` covers all the relay
+tools. `deviceStatusShape.test.ts` fails if a helper result is cast again.
+
 ⚠️ **`raw call()` skips the shared guards.** `htmlFallthrough` runs inside `getJson`/`postJson`
 only, so a raw-`call()` site gets no SPA-fallthrough protection — a missing dev-server route answers
 **200 with `index.html`**. Raw `call()` is legitimate (a §5 label more specific than `getJson`

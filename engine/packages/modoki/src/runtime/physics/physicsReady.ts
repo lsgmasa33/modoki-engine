@@ -56,7 +56,20 @@ export async function ensurePhysicsReady(world: World): Promise<PhysicsReadiness
   return errors.length === 0 ? { ok: true } : { ok: false, error: errors.join('; ') };
 }
 
-interface PendingModule { name: 'physics2D' | 'physics3D'; init: () => Promise<void>; ready: () => boolean }
+export type PhysicsModuleName = 'physics2D' | 'physics3D';
+interface PendingModule { name: PhysicsModuleName; init: () => Promise<void>; ready: () => boolean }
+
+/** `ensurePhysicsReady` for ONE module — for a caller whose answer depends on a single dimension
+ *  (`scene-query`, #1260). Waiting on both would let the other dimension's slow load mask this one's
+ *  permanent failure as "still loading". Never rejects; loads nothing the build strips. */
+export async function ensurePhysicsModuleReady(name: PhysicsModuleName): Promise<PhysicsReadiness> {
+  const on = name === 'physics2D' ? __MODOKI_MODULE_PHYSICS2D__ : __MODOKI_MODULE_PHYSICS3D__;
+  if (!on) return { ok: false, error: `[${name}] not in this build` };
+  const e = name === 'physics2D'
+    ? await awaitLoader(initRapier2D, isRapierReady)
+    : await awaitLoader(initRapier3D, isRapier3DReady);
+  return e ? { ok: false, error: `[${name}] ${e}` } : { ok: true };
+}
 
 /** The Rapier modules `world`'s bodies need that are NOT instantiated yet (empty = a tick would
  *  simulate). Synchronous — the cheap "is there anything to wait for?" check before an await. */

@@ -97,7 +97,29 @@ export function flatAssetTotal(
  *  Cmd+A → Delete under the sprite chip queued every sprite for a delete that removes nothing on disk and
  *  pushes an undo that restores nothing. */
 export function fileActionTargets(selected: ReadonlyArray<AssetEntry>): AssetEntry[] {
-  return selected.filter((a) => a.type !== 'sprite');
+  return selected.filter(isFileRow);
+}
+
+/** THE row-level answer to "does this row have a file of its own?" (#1257). Every selection-driven file
+ *  action — delete/duplicate/copy (`fileActionTargets`), F2 rename (`resolveAssetKey`), the context menu's
+ *  target count and a folder drop (`fileActionPaths`) — asks here, so the next sprite-like row type is one
+ *  edit rather than a fourth local filter. */
+export function isFileRow(a: AssetEntry): boolean {
+  return a.type !== 'sprite';
+}
+
+/** `fileActionTargets` for callers that hold PATHS (a selection Set, a drag payload): drops every path
+ *  whose listed entry is not a file row, keeps the rest in order (#1257). A path with NO entry in
+ *  `assets` is kept — an engine built-in or a folder is not in the project list, and deciding what
+ *  those mean is the caller's business, exactly as it was before this filter existed.
+ *
+ *  Why it matters beyond the 404s: the context menu derives `many` from this count, so one texture plus
+ *  a few selected sprite rows used to read as a multi-selection and hid Rename, Instantiate, Re-import,
+ *  Copy Path and Find References for the one real file. */
+export function fileActionPaths(paths: Iterable<string>, assets: ReadonlyArray<AssetEntry>): string[] {
+  const nonFile = new Set<string>();
+  for (const a of assets) if (!isFileRow(a)) nonFile.add(a.path);
+  return [...paths].filter((p) => !nonFile.has(p));
 }
 
 /** Category view: group by type, ordered by the shared canonical type order (so

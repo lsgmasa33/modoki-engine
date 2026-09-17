@@ -385,6 +385,7 @@
   "endBootSpan",
   "endProfilerSample",
   "ensureManifestLoaded",
+  "ensurePhysicsModuleReady",
   "ensurePhysicsReady",
   "ensureRiggedModelLoaded",
   "ensureRiggedModelLoadedFor",

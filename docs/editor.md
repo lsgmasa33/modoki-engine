@@ -749,6 +749,24 @@ per the editor `.ts`-carries-tests rule below.
 `handlePrefabDrop`'s `type !== 'prefab'` bail is still load-bearing even though no human can reach
 it, because `modoki_dnd` dispatches `drop` unconditionally and only *reports* what `accepted` was.
 
+### A sprite ROW has no file — every selection-driven file action asks `isFileRow` (#1249, #1257)
+
+When the Assets list is narrowed to sprites (the `sprite` chip, or a search matching a slice), each
+sprite is a flat row whose path is `<texture>#<guid>` (`#default` for the whole-image sprite). No file
+exists at that path, so a rename, move, delete, duplicate or copy of it 404s at best. Select All
+reaches those rows, so **a file action must filter the selection, not trust it**, and every one asks
+the same predicate in `panels/assetListing.ts`: `isFileRow`, through `fileActionTargets` (entries) or
+`fileActionPaths` (paths — a selection Set, a drag payload). Callers today: delete/duplicate/copy
+(#1249), F2 in `resolveAssetKey`, the context menu's target count, and the folder drop (#1257).
+
+The count is the part a user sees: the menu derives `many` from it, so counting sprite rows made one
+texture plus a few sprites read as a multi-selection and hid Rename, Instantiate, Re-import, Copy Path
+and Find References for the one real file. `fileActionPaths` keeps a path with no listed entry (a
+folder, an engine built-in) — what those mean stays the caller's call. **Not filtered, on purpose:**
+the `application/editor-asset-paths` drag payload (the Skin editor's parts list takes sprites), the
+Inspector's multi-selection, and the footer's "N selected". A new selection-driven file action goes
+through the predicate rather than a local `type !== 'sprite'`.
+
 ### A panel that reads `getAllAssets()` must subscribe to `assetsVersion`
 
 `getAllAssets()` reads the module-level manifest map, and React has no idea when that map
@@ -825,7 +843,7 @@ Extracted decision modules:
 
 | module | what it decides |
 |---|---|
-| `panels/assetListing.ts` | Assets filtering, sprite/type grouping, the visible-order walk that drives keyboard nav |
+| `panels/assetListing.ts` | Assets filtering, sprite/type grouping, the file-row predicate for file actions, the visible-order walk that drives keyboard nav |
 | `panels/assetKeyCommands.ts` | every Assets keystroke → a command (platform-dependent delete chord, type-ahead) |
 | `panels/assetSelection.ts` | Assets click + drag selection policy |
 | `panels/assetOps.ts` | import/re-import planning, the delete sidecar rule, rename validation |

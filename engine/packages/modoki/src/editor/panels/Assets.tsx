@@ -58,7 +58,7 @@ import {
 } from '../utils/assetPaths';
 import { ASSET_TYPE_COLORS, AssetTypeGlyph, compareAssetTypes } from './assetTypeIcons';
 import {
-  spritesByTexture as spritesByTextureOf, filterAssets, flatAssetTotal, fileActionTargets, groupByType, visibleOrder,
+  spritesByTexture as spritesByTextureOf, filterAssets, flatAssetTotal, fileActionTargets, fileActionPaths, groupByType, visibleOrder,
   ASSETS_SECTION, type ViewMode,
 } from './assetListing';
 import { resolveAssetKey } from './assetKeyCommands';
@@ -1436,8 +1436,10 @@ export default function Assets() {
   const ctxMenuItems = useCallback((asset: AssetEntry): ContextMenuItem[] => {
     const items: ContextMenuItem[] = [];
     // Number of items the action will apply to (the menu was opened on a row
-    // inside the current multi-selection ⇒ act on the whole selection).
-    const count = selection.has(asset.path) ? Math.max(1, selection.size) : 1;
+    // inside the current multi-selection ⇒ act on the whole selection). Counted over FILE rows
+    // only (#1257): selected sprite rows are not acted on, and counting them made one texture
+    // plus a few sprites read as `many` and hid this file's single-item actions.
+    const count = selection.has(asset.path) ? Math.max(1, fileActionPaths(selection, assets).length) : 1;
     const many = count > 1;
     const suffix = many ? ` (${count})` : '';
     if (!many && asset.type === 'prefab') {
@@ -1468,7 +1470,7 @@ export default function Assets() {
     if (!many) items.push({ label: 'Find References', onClick: () => openFindReferences(asset.guid || asset.path, asset.name) });
     items.push({ label: `Move to Trash${suffix}`, onClick: () => (many ? deleteSelection() : handleDelete(asset)), danger: true });
     return items;
-  }, [handleDelete, handleDuplicate, refresh, reimport, selection, clipboard, duplicateSelection, deleteSelection, copySelection, pasteClipboard, openFindReferences]);
+  }, [handleDelete, handleDuplicate, refresh, reimport, selection, assets, clipboard, duplicateSelection, deleteSelection, copySelection, pasteClipboard, openFindReferences]);
 
   // Drop handler: entity dragged from Hierarchy → create prefab
   const [dropHighlight, setDropHighlight] = useState<string | null>(null); // folder path being hovered
@@ -1569,7 +1571,9 @@ export default function Assets() {
     // dragged folder gets `prefix: true` — without it the repair below matched the folder itself
     // and returned `undefined` for every file under it (#867 member 2).
     const known = { pendingFolders, diskFolders, assets };
-    const planned = planFilesDropMoves(filePaths, targetFolder, (p) => isFolderPath(p, known));
+    // #1257 — a multi-drag carries the whole selection, sprite rows included (the asset-paths payload
+    // needs them), but a sprite has no file to move: each one 404'd and logged "Could not move".
+    const planned = planFilesDropMoves(fileActionPaths(filePaths, assets), targetFolder, (p) => isFolderPath(p, known));
     const moves: DropMove[] = [];
     for (const m of planned) {
       // `moveFileTo(from, TO)`, not `moveFile(from, FOLDER)`: the planner has already derived the

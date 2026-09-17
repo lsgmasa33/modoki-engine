@@ -20,7 +20,7 @@ import {
   Transform, EntityAttributes, RigidBody3D, Collider3D, Physics3D,
   RigidBody2D, Collider2D, Physics2D,
   physics3DSystem, physics2DSystem, disposePhysics3D, disposePhysics2D,
-  initRapier3D, initRapier2D,
+  initRapier3D, initRapier2D, getPlayState, setPlayState,
 } from '@modoki/engine/runtime';
 import { SYSTEM_PRIORITY } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -44,7 +44,7 @@ afterEach(() => {
 });
 
 type Reply = {
-  ok?: boolean; code?: string; error?: string; hint?: string; options?: string[];
+  ok?: boolean; code?: string; error?: string; hint?: string; options?: string[]; reason?: string;
   kind?: string; dim?: string;
   hit?: { entityId: number; guid: string | null; name: string | null; point?: number[]; normal?: number[]; distance?: number } | null;
 };
@@ -71,12 +71,60 @@ describe('scene-query: a refusal is never dressed up as a miss', () => {
     // exactly as it does for a clean miss — so an op that just forwarded it would tell the agent
     // the ray flew through empty space.
     tw = createTestWorld({ systems: [] });
-    const r = await q({ kind: 'raycast', dim: '3d', origin: [0, 10, 0], direction: [0, -1, 0] });
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'static' }), Collider3D({ shape: 'box', halfW: 1, halfH: 1, halfD: 1 }));
+    // createTestWorld starts the sim (so `step` advances); a stopped editor is what this case is about.
+    const prev = getPlayState();
+    setPlayState('stopped');
+    const r = await q({ kind: 'raycast', dim: '3d', origin: [0, 10, 0], direction: [0, -1, 0] }).finally(() => setPlayState(prev));
     expect(r.ok).toBe(false);
     expect(r.code).toBe('NOT_AVAILABLE_HERE');
+    expect(r.reason).toBe('stopped');
     expect(r.hit).toBeUndefined();               // no null hit to misread
     expect(String(r.error)).toMatch(/NOT "the query missed"/);
     expect(String(r.hint)).toMatch(/play/i);     // …and it says how to get a world
+  });
+
+  it('says WHICH absence: no bodies, stopped, or in play but not ticked yet (#1260)', async () => {
+    const body = () => [
+      Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 1, halfH: 1, halfD: 1 }),
+    ] as const;
+    const cast = { kind: 'raycast', dim: '3d', origin: [0, 10, 0], direction: [0, -1, 0] };
+    const prev = getPlayState();
+    try {
+      // No bodies: play mode cannot help, so the hint must not say "start the sim".
+      tw = createTestWorld({ systems: [PHYS3] });
+      setPlayState('playing');
+      let r = await q(cast);
+      expect(r.code).toBe('NOT_AVAILABLE_HERE');
+      expect(r.reason).toBe('no-bodies');
+      expect(String(r.hint)).toMatch(/RigidBody3D/);
+
+      // A body, in play mode, before the physics system has ticked — the UC12 window. The sim IS
+      // running, so "start the sim" would be wrong; the answer is "retry after a frame".
+      tw.spawn(...body());
+      r = await q(cast);
+      expect(r.reason).toBe('not-built-yet');
+      expect(String(r.hint)).toMatch(/retry after a frame/i);
+      expect(String(r.hint)).not.toMatch(/start the sim/i);
+
+      // Paused is still play mode — a step builds the world.
+      setPlayState('paused');
+      expect((await q(cast)).reason).toBe('not-built-yet');
+
+      // Stopped with a body: now "start the sim" is the remedy.
+      setPlayState('stopped');
+      r = await q(cast);
+      expect(r.reason).toBe('stopped');
+      expect(String(r.hint)).toMatch(/start the sim/i);
+
+      // And once it ticks, the same query answers.
+      setPlayState('playing');
+      tw.step(1);
+      expect((await q(cast)).ok).toBe(true);
+    } finally {
+      setPlayState(prev);
+    }
   });
 
   it('the 2D and 3D worlds are SEPARATE — a 2d query on a 3d-only scene refuses', async () => {

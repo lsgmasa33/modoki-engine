@@ -249,7 +249,7 @@ describe('device tool surface — every tool, table-driven', () => {
     const RELAY_ANNOTATIONS: Record<string, string[]> = {
       device_status: ['app-identity'], // the App/Device lines, omitted when the bridge cannot answer
     };
-    const lease = { state: 'connected', target: { host: '127.0.0.1', port: 9095 } };
+    const lease = { state: 'connected', target: { host: '127.0.0.1', port: 9095, useAdb: false }, lastTarget: null };
     // BOTH relay behaviours (#1140 close-out §2d): with the relay refusing, a data-plane call made only
     // after an annotation SUCCEEDS is never reached — the second review put one in device_status's
     // success branch and the refusing pass stayed green. The answering pass returns a well-formed

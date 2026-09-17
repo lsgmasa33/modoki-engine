@@ -25,6 +25,7 @@
  *  stubbing globals. */
 
 import { splitAssetPath, type AssetEntry } from '../utils/assetPaths';
+import { isFileRow } from './assetListing';
 
 /** How long a type-ahead buffer survives without another keystroke. */
 export const TYPE_AHEAD_RESET_MS = 700;
@@ -45,7 +46,8 @@ export type AssetKeyCommand =
   | { kind: 'clipboard'; op: 'copy' | 'cut' | 'paste' }
   | { kind: 'duplicate' }
   | { kind: 'delete' }
-  /** `path` is null when nothing is selected — consumed, but a no-op. */
+  /** `path` is null when nothing is selected, or when the selection is a row with no file to rename
+   *  (a sprite, #1257) — consumed, but a no-op. */
   | { kind: 'rename'; path: string | null }
   | { kind: 'open'; path: string | null }
   /** A selection/focus move. `paths` ABSENT means leave the selection alone (the
@@ -99,7 +101,12 @@ export function resolveAssetKey(input: AssetKeyInput): AssetKeyResult {
   if (mod && lower === 'x') return claim({ kind: 'clipboard', op: 'cut' });
   if (mod && lower === 'v') return claim({ kind: 'clipboard', op: 'paste' });
   if (mod && lower === 'd') return claim({ kind: 'duplicate' });
-  if (key === 'F2') return claim({ kind: 'rename', path: selected });
+  if (key === 'F2') {
+    // #1257 — a flat sprite row (`<texture>#<guid>`) has no file; its context menu already offers no
+    // Rename, and the key must agree rather than open a rename box whose commit 404s.
+    const row = selected === null ? undefined : assets.find((x) => x.path === selected);
+    return claim({ kind: 'rename', path: row && !isFileRow(row) ? null : selected });
+  }
 
   // See note 1: the delete chord is not the same key on every platform.
   const isDelete = isMac ? (key === 'Backspace' && input.metaKey) : key === 'Delete';

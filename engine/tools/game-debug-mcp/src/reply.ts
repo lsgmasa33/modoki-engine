@@ -89,6 +89,7 @@ export function parseNativeLogsReply(raw: unknown): NativeLogsReply {
 export { describeShape } from '../../shared/mcpResult.js';
 import { describeShape } from '../../shared/mcpResult.js';
 import { isDeviceFailureText } from '../../shared/deviceRefusal.js';
+import type { BackendIdentity } from '../../shared/identity.js';
 
 // ── device_list reply shape (#1211 C-21) ───────────────────────────────────
 /** `clone` is typed as the route sends it, but the decoder does not require it: the claims file is
@@ -143,6 +144,68 @@ export function decodeDeviceListReply(raw: unknown): { ok: true; reply: DeviceLi
   return { ok: false, got: describeShape(v) };
 }
 
+// ── Every editor-backend reply is DECODED (#1313, §9-bis) ────────────────────
+/** What a backend decoder returns. `got` describes the shape it could not read, for the refusal. */
+export type Decoded<T> = { ok: true; value: T } | { ok: false; got: string };
+export type Decoder<T> = (raw: unknown) => Decoded<T>;
+
+const isObject = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
+
+/** `device_list`'s decoder in the shape the backend helpers take. */
+export const deviceListDecoder: Decoder<DeviceListReply> = (raw) => {
+  const d = decodeDeviceListReply(raw);
+  return d.ok ? { ok: true, value: d.reply } : d;
+};
+
+/** Decode `/api/device/status` — and `/api/device/connect` / `/api/device/disconnect`, which answer
+ *  the same `DeviceConnectStatus`. The fields required are the ones a MISREAD turns into a wrong
+ *  answer rather than a crash: an absent `useAdb` read as "not adb" sent an adb lease down the native
+ *  screenshot path, and an absent `target` on a connected lease read as "no lease". A disconnected
+ *  status may omit `target`: that is the same answer as `null`. */
+export function decodeLeaseStatus(raw: unknown): Decoded<LeaseStatus> {
+  const v = parseReply<unknown>(raw);
+  if (!isObject(v) || typeof v.state !== 'string') return { ok: false, got: describeShape(v) };
+  const t = v.target;
+  const targetOk = t === null || t === undefined
+    ? v.state !== 'connected'
+    : isObject(t) && typeof t.port === 'number' && typeof t.useAdb === 'boolean'
+      && (t.serial === undefined || typeof t.serial === 'string')
+      && (t.udid === undefined || typeof t.udid === 'string');
+  const last = v.lastTarget;
+  if (!targetOk || !(last === null || last === undefined || isObject(last))) {
+    return { ok: false, got: `${describeShape(v)}; target: ${describeShape(t)}` };
+  }
+  return { ok: true, value: { ...(v as unknown as LeaseStatus), target: (t ?? null) as LeaseStatus['target'], lastTarget: (last ?? null) as LeaseStatus['lastTarget'] } };
+}
+
+/** The `/api/device/request` envelope: the device's own reply under `result`, with any sibling
+ *  fields the route adds about the read itself (truncation, `unverified`). Every 2xx the route sends
+ *  carries a `result` KEY — without one, `deviceRequest` handed `undefined` to all the relay tools,
+ *  which read it as a successful empty answer. */
+export type DeviceRequestReply = Record<string, unknown> & { result: unknown };
+export function decodeDeviceRequestReply(raw: unknown): Decoded<DeviceRequestReply> {
+  return isObject(raw) && 'result' in raw
+    ? { ok: true, value: raw as DeviceRequestReply }
+    : { ok: false, got: describeShape(raw) };
+}
+
+/** Decode `/api/identity`. Only `repoRoot` is load-bearing: the wrong-clone check compares it. */
+export function decodeIdentity(raw: unknown): Decoded<BackendIdentity> {
+  return isObject(raw) && typeof raw.repoRoot === 'string'
+    ? { ok: true, value: raw as unknown as BackendIdentity }
+    : { ok: false, got: describeShape(raw) };
+}
+
+/** Decode `/api/toolchain` down to the one part this MCP reads. A missing `adb.present` used to read
+ *  as "adb is not installed". */
+export function decodeToolchain(raw: unknown): Decoded<{ adb: { present: boolean; path?: string } }> {
+  if (isObject(raw) && isObject(raw.adb) && typeof raw.adb.present === 'boolean'
+    && (raw.adb.path === undefined || raw.adb.path === null || typeof raw.adb.path === 'string')) {
+    return { ok: true, value: { adb: { present: raw.adb.present, ...(typeof raw.adb.path === 'string' ? { path: raw.adb.path } : {}) } } };
+  }
+  return { ok: false, got: isObject(raw) ? `${describeShape(raw)}; adb: ${describeShape(raw.adb)}` : describeShape(raw) };
+}
+
 /** The claim half of a `device_list` row. The route's `self` is what tells YOUR clone's claim from a
  *  sibling's — ignoring it rendered the lease this session holds as "CLAIMED by <some path>", which
  *  reads as a collision and sends the agent off to find another phone. Same `clone ===` rule as the
@@ -182,7 +245,12 @@ export const TRUSTED_WDA_MECHANISM = 'trusted-wda' as const;
 export interface LeaseStatus {
   state: string;
   /** `useUsb`/`udid`: an iOS lease tunnelled over USB by go-ios (#1065). */
-  target: { host: string; port: number; useAdb: boolean; useUsb?: boolean; udid?: string } | null;
+  guid?: string;
+  /** `serial` (#149): the adb serial the LEASE resolved at connect time — present only for an adb
+   *  target, so a screenshot can be aimed at the SAME phone the lease drives rather than a guessed
+   *  one. `DEVICE_STATUS_TARGET_FIELDS` (mcp-tools.ts) is type-checked equal to these keys, and
+   *  `deviceStatusShape.test.ts` compares that list against `DeviceConnectStatus`. */
+  target: { host: string; port: number; useAdb: boolean; serial?: string; useUsb?: boolean; udid?: string } | null;
   lastTarget: { ip: string; useAdb: boolean; useUsb?: boolean } | null;
   detail?: string;
   /** LIVE probe result (#32) — present only when `state === 'connected'` (a disconnected lease has
