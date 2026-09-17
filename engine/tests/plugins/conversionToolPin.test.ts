@@ -27,7 +27,7 @@ import { defaultToolchainDir } from '../../scripts/toolchainHome.mjs';
 import { ensureFfmpeg, ensureFfprobe, withFfprobe } from '../../plugins/ffmpeg-tool';
 import { AUDIO_ENCODER_VERSION } from '../../plugins/audio-cache';
 import { VIDEO_ENCODER_VERSION } from '../../plugins/video-cache';
-import { conversionCliBin, conversionCliDir, CONVERSION_CLI_PINS, isPinnedConversionTool } from '../../toolchain';
+import { conversionCliBin, conversionCliDir, CONVERSION_CLI_PINS, isPinnedConversionTool, pinLabel } from '../../toolchain';
 import { ensureKtxCli } from '../../plugins/texture-convert';
 import { ensureMsdfAtlasGen } from '../../plugins/font-convert';
 import { __probeRiggedToktx, __resetRiggedCliChecks } from '../../plugins/rigged-model-optimize';
@@ -191,7 +191,7 @@ describe.skipIf(process.platform === 'win32')('toktx and msdf-atlas-gen are pinn
     { id: 'msdf-atlas-gen', ensure: ensureMsdfAtlasGen, env: 'MODOKI_MSDF_ATLAS_GEN' },
   ] as const;
 
-  /** A pinned copy where `install()` leaves one: `<toolchain>/<id>/<version>/<id>`. */
+  /** A pinned copy where `install()` leaves one: `<toolchain>/<id>/<pinLabel>/<id>`. */
   const provisionNative = (tc: string, id: 'toktx' | 'msdf-atlas-gen') => stub(conversionCliBin(tc, id), `${id} pinned`);
 
   beforeEach(() => {
@@ -278,25 +278,40 @@ describe.skipIf(process.platform === 'win32')('toktx and msdf-atlas-gen are pinn
 
 /** The native pins and their encoder tags move together, for the reason the ffmpeg table above
  *  gives: a cache hit returns before the CLI is resolved, so only a tag bump evicts an entry an
- *  older build converted. The first row is every conversion before #1327 (whatever each machine
- *  had); the tags it used may never come back. */
-const NATIVE_PIN_GENERATIONS: ReadonlyArray<{ toktx: string; msdf: string; tex: string; atlas: string; font: string }> = [
-  { toktx: 'unpinned', msdf: 'unpinned', tex: 'tex-2', atlas: 'atlas-1', font: 'font-5' },
-  { toktx: '4.4.2', msdf: '1.4', tex: 'tex-3', atlas: 'atlas-2', font: 'font-6' },
+ *  older build converted. The first row of each table is every conversion before #1327 (whatever
+ *  each machine had); the tags it used may never come back. toktx feeds textures and atlases,
+ *  msdf-atlas-gen feeds fonts, so each table moves only the tags its tool reaches. msdf rows are
+ *  keyed by the pin LABEL, not the version: `1.4-skia` is the same release as `1.4` rebuilt with
+ *  Skia preprocessing (owner, 2026-09-17), and it bakes different atlases. */
+const TOKTX_PIN_GENERATIONS: ReadonlyArray<{ pin: string; tex: string; atlas: string }> = [
+  { pin: 'unpinned', tex: 'tex-2', atlas: 'atlas-1' },
+  { pin: '4.4.2', tex: 'tex-3', atlas: 'atlas-2' },
+];
+const MSDF_PIN_GENERATIONS: ReadonlyArray<{ pin: string; font: string }> = [
+  { pin: 'unpinned', font: 'font-5' },
+  { pin: '1.4', font: 'font-6' },
+  { pin: '1.4-skia', font: 'font-7' },
 ];
 
 describe('the native pins and the texture/atlas/font tags move together (#1327)', () => {
-  it('the current pins have a row, and its tags are the ones in force', () => {
-    const row = NATIVE_PIN_GENERATIONS.find((r) =>
-      r.toktx === CONVERSION_CLI_PINS.toktx.version && r.msdf === CONVERSION_CLI_PINS['msdf-atlas-gen'].version);
-    expect(row, 'CONVERSION_CLI_PINS changed: add a NATIVE_PIN_GENERATIONS row and bump the tex-/atlas-/font- tags').toBeDefined();
-    expect({ tex: TEXTURE_ENCODER_VERSION, atlas: ATLAS_ENCODER_VERSION, font: FONT_ENCODER_VERSION })
-      .toEqual({ tex: row!.tex, atlas: row!.atlas, font: row!.font });
+  it('the current toktx pin has a row, and its tags are the ones in force', () => {
+    const row = TOKTX_PIN_GENERATIONS.find((r) => r.pin === pinLabel('toktx'));
+    expect(row, 'the toktx pin changed: add a TOKTX_PIN_GENERATIONS row and bump the tex-/atlas- tags').toBeDefined();
+    expect({ tex: TEXTURE_ENCODER_VERSION, atlas: ATLAS_ENCODER_VERSION }).toEqual({ tex: row!.tex, atlas: row!.atlas });
   });
 
-  it('no two generations share a tag', () => {
-    for (const k of ['tex', 'atlas', 'font'] as const) {
-      expect(new Set(NATIVE_PIN_GENERATIONS.map((r) => r[k])).size, k).toBe(NATIVE_PIN_GENERATIONS.length);
+  it('the current msdf-atlas-gen pin (version AND build) has a row, and its tag is the one in force', () => {
+    const row = MSDF_PIN_GENERATIONS.find((r) => r.pin === pinLabel('msdf-atlas-gen'));
+    expect(row, 'the msdf-atlas-gen pin changed: add an MSDF_PIN_GENERATIONS row and bump the font- tag').toBeDefined();
+    expect(FONT_ENCODER_VERSION).toBe(row!.font);
+  });
+
+  it('no two generations share a tag or a pin', () => {
+    for (const k of ['pin', 'tex', 'atlas'] as const) {
+      expect(new Set(TOKTX_PIN_GENERATIONS.map((r) => r[k])).size, k).toBe(TOKTX_PIN_GENERATIONS.length);
+    }
+    for (const k of ['pin', 'font'] as const) {
+      expect(new Set(MSDF_PIN_GENERATIONS.map((r) => r[k])).size, k).toBe(MSDF_PIN_GENERATIONS.length);
     }
   });
 });

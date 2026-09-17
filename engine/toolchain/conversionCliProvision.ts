@@ -17,8 +17,9 @@
  *   `toktx` carries an `@executable_path` rpath, so the sibling dylib resolves as-is. Windows ships
  *   only as an NSIS installer, which 7-Zip can unpack (the release workflow does the same).
  * - `msdf-atlas-gen`: upstream publishes Windows zips only. The macOS binary is OURS — built once,
- *   statically linked, by `engine/scripts/build-msdf-atlas-gen-macos.sh` and published as the
- *   `toolchain-msdf-atlas-gen-<ver>` prerelease on the public modoki-engine repo (a prerelease, so
+ *   statically linked and WITH Skia (as upstream builds Windows), by
+ *   `engine/scripts/build-msdf-atlas-gen-macos.sh` and published as the
+ *   `toolchain-msdf-atlas-gen-<label>` prerelease on the public modoki-engine repo (a prerelease, so
  *   the editor's auto-updater, which follows `/releases/latest`, never sees it).
  *
  * The pin is per PLATFORM, not across platforms — a Windows and a macOS build are different
@@ -57,7 +58,11 @@ export interface PinnedCliAsset {
 }
 
 export interface PinnedCli {
+  /** The upstream release version (what the tool's own banner prints). */
   version: string
+  /** A label for OUR build choices when they are part of the pin — e.g. `skia` — so that changing
+   *  them moves the install dir exactly as a version bump does (every machine reinstalls). */
+  build?: string
   /** Keyed by `<platform>-<arch>` (`darwin-arm64`, `win32-x64`). A missing key means no pinned
    *  build exists for that host, so the tool is not installable there. */
   dist: Record<string, PinnedCliAsset>
@@ -99,10 +104,14 @@ export const CONVERSION_CLI_PINS: Record<ConversionCliId, PinnedCli> = {
   },
   'msdf-atlas-gen': {
     version: '1.4',
+    // Both builds have Skia geometry preprocessing (owner, 2026-09-17): upstream's Windows zip always
+    // did; ours did not until this label, and a font with overlapping contours then baked by a
+    // different algorithm per platform.
+    build: 'skia',
     dist: {
       'darwin-arm64': {
-        url: 'https://github.com/lsgmasa33/modoki-engine/releases/download/toolchain-msdf-atlas-gen-1.4/msdf-atlas-gen-1.4-macos-arm64.tar.gz',
-        sha256: '6296666b1f8f61c17c3bb5d1cb9643bcd918445750293da65699f9da9d2348c9',
+        url: 'https://github.com/lsgmasa33/modoki-engine/releases/download/toolchain-msdf-atlas-gen-1.4-skia/msdf-atlas-gen-1.4-skia-macos-arm64.tar.gz',
+        sha256: '1e941151f1d57dfb59b4f4adc262b60022f1e28c386de8d656d007b1ae75d0ea',
         kind: 'tar.gz',
         files: [['msdf-atlas-gen/msdf-atlas-gen', 'msdf-atlas-gen']],
       },
@@ -123,9 +132,15 @@ export function conversionCliDist(
   return CONVERSION_CLI_PINS[id].dist[`${platform}-${arch}`]
 }
 
-/** `<toolchainDir>/<id>/<pinned version>` — where the pinned copy lives. */
+/** `<toolchainDir>/<id>/<pinLabel>` — where the pinned copy lives. */
 export function conversionCliDir(toolchainDir: string, id: ConversionCliId): string {
-  return path.join(toolchainDir, id, CONVERSION_CLI_PINS[id].version)
+  return path.join(toolchainDir, id, pinLabel(id))
+}
+
+/** `<version>` or `<version>-<build>` — the install dir name, and how logs name the pin. */
+export function pinLabel(id: ConversionCliId): string {
+  const { version, build } = CONVERSION_CLI_PINS[id]
+  return build ? `${version}-${build}` : version
 }
 
 /** Absolute path to the pinned executable under `toolchainDir`. Platform-injectable so any
@@ -232,11 +247,11 @@ export async function ensureConversionCli(
 ): Promise<string> {
   const platform = opts.platform ?? process.platform
   const arch = opts.arch ?? process.arch
-  const pin = CONVERSION_CLI_PINS[id]
+  const label = pinLabel(id)
   const asset = conversionCliDist(id, platform, arch)
   if (!asset) {
     throw new Error(
-      `No pinned ${id} ${pin.version} build exists for ${platform}-${arch} (#1327). ` +
+      `No pinned ${id} ${label} build exists for ${platform}-${arch} (#1327). ` +
       `Set ${id === 'toktx' ? 'MODOKI_TOKTX' : 'MODOKI_MSDF_ATLAS_GEN'} to a binary to use one deliberately.`)
   }
   const log = opts.onLog ?? (() => {})
@@ -245,18 +260,18 @@ export async function ensureConversionCli(
   const runs = () => (opts.probe ?? defaultRunProbe)(bin, VERSION_ARG[id])
   if (fs.existsSync(bin)) {
     if (runs()) return bin
-    log(`${id} ${pin.version} under ${dir} does not run — reinstalling it.`)
+    log(`${id} ${label} under ${dir} does not run — reinstalling it.`)
     // Re-checked at the moment of the move: a sibling may have repaired it since the probe above,
     // and its good copy must not be the one moved aside.
     if (!discard(dir, () => !runs())) {
       if (runs()) return bin
       throw new Error(
-        `${id} ${pin.version} under ${dir} does not run and could not be moved aside to replace it ` +
+        `${id} ${label} under ${dir} does not run and could not be moved aside to replace it ` +
         '(is it in use, or held by antivirus?). Close what uses it and retry.')
     }
   }
 
-  log(`Downloading ${id} ${pin.version}…`)
+  log(`Downloading ${id} ${label}…`)
   const doFetch = opts.fetchImpl ?? (fetch as unknown as FetchLike)
   const res = await doFetch(asset.url)
   if (!res.ok) throw new Error(`${id} download failed: ${asset.url} → HTTP ${res.status}`)
@@ -268,7 +283,7 @@ export async function ensureConversionCli(
 
   const parent = path.dirname(dir)
   fs.mkdirSync(parent, { recursive: true })
-  const work = fs.mkdtempSync(path.join(parent, `.${pin.version}-`))
+  const work = fs.mkdtempSync(path.join(parent, `.${label}-`))
   try {
     const archive = path.join(work, path.basename(asset.url))
     fs.writeFileSync(archive, buf)
@@ -279,7 +294,7 @@ export async function ensureConversionCli(
     fs.mkdirSync(staged)
     for (const [from, to] of asset.files) {
       const src = path.join(unpacked, from)
-      if (!fs.existsSync(src)) throw new Error(`${id} ${pin.version}: the asset has no ${from} — its layout changed; update the pin.`)
+      if (!fs.existsSync(src)) throw new Error(`${id} ${label}: the asset has no ${from} — its layout changed; update the pin.`)
       fs.copyFileSync(src, path.join(staged, to)) // follows symlinks → real bytes
       try { fs.chmodSync(path.join(staged, to), 0o755) } catch { /* best-effort; Windows ignores it */ }
     }
@@ -304,11 +319,11 @@ export async function ensureConversionCli(
   if (!fs.existsSync(bin)) throw new Error(`${id} install incomplete — expected ${bin}`)
   if (!runs()) {
     throw new Error(
-      `${id} ${pin.version} installed under ${dir} but does not run` +
+      `${id} ${label} installed under ${dir} but does not run` +
       (platform === 'win32' && id === 'toktx'
         ? ' — the Windows toktx needs the Microsoft Visual C++ Redistributable (x64).'
         : '.'))
   }
-  log(`${id} ${pin.version} → ${dir}`)
+  log(`${id} ${label} → ${dir}`)
   return bin
 }

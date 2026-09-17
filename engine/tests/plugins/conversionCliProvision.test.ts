@@ -70,7 +70,7 @@ describe('conversionCliProvision — ensureConversionCli (mocked fetch)', () => 
     expect(conversionCliDist('msdf-atlas-gen', 'darwin', 'x64')).toBeUndefined()
     const neverFetch: FetchLike = async () => { throw new Error('must not download for an unpinned host') }
     await expect(ensureConversionCli('msdf-atlas-gen', base, { fetchImpl: neverFetch, platform: 'darwin', arch: 'x64' }))
-      .rejects.toThrow(/No pinned msdf-atlas-gen 1\.4 build exists for darwin-x64[\s\S]*MODOKI_MSDF_ATLAS_GEN/)
+      .rejects.toThrow(/No pinned msdf-atlas-gen 1\.4-skia build exists for darwin-x64[\s\S]*MODOKI_MSDF_ATLAS_GEN/)
   })
 
   it('a present copy that does not RUN is reinstalled, not returned', async () => {
@@ -127,7 +127,7 @@ describe('conversionCliProvision — ensureConversionCli (mocked fetch)', () => 
     }
     expect(await ensureConversionCli('msdf-atlas-gen', base, opts(fakeFetch(bytes), { expand, probe: () => true }))).toBe(bin)
     expect(fs.readFileSync(bin, 'utf8')).toBe('the winner')
-    expect(leftovers('msdf-atlas-gen')).toEqual(['1.4'])
+    expect(leftovers('msdf-atlas-gen')).toEqual(['1.4-skia'])
   })
 
   it.skipIf(process.platform === 'win32')('the REAL probe treats a non-executable copy as broken and repairs it', async () => {
@@ -145,7 +145,7 @@ describe('conversionCliProvision — ensureConversionCli (mocked fetch)', () => 
     }
     await ensureConversionCli('msdf-atlas-gen', base, opts(fakeFetch(bytes), { expand }))
     expect(spawnSync(bin, ['-version'], { encoding: 'utf8' }).stdout).toContain('repaired')
-    expect(leftovers('msdf-atlas-gen')).toEqual(['1.4'])
+    expect(leftovers('msdf-atlas-gen')).toEqual(['1.4-skia'])
   })
 
   it('a leftover dir WITHOUT the executable is debris: moved aside and replaced', async () => {
@@ -163,7 +163,7 @@ describe('conversionCliProvision — ensureConversionCli (mocked fetch)', () => 
     }
     await ensureConversionCli('msdf-atlas-gen', base, opts(fakeFetch(bytes), { expand, probe: () => true }))
     expect(fs.readdirSync(dir)).toEqual(['msdf-atlas-gen'])
-    expect(leftovers('msdf-atlas-gen')).toEqual(['1.4'])
+    expect(leftovers('msdf-atlas-gen')).toEqual(['1.4-skia'])
   })
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('a broken copy that cannot be moved aside fails with THAT reason, before any download', async () => {
@@ -210,9 +210,9 @@ describe('conversionCliProvision — ensureConversionCli (mocked fetch)', () => 
     }
     try {
       const bin = await ensureConversionCli('msdf-atlas-gen', base, opts(fakeFetch(bytes)))
-      expect(bin).toBe(path.join(base, 'msdf-atlas-gen', '1.4', 'msdf-atlas-gen'))
+      expect(bin).toBe(path.join(base, 'msdf-atlas-gen', '1.4-skia', 'msdf-atlas-gen'))
       expect(spawnSync(bin, ['-version'], { encoding: 'utf8' }).stdout).toContain('v1.4.0')
-      expect(leftovers('msdf-atlas-gen')).toEqual(['1.4'])
+      expect(leftovers('msdf-atlas-gen')).toEqual(['1.4-skia'])
     } finally {
       fs.rmSync(src, { recursive: true, force: true })
     }
@@ -305,7 +305,7 @@ describe('the pin table covers what the editor ships on', () => {
 
   it('the Windows executable path carries .exe', () => {
     expect(conversionCliBin('/tc', 'toktx', 'win32')).toBe(path.join('/tc', 'toktx', '4.4.2', 'toktx.exe'))
-    expect(conversionCliBin('/tc', 'msdf-atlas-gen', 'darwin')).toBe(path.join('/tc', 'msdf-atlas-gen', '1.4', 'msdf-atlas-gen'))
+    expect(conversionCliBin('/tc', 'msdf-atlas-gen', 'darwin')).toBe(path.join('/tc', 'msdf-atlas-gen', '1.4-skia', 'msdf-atlas-gen'))
   })
 })
 

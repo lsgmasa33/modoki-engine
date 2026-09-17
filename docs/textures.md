@@ -216,20 +216,30 @@ same hash over different bytes. Where each converter stands:
 |---|---|---|
 | audio, video | `ffmpeg` / `ffprobe` | **Pinned** (#1297): only the provisioned `ffmpeg-static` / `@ffprobe-installer` copy (or a deliberate `MODOKI_FFMPEG`/`MODOKI_FFPROBE`), never PATH — [editor-toolchain.md](editor-toolchain.md) § "Conversion CLIs are pinned". The same build per PLATFORM, not across platforms. |
 | textures, atlases | `toktx` | **Pinned** (#1327): KTX-Software 4.4.2, sha256-checked, from the toolchain dir, the packaged editor's bundle, or a deliberate `MODOKI_TOKTX` — never PATH. Same build per platform. |
-| fonts | `msdf-atlas-gen` | **Pinned** (#1327): 1.4 — on macOS our own static build (upstream ships Windows only), on Windows Chlumsky's zip; never PATH. ⚠️ The two are not merely two builds: Chlumsky's Windows build has **Skia** (it preprocesses overlapping contours), ours does not (it resolves overlaps in overlap mode, like Homebrew's). A font with overlapping contours — variable-font instances usually have them — bakes by a different geometry pipeline per platform under one `font-*` hash. Predates #1327; aligning them is an owner quality call. |
+| fonts | `msdf-atlas-gen` | **Pinned** (#1327): 1.4 with **Skia** (pin label `1.4-skia`) — on macOS our own static build (upstream ships Windows only), on Windows Chlumsky's zip; never PATH. Both preprocess overlapping contours, so a font that has them — variable-font instances usually do — bakes by the same geometry pipeline on both platforms (owner, 2026-09-17). Before that, the Mac build (like Homebrew's) had no Skia and resolved overlaps in overlap mode. Same algorithm across platforms; not the same compiler. |
 | models (rigged) | `gltf-transform`, `toktx` | Took the other route — hashes the tool versions INTO its key, which is why `modelCache.hash` is peeled above. Its `toktx` resolves through the same pinned entry. |
 | environments | none (JS) | Not exposed. |
 
 **Pinning both changed no committed value on the machine that did it** (#1327, measured
 2026-09-17). The unpacked pinned `toktx` + `libktx` are byte-identical to the hand-installed
 4.4.2, and five fonts (Latin and CJK) baked byte-identical atlas PNG and JSON under the
-Homebrew build and the pinned static build. `tex-3`/`atlas-2`/`font-6` exist to evict the
+Homebrew build and the FIRST pinned static build (no Skia — superseded, see below). `tex-3`/`atlas-2`/`font-6` exist to evict the
 entries a DIFFERENT machine's unpinned build left in its local cache. All 293 affected sidecars
 were re-imported through the real handlers, and no committed width/height/mipLevels/glyph/atlas
 value moved; the commit carries only the `hash` fields. (A re-import also normalises older
 sidecars — a `type` stamp, `srcWidth`/`srcHeight`, and on 5 2D textures a `webp` variant their
 committed `variants` lacks — which that commit deliberately left out.) A Windows machine converts with the Windows builds of the same
 versions, so its bytes are not claimed to match a Mac's.
+
+**Adding Skia DID change the font atlases, but not the glyph shapes** (measured 2026-09-17, all 18
+repo fonts, importer flags, old no-Skia pin against the `1.4-skia` pin). The glyph layout JSON is
+byte-identical for every font. Every PNG differs, mostly because edges land in different colour
+channels. Decoded the way the renderer reads it (median of RGB against 0.5), no pixel flips between
+inside and outside the glyph in any font. The distance values away from the edge moved on 0–0.25%
+of pixels, most in the variable fonts with overlapping contours (Roboto, Merriweather Sans, Nunito,
+Geologica), where only outline and glow effects read them. Court's VarelaRound and Wordweave's
+KleeOne show no alpha change at all. `font-7` evicts the old atlases; the 10 committed font sidecars
+changed only their `hash`.
 
 **`audioCache.durationSec` joined the peel in #1289** — the same "machine-dependent
 by construction" test, reached from the other side. It is not derived from

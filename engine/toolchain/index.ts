@@ -1901,7 +1901,7 @@ export { ensureRuby, rubyDistKey, rubyDirFor, PINNED_RUBY, type ProvisionedRuby 
 // On-demand go-ios provisioning: hands-free install+launch on an iOS ≤16 device (no ⌘R handoff).
 export { ensureGoIos, goIosBinFor, goIosDirFor, PINNED_GO_IOS, type ProvisionedGoIos } from './goIosProvision'
 export {
-  ensureConversionCli, conversionCliBin, conversionCliDir, conversionCliDist, CONVERSION_CLI_PINS, canExpand, ranOk,
+  ensureConversionCli, conversionCliBin, conversionCliDir, conversionCliDist, CONVERSION_CLI_PINS, canExpand, ranOk, pinLabel,
   type ConversionCliId, type PinnedCli, type PinnedCliAsset,
 } from './conversionCliProvision'
 // On-demand Android SDK provisioning (E-3): cmdline-tools bootstrap + sdkmanager packages/licenses.

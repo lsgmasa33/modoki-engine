@@ -23,8 +23,10 @@ import { expandCharset } from '../packages/modoki/src/runtime/core/fontSettings'
 
 /** Bump when msdf-atlas-gen flags / the converter pipeline change so stale cache
  *  entries are invalidated automatically. */
+// font-7: the pinned msdf-atlas-gen is rebuilt WITH Skia preprocessing (#1327 follow-up) — overlapping
+//         contours now bake the way the Windows build bakes them.
 // font-6: the pinned msdf-atlas-gen (#1327) — evicts atlases an unpinned build baked under the same key.
-export const FONT_ENCODER_VERSION = 'font-6'; // font-5: variable-font axis instancing (hb-subset)
+export const FONT_ENCODER_VERSION = 'font-7'; // font-5: variable-font axis instancing (hb-subset)
 
 export function getFontCacheDir(projectRoot: string): string {
   return path.join(projectRoot, '.cache', 'modoki-fonts');

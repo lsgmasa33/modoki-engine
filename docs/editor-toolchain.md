@@ -251,22 +251,27 @@ from the machine; a converter cannot.
   **Bumping either pin must bump `aud-*`/`vid-*` too** (the comment on `NPM_BINARY_PINS` says why).
 - **toktx / msdf-atlas-gen are not on npm** (#1327), so `engine/toolchain/conversionCliProvision.ts`
   pins them as release assets with a hand-maintained sha256, per `<platform>-<arch>`, and installs
-  each into a VERSIONED dir (`<toolchain>/<id>/<version>/`) — a pin bump points detection at a dir
+  each into a VERSIONED dir (`<toolchain>/<id>/<version>[-<build>]/`, see `pinLabel`) — a pin bump points detection at a dir
   that does not exist yet, so there is no stale check to get wrong. The assets:
   - `toktx`: KhronosGroup's macOS `.pkg`, unpacked with `pkgutil --expand-full` (no sudo, nothing
     installed system-wide), keeping `toktx` + the real `libktx.4.dylib`; its Windows NSIS installer,
     unpacked with 7-Zip — which the toolchain does not provision, so Build Support installs it
     unprompted only where a 7-Zip is found, and otherwise leaves it a button whose failure says so.
   - `msdf-atlas-gen`: upstream publishes Windows zips only. The macOS binary is OURS, built once by
-    `engine/scripts/build-msdf-atlas-gen-macos.sh` — from sha256-pinned sources, every non-system
-    library linked statically, with the Homebrew formula's options — and published as the
-    `toolchain-msdf-atlas-gen-1.4` **prerelease** on the public modoki-engine repo (a prerelease so the
-    editor's updater, which follows `/releases/latest`, never sees it). Before this the release job ran
-    `brew install`, which on the macOS 14 runner COMPILED it against whatever Homebrew had that day. A
-    new version means re-running the script, publishing a new prerelease, and updating the pin.
-  - The two `msdf-atlas-gen` builds differ in ALGORITHM, not just compiler: Chlumsky's Windows zip is
-    built with Skia (`-preprocess`), ours is not (overlap mode) — [textures.md](textures.md) has the
-    consequence.
+    `engine/scripts/build-msdf-atlas-gen-macos.sh` — from sha256-pinned sources, the way upstream
+    builds its Windows zip (vcpkg, pinned to a release tag, WITH Skia), every non-system library
+    linked statically — and published as the `toolchain-msdf-atlas-gen-1.4-skia` **prerelease** on the
+    public modoki-engine repo (a prerelease so the editor's updater, which follows `/releases/latest`,
+    never sees it). Before #1327 the release job ran `brew install`, which on the macOS 14 runner
+    COMPILED it against whatever Homebrew had that day. A new version means re-running the script,
+    publishing a new prerelease, and updating the pin.
+  - **Both `msdf-atlas-gen` builds have Skia** (owner, 2026-09-17), so both preprocess overlapping
+    contours (`-preprocess`, the default in a Skia build). Our first pinned Mac build did not — like
+    Homebrew's, it resolved overlaps in overlap mode, a different ALGORITHM from Windows. The pin's
+    `build: 'skia'` label is what moved the install dir to `1.4-skia/` and the font tag to `font-7`;
+    a pin whose bytes change for a build choice needs a new label, not just a new sha. ⚠️ The vcpkg
+    tag cannot simply be bumped: Skia m146 removed the `SkPath` edit methods msdfgen 1.13 calls, so
+    the script's `VCPKG_TAG` stays at the last release with Skia m144 until msdfgen moves on.
   - A present copy that does not RUN is reinstalled rather than returned (a file that exists but
     cannot start reads as "not provisioned" to `detect()`, so returning it would leave Build Support
     stuck). The Windows `toktx.exe` imports the MSVC runtime, which the KTX installer payload does not

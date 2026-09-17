@@ -5,7 +5,7 @@
  * msdf-atlas-gen to bake mtsdf atlases. What it bundles is the PINNED build
  * (pinnedToolForStaging.cjs, #1327), never whatever the build machine has on PATH —
  * the packaged editor bakes with what it bundles. On macOS that is our own statically
- * linked build (engine/scripts/build-msdf-atlas-gen-macos.sh; Chlumsky ships
+ * linked Skia build (engine/scripts/build-msdf-atlas-gen-macos.sh; Chlumsky ships
  * win32/win64 only), so its dylib closure below is EMPTY.
  *
  * The relocation is kept for an MODOKI_MSDF_ATLAS_GEN pointing at a dynamically

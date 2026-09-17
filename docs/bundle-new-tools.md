@@ -131,7 +131,7 @@ Runtime resolution is shared: `engine/electron/main.ts` `resolveBundled(envVar, 
 | Tool | Env var | macOS stager (pinned source) | Windows source (pinned) | Sibling files |
 |---|---|---|---|---|
 | **toktx** (KTX2 encode) | `MODOKI_TOKTX` | `stage-toktx.cjs` — KTX-Software `.pkg` v4.4.2, unpacked | KTX-Software NSIS `.exe`, v4.4.2, 7z-extracted | `ktx.dll` (win), `libktx.4.dylib` (mac) |
-| **msdf-atlas-gen** (MTSDF font atlas) | `MODOKI_MSDF_ATLAS_GEN` | `stage-msdf.cjs` — our static v1.4 build (`build-msdf-atlas-gen-macos.sh`) | Chlumsky win64 `.zip`, v1.4 | none (both statically linked) |
+| **msdf-atlas-gen** (MTSDF font atlas) | `MODOKI_MSDF_ATLAS_GEN` | `stage-msdf.cjs` — our static v1.4 Skia build (`build-msdf-atlas-gen-macos.sh`) | Chlumsky win64 `.zip`, v1.4 | none (both statically linked) |
 
 ## Did the playable-ad build add a new bundled tool? — NO (recorded 2026-07-19)
 
