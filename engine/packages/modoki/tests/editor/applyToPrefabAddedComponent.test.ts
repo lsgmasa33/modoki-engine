@@ -287,3 +287,49 @@ describe('applyToPrefabSelective — scene-only fields stay out of the template'
     expect(result.applied).toBe(false);
   });
 });
+
+/** #1308 — an Apply to a prefab a scene OWNS leaves the RUNTIME cache holding the written bytes.
+ *  It used to evict: the scene's owner hold stayed, the bytes went, and only a scene load refilled
+ *  them, so every synchronous runtime reader (a pooled scroll view) read nothing after an Apply.
+ *  Real runtime cache, real `writePrefabFile`. */
+describe('applyToPrefabSelective — the runtime prefab cache stays warm (#1308)', () => {
+  it('the owned prefab is still cached after the Apply, and carries the applied trait', async () => {
+    const { setPrefabCache, applyToPrefabSelective } = await getModule();
+    const cache = await import('../../src/runtime/loaders/meshTemplateCache');
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    registerAsset(SRC, '/games/g/assets/ship.prefab.json', 'prefab');
+    // The scene's hold. The fetch stub hands back a body the loader cannot parse, so this adds the
+    // OWNER and caches nothing — seeding the bytes is the editor write's job below.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await cache.acquirePrefab(1, SRC);
+    warn.mockRestore();
+
+    writeOk = true;
+    try {
+      setPrefabCache(SRC, makeOldPrefab() as any);
+      expect(cache.getCachedPrefab(SRC), 'setPrefabCache seats the owned prefab').toBeDefined();
+
+      const root = testWorld.spawn(
+        Transform({ x: 0, y: 0, z: 0 }),
+        EntityAttributes({ name: 'Ship', parentId: 0, guid: 'g-root' }),
+        ShipShake({ posAmpX: 0.5, posAmpY: 0.25, speed: 3 }),
+        PrefabInstance({ source: SRC, localId: 1, rootInstanceId: ROOT }),
+      );
+      const rootId = root.id();
+      testWorld.query(PrefabInstance).updateEach(([pi]) => { (pi as any).rootInstanceId = rootId; });
+      entityIndex.set(rootId, root);
+      entityInfos.push({ id: rootId, name: 'Ship', parentId: 0, sortOrder: 0, traits: ['Transform', 'EntityAttributes', 'ShipShake', 'PrefabInstance'] });
+
+      const rev0 = cache.getPrefabRevision(SRC);
+      await applyToPrefabSelective(rootId, new Set(['1.ShipShake.speed']));
+
+      const runtime = cache.getCachedPrefab(SRC) as { entities: { traits: Record<string, any> }[] } | undefined;
+      expect(runtime, 'an eviction here is the #1308 blank view').toBeDefined();
+      expect(runtime!.entities[0].traits.ShipShake?.speed).toBe(3);
+      expect(cache.getPrefabRevision(SRC), 'pools built from the old bytes must be told').toBeGreaterThan(rev0);
+    } finally {
+      writeOk = false;
+      cache.disposeAllCachedResources();
+    }
+  });
+});

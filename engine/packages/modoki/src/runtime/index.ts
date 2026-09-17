@@ -300,7 +300,7 @@ export {
   acquireModel, releaseModel,
   acquireMesh, releaseMesh,
   acquireMaterial, releaseMaterial,
-  acquirePrefab, releasePrefab, getCachedPrefab, invalidatePrefab,
+  acquirePrefab, releasePrefab, getCachedPrefab, invalidatePrefab, replaceCachedPrefab, getPrefabRevision,
   acquireEnvironment, releaseEnvironment, getCachedEnvironment,
   releaseAllForScene, getResourceStats,
   type SceneId,

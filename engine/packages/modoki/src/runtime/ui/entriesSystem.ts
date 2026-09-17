@@ -116,6 +116,17 @@ export interface EntryPrefabProvider {
    *  height is a legitimate answer of 0, so that test cannot tell "uncached" from "unsized". The
    *  provider is the only thing that knows, so it is the thing that gets asked. */
   isCached(prefabGuid: string): boolean;
+  /** A signature that changes whenever the prefab's cached content (its own bytes, or a prefab it
+   *  nests) is replaced (#1308). Compared for EQUALITY only.
+   *
+   *  ⚠️ **The pool never re-reads a prefab once it has spawned from it** — and neither does the
+   *  editor's Apply-to-Prefab refresh, which skips Transient subtrees on purpose (#1301). So without
+   *  this, applying an edit to a pooled row's prefab leaves every row showing the OLD prefab until
+   *  the scene is reloaded. The system compares it per view and re-spawns the pool on a change.
+   *
+   *  Required, like `rootAuthoredUI`, so a fake provider cannot make the re-spawn silently
+   *  unreachable. A fake that never changes content returns a constant. */
+  revision(prefabGuid: string): string;
 }
 
 let provider: EntryPrefabProvider | null = null;
@@ -212,6 +223,10 @@ interface ViewState {
    *  behind the "still uncached" warning. Scroll-event drives do not advance it: they are not
    *  frames, and counting them would turn a threshold in frames into a threshold in gestures. */
   uncachedTicks: number;
+  /** The provider's `revision` for this view's entry prefabs when the pool was built. A change
+   *  means the prefab bytes were replaced under the pool, so its rows are instances of the OLD
+   *  prefab and get re-spawned (#1308). */
+  lastRevision: string;
 }
 const viewStates = new Map<string, ViewState>();
 onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); warnedOverridden.clear(); warnedRefusedUnit.clear(); });
@@ -507,10 +522,26 @@ function driveView(
   const windowScrollX = jumpX ?? sv.scrollX;
   const windowScrollY = jumpY ?? sv.scrollY;
 
+  // #1308 — the entry prefab's content was replaced (an editor Apply / save) since this pool was
+  // built: its rows are instances of the OLD prefab. Release the whole pool and drop the window
+  // state so this very drive rebuilds it from the new bytes. Before the window state is read, so
+  // the rebuilt pool is not compared against the old pool's origin.
+  const revision = provider ? kinds.map((k) => provider!.revision(k.prefab)).join('\n') : '';
+  const prior = viewStates.get(viewGuid);
+  const rebuilt = prior !== undefined && prior.lastRevision !== revision;
+  if (rebuilt) {
+    releaseViewPool(world, view, m);
+    viewStates.delete(viewGuid);
+  }
+
   const st = viewStates.get(viewGuid)
     ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0,
-         frameScrollX: 0, frameScrollY: 0,
-         lastEntryW: -1, lastEntryH: -1, lastGapX: -1, lastGapY: -1, lastCols: -1, lastRows: -1, uncachedTicks: 0 };
+         // ⚠️ A rebuild KEEPS the per-frame travel baseline. A fresh 0 is harmless on a view's first
+         // drive, but a rebuild first seen on a SCROLL-event drive carries that 0 forward (only the
+         // pipeline tick advances it), so the next tick reads the whole scroll offset as travel and
+         // raises the pool to its cap — measured 8 -> 36 rows at entry 500 (#1308 close-out).
+         frameScrollX: rebuilt ? prior.frameScrollX : 0, frameScrollY: rebuilt ? prior.frameScrollY : 0,
+         lastEntryW: -1, lastEntryH: -1, lastGapX: -1, lastGapY: -1, lastCols: -1, lastRows: -1, uncachedTicks: 0, lastRevision: revision };
 
   // ⚠️ Runs BEFORE the early-outs below, and that placement is the whole point. A prefab that
   // never caches makes `rootSize` 0, so an authored `entryHeight: 0` ("read it from the prefab")
@@ -591,6 +622,7 @@ function driveView(
     lastEntryW: entryW, lastEntryH: entryH, lastGapX: gapX, lastGapY: gapY,
     lastCols: xw.pooled, lastRows: yw.pooled,
     uncachedTicks,
+    lastRevision: revision,
   });
 
   const content = ensureContentChild(world, view, m);

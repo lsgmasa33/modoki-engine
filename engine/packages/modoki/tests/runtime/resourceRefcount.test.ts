@@ -432,6 +432,103 @@ describe('refcount cache — prefab', () => {
     });
   });
 
+  /** #1308 — an editor write REPLACES the runtime entry of an owned prefab instead of evicting it.
+   *
+   *  The eviction left the owner set intact and the cache empty; only a scene load refills it, so
+   *  every synchronous runtime reader (the pooled scroll view first) read nothing after an Apply.
+   *  These run against the REAL cache and the REAL provider, for the reason the #363 block above
+   *  gives. */
+  describe('replaceCachedPrefab (#1308)', () => {
+    const PX = '/entry-px.prefab.json';
+    const edited = (width: number) => ({ id: G(PX), version: 1, name: 'entry-px', rootLocalId: 1,
+      entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width, widthUnit: 'px', height: 240, heightUnit: 'px' } } }] });
+
+    it('an OWNED prefab stays cached, holding the written bytes — the pool can still size and spawn', async () => {
+      const { acquirePrefab, replaceCachedPrefab, getCachedPrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G(PX));
+      replaceCachedPrefab(G(PX), edited(200));
+      expect(getCachedPrefab(G(PX)), 'an eviction here is the #1308 blank view').toBeDefined();
+      expect(entryPrefabProvider.isCached(G(PX))).toBe(true);
+      expect(entryPrefabProvider.rootSize(G(PX)).width, 'the NEW bytes, not the fetched ones').toBe(200);
+    });
+
+    it('an UNOWNED prefab is evicted, not seated — nothing would ever release that entry', async () => {
+      const { acquirePrefab, releasePrefab, replaceCachedPrefab, getCachedPrefab } = await getCache();
+      replaceCachedPrefab(G(PX), edited(200));
+      expect(getCachedPrefab(G(PX)), 'never acquired').toBeUndefined();
+      await acquirePrefab(1, G(PX));
+      releasePrefab(1, G(PX));
+      replaceCachedPrefab(G(PX), edited(300));
+      expect(getCachedPrefab(G(PX)), 'acquired then released').toBeUndefined();
+    });
+
+    it('seats a COPY — a later mutation of the caller\'s object does not reach the runtime entry', async () => {
+      const { acquirePrefab, replaceCachedPrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G(PX));
+      const doc = edited(200);
+      replaceCachedPrefab(G(PX), doc);
+      (doc.entities[0].traits.UIElement as { width: number }).width = 999;
+      expect(entryPrefabProvider.rootSize(G(PX)).width).toBe(200);
+    });
+
+    it('an in-flight fetch of the PRE-write bytes lands after the replace and is refused (#863)', async () => {
+      const { acquirePrefab, replaceCachedPrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      let open: () => void = () => {};
+      fetchGates[PX] = new Promise<void>((r) => { open = r; });
+      const pending = acquirePrefab(1, G(PX)); // owner added synchronously; the fetch is held
+      replaceCachedPrefab(G(PX), edited(200));
+      open();
+      await pending;
+      expect(entryPrefabProvider.rootSize(G(PX)).width, 'the stale 120 must not land on top').toBe(200);
+    });
+
+    it('accepts the resolved PATH as well as the guid — the agent create op hands a path', async () => {
+      // `resolveRef` rejects an internal asset path with a console.error and returns undefined, so
+      // routing the path form through it turned this replace into an eviction plus a false error.
+      const { acquirePrefab, replaceCachedPrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await acquirePrefab(1, G(PX));
+        replaceCachedPrefab(PX, edited(200));
+        expect(entryPrefabProvider.rootSize(G(PX)).width, 'seated under the path key, not evicted').toBe(200);
+        expect(err, 'no "use a GUID" error for the path form').not.toHaveBeenCalled();
+      } finally { err.mockRestore(); }
+    });
+
+    it('the signature changes when a NESTED row is removed — a revision sum would cancel out', async () => {
+      // nested (rev 0) nests tree. Bump tree to 1, then write nested WITHOUT the tree row: nested
+      // goes to 1 and tree leaves the walk, so a sum reads 0+1 before and 1 after — equal.
+      const { acquirePrefab, replaceCachedPrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/nested.prefab.json'));
+      await acquirePrefab(1, G('/tree.prefab.json'));
+      replaceCachedPrefab(G('/tree.prefab.json'), { version: 1, name: 'tree', rootLocalId: 1, entities: [] });
+      const before = entryPrefabProvider.revision(G('/nested.prefab.json'));
+      replaceCachedPrefab(G('/nested.prefab.json'), { version: 1, name: 'nested', rootLocalId: 1,
+        entities: [{ localId: 1, name: 'Root', traits: {} }] });
+      expect(entryPrefabProvider.revision(G('/nested.prefab.json'))).not.toBe(before);
+    });
+
+    it('bumps the provider revision of the prefab AND of every prefab nesting it', async () => {
+      const { acquirePrefab, replaceCachedPrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/nested.prefab.json')); // nests /tree.prefab.json
+      await acquirePrefab(1, G('/tree.prefab.json'));
+      await acquirePrefab(1, G('/rock.prefab.json'));
+      const nested0 = entryPrefabProvider.revision(G('/nested.prefab.json'));
+      const tree0 = entryPrefabProvider.revision(G('/tree.prefab.json'));
+      replaceCachedPrefab(G('/rock.prefab.json'), { version: 1, name: 'rock', rootLocalId: 1, entities: [] });
+      expect(entryPrefabProvider.revision(G('/nested.prefab.json')), 'an unrelated prefab changes nothing').toBe(nested0);
+      replaceCachedPrefab(G('/tree.prefab.json'), { version: 1, name: 'tree', rootLocalId: 1, entities: [] });
+      expect(entryPrefabProvider.revision(G('/tree.prefab.json'))).not.toBe(tree0);
+      expect(entryPrefabProvider.revision(G('/nested.prefab.json')), 'the CHILD changed under the parent').not.toBe(nested0);
+    });
+  });
+
   /** #765 — `rootSize` against the REAL cache, not a fake that hands back a hardcoded unitless
    *  number. This is the test whose absence let the bug live: `rootSize` used to read
    *  `UIElement.width`/`height` and ignore `widthUnit`/`heightUnit`, so a `%`-authored root was

@@ -16,7 +16,7 @@ import { durableGuid } from '../../runtime/core/assetRefRules';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { entityRef, type EntityRef } from '../undo/entityRef';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
-import { invalidatePrefab } from '../../runtime/loaders/meshTemplateCache';
+import { invalidatePrefab, replaceCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
@@ -1001,9 +1001,9 @@ export async function preloadNestedPrefabsForSubtree(selectedEntityId: number): 
  *  it — no matter what happened at scene load.
  *
  *  ⚠️ Sets the map DIRECTLY rather than calling `setPrefabCache`, deliberately: that helper also
- *  calls `invalidatePrefab`, because every one of its callers follows a prefab FILE WRITE. This
- *  one follows a READ, and invalidating the runtime cache on every drag-drop would throw away
- *  exactly the entries the loader just acquired. */
+ *  rewrites the runtime cache entry (and bumps its revision, re-spawning every pool built from it —
+ *  #1308), because every one of its callers follows a prefab FILE WRITE. This one follows a READ,
+ *  and churning the runtime cache on every drag-drop would be pure cost. */
 export async function instantiatePrefabInstance(
   prefab: PrefabFile, sourcePath: string, parentId: number = 0,
 ): Promise<number> {
@@ -1021,10 +1021,10 @@ export async function instantiatePrefabInstance(
 /** Seed the editor prefab cache from a READ — the scene-load warm and the instantiate helper.
  *
  *  ⚠️ Deliberately NOT `setPrefabCache`, and the difference is the whole reason this exists:
- *  that one also calls `invalidatePrefab`, because all of ITS callers follow a prefab FILE
- *  WRITE and a later scene load must re-read from disk. A read-side seed that invalidated the
- *  runtime cache would throw away the very entries the scene loader just acquired — on every
- *  drag-drop, and once per prefab on every scene swap. */
+ *  that one also rewrites the runtime cache (`replaceCachedPrefab`), because all of ITS callers
+ *  follow a prefab FILE WRITE. A read-side seed doing that would bump the prefab's revision and
+ *  re-spawn every pooled row built from it (#1308) — on every drag-drop, and once per prefab on
+ *  every scene swap. */
 export function primeEditorPrefabCache(source: string, prefab: PrefabFile): void {
   prefabCache.set(source, prefab);
 }
@@ -2050,10 +2050,12 @@ export function reattachPrefabInstance(
 export function setPrefabCache(source: string, prefab: PrefabFile | null): void {
   if (prefab) prefabCache.set(source, prefab);
   else prefabCache.delete(source);
-  // Keep the runtime refcounted prefab cache in sync — every setPrefabCache call
-  // follows a prefab file write (save-as-prefab, overwrite, delete/undo), so a
-  // later scene load must re-read from disk rather than serve a stale copy.
-  invalidatePrefab(source);
+  // Keep the runtime refcounted prefab cache in sync — every setPrefabCache call follows a prefab
+  // file write (save-as-prefab, overwrite, delete/undo). A write REPLACES the runtime entry rather
+  // than evicting it: an eviction strands every synchronous runtime reader until the next scene
+  // load (#1308). A delete still evicts.
+  if (prefab) replaceCachedPrefab(source, prefab);
+  else invalidatePrefab(source);
 }
 
 /** Look up an entity's PrefabInstance source + rootInstanceId. Returns null if
@@ -2117,14 +2119,16 @@ export async function writePrefabFile(source: string, prefab: PrefabFile): Promi
   try {
     const res = await postWriteFile(path, content);
     if (res.ok) {
-      // Evict the runtime refcounted prefab cache so the NEXT scene load re-reads
-      // the new file from disk. Without this, opening another scene that uses this
-      // prefab re-instantiates from the stale cached copy (e.g. missing flames/
-      // ShipShake the user just applied). The editor's own prefabCache is updated
-      // by the caller. Pass `source` (the GUID), NOT the resolved `path`: the cache
-      // is keyed by resolveRef(guid), and resolveRef REJECTS internal asset paths
-      // (→ undefined), so invalidatePrefab(path) would silently no-op.
-      invalidatePrefab(source);
+      // Put the bytes just written into the runtime refcounted prefab cache. Without
+      // this, opening another scene that uses this prefab re-instantiates from the
+      // stale cached copy (e.g. missing flames/ShipShake the user just applied).
+      // REPLACE, not evict (#1308): an eviction left every synchronous runtime reader
+      // — a pooled scroll view, a timeline spawn — reading nothing until the next
+      // scene load, which blanked a UIEntries view on Apply. (An unowned prefab is
+      // still just evicted — see replaceCachedPrefab.) The editor's own prefabCache
+      // is updated by the caller. `source` may be a GUID or a path (the agent `create`
+      // op hands the path); replaceCachedPrefab keys either form correctly.
+      replaceCachedPrefab(source, prefab);
       console.log(`[Prefab] Wrote "${prefab.name}" → ${path}`);
       return true;
     }
@@ -2140,7 +2144,7 @@ export async function writePrefabFile(source: string, prefab: PrefabFile): Promi
 }
 
 /** Install a prefab snapshot as the live source: update the editor cache, persist
- *  the file (which evicts the runtime refcounted cache), and preload nested children.
+ *  the file (which replaces the runtime refcounted cache entry), and preload nested children.
  *  Does NOT touch live instances — the caller rebuilds the scene, which re-instantiates
  *  every instance from this cache. Used by Apply-to-Prefab undo/redo to restore the
  *  prefab base before replaying the scene snapshot. */

@@ -77,6 +77,9 @@ const runtimeCache = new Map<string, unknown>();
 const invalidateSpy = vi.fn();
 vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
   invalidatePrefab: (...a: unknown[]) => invalidateSpy(...a),
+  // The write side's runtime-cache call since #1308 — the same spy, because the read-side test
+  // below guards "the warm never touches the runtime cache", whichever call that touch would be.
+  replaceCachedPrefab: (...a: unknown[]) => invalidateSpy(...a),
   getCachedPrefab: (ref: string) => runtimeCache.get(ref),
 }));
 
@@ -169,9 +172,10 @@ describe('warmEditorPrefabCacheFor — the scene swap', () => {
     expect(getCachedPrefabSync(GUID)!.name).toBe('Fish');
   });
 
-  /** ⚠️ The read-side seed must not call setPrefabCache, which invalidates the RUNTIME cache.
-   *  Doing so would discard, once per prefab on every swap, exactly the entries the loader just
-   *  acquired — turning a free map copy into a guaranteed re-fetch on the next scene. */
+  /** ⚠️ The read-side seed must not call setPrefabCache, which rewrites the RUNTIME cache entry
+   *  (it evicted before #1308; it now replaces and bumps the prefab's revision). Doing so would, once
+   *  per prefab on every swap, churn exactly the entries the loader just acquired — and re-spawn
+   *  every pooled row built from them. */
   it('does NOT invalidate the runtime cache it just read from', async () => {
     const { setPrefabCache } = await mod();
     setPrefabCache(GUID, null);

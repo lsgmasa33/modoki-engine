@@ -3171,6 +3171,12 @@ rebuild and is never per-frame.
   fetch that failed. It is exactly the diagnostic #344 lacked — Court's level selector rendered an
   empty grid with `npm run verify` green at 8,462 tests, because every one of those tests reads the
   prefab FILE and the file was well-formed.
+  ⚠️ **An editor Apply-to-Prefab used to trigger exactly this warning for a REAL reason (#1308).**
+  The write evicted the runtime cache entry, and only a scene load refills it, so the pool parked
+  every row and the view stayed blank. The write now replaces the entry instead
+  ([prefabs.md](prefabs.md) § "A prefab EDIT replaces the runtime cache entry"). The provider's
+  `revision` changes with it, and the system rebuilds the view's whole pool so the rows show the
+  applied edit rather than the old prefab.
   ⚠️ **#344's recorded cause — "a `version: 2` makes the loader decline to cache" — is not real,
   and the belief had spread to four places.** `fetchPrefab` (`meshTemplateCache.ts`) fetches,
   parses and caches without ever inspecting `version`; `editor/scene/prefab.ts` *wrote* `2` for

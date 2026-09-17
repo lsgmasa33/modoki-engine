@@ -888,7 +888,7 @@ spelling comes from `absToAssetUrl`; see "Asset urls take the disk's spelling" b
 **Not verified: stale live display.** A Replace keeps the guid, and `/api/write-file` skips the
 watcher for the editor's own writes. So an entity already showing a replaced particle, clip or rig
 may keep showing the old definition from a guid-keyed runtime cache until the scene reloads. Prefabs
-are not affected: `setPrefabCache` evicts the runtime prefab cache. This came from reading the code
+are not affected: `setPrefabCache` replaces the runtime prefab cache entry with the written bytes (#1308). This came from reading the code
 in the #1264 close-out review, not from an observation.
 
 Guarded by `tests/editor/createWritesAskFirst.test.ts`: no editor function may mint a guid and write

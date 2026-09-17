@@ -8,7 +8,7 @@
 import type { World } from 'koota';
 import { setEntryPrefabProvider, type EntryPrefabProvider } from '../ui/entriesSystem';
 import { spawnPrefabInstance } from './loadSceneFile';
-import { getCachedPrefab } from './meshTemplateCache';
+import { getCachedPrefab, getPrefabRevision } from './meshTemplateCache';
 import { effectivePrefabRootTraits } from './prefabOverrides';
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
@@ -91,7 +91,27 @@ function rootTraits(prefabGuid: string): Record<string, unknown> | null {
   });
 }
 
+/** A signature of `prefabGuid`'s content: `guid@revision` for it and every prefab it nests,
+ *  transitively, in walk order (#1308). An edit applied to a CHILD prefab changes what a pooled
+ *  parent row spawns just as much as one applied to the root.
+ *
+ *  ⚠️ **A list, not a SUM.** A sum was the first cut, and it collides: removing a nested row
+ *  subtracts that child's revision while the write adds 1 to the parent's, so a child at revision 1
+ *  cancels out exactly and the pool kept rows showing the removed child (#1308 close-out). Naming
+ *  every member makes a changed set, a swapped ref and a bumped revision all distinct. */
+function contentSignature(prefabGuid: string, seen = new Set<string>()): string[] {
+  if (!prefabGuid || seen.has(prefabGuid)) return [];
+  seen.add(prefabGuid);
+  const out = [`${prefabGuid}@${getPrefabRevision(prefabGuid)}`];
+  for (const row of cached(prefabGuid)?.entities ?? []) {
+    const nested = (row as { prefab?: unknown }).prefab;
+    if (typeof nested === 'string' && nested) out.push(...contentSignature(nested, seen));
+  }
+  return out;
+}
+
 export const entryPrefabProvider: EntryPrefabProvider = {
+  revision(prefabGuid) { return contentSignature(prefabGuid).join(' '); },
   rootSize(prefabGuid) {
     const traits = rootTraits(prefabGuid);
     // No resolvable root yet: 0 in either unit is the same 0, but `'px'` is the honest label —

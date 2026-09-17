@@ -84,6 +84,7 @@ function makeProvider(rootOverrides: Record<string, unknown> = {}) {
     spawned,
     askedFor,
     isCached: () => true,
+    revision: () => '',
     rootSize: (g: string) => { askedFor.rootSize.push(g); return { width: 0, widthUnit: 'px' as const, height: ENTRY_H, heightUnit: 'px' as const }; },
     // ⚠️ The SAME record `spawnInstance` authors onto the root below (#1026). A fake whose
     // `rootAuthoredUI` disagrees with what it spawns models a prefab that cannot exist, and the
@@ -162,6 +163,66 @@ describe('entriesSystem', () => {
     const contentNames: string[] = [];
     testWorld.query(EntityAttributes).updateEach(([a]: any[]) => contentNames.push(a.name));
     expect(contentNames).toContain(sys.ENTRIES_CONTENT_NAME);
+  });
+
+  it('re-spawns the whole pool when the entry prefab\'s content revision changes (#1308)', async () => {
+    // An editor Apply replaces the prefab bytes under a live pool. Its rows are instances of the
+    // OLD prefab, and nothing else rebuilds them — the Apply refresh skips Transient subtrees
+    // (#1301) — so without this the view shows the pre-edit rows until a scene reload.
+    const { sys, provider, view } = await setup();
+    const rev = { value: 0 };
+    (provider as { revision: () => string }).revision = () => `p@${rev.value}`;
+    sys.entriesSystem(testWorld);
+    const before = [...provider.spawned];
+    expect(before).toHaveLength(8);
+
+    for (let i = 0; i < 3; i++) sys.entriesSystem(testWorld);
+    expect(provider.spawned, 'an unchanged revision re-spawns nothing').toHaveLength(8);
+
+    for (const id of before) {
+      const e = idIndex.get(id);
+      e.set(EntityAttributes, { ...(e.get(EntityAttributes) as any), name: 'OldRow' });
+    }
+    rev.value = 1;
+    markUIDirtySpy.mockClear();
+    sys.entriesSystem(testWorld);
+    expect(provider.spawned, 'a fresh pool of the same size').toHaveLength(16);
+    // By a MARK, not by id: koota recycles the released ids straight into the new pool.
+    const names: string[] = [];
+    testWorld.query(EntityAttributes).updateEach(([a]: any[]) => names.push(a.name));
+    expect(names.filter(n => n === 'OldRow'), 'every pre-edit row is released').toHaveLength(0);
+    expect(names.filter(n => n === 'Entry')).toHaveLength(8);
+    expect((view.get(UIEntries) as any).poolSize).toBe(8);
+    expect(markUIDirtySpy, 'the rebuilt rows reach the projection').toHaveBeenCalled();
+
+    sys.entriesSystem(testWorld);
+    expect(provider.spawned, 'and it settles — no re-spawn every frame after').toHaveLength(16);
+  });
+
+  it('a rebuild first seen on a SCROLL-event drive keeps the travel baseline — the pool does not balloon (#1308)', async () => {
+    // The rebuilt view state used to start at frameScrollY 0; the scroll drive does not advance
+    // the baseline, so the next pipeline tick read the whole offset (entry 500) as travel and
+    // raised the pool to its three-viewport cap: 8 -> 36 rows, and the pool never shrinks.
+    const { sys, provider } = await setup();
+    const rev = { value: 0 };
+    (provider as { revision: () => string }).revision = () => `p@${rev.value}`;
+    const view = [...testWorld.query(UIEntries)][0];
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 500);
+    sys.entriesSystem(testWorld);
+    // Count the pooled ENTITIES against the published want: the pool never shrinks, so a ballooned
+    // rebuild keeps its rows behind a `poolSize` that has already settled back (measured with the
+    // defect in: 36 rows behind a published 8). A freshly rebuilt pool grows only to the want.
+    // (Not against the pre-rebuild count — the jump to entry 500 grew THAT pool already.)
+    const pooled = () => [...testWorld.query(UIEntry)].length;
+
+    rev.value = 1;
+    sys.entriesSystem(testWorld, { fromScroll: true });
+    sys.entriesSystem(testWorld);
+    sys.entriesSystem(testWorld);
+    const want = (view.get(UIEntries) as any).poolSize;
+    expect(want, 'sanity — the settled window').toBe(8);
+    expect(pooled(), 'the rebuilt pool is the settled window, not the raise cap').toBe(want);
   });
 
   it('writes the scroll offset as PX padding, never percent', async () => {
@@ -1032,6 +1093,7 @@ describe('entriesSystem', () => {
     // case `consumeEntryRequest`'s own guard is written for.
     sys.setEntryPrefabProvider({
       isCached: () => true,
+      revision: () => '',
       rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
       rootAuthoredUI: () => undefined,   // spawns nothing, so there is no pooled root to warn about
       spawnInstance: () => 0,
@@ -1308,6 +1370,7 @@ describe('entriesSystem', () => {
     src.registerEntrySource('test.rows', () => ({ members: {} }));
     sys.setEntryPrefabProvider({
       isCached: () => true,
+      revision: () => '',
       rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
       rootAuthoredUI: () => undefined,
       spawnInstance: () => 0,
@@ -1354,6 +1417,7 @@ describe('entriesSystem', () => {
     src.registerEntrySource('test.rows', () => ({ members: {} }));
     sys.setEntryPrefabProvider({
       isCached: () => true,
+      revision: () => '',
       rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
       rootAuthoredUI: () => undefined,
       spawnInstance: () => 0,
@@ -1551,7 +1615,7 @@ describe('entriesSystem', () => {
     const { sys, src, view } = await setup();
     const api = await import('../../src/runtime/ui/scrollApi');
     src.registerEntrySource('test.rows', () => ({ members: {} }));
-    sys.setEntryPrefabProvider({ isCached: () => false, rootSize: () => ({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' }), rootAuthoredUI: () => undefined, spawnInstance: () => 0 });
+    sys.setEntryPrefabProvider({ isCached: () => false, revision: () => '', rootSize: () => ({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' }), rootAuthoredUI: () => undefined, spawnInstance: () => 0 });
 
     api.scrollToEntry('view-guid', { y: 42 });
     sys.entriesSystem(testWorld);
@@ -1602,6 +1666,7 @@ describe('entriesSystem', () => {
     return {
       spawns,
       isCached: () => cached.value,
+      revision: () => '',
       rootSize: () => (cached.value ? size : { width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
       rootAuthoredUI: () => undefined,   // spawnInstance returns 0 — nothing is ever pooled here
       spawnInstance: (_w: any, guid: string) => { spawns.push(guid); return 0; },
@@ -1922,6 +1987,7 @@ describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset ho
     src.registerEntrySource('test.rows', () => ({ members: {} }));
     sys.setEntryPrefabProvider({
       isCached: () => false,
+      revision: () => '',
       rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
       rootAuthoredUI: () => undefined,   // never cached, so nothing pools
       spawnInstance: () => 0,

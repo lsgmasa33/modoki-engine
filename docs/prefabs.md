@@ -315,40 +315,66 @@ re-applies the root's extra traits, and replays the `overrides` map per localId.
 Override tracking is per-localId, so edits to a sub-entity (not just the root)
 survive a reload.
 
-## ⚠️ A prefab EDIT empties the runtime cache, and nothing refills it
+## ⚠️ A prefab EDIT replaces the runtime cache entry — it used to empty it (#1308)
 
-**Saving a prefab in the editor drops it out of the runtime cache, and only a SCENE LOAD puts it
-back.** A game that spawns prefab instances at runtime therefore stops being able to, silently,
-for the rest of the session — the symptom is whatever that game does when the prefab is missing.
+**An editor write of a prefab a scene owns now puts the written bytes straight into the runtime
+cache.** Before #1308 it DELETED the entry, and only a scene load put it back, so every
+synchronous runtime reader silently read nothing for the rest of the session.
 
-The mechanism, verified in a running editor (2026-08-19):
+The mechanism:
 
 - A prefab write goes through `setPrefabCache()` / `writePrefabFile()`
-  (`editor/scene/prefab.ts`), which calls `invalidatePrefab(source)` — deleting the entry from
-  the **runtime** `prefabCache` in `runtime/loaders/meshTemplateCache.ts`.
-- `acquirePrefab` is the only thing that refills it, and it is called from just two kinds of
-  place: `SceneManager` during a scene load, and games that preload deliberately
-  (`games/sling`, `demos/forest-camp`, each with its own owner-id sentinel).
-- So after such a write, `getCachedPrefab()` returns `undefined` until the next scene load.
-  **Nothing warns.**
+  (`editor/scene/prefab.ts`), which calls `replaceCachedPrefab(source, prefab)`
+  (`runtime/loaders/meshTemplateCache.ts`).
+  - **If a scene owns the prefab**, it seats a JSON copy of the written bytes. The copy is run
+    through the same load-path migration `fetchPrefab` applies. The #863 key token is still bumped,
+    so an in-flight fetch of the pre-write bytes is refused.
+  - **If nothing owns it**, it evicts as before. Seating an entry nothing owns would leave a row
+    that no `releaseAllForScene` ever drops.
+  - A delete (`setPrefabCache(src, null)`) still evicts.
+- **Why this matters:** an eviction left the scene's owner hold intact and the bytes gone.
+  `acquirePrefab` is the only thing that refills the cache, and outside games that preload
+  deliberately, only `SceneManager`'s scene load calls it. The readers stranded by that:
+  - the `UIEntries` pool: its stride went to 0, every slot parked, and the view went blank (#1308);
+  - timeline scrub and control-track spawns;
+  - a nested row inside any runtime spawn.
+- **Every replace or evict bumps a per-key content revision** (`getPrefabRevision`). A runtime
+  spawner compares it to tell that its live instances were built from OLD bytes.
+  - `EntryPrefabProvider.revision` is a `guid@revision` list over the entry prefab and every
+    prefab it nests. It is a list, not a sum: a sum let a removed nested row cancel the parent's
+    bump, so the pool kept stale rows.
+  - `entriesSystem` releases and rebuilds a view's whole pool when that signature changes. The
+    rebuild keeps the view's per-frame scroll baseline; a fresh 0 there, on a rebuild first seen
+    by a scroll-event drive, ballooned the pool to its raise cap.
+  - ⚠️ **A rebuild does not re-target keyboard/gamepad focus.** The focused row is destroyed
+    before the focus capture runs. Focus usually survives anyway, because the respawned row in
+    the same slot gets the same seeded guids, and `uiFocusSystem` finds it again. It can land
+    on a DIFFERENT entry when the Apply arrives mid-scroll: the rebuilt drive starts with minimum
+    overscan, so the window origin moves. It falls back to the scope's autoFocus when the edit
+    removed the focused member. Both need an editor Apply during Play; read from code, not
+    observed.
+  - This is needed because the Apply refresh skips Transient subtrees on purpose (§ Authoring
+    scope, #1301), so nothing else would rebuild pooled rows.
 
-⚠️ **WHICH writes actually strand it — this matters, and an earlier draft of this section got it
-wrong.** The invalidate's own comment states the intended contract ("so the NEXT scene load
-re-reads the new file"), and **prefab-EDIT MODE honours it**: `exitPrefabEditing` calls
-`loadScene(target)`, which re-acquires. So the open-edit-save-exit loop is safe, and
-`games/court/art.md`'s claim that the tray "picks the new offsets up when you leave edit mode"
-is **correct for that workflow**.
+**Paths that write an in-use prefab without reloading.** Since #1308 all of these keep the cache
+warm:
+- **Apply to Prefab** on a scene instance: `applyToPrefabWithUndo` → `writePrefabFile`.
+- **`modoki_prefab action:'apply'`** (and `'create'`).
+- Create Prefab → Replace, and the skin-prefab writes (both through `setPrefabCache`).
 
-The paths that invalidate an in-use prefab and do **not** reload are:
-- **Apply to Prefab** on a scene instance — `applyToPrefabWithUndo` → `writePrefabFile`, live-only.
-- **`modoki_prefab action:'apply'`** (and `'create'`), the agent surface for the same op.
+Paths that also reload:
+- Prefab-EDIT mode reloads on exit (`exitPrefabEditing` → `loadScene(target)`).
+- Undo/redo of an Apply reloads (`restoreSnapshot` → `loadScene`).
 
-Creating a NEW prefab from an entity (`assetOps.ts`) also invalidates, but only its own
-freshly-minted guid, which nothing is using yet — harmless.
+**An external `.prefab.json` write** (a hand edit, `git checkout`) goes through the scene hot
+reload. `handleSceneChanged` evicts and then reloads (#1169, [editor-hmr.md](editor-hmr.md)), and
+that path is unchanged: the reload is what refills the cache there.
 
-⚠️ **There is NO file-watcher path.** Editing a `.prefab.json` on disk does not invalidate
-anything, so the runtime keeps serving the OLD prefab until a scene load — a staleness problem,
-not a fallback one, and the opposite failure to the above.
+**Game code still owns two cases.** Instances a game spawned at runtime keep the art they were
+built with: the cache is warm again, but nothing re-spawns them. And a prefab that really is
+missing still reads `undefined`. So the guidance below (re-acquire on a miss; remember what each
+instance was built FROM) still applies, and the incidents below are the pre-#1308 shape of the
+failure.
 
 **What this looks like in a game.** Court's guard flag falls back to drawn primitives when its
 prefab is uncached, so after an Apply-to-Prefab the flags already planted keep the real art while
@@ -384,7 +410,10 @@ first alone is not enough:
    on every board build, so it was safe either way; `games/sling` clears its only on unregister and
    `demos/forest-camp` only on world swap — and an Apply-to-Prefab is neither.
 2. **Remember what each live instance was built FROM**, and retire instances whose source no
-   longer matches. Without this, the window between the invalidation and the re-acquire leaves a
+   longer matches. ⚠️ **Key that record on the prefab's REVISION, not only its guid**
+   (`${guid}@${getPrefabRevision(guid)}`). An editor Apply replaces the entry in place, so the guid
+   never changes; Court's flag layer keys `art` this way so that an edit made during Play still
+   retires every planted flag (`syncFlags`). Without this, the window between the invalidation and the re-acquire leaves a
    mixed population that never converges, because "this cell already has an instance" is true and
    says nothing about which art that instance wears.
 

@@ -2270,7 +2270,70 @@ export function invalidatePrefab(prefabRef: string): void {
     // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
     // re-caches the stale prefab on top of whatever refetch follows.
     cacheToken.invalidateKey(key);
+    bumpPrefabRevision(key);
   }
+}
+
+/** Per-key content revision of the runtime prefab cache — bumped whenever the bytes under a key
+ *  are replaced or evicted, so a runtime spawner holding instances built from the OLD bytes can
+ *  tell (#1308: a `UIEntries` pool re-spawns its rows on a change). Monotonic for the session and
+ *  deliberately NOT cleared by `disposeAllCachedResources`: a reset to 0 could land back on a value
+ *  a spawner recorded before the teardown and read as "unchanged". Keyed like the cache (resolved
+ *  path, or the raw ref `invalidatePrefab` was handed). */
+const prefabRevision = new Map<string, number>();
+function bumpPrefabRevision(key: string): void {
+  prefabRevision.set(key, (prefabRevision.get(key) ?? 0) + 1);
+}
+
+/** The content revision of a cached prefab (see `prefabRevision`); 0 for a prefab whose bytes
+ *  were never replaced this session. Accepts a guid or the resolved path — the path form is taken
+ *  as-is, like `replaceCachedPrefab`, because `resolveRef` rejects it loudly. */
+export function getPrefabRevision(prefabRef: string): number {
+  const prefabPath = prefabCacheKey(prefabRef);
+  return prefabPath ? prefabRevision.get(prefabPath) ?? 0 : 0;
+}
+
+/** The cache key a prefab ref names: a GUID resolves through the manifest; anything else is taken
+ *  as the resolved path already. ⚠️ Not `refToPath` for the path form — `resolveRef` rejects an
+ *  internal asset path with a console.error and returns undefined, and `writePrefabFile`'s agent
+ *  `create` caller hands a PATH: that turned a replace into an eviction plus a false error (#1308
+ *  close-out). `invalidatePrefab` carves the same exception out for the same reason. */
+function prefabCacheKey(prefabRef: string): string | undefined {
+  return isGuid(prefabRef) ? refToPath(prefabRef) : prefabRef || undefined;
+}
+
+/** Replace a prefab's runtime cache entry with bytes the caller just WROTE — the editor's
+ *  apply/save/create path (#1308).
+ *
+ *  ⚠️ **Replace, not evict, whenever a scene still owns the prefab.** An eviction leaves the owner
+ *  set intact but the cache empty, and only `acquirePrefab` refills it — which only a scene load
+ *  calls. Every SYNCHRONOUS runtime reader (the `UIEntries` pool, timeline scrub + control-track
+ *  spawns, a nested row inside any spawn) then reads `undefined` until the next reload: an
+ *  applied edit blanked a pooled scroll view outright. The caller already holds the bytes, so
+ *  there is nothing to refetch.
+ *
+ *  With NO owner it evicts exactly like `invalidatePrefab`: seating an entry nothing owns would
+ *  leave a cache row that no `releaseAllForScene` ever drops.
+ *
+ *  Accepts a guid or the resolved path (see `prefabCacheKey`).
+ *
+ *  The seated value is a CLONE run through the same load-path migration `fetchPrefab` applies, so
+ *  a later mutation of the caller's object (the editor cache keeps its own) cannot leak in, and a
+ *  reader sees the shape a fetch would have produced. The key's #863 token is still bumped, so an
+ *  in-flight fetch carrying the pre-write bytes is refused rather than landing on top. */
+export function replaceCachedPrefab(prefabRef: string, data: unknown): void {
+  const prefabPath = prefabCacheKey(prefabRef);
+  if (!prefabPath || !prefabOwners.get(prefabPath)?.size || !data || typeof data !== 'object') {
+    invalidatePrefab(prefabRef);
+    return;
+  }
+  invalidatePrefab(prefabRef); // drops the pending promise + refuses an in-flight stale fetch
+  // A JSON round trip, not structuredClone: the entry must be exactly what a FETCH of the written
+  // file would parse to (no `undefined`-valued keys, no non-JSON values).
+  const copy = JSON.parse(JSON.stringify(data)) as { id?: unknown; entities?: { traits?: Record<string, unknown> }[] };
+  for (const entry of copy.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+  prefabCache.set(prefabPath, copy);
+  if (typeof copy.id === 'string') registerAsset(copy.id, prefabPath, 'prefab');
 }
 
 function fetchPrefab(prefabPath: string): Promise<void> {

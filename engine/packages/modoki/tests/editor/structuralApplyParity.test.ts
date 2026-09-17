@@ -90,7 +90,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => TRAITS,
 }));
 vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
-  invalidatePrefab: vi.fn(),
+  invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(),
   getCachedPrefab: vi.fn(),
   loadModelTemplates: vi.fn(),
 }));

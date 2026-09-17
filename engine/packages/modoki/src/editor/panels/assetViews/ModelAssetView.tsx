@@ -270,16 +270,23 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
                 if (existing && Array.isArray(existing.entities)) prefab = mergeRiggedPrefab(prefab, existing);
               }
               if (prefab) {
-                await writeAssetFile(prefabPath, jsonFileBody(prefab));
-                // Refresh the editor cache to the just-written prefab AND evict the
-                // runtime refcounted prefab cache (meshTemplateCache) — otherwise the
-                // NEXT scene load / Play→Stop revert re-expands the STALE cached copy
-                // and a rigged re-import's freshly-added bone entities vanish. The raw
-                // /api/write-file above bypasses writePrefabFile()'s own eviction, so we
-                // mirror it here. Key by the stable GUID so both caches resolve it.
-                setPrefabCache(prefab.id ?? prefabPath, prefab);
-                const verb = !prefabExists ? 'Created' : isRigged ? 'Merged' : 'Regenerated';
-                console.log(`[Inspector] ${verb} prefab: ${prefabPath}${existingId ? ` (preserved id ${existingId})` : ''}`);
+                const wrote = await writeAssetFile(prefabPath, jsonFileBody(prefab));
+                // Refresh the editor cache to the just-written prefab AND the runtime
+                // refcounted prefab cache (meshTemplateCache) — otherwise the NEXT scene
+                // load / Play→Stop revert re-expands the STALE cached copy and a rigged
+                // re-import's freshly-added bone entities vanish. The raw /api/write-file
+                // above bypasses writePrefabFile()'s own cache update, so we mirror it
+                // here. Key by the stable GUID so both caches resolve it.
+                // ⚠️ ONLY on a successful write: the runtime entry is REPLACED now (#1308),
+                // and a scene load short-circuits on a cache hit, so seating bytes that never
+                // reached disk would keep serving them for as long as a scene owns the prefab.
+                if (wrote) {
+                  setPrefabCache(prefab.id ?? prefabPath, prefab);
+                  const verb = !prefabExists ? 'Created' : isRigged ? 'Merged' : 'Regenerated';
+                  console.log(`[Inspector] ${verb} prefab: ${prefabPath}${existingId ? ` (preserved id ${existingId})` : ''}`);
+                } else {
+                  console.error(`[Inspector] Could not write prefab: ${prefabPath}`);
+                }
               }
             }
           }
