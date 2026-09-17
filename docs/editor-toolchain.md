@@ -266,7 +266,10 @@ from the machine; a converter cannot.
     COMPILED it against whatever Homebrew had that day. A new version means re-running the script,
     publishing a new prerelease, and updating the pin.
   - **Both `msdf-atlas-gen` builds have Skia** (owner, 2026-09-17), so both preprocess overlapping
-    contours (`-preprocess`, the default in a Skia build). Our first pinned Mac build did not — like
+    contours (`-preprocess`, the default in a Skia build). They even share the Skia COMMIT: upstream's
+    1.4 Windows exe names the vcpkg buildtree `skia/src/41119015ca-…`, the tail of the `REF` that
+    vcpkg 2026.02.27's skia port pins (`ee20d565…41119015ca`), so what still differs is the compiler.
+    Our first pinned Mac build did not — like
     Homebrew's, it resolved overlaps in overlap mode, a different ALGORITHM from Windows. The pin's
     `build: 'skia'` label is what moved the install dir to `1.4-skia/` and the font tag to `font-7`;
     a pin whose bytes change for a build choice needs a new label, not just a new sha. ⚠️ The vcpkg

@@ -236,8 +236,8 @@ repo fonts, importer flags, old no-Skia pin against the `1.4-skia` pin). The gly
 byte-identical for every font. Every PNG differs, mostly because edges land in different colour
 channels. Decoded the way the renderer reads it (median of RGB against 0.5), no pixel flips between
 inside and outside the glyph in any font. The distance values away from the edge moved on 0–0.25%
-of pixels, most in the variable fonts with overlapping contours (Roboto, Merriweather Sans, Nunito,
-Geologica), where only outline and glow effects read them. Court's VarelaRound and Wordweave's
+of pixels: 0.1–0.25% in the variable fonts with overlapping contours (Merriweather Sans, Roboto,
+Nunito), 0.02% or less in the rest, and only outline and glow effects read those values. Court's VarelaRound and Wordweave's
 KleeOne show no alpha change at all. `font-7` evicts the old atlases; the 10 committed font sidecars
 changed only their `hash`.
 
