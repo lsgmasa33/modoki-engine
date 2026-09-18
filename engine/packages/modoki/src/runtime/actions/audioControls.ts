@@ -23,7 +23,7 @@
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
 import type { Entity, ExtractSchema, TraitValue } from 'koota';
-import { registerUIAction, refuseAction, type UIActionRefusal } from '../core/actionRegistry';
+import { registerEngineAction, refuseAction, type UIActionRefusal } from '../core/actionRegistry';
 import { addStoreHook } from '../ui/storeHooks';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { AudioSource } from '../traits/AudioSource';
@@ -131,17 +131,17 @@ export function registerAudioControls(): void {
   // is one queue push per click and no more.
   setUIClickCue(() => cueSound('ui.click'));
 
-  registerUIAction('audio.play', ({ target }) => patchSource('audio.play', target, { playing: true }));
-  registerUIAction('audio.pause', ({ target }) => patchSource('audio.pause', target, { playing: false }));
-  registerUIAction('audio.toggle', ({ target }) => {
+  registerEngineAction('audio.play', ({ target }) => patchSource('audio.play', target, { playing: true }));
+  registerEngineAction('audio.pause', ({ target }) => patchSource('audio.pause', target, { playing: false }));
+  registerEngineAction('audio.toggle', ({ target }) => {
     const a = target?.get(AudioSource);
     return patchSource('audio.toggle', target, { playing: !a?.playing });
   });
-  registerUIAction('audio.stop', ({ target, world }) => {
+  registerEngineAction('audio.stop', ({ target, world }) => {
     if (target) stopEntityAudio(world, target);
     return patchSource('audio.stop', target, { playing: false });
   });
-  registerUIAction('audio.setClip', {
+  registerEngineAction('audio.setClip', {
     params: {
       key: { type: 'string', tooltip: "Bank key on the target AudioSource.clips (preferred). Falls back to `clip` if empty." },
       clip: { type: 'string', accept: ['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.flac'], tooltip: 'Literal clip GUID (bank-less shorthand).' },
@@ -155,7 +155,7 @@ export function registerAudioControls(): void {
       return patchSource('audio.setClip', target, { clip, playing: true });
     },
   });
-  registerUIAction('audio.toggleCrossfade', {
+  registerEngineAction('audio.toggleCrossfade', {
     params: { seconds: { type: 'number', min: 0, step: 0.1, tooltip: 'Crossfade duration when ON (default 1.5s).' } },
     handler: ({ target, params }) => {
       const a = target?.get(AudioSource);
@@ -164,7 +164,7 @@ export function registerAudioControls(): void {
       return patchSource('audio.toggleCrossfade', target, { crossfadeSec: a.crossfadeSec > 0 ? 0 : sec });
     },
   });
-  registerUIAction('audio.setBusVolume', {
+  registerEngineAction('audio.setBusVolume', {
     params: {
       bus: { type: 'enum', options: [...BUS_NAMES], tooltip: 'Mixer bus to set.' },
       value: { type: 'number', min: 0, max: 100, tooltip: '0..100 (from a slider). $value binds the slider value.' },
@@ -187,7 +187,7 @@ export function registerAudioControls(): void {
       return undefined;
     },
   });
-  registerUIAction('audio.playOneShot', {
+  registerEngineAction('audio.playOneShot', {
     params: {
       key: { type: 'string', tooltip: "Bank key on the target AudioSource.clips (preferred). Falls back to `clip` if empty." },
       clip: { type: 'string', accept: ['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.flac'], tooltip: 'Literal clip GUID (bank-less shorthand).' },

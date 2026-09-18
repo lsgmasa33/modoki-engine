@@ -36,7 +36,7 @@
  * key in here would put engine-chosen storage under a game-chosen setting.
  */
 
-import { registerUIAction, refuseAction } from '../core/actionRegistry';
+import { registerEngineAction, refuseAction } from '../core/actionRegistry';
 import { getCurrentWorld } from '../core/ecs/worldRegistry';
 import { HapticSettings } from '../traits/HapticSettings';
 import { playHaptic } from '../haptics/hapticsService';
@@ -62,7 +62,7 @@ function setEnabled(next: boolean): boolean {
 const NO_SETTINGS = 'no HapticSettings entity in the scene — nothing to change (author one to make haptics switchable)';
 
 export function registerHapticControls(): void {
-  registerUIAction('haptics.play', {
+  registerEngineAction('haptics.play', {
     params: {
       // A STRING, not an enum: a game registers its own pattern names (`registerHapticPatterns`), so
       // the engine's default set is not the vocabulary. Declared, so an empty `pattern` is dropped at
@@ -78,7 +78,7 @@ export function registerHapticControls(): void {
     },
   });
 
-  registerUIAction('haptics.toggle', () => {
+  registerEngineAction('haptics.toggle', () => {
     const e = settingsEntity();
     const s = e?.get(HapticSettings);
     if (!s || !setEnabled(!s.enabled)) return refuseAction(`[haptics.toggle] ${NO_SETTINGS}`, { log: false });
@@ -89,7 +89,7 @@ export function registerHapticControls(): void {
   // `UIActionPayload` is `string | number`, so a BOOLEAN cannot ride it and a fallback would be a
   // branch that can never fire — the same dead-code shape this handler was just rescued from.
   // `params` is `Record<string, unknown>` and carries a real authored boolean.
-  registerUIAction('haptics.set', ({ params }) => {
+  registerEngineAction('haptics.set', ({ params }) => {
     const enabled = params?.enabled;
     if (typeof enabled !== 'boolean') {   // authored scene data — validated, never trusted
       return refuseAction(`[haptics.set] params.enabled must be a boolean, got ${JSON.stringify(enabled)}`, { log: false });

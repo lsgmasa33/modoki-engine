@@ -44,7 +44,7 @@
  *  persisting or vice versa, and the two would drift.
  */
 
-import { registerUIAction, refuseAction } from '../core/actionRegistry';
+import { registerEngineAction, refuseAction } from '../core/actionRegistry';
 import { choosePlayerQualityTier } from '../rendering/playerQualityTier';
 import { isQualityTier, TIER_ORDER } from '../rendering/qualityTier';
 
@@ -53,7 +53,7 @@ import { isQualityTier, TIER_ORDER } from '../rendering/qualityTier';
 const AUTO = 'auto';
 
 export function registerQualityControls(): void {
-  registerUIAction('quality.set', {
+  registerEngineAction('quality.set', {
     params: {
       tier: {
         type: 'enum', options: [AUTO, ...TIER_ORDER],

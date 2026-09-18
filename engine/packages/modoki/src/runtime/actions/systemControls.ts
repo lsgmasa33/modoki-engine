@@ -40,7 +40,7 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 import type { World } from 'koota';
 
 import type { ModokiSystemPlugin } from 'capacitor-modoki-system';
-import { registerUIAction, refuseAction } from '../core/actionRegistry';
+import { registerEngineAction, refuseAction } from '../core/actionRegistry';
 import { emit } from '../core/journal';
 
 /** The native plugin's registered name — `jsName` in the Swift plugin, `@CapacitorPlugin(name)` in
@@ -156,7 +156,7 @@ async function writeClipboard(text: string): Promise<boolean> {
 }
 
 export function registerSystemControls(): void {
-  registerUIAction('system.openUrl', {
+  registerEngineAction('system.openUrl', {
     params: {
       url: { type: 'string', tooltip: 'An https:// page to open in the system browser — e.g. the Privacy Policy or Terms of Use.' },
     },

@@ -4,7 +4,7 @@
  *  NavigationManager, which owns the history stack. These lifecycle actions have
  *  no state, so they stay as plain built-ins registered once at startup. */
 
-import { registerUIAction, refuseAction } from '../core/actionRegistry';
+import { registerEngineAction, refuseAction } from '../core/actionRegistry';
 import { shutdownRealmThenReload } from '../core/realmShutdown';
 import { SkeletalAnimator } from '../traits/SkeletalAnimator';
 import { Animator } from '../traits/Animator';
@@ -51,7 +51,7 @@ export function registerEngineActions(): void {
   // Fire-and-forget deliberately, unlike `resumeReload.ts`'s `deps.reload()`: a UIAction has no
   // caller waiting to hear back and no `reloading` latch to un-stick on failure, so there is
   // nothing an `await` here would let a `catch` do.
-  registerUIAction('engine.reload', () => {
+  registerEngineAction('engine.reload', () => {
     if (typeof window === 'undefined') return;
     void shutdownRealmThenReload(() => window.location.reload());
   });
@@ -61,7 +61,7 @@ export function registerEngineActions(): void {
   //  coordinates (the units an author thinks in — "page 3", not "pixel 1863"), and the system
   //  converts them using the entry size it already resolves. `params.behavior` is
   //  'instant' | 'smooth', the only two values the CSS backend can genuinely honour.
-  registerUIAction('ui.scrollTo', ({ target, params }) => {
+  registerEngineAction('ui.scrollTo', ({ target, params }) => {
     if (!target) return refuseAction('[ui.scrollTo] no target entity — point the binding at the scroll view');
     const guid = guidOfEntity(target);
     if (!guid) return refuseAction('[ui.scrollTo] target has no guid');
@@ -73,7 +73,7 @@ export function registerEngineActions(): void {
 
   // engine.quit — native-only. On web there is nothing to quit; the app shell
   // can wire Capacitor's App.exitApp() if a real quit is needed on device.
-  registerUIAction('engine.quit', () => {
+  registerEngineAction('engine.quit', () => {
     console.info('[engine.quit] no-op on web');
   });
 
@@ -84,7 +84,7 @@ export function registerEngineActions(): void {
   //  `playing` field (SkeletalAnimator = GLB skeletal clips, Animator = keyframe
   //  .anim.json), so toggling is a plain field write the render sync picks up
   //  next frame. Toggles whichever animator trait(s) the target carries.
-  registerUIAction('engine.toggleAnimator', ({ target }) => {
+  registerEngineAction('engine.toggleAnimator', ({ target }) => {
     if (!target) return refuseAction('[engine.toggleAnimator] no target entity — set the binding target to an animator entity');
     let toggled = false;
     const skel = target.get(SkeletalAnimator);
@@ -117,7 +117,7 @@ export function registerEngineActions(): void {
   //  the first clip on a name it has no action for, and merges a still-loading source when it arrives). That rule used
   //  to live only in the agent bridge's pre-flight, so an agent was refused a typo'd skeletal clip that
   //  an authored button silently wrote (#1129, owner 2026-09-14).
-  registerUIAction('engine.playClip', {
+  registerEngineAction('engine.playClip', {
     params: { clip: { type: 'string', tooltip: 'Clip NAME to play — must exist on the target animator (keyframe/sprite bank, or a GLB/animset clip for skeletal)' } },
     handler: ({ target, params, payload }) => {
       if (!target) return refuseAction('[engine.playClip] no target entity — set the binding target to an animator entity');
@@ -184,7 +184,7 @@ export function registerEngineActions(): void {
   //  `time`, never from `lastTime`. Two docblocks claimed otherwise and were corrected in the same
   //  change — do not reintroduce a seek "fix" that resets `lastTime` to prevent a replay it cannot
   //  cause.
-  registerUIAction('engine.director', {
+  registerEngineAction('engine.director', {
     params: {
       action: {
         type: 'enum', options: ['play', 'pause', 'toggle', 'restart'],

@@ -15,7 +15,7 @@
  *   - `video.setClip`— swap the clip by GUID. */
 
 import type { Entity } from 'koota';
-import { registerUIAction, refuseAction, type UIActionRefusal } from '../core/actionRegistry';
+import { registerEngineAction, refuseAction, type UIActionRefusal } from '../core/actionRegistry';
 import { VideoPlayer } from '../traits/VideoPlayer';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { seekEntityVideo, claimVideoEndEmit } from '../video/videoSystem';
@@ -40,20 +40,20 @@ function patch(action: string, target: Entity | undefined, fields: Partial<{ pla
 }
 
 export function registerVideoControls(): void {
-  registerUIAction('video.play', ({ target }) => patch('video.play', target, { playing: true }));
-  registerUIAction('video.pause', ({ target }) => patch('video.pause', target, { playing: false }));
-  registerUIAction('video.toggle', ({ target }) => {
+  registerEngineAction('video.play', ({ target }) => patch('video.play', target, { playing: true }));
+  registerEngineAction('video.pause', ({ target }) => patch('video.pause', target, { playing: false }));
+  registerEngineAction('video.toggle', ({ target }) => {
     const v = target?.get(VideoPlayer);
     return patch('video.toggle', target, { playing: !v?.playing });
   });
 
-  registerUIAction('video.stop', ({ target }) => {
+  registerEngineAction('video.stop', ({ target }) => {
     if (!target) return playerRefusal('video.stop', target);
     seekEntityVideo(target.id(), 0);
     return patch('video.stop', target, { playing: false });
   });
 
-  registerUIAction('video.skip', ({ target }) => {
+  registerEngineAction('video.skip', ({ target }) => {
     if (!target) return playerRefusal('video.skip', target);
     const v = target.get(VideoPlayer);
     // Announce BEFORE stopping. `emitVideoSkip` also emits `@video.end`, so a game
@@ -74,7 +74,7 @@ export function registerVideoControls(): void {
     return undefined;
   });
 
-  registerUIAction('video.seek', {
+  registerEngineAction('video.seek', {
     params: {
       seconds: { type: 'number', min: 0, step: 0.1, tooltip: 'Absolute position in seconds.' },
     },
@@ -88,7 +88,7 @@ export function registerVideoControls(): void {
     },
   });
 
-  registerUIAction('video.setClip', {
+  registerEngineAction('video.setClip', {
     params: {
       clip: {
         type: 'string', accept: ['.mp4', '.mov', '.m4v', '.webm', '.mkv'],

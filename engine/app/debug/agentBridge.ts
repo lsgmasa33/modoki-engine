@@ -57,6 +57,8 @@ import {
   dispatchUIAction,
   isActionRefusal,
   getUIActionNames,
+  isControlLessAction,
+  actionControlOnScreen,
   getUIActionParams,
   getReadSourceNames,
   getReadValue,
@@ -1060,6 +1062,22 @@ registerAgentOp('dispatch-action', (params) => {
   if (!p.name) return { ok: false, dispatched: false, reason: 'missing action name' };
   if (!isSimRunning()) return { ok: false, dispatched: false, reason: 'not playing — press Play first', simRunning: false };
   if (!getUIActionNames().includes(p.name)) return { ok: false, dispatched: false, reason: `unknown action '${p.name}'`, known: getUIActionNames() };
+  // #1406 — a player can only reach a control-bound action through its control, so an agent may not
+  // reach it with that control off screen either (owner ruling on #1406: the ENGINE refuses, not each
+  // game). Checked here and not in `dispatchUIAction`: a real press (`applyBindings`) has a mounted
+  // control by construction, and the debug menu and headless tests have no screen to ask about. An
+  // action no control carries opts out with `noControl` at registration (every engine built-in does).
+  if (!isControlLessAction(p.name)) {
+    const seen = actionControlOnScreen(getCurrentWorld(), p.name);
+    if (!seen.onScreen) {
+      return {
+        ok: false, dispatched: false, gate: 'no-control-on-screen', carriers: seen.carriers, simRunning: true,
+        reason: seen.carriers.length > 0
+          ? `no control that triggers '${p.name}' is on screen (${seen.carriers.slice(0, 5).join(', ')}${seen.carriers.length > 5 ? ` and ${seen.carriers.length - 5} more` : ''} ${seen.carriers.length === 1 ? 'is' : 'are'} hidden), so a player could not press it — open the screen that shows it first`
+          : `no UI control in the current world triggers '${p.name}', so a player could not press it — open the screen that shows it first. If a timeline, a zone, a collision or code fires it instead, register it with \`noControl: true\``,
+      };
+    }
+  }
   // Resolve targetGuid HERE so a phantom guid is reported, not obeyed. dispatchUIAction
   // scans for it and, finding nothing, calls the handler with target:undefined — the handler
   // console.warns and returns, and this op used to answer {dispatched:true}. The agent then

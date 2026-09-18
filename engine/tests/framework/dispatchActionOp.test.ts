@@ -18,6 +18,7 @@ import {
   createTestWorld, type TestWorld, Transform, EntityAttributes, destroyEntity, Director, setTimeline, clearTimelineCache, normalizeTimeline,
   Animator, SkeletalAnimator, AudioSource, VideoPlayer, HapticSettings, setAnimSet, clearAnimSetCache,
   registerEngineActions, registerAudioControls, registerVideoControls, registerHapticControls, registerQualityControls, registerIapControls,
+  UIElement, UIAction, RenderableUI, uiTreeProjection, markUIDirty, dispatchUIAction,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -27,11 +28,14 @@ registerAllTraits();
 let game: TestWorld | undefined;
 afterEach(() => { game?.dispose(); game = undefined; clearTimelineCache(); clearAnimSetCache(); vi.restoreAllMocks(); });
 
+/** A test action no control carries (#1406) — these rows are about the op, not the carrier gate. */
+const NO_CONTROL = { noControl: true, handler: () => {} };
+
 type DispatchReply = { ok?: boolean; dispatched: boolean; reason?: string; known?: string[]; slavedTo?: string };
 
 describe('dispatch-action: a no-op is a surfaced failure (F8)', () => {
   it('an unknown action name → ok:false, dispatched:false, with the known list', async () => {
-    game = createTestWorld({ actions: { 'my.real': () => {} } });
+    game = createTestWorld({ actions: { 'my.real': NO_CONTROL } });
     const r = await runAgentOp('dispatch-action', { name: 'totally.bogus' }) as DispatchReply;
     expect(r.ok).toBe(false);
     expect(r.dispatched).toBe(false);
@@ -39,7 +43,7 @@ describe('dispatch-action: a no-op is a surfaced failure (F8)', () => {
   });
 
   it('a stale targetGuid → ok:false, dispatched:false', async () => {
-    game = createTestWorld({ actions: { 'my.real': () => {} } });
+    game = createTestWorld({ actions: { 'my.real': NO_CONTROL } });
     const r = await runAgentOp('dispatch-action', { name: 'my.real', targetGuid: 'ghost-guid' }) as DispatchReply;
     expect(r.ok).toBe(false);
     expect(r.dispatched).toBe(false);
@@ -49,7 +53,7 @@ describe('dispatch-action: a no-op is a surfaced failure (F8)', () => {
   // #1223 close-out: targetGuid resolves through the shared resolver, so a stale runtime guid says why.
   // Mutation: drop the `stale` spread from the op's targetGuid refusal.
   it('a despawned runtime targetGuid → NOT_FOUND with stale:"despawned"', async () => {
-    game = createTestWorld({ actions: { 'my.real': () => {} } });
+    game = createTestWorld({ actions: { 'my.real': NO_CONTROL } });
     const shot = game.spawn(Transform(), EntityAttributes({ name: 'Shot' }));
     const guid = (shot.get(EntityAttributes) as { guid: string }).guid;
     destroyEntity(shot);
@@ -59,7 +63,7 @@ describe('dispatch-action: a no-op is a surfaced failure (F8)', () => {
 
   it('a valid action DOES dispatch — ok is NOT false, dispatched:true, and the handler ran', async () => {
     let hits = 0;
-    game = createTestWorld({ actions: { 'my.real': () => { hits++; } } });
+    game = createTestWorld({ actions: { 'my.real': { noControl: true, handler: () => { hits++; } } } });
     const r = await runAgentOp('dispatch-action', { name: 'my.real' }) as DispatchReply;
     expect(r.dispatched).toBe(true);
     expect(r.ok).not.toBe(false); // success carries no ok:false, so isFailureBody passes it
@@ -217,5 +221,103 @@ describe('dispatch-action reports every handler refusal (#1129)', () => {
     expect(r.dispatched).toBe(true);
     expect(r.ok).not.toBe(false);
     row.check?.(game);
+  });
+});
+
+/**
+ * #1406 — an agent dispatch refuses when no control carrying the action is on screen.
+ *
+ * A player reaches a control-bound action only through its control, and a hidden control is
+ * unmounted, so the op asks the same question before it dispatches. The fixture is the shape the
+ * issue found in every game: a Confirm button inside a panel.
+ */
+describe('dispatch-action refuses an action whose control is not on screen (#1406)', () => {
+  let hits = 0;
+  beforeAll(() => { registerEngineActions(); });
+
+  /** A panel (visible or not) holding a Confirm button whose click `call`s `game.confirm`. */
+  function spawnPanel(g: TestWorld, opts: { panelVisible: boolean; pointerThrough?: boolean }) {
+    const panel = g.spawn(RenderableUI(), UIElement({ isVisible: opts.panelVisible }), EntityAttributes({ guid: 'panel', name: 'Panel' }));
+    const button = g.spawn(
+      RenderableUI(), UIElement({ pointerThrough: opts.pointerThrough === true }),
+      UIAction({ bindings: [{ event: 'click', kind: 'call', action: 'game.confirm' }] }),
+      EntityAttributes({ guid: 'confirm', name: 'Confirm', parentId: panel.id() }),
+    );
+    return { panel, button };
+  }
+  function freshWorld() {
+    hits = 0;
+    game = createTestWorld({ actions: { 'game.confirm': () => { hits++; } } });
+    return game;
+  }
+  const dispatch = () => runAgentOp('dispatch-action', { name: 'game.confirm' }) as Promise<DispatchReply & { gate?: string; carriers?: string[] }>;
+
+  it('a carrier inside a hidden panel → refused, naming the hidden carrier; the handler does not run', async () => {
+    spawnPanel(freshWorld(), { panelVisible: false });
+    const r = await dispatch();
+    expect(r).toMatchObject({ ok: false, dispatched: false, gate: 'no-control-on-screen', carriers: ['Confirm'] });
+    expect(r.reason).toMatch(/Confirm is hidden/);
+    expect(hits).toBe(0);
+  });
+
+  it('a pooled list names every row alike — each carrier name is reported once', async () => {
+    const g = freshWorld();
+    const { panel } = spawnPanel(g, { panelVisible: false });
+    g.spawn(RenderableUI(), UIElement({}), UIAction({ bindings: [{ event: 'click', kind: 'call', action: 'game.confirm' }] }), EntityAttributes({ name: 'Confirm', parentId: panel.id() }));
+    const r = await dispatch();
+    expect(r.carriers).toEqual(['Confirm']);
+  });
+
+  it('ACCEPT SIDE: the same carrier with its panel shown → dispatched', async () => {
+    spawnPanel(freshWorld(), { panelVisible: true });
+    const r = await dispatch();
+    expect(r.dispatched).toBe(true);
+    expect(hits).toBe(1);
+  });
+
+  it('a carrier hidden since the last UI sync still counts — a Confirm whose own `set` closed its panel first', async () => {
+    const g = freshWorld();
+    const { panel } = spawnPanel(g, { panelVisible: true });
+    markUIDirty();
+    uiTreeProjection(g.world); // the frame the player saw
+    panel.set(UIElement, { ...panel.get(UIElement)!, isVisible: false }); // the button's `set` row, first
+    const r = await dispatch();
+    expect(r.dispatched).toBe(true);
+    expect(hits).toBe(1);
+  });
+
+  it('a carrier that is pointerThrough takes no press → refused', async () => {
+    spawnPanel(freshWorld(), { panelVisible: true, pointerThrough: true });
+    const r = await dispatch();
+    expect(r).toMatchObject({ ok: false, gate: 'no-control-on-screen' });
+    expect(hits).toBe(0);
+  });
+
+  it('an action no control carries, NOT declared noControl → refused, and the reason names the flag', async () => {
+    freshWorld();
+    const r = await dispatch();
+    expect(r).toMatchObject({ ok: false, gate: 'no-control-on-screen', carriers: [] });
+    expect(r.reason).toMatch(/noControl: true/);
+  });
+
+  it('ACCEPT SIDE: an action declared noControl with no carrier → dispatched', async () => {
+    hits = 0;
+    game = createTestWorld({ actions: { 'game.confirm': { noControl: true, handler: () => { hits++; } } } });
+    const r = await dispatch();
+    expect(r.dispatched).toBe(true);
+    expect(hits).toBe(1);
+  });
+
+  it('an engine built-in is noControl — engine.director dispatches with no control anywhere', async () => {
+    const g = freshWorld();
+    g.spawn(EntityAttributes({ guid: 't' }), Director({ timeline: 'x' }));
+    const r = await runAgentOp('dispatch-action', { name: 'engine.director', targetGuid: 't', params: { action: 'pause' } }) as DispatchReply;
+    expect(r.dispatched).toBe(true);
+  });
+
+  it('only the agent op asks: a real press (`dispatchUIAction`, as applyBindings calls it) still runs with the panel hidden', () => {
+    spawnPanel(freshWorld(), { panelVisible: false });
+    dispatchUIAction('game.confirm', {});
+    expect(hits).toBe(1);
   });
 });

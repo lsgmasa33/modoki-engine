@@ -102,6 +102,13 @@ export interface UIActionDef {
    *  AND dispatch: a declared param arriving as `''` is dropped before the handler runs
    *  (`normaliseParams`, #1075). Omit for actions that take no authored args. */
   params?: Record<string, FieldHint>;
+  /** No UI control carries this action, so an AGENT dispatch (the `dispatch-action` op) must not ask
+   *  for one on screen (#1406). Set it for an action fired only by a timeline signal, an `OnSequence`,
+   *  a zone or collision trait, or code, and for a payload-only action no button names. Every engine
+   *  built-in has it (`registerEngineAction`): those are general verbs an agent aims with a
+   *  `targetGuid`, not a game intent tied to one button. Without it, an agent dispatch is refused
+   *  unless some control naming the action is on screen (`ui/actionCarriers.ts`). */
+  noControl?: boolean;
 }
 
 /** Options for dispatching an action — the target is given as a GUID and resolved
@@ -152,6 +159,17 @@ function normaliseParams(def: UIActionDef, params: Record<string, unknown> | und
 
 export function registerUIAction(name: string, def: UIActionHandler | UIActionDef) {
   defs.set(name, asDef(def));
+}
+
+/** Register an ENGINE built-in action: a general verb (`engine.playClip`, `audio.play`, …) that an
+ *  agent may dispatch whatever is on screen, so it is registered `noControl` (#1406). */
+export function registerEngineAction(name: string, def: UIActionHandler | UIActionDef) {
+  defs.set(name, { ...asDef(def), noControl: true });
+}
+
+/** Did this action's registration declare `noControl` (#1406)? False for an unknown name. */
+export function isControlLessAction(name: string): boolean {
+  return defs.get(name)?.noControl === true;
 }
 
 export function unregisterUIAction(name: string) {

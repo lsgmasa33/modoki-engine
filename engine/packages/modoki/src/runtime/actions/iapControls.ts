@@ -39,11 +39,11 @@
  * the deterministic headless pipeline.
  */
 
-import { registerUIAction, refuseAction } from '../core/actionRegistry';
+import { registerEngineAction, refuseAction } from '../core/actionRegistry';
 import { purchase, restorePurchases } from '../iap/purchaseService';
 
 export function registerIapControls(): void {
-  registerUIAction('iap.buy', ({ payload, params }) => {
+  registerEngineAction('iap.buy', ({ payload, params }) => {
     // Accepts BOTH shapes on purpose. A product id is a single value, so the scalar form is the
     // natural UIAction convention (and the only one an agent `dispatch_action` can send); the
     // object form is what a scene binding that carries several fields will use. Supporting only
@@ -66,7 +66,7 @@ export function registerIapControls(): void {
     return undefined;
   });
 
-  registerUIAction('iap.restore', () => {
+  registerEngineAction('iap.restore', () => {
     void restorePurchases();
   });
 }

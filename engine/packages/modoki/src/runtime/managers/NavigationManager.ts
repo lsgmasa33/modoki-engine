@@ -175,16 +175,17 @@ class NavigationManagerImpl implements ManagerDef {
     // made inside the async `loadScene`/`back` would reach it as a pending promise and be reported as
     // `dispatched:true`. A load that is attempted and then FAILS is not a refusal and stays in the
     // promise — the op does not report that either, deliberately: it would mean awaiting a scene load.
-    'engine.loadScene': ({ payload }: UIActionContext) => {
+    // `noControl`: engine verbs, like every built-in (`registerEngineAction`, #1406).
+    'engine.loadScene': { noControl: true, handler: ({ payload }: UIActionContext) => {
       if (!resolvePath(payload)) {
         return refuseAction(`[engine.loadScene] could not resolve scene "${String(payload)}" — pass a scene GUID or path`);
       }
       return this.loadScene(payload);
-    },
+    } },
     // Unlogged: Back at the root was always a silent no-op for a player.
-    'engine.navigateBack': () => (this.canGoBack
+    'engine.navigateBack': { noControl: true, handler: () => (this.canGoBack
       ? this.back()
-      : refuseAction('[engine.navigateBack] no previous scene — the history is empty (at the root)', { log: false })),
+      : refuseAction('[engine.navigateBack] no previous scene — the history is empty (at the root)', { log: false })) },
   };
 
   init(): void {

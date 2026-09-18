@@ -550,7 +550,7 @@ export {
 export {
   wireDomGestureTracking, unwireDomGestureTracking, isDomGestureActive, resetDomGestureTracking,
 } from './ui/domGestureTracking';
-export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams, refuseAction, isActionRefusal } from './core/actionRegistry';
+export { registerUIAction, registerEngineAction, isControlLessAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams, refuseAction, isActionRefusal } from './core/actionRegistry';
 export type { UIActionRefusal } from './core/actionRegistry';
 export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './core/actionRegistry';
 export { registerEngineActions } from './actions/engineActions';
@@ -986,6 +986,8 @@ export {
   shouldFireActions, shouldRunSimTier, isPoseOnly, isLiveRender, canEdit, inPreviewSession,
 } from './core/playState';
 export { uiTreeProjection, markUIDirty, setEditorDirtyCallback, onEditorDirty } from './ui/uiTreeStore';
+export { actionControlOnScreen } from './ui/actionCarriers';
+export type { ActionControlReport } from './ui/actionCarriers';
 // A game that registers its OWN InputSource should call `noteUserInput` from it — see
 // `core/userActivity.ts`. Without it, quality-tier calibration reads that game as idle.
 export { noteUserInput, msSinceUserInput, hasRecentUserInput } from './core/userActivity';

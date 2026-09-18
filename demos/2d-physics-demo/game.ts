@@ -100,7 +100,7 @@ export const game: GameDefinition = {
     // The Sensor Zone's OnCollision2D dispatches these; ctx.params.self is the zone,
     // ctx.target is the body that entered/left. We tint the zone + log to the journal
     // so the reaction is verifiable by data (modoki_journal), not just by eye.
-    registerUIAction('sensorZone/enter', (ctx) => {
+    registerUIAction('sensorZone/enter', { noControl: true, handler: (ctx) => {
       const { self, other, otherRef } = (ctx.params ?? {}) as { self?: Entity; other?: Entity; otherRef?: string | number };
       if (typeof self !== 'number') return noSelf('sensorZone/enter');
       tintOnEnter(self, other, { color: HOT_COLOR, opacity: HOT_OPACITY });
@@ -108,13 +108,13 @@ export const game: GameDefinition = {
       // the body was alive. Never `entityRef(other)` here: on an exit the body may be despawned
       // and its index reused, so its handle can no longer name it (#1227). Verify via modoki_journal.
       ctx.emit('zone', { phase: 'enter', body: otherRef });
-    });
-    registerUIAction('sensorZone/exit', (ctx) => {
+    } });
+    registerUIAction('sensorZone/exit', { noControl: true, handler: (ctx) => {
       const { self, other, otherRef } = (ctx.params ?? {}) as { self?: Entity; other?: Entity; otherRef?: string | number };
       if (typeof self !== 'number') return noSelf('sensorZone/exit');
       restoreOnExit(self, other, BASE_FALLBACK);
       ctx.emit('zone', { phase: 'exit', body: otherRef });
-    });
+    } });
 
     // The physics-free twin. The Trigger Zone entity carries NO RigidBody2D and NO
     // Collider2D — only `Zone2D` (the area, sized by its Transform scale) and `OnZone2D`
@@ -124,18 +124,18 @@ export const game: GameDefinition = {
     // distinct journal type so the two stations stay tellable apart in `modoki_journal`.
     // (The engine also emits its own `@zone` event for every crossing — this one is the
     // game's reaction, not the engine's record.)
-    registerUIAction('triggerZone/enter', (ctx) => {
+    registerUIAction('triggerZone/enter', { noControl: true, handler: (ctx) => {
       const { self, other, otherRef } = (ctx.params ?? {}) as { self?: Entity; other?: Entity; otherRef?: string | number };
       if (typeof self !== 'number') return noSelf('triggerZone/enter');
       tintOnEnter(self, other, { color: ZONE_HOT_COLOR, opacity: ZONE_HOT_OPACITY });
       ctx.emit('zoneTrigger', { phase: 'enter', body: otherRef });
-    });
-    registerUIAction('triggerZone/exit', (ctx) => {
+    } });
+    registerUIAction('triggerZone/exit', { noControl: true, handler: (ctx) => {
       const { self, other, otherRef } = (ctx.params ?? {}) as { self?: Entity; other?: Entity; otherRef?: string | number };
       if (typeof self !== 'number') return noSelf('triggerZone/exit');
       restoreOnExit(self, other, ZONE_BASE_FALLBACK);
       ctx.emit('zoneTrigger', { phase: 'exit', body: otherRef });
-    });
+    } });
   },
   unregisterSystems: () => {
     for (const a of ACTIONS) unregisterUIAction(a);

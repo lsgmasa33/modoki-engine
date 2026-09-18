@@ -598,6 +598,37 @@ arrival. ⚠️ **A handler whose required input only an ENGINE dispatcher can s
 is absent** (#1185) — the physics demos' zone reactions need `params.self`, an Entity that the collision or zone
 dispatch passes and an agent's JSON params never can, so every agent dispatch of them used to tint
 nothing, journal a crossing that never happened, and answer `dispatched:true`.
+
+**An agent dispatch refuses when no control carrying the action is on screen** (#1406, owner ruling).
+A player can reach a control-bound action only through its control, and a hidden control is
+unmounted, so a handler written to be reached through its button used to run with that button
+hidden: a panel's Confirm with no confirmation up, a result screen's Next on an unsolved board. The
+`dispatch-action` op now asks `actionControlOnScreen` (`runtime/ui/actionCarriers.ts`) first and
+answers `ok:false, gate:'no-control-on-screen'`, with `carriers` naming the controls it found hidden.
+- **A carrier** is a `UIElement` whose `UIAction` has a `call` row naming the action, on any
+  event. It counts when it is not `pointerThrough`, and it is shown **now** (itself and every
+  ancestor `isVisible !== false`, not in a deactivated subtree) **or at the last UI sync** (the
+  projected tree the renderer drew).
+- **Both readings are load-bearing.** "Now" lets an agent open a panel and press in it in one turn.
+  "Last sync" covers a Confirm whose own `set` rows close its dialog BEFORE its `call` row runs, so
+  the panel the player pressed is already hidden when the check runs.
+- **Only the op asks.** `dispatchUIAction` is unchanged: a real press (`applyBindings`) has a
+  mounted control by construction, and the debug menu's Cheats tab and `createTestWorld` have no
+  screen to ask about.
+- ⚠️ **An action no control carries must be registered `noControl: true`**, or every agent dispatch
+  of it is refused. That covers an action fired by a timeline signal, an `OnSequence`, a zone or
+  collision trait, or code. Every engine built-in is registered through `registerEngineAction`,
+  which sets it: those are general verbs an agent aims with a `targetGuid` (`modoki_play_clip`
+  dispatches `engine.playClip`), not a game intent tied to one button. The refusal names the flag.
+- **Not seen:** a `UIBinding.visibleBinding` hide, which `UINode` evaluates at render time from
+  the store. A control hidden only that way still counts, so the dispatch runs, as before. And
+  `EntityAttributes.isActive` is read through `deactivatedEntities`, which the transform pass
+  refreshes once a frame: a subtree re-activated and dispatched into in the same turn (one
+  `modoki_eval`) is refused until a frame runs.
+- **Not seen either: a control that is drawn but COVERED by a modal** (#1418). Only a game's own
+  check can refuse that today.
+- A game may keep a stricter check of its own on top. Court's `CONTROL_SHOWN` refuses a control
+  that is drawn but covered by a full-screen overlay (#1405).
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
 sim is stopped, so editor Stopped/Paused states never mutate the scene.)
 
