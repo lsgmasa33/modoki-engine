@@ -887,7 +887,7 @@ fixed a real gap: the added-child writer claimed to mirror serialize.ts but neve
   (`SkinnedMeshRenderer`, `AnimationLibrary`, `MaterialInstance`, `Input`, `UIAction`) have no static
   key order, and game-registered traits are invisible to `registerAllTraits()`. `added[]` subtrees
   are left out because older ones were written uncompacted.
-- **No ledger.** Measured 2026-09-18, the whole population was 8 hand-authored ad-UI objects out
+- **No ledger.** Measured 2026-09-18, the whole population was 8 hand-authored UI objects out
   of order (Court's No Ads UI, #1410; wordweave's ad-break UI; the #1398 Player ID row) plus 2
   default-valued scalars. They were canonicalized in the same change: keys reordered and the two
   defaults dropped, values unchanged, the `version` line untouched. A per-object
