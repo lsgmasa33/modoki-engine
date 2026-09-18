@@ -3,10 +3,11 @@
  * GUID/path refs through the shared asset manifest. Mirrors animSetCache: the
  * first access kicks off an async fetch and returns null until it resolves; while
  * a load is PENDING the per-frame sprite driver (`spriteAnimationSystem`) simply
- * retries next frame. Note a FAILED fetch is remembered in `failed` and is NOT
- * retried at runtime (only invalidate/clear resets it) — same accepted trade-off
- * as animSetCache/animationClipCache. Sprite-anim sets are plain DATA (named clips
- * of sprite-slice GUIDs + timing) — nothing to GPU-dispose.
+ * retries next frame. A FAILED fetch is remembered in `failed` (a `loadFailureMemo`):
+ * a missing or unreadable file stays failed until invalidate/clear, and a network
+ * failure is retried with backoff (#1371) — same as every sibling def cache.
+ * Sprite-anim sets are plain DATA (named clips of sprite-slice GUIDs + timing) —
+ * nothing to GPU-dispose.
  *
  * A `.spriteanim.json` holds a NAMED SET of sprite clips: `{ id, clips: { <name>:
  * { frames: sprite-GUID[], fps, mode, cycles } } }`. The `SpriteAnimator` trait
@@ -24,6 +25,7 @@ import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { defaultSpriteClip, type SpriteClip } from '../traits/SpriteAnimator';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
+import { createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
 import { createTeardownToken } from '../core/liveness';
 
 /** The subset of a SpriteAnimator instance the resolvers below read. */
@@ -40,7 +42,7 @@ export interface SpriteAnimDef {
 
 const cache = new Map<string, SpriteAnimDef>();
 const loading = new Map<string, Promise<void>>();
-const failed = new Set<string>();
+const failed = createLoadFailureMemo({ label: 'spriteAnimCache', unknownIs: 'permanent' });
 /** Teardown liveness, captured per PATH before each load and re-checked after.
  *
  *  `invalidateAll()` is `clearSpriteAnimCache`'s (the whole cache is gone). A per-key
@@ -101,7 +103,7 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
-  if (failed.has(path)) return null;
+  if (failed.blocked(path)) return null;
   // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
   // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
   // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
@@ -110,7 +112,7 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
       .then((r) => {
         return parseAssetJson(r, path);
       })
@@ -122,8 +124,7 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
         cache.set(path, normalizeSpriteAnim(json as Partial<SpriteAnimDef>));
       })
       .catch((e) => {
-        if (stillLive()) failed.add(path);
-        console.warn(`[spriteAnimCache] failed to load ${path}:`, e);
+        failed.record(path, e, stillLive());
       })
       .finally(() => loading.delete(path));
     loading.set(path, p);
@@ -173,7 +174,7 @@ export function setSpriteAnim(refOrPath: string, def: Partial<SpriteAnimDef>): v
   const path = spriteAnimCacheKey(refOrPath);
   if (!path) return;
   cache.set(path, normalizeSpriteAnim(def));
-  failed.delete(path);
+  failed.forget(path);
 }
 
 /** Drop a cached set so the next access re-fetches (e.g. after an external edit). */
@@ -187,7 +188,7 @@ export function invalidateSpriteAnim(refOrPath: string): void {
   // DIFFERENT set.
   liveness.invalidateKey(path);
   cache.delete(path);
-  failed.delete(path);
+  failed.forget(path);
   loading.delete(path);
 }
 

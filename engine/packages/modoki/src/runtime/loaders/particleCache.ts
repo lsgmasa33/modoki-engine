@@ -10,6 +10,7 @@ import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
+import { createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
 import { defaultParticleEffect, PARTICLE_FORMAT_VERSION, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
 import { particleDefProvider } from '../particles/particleDefProvider';
 import { resolveColliderShape } from '../particles/colliders';
@@ -19,7 +20,7 @@ import { classifyFormatVersion } from '../core/formatVersion';
 
 const cache = new Map<string, ParticleEffectDef>();
 const loading = new Map<string, Promise<void>>();
-const failed = new Set<string>();
+const failed = createLoadFailureMemo({ label: 'particleCache', unknownIs: 'permanent' });
 // Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
 const unknownGuidSeen = new Set<string>();
 
@@ -140,7 +141,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
-  if (failed.has(path)) return null;
+  if (failed.blocked(path)) return null;
   // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
   // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
   // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
@@ -149,7 +150,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path); // detects a cache clear or per-key invalidation during the async load
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
       .then((r) => {
         return parseAssetJson(r, path);
       })
@@ -178,7 +179,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
                 `this build's PARTICLE_FORMAT_VERSION (${PARTICLE_FORMAT_VERSION}) — not caching it.`
               : `[particleCache] refusing ${path}: version field is unreadable (${verdict.reason}) — not caching it.`,
           );
-          failed.add(path);
+          failed.markPermanent(path, `format refused: ${verdict.kind}`);
           return;
         }
         // Self-register guid → path (same pattern as meshTemplateCache) so a
@@ -189,8 +190,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
         storeEffect(path, json as Partial<ParticleEffectDef>);
       })
       .catch((e) => {
-        if (stillLive()) failed.add(path);
-        console.warn(`[particleCache] failed to load ${path}:`, e);
+        failed.record(path, e, stillLive());
       })
       .finally(() => loading.delete(path));
     loading.set(path, p);
@@ -225,7 +225,7 @@ export function setParticleEffect(refOrPath: string, def: ParticleEffectDef): vo
   const path = particleCacheKey(refOrPath);
   if (!path) return;
   storeEffect(path, def);
-  failed.delete(path);
+  failed.forget(path);
 }
 
 /** The ONE write into the cache, and it wakes the render loops — same rule as `rig2dCache`'s
@@ -249,7 +249,7 @@ export function invalidateParticleEffect(refOrPath: string): void {
   // DIFFERENT effect.
   liveness.invalidateKey(path);
   cache.delete(path);
-  failed.delete(path);
+  failed.forget(path);
   loading.delete(path);
 }
 

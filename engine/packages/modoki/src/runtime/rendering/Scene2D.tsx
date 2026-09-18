@@ -62,6 +62,7 @@ import { computePivotOffset, computeSpriteScale, drawPrimitiveShapeGfx, drawColl
 import { computeCanvasScale, canvasPxToClient } from './canvas2DScaler';
 import { getSpriteEpoch } from '../loaders/assetManifest';
 import { ensureSpriteMaterial, clearSpriteMaterialCache } from '../loaders/spriteMaterialCache';
+import { MaterialTexRetry } from '../loaders/materialTexRetry';
 import { makePixiShaderInstance, buildUniformValues, type PixiShaderProgram } from './pixiShaderBuilder';
 import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty, hasAny2DMaterialDirty } from './sprite2DMaterialBroker';
@@ -886,10 +887,10 @@ export class Scene2DRenderer {
   // Pooled per-frame set of entity ids drawn by the material pass — used to purge stale
   // entityShaders entries without a per-frame allocation.
   private readonly _materialIdsScratch = new Set<number>();
-  // Sprite-texture urls a material entity has kicked an async Assets.load for but that
-  // aren't resident yet — dedupes the load so the every-running-frame material pass
-  // doesn't re-issue it. Cleared per-url on settle (then markDirty wakes the rebuild).
-  private readonly _materialTexLoading = new Set<string>();
+  // Sprite-texture loads a material entity has kicked but that aren't resident yet — deduped so the
+  // every-running-frame material pass doesn't re-issue them, and a FAILED url backs off instead of
+  // refetching every dirty frame (#1374). Settle wakes the rebuild via markDirty.
+  private readonly _materialTex = new MaterialTexRetry(loadPixiTexture, () => this.markDirty());
   // Entity id → the packed entity (`entity.valueOf()`) that claimed it THIS pass. Cleared at the top
   // of the pass and consumed by the slot-disposal sweep at its end — and, between passes, by
   // `bounds2DProvider`, which refuses a slot whose owner is no longer alive: koota hands a destroyed
@@ -1467,15 +1468,7 @@ export class Scene2DRenderer {
       Assets.cache.remove(url);
       this.markDirty();
     }
-    if (!this._materialTexLoading.has(url)) {
-      this._materialTexLoading.add(url);
-      loadPixiTexture(url)
-        .then(() => { this._materialTexLoading.delete(url); this.markDirty(); })
-        .catch((e: unknown) => {
-          this._materialTexLoading.delete(url);
-          console.warn(`[Scene2D] Material sprite texture load failed: ${url}`, e);
-        });
-    }
+    this._materialTex.request(url);
     return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
   }
 
@@ -2901,7 +2894,7 @@ export class Scene2DRenderer {
       this.parentMaskOf.clear();
       this.warnedMaskIds.clear();
       this.entityShaders.clear();
-      this._materialTexLoading.clear();
+      this._materialTex.clear();
       // 2D-material programs are world-lifecycle — clear UNCONDITIONALLY (not renderer-count
       // gated like the texture net): every live per-entity Shader holds its OWN program
       // reference, so wiping the shared cache can't strand the other viewport's already-drawn
@@ -3001,7 +2994,7 @@ export class Scene2DRenderer {
     // ramp textures it holds leak their GPU memory (#455).
     this.flushPendingMaskDestroy();
     this.entityShaders.clear();
-    this._materialTexLoading.clear();
+    this._materialTex.clear();
     // Unconditional (see onWorldSwap): safe with a sibling renderer live because a clear that
     // superseded a compile fires the shared dirty wake (#1368), not because it's maps-only — this
     // call site NEEDS that wake, since below

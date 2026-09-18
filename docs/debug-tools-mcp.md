@@ -1784,7 +1784,9 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   (`match`/`score`/`win`) PLUS engine `@`-lifecycle events (`@spawn`/`@despawn`, `@anim-start`/
   `@anim-loop`/`@anim-finish`, `@contact`/`@sensor`, `@scene-loaded`/`@scene-swapped`, `@tier`
   — a quality-tier change carrying `prev`/`source`/`reason`, and `@ui.overflow` at level `warn` — a
-  UI element's text painting outside its box, [ui-system.md § Text overflow warning](ui-system.md#text-overflow-warning)), GUID-addressed.
+  UI element's text painting outside its box, [ui-system.md § Text overflow warning](ui-system.md#text-overflow-warning),
+  and `@asset-load-failed` at level `warn` — a lazily-loaded asset def or texture that failed, once
+  per failure streak in each world that reads it, [architecture.md § A load failure is classified before it is remembered](architecture.md#a-load-failure-is-classified-before-it-is-remembered-1371-1374)), GUID-addressed.
   `modoki_dispatch_action` fires a game intent by name (needs Play); `modoki_list_actions` discovers
   dispatchable actions + read-values. Assert on events, not screenshots. Returns the **last 100 events
   + `byType` counts over the whole 10,000-event ring** (a `@contact`-heavy physics session is ~582k

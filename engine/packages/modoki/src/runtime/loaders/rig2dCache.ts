@@ -2,9 +2,10 @@
  *  the shared asset manifest. Mirrors `spriteAnimCache`: the first access kicks off
  *  an async fetch and returns null until it resolves; while a load is PENDING the
  *  per-frame deform driver (`skin2DSystem`) simply retries next frame. A FAILED
- *  fetch is remembered in `failed` and NOT retried at runtime (only invalidate/clear
- *  resets it). A rig is plain DATA (mesh + bind-pose bones + weights) — nothing to
- *  GPU-dispose; the backing texture is owned by the sprite/scene-resource lifecycle.
+ *  fetch is remembered in `failed` (`loadFailureMemo`): a missing/unreadable rig until
+ *  invalidate/clear, a network failure only until its backoff expires (#1371).
+ *  A rig is plain DATA (mesh + bind-pose bones + weights) — nothing to GPU-dispose; the
+ *  backing texture is owned by the sprite/scene-resource lifecycle.
  *
  *  The rig TYPES + normalization moved to `skinning/rig2dTypes.ts` (P7 C13) — re-exported
  *  here for existing callers. This file keeps only the fetch/cache lifecycle. */
@@ -15,6 +16,7 @@ import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { normalizeRig2D, type Rig2DFile, type ParsedRig2D } from '../skinning/rig2dTypes';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
+import { createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
 import { createTeardownToken } from '../core/liveness';
 import { fireDirtyListeners } from '../core/renderDirty';
 
@@ -48,7 +50,7 @@ const cache = new Map<string, ParsedRig2D>();
  *  matters, the sanctioned shape is an injected flag, not the build-time global. */
 const sourceCache = new Map<string, Rig2DFile>();
 const loading = new Map<string, Promise<void>>();
-const failed = new Set<string>();
+const failed = createLoadFailureMemo({ label: 'rig2dCache', unknownIs: 'permanent' });
 /** Teardown liveness, captured per PATH before each load and re-checked after.
  *
  *  `invalidateAll()` is `clearRig2DCache`'s (the whole cache is gone). A per-key `invalidateRig2D`
@@ -75,7 +77,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
-  if (failed.has(path)) return null;
+  if (failed.blocked(path)) return null;
   // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
   // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
   // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
@@ -84,7 +86,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
       .then((r) => {
         return parseAssetJson(r, path);
       })
@@ -96,8 +98,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
         storeRig(path, json as Rig2DFile);
       })
       .catch((e) => {
-        if (stillLive()) failed.add(path);
-        console.warn(`[rig2dCache] failed to load ${path}:`, e);
+        failed.record(path, e, stillLive());
       })
       .finally(() => loading.delete(path));
     loading.set(path, p);
@@ -134,7 +135,7 @@ export function setRig2D(refOrPath: string, def: Rig2DFile): void {
   const path = rig2dCacheKey(refOrPath);
   if (!path) return;
   storeRig(path, def);
-  failed.delete(path);
+  failed.forget(path);
 }
 
 /** The ONE write into the cache, and it wakes the render loops (#1141).
@@ -164,7 +165,7 @@ export function invalidateRig2D(refOrPath: string): void {
   liveness.invalidateKey(path);
   cache.delete(path);
   sourceCache.delete(path);
-  failed.delete(path);
+  failed.forget(path);
   loading.delete(path);
 }
 

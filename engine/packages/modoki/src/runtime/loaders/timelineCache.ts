@@ -9,12 +9,13 @@ import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
+import { createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
 import { normalizeTimeline, type TimelineDef } from '../timeline/types';
 import { createTeardownToken } from '../core/liveness';
 
 const cache = new Map<string, TimelineDef>();
 const loading = new Map<string, Promise<void>>();
-const failed = new Set<string>();
+const failed = createLoadFailureMemo({ label: 'timelineCache', unknownIs: 'permanent' });
 /** Teardown liveness, captured per PATH before each load and re-checked after.
  *
  *  `invalidateAll()` is `clearTimelineCache`'s (the whole cache is gone). A per-key
@@ -41,7 +42,7 @@ export function getTimeline(ref: string, opts?: { load?: boolean }): TimelineDef
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
-  if (failed.has(path)) return null;
+  if (failed.blocked(path)) return null;
   // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
   // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
   // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
@@ -50,7 +51,7 @@ export function getTimeline(ref: string, opts?: { load?: boolean }): TimelineDef
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
       .then((r) => {
         return parseAssetJson(r, path);
       })
@@ -62,8 +63,7 @@ export function getTimeline(ref: string, opts?: { load?: boolean }): TimelineDef
         cache.set(path, normalizeTimeline(json as Partial<TimelineDef>));
       })
       .catch((e) => {
-        if (stillLive()) failed.add(path);
-        console.warn(`[timelineCache] failed to load ${path}:`, e);
+        failed.record(path, e, stillLive());
       })
       .finally(() => loading.delete(path));
     loading.set(path, p);
@@ -94,7 +94,7 @@ const LOAD_TIMELINE_NOW_MAX_ATTEMPTS = 3;
 async function loadTimelineNowAttempt(path: string, attempt: number): Promise<TimelineDef | null> {
   const stillLive = liveness.capture(path);
   try {
-    const r = await fetch(assetUrl(path), ASSET_FETCH_INIT);
+    const r = await fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
     // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
     const json = (await parseAssetJson(r, path)) as Partial<TimelineDef>;
     if (!stillLive()) {
@@ -112,8 +112,7 @@ async function loadTimelineNowAttempt(path: string, attempt: number): Promise<Ti
     cache.set(path, def);
     return def;
   } catch (e) {
-    if (stillLive()) failed.add(path);
-    console.warn(`[timelineCache] failed to load ${path}:`, e);
+    failed.record(path, e, stillLive());
     return null;
   }
 }
@@ -123,7 +122,7 @@ export function setTimeline(refOrPath: string, def: TimelineDef): void {
   const path = timelineCacheKey(refOrPath);
   if (!path) return;
   cache.set(path, normalizeTimeline(def));
-  failed.delete(path);
+  failed.forget(path);
 }
 
 /** Drop a cached timeline so the next access re-fetches (e.g. after an external edit). */
@@ -137,7 +136,7 @@ export function invalidateTimeline(refOrPath: string): void {
   // a DIFFERENT timeline.
   liveness.invalidateKey(path);
   cache.delete(path);
-  failed.delete(path);
+  failed.forget(path);
   loading.delete(path);
 }
 

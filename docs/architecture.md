@@ -642,6 +642,71 @@ time-based budget (retry while
 `now - firstFailureAt < N`, capped at K attempts) would actually cover a transient
 WASM-instantiate failure; a count-only budget against a frame-rate caller does not.
 
+### A load failure is classified before it is remembered (#1371, #1374)
+
+**A loader that remembers a failed fetch must first ask whether the same bytes would fail again.**
+The lazy def caches (`rig2dCache`, `spriteAnimCache`, `animSetCache`, `particleCache`,
+`animationClipCache`, `timelineCache`) each kept a `failed` set that remembered EVERY failure for
+the life of the process, so one dropped request on a phone disabled that asset until the app
+restarted. Weaveling's willow and susuki (`rig2dCache`) went still for the session, and the game's
+own journal still reported each ambient run as ending cleanly. Scene2D's material-sprite textures
+had the opposite bug: no failure memory, so a 404 refetched on every dirty frame. Both come from one
+missing distinction, and `runtime/loaders/loadFailureMemo.ts` is where it now lives:
+
+| Class | What | Memory |
+|---|---|---|
+| **permanent** | 404/410, the dev server's SPA fallback (`MissingAssetError.absent`), a parse error, a format refusal | Remembered until the cache's own `invalidate*`/`set*`/`clear*` calls `forget` — as before |
+| **transient** | no response (`AssetNetworkError`), any other non-ok status (5xx, 403, 429) | Exponential backoff: 1 s, doubling, **capped at 10 minutes, never given up** (owner ruling 2026-09-18) |
+| **unknown** | anything else | The memo's `unknownIs`: `permanent` in the JSON caches (their unknowns are normaliser throws, which the bytes reproduce), `transient` in Scene2D (Pixi reports a 404 and a dropped connection as the same opaque error) |
+
+Three decisions that are easy to undo by accident:
+
+- **The network error is marked at the fetch, not recognised afterwards.** `fetch` rejects with a
+  bare `TypeError`, and so does a bug in a normaliser. So every loader writes
+  `fetch(...).catch(rethrowAsNetworkError)`; that `.catch` sits directly on the fetch promise and
+  sees only the fetch's own rejection. Classifying `TypeError` as network would turn every code
+  bug into an endless retry. ⚠️ **The fetch is only half of the request.** A connection that drops
+  after the headers makes `res.text()` reject, not `fetch`, so `parseAssetJson` wraps the body
+  read in `AssetNetworkError` too. The first version missed this, and a mid-body drop was still
+  permanent. The close-out review found it. **An `AbortError` passes through unwrapped**, because
+  a caller's `signal` cancelling a body is not a failure. Every caller that passes a signal
+  filters on that name, and wrapping it made a superseded scene load toast "Failed to load".
+- **No attempt budget.** #541's bounded retry (three attempts) fits a failed `import()`, which the
+  browser's module map makes unretryable anyway. It is wrong for a `fetch`, which does reach the
+  network again. And because these getters are called every frame, an attempt budget is used up
+  within a few frames of the failure. The cap bounds the cost instead: a dead asset costs one
+  request per 10 minutes.
+- **Announced once per streak, and once per WORLD.** One `console.warn` marks the first failure.
+  The silent retries after it stay silent until the key loads or is forgotten. The
+  `@asset-load-failed` journal event (level `warn`, payload `{cache, key, transient, error}`) is
+  what lets a game, or `modoki_journal`/`device_journal`, see "nothing drew" at all. ⚠️ That event
+  must reach the world that is RUNNING. `SceneManager` acquires the next scene's assets (the def
+  preloads, `acquireMesh`) BEFORE it makes that world current, and each world keeps its own journal.
+  So a failure at scene load lands in the outgoing world's journal, and the swap throws that
+  journal away. `blocked()` therefore re-announces a remembered failure into any world that has not
+  heard it yet. It is the question every consumer asks every frame, in the world it is drawing.
+  Permanent refusals that the loader reports itself (format version, unknown material type) are
+  journalled through `markPermanent`.
+
+`meshTemplateCache` records every failure in its own memo, `netRetry`, which announces it and backs off
+a transient one. It keeps its `MESH_FAILED`/`MATERIAL_FAILED` sentinels, written for the permanent
+class only, which is what its resolvers read. A load that lands calls `forget` on the path, and so
+does the last scene releasing it. That keeps a mesh's failure memory scene-scoped like its entry:
+the next scene's acquire refetches, and a later outage starts at the base delay and is announced
+again. The sentinels answer before `netRetry.blocked()` is ever asked, so the resolvers call
+`netRetry.seen()` on a sentinel hit to get the same per-world re-announcement. ⚠️ A transient failure inside
+`acquireMesh` returns before it records the mesh's transitive deps. When the render-path resolver's
+retry later loads the model, those templates have no owning scene: this is the F6 unowned-load case
+`acquireMesh` already documents. Before #1371 it could not be reached from here, because the failure
+was permanent. So "never renders" became "renders, possibly resident until that model is acquired
+again". `spriteMaterialCache` is
+deliberately untouched: its failures are shader compiles, which are all deterministic. Scene2D's
+state lives in `loaders/materialTexRetry.ts` (`MaterialTexRetry`), so its decisions can be tested
+without a Pixi app. It has no invalidation hook because it does not need one: a re-import moves the
+resolved url (`withCacheBust`). A per-load generation number stops a load that a teardown
+superseded from releasing the newer load that replaced it. What it does have is its own timer wake when a backoff expires, because an idle
+scene has nothing else to mark it dirty.
+
 ## Single source of truth — where a value lives is decided by what KIND of value it is
 
 A core Modoki philosophy: never hardcode game data in TS that duplicates the scene/prefab/config;

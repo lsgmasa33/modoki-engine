@@ -64,6 +64,19 @@ export class MissingAssetError extends Error {
   }
 }
 
+/** The request itself failed — no response at all (offline, DNS, connection reset, CORS), or the
+ *  connection dropped while the BODY was being read. `fetch`/`res.text()` report both as a bare
+ *  `TypeError` (Safari: "Load failed"), which is also what a bug in a parse step throws, so the
+ *  fetch sites mark them at the source instead of guessing from the class afterwards: the fetch's
+ *  own rejection via `fetch(...).catch(rethrowAsNetworkError)` (`loadFailureMemo.ts`), the body
+ *  read inside {@link parseAssetJson}. Classified TRANSIENT by `loadFailureMemo` (#1371). */
+export class AssetNetworkError extends Error {
+  constructor(cause: unknown) {
+    super(`network error: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = 'AssetNetworkError';
+  }
+}
+
 /** True when `e` is `parseAssetJson`'s did-not-come-back case (SPA fallback or ANY non-ok
  *  response) — never true for a real JSON parse failure or an unrelated error.
  *
@@ -113,7 +126,16 @@ export async function parseAssetJson(res: Response, path: string): Promise<unkno
       absent: res.status === 404 || res.status === 410,
     });
   }
-  const text = await res.text();
+  // A connection that drops AFTER the headers rejects HERE, not at `fetch` — the review of #1371
+  // found this path still classed a mid-body network drop as a permanent parse failure.
+  // ⚠️ Except a CANCELLATION: a caller's `signal` aborting a body still streaming rejects here with
+  // `AbortError`, and every caller that passes a signal filters on that name (a superseded scene
+  // load returns 'superseded' instead of toasting "Failed to load"). Wrapping it turned a cancel into
+  // a failure — found by #1371's close-out §2d review.
+  const text = await res.text().catch((e: unknown) => {
+    if ((e as { name?: unknown } | null)?.name === 'AbortError') throw e; // a DOMException is not always instanceof Error
+    throw new AssetNetworkError(e);
+  });
   if (isHtmlFallthrough(text)) {
     throw new MissingAssetError(
       `no asset at ${path} — the dev server answered with index.html (its SPA fallback), which `

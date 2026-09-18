@@ -40,9 +40,10 @@ export function loadPixiTexture(url: string): Promise<Texture> {
   // emitter off this promise and woke nothing, so on a stopped Scene2D a texture slower than the
   // idle grace left the emitter hidden until an unrelated edit. Scene2D's own sites also wake
   // themselves; this covers every consumer that does not.
-  // ⚠️ SUCCESS only. A reject stays silent here because Scene2D's material-sprite path retries a
-  // failed url on every dirty frame (#1374) — a reject wake would make a 404 a self-sustaining
-  // render loop. A consumer that reveals something on failure wakes for itself.
+  // ⚠️ SUCCESS only. A reject stays silent here: a consumer that retries a failed url decides WHEN
+  // itself — Scene2D's material-sprite path backs off and schedules its own wake (#1374) — and a
+  // reject wake here would retry a 404 at frame rate. A consumer that reveals something on failure
+  // wakes for itself.
   if (!miss || wakePending.has(url)) return load;
   wakePending.add(url);
   return load.then(

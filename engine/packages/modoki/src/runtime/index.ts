@@ -310,6 +310,10 @@ export {
   type SceneId,
 } from './loaders/meshTemplateCache';
 export {
+  requestPrefab, MAX_PREFAB_FETCH_ATTEMPTS,
+  type PrefabDocLike, type RequestPrefabOptions,
+} from './loaders/prefabRequest';
+export {
   acquireRiggedModel, releaseRiggedModelsForScene, ensureRiggedModelLoaded,
   ensureRiggedModelLoadedFor,
   getRiggedModel, getClipNames, getBoneNames, disposeAllRiggedModels, type RiggedModel,

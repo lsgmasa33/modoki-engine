@@ -929,8 +929,9 @@ longer runs at invalidation time — in production that is a few frames, and fre
 be the same use-after-free one level down.
 
 **The sweep backs off when a retiree is legitimately PINNED.** A retiree can be held forever and
-correctly so: if the refetch after an invalidation fails, `fetchMaterial` caches
-`MATERIAL_FAILED`, `resolveMaterial` returns undefined for that path permanently, and
+correctly so: if the refetch after an invalidation fails PERMANENTLY (a 404 or an unreadable file — a network
+failure only backs off, #1371), `fetchMaterial` caches `MATERIAL_FAILED`, `resolveMaterial`
+returns undefined for that path permanently, and
 `syncMaterial` can never rebind — so the mesh keeps drawing the retiree. Without a backoff
 `retired.size` never returns to 0 and every surface pays a full `scene.traverse()` on every frame
 for the rest of the session. ⚠️ The grace before backing off is **3 fruitless sweeps, not 1**, and

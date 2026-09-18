@@ -12,6 +12,7 @@ import { registerBuiltinMaterialTypes } from './materialPresets';
 import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, getAssetEntry, getGuidForPath } from './assetManifest';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
+import { classifyLoadFailure, createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { classifyFormatVersion } from '../core/formatVersion';
 import { MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION } from '../traits/Renderable3D';
@@ -852,6 +853,13 @@ type MeshAsset = { model: string; mesh: string; postprocessor: string; material?
  *  so repeated `resolveMeshTemplate` calls short-circuit instead of re-fetching
  *  the same 404 forever. Mirrors MATERIAL_FAILED in fetchMaterial. */
 const MESH_FAILED: unique symbol = Symbol('MESH_FAILED');
+/** This file's failure memory beside the sentinels (#1371). Every failed fetch is RECORDED here, so
+ *  it is announced once on the console and in the journal (`@asset-load-failed`). A permanent one
+ *  (missing, unreadable, refused) also takes `MESH_FAILED`/`MATERIAL_FAILED`, which the resolvers
+ *  read. A transient one (no response, a non-404 status) takes no sentinel, and
+ *  `fetchMeshAsset`/`fetchMaterial` refuse to refetch it until its backoff expires. A landed load
+ *  forgets the key. `.mesh.json`/`.mat.json` paths cannot collide, so one memo serves both caches. */
+const netRetry = createLoadFailureMemo({ label: 'MeshCache', unknownIs: 'permanent' });
 
 /** Mesh asset file cache (path → parsed MeshAsset or MESH_FAILED) */
 const meshAssetCache = new Map<string, MeshAsset | typeof MESH_FAILED>();
@@ -901,6 +909,7 @@ const meshAssetLoadPromises = new Map<string, Promise<void>>();
  *  Takes the asset PATH — the watcher's `urlPath`, the same form every key in this cache is. */
 export function invalidateMeshAsset(meshPath: string): void {
   cacheToken.invalidateKey(meshPath);
+  netRetry.forget(meshPath);
   meshAssetLoadPromises.delete(meshPath);
   const stale = meshAssetCache.get(meshPath);
   if (!stale || stale === MESH_FAILED) {
@@ -935,7 +944,13 @@ export function resolveMeshTemplate(meshRef: string): MeshTemplate | undefined {
 
   // Check if we already resolved this mesh asset
   const cached = meshAssetCache.get(meshRef);
-  if (cached === MESH_FAILED) return undefined; // permanently failed — stop re-fetching
+  if (cached === MESH_FAILED) {
+    // The sentinel short-circuits before `fetchMeshAsset` ever asks `netRetry.blocked`, so tell the
+    // memo a consumer in THIS world asked — or a failure recorded during a scene load stays in the
+    // outgoing world's journal (#1371 close-out §2d).
+    netRetry.seen(meshRef);
+    return undefined; // permanently failed — stop re-fetching
+  }
   if (cached) {
     // cached.model may be a guid; resolve transitively
     const modelPath = refToPath(cached.model);
@@ -1043,6 +1058,7 @@ export function resolveMeshLodInfo(
 function fetchMeshAsset(meshPath: string, revalidate?: { stale: MeshAsset }): Promise<void> {
   if (!revalidate && meshAssetCache.has(meshPath)) return Promise.resolve();
   if (!revalidate && meshAssetLoadPromises.has(meshPath)) return meshAssetLoadPromises.get(meshPath)!;
+  if (!revalidate && netRetry.blocked(meshPath)) return Promise.resolve();
 
   // Same per-key liveness as its sibling fetchers (#863 close-out). This cache had none at all,
   // and it IS invalidated per-key: `invalidateModel` drops every meshAssetCache entry whose
@@ -1055,13 +1071,11 @@ function fetchMeshAsset(meshPath: string, revalidate?: { stale: MeshAsset }): Pr
 
   const promise = (async () => {
     try {
-      const res = await fetch(assetUrl(meshPath), ASSET_FETCH_INIT);
+      const res = await fetch(assetUrl(meshPath), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
       if (!stillLive()) return;
-      if (!res.ok) {
-        if (revalidate) { console.warn(`[MeshCache] kept the previous ${meshPath}: re-read failed (${res.status})`); return; }
-        meshAssetCache.set(meshPath, MESH_FAILED); // cache failure — don't retry
-        return;
-      }
+      if (!res.ok && revalidate) { console.warn(`[MeshCache] kept the previous ${meshPath}: re-read failed (${res.status})`); return; }
+      // Any other non-ok status throws `MissingAssetError` from `parseAssetJson` below, and the
+      // catch splits it: 404/410 → permanent `MESH_FAILED`, anything else → back off (#1371).
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
       const asset = await parseAssetJson(res, meshPath) as { id?: string } & MeshAsset;
       // Format-version REFUSAL (docs/format-versioning.md § 2b-bis, #784 phase C2b item 6):
@@ -1078,10 +1092,13 @@ function fetchMeshAsset(meshPath: string, revalidate?: { stale: MeshAsset }): Pr
         );
         if (!stillLive() || revalidate) return;
         meshAssetCache.set(meshPath, MESH_FAILED);
+        netRetry.markPermanent(meshPath, `format refused: ${verdict.kind}`);
         return;
       }
       if (!stillLive()) return;
-      if (!revalidate) meshAssetCache.set(meshPath, asset);
+      // A load that lands ends any failure streak, so a later outage starts at the base delay and is
+      // announced again (#1371 review: `netRetry` was forgotten only by invalidate/dispose).
+      if (!revalidate) { meshAssetCache.set(meshPath, asset); netRetry.forget(meshPath); }
       // Self-register so future ref-by-guid resolves to this path
       if (asset.id) registerAsset(asset.id, meshPath, 'mesh');
 
@@ -1130,8 +1147,14 @@ function fetchMeshAsset(meshPath: string, revalidate?: { stale: MeshAsset }): Pr
       // parsed, so a `.mesh.json` landing after that parse redrew nothing on an idle surface.
       if (stillLive()) fireDirtyListeners();
     } catch (e) {
-      console.warn(`[MeshCache] Failed to load mesh asset ${meshPath}:`, e);
-      if (!revalidate) meshAssetCache.set(meshPath, MESH_FAILED);
+      if (revalidate) {
+        console.warn(`[MeshCache] kept the previous ${meshPath}: re-read failed:`, e);
+      } else {
+        // The memo announces it (console + journal) and backs a transient one off; a permanent one
+        // also takes the sentinel every resolver here reads.
+        netRetry.record(meshPath, e, stillLive());
+        if (classifyLoadFailure(e) !== 'transient' && stillLive()) meshAssetCache.set(meshPath, MESH_FAILED);
+      }
     } finally {
       meshAssetLoadPromises.delete(meshPath);
     }
@@ -1267,6 +1290,7 @@ export function invalidateMaterial(matPath: string) {
   if (mat && mat !== MATERIAL_FAILED) { retiredMaterials.add(mat); retiredMaterialPaths.set(mat, matPath); }
   materialCache.delete(matPath);
   materialLoadPromises.delete(matPath);
+  netRetry.forget(matPath);
   // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
   // re-caches the stale material on top of whatever refetch follows.
   cacheToken.invalidateKey(matPath);
@@ -1371,7 +1395,7 @@ export function resolveMaterial(materialRef: string): THREE.Material | undefined
   const matPath = refToPath(materialRef);
   if (!matPath || !matPath.endsWith('.mat.json')) return undefined;
   const cached = materialCache.get(matPath);
-  if (cached === MATERIAL_FAILED) return undefined; // permanently failed
+  if (cached === MATERIAL_FAILED) { netRetry.seen(matPath); return undefined; } // permanently failed (see resolveMeshTemplate)
   if (cached) return cached as THREE.Material;
   if (!materialLoadPromises.has(matPath)) fetchMaterial(matPath);
   return undefined;
@@ -1382,21 +1406,16 @@ export function resolveMaterial(materialRef: string): THREE.Material | undefined
 function fetchMaterial(matPath: string): Promise<void> {
   if (materialCache.has(matPath)) return Promise.resolve();
   if (materialLoadPromises.has(matPath)) return materialLoadPromises.get(matPath)!;
+  if (netRetry.blocked(matPath)) return Promise.resolve();
 
   const stillLive = cacheToken.capture(matPath); // per-key: detects disposal OR a per-path invalidate during async load
 
   const promise = (async () => {
     try {
-      const res = await fetch(assetUrl(matPath), ASSET_FETCH_INIT);
-      if (!res.ok) {
-        // Liveness-guarded like every other write in this function (#863 residual, found by
-        // #864's close-out): MATERIAL_FAILED is a PERMANENT sentinel — `resolveMaterial` returns
-        // undefined for it forever — so a stale continuation stamping it over a material that was
-        // re-imported and refetched successfully kills that material for the session.
-        if (!stillLive()) return;
-        materialCache.set(matPath, MATERIAL_FAILED); // cache failure — don't retry
-        return;
-      }
+      const res = await fetch(assetUrl(matPath), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
+      // A non-ok status throws `MissingAssetError` from `parseAssetJson` below and lands in the
+      // catch, which splits 404/410 (permanent `MATERIAL_FAILED`) from every other status
+      // (back off and retry, #1371). This branch used to stamp the permanent sentinel for a 503.
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches the untyped `res.json()` this replaces
       const data = await parseAssetJson(res, matPath) as any;
@@ -1413,8 +1432,9 @@ function fetchMaterial(matPath: string): Promise<void> {
               `this build's MATERIAL_FORMAT_VERSION (${MATERIAL_FORMAT_VERSION}) — not building it.`
             : `[MeshCache] refusing ${matPath}: version field is unreadable (${verdict.reason}) — not building it.`,
         );
-        if (!stillLive()) return; // see the MATERIAL_FAILED note above (#863 residual)
+        if (!stillLive()) return; // liveness-guarded: MATERIAL_FAILED is permanent (#863 residual; note in the catch below)
         materialCache.set(matPath, MATERIAL_FAILED);
+        netRetry.markPermanent(matPath, `format refused: ${verdict.kind}`);
         return;
       }
       // Self-register so future ref-by-guid resolves to this path
@@ -1457,8 +1477,9 @@ function fetchMaterial(matPath: string): Promise<void> {
       const builder = getMaterialBuilder(type);
       if (!builder) {
         console.warn(`[MeshCache] Unknown material type "${type}" in ${matPath}. Falling back to a pink material.`);
-        if (!stillLive()) return; // see the MATERIAL_FAILED note above (#863 residual)
+        if (!stillLive()) return; // liveness-guarded: MATERIAL_FAILED is permanent (#863 residual; note in the catch below)
         materialCache.set(matPath, MATERIAL_FAILED);
+        netRetry.markPermanent(matPath, `unknown material type "${type}"`);
         return;
       }
       const mat = await builder.build(data);
@@ -1567,6 +1588,7 @@ function fetchMaterial(matPath: string): Promise<void> {
         retiredMaterialPaths.set(prevMat, matPath);
       }
       materialCache.set(matPath, mat);
+      netRetry.forget(matPath); // a landed load ends the failure streak (see fetchMeshAsset)
       // Wake the render loop so syncMaterial re-binds this freshly-built instance.
       // Critical for a LIVE material edit: invalidateMaterial() drops the old
       // instance and this refetch is async (fetch + KTX2 texture transcode). The
@@ -1578,11 +1600,15 @@ function fetchMaterial(matPath: string): Promise<void> {
       // (Harmless during initial scene load — the frame loop is already drawing.)
       fireDirtyListeners();
     } catch (e) {
-      console.warn(`[MeshCache] Failed to load material ${matPath}:`, e);
-      // The FOURTH post-await MATERIAL_FAILED write, and the most reachable of them in dev:
-      // `parseAssetJson` THROWS (MissingAssetError on the dev-server SPA fallback, a plain Error
-      // on a bad parse), so a missing or half-written .mat.json lands HERE, not in the `!res.ok`
-      // branch above. Same guard as its three siblings and for the same reason — the sentinel is
+      // A network failure or a non-404 status is not the file's fault — back off and retry
+      // instead of stamping the permanent sentinel below (#1371).
+      // The memo announces every class (console + journal); only a permanent one takes the sentinel.
+      netRetry.record(matPath, e, stillLive());
+      if (classifyLoadFailure(e) === 'transient') return;
+      // The most reachable post-await MATERIAL_FAILED write: `parseAssetJson` THROWS
+      // (MissingAssetError on a 404 or the dev-server SPA fallback, a plain Error on a bad parse),
+      // so a missing or half-written .mat.json lands HERE. Liveness-guarded like its siblings
+      // above (#863 residual, found by #864's close-out) and for the same reason — the sentinel is
       // PERMANENT and `fetchMaterial` short-circuits on `materialCache.has`, so a stale
       // continuation stamping it over a successfully refetched material kills that material for
       // the session with nothing to retry it.
@@ -1652,6 +1678,7 @@ export function disposeAllCachedResources() {
   hierarchyCache.clear();
   meshAssetCache.clear();
   meshAssetLoadPromises.clear();
+  netRetry.clear();
 
   // Dispose .mat.json materials (may overlap with template materials — dedupe)
   for (const [, mat] of materialCache) {
@@ -1904,7 +1931,7 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
   // release lands inside THAT await rather than this one — is fixed at its own
   // post-await guard below (#552).
   if (!meshAssetOwners.get(meshPath)?.has(sceneId)) {
-    if (!meshAssetOwners.get(meshPath)?.size) meshAssetCache.delete(meshPath);
+    if (!meshAssetOwners.get(meshPath)?.size) { meshAssetCache.delete(meshPath); netRetry.forget(meshPath); }
     return;
   }
 
@@ -1984,6 +2011,9 @@ function releaseMeshByPath(sceneId: SceneId, meshPath: string): void {
   const wasLast = removeOwner(meshAssetOwners, meshPath, sceneId);
   if (wasLast) {
     meshAssetCache.delete(meshPath);
+    // A mesh's failure memory is SCENE-scoped like its entry: the next scene's acquire refetches a
+    // path the last one could not load, exactly as it did before `netRetry` held permanent entries.
+    netRetry.forget(meshPath);
   }
 
   // Release transitive dependencies — these are stored as guids on disk so

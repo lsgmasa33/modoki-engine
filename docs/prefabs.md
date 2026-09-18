@@ -380,7 +380,7 @@ failure.
 prefab is uncached, so after an Apply-to-Prefab the flags already planted keep the real art while
 every new one draws a placeholder, and the board stays mixed until a scene load. Fixed there by
 recording the art each instance was spawned with, retiring on a mismatch, and asking for the
-prefab back once on a miss (`syncFlags`, `games/court/runtime/systems.ts`).
+prefab back through `requestPrefab` on a miss (`syncFlags`, `games/court/runtime/systems.ts`).
 
 **Measured on Court's tray badge, 2026-08-19** — the wholesale version of the same failure. With
 the prefab cached, a board build gives the authored instance (`Coin` ×6, `CountBadge`, `CountBanner`,
@@ -393,49 +393,50 @@ same cache and both fall back.
 **If you spawn prefab instances at runtime, handle the miss on purpose.** Two things, and the
 first alone is not enough:
 
-1. **Re-acquire on a cache miss** — `void acquirePrefab(<your owner sentinel>, guid)`, guarded so
-   it fires once per guid rather than every frame.
-   ⚠️ **Re-arm that guard on the fetch POPULATING the cache — never in a `.catch`.** Measured
-   2026-08-19: `acquirePrefab` on an unresolvable guid **RESOLVES**, with the cache still empty —
-   `fetchPrefab` swallows `!res.ok` and parse errors and never rejects. So a `.catch(() => rearm)`
-   is dead code, and a guard that is never re-armed heals only the FIRST invalidation: a second
-   Apply-to-Prefab in the same session stays broken. Re-arming unconditionally is the opposite
-   trap, refetching a genuinely-missing prefab every frame forever. `.finally(() => { if
-   (getCachedPrefab(ref)) rearm; })` escapes both of those — and walks into a third, below.
-   **Do not copy it without reading on.**
-   ⚠️ **`.finally(() => { if (getCachedPrefab(ref)) rearm; })` does NOT "do neither" — it latches a
-   TRANSIENT failure permanently, and every site above is written this way.** The settle carries no
-   information about *why* the cache is empty: `fetchPrefab` swallows a 5xx, an offline blip and a
-   deleted guid identically. So "re-arm only on success" reads every transient failure as a deletion
-   and disables that prefab for the rest of the session — surviving a Play/Stop, since module state
-   outlives the world. Measured on `games/wordweave` (#1359): one failed fetch at boot killed the
-   celebration permanently, which is *worse* than the unconditional re-arm it replaced, because that
-   at least healed on the next trigger. **A bounded attempt budget, reset when the world changes, is
-   the shape that genuinely does neither** — `games/wordweave/runtime/celebrationFx.ts` carries the
-   worked version, with the in-flight dedup kept as a separate set from the give-up latch, since one
-   set doing both jobs is what produced both failure modes in turn.
-   ⚠️ **Re-arm on the SAME predicate your lookup uses — `getCachedPrefab` alone is not it if your
-   miss test is stricter.** A caller that treats an entity-less document as a miss (`games/wordweave`
-   does: a prefab with no entities spawns nothing) and re-arms on bare truthiness accepts that empty
-   document, releases the guard and refetches forever — the same defect one step removed, and it
-   survives the obvious test because the cache genuinely did fill. Factor the test into one function
-   and call it from both places, so the two cannot drift (#1359).
+1. **Re-acquire on a cache miss — call `requestPrefab(<your owner sentinel>, guid, { world })`**
+   (`@modoki/engine/runtime`, #1376) wherever you would have read `getCachedPrefab`. It returns the
+   cached document or null, and on a miss it asks for the prefab back. Call it every time you need
+   the prefab (every frame is fine). **Do not hand-write this latch.** Seven spawners across four
+   projects did, from an earlier version of this section, and every copy was wrong in at least one
+   of the three ways below. The helper exists so the next spawner cannot repeat them:
+   - **In-flight dedup, released on EVERY settle.** Without it a per-frame caller refetches every
+     frame (#1373).
+   - **A bounded give-up budget, per world, refunded on a hit.** Measured 2026-08-19:
+     `acquirePrefab` on an unresolvable guid **RESOLVES**, with the cache still empty.
+     `fetchPrefab` swallows `!res.ok` and parse errors and never rejects, so a 404, a 5xx and an
+     offline blip look identical. Re-arming only on success (`.finally(() => { if
+     (getCachedPrefab(ref)) rearm; })`, the shape this section used to prescribe) reads every
+     transient failure as a deletion and disables the prefab for the session (#1359). Re-arming
+     unconditionally refetches a deleted guid forever. A `.catch` re-arm (or a `.catch` warning,
+     #1375) is dead code. Three attempts per world, then it stops. ⚠️ **"Per world" is an EDITOR
+     safety net:** a built game never swaps its world, so there the give-up lasts the session.
+     That is accepted because this is a recovery path. The scene load already acquired the prefab.
+     It is a real change for `games/court`, whose hand-written guards were cleared on every board
+     build. That gave a missing prefab one more try per level, forever. A per-frame caller (the
+     flag layer, the win confetti, the debug-menu preview) now spends its three tries in about
+     three fetch round-trips and stops until the next Play. A preview of a prefab that gave up
+     stays parked, and the tap looks dead until then.
+   - **The hit test and the re-arm test are ONE predicate.** The default is "has at least one
+     entity", since an entity-less document spawns nothing. A caller whose miss test is stricter
+     passes it as `isHit`: Court's tray badge passes its layout parse, because a cached document
+     that does not parse is as useless there as a missing one. A re-arm on bare truthiness accepts
+     such a document, releases the guard and refetches forever (#1359). A caller that reports an
+     unspawnable document separately passes `isHit: () => true` (forest-camp's
+     `arrow-spawn-failed`).
    ⚠️ **The re-acquire is async, so the action that found the miss still fails — record it.** The
    shot, spawn or build that hit the empty cache cannot wait for the fetch, and dropping it silently
    makes it read as a dead control. `demos/forest-camp` journals `archery.shot-refused` with
    `reason: 'arrow-prefab-not-cached'` for exactly this window (#996).
-   ⚠️ **Record it at the level the SYMPTOM justifies, and prefer the give-up to the miss.** A miss
-   is also what a healthy cold cache looks like one frame before it fills, so a `warn` on every miss
-   produces a line that reads identically for "this prefab was deleted" and "an editor Apply evicted
-   it and it is already on its way back" — the one question the reader came to answer. Where the
-   action is a *player* action being refused, record it as forest-camp does, because the player
-   really did lose something. Where it is decoration, the informative moment is the fetch giving up:
-   `games/wordweave` journals `wordweave/fx-prefab-unavailable` when the budget is spent and stays
-   silent through the cold-cache window (#1359).
-   ⚠️ Whether you are exposed depends on **what else clears your guard**: `games/court` clears its
-   on every board build, so it was safe either way; `games/sling` clears its only on unregister,
-   `games/wordweave` only on unregister (`resetFx`), and `demos/forest-camp` only on world swap —
-   and an Apply-to-Prefab is none of them.
+   ⚠️ **The miss itself is not the useful signal; the give-up is.** A miss is also what a healthy
+   cold cache looks like one frame before it fills. So `requestPrefab` stays silent through the
+   miss and journals **`prefab/unavailable`** (`warn`, payload `{prefab, owner, attempts}`) once,
+   when the budget is spent and the prefab still has not arrived. That is also the only way a
+   failed PRELOAD is ever seen, because `acquirePrefab` never rejects. Where the refused action is
+   a *player* action, record it anyway, as forest-camp does, because the player really did lose
+   something.
+   **What stays on `acquirePrefab`:** a preload that AWAITS a batch (a scene load, sling's
+   bootstrap `Promise.all`) is not a latch. `engine/tests/architecture/prefabRequestSites.test.ts`
+   fails when a game or demo calls `acquirePrefab(` outside its short list of such sites.
 2. **Remember what each live instance was built FROM**, and retire instances whose source no
    longer matches. ⚠️ **Key that record on the prefab's REVISION, not only its guid**
    (`${guid}@${getPrefabRevision(guid)}`). An editor Apply replaces the entry in place, so the guid
@@ -451,8 +452,7 @@ guid)` adds that sentinel to the prefab's owner set, so the scene's own `release
 never evict it and the prefab outlives the game. Drop the holds wholesale when the game
 unregisters — `releaseAllForScene(<sentinel>)`, not `releasePrefab` per guid, because a per-guid
 release leaks anything the acquire pulled in transitively (`games/sling` records this at its own
-call site, and `games/court` had to add it after missing it). Two other games still spawn prefabs
-at runtime without the re-acquire half: #265.
+call site, and `games/court` had to add it after missing it).
 
 ## Mesh sharing
 

@@ -9,13 +9,14 @@ import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
+import { createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
 import { normalizeAnimationClip, type AnimationClipDef } from '../animation/types';
 import { createTeardownToken } from '../core/liveness';
 import { awaitLazyLoad } from './awaitLazyLoad';
 
 const cache = new Map<string, AnimationClipDef>();
 const loading = new Map<string, Promise<void>>();
-const failed = new Set<string>();
+const failed = createLoadFailureMemo({ label: 'animationClipCache', unknownIs: 'permanent' });
 /** Teardown liveness, captured per PATH before each load and re-checked after.
  *
  *  `invalidateAll()` is `clearAnimationClipCache`'s (the whole cache is gone). A per-key
@@ -47,7 +48,7 @@ export function getAnimationClip(ref: string, opts?: { load?: boolean }): Animat
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
-  if (failed.has(path)) return null;
+  if (failed.blocked(path)) return null;
   // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
   // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
   // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
@@ -56,7 +57,7 @@ export function getAnimationClip(ref: string, opts?: { load?: boolean }): Animat
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
       .then((r) => {
         return parseAssetJson(r, path);
       })
@@ -68,8 +69,7 @@ export function getAnimationClip(ref: string, opts?: { load?: boolean }): Animat
         cache.set(path, normalizeAnimationClip(json as Partial<AnimationClipDef>));
       })
       .catch((e) => {
-        if (stillLive()) failed.add(path);
-        console.warn(`[animationClipCache] failed to load ${path}:`, e);
+        failed.record(path, e, stillLive());
       })
       .finally(() => loading.delete(path));
     loading.set(path, p);
@@ -99,7 +99,7 @@ export function setAnimationClip(refOrPath: string, def: AnimationClipDef): void
   const path = clipCacheKey(refOrPath);
   if (!path) return;
   cache.set(path, normalizeAnimationClip(def));
-  failed.delete(path);
+  failed.forget(path);
 }
 
 /** Drop a cached clip so the next access re-fetches (e.g. after an external edit). */
@@ -113,7 +113,7 @@ export function invalidateAnimationClip(refOrPath: string): void {
   // DIFFERENT clip.
   liveness.invalidateKey(path);
   cache.delete(path);
-  failed.delete(path);
+  failed.forget(path);
   loading.delete(path);
 }
 

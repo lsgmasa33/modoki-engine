@@ -21,6 +21,7 @@ import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
+import { createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
 import { createTeardownToken } from '../core/liveness';
 
 /** Per-clip playback parameters within an animset. All optional — a missing
@@ -60,7 +61,7 @@ export const ANIMSET_DEFAULTS: ResolvedAnimParams = Object.freeze({
 
 const cache = new Map<string, AnimSetDef>();
 const loading = new Map<string, Promise<void>>();
-const failed = new Set<string>();
+const failed = createLoadFailureMemo({ label: 'animSetCache', unknownIs: 'permanent' });
 /** Teardown liveness, captured per PATH before each load and re-checked after.
  *
  *  `invalidateAll()` is `clearAnimSetCache`'s (the whole cache is gone). A per-key
@@ -93,16 +94,17 @@ export function getAnimSet(ref: string, opts?: { load?: boolean }): AnimSetDef |
   if (!path) return null;
   const hit = cache.get(path);
   if (hit) return hit;
-  if (failed.has(path)) return null;
+  if (failed.blocked(path)) return null;
   // `load:false` — PEEK the cache without starting a fetch. For callers whose contract is "what is
   // in the live cache right now" (the `read-asset-def` agent op): the default getter treats a miss
   // as "not loaded YET" and kicks off a background load, so asking about an absent asset queued a
-  // fetch that could only fail and permanently `failed.add`-poison the path (no watcher heals it on
-  // device) — for a question the caller had already decided to answer with a refusal.
+  // fetch that could only fail and permanently mark the path failed (a 404 is permanent in
+  // `loadFailureMemo`, and no watcher heals it on device) — for a question the caller had already
+  // decided to answer with a refusal.
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
       .then((r) => {
         return parseAssetJson(r, path);
       })
@@ -114,8 +116,7 @@ export function getAnimSet(ref: string, opts?: { load?: boolean }): AnimSetDef |
         cache.set(path, normalizeAnimSet(json as Partial<AnimSetDef>));
       })
       .catch((e) => {
-        if (stillLive()) failed.add(path);
-        console.warn(`[animSetCache] failed to load ${path}:`, e);
+        failed.record(path, e, stillLive());
       })
       .finally(() => loading.delete(path));
     loading.set(path, p);
@@ -162,7 +163,7 @@ export function setAnimSet(refOrPath: string, def: Partial<AnimSetDef>): void {
   const path = animSetCacheKey(refOrPath);
   if (!path) return;
   cache.set(path, normalizeAnimSet(def));
-  failed.delete(path);
+  failed.forget(path);
 }
 
 /** Drop a cached animset so the next access re-fetches (e.g. after an external edit). */
@@ -176,7 +177,7 @@ export function invalidateAnimSet(refOrPath: string): void {
   // a DIFFERENT animset.
   liveness.invalidateKey(path);
   cache.delete(path);
-  failed.delete(path);
+  failed.forget(path);
   loading.delete(path);
 }
 

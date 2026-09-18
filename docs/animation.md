@@ -299,7 +299,10 @@ at time 0 and an externally-set `time` (scrubbing) resolves correctly even while
 (`.spriteanim.json`) are all the same shape: first access kicks off a lazy `fetch`, returns
 null/undefined until it resolves (the per-frame driver simply retries next frame), resolves GUIDs
 through the asset manifest, and lets the editor seed/invalidate by path for live preview. A **failed**
-fetch is remembered and NOT retried at runtime — only `invalidate`/`clear` resets it. All three are
+fetch is remembered by class ([architecture.md § A load failure is classified before it is
+remembered](architecture.md#a-load-failure-is-classified-before-it-is-remembered-1371-1374)): a
+missing or unreadable file stays failed until `invalidate`/`clear`, while a network failure or a
+5xx is retried with backoff (1 s doubling to a 10-minute cap). All three are
 plain DATA (nothing to GPU-dispose); `clear*Cache` bumps a liveness token so an in-flight load is
 dropped. ⚠️ Nothing in production calls `clear*Cache` — only the test-only
 `disposeAllCachedResources` does — so these caches OUTLIVE a scene swap.
