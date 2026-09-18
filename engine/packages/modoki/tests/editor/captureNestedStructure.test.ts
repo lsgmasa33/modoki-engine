@@ -10,12 +10,14 @@ import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
 const EntityAttributes = trait({ name: '' as string, parentId: 0, guid: '' as string, sortOrder: 0 });
-const PrefabInstance = trait({ source: '' as string, localId: 0, rootInstanceId: 0 });
+// `parentLocalId` is the row stamp every expansion writes; without it the mock could not hold one and
+// every nested root read as unstamped — i.e. user-added (#1367), which is not what this test is about.
+const PrefabInstance = trait({ source: '' as string, localId: 0, rootInstanceId: 0, parentLocalId: 0 });
 
 const TRAITS = [
   { name: 'Transform', trait: Transform, category: 'component', fields: { x: 0, y: 0, z: 0 } },
   { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: 0, parentId: 0, guid: 0, sortOrder: 0 } },
-  { name: 'PrefabInstance', trait: PrefabInstance, category: 'component', fields: { source: 0, localId: 0, rootInstanceId: 0 } },
+  { name: 'PrefabInstance', trait: PrefabInstance, category: 'component', fields: { source: 0, localId: 0, rootInstanceId: 0, parentLocalId: 0 } },
 ] as const;
 
 let testWorld: ReturnType<typeof createWorld>;

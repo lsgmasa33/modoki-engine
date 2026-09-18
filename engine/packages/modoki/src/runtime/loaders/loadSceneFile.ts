@@ -74,6 +74,11 @@ export interface AddedEntity {
   removedTraits?: Record<number, string[]>;
   /** The nested instance's deep overrides reaching into ITS nested descendants. */
   nestedOverrides?: NestedOverridePaths;
+  /** STRUCTURAL edits inside the nested instance's own nested descendants, path-keyed exactly like
+   *  `nestedOverrides` and read the same way a top-level entry's `nestedStructure` is (#1369). The
+   *  reference node is the outermost layer for everything under it, so this is written by a SCENE
+   *  capture (`captureNestedChannels`) — a prefab row still cannot carry the slot. */
+  nestedStructure?: NestedStructurePaths;
 }
 
 export interface SceneEntityEntry {
@@ -450,8 +455,9 @@ function migrateV12toV13(data: SceneData): void {
 }
 
 /** Migrate v13→v14: no-op passthrough. v14 only ADDS an optional path-keyed `nestedStructure`
- *  beside `nestedOverrides` (on an instance entry, an added reference node and a prefab row),
- *  carrying structural edits made inside a nested instance that expanded from a row (#1358).
+ *  beside `nestedOverrides` (on an instance entry — #1358 — and an added reference node — #1369 —
+ *  never on a prefab row itself), carrying structural edits made inside a nested instance that
+ *  expanded from a row.
  *  No existing field changes shape and no v13 file can carry the key, so there is nothing to walk.
  *
  *  ⚠️ The version still had to move, and this step is what makes a v13 file carry the new number:
@@ -786,6 +792,7 @@ export function applyStructureByLocalToEcs(
         const rootEcsId = instantiatePrefabIntoWorld(
           world, child, parentEcsId, undefined, node.prefab, node.overrides,
           { added: node.added, removed: node.removed, removedTraits: node.removedTraits }, undefined, node.nestedOverrides,
+          node.nestedStructure,
         );
         // RESTORE the node's own guid (QA-PREFAB-0004). A nested instance's root is
         // serialized with its guid right here in the `added[]` entry — the same way a
@@ -1297,6 +1304,9 @@ export function collectResourceRefsFromEntities(
       }
       node.children.forEach(walkAdded);
       node.added?.forEach(walkAdded);
+      // A reference node's own `nestedStructure` (#1369) holds added nodes too — the same build-side
+      // blindness the entry-level slot below guards against.
+      for (const delta of Object.values(node.nestedStructure ?? {})) delta.added?.forEach(walkAdded);
     };
     entry.added?.forEach(walkAdded);
     // ⚠️ `nestedStructure`'s added nodes are refs the BUILD reads through this walker

@@ -427,3 +427,28 @@ describe('members the loader anchors above the instance root follow too (#1339)'
     expect(uiRefs(copy)).toEqual(guesses);
   });
 });
+
+// #1369 close-out sweep: `remintSceneEntityGuids`' own-guid walk descended `children` and `added`
+// only, so a node inside a `nestedStructure` slot — #1358's on an entry, #1369's on a reference node —
+// kept its guid in the copy: two scene files holding one entity guid (#1293's class), and a ref to it
+// in the copy still aiming at the original. Mutation: drop the `nestedStructure` visit in `visit`.
+describe('nodes inside a nestedStructure slot are reminted too (#1358/#1369 slots)', () => {
+  const G_ENTRY = 'cccccccc-0000-4000-8000-000000000001';
+  const G_NODE = 'cccccccc-0000-4000-8000-000000000002';
+  const node = (guid: string) => ({ parentLocalId: 1, guid, name: 'Bolt', children: [],
+    traits: { EntityAttributes: { name: 'Bolt', parentId: 0, guid } } });
+  it('an added node in an entry slot and in a reference node\'s slot both get new guids', () => {
+    const scene = { id: 's', version: 14, entities: [
+      { id: 1, traits: { EntityAttributes: { name: 'H', parentId: 0, guid: 'cccccccc-0000-4000-8000-0000000000ff' },
+        UIAction: { bindings: [{ event: 'click', action: 'noop', target: G_ENTRY }, { event: 'click', action: 'noop', target: G_NODE }] } } },
+      { id: 2, prefab: OUTER, guid: ROOT, traits: { EntityAttributes: { name: 'OuterRoot', parentId: 0 } },
+        nestedStructure: { 4: { added: [node(G_ENTRY)] } },
+        added: [{ parentLocalId: 3, guid: ANCHORED, name: 'AddedInner', prefab: INNER, traits: {}, children: [],
+          nestedStructure: { 2: { added: [node(G_NODE)] } } }] },
+    ] };
+    let n = 0;
+    const copy = JSON.stringify(remintSceneEntityGuids(scene as never, () => `dddddddd-0000-4000-8000-${String(++n).padStart(12, '0')}`));
+    expect(copy).not.toContain(G_ENTRY);
+    expect(copy).not.toContain(G_NODE);
+  });
+});

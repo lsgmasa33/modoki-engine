@@ -416,24 +416,27 @@ function spmProjects(): { id: string; dir: string; manifest: string }[] {
     .filter((p) => fs.existsSync(p.manifest));
 }
 
-/** #342's parked exception (commit `e34e8d8fe`, "park AppLovin out of the NATIVE build, not just
- *  out of the code"): `games/court` deliberately omits `capacitor-applovin-max` from its
- *  committed Package.swift even though the package itself declares `capacitor.ios` and would
- *  otherwise be expected here.
+/** **Empty since #342 (2026-09-18), and the way it emptied is the lesson.**
  *
- *  An explicit, EXACT-MATCH exception — NOT a permissive "ignore this pair forever" filter. The
- *  second test below asserts the entry is STILL absent, so that when #342 unblocks and
- *  `CapacitorApplovinMax` legitimately returns to the manifest, THIS repo's own test fails loudly
- *  (the exception no longer matches reality) and forces someone to delete the entry — rather than
- *  quietly tolerating either state forever.
+ *  It held one row: `games/court::capacitor-applovin-max`. `games/court` depended on the plugin but
+ *  deliberately omitted it from its committed Package.swift, so the dep was legitimately undeclared
+ *  and this row excused it (commit `e34e8d8fe`, "park AppLovin out of the NATIVE build, not just out
+ *  of the code").
  *
- *  Spent through `assertExemptionLedger` since #1140. The hand-rolled "still absent" test did not
- *  check that the dep was still in package.json, so removing the plugin outright left the row
- *  standing; the over-blessed arm covers both. */
-const KNOWN_MISSING: ReadonlyArray<{ item: string; reason: string }> = [
-  { item: 'games/court::capacitor-applovin-max',
-    reason: '#342 — AppLovin MAX is parked; its SPM product is deliberately absent from the committed Package.swift' },
-];
+ *  #342 then removed the dependency outright — the owner ruled Court runs one ad stack — and with no
+ *  dependency there is no undeclared dep to excuse, so the row stopped matching and **this file went
+ *  red**. That is the ledger's over-blessed arm firing exactly as its own previous docblock predicted
+ *  it would ("removing the plugin outright left the row standing; the over-blessed arm covers both").
+ *  The row is deleted rather than the assertion loosened, which is what its `fix` string asked for.
+ *
+ *  ⚠️ **Deleting the last row makes this check VACUOUS unless the scan is bounded**, because
+ *  `population` here is pure-offender — undeclared deps, where empty is the GOAL and therefore not
+ *  evidence the detector still works. So the assertion now passes `scanned` (every (project, dep)
+ *  pair actually walked) and lets `floor` bound THAT. Do not "fix" a future red by dropping the
+ *  floor to 0: that restores the blind spot this helper exists to close. Court's own twin,
+ *  `games/court/tests/capacitorPluginAllowlist.test.ts`, emptied the same way in the same commit and
+ *  took the same treatment. */
+const KNOWN_MISSING: ReadonlyArray<{ item: string; reason: string }> = [];
 
 describe('committed Package.swift vs package.json — every SPM-iOS capacitor dep is declared (#371)', () => {
   // Gated for the same reason as 'sees the pbxproj road it is meant to police' above: the public
@@ -450,9 +453,13 @@ describe('committed Package.swift vs package.json — every SPM-iOS capacitor de
     'every SPM-iOS capacitor dep in package.json is declared in Package.swift',
     () => {
       const undeclared: Array<{ item: string; site: string }> = [];
+      // Counted, not derived from `undeclared`: this is the size of the set the detector WALKED, and
+      // it is what keeps the check non-vacuous now that KNOWN_MISSING is empty (see its docblock).
+      let scanned = 0;
       for (const proj of spmProjects()) {
         const manifestText = fs.readFileSync(proj.manifest, 'utf8');
         for (const dep of iosSpmDeps(proj.dir)) {
+          scanned += 1;
           if (!isSpmDepDeclared(dep, manifestText)) {
             undeclared.push({
               item: `${proj.id}::${dep}`,
@@ -466,11 +473,16 @@ describe('committed Package.swift vs package.json — every SPM-iOS capacitor de
         label: 'KNOWN_MISSING in capacitorPlatformDeclarations',
         population: undeclared,
         exempt: KNOWN_MISSING,
-        floor: 1,
+        scanned,
+        // Deliberately well under the real pair count — MEASURED at 109 (project, dep) pairs on
+        // 2026-09-18 — exactly like the sibling 'finds projects to check' assertion above: this
+        // bounds the SCAN so only a broken detector trips it, and is not a census that would red
+        // every time a project gains or drops a plugin.
+        floor: 10,
         fix: 'package.json depends on these and their own package.json declares capacitor.ios, so '
           + '`cap sync ios` will re-add them on every build (#371). A KNOWN_MISSING row that blesses '
-          + 'more than exists means #342 unblocked (or the plugin was removed): delete the row '
-          + '(see commit e34e8d8fe) rather than loosening this assertion.',
+          + 'more than exists means the plugin was removed (as #342 did for AppLovin) or its manifest '
+          + 'entry legitimately returned: delete the row rather than loosening this assertion.',
       });
     },
   );

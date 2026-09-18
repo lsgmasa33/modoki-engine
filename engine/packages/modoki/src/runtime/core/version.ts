@@ -41,9 +41,9 @@ export const ENGINE_VERSION = '0.1.0';
 // since that's what rendered before); the anchor field is then dropped
 // unconditionally.
 // v14: no-op passthrough — adds an optional path-keyed `nestedStructure` beside
-// `nestedOverrides` on a prefab-instance entry, an added reference node and a
-// prefab row, carrying STRUCTURAL edits made inside a nested instance that
-// expanded from a row (#1358). No existing field changes shape and no file
+// `nestedOverrides` on a prefab-instance entry (#1358) and on an added reference
+// node (#1369) — never on a prefab row itself — carrying STRUCTURAL edits made
+// inside a nested instance that expanded from a row. No existing field changes shape and no file
 // carries the key yet, so there is nothing to migrate.
 // ⚠️ The bump is still required. Scene's disposition is REFUSE
 // (docs/format-versioning.md), so an OLDER build must refuse a v14 scene rather

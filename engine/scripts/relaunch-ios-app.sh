@@ -69,8 +69,11 @@ else
     [[ -f "$HERE/$MODOKI_PROJECT/project.user.json" ]] && CANDIDATES+=("$HERE/$MODOKI_PROJECT/project.user.json")
   else
     # Prefer the project that OWNS this bundle id — different projects legitimately target
-    # different phones (here: most name the iPhone Air, Court names the iPhone 8), so scanning
-    # them all would refuse as ambiguous for the one question that has an obvious right answer.
+    # different phones, so scanning them all would refuse as ambiguous for the one question that
+    # has an obvious right answer. (This comment used to name which phone each project pins. It
+    # cannot: project.user.json is gitignored, so the pin is per-MACHINE and a committed example
+    # goes stale invisibly — it said Court names the iPhone 8, and on the hub Mac on 2026-09-18
+    # Court named the iPad mini 5. See docs/devices.md.)
     for f in "$HERE"/games/*/project.user.json "$HERE"/demos/*/project.user.json; do
       [[ -f "$f" ]] || continue
       cfg="${f%/project.user.json}/project.config.json"

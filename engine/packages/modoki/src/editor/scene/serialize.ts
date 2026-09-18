@@ -3,7 +3,6 @@
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { collectTransientSubtreeIds } from './authoringScope';
-import { hasDocKey } from '../../runtime/core/docKeys';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
@@ -24,9 +23,11 @@ import { setPlayState, getRunMode } from '../../runtime/core/playState';
 import { beginWorldReplacement } from './authoringSettle';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
+import { captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, preloadNestedPrefabs } from './prefab';
+// Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
+export { captureNestedSceneDelta } from './prefab';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths } from '../../runtime/loaders/loadSceneFile';
-import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, nestedPathKey, collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
+import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
@@ -111,105 +112,6 @@ export interface SceneFile {
 }
 
 // ── Serialize Scene (generic) ───────────────────────────
-
-/** Capture a nested instance's SCENE-specific override delta: its full per-localId
- *  override (vs the child prefab base) minus the fields the parent prefab's own
- *  nested row already overrides. So the scene stores only what it uniquely changed
- *  on this nested instance — the row's own overrides (e.g. the flames' mirrored
- *  positions) stay owned by the parent prefab and aren't redundantly baked in. */
-export function captureNestedSceneDelta(
-  nestedRootId: number,
-  childPrefab: Parameters<typeof captureInstanceOverrides>[1],
-  rowOverrides: Record<number, Record<string, Record<string, unknown>>> | undefined,
-): Record<number, Record<string, Record<string, unknown>>> {
-  const all = captureInstanceOverrides(nestedRootId, childPrefab);
-  for (const [lidStr, traits] of Object.entries(all)) {
-    const lid = Number(lidStr);
-    // A nested instance's member guids are regenerated from the prefab chain each
-    // load — never scene-authored — so drop them; otherwise the serialize guid
-    // pre-pass makes every nested member look "overridden".
-    if (traits.EntityAttributes) delete (traits.EntityAttributes as Record<string, unknown>).guid;
-    const rowTraits = rowOverrides?.[lid];
-    for (const [traitName, fields] of Object.entries(traits)) {
-      const rowFields = rowTraits?.[traitName];
-      // `hasDocKey` (#986): `f` and `rowFields` both derive from scene/prefab JSON, so a
-      // prototype-named field tested TRUE against any rowFields object and was wrongly
-      // deleted from the serialized output.
-      if (rowFields) for (const f of Object.keys(fields)) if (hasDocKey(rowFields, f)) delete fields[f];
-      if (Object.keys(fields).length === 0) delete traits[traitName];
-    }
-    if (Object.keys(traits).length === 0) delete all[lid];
-  }
-  return all;
-}
-
-/** The override map the PREFAB FILES alone would apply to a nested instance reached
- *  by `path` (a chain of nested-row localIds) from a fresh instantiation of
- *  `topSource` — i.e. every ancestor prefab row's own overrides + deep overrides
- *  targeting it, resolved outside-in exactly like the runtime. Subtracted from the
- *  live capture so the scene stores only the delta IT uniquely changed (and an
- *  intermediate prefab change still propagates). All path prefabs must be cached. */
-function resolveEffectivePrefabOverride(
-  topSource: string,
-  path: number[],
-): Record<number, Record<string, Record<string, unknown>>> {
-  let prefab = getCachedPrefabSync(topSource);
-  let pending: NestedOverridePaths | undefined;
-  let result: Record<number, Record<string, Record<string, unknown>>> = {};
-  for (let i = 0; i < path.length; i++) {
-    if (!prefab) return result;
-    const r = path[i];
-    const row = prefab.entities.find((e) => e.localId === r && e.prefab);
-    if (!row) return result;
-    const { direct, forward } = descendNestedOverrides(pending, r);
-    const stepDirect = direct ? mergeOverrideMaps(row.overrides, direct) : (row.overrides ?? {});
-    pending = mergeNestedOverridePaths(row.nestedOverrides, forward);
-    if (i === path.length - 1) result = stepDirect;
-    prefab = getCachedPrefabSync(row.prefab!);
-  }
-  return result;
-}
-
-/** The structural lists the PREFAB CHAIN itself already applies to the nested instance at `path` —
- *  the structural twin of `resolveEffectivePrefabOverride`, walking the same rows in the same order
- *  (#1358).
- *
- *  Used as the baseline to diff a captured interior against: the scene writes `nestedStructure` only
- *  where the live interior differs from what the prefabs already produce, so an intermediate prefab
- *  gaining a member still propagates into every instance instead of being frozen out by a scene that
- *  restated the old list. */
-function resolveEffectivePrefabStructure(
-  topSource: string,
-  path: number[],
-): { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> } {
-  // ⚠️ NO path-keyed descend here, deliberately, and this is the shape to keep until #1369 adds a
-  // writer. A prefab ROW cannot carry `nestedStructure` — only a SCENE writes the slot — so there is
-  // nothing for an outer layer to have addressed at an intermediate step: the baseline at every step
-  // is that row's OWN lists. The first cut threaded `descendPathKeyed` here anyway; `pending` was
-  // seeded `undefined` and its only assignment came from itself, so `direct` was unreachable and the
-  // comment describing "the outer one where it exists" named a case with no producer. A dead branch
-  // under a confident comment is this repo's most expensive defect class, so it is gone rather than
-  // left for the next reader to believe.
-  let prefab = getCachedPrefabSync(topSource);
-  let result: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> } = {};
-  for (let i = 0; i < path.length; i++) {
-    if (!prefab) return result;
-    const row = prefab.entities.find((e) => e.localId === path[i] && e.prefab);
-    if (!row) return result;
-    if (i === path.length - 1) {
-      result = { added: row.added, removed: row.removed, removedTraits: row.removedTraits };
-    }
-    prefab = getCachedPrefabSync(row.prefab!);
-  }
-  return result;
-}
-
-/** Does this structural delta state nothing at all? */
-function emptyStructure(
-  v: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> },
-): boolean {
-  return !v.added?.length && !v.removed?.length && !Object.keys(v.removedTraits ?? {}).length;
-}
 
 /** Serialize the live ECS world to a SceneFile.
  *
@@ -355,10 +257,6 @@ export async function serializeScene(opts?: {
   const prefabChildIds = new Set<number>();
   const prefabSources = new Set<string>();
   const prefabRootInfo = new Map<number, { source: string; localId: number }>();
-  // Owned nested instances (a prefab's internal nested instances, e.g. a ship's
-  // flames): their scene-level overrides are captured onto the OWNING top-level
-  // instance entry rather than written as standalone entities.
-  const nestedInstances: { rootId: number; source: string; parentLocalId: number; ownerId: number }[] = [];
   const byId = new Map(entityInfos.map((e) => [e.id, e] as const));
   if (piMeta) {
     for (const info of entityInfos) {
@@ -382,12 +280,9 @@ export async function serializeScene(opts?: {
         const parentIsMember = parentInfo?.traits.includes('PrefabInstance');
         if (parentIsMember && parentLocalId) {
           // Owned nested instance (expanded from the parent prefab, so it carries a
-          // parentLocalId): its scene-level edits ride on the owner's
-          // nestedOverrides — it is NOT written as its own scene entry.
+          // parentLocalId): its scene-level edits ride on the owner's nested channels
+          // (`captureNestedChannels`) — it is NOT written as its own scene entry.
           prefabChildIds.add(info.id);
-          const parentPi = readTraitData(info.parentId, piMeta);
-          const ownerId = (parentPi?.['rootInstanceId'] as number) || info.parentId;
-          nestedInstances.push({ rootId: info.id, source, parentLocalId, ownerId });
           prefabSources.add(source); // preload child prefab for delta capture
         } else if (parentIsMember) {
           // User-added nested instance dragged under a prefab member (parentLocalId
@@ -417,7 +312,9 @@ export async function serializeScene(opts?: {
   // skip set so they aren't ALSO written as standalone scene entities (which is
   // how they used to leak out and orphan on reload).
   const rootStructure = new Map<number, { added: AddedEntity[]; removed: number[]; removedTraits: Record<number, string[]> }>();
-  const ownedNestedByRoot = new Map<number, Map<number, number>>();
+  // The nested channels, per top-level root — one top-down walk each (#1369; see captureNestedChannels).
+  const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
+  const nestedStructureByTop = new Map<number, NestedStructurePaths>();
   for (const [rootId, { source }] of prefabRootInfo) {
     const prefab = await getPrefabSource(source);
     if (!prefab) continue;
@@ -426,64 +323,14 @@ export async function serializeScene(opts?: {
     await preloadNestedPrefabs(prefab);
     const s = captureInstanceStructure(rootId, prefab);
     for (const ecsId of s.consumedEcsIds) prefabChildIds.add(ecsId);
-    ownedNestedByRoot.set(rootId, s.ownedNested);
+    const channels = captureNestedChannels(source, s.ownedNested);
+    for (const ecsId of channels.consumedEcsIds) prefabChildIds.add(ecsId);
+    if (channels.nestedOverrides) nestedOverridesByTop.set(rootId, channels.nestedOverrides);
+    if (channels.nestedStructure) nestedStructureByTop.set(rootId, channels.nestedStructure);
     if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length) {
       rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits });
     }
   }
-
-  // ⚠️ Reconcile the pre-pass's PROVISIONAL owned/user-added split against the authoritative one
-  // (#1354). The pre-pass above can only afford a per-node `parentLocalId > 0` test, because the
-  // owning prefab's rows are not loaded yet at that point — but `captureInstanceStructure` partitions
-  // the rows, and the two can disagree. An instance BOTH of them disown is written nowhere at all:
-  // `captureChild` skips it as owned, so it gets no `added[]` reference node, while the pre-pass
-  // called it user-added, so it gets no `nestedOverrides` entry either. Its edits, its guid and every
-  // ref aimed at it are then silently gone on the next load.
-  //
-  // Reachable from the editor in four ordinary steps: duplicate an owned nested instance (the copy is
-  // unstamped by `clearOwnedNestedStampFromSnapshot`), edit the copy, delete the source, save — the
-  // pre-pass reads the copy's absent stamp as user-added while the partition hands it the now-free
-  // row. The mirror disagreement (a stamped instance the partition did NOT give the row to) would
-  // instead write it TWICE, and the `nestedOverrides` write clobbers the claimant's own overrides.
-  //
-  // Only instances directly under a member of a TOP-LEVEL instance are reconciled, which is exactly
-  // where the partition has an opinion and where a stamp can be missing. Deeper owned instances are
-  // stamped by the loader as each row expands, so the pre-pass is right about them.
-  for (const [rootId, owned] of ownedNestedByRoot) {
-    for (let i = nestedInstances.length - 1; i >= 0; i--) {
-      const ni = nestedInstances[i]!;
-      if (ni.ownerId === rootId && !owned.has(ni.rootId)) nestedInstances.splice(i, 1);
-    }
-    for (const [ecsId, rowLocalId] of owned) {
-      if (nestedInstances.some((ni) => ni.rootId === ecsId)) continue;
-      const src = piMeta ? (readTraitData(ecsId, piMeta)?.['source'] as string | undefined) : undefined;
-      if (!src) continue;
-      nestedInstances.push({ rootId: ecsId, source: src, parentLocalId: rowLocalId, ownerId: rootId });
-    }
-  }
-
-  // Nested-instance override pre-pass: for EACH nested instance (at any depth),
-  // resolve the path of nested-row localIds up to the owning TOP-level instance,
-  // capture the SCENE-specific override delta (its full override minus what the
-  // prefab chain already applies to it — so the scene stores only what it uniquely
-  // changed and an intermediate prefab change still propagates), and file it under
-  // the top instance's nestedOverrides[path]. The path-keyed form (e.g. "2.5")
-  // lets the scene override a member nested arbitrarily deep; a one-level path is
-  // the legacy single-segment key, so existing scenes round-trip unchanged.
-  const nestedById = new Map(nestedInstances.map((ni) => [ni.rootId, ni] as const));
-  /** Walk up the owner chain to the top-level instance; returns its id + the path
-   *  of nested-row localIds from it down to `rootId`, or null if no top-level owner. */
-  const resolvePath = (rootId: number): { topId: number; path: number[] } | null => {
-    const path: number[] = [];
-    let cur = rootId, guard = 0;
-    while (guard++ < 64) {
-      const ni = nestedById.get(cur);
-      if (!ni) break; // reached a non-nested instance (a top-level root)
-      path.unshift(ni.parentLocalId);
-      cur = ni.ownerId;
-    }
-    return prefabRootInfo.has(cur) ? { topId: cur, path } : null;
-  };
 
   /** The order entities are WRITTEN in — the Hierarchy's display order, made fully
    *  stable (QA-HIER-0002). The rule itself lives in `runtime/core/ecs/entityOrder.ts`,
@@ -510,56 +357,6 @@ export async function serializeScene(opts?: {
     name: info.name,
     guid: guidForId(info.id),
   }));
-
-  const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
-  const nestedStructureByTop = new Map<number, NestedStructurePaths>();
-  for (const ni of nestedInstances) {
-    const resolved = resolvePath(ni.rootId);
-    if (!resolved || resolved.path.length === 0) continue;
-    const topSource = prefabRootInfo.get(resolved.topId)!.source;
-    const childPrefab = await getPrefabSource(ni.source);
-    if (!childPrefab) continue;
-    const key = nestedPathKey(resolved.path);
-    // Subtract what the whole prefab chain applies to this instance (not just the
-    // immediate row) so a deep scene edit stores only its own delta.
-    const effective = resolveEffectivePrefabOverride(topSource, resolved.path);
-    const delta = captureNestedSceneDelta(ni.rootId, childPrefab, effective);
-    if (Object.keys(delta).length > 0) {
-      const map = nestedOverridesByTop.get(resolved.topId) ?? {};
-      map[key] = delta;
-      nestedOverridesByTop.set(resolved.topId, map);
-    }
-    // The STRUCTURAL interior of this nested instance (#1358). Nothing captured it before, so a
-    // member deleted or dragged out inside a row's own expansion was simply not saved: the row
-    // re-expanded whole on the next load, and a dragged-out entity came back at BOTH places, two
-    // entities holding one guid.
-    //
-    // Written only where the live interior differs from what the prefab chain already applies —
-    // otherwise a scene that merely restated the row's own lists would freeze this instance against
-    // later prefab edits (a member added to the inner prefab would never appear here again).
-    const structure = captureInstanceStructure(ni.rootId, childPrefab);
-    for (const ecsId of structure.consumedEcsIds) prefabChildIds.add(ecsId);
-    const live = { added: structure.added, removed: structure.removed, removedTraits: structure.removedTraits };
-    // ⚠️ Skipped ONLY when the live interior and the prefab chain's own are both empty — the common
-    // case, and the one that must stay absent so a member added to the inner prefab later still
-    // reaches an untouched instance.
-    //
-    // Otherwise the slot is written with all three lists VERBATIM, empty arrays included, because
-    // once the scene addresses a path it OWNS the interior. The first cut compared the live capture
-    // against the file-authored baseline and wrote only the differing fields, which was wrong twice
-    // over: the two documents are not comparable (the live side is compacted by
-    // `snapshotAddedTraits` and carries a live parentId, the baseline is whatever the prefab file
-    // holds, so "equal" was unreachable for any row with authored structure), and dropping an empty
-    // list made "the row's own list no longer applies" UNREPRESENTABLE — the loader read absent as
-    // "not stated" and fell back to the row, so deleting the last member of a row-authored `added`
-    // wrote `{}` and the member came back on reload.
-    const baseline = resolveEffectivePrefabStructure(topSource, resolved.path);
-    if (!(emptyStructure(live) && emptyStructure(baseline))) {
-      const map = nestedStructureByTop.get(resolved.topId) ?? {};
-      map[key] = { added: live.added, removed: live.removed, removedTraits: live.removedTraits };
-      nestedStructureByTop.set(resolved.topId, map);
-    }
-  }
 
   for (const info of orderedInfos) {
     // Skip prefab children + structural additions — re-instantiated from the prefab
@@ -868,6 +665,7 @@ export function assertNoPathRefs(entry: SerializedEntity): void {
     flag(`${ctx}.prefab`, node.prefab);
     flagOverrideMap(node.overrides, `${ctx}.overrides`);
     flagNested(node.nestedOverrides, `${ctx}.nestedOverrides`);
+    flagNestedStructure(node.nestedStructure, `${ctx}.nestedStructure`); // a reference node's own slot (#1369)
     for (let i = 0; i < (node.children?.length ?? 0); i++) flagAdded(node.children[i], `${ctx}.child[${i}]`);
     for (let i = 0; i < (node.added?.length ?? 0); i++) flagAdded(node.added![i], `${ctx}.added[${i}]`);
   };

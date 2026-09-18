@@ -612,6 +612,12 @@ export function remintSceneEntityGuids(
       if (anchor && !topLevel) anchors.push([anchor, row]);
       visit(row.children, false);
       visit(row.added, false);
+      // A `nestedStructure` slot — on an entry (#1358) or on a reference node (#1369) — holds added
+      // nodes with their own guids too; missed here, the copy kept them and two files shared them.
+      const slot = (row as { nestedStructure?: unknown }).nestedStructure;
+      if (slot && typeof slot === 'object') {
+        for (const delta of Object.values(slot as Record<string, { added?: unknown } | null>)) visit(delta?.added, false);
+      }
     }
   };
   visit(scene.entities, true);
