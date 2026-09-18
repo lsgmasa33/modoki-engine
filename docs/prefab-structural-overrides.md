@@ -327,6 +327,40 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   live re-apply (`captureNestedInstanceOverrides`) skips every instance whose chain passes
   through a user-added root. It used to visit them too and apply their structure a second
   time — one Bolt became two on every rebuild.
+
+  **What the re-apply of an OWNED nested instance states (#1386, #1401, #1383).** The fresh expansion
+  already applies everything the outer prefab's row chain authors, so the capture is the live instance
+  **minus that chain**. The chain comes from the document the live tree was expanded FROM, which is
+  `rebuildInstance`'s `baseline` (a refresh passes its old file). Only the scene's own edit is left:
+  - **values** are dropped when they EQUAL the chain's value. A scene that changed a row-set field
+    keeps its change, which the key-presence rule `captureNestedSceneDelta` uses for saving would lose.
+    The chain's member tokens are first resolved by `baseTokenResolver` from the nested root: its own
+    frame, with `^` climbing to the instance whose row expanded it. The loader applies every value in
+    that frame, whichever layer authored it. A reference node's payload is in its own instance's frame
+    and is left whole, as `rebaseAddedTokens` leaves it. The live side holds
+    guids, so an unresolved `@member:` token never compared equal and froze the old target. A trait
+    the chain ADDS is captured whole, schema defaults included, so an unauthored field equal to its
+    default counts as the chain's too.
+  - **`removed` / `removedTraits`** lose the chain's own entries.
+  - **`added` nodes** are matched to the chain by **template key**: the live marker, or
+    `recoverTemplateKey` once a round trip dropped it. A key-less legacy node matches by the durable
+    guid it carried. An unchanged match is dropped: the fresh copy owns it, so a template edit
+    reaches it. An EDITED match is kept, and the re-apply deletes the fresh copy first and restores
+    the key marker on the survivor. Restating these nodes spawned every row-authored node twice.
+  - ⚠️ **A template node the scene DELETED still comes back.** With no live node there is nothing to
+    match, and "deleted here" cannot be told from "added by the refresh" without the old live key set.
+    A template node the scene MOVED below another added node also duplicates. Only nodes directly
+    under a member are matched, so its fresh copy returns at the template anchor beside the moved
+    one. A save and reload gives one, because the scene's `nestedStructure` owns the interior. Both
+    predate this subtraction.
+  - A nested instance whose `parentLocalId` climb does **not reach the outer root** (it stops at a
+    plain `added` node) gets no capture. The outer structure already carries it as a reference node.
+    Its partial chain used to address the real row's expansion and write its overrides there. This is
+    latent from the editor: reparent unpacks, and duplicating clears the stamp.
+
+  #1401 is latent the same way. Apply is the only rebuild from a CHANGED document, and it adds or
+  removes whole rows, so the `baseline` hand-off in `refreshInstances` has no editor flow to test.
+  `tests/editor/rebuildNestedReapply.test.ts` drives it at `rebuildInstance`.
 - **Resources.** `collectResourceRefsFromEntities` surfaces `added[].prefab` and
   recurses a reference node's own `added`, so `SceneManager` acquires the child
   prefab (and its transitive refs) at load.

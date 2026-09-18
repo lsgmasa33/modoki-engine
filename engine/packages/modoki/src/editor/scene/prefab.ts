@@ -2118,10 +2118,12 @@ export function captureNestedSceneDelta(
  *  live capture so the scene stores only the delta IT uniquely changed (and an
  *  intermediate prefab change still propagates). All path prefabs must be cached. */
 export function resolveEffectivePrefabOverride(
-  topSource: string,
+  topSource: string | PrefabFile,
   path: number[],
 ): Record<number, Record<string, Record<string, unknown>>> {
-  let prefab = getCachedPrefabSync(topSource);
+  // A DOCUMENT names the top level directly: a refresh resolves against the file the live tree was
+  // expanded from, which the cache no longer holds (#1401).
+  let prefab: PrefabFile | null = typeof topSource === 'string' ? getCachedPrefabSync(topSource) : topSource;
   let pending: NestedOverridePaths | undefined;
   let result: Record<number, Record<string, Record<string, unknown>>> = {};
   for (let i = 0; i < path.length; i++) {
@@ -2147,7 +2149,7 @@ export function resolveEffectivePrefabOverride(
  *  gaining a member still propagates into every instance instead of being frozen out by a scene that
  *  restated the old list. */
 function resolveEffectivePrefabStructure(
-  topSource: string,
+  topSource: string | PrefabFile,
   path: number[],
 ): { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> } {
   // The path-keyed descend, exactly as `resolveEffectivePrefabOverride` walks it (#1381). A prefab
@@ -2159,7 +2161,7 @@ function resolveEffectivePrefabStructure(
   //
   // (Before #1381 only a scene capture wrote the slot, so this descend had no producer and was
   // removed as dead code — correctly at the time. It returned with its producer.)
-  let prefab = getCachedPrefabSync(topSource);
+  let prefab: PrefabFile | null = typeof topSource === 'string' ? getCachedPrefabSync(topSource) : topSource;
   let pending: NestedStructurePaths | undefined;
   let result: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> } = {};
   for (let i = 0; i < path.length; i++) {
@@ -3312,15 +3314,23 @@ interface NestedInstanceCapture {
   source: string;
   overrides: Record<number, Record<string, Record<string, unknown>>>;
   structure: InstanceStructure;
+  /** Template-authored added nodes the scene EDITED: the fresh expansion spawns each one again, so the
+   *  re-apply deletes that copy before it spawns the captured one (#1386). `key` is empty for a legacy
+   *  node matched by its file guid. */
+  replace: { key: string; guid: string }[];
 }
 
 /** Capture every NESTED prefab instance inside the live subtree under
  *  `outerRootId` (each captured against its OWN child prefab). Without this an
  *  outer rebuild re-expands nested rows straight from the file, discarding any
  *  per-copy override the user made on a specific nested child (design risk R3).
- *  The captured set is a superset of the file's row overrides, so re-applying it
- *  after the rebuild is idempotent for those and additive for the live edits. */
-function captureNestedInstanceOverrides(outerRootId: number): NestedInstanceCapture[] {
+ *
+ *  Each capture is the live instance MINUS what the prefab chain of `baseline` already applies to it
+ *  (#1386, #1401) — `baseline` being the outer document the live tree was expanded FROM (a refresh's
+ *  old file). The fresh expansion re-produces that part itself, so restating it is wrong both ways: an
+ *  `added` node is not idempotent and spawned twice, and a restated row value froze the OLD value over
+ *  a refreshed one. What remains is the scene's own edit, which is the only thing the re-apply owes. */
+function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFile): NestedInstanceCapture[] {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return [];
 
@@ -3338,8 +3348,13 @@ function captureNestedInstanceOverrides(outerRootId: number): NestedInstanceCapt
     const pi = piOf(id);
     return !!pi && pi.rootInstanceId === id && id !== outerRootId;
   };
-  // parentLocalId path from the outer root down to nested root `n`.
-  const chainOf = (n: number): number[] => {
+  // parentLocalId path from the outer root down to nested root `n` — or null when the climb does not
+  // REACH the outer root (#1383). It stops early at a plain node (an `added[]` node has no
+  // PrefabInstance, so `rootOf` answers 0), and the partial chain it held addressed a DIFFERENT
+  // instance from the outer root: a stamped instance under a plain node wrote its overrides onto the
+  // real row's expansion. Such an instance is not a row expansion of this outer at all — the outer
+  // structure capture carries it whole, as a reference node under that plain node.
+  const chainOf = (n: number): number[] | null => {
     const chain: number[] = [];
     let cur = n, guard = 0;
     while (cur && cur !== outerRootId && guard++ < 64) {
@@ -3348,8 +3363,36 @@ function captureNestedInstanceOverrides(outerRootId: number): NestedInstanceCapt
       chain.unshift((pi.parentLocalId as number) || 0);
       cur = rootOf(byId.get(cur)?.parentId ?? 0); // climb to the parent instance's root
     }
-    return chain;
+    return cur === outerRootId ? chain : null;
   };
+  // guid → template key of each added node hanging directly under a member of nested root `n` (the
+  // level a structure capture's `added` lists). The marker first; a node that lost it (Play→Stop, an
+  // undo respawn) recovers it from its derived guid.
+  const recoverMemo = new Map<number, string>();
+  const addedKeysOf = (n: number): Map<string, string> => {
+    const out = new Map<string, string>();
+    for (const e of all) {
+      if (rootOf(e.id) !== n) continue;
+      for (const c of childrenOf.get(e.id) ?? []) {
+        if (rootOf(c) === n) continue; // a member, not an added node
+        const guid = durableGuid(byId.get(c)?.guid);
+        const key = templateKeyOf(findEntity(c)) || recoverTemplateKey(c, recoverMemo);
+        if (guid && key) out.set(guid, key);
+      }
+    }
+    return out;
+  };
+
+  // The chain's member tokens resolved to the live guids they name (`baseTokenResolver`: the nested
+  // root's own frame, `^` climbing to the instance whose row expanded it). The loader applies every
+  // value an instance receives — its row's, and whatever an outer layer forwarded — in THAT frame.
+  // The live capture holds guids, so an unresolved token never compared equal: a token-bearing row
+  // value or node read as a scene edit and froze the old template (#1386 review). A REFERENCE node's
+  // payload is in its own instance's frame, so it is left whole, as `rebaseAddedTokens` leaves it.
+  const resolveNodes = (resolve: (v: unknown) => unknown, nodes: AddedEntity[] | undefined): AddedEntity[] | undefined =>
+    nodes?.map((n) => (n.prefab ? n : {
+      ...n, traits: resolve(n.traits) as AddedEntity['traits'], children: resolveNodes(resolve, n.children) ?? [],
+    }));
 
   const captures: NestedInstanceCapture[] = [];
   const seen = new Set<number>();
@@ -3363,22 +3406,110 @@ function captureNestedInstanceOverrides(outerRootId: number): NestedInstanceCapt
     // `structure.added` holds it with its own overrides, structure and nested channels (#1369), and
     // `rebuildInstance`'s `applyStructureByRootInstance` re-spawns it whole. Re-applying it here a
     // second time duplicated every subtree it had added — a rebuild turned one Bolt into two.
-    const chain = isNestedRoot(id) ? chainOf(id) : [];
-    if (isNestedRoot(id) && !chain.includes(0)) {
+    const chain = isNestedRoot(id) ? chainOf(id) : null;
+    if (chain && !chain.includes(0)) {
       const source = piOf(id)!.source as string;
       const childPrefab = getCachedPrefabSync(source);
       if (childPrefab) {
+        const resolve = baseTokenResolver(id);
+        const chainStructure = resolveEffectivePrefabStructure(baseline, chain);
+        const { structure, replace } = subtractChainStructure(
+          captureInstanceStructure(id, childPrefab),
+          { ...chainStructure, added: resolveNodes(resolve, chainStructure.added) },
+          chainStructure.added?.length ? addedKeysOf(id) : new Map());
         captures.push({
           chain,
           source,
-          overrides: captureInstanceOverrides(id, childPrefab),
-          structure: captureInstanceStructure(id, childPrefab),
+          overrides: subtractChainOverrides(
+            captureInstanceOverrides(id, childPrefab), resolve(resolveEffectivePrefabOverride(baseline, chain)) as Record<number, Record<string, Record<string, unknown>>>, childPrefab),
+          structure,
+          replace,
         });
       }
     }
     for (const c of childrenOf.get(id) ?? []) stack.push(c);
   }
   return captures;
+}
+
+/** Drop every captured field whose live value EQUALS what the prefab chain applies. By value, not by
+ *  key presence (`captureNestedSceneDelta`'s rule): a scene that changed a row-set field keeps its
+ *  change across the rebuild.
+ *
+ *  A trait the CHAIN adds (absent from `childPrefab` at that member) is captured whole, schema
+ *  defaults included, because the capture sees an added trait. The loader builds it as
+ *  `meta.trait(authored)`, so an unauthored field equal to its default is the chain's too; left in,
+ *  it kept the trait alive after a refresh that removed it (#1386 review). */
+function subtractChainOverrides(
+  live: Record<number, Record<string, Record<string, unknown>>>,
+  chain: Record<number, Record<string, Record<string, unknown>>>,
+  childPrefab: PrefabFile,
+): Record<number, Record<string, Record<string, unknown>>> {
+  for (const [lid, traits] of Object.entries(live)) {
+    const chainTraits = chain[Number(lid)];
+    if (!chainTraits) continue;
+    const member = childPrefab.entities.find((e) => e.localId === Number(lid));
+    for (const [trait, fields] of Object.entries(traits)) {
+      const chainFields = chainTraits[trait];
+      if (!chainFields || typeof chainFields !== 'object') continue;
+      const chainAdded = member?.traits[trait] === undefined;
+      const schema = chainAdded ? (getTraitByName(trait)?.trait as { schema?: Record<string, unknown> } | undefined)?.schema : undefined;
+      for (const f of Object.keys(fields)) {
+        if (hasDocKey(chainFields, f)) {
+          if (valuesEqual(fields[f], chainFields[f])) delete fields[f];
+        } else if (schema && f in schema) {
+          const def = typeof schema[f] === 'function' ? (schema[f] as () => unknown)() : schema[f];
+          if (valuesEqual(fields[f], def)) delete fields[f];
+        }
+      }
+      if (Object.keys(fields).length === 0) delete traits[trait];
+    }
+    if (Object.keys(traits).length === 0) delete live[Number(lid)];
+  }
+  return live;
+}
+
+/** The structural half of the subtraction. `removed`/`removedTraits` lose what the chain lists. An
+ *  `added` node the chain authored is recognised by its TEMPLATE KEY (a guid is derived per instance
+ *  since #1387; a legacy key-less file node by the durable guid it carried): unchanged, it is dropped,
+ *  since the fresh expansion spawns it and a refresh's edit to it must reach this instance; EDITED, it
+ *  is kept and listed in `replace`, so the fresh copy gives way to it rather than sitting beside it.
+ *
+ *  ⚠️ A template node the scene DELETED still comes back: with no live node there is nothing to
+ *  match, and "deleted here" cannot be told from "added by the refresh" without the old live key set.
+ *  The rebuild did the same before this subtraction existed. */
+function subtractChainStructure(
+  full: InstanceStructure,
+  chain: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> },
+  keysByGuid: Map<string, string>,
+): { structure: InstanceStructure; replace: { key: string; guid: string }[] } {
+  const byKey = new Map<string, AddedEntity>();
+  const byGuid = new Map<string, AddedEntity>();
+  for (const n of chain.added ?? []) {
+    if (n.key) byKey.set(n.key, n);
+    else if (durableGuid(n.guid)) byGuid.set(n.guid, n);
+  }
+  const added: AddedEntity[] = [];
+  const replace: { key: string; guid: string }[] = [];
+  for (const node of full.added) {
+    const key = node.guid ? keysByGuid.get(node.guid) : undefined;
+    const base = (key ? byKey.get(key) : undefined) ?? (node.guid ? byGuid.get(node.guid) : undefined);
+    if (!base) { added.push(node); continue; }
+    if (sameStructure({ added: [node] }, { added: [base] })) continue;
+    added.push(node);
+    replace.push({ key: base.key ? key! : '', guid: node.guid });
+  }
+  const chainRemoved = new Set(chain.removed ?? []);
+  const removedTraits: Record<number, string[]> = {};
+  for (const [lid, names] of Object.entries(full.removedTraits)) {
+    const chainNames = new Set(chain.removedTraits?.[Number(lid)] ?? []);
+    const own = names.filter((n) => !chainNames.has(n));
+    if (own.length) removedTraits[Number(lid)] = own;
+  }
+  return {
+    structure: { ...full, added, removed: full.removed.filter((l) => !chainRemoved.has(l)), removedTraits },
+    replace,
+  };
 }
 
 /** Re-apply nested-instance captures onto a freshly rebuilt outer instance,
@@ -3405,14 +3536,30 @@ function reapplyNestedInstanceOverrides(newOuterRootId: number, captures: Nested
     });
     return found;
   };
+  // The fresh copies of `replace`'s nodes under nested root `root`: added nodes directly under a member.
+  const freshCopies = (root: number, replace: NestedInstanceCapture['replace']): number[] => {
+    const keys = new Set(replace.map((r) => r.key).filter(Boolean));
+    const guids = new Set(replace.filter((r) => !r.key).map((r) => r.guid));
+    const rootOf = (id: number) => (readTraitData(id, PrefabInstanceMeta)?.rootInstanceId as number) ?? 0;
+    const all = getAllEntities();
+    const members = new Set(all.filter((e) => rootOf(e.id) === root).map((e) => e.id));
+    return all
+      .filter((e) => members.has(e.parentId) && !members.has(e.id))
+      .filter((e) => keys.has(templateKeyOf(findEntity(e.id))) || guids.has(e.guid ?? ''))
+      .map((e) => e.id);
+  };
 
   for (const cap of captures) {
     let cur = newOuterRootId;
     for (const plid of cap.chain) { cur = findChildNestedRoot(cur, plid); if (!cur) break; }
     if (!cur || cur === newOuterRootId) continue;
+    if (cap.replace.length) deleteEntities(freshCopies(cur, cap.replace));
     applyOverridesByRootInstance(cur, cap.overrides);
     const childPrefab = getCachedPrefabSync(cap.source);
     if (childPrefab) applyStructureByRootInstance(cur, childPrefab, cap.structure);
+    // The respawned node is the scene-form capture, which carries no key: restore the marker, so the
+    // next template write keys it as the node it replaced rather than recovering or minting one.
+    for (const r of cap.replace) if (r.key) setTemplateKey(findEntityByGuid(r.guid), r.key);
   }
 }
 
@@ -3435,6 +3582,9 @@ export function rebuildInstance(
   prefab: PrefabFile,
   overrides: Record<number, Record<string, Record<string, unknown>>>,
   structure: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; consumedEcsIds?: Set<number> },
+  /** The document the LIVE tree was expanded from, when it is not `prefab` — a refresh's old file. The
+   *  nested re-apply subtracts what that document's chain applies (#1386, #1401). */
+  baseline: PrefabFile = prefab,
 ): number {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return rootInstanceId;
@@ -3448,7 +3598,7 @@ export function rebuildInstance(
 
   // Snapshot live per-copy overrides on nested children BEFORE the teardown
   // (they get cascade-destroyed with the outer members and re-expanded fresh).
-  const nestedCaptures = captureNestedInstanceOverrides(rootInstanceId);
+  const nestedCaptures = captureNestedInstanceOverrides(rootInstanceId, baseline);
 
   // Transience is a property of the IDENTITY, not of the id — the same reasoning that carries the
   // durable guid across the respawn below. Read before the teardown, re-applied after (#1301).
@@ -3555,7 +3705,7 @@ function refreshInstances(
     // rebuildInstance (it walks the live non-member descendants).
     const captured = captureInstanceOverrides(oldRootId, oldPrefab);
     const capturedStructure = captureInstanceStructure(oldRootId, oldPrefab);
-    rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure);
+    rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure, oldPrefab);
   }
 
   // Reports what was REBUILT, not what was listed. The two differ exactly when a root died
