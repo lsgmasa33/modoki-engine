@@ -428,11 +428,9 @@ text that has not yet round-tripped through the store — and omitting it from t
 is a stale closure plus a lint warning. The `setLocalValue` updater is what keeps `localValue`
 itself out of the deps, which matters for the same reason.
 
-- **Stateless on purpose.** Remembering the last value the field committed also settles the repro and
-  goes stale: nothing clears the memory, so once something drags the value away and back to the
-  remembered one, the field skips a re-sync it owes and sits on the intermediate text. (`NumBox`'s
-  latch is the same idea done safely — it is cleared by the external-change effect, which is exactly
-  what makes it a *trailing-blur* swallow rather than a permanent one.)
+- **This rule alone was not enough — see the next section (#1411).** It was first shipped
+  stateless, on the argument that remembering what the field committed goes stale. That argument is
+  right about an UNBOUNDED memory, and it is why the memory #1411 added is cleared three ways.
 - **Two known costs, both deliberate.** A non-injective `parse` — `BufferedNumberInput`'s min/max
   clamp — cannot be told from a reformat, so typing `1.8` into a `max=1` field leaves the display on
   `1.8` while the store holds `1` until blur reconciles it. That is what a FOCUSED window already
@@ -447,6 +445,47 @@ itself out of the deps, which matters for the same reason.
   moved the store and supplied the echo. Most of its number fields are clamped (25 of 38 carry a
   `min`/`max`, by `grep -nE "<(Num|NumInput)\b[^>]*(min|max)=\{"`), so the exposure is the panel,
   not a corner of it.
+
+### …and a LATE echo of an earlier keystroke (#1411)
+
+The echo rule compares the store's value with the text *on screen now*. But the Inspector samples
+the store once per frame (its rAF-coalesced refresh), so at typing speed the echo that arrives can
+belong to an EARLIER keystroke. It matches nothing on screen and looks exactly like an external
+change. **Measured live** in an unfocused editor (`games/anim-bug`, the name field, the alphabet
+typed by `modoki_type_text`): React wrote `…qr` over `…qrs`, the `t` landed after it, and the `s`
+was gone — about one character lost per run, at a random position. A focused window never shows it,
+because `focusedRef` skips the whole re-sync.
+
+**The fix: the field remembers what it committed.** `resyncBuffered`
+(`editor/panels/bufferedEcho.ts`) is the whole decision, shared by `useBufferedValue` and
+`ParticleEditor`'s `NumInput`:
+
+- A store value that equals the text on screen → keep the text (the #242 rule).
+- A store value found in the field's pending commits → a late echo: keep the text, and drop that
+  entry and everything before it (echoes arrive in commit order).
+- Anything else → a real external change: re-sync, and **forget every pending entry**.
+
+The memory is cleared three ways, and each one closes a stale-memory failure the review found:
+1. **Any external change** clears it, so a value dragged away and back re-syncs.
+2. **A change of owner.** Inspector fields are keyed by field NAME, so one instance survives a
+   selection change. The Inspector provides `BufferedFieldScope` (its selection) and the Particle
+   Editor provides it too (the effect's path, since its Sections survive a retarget). A new scope
+   clears the memory. A blur clears it as well, when one fires. Without this, typing `ab` into A's name and selecting B (named `a`) within the
+   window left `ab` on screen for B.
+3. **Time**: an entry expires after `ECHO_WINDOW_MS` (1 s), stamped AFTER the write so a slow
+   `onChange` cannot expire its own entry. The commit that ends an edit has nothing after it to
+   consume it, and nothing may wait for a blur to clear it (#233).
+
+**One ambiguity is deliberate, and cannot be closed without an identity on the echo.** Echoes are
+coalesced, so `1`, `12`, then a backspace to `1` in one frame is answered by ONE echo of `1`. That
+consumes the first `1`, and `12` lingers for up to a second. An undo to `12` inside that second is
+skipped and the field shows `1`. Clearing on a match with the LATEST entry would fix this and bring
+#1411 back whenever echoes are not coalesced, which is the worse trade. As with the clamp above:
+in an agent-driven session, read the value back from the store, never off the field.
+
+Tests: `engine/tests/editor/bufferedEcho.test.ts` (the decision) and
+`engine/packages/modoki/tests/editor/fields.test.tsx` § #1411 (the hook's wiring: the record, the scope
+reset, the stamp order).
 
 ### And the mirror-image trap: Escape, in a window that IS focused
 

@@ -228,6 +228,7 @@ function mockDeps() {
     // A 'vid:' ref stands in for a video-asset GUID: a Sprite slot that skips the
     // still-image pipeline entirely (no resolve, no Assets.load, no url retain).
     isVideoRef: (ref: string) => typeof ref === 'string' && ref.startsWith('vid:'),
+    isUnknownAssetGuid: () => false,
     isImagePath: (ref: string) =>
       typeof ref === 'string' && (ref.startsWith('sheet:') || ref.startsWith('img:') || ref.startsWith('http') || ref.startsWith('/')),
     resolveImageUrl: (ref: string) => {

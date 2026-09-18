@@ -7,7 +7,7 @@
  *  Cmd+S (Save All), like every other authored surface. It used to autosave on a 400ms debounce —
  *  see useParkedAssetDoc.ts and docs/mcp-persistence.md for why that went. */
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useContext } from 'react';
 import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
 import { jsonFileBody } from '../backend/editorBackend';
 import { writeNewAssetDocument } from '../scene/createAssetDocument';
@@ -28,7 +28,8 @@ import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { classifyParticleFetchSuccess, classifyParticleFetchFailure } from './particleLoadPersist';
 import { chooseNewAssetPath } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
-import { applyWheelStep, useWheelStep } from './fields';
+import { applyWheelStep, useWheelStep, BufferedFieldScope } from './fields';
+import { resyncBuffered, ECHO_WINDOW_MS, type PendingCommit } from './bufferedEcho';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fieldIds';
@@ -512,6 +513,9 @@ export default function ParticleEditor() {
   savedMarkRef.current = markSaved; // let the load effect seed the saved reference
 
   return (
+    // NumInput instances survive a retarget (Sections are not re-keyed by asset), so the scope tells
+    // them the owner changed and their pending commits are the previous effect's (#1411).
+    <BufferedFieldScope.Provider value={asset?.path ?? null}>
     <div style={{ display: 'flex', width: '100%', height: '100%', background: '#1a1a2e', fontFamily: 'monospace', fontSize: 12, color: '#ccc' }}>
       {/* Viewport */}
       <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
@@ -791,6 +795,7 @@ export default function ParticleEditor() {
         </div>
       )}
     </div>
+    </BufferedFieldScope.Provider>
   );
 }
 
@@ -878,16 +883,29 @@ function NumInput({ uiId, uiLabel, value, on, title, min, max, step, disabled, w
   // ⭐ So the guard is the ECHO: when the text on screen would commit exactly the value already in
   // the store, re-syncing can only reformat it, which is the destruction itself and never new
   // information. A real external change (a preset load, an undo, retargeting the panel) does not
-  // match and still re-syncs. Same fix as `useBufferedValue` in `fields.tsx`.
+  // match and still re-syncs. Same fix as `useBufferedValue` in `fields.tsx`, through the same
+  // `resyncBuffered` — which also skips a LATE echo of an earlier keystroke (#1411: the echo of
+  // `…3` arriving after `…35` was typed would otherwise rewrite it and drop the `5`).
+  const localRef = useRef(local);
+  localRef.current = local;
+  const pendingRef = useRef<PendingCommit<number | null>[]>([]);
+  const scope = useContext(BufferedFieldScope);
+  const scopeRef = useRef(scope);
   useEffect(() => {
+    if (scopeRef.current !== scope) { scopeRef.current = scope; pendingRef.current = []; }
     if (focused.current) return;
-    setLocal((cur) => (Object.is(committedValueOf(cur, min, max), value) ? cur : String(value)));
-  }, [value, min, max]);
+    const r = resyncBuffered<number | null>(localRef.current, value, pendingRef.current, (raw) => committedValueOf(raw, min, max), performance.now());
+    pendingRef.current = r.pending;
+    if (r.text !== null) setLocal(r.text);
+  }, [value, min, max, scope]);
   const handle = (raw: string) => {
     setLocal(raw);
+    localRef.current = raw;
     const c = committedValueOf(raw, min, max);
     if (c === null) return; // mid-typing ("", "-", ".") — keep the text, push nothing
     on(c);
+    const now = performance.now(); // after the write — see useBufferedValue
+    pendingRef.current = [...pendingRef.current.filter((p) => now - p.at <= ECHO_WINDOW_MS), { value: c, at: now }];
   };
   // Mouse-wheel adjust (focused only); Shift = ×10. Steps from the shown value, falling
   // back to the committed value mid-typing. Writes local + upstream directly (the wheel
@@ -905,7 +923,7 @@ function NumInput({ uiId, uiLabel, value, on, title, min, max, step, disabled, w
       data-ui-id={uiId} data-ui-kind="field" data-ui-label={uiLabel}
       type="text" inputMode="decimal" title={title} value={local} disabled={disabled}
       onFocus={() => { focused.current = true; }}
-      onBlur={() => { focused.current = false; setLocal(String(value)); }}
+      onBlur={() => { focused.current = false; pendingRef.current = []; setLocal(String(value)); }}
       onChange={(e) => handle(e.target.value)}
       style={{ ...input, width }}
     />

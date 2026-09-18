@@ -277,6 +277,15 @@ function warnUnresolvedSprite(ref: string, why: string): undefined {
   return undefined;
 }
 
+/** The DOM twin of {@link warnUnresolvedSprite}, for `resolveBrowserImageUrl`'s production path
+ *  (UI `<img>`/background). Same dedupe and same forget-on-resolve. */
+const _domUnresolvedWarned = new Set<string>();
+function warnUnresolvedDomImage(ref: string, why: string): void {
+  if (!isGuid(ref) || _domUnresolvedWarned.has(ref)) return;
+  _domUnresolvedWarned.add(ref);
+  console.warn(`[UIImage] Unknown asset guid: ${ref}\n  (${why} — deleted, dropped from the build, renamed, or never assigned an id?)`);
+}
+
 /** A ref that resolves is no longer "unresolved" — drop it so a future genuine failure warns. */
 function forgetUnresolvedSprite(ref: string): void {
   if (_unresolvedSpriteWarned.size) _unresolvedSpriteWarned.delete(ref);
@@ -287,6 +296,7 @@ function forgetUnresolvedSprite(ref: string): void {
  *  sibling test that already tripped it. */
 export function resetUnresolvedSpriteWarnings(): void {
   _unresolvedSpriteWarned.clear();
+  _domUnresolvedWarned.clear();
 }
 
 /** Resolve a 2D image-or-sprite ref to `{ url, frame, pivot }`.
@@ -367,7 +377,15 @@ export function resolveBrowserImageUrl(ref: string, warnKtx = false): string | u
   const texRef = entry?.type === 'sprite' && entry.sprite ? entry.sprite.texture : ref;
   const texEntry = getAssetEntry(texRef);
   const sourcePath = resolveRef(texRef);
-  if (!sourcePath) return undefined;
+  if (!sourcePath) {
+    // A deleted/unknown image guid on the production-DOM path (#1408): a UI image that is simply
+    // absent, with a clean console, is the shape `warnUnresolvedSprite` exists to prevent on the
+    // 2D side. Gated on the same opt-in as the KTX warning: UINode passes it (in the editor's UI
+    // preview too); the SceneView's Canvas2D draw path does not.
+    if (warnKtx) warnUnresolvedDomImage(ref, texRef !== ref ? `its parent texture ${texRef} is not in the manifest` : 'not in the manifest');
+    return undefined;
+  }
+  if (_domUnresolvedWarned.size) _domUnresolvedWarned.delete(ref);
   const settings = texEntry?.texture;
   if (settings) {
     // The WebP/PNG sibling a 2d/ui texture exposes (mirrors what the build emits).

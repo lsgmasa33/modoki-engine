@@ -38,11 +38,17 @@ function trackWorld<T>(w: T): T { createdWorlds.push(w); return w; }
  */
 const spriteUrlRedirects = new Map<string, string>();
 
+/** Every ref the `resolveSprite` mock was asked for, in order — read by the #1408 tests below,
+ *  which pin WHEN Scene2D routes an unknown guid through it (for its warning). A `gone:` ref
+ *  stands in for a guid the manifest no longer knows (`isUnknownAssetGuid`). Cleared per test. */
+const resolveSpriteCalls: string[] = [];
+
 beforeEach(() => {
   vi.resetModules();
 });
 afterEach(() => {
   spriteUrlRedirects.clear();
+  resolveSpriteCalls.length = 0;
   for (const w of createdWorlds) { try { w.destroy(); } catch { /* already disposed */ } }
   createdWorlds.length = 0;
   // ⚠️ **Several tests here spy `console.warn` and do not restore it** (#1110 close-out finding
@@ -329,8 +335,10 @@ function mockDeps() {
       if (ref.startsWith('http') || ref.startsWith('/')) return ref;
       return undefined;
     },
+    isUnknownAssetGuid: (ref: string) => typeof ref === 'string' && ref.startsWith('gone:'),
     resolveSprite: (ref: string) => {
       if (typeof ref !== 'string') return undefined;
+      resolveSpriteCalls.push(ref);
       // `sheet:<i>` → a sliced FRAME of one shared sheet (same url, different sub-rect) —
       // the sprite-sheet animation case the in-place frame-swap path targets.
       const m = /^sheet:(\d+)$/.exec(ref);
@@ -1611,6 +1619,59 @@ describe('Scene2D.renderFrame', () => {
 
       expect(wrapper.destroy).toHaveBeenCalledWith(false);            // wrapper dropped, source kept
       expect(pixi.Assets.__unloaded).toContain('http://t/sheet.png'); // base source unloaded at refcount 0
+    });
+  });
+
+  // #1408: a guid the manifest no longer knows is not an image to `isImagePath`, so it draws as the
+  // graphics fallback — and must still be routed through `resolveSprite` once, for its warning.
+  describe('an unknown sprite guid reaches resolveSprite for its warning (#1408)', () => {
+    it('a new slot resolves it once, and a static frame after does not resolve it again', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'gone:tex' });
+      scene2d.renderFrame();
+      expect((pool.getSlot(canvas.id())!.container.children[0] as any).kind).toBe('graphics'); // fallback still draws
+      expect(resolveSpriteCalls).toEqual(['gone:tex']);
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame();
+      expect(resolveSpriteCalls).toEqual(['gone:tex']);
+    });
+
+    it('a ref change onto an unknown guid resolves it; a primitive keyword never does', async () => {
+      const { traits, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square' });
+      scene2d.renderFrame();
+      expect(resolveSpriteCalls).toEqual([]);
+      child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'gone:tex' });
+      scene2d.renderFrame();
+      expect(resolveSpriteCalls).toEqual(['gone:tex']);
+    });
+
+    it('a texture deleted UNDER a live sprite (same ref, sprite → graphics) resolves it', async () => {
+      const { pixi, traits, pool, scene2d, world } = await setup();
+      pixi.Assets.__seed('/hero.png', { width: 64, height: 64 });
+      spriteUrlRedirects.set('gone:tex', '/hero.png');          // resolvable: an image sprite
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'gone:tex' });
+      scene2d.renderFrame();
+      expect((pool.getSlot(canvas.id())!.container.children[0] as any).kind).toBe('sprite');
+      resolveSpriteCalls.length = 0;
+      spriteUrlRedirects.delete('gone:tex');                     // the texture is deleted
+      child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D) }); // same ref, re-dirtied
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame();
+      expect((pool.getSlot(canvas.id())!.container.children[0] as any).kind).toBe('graphics');
+      expect(resolveSpriteCalls).toEqual(['gone:tex']);
+    });
+
+    it('a 2D-material entity whose sprite guid is unknown resolves it on the material path', async () => {
+      const { traits, scene2d, world, matReady } = await setup();
+      matReady.add('matGuid');
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'gone:tex', material: 'matGuid' });
+      scene2d.renderFrame();
+      expect(resolveSpriteCalls).toContain('gone:tex');
     });
   });
 

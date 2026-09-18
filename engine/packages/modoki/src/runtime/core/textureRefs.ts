@@ -74,6 +74,17 @@ export function isVideoRef(ref: string): boolean {
   return /\.(mp4|mov|m4v|webm|mkv)$/i.test(ref);
 }
 
+/** True if ref is a GUID the manifest does not know at all — a deleted, renamed or never-imported
+ *  asset. {@link isImagePath} deliberately answers `false` for these (so a material guid is never
+ *  mistaken for an image), which sends such a 2D sprite down the plain-graphics path where
+ *  `resolveSprite` — and its `[Sprite2D] Unknown asset guid` warning — is never reached (#1408).
+ *  Scene2D asks this to route the ref through `resolveSprite` once, for the warning alone. */
+export function isUnknownAssetGuid(ref: string): boolean {
+  if (!ref || !isGuid(ref)) return false;
+  const p = textureProvider.get();
+  return !!p && p.getAssetType(ref) === undefined;
+}
+
 /** Resolve a sprite ref through the texture-resolution seam. See {@link ResolvedSprite}. */
 export function resolveSprite(ref: string): ResolvedSprite | undefined {
   return textureProvider.get()?.resolveSprite(ref);

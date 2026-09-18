@@ -616,6 +616,36 @@ fail the scene load outright on a 2D-only project; see
 `invalidateTexture(ref)` evicts the cached bytes for every variant from
 `THREE.Cache` so a re-import re-fetches the freshly-converted files.
 
+### A deleted image guid must warn, on every path that draws one (#1408)
+
+A texture deleted while a 2D sprite or UI image still references it should not leave a wrong
+picture and a clean console. The trap is that the path decides "is this an image?" BEFORE it
+resolves. `isImagePath` (`runtime/core/textureRefs.ts`) asks the manifest for the guid's type, and
+an unknown guid answers "not an image" on purpose, so a material guid is never treated as one. So
+Scene2D drew the graphics fallback (a white square, kept on purpose) and never reached
+`resolveSprite`, the only place `[Sprite2D] Unknown asset guid` is emitted.
+
+`isUnknownAssetGuid` names that case. Each path routes such a ref to its warning:
+
+| Path | Warning | Where |
+|---|---|---|
+| A plain 2D sprite: on a new slot, a ref change, or the sprite → graphics flip of a texture deleted UNDER a live sprite | `[Sprite2D] Unknown asset guid` | Scene2D's Renderable2D pass |
+| A 2D-material entity's sprite and texture params (the material pass owns the entity, so the sprite pass is not reached) | `[Sprite2D] Unknown asset guid` | `resolveMaterialTextureRef` |
+| A UI `<img>`/background: every `UINode` render, in the editor's UI preview too (the `warnKtx` opt-in; only the SceneView's Canvas2D draw path stays quiet). A sprite guid whose parent texture is gone names that texture | `[UIImage] Unknown asset guid` | `resolveBrowserImageUrl` |
+
+Each warning fires once per guid, and is forgotten once the guid resolves again, so a later
+genuine break warns again.
+
+⚠️ **Limit: a texture deleted UNDER a UI image already on screen does not warn until the node
+re-renders** (a scene reload, or an edit to that element). The manifest prune (`unregisterAsset`)
+neither marks the UI tree dirty nor changes the node's `imageEpoch`, so the memoised `UINode` never
+calls the resolver again, and the old picture stays up. Scene2D has no such gap, because the
+sprite → graphics flip rebuilds its slot. This only happens in the editor (nothing is deleted at
+runtime), and closing it means UI-tree invalidation on prune, which is a different change. The 3D side needs none of this: `loadTexture3D` throws on an unresolved
+ref, and every caller warns. Tests: `engine/tests/assets/unknownSpriteGuid.test.ts`, and the
+call sites in `engine/packages/modoki/tests/runtime/Scene2D.test.ts` § "an unknown sprite guid
+reaches resolveSprite".
+
 ### 2D KTX2 sprites (PixiJS)
 
 The 2D path decodes `.ktx2` sprites/atlas-pages through PixiJS's own KTX2 parser,

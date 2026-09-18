@@ -3,8 +3,9 @@
  *  (jsdom + @testing-library/react) without dragging in the Inspector's heavy
  *  transitive deps (model import, texture resolver, three.js preview, store). */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, createContext, useContext } from 'react';
 import { MIXED_PLACEHOLDER } from '../../runtime/rendering/mixedPlaceholder';
+import { resyncBuffered, ECHO_WINDOW_MS, type PendingCommit } from './bufferedEcho';
 
 /** Shared monospace input style for Inspector-style field inputs. */
 export const inputStyle: React.CSSProperties = {
@@ -95,6 +96,13 @@ export function Info({ text }: { text: string }) {
  *  handle vocabulary because `modoki_handles` reads it back as `meta.mixed` — see its declaration. */
 export { MIXED_PLACEHOLDER };
 
+/** Who owns the value the buffered fields below are editing — the Inspector provides its selection.
+ *  A field instance is reused across owners (the Inspector keys fields by field name), so when this
+ *  changes the field forgets its pending commits: they were the PREVIOUS owner's, and one that
+ *  happens to equal the new owner's value would otherwise be skipped as a late echo (#1411).
+ *  `null` (no provider) never changes, which keeps every other caller on the old behaviour. */
+export const BufferedFieldScope = createContext<unknown>(null);
+
 /** Local-state input hook: buffers keystrokes while focused so ECS re-renders
  *  don't overwrite in-flight typing. Syncs the ECS value back when not focused.
  *  When `mixed` is true (multi-select with differing values), the input shows
@@ -109,38 +117,42 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
   // guard below is deliberately holding back, for one). Read the latest one through a ref.
   const parseRef = useRef(parse);
   parseRef.current = parse;
+  // The text on screen, for the re-sync below (which must not decide inside a state updater: the
+  // decision also consumes `pendingRef`, and an updater may run twice).
+  const localRef = useRef(localValue);
+  localRef.current = localValue;
+  // What this field itself committed and has not yet seen echo back — see bufferedEcho.ts (#1411).
+  const pendingRef = useRef<PendingCommit<T>[]>([]);
+  const scope = useContext(BufferedFieldScope);
+  const scopeRef = useRef(scope);
   // Sync from ECS when the value changed for a reason other than this field's own typing.
   useEffect(() => {
+    if (scopeRef.current !== scope) { scopeRef.current = scope; pendingRef.current = []; }
     if (focusedRef.current) return;
-    setLocalValue((current) => {
-      // ⚠️ **`focusedRef` IS NOT ENOUGH, BECAUSE A FOCUS EVENT IS NOT GUARANTEED TO FIRE (#242).**
-      // Chromium dispatches `focus`/`blur` only while `document.hasFocus()`, so with the editor
-      // window not OS-focused — the permanent state of an agent-driven MCP session, and an ordinary
-      // one for a human with another window on top — `focusedRef` is never true and this effect
-      // clobbers the buffer mid-edit. It is this field's OWN commit that does the clobbering:
-      // clearing the field commits `parse('')` (0), the store echoes 0 back, and the echo rewrites
-      // the empty buffer to '0' — so the next keystrokes land on '0' and `-3.5` is typed as
-      // '0-3.5', which parses to 0. Measured on `games/sling` Lvl-0002: asked for -3.5, stored 0,
-      // and the input tool reported success. Same shape as #233 (`qa/knowledge.md` §5: nothing in
-      // the editor may depend on a focus event firing).
-      //
-      // ⭐ So the guard is the ECHO, not the focus: when the text on screen already MEANS the
-      // store's value, re-syncing can only reformat it ('' or '-' -> '0', '3.50' -> '3.5') — which
-      // is exactly the destruction above, and never new information. A real external change (a
-      // gizmo drag, an undo, a selection change) does not parse-match and still re-syncs.
-      // Stateless on purpose: remembering the last committed value instead would go stale the
-      // moment something dragged the value away and back to it, and skip a re-sync it owed.
-      if (!mixed && Object.is(parseRef.current(current), externalValue)) return current;
-      return mixed ? '' : String(externalValue);
-    });
-  }, [externalValue, mixed]);
+    if (mixed) { pendingRef.current = []; setLocalValue(''); return; }
+    // ⚠️ `focusedRef` IS NOT ENOUGH, BECAUSE A FOCUS EVENT IS NOT GUARANTEED TO FIRE (#242).
+    // Chromium dispatches `focus`/`blur` only while `document.hasFocus()`, so with the editor
+    // window not OS-focused — the permanent state of an agent-driven MCP session, and an ordinary
+    // one for a human with another window on top — `focusedRef` is never true and this effect
+    // would clobber the buffer mid-edit with this field's OWN commits coming back: the echo of the
+    // latest keystroke (#242: clearing commits 0, the echo rewrites '' to '0', `-3.5` lands as
+    // '0-3.5') and the LATE echo of an earlier one (#1411: `…qr` written over `…qrs`, a character
+    // lost per run). `resyncBuffered` tells those apart from a real external change (a gizmo drag,
+    // an undo, a selection change), which still re-syncs. Same shape as #233 (`qa/knowledge.md` §5:
+    // nothing in the editor may depend on a focus event firing).
+    const r = resyncBuffered(localRef.current, externalValue, pendingRef.current, parseRef.current, performance.now());
+    pendingRef.current = r.pending;
+    if (r.text !== null) setLocalValue(r.text);
+  }, [externalValue, mixed, scope]);
   const onFocus = useCallback(() => { focusedRef.current = true; }, []);
   const onBlur = useCallback(() => {
     focusedRef.current = false;
+    pendingRef.current = [];
     setLocalValue(mixed ? '' : String(externalValue)); // reconcile with ECS — reverts an unaccepted edit
   }, [externalValue, mixed]);
   const handleChange = useCallback((raw: string) => {
     setLocalValue(raw);
+    localRef.current = raw;
     // Mixed-mode (multi-select with differing values): a transient empty string
     // mid-edit (type, then backspace to empty) must NOT broadcast the parse
     // fallback (0 / '') to every selected entity — that's an accidental mass
@@ -152,7 +164,12 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
     // onBlur then reverts the display to the last good value. Prevents a stray string
     // (like "1") being committed into a GUID-only reference.
     if (validate && !validate(raw)) return;
-    onChange(parse(raw));
+    const value = parse(raw);
+    onChange(value);
+    // Stamped AFTER the write: a slow `onChange` (a heavy re-render) must not eat into the window
+    // in which its own echo is expected back.
+    const now = performance.now();
+    pendingRef.current = [...pendingRef.current.filter((p) => now - p.at <= ECHO_WINDOW_MS), { value, at: now }];
   }, [onChange, parse, mixed, validate]);
   // For styling: the currently-shown text is "valid" when there's no guard, or it passes.
   const valid = !validate || validate(localValue);

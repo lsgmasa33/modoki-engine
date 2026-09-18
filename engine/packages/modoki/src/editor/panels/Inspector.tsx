@@ -29,7 +29,7 @@ import { describeEntityGuid } from './entityGuidLabel';
 // must not be able to disagree with the layout that makes it inert.
 import { STRETCH_X, STRETCH_Y, isSizeInert } from '../../runtime/ui/anchorLayout';
 import { inertUIAnchorBooleanReason } from '../../runtime/ui/anchorCss';
-import { BufferedTextInput, BufferedNumberInput, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER } from './fields';
+import { BufferedTextInput, BufferedNumberInput, BufferedFieldScope, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER } from './fields';
 import { type TraitEntry, sameTraitResult, readMergedTraits } from './inspectorMerge';
 import { AssetRefField } from './AssetRefField';
 import { parseClipBank, stringifyClipBank, type ClipBankEntry } from '../../runtime/audio/clipBank';
@@ -1960,6 +1960,10 @@ export default function Inspector() {
     : 'Copy Component';
 
   return (
+    // Every buffered field below is keyed by FIELD NAME, not by entity, so one field instance
+    // survives a selection change — and with it, its record of pending commits. The scope tells it
+    // the owner changed, so a late echo from the previous entity cannot shadow this one's value (#1411).
+    <BufferedFieldScope.Provider value={selectedIds.join(',')}>
     <div style={containerStyle}>
       {/* Header with delete button */}
       <div style={{ height: 32, padding: '0 8px', borderBottom: '1px solid #333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -2173,6 +2177,7 @@ export default function Inspector() {
         )}
       </div>
     </div>
+    </BufferedFieldScope.Provider>
   );
 }
 

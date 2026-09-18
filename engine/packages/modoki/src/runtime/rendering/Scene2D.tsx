@@ -53,7 +53,7 @@ import { getSkin2DBuffer, clearSkin2DBuffers, frameSkin2DUVs } from '../skinning
 import { clearDeform2DBuffers } from '../animation/deform2DBuffers';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_2D, PRIORITY_EDITOR_2D } from './frameDriver';
 import { sceneManager } from '../scene/SceneManager';
-import { isImagePath, isVideoRef, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
+import { isImagePath, isVideoRef, isUnknownAssetGuid, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
 import { syncVideoTextures2D, disposeVideoTextures2D, flushPendingVideoDestroy2D } from './videoTextureSync2D';
 /** Shared empty result for the video pass when the module is excluded — a fresh [] per frame
  *  would allocate for a subsystem that isn't even in the build. */
@@ -1443,7 +1443,12 @@ export class Scene2DRenderer {
    *  textureMatrix maps the quad's 0..1 UVs into the sub-rect, so the shader samples the
    *  right pixels; a whole image borrows the base texture. */
   private resolveMaterialTextureRef(spriteRef: string, wholeOnly = false): { base: Texture; resolved: ResolvedSprite | null; url: string; hasFrame: boolean } {
-    if (!isImagePath(spriteRef)) return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
+    if (!isImagePath(spriteRef)) {
+      // A deleted texture guid (#1408): warn through resolveSprite, as the sprite pass does — a
+      // material entity rarely reaches that pass, so without this it drew WHITE with a clean console.
+      if (isUnknownAssetGuid(spriteRef)) resolveSprite(spriteRef);
+      return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
+    }
     const resolved = resolveSprite(spriteRef);
     if (!resolved) return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false }; // guid not in manifest yet
     const url = resolved.url;
@@ -1752,6 +1757,16 @@ export class Scene2DRenderer {
         if (needResolve) {
           resolved = resolveSprite(rend.sprite);
           if (!resolved) return; // guid not yet in manifest — wait for next frame
+        } else if (!imageMode && !videoMode &&
+          (!displaySlot || displaySlot.spriteRef !== rend.sprite || displaySlot.kind !== spriteKind) &&
+          isUnknownAssetGuid(rend.sprite)) {
+          // A guid the manifest does not know (deleted texture, #1408) is not an "image" to
+          // isImagePath, so it draws as the plain graphics fallback and would never reach
+          // resolveSprite's `[Sprite2D] Unknown asset guid` warning — a wrong sprite with a clean
+          // console. Resolve it for the warning alone whenever the slot is (re)built: a new slot,
+          // a ref change, or the kind flip that a texture deleted UNDER a live sprite produces
+          // (same ref, sprite → graphics). The fallback still draws.
+          resolveSprite(rend.sprite);
         }
 
         // FRAME SWAP (sprite-sheet animation / atlas swap): the ref changed but it
