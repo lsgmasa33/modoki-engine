@@ -57,6 +57,8 @@ export const analytics = {
   async setUserProperty(_key: string, _value: string): Promise<void> {},
   async setCurrentScreen(_screenName: string): Promise<void> {},
   async setEnabled(_enabled: boolean): Promise<void> {},
+  /** #1398 — the real wrapper's off-native answer: no app-instance ID, so the Player ID row says so. */
+  async getAppInstanceId(): Promise<string | undefined> { return undefined; },
 };
 
 /**

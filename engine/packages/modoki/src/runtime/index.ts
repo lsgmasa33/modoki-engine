@@ -128,6 +128,7 @@ export {
 export {
   ALL_PROVIDERS, reauthProviderFor,
   type AccountProvider, type AccountState, type AvailableProviders, type SignInFailure,
+  supportId, supportIdView, type SupportId, type SupportIdView, type SupportIdWords, type CopyFeedback,
 } from './account';
 // In-app purchases (#196). `reconcile()` MUST run once per launch before the player can buy
 // anything — it is the recovery pass for a purchase interrupted by a crash or force-close.
@@ -154,7 +155,7 @@ export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
 export { registerHapticControls } from './actions/hapticControls';
 export { registerQualityControls } from './actions/qualityControls';
-export { registerSystemControls } from './actions/systemControls';
+export { registerSystemControls, copyToClipboard } from './actions/systemControls';
 export {
   playHaptic, configureHaptics, areHapticsEnabled, canDeviceVibrate,
   hapticLatencyMean, hapticLatencySamples, clearHapticLatency,
@@ -320,6 +321,9 @@ export {
 export {
   AssetNetworkError, MissingAssetError, absentIfBundled, checkAssetResponse, isAppBundleUrl, readAssetBytes, statusIsAbsent,
 } from './core/assetLoadErrors';
+// The JSON half of the same recipe: status, SPA fallback and a mid-body drop typed for the memo.
+// `checkAssetResponse` + `res.json()` would leave that drop an untyped `TypeError` (#1399).
+export { parseAssetJson } from './loaders/assetFetch';
 export {
   requestPrefab, MAX_PREFAB_FETCH_ATTEMPTS,
   type PrefabDocLike, type RequestPrefabOptions,

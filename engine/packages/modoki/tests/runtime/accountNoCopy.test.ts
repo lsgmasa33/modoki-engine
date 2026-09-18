@@ -54,6 +54,8 @@ const ALLOWED_LITERALS: readonly string[] = [
   'signed-out', 'working', 'signing-in', 'signing-out', 'deleting', 'signed-in', 'error',
   // SignInFailure
   'network', 'not-configured', 'credential-in-use', 'failed',
+  // SupportId kinds (#1398)
+  'account', 'install', 'none',
 ];
 
 /** Every quoted/templated string literal in `code` (comments already stripped), excluding module

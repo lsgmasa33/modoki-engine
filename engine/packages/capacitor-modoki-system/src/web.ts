@@ -32,6 +32,21 @@ export class ModokiSystemWeb extends WebPlugin implements ModokiSystemPlugin {
     throw this.unimplemented('kvInfo is iOS-only');
   }
 
+  // Presence first: outside a secure context `navigator.clipboard` is undefined, and `?.writeText`
+  // would resolve undefined, which reads as a copy that never happened.
+  async copyText(options: { text: string }): Promise<{ copied: boolean }> {
+    const text = options?.text;
+    if (typeof text !== 'string' || text === '' || typeof navigator === 'undefined' || !navigator.clipboard) {
+      return { copied: false };
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      return { copied: true };
+    } catch {
+      return { copied: false };
+    }
+  }
+
   // `window.open` returning null is not a failure signal here — see `openUrl` in definitions.ts.
   // The https-only rule is restated in Swift, Java and the engine's `system.openUrl` action, because
   // none of them can import this file.

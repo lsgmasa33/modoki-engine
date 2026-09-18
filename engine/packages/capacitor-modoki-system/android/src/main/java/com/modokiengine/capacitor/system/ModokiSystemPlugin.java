@@ -1,6 +1,8 @@
 package com.modokiengine.capacitor.system;
 
 import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
@@ -55,6 +57,29 @@ public class ModokiSystemPlugin extends Plugin {
 
         JSObject ret = new JSObject();
         ret.put("opened", openable && start(new Intent(Intent.ACTION_VIEW, uri)));
+        call.resolve(ret);
+    }
+
+    // Plain text on the system clipboard (#1398) — a player ID the player pastes into a support
+    // email. Native because a WebView clipboard write needs the tap's user activation, which an
+    // engine-dispatched action cannot promise. Android 13+ shows its own "Copied" confirmation.
+    @PluginMethod
+    public void copyText(PluginCall call) {
+        String text = call.getString("text");
+        JSObject ret = new JSObject();
+        ClipboardManager clipboard = (ClipboardManager) getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+        if (text == null || text.isEmpty() || clipboard == null) {
+            ret.put("copied", false);
+            call.resolve(ret);
+            return;
+        }
+        try {
+            clipboard.setPrimaryClip(ClipData.newPlainText("text", text));
+            ret.put("copied", true);
+        } catch (RuntimeException e) {
+            // A background app or a restricted profile can refuse the write.
+            ret.put("copied", false);
+        }
         call.resolve(ret);
     }
 

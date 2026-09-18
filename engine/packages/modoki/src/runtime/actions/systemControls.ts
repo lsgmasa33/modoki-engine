@@ -6,6 +6,9 @@
  *    screen's Privacy Policy / Terms of Use link uses, with the URL authored on the binding in the
  *    scene rather than in code.
  *
+ * Plus one plain function, `copyToClipboard` (#1398), which is not an action because what it copies
+ * (a player ID) is runtime data a scene binding cannot carry. A game's own action calls it.
+ *
  * ── Where the page opens ────────────────────────────────────────────────────
  * - **Native (iOS / Android):** `capacitor-modoki-system`'s `openUrl` — Safari or the default Android
  *   browser, leaving the app (the owner's call, 2026-09-15: system browser, not an in-app sheet).
@@ -34,6 +37,7 @@
  */
 
 import { Capacitor, registerPlugin } from '@capacitor/core';
+import type { World } from 'koota';
 
 import type { ModokiSystemPlugin } from 'capacitor-modoki-system';
 import { registerUIAction, refuseAction } from '../core/actionRegistry';
@@ -92,6 +96,60 @@ export function isOpenableUrl(url: unknown): url is string {
   if (typeof url !== 'string' || !OPENABLE_URL.test(url) || BAD_PERCENT.test(url)) return false;
   try {
     return new URL(url).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/** Put `text` on the system clipboard (#1398): a Settings "Copy player ID" button, where support
+ *  needs the player to paste an exact value into an email. Resolves `true` only when the text was
+ *  handed to a clipboard, and `false` otherwise. It never rejects, so the caller can show a
+ *  "Copied" or a failure line without a try/catch.
+ *
+ *  - **Native:** `capacitor-modoki-system`'s `copyText` (`UIPasteboard` / `ClipboardManager`). NOT
+ *    `navigator.clipboard`: a UI action runs from the ECS dispatch, which can fall outside the tap's
+ *    user-activation window that WebKit requires for a clipboard write, and whether the app's
+ *    `capacitor://` page counts as a secure context was never measured. The native pasteboard
+ *    depends on neither. A native build without the plugin, or a bundle delivered by OTA to a binary
+ *    whose plugin predates `copyText`, answers `false` and logs it at `error`, never a false success.
+ *  - **Web and the editor:** `navigator.clipboard.writeText`. It checks PRESENCE first, because
+ *    outside a secure context `navigator.clipboard` is undefined and `?.writeText` would resolve
+ *    `undefined`, which reads as success with an untouched clipboard.
+ *
+ *  Journaled as `system.copyText` `{ copied }`, never with the text itself, because the value is an
+ *  identifier and the journal is shipped in bug reports. */
+export async function copyToClipboard(text: string, world?: World): Promise<boolean> {
+  const copied = await writeClipboard(text);
+  emit('system.copyText', { copied }, world, copied ? 'info' : 'warn');
+  return copied;
+}
+
+async function writeClipboard(text: string): Promise<boolean> {
+  if (typeof text !== 'string' || text === '') return false;
+  if (Capacitor.isNativePlatform()) {
+    if (!Capacitor.isPluginAvailable(PLUGIN_NAME)) {
+      console.error('[copyToClipboard] this native build does not include capacitor-modoki-system — add it to the '
+        + 'game\'s package.json and capacitor.config.json includePlugins, then cap sync.');
+      return false;
+    }
+    const plugin = system();
+    if (typeof plugin.copyText !== 'function') {
+      console.error('[copyToClipboard] the native capacitor-modoki-system predates copyText (an OTA bundle on an older binary).');
+      return false;
+    }
+    try {
+      return (await plugin.copyText({ text })).copied === true;
+    } catch (err) {
+      // The registerPlugin fallback proxy rejects "not implemented" on a binary without copyText.
+      console.error('[copyToClipboard] copyText failed:', err);
+      return false;
+    }
+  }
+  const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard;
+  if (!clipboard || typeof clipboard.writeText !== 'function') return false;
+  try {
+    await clipboard.writeText(text);
+    return true;
   } catch {
     return false;
   }

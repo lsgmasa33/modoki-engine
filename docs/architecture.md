@@ -718,8 +718,16 @@ now. What they needed from it:
 - **It lives in L0.** `core/loadFailureMemo.ts` and `core/assetLoadErrors.ts` (the error types,
   `statusIsAbsent`, `checkAssetResponse`, `readAssetBytes`). `rendering/`, `audio/` and `video/`
   are L2 and may not import `loaders/` (docs/architecture-layers.md). `loaders/assetFetch.ts`
-  re-exports the error types. `@modoki/engine` exports the memo too, so a game's own loader
-  (Court's level list, #1399; Wordweave's corpus, #1400) can use the same rule.
+  re-exports the error types. `@modoki/engine` exports the memo too, and `parseAssetJson`, so a
+  game's own loader (Court's level list, #1399; Wordweave's corpus, #1400) can use the same rule.
+  ⚠️ **Export `parseAssetJson`, not just the memo** (#1399): without it a game writes
+  `checkAssetResponse` + `res.json()`, and a connection that drops mid-body stays an untyped
+  `TypeError`, so it is misread as a permanent failure. Court's adoption (`levelLoadFailures`
+  in `games/court/runtime/systems.ts`) gates both per-frame asks on `blocked()`. The level gate
+  sits where the board despawn used to re-run on every lap of a failing load. ⚠️ A blocked level
+  still despawns ANOTHER level's board, once: returning before the despawn left the previous board
+  drawn with nothing driving its input (found in review). `enterWorld` clears the memo, so
+  Stop→Play refetches.
 - **`onRetryDue`, a wake per backing-off key.** A per-frame asker (`scene3DSync`'s model and HDR
   acquires) comes back by itself. A render-on-demand surface, a slot built once, or an idle
   Scene2D does not. So the memo can arm one timer per key, which `forget`/`clear` cancel. The

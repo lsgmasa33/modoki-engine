@@ -34,6 +34,17 @@ export interface ModokiSystemPlugin {
   openUrl(options: { url: string }): Promise<{ opened: boolean }>;
 
   /**
+   * Put plain text on the system clipboard (#1398) — `UIPasteboard.general` on iOS,
+   * `ClipboardManager` on Android. Native rather than `navigator.clipboard` because a write from
+   * the web view needs the tap's user activation, which an action dispatched through the engine
+   * cannot promise to still hold.
+   *
+   * Resolves `{copied: false}` rather than rejecting when nothing was copied (empty text, no
+   * clipboard service). On the web, `copied` means `navigator.clipboard.writeText` resolved.
+   */
+  copyText(options: { text: string }): Promise<{ copied: boolean }>;
+
+  /**
    * iOS only (#1271): every entry of the backup-excluded key-value store whose key starts with
    * `prefix`. The store lives in a folder marked `isExcludedFromBackup`, so an iCloud or Finder
    * backup never copies it. Android rejects these as unavailable and the web as unimplemented: Android's

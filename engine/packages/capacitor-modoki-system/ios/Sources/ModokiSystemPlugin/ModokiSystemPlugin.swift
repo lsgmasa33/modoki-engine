@@ -10,6 +10,7 @@ public class ModokiSystemPlugin: CAPPlugin, CAPBridgedPlugin {
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "openAppSettings", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "openUrl", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "copyText", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "kvGetAll", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "kvSet", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "kvRemove", returnType: CAPPluginReturnPromise),
@@ -59,6 +60,20 @@ public class ModokiSystemPlugin: CAPPlugin, CAPBridgedPlugin {
             call.resolve(try store.info())
         } catch {
             call.reject("kvInfo failed: \(error.localizedDescription)")
+        }
+    }
+
+    // Plain text on the general pasteboard (#1398) — a player ID the player pastes into a support
+    // email. Native because a web-view clipboard write needs the tap's user activation, which an
+    // engine-dispatched action cannot promise. UIPasteboard is main-thread UIKit.
+    @objc func copyText(_ call: CAPPluginCall) {
+        guard let text = call.getString("text"), !text.isEmpty else {
+            call.resolve(["copied": false])
+            return
+        }
+        DispatchQueue.main.async {
+            UIPasteboard.general.string = text
+            call.resolve(["copied": UIPasteboard.general.hasStrings])
         }
     }
 

@@ -753,6 +753,38 @@ in the Inspector, not in code. Both shipping games' settings panels use it for t
   opened. On the web `opened` is always `true`: a popup blocker and the editor's deny-and-forward
   handler both make `window.open` return `null`, so the web cannot tell them apart.
 
+**`copyToClipboard(text, world?)`** (#1398, same file) puts plain text on the system clipboard and
+resolves `true` only when it got there. It never rejects. Both games' Settings "Player ID" row uses it.
+It is a function a game's own action calls, **not** a built-in action, because what it copies is
+runtime data (a player's ID) that a scene binding cannot carry.
+- **Native goes through the plugin, not `navigator.clipboard`.** `capacitor-modoki-system`'s
+  `copyText` writes `UIPasteboard.general` on iOS and `ClipboardManager` on Android. A UI action runs
+  from the ECS dispatch, which can fall outside the tap's user-activation window that WebKit
+  requires for a web-view clipboard write. It was also never measured whether the app's
+  `capacitor://` page counts as a secure context. The native pasteboard depends on neither.
+- **It never reports a copy that did not happen.** A native build without the plugin, an OTA bundle
+  on a binary whose plugin predates `copyText`, a plugin rejection, a web page outside a secure
+  context (`navigator.clipboard` is then *absent*, and `?.writeText` would resolve `undefined` and
+  read as success), or empty text: each answers `false`. The two native build defects also log at
+  `error`.
+- **Journaled as `system.copyText` `{ copied }`, never with the text.** The value is an identifier,
+  and the journal travels in bug reports.
+- The debug overlay's copy-IP button (`DeviceTab.tsx`) deliberately keeps its own
+  `navigator.clipboard` call. It runs inside a React `onClick`, so it still holds the user
+  activation, and it has to work in debug builds of games that do not bundle the plugin.
+
+**Which ID a "Player ID" row shows** is the engine's `supportId(uid, appInstanceId)` in
+`runtime/account/`. The owner's ruling (2026-09-18) is the account uid when signed in, otherwise
+this install's Firebase Analytics app-instance ID, and `none` with neither. Today `none` means
+off-native (the editor, the web, a playable) or a native build whose Firebase call failed or is not
+configured. Firebase would also withhold the ID if ANALYTICS_STORAGE consent were denied, but neither
+game sets analytics consent today (#1398 close-out: no `setConsent` and no consent plist keys in
+either). `supportIdView` turns that
+decision and the last copy's outcome into the row's text. The **whole** ID is shown and copied, never
+a shortened one. There is no Copy button for `none`, because a Copy that copies nothing is a control
+that does nothing. Like the rest of that module, neither function carries any player-visible copy:
+each game passes its own authored words.
+
 #### Global input lock (#466)
 
 `applyBindings` guards every **discrete activation** (`click`, `submit`, a `UIToggle`'s

@@ -6,3 +6,6 @@ export {
   ALL_PROVIDERS, reauthProviderFor,
   type AccountProvider, type AccountState, type AvailableProviders, type SignInFailure,
 } from './types';
+export {
+  supportId, supportIdView, type SupportId, type SupportIdView, type SupportIdWords, type CopyFeedback,
+} from './supportId';
