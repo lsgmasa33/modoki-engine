@@ -46,7 +46,7 @@ import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
 import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
 
 import { readFontAxes } from '../font-instance';
-import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
+import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash, remintSceneEntityGuids } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 
@@ -478,6 +478,22 @@ function stripUtf8Bom(buf: Buffer): Buffer {
  *  A rebuild failure is NOT a failure of the write — the file already moved or was copied or
  *  trashed — so it is reported as `false` rather than thrown into a 500 that reads as "nothing
  *  happened" and invites a retry against a file that is already there. */
+/** Where a client write to `filePath` lands on disk, or null when it may not write there. Normally
+ *  an asset URL (/assets/…, /games/…) via resolveAssetPath. But a flat project's scenes load through
+ *  Vite's /@fs/<abs> form, so the editor may hold a /@fs path (e.g. saving the current scene, or a
+ *  code-editor script save) — accepted, restricted to within the project root so a write can't
+ *  escape the project. This is also the code editor's read-only guard: the engine source root lives
+ *  OUTSIDE projectRoot, so an engine-source /@fs path lands here as null. Never trust a client
+ *  `writable` flag. */
+function resolveWritableFilePath(ctx: BackendContext, filePath: string): string | null {
+  if (filePath.startsWith('/@fs/')) {
+    const abs = fromFsUrl(filePath);
+    const rel = path.relative(ctx.projectRoot, abs);
+    return (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) ? abs : null;
+  }
+  return ctx.resolveAssetPath(filePath);
+}
+
 function rebuildManifestInline(ctx: BackendContext): boolean {
   try { ctx.rebuildManifest(); return true; } catch { return false; }
 }
@@ -4474,22 +4490,8 @@ async function describeUnresolvedAgainstLiveWorld(
   if (urlPath === '/api/write-file' && method === 'POST') {
     try {
       const { path: filePath, content, encoding, ifMatch, ifNoneMatch } = (body ?? {}) as { path: string; content: unknown; encoding?: string; ifMatch?: string; ifNoneMatch?: string };
-      // Resolve the write target. Normally an asset URL (/assets/…, /games/…)
-      // via resolveAssetPath. But a flat project's scenes load through Vite's
-      // /@fs/<abs> form, so the editor may hold a /@fs path (e.g. saving the
-      // current scene, or a code-editor script save) — accept it, restricted to
-      // within the project root so a write can't escape the project. This is
-      // also the code editor's read-only guard: the engine source root lives
-      // OUTSIDE projectRoot, so an engine-source /@fs path lands here as null →
-      // 403. Never trust a client `writable` flag.
-      let absPath: string | null;
-      if (filePath.startsWith('/@fs/')) {
-        const abs = fromFsUrl(filePath);
-        const rel = path.relative(ctx.projectRoot, abs);
-        absPath = (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) ? abs : null;
-      } else {
-        absPath = ctx.resolveAssetPath(filePath);
-      }
+      // Asset URL or in-project /@fs path; null → 403 (see resolveWritableFilePath).
+      const absPath = resolveWritableFilePath(ctx, filePath);
       if (!absPath) return { kind: 'raw', status: 403, contentType: 'application/json', body: '{}' };
       // Optional `ifMatch` precondition (#469) — a server-side conditional write, so a
       // compare-and-swap caller gets the compare and the write as ONE atomic operation instead
@@ -4538,6 +4540,67 @@ async function describeUnresolvedAgainstLiveWorld(
       // scanner keys it `/assets/scenes/new.json` — a caller registering the spelling it asked for would
       // give the manifest a key the scan never produces. Null for a `/@fs` path.
       return json({ ok: true, path: ctx.absToAssetUrl(absPath, { onDisk: true }) });
+    } catch (e) {
+      return json({ error: String(e) }, 500);
+    }
+  }
+
+  // ── POST /api/scene-save-as {path, content} (M) ── an agent Save As of the OPEN scene (#1414).
+  // `content` is the open scene as serialized, so it carries the ORIGINAL's scene id and entity
+  // guids. Written as-is, two files would claim one guid and the scanner's heal would re-mint one of
+  // them — the committed original, whenever the copy sorts first. So the copy gets the identity
+  // Duplicate gives: a fresh scene id and reminted entity guids (`remintSceneEntityGuids`, with
+  // #1293's accepted Persistent cost). It OVERWRITES whatever scene is at `path`, under the fresh id
+  // (owner, 2026-09-18) — the deliberate exception to #1264's "a Replace keeps the replaced guid".
+  // The client decides that the target is not the open scene's own file and not another loaded one.
+  if (urlPath === '/api/scene-save-as' && method === 'POST') {
+    try {
+      const { path: filePath, content, openPath, loadedPaths } = (body ?? {}) as { path: string; content: string; openPath?: string; loadedPaths?: unknown };
+      const absPath = typeof filePath === 'string' ? resolveWritableFilePath(ctx, filePath) : null;
+      if (!absPath) return outsideAssetRoots('Path outside allowed directories');
+      // The open scene's OWN file under another spelling — `%20`, `./`, a `/@fs/` form, a case
+      // variant — which the client's string compare cannot see. Writing a copy here would give the
+      // ORIGINAL a fresh id and reminted entity guids, the very damage this route exists to prevent.
+      // Compared by the file the disk resolves both to. The same goes for every OTHER loaded scene
+      // (a base): overwriting one would replace a file the live world is built from.
+      const onDiskFile = (p: unknown): string | null => {
+        const abs = typeof p === 'string' ? resolveWritableFilePath(ctx, p) : null;
+        return abs && fs.existsSync(abs) ? fs.realpathSync.native(abs) : null;
+      };
+      const targetFile = fs.existsSync(absPath) ? fs.realpathSync.native(absPath) : null;
+      if (targetFile) {
+        if (onDiskFile(openPath) === targetFile) {
+          return json({ error: 'that path is the open scene\'s own file', sameFile: true }, 409);
+        }
+        if (Array.isArray(loadedPaths) && loadedPaths.some((p) => onDiskFile(p) === targetFile)) {
+          return json({ error: 'that path is another scene loaded under the open one', targetLoaded: true }, 409);
+        }
+      }
+      // A NEW file must carry the scene suffix, or the manifest would type it as something else.
+      if (!fs.existsSync(absPath) && !absPath.endsWith('.scene.json')) {
+        return json({ error: 'a new scene file must be named <name>.scene.json', wrongKind: true }, 409);
+      }
+      let scene: Record<string, unknown>;
+      try { scene = JSON.parse(String(content).replace(/^\uFEFF/, '')); } catch { return json({ error: 'content is not valid JSON' }, 400); }
+      // Never cross kinds (#1264): the client only sends a `.scene.json` name or a file the manifest
+      // already types `scene`, so this is the backstop for a manifest that disagrees.
+      if (fs.existsSync(absPath)) {
+        const onDisk = ctx.absToAssetUrl(absPath, { onDisk: true });
+        const existing = ctx.getManifest().assets.find((a) => a.path === onDisk);
+        if (existing && existing.type !== 'scene') {
+          return json({ error: `${onDisk} is not a scene (it is typed '${existing.type}')`, wrongKind: true, existingType: existing.type }, 409);
+        }
+      }
+      const guid = crypto.randomUUID();
+      const copy = remintSceneEntityGuids({ ...scene, id: guid }, () => crypto.randomUUID(), makePrefabResolver(ctx));
+      const bytes = assetJsonBytes(copy);
+      ctx.markEditorWrite(absPath, crypto.createHash('sha1').update(bytes).digest('hex'));
+      const dir = path.dirname(absPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      writeJsonAtomic(absPath, bytes);
+      // The manifest must hear about the fresh id now: an overwritten scene's OLD id leaves it here.
+      const manifestRebuilt = rebuildManifestInline(ctx);
+      return json({ ok: true, guid, path: ctx.absToAssetUrl(absPath, { onDisk: true }) ?? filePath, manifestRebuilt });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }

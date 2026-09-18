@@ -8,7 +8,8 @@
  *  tested both ways: nothing written → `REFUSED_BY_OP`, something written → `PARTIAL`. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createTestWorld, type TestWorld, setPlayState, registerAsset, findEntity, Transform, EntityAttributes } from '@modoki/engine/runtime';
+import { createTestWorld, type TestWorld, setPlayState, registerAsset, findEntity, Transform, EntityAttributes, sceneManager, type LoadedSceneEntry } from '@modoki/engine/runtime';
+import { markSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { markSceneSaved, clearHistory, clearDirtyAssets, markAssetDirty, setCurrentScenePath, setPrefabCache } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
@@ -123,8 +124,12 @@ describe('save-all with NO scene path (the Save-As panel needs a human) — same
 });
 
 describe('save-all with an explicit path that is not a scene file name (#1413)', () => {
+  // Both scene-write routes: a path other than the open scene's is a Save As since #1414, which goes
+  // through /api/scene-save-as (the stub answers it without a guid, so it reports write-failed —
+  // these tests are about which NAMES are accepted, not about the save-as itself).
   const writesTo = () => (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls
-    .filter(([u]) => String(u).includes('/api/write-file'));
+    .filter(([u]) => String(u).includes('/api/write-file') || String(u).includes('/api/scene-save-as'));
+  const notANameRefusal = (e: unknown) => expect((e as { message?: string } | null)?.message ?? '').not.toMatch(/not a scene file name/);
   beforeEach(() => { setCurrentScenePath('/assets/scenes/open-1413.scene.json'); });
 
   it('a plain .json is REFUSED, nothing is written, and the corrected path is named', async () => {
@@ -151,13 +156,57 @@ describe('save-all with an explicit path that is not a scene file name (#1413)',
 
   it('a legacy /scenes/*.json the manifest already types scene is still re-savable under its name', async () => {
     registerAsset('00001413-0000-4000-8000-000000001413', '/assets/scenes/legacy-1413.json', 'scene');
-    await runAgentOp('save-all', { path: '/assets/scenes/legacy-1413.json' });
+    notANameRefusal(await runAgentOp('save-all', { path: '/assets/scenes/legacy-1413.json' }).then(() => null, (e: unknown) => e));
     expect(writesTo().length).toBeGreaterThan(0);
   });
 
   it('a .scene.json path saves', async () => {
-    await runAgentOp('save-all', { path: '/assets/scenes/new-1413.scene.json' });
+    notANameRefusal(await runAgentOp('save-all', { path: '/assets/scenes/new-1413.scene.json' }).then(() => null, (e: unknown) => e));
     expect(writesTo().length).toBeGreaterThan(0);
+  });
+});
+
+describe('save-all Save As whose copy FAILS after a dirty base was written (#1414) — PARTIAL, naming the base', () => {
+  const OPEN = '/assets/scenes/open-1414.scene.json';
+  const BASE = '/assets/scenes/base-1414.scene.json';
+  const OPEN_ID = '00001414-0000-4000-8000-000000000001';
+  const BASE_ID = '00001414-0000-4000-8000-000000000002';
+  beforeEach(() => {
+    registerAsset(OPEN_ID, OPEN, 'scene');
+    setCurrentScenePath(OPEN);
+    markSceneSaved();
+    clearAllSceneDirty();
+    vi.spyOn(sceneManager, 'getLoadedScenes').mockReturnValue(new Map([
+      [OPEN_ID, { guid: OPEN_ID, path: OPEN, role: 'primary' } as unknown as LoadedSceneEntry],
+      [BASE_ID, { guid: BASE_ID, path: BASE, role: 'base' } as unknown as LoadedSceneEntry],
+    ]) as never);
+    markSceneDirty(BASE_ID);
+    // The base write lands; the copy is refused (a path outside the roots, say).
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/scene-save-as')) return { ok: false, status: 403, json: async () => ({}) } as unknown as Response;
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+  });
+  afterEach(() => { vi.restoreAllMocks(); clearAllSceneDirty(); });
+
+  it('a copy that lands but is not reopened names the base too', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/scene-save-as')) return { ok: true, status: 200, json: async () => ({ ok: true, guid: '00001414-0000-4000-8000-000000000003', path: '/assets/scenes/copy-1414.scene.json' }) } as unknown as Response;
+      if (url.includes('/api/')) return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+      return { ok: false, status: 404, json: async () => ({}), text: async () => '' } as unknown as Response; // the reopen fails
+    }));
+    const err = await runAgentOp('save-all', { path: '/assets/scenes/copy-1414.scene.json' }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err).toMatchObject({ code: 'PARTIAL' });
+    expect(err?.message).toContain(`scene ${BASE}`);
+  });
+
+  it('is PARTIAL and says the base landed — not "Nothing was written"', async () => {
+    const err = await runAgentOp('save-all', { path: '/assets/scenes/copy-1414.scene.json' }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err).toMatchObject({ code: 'PARTIAL' });
+    expect(err?.message).toContain(`scene ${BASE}`);
+    expect(err?.message).not.toMatch(/Nothing was written/);
   });
 });
 

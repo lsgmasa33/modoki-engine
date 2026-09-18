@@ -868,6 +868,38 @@ checked the exact destination (`scene.json`), it does not ask a second time.
   `parentLocalId`?", which is `plan.nestedRefs`; the untag asks "was my nearest linked ancestor
   stripped?" instead. Not fixed — tracked on #1272.
 
+**The one exception: an agent Save As gets a FRESH id, and overwrites under it (#1414, owner
+2026-09-18).** `modoki_save_all { path }` naming another file than the open scene's writes a copy
+through `/api/scene-save-as`, which stamps a new scene id and re-mints the entity guids exactly as
+Duplicate does (`remintSceneEntityGuids`, with #1293's accepted `Persistent` cost). If a scene is
+already at that path, it is overwritten, and its old id stops resolving. That is deliberate: what
+referenced a scene replaced by Save As no longer resolves. It is not drift from the rule above.
+- **Why not keep an id.** The copy used to take the OPEN scene's id, so two files claimed one guid.
+  The dev scanner heals that by keeping the lexicographically-first path's id and rewriting the
+  other file's (`buildManifest(…, heal=true)`), so it re-minted the COMMITTED original whenever the
+  copy sorted first. Measured on the MCP smoke: `mcp-smoke-save` rewrote `tropical-island`'s id. The
+  smoke case now does exactly that save-as and asserts the original stays byte-identical.
+- **The editor reopens the copy.** The live world still holds the original's scene and entity guids.
+  Left pointing at the copy, the next save would write them straight back into it, so the copy is
+  loaded from disk. Any undo stack kept for the target path is dropped first (`forgetHistory`), since
+  it names guids the copy does not have, and the #124 authored-writes warning is printed before the
+  reopen, because a load clears its records. Before that, every OTHER dirty loaded scene (a base) is
+  written to its own file, because the reopen reloads the chain. If one of those writes fails,
+  nothing is copied. If an edit lands during the write, or the reopen fails, the editor stays on the
+  original, which is still unsaved, and the op answers `PARTIAL`. A failed copy after the bases
+  landed is `PARTIAL` too, naming them.
+- **Not a Save As:** the open scene's own path is a plain save that keeps its id and its on-disk
+  spelling. The client compares strings (case-insensitively, or by the manifest naming the open
+  scene's guid there), which cannot see every spelling of one file: `%20`, `./` and a `/@fs/` form
+  all resolve to it. So the route also compares the two files the DISK resolves (`realpath`) and
+  answers `409 sameFile`, and the client falls back to the plain save, to the path it captured
+  before its awaits (a scene load landing meanwhile is refused as `superseded`, not overwritten).
+  Every other loaded scene is compared the same way and answers `409 targetLoaded`. Without these
+  backstops a second spelling re-minted the ORIGINAL's ids, or a base's (both found in the #1414
+  close-out reviews). A
+  scene with no path yet (`new_scene`) already has a fresh id. A base loaded under the open scene is
+  refused as a target. The human Save As is unaffected: it is offered only for an untitled scene.
+
 **A Replace never crosses KINDS.** The scene flows write plain `.json`, so their destination can be
 `Enemy.prefab.json`. Kept, that guid would be re-registered as a scene, and every `PrefabInstance.source`
 would resolve to a scene document. A destination the manifest types as another kind is refused

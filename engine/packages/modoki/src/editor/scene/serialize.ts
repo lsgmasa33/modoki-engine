@@ -12,9 +12,9 @@ import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
 import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
-import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+import { writeAssetFile, writeSceneCopy, jsonFileBody } from '../backend/editorBackend';
 import { chooseNewAssetPath } from '../utils/saveDialog';
-import { SCENE_EXT } from './sceneFileName';
+import { SCENE_EXT, classifyExplicitSceneSave } from './sceneFileName';
 import { writeNewAssetDocument } from './createAssetDocument';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -22,7 +22,7 @@ import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
 import { setPlayState, getRunMode } from '../../runtime/core/playState';
 import { beginWorldReplacement } from './authoringSettle';
-import { swapHistory, getEditVersion } from '../undo/undoManager';
+import { swapHistory, forgetHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, preloadNestedPrefabs } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
@@ -1026,7 +1026,12 @@ export function causeSpecs(): Readonly<Record<keyof UnsavedCauses, CauseSpec>> {
 export interface SaveResult {
   saved: boolean;
   path: string | null;
-  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'prefab-edit';
+  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'prefab-edit' | 'target-loaded' | 'superseded';
+  /** Set when an explicit `path` wrote the open scene to ANOTHER file (#1414): the copy got a fresh
+   *  scene id and reminted entity guids, and the editor then reopened it from disk so the live world
+   *  carries the identities the file does. `reopened:false` means the copy IS on disk but the editor
+   *  is still on `from`, with its edits unsaved there — `note` says why. */
+  savedAs?: { from: string; reopened: boolean; note?: string };
   /** Other loaded scenes (Phase 12, M3 — a dirty BASE, edited in place) written in
    *  the SAME `saveAll` call, alongside the primary. Absent/empty when nothing else
    *  was dirty. A base is only ever written once the primary's own save succeeded —
@@ -1063,6 +1068,94 @@ export interface SaveResult {
    *  `ASSET_SCHEMA_TYPES` document, so it does not go through `/api/asset-write`. Present on a
    *  FAILED result too — this flush is unconditional, same as the asset flush above. */
   importSettings?: MetaFlushResult;
+}
+
+/** `saveScene`'s agent Save As (#1414): write the open scene to `target` as a COPY with its own
+ *  identity, then reopen the copy.
+ *
+ *  The copy cannot carry the open scene's ids. Two files claiming one scene guid is what the dev
+ *  scanner heals by re-minting one of them, and it picks by path order, so it re-minted the COMMITTED
+ *  original whenever the copy sorted first; the entity guids would be shared too. So the backend
+ *  stamps a fresh scene id and re-mints the entity guids, exactly as Duplicate does, and overwrites
+ *  whatever scene is at `target` (owner, 2026-09-18) — anything that referenced that scene's old id
+ *  no longer resolves. That is the one deliberate exception to #1264's "a Replace keeps the replaced
+ *  guid": see docs/mcp-persistence.md.
+ *
+ *  **Why it reopens.** The live world still holds the ORIGINAL's scene id and entity guids. Left
+ *  pointing at the copy, the next save would write them straight back into it — the collision this
+ *  exists to prevent. Loading the copy is the one way the world takes the file's identities. It swaps
+ *  to the copy's (empty) undo history, since the old entries name the old guids.
+ *
+ *  **Why the other loaded scenes save FIRST.** The reopen reloads the whole chain from disk, so a
+ *  dirty base still only in memory would be discarded. They are written now (the same writes Save All
+ *  makes after the primary anyway); if any fails, nothing is copied and nothing is reopened.
+ *
+ *  The original file is never written. */
+async function saveSceneAs(target: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number): Promise<SaveResult> {
+  const from = _currentScenePath!;
+  const others = await saveOtherLoadedScenes();
+  const othersReport = {
+    ...(others.extraSaved.length ? { extraSaved: others.extraSaved } : {}),
+    ...(others.failed.length ? { failed: others.failed } : {}),
+  };
+  if (others.failed.length) return { saved: false, path: target, reason: 'write-failed', ...othersReport };
+  const written = await writeSceneCopy(target, content, from, [...sceneManager.getLoadedScenes().values()].map((e) => e.path));
+  if (written === 'same-file') {
+    // `target` is the open scene's own file under another spelling (`%20`, `./`, a `/@fs/` form) —
+    // the classifier compares strings, the disk does not. A plain save, to `from` as captured: a
+    // scene load landing during the awaits above would otherwise take this write over ITS file.
+    if (_currentScenePath !== from) return { saved: false, path: from, reason: 'superseded', ...othersReport };
+    return { ...(await writePrimaryScene(from, content, sceneId, entityCount, savedAtEditVersion)), ...othersReport };
+  }
+  if (written === 'target-loaded') return { saved: false, path: target, reason: 'target-loaded', ...othersReport };
+  if (!written) {
+    console.error(`[Editor] Failed to save scene as ${target}`);
+    return { saved: false, path: target, reason: 'write-failed', ...othersReport };
+  }
+  // Also drops an overwritten scene's old id — `registerAsset` evicts the guid that owned the path —
+  // so what referenced it no longer resolves (the accepted cost), rather than resolving to the copy.
+  registerAsset(written.guid, written.path, 'scene');
+  // The overwritten file's kept undo stack names guids the copy does not have — on every exit below.
+  forgetHistory(written.path);
+  editorEmit('!save', { path: written.path, entities: entityCount }); // Editor Percept (V2)
+  console.log(`[Editor] Saved scene as a copy (fresh id ${written.guid}): ${entityCount} entities → ${written.path}`);
+  const stay = (note: string): SaveResult => ({ saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: false, note }, ...othersReport });
+  // An edit that landed during the writes is in the live world but not in the copy — reopening
+  // would discard it. Stay on the original, still dirty, and say so (#573's window, one level up).
+  if (getEditVersion() !== savedAtEditVersion) {
+    return stay(`an edit landed while the copy was being written, so it is NOT in the copy; the editor stays on ${from} with that edit unsaved`);
+  }
+  // The reopen swaps the world, and `SceneManager` clears the #124 records on a load — so warn now,
+  // or the copy is the one save that bakes a system-rewritten field in silently.
+  warnAuthoredWritesWhileStopped();
+  const outcome = await loadScene(written.path);
+  if (outcome === 'superseded') {
+    return stay(`another scene load started meanwhile and won, so the editor is on whatever that load opened; ${from} was not written`);
+  }
+  if (outcome !== 'loaded') {
+    return stay(`the copy could not be reopened (${outcome}${_lastLoadFailureMessage ? `: ${_lastLoadFailureMessage}` : ''}); the editor stays on ${from} with its edits unsaved`);
+  }
+  return { saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: true }, ...othersReport };
+}
+
+/** Write the serialized primary scene to `path` under its own id, and make `path` the open scene's. */
+async function writePrimaryScene(path: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number): Promise<SaveResult> {
+  const openBefore = _currentScenePath;
+  const ok = await writeAssetFile(path, content);
+  if (!ok) {
+    console.error(`[Editor] Failed to save scene to ${path}`);
+    return { saved: false, path, reason: 'write-failed' };
+  }
+  registerAsset(sceneId, path, 'scene');
+  editorEmit('!save', { path, entities: entityCount }); // Editor Percept (V2)
+  console.log(`[Editor] Saved scene: ${entityCount} entities → ${path}`);
+  // A scene load that landed during the write owns the editor now. Pointing it back at `path`, or
+  // stamping its world as saved, would make the next save write THAT world over this file (#1414
+  // close-out review). The bytes above are the old scene's, written to its own file — still true.
+  if (_currentScenePath !== openBefore) return { saved: true, path, reason: 'ok' };
+  if (path !== _currentScenePath) setCurrentScenePath(path);
+  markSceneSaved(savedAtEditVersion);
+  return { saved: true, path, reason: 'ok' };
 }
 
 export async function saveScene(opts: {
@@ -1124,22 +1217,20 @@ export async function saveScene(opts: {
   // re-reading the version on the other side of an await; see markSceneSaved's doc comment.
   const savedAtEditVersion = getEditVersion();
 
-  const knownPath = explicitPath || _currentScenePath;
-  if (knownPath) {
-    // Save to known path via dev server
-    const ok = await writeAssetFile(knownPath, content);
-    if (ok) {
-      // scene.id is always populated by serializeScene (required field).
-      registerAsset(scene.id, knownPath, 'scene');
-      if (knownPath !== _currentScenePath) setCurrentScenePath(knownPath);
-      editorEmit('!save', { path: knownPath, entities: scene.entities.length }); // Editor Percept (V2)
-      console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${knownPath}`);
-      markSceneSaved(savedAtEditVersion);
-      return { saved: true, path: knownPath, reason: 'ok' };
-    }
-    console.error(`[Editor] Failed to save scene to ${knownPath}`);
-    return { saved: false, path: knownPath, reason: 'write-failed' };
-  }
+  const kind = explicitPath ? classifyExplicitSceneSave(explicitPath, {
+    currentPath: _currentScenePath,
+    openSceneId: scene.id,
+    targetGuid: getGuidForPath(explicitPath),
+    loadedPaths: [...sceneManager.getLoadedScenes().values()].map((e) => e.path),
+  }) : null;
+  if (kind === 'target-loaded') return { saved: false, path: explicitPath!, reason: 'target-loaded' };
+  if (kind === 'save-as') return saveSceneAs(explicitPath!, content, scene.id, scene.entities.length, savedAtEditVersion);
+
+  // The open scene's own file is written under the spelling it was opened with (#1273) — a
+  // case-variant `path` names the same file, and adopting it would give the manifest a second key.
+  const knownPath = kind === 'same' ? _currentScenePath! : explicitPath || _currentScenePath;
+  // scene.id is always populated by serializeScene (required field).
+  if (knownPath) return writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAtEditVersion);
 
   // No path, and no dialog allowed (an agent) — say so instead of opening a modal panel
   // only a human can close.
@@ -1533,6 +1624,46 @@ export function warnAuthoredWritesWhileStopped(): void {
   clearAuthoredWritesWhileStopped();
 }
 
+/** Write every OTHER loaded scene with unsaved edits (a dirty base, edited in place) to its own
+ *  path. Save All's second half; also run by `saveSceneAs` BEFORE its reopen. */
+async function saveOtherLoadedScenes(): Promise<{ extraSaved: { path: string; guid: string }[]; failed: { path: string; guid: string; reason: string }[] }> {
+  const extraSaved: { path: string; guid: string }[] = [];
+  const failed: { path: string; guid: string; reason: string }[] = [];
+  // Snapshot the chain BEFORE iterating — each iteration below `await`s (serialize +
+  // write), and a scene swap landing mid-loop would otherwise mutate the live Map
+  // out from under a bare `for...of`, skipping or misattributing entries.
+  const loadedScenes = [...sceneManager.getLoadedScenes().values()];
+  for (const entry of loadedScenes) {
+    if (entry.role === 'primary' || !isSceneDirty(entry.guid)) continue;
+    // Catch per-scene so one scene that fails to serialize can't block every OTHER
+    // dirty scene in the same Save All, and so its dirty flag stays SET (not
+    // silently cleared) until it can actually be written. This used to be load-
+    // bearing for Phase 12's A8/A9 guard, which threw for a base containing a
+    // prefab instance; that guard is gone (both bugs fixed), but the per-scene
+    // isolation is worth keeping on its own merits for any future throw.
+    let sceneFile;
+    try {
+      sceneFile = await serializeScene({ scene: { path: entry.path, guid: entry.guid } });
+    } catch (e) {
+      console.error(`[Editor] Refused to save "${entry.path}": ${(e as Error).message}`);
+      failed.push({ path: entry.path, guid: entry.guid, reason: `serialize failed: ${(e as Error).message}` });
+      continue;
+    }
+    const ok = await writeAssetFile(entry.path, jsonFileBody(sceneFile));
+    if (!ok) {
+      console.error(`[Editor] Failed to save scene to ${entry.path}`);
+      failed.push({ path: entry.path, guid: entry.guid, reason: 'the write to disk was rejected' });
+      continue;
+    }
+    registerAsset(entry.guid, entry.path, 'scene');
+    clearSceneDirty(entry.guid);
+    editorEmit('!save', { path: entry.path, entities: sceneFile.entities.length }); // Editor Percept (V2)
+    console.log(`[Editor] Saved scene: ${sceneFile.entities.length} entities → ${entry.path}`);
+    extraSaved.push({ path: entry.path, guid: entry.guid });
+  }
+  return { extraSaved, failed };
+}
+
 /** Save all editor-managed assets: every parked ASSET doc (the dirty-asset registry), the
  *  primary scene file (via `saveScene`), THEN every OTHER dirty scene in the loaded chain — a
  *  base edited in place (Phase 12, M3, scene-loading.md) — to ITS OWN file. Per-material edits
@@ -1549,7 +1680,8 @@ export function warnAuthoredWritesWhileStopped(): void {
  *  run-mode refusal (no writing while playing/previewing) sits above this loop, so it
  *  covers bases too; a cancelled Save-As or a failed primary write means nothing else
  *  gets written either, and the caller sees the primary's own failure reason
- *  unchanged. Silent by design (the owner's call, 2026-07-26) — the dirty-dot on the
+ *  unchanged. ⚠️ Except an agent Save As (#1414), which writes the bases FIRST because its
+ *  reopen reloads them — so a failed copy can come back `saved:false` WITH `extraSaved`. Silent by design (the owner's call, 2026-07-26) — the dirty-dot on the
  *  Hierarchy scene-group row (Phase 13) is the visibility half that makes a silent
  *  multi-file save legible instead of a surprise. */
 export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {}): Promise<SaveResult> {
@@ -1592,40 +1724,12 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   // (playing/previewing) doesn't warn about a file nothing wrote.
   warnAuthoredWritesWhileStopped();
 
-  const extraSaved: { path: string; guid: string }[] = [];
-  const failed: { path: string; guid: string; reason: string }[] = [];
-  // Snapshot the chain BEFORE iterating — each iteration below `await`s (serialize +
-  // write), and a scene swap landing mid-loop would otherwise mutate the live Map
-  // out from under a bare `for...of`, skipping or misattributing entries.
-  const loadedScenes = [...sceneManager.getLoadedScenes().values()];
-  for (const entry of loadedScenes) {
-    if (entry.role === 'primary' || !isSceneDirty(entry.guid)) continue;
-    // Catch per-scene so one scene that fails to serialize can't block every OTHER
-    // dirty scene in the same Save All, and so its dirty flag stays SET (not
-    // silently cleared) until it can actually be written. This used to be load-
-    // bearing for Phase 12's A8/A9 guard, which threw for a base containing a
-    // prefab instance; that guard is gone (both bugs fixed), but the per-scene
-    // isolation is worth keeping on its own merits for any future throw.
-    let sceneFile;
-    try {
-      sceneFile = await serializeScene({ scene: { path: entry.path, guid: entry.guid } });
-    } catch (e) {
-      console.error(`[Editor] Refused to save "${entry.path}": ${(e as Error).message}`);
-      failed.push({ path: entry.path, guid: entry.guid, reason: `serialize failed: ${(e as Error).message}` });
-      continue;
-    }
-    const ok = await writeAssetFile(entry.path, jsonFileBody(sceneFile));
-    if (!ok) {
-      console.error(`[Editor] Failed to save scene to ${entry.path}`);
-      failed.push({ path: entry.path, guid: entry.guid, reason: 'the write to disk was rejected' });
-      continue;
-    }
-    registerAsset(entry.guid, entry.path, 'scene');
-    clearSceneDirty(entry.guid);
-    editorEmit('!save', { path: entry.path, entities: sceneFile.entities.length }); // Editor Percept (V2)
-    console.log(`[Editor] Saved scene: ${sceneFile.entities.length} entities → ${entry.path}`);
-    extraSaved.push({ path: entry.path, guid: entry.guid });
-  }
+  const others = await saveOtherLoadedScenes();
+  // A Save As already saved the others before its reopen (`saveSceneAs`), and reports them itself.
+  // By path: a base written inside `saveSceneAs` and dirtied again during its copy write is
+  // written twice, and reported once.
+  const extraSaved = [...new Map([...(primaryResult.extraSaved ?? []), ...others.extraSaved].map((e) => [e.path, e])).values()];
+  const failed = [...(primaryResult.failed ?? []), ...others.failed];
   return withAssets({
     ...primaryResult,
     ...(extraSaved.length ? { extraSaved } : {}),

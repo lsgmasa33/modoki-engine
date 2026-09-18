@@ -2208,6 +2208,9 @@ export function registerEditorAgentOps(): void {
     // Computed BEFORE the first exit so every refusal below can take its §5 code from it: `PARTIAL`
     // exactly when something was written, decided from this list rather than from the prose (#1012).
     const landed = [
+      // A Save As writes the loaded bases BEFORE its copy (#1414), so they can land on a failed save —
+      // or on one whose copy was not reopened, which exits through a refusal below too.
+      ...(r.saved && !(r.savedAs && !r.savedAs.reopened) ? [] : (r.extraSaved ?? []).map((e) => `scene ${e.path}`)),
       ...(r.assets?.saved ?? []).map((pth) => `asset ${pth}`),
       ...(r.importSettings?.saved ?? []).map((pth) => `import settings for ${pth}`),
       ...(r.baseScenes?.saved ?? []).map((pth) => `base-scene ref on ${pth}`),
@@ -2244,12 +2247,22 @@ export function registerEditorAgentOps(): void {
         `save-all PARTIALLY failed: the primary scene ${r.saved ? `saved to ${r.path}` : 'did not save'}, but ` +
         `${allFails.length} item(s) did NOT: ${allFails.join('; ')}. Those changes are still in the ` +
         `live world / pending only, and stay marked dirty — a build reads FILES and would ship ` +
-        `WITHOUT them. Fix the cause and call save_all again.`,
+        `WITHOUT them. Fix the cause and call save_all again.${r.saved ? '' : landedNote}`,
       );
+    }
+    // A Save As whose copy landed but could not be reopened (#1414): the copy is on disk under a
+    // fresh id, and the editor is still on the ORIGINAL with its edits unsaved. Not a success —
+    // the tool promises the scene moves to the new path — and not "nothing written" either.
+    if (r.saved && r.savedAs && !r.savedAs.reopened) {
+      throw new OpRefusal('PARTIAL',
+        `save-all: the scene WAS written to ${r.path} as a copy with a fresh scene id, but ${r.savedAs.note ?? 'it could not be reopened'}. ` +
+        `${r.savedAs.from} itself was not written.${landedNote}`);
     }
     if (r.saved) {
       return {
         ok: true, scenePath: r.path,
+        // A Save As (#1414): name what the copy was made from, and that it carries its own id.
+        ...(r.savedAs ? { savedAsCopyOf: r.savedAs.from, freshSceneId: true } : {}),
         ...(r.extraSaved?.length ? { extraSaved: r.extraSaved } : {}),
         // Name the asset docs this save wrote. They are the half a caller cannot otherwise see —
         // `saved:false` was the answer when the edit was parked, and this is where that promise
@@ -2262,6 +2275,14 @@ export function registerEditorAgentOps(): void {
         // reason as the two above, and missing for the same reason they each once were.
         ...(r.importSettings?.saved.length ? { savedImportSettings: r.importSettings.saved } : {}),
       };
+    }
+    if (r.reason === 'target-loaded') {
+      throw new OpRefusal(
+        partialOr('REFUSED_BY_OP'),
+        `save-all: "${r.path}" is another scene loaded under the open one (a base scene in its chain). Saving the ` +
+        'open scene over it would replace a file the live world is built from. The scene was NOT written. Choose another path.'
+        + landedNote,
+      );
     }
     if (r.reason === 'needs-path') {
       throw new OpRefusal(

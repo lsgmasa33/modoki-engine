@@ -654,7 +654,13 @@ describe('the real registered surface', () => {
   //   fact from a place nobody reads to the place everybody does SPENDS this budget by definition —
   //   so a "no new information" change can still cost 4 KB, and that is the spend being approved
   //   here, not an oversight.
-  const DEFINITION_BYTES = 171_084;
+  // 2026-09-18 (#1414, work-ai3): RE-PINNED to 175,280 — measured on this branch after merging
+  // origin/main. The surface measured 175,052 before #1414 (the pre-#1414 editor.ts swapped back in),
+  // inside the headroom with 32 B of it left: the rest was spent by the branches merged since the
+  // 171,084 pin (booked in their ledgers). #1414 adds 228 B to modoki_save_all's `path`, which the
+  // owner's ruling required to say that a
+  // path naming another file is a Save As with a FRESH id that OVERWRITES what is there.
+  const DEFINITION_BYTES = 175_280;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

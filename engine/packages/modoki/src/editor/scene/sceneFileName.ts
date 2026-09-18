@@ -32,3 +32,30 @@ export function correctedScenePath(path: string): string {
 export function isAcceptableScenePath(path: string, ctx: { currentPath: string | null; existingType: string | undefined }): boolean {
   return path.endsWith(SCENE_EXT) || path === ctx.currentPath || ctx.existingType === 'scene';
 }
+
+/** What an EXPLICIT save path means for the open scene (#1414).
+ *  - `untitled`: nothing is open under a path yet (a `new_scene`), so its id is already fresh — a
+ *    plain first save.
+ *  - `same`: the open scene's own file — by path, compared case-insensitively because APFS/NTFS fold
+ *    case (#1273), or by the manifest naming the open scene's guid at that path.
+ *  - `target-loaded`: another scene in the loaded chain (a base). Overwriting it with this scene
+ *    would replace a file the live world is built from.
+ *  - `save-as`: any other file. The copy gets a fresh scene id and reminted entity guids, and
+ *    overwrites what is there (owner, 2026-09-18). Written as-is, two files would claim one guid and
+ *    the scanner's heal would re-mint whichever sorts second — the committed original, sometimes. */
+export type ExplicitSceneSave = 'untitled' | 'same' | 'target-loaded' | 'save-as';
+
+export function classifyExplicitSceneSave(target: string, ctx: {
+  currentPath: string | null;
+  openSceneId: string;
+  /** The guid the manifest has registered at `target`, if any. */
+  targetGuid: string | undefined;
+  /** Every loaded scene's path, the open one included. */
+  loadedPaths: readonly string[];
+}): ExplicitSceneSave {
+  if (!ctx.currentPath) return 'untitled';
+  const t = target.toLowerCase();
+  if (t === ctx.currentPath.toLowerCase() || (!!ctx.targetGuid && ctx.targetGuid.toLowerCase() === ctx.openSceneId.toLowerCase())) return 'same';
+  if (ctx.loadedPaths.some((p) => p.toLowerCase() === t)) return 'target-loaded';
+  return 'save-as';
+}

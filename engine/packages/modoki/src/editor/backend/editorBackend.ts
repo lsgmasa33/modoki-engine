@@ -105,6 +105,29 @@ export function postWriteFile(
   });
 }
 
+/** Write the OPEN scene to another file as a COPY with its own identity (#1414): the backend stamps
+ *  a fresh scene id and re-mints the entity guids, then overwrites whatever scene is at `filePath`.
+ *  `content` is the scene as serialized (`jsonFileBody`). Resolves to the copy's new guid and the
+ *  path the disk spells it with; `'same-file'` when `filePath` resolves to `openPath`'s own file, or
+ *  `'target-loaded'` to another of `loadedPaths` (nothing written either way — the backend compares
+ *  the files the DISK resolves, which a client string compare cannot); or null when the write was
+ *  refused or failed. */
+export async function writeSceneCopy(filePath: string, content: string, openPath: string, loadedPaths: readonly string[]): Promise<{ guid: string; path: string } | 'same-file' | 'target-loaded' | null> {
+  try {
+    const res = await backendFetch('/api/scene-save-as', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: filePath, content, openPath, loadedPaths }),
+    });
+    if (res.status === 409) {
+      const j = await res.json().catch(() => ({})) as { sameFile?: boolean; targetLoaded?: boolean };
+      return j.sameFile ? 'same-file' : j.targetLoaded ? 'target-loaded' : null;
+    }
+    if (!res.ok) return null;
+    const j = await res.json() as { guid?: string; path?: string };
+    return typeof j.guid === 'string' ? { guid: j.guid, path: typeof j.path === 'string' ? j.path : filePath } : null;
+  } catch { return null; }
+}
+
 /** Write a text or base64-encoded file via /api/write-file — the ONE client write wrapper every
  *  JSON write in the editor now routes through (#835; collapses five near-identical copies —
  *  `serialize.ts`'s `writeFileToServer`, this module's own prior duplicate, a third copy in

@@ -672,6 +672,13 @@ function parkSurvivors(key: string, undo: readonly UndoAction[], redo: readonly 
   else _histories.delete(key);
 }
 
+/** Drop the stacks kept for `key`, so the next visit starts empty. For a file whose content was
+ *  replaced wholesale (an agent Save As over it, #1414): its old entries name guids the new
+ *  content does not have. No-op for the active key — that history is the live one. */
+export function forgetHistory(key: string): void {
+  if (key !== _activeKey) _histories.delete(key);
+}
+
 /** Test-only: reset the context map + active key. */
 export function _resetHistoryContexts() {
   _histories.clear();
