@@ -1407,6 +1407,54 @@ export interface RenderState {
   emitLifecycle: boolean;
 }
 
+/** A field `forgetEcsObject` can clear by bare id. The members are FUNCTION PROPERTIES, not method
+ *  signatures, on purpose: a method is compared bivariantly, which let `EntityTable` (whose `delete`
+ *  takes a packed `Entity` and calls `.id()` on it) satisfy this and then throw on first teardown. */
+type EntityRowKey = {
+  [K in keyof RenderState]: RenderState[K] extends { delete: (id: number) => boolean; clear: () => void } ? K : never;
+}[keyof RenderState];
+
+/** Every per-entity row describing the ONE `ecsObjects` object at an id — the single list each
+ *  teardown clears through `forgetEcsObject` (#1388). Four sites used to restate it by hand and one
+ *  drifted (#1385: the GLB mesh swap kept `ecsMaterials`). A map added to `RenderState` must be
+ *  listed here or in `scene3DSyncRenderStateRows.test.ts`'s `OWNED_ELSEWHERE` ledger, or that test fails.
+ *  Deliberately NOT here: `skinnedShadowFlags`/`skinned`/`billboards`/`textMeshes` — other passes
+ *  own them, and an entity may carry a SkinnedModel beside a Renderable3D under the same id. */
+export const ECS_OBJECT_ROWS = [
+  'ecsObjects', 'ecsOwners', 'ecsSprites', 'ecsMaterials',
+  'ecsColors', 'ecsSizes', 'ecsShadowFlags', 'ownsGeometry',
+] as const satisfies readonly EntityRowKey[];
+
+/** Drop every `ECS_OBJECT_ROWS` row for `id`. Bookkeeping ONLY — removing the object from the scene
+ *  and disposing/retiring what it owns differ per site and stay with the caller. Clearing
+ *  `ecsSizes`/`ecsColors` for a GLB is harmless (only the primitive pass reads them); clearing
+ *  `ecsMaterials` and `ecsShadowFlags` is load-bearing (a rebuilt object must re-run `syncMaterial`
+ *  and `applyShadowFlags`, or it keeps a baked material / starts unshadowed). */
+export function forgetEcsObject(state: RenderState, id: number): void {
+  for (const key of ECS_OBJECT_ROWS) state[key].delete(id);
+}
+
+/** Drop the object at `id` MID-PASS so the caller can build its replacement: out of the scene, owned
+ *  geometry disposed, owned materials RETIRED rather than disposed (#477 — this runs in the frame
+ *  callback that also renders), then every row forgotten. The GLB mesh swap and the primitive
+ *  rebuild share it: the swap used to skip the dispose, so an id that turned from a primitive into
+ *  a GLB in one frame leaked the primitive's geometry and default material — `disposeRenderState`
+ *  walks only `ecsObjects`, which no longer held it (#1388 close-out). */
+function discardForRebuild(state: RenderState, scene: THREE.Scene, id: number, obj: THREE.Object3D): void {
+  scene.remove(obj);
+  if (state.ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
+    (obj as THREE.Mesh).geometry.dispose();
+  }
+  for (const target of materialTargetsOf(obj)) {
+    const mat = target.material as THREE.Material;
+    if (mat && state.ownedMaterials.has(mat)) {
+      state.ownedMaterials.delete(mat);
+      retireDerivedMaterial(mat, () => mat.dispose());
+    }
+  }
+  forgetEcsObject(state, id);
+}
+
 /** Create a fresh RenderState with empty maps/sets. Pass emitLifecycle=true for the
  *  primary (game/runtime) surface so animation lifecycle events are journaled once. */
 export function createRenderState(emitLifecycle = false): RenderState {
@@ -1494,12 +1542,7 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       }
       scene.remove(obj);
     }
-    state.ecsObjects.delete(id);
-    state.ecsOwners.delete(id);
-    state.ecsSprites.delete(id);
-    state.ecsMaterials.delete(id);
-    state.ecsShadowFlags.delete(id);
-    state.ownsGeometry.delete(id);
+    forgetEcsObject(state, id);
   };
 
   // A `.mesh.json` EDIT (#1380): the entity's ref string is unchanged, so without this the sync
@@ -1594,15 +1637,8 @@ export function disposeRenderState(state: RenderState, scene: THREE.Scene) {
   state.billboards.clear();
   for (const [, entry] of state.textMeshes) disposeTextMeshEntry(entry, scene);
   state.textMeshes.clear();
-  state.ecsObjects.clear();
-  state.ecsOwners.clear();
-  state.ecsSprites.clear();
-  state.ecsMaterials.clear();
-  state.ecsColors.clear();
-  state.ecsSizes.clear();
-  state.ecsShadowFlags.clear();
+  for (const key of ECS_OBJECT_ROWS) state[key].clear();
   state.skinnedShadowFlags.clear();
-  state.ownsGeometry.clear();
   state.ownedMaterials.clear();
 }
 
@@ -2951,19 +2987,10 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     let obj = ownedEcsObject(state, scene, entity, callbacks);
 
     if (obj && ecsSprites.get(id) !== rend.mesh) {
-      scene.remove(obj);
-      ecsObjects.delete(id);
-      state.ecsOwners.delete(id);
-      ecsSprites.delete(id);
-      ownsGeometry.delete(id);
-      // A fresh THREE object is about to be built below, defaulting to no shadow — force the
-      // next applyShadowFlags check to re-apply rather than reading a stale "unchanged" key.
-      ecsShadowFlags.delete(id);
-      // And the material record, as the eviction listener and the primitive rebuild already do.
-      // Without it an EMPTY-ref entity swapped to another mesh kept `prevMat '' === curMat ''`, so
-      // `syncMaterial` never re-ran and the new mesh drew its BAKED material — not the engine
-      // default an empty ref renders (#1385), and not what the same entity shows after a reload.
-      ecsMaterials.delete(id);
+      // Every row, not a hand-picked few: this site once kept `ecsMaterials`, so an EMPTY-ref
+      // entity swapped to another mesh read `'' === ''`, never re-ran `syncMaterial`, and drew the
+      // new mesh's BAKED material instead of the engine default (#1385).
+      discardForRebuild(state, scene, id, obj);
       obj = undefined;
     }
 
@@ -3075,30 +3102,10 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     // nothing left to warn about (`warnUnknownPrimitiveOnce` had already fired for that name on
     // the frame the kind changed). Gating the ENTIRE condition on `meshKnown` closes every route.
     if (obj && meshKnown && (sizeChanged || kindChanged)) {
-      scene.remove(obj);
-      // Dispose owned geometry from the previous mesh so size churn doesn't leak.
-      if (ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
-        (obj as THREE.Mesh).geometry.dispose();
-      }
-      // The owned MATERIAL needs the same care as the geometry above, and for the #477 reason:
-      // nothing binds it once this mesh is dropped, and no later pass would come back for it —
-      // `disposeRenderState` only walks `ecsObjects`, which no longer holds this mesh. Retire it
-      // rather than disposing inline; this runs mid-pass, in the frame callback that also renders.
-      const discardedMat = (obj as THREE.Mesh).material as THREE.Material;
-      if (discardedMat && state.ownedMaterials.has(discardedMat)) {
-        state.ownedMaterials.delete(discardedMat);
-        retireDerivedMaterial(discardedMat, () => discardedMat.dispose());
-      }
-      ecsObjects.delete(id);
-      state.ecsOwners.delete(id);
-      ecsSprites.delete(id);
-      ecsColors.delete(id);
-      ecsMaterials.delete(id);
-      ecsSizes.delete(id);
-      // A fresh mesh is about to be built below, defaulting to no shadow — force the next
-      // applyShadowFlags check to re-apply rather than reading a stale "unchanged" key.
-      ecsShadowFlags.delete(id);
-      ownsGeometry.delete(id);
+      // Owned geometry is disposed so size churn doesn't leak; the owned MATERIAL is retired, not
+      // disposed inline, for the #477 reason — nothing binds it once this mesh is dropped, and
+      // `disposeRenderState` only walks `ecsObjects`, which no longer holds this mesh.
+      discardForRebuild(state, scene, id, obj);
       obj = undefined;
     }
 
@@ -3208,13 +3215,7 @@ function removeEcsObject(state: RenderState, scene: THREE.Scene, id: number, obj
       mat.dispose();
     }
   }
-  state.ecsObjects.delete(id);
-  state.ecsOwners.delete(id);
-  state.ecsSprites.delete(id);
-  state.ecsColors.delete(id);
-  state.ecsMaterials.delete(id);
-  state.ecsShadowFlags.delete(id);
-  state.ownsGeometry.delete(id);
+  forgetEcsObject(state, id);
 }
 
 /** The kept object at `entity`'s index, or `undefined` after evicting one built for a DIFFERENT

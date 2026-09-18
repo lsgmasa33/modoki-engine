@@ -27,6 +27,22 @@ Layering: `Scene3D` mounts an absolutely-positioned container at `zIndex: 0`. Th
 
 Object lifetimes are tracked in a `RenderState` (`ecsObjects`, `ecsSprites`, `ecsMaterials`, …); entities that disappear from the query are removed and their owned geometry/materials disposed.
 
+The per-entity rows describing one `ecsObjects` object (`ecsOwners`, `ecsSprites`, `ecsMaterials`,
+`ecsColors`, `ecsSizes`, `ecsShadowFlags`, `ownsGeometry`) are named ONCE, in `ECS_OBJECT_ROWS`, and
+every teardown — the asset-invalidation eviction, the GLB mesh swap, the primitive rebuild, the
+end-of-pass reap and `disposeRenderState` — clears them through `forgetEcsObject` (#1388). Only the
+bookkeeping is shared by all five; disposal genuinely differs (the reap disposes inline, the
+eviction retires light-mask variants). The two MID-PASS rebuilds — the GLB mesh swap and the primitive
+rebuild — share `discardForRebuild` on top of it (dispose owned geometry, RETIRE owned materials per
+#477), because the swap used to skip that step: an id that turned from a primitive into a GLB in one
+frame leaked the primitive's geometry and default material, since `disposeRenderState` walks only
+`ecsObjects`. The failure it closes: four sites hand-listed the maps and one drifted — the GLB swap kept
+`ecsMaterials`, so an empty-ref entity swapped to another mesh drew the new mesh's baked material
+(#1385). Missing `ecsShadowFlags` does the same to shadows: a fresh object starts unshadowed and the
+stale key reads "unchanged". **A new per-entity map joins that list** — or, if another pass owns it
+(`skinnedShadowFlags`, `skinned`, `billboards`, `textMeshes`), the `OWNED_ELSEWHERE` ledger in
+`scene3DSyncRenderStateRows.test.ts`; that test fails until one of the two names it.
+
 ### `2d` — PixiJS v8
 
 `Scene2D.tsx` renders `Renderable2D` entities into their nearest `Canvas2D` ancestor's PixiJS container. A sprite is drawn either as a tinted `Graphics` primitive (driven by `Renderable2D.color`) or an image. Shared draw computations live in `render2DUtils.ts` (`drawPrimitiveShapeGfx()`, etc.) so the editor and runtime share one code path. Full detail: [2D Rendering (PixiJS)](#2d-rendering-pixijs) below.
