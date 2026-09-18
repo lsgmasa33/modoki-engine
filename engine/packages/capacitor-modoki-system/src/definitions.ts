@@ -49,4 +49,21 @@ export interface ModokiSystemPlugin {
 
   /** iOS only: where the store is, whether the backup exclusion is set, and how many entries it holds. */
   kvInfo(): Promise<{ path: string; excludedFromBackup: boolean; entries: number }>;
+
+  /**
+   * Ask the OS to show its own "rate this app" prompt — `SKStoreReviewController` on iOS, the Play
+   * In-App Review flow on Android (#939).
+   *
+   * ⚠️ **`requested: true` does NOT mean the player saw anything, and nothing can tell you whether
+   * they did.** Both platforms treat this as a hint: they apply their own quota (iOS shows at most
+   * ~3 per user per year and may show nothing at all), they never report the outcome, and they
+   * never say whether a review was written. So a caller must treat one call as one *spent
+   * opportunity*, not as a displayed dialog, and must never re-ask because "nothing happened" —
+   * there is no such signal, and asking again only burns the quota faster.
+   *
+   * `requested` is therefore only "the OS accepted the request without erroring". It resolves
+   * `false` rather than rejecting when the platform has no such flow (the web, or an Android build
+   * without Play services), so a caller needs no platform branch of its own.
+   */
+  requestReview(): Promise<{ requested: boolean }>;
 }

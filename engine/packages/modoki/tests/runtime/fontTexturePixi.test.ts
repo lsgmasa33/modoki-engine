@@ -1,5 +1,10 @@
 /** getFontTexturePixi — every renderer waiting on an atlas load must be woken, not just the first.
  *
+ *  #1368: the wake is now the font family's SHARED hub, `markTextDirty(fontId)`, fired by the
+ *  store — not a per-caller `onReady` set. The tests below count it through `getTextDirtyVersion`
+ *  (per-font, so parallel cases cannot bleed into each other) and `onTextDirty` (what a surface
+ *  actually subscribes to). The history below is why a per-caller channel was the wrong shape.
+ *
  *  ⚠️ **The bug this pins.** `cache`/`loading` are MODULE-level and shared by every
  *  `Scene2DRenderer`, and the editor always runs two of them (the Game panel and the Scene panel).
  *  Both ask for the same font atlas in the same frame. The first started the load and registered
@@ -47,6 +52,13 @@ vi.mock('../../src/runtime/rendering/pixiTextureLoad', () => ({ loadMtsdfAtlasTe
 const { getFontTexturePixi } = await import('../../src/runtime/rendering/text/fontTexturePixi');
 const { BakedFontProvider } = await import('../../src/runtime/rendering/text/fontProvider');
 const { DynamicFontProvider } = await import('../../src/runtime/rendering/text/dynamicFontProvider');
+const { getTextDirtyVersion, onTextDirty } = await import('../../src/runtime/rendering/text/textDirty');
+
+/** How many text-dirty wakes attributed to `fontId` land from now on. */
+function wakesFor(fontId: string): () => number {
+  const v0 = getTextDirtyVersion(fontId);
+  return () => getTextDirtyVersion(fontId) - v0;
+}
 
 /** A baked (image-URL) provider. `atlasCanvasAt` absent → the baked path, not the dynamic one. */
 function provider(id: string) {
@@ -64,66 +76,72 @@ const fakeTexture = () => ({ source: { scaleMode: '', alphaMode: '', update: vi.
 describe('getFontTexturePixi — concurrent renderers', () => {
   beforeEach(() => { loadCalls = 0; loadMtsdfAtlasTexture.mockClear(); unload.mockClear(); });
 
-  it('wakes BOTH renderers when one shared atlas load lands', async () => {
+  it('one shared load wakes EVERY surface through the shared text hub, attributed to its font (#1368)', async () => {
     const p = provider('font-both');
-    const wakeA = vi.fn();
-    const wakeB = vi.fn();
+    const woke = wakesFor('font-both');
+    // Two surfaces, subscribed the way Scene2D / Scene3D / SceneView are — neither passes anything in.
+    const surfaceA = vi.fn();
+    const surfaceB = vi.fn();
+    const offA = onTextDirty(surfaceA);
+    const offB = onTextDirty(surfaceB);
 
     // Frame N: the Game panel asks first and starts the load; the Scene panel asks second.
-    expect(getFontTexturePixi(p, 0, wakeA), 'nothing to draw yet').toBeNull();
-    expect(getFontTexturePixi(p, 0, wakeB), 'and the second caller waits too').toBeNull();
+    expect(getFontTexturePixi(p, 0), 'nothing to draw yet').toBeNull();
+    expect(getFontTexturePixi(p, 0), 'and the second caller waits too').toBeNull();
     expect(loadCalls, 'ONE network load is shared — the second must not kick a duplicate').toBe(1);
 
     resolveLoad(fakeTexture());
-    await vi.waitFor(() => expect(wakeA).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(woke()).toBe(1));
 
-    // THE REGRESSION: wakeB used to be dropped, so the second panel never repainted and its text
-    // stayed missing until an unrelated dirty event.
-    expect(wakeB, 'the SECOND renderer is woken too — this is the whole bug').toHaveBeenCalledTimes(1);
+    // THE REGRESSION: the second panel's wake used to be dropped, so its text stayed missing until
+    // an unrelated dirty event. A shared hub cannot drop a subscriber that never had to register.
+    expect(surfaceA).toHaveBeenCalledTimes(1);
+    expect(surfaceB, 'the SECOND surface is woken too — this is the whole bug').toHaveBeenCalledTimes(1);
+    offA(); offB();
   });
 
   it('serves the cached texture synchronously afterwards, with no further load or wake', async () => {
     const p = provider('font-cached');
-    const wake = vi.fn();
-    getFontTexturePixi(p, 0, wake);
+    const woke = wakesFor('font-cached');
+    getFontTexturePixi(p, 0);
     resolveLoad(fakeTexture());
-    await vi.waitFor(() => expect(wake).toHaveBeenCalled());
+    await vi.waitFor(() => expect(woke()).toBe(1));
 
-    const late = vi.fn();
-    const tex = getFontTexturePixi(p, 0, late);
+    const tex = getFontTexturePixi(p, 0);
     expect(tex, 'a later caller gets the texture straight back').not.toBeNull();
-    expect(late, 'and is NOT called back — it already has what it asked for').not.toHaveBeenCalled();
+    expect(woke(), 'a cache HIT never wakes — a per-frame caller cannot keep a surface awake').toBe(1);
     expect(loadCalls, 'still one load').toBe(1);
   });
 
   it('caches the texture BEFORE waking, so a synchronous re-render finds it', async () => {
-    // A waiter that re-renders inside its own wake-up must see the cache populated, or it kicks a
+    // A surface that re-renders inside its own wake-up must see the cache populated, or it kicks a
     // second load and draws nothing again.
     const p = provider('font-order');
     let seenDuringWake: unknown = 'not-called';
-    getFontTexturePixi(p, 0, () => { seenDuringWake = getFontTexturePixi(p, 0); });
+    getFontTexturePixi(p, 0);
+    const off = onTextDirty(() => { seenDuringWake = getFontTexturePixi(p, 0); });
     resolveLoad(fakeTexture());
     await vi.waitFor(() => expect(seenDuringWake).not.toBe('not-called'));
+    off();
     expect(seenDuringWake, 'the texture is already cached when the wake-up fires').not.toBeNull();
     expect(loadCalls, 'so no second load is kicked').toBe(1);
   });
 
-  it('a FAILED load drops its waiters and frees the key for a retry', async () => {
+  it('a FAILED load wakes nobody and frees the key for a retry', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const p = provider('font-fail');
-    const wake = vi.fn();
-    getFontTexturePixi(p, 0, wake);
+    const woke = wakesFor('font-fail');
+    getFontTexturePixi(p, 0);
     rejectLoad(new Error('404'));
     await vi.waitFor(() => expect(warn).toHaveBeenCalled());
 
-    // Not woken: there is nothing to draw. But the key must be free, or a later attempt would be
-    // queued behind a dead load forever — and its wake-ups would never fire either.
-    expect(wake, 'no wake-up for a load with no texture').not.toHaveBeenCalled();
-    const retry = vi.fn();
-    getFontTexturePixi(p, 0, retry);
+    // Not woken: there is nothing to draw, and a wake would make a failing atlas a per-frame
+    // fetch loop. But the key must be free, or a later attempt would wait on a dead load forever.
+    expect(woke(), 'no wake-up for a load with no texture').toBe(0);
+    getFontTexturePixi(p, 0);
     expect(loadCalls, 'the next call re-attempts rather than joining the dead load').toBe(2);
     resolveLoad(fakeTexture());
-    await vi.waitFor(() => expect(retry).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(woke()).toBe(1));
     warn.mockRestore();
   });
 });
@@ -183,13 +201,13 @@ describe('the baked page-0 image is cached independently of atlasVersion', () =>
   beforeEach(() => { loadCalls = 0; loadMtsdfAtlasTexture.mockClear(); });
   it('does not re-load the image when a generation bumps the version', async () => {
     const p = provider('hybrid') as unknown as { atlasVersion: number };
-    const wake = vi.fn();
-    expect(getFontTexturePixi(p as never, 0, wake)).toBeNull();  // starts exactly one load
+    const woke = wakesFor('hybrid');
+    expect(getFontTexturePixi(p as never, 0)).toBeNull();  // starts exactly one load
     expect(loadCalls).toBe(1);
 
     const tex = fakeTexture();
     resolveLoad(tex);
-    await vi.waitFor(() => expect(wake).toHaveBeenCalled());
+    await vi.waitFor(() => expect(woke()).toBe(1));
     expect(getFontTexturePixi(p as never, 0)).toBe(tex);
 
     // A glyph batch lands: the generated CANVAS pages changed; the baked image did not.
@@ -219,8 +237,8 @@ describe('a provider disposed mid-load must not leave its texture in the cache',
 
   it('drops the entry when the load lands after invalidateFont disposed the provider, and STILL wakes the waiter', async () => {
     const p1 = liveProvider('font-invalidated');
-    const wake = vi.fn();
-    expect(getFontTexturePixi(p1 as never, 0, wake), 'load in flight').toBeNull();
+    const woke = wakesFor('font-invalidated');
+    expect(getFontTexturePixi(p1 as never, 0), 'load in flight').toBeNull();
 
     // The human re-bakes the font: invalidateFont disposes p1 and re-acquires under the same guid.
     p1.dispose();
@@ -237,17 +255,18 @@ describe('a provider disposed mid-load must not leave its texture in the cache',
     expect(stale.destroy, 'and its SOURCE goes with it, not just the wrapper').toHaveBeenCalledWith(true);
     expect(unload, 'Assets never owned this texture, so unloading it would be a no-op').not.toHaveBeenCalled();
 
-    // ⚠️ THE WAITER MUST STILL BE WOKEN, and an earlier version of this fix asserted the exact
-    // opposite. `waiters` is keyed by the font GUID, so it outlives the provider INSTANCE while
-    // the cache entry does not: the set can hold a waiter belonging to the live successor (p2
-    // below), queued behind p1's still-in-flight load. Not waking strands that renderer — the
-    // "texts are not rendered until I click the entity" bug the waiters set exists to prevent.
+    // ⚠️ THE WAKE MUST STILL FIRE, and an earlier version of this fix asserted the exact
+    // opposite. `inFlight` is keyed by the font GUID, so it outlives the provider INSTANCE while
+    // the cache entry does not: a repaint for the live successor (p2 below) finds p1's load in
+    // flight and returns null without starting its own. Not waking strands that repaint — the
+    // "texts are not rendered until I click the entity" bug. `markTextDirty` is keyed by the same
+    // guid, so the wake reaches p2's text.
     //
     // It cannot loop: a woken repaint resolves its provider through `getLoadedFont(guid)`, and
     // every disposal path deletes from `providers` synchronously, so the retry gets the LIVE
     // provider or none — never the disposed p1 that landed here. Bounded at one iteration, which
     // is what the `loadCalls === 2` assertion below measures.
-    expect(wake, 'a live successor may be queued behind this load — wake it').toHaveBeenCalledTimes(1);
+    expect(woke(), 'a live successor may be waiting on this load — wake it').toBe(1);
 
     const p2 = liveProvider('font-invalidated');
     expect(getFontTexturePixi(p2 as never, 0), 'the DEAD provider’s atlas must not be served')
@@ -329,12 +348,12 @@ describe('a destroyed baked image texture already in the cache is evicted, not s
 
   it('evicts and starts a fresh load instead of returning the destroyed texture', async () => {
     const p = provider('font-baked-destroyed');
-    const wake1 = vi.fn();
-    expect(getFontTexturePixi(p, 0, wake1), 'load in flight').toBeNull();
+    const woke = wakesFor('font-baked-destroyed');
+    expect(getFontTexturePixi(p, 0), 'load in flight').toBeNull();
 
     const tex1 = fakeTexture() as unknown as { source: unknown; destroyed?: boolean };
     resolveLoad(tex1);
-    await vi.waitFor(() => expect(wake1).toHaveBeenCalled());
+    await vi.waitFor(() => expect(woke()).toBe(1));
     expect(getFontTexturePixi(p, 0), 'cached after landing').toBe(tex1);
 
     // Destroy the texture WITHOUT going through the provider's disposer (a real
@@ -342,8 +361,7 @@ describe('a destroyed baked image texture already in the cache is evicted, not s
     // is exactly the "disposer did not evict it" case the guard defends against.
     tex1.destroyed = true;
 
-    const wake2 = vi.fn();
-    const result = getFontTexturePixi(p, 0, wake2);
+    const result = getFontTexturePixi(p, 0);
     expect(result, 'must not hand back the destroyed texture').not.toBe(tex1);
     expect(result, 'a fresh load starts instead').toBeNull();
     expect(loadCalls, 'a second load is kicked for the evicted entry').toBe(2);

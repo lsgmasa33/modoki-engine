@@ -484,7 +484,7 @@ export function detectType(relPath: string, ext: string): string | null {
 /** What a watched .json change asks the live renderer to do. 'scene'/'prefab' hot-reload the
  *  world; 'animation', 'timeline' and 'particle' only invalidate their asset cache (reloading
  *  the scene would be wrong — and would discard unsaved work). */
-export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader';
+export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader' | 'mesh';
 
 export function classifySceneChange(rel: string): LiveReloadKind | null {
   const type = detectType(rel, '.json');
@@ -540,6 +540,13 @@ export function classifySceneChange(rel: string): LiveReloadKind | null {
   // invalidation ever fired for an agent shader write.
   if (type === 'material') return 'material';
   if (type === 'shader') return 'shader';
+  // `.mesh.json` (#1380) — the one render-affecting document here that is NOT an
+  // ASSET_SCHEMA_TYPE, which is how it slipped past #842's schema ⊆ kind check: no agent tool
+  // writes it and it is never parked, so the only external writer is a plain file edit (the
+  // user's own Claude Code, a shell, a git checkout). Without this case an edited model/mesh
+  // binding kept rendering until the next scene swap. The editor's OWN write (modelImport) is
+  // `markEditorWrite`-suppressed and invalidates itself.
+  if (type === 'mesh') return 'mesh';
   if (type === 'scene') return 'scene';
   return null;
 }

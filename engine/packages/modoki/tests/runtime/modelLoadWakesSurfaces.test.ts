@@ -14,7 +14,7 @@
  *  reaching THAT registry is the whole of the fix. The RIGGED cache fires the same edge and is
  *  pinned in riggedModelCache.test.ts, which already mocks a real loader. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
 
 vi.mock('three/examples/jsm/libs/meshopt_decoder.module.js', () => ({ MeshoptDecoder: {} }));
@@ -22,7 +22,7 @@ vi.mock('three/examples/jsm/loaders/GLTFLoader.js', () => ({
   GLTFLoader: class { setMeshoptDecoder(_d: unknown) {} load() {} },
 }));
 
-import { loadModelTemplates, getMeshTemplate, invalidateModel } from '../../src/runtime/loaders/meshTemplateCache';
+import { loadModelTemplates, getMeshTemplate, invalidateModel, acquireMesh, getMeshAsset } from '../../src/runtime/loaders/meshTemplateCache';
 import { addDirtyListener } from '../../src/runtime/core/renderDirty';
 import { offerParsedGltf } from '../../src/runtime/loaders/parsedGltfHandoff';
 
@@ -76,5 +76,31 @@ describe('the model load edge wakes every idle-gated surface (#1363)', () => {
     offA(); offB();
     expect(after).toHaveBeenCalled();
     warn.mockRestore();
+  });
+});
+
+// #1368 D: a `.mesh.json` can land AFTER its GLB was already parsed by another consumer. Then
+// neither upstream wake fires — `loadModelTemplates` hands back the settled promise (no parse, no
+// wake) and `registerAsset` wakes only on a manifest change — so on an idle surface the mesh asset
+// became readable and nothing redrew. `fetchMeshAsset` now wakes once the asset is usable.
+describe('a .mesh.json landing after its GLB is already parsed still wakes (#1368 D)', () => {
+  beforeEach(() => { invalidateModel('models/hull.glb'); });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  // Paths are RELATIVE on purpose: a leading-slash ref is an internal asset path, which `resolveRef`
+  // rejects, so the fixture would silently never load (the sanity check below catches exactly that).
+  it('fires the shared dirty signal with the mesh asset readable', async () => {
+    offer('models/hull.glb', 'Hull');
+    await loadModelTemplates('models/hull.glb'); // another consumer parsed it first
+    const doc = JSON.stringify({ model: 'models/hull.glb', mesh: 'Hull' });
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, text: async () => doc }) as unknown as Response));
+
+    const seenAssetAtFireTime: boolean[] = [];
+    const off = addDirtyListener(() => { seenAssetAtFireTime.push(!!getMeshAsset('models/hull.mesh.json')); });
+    await acquireMesh(1, 'models/hull.mesh.json');
+    off();
+
+    expect(getMeshAsset('models/hull.mesh.json'), 'fixture sanity: the asset loaded').toBeTruthy();
+    expect(seenAssetAtFireTime, 'some wake must land once the asset is readable').toContain(true);
   });
 });

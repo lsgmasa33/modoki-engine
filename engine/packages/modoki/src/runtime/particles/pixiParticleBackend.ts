@@ -22,6 +22,7 @@ import {
   type IParticleBackendCore, type ParticleEffectDef, type ParticleHandle,
 } from './types';
 import { rawNow } from '../core/clock';
+import { fireDirtyListeners } from '../core/renderDirty';
 import { CpuParticleSim } from './cpuSimulator';
 import { createPixiParticles, type PixiParticleObject } from './pixiParticleObject';
 import { resolveImageUrl } from '../core/textureRefs';
@@ -216,6 +217,9 @@ export class PixiParticleBackend implements IParticle2DBackend {
       .catch((e) => {
         console.warn(`[particles2d] texture load failed: ${ref}`, e);
         this.revealEmitter(entry); // a dead sprite must never hide an emitter forever
+        // `loadPixiTexture` wakes on success only (a reject wake would loop Scene2D's per-frame
+        // retry, #1374), so this reveal owes its own — once per failed load, never per frame.
+        fireDirtyListeners();
       });
   }
 

@@ -619,6 +619,7 @@
   "invalidateAudio",
   "invalidateEnvironment",
   "invalidateMaterial",
+  "invalidateMeshAsset",
   "invalidateModel",
   "invalidateModelAndRig",
   "invalidateParticleEffect",

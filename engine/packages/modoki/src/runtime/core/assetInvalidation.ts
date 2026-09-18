@@ -29,7 +29,7 @@
 import { fireDirtyListeners } from './renderDirty';
 import { notifyListeners } from './notifyListeners';
 
-export type InvalidatedAssetKind = 'model' | 'texture' | 'audio' | 'environment' | 'shader';
+export type InvalidatedAssetKind = 'model' | 'texture' | 'audio' | 'environment' | 'shader' | 'mesh';
 
 /** Not every re-importable asset type is here, and the absences were measured (#304
  *  close-out). `font` has its OWN channel — `onFontInvalidated` in `assetManifest`,
@@ -46,7 +46,15 @@ export type InvalidatedAssetKind = 'model' | 'texture' | 'audio' | 'environment'
  *  own GUID-keyed program map + `pixiShaderBuilder`'s cache); it must not import
  *  `meshTemplateCache` directly (that would pull three.js into a 2D-only build and defeat the
  *  `__MODOKI_MODULE_RENDER3D__` tree-shaking `materialPresets.ts` relies on), so it emits
- *  through this registry instead and `meshTemplateCache` subscribes on the 3D side. */
+ *  through this registry instead and `meshTemplateCache` subscribes on the 3D side.
+ *
+ *  `mesh` (#1380) is fired by an EDIT, not a re-import: a `.mesh.json` whose `model`/`mesh` binding
+ *  changed with its GLB untouched. `scene3DSync` caches each entity's built object by its mesh REF
+ *  string, which the edit leaves unchanged, so replacing the definition alone redraws nothing — the
+ *  renderer has to hear which path changed and tear its objects down. `path` is the `.mesh.json`
+ *  asset path. ⚠️ Unlike the kinds above it fires AFTER the new bytes are loaded, just before the
+ *  cache swaps to them — `invalidateMeshAsset` is stale-while-revalidate — and not at all when a
+ *  re-read finds the same binding. */
 
 /** `path` is the source asset path whose bytes changed. `targets` names every
  *  path whose cached derivations are about to be dropped — for a model that is

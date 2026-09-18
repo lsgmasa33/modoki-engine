@@ -785,6 +785,8 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
   ...['PrefabEntity.overrides', 'PrefabEntity.removedTraits', 'PrefabEntity.nestedOverrides'].map((f) => ({
     item: `engine/packages/modoki/src/editor/scene/prefab.ts::${f}`,
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id — the editor twin of loaders/loadSceneFile.ts PrefabFileEntry{}; editor/scene/prefab.ts:42' })),
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::PlannedNestedRow.nestedOverrides',
+    reason: 'not-entity: path-keyed by nested-row localIds, then a nested prefab member\'s localId — the row value serializePrefab writes as PrefabEntity.nestedOverrides (#1381), never a runtime entity id; editor/scene/prefab.ts:171' },
   ...['SerializedEntity.overrides', 'SerializedEntity.removedTraits', 'SerializedEntity.nestedOverrides'].map((f) => ({
     item: `engine/packages/modoki/src/editor/scene/serialize.ts::${f}`,
     reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id — the written twin of loaders/loadSceneFile.ts SceneEntityEntry; editor/scene/serialize.ts:41' })),

@@ -1,6 +1,7 @@
 ext {
     junitVersion = project.hasProperty('junitVersion') ? rootProject.ext.junitVersion : '4.13.2'
     androidxAppCompatVersion = project.hasProperty('androidxAppCompatVersion') ? rootProject.ext.androidxAppCompatVersion : '1.7.1'
+    playReviewVersion = project.hasProperty('playReviewVersion') ? rootProject.ext.playReviewVersion : '2.0.2'
 }
 
 buildscript {
@@ -45,4 +46,7 @@ dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
     implementation project(':capacitor-android')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    // The Play In-App Review flow (#939). Play-only by nature: on a device without Play services the
+    // task fails and `requestReview` resolves `{requested: false}` rather than throwing.
+    implementation "com.google.android.play:review:$playReviewVersion"
 }

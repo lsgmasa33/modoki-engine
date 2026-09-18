@@ -101,6 +101,16 @@ const SEED_MEMBER_NAMES = new Set([
  *  bare identifier calls only (a `.fireEvent()` method on an unrelated object is not this). */
 const SEED_PATTERN = /^(fire|route)[A-Z]/;
 
+/** Promise continuations. A function literal passed to one of these can NEVER run synchronously
+ *  inside the `updateEach` callback — a settled promise still schedules it as a microtask, after
+ *  koota's write-back — so it is not the #445 hazard and the walker does not descend into it.
+ *  The RECEIVER chain (`fireX().then(...)`) and non-literal arguments still run synchronously and
+ *  are still walked. Added for #1368, whose async refill wake (`fireDirtyListeners` in a texture
+ *  page's `.then`) is reached from a billboard build inside `updateEach` and was reported as
+ *  synchronous. Only literal callbacks are skipped: a named function passed by reference is not a
+ *  call at the site, so it was never walked anyway. */
+const DEFERRED_METHODS = new Set(['then', 'catch', 'finally']);
+
 interface Violation { file: string; line: number; chain: string[] }
 
 /** Every top-level (any-depth) `function name(...) {}` / `const name = (...) => ...` /
@@ -157,6 +167,17 @@ function findFanoutChain(
   let result: string[] | null = null;
   const visit = (n: ts.Node) => {
     if (result) return;
+    if (
+      ts.isCallExpression(n)
+      && ts.isPropertyAccessExpression(n.expression)
+      && DEFERRED_METHODS.has(n.expression.name.text)
+    ) {
+      visit(n.expression.expression); // the receiver runs NOW
+      for (const arg of n.arguments) {
+        if (!ts.isArrowFunction(arg) && !ts.isFunctionExpression(arg)) visit(arg);
+      }
+      return;
+    }
     if (ts.isCallExpression(n)) {
       const callee = n.expression;
       if (ts.isIdentifier(callee)) {
@@ -279,12 +300,19 @@ describe('updateEach callbacks never synchronously reach a subscriber fan-out (#
       '  world.query(B).updateEach(([b]) => { helper(); });',           // same-file chain
       '  world.query(C).updateEach(([c]) => { bus.__emitZone(c); });', // member seed
       '  world.query(D).updateEach(([d]) => { fireOnSomething(d); });',// SEED_PATTERN
+      // #1368: a promise continuation is deferred — NOT flagged, however it is reached...
+      'function loadPage(u) { return fetchIt(u).then((t) => { fireDirtyListeners(); return t; }); }',
+      '  ;world.query(E).updateEach(([e]) => { loadPage(e.url); });',
+      '  ;world.query(F).updateEach(([f]) => { p.catch(function () { dispatchGameAction("y"); }); });',
+      // ...but the RECEIVER of `.then` runs synchronously and still is.
+      '  ;world.query(G).updateEach(([g]) => { fireOnOther(g).then(() => {}); });',
       '}',
     ].join('\n');
     expect(violationsInSource('synthetic.ts', src).map((v) => `${v.line}: ${v.chain.join(' -> ')}`)).toEqual([
       '4: helper -> dispatchGameAction',
       '5: __emitZone',
       '6: fireOnSomething',
+      '10: fireOnOther',
     ]);
   });
 });

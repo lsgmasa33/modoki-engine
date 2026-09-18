@@ -70,7 +70,7 @@ function findPrefabs(proj) {
   }).map(({ abs }) => abs).sort();
 }
 
-const NESTED_FIELDS = ['prefab', 'overrides', 'added', 'removed', 'removedTraits', 'nestedOverrides'];
+const NESTED_FIELDS = ['prefab', 'overrides', 'added', 'removed', 'removedTraits', 'nestedOverrides', 'nestedStructure'];
 
 let totalPrefabs = 0, totalChanged = 0, problems = 0, regressions = 0;
 

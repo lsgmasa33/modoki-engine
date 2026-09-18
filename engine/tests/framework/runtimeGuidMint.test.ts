@@ -254,6 +254,25 @@ describe('copies and string refs under a real mint (#1210)', () => {
     expect(node.traits.EntityAttributes.guid).toBeUndefined();
   });
 
+  // #1377. Mutation: drop `delete copy.parentId` in `snapshotAddedTraits`.
+  it('an ADDED child\'s captured trait bag carries no live parentId — its anchor is parentLocalId', async () => {
+    tw = createTestWorld({});
+    setPrefabCache(KIT, kit() as never);
+    const rootId = instantiatePrefab(kit() as never);
+    setPrefabSource(rootId, KIT);
+    const part = byName('Part');
+    const added = spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Anchored', parentId: part.id() }));
+    spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Grandchild', parentId: added.id() }));
+    const s = captureInstanceStructure(rootId, kit() as never);
+    const node = s.added.find((n) => n.name === 'Anchored')!;
+    expect(node).toBeDefined();
+    expect(node.parentLocalId).toBeGreaterThan(0);
+    expect(node.traits.EntityAttributes).not.toHaveProperty('parentId');
+    // The nested child goes through the same capture — a live id at any depth is the same leak.
+    expect(node.children[0].name).toBe('Grandchild');
+    expect(node.children[0].traits.EntityAttributes).not.toHaveProperty('parentId');
+  });
+
   it('a user-added NESTED instance holding a runtime guid is captured unguided', () => {
     tw = createTestWorld({});
     setPrefabCache(KIT, kit() as never);

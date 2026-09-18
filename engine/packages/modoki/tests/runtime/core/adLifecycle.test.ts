@@ -249,6 +249,21 @@ describe('fullscreen shows', () => {
     expect(getActiveReloadBlockers()).not.toContain(BLOCKER);
   });
 
+  it('reports a fullscreen ad as showing from the show until its dismissal — the reward lands in between (#1379)', async () => {
+    const { sdk, sink } = fakeSdk();
+    sdk.present = vi.fn(() => new Promise<unknown>(() => {}));
+    const l = make(sdk);
+    await ready(l);
+    expect(l.isFullscreenShowing()).toBe(false);
+    const result = l.showFullscreen('rewarded', 'p');
+    sink().presented('rewarded');
+    await result;
+    sink().rewardEarned({ kind: 'rewarded', type: 'coins', amount: 1 });
+    expect(l.isFullscreenShowing(), 'AdMob pays while the video is still up').toBe(true);
+    sink().dismissed('rewarded');
+    expect(l.isFullscreenShowing()).toBe(false);
+  });
+
   it.each([
     ['the SDK rejects', (_s: AdEventSink) => {}, true],
     ['failedToPresent arrives', (s: AdEventSink) => s.failedToPresent('interstitial'), false],

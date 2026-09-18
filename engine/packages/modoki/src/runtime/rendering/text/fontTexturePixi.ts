@@ -13,44 +13,21 @@
 import { Texture, CanvasSource } from 'pixi.js';
 import { loadMtsdfAtlasTexture } from '../pixiTextureLoad';
 import type { FontProvider } from './fontProvider';
-import { notifyListeners } from '../../core/notifyListeners';
+import { markTextDirty } from './textDirty';
 
 const cache = new Map<string, Texture>();
-/** In-flight atlas loads → every caller waiting to be woken when one lands.
+/** In-flight atlas loads, keyed like `cache` — a dedupe marker so a second caller does not
+ *  start a second load of the same atlas.
  *
- *  ⚠️ **A Set of waiters, not a bare `loading` flag, and that IS the bug this replaces.** The cache
- *  is module-level and SHARED by every `Scene2DRenderer`, and the editor always runs two of them
- *  (the Game panel and the Scene panel). Both ask for the same atlas in the same frame; the first
- *  starts the load, and the second used to hit a `loading.has(key)` early-return that dropped its
- *  `onReady` on the floor. So when the texture landed only ONE renderer was marked dirty — the
- *  other kept its last frame, which had every primitive (those are synchronous) and no TEXT, until
- *  some unrelated repaint. Reported as "the texts are not rendered when I open the prefab; I have
- *  to click on the entity to see the text": clicking changes the selection, which marks the panel
- *  dirty, and the now-cached atlas draws.
- *
- *  Bounded by the settle: the set is cleared on resolve AND on reject. A renderer that re-renders
- *  several times during one load adds one closure per frame (they are fresh arrows, so identity
- *  cannot dedupe them) — a handful, all idempotent `markDirty` calls, all dropped on settle. */
-const waiters = new Map<string, Set<() => void>>();
-
-/** Register `fn` to be woken when `key`'s load settles. Returns true if a load is ALREADY in
- *  flight — i.e. the caller must not start a second one. */
-function addWaiter(key: string, fn?: () => void): boolean {
-  const existing = waiters.get(key);
-  if (existing) { if (fn) existing.add(fn); return true; }
-  waiters.set(key, fn ? new Set([fn]) : new Set());
-  return false;
-}
-
-/** Settle `key`: wake everyone waiting on it exactly once, then drop the set. */
-function settleWaiters(key: string, wake: boolean): void {
-  const set = waiters.get(key);
-  waiters.delete(key);
-  if (!wake || !set) return;
-  // Isolated per waiter (#888): the `waiters.delete(key)` above has ALREADY run, so a throwing
-  // waiter used to leave every waiter behind it parked forever with nothing left to settle them.
-  notifyListeners(set, 'fontTexturePixi', []);
-}
+ *  ⚠️ **This used to be a map of per-caller `onReady` waiters, and that channel is gone on
+ *  purpose (#1368 B).** The editor always runs two `Scene2DRenderer`s (Game + Scene panel) on this
+ *  one module-level cache, and an earlier `loading` flag dropped the second renderer's wake — text
+ *  missing until you clicked the entity. The waiter set fixed that for the renderers that passed a
+ *  callback, and only for them. The load now settles into the font family's SHARED hub,
+ *  `markTextDirty(fontId)`, which every idle-gated surface subscribes to (Scene2D, Scene3D,
+ *  SceneView) and which also bumps that font's text version, so the woken frame re-lays out
+ *  exactly this font's text. Same hub `fontAtlasLoader` and `dynamicFontProvider` already use. */
+const inFlight = new Set<string>();
 /** Last atlasVersion uploaded into each dynamic canvas-backed Texture. */
 const uploadedVersion = new WeakMap<Texture, number>();
 
@@ -92,9 +69,9 @@ function getDynamicFontTexturePixi(provider: FontProvider, page: number): Textur
 
 /** Get (or kick off loading of) the atlas texture for a font provider's `page`
  *  (default 0). Returns the cached Texture, or null while it loads / for a page with
- *  no image yet; `onReady` fires once a load completes so the caller can re-render.
+ *  no image yet; a completed load fires `markTextDirty(provider.id)` so every surface re-renders.
  *  Baked fonts are single-page (page 0 → the image URL). */
-export function getFontTexturePixi(provider: FontProvider, page = 0, onReady?: () => void): Texture | null {
+export function getFontTexturePixi(provider: FontProvider, page = 0): Texture | null {
   // Ask for a CANVAS first, and fall through when there isn't one — do NOT branch on the
   // method merely existing. A baked-seeded dynamic font has both: page 0 is the baked
   // IMAGE and generated pages follow it, so branching on `atlasCanvasAt` being defined
@@ -118,8 +95,9 @@ export function getFontTexturePixi(provider: FontProvider, page = 0, onReady?: (
   // branch of two reads as complete and is not.
   if (existing?.destroyed) cache.delete(key);
   else if (existing) return existing;
-  // Queue behind an in-flight load rather than dropping this caller's wake-up (see `waiters`).
-  if (addWaiter(key, onReady)) return null;
+  // Already loading — its settle wakes every surface, this caller included (see `inFlight`).
+  if (inFlight.has(key)) return null;
+  inFlight.add(key);
 
   const url = provider.atlasImageUrl;
   // ⚠️ NOT `loadPixiTexture` (#1045): `Assets.load` decodes via a bare `createImageBitmap(blob)`,
@@ -162,12 +140,12 @@ export function getFontTexturePixi(provider: FontProvider, page = 0, onReady?: (
       // wake below is STILL CORRECT. Do not "fix" this into an early return or a `wake:false`;
       // that was tried during #481's close-out and is a regression, twice over:
       //
-      //  · `waiters` is keyed by the font GUID, so it OUTLIVES the provider INSTANCE while the
-      //    cache entry does not. The set can legitimately hold a waiter belonging to the live
-      //    SUCCESSOR — `invalidateFont` disposes P1 and re-acquires P2 under the same guid, and a
-      //    repaint in that window queues P2's `markDirty` behind P1's still-in-flight load
-      //    (`addWaiter` returns true). Not waking strands exactly that renderer, which is verbatim
-      //    the "texts are not rendered until I click the entity" bug this set exists to prevent.
+      //  · `inFlight` is keyed by the font GUID, so it OUTLIVES the provider INSTANCE while the
+      //    cache entry does not. `invalidateFont` disposes P1 and re-acquires P2 under the same
+      //    guid, and a repaint in that window finds P1's load still in flight and returns null
+      //    WITHOUT starting P2's. Not waking strands exactly that repaint, which is verbatim the
+      //    "texts are not rendered until I click the entity" bug. (`markTextDirty` is keyed by the
+      //    same guid, so the wake reaches P2's text.)
       //  · The feared load/unload storm cannot happen. A woken repaint resolves its provider
       //    through `getLoadedFont(guid)`, and every disposal path deletes from `providers` in the
       //    same synchronous block — so the retry gets the LIVE P2 or no provider at all, never the
@@ -176,15 +154,15 @@ export function getFontTexturePixi(provider: FontProvider, page = 0, onReady?: (
       // The `.catch` below may settle without waking only because no successor is stranded there;
       // the analogy between the two paths is false.
       //
-      // Cache FIRST, then wake — a waiter re-renders synchronously inside markDirty in some
+      // Cache FIRST, then wake — a listener re-renders synchronously inside markDirty in some
       // hosts, and it must find the texture rather than kick a second load.
-      settleWaiters(key, true);
+      inFlight.delete(key);
+      markTextDirty(provider.id);
     })
     .catch((e: unknown) => {
-      // Drop the waiters without waking them: there is nothing to draw, and the next call
-      // re-attempts the load (the key is free again). Leaving them queued would strand a later
-      // successful load's wake-ups behind closures from a dead attempt.
-      settleWaiters(key, false);
+      // Free the key WITHOUT waking: there is nothing to draw, and the next call re-attempts the
+      // load. A wake here would make a failing atlas a per-frame fetch loop.
+      inFlight.delete(key);
       console.warn(`[fontTexturePixi] atlas load failed: ${url}`, e);
     });
   return null;

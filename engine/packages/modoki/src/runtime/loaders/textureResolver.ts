@@ -26,6 +26,7 @@ import { warnVocabOnce } from '../core/warnVocab';
 import { hasDocKey } from '../core/docKeys';
 import { getActiveTextureSizeCap } from '../core/textureSizeCap';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
+import { fireDirtyListeners } from '../core/renderDirty';
 import { createSupersessionToken, createTeardownToken } from '../core/liveness';
 export { getActiveRenderer, onRendererReady, rendererReady, getRendererGateHealth } from '../core/activeRenderer';
 export type { RendererGateHealth } from '../core/activeRenderer';
@@ -515,11 +516,23 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
     applyTextureSettings(tex, settings, isKtx, opts?.flipY);
     (tex.userData as Record<string, unknown>)[KEY] = key;
     entry.texture = tex;
+    // The WAKE lives here, in the one store every 3D texture goes through (#1368) — not in each
+    // caller. A KTX2 transcode can outlast an idle surface's ~1 s frame grace, and the consumer's
+    // own `.then` (a particle emitter's reveal, a material's map) runs in this same microtask
+    // chain, i.e. before the woken frame. Fired AFTER the cache write, so a listener that reads
+    // back synchronously finds the texture. A MISS only: a hit returned `hit.promise` above and
+    // fires nothing, so a per-frame caller can never keep a surface awake through this.
+    fireDirtyListeners();
     return tex;
   }).catch((e) => {
     // Don't cache a rejected load forever — a later call should be free to retry
     // (e.g. once the renderer/transcoder becomes ready). Acquirers see the reject.
     if (texCache.get(key) === entry) texCache.delete(key);
+    // A reject wakes too: the particle backends reveal their radial fallback on it. ⚠️ Safe only
+    // because NO caller retries per frame (each loads once per build/setDef) — the eviction above
+    // makes the next call a fresh miss, so a per-frame retrier would turn this wake into a
+    // self-sustaining render loop on a 404. Check that before adding a per-frame caller.
+    fireDirtyListeners();
     throw e;
   });
   texCache.set(key, entry);

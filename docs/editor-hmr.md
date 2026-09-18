@@ -23,7 +23,7 @@ Related: [editor-input.md](./editor-input.md) (the keymap contract), [debug-tool
 
 ⚠️ **"The world reloads" does not mean every cached ASSET is re-read.** Per-kind invalidation on an
 external write lives in `ASSET_CACHE_INVALIDATORS` (`engine/app/debug/agentBridge.ts`) —
-animation, timeline, particle, spriteanim, rig2d, animset, material, shader. **`prefab` is
+animation, timeline, particle, spriteanim, rig2d, animset, material, shader, mesh. **`prefab` is
 deliberately NOT in it** — that branch also runs during Play, and evicting a prefab mid-Play breaks the
 runtime's synchronous `getCachedPrefab` spawns. A `.prefab.json` change falls through to the scene
 hot-reload instead, and `handleSceneChanged` evicts **both** prefab caches immediately before that
@@ -46,6 +46,32 @@ scale. `load_scene` on the path already open still behaves that old way (it is a
 watcher event), and swapping to a different scene and back re-reads the prefab only if that other
 scene does NOT also use it. **Verify any disk edit by querying the live spawned entity, never by
 re-reading the file you wrote.**
+
+**`mesh` (`.mesh.json`, #1380) needs more than an eviction, and it is the one kind here that is not an
+`ASSET_SCHEMA_TYPE`.** Nothing agent-side writes one and it is never parked, so the only external
+writer is a plain file edit — which is why #842's "schema type ⊆ live-reload kind" check could not
+see it (`liveReloadKinds.test.ts` now enumerates the classifier's whole JSON table instead), and a
+changed `model`/`mesh` binding rendered until the next scene swap. (The file's `material` field is
+not a live fallback, by the owner's choice on #1385: a GLB entity with an empty `Renderable3D.material`
+renders the engine default, and the importer copies the file's material onto the entity at spawn. So
+a `material`-only edit changes nothing on screen and announces nothing. And a GLB entity whose
+`Renderable3D.mesh` is swapped keeps the default too — the swap re-runs the material bind.) Two mechanisms make it work:
+- **Stale-while-revalidate, not evict.** `invalidateMeshAsset` keeps the cached definition serving
+  while it re-reads the file, and swaps only once the new definition AND its model templates are
+  loaded. An eager evict made `resolveMeshTemplate` return nothing for the refetch's duration — during
+  Play a mesh collider was rebuilt with no geometry — and did it even for a byte-identical write. A
+  failed re-read (a half-typed hand edit) keeps the old entry, #1169's prefab rule.
+- **A renderer teardown.** `scene3DSync` caches each entity's built object keyed on the
+  `Renderable3D.mesh` **ref string**, which the edit does not change, so swapping the definition alone
+  redraws nothing. The swap is preceded by a `'mesh'` asset-invalidation event — only when the binding
+  actually changed — and `attachInvalidationListener` tears down every entity whose ref resolves to
+  that path. The Inspector's `MeshAssetView`/`MeshPreview` re-read on the same event, which is
+  why an UNCACHED (never loaded, or failed) entry still announces one: a panel showing a broken
+  file must re-read when it is fixed.
+
+The editor's own write (`modelImport`) is `markEditorWrite`-suppressed, so it calls
+`invalidateMeshAsset` itself, **after** the write. A model the edited file newly names loads unowned
+until the next swap — the render-path-resolver case `acquireMesh` already documents.
 
 ### A reload the editor cannot take right now is DEFERRED, not dropped
 

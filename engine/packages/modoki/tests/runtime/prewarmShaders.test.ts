@@ -52,12 +52,12 @@ function makeRigPrototype(): THREE.Object3D {
 const disposeRetiredEnvironment = vi.fn();
 const disposeRetiredMaterial = vi.fn();
 
-async function setup(opts: { primitives?: boolean; env?: unknown; pmrem?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material; retiredEnvs?: Set<unknown>; retiredMats?: Set<unknown>; primitiveMaterial?: THREE.Material } = {}) {
+async function setup(opts: { meshTemplate?: { geometry: THREE.BufferGeometry; material: THREE.Material }; primitives?: boolean; env?: unknown; pmrem?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material; retiredEnvs?: Set<unknown>; retiredMats?: Set<unknown>; primitiveMaterial?: THREE.Material } = {}) {
   vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
-    resolveMeshTemplate: vi.fn(() => null), resolveMeshLodInfo: vi.fn(() => null),
+    resolveMeshTemplate: vi.fn(() => opts.meshTemplate ?? null), resolveMeshLodInfo: vi.fn(() => null),
     resolveMaterialForMesh: vi.fn(() => opts.primitiveMaterial ?? null),
     // A rig's SkinnedMeshRenderer override resolves through THIS function, so a test that
     // supplies `overrideMaterial` is the only one that can tell "override applied" from
@@ -109,8 +109,8 @@ async function setup(opts: { primitives?: boolean; env?: unknown; pmrem?: unknow
 
   const { createWorld } = await import('koota');
   const sync = await import('../../src/runtime/rendering/scene3DSync');
-  const { Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes } = await import('../../src/runtime/traits');
-  return { world: createWorld(), sync, Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes, createPrimitiveMesh };
+  const { Renderable3D, Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes } = await import('../../src/runtime/traits');
+  return { world: createWorld(), sync, Renderable3D, Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes, createPrimitiveMesh };
 }
 
 /** A renderer stub that records, AT compile time, a snapshot of the scene it was
@@ -133,7 +133,7 @@ function makeRendererStub(stubOpts: { isWebGPU?: boolean } = {}) {
   /** Per-mesh pipeline-key inputs AT compile time (#238): the world-transform determinant sign,
    *  `frustumCulled`, and the material's `side`. All three decide WHICH pipeline three builds, and
    *  all three are cleared or restored by the time the prewarm returns. */
-  const compiledMeshes: { det: number; frustumCulled: boolean; side: THREE.Side; transparent: boolean; material: THREE.Material }[][] = [];
+  const compiledMeshes: { det: number; frustumCulled: boolean; side: THREE.Side; transparent: boolean; material: THREE.Material; geometry: THREE.BufferGeometry }[][] = [];
   const renderer = {
     compileAsync: vi.fn(async (scene: THREE.Scene) => {
       compiledScenes.push(scene);
@@ -157,7 +157,7 @@ function makeRendererStub(stubOpts: { isWebGPU?: boolean } = {}) {
           .filter((o) => (o as THREE.Mesh).isMesh)
           .map((o) => {
             const m = (o as THREE.Mesh).material as THREE.Material;
-            return { det: o.matrixWorld.determinant(), frustumCulled: o.frustumCulled, side: m.side, transparent: m.transparent, material: m };
+            return { det: o.matrixWorld.determinant(), frustumCulled: o.frustumCulled, side: m.side, transparent: m.transparent, material: m, geometry: (o as THREE.Mesh).geometry };
           }),
       );
       standardMeshCounts.push(
@@ -335,6 +335,30 @@ describe('prewarmShadersForWorld — one placeholder per distinct (mesh, materia
     // cannot change the compiled program and must not split the key.
     expect(standardMeshCounts[0]).toBe(1);
     expect(createPrimitiveMesh).toHaveBeenCalledTimes(1); // the per-entity mint is skipped too
+  });
+
+  it('compiles the engine DEFAULT for a GLB mesh with an empty material — what syncMaterial binds (#1385)', async () => {
+    // The owner's choice on #1385: an empty `Renderable3D.material` renders grey, not the baked
+    // (or `.mesh.json`) material. The prewarm used to compile the baked one here — a variant the
+    // frame never draws — and left the default to compile synchronously on the first real frame.
+    const baked = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+    baked.name = 'Baked';
+    const geometry = new THREE.BufferGeometry();
+    const { world, sync, Renderable3D } = await setup({ meshTemplate: { geometry, material: baked } });
+    const { renderer, compiledMeshes } = makeRendererStub();
+    world.spawn(Renderable3D({ isVisible: true, mesh: 'mesh-guid', material: '' }));
+
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+    // Find THIS entity's placeholder by its geometry: with nothing else compiled, the F4 fallback
+    // mesh is also a grey standard material, so a colour check over every mesh passes even when
+    // the entity compiled nothing (close-out review).
+    const placeholder = compiledMeshes.flat().find((c) => c.geometry === geometry);
+    expect(placeholder, 'the empty-ref entity must compile SOMETHING').toBeDefined();
+    const m = placeholder!.material as THREE.MeshStandardMaterial;
+    expect(m, 'the baked material is a variant nobody draws for an empty ref').not.toBe(baked);
+    expect({ color: m.color.getHex(), roughness: m.roughness, metalness: m.metalness, transparent: m.transparent, wireframe: m.wireframe },
+      'the engine default is what the frame binds').toEqual({ color: 0xcccccc, roughness: 0.5, metalness: 0, transparent: false, wireframe: false });
   });
 
   it('keeps one placeholder per distinct pair — a different material still compiles', async () => {

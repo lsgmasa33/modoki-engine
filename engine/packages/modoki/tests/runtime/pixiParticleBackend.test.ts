@@ -9,6 +9,18 @@
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Container } from 'pixi.js';
+import { addDirtyListener } from '../../src/runtime/core/renderDirty';
+
+// Only the #1368 block below reaches these: every other test runs headless (no `window`), where
+// the backend reveals before resolving a url at all.
+const tex = vi.hoisted(() => ({ reject: null as null | ((e: unknown) => void) }));
+vi.mock('../../src/runtime/core/textureRefs', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/runtime/core/textureRefs')>()),
+  resolveImageUrl: () => '/spark.png',
+}));
+vi.mock('../../src/runtime/rendering/pixiTextureLoad', () => ({
+  loadPixiTexture: () => new Promise((_res, rej) => { tex.reject = rej; }),
+}));
 import { Matrix4 } from 'three';
 import { PixiParticleBackend } from '../../src/runtime/particles/pixiParticleBackend';
 import { defaultParticleEffect, type ParticleEffectDef } from '../../src/runtime/particles/types';
@@ -322,5 +334,30 @@ describe('a textured 2D emitter waits HIDDEN, bounded (#338 close-out F4)', () =
     const be = new PixiParticleBackend(f.make as never);
     const h = be.create(def());
     expect(be.getContainer(h).visible).toBe(true);
+  });
+});
+
+describe('a FAILED 2D texture load reveals the emitter AND wakes the idle gate (#1368 G1)', () => {
+  // `loadPixiTexture` wakes on SUCCESS only — a reject wake would turn Scene2D's per-frame retry of
+  // a 404 (#1374) into a render loop — so the backend's failure reveal owes its own wake. Without it
+  // a stopped Scene2D keeps its last frame, which does not have the emitter in it.
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('the frame the wake buys already shows the emitter', async () => {
+    vi.stubGlobal('window', {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const h = be.create(def({ render: { blend: 'additive', texture: 'some-guid' } } as Partial<ParticleEffectDef>));
+    expect(be.getContainer(h).visible, 'hidden while the sprite is in flight').toBe(false);
+    await vi.waitFor(() => expect(tex.reject).toBeTruthy()); // the load goes through a lazy import
+
+    let visibleOnWokenFrame: boolean | undefined;
+    const off = addDirtyListener(() => { setTimeout(() => { visibleOnWokenFrame ??= be.getContainer(h).visible; }, 0); });
+    tex.reject!(new Error('404'));
+    await vi.waitFor(() => expect(visibleOnWokenFrame, 'a failed load must still wake the idle gate').toBeDefined());
+    off();
+    warn.mockRestore();
+    expect(visibleOnWokenFrame).toBe(true);
   });
 });

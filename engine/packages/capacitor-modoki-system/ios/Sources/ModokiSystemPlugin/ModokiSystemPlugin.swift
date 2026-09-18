@@ -1,4 +1,5 @@
 import Capacitor
+import StoreKit
 import UIKit
 
 @objc(ModokiSystemPlugin)
@@ -13,6 +14,7 @@ public class ModokiSystemPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "kvSet", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "kvRemove", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "kvInfo", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "requestReview", returnType: CAPPluginReturnPromise),
     ]
 
     private let store = BackupExcludedStore()
@@ -93,6 +95,27 @@ public class ModokiSystemPlugin: CAPPlugin, CAPBridgedPlugin {
             UIApplication.shared.open(url, options: [:]) { opened in
                 call.resolve(["opened": opened])
             }
+        }
+    }
+
+    // The OS review prompt (#939). `requested` says only that the request was handed over: StoreKit
+    // never reports whether the sheet appeared, and it silently does nothing once its own quota is
+    // spent. Resolving false without a window scene rather than rejecting keeps the caller free of
+    // platform branching.
+    @objc func requestReview(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            // compactMap BEFORE the activation test: `first(where:)` then `as?` takes the first
+            // foreground-active scene of ANY type and resolves false if it is not a window scene,
+            // although a valid one exists. The ask is already stamped as spent by then, so that
+            // costs the install its one opportunity and reports nothing.
+            guard let scene = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first(where: { $0.activationState == .foregroundActive }) else {
+                call.resolve(["requested": false])
+                return
+            }
+            SKStoreReviewController.requestReview(in: scene)
+            call.resolve(["requested": true])
         }
     }
 }

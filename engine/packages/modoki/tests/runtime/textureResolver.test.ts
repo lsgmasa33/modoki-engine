@@ -9,6 +9,7 @@ import {
 } from '../../src/runtime/loaders/textureResolver';
 import { DEFAULT_TEXTURE_SETTINGS } from '../../src/runtime/loaders/textureSettings';
 import { setActiveTextureSizeCap, resetActiveTextureSizeCap } from '../../src/runtime/core/textureSizeCap';
+import { addDirtyListener } from '../../src/runtime/core/renderDirty';
 
 const GUID = '11111111-1111-4111-8111-111111111111';
 const PATH = '/games/g/assets/tex/rock.png';
@@ -304,6 +305,36 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
     const t = await loadTexture3D(GUID); // default mock resolves
     expect(t).toBeInstanceOf(THREE.Texture);
     expect(getSharedTextureStats().count).toBe(1);
+  });
+
+  // #1368 C: this is the ONE store every 3D texture goes through, so the refill wake lives here —
+  // a KTX2 transcode can outlast an idle surface's ~1 s grace, and the stopped GameView then never
+  // draws the texture (or the particle emitter hidden until it lands). One wake per MISS.
+  it('a MISS wakes every surface once, after the texture is stamped shared; a HIT wakes nothing (#1368)', async () => {
+    registerAsset(GUID, PATH, 'texture');
+    let minted: THREE.Texture | undefined;
+    loadAsyncSpy.mockImplementation(async () => (minted = new THREE.Texture()) as never);
+    const seen: boolean[] = [];
+    const off = addDirtyListener(() => seen.push(isSharedTexture(minted)));
+    const a = await loadTexture3D(GUID);
+    expect(seen, 'one wake, fired after the store — a listener must find the texture ready').toEqual([true]);
+    await loadTexture3D(GUID); // hit
+    await loadTexture3D(GUID); // hit
+    off();
+    expect(seen, 'a hit returns the settled promise and never wakes').toHaveLength(1);
+    expect(a).toBe(minted);
+  });
+
+  it('a REJECTED load wakes too (the particle radial-fallback reveal), and the retry is a fresh miss (#1368)', async () => {
+    registerAsset(GUID, PATH, 'texture');
+    loadAsyncSpy.mockRejectedValueOnce(new Error('404'));
+    const wake = vi.fn();
+    const off = addDirtyListener(wake);
+    await expect(loadTexture3D(GUID)).rejects.toThrow('404');
+    expect(wake).toHaveBeenCalledTimes(1);
+    await loadTexture3D(GUID);
+    off();
+    expect(wake).toHaveBeenCalledTimes(2);
   });
 
   // ⚠️ THIS TEST'S EXPECTATION WAS INVERTED, deliberately. It used to assert that

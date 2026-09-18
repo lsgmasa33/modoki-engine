@@ -141,6 +141,10 @@ export interface AdLifecycle {
   isReady(kind: FullscreenKind): boolean;
   /** The single payout slot. A second registration REPLACES the first; two would pay twice. */
   onRewardEarned(handler: RewardHandler | null): void;
+  /** Is a fullscreen ad on screen right now — from the moment a show starts until its `dismissed` (or a
+   *  failure to present)? A game raising its own UI off a REWARD needs this: the reward event arrives while
+   *  the video is still up, so anything it raises plays out underneath the ad (#1379). */
+  isFullscreenShowing(): boolean;
   isInitialized(): boolean;
 }
 
@@ -487,6 +491,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
       rewardHandler = handler;
       lastRewardHandler = handler;
     },
+    isFullscreenShowing: () => fullscreenShowing,
     isInitialized: () => initialized,
   };
 }

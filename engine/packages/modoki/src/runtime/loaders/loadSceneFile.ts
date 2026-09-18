@@ -14,7 +14,7 @@ import { emptyDocMap, hasDocKey } from '../core/docKeys';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import {
   mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, foldTraitOverride,
-  descendPathKeyed, nestedPathKey,
+  descendPathKeyed, nestedPathKey, mergeNestedStructurePaths,
   type NestedOverridePaths,
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION } from '../core/version';
@@ -77,7 +77,8 @@ export interface AddedEntity {
   /** STRUCTURAL edits inside the nested instance's own nested descendants, path-keyed exactly like
    *  `nestedOverrides` and read the same way a top-level entry's `nestedStructure` is (#1369). The
    *  reference node is the outermost layer for everything under it, so this is written by a SCENE
-   *  capture (`captureNestedChannels`) — a prefab row still cannot carry the slot. */
+   *  capture (`captureNestedChannels`). Promoted into a prefab by Apply, it becomes the ROW's own
+   *  slot (`PrefabFileEntry.nestedStructure`, #1381). */
   nestedStructure?: NestedStructurePaths;
 }
 
@@ -557,7 +558,7 @@ export function applyOverridesByLocalToEcs(
 // this file imports, and which runs in Node with no trait registry — can compose a prefab's
 // effective root with the SAME rules this spawner uses. Re-exported so their existing importers
 // (`editor/scene/prefab.ts`, `editor/scene/serialize.ts`) are unchanged.
-export { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, descendPathKeyed, nestedPathKey };
+export { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey };
 export type { NestedOverridePaths };
 
 /** Structural overrides applied on top of a freshly-instantiated prefab. */
@@ -825,6 +826,9 @@ type PrefabFileEntry = {
   /** A prefab row's OWN deep overrides reaching into its nested descendants
    *  (path-keyed). Outer layers merge over these (outermost wins). */
   nestedOverrides?: NestedOverridePaths;
+  /** A prefab row's OWN structural edits inside its nested descendants (#1381) — the structural
+   *  twin of `nestedOverrides`. An outer layer addressing the same path replaces it whole. */
+  nestedStructure?: NestedStructurePaths;
 };
 
 /** Give prefab-instance MEMBERS a stable, addressable GUID.
@@ -956,7 +960,9 @@ export function instantiatePrefabIntoWorld(
       // structure REPLACES the row's per-field lists rather than merging element-wise — a scene that
       // deleted a member of this expansion is stating the whole list for that instance, and merging
       // two `removed` arrays would make an un-delete unrepresentable.
-      const { direct: structDirect, forward: structForward } = descendPathKeyed(nestedStructure, rowLocalId);
+      const { direct: structDirect, forward: outerStructForward } = descendPathKeyed(nestedStructure, rowLocalId);
+      // The row's OWN deep structure (#1381) sits under what the outer layer forwarded — outer wins per path.
+      const structForward = mergeNestedStructurePaths(entry.nestedStructure, outerStructForward);
       const childRoot = instantiatePrefabIntoWorld(
         world, child, 0, undefined, entry.prefab, childOverrides,
         // Once an outer layer addresses this path it OWNS the interior: all three lists come from

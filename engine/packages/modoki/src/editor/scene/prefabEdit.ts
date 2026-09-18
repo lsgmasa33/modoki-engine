@@ -193,6 +193,10 @@ export function buildPrefabEditScene(prefab: PrefabFile): SceneData {
       id: pe.localId, name: pe.name, traits,
       prefab: pe.prefab, overrides: pe.overrides,
       added: pe.added, removed: pe.removed, removedTraits: pe.removedTraits,
+      // Both nested channels too (#1381): the row becomes a top-level scene entry here, the carrier
+      // that already reads them, so the edit world shows the row as instances of it expand. The
+      // save re-captures them from this live expansion (`planPrefabRows`).
+      nestedOverrides: pe.nestedOverrides, nestedStructure: pe.nestedStructure,
     };
   });
   entities.push(...scaffoldEntities());

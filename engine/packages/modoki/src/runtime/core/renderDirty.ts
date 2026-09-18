@@ -49,6 +49,12 @@ export function addDirtyListener(fn: () => void): () => void {
  *  `timelineCache` — they feed systems that do not run while stopped). Read it before concluding a
  *  cache is missing one.
  *
+ *  #1368 extended it to the texture/asset stores (`loadTexture3D`, `loadPixiTexture`,
+ *  `fetchMeshAsset`, billboard pages) and deleted the last two private per-caller channels
+ *  (`spriteMaterialCache`, `fontTexturePixi`). ⚠️ Two constraints came with it, both in that doc
+ *  section: **never fire on a cache HIT** (stores are called from draw paths — a hit that fires is
+ *  a permanent render loop), and **fire on a REJECT only when no caller retries per frame**.
+ *
  *  ⚠️ **What a fire actually costs, since this asks every refill to make one.** Four of the five
  *  subscribers are pure flag sets (`Scene3D`, `Scene2D`, `SceneView`, `canvas2DDirty`). The fifth is
  *  NOT: `uiTreeStore` subscribes `markUIDirty`, which sets its flag **and** calls `notifyEditorDirty`,

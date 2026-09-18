@@ -12,6 +12,9 @@ import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.google.android.play.core.review.ReviewInfo;
+import com.google.android.play.core.review.ReviewManager;
+import com.google.android.play.core.review.ReviewManagerFactory;
 
 @CapacitorPlugin(name = "ModokiSystem")
 public class ModokiSystemPlugin extends Plugin {
@@ -52,6 +55,40 @@ public class ModokiSystemPlugin extends Plugin {
 
         JSObject ret = new JSObject();
         ret.put("opened", openable && start(new Intent(Intent.ACTION_VIEW, uri)));
+        call.resolve(ret);
+    }
+
+    // The Play In-App Review flow (#939). Two async steps: request the ReviewInfo, then launch it.
+    // `requested` means only that Play accepted the launch — it never reports whether a dialog was
+    // shown or a review written, and it silently does nothing once its own quota is spent. Any
+    // failure (no Play services, a sideloaded build, an internal Play error) resolves false rather
+    // than rejecting, so the caller needs no platform branch.
+    @PluginMethod
+    public void requestReview(PluginCall call) {
+        final android.app.Activity activity = getActivity();
+        if (activity == null) {
+            resolveRequested(call, false);
+            return;
+        }
+        try {
+            final ReviewManager manager = ReviewManagerFactory.create(getContext());
+            manager.requestReviewFlow().addOnCompleteListener(task -> {
+                if (!task.isSuccessful()) {
+                    resolveRequested(call, false);
+                    return;
+                }
+                ReviewInfo info = task.getResult();
+                manager.launchReviewFlow(activity, info)
+                    .addOnCompleteListener(flow -> resolveRequested(call, flow.isSuccessful()));
+            });
+        } catch (Exception e) {
+            resolveRequested(call, false);
+        }
+    }
+
+    private void resolveRequested(PluginCall call, boolean requested) {
+        JSObject ret = new JSObject();
+        ret.put("requested", requested);
         call.resolve(ret);
     }
 

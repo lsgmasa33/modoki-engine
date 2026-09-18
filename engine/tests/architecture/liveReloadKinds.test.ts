@@ -73,6 +73,7 @@ import {
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { ASSET_SCHEMA_TYPES } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import { JSON_ASSET_SUFFIX_TYPE } from '../../packages/modoki/src/runtime/loaders/assetTypeClassifier';
 
 const REPO = path.resolve(__dirname, '../../..');
 // ⚠️ **Every unit here is read through the parser (#1195).** They used to be text: a union was
@@ -287,6 +288,39 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
         + '`type === \'<kind>\'` branch in classifySceneChange + SceneChangedKind + '
         + 'ASSET_CACHE_INVALIDATORS in agentBridge.ts — or, if a broadcast is genuinely not needed, '
         + 'add it to NOT_LIVE_RELOADABLE above with a verified reason.',
+    });
+  });
+
+  /** JSON document types the watcher deliberately does not broadcast, beyond the ones
+   *  `NOT_LIVE_RELOADABLE` already covers. Same bar: a verified reason, never to silence a failure. */
+  const NOT_WATCHED_DOCUMENTS: ReadonlyArray<{ item: string; reason: string }> = [
+    ...NOT_LIVE_RELOADABLE,
+    ...(['level', 'wave', 'court-level'] as const).map((item) => ({
+      item,
+      reason: 'game-owned pure data (Sling / Court levels): no engine cache holds it — '
+        + '`engine/packages/modoki/src` has no reader for the type — so there is nothing engine-side '
+        + 'for a broadcast to invalidate; the game that reads it owns its freshness.',
+    })),
+  ];
+
+  it('every JSON document type the classifier knows is in LiveReloadKind, or exempt with a reason (#1380)', () => {
+    // The #842 check above enumerates ASSET_SCHEMA_TYPES — the agent-WRITABLE set — and that is the
+    // wrong population for "can this go stale on disk". `.mesh.json` is not agent-writable and not
+    // parkable, so it passed that check, while a plain file edit (the user's own Claude Code, a
+    // shell, a git checkout) changed its binding and nothing invalidated it. Every document the
+    // classifier types can be edited that way, so the population is the classifier's own table.
+    assertExemptionLedger({
+      label: 'NOT_WATCHED_DOCUMENTS in liveReloadKinds',
+      population: JSON_ASSET_SUFFIX_TYPE.map(([, t]) => t)
+        .filter((t) => !PRODUCER.includes(t))
+        .map((t) => ({ item: t, site: t })),
+      exempt: NOT_WATCHED_DOCUMENTS,
+      floor: 1,
+      fix: 'These JSON document types are typed by JSON_ASSET_SUFFIX_TYPE (assetTypeClassifier.ts) '
+        + 'but absent from LiveReloadKind, so a plain file edit to one never broadcasts and nothing '
+        + 'cached from it is invalidated. Add a kind (LiveReloadKind + classifySceneChange branch + '
+        + 'SceneChangedKind + ASSET_CACHE_INVALIDATORS), or exempt it in NOT_WATCHED_DOCUMENTS with a '
+        + 'verified reason.',
     });
   });
 });

@@ -1723,9 +1723,10 @@ export class Scene2DRenderer {
         // Custom 2D material: once its shader program is ready, the material pass (Step
         // 3b) owns this entity — skip it here. While the program is still loading (or
         // failed) we fall through and render the default sprite/tint, so it's never blank.
-        // The onReady wake makes the entity swap to the material Mesh when the async compile
-        // finishes even while the sim is stopped (else the idle gate would skip it forever).
-        if (rend.material && ensureSpriteMaterial(rend.material, () => this.markDirty())) return;
+        // The cache's store fires the shared dirty wake when the compile lands (#1368), so the
+        // entity swaps to the material Mesh even while the sim is stopped (else the idle gate
+        // would skip it forever) — `addDirtyListener` below is how this renderer hears it.
+        if (rend.material && ensureSpriteMaterial(rend.material)) return;
 
         // Find which Canvas2D this entity belongs to
         const canvasId = this.findCanvasAncestor(id);
@@ -1944,7 +1945,7 @@ export class Scene2DRenderer {
       ([tf, rend]: [any, any], entity: any) => {
         if (!rend.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         if (!rend.material) return;
-        const program = ensureSpriteMaterial(rend.material, () => this.markDirty()) as PixiShaderProgram | undefined;
+        const program = ensureSpriteMaterial(rend.material) as PixiShaderProgram | undefined;
         if (!program) return; // still loading / failed → Step 3 drew the default; nothing here
 
         const id = entity.id();
@@ -2398,7 +2399,7 @@ export class Scene2DRenderer {
         // guard below then skips every page: the string renders as nothing. For a BAKED provider
         // that is permanent, not transient — `atlasVersion` is `readonly = 0`, so the
         // "rebuilds on atlasVersion/textDirty bump" consolation below cannot fire for it.
-        const gate = getFontTexturePixi(provider, 0, () => this.markDirty());
+        const gate = getFontTexturePixi(provider, 0);
         if (!gate || gate.destroyed) return;
 
         this.activeIds.set(id, entity.valueOf());
@@ -2477,7 +2478,7 @@ export class Scene2DRenderer {
               // (`fontTexturePixi.ts` caches by provider id + page); the full rebuild path
               // self-heals a moved texture by rebuilding the Mesh, the fast path does not.)
               const texturesReady = slot.pageNums.every((page, i) => {
-                const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
+                const ptex = getFontTexturePixi(provider, page);
                 const shader = slot!.textShaders?.[i];
                 return !!ptex && !ptex.destroyed && !!shader && canReuseMtsdfPixiShader(shader, ptex, atlas);
               });
@@ -2535,7 +2536,7 @@ export class Scene2DRenderer {
               slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
               try {
                 for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)
-                  const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
+                  const ptex = getFontTexturePixi(provider, page);
                   // A destroyed Texture is still truthy — `!ptex` alone would miss the contract hole
                   // where a just-minted texture is torn down inside the same call (#481, an
                   // already-disposed provider's addDisposable running synchronously). Same posture as
@@ -2908,7 +2909,8 @@ export class Scene2DRenderer {
       // it's memoised at module scope in `pixiShaderBuilder`'s program cache, keyed on the
       // manifest path, and this clear never evicts it — so the clear no longer forces a
       // recompile at all. It ALSO bumps a generation that supersedes any in-flight compile —
-      // what keeps a sibling safe from THAT is that the clear fires the pending waiters (#523),
+      // what keeps a sibling safe from THAT is that a clear which superseded a compile fires the
+      // shared dirty wake (#523, #1368 — every Scene2DRenderer subscribes via addDirtyListener),
       // not that it's maps-only. Gating this on liveRenderers<=1 was the bug that left an
       // EDITED .shader.json serving its stale compiled program on hot-reload whenever both
       // GameView + SceneView were live (the default editor).
@@ -3000,8 +3002,9 @@ export class Scene2DRenderer {
     this.flushPendingMaskDestroy();
     this.entityShaders.clear();
     this._materialTexLoading.clear();
-    // Unconditional (see onWorldSwap): safe with a sibling renderer live because the clear wakes
-    // pending waiters, not because it's maps-only — this call site NEEDS that wake, since below
+    // Unconditional (see onWorldSwap): safe with a sibling renderer live because a clear that
+    // superseded a compile fires the shared dirty wake (#1368), not because it's maps-only — this
+    // call site NEEDS that wake, since below
     // only re-dirties the instance that's going away, not the surviving sibling.
     clearSpriteMaterialCache();
     this.activeIds.clear();

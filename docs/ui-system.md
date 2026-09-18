@@ -3882,6 +3882,11 @@ The **baked/image** path had the same two holes and a describable route:
   cache. **That one is NOT a defect, and the close-out initially "fixed" it and was wrong** — the
   episode is recorded here because the wrong fix is the intuitive one:
 
+  > *(Historical: the per-caller `waiters` set this describes was replaced in #1368 by an
+  > `inFlight` dedupe set plus the shared `markTextDirty(fontId)` hub. The lesson carries over
+  > unchanged — `inFlight` and the text-dirty key are both the font GUID, so the load still
+  > wakes on a disposed provider, for P2's sake.)*
+  >
   > Settling those waiters with `wake: false` looks right (there is no texture to draw, same as
   > the `.catch` path) and is a regression. `waiters` is keyed by the font **GUID**, so it
   > outlives the provider *instance* while the cache entry does not: the set can hold a waiter

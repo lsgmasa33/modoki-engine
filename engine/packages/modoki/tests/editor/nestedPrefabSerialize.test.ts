@@ -259,13 +259,16 @@ describe('tagEntityTreeAsInstance mirrors the rows serializePrefab wrote (#1278)
   });
 
   /** An OWNED grand-nested instance — one that the nested prefab's OWN file produced, marked by
-   *  `parentLocalId > 0`. `captureInstanceStructure`'s `captureChild` returns null for these, so
-   *  they never enter `consumedEcsIds` and, being self-rooted, they are not members either: the
-   *  serializer gives them a reference row of their OWN. Any rule of the form "skip every
-   *  descendant of a nested root" therefore drops a row that exists, and everything after it is
-   *  numbered one short — the entity whose row went missing ends up with NO PrefabInstance at
-   *  all. Found by close-out review of the first #1278 fix, which had exactly that rule. */
-  it('an OWNED grand-nested instance still gets its own row, and nothing after it is skipped', async () => {
+   *  `parentLocalId > 0`. It re-expands from its owner's row (O1 → OUTER's row 3), so it gets NO
+   *  row of its own and keeps OUTER's stamp (#1382). This case used to assert the opposite — a
+   *  second `Hull` row, re-stamped onto it — which wrote the instance twice: instantiating the new
+   *  prefab gave two Hulls, and the scene's next save wrote `removed:[3]` plus a reference node.
+   *
+   *  What still holds from the first #1278 review: the skip is by the row PARTITION
+   *  (`captureNestedChannels`' `ownedMemberEcsIds`), never "every descendant of a nested root", so
+   *  nothing ordered after it is dropped or numbered one short — D, the entity that rule once left
+   *  with no PrefabInstance at all, is still tagged with its own row. */
+  it('an OWNED grand-nested instance gets no row of its own, and nothing after it is skipped (#1382)', async () => {
     const { serializePrefab, setPrefabCache, tagEntityTreeAsInstance } = await getModule();
     setPrefabCache(INNER, innerPrefab as any);
     setPrefabCache(OUTER, outerPrefab as any);
@@ -290,8 +293,10 @@ describe('tagEntityTreeAsInstance mirrors the rows serializePrefab wrote (#1278)
     bolt.add(PrefabInstance({ source: INNER, localId: 2, rootInstanceId: hull.id() }));
 
     const p = serializePrefab(r.id())!;
-    // Two reference rows: O1 (the outer instance) and Hull (owned, but still its own row).
-    expect(p.entities.filter((e) => e.prefab).map((e) => e.name)).toEqual(['O1', 'Hull']);
+    // One reference row: O1. Hull re-expands from it (OUTER's row 3), and so does Bolt.
+    expect(p.entities.filter((e) => e.prefab).map((e) => e.name)).toEqual(['O1']);
+    expect(p.entities.map((e) => e.name)).not.toContain('Hull');
+    expect(p.entities.map((e) => e.name)).not.toContain('Bolt');
 
     tagEntityTreeAsInstance(r.id(), TAG_PATH);
 
@@ -305,8 +310,8 @@ describe('tagEntityTreeAsInstance mirrors the rows serializePrefab wrote (#1278)
     // D is the entity the old "skip every descendant" rule lost entirely.
     expect(d.has(PrefabInstance)).toBe(true);
     expect(piOf(d).localId).toBe(p.entities.find((e) => e.name === 'D')!.localId);
-    // Hull is re-stamped against ITS row in the new prefab, not left on OUTER's row 3.
-    expect(piOf(hull).parentLocalId).toBe(p.entities.find((e) => e.name === 'Hull')!.localId);
+    // Hull keeps OUTER's row stamp — the tagger does not touch an owned instance.
+    expect(piOf(hull).parentLocalId).toBe(3);
     expect(piOf(hull).source).toBe(INNER);
   });
 

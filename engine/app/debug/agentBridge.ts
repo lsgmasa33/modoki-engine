@@ -86,6 +86,7 @@ import {
   invalidateAnimSet,
   invalidateMaterial,
   invalidateShader,
+  invalidateMeshAsset,
   invalidatePrefab,
   fireDirtyListeners,
   findEntityByGuid,
@@ -2640,7 +2641,7 @@ const handleOp = runAgentOp;
  *  in `engine/plugins/vite-asset-scanner.ts` (the producer) — kept as a local union rather than
  *  a type import because the plugin is a Node module and the app tsconfig has no node types.
  *  Keep the two in sync; a new kind that lands here without a branch below is simply ignored. */
-type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader';
+type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader' | 'mesh';
 
 /**
  * Kinds whose ONLY stale thing is a cached asset definition → drop that entry and stop. Never a
@@ -2676,6 +2677,10 @@ const ASSET_CACHE_INVALIDATORS: Partial<Record<SceneChangedKind, (urlPath: strin
   // write never invalidated the cache and a stale parked edit was never dropped at the next save.
   material: invalidateMaterial,
   shader: invalidateShader,
+  // Ninth (#1380): `.mesh.json` is not an ASSET_SCHEMA_TYPE, so #842's schema ⊆ kind check could
+  // not see it — only a plain file edit writes one externally. The invalidator also tells the
+  // renderer, because its built object is cached by the unchanged ref string.
+  mesh: invalidateMeshAsset,
 };
 
 /** The file on disk for `urlPath` just changed, so its cached def is being dropped — any

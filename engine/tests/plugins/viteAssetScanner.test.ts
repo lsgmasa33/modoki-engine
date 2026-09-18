@@ -192,12 +192,13 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
   it("broadcasts a .shader.json as 'shader' — spriteMaterialCache holds it by GUID (#842)", () => {
     expect(classifySceneChange('/games/x/assets/shaders/holo.shader.json')).toBe('shader');
   });
-  // `.mesh.json` genuinely does not broadcast, but note the REASON is not "no cache" either —
-  // `meshAssetCache` exists. It is that no mesh doc is agent-writable or parkable
-  // (`mesh` is not in ASSET_SCHEMA_TYPES), so nothing can park a stale one or edit it live. If a
-  // mesh ever becomes writable, this line is the one that has to move with it.
-  it('does NOT broadcast a .mesh.json — not writable, so nothing can go stale live', () => {
-    expect(classifySceneChange('/games/x/assets/models/cube.mesh.json')).toBeNull();
+  // `.mesh.json` asserted `null` here until #1380, on the reason "not agent-writable, so nothing
+  // can go stale live". The first half was true (`mesh` is not in ASSET_SCHEMA_TYPES) and the
+  // conclusion did not follow: a PLAIN file edit — the user's own Claude Code, a shell, a git
+  // checkout — changes the binding with no agent tool involved, and the old one then rendered until
+  // the next scene swap. The same pattern this block's header records, a third time.
+  it("broadcasts a .mesh.json as 'mesh' — a plain file edit changes its binding (#1380)", () => {
+    expect(classifySceneChange('/games/x/assets/models/cube.mesh.json')).toBe('mesh');
   });
   // Cache-invalidation kinds: NOT a scene reload (that would discard unsaved work) — the
   // renderer drops just the one stale asset. `.timeline.json` returned null before the fix,

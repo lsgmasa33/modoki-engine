@@ -2,6 +2,7 @@
  *  load goes through, so the playable-blob fix lives in ONE place. */
 
 import { Assets, ImageSource, Texture } from 'pixi.js';
+import { fireDirtyListeners } from '../core/renderDirty';
 
 /** Load a texture through PixiJS Assets, forcing the image parser for `blob:` URLs.
  *
@@ -16,13 +17,38 @@ import { Assets, ImageSource, Texture } from 'pixi.js';
  *  are ALWAYS browser-decodable — the asset profile forces WebP/PNG, never KTX2 — so
  *  forcing the `'texture'` parser (loadTextures' id) is correct there. Non-blob URLs
  *  (dev / web / native — real extensions, incl. KTX2) auto-detect as before. */
+/** Urls whose in-flight load already owns the refill wake. Pixi publishes to `Assets.cache` only
+ *  on RESOLVE, so every call made while a load is in flight also reads as a miss — and Scene2D's
+ *  skinned-part path calls this once per rendered frame until the texture is live. Without this,
+ *  a 2 s load at 60 fps landed ~120 wakes in one burst; with it, exactly one per load. */
+const wakePending = new Set<string>();
+
 export function loadPixiTexture(url: string): Promise<Texture> {
   evictSourcelessEntry(url);
+  // Decided BEFORE the load (#1368 G1): the wake belongs to a load that actually fetched, never to
+  // a cache hit — Scene2D calls through here from its draw path, and a hit that woke would keep the
+  // idle gate awake forever. Asked after the eviction above, so a sourceless corpse counts as a miss.
+  const miss = !Assets.cache.has(url);
+  let load: Promise<Texture>;
   if (url.startsWith('blob:')) {
     disablePixiTextureWorker();
-    return Assets.load<Texture>({ src: url, parser: 'texture' });
+    load = Assets.load<Texture>({ src: url, parser: 'texture' });
+  } else {
+    load = Assets.load<Texture>(url);
   }
-  return Assets.load<Texture>(url);
+  // The WAKE lives in the shim, not at each call site (#1368 G1): `pixiParticleBackend` reveals its
+  // emitter off this promise and woke nothing, so on a stopped Scene2D a texture slower than the
+  // idle grace left the emitter hidden until an unrelated edit. Scene2D's own sites also wake
+  // themselves; this covers every consumer that does not.
+  // ⚠️ SUCCESS only. A reject stays silent here because Scene2D's material-sprite path retries a
+  // failed url on every dirty frame (#1374) — a reject wake would make a 404 a self-sustaining
+  // render loop. A consumer that reveals something on failure wakes for itself.
+  if (!miss || wakePending.has(url)) return load;
+  wakePending.add(url);
+  return load.then(
+    (tex) => { wakePending.delete(url); fireDirtyListeners(); return tex; },
+    (e: unknown) => { wakePending.delete(url); throw e; },
+  );
 }
 
 /** Load a BAKED MTSDF font atlas — as DATA, never through `Assets.load` (#1045).

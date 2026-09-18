@@ -119,6 +119,27 @@ export function mergeNestedOverridePaths(
   return out;
 }
 
+/** Merge two path-keyed STRUCTURE maps (`NestedStructurePaths`, #1381); `outer` wins per PATH, and
+ *  wins WHOLE — never element-wise. A layer that addresses a path owns that instance's interior (all
+ *  three lists, see the loader's `structDirect`), so merging two `removed` arrays would make an
+ *  un-delete by the outer layer unrepresentable. Used where a prefab ROW's own `nestedStructure`
+ *  meets the structure an outer layer forwarded into the same expansion. Neither input is mutated.
+ *
+ *  Generic over the payload only because `NestedStructurePaths` is declared in loadSceneFile.ts,
+ *  which imports this module. */
+export function mergeNestedStructurePaths<T>(
+  inner: Record<string, T> | undefined,
+  outer: Record<string, T> | undefined,
+): Record<string, T> | undefined {
+  if (!inner) return outer;
+  if (!outer) return inner;
+  // `emptyDocMap()` (#986): the keys are path strings read out of a file.
+  const out = emptyDocMap() as Record<string, T>;
+  for (const [k, v] of Object.entries(inner)) out[k] = v;
+  for (const [k, v] of Object.entries(outer)) out[k] = v;
+  return out;
+}
+
 /** Fold ONE trait's override fields onto its current values — the per-trait rule the spawner
  *  applies (`applyOverridesByLocalToEcs`) and `effectivePrefabMemberTraits` models, kept in one place
  *  so the two cannot disagree about precedence or about which fields count.

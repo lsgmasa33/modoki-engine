@@ -401,14 +401,41 @@ first alone is not enough:
    is dead code, and a guard that is never re-armed heals only the FIRST invalidation: a second
    Apply-to-Prefab in the same session stays broken. Re-arming unconditionally is the opposite
    trap, refetching a genuinely-missing prefab every frame forever. `.finally(() => { if
-   (getCachedPrefab(ref)) rearm; })` is the shape that does neither.
+   (getCachedPrefab(ref)) rearm; })` escapes both of those — and walks into a third, below.
+   **Do not copy it without reading on.**
+   ⚠️ **`.finally(() => { if (getCachedPrefab(ref)) rearm; })` does NOT "do neither" — it latches a
+   TRANSIENT failure permanently, and every site above is written this way.** The settle carries no
+   information about *why* the cache is empty: `fetchPrefab` swallows a 5xx, an offline blip and a
+   deleted guid identically. So "re-arm only on success" reads every transient failure as a deletion
+   and disables that prefab for the rest of the session — surviving a Play/Stop, since module state
+   outlives the world. Measured on `games/wordweave` (#1359): one failed fetch at boot killed the
+   celebration permanently, which is *worse* than the unconditional re-arm it replaced, because that
+   at least healed on the next trigger. **A bounded attempt budget, reset when the world changes, is
+   the shape that genuinely does neither** — `games/wordweave/runtime/celebrationFx.ts` carries the
+   worked version, with the in-flight dedup kept as a separate set from the give-up latch, since one
+   set doing both jobs is what produced both failure modes in turn.
+   ⚠️ **Re-arm on the SAME predicate your lookup uses — `getCachedPrefab` alone is not it if your
+   miss test is stricter.** A caller that treats an entity-less document as a miss (`games/wordweave`
+   does: a prefab with no entities spawns nothing) and re-arms on bare truthiness accepts that empty
+   document, releases the guard and refetches forever — the same defect one step removed, and it
+   survives the obvious test because the cache genuinely did fill. Factor the test into one function
+   and call it from both places, so the two cannot drift (#1359).
    ⚠️ **The re-acquire is async, so the action that found the miss still fails — record it.** The
    shot, spawn or build that hit the empty cache cannot wait for the fetch, and dropping it silently
    makes it read as a dead control. `demos/forest-camp` journals `archery.shot-refused` with
    `reason: 'arrow-prefab-not-cached'` for exactly this window (#996).
+   ⚠️ **Record it at the level the SYMPTOM justifies, and prefer the give-up to the miss.** A miss
+   is also what a healthy cold cache looks like one frame before it fills, so a `warn` on every miss
+   produces a line that reads identically for "this prefab was deleted" and "an editor Apply evicted
+   it and it is already on its way back" — the one question the reader came to answer. Where the
+   action is a *player* action being refused, record it as forest-camp does, because the player
+   really did lose something. Where it is decoration, the informative moment is the fetch giving up:
+   `games/wordweave` journals `wordweave/fx-prefab-unavailable` when the budget is spent and stays
+   silent through the cold-cache window (#1359).
    ⚠️ Whether you are exposed depends on **what else clears your guard**: `games/court` clears its
-   on every board build, so it was safe either way; `games/sling` clears its only on unregister and
-   `demos/forest-camp` only on world swap — and an Apply-to-Prefab is neither.
+   on every board build, so it was safe either way; `games/sling` clears its only on unregister,
+   `games/wordweave` only on unregister (`resetFx`), and `demos/forest-camp` only on world swap —
+   and an Apply-to-Prefab is none of them.
 2. **Remember what each live instance was built FROM**, and retire instances whose source no
    longer matches. ⚠️ **Key that record on the prefab's REVISION, not only its guid**
    (`${guid}@${getPrefabRevision(guid)}`). An editor Apply replaces the entry in place, so the guid

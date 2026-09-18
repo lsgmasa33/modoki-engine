@@ -306,3 +306,49 @@ describe('a SUB-EMITTER child waits hidden too — the same defect one level dow
     expect(child?.visible, 'a child must not stay invisible forever either').toBe(true);
   });
 });
+
+// ── #1368 A: the backend owes NO wake of its own — the texture STORE's wake is enough. ──
+// On a stopped Scene3D the reveal is only drawn if something wakes the idle gate, and nothing in
+// the backend does. The wake lives in `loadTexture3D`'s store; what this pins is that the reveal
+// has already happened by the frame that wake buys (a frame is a later macrotask — rAF). So the
+// provider is wired to the REAL resolver here: a mocked provider would mock away the very wake
+// under test, and this would pass with it deleted.
+const WAKE_GUID = '3b0f7d2c-9a41-4e55-8c1d-2f6a7b8c9d01';
+async function wireRealResolver() {
+  const real = await import('../../src/runtime/loaders/textureResolver');
+  const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+  const { textureProvider } = await import('../../src/runtime/core/textureProvider');
+  registerAsset(WAKE_GUID, 'tex/wake-spark.png', 'texture'); // unconverted -> plain TextureLoader, no KTX2 caps gate
+  const impl = textureProvider.get() as unknown as { loadTexture3D: ReturnType<typeof vi.fn>; releaseTexture3D: ReturnType<typeof vi.fn> };
+  impl.loadTexture3D.mockImplementation(real.loadTexture3D);
+  impl.releaseTexture3D.mockImplementation(real.releaseTexture3D);
+  let land!: (t: THREE.Texture) => void;
+  const spy = vi.spyOn(THREE.Loader.prototype, 'loadAsync').mockImplementation(
+    () => new Promise((res) => { land = res as (t: THREE.Texture) => void; }) as never,
+  );
+  return {
+    /** The resolver reaches `loadAsync` a few microtasks after the call, not synchronously. */
+    land: async (t: THREE.Texture) => { await vi.waitFor(() => expect(spy).toHaveBeenCalled()); land(t); },
+    restore: () => { spy.mockRestore(); impl.loadTexture3D.mockReset(); impl.releaseTexture3D.mockReset(); real.disposeAllSharedTextures(); },
+  };
+}
+
+describe('the texture store\'s refill wake reveals a CPU emitter on a stopped surface (#1368 A)', () => {
+  it('the emitter is visible on the frame the wake buys', async () => {
+    const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+    const wired = await wireRealResolver();
+    try {
+      const be = new CpuTslBackend();
+      const def = { ...textured(), render: { blend: 'additive', texture: WAKE_GUID } } as ParticleEffectDef;
+      const group = be.getObject3D(be.create(def));
+      expect(group.visible, 'hidden while the sprite is in flight').toBe(false);
+
+      let visibleOnWokenFrame: boolean | undefined;
+      const off = addDirtyListener(() => { setTimeout(() => { visibleOnWokenFrame ??= group.visible; }, 0); });
+      await wired.land(new THREE.Texture());
+      await vi.waitFor(() => expect(visibleOnWokenFrame, 'the store must wake an idle surface').toBeDefined());
+      off();
+      expect(visibleOnWokenFrame, 'and that frame must already see the reveal').toBe(true);
+    } finally { wired.restore(); }
+  });
+});

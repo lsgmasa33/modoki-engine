@@ -331,13 +331,18 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   prefab (and its transitive refs) at load.
 - **Apply to Prefab.** `insertAddedSubtree` writes a reference node as a nested
   **row** in the owner's `.prefab.json`, so promoting it matches how `serializePrefab`
-  writes nested rows. (It also raises `version` to `PREFAB_FORMAT_VERSION`, which since
+  writes nested rows, and the node's `nestedOverrides` + `nestedStructure` become the row's own
+  (#1381). (It also raises `version` to `PREFAB_FORMAT_VERSION`, which since
   #379 every writer stamps unconditionally — the bump is no longer a signal that the file
   gained nesting.)
 - **Recursion.** Because `captureInstanceReference` calls `captureInstanceStructure`,
   a user-added instance nested inside another is captured (and expanded) recursively.
   `serializePrefab`'s nested-row loop skips an instance already folded into a parent
-  reference node (`skip.has(e.id)`), so it is never double-emitted.
+  reference node (`skip.has(e.id)`), so it is never double-emitted. It equally skips every
+  **owned** nested instance inside a row, at any depth (`captureNestedChannels`'
+  `ownedMemberEcsIds`) — the row re-expands them. They once got a second reference row at the
+  prefab root, so a Create Prefab over a held instance wrote its owned INNER twice and the tagger
+  re-stamped it onto the wrong row (#1382).
 
 ## The scene's structural channel into a nested instance (`nestedStructure`)
 
@@ -347,8 +352,9 @@ until #1358 it had no channel for that instance's **structure**. `serializeScene
 delta and nothing else. So a member deleted inside it came back on the next load, and a member
 dragged out of it existed at **both** places — two entities holding one guid.
 
-`nestedStructure` is the sibling slot, on a scene entry and on an added reference node (#1369) —
-**not** on a prefab row (see below) — keyed by the same path grammar (`nestedPathKey`):
+`nestedStructure` is the sibling slot, on a scene entry, on an added reference node (#1369) and on a
+prefab nested row (#1381) — see *Three carriers* below — keyed by the same path grammar
+(`nestedPathKey`):
 
 ```ts
 nestedStructure?: Record<string /* "4", "4.7" */, {
@@ -367,7 +373,7 @@ nestedStructure?: Record<string /* "4", "4.7" */, {
   asymmetry is deliberate and follows from the previous point.
   ⚠️ The first cut instead compared the live capture against the file-authored baseline and wrote
   only the differing fields. Those two documents are **not comparable** — `snapshotAddedTraits`
-  compacts schema-default fields and carries a live `parentId`, the baseline is whatever the prefab
+  compacts schema-default fields (and until #1377 carried a live `parentId`), the baseline is whatever the prefab
   file holds — so "equal" was unreachable for any row with authored structure: the slot was written
   on a no-op save, baking a live ECS id into the scene file and freezing the instance, which is the
   one thing the gate existed to prevent.
@@ -391,20 +397,52 @@ The third one is the expensive one to miss, and its own docblock asserts parity 
 a document with no `resources[]` an unqueued ref reaches `vite-asset-scanner`'s guid check and
 **fails the build** on legitimate authoring.
 
-⚠️ **Two carriers, and a prefab ROW is not one of them.** The slot sits on a scene's top-level entry
-and on an added **reference node**. That includes a reference node inside a prefab row's `added[]`,
-because `serializePrefab` (Create Prefab, a prefab-edit save) captures those through the same
-`captureNestedRef`. Each carrier is the outermost layer for its own paths, and a path steps only
-through nested ROWS, so `resolveEffectivePrefabStructure` never has an outer layer to descend. A
-prefab row does **not** carry the slot itself: the declaration existed during #1358 and was removed
-because nothing wrote it, and `prefabEdit.ts` would strip a hand-authored one. Promoting a reference
-node INTO a row (Apply to Prefab, `insertAddedSubtree`) therefore drops its `nestedStructure`,
-which is #1381. The reference node's field came back in #1369 **together with its writer**
-(`captureNestedRef` → `captureNestedChannels`), which is the order CLAUDE.md requires for an
-authored field.
+⚠️ **Three carriers — a scene entry, a reference node, and a prefab ROW (#1381).** Each is the
+outermost layer for its own paths *within its document*, and a path steps only through nested ROWS.
+Where two meet during expansion the outer one wins **per path, whole** (`mergeNestedStructurePaths`
+— never element-wise, for the same un-delete reason as above), and `resolveEffectivePrefabStructure`
+descends the rows' slots path-keyed exactly as `resolveEffectivePrefabOverride` does, so a scene's
+baseline includes what an intermediate row already did to the interior.
+
+The row carrier is written two ways, both **with a writer**, which is the order CLAUDE.md requires
+for an authored field:
+- **Promotion** (Apply to Prefab, `insertAddedSubtree`) copies a reference node's slot into the row.
+- **A prefab-edit save / Create Prefab** (`serializePrefab` → `planPrefabRows`) **captures** each
+  row's channels from its live expansion with the same `captureNestedChannels` walk the other two
+  carriers use. Captured, not passed through: `buildPrefabEditScene` forwards both channels onto the
+  row's scene entry, so the edit world IS the expansion, and an edit made inside a row's nested row
+  in the prefab editor must replace the file's value rather than be overwritten by it.
+  ⚠️ **The row writer does NOT use the scene's "restate when the baseline is non-empty" rule**
+  (`omitUnchanged`). A path whose live interior equals what the inner prefab chain already applies
+  is omitted. Otherwise a no-op save of the outer prefab pins the inner prefab's own authored
+  structure into the outer file, and a later edit to the inner prefab stops reaching every instance
+  of the outer one. The compare that #1358 rejected for scenes is sound here, because file-authored
+  `added` nodes come from the same compacting capture, and #1377 stopped capturing the live
+  `parentId`. The compare (`sameStructure`) is over content: `added`/`removed` are sets, and a
+  file bag is run through the capture's own compaction (`compactAddedTraitData`), so hand-ordered
+  lists and legacy full bags compare equal too. A mismatch still writes the path verbatim, which is
+  the safe direction.
+  An owned nested instance whose prefab is uncached still re-expands from its owner's row, so it and
+  everything under it are skipped. Anything added inside it is dropped with a warning, following the
+  `captureNestedRef` precedent; every caller warms the cache first (#1295).
+
+⚠️ **Why the channels are not folded into the row at promotion instead.** A reference node's
+`nestedStructure` is keyed by paths inside ITS OWN prefab, so no key ever targets a row the promoted
+(outer) prefab owns — its direct lists already land in the row's `added`/`removed`. The only fold
+possible would write into the inner prefab's file, changing every instance of it.
+
+**No `PREFAB_FORMAT_VERSION` bump for the row slot, deliberately.** Unlike a scene (v14, REFUSE),
+nothing on the prefab loading path reads the version at all (see `PREFAB_FORMAT_VERSION`'s docblock),
+so a bump would protect nothing: an older build still loads the file, ignores the field and would
+drop it on its next save. That is the same exposure every optional prefab field has had since v1.
+
+History: the row slot was declared during #1358 and removed because nothing wrote it, and the
+descend in `resolveEffectivePrefabStructure` was removed as dead for the same reason. Both came back
+in #1381 with their producers; before that, promotion dropped the slot and a prefab-edit save lost a
+row's file-authored `nestedOverrides` too.
 
 **One walk, `captureNestedChannels(source, ownedNested)`** (`editor/scene/prefab.ts`), produces both
-channels for both carriers. It descends top-down through the row partition at every level
+channels for all three carriers. It descends top-down through the row partition at every level
 (`captureInstanceStructure(…).ownedNested`). It replaced a bottom-up walk in `serializeScene` that
 resolved each owned instance UP to a top-level root, which was why a chain through a reference node
 resolved to nothing. Paths are written sorted, so key order does not depend on ECS ids.

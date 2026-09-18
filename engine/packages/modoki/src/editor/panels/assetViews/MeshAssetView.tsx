@@ -6,7 +6,7 @@ import { useState, useEffect } from 'react';
 import { whenMeshTemplate, meshStatsFromTemplate } from '../../../runtime/loaders/meshTemplateCache';
 import { InfoRow, Section } from './widgets';
 import { MeshPreview } from '../MeshPreview';
-import { useModelInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
+import { useModelInvalidationEpoch, useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
 
 export function MeshAssetView({ path }: { path: string }) {
   const [data, setData] = useState<Record<string, unknown> | null>(null);
@@ -15,7 +15,9 @@ export function MeshAssetView({ path }: { path: string }) {
 
   // A re-import rewrites this `.mesh.json` in place, so neither `path` nor the
   // browser's cached copy of it changes (#294) — bump both off the invalidation epoch.
-  const epoch = useModelInvalidationEpoch();
+  // Plus the file's OWN edit (#1380): a plain write to this `.mesh.json`, GLB untouched, fires
+  // `'mesh'` and never `'model'`. A sum of two counters that only rise still changes on each.
+  const epoch = useModelInvalidationEpoch() + useAssetInvalidationEpoch('mesh', (p) => p === path);
 
   useEffect(() => {
     const ac = new AbortController();

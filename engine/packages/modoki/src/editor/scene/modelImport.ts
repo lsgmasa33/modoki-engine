@@ -8,7 +8,7 @@ import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBac
 import { deleteAssetFile } from '../panels/assetOps';
 import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
 import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
-import { loadModelTemplates, getTemplatesForModel, invalidateMaterial } from '../../runtime/loaders/meshTemplateCache';
+import { loadModelTemplates, getTemplatesForModel, invalidateMaterial, invalidateMeshAsset } from '../../runtime/loaders/meshTemplateCache';
 import { ensureRiggedModelLoaded } from '../../runtime/loaders/riggedModelCache';
 import { invalidateModelAndRig } from '../../runtime/loaders/reimportInvalidation';
 import { offerParsedGltf, disposePendingGltf } from '../../runtime/loaders/parsedGltfHandoff';
@@ -1021,6 +1021,10 @@ async function importModelInner(
       // Write BEFORE registering — see the note at the material site above (#311).
       await writeAssetFileOrAbort(meshPath, jsonFileBody(meshAsset));
       registerAsset(meshAsset.id!, meshPath, 'mesh');
+      // AFTER the write (#1380). `invalidateModelAndRig` above evicted this entry BEFORE it, and
+      // the awaits since then leave a window for a render frame to refetch the OLD file and cache
+      // it again; this write is `markEditorWrite`-suppressed, so the watcher will not evict it.
+      invalidateMeshAsset(meshPath);
       meshFileMap.set(meshName, meshPath);
       meshFiles.push(meshPath);
     }

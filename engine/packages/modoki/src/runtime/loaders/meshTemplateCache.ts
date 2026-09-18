@@ -870,6 +870,50 @@ export function getMeshAsset(meshRef: string): MeshAsset | undefined {
 /** In-flight mesh-asset fetches, keyed by path. Awaitable for the refcount API. */
 const meshAssetLoadPromises = new Map<string, Promise<void>>();
 
+/** Re-read one `.mesh.json` because the FILE changed — its `model` or `mesh` binding may now name
+ *  something else (#1380). (Its `material` field is re-read too, but a live entity never draws it —
+ *  see `resolveMaterialForMesh`, #1385 — so a change to it alone announces nothing.)
+ *
+ *  Before this, the entry was evicted only through its MODEL (`invalidateModel`, keyed on the
+ *  GLB) and at scene-swap release, so a `.mesh.json`-only edit — the GLB untouched — reached no
+ *  invalidator and the old binding rendered until the next scene swap.
+ *
+ *  **Stale-while-revalidate, not evict.** A cached entry keeps serving while the file is re-read,
+ *  and is replaced only once the new definition AND its model templates are loaded. An eager evict
+ *  made `resolveMeshTemplate` return undefined for the refetch's duration — during Play that is a
+ *  mesh collider rebuilt with no geometry (`physics3DSystem`'s `'nomesh'` signature) — and did so
+ *  even for a byte-identical write. A re-read that fails (a half-typed hand edit) keeps the old
+ *  entry, the rule #1169 set for prefabs.
+ *
+ *  Replacing the entry is only half of it. `scene3DSync` builds an entity's object once and caches
+ *  it keyed on the `Renderable3D.mesh` REF STRING, which a file edit does not change — so the swap
+ *  alone would go on drawing the old mesh. The `'mesh'` event, fired just before the swap and only
+ *  when the binding changed, is what tears that object down (`attachInvalidationListener`).
+ *
+ *  An entry that is NOT cached (never loaded, or MESH_FAILED) has nothing to keep serving: it is
+ *  dropped so the next resolve loads the file fresh. Either way the #863 token refuses an in-flight
+ *  fetch of the pre-edit bytes.
+ *
+ *  Ownership (`meshAssetOwners`, `meshTransitiveDeps`) is left alone: the scene still owns the
+ *  ref. A model the EDITED file newly names is therefore loaded unowned until the next swap — the
+ *  F6 render-path-resolver case `acquireMesh` already documents, not a new one.
+ *
+ *  Takes the asset PATH — the watcher's `urlPath`, the same form every key in this cache is. */
+export function invalidateMeshAsset(meshPath: string): void {
+  cacheToken.invalidateKey(meshPath);
+  meshAssetLoadPromises.delete(meshPath);
+  const stale = meshAssetCache.get(meshPath);
+  if (!stale || stale === MESH_FAILED) {
+    // Still announced: nothing is BUILT from an uncached entry, so the renderer's teardown finds
+    // nothing, but the Inspector's MeshAssetView/MeshPreview listen for this event too — a panel
+    // showing "Failed to load geometry." for a broken file must re-read when the file is fixed.
+    emitAssetInvalidated('mesh', meshPath);
+    meshAssetCache.delete(meshPath);
+    return;
+  }
+  void fetchMeshAsset(meshPath, { stale });
+}
+
 /** Resolve a mesh reference — handles legacy sprite names, *.mesh.json paths,
  *  and asset guids. For mesh assets: fetches the JSON, lazy-loads the model,
  *  returns the template. Returns undefined synchronously if not yet loaded
@@ -989,17 +1033,24 @@ export function resolveMeshLodInfo(
 }
 
 /** Async: fetch a .mesh.json file and preload its model. Returns a promise the
- *  refcount API can await; safe to call multiple times — dedupes via meshAssetCache + meshAssetLoadPromises. */
-function fetchMeshAsset(meshPath: string): Promise<void> {
-  if (meshAssetCache.has(meshPath)) return Promise.resolve();
-  if (meshAssetLoadPromises.has(meshPath)) return meshAssetLoadPromises.get(meshPath)!;
+ *  refcount API can await; safe to call multiple times — dedupes via meshAssetCache + meshAssetLoadPromises.
+ *
+ *  `revalidate` is the REVALIDATE mode {@link invalidateMeshAsset} uses: `stale` is the entry
+ *  still being served. The fetch then runs even though the path is cached, a failure KEEPS `stale`
+ *  instead of stamping the permanent MESH_FAILED (a half-typed hand edit must not kill a mesh that
+ *  was rendering), and the new definition replaces `stale` only once its model templates are
+ *  loaded — announced with a `'mesh'` event, and only when the binding actually changed. */
+function fetchMeshAsset(meshPath: string, revalidate?: { stale: MeshAsset }): Promise<void> {
+  if (!revalidate && meshAssetCache.has(meshPath)) return Promise.resolve();
+  if (!revalidate && meshAssetLoadPromises.has(meshPath)) return meshAssetLoadPromises.get(meshPath)!;
 
   // Same per-key liveness as its sibling fetchers (#863 close-out). This cache had none at all,
   // and it IS invalidated per-key: `invalidateModel` drops every meshAssetCache entry whose
   // `asset.model` resolves to the re-imported GLB, so without this an in-flight fetch of the
   // PRE-import `.mesh.json` re-seats the stale asset on top of the refetch. Outside #863's own
-  // sweep only because that one enumerated `invalidate*` functions and there is no
-  // `invalidateMeshAsset` — the cache is invalidated through the model's name, not its own.
+  // sweep only because that one enumerated `invalidate*` functions and there was no
+  // `invalidateMeshAsset` then — the cache was invalidated only through the model's name. It
+  // now has its own ({@link invalidateMeshAsset}, #1380), which refuses through this same token.
   const stillLive = cacheToken.capture(meshPath);
 
   const promise = (async () => {
@@ -1007,6 +1058,7 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
       const res = await fetch(assetUrl(meshPath), ASSET_FETCH_INIT);
       if (!stillLive()) return;
       if (!res.ok) {
+        if (revalidate) { console.warn(`[MeshCache] kept the previous ${meshPath}: re-read failed (${res.status})`); return; }
         meshAssetCache.set(meshPath, MESH_FAILED); // cache failure — don't retry
         return;
       }
@@ -1024,12 +1076,12 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
               `this build's MESH_FORMAT_VERSION (${MESH_FORMAT_VERSION}) — not caching it.`
             : `[MeshCache] refusing ${meshPath}: version field is unreadable (${verdict.reason}) — not caching it.`,
         );
-        if (!stillLive()) return;
+        if (!stillLive() || revalidate) return;
         meshAssetCache.set(meshPath, MESH_FAILED);
         return;
       }
       if (!stillLive()) return;
-      meshAssetCache.set(meshPath, asset);
+      if (!revalidate) meshAssetCache.set(meshPath, asset);
       // Self-register so future ref-by-guid resolves to this path
       if (asset.id) registerAsset(asset.id, meshPath, 'mesh');
 
@@ -1062,9 +1114,24 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
           await loadModelTemplates(modelPath, undefined, asset.postprocessor || 'none');
         }
       }
+      if (revalidate) {
+        if (!stillLive()) return;
+        // Swap only now, with the new model's templates loaded, so the rebuild the event triggers
+        // resolves at once — an eager evict left the entity (and a mesh collider built from it)
+        // without geometry until the refetch landed, even for a byte-identical write.
+        const changed = !sameMeshBinding(revalidate.stale, asset);
+        if (changed) emitAssetInvalidated('mesh', meshPath);
+        meshAssetCache.set(meshPath, asset);
+        if (changed) return; // emitAssetInvalidated already fired the wake
+      }
+      // The asset is readable NOW, and neither upstream wake is guaranteed to have fired (#1368 D):
+      // `registerAsset` wakes only on a manifest change, and `loadModelTemplates` wakes only on a
+      // real parse — it hands back the settled promise for a GLB some other consumer already
+      // parsed, so a `.mesh.json` landing after that parse redrew nothing on an idle surface.
+      if (stillLive()) fireDirtyListeners();
     } catch (e) {
       console.warn(`[MeshCache] Failed to load mesh asset ${meshPath}:`, e);
-      meshAssetCache.set(meshPath, MESH_FAILED);
+      if (!revalidate) meshAssetCache.set(meshPath, MESH_FAILED);
     } finally {
       meshAssetLoadPromises.delete(meshPath);
     }
@@ -1072,6 +1139,14 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
 
   meshAssetLoadPromises.set(meshPath, promise);
   return promise;
+}
+
+/** The fields that decide what a `.mesh.json` renders or shows (`id` and `version` do not).
+ *  `material` is deliberately NOT one: no live entity draws it (see `resolveMaterialForMesh`,
+ *  #1385) and `MeshAssetView` does not display it, so announcing a material-only edit would rebuild
+ *  every entity on the path to identical output. The entry still takes the new bytes. */
+function sameMeshBinding(a: MeshAsset, b: MeshAsset): boolean {
+  return a.model === b.model && a.mesh === b.mesh && a.postprocessor === b.postprocessor;
 }
 
 // ── Material Asset Resolution ──
@@ -1259,7 +1334,14 @@ export function disposeRetiredMaterial(mat: THREE.Material): void {
 }
 
 /** Resolve material for a mesh: checks Renderable.material, then mesh asset's material field.
- *  Accepts guid or path refs for both arguments. Returns undefined if not resolved yet. */
+ *  Accepts guid or path refs for both arguments. Returns undefined if not resolved yet.
+ *
+ *  ⚠️ The mesh-asset fallback is NOT what a live GLB entity draws. With an empty
+ *  `Renderable3D.material`, `scene3DSync`'s `syncMaterial` binds the engine default over this pick
+ *  in the same frame — deliberately: a mesh with no material authored on the entity renders grey
+ *  (#1385, the owner's choice over honouring this fallback; it also keeps identical grey entities
+ *  batched into one draw call). So the `.mesh.json` `material` field is a record of what the import
+ *  bound, which the importer copies onto the entity at spawn — not a live fallback. */
 export function resolveMaterialForMesh(renderableMaterial: string, meshRef: string): THREE.Material | undefined {
   // 1. Explicit material on Renderable. Pass the ORIGINAL ref (guid or path) to
   //    resolveMaterial — it does its own refToPath. Passing the already-resolved

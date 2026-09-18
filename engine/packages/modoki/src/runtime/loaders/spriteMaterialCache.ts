@@ -24,12 +24,11 @@ import { createTeardownToken } from '../core/liveness';
 import { isGuid } from '../core/assetRefRules';
 import { getGuidForPath, resolveRef } from './assetManifest';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
-import { notifyListeners } from '../core/notifyListeners';
+import { fireDirtyListeners } from '../core/renderDirty';
 import { errorText } from '../core/errorText';
 
 const programs = new Map<string, PixiShaderProgram>(); // guid → resolved program
 const loading = new Map<string, Promise<void>>();      // guid → in-flight compile
-const waiters = new Map<string, Set<() => void>>();    // guid → onReady wakes awaiting the in-flight compile
 const failed = new Set<string>();                      // guid → compile returned null (don't retry every frame)
 // Teardown liveness, KEYED BY GUID (#852) — same shape as spriteAnimCache/particleCache/etc. An
 // in-flight compile captures it BY GUID before starting and bails on resolve/reject if either the
@@ -59,52 +58,39 @@ export function getSpriteMaterialProgram(guid: string): PixiShaderProgram | unde
  *  Starts the async build on first sight; returns undefined while loading or after a
  *  permanent failure (caller falls back to the default sprite shader).
  *
- *  `onReady` (optional) is invoked when an in-flight compile resolves to a usable program —
- *  the caller passes `() => markDirty()` so the idle whole-frame gate wakes and the entity
- *  swaps from its fallback sprite to the material Mesh even while the sim is stopped (mirrors
- *  makeSprite's Assets.load `.then(markDirty)` / the font-load pattern). EVERY waiting caller's
- *  `onReady` is kept and fired — not just the first — so with two live viewports (editor
- *  GameView + SceneView, each its own renderer + `markDirty`) BOTH wake when the program lands;
- *  keeping only the first left the second viewport drawing its fallback sprite until an
- *  unrelated dirty. */
-export function ensureSpriteMaterial(guid: string, onReady?: () => void): PixiShaderProgram | undefined {
+ *  When the compile lands, the STORE fires the shared `fireDirtyListeners` wake (#1368 B), so every
+ *  idle-gated surface swaps from its fallback sprite to the material Mesh even while the sim is
+ *  stopped. ⚠️ This replaced a per-caller `onReady` channel, and do not bring it back: it woke only
+ *  the renderers that happened to pass a callback — correct while every caller was a Scene2D that
+ *  did, and silently wrong for the first one that doesn't (the `modelLoadNotify` shape #1363
+ *  deleted). One wake per compile, so a per-frame caller cannot keep a surface awake. */
+export function ensureSpriteMaterial(guid: string): PixiShaderProgram | undefined {
   if (!guid) return undefined;
   const ready = programs.get(guid);
   if (ready) return ready;
   if (failed.has(guid)) return undefined;
-  if (loading.has(guid)) {
-    // Compile already in flight (another entity/viewport kicked it) — register this caller's
-    // wake too so it re-runs the frame when the program lands.
-    if (onReady) waiters.get(guid)?.add(onReady);
-    return undefined;
-  }
+  if (loading.has(guid)) return undefined; // in flight — the store's shared wake covers this caller too
 
   const path = resolveRefWarnOnce(guid, 'spriteMaterialCache', unknownGuidSeen);
   if (!path) { failed.add(guid); return undefined; } // unresolved GUID — warned once above
 
-  const set = new Set<() => void>();
-  if (onReady) set.add(onReady);
-  waiters.set(guid, set);
   const stillLive = liveness.capture(guid);
   const p = buildPixiShaderProgram(path)
     .then((program) => {
       // Superseded by a clear mid-compile — a NEW compile for this guid may already own
-      // `loading`/`waiters`; touching either here would delete the new one's in-flight entry
-      // and orphan its waiters. Bail before any map write, and don't cache a program built
-      // against source a clear (e.g. a `.shader.json` save) may have already made stale.
+      // `loading`; touching it here would delete the new one's in-flight entry. Bail before any
+      // map write, and don't cache a program built against source a clear (e.g. a `.shader.json`
+      // save) may have already made stale.
       if (!stillLive()) return;
       loading.delete(guid);
-      const wakes = waiters.get(guid); waiters.delete(guid);
-      // Isolated per waiter (#888), and the ordering is why it matters: `waiters.delete(guid)`
-      // above has already run, so a throwing waiter used to leave every waiter behind it parked
-      // forever with nothing left to settle them. Same shape as `fontTexturePixi.settleWaiters`.
-      if (program) { programs.set(guid, program); if (wakes) notifyListeners(wakes, 'spriteMaterialCache', []); }
+      // Store FIRST, then wake — a listener that renders synchronously must find the program.
+      if (program) { programs.set(guid, program); fireDirtyListeners(); }
       else failed.add(guid); // missing body / wrong space / reserved-name — buildPixiShaderProgram warned
     })
     .catch((e) => {
       console.warn(`[spriteMaterialCache] failed to build 2D material ${guid}: ${e instanceof Error ? errorText(e) : String(e)}`);
       if (!stillLive()) return; // superseded — see .then above
-      loading.delete(guid); waiters.delete(guid);
+      loading.delete(guid);
       failed.add(guid);
     });
   loading.set(guid, p);
@@ -115,22 +101,19 @@ export function ensureSpriteMaterial(guid: string, onReady?: () => void): PixiSh
  *  teardown; entities re-`ensure` their material on the next frame. */
 export function clearSpriteMaterialCache(): void {
   // Invalidating liveness supersedes every in-flight compile, and a superseded resolve/reject
-  // (see the `!stillLive()` bails above) deliberately fires no `onReady` wake. That's fine
-  // for a caller that re-dirties itself after clearing (world swap, `persistAssetEdit`) — but a
-  // renderer still LIVE after the clear (`Scene2D.stop()` clears this shared cache while a
-  // sibling viewport keeps drawing) loses the only signal that would make it re-`ensure`, and its
-  // entities are stuck on the fallback sprite until some unrelated dirty. So snapshot the pending
-  // waiters BEFORE invalidating/clearing, then fire them AFTER — a re-entrant `ensureSpriteMaterial`
-  // from a wake sees a clean cache and the new liveness generation, not the one being torn down. (#523)
-  const pending = [...waiters.values()].flatMap((set) => [...set]);
+  // (see the `!stillLive()` bails above) deliberately fires no wake. That's fine for a caller
+  // that re-dirties itself after clearing (world swap, `persistAssetEdit`) — but a renderer still
+  // LIVE after the clear (`Scene2D.stop()` clears this shared cache while a sibling viewport keeps
+  // drawing) loses the only signal that would make it re-`ensure`, and its entities are stuck on
+  // the fallback sprite until some unrelated dirty. So a clear that superseded a compile wakes
+  // once, AFTER clearing — a re-entrant `ensureSpriteMaterial` from the wake sees a clean cache
+  // and the new liveness generation, not the one being torn down. (#523)
+  const superseded = loading.size > 0;
   liveness.invalidateAll();
   programs.clear();
   loading.clear();
-  waiters.clear();
   failed.clear();
-  // Isolated per waiter (#953): every map above is already cleared, so a throwing wake would leave
-  // each wake behind it permanently unfired — those renderers stay on the fallback sprite.
-  notifyListeners(pending, 'spriteMaterialCache', []);
+  if (superseded) fireDirtyListeners();
 }
 
 /** The ONE definition of "a `.shader.json` changed" (#842, made per-key by #852). Both the
@@ -185,22 +168,15 @@ export function invalidateShader(manifestPath: string): void {
     // (#304) — a subscriber (meshTemplateCache's 3D reverse index) can still read what's about to
     // be dropped.
     emitAssetInvalidated('shader', shaderPath);
-    // Snapshot this guid's waiters BEFORE evicting, fire them AFTER — the per-key mirror of
-    // `clearSpriteMaterialCache`'s wake, and load-bearing for the same reason (#523). A
-    // superseded compile's resolve/reject deliberately fires no `onReady`, so a renderer still
-    // live across this invalidation (a sibling viewport, or the editor's GameView + SceneView)
-    // would otherwise lose the only signal that makes it re-`ensure`, and its entities would sit
-    // on the fallback sprite until some unrelated dirty. Dropping the set without firing it is
-    // the flash this issue fixes, made PERMANENT for the one shader actually edited.
-    const pending = [...(waiters.get(guid) ?? [])];
     liveness.invalidateKey(guid);
     programs.delete(guid);
     failed.delete(guid);
     loading.delete(guid);
-    waiters.delete(guid);
-    // Isolated per waiter (#953): a throwing wake used to escape here and skip BOTH the wakes
-    // behind it and `invalidatePixiShaderProgram` below, so the shader edit silently didn't take.
-    notifyListeners(pending, 'spriteMaterialCache', []);
+    // A superseded compile's resolve deliberately fires no wake (#523), so a renderer still live
+    // across this invalidation must be woken here, or its entities sit on the fallback sprite for
+    // the ONE shader actually edited. Unconditional, and AFTER the eviction so the woken frame
+    // re-`ensure`s against the new generation — the per-key mirror of `clearSpriteMaterialCache`.
+    fireDirtyListeners();
   } else {
     // Unresolved guid — fail SAFE, not silent. See the docblock above: "unknown" must not be
     // treated as "absent", or an edit to a not-yet-indexed shader would silently not take.

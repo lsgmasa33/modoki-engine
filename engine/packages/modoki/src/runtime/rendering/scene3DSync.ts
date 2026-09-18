@@ -2,6 +2,7 @@
 
 import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
+import { fireDirtyListeners } from '../core/renderDirty';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { noteGpuContextCreated } from '../core/gpuContextTracking';
 import { installGlProgramReleaseHatch } from './glProgramRelease';
@@ -63,6 +64,7 @@ import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { resolveAnimSetParams, ANIMSET_DEFAULTS, getAnimSet } from '../loaders/animSetCache';
 import { clone as cloneSkeleton, retargetClip } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { resolveRef } from '../loaders/assetManifest';
+import { onAssetInvalidated } from '../core/assetInvalidation';
 import { onWorldSwap, findEntityByGuid, peekCurrentWorld } from '../core/ecs/world';
 import { EntityTable } from '../core/ecs/entityTable';
 import { emit, entityRef } from '../core/journal';
@@ -127,8 +129,9 @@ function warnUnknownPrimitiveOnce(id: number, meshName: string): void {
 // Materials created inline for specific entities (not from caches) are tracked PER RENDER STATE,
 // as `RenderState.ownedMaterials` — only those are safe to dispose when reassigned or at teardown;
 // shared cache materials and the primitive placeholder sentinel must not be. `_defaultMaterial`
-// itself is never bound directly either (#480) — `syncMaterial` clones it per entity and owns
-// the clone, so the module-level instance stays untouched and is safe only as a clone SOURCE.
+// is never OWNED: a PRIMITIVE with an empty ref gets a per-entity clone it owns (#480), while a GLB
+// (`Renderable3D`) mesh with an empty ref binds the shared instance directly (#1385), so it must
+// never be disposed through a render state.
 //
 // ⚠️ Per-state, not module-global, because THE EDITOR RUNS TWO OF THESE on one world (SceneView +
 // the Game panel's Scene3D) and each mints its OWN inline materials. A shared set let one loop's
@@ -1448,9 +1451,65 @@ function disposeSkinnedEntry(entry: SkinnedEntry): void {
  *  that model — *before* the underlying geometry is disposed. Without this,
  *  the next render frame trips WebGPU's "setIndexBuffer parameter is not a
  *  GPUBuffer" because the in-scene mesh still points at the freed buffer.
+ *  Also evicts on a `'mesh'` event — a `.mesh.json` edited with its GLB untouched (#1380) —
+ *  because the built object is cached by ref string and nothing else would rebuild it.
  *  Returns the unsubscribe function; callers should invoke it on teardown. */
 export function attachInvalidationListener(state: RenderState, scene: THREE.Scene): () => void {
-  return onModelInvalidated((_modelPath, targets) => {
+  /** Tear down one entity's built object so the next sync rebuilds it from the cache. The model
+   *  and mesh branches below share it, so a new row in the per-entity maps is cleared by both. */
+  const evictEntity = (id: number, disposedMats: ReadonlySet<THREE.Material>): void => {
+    const obj = state.ecsObjects.get(id);
+    if (obj) {
+      // #719: retire any light-mask variant derived from a material `invalidateModel` is about
+      // to dispose, BEFORE it disposes it.
+      //
+      // ⚠️ This is what makes disposing GLB template materials safe on the RE-IMPORT path.
+      // `Material.clone()` copies texture REFERENCES (see `derivedMaterials.ts`), and a
+      // light-mask variant is such a clone. On a scene swap the variant caches are already
+      // drained — `SceneManager` fires `onWorldSwap` before `releaseAllForScene` — but a
+      // re-import of a live model swaps no world at all, so without this a variant would sit in
+      // `owned` sampling textures that are about to be freed.
+      //
+      // ⚠️ **Narrowed to `disposedMats` on purpose — retiring by evicted OBJECT over-reaches.**
+      // A mesh with a material override binds the shared cached `.mat.json`
+      // (`resolveMaterialForMesh(...) || template.material`), which `invalidateModel` never
+      // disposes. Retiring on that base would delete variants belonging to other, still-live
+      // entities sharing the override; each then re-mints a clone + pipeline and renders UNLIT
+      // until it compiles (see `lightMaskVariants.ts`'s header). So retire only what is actually
+      // about to be freed.
+      //
+      // Runs on this side because this listener is what knows WHICH objects are being evicted —
+      // not for layering reasons: `loaders/` and this file are both L3-unrestricted
+      // (`engine/eslint.config.js` `L3_FOLDERS` / `L3_RECLASSIFIED_FILES`), so either direction
+      // would have been legal. The ordering holds because `invalidateModel` fires
+      // `emitAssetInvalidated` synchronously BEFORE it disposes anything.
+      for (const mat of materialsOf(obj)) {
+        const base = baseOf(mat);
+        if (disposedMats.has(base)) retireVariantsOf(base);
+      }
+      scene.remove(obj);
+    }
+    state.ecsObjects.delete(id);
+    state.ecsOwners.delete(id);
+    state.ecsSprites.delete(id);
+    state.ecsMaterials.delete(id);
+    state.ecsShadowFlags.delete(id);
+    state.ownsGeometry.delete(id);
+  };
+
+  // A `.mesh.json` EDIT (#1380): the entity's ref string is unchanged, so without this the sync
+  // never rebuilds and the old binding keeps drawing. Nothing is disposed on this path — the GLB
+  // was not touched, so its templates and their materials stay cached — hence no variant retires.
+  const offMesh = onAssetInvalidated((kind, meshPath) => {
+    if (kind !== 'mesh') return;
+    const toEvict: number[] = [];
+    for (const [id, meshRef] of state.ecsSprites) {
+      if (resolveRef(meshRef) === meshPath) toEvict.push(id);
+    }
+    for (const id of toEvict) evictEntity(id, NO_MATERIALS);
+  });
+
+  const offModel = onModelInvalidated((_modelPath, targets) => {
     const toEvict: number[] = [];
     for (const [id, meshRef] of state.ecsSprites) {
       const asset = getMeshAsset(meshRef);
@@ -1472,45 +1531,7 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       }
     }
 
-    for (const id of toEvict) {
-      const obj = state.ecsObjects.get(id);
-      if (obj) {
-        // #719: retire any light-mask variant derived from a material `invalidateModel` is about
-        // to dispose, BEFORE it disposes it.
-        //
-        // ⚠️ This is what makes disposing GLB template materials safe on the RE-IMPORT path.
-        // `Material.clone()` copies texture REFERENCES (see `derivedMaterials.ts`), and a
-        // light-mask variant is such a clone. On a scene swap the variant caches are already
-        // drained — `SceneManager` fires `onWorldSwap` before `releaseAllForScene` — but a
-        // re-import of a live model swaps no world at all, so without this a variant would sit in
-        // `owned` sampling textures that are about to be freed.
-        //
-        // ⚠️ **Narrowed to `disposedMats` on purpose — retiring by evicted OBJECT over-reaches.**
-        // A mesh with a material override binds the shared cached `.mat.json`
-        // (`resolveMaterialForMesh(...) || template.material`), which `invalidateModel` never
-        // disposes. Retiring on that base would delete variants belonging to other, still-live
-        // entities sharing the override; each then re-mints a clone + pipeline and renders UNLIT
-        // until it compiles (see `lightMaskVariants.ts`'s header). So retire only what is actually
-        // about to be freed.
-        //
-        // Runs on this side because this listener is what knows WHICH objects are being evicted —
-        // not for layering reasons: `loaders/` and this file are both L3-unrestricted
-        // (`engine/eslint.config.js` `L3_FOLDERS` / `L3_RECLASSIFIED_FILES`), so either direction
-        // would have been legal. The ordering holds because `invalidateModel` fires
-        // `emitAssetInvalidated` synchronously BEFORE it disposes anything.
-        for (const mat of materialsOf(obj)) {
-          const base = baseOf(mat);
-          if (disposedMats.has(base)) retireVariantsOf(base);
-        }
-        scene.remove(obj);
-      }
-      state.ecsObjects.delete(id);
-      state.ecsOwners.delete(id);
-      state.ecsSprites.delete(id);
-      state.ecsMaterials.delete(id);
-      state.ecsShadowFlags.delete(id);
-      state.ownsGeometry.delete(id);
-    }
+    for (const id of toEvict) evictEntity(id, disposedMats);
 
     // Skinned (rigged) entries: evict any whose GLB was invalidated so the next
     // syncSkinnedModels rebuilds the clone from the freshly-reloaded prototype.
@@ -1523,7 +1544,10 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
     }
     for (const id of skinnedToEvict) state.skinned.deleteId(id); // disposes, and drops its shadow-flags row
   });
+  return () => { offModel(); offMesh(); };
 }
+
+const NO_MATERIALS: ReadonlySet<THREE.Material> = new Set();
 
 /** Dispose all tracked objects, remove from scene, and clear collections.
  *
@@ -1539,8 +1563,9 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
  *    - **`primitives._placeholderMaterial`**, the module-level sentinel a primitive holds while its
  *      authored material is still loading (or forever, if the ref does not resolve) — documented
  *      at its definition as "must never be disposed";
- *    - **`_defaultMaterial`**, the module-level fallback for an empty ref — `syncMaterial` never
- *      binds it directly (#480), only a per-entity CLONE that IS owned and disposed normally.
+ *    - **`_defaultMaterial`**, the module-level fallback for an empty ref — bound DIRECTLY to every
+ *      empty-ref GLB mesh (#1385); only a primitive gets a per-entity clone, owned and disposed
+ *      normally (#480).
  *  All but the last are process-wide singletons or cache entries, so one panel unmounting broke
  *  them for every panel. Ownership is the only safe discriminator, and it is already tracked. */
 export function disposeRenderState(state: RenderState, scene: THREE.Scene) {
@@ -2929,6 +2954,11 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       // A fresh THREE object is about to be built below, defaulting to no shadow — force the
       // next applyShadowFlags check to re-apply rather than reading a stale "unchanged" key.
       ecsShadowFlags.delete(id);
+      // And the material record, as the eviction listener and the primitive rebuild already do.
+      // Without it an EMPTY-ref entity swapped to another mesh kept `prevMat '' === curMat ''`, so
+      // `syncMaterial` never re-ran and the new mesh drew its BAKED material — not the engine
+      // default an empty ref renders (#1385), and not what the same entity shows after a reload.
+      ecsMaterials.delete(id);
       obj = undefined;
     }
 
@@ -3343,7 +3373,15 @@ function buildBillboardEntry(
     entry.textures.push(null);
     if (part.url) {
       let job = pageCache.get(part.url);
-      if (!job) { job = loadBillboardPage(part.url); pageCache.set(part.url, job); }
+      if (!job) {
+        // Wake on the SHARED job, not per part (#1368 G2): a page landing after the idle gate's
+        // grace redraws nothing on a stopped Scene3D. Once per page per BUILD — `pageCache` is
+        // local to this build, so a rebuild refetches and wakes again; that is bounded because a
+        // rebuild needs a `billboardSig` change, never a plain frame. This `.then` runs before any
+        // part's below, all ahead of the woken frame.
+        job = loadBillboardPage(part.url).then((tex) => { fireDirtyListeners(); return tex; });
+        pageCache.set(part.url, job);
+      }
       job.then((tex) => {
         // Disposed/rebuilt mid-load: the entry is dead and its texture-dispose loop
         // already ran (saw null here), so free this late arrival ourselves — else it leaks.
@@ -4401,10 +4439,13 @@ async function prewarmShadersForWorldInner(
     const template = resolveMeshTemplate(rend.mesh);
     if (!template) { unresolvedMesh++; return; }
     const authored = resolveMaterialForMesh(rend.material, rend.mesh);
-    // An empty `material` is a legitimate "use the mesh's baked material" — only a ref that was
-    // AUTHORED and did not resolve is a miss.
+    // Only a ref that was AUTHORED and did not resolve is a miss. An EMPTY ref draws the engine
+    // default — `syncMaterial` binds `_defaultMaterial` over whatever the build picked (#1385, the
+    // owner's choice: a GLB mesh with no material is grey, not its baked or `.mesh.json` material)
+    // — so that is the variant to compile. This used to compile the baked material for it, a
+    // variant nobody draws, and left the default to `compileLiveScene` after the swap.
     if (rend.material && !authored) unresolvedMaterial++;
-    const material = authored || template.material;
+    const material = rend.material ? (authored || template.material) : _defaultMaterial;
     count += place(template.geometry, material, mirrored, (o) => applyShadowFlags(o, rend.castShadow, rend.receiveShadow));
   });
 

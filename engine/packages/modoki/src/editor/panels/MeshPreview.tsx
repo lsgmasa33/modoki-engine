@@ -6,7 +6,7 @@
 import { useCallback } from 'react';
 import * as THREE from 'three';
 import { whenMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
-import { useModelInvalidationEpoch } from './useAssetInvalidationEpoch';
+import { useModelInvalidationEpoch, useAssetInvalidationEpoch } from './useAssetInvalidationEpoch';
 import { Preview3DShell } from './Preview3DShell';
 import type { PreviewSceneHandle } from './previewScene';
 
@@ -17,7 +17,9 @@ export function MeshPreview({ path }: { path: string }) {
   // Unfiltered on purpose: mapping a `.mesh.json` back to its source model is only
   // possible through the very cache entry the invalidation is about to delete, and
   // rebuilding one 320x220 preview is far cheaper than getting that mapping wrong.
-  const epoch = useModelInvalidationEpoch();
+  // A `'mesh'` event (#1380) is the file's own edit, and it names the `.mesh.json` path directly,
+  // so that half CAN be filtered; it fires only once the new definition is cached.
+  const epoch = useModelInvalidationEpoch() + useAssetInvalidationEpoch('mesh', (p) => p === path);
   const populate = useCallback(async (h: PreviewSceneHandle, signal: AbortSignal) => {
     const template = await whenMeshTemplate(path);
     if (signal.aborted) return;

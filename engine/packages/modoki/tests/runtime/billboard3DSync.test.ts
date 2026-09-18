@@ -30,8 +30,12 @@ async function setup() {
   vi.doMock('../../src/runtime/core/assetRefRules', () => ({ isGuid: (s: string) => !!s }));
   // Mock the KTX2 loader (billboards load part.url via getKTX2Loader / TextureLoader).
   const loadAsync = vi.fn(async () => ({ isTexture: true, colorSpace: '', flipY: false }));
+  // `ensureKtx2Caps` too: `loadBillboardPage` gates a KTX2 page on it. Without it every page load
+  // in this file REJECTED (a missing-export error, swallowed by the `.catch` warn), so no test here
+  // ever saw a page land — found by #1368's G2 test, the first one to wait for one.
   vi.doMock('../../src/runtime/loaders/textureResolver', () => ({
     getKTX2Loader: () => ({ loadAsync }),
+    ensureKtx2Caps: async () => {},
   }));
 
   const { createWorld } = await import('koota');
@@ -291,5 +295,31 @@ describe('syncBillboardSprites — owner stamp (#1197)', () => {
 
     expect(state.billboards.get(id)).toBe(entry); // kept, not rebuilt — the case the stamp must follow
     expect(entry.owner).toBe(second.valueOf());
+  });
+});
+
+// #1368 G2: a billboard page lands asynchronously and binds `mat.map`, but nothing woke the idle
+// gate — so on a stopped Scene3D the page arriving after the ~1 s grace was never drawn. The wake
+// rides the SHARED page job (once per load, whatever number of parts share the page).
+describe('syncBillboardSprites — a landed texture page wakes the idle gate (#1368 G2)', () => {
+  it('wakes once per page load, and the frame it buys sees the map bound', async () => {
+    const { world, traits, sync, bufs, T } = await setup();
+    const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+    const e = spawnBillboard(world, traits);
+    bufs.putSkin2DBuffer(e.id(), { parts: [quadPart(), { ...quadPart(), name: 'arm', order: 1 }] }); // two parts, ONE page
+    const state = sync.createRenderState();
+
+    const mapsOnWokenFrame: boolean[] = [];
+    const off = addDirtyListener(() => {
+      setTimeout(() => {
+        const entry = state.billboards.get(e.id())!;
+        mapsOnWokenFrame.push(entry.meshes.every((m: any) => !!m.material.map));
+      }, 0);
+    });
+    sync.syncBillboardSprites(world, new T.Scene(), state);
+    await vi.waitFor(() => expect(mapsOnWokenFrame.length, 'a landed page must wake an idle surface').toBeGreaterThan(0));
+    await new Promise((r) => setTimeout(r, 0));
+    off();
+    expect(mapsOnWokenFrame, 'one wake for the shared page, and its frame sees every part bound').toEqual([true]);
   });
 });

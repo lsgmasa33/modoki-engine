@@ -8,6 +8,13 @@ export class ModokiSystemWeb extends WebPlugin implements ModokiSystemPlugin {
     return { opened: false };
   }
 
+  // A browser has no store listing to review. Benign `false` rather than `unimplemented()`, because
+  // the game calls this on every platform and a throw would make the editor and the playable build
+  // branch on platform themselves — the thing this package exists to spare them.
+  async requestReview(): Promise<{ requested: boolean }> {
+    return { requested: false };
+  }
+
   // The backup-excluded store is an iOS file store (#1271); the web has PlayerPrefs' localStorage.
   async kvGetAll(): Promise<{ entries: Record<string, string> }> {
     throw this.unimplemented('kvGetAll is iOS-only');

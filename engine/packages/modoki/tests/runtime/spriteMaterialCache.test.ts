@@ -28,6 +28,9 @@ vi.mock('../../src/runtime/rendering/pixiShaderBuilder', () => ({
 }));
 
 let cache: typeof import('../../src/runtime/loaders/spriteMaterialCache');
+/** The SHARED dirty hub every idle-gated surface subscribes to (#1368) — subscribed on the same
+ *  fresh module instance the cache imports, so it hears exactly what a Scene2D would. */
+let wake: ReturnType<typeof vi.fn<() => void>>;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -35,6 +38,8 @@ beforeEach(async () => {
   build = vi.fn<(p: string) => unknown>();
   invalidateProgram = vi.fn<(p?: string) => void>();
   cache = await import('../../src/runtime/loaders/spriteMaterialCache');
+  wake = vi.fn<() => void>();
+  (await import('../../src/runtime/core/renderDirty')).addDirtyListener(wake);
 });
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -72,43 +77,50 @@ describe('ensureSpriteMaterial', () => {
     expect(build).toHaveBeenCalledTimes(1);
   });
 
-  it('invokes onReady once when the async compile resolves (idle-gate wake)', async () => {
+  // #1368 B: the wake lives in the STORE and goes to the shared hub. It used to be a per-caller
+  // `onReady` channel, which woke only the renderers that happened to pass one.
+  it('the store fires the SHARED dirty wake once when the compile lands, after caching it (#1368)', async () => {
     paths.set('g1', 'mat.shader.json');
     const program = { params: [] } as any;
     build.mockResolvedValue(program);
-    const onReady = vi.fn();
+    const seen: unknown[] = [];
+    wake.mockImplementation(() => seen.push(cache.getSpriteMaterialProgram('g1')));
 
-    expect(cache.ensureSpriteMaterial('g1', onReady)).toBeUndefined();
-    expect(onReady).not.toHaveBeenCalled();  // not yet — still loading
+    expect(cache.ensureSpriteMaterial('g1')).toBeUndefined();
+    expect(wake).not.toHaveBeenCalled();  // not yet — still loading
     await flush();
-    expect(onReady).toHaveBeenCalledTimes(1); // fired when the program landed
+    expect(wake).toHaveBeenCalledTimes(1); // fired when the program landed
+    expect(seen, 'a listener that renders synchronously must find the program').toEqual([program]);
   });
-
-  it('invokes EVERY waiting caller onReady, not just the first (two live viewports both wake)', async () => {
+  it('a caller that joins an in-flight compile needs no callback — the one shared wake covers it', async () => {
     paths.set('g1', 'mat.shader.json');
-    const program = { params: [] } as any;
-    build.mockResolvedValue(program);
-    const wakeA = vi.fn(); // GameView renderer's markDirty
-    const wakeB = vi.fn(); // SceneView renderer's markDirty — registered while the compile is in flight
+    build.mockResolvedValue({ params: [] } as any);
 
-    cache.ensureSpriteMaterial('g1', wakeA); // kicks the compile, registers wake A
-    cache.ensureSpriteMaterial('g1', wakeB); // dedups the compile but must still register wake B
+    cache.ensureSpriteMaterial('g1'); // GameView kicks the compile
+    cache.ensureSpriteMaterial('g1'); // SceneView dedups onto it
     await flush();
 
-    expect(wakeA).toHaveBeenCalledTimes(1);
-    expect(wakeB).toHaveBeenCalledTimes(1); // BOTH viewports wake → both swap to the material Mesh
+    expect(wake).toHaveBeenCalledTimes(1); // one hub fire reaches BOTH surfaces
     expect(build).toHaveBeenCalledTimes(1);
   });
 
-  it('does not invoke onReady when the build fails', async () => {
+  it('a cache HIT never wakes — a per-frame caller cannot keep the idle gate awake', async () => {
+    paths.set('g1', 'mat.shader.json');
+    build.mockResolvedValue({ params: [] } as any);
+    cache.ensureSpriteMaterial('g1');
+    await flush();
+    wake.mockClear();
+
+    for (let i = 0; i < 5; i++) expect(cache.ensureSpriteMaterial('g1')).toBeDefined();
+    expect(wake).not.toHaveBeenCalled();
+  });
+  it('does not wake when the build fails', async () => {
     paths.set('g1', 'mat.shader.json');
     build.mockResolvedValue(null);
-    const onReady = vi.fn();
-    cache.ensureSpriteMaterial('g1', onReady);
+    cache.ensureSpriteMaterial('g1');
     await flush();
-    expect(onReady).not.toHaveBeenCalled();
+    expect(wake).not.toHaveBeenCalled();
   });
-
   it('marks a failed build and does not retry it every frame', async () => {
     paths.set('g1', 'mat.shader.json');
     build.mockResolvedValue(null); // buildPixiShaderProgram fell back
@@ -119,16 +131,15 @@ describe('ensureSpriteMaterial', () => {
     expect(build).toHaveBeenCalledTimes(1); // not retried
   });
 
-  it('a REJECTED compile clears loading/waiters, marks failed, warns, and never re-invokes onReady or build', async () => {
+  it('a REJECTED compile clears loading, marks failed, warns, and never wakes or rebuilds', async () => {
     paths.set('g1', 'mat.shader.json');
     build.mockRejectedValue(new Error('boom')); // buildPixiShaderProgram's promise rejects → .catch
-    const onReady = vi.fn();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    expect(cache.ensureSpriteMaterial('g1', onReady)).toBeUndefined(); // kicks off the compile
+    expect(cache.ensureSpriteMaterial('g1')).toBeUndefined(); // kicks off the compile
     await flush();
 
-    expect(onReady).not.toHaveBeenCalled();                 // waiters dropped, no wake on failure
+    expect(wake).not.toHaveBeenCalled();                 // no wake on failure
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining('[spriteMaterialCache] failed to build 2D material g1'),
     );
@@ -136,9 +147,9 @@ describe('ensureSpriteMaterial', () => {
 
     // failed-marker holds: subsequent ensures return undefined without recompiling.
     expect(cache.ensureSpriteMaterial('g1')).toBeUndefined();
-    expect(cache.ensureSpriteMaterial('g1', onReady)).toBeUndefined();
+    expect(cache.ensureSpriteMaterial('g1')).toBeUndefined();
     expect(build).toHaveBeenCalledTimes(1); // not retried after the rejection
-    expect(onReady).not.toHaveBeenCalled();
+    expect(wake).not.toHaveBeenCalled();
   });
 
   // #1055. A JavaScriptCore stack (iOS) is frames only, so `stack || message` warned with a frame and
@@ -224,26 +235,26 @@ describe('ensureSpriteMaterial', () => {
     const first = deferred<unknown>();
     const second = deferred<unknown>();
     build.mockReturnValueOnce(first.promise);
-    const onReady = vi.fn();
 
     expect(cache.ensureSpriteMaterial('g1')).toBeUndefined(); // first compile in flight
     cache.clearSpriteMaterialCache();                          // supersedes the first
+    wake.mockClear();                                          // (the clear's own wake — tested below)
 
     build.mockReturnValueOnce(second.promise);
-    expect(cache.ensureSpriteMaterial('g1', onReady)).toBeUndefined(); // second compile + waiter registered
+    expect(cache.ensureSpriteMaterial('g1')).toBeUndefined(); // second compile in flight
     expect(build).toHaveBeenCalledTimes(2);
 
     first.resolve(staleProgram); // superseded resolve must not touch the second compile's state
     await flush();
 
-    // The second compile's in-flight/waiter bookkeeping must have survived the first's cleanup.
+    // The second compile's in-flight bookkeeping must have survived the first's cleanup.
     expect(cache.getSpriteMaterialProgram('g1')).toBeUndefined(); // fresh compile hasn't landed yet
-    expect(onReady).not.toHaveBeenCalled();
+    expect(wake).not.toHaveBeenCalled();
 
     second.resolve(freshProgram);
     await flush();
 
-    expect(onReady).toHaveBeenCalledTimes(1); // the fresh compile's own waiter fires
+    expect(wake).toHaveBeenCalledTimes(1); // the fresh compile's store wakes
     expect(cache.getSpriteMaterialProgram('g1')).toBe(freshProgram);
   });
 
@@ -256,13 +267,13 @@ describe('ensureSpriteMaterial', () => {
     const second = deferred<unknown>();
     build.mockReturnValueOnce(first.promise);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const onReady = vi.fn();
 
     expect(cache.ensureSpriteMaterial('g1')).toBeUndefined(); // first compile in flight
     cache.clearSpriteMaterialCache();                          // supersedes it
+    wake.mockClear();                                          // (the clear's own wake — tested below)
 
     build.mockReturnValueOnce(second.promise);
-    expect(cache.ensureSpriteMaterial('g1', onReady)).toBeUndefined(); // second compile in flight
+    expect(cache.ensureSpriteMaterial('g1')).toBeUndefined(); // second compile in flight
 
     first.reject(new Error('boom'));
     await flush();
@@ -275,7 +286,7 @@ describe('ensureSpriteMaterial', () => {
     second.resolve({ params: [], id: 'fresh' } as any);
     await flush();
 
-    expect(onReady).toHaveBeenCalledTimes(1);
+    expect(wake).toHaveBeenCalledTimes(1);
     expect(cache.getSpriteMaterialProgram('g1')).toEqual({ params: [], id: 'fresh' });
     warn.mockRestore();
   });
@@ -284,42 +295,28 @@ describe('ensureSpriteMaterial', () => {
   // avoid clobbering them. Without this, a renderer still live after a sibling's clear (e.g.
   // Scene2D.stop() on one viewport while another keeps drawing) never learns its material landed
   // and is stuck on the fallback sprite until some unrelated dirty.
-  it('clearSpriteMaterialCache wakes waiters whose compile it superseded', async () => {
+  it('clearSpriteMaterialCache wakes once when it superseded a compile, and the stale resolve wakes nobody', async () => {
     paths.set('g1', 'mat.shader.json');
     const staleProgram = { params: [], id: 'stale' } as any;
     const { promise, resolve } = deferred<unknown>();
     build.mockReturnValue(promise); // never settles before the clear
-    const onReady = vi.fn();
-    const onReady2 = vi.fn();
 
-    expect(cache.ensureSpriteMaterial('g1', onReady)).toBeUndefined();   // kicks off the compile
-    expect(cache.ensureSpriteMaterial('g1', onReady2)).toBeUndefined();  // dedups, takes the loading.has branch
+    expect(cache.ensureSpriteMaterial('g1')).toBeUndefined();   // kicks off the compile
+    expect(cache.ensureSpriteMaterial('g1')).toBeUndefined();   // dedups, takes the loading.has branch
 
     cache.clearSpriteMaterialCache();
-
-    expect(onReady).toHaveBeenCalledTimes(1);
-    expect(onReady2).toHaveBeenCalledTimes(1);
+    expect(wake).toHaveBeenCalledTimes(1);
 
     // The superseded compile eventually resolving must not cache anything or wake anyone again.
     resolve(staleProgram);
     await flush();
     expect(cache.getSpriteMaterialProgram('g1')).toBeUndefined();
-    expect(onReady).toHaveBeenCalledTimes(1);
-    expect(onReady2).toHaveBeenCalledTimes(1);
+    expect(wake).toHaveBeenCalledTimes(1);
   });
 
-  it('clearSpriteMaterialCache: a waiter that throws does not starve the waiters after it (#953)', () => {
-    paths.set('g1', 'mat.shader.json');
-    build.mockReturnValue(new Promise(() => {})); // in flight forever, so both waiters stay parked
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const second = vi.fn();
-    cache.ensureSpriteMaterial('g1', () => { throw new Error('bad wake'); });
-    cache.ensureSpriteMaterial('g1', second);
-
-    expect(() => cache.clearSpriteMaterialCache()).not.toThrow();
-
-    expect(second, 'every map is already cleared, so a starved wake is never fired again').toHaveBeenCalledTimes(1);
-    expect(errSpy).toHaveBeenCalled();
+  it('clearSpriteMaterialCache with nothing in flight does not wake', () => {
+    cache.clearSpriteMaterialCache();
+    expect(wake).not.toHaveBeenCalled();
   });
 });
 
@@ -367,25 +364,26 @@ describe('invalidateShader (#852 per-key)', () => {
     expect(invalidateProgram).toHaveBeenCalledWith(PATH_A); // the pixiShaderBuilder optimisation still runs
   });
 
-  it('a waiter that throws skips neither the waiters after it nor the pixiShaderBuilder eviction (#953)', async () => {
-    // Pre-#953 the per-key wake was a bare loop, so a throw escaped `invalidateShader` BEFORE its
-    // last statement, `invalidatePixiShaderProgram(manifestPath)`: the edit silently did not take.
+  it('wakes AFTER evicting the edited program, and still runs the pixiShaderBuilder eviction (#523, #1368)', async () => {
+    // `emitAssetInvalidated` also fires the hub, but BEFORE the eviction (subscribers must read
+    // what is about to go). A renderer woken only by that sees the old program; the store's own
+    // wake is the one whose frame re-`ensure`s against the new generation.
     const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
     paths.set(GUID_A, PATH_A);
     registerAsset(GUID_A, PATH_A, 'shader');
-    build.mockReturnValue(new Promise(() => {})); // in flight forever, so both waiters stay parked
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const second = vi.fn();
-    cache.ensureSpriteMaterial(GUID_A, () => { throw new Error('bad wake'); });
-    cache.ensureSpriteMaterial(GUID_A, second);
+    const programA = { params: [], id: 'A' } as any;
+    build.mockResolvedValue(programA);
+    cache.ensureSpriteMaterial(GUID_A);
+    await flush();
+    const seen: unknown[] = [];
+    wake.mockImplementation(() => seen.push(cache.getSpriteMaterialProgram(GUID_A)));
 
-    expect(() => cache.invalidateShader(PATH_A)).not.toThrow();
+    cache.invalidateShader(PATH_A);
 
-    expect(second).toHaveBeenCalledTimes(1);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.at(-1), 'the last wake must land after the eviction').toBeUndefined();
     expect(invalidateProgram).toHaveBeenCalledWith(PATH_A);
-    expect(errSpy).toHaveBeenCalled();
   });
-
   it('resolves a WATCHER-shaped path (a leading-slash asset URL, not a bare relative path invented by a test)', async () => {
     const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
     // Shape produced by absToAssetUrl (engine/plugins/vite-asset-scanner.ts) — what
@@ -457,41 +455,33 @@ describe('invalidateShader (#852 per-key)', () => {
     expect(cache.getSpriteMaterialProgram(GUID_B)).toBe(freshProgramB);
   });
 
-  it('wakes the invalidated guid\'s waiters, and does NOT wake an unrelated guid\'s', async () => {
-    // The per-key mirror of `clearSpriteMaterialCache wakes waiters whose compile it superseded`.
-    // A superseded compile fires no `onReady`, so evicting the set without firing it leaves a
-    // still-live renderer with no signal to re-`ensure` — its entities stay on the fallback
-    // sprite until an unrelated dirty. That is this issue's flash, made permanent for the one
-    // shader actually edited.
+  it('invalidating A leaves B\'s in-flight compile alone — it still lands and wakes on its own', async () => {
     // ⚠️ `registerAsset` is NOT optional here, and omitting it does not fail loudly — it makes
     // `getGuidForPath` return undefined, so `invalidateShader` takes its unresolved-path FALLBACK
     // and this test silently asserts against the wholesale clear, i.e. the exact behaviour #852
-    // removed. It passed anyway in a whole-file run because `assetManifest`'s module-level
-    // `pathToGuid` is NOT reset by `vi.resetModules()` and still held the earlier tests'
-    // registrations; run alone, it failed. Every test in this block needs its own.
+    // removed. `assetManifest`'s module-level `pathToGuid` is NOT reset by `vi.resetModules()`,
+    // so a whole-file run can pass on an earlier test's registration; every test needs its own.
     const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
     paths.set(GUID_A, PATH_A);
     paths.set(GUID_B, PATH_B);
     registerAsset(GUID_A, PATH_A, 'shader');
     registerAsset(GUID_B, PATH_B, 'shader');
     const { promise: pA } = deferred<unknown>();
-    const { promise: pB } = deferred<unknown>();
-    const onReadyA = vi.fn();
-    const onReadyA2 = vi.fn();
-    const onReadyB = vi.fn();
+    const b = deferred<unknown>();
+    const programB = { params: [], id: 'B' } as any;
 
     build.mockReturnValueOnce(pA);
-    expect(cache.ensureSpriteMaterial(GUID_A, onReadyA)).toBeUndefined();
-    expect(cache.ensureSpriteMaterial(GUID_A, onReadyA2)).toBeUndefined(); // dedups onto the same compile
-    build.mockReturnValueOnce(pB);
-    expect(cache.ensureSpriteMaterial(GUID_B, onReadyB)).toBeUndefined();
+    expect(cache.ensureSpriteMaterial(GUID_A)).toBeUndefined();
+    build.mockReturnValueOnce(b.promise);
+    expect(cache.ensureSpriteMaterial(GUID_B)).toBeUndefined();
 
     cache.invalidateShader(PATH_A);
+    expect(wake).toHaveBeenCalled(); // A's superseded compile will never wake — the eviction did
+    wake.mockClear();
 
-    // EVERY waiter on A wakes — not just the first (two live viewports each register their own).
-    expect(onReadyA).toHaveBeenCalledTimes(1);
-    expect(onReadyA2).toHaveBeenCalledTimes(1);
-    // B's compile is untouched and still in flight, so its waiter must NOT have been woken.
-    expect(onReadyB).not.toHaveBeenCalled();
+    b.resolve(programB);
+    await flush();
+    expect(cache.getSpriteMaterialProgram(GUID_B)).toBe(programB);
+    expect(wake).toHaveBeenCalledTimes(1);
   });
 });

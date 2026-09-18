@@ -111,11 +111,15 @@ vi.stubGlobal('fetch', mockFetch);
 
 // Mock template cache
 let mockTemplates = new Map<string, { geometry: THREE.BufferGeometry; material: THREE.Material; name: string }>();
+/** Each `invalidateMeshAsset` call, with the file's content ON DISK at that moment — so a test can
+ *  tell an eviction made AFTER the write from one made before it (#1380). */
+let meshInvalidations: Array<{ path: string; contentAtCall: string | undefined }> = [];
 vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
   loadModelTemplates: vi.fn(async () => {}),
   getTemplatesForModel: vi.fn(() => mockTemplates),
   invalidateModel: vi.fn(),
   invalidateMaterial: vi.fn(),
+  invalidateMeshAsset: (path: string) => { meshInvalidations.push({ path, contentAtCall: vfsFiles.get(path) }); },
   // modelImport reaches this module through `reimportInvalidation` now (#1366), and that
   // module imports `invalidateEnvironment` too. An explicit-list mock factory has to carry
   // every export its importers actually reach, or the import throws before any test runs.
@@ -151,6 +155,7 @@ beforeEach(() => {
   vfsFiles = new Map();
   vfsMeta = new Map();
   deletedPaths = [];
+  meshInvalidations = [];
   metaReadFails = new Set();
   mockTemplates = new Map();
   mockPostprocessor = {};
@@ -185,6 +190,29 @@ async function getModule() {
 }
 
 const GLB = '/assets/models/level.glb';
+
+describe('the .mesh.json write is followed by its own eviction (#1380)', () => {
+  it('evicts each written .mesh.json AFTER its bytes are on disk, on a re-import that changes them', async () => {
+    // `invalidateModelAndRig` evicts BEFORE the write, and the awaits between leave a window for a
+    // render frame to refetch the OLD file; the write itself is `markEditorWrite`-suppressed, so the
+    // watcher never evicts it either. Only an eviction that sees the NEW content closes that window.
+    const { importModel } = await getModule();
+    addTemplate('wall', mat('brick'));
+    await importModel(GLB, 'level');
+    const meshFile = [...vfsFiles.keys()].find((p) => p.endsWith('.mesh.json'))!;
+
+    meshInvalidations = [];
+    // A different material only to make the second import write DIFFERENT bytes to the same
+    // `.mesh.json` — what this asserts is the eviction's timing, not anything the renderer draws.
+    addTemplate('wall', mat('stone', 0x223344));
+    await importModel(GLB, 'level');
+
+    const written = vfsFiles.get(meshFile);
+    expect(meshInvalidations.map((c) => c.path)).toContain(meshFile);
+    expect(meshInvalidations.find((c) => c.path === meshFile)?.contentAtCall,
+      'the eviction must run once the NEW bytes are written, not before').toBe(written);
+  });
+});
 
 describe('re-import id stability (Missing-Test #7)', () => {
   it('preserves the GLB / mesh / material guids across a re-import', async () => {

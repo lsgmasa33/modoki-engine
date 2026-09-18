@@ -75,6 +75,15 @@ export const notifications = {
 };
 
 /**
+ * The store review prompt (#939) — a no-op namespace, for the same reason as the others: a playable
+ * ad runs inside an ad SDK's webview with no app to review, and reaching a Capacitor plugin from
+ * there would pull the whole native bridge into a build with a 5 MB ceiling.
+ */
+export const review = {
+  async request(): Promise<boolean> { return false; },
+};
+
+/**
  * Ads — a no-op namespace, mirroring `export * as ads from './ads'` in Court's package (#342) and
  * Weaveling's (#1309).
  *
@@ -93,6 +102,8 @@ export const ads = {
   rewardedReady(): boolean { return false; },
   // #1330 — the break before an ad asks whether one is loaded; a playable has none, so no card shows.
   interstitialReady(): boolean { return false; },
+  // #1379 — the purchase card waits while an ad is up; a playable never shows one.
+  fullscreenAdShowing(): boolean { return false; },
   bannerHeightPx(): number { return 0; },
   privacyOptionsRequired(): boolean { return false; },
   async showPrivacyOptions(): Promise<void> {},

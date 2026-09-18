@@ -295,7 +295,7 @@ export {
   registerRuntimeMeshTemplate, unregisterRuntimeMeshTemplate,
   resolveMaterial, resolveMaterialForMesh,
   getTemplatesForModel,
-  invalidateModel, invalidateMaterial, disposeAllCachedResources,
+  invalidateModel, invalidateMaterial, invalidateMeshAsset, disposeAllCachedResources,
   invalidateEnvironment,
   onModelInvalidated,
   // ⚠️ A RE-IMPORT evicts through `REIMPORT_INVALIDATORS` below, never by calling these
