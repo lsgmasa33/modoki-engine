@@ -28,7 +28,7 @@
 // `import.meta.hot.invalidate()` — it only propagates to importers and was silently
 // swallowed by Scene3D.tsx's Fast Refresh boundary.
 
-import { normalView, materialReference, outputStruct, vec4 } from 'three/tsl';
+import { normalView, materialReference, outputStruct, vec4, emissive, diffuseColor, luminance, saturate, mix, max } from 'three/tsl';
 // A real import, not just the re-export below: `nprFragmentOutput` CALLS this, and a
 // re-export creates no local binding.
 import { ensureLineColorOnMaterials } from '../materialExtras';
@@ -72,6 +72,35 @@ export function nprFragmentOutput(colorRGBA: unknown, preserve?: unknown): unkno
     colorRGBA as any,
     vec4(normalView, 1.0) as any,
     vec4(materialReference('lineColor', 'color') as any, preserveNode as any) as any,
+  );
+}
+
+/** The `lineColor` MRT target every STANDARD material writes when NPR is on (custom
+ *  shaders write their own via `nprFragmentOutput`): rgb = outline colour, a = colour
+ *  preserve. Both are pulled toward the fragment's EMISSIVE by how strongly it glows (#1416),
+ *  so NPR neither outlines nor greys out a light source. `gain` is the authored
+ *  `NPRPostFX.emissivePassthrough` uniform (0 = the pre-#1416 look, exactly):
+ *   - preserve → `max(nprColorPreserve, m)`: the composite keeps the true, UNCLAMPED lit
+ *     colour, so bloom downstream sees the HDR value instead of a grayscale fill capped at 1.
+ *   - lineColor → `mix(lineColor, emissive, m)`: a line drawn ON a glowing pixel is in the
+ *     surface's own colour and vanishes. The neighbouring non-emissive pixels still draw
+ *     theirs, so the glow keeps its silhouette outline.
+ *  `m = saturate(luminance(emissive) × gain) × alpha`, where `emissive` is three's per-fragment
+ *  emissive PROPERTY (colour × intensity × map), so a material with no emissive is exactly the
+ *  old `vec4(lineColor, nprColorPreserve)`. The `× alpha` (`diffuseColor.a`) is load-bearing:
+ *  three gives every MRT target except `output` NO blending, so a transparent draw OVERWRITES
+ *  this target — an alpha-faded emissive halo card would otherwise punch a full-colour window through
+ *  the grayscale image behind it. Measured before the fix: small dense glows in
+ *  postfx-demo were ~95% edge pixels and rendered black (chandelier p99 luma 14 vs 232 with
+ *  lines off) — the Sobel lines, not a lost emissive term, were what darkened them. */
+export function nprLineColorTarget(gain: unknown): unknown {
+  ensureLineColorOnMaterials();
+  // The casts are types only: @types/three 0.185+ types `materialReference` as an untyped
+  // `MaterialReferenceNode`, which the TSL math overloads no longer accept.
+  const glow = (saturate((luminance(emissive) as any).mul(gain)) as any).mul((diffuseColor as any).a);
+  return vec4(
+    mix(materialReference('lineColor', 'color') as any, emissive, glow) as any,
+    max(materialReference('nprColorPreserve', 'float') as any, glow) as any,
   );
 }
 
@@ -126,6 +155,8 @@ export interface NPRConfig {
   lineStrength: number;
   grayscaleGamma: number;
   grayscaleLift: number;
+  /** Emissive pass-through gain (#1416) — see `nprLineColorTarget`. */
+  emissivePassthrough: number;
   /** Enable FXAA post-AA on the composite output. */
   fxaa: boolean;
   /** Relative-contrast threshold for FXAA edge detection (typical 0.05–0.25). */

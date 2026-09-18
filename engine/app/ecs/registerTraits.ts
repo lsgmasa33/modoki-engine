@@ -1405,6 +1405,7 @@ export function registerAllTraits() {
       lineStrength: { type: 'number', step: 0.05, min: 0, max: 1, section: 'Lines', tooltip: 'Multiplier on the line mask. 1 = full black, 0 = no lines.' },
       grayscaleGamma: { type: 'number', step: 0.05, min: 0.1, max: 2, section: 'Grayscale Fill', tooltip: 'Luminance remap exponent. <1 lifts midtones toward highlights.', showWhen: { fillMode: ['grayscale'] } },
       grayscaleLift: { type: 'number', step: 0.05, min: 0, max: 1, section: 'Grayscale Fill', tooltip: 'Black lift. Higher pushes shadows toward white.', showWhen: { fillMode: ['grayscale'] } },
+      emissivePassthrough: { type: 'number', step: 0.1, min: 0, max: 4, section: 'Emissive', tooltip: 'How strongly glowing (emissive) surfaces escape the stylization: kept in full HDR colour so bloom sees them, with no line drawn on them. 0 = stylize emissive like everything else.' },
       fxaa: { type: 'boolean', section: 'FXAA', tooltip: 'Post-process antialiasing on the composite output. Reduces silhouette aliasing during rotation.' },
       fxaaEdgeThreshold: { type: 'number', step: 0.005, min: 0, max: 0.5, section: 'FXAA', tooltip: 'Relative-contrast threshold. Higher = AA only on stronger edges. Typical 0.05–0.25.', showWhen: { fxaa: ['true'] } },
       fxaaEdgeThresholdMin: { type: 'number', step: 0.001, min: 0, max: 0.1, section: 'FXAA', tooltip: 'Absolute luma floor — pixels below this are treated as flat. Typical 0.01–0.05.', showWhen: { fxaa: ['true'] } },

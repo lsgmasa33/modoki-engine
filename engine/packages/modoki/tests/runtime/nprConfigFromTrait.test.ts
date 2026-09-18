@@ -13,7 +13,7 @@ const snap = (over: Partial<NprTraitSnapshot> = {}): NprTraitSnapshot => ({
   fillMode: 'grayscale',
   depthThreshold: 0.1, normalThreshold: 0.2, colorThreshold: 0.3,
   lineThickness: 1, lineStrength: 0.5,
-  grayscaleGamma: 1.2, grayscaleLift: 0.05,
+  grayscaleGamma: 1.2, grayscaleLift: 0.05, emissivePassthrough: 1,
   fxaa: true, fxaaEdgeThreshold: 0.125, fxaaEdgeThresholdMin: 0.05, fxaaBlendStrength: 4,
   superSampleScale: 1,
   ...over,
@@ -58,6 +58,9 @@ describe('nprConfigSignature', () => {
     expect(nprConfigSignature(nprConfigFromTrait(snap({ lineThickness: 2 }), 0x000000))).not.toBe(base);
     expect(nprConfigSignature(nprConfigFromTrait(snap({ fxaa: false }), 0x000000))).not.toBe(base);
     expect(nprConfigSignature(nprConfigFromTrait(snap({ superSampleScale: 2 }), 0x000000))).not.toBe(base);
+    // #1416: kept complete for consistency only. `nprConfigSignature` has no production caller; the
+    // guard that actually gates the live uniform write is `stackSignature` (postfxStackPlan.test.ts).
+    expect(nprConfigSignature(nprConfigFromTrait(snap({ emissivePassthrough: 0 }), 0x000000))).not.toBe(base);
     expect(nprConfigSignature(nprConfigFromTrait(snap(), 0x010000))).not.toBe(base); // clearColor only
   });
 

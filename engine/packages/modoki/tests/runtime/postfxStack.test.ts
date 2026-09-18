@@ -85,6 +85,13 @@ const scenePasses: ReturnType<typeof makeScenePass>[] = [];
 
 // `uniform()` with an observable `.value` and a chaining `.setName()` (the NPR
 // + FXAA stages call `uniform(x).setName('...')`).
+// A TSL-shaped node for the lineColor target's math (#1416): `.mul()` chains like TSL, and it is
+// NON-enumerable so `toEqual` compares only the recorded structure, never the method.
+function tslNode<T extends object>(tag: T): T {
+  Object.defineProperty(tag, 'mul', { enumerable: false, value: (x: unknown) => tslNode({ __mul: [tag, x] }) });
+  return tag;
+}
+
 function makeUniform(initial: unknown) {
   const u: { value: unknown; setName: () => typeof u } = { value: initial, setName: () => u };
   return u;
@@ -187,6 +194,12 @@ beforeEach(() => {
     materialReference: vi.fn((n: string) => ({ __matRef: n })),
     outputStruct: vi.fn((...a: unknown[]) => ({ __outputStruct: a })),
     vec4: vi.fn((...a: unknown[]) => ({ __vec4: a })),
+    // The lineColor MRT target's emissive terms (#1416, `nprLineColorTarget`).
+    emissive: { __emissive: true },
+    diffuseColor: { a: { __alpha: true } },
+    luminance: vi.fn((v: unknown) => tslNode({ __luminance: v })),
+    saturate: vi.fn((v: unknown) => tslNode({ __saturate: v })),
+    max: vi.fn((a: unknown, b: unknown) => ({ __max: [a, b] })),
   }));
 
   vi.doMock('three/webgpu', () => ({
@@ -272,7 +285,7 @@ const nprCfg = (over: Record<string, unknown> = {}) => ({
   isOrthographic: false, superSampleScale: 1, fillMode: 'grayscale',
   depthThreshold: 0.005, normalThreshold: 0.4, colorThreshold: 0.15,
   lineThickness: 1, lineStrength: 1, grayscaleGamma: 0.7, grayscaleLift: 0.3,
-  clearColor: 0x000000, ...over,
+  emissivePassthrough: 1, clearColor: 0x000000, ...over,
 });
 const fxaaCfg = (over: Record<string, unknown> = {}) => ({
   edgeThreshold: 0.125, edgeThresholdMin: 0.0312, blendStrength: 4, ...over,
@@ -577,6 +590,29 @@ describe('PostFXStack — NPR stylize stage', () => {
     expect(Object.keys(dict).sort()).toEqual(['lineColor', 'normal', 'output']);
   });
 
+  // #1416: small, dense emissive geometry (postfx-demo's chandelier glows) was ~all edge pixels,
+  // so the Sobel lines painted it black and the grayscale fill clamped what survived to 1.0. The
+  // lineColor target pulls BOTH its fields toward the fragment's emissive, by how strongly it
+  // glows: preserve → the composite keeps the HDR lit colour (bloom sees it), line colour → the
+  // surface's own colour (a line drawn on the glow vanishes).
+  it('pulls the lineColor target toward the fragment emissive, by glow strength (#1416)', async () => {
+    const { pass } = await import('three/tsl');
+    await makeStack({ npr: nprCfg({ emissivePassthrough: 0.5 }) });
+    const scenePass = (pass as unknown as ReturnType<typeof vi.fn>).mock.results[0].value;
+    const dict = scenePass.setMRT.mock.calls[0][0] as Record<string, unknown>;
+    // m = saturate(luminance(emissive) × gain) × alpha. The gain is the authored knob's live
+    // uniform, seeded from the request; the × alpha stops a transparent emissive draw (which
+    // OVERWRITES this unblended target) from punching a full-colour window through the image.
+    const gain = expect.objectContaining({ value: 0.5 });
+    const glow = { __mul: [{ __saturate: { __mul: [{ __luminance: { __emissive: true } }, gain] } }, { __alpha: true }] };
+    expect(dict.lineColor).toEqual({
+      __vec4: [
+        { __mix: [{ __matRef: 'lineColor' }, { __emissive: true }, glow] },
+        { __max: [{ __matRef: 'nprColorPreserve' }, glow] },
+      ],
+    });
+  });
+
   it('excludes the particle layer from the geometry pass (particles are stage 2)', async () => {
     const { pass } = await import('three/tsl');
     const { PARTICLE_LAYER } = await import('../../src/runtime/rendering/layers');
@@ -771,6 +807,17 @@ describe('PostFXStack — NPR rebuild-vs-live contract (blocker 5)', () => {
     const u = (buildCompositeNodeSpy.mock.calls[0][0] as any).uniforms;
     expect(stack.setConfig({ npr: nprCfg({ clearColor: 0xff8800 }) } as never)).toBe(false);
     expect((u.clearColor.value as THREE.Color).getHex()).toBe(0xff8800);
+  });
+
+  it('writes emissivePassthrough into the lineColor target\'s gain uniform LIVE (#1416)', async () => {
+    const { pass } = await import('three/tsl');
+    const stack = await makeStack({ npr: nprCfg({ emissivePassthrough: 1 }) });
+    const scenePass = (pass as unknown as ReturnType<typeof vi.fn>).mock.results[0].value;
+    const lineColor = scenePass.setMRT.mock.calls[0][0].lineColor as { __vec4: [{ __mix: unknown[] }, unknown] };
+    const gain = ((lineColor.__vec4[0].__mix[2] as any).__mul[0].__saturate.__mul[1]) as { value: number };
+    expect(gain.value).toBe(1);
+    expect(stack.setConfig({ npr: nprCfg({ emissivePassthrough: 0 }) } as never)).toBe(false);
+    expect(gain.value).toBe(0); // the SAME uniform the MRT node holds — no rebuild, no stale copy
   });
 
   it('returns TRUE when superSampleScale changes (resizes every render target)', async () => {

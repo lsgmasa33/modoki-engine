@@ -3795,6 +3795,46 @@ whenever `superSampleScale > 1` (SSAA already covers it, at scale² cost).
 
 The material property `nprColorPreserve` (0..1) lets a material keep its true hue through NPR. It's injected into the `lineColor` MRT target's **alpha**; the composite lerps the grayscale fill toward the lit scene color by that amount (`mix(fill, sceneColor, preserve)`). Outlines are still drawn on top at every preserve level.
 
+**Emissive surfaces pass through NPR** (#1416). For a standard material, the `lineColor` target
+pulls both fields toward the fragment's emissive, by
+`m = saturate(luminance(emissive) × emissivePassthrough) × alpha` — `nprLineColorTarget()` in
+`npr/NPRPostProcess.ts`. `emissivePassthrough` is an `NPRPostFX` field (default 1, a live
+uniform; **0 reproduces the pre-#1416 look exactly**, which makes it the before/after switch too). Preserve becomes `max(nprColorPreserve, m)`,
+so a glowing pixel keeps its true lit colour, **unclamped**, and bloom downstream sees its HDR
+value instead of a grayscale fill capped at 1.0. The line colour becomes
+`mix(lineColor, emissive, m)`, so a line drawn ON the glow is in its own colour and vanishes,
+while non-emissive neighbours still draw theirs, so a glow in front of geometry keeps its
+silhouette. A glow in front of empty background has no outline at all, because the composite draws
+no line where nothing was drawn (`isForeground`). `emissive`
+is three's per-fragment property (colour × intensity × map), so a non-emissive material writes
+exactly the old `vec4(lineColor, nprColorPreserve)`. A custom shader using `nprFragmentOutput`
+does not get this, because it writes the target itself. Why it matters: postfx-demo's glows are
+small, dense geometry that is nearly all Sobel edge pixels. The black line colour replaced them,
+and emissive was never actually lost. Before/after, measured on a sconce glow in the editor: the
+disc went from grey 225 with its rim eaten by the outline (1,393 bright px) to warm
+(254,248,232) at full size (1,792 px), and the bloom halo at 60px from centre went 47 → 134 luma.
+**Why the × alpha:** three gives every MRT target except `output` **no blending**
+(`MRTNode.getBlendMode`), so a transparent draw OVERWRITES `lineColor` whatever its opacity.
+Unscaled, an alpha-faded emissive halo card would cut a full-colour window through the grayscale
+image behind it. This covers fading through ALPHA only. An additive-blended card (faint through
+its rgb, alpha 1) would still cut the window, but none is reachable today: material assets expose
+no `blending`, glTF has no additive mode, and additive particles are excluded from the NPR pass
+(`PARTICLE_LAYER`). **Two things no test catches:** a three bump that renames or stops assigning the
+`EmissiveColor` property (`NodeMaterial.setupLighting`) silently makes `m ≡ 0`, and the mocked-TSL
+unit test stays green. And a non-emissive material reads an **unassigned** `EmissiveColor`. It is
+zero-initialised on WebGPU (WGSL `var<private>`, observed), and on the WebGL2 fallback it relies on
+WebGL's zero-initialisation rule, which has **not been observed** on a device. Check both with the
+following check when raising the three ceiling. (1) With NPR on, dump the renderer's fragment programs
+(`modoki_eval`: `window.__3d.renderer._pipelines.programs.fragment`, each entry's `.code`) and
+confirm the MRT's third output still mixes toward `EmissiveColor`, which is still assigned in
+the lighting setup. (2) Look up close at a postfx-demo sconce glow with `emissivePassthrough` at 0
+and then 1: the disc must go from grey and outlined to warm and full-sized. (3) Once, on the
+WebGL2 fallback (the iPhone 8), confirm that non-emissive surfaces still render grayscale and
+outlined.
+⚠️ **Measure this class close up.** At gallery distance the glows are ~4px, mostly inside their
+lamp shades, and tone-mapped to near-white. A crop there reads the same before and after the
+fix, and one session nearly concluded the fix did nothing.
+
 Both `lineColor` and `nprColorPreserve` are auto-patched onto `THREE.Material.prototype` via `Object.defineProperty` (defaulting to black / `0`), so `materialReference(...)` resolves for **all** materials — including GLB-imported ones — without patching every creation site. (The `Tint` trait sets `nprColorPreserve` on its tinted clones so the grayscale fill blends toward the team color.)
 
 ⚠️ **Both values are stored in `userData`, under one namespaced key, by `rendering/materialExtras.ts` — never in a `_`-prefixed backing field.** That is not a style choice; a `_` field survives **neither** clone route in this engine (#351). `Material.copy()` is a hand-written field list that has never heard of ours, and `cloneDerived` skips `/^(is[A-Z]|_)/` as three's own private-field convention. While they lived in `_nprColorPreserve` / `_lineColor`, a mesh that was **both tinted and light-masked** lost its `Tint.amount` and rendered at `nprColorPreserve: 0` — full grayscale fill. It failed in the confusing direction, because `.color` IS a field `Material.copy()` knows: the object looked tinted while the preserve strength was wrong, which reads as an NPR/lighting bug rather than a Tint one.
@@ -3821,6 +3861,7 @@ Two rules follow, and both are load-bearing:
 | `lineStrength` | `1` | Multiplier on the line mask before darkening the fill (0..1). |
 | `grayscaleGamma` | `0.7` | Luminance remap exponent (grayscale mode); `<1` lifts midtones. |
 | `grayscaleLift` | `0.3` | Black lift in grayscale mode (0..1). |
+| `emissivePassthrough` | `1` | Gain on emissive luminance: how strongly a glowing surface escapes the stylization (kept in HDR colour, no line on it). `0` = the pre-#1416 look. See [Color preservation](#color-preservation). |
 | `fxaa` | `true` | FXAA post-AA on the composite output. |
 | `fxaaEdgeThreshold` | `0.125` | FXAA relative-contrast threshold (typical 0.05–0.25). |
 | `fxaaEdgeThresholdMin` | `0.0312` | FXAA absolute luma floor — pixels below are flat. |

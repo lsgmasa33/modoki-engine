@@ -87,6 +87,7 @@ export function scanPostFXTraits(world: World): PostFXTraitScan {
       lineStrength: fx.lineStrength,
       grayscaleGamma: fx.grayscaleGamma,
       grayscaleLift: fx.grayscaleLift,
+      emissivePassthrough: fx.emissivePassthrough,
       fxaa: fx.fxaa,
       fxaaEdgeThreshold: fx.fxaaEdgeThreshold,
       fxaaEdgeThresholdMin: fx.fxaaEdgeThresholdMin,
@@ -144,6 +145,7 @@ const NPR_PRESENCE_PLACEHOLDER = Object.freeze({
   lineStrength: 0,
   grayscaleGamma: 1,
   grayscaleLift: 0,
+  emissivePassthrough: 0,
   clearColor: 0,
 }) as PostFXRequest['npr'];
 

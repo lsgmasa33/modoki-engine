@@ -19,6 +19,7 @@ export interface NprTraitSnapshot {
   lineStrength: number;
   grayscaleGamma: number;
   grayscaleLift: number;
+  emissivePassthrough: number;
   fxaa: boolean;
   fxaaEdgeThreshold: number;
   fxaaEdgeThresholdMin: number;
@@ -43,6 +44,7 @@ export function nprConfigFromTrait(fx: NprTraitSnapshot, clearColor: number): NP
     lineStrength: fx.lineStrength,
     grayscaleGamma: fx.grayscaleGamma,
     grayscaleLift: fx.grayscaleLift,
+    emissivePassthrough: fx.emissivePassthrough,
     fxaa: fx.fxaa,
     fxaaEdgeThreshold: fx.fxaaEdgeThreshold,
     fxaaEdgeThresholdMin: fx.fxaaEdgeThresholdMin,
@@ -60,7 +62,7 @@ export function nprConfigSignature(c: NPRConfig): string {
   return [
     c.fillMode, c.depthThreshold, c.normalThreshold, c.colorThreshold,
     c.lineThickness, c.lineStrength, c.grayscaleGamma, c.grayscaleLift,
-    c.fxaa, c.fxaaEdgeThreshold, c.fxaaEdgeThresholdMin, c.fxaaBlendStrength,
+    c.emissivePassthrough, c.fxaa, c.fxaaEdgeThreshold, c.fxaaEdgeThresholdMin, c.fxaaBlendStrength,
     c.superSampleScale, c.clearColor,
   ].join('|');
 }

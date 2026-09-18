@@ -624,6 +624,7 @@ export default function Scene3D() {
               lineStrength: nprSnap.lineStrength,
               grayscaleGamma: nprSnap.grayscaleGamma,
               grayscaleLift: nprSnap.grayscaleLift,
+              emissivePassthrough: nprSnap.emissivePassthrough,
               clearColor: nprSnap.clearColor,
             };
             if (planFxaaEnabled({ requested: nprSnap.fxaa, isWebGLBackend, superSampleScale: ssScale })) {

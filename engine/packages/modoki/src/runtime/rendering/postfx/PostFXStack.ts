@@ -37,8 +37,8 @@
 // which is exactly how a correct shader fix ended up looking broken.
 
 import * as THREE from 'three';
-import { RenderPipeline, QuadMesh, type Node, type NodeMaterial } from 'three/webgpu';
-import { pass, mrt, output, normalView, add, mul, mix, float, vec3, uniform, rtt, materialReference, vec4 } from 'three/tsl';
+import { RenderPipeline, QuadMesh, type NodeMaterial } from 'three/webgpu';
+import { pass, mrt, output, normalView, add, mul, mix, float, vec3, uniform, rtt, vec4 } from 'three/tsl';
 import { bloom } from 'three/examples/jsm/tsl/display/BloomNode.js';
 import { dof } from 'three/examples/jsm/tsl/display/DepthOfFieldNode.js';
 import { vignette } from 'three/examples/jsm/tsl/display/CRT.js';
@@ -50,7 +50,7 @@ import {
 import { buildCompositeNode, type NPRCompositeUniforms } from '../npr/compositeNodes';
 import { buildFXAANode } from '../npr/fxaaNode';
 import { ParticlePassNode } from '../npr/ParticlePassNode';
-import { ensureLineColorOnMaterials, computeNprTexelSize } from '../npr/NPRPostProcess';
+import { nprLineColorTarget, computeNprTexelSize } from '../npr/NPRPostProcess';
 import { PARTICLE_LAYER } from '../layers';
 import {
   planStages, requiredMrtTargets, needsRebuild, aoPassSettings,
@@ -121,6 +121,9 @@ interface StageCtx {
   depthTextureNode: unknown;
   normalTextureNode: unknown;
   lineColorTextureNode: unknown;
+  /** The lineColor MRT target's emissive pass-through gain (#1416). Built with the MRT, so it
+   *  lives here for the 'npr' stage's `applyConfig` to write; null when NPR is off. */
+  emissivePassthrough: { value: number } | null;
   isOrthographic: boolean;
 }
 
@@ -222,22 +225,18 @@ export class PostFXStack {
     // I2: this is the UNION for the whole chain, computed once — never a
     // per-effect target set (changing the layout is a global cost, and a
     // material that doesn't write every target has its draw silently dropped).
+    let emissivePassthrough: { value: number } | null = null;
     if (targets.length > 1) {
       const mrtDict: Record<string, unknown> = { output };
       if (targets.includes('normal')) mrtDict.normal = normalView;
       if (targets.includes('lineColor')) {
-        // Per-material outline color (rgb) + color-preserve amount (a).
-        // `materialReference` reads material.lineColor / material.nprColorPreserve
-        // at fragment time; the prototype patch guarantees EVERY material answers
-        // to both (defaults black / 0). Custom fragmentNode shaders write this
-        // target themselves via `nprFragmentOutput`, which packs the same fields.
-        ensureLineColorOnMaterials();
-        // The casts are types only: @types/three 0.185+ types `materialReference` as an untyped
-        // `MaterialReferenceNode`, which `vec4`'s overloads no longer accept.
-        mrtDict.lineColor = vec4(
-          materialReference('lineColor', 'color') as unknown as Node<'vec3'>,
-          materialReference('nprColorPreserve', 'float') as unknown as Node<'float'>,
-        );
+        // Per-material outline color (rgb) + color-preserve amount (a), both pulled
+        // toward the fragment's emissive so NPR does not outline or grey a glow
+        // (#1416 — see `nprLineColorTarget`). Custom fragmentNode shaders write this
+        // target themselves via `nprFragmentOutput`, which packs the plain fields.
+        const gain = uniform(req.npr?.emissivePassthrough ?? 1).setName('nprEmissivePassthrough');
+        emissivePassthrough = gain as unknown as { value: number };
+        mrtDict.lineColor = nprLineColorTarget(gain);
       }
       (scenePass as unknown as { setMRT(m: unknown): void }).setMRT(mrt(mrtDict as never));
     }
@@ -267,6 +266,7 @@ export class PostFXStack {
       depthTextureNode: scenePass.getTextureNode('depth'),
       normalTextureNode: targets.includes('normal') ? scenePass.getTextureNode('normal') : null,
       lineColorTextureNode: targets.includes('lineColor') ? scenePass.getTextureNode('lineColor') : null,
+      emissivePassthrough,
       isOrthographic: (camera as { isOrthographicCamera?: boolean }).isOrthographicCamera === true,
     };
 
@@ -367,6 +367,7 @@ export class PostFXStack {
               uniforms.lineStrength.value = c.lineStrength;
               uniforms.grayscaleGamma.value = c.grayscaleGamma;
               uniforms.grayscaleLift.value = c.grayscaleLift;
+              if (ctx.emissivePassthrough) ctx.emissivePassthrough.value = c.emissivePassthrough;
               (uniforms.clearColor.value as THREE.Color).setHex(c.clearColor);
             },
             // RTTNode's inherited dispose() only fires an event — it frees neither

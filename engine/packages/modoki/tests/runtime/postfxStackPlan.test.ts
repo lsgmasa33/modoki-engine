@@ -22,7 +22,7 @@ const npr = (over: Record<string, unknown> = {}) => ({
   isOrthographic: false, superSampleScale: 1, fillMode: 'grayscale' as const,
   depthThreshold: 0.005, normalThreshold: 0.4, colorThreshold: 0.15,
   lineThickness: 1, lineStrength: 1, grayscaleGamma: 0.7, grayscaleLift: 0.3,
-  clearColor: 0x000000, ...over,
+  emissivePassthrough: 1, clearColor: 0x000000, ...over,
 });
 
 describe('planStages', () => {
@@ -112,6 +112,13 @@ describe('stackSignature', () => {
     ['samples', { samples: 8 }],
   ])('changes when the AO %s changes — the cost knobs are live edits too', (_label, over) => {
     expect(stackSignature({ ao: ao(over) })).not.toBe(stackSignature({ ao: ao() }));
+  });
+
+  /** #1416 — same trap for NPR's emissive pass-through: left out of `serializeNpr`, an Inspector
+   *  edit of the knob would never reach the lineColor target's uniform. */
+  it('changes when NPR emissivePassthrough changes, as a LIVE update', () => {
+    expect(stackSignature({ npr: npr({ emissivePassthrough: 0 }) })).not.toBe(stackSignature({ npr: npr() }));
+    expect(needsRebuild({ npr: npr() }, { npr: npr({ emissivePassthrough: 0 }) })).toBe(false);
   });
 
   it('an AO cost-knob change is a LIVE update, never a rebuild', () => {

@@ -87,6 +87,9 @@ export interface NprStageConfig {
   lineStrength: number;
   grayscaleGamma: number;
   grayscaleLift: number;
+  /** Emissive pass-through gain (#1416) — a live uniform read by the scene pass's lineColor
+   *  MRT target, not by the composite. */
+  emissivePassthrough: number;
   /** Camera clear color (hex) shown where the MRT pass drew no geometry. */
   clearColor: number;
 }
@@ -174,7 +177,7 @@ function serializeNpr(c: NprStageConfig): string {
     c.isOrthographic, c.superSampleScale, c.fillMode,
     c.depthThreshold, c.normalThreshold, c.colorThreshold,
     c.lineThickness, c.lineStrength, c.grayscaleGamma, c.grayscaleLift,
-    c.clearColor,
+    c.emissivePassthrough, c.clearColor,
   ].join(':');
 }
 

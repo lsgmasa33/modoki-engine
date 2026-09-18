@@ -23,6 +23,11 @@ export const NPRPostFX = trait({
   grayscaleGamma: 0.7,
   /** Black lift in grayscale mode. 0..1. */
   grayscaleLift: 0.3,
+  /** How strongly an EMISSIVE surface escapes the stylization (#1416): its true HDR colour is
+   *  kept (so bloom sees it) and no line is drawn on it. Gain on the emissive luminance — at 1 a
+   *  surface whose emissive luminance reaches 1 passes through fully; 0 stylizes emissive like
+   *  everything else. See docs/rendering.md § "Color preservation". */
+  emissivePassthrough: 1,
   /** FXAA post-AA on the composite output. */
   fxaa: true,
   /** FXAA relative-contrast threshold (typical 0.05–0.25). */
