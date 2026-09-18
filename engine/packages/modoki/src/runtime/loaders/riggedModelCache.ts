@@ -41,6 +41,7 @@ import { takeParsedGltf, disposePendingGltf } from './parsedGltfHandoff';
 // mocks `world.ts` without stubbing it. That is the whole reason renderDirty was extracted.
 import { fireDirtyListeners } from '../core/renderDirty';
 import { createTeardownToken } from '../core/liveness';
+import { classifyLoadFailure, createLoadFailureMemo } from '../core/loadFailureMemo';
 
 export interface RiggedModel {
   /** The parsed GLB scene graph — bones, SkinnedMeshes, materials. Cloned per
@@ -70,6 +71,15 @@ const owners = new Map<string, Set<SceneId>>();
 // resolves AFTER teardown (or a per-key invalidateRiggedModel) disposes its result instead of
 // leaving an owner-less — or stale — entry in the cache (#863).
 const liveness = createTeardownToken();
+/** What a FAILED load left behind (#1397). Before it, a failure left nothing: the render sync asks
+ *  every frame (`ensureRiggedModelLoadedFor`), so a missing rig was requested again every frame —
+ *  two GLB requests per lap, variant then raw. A 404 (three's `HttpError`) is now remembered until
+ *  invalidated; anything else backs off. `unknownIs: 'transient'` because GLTFLoader reports a
+ *  dropped connection and a parse error through the same `onError`, and backing off bounds a bad
+ *  file while sticking would make one network blip permanent. `onRetryDue` wakes a
+ *  render-on-demand view (SceneView) when a retry is due. Rule: docs/architecture.md § "A load
+ *  failure is classified before it is remembered". */
+const failures = createLoadFailureMemo({ label: 'RiggedCache', unknownIs: 'transient', onRetryDue: () => fireDirtyListeners() });
 
 // Constructed lazily on first load (not at module scope) so importing this
 // module is side-effect-free — matches meshTemplateCache, and keeps callers that
@@ -178,6 +188,7 @@ function disposeMesh(mesh: THREE.Mesh, disposedTex?: Set<THREE.Texture>): void {
 function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void> {
   if (cache.has(path)) { disposePendingGltf(path); return Promise.resolve(); }
   if (loadPromises.has(path)) return loadPromises.get(path)!;
+  if (failures.blocked(path)) return Promise.resolve();
 
   const stillLive = liveness.capture(path);
   // Try the derived variant first; on failure, fall back to the raw source so a
@@ -225,6 +236,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
       // Key under the original `path` (the refToPath result) so getRiggedModel
       // / owners lookups resolve regardless of which candidate actually loaded.
       cache.set(path, model);
+      failures.forget(path);
       console.log(`[RiggedCache] Loaded ${loadedFrom} — ${model.animations.length} clip(s): ${model.animations.map((c) => c.name).join(', ')}`);
       // Same render-on-demand edge the static mesh cache fires: a re-imported SKINNED GLB is
       // evicted from the scene by attachInvalidationListener and rebuilt only on a frame that
@@ -239,6 +251,10 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
     const handoff = takeParsedGltf(path);
     if (handoff) { finishLoad({ scene: handoff.scene, animations: handoff.animations }, `${path} (import handoff)`); return; }
 
+    // The failure a fallback lap is remembered by: a transient failure on ANY candidate makes the
+    // whole load transient — the variant may have 404'd for good, but the raw file behind it was
+    // never actually answered, so it may yet load.
+    let transientFailure: unknown;
     const tryLoad = (loader: GLTFLoader, i: number) => loader.load(
       // modelGlbUrl appends the model's content hash as ?v=<hash> (mirrors the static
       // modelGlbUrl path) so a re-import busts every cache keyed on that URL. Both
@@ -249,11 +265,12 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
       (gltf) => finishLoad(gltf as { scene: THREE.Group; animations?: THREE.AnimationClip[] }, candidates[i]),
       undefined,
       (err) => {
+        if (transientFailure === undefined && classifyLoadFailure(err) !== 'permanent') transientFailure = err;
         if (i + 1 < candidates.length) {
           console.warn(`[RiggedCache] ${candidates[i]} failed; falling back to raw ${candidates[i + 1]}`);
           tryLoad(loader, i + 1);
         } else {
-          console.error(`[RiggedCache] Failed to load ${path}:`, err);
+          failures.record(path, transientFailure ?? err, stillLive() && owners.has(path));
           resolve(); // resolve anyway — the render sync just skips an unloaded model
         }
       },
@@ -272,6 +289,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
       (loader) => tryLoad(loader, 0),
       (err) => {
         console.error(`[RiggedCache] GLTF loader unavailable for ${path}:`, err);
+        failures.record(path, err, stillLive() && owners.has(path));
         resolve(); // resolve anyway — the render sync just skips an unloaded model
       },
     );
@@ -332,6 +350,7 @@ export function releaseRiggedModelsForScene(sceneId: SceneId): void {
       if (model) disposePrototype(model);
       cache.delete(path);
       loadPromises.delete(path);
+      failures.forget(path); // failure memory is scene-scoped, like the mesh cache's (#1371)
     }
   }
 }
@@ -389,6 +408,7 @@ export function invalidateRiggedModel(modelRef: string): void {
     if (model) disposePrototype(model);
     cache.delete(key);
     loadPromises.delete(key);
+    failures.forget(key); // a re-import may have fixed the file
     // #863: an in-flight load of THIS key is carrying pre-invalidation bytes — refuse it, or it
     // re-caches the stale prototype on top of whatever re-import follows.
     liveness.invalidateKey(key);
@@ -467,4 +487,5 @@ export function disposeAllRiggedModels(): void {
   cache.clear();
   loadPromises.clear();
   owners.clear();
+  failures.clear();
 }

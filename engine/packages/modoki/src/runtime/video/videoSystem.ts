@@ -27,6 +27,7 @@ import { isPackedAlive } from '../core/ecs/entityTable';
 import { playVideo, applyTimeScale, videoFadeGain, type VideoHandle } from './videoService';
 import { emitVideoStart, emitVideoEnd, emitVideoBlocked, type VideoEventPayload } from './VideoEvents';
 import { getTimeScale } from '../core/getTime';
+import { classifyLoadFailure, createLoadFailureMemo } from '../core/loadFailureMemo';
 
 /** Live handle per entity, plus the clip it was created for (so a `clip` change is
  *  detectable without asking the element for its URL, which may be variant-resolved). */
@@ -96,6 +97,18 @@ const readyUrls = new Map<number, { clip: string; url: string }>();
  *  every ~4s, forever, on a CORS failure). A failure is sticky until the clip changes,
  *  so recovery is an explicit act rather than an accident. */
 const failed = new Map<number, string>();
+/** A download that failed TRANSIENTLY — no response, a dropped body, a status other than 404/410 —
+ *  backs off and is retried, per CLIP (#1397, owner ruling 2026-09-18: "retry, still stop on 404").
+ *  `failed` above keeps the permanent ones: a missing file, a cache refusal. Before this a blip
+ *  blanked the entity's video until its clip or scene changed. The storm `failed` exists to stop
+ *  cannot come back: the reconcile asks every frame, but a backing-off clip costs one download per
+ *  step (1 s doubling to 10 min). ⚠️ Accepted cost of the ruling: a CORS refusal has no response,
+ *  so it is indistinguishable from an outage and is retried at the 10-minute cap for the session. */
+const netRetry = createLoadFailureMemo({ label: 'video', unknownIs: 'permanent' });
+/** Rejections already recorded. Entities that share a clip share ONE download (`VideoCache` keys
+ *  it), so they all see the same rejection; recording it once per entity would advance the backoff
+ *  N steps for one outage (#1397 close-out review). */
+const recordedFailures = new WeakSet<object>();
 
 /** Which PACKED entity (`entity.valueOf()` — generation included) currently owns each id's slot
  *  in the maps above. #336, the sibling of QA-ZONE-0003: koota's `entity.id()` masks the
@@ -202,7 +215,9 @@ export function stopWorldVideo(): void {
 // which would match a stale `owner` entry and skip the purge, silently inheriting the previous
 // scene's `failed`/`progress`/`readyUrls`. Clearing here makes every entity in the new world
 // first-sight, so it inherits nothing.
-onWorldSwap(() => { stopWorldVideo(); owner.clear(); });
+// The transient memo is keyed by clip, not entity, so it has no index-space hazard — it goes with
+// the swap because a new scene is a fresh chance, as it is for every other cache (#1397).
+onWorldSwap(() => { stopWorldVideo(); owner.clear(); netRetry.clear(); });
 
 export function videoSystem(world: World): void {
   // "Not playing → no video." Mirrors skeletal animation and audio: a stopped editor
@@ -277,6 +292,7 @@ export function videoSystem(world: World): void {
 
         // This clip already failed for this entity — do NOT try again every frame.
         if (failed.get(id) === vp.clip) return;
+        if (netRetry.blocked(vp.clip)) return; // a transient failure is backing off
 
         const src = resolveSource?.(vp.clip);
         // `download` policy: fetch into the local cache first, then play from disk.
@@ -299,11 +315,17 @@ export function videoSystem(world: World): void {
             if (rec.cancelled) return;
             pending.delete(id);
             progress.set(id, 1);
+            netRetry.forget(clip);
             if (localUrl) readyUrls.set(id, { clip, url: localUrl });
           }).catch((e) => {
             if (rec.cancelled) return;
             pending.delete(id);
             progress.set(id, 0);
+            if (classifyLoadFailure(e) === 'transient') {
+              const once = typeof e === 'object' && e !== null;
+              if (!once || !recordedFailures.has(e)) { if (once) recordedFailures.add(e); netRetry.record(clip, e); }
+              return;
+            }
             failed.set(id, clip);
             // Loud ONCE, not once per frame. A refused/failed download is a real
             // problem (budget, network, CORS) and silently showing nothing is how it
@@ -496,6 +518,7 @@ export function __resetVideoSystem(): void {
   progress.clear();
   readyUrls.clear();
   failed.clear();
+  netRetry.clear();
   owner.clear();
   resolveUrl = (guid) => guid;
   resolveSource = null;

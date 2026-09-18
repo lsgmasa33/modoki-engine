@@ -24,6 +24,8 @@ function deferred<T>(): Deferred<T> {
 }
 
 let xhrUrls: string[];
+/** #1397: how the fake XHR answers a url — a status, the SPA fallback, or no response at all. */
+let xhrFail: Map<string, number | 'html' | 'network'>;
 let bytesByUrl: Map<string, ArrayBuffer>;
 let urlByBytes: Map<ArrayBuffer, string>;
 // Decode gates keyed by URL (== path here — these tests use plain relative paths with no
@@ -46,6 +48,7 @@ function resolveDecode(path: string, buffer: AudioBuffer): void {
 
 function installAudioMocks(): void {
   xhrUrls = [];
+  xhrFail = new Map();
   bytesByUrl = new Map();
   urlByBytes = new Map();
   decodeGates = new Map();
@@ -57,9 +60,16 @@ function installAudioMocks(): void {
     response: ArrayBuffer | null = null;
     onload: (() => void) | null = null;
     onerror: (() => void) | null = null;
+    statusText = '';
+    contentType = 'audio/wav';
+    getResponseHeader(name: string): string | null { return name.toLowerCase() === 'content-type' ? this.contentType : null; }
     open(_method: string, url: string): void { this.url = url; }
     send(): void {
       xhrUrls.push(this.url);
+      const fail = xhrFail.get(this.url);
+      if (fail === 'network') { this.status = 0; queueMicrotask(() => this.onerror?.()); return; }
+      if (typeof fail === 'number') { this.status = fail; this.response = new ArrayBuffer(8); queueMicrotask(() => this.onload?.()); return; }
+      if (fail === 'html') this.contentType = 'text/html; charset=utf-8';
       let buf = bytesByUrl.get(this.url);
       if (!buf) {
         buf = new ArrayBuffer(8); // non-empty — xhrAudioBytes rejects an empty response
@@ -272,5 +282,86 @@ describe('audioBufferCache invalidation refill (#1361)', () => {
     const buf = {} as AudioBuffer;
     resolveDecode(xhrUrls[0], buf);
     await vi.waitFor(() => expect(cache.getCachedAudioBuffer(guid)).toBe(buf));
+  });
+});
+
+/** #1397 — every gesture runs `retryFailedAudioDecodes`, which re-attempted every owned clip with
+ *  no buffer. That is the iOS decode unlock and must keep working for a DECODE failure — but a clip
+ *  whose FILE was missing was re-downloaded on every tap too, and a 404 page (or the SPA fallback)
+ *  reached `decodeAudioData` and was reported as a decode failure. */
+describe('audioBufferCache — a failed FETCH is remembered; a failed DECODE is still retried per gesture (#1397)', () => {
+  async function withClock() {
+    const clock = await import('../../src/runtime/core/clock');
+    const { RETRY_BASE_MS } = await import('../../src/runtime/core/loadFailureMemo');
+    clock.setManualNow(0);
+    return { clock, RETRY_BASE_MS };
+  }
+  const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
+
+  it('a 404 is fetched ONCE across many gestures, until invalidateAudio', async () => {
+    installAudioMocks();
+    const { clock } = await withClock();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cache = await getCache();
+    xhrFail.set('gone.wav', 404);
+    await cache.acquireAudio(1, 'gone.wav');
+    for (let tap = 0; tap < 5; tap++) { cache.retryFailedAudioDecodes(); await flush(); }
+    clock.advanceManual(60 * 60 * 1000);
+    cache.retryFailedAudioDecodes(); await flush();
+    expect(xhrUrls.filter((u) => u === 'gone.wav')).toHaveLength(1);
+
+    xhrFail.delete('gone.wav'); // the reimport fixed it
+    cache.invalidateAudio('gone.wav'); // refills the owned clip
+    await flush();
+    expect(xhrUrls.filter((u) => u === 'gone.wav')).toHaveLength(2);
+    clock.restoreRealClock();
+    vi.restoreAllMocks();
+  });
+
+  it('the SPA fallback is a missing file, not a decode failure — it never reaches decodeAudioData', async () => {
+    installAudioMocks();
+    const { clock } = await withClock();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cache = await getCache();
+    xhrFail.set('spa.wav', 'html');
+    await cache.acquireAudio(1, 'spa.wav');
+    for (let tap = 0; tap < 3; tap++) { cache.retryFailedAudioDecodes(); await flush(); }
+    expect(xhrUrls.filter((u) => u === 'spa.wav')).toHaveLength(1);
+    expect(decodeGates.has('spa.wav'), 'decodeAudioData was never asked').toBe(false);
+    clock.restoreRealClock();
+    vi.restoreAllMocks();
+  });
+
+  it('a dropped connection backs off, then the next gesture after the backoff refetches', async () => {
+    installAudioMocks();
+    const { clock, RETRY_BASE_MS } = await withClock();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cache = await getCache();
+    xhrFail.set('net.wav', 'network');
+    await cache.acquireAudio(1, 'net.wav');
+    for (let tap = 0; tap < 5; tap++) { cache.retryFailedAudioDecodes(); await flush(); }
+    expect(xhrUrls.filter((u) => u === 'net.wav')).toHaveLength(1);
+    clock.advanceManual(RETRY_BASE_MS);
+    xhrFail.delete('net.wav');
+    cache.retryFailedAudioDecodes(); await flush();
+    expect(xhrUrls.filter((u) => u === 'net.wav')).toHaveLength(2);
+    clock.restoreRealClock();
+    vi.restoreAllMocks();
+  });
+
+  it('a DECODE failure is still retried on the next gesture — the iOS unlock path is untouched', async () => {
+    installAudioMocks();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cache = await getCache();
+    // iOS: the context is suspended, so the load-time decode rejects.
+    const rejected = Promise.reject(new Error('EncodingError'));
+    rejected.catch(() => {});
+    decodeGates.set('locked.wav', { promise: rejected, resolve: () => {} });
+    await cache.acquireAudio(1, 'locked.wav');
+    decodeGates.delete('locked.wav'); // the next decode waits on a fresh gate
+    cache.retryFailedAudioDecodes(); // the first gesture resumed the context
+    await flush();
+    expect(xhrUrls.filter((u) => u === 'locked.wav')).toHaveLength(2);
+    vi.restoreAllMocks();
   });
 });

@@ -654,6 +654,8 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'gen-in-value: the mesh is rebuilt on a layout/style signature change recomputed each pass; the one time-accumulated piece, the text-animation clock, carries its packed owner (animOwner via textAnimElapsed, #868); rendering/scene3DSync.ts:3796' },
   { item: 'rendering/scene3DSync.ts::TextMeshEntry.pages',
     reason: 'not-entity: Font atlas page number -> page mesh; rendering/scene3DSync.ts:3756' },
+  { item: 'rendering/scene3DSync.ts::BillboardEntry.pendingPages',
+    reason: 'not-entity: Holds rig PART indices (positions in entry.meshes) whose page load failed, never an entity id; owned by one BillboardEntry, which is disposed with its entity and rebuilt on a rig/signature change (#1397); rendering/scene3DSync.ts:1360' },
   { item: 'rendering/shadowCasterCapFrame.ts::kept',
     reason: 'scratch: Reassigned at the top of every syncLights and read only by shadowCasterAllowed in that call\'s light loop; rendering/shadowCasterCapFrame.ts:49' },
   { item: 'rendering/sprite2DMaterialBroker.ts::shaderMaps',

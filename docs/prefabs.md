@@ -405,10 +405,15 @@ first alone is not enough:
    of the three ways below. The helper exists so the next spawner cannot repeat them:
    - **In-flight dedup, released on EVERY settle.** Without it a per-frame caller refetches every
      frame (#1373).
-   - **A bounded give-up budget, per world, refunded on a hit.** Measured 2026-08-19:
-     `acquirePrefab` on an unresolvable guid **RESOLVES**, with the cache still empty.
-     `fetchPrefab` swallows `!res.ok` and parse errors and never rejects, so a 404, a 5xx and an
-     offline blip look identical. Re-arming only on success (`.finally(() => { if
+   - **A bounded give-up budget, per world, refunded on a hit, and never spent on an outage
+     (#1397).** `acquirePrefab` on an unresolvable guid **RESOLVES**, with the cache still empty
+     (measured 2026-08-19). It still never rejects. What changed is that `fetchPrefab` now
+     classifies its failures: it remembers a 404 or a bad file until the prefab is invalidated,
+     and backs off a 5xx or a dropped connection. `requestPrefab` refunds an attempt that ended
+     transiently. So the three attempts are spent only on a prefab that is not coming, and an
+     outage retries on the shared backoff (1 s doubling to 10 min) instead of giving the prefab up.
+     The rule: [architecture.md](architecture.md) § "A load failure is classified before it is
+     remembered". Before #1397 a 404, a 5xx and an offline blip looked identical here. Re-arming only on success (`.finally(() => { if
      (getCachedPrefab(ref)) rearm; })`, the shape this section used to prescribe) reads every
      transient failure as a deletion and disables the prefab for the session (#1359). Re-arming
      unconditionally refetches a deleted guid forever. A `.catch` re-arm (or a `.catch` warning,
@@ -418,7 +423,8 @@ first alone is not enough:
      It is a real change for `games/court`, whose hand-written guards were cleared on every board
      build. That gave a missing prefab one more try per level, forever. A per-frame caller (the
      flag layer, the win confetti, the debug-menu preview) now spends its three tries in about
-     three fetch round-trips and stops until the next Play. A preview of a prefab that gave up
+     three fetch round-trips and stops until the next Play. Since #1397 that is true of a prefab that
+     is NOT THERE; an outage backs off and does not spend the tries. A preview of a prefab that gave up
      stays parked, and the tap looks dead until then.
    - **The hit test and the re-arm test are ONE predicate.** The default is "has at least one
      entity", since an entity-less document spawns nothing. A caller whose miss test is stricter

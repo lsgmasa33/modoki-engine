@@ -211,7 +211,7 @@ function mockDeps() {
     const cacheMap = new Map<string, any>();
     const unloaded: string[] = [];
     const Assets = {
-      cache: { has: (url: string) => cacheMap.has(url), remove: (url: string) => cacheMap.delete(url) },
+      cache: { has: (url: string) => cacheMap.has(url), get: (url: string) => cacheMap.get(url), remove: (url: string) => cacheMap.delete(url) },
       get: (url: string) => cacheMap.get(url),
       load: (url: string) => {
         // Loaded textures carry a live `source` (with a `.style`) — the 2D-material path
@@ -1646,6 +1646,7 @@ describe('Scene2D.renderFrame', () => {
     child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'http://t/b.png' });
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
+    scene2d.renderFrame(); // the woken frame binds b (#1397: slots bind through the retrier's drain)
 
     // a.png was the last (only) user → unloaded; b.png now bound, not unloaded.
     expect(pixi.Assets.__unloaded).toContain('http://t/a.png');
@@ -1687,8 +1688,14 @@ describe('Scene2D.renderFrame', () => {
   // when an entity's sprite url changes while the old url's texture is still loading, the
   // stale resolve must NOT bind onto the (now destroyed) old sprite or onto the new one.
   it('a stale async texture load is dropped after the url changed mid-load (F12)', async () => {
-    const { pool, traits, scene2d, world } = await setup();
-    // Neither url seeded → makeSprite takes the ASYNC load branch (load left in flight).
+    const { pixi, pool, traits, scene2d, world } = await setup();
+    // Loads resolve by hand, and a texture becomes resident only when its load does — as in real
+    // Pixi. (The default fake marks a url resident synchronously, which lets a drain bind `a` onto
+    // spriteA before the swap destroys it and so cannot tell a dropped waiter from a bound one.)
+    const settle = new Map<string, () => void>();
+    pixi.Assets.load = (url: string) => new Promise((res) => {
+      settle.set(url, () => { const t = { width: 32, height: 32, source: { style: {} } }; pixi.Assets.__seed(url, t); res(t); });
+    });
     const canvas = spawnCanvas(world, traits);
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/a.png' });
 
@@ -1704,11 +1711,13 @@ describe('Scene2D.renderFrame', () => {
     expect(spriteB).not.toBe(spriteA);
     expect(spriteA.destroyed).toBe(true);
 
-    // Flush both pending loads (a's stale resolve, then b's).
-    await Promise.resolve();
-    await Promise.resolve();
+    // Both loads land (a's is stale), then the frame their wake buys — slots bind in its drain (#1397).
+    settle.get('http://t/a.png')!();
+    settle.get('http://t/b.png')!();
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    scene2d.renderFrame();
 
-    expect(spriteA.texture.width).toBe(0);       // a's resolve dropped (destroyed guard) — no rebind
+    expect(spriteA.texture.width).toBe(0);       // a's waiter dropped (destroyed guard) — no rebind
     expect(spriteB.texture.width).toBe(32);      // b bound normally
     expect(pool.getSlot(canvas.id())!.container.children.length).toBe(1);
   });
@@ -1925,6 +1934,7 @@ describe('Scene2D.renderFrame', () => {
       expect(obj.texture).not.toBe(stale); // never bound the sourceless corpse
 
       await Promise.resolve(); await Promise.resolve(); // let the evict-and-reload settle (markDirty)
+      scene2d.renderFrame(); // the woken frame binds it (#1397: slots bind through the retrier's drain)
 
       expect(obj.texture).not.toBe(stale);
       expect(obj.texture.source?.style).toBeDefined();   // the RELOADED texture (Assets.load mints a live source)

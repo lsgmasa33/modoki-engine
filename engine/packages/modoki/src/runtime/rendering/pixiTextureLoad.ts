@@ -3,6 +3,8 @@
 
 import { Assets, ImageSource, Texture } from 'pixi.js';
 import { fireDirtyListeners } from '../core/renderDirty';
+import { AssetNetworkError, checkAssetResponse } from '../core/assetLoadErrors';
+import { rethrowAsNetworkError } from '../core/loadFailureMemo';
 
 /** Load a texture through PixiJS Assets, forcing the image parser for `blob:` URLs.
  *
@@ -84,9 +86,11 @@ export function loadPixiTexture(url: string): Promise<Texture> {
  *  flag IS honoured for those. */
 export async function loadMtsdfAtlasTexture(url: string): Promise<Texture> {
   if (typeof createImageBitmap !== 'function') return loadPixiTexture(url);
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`atlas fetch failed (${response.status}): ${url}`);
-  const bitmap = await createImageBitmap(await response.blob(), {
+  // Every outcome typed for `fontTexturePixi`'s failure memo (#1397): no response and a dropped
+  // body are network errors, a non-ok status or the SPA fallback a `MissingAssetError`.
+  const response = checkAssetResponse(await fetch(url).catch(rethrowAsNetworkError), url);
+  const blob = await response.blob().catch((e: unknown) => { throw new AssetNetworkError(e); });
+  const bitmap = await createImageBitmap(blob, {
     premultiplyAlpha: 'none',
     colorSpaceConversion: 'none',
   });

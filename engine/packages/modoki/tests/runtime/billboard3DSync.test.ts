@@ -323,3 +323,39 @@ describe('syncBillboardSprites — a landed texture page wakes the idle gate (#1
     expect(mapsOnWokenFrame, 'one wake for the shared page, and its frame sees every part bound').toEqual([true]);
   });
 });
+
+// #1397: a billboard entry is rebuilt only on a `billboardSig` change, so a page whose load failed
+// stayed missing for the entry's whole life — a network blip blanked the sprite until its rig
+// changed. The failure now backs off, and the per-frame sync re-asks once the backoff expires.
+describe('syncBillboardSprites — a failed page is retried after its backoff (#1397)', () => {
+  it('retries once the backoff expires (not every frame before it) and binds the page', async () => {
+    const { world, traits, sync, bufs, T, loadAsync } = await setup();
+    const clock = await import('../../src/runtime/core/clock');
+    const { RETRY_BASE_MS } = await import('../../src/runtime/core/loadFailureMemo');
+    clock.setManualNow(0);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      loadAsync.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+      const e = spawnBillboard(world, traits);
+      bufs.putSkin2DBuffer(e.id(), { parts: [quadPart()] });
+      const state = sync.createRenderState();
+      const scene = new T.Scene();
+      const settle = () => new Promise((r) => setTimeout(r, 0));
+
+      sync.syncBillboardSprites(world, scene, state);
+      await settle();
+      for (let frame = 0; frame < 5; frame++) { sync.syncBillboardSprites(world, scene, state); await settle(); }
+      expect(loadAsync, 'backing off: frames inside the backoff do not refetch').toHaveBeenCalledTimes(1);
+      const mesh = state.billboards.get(e.id())!.meshes[0] as any;
+      expect(mesh.material.map).toBeFalsy();
+
+      clock.advanceManual(RETRY_BASE_MS);
+      sync.syncBillboardSprites(world, scene, state);
+      await vi.waitFor(() => expect(mesh.material.map, 'the retried page binds').toBeTruthy());
+      expect(loadAsync).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.restoreRealClock();
+      warn.mockRestore();
+    }
+  });
+});

@@ -169,7 +169,7 @@ describe('buildPixiShaderProgram (WebGPU backend, mocked fetch)', () => {
       const body = files.get(String(url));
       return Promise.resolve(body != null
         ? { ok: true, json: () => Promise.resolve(JSON.parse(body)), text: () => Promise.resolve(body) }
-        : { ok: false, json: () => Promise.reject(new Error('404')), text: () => Promise.resolve('') });
+        : { ok: false, status: 404, statusText: 'Not Found', json: () => Promise.reject(new Error('404')), text: () => Promise.resolve('') });
     }) as any);
     ({ buildPixiShaderProgram } = await import('../../src/runtime/rendering/pixiShaderBuilder'));
   });
@@ -245,6 +245,23 @@ describe('buildPixiShaderProgram (WebGPU backend, mocked fetch)', () => {
     expect(await buildPixiShaderProgram('nope.shader.json')).toBeNull();
   });
 
+  it('a body the server could not deliver REJECTS as transient, so the material cache backs off instead of falling back for the scene (#1397)', async () => {
+    const { classifyLoadFailure } = await import('../../src/runtime/core/loadFailureMemo');
+    files.set('nb503.shader.json', manifest({ uSpeed: P('float', 1) }));
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal('fetch', vi.fn((url: string) => (String(url).endsWith('.wgsl')
+      ? Promise.resolve({ ok: false, status: 503, statusText: 'Service Unavailable' })
+      : (realFetch as (u: string) => Promise<unknown>)(url))));
+    const outcome = await buildPixiShaderProgram('nb503.shader.json').then(() => 'resolved', (e: unknown) => classifyLoadFailure(e));
+    expect(outcome).toBe('transient');
+    vi.stubGlobal('fetch', vi.fn((url: string) => (String(url).endsWith('.wgsl')
+      ? Promise.reject(new TypeError('Failed to fetch'))
+      : (realFetch as (u: string) => Promise<unknown>)(url))));
+    const dropped = await buildPixiShaderProgram('nb503.shader.json').then(() => 'resolved', (e: unknown) => classifyLoadFailure(e));
+    expect(dropped).toBe('transient');
+    vi.stubGlobal('fetch', realFetch);
+  });
+
   it('falls back (null) when the active-backend body is missing', async () => {
     files.set('nb.shader.json', manifest({ uSpeed: P('float', 1) }));
     // no .wgsl body seeded
@@ -304,7 +321,7 @@ describe('buildPixiShaderProgram program cache (#716, GL backend, mocked fetch)'
       const body = files.get(String(url));
       return Promise.resolve(body != null
         ? { ok: true, json: () => Promise.resolve(JSON.parse(body)), text: () => Promise.resolve(body) }
-        : { ok: false, json: () => Promise.reject(new Error('404')), text: () => Promise.resolve('') });
+        : { ok: false, status: 404, statusText: 'Not Found', json: () => Promise.reject(new Error('404')), text: () => Promise.resolve('') });
     }) as any);
     ({ buildPixiShaderProgram, invalidatePixiShaderProgram } = await import('../../src/runtime/rendering/pixiShaderBuilder'));
     ({ clearSpriteMaterialCache: clearSpriteMaterialCacheDyn } = await import('../../src/runtime/loaders/spriteMaterialCache'));
@@ -449,7 +466,7 @@ describe('buildPixiShaderProgram — a REJECTED build (close-out review of #716,
       const body = files.get(String(url));
       return Promise.resolve(body != null
         ? { ok: true, json: () => Promise.resolve(JSON.parse(body)), text: () => Promise.resolve(body) }
-        : { ok: false, json: () => Promise.reject(new Error('404')), text: () => Promise.resolve('') });
+        : { ok: false, status: 404, statusText: 'Not Found', json: () => Promise.reject(new Error('404')), text: () => Promise.resolve('') });
     }) as any);
     ({ buildPixiShaderProgram } = await import('../../src/runtime/rendering/pixiShaderBuilder'));
   });

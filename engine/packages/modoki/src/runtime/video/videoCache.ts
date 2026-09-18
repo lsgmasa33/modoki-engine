@@ -24,6 +24,8 @@
  *  the Cache API is already exempt. */
 
 import { createTeardownToken } from '../core/liveness';
+import { rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { AssetNetworkError, MissingAssetError, statusIsAbsent } from '../core/assetLoadErrors';
 import {
   planAdmission, explainRefusal, totalBytes, type CacheEntry,
 } from './videoCachePolicy';
@@ -186,8 +188,15 @@ export class VideoCache {
     // Captured before the first await, PER KEY: `clear()` invalidates everything, `delete(key)`
     // invalidates just this one. Re-checked at the one place this writes shared state.
     const stillLive = this.liveness.capture(key);
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`video download failed: ${res.status} ${res.statusText} — ${url}`);
+    // Typed for `videoSystem`'s retry decision (#1397): no response is an `AssetNetworkError`, a
+    // non-ok status a `MissingAssetError` (absent only for 404/410). A cache REFUSAL below stays a
+    // plain Error — the same bytes would be refused again, so it must not be retried.
+    const res = await fetch(url).catch(rethrowAsNetworkError);
+    if (!res.ok) {
+      throw new MissingAssetError(`video download failed: ${res.status} ${res.statusText} — ${url}`, {
+        status: res.status, absent: statusIsAbsent(res.status),
+      });
+    }
 
     const declared = Number(res.headers.get('content-length')) || undefined;
 
@@ -200,7 +209,11 @@ export class VideoCache {
       if (!plan.ok) throw new Error(`video cache refused ${key}: ${explainRefusal(plan, this.budget)}`);
     }
 
-    const blob = await this.readWithProgress(res, declared, onProgress);
+    // A connection dropped mid-body is a network failure, not a bad file (#1397).
+    const blob = await this.readWithProgress(res, declared, onProgress).catch((e: unknown) => {
+      if ((e as { name?: unknown } | null)?.name === 'AbortError') throw e;
+      throw new AssetNetworkError(e);
+    });
 
     // Re-plan against the ACTUAL size: a server may lie, omit Content-Length, or the
     // cache may have changed while we were downloading.

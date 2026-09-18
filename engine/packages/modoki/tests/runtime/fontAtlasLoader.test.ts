@@ -3,15 +3,19 @@
  *  released from re-inserting an owner-less provider (the leak the spine review
  *  flagged). manifest + assetUrl + fetch are mocked so it's pure. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { completeResponse } from '../stubs/assetResponse';
+import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
+import { RETRY_BASE_MS } from '../../src/runtime/core/loadFailureMemo';
 
 /** Guids the manifest pretends NOT to know — lets a test flip a ref from unresolvable to
  *  resolvable and back, which is what the warn-once "forget" behaviour is about. */
 const missingGuids = new Set<string>();
+/** #1397: a test can make a guid's manifest entry a DYNAMIC font. */
+const fontBlocks = new Map<string, unknown>();
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
   resolveRef: (g: string) => (g.startsWith('font-') && !missingGuids.has(g) ? `/fonts/${g}.ttf` : undefined),
-  getAssetEntry: () => ({ hash: 'h1' }),
+  getAssetEntry: (g: string) => ({ hash: 'h1', font: fontBlocks.get(g) }),
   isGuid: (g: unknown) => typeof g === 'string' && g.startsWith('font-'),
   onFontInvalidated: () => () => {},
 }));
@@ -44,6 +48,7 @@ function mockFetchOnce(json: unknown, deferred?: { resolve: () => void }) {
 beforeEach(() => {
   disposeAllFonts();
   vi.unstubAllGlobals();
+  fontBlocks.clear();
 });
 
 describe('fontAtlasLoader refcount', () => {
@@ -260,5 +265,113 @@ describe('fontAtlasLoader liveness generation (#856 per-key)', () => {
 
     expect(result).toBeNull();
     expect(getLoadedFont('font-b')).toBeUndefined();
+  });
+});
+
+/** #1397 — `ensureFontLoaded` runs every frame from both renderers, and a failed acquire used to
+ *  remember nothing, so a font whose metrics were missing was fetched again every frame. */
+describe('fontAtlasLoader — a failed load is classified before it is remembered (#1397)', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const frames = async (n: number) => { for (let i = 0; i < n; i++) await acquireFont(1, 'font-a'); };
+  const urls = () => fetchMock.mock.calls.map((c) => String(c[0]));
+
+  beforeEach(() => {
+    // 'a dynamic font seeds from its bake' leaves its getAssetEntry spy installed.
+    vi.restoreAllMocks();
+    setManualNow(0);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+  });
+  afterEach(() => { restoreRealClock(); vi.restoreAllMocks(); });
+
+  it('a 404 on the metrics is fetched ONCE across many frames, until invalidateFont', async () => {
+    fetchMock.mockImplementation(async () => new Response('nope', { status: 404 }));
+    await frames(5);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    advanceManual(60 * 60 * 1000);
+    await frames(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockImplementation(async () => completeResponse({ ok: true, status: 200, json: async () => METRICS }));
+    invalidateFont('font-a');
+    expect(await acquireFont(1, 'font-a')).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('a dropped connection backs off, then retries and loads', async () => {
+    fetchMock.mockImplementation(async () => { throw new TypeError('Failed to fetch'); });
+    await frames(4);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    advanceManual(RETRY_BASE_MS);
+    fetchMock.mockImplementation(async () => completeResponse({ ok: true, status: 200, json: async () => METRICS }));
+    expect(await acquireFont(1, 'font-a')).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('a DYNAMIC font whose bake answers 503 backs off — it does not pay the slow WASM seed path for a blip', async () => {
+    fontBlocks.set('font-a', { mode: 'dynamic' });
+    fetchMock.mockImplementation(async () => new Response('busy', { status: 503 }));
+    await frames(3);
+    // Only the metrics were asked for: the seed path's `.ttf` fetch never ran.
+    expect(urls()).toEqual(['/fonts/font-a.ttf~metrics.json?v=h1']);
+    advanceManual(RETRY_BASE_MS);
+    await frames(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('a stale load settling does not evict its replacement\'s in-flight entry', async () => {
+    const gates: Array<() => void> = [];
+    fetchMock.mockImplementation(() => new Promise<Response>((resolve) => {
+      gates.push(() => resolve(new Response('nope', { status: 404 })));
+    }));
+    const stale = acquireFont(1, 'font-a');
+    await Promise.resolve();
+    invalidateFont('font-a');                  // supersedes it
+    const replacement = acquireFont(1, 'font-a'); // the next frame's load
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    gates[0]();                                // the stale load settles first
+    await stale;
+    void acquireFont(1, 'font-a');             // a frame while the replacement is still in flight
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(2); // was 3: the stale finally deleted the replacement
+    gates[1]();
+    await replacement;
+  });
+
+  it('a DYNAMIC font whose bake is ABSENT (the SPA fallback) still falls through to the seed path', async () => {
+    fontBlocks.set('font-a', { mode: 'dynamic' });
+    fetchMock.mockImplementation(async (u: string) => (String(u).includes('~metrics')
+      ? new Response('<!doctype html><html></html>', { status: 200, headers: { 'content-type': 'text/html' } })
+      : new Response('nope', { status: 404 })));
+    await frames(1);
+    expect(urls()).toEqual(['/fonts/font-a.ttf~metrics.json?v=h1', '/fonts/font-a.ttf?v=h1']);
+  });
+
+  it('a transient failure repaints dirty-gated text when its retry is due', async () => {
+    const { onTextDirty } = await import('../../src/runtime/rendering/text/textDirty');
+    fetchMock.mockImplementation(async () => { throw new TypeError('Failed to fetch'); });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      await frames(1);
+      const fired = vi.fn();
+      const off = onTextDirty(fired);
+      await vi.advanceTimersByTimeAsync(RETRY_BASE_MS - 10);
+      expect(fired).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(fired).toHaveBeenCalled();
+      off();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('failure memory is scene-scoped: the last owner letting go forgets it', async () => {
+    fetchMock.mockImplementation(async () => new Response('nope', { status: 404 }));
+    await frames(1);
+    releaseFontsForScene(1);
+    await frames(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

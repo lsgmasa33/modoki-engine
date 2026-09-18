@@ -12,17 +12,15 @@
  *  Pixi app (the renderer's constructor needs one). Rule: docs/architecture.md § "A load failure is
  *  classified before it is remembered". */
 
-import { createLoadFailureMemo } from './loadFailureMemo';
-import { rawNow } from '../core/clock';
+import { createLoadFailureMemo } from '../core/loadFailureMemo';
 
 export class MaterialTexRetry {
   /** url → the generation of the load that owns it. A settle whose generation no longer matches
    *  belongs to a load a `clear()` (teardown) superseded, and must not touch the newer one's entry. */
   private readonly loading = new Map<string, number>();
-  private readonly failed = createLoadFailureMemo({ label: 'Scene2D', unknownIs: 'transient' });
-  /** One wake per backing-off url: an idle scene has nothing else to dirty it, so without this a
-   *  texture whose backoff expired would wait for an unrelated edit to be retried. */
-  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** `onRetryDue` wakes the renderer when a url's backoff expires: an idle scene has nothing else
+   *  to dirty it, so without the wake a due retry would wait for an unrelated edit. */
+  private readonly failed = createLoadFailureMemo({ label: 'Scene2D', unknownIs: 'transient', onRetryDue: () => this.wake() });
   private generation = 0;
 
   private readonly load: (url: string) => Promise<unknown>;
@@ -47,28 +45,56 @@ export class MaterialTexRetry {
         const live = this.loading.get(url) === gen;
         if (live) this.loading.delete(url);
         this.failed.record(url, e, live);
-        if (live) this.scheduleWake(url);
       },
     );
   }
 
+  /** url → the consumers waiting to bind it once resident (#1397). */
+  private readonly waiters = new Map<string, Array<{ dead: () => boolean; bind: () => void }>>();
+
+  /** Wait for `url` on behalf of a consumer that is built ONCE and never asks again — a sprite
+   *  slot (`Scene2D.makeSprite`). Kicks the load; {@link drain} binds it when it lands, and
+   *  re-requests it (after the backoff) when it failed. `dead` reports that the consumer was
+   *  destroyed, so a waiter for a url its slot no longer wants is dropped, never bound. */
+  whenResident(url: string, dead: () => boolean, bind: () => void): void {
+    let list = this.waiters.get(url);
+    if (!list) { list = []; this.waiters.set(url, list); }
+    list.push({ dead, bind });
+    this.request(url);
+  }
+
+  /** Bind every waiter whose url is now resident (`isResident`), drop dead ones, and re-request the
+   *  rest — a no-op while a url is in flight or backing off, a fresh load once its backoff
+   *  expired. The caller runs it at the top of a frame that renders; this class's wakes (a load
+   *  landed, a retry is due) are what make that frame happen on an idle surface. Returns true when
+   *  it bound anything. */
+  drain(isResident: (url: string) => boolean): boolean {
+    let bound = false;
+    for (const [url, list] of this.waiters) {
+      const live = list.filter((w) => !w.dead());
+      if (!live.length) { this.waiters.delete(url); continue; }
+      if (isResident(url)) {
+        this.waiters.delete(url);
+        for (const w of live) w.bind();
+        bound = true;
+      } else {
+        if (live.length !== list.length) this.waiters.set(url, live);
+        this.request(url);
+      }
+    }
+    return bound;
+  }
+
+  /** Test seam / fast path: how many urls have waiters. */
+  get waitingUrls(): number { return this.waiters.size; }
+
   /** Teardown (world swap, renderer dispose): forget everything and cancel pending wakes. */
   clear(): void {
-    for (const t of this.timers.values()) clearTimeout(t);
-    this.timers.clear();
     this.loading.clear();
     this.failed.clear();
+    this.waiters.clear();
   }
 
   /** Test seam: how many retry wakes are pending. */
-  get pendingWakes(): number { return this.timers.size; }
-
-  private scheduleWake(url: string): void {
-    const at = this.failed.retryAt(url);
-    if (at === undefined || this.timers.has(url)) return;
-    this.timers.set(url, setTimeout(() => {
-      this.timers.delete(url);
-      this.wake();
-    }, Math.max(0, at - rawNow())));
-  }
+  get pendingWakes(): number { return this.failed.pendingWakes; }
 }

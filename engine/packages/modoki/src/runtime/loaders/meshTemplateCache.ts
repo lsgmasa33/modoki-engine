@@ -12,7 +12,7 @@ import { registerBuiltinMaterialTypes } from './materialPresets';
 import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, getAssetEntry, getGuidForPath } from './assetManifest';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { classifyLoadFailure, createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
+import { classifyLoadFailure, createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { classifyFormatVersion } from '../core/formatVersion';
 import { MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION } from '../traits/Renderable3D';
@@ -1708,6 +1708,7 @@ export function disposeAllCachedResources() {
   envCache.clear();
   envLoadPromises.clear();
   envOwners.clear();
+  envFailures.clear();
   // Retired envs too: their sweep runs from `syncEnvironment`, so a surface that stops
   // rendering (or a build with no 3D surface at all) would otherwise strand them forever.
   // Everything binding them is being torn down with this generation anyway.
@@ -1723,6 +1724,7 @@ export function disposeAllCachedResources() {
   meshTransitiveDeps.clear();
   prefabCache.clear();
   prefabLoadPromises.clear();
+  prefabFailures.clear();
 
   // Particle effect defs and animation clips are plain data (no GPU resources),
   // but they accumulate across scene loads and a late fetch could re-register a
@@ -1810,6 +1812,21 @@ const meshDepKey = (sceneId: SceneId, meshPath: string) => `${sceneId}\x00${mesh
 const prefabCache = new Map<string, unknown>();
 /** In-flight prefab fetches. */
 const prefabLoadPromises = new Map<string, Promise<void>>();
+/** What a FAILED prefab fetch left behind (#1397). Before it, nothing — `fetchPrefab` swallowed a
+ *  non-ok status, a network error and a parse error alike and resolved with the cache empty, so
+ *  `requestPrefab` could not tell a deleted prefab from an outage and had to spend a flat attempt
+ *  budget on both (#1376). A 404 or a bad file is now remembered until the prefab is invalidated,
+ *  replaced or its last scene lets go; an outage backs off, and {@link prefabFetchRetryAt} tells
+ *  `requestPrefab` it is one. */
+const prefabFailures = createLoadFailureMemo({ label: 'MeshCache:prefab', unknownIs: 'permanent' });
+
+/** When a prefab whose fetch failed TRANSIENTLY may be fetched again (`rawNow()` ms), or undefined
+ *  when its last fetch did not fail transiently (never failed, loaded, or failed for good). For
+ *  `requestPrefab`, which must not spend its give-up budget on an outage (#1397). */
+export function prefabFetchRetryAt(prefabRef: string): number | undefined {
+  const prefabPath = refToPath(prefabRef);
+  return prefabPath ? prefabFailures.retryAt(prefabPath) : undefined;
+}
 
 const addOwner = (map: Map<string, Set<SceneId>>, key: string, sceneId: SceneId): boolean =>
   addToOwnerSet(map, key, sceneId);
@@ -2095,6 +2112,13 @@ export async function acquirePrefab(sceneId: SceneId, prefabRef: string): Promis
 const envCache = new Map<string, THREE.DataTexture>();
 const envLoadPromises = new Map<string, Promise<void>>();
 const envOwners = new Map<string, Set<SceneId>>();
+/** What a FAILED HDR load left behind (#1397). Before it, nothing: `syncEnvironment` asks every
+ *  frame while `envCache` misses, so a missing HDR was requested again every frame. Its own memo,
+ *  not `netRetry` — that one keys mesh/material paths and is `unknownIs: 'permanent'`, and three's
+ *  HDRLoader/UltraHDRLoader report a dropped connection and a parse error through one `onError`
+ *  (a 404 arrives as FileLoader's `HttpError`, which is classified). `onRetryDue` wakes an idle
+ *  render-on-demand viewport. */
+const envFailures = createLoadFailureMemo({ label: 'MeshCache:env', unknownIs: 'transient', onRetryDue: () => fireDirtyListeners() });
 // Both memoise the PROMISE rather than the loader: construction is async since #254, and a
 // field assigned after an await is observable half-done by a concurrent caller. Nothing is
 // configured after construction here, so the worst case would only be a wasted second loader
@@ -2205,6 +2229,7 @@ export function invalidateEnvironment(hdrRef: string): void {
   if (tex) retiredEnvs.add(tex);
   envCache.delete(hdrPath);
   envLoadPromises.delete(hdrPath);
+  envFailures.forget(hdrPath); // a re-import may have fixed the file
   // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
   // re-caches the stale texture on top of whatever refetch follows.
   cacheToken.invalidateKey(hdrPath);
@@ -2277,6 +2302,7 @@ function runEnvDisposeHooks(tex: THREE.DataTexture): void {
 function fetchEnvironment(hdrPath: string): Promise<void> {
   if (envCache.has(hdrPath)) return Promise.resolve();
   if (envLoadPromises.has(hdrPath)) return envLoadPromises.get(hdrPath)!;
+  if (envFailures.blocked(hdrPath)) return Promise.resolve();
 
   // Snapshot liveness BEFORE the async load so a release-mid-load (or a
   // full disposeAllCachedResources) is observable when the texture arrives.
@@ -2292,7 +2318,7 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
     try {
       loader = await loaderForEnv(hdrPath);
     } catch (err) {
-      console.warn(`[MeshCache] HDR loader unavailable for ${hdrPath}:`, err);
+      envFailures.record(hdrPath, err, stillLive() && envOwners.has(hdrPath));
       return; // syncEnvironment falls back to no env — same degrade as a failed load
     }
     await new Promise<void>((resolve) => {
@@ -2316,6 +2342,7 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
           const prev = envCache.get(hdrPath);
           if (prev && prev !== texture) retiredEnvs.add(prev);
           envCache.set(hdrPath, texture);
+          envFailures.forget(hdrPath);
           // Wake the render-on-demand viewport so syncEnvironment applies this IBL.
           // Like the material refetch above, an HDR that finishes loading after the
           // Inspector's dirty grace window (editor live-edit / re-import) would otherwise
@@ -2325,13 +2352,18 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
         },
         undefined,
         (err) => {
-          console.warn(`[MeshCache] HDR load failed for ${hdrPath}:`, err);
+          // Owner-checked like the success path above: the last release does not bump the token,
+          // so a failure landing after it would otherwise remember a path nobody holds.
+          envFailures.record(hdrPath, err, stillLive() && envOwners.has(hdrPath));
           resolve(); // resolve anyway — syncEnvironment will fall back to no env
         },
       );
     });
   })().finally(() => {
-    envLoadPromises.delete(hdrPath);
+    // Identity-checked, as riggedModelCache/fontAtlasLoader do: an invalidateEnvironment mid-flight
+    // deletes this entry and the next frame starts a REPLACEMENT; deleting unconditionally here
+    // would evict the replacement when this stale load settles.
+    if (envLoadPromises.get(hdrPath) === promise) envLoadPromises.delete(hdrPath);
   });
 
   envLoadPromises.set(hdrPath, promise);
@@ -2348,6 +2380,7 @@ function releasePrefabByPath(sceneId: SceneId, prefabPath: string): void {
   const wasLast = removeOwner(prefabOwners, prefabPath, sceneId);
   if (wasLast) {
     prefabCache.delete(prefabPath);
+    prefabFailures.forget(prefabPath); // failure memory is scene-scoped, like the mesh cache's (#1371)
   }
 }
 
@@ -2382,6 +2415,7 @@ export function invalidatePrefab(prefabRef: string): void {
     if (!key) continue;
     prefabCache.delete(key);
     prefabLoadPromises.delete(key);
+    prefabFailures.forget(key); // an edit may have fixed the file
     // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
     // re-caches the stale prefab on top of whatever refetch follows.
     cacheToken.invalidateKey(key);
@@ -2448,12 +2482,14 @@ export function replaceCachedPrefab(prefabRef: string, data: unknown): void {
   const copy = JSON.parse(JSON.stringify(data)) as { id?: unknown; entities?: { traits?: Record<string, unknown> }[] };
   for (const entry of copy.entities ?? []) migrateUIAnchorZIndexStructured(entry);
   prefabCache.set(prefabPath, copy);
+  prefabFailures.forget(prefabPath);
   if (typeof copy.id === 'string') registerAsset(copy.id, prefabPath, 'prefab');
 }
 
 function fetchPrefab(prefabPath: string): Promise<void> {
   if (prefabCache.has(prefabPath)) return Promise.resolve();
   if (prefabLoadPromises.has(prefabPath)) return prefabLoadPromises.get(prefabPath)!;
+  if (prefabFailures.blocked(prefabPath)) return Promise.resolve();
 
   // Snapshot liveness so a fetch that resolves AFTER an invalidatePrefab (or full teardown)
   // doesn't re-seat the pre-invalidation bytes into the freshly-cleared cache (#863). Mirrors
@@ -2462,9 +2498,9 @@ function fetchPrefab(prefabPath: string): Promise<void> {
 
   const promise = (async () => {
     try {
-      const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT);
-      if (!res.ok) return;
-      // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+      const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
+      // parseAssetJson types a non-ok status and the SPA fallback (a missing asset arriving as
+      // 200 OK index.html), so the failure memo can tell absent from unreachable (#1397).
       const data = await parseAssetJson(res, prefabPath) as { id?: string; entities?: { traits?: Record<string, unknown> }[] };
       // Prefabs carry no migration chain at all — `PREFAB_FORMAT_VERSION` is a writer-only
       // stamp nothing on the loading path inspects (#365/#379). Applying the zIndex
@@ -2477,13 +2513,16 @@ function fetchPrefab(prefabPath: string): Promise<void> {
       for (const entry of data.entities ?? []) migrateUIAnchorZIndexStructured(entry);
       if (!stillLive()) return; // invalidated (or torn down) while this fetch was in flight
       prefabCache.set(prefabPath, data);
+      prefabFailures.forget(prefabPath);
       if (typeof data.id === 'string') registerAsset(data.id, prefabPath, 'prefab');
     } catch (e) {
-      console.warn(`[MeshCache] Failed to load prefab ${prefabPath}:`, e);
-    } finally {
-      prefabLoadPromises.delete(prefabPath);
+      prefabFailures.record(prefabPath, e, stillLive() && prefabOwners.has(prefabPath));
     }
-  })();
+  })().finally(() => {
+    // Identity-checked, as the env/rigged/font twins are: an invalidatePrefab mid-flight deletes
+    // this entry and the next ask starts a REPLACEMENT this stale settle must not evict.
+    if (prefabLoadPromises.get(prefabPath) === promise) prefabLoadPromises.delete(prefabPath);
+  });
 
   prefabLoadPromises.set(prefabPath, promise);
   return promise;
@@ -2513,6 +2552,13 @@ export function releaseAllForScene(sceneId: SceneId): void {
   for (const path of [...envOwners.keys()]) {
     if (envOwners.get(path)?.has(sceneId)) releaseEnvironmentByPath(sceneId, path);
   }
+  // Env failure memory ends with ANY scene release, not just the last owner's (#1397 review).
+  // `syncEnvironment`'s per-frame fallback acquires under owner -1, which no scene release ever
+  // removes — and a failed HDR always misses the cache, so it always carries that stamp. Keyed on
+  // the owner set, a 404'd HDR would stay blocked for the session: a restored file, or the next
+  // scene using the same HDR, would never be retried. A scene swap is the unit of memory here, and
+  // clearing costs at most one request per failed HDR.
+  envFailures.clear();
   // Rigged skeletal GLBs (parallel cache) — release this scene's holds too.
   releaseRiggedModelsForScene(sceneId);
   // Audio buffers (parallel cache) — release this scene's holds too.

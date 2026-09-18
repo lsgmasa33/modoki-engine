@@ -10,9 +10,31 @@
 
 import * as THREE from 'three';
 import type { FontProvider } from './fontProvider';
+import { markTextDirty } from './textDirty';
+import { createLoadFailureMemo } from '../../core/loadFailureMemo';
 
 const cache = new Map<string, THREE.Texture>();
 const loader = new THREE.TextureLoader();
+/** What a FAILED atlas load left behind (#1397). Before it, the placeholder Texture that
+ *  `TextureLoader.load` returns stayed cached with no image for as long as the provider lived, so a
+ *  network blip left that font's 3D text invisible until the scene changed. A failure now evicts
+ *  the placeholder and is remembered here; `TextureLoader` goes through an `<img>`, which reports
+ *  a 404 and a dropped connection as the same bare `Event`, so every failure is `transient` and
+ *  backs off (1 s doubling to 10 min) — a missing file costs one request per step, a blip
+ *  recovers. `onRetryDue` repaints the font's text so render-on-demand surfaces ask again. Keyed
+ *  like the Pixi twin: `fontId + '\n' + url`. */
+const failures = createLoadFailureMemo({
+  label: 'fontTextureThree',
+  unknownIs: 'transient',
+  onRetryDue: (key) => markTextDirty(key.slice(0, key.indexOf('\n'))),
+});
+/** Providers whose page-0 image disposer is registered — ONE per provider, not one per load: a
+ *  retry is a new load, and registering per load grew the provider's disposer list by one per
+ *  backoff step for as long as an outage lasted. */
+const imageDisposerRegistered = new WeakSet<FontProvider>();
+/** Providers that have been disposed — an atlas load that fails after its provider was superseded
+ *  (`invalidateFont`) must not record a failure under the key its successor is about to use. */
+const disposedProviders = new WeakSet<FontProvider>();
 /** Last atlasVersion uploaded into each dynamic CanvasTexture (so a grow re-uploads). */
 const uploadedVersion = new WeakMap<THREE.Texture, number>();
 
@@ -72,12 +94,37 @@ export function getFontTexture(provider: FontProvider, page = 0): THREE.Texture 
   const existing = cache.get(key);
   if (existing) return existing;
 
-  const tex = loader.load(provider.atlasImageUrl);
+  const url = provider.atlasImageUrl;
+  const failureKey = `${provider.id}\n${url}`;
+  if (failures.blocked(failureKey)) return null;
+  const tex = loader.load(
+    url,
+    () => {
+      failures.forget(failureKey);
+      // Repaint once the image is actually here. The retry's own wake (`onRetryDue`) fires BEFORE
+      // this load starts, and the idle 3D surfaces render only ~1 s after a wake — an atlas slower
+      // than that would land into a frame nobody draws (#1397 review).
+      markTextDirty(provider.id);
+    },
+    undefined,
+    (err) => {
+      // Evict the image-less placeholder, so the next ask after the backoff loads again instead
+      // of finding it cached. Identity-checked: a disposed-and-reacquired font may own the key now.
+      if (cache.get(key) === tex) cache.delete(key);
+      tex.dispose();
+      failures.record(failureKey, err, !disposedProviders.has(provider));
+    },
+  );
   styleFontTexture(tex);
   cache.set(key, tex);
-  provider.addDisposable(() => {
-    const t = cache.get(key);
-    if (t) { t.dispose(); cache.delete(key); }
-  });
+  if (!imageDisposerRegistered.has(provider)) {
+    imageDisposerRegistered.add(provider);
+    provider.addDisposable(() => {
+      disposedProviders.add(provider);
+      const t = cache.get(key);
+      if (t) { t.dispose(); cache.delete(key); }
+      failures.forget(failureKey);
+    });
+  }
   return tex;
 }

@@ -3,6 +3,7 @@
 import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
 import { fireDirtyListeners } from '../core/renderDirty';
+import { createLoadFailureMemo } from '../core/loadFailureMemo';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { noteGpuContextCreated } from '../core/gpuContextTracking';
 import { installGlProgramReleaseHatch } from './glProgramRelease';
@@ -1353,6 +1354,10 @@ export interface BillboardEntry {
   /** Set true by `disposeBillboardEntry`. An in-flight page-load resolving after this
    *  disposes its own texture instead of writing to the dead entry (leak guard). */
   disposed: boolean;
+  /** Parts whose page failed to load, or was backing off when the entry was built (#1397). The
+   *  entry is rebuilt only on a `billboardSig` change, so without this a failed page stayed
+   *  missing for the entry's whole life; `syncSkinnedSprite3D` re-asks these each frame. */
+  pendingPages: Set<number>;
 }
 
 export interface RenderState {
@@ -3335,6 +3340,55 @@ async function loadBillboardPage(url: string): Promise<THREE.Texture> {
   });
 }
 
+/** What a FAILED billboard page load left behind (#1397), by url. The url carries the content
+ *  hash, so a re-import arrives under a fresh key. `unknownIs: 'transient'`: `TextureLoader` goes
+ *  through an `<img>`, whose failure is a bare Event (a 404 from the KTX2 loader is three's
+ *  classified `HttpError`). `onRetryDue` wakes a stopped Scene3D so the retry actually runs. */
+const billboardPageFailures = createLoadFailureMemo({ label: 'billboard', unknownIs: 'transient', onRetryDue: () => fireDirtyListeners() });
+
+/** Load `url` into part `idx` of `entry`, sharing one load per url per `jobs` map (a build, or one
+ *  frame's retries). A page that is backing off, or whose load fails, goes to
+ *  `entry.pendingPages` for {@link retryBillboardPages}. */
+function loadBillboardPart(
+  entry: BillboardEntry, idx: number, mat: THREE.MeshBasicMaterial, url: string,
+  jobs: Map<string, Promise<THREE.Texture>>,
+): void {
+  if (billboardPageFailures.blocked(url)) { entry.pendingPages.add(idx); return; }
+  let job = jobs.get(url);
+  if (!job) {
+    // Wake on the SHARED job, not per part (#1368 G2): a page landing after the idle gate's
+    // grace redraws nothing on a stopped Scene3D. Once per page per `jobs` map — a build's, or
+    // one frame's retries — so it is bounded by rebuilds and by the failure memo's backoff,
+    // never a plain frame. This `.then` runs before any part's below, all ahead of the woken
+    // frame. The failure is recorded here, once per load, not once per part.
+    job = loadBillboardPage(url).then(
+      (tex) => { billboardPageFailures.forget(url); fireDirtyListeners(); return tex; },
+      (e: unknown) => { billboardPageFailures.record(url, e); throw e; },
+    );
+    jobs.set(url, job);
+  }
+  job.then((tex) => {
+    // Disposed/rebuilt mid-load: the entry is dead and its texture-dispose loop
+    // already ran (saw null here), so free this late arrival ourselves — else it leaks.
+    if (entry.disposed) { tex.dispose(); return; }
+    mat.map = tex; mat.needsUpdate = true;
+    entry.textures[idx] = tex;
+  }, () => { if (!entry.disposed) entry.pendingPages.add(idx); })
+    .catch((e: unknown) => console.warn(`[billboard] binding page ${url} failed:`, e));
+}
+
+/** Re-ask every part whose page failed, once its backoff has expired (#1397). Per frame, but a
+ *  no-op for an entry with nothing pending and for a url still backing off. */
+function retryBillboardPages(entry: BillboardEntry, parts: Skin2DPartBuffer[]): void {
+  const jobs = new Map<string, Promise<THREE.Texture>>();
+  for (const idx of [...entry.pendingPages]) {
+    const url = parts[idx]?.url;
+    entry.pendingPages.delete(idx);
+    // Still backing off → `loadBillboardPart` puts it straight back.
+    if (url) loadBillboardPart(entry, idx, entry.meshes[idx].material as THREE.MeshBasicMaterial, url, jobs);
+  }
+}
+
 /** Create the THREE objects for one billboarded rig and kick off texture loads. */
 function buildBillboardEntry(
   owner: number,
@@ -3348,7 +3402,7 @@ function buildBillboardEntry(
   group.add(flip);
   const entry: BillboardEntry = {
     owner, rigRef: ss.rig, sig: billboardSig(buf.parts), mode: opt.mode, group, flip,
-    meshes: [], orders: [], textures: [], deformVersion: -1, disposed: false,
+    meshes: [], orders: [], textures: [], deformVersion: -1, disposed: false, pendingPages: new Set(),
   };
   // Load each distinct page URL once and share across the parts that use it.
   const pageCache = new Map<string, Promise<THREE.Texture>>();
@@ -3371,25 +3425,7 @@ function buildBillboardEntry(
     entry.meshes.push(mesh);
     entry.orders.push(part.order);
     entry.textures.push(null);
-    if (part.url) {
-      let job = pageCache.get(part.url);
-      if (!job) {
-        // Wake on the SHARED job, not per part (#1368 G2): a page landing after the idle gate's
-        // grace redraws nothing on a stopped Scene3D. Once per page per BUILD — `pageCache` is
-        // local to this build, so a rebuild refetches and wakes again; that is bounded because a
-        // rebuild needs a `billboardSig` change, never a plain frame. This `.then` runs before any
-        // part's below, all ahead of the woken frame.
-        job = loadBillboardPage(part.url).then((tex) => { fireDirtyListeners(); return tex; });
-        pageCache.set(part.url, job);
-      }
-      job.then((tex) => {
-        // Disposed/rebuilt mid-load: the entry is dead and its texture-dispose loop
-        // already ran (saw null here), so free this late arrival ourselves — else it leaks.
-        if (entry.disposed) { tex.dispose(); return; }
-        mat.map = tex; mat.needsUpdate = true;
-        entry.textures[idx] = tex;
-      }).catch((e) => console.warn(`[billboard] texture load failed: ${part.url}`, e));
-    }
+    if (part.url) loadBillboardPart(entry, idx, mat, part.url, pageCache);
   });
   scene.add(group);
   return entry;
@@ -3424,6 +3460,7 @@ function syncSkinnedSprite3D(
     disposeBillboardEntry(entry, scene); billboards.delete(id); entry = undefined;
   }
   if (!entry) { entry = buildBillboardEntry(entity.valueOf(), ss, opt, buf, scene); billboards.set(id, entry); }
+  else if (entry.pendingPages.size) retryBillboardPages(entry, buf.parts);
   entry.owner = entity.valueOf();
   entry.mode = opt.mode;
 

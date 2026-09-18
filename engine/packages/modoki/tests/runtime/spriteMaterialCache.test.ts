@@ -485,3 +485,52 @@ describe('invalidateShader (#852 per-key)', () => {
     expect(wake).toHaveBeenCalledTimes(1);
   });
 });
+
+/** #1397 — a build that failed because the manifest or body could not be FETCHED used to go to
+ *  `failed`, sticky until the next world swap: one network blip dropped that material to the
+ *  fallback sprite for the whole scene. A transient failure now backs off and is retried; a
+ *  missing file, a bad manifest or a compile error still sticks. */
+describe('ensureSpriteMaterial — a transient fetch failure backs off instead of sticking (#1397)', () => {
+  it('retries after the backoff, not every frame before it, and then compiles', async () => {
+    const clock = await import('../../src/runtime/core/clock');
+    const { RETRY_BASE_MS } = await import('../../src/runtime/core/loadFailureMemo');
+    const { AssetNetworkError } = await import('../../src/runtime/core/assetLoadErrors');
+    clock.setManualNow(0);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      paths.set('g1', 'mat.shader.json');
+      build.mockRejectedValueOnce(new AssetNetworkError(new TypeError('Failed to fetch')));
+      cache.ensureSpriteMaterial('g1');
+      await flush();
+      for (let frame = 0; frame < 5; frame++) cache.ensureSpriteMaterial('g1');
+      expect(build).toHaveBeenCalledTimes(1);
+
+      clock.advanceManual(RETRY_BASE_MS);
+      const program = { id: 'p' };
+      build.mockResolvedValueOnce(program);
+      cache.ensureSpriteMaterial('g1');
+      await flush();
+      expect(build).toHaveBeenCalledTimes(2);
+      expect(cache.ensureSpriteMaterial('g1')).toBe(program);
+    } finally {
+      clock.restoreRealClock();
+    }
+  });
+
+  it('a compile error is still sticky until the world swap', async () => {
+    const clock = await import('../../src/runtime/core/clock');
+    clock.setManualNow(0);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      paths.set('g1', 'mat.shader.json');
+      build.mockRejectedValueOnce(new Error('extractStructAndGroups: bad token'));
+      cache.ensureSpriteMaterial('g1');
+      await flush();
+      clock.advanceManual(60 * 60 * 1000);
+      cache.ensureSpriteMaterial('g1');
+      expect(build).toHaveBeenCalledTimes(1);
+    } finally {
+      clock.restoreRealClock();
+    }
+  });
+});

@@ -30,8 +30,8 @@ import {
 import {
   createLoadFailureMemo, classifyLoadFailure, retryDelayMs, AssetNetworkError,
   RETRY_BASE_MS, RETRY_CAP_MS,
-} from '../../packages/modoki/src/runtime/loaders/loadFailureMemo';
-import { MissingAssetError, parseAssetJson } from '../../packages/modoki/src/runtime/loaders/assetFetch';
+} from '../../packages/modoki/src/runtime/core/loadFailureMemo';
+import { MissingAssetError, parseAssetJson, checkAssetResponse, readAssetBytes } from '../../packages/modoki/src/runtime/loaders/assetFetch';
 import { createWorld } from 'koota';
 import { setCurrentWorld, getCurrentWorld } from '../../packages/modoki/src/runtime/core/ecs/worldRegistry';
 import { setManualNow, advanceManual, restoreRealClock } from '../../packages/modoki/src/runtime/core/clock';
@@ -387,5 +387,96 @@ describe('#1371 close-out §2d findings', () => {
     await acquireMesh(9104, guid);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     releaseMesh(9104, guid);
+  });
+});
+
+// ── #1397: the helper extensions the remaining loaders need ─────────────────────────────────────
+
+/** three's FileLoader `HttpError` — not exported, so the test builds the same shape. */
+function threeHttpError(status: number): Error {
+  return Object.assign(new Error(`fetch for "x" responded with ${status}`), { response: { status } });
+}
+
+describe('#1397 E3 — three.js HttpError is classified by its status', () => {
+  it('404/410 are permanent, other statuses transient, and a bare TypeError from the same loader stays unknown', () => {
+    expect(classifyLoadFailure(threeHttpError(404))).toBe('permanent');
+    expect(classifyLoadFailure(threeHttpError(410))).toBe('permanent');
+    expect(classifyLoadFailure(threeHttpError(503))).toBe('transient');
+    expect(classifyLoadFailure(threeHttpError(403))).toBe('transient');
+    // FileLoader routes a dropped connection AND a parse error through one onError — no status.
+    expect(classifyLoadFailure(new TypeError('Failed to fetch'))).toBe('unknown');
+    // A non-Error carrying a status is not three's HttpError.
+    expect(classifyLoadFailure({ response: { status: 404 } })).toBe('unknown');
+  });
+});
+
+describe('#1397 E2 — checkAssetResponse types a binary asset\'s response', () => {
+  const res = (status: number, type: string) => new Response(status === 204 ? null : 'x', { status, headers: { 'content-type': type } });
+  it('404 and 410 are absent; a 503 is not; the SPA fallback (200 text/html) is absent; a real body passes', () => {
+    const thrown = (r: Response) => { try { checkAssetResponse(r, '/f.ttf'); return undefined; } catch (e) { return e; } };
+    for (const s of [404, 410]) {
+      const e = thrown(res(s, 'text/plain'));
+      expect(e).toBeInstanceOf(MissingAssetError);
+      expect(classifyLoadFailure(e)).toBe('permanent');
+    }
+    const e503 = thrown(res(503, 'text/plain'));
+    expect(e503).toBeInstanceOf(MissingAssetError);
+    expect(classifyLoadFailure(e503)).toBe('transient');
+    const spa = thrown(res(200, 'text/html; charset=utf-8'));
+    expect(spa).toBeInstanceOf(MissingAssetError);
+    expect(classifyLoadFailure(spa)).toBe('permanent');
+    const ok = res(200, 'font/ttf');
+    expect(checkAssetResponse(ok, '/f.ttf')).toBe(ok);
+  });
+
+  it('readAssetBytes marks a body read that fails as a network error, but passes a cancel through', async () => {
+    const drop = { arrayBuffer: () => Promise.reject(new TypeError('Load failed')) } as unknown as Response;
+    await expect(readAssetBytes(drop)).rejects.toBeInstanceOf(AssetNetworkError);
+    const abort = Object.assign(new Error('aborted'), { name: 'AbortError' });
+    const cancelled = { arrayBuffer: () => Promise.reject(abort) } as unknown as Response;
+    await expect(readAssetBytes(cancelled)).rejects.toBe(abort);
+  });
+});
+
+describe('#1397 E1 — onRetryDue wakes a caller whose askers do not come back on their own', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('fires once when a transient backoff expires, and not before', () => {
+    const due = vi.fn();
+    const memo = createLoadFailureMemo({ label: 't', unknownIs: 'transient', onRetryDue: due });
+    memo.record('k', new AssetNetworkError('x'));
+    expect(memo.pendingWakes).toBe(1);
+    vi.advanceTimersByTime(RETRY_BASE_MS - 1);
+    expect(due).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(due).toHaveBeenCalledTimes(1);
+    expect(due).toHaveBeenCalledWith('k');
+    expect(memo.pendingWakes).toBe(0);
+  });
+
+  it('a repeat failure replaces the timer rather than stacking a second one', () => {
+    const due = vi.fn();
+    const memo = createLoadFailureMemo({ label: 't', unknownIs: 'transient', onRetryDue: due });
+    memo.record('k', new AssetNetworkError('x'));
+    memo.record('k', new AssetNetworkError('x'));
+    expect(memo.pendingWakes).toBe(1);
+    vi.advanceTimersByTime(RETRY_CAP_MS);
+    expect(due).toHaveBeenCalledTimes(1);
+  });
+
+  it('a permanent failure arms nothing, and forget/clear cancel a pending wake', () => {
+    const due = vi.fn();
+    const memo = createLoadFailureMemo({ label: 't', unknownIs: 'transient', onRetryDue: due });
+    memo.record('gone', new MissingAssetError('404', { status: 404, absent: true }));
+    expect(memo.pendingWakes).toBe(0);
+    memo.record('a', new AssetNetworkError('x'));
+    memo.record('b', new AssetNetworkError('x'));
+    memo.forget('a');
+    expect(memo.pendingWakes).toBe(1);
+    memo.clear();
+    expect(memo.pendingWakes).toBe(0);
+    vi.advanceTimersByTime(RETRY_CAP_MS);
+    expect(due).not.toHaveBeenCalled();
   });
 });

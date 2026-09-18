@@ -642,7 +642,7 @@ time-based budget (retry while
 `now - firstFailureAt < N`, capped at K attempts) would actually cover a transient
 WASM-instantiate failure; a count-only budget against a frame-rate caller does not.
 
-### A load failure is classified before it is remembered (#1371, #1374)
+### A load failure is classified before it is remembered (#1371, #1374, #1397)
 
 **A loader that remembers a failed fetch must first ask whether the same bytes would fail again.**
 The lazy def caches (`rig2dCache`, `spriteAnimCache`, `animSetCache`, `particleCache`,
@@ -651,7 +651,7 @@ the life of the process, so one dropped request on a phone disabled that asset u
 restarted. Weaveling's willow and susuki (`rig2dCache`) went still for the session, and the game's
 own journal still reported each ambient run as ending cleanly. Scene2D's material-sprite textures
 had the opposite bug: no failure memory, so a 404 refetched on every dirty frame. Both come from one
-missing distinction, and `runtime/loaders/loadFailureMemo.ts` is where it now lives:
+missing distinction, and `runtime/core/loadFailureMemo.ts` is where it now lives:
 
 | Class | What | Memory |
 |---|---|---|
@@ -699,13 +699,84 @@ again. The sentinels answer before `netRetry.blocked()` is ever asked, so the re
 retry later loads the model, those templates have no owning scene: this is the F6 unowned-load case
 `acquireMesh` already documents. Before #1371 it could not be reached from here, because the failure
 was permanent. So "never renders" became "renders, possibly resident until that model is acquired
-again". `spriteMaterialCache` is
-deliberately untouched: its failures are shader compiles, which are all deterministic. Scene2D's
+again". Scene2D's
 state lives in `loaders/materialTexRetry.ts` (`MaterialTexRetry`), so its decisions can be tested
 without a Pixi app. It has no invalidation hook because it does not need one: a re-import moves the
 resolved url (`withCacheBust`). A per-load generation number stops a load that a teardown
 superseded from releasing the newer load that replaced it. What it does have is its own timer wake when a backoff expires, because an idle
 scene has nothing else to mark it dirty.
+
+#### Every loader, not just the first nine (#1397)
+
+#1371/#1374 fixed nine sites. A sweep found fourteen more with the same missing distinction.
+Some had no memory, so a 404 was requested again every frame or every tap: the rigged-model cache,
+HDR environments, font atlases, 2D skinned parts and audio. Others remembered every failure for good,
+so a blip was permanent: the Three atlas, dynamic-font glyphs, 2D sprite slots, 3D billboard pages,
+2D shader fetches, video downloads and `requestPrefab`'s give-up budget. They all use the one memo
+now. What they needed from it:
+
+- **It lives in L0.** `core/loadFailureMemo.ts` and `core/assetLoadErrors.ts` (the error types,
+  `statusIsAbsent`, `checkAssetResponse`, `readAssetBytes`). `rendering/`, `audio/` and `video/`
+  are L2 and may not import `loaders/` (docs/architecture-layers.md). `loaders/assetFetch.ts`
+  re-exports the error types. `@modoki/engine` exports the memo too, so a game's own loader
+  (Court's level list, #1399; Wordweave's corpus, #1400) can use the same rule.
+- **`onRetryDue`, a wake per backing-off key.** A per-frame asker (`scene3DSync`'s model and HDR
+  acquires) comes back by itself. A render-on-demand surface, a slot built once, or an idle
+  Scene2D does not. So the memo can arm one timer per key, which `forget`/`clear` cancel. The
+  wake is the shared dirty hub (`fireDirtyListeners`) or `markTextDirty(fontId)`, never a private
+  channel (#1368). ⚠️ **Waking when the retry is due is not enough:** the woken frame starts the
+  load, and an idle 3D surface renders only about 1 s after a wake. So a load that lands must wake
+  again, which is what the Three atlas missed at first.
+- **Typing binary fetches.** `checkAssetResponse` is `parseAssetJson`'s status half for a body you
+  cannot sniff: a non-ok status, and a `text/html` content type, which for a binary asset can
+  only be the SPA fallback. `readAssetBytes` marks a body that drops mid-read. Audio's XHR
+  applies the same two checks by hand. Before, a 404 page reached `decodeAudioData` and read as a
+  decode failure.
+- **three's `HttpError`.** FileLoader (under GLTFLoader, HDRLoader, KTX2) rejects a non-ok response
+  with an `HttpError` carrying the Response, so `classifyLoadFailure` reads `e.response.status`. A
+  bare `TypeError` from the same `onError` stays unknown: FileLoader sends a dropped connection
+  and a parse error through the same callback.
+
+Loaders that cannot see a status are `unknownIs: 'transient'`: Pixi's `Assets.load` (sprites,
+skinned parts, the no-`createImageBitmap` atlas fallback), and `TextureLoader`/`<img>` (the Three
+atlas, billboard pages), whose failure is a bare `Event`. Backing off bounds a 404 to one request
+per step. Sticking would make a blip permanent.
+
+Four sites keep something the rule would otherwise erase:
+
+- **Audio: the memo covers the FETCH only.** `retryFailedAudioDecodes` re-attempts every owned
+  clip on each gesture. That is the iOS decode unlock (`decodeAudioData` rejects while the context
+  is suspended), so a decode failure is still retried per gesture.
+- **Dynamic-font glyphs: two budgets.** A network failure of the `.ttf` backs off without end.
+  While it backs off, new codepoints are parked on the armed retry instead of fetching. A generator
+  or WASM failure keeps #541/#635's `MAX_FLUSH_RETRIES`, because that one IS a broken font.
+- **Video: transient only** (owner ruling 2026-09-18, "retry, still stop on 404"). A 404/410 or
+  a cache refusal stays sticky until the clip changes, since the refusal would repeat. A
+  transient failure backs off per clip. Accepted cost: a CORS refusal has no response, looks like
+  an outage, and is retried at the 10-minute cap for the session.
+- **`requestPrefab`: the give-up budget stays, and an outage does not spend it.** The budget
+  existed because `fetchPrefab` could not tell a deleted prefab from an outage. It still gives up
+  on a prefab that is not coming (a 404, a document the caller's `isHit` rejects). An attempt that
+  ends in a transient failure is refunded (`prefabFetchRetryAt`), so a built game no longer gives
+  a prefab up for the session after about 1.5 s of dropped connection. See prefabs.md.
+
+The in-flight dedupe maps got the same **identity-checked delete** everywhere a `finally` clears
+them (fonts, HDR, prefabs), for the reason riggedModelCache spells out. A load superseded by an
+invalidation must not evict the replacement that took its key. If it does, the next frame starts a
+third load, and a failure the replacement was about to record is requested again first.
+
+⚠️ **On iOS native, a MISSING bundled file is classified as an outage.** Capacitor's
+`WebViewAssetHandler.swift` does not answer a missing file with a 404. `Data(contentsOf:)` throws,
+and the handler calls `urlSchemeTask.didFailWithError`, so `fetch` rejects exactly as it does
+offline and `rethrowAsNetworkError` marks it transient. So on a device, a bundled asset that is in
+the manifest but not in the bundle backs off forever: a local read every 10 minutes at the cap.
+It is never remembered as absent, and `requestPrefab` never reports it `prefab/unavailable`. That
+case is a build defect, and the retries cost no network. What it loses is the diagnosis:
+`@asset-load-failed` says `transient: true`. #1371's sites carried this before #1397. Android is
+unchecked. Tracked in #1402.
+
+Left out on purpose: the 3D `fileShaderBuilder` fallback's lifetime (not traced), and re-downloading
+audio bytes on every decode retry.
 
 ## Single source of truth — where a value lives is decided by what KIND of value it is
 

@@ -175,7 +175,9 @@ Commits `25f3b2f` + `633abcf` (review fixes).
 - **…and the eviction refills an OWNED buffer clip itself (#1361).** `getCachedAudioBuffer` is
   read-only — the audio system treats a miss as "not decoded yet" and waits — and the only other
   refill, `retryFailedAudioDecodes`, runs from `audioService.resume()` on the next pointer, key or
-  visibility event. So after any re-import, new plays of that clip were silent until a click, or
+  visibility event. (Since #1397 that refill re-attempts a failed DECODE on every gesture, which is
+  the iOS unlock, but not a failed FETCH: a missing clip is remembered and an outage backs off. See
+  [architecture.md](architecture.md) § "A load failure is classified before it is remembered".) So after any re-import, new plays of that clip were silent until a click, or
   until a scene reload when an agent drove the re-import with no input at all (reproduced live on
   `games/audio-demo`: owned, uncached 3 s later). `invalidateAudio` now re-fetches when a scene owns
   the clip and the manifest says `buffer`; an unowned clip stays evicted, since no

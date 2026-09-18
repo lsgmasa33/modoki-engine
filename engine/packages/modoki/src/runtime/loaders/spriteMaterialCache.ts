@@ -26,6 +26,7 @@ import { getGuidForPath, resolveRef } from './assetManifest';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
 import { fireDirtyListeners } from '../core/renderDirty';
 import { errorText } from '../core/errorText';
+import { classifyLoadFailure, createLoadFailureMemo } from '../core/loadFailureMemo';
 
 const programs = new Map<string, PixiShaderProgram>(); // guid → resolved program
 const loading = new Map<string, Promise<void>>();      // guid → in-flight compile
@@ -43,6 +44,13 @@ const failed = new Set<string>();                      // guid → compile retur
 // (#852). Keying liveness by guid is what lets `invalidateShader` evict ONLY the edited guid's
 // entry without superseding any other guid's in-flight compile.
 const liveness = createTeardownToken<string>();
+/** A build that failed because the manifest or body could not be FETCHED (#1397). Before it,
+ *  every failure — including a dropped connection — went to `failed`, which is sticky until the
+ *  next world swap, so one blip dropped that material to the fallback sprite for the whole scene.
+ *  Only a transient failure lands here (the fetch helpers type it); a missing file, a bad
+ *  manifest and a compile error still go to `failed`. `onRetryDue` wakes an idle surface so the
+ *  material pass asks again. */
+const netRetry = createLoadFailureMemo({ label: 'spriteMaterialCache', unknownIs: 'permanent', onRetryDue: () => fireDirtyListeners() });
 // Parity fix, close-out sweep of QA-ANIM-0018: `resolveRef` never warns for a validly-shaped
 // guid simply absent from the manifest — the comment below claiming "resolveRef already warned"
 // was wrong. Separate from `failed` above: this one forgets a guid once it resolves (so a LATER
@@ -70,6 +78,7 @@ export function ensureSpriteMaterial(guid: string): PixiShaderProgram | undefine
   if (ready) return ready;
   if (failed.has(guid)) return undefined;
   if (loading.has(guid)) return undefined; // in flight — the store's shared wake covers this caller too
+  if (netRetry.blocked(guid)) return undefined; // a fetch failed and is backing off (#1397)
 
   const path = resolveRefWarnOnce(guid, 'spriteMaterialCache', unknownGuidSeen);
   if (!path) { failed.add(guid); return undefined; } // unresolved GUID — warned once above
@@ -84,10 +93,17 @@ export function ensureSpriteMaterial(guid: string): PixiShaderProgram | undefine
       if (!stillLive()) return;
       loading.delete(guid);
       // Store FIRST, then wake — a listener that renders synchronously must find the program.
+      netRetry.forget(guid);
       if (program) { programs.set(guid, program); fireDirtyListeners(); }
       else failed.add(guid); // missing body / wrong space / reserved-name — buildPixiShaderProgram warned
     })
     .catch((e) => {
+      if (classifyLoadFailure(e) === 'transient') {
+        // The server could not be reached — back off and retry rather than fall back for the scene.
+        netRetry.record(guid, e, stillLive());
+        if (stillLive()) loading.delete(guid);
+        return;
+      }
       console.warn(`[spriteMaterialCache] failed to build 2D material ${guid}: ${e instanceof Error ? errorText(e) : String(e)}`);
       if (!stillLive()) return; // superseded — see .then above
       loading.delete(guid);
@@ -113,6 +129,7 @@ export function clearSpriteMaterialCache(): void {
   programs.clear();
   loading.clear();
   failed.clear();
+  netRetry.clear();
   if (superseded) fireDirtyListeners();
 }
 
@@ -171,6 +188,7 @@ export function invalidateShader(manifestPath: string): void {
     liveness.invalidateKey(guid);
     programs.delete(guid);
     failed.delete(guid);
+    netRetry.forget(guid);
     loading.delete(guid);
     // A superseded compile's resolve deliberately fires no wake (#523), so a renderer still live
     // across this invalidation must be woken here, or its entities sit on the fallback sprite for

@@ -18,10 +18,13 @@
  *      canvas branch's closure disposes/evicts only that branch's cache entry, and likewise for
  *      the baked branch's. A test that only ever built a canvas provider would leave the baked
  *      branch's closure — and a regression to it — untouched. */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as THREE from 'three';
 import { getFontTexture } from '../../src/runtime/rendering/text/fontTextureThree';
 import type { FontProvider } from '../../src/runtime/rendering/text/fontProvider';
+import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
+import { RETRY_BASE_MS } from '../../src/runtime/core/loadFailureMemo';
+import { getTextDirtyVersion } from '../../src/runtime/rendering/text/textDirty';
 
 /** A dynamic-style fake provider: `atlasCanvasAt` returns a real canvas, so `getFontTexture`
  *  takes the CanvasTexture branch. `addDisposable` just records the last registered closure —
@@ -149,5 +152,121 @@ describe('addDisposable eviction — each branch registers, and is exercised on,
     // The cache entry is gone — the next call mints a fresh texture, not the disposed one.
     const rebuilt = getFontTexture(p, 0);
     expect(rebuilt, 'a rebuilt baked texture after eviction must be a NEW object').not.toBe(tex);
+  });
+});
+
+/** #1397 — a failed atlas load used to leave the image-less placeholder cached for the provider's
+ *  whole life, so 3D text stayed invisible after a network blip until the scene changed. */
+describe('a failed atlas load backs off and retries (#1397)', () => {
+  afterEach(() => { vi.restoreAllMocks(); restoreRealClock(); vi.useRealTimers(); });
+
+  /** Stub the image load: every call fails (or succeeds) on the next microtask. */
+  function stubLoader(fail: () => boolean) {
+    // Cast: three types `load` generically over the image type, which a stub has no reason to match.
+    return vi.spyOn(THREE.TextureLoader.prototype, 'load').mockImplementation(((
+      _url: string, onLoad?: (t: THREE.Texture) => void, _p?: unknown, onError?: (e: unknown) => void,
+    ) => {
+      const tex = new THREE.Texture();
+      queueMicrotask(() => { if (fail()) onError?.(new Event('error')); else onLoad?.(tex); });
+      return tex;
+    }) as never);
+  }
+
+  it('evicts the placeholder, returns null while backing off, then loads a fresh texture', async () => {
+    setManualNow(0);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let failing = true;
+    const load = stubLoader(() => failing);
+    const p = bakedProvider('font-3d-fail');
+    const first = getFontTexture(p, 0);
+    expect(first).toBeTruthy();
+    await Promise.resolve(); await Promise.resolve();
+    expect(getFontTexture(p, 0), 'backing off: no placeholder, no refetch').toBeNull();
+    expect(load).toHaveBeenCalledTimes(1);
+    advanceManual(RETRY_BASE_MS);
+    failing = false;
+    const second = getFontTexture(p, 0);
+    expect(second).toBeTruthy();
+    expect(second).not.toBe(first);
+    expect(load).toHaveBeenCalledTimes(2);
+    await Promise.resolve();
+    expect(getFontTexture(p, 0), 'a landed load is served from the cache').toBe(second);
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('repaints the font\'s text when the retry is due', async () => {
+    setManualNow(0);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    stubLoader(() => true);
+    const p = bakedProvider('font-3d-wake');
+    getFontTexture(p, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    const v0 = getTextDirtyVersion('font-3d-wake');
+    await vi.advanceTimersByTimeAsync(RETRY_BASE_MS - 10);
+    expect(getTextDirtyVersion('font-3d-wake')).toBe(v0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(getTextDirtyVersion('font-3d-wake')).toBe(v0 + 1);
+  });
+});
+
+describe('the atlas failure memo against provider lifetimes (#1397 review)', () => {
+  afterEach(() => { vi.restoreAllMocks(); restoreRealClock(); });
+
+  /** A provider with a real disposer list: `dispose()` runs them, and a registration after that
+   *  runs immediately (fontProvider.ts's documented contract). */
+  function liveProvider(id: string) {
+    const fns: Array<() => void> = [];
+    let dead = false;
+    return {
+      id, atlasVersion: 0, atlasImageUrl: `/fonts/${id}~atlas.png`,
+      addDisposable: (fn: () => void) => { if (dead) fn(); else fns.push(fn); },
+      dispose: () => { dead = true; for (const f of fns.splice(0)) f(); },
+      get registered() { return fns.length; },
+    };
+  }
+  function stub(outcome: () => 'ok' | 'fail') {
+    return vi.spyOn(THREE.TextureLoader.prototype, 'load').mockImplementation(((
+      _u: string, onLoad?: (t: THREE.Texture) => void, _p?: unknown, onError?: (e: unknown) => void,
+    ) => {
+      const tex = new THREE.Texture();
+      queueMicrotask(() => { if (outcome() === 'ok') onLoad?.(tex); else onError?.(new Event('error')); });
+      return tex;
+    }) as never);
+  }
+
+  it('repaints the font\'s text when the atlas LANDS, not only when the retry starts', async () => {
+    stub(() => 'ok');
+    const p = liveProvider('font-3d-land');
+    const v0 = getTextDirtyVersion('font-3d-land');
+    getFontTexture(p as never, 0);
+    await Promise.resolve(); await Promise.resolve();
+    expect(getTextDirtyVersion('font-3d-land')).toBe(v0 + 1);
+  });
+
+  it('registers ONE disposer per provider however many retries an outage costs', async () => {
+    setManualNow(0);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    stub(() => 'fail');
+    const p = liveProvider('font-3d-once');
+    for (let i = 0; i < 4; i++) {
+      getFontTexture(p as never, 0);
+      await Promise.resolve(); await Promise.resolve();
+      advanceManual(60 * 60 * 1000);
+    }
+    expect(p.registered).toBe(1);
+  });
+
+  it('a load that fails after its provider was disposed does not block the successor', async () => {
+    setManualNow(0);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const load = stub(() => 'fail');
+    const p1 = liveProvider('font-3d-succ');
+    getFontTexture(p1 as never, 0);
+    p1.dispose();                  // invalidateFont, while the load is in flight
+    await Promise.resolve(); await Promise.resolve(); // …and then it fails
+    const p2 = liveProvider('font-3d-succ');
+    expect(getFontTexture(p2 as never, 0), 'the successor loads rather than inheriting a backoff').toBeTruthy();
+    expect(load).toHaveBeenCalledTimes(2);
   });
 });

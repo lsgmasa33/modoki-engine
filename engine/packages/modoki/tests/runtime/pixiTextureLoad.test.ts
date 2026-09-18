@@ -190,7 +190,7 @@ describe('loadMtsdfAtlasTexture — the atlas must decode UNPREMULTIPLIED (#1045
     load.mockClear();
     bitmapOpts = undefined;
     createCalls = 0;
-    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, status: 200, blob: () => Promise.resolve({} as Blob) })));
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'content-type': 'image/png' }), blob: () => Promise.resolve({} as Blob) })));
     vi.stubGlobal('createImageBitmap', vi.fn((_blob: Blob, opts?: ImageBitmapOptions) => {
       createCalls++;
       bitmapOpts = opts;
@@ -245,10 +245,25 @@ describe('loadMtsdfAtlasTexture — the atlas must decode UNPREMULTIPLIED (#1045
   });
 
   it('rejects on a failed fetch rather than resolving a blank texture', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: false, status: 404, blob: () => Promise.resolve({} as Blob) })));
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: false, status: 404, headers: new Headers({ 'content-type': 'image/png' }), blob: () => Promise.resolve({} as Blob) })));
     // A resolved-but-empty texture would draw nothing and look exactly like this bug; the caller's
     // .catch() logs the URL instead.
     await expect(loadMtsdfAtlasTexture(url)).rejects.toThrow('404');
+  });
+
+  it('types every failure for the atlas failure memo (#1397)', async () => {
+    const { classifyLoadFailure } = await import('../../src/runtime/core/loadFailureMemo');
+    const outcome = async () => classifyLoadFailure(await loadMtsdfAtlasTexture(url).then(() => null, (e: unknown) => e));
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: false, status: 404, headers: new Headers(), blob: () => Promise.resolve({} as Blob) })));
+    expect(await outcome(), 'a 404').toBe('permanent');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'content-type': 'text/html' }), blob: () => Promise.resolve({} as Blob) })));
+    expect(await outcome(), 'the SPA fallback').toBe('permanent');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: false, status: 503, headers: new Headers(), blob: () => Promise.resolve({} as Blob) })));
+    expect(await outcome(), 'a 503').toBe('transient');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('Failed to fetch'))));
+    expect(await outcome(), 'no response').toBe('transient');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, status: 200, headers: new Headers(), blob: () => Promise.reject(new TypeError('Load failed')) })));
+    expect(await outcome(), 'a body dropped mid-read').toBe('transient');
   });
 
   it('falls back to Assets.load where createImageBitmap does not exist — SAFELY', async () => {

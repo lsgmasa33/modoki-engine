@@ -3,7 +3,7 @@
  *  Mocks the GLTFLoader (returns a scene + named clips) and the asset manifest
  *  (ref → path) so the cache can be exercised without real GLB binary data. */
 
-import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll, afterEach } from 'vitest';
 
 vi.mock('three/examples/jsm/libs/meshopt_decoder.module.js', () => ({ MeshoptDecoder: {} }));
 
@@ -16,7 +16,11 @@ const manifest = vi.hoisted(() => ({ entry: undefined as { modelCache?: unknown;
 // dispose/removeFromParent spies.
 // failVariant: make a `.processed.glb` URL error so the raw-source fallback (#7)
 // kicks in. dropPlane: opt into the postprocessor filterMesh path.
-const cfg = vi.hoisted(() => ({ dropPlane: false, failVariant: false, holdLoad: false }));
+const cfg = vi.hoisted(() => ({
+  dropPlane: false, failVariant: false, holdLoad: false,
+  // #1397: every load of a url this returns an error for fails with that error.
+  failWith: null as null | ((path: string) => unknown),
+}));
 // When cfg.holdLoad, the mock does NOT auto-resolve on a 0ms timer — each load's onLoad is parked
 // here so a test can settle a SPECIFIC in-flight load by hand. Without that, two loads racing on
 // two 0ms timers makes any assertion about which settles first timing-dependent.
@@ -32,6 +36,8 @@ vi.mock('three/examples/jsm/loaders/GLTFLoader.js', () => ({
     load(path: string, onLoad: (gltf: any) => void, _onProgress?: any, onError?: (err: any) => void) {
       loads.count[path] = (loads.count[path] || 0) + 1;
       loads.last = path;
+      const failure = cfg.failWith?.(path);
+      if (failure !== undefined) { setTimeout(() => onError?.(failure), 0); return; }
       // #7: a derived `.processed.glb` variant that 404s → onError, so the cache
       // retries the stripped raw URL (and only the raw load builds a scene).
       if (cfg.failVariant && path.endsWith('.processed.glb')) {
@@ -109,6 +115,8 @@ import {
 } from '../../src/runtime/loaders/parsedGltfHandoff';
 import { setActiveRenderer, getKTX2Loader } from '../../src/runtime/loaders/textureResolver';
 import { addDirtyListener } from '../../src/runtime/core/renderDirty';
+import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
+import { RETRY_BASE_MS } from '../../src/runtime/core/loadFailureMemo';
 
 const REF = 'alien.glb';
 const PATH = '/models/alien.glb';
@@ -136,6 +144,7 @@ beforeEach(() => {
   cfg.dropPlane = false;
   cfg.failVariant = false;
   cfg.holdLoad = false;
+  cfg.failWith = null;
   held.fire = [];
   planeHolder.mesh = undefined;
   bodyHolder.mesh = undefined;
@@ -501,5 +510,97 @@ describe('riggedModelCache', () => {
       // Cache is keyed under the original (variant) path; getRiggedModel(REF) resolves it.
       expect(getClipNames(REF)).toEqual(['Walk-Cycle', 'Run-Cycle', 'Idle_Aggressive']);
     });
+  });
+});
+
+/** #1397 — a failed rig load is remembered, classified. The render sync calls
+ *  `ensureRiggedModelLoadedFor` every frame, so before this a missing rig was requested again every
+ *  frame — two GLB requests per lap (variant, then raw). */
+describe('riggedModelCache — a failed load is classified before it is remembered (#1397)', () => {
+  const VARIANT = '/models/alien.glb.processed.glb';
+  const httpError = (status: number) => Object.assign(new Error(`responded with ${status}`), { response: { status } });
+  const settle = () => new Promise((r) => setTimeout(r, 5));
+  /** Ask the way the render sync does: once per "frame", letting each lap settle. */
+  const frames = async (n: number) => { for (let i = 0; i < n; i++) { ensureRiggedModelLoadedFor(1, REF); await settle(); } };
+
+  beforeEach(() => {
+    setManualNow(0);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    manifest.entry = { modelCache: {} }; // two candidates: the variant, then the raw source
+  });
+  afterEach(() => { restoreRealClock(); vi.restoreAllMocks(); });
+
+  it('a 404 on both candidates is requested ONCE across many frames, until invalidateRiggedModel', async () => {
+    cfg.failWith = () => httpError(404);
+    await frames(5);
+    expect(loads.count[VARIANT]).toBe(1);
+    expect(loads.count[PATH]).toBe(1);
+    advanceManual(60 * 60 * 1000); // however long the session runs
+    await frames(2);
+    expect(loads.count[PATH]).toBe(1);
+
+    cfg.failWith = null; // the re-import fixed the file
+    invalidateRiggedModel(REF);
+    await frames(1);
+    expect(loads.count[PATH]).toBe(1); // the variant now loads — no fallback lap needed
+    expect(loads.count[VARIANT]).toBe(2);
+    expect(getRiggedModel(REF)).toBeDefined();
+  });
+
+  it('a dropped connection backs off, then retries and loads (was: a request every frame)', async () => {
+    cfg.failWith = () => new TypeError('Failed to fetch');
+    await frames(4);
+    expect(loads.count[VARIANT]).toBe(1);
+    advanceManual(RETRY_BASE_MS);
+    cfg.failWith = null;
+    await frames(1);
+    expect(loads.count[VARIANT]).toBe(2);
+    expect(getRiggedModel(REF)).toBeDefined();
+  });
+
+  it('a variant the server could not serve is TRANSIENT even when the raw fallback 404s — the variant may yet load', async () => {
+    // The LAST error is a permanent 404, so recording only it would stick for the session.
+    cfg.failWith = (path) => (path === VARIANT ? httpError(503) : httpError(404));
+    await frames(3);
+    expect(loads.count[PATH]).toBe(1);
+    advanceManual(RETRY_BASE_MS);
+    await frames(1);
+    expect(loads.count[PATH]).toBe(2);
+  });
+
+  it('a failure landing after its last owner let go is not remembered', async () => {
+    cfg.failWith = () => httpError(404);
+    ensureRiggedModelLoadedFor(1, REF);  // in flight — the error fires on a 0 ms timer
+    releaseRiggedModelsForScene(1);      // the scene goes before it lands
+    await settle(); await settle();
+    ensureRiggedModelLoadedFor(2, REF);  // the next scene
+    await settle(); await settle();
+    expect(loads.count[PATH]).toBe(2);
+  });
+
+  it('a transient failure wakes idle render-on-demand surfaces when its retry is due', async () => {
+    cfg.failWith = () => new TypeError('Failed to fetch');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      ensureRiggedModelLoadedFor(1, REF);
+      await vi.advanceTimersByTimeAsync(5); // both candidates fail
+      const fired = vi.fn();
+      const off = addDirtyListener(fired);
+      await vi.advanceTimersByTimeAsync(RETRY_BASE_MS - 20);
+      expect(fired).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(fired).toHaveBeenCalled();
+      off();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('failure memory is scene-scoped: the last owner letting go forgets a permanent failure', async () => {
+    cfg.failWith = () => httpError(404);
+    await frames(1);
+    releaseRiggedModelsForScene(1);
+    await frames(1);
+    expect(loads.count[PATH]).toBe(2);
   });
 });

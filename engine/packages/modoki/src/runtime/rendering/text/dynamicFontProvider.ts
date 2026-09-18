@@ -19,6 +19,8 @@
  */
 
 import { notifyListeners } from '../../core/notifyListeners';
+import { classifyLoadFailure, retryDelayMs } from '../../core/loadFailureMemo';
+import { rawNow } from '../../core/clock';
 import type { FontProvider } from './fontProvider';
 import type { Glyph, FontMetrics, AtlasInfo, GlyphAtlas } from './glyphAtlas';
 import { kerningKey } from './glyphAtlas';
@@ -232,6 +234,13 @@ export class DynamicFontProvider implements FontProvider {
   // re-queue is a per-frame storm rather than a retry.
   private flushFailures = 0;
   private warnedFlushFail = false;
+  // A NETWORK failure (the `.ttf` fetch behind `bytes()`: no response, or a status other than
+  // 404/410) is counted apart from `flushFailures` and never exhausts (#1397): the outage ends,
+  // the font does not become broken, and the budget above was spent in ~1.5 s of one. It backs off
+  // on the shared schedule (`retryDelayMs`, 1 s doubling to the 10-min cap) and `transientRetryAt`
+  // parks any new batch on the armed retry until then, so an outage costs one fetch per step.
+  private transientFailures = 0;
+  private transientRetryAt = 0;
   // Arms the self-scheduled retry a failed flush promises (#635) — see `scheduleFlushRetry`.
   // Never touched outside flush()'s catch/scheduleFlushRetry/cancelFlushRetry/dispose().
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -376,12 +385,22 @@ export class DynamicFontProvider implements FontProvider {
   /** Drain `pending` one generation at a time (coalesces a burst into few calls). */
   private async flush(): Promise<void> {
     if (this.generating || this.pending.size === 0) return;
+    if (this.transientFailures > 0 && rawNow() < this.transientRetryAt) {
+      // Backing off a network failure: park the new codepoints on the armed retry rather than
+      // fetch again. They stay in `requested`, so a per-frame caller does not re-queue them.
+      const parked = [...this.pending];
+      this.pending.clear();
+      this.scheduleFlushRetry(parked, this.transientRetryAt - rawNow());
+      return;
+    }
     this.generating = true;
     const batch = [...this.pending];
     this.pending.clear();
     try {
       await this.generateBatch(batch, /* pin */ false);
       this.flushFailures = 0; // a working generation clears the budget
+      this.transientFailures = 0;
+      this.transientRetryAt = 0;
       this.warnedFlushFail = false;
     } catch (e) {
       // Un-stick THIS batch's codepoints from `requested` so a later `ensureGlyphs` call
@@ -400,12 +419,23 @@ export class DynamicFontProvider implements FontProvider {
       // latency for the life of the page — and #541's cleared `bytes()` memo re-fetches on
       // every lap. Past the budget the codepoints stay in `requested` and render as tofu,
       // which is stable and diagnosable, instead of storming behind one warning.
-      this.flushFailures += 1;
+      const transient = classifyLoadFailure(e) === 'transient';
+      if (transient) {
+        this.transientFailures += 1;
+        this.transientRetryAt = rawNow() + retryDelayMs(this.transientFailures);
+      } else {
+        this.flushFailures += 1;
+      }
       if (!this.warnedFlushFail) {
         this.warnedFlushFail = true;
         console.warn(`[DynamicFontProvider] generation failed for ${this.id}:`, e);
       }
-      if (this.flushFailures <= MAX_FLUSH_RETRIES) {
+      if (transient) {
+        // No un-stick: the timer re-queues the batch once the backoff expires (#1397). Leaving it in
+        // `requested` only spares per-frame callers a re-queue that the park at the top of
+        // `flush()` would bounce anyway — that park is what keeps an outage to one fetch per step.
+        this.scheduleFlushRetry(batch, this.transientRetryAt - rawNow());
+      } else if (this.flushFailures <= MAX_FLUSH_RETRIES) {
         for (const cp of batch) this.requested.delete(cp);
         // #635: the un-stick above is a promise this batch gets ANOTHER lap, but for STATIC
         // text (a label whose string never changes — "TAP TO START") no lap ever arrives on
@@ -428,7 +458,7 @@ export class DynamicFontProvider implements FontProvider {
         // re-queueing into `pending` from here would re-enter `flush()` immediately and turn
         // the bounded retry `MAX_FLUSH_RETRIES` exists for into a per-frame storm. The re-queue
         // happens only inside the TIMER callback, on its own backoff schedule.
-        this.scheduleFlushRetry(batch);
+        this.scheduleFlushRetry(batch, FLUSH_RETRY_BASE_MS * 2 ** (this.flushFailures - 1));
       } else {
         // Budget exhausted this lap — an armed retry from an earlier, still-within-budget
         // failure must not outlive the budget that authorised it.
@@ -443,8 +473,9 @@ export class DynamicFontProvider implements FontProvider {
   /** Arm the retry the un-stick in `flush()`'s catch is paying for (#635). A static label
    *  never calls `ensureGlyphs` again on its own — see the comment at the call site — so
    *  this provider has to re-queue the batch itself instead of waiting for a caller that
-   *  never comes. Backoff doubles per consecutive failure and is bounded by the same
-   *  `MAX_FLUSH_RETRIES` budget the un-stick itself is gated on.
+   *  never comes. The caller passes the delay: for a generator failure it doubles per
+   *  consecutive failure and is bounded by the same `MAX_FLUSH_RETRIES` budget the un-stick
+   *  itself is gated on; for a network failure it is the shared unbounded schedule (#1397).
    *
    *  Every call MERGES its `batch` into {@link retryBatch} first, unconditionally — only
    *  whether a NEW timer gets armed is gated on `retryTimer === null`. A second (or third)
@@ -456,13 +487,13 @@ export class DynamicFontProvider implements FontProvider {
    *  (a scene swap disposed the provider, the budget got exhausted by an unrelated batch,
    *  or a codepoint landed some other way — e.g. a manual `ensureGlyphs` lap during the
    *  backoff window, the SECOND independent recovery route the un-stick still provides). */
-  private scheduleFlushRetry(batch: number[]): void {
+  private scheduleFlushRetry(batch: number[], delay: number): void {
     for (const cp of batch) this.retryBatch.add(cp);
     if (this.disposed || this.retryTimer !== null) return;
-    const delay = FLUSH_RETRY_BASE_MS * 2 ** (this.flushFailures - 1);
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
-      if (this.disposed || this.flushFailures > MAX_FLUSH_RETRIES) return;
+      // A network streak is never out of budget (#1397); only generator failures exhaust it.
+      if (this.disposed || (this.transientFailures === 0 && this.flushFailures > MAX_FLUSH_RETRIES)) return;
       let queued = false;
       for (const cp of this.retryBatch) {
         if (this.baked?.glyphs.has(cp) || this.glyphMap.has(cp)) continue; // landed some other way
@@ -472,7 +503,7 @@ export class DynamicFontProvider implements FontProvider {
       }
       this.retryBatch.clear();
       if (queued) void this.flush();
-    }, delay);
+    }, Math.max(0, delay));
   }
 
   /** Disarm a pending retry — dispose(), or a later failure that exhausts the budget.

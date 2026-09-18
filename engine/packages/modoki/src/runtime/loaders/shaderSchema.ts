@@ -3,6 +3,7 @@
 
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
+import { classifyLoadFailure, rethrowAsNetworkError } from '../core/loadFailureMemo';
 import { warnUnknownParamTypes, type ShaderManifest } from '../core/shaderSchema';
 
 export {
@@ -14,15 +15,23 @@ export {
  *  Lives here (no three deps) so both the runtime loader and the editor catalog
  *  can read schemas without pulling in the WebGPU material pipeline. */
 export async function fetchShaderManifest(manifestPath: string): Promise<ShaderManifest | null> {
+  return fetchShaderManifestClassified(manifestPath).catch(() => null);
+}
+
+/** {@link fetchShaderManifest}, except a TRANSIENT failure (no response, a dropped body, a status
+ *  other than 404/410) rejects instead of resolving null — the `assetPlumbing` contract, for the
+ *  2D material cache's failure memo (#1397). An absent or unparseable manifest still resolves
+ *  null: those the same bytes reproduce. */
+export async function fetchShaderManifestClassified(manifestPath: string): Promise<ShaderManifest | null> {
   try {
-    const res = await fetch(assetUrl(manifestPath), ASSET_FETCH_INIT);
-    if (!res.ok) return null;
+    const res = await fetch(assetUrl(manifestPath), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
     // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
     const json = (await parseAssetJson(res, manifestPath)) as ShaderManifest;
     if (!json.params) json.params = {};
     warnUnknownParamTypes(manifestPath, json.params);
     return json;
-  } catch {
+  } catch (e) {
+    if (classifyLoadFailure(e) === 'transient') throw e;
     return null;
   }
 }

@@ -21,7 +21,7 @@ import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
+import { createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
 import { createTeardownToken } from '../core/liveness';
 
 /** Per-clip playback parameters within an animset. All optional — a missing

@@ -309,6 +309,17 @@ export {
   releaseAllForScene, getResourceStats,
   type SceneId,
 } from './loaders/meshTemplateCache';
+// A game loader that fetches something itself (a level list, a manifest) classifies its failures
+// the same way the engine's caches do (#1397): a missing file stays failed, an outage backs off.
+// Rule: docs/architecture.md § "A load failure is classified before it is remembered".
+export {
+  createLoadFailureMemo, classifyLoadFailure, rethrowAsNetworkError, retryDelayMs,
+  RETRY_BASE_MS, RETRY_CAP_MS,
+  type LoadFailureMemo, type LoadFailureClass,
+} from './core/loadFailureMemo';
+export {
+  AssetNetworkError, MissingAssetError, checkAssetResponse, readAssetBytes, statusIsAbsent,
+} from './core/assetLoadErrors';
 export {
   requestPrefab, MAX_PREFAB_FETCH_ATTEMPTS,
   type PrefabDocLike, type RequestPrefabOptions,

@@ -57,6 +57,8 @@ import {
 } from '../core/shaderSchema';
 import { assetPlumbing } from '../core/assetPlumbing';
 import { hasDocKey } from '../core/docKeys';
+import { AssetNetworkError, MissingAssetError, statusIsAbsent } from '../core/assetLoadErrors';
+import { rethrowAsNetworkError } from '../core/loadFailureMemo';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -368,8 +370,15 @@ async function fetchPixiShaderSource(manifestPath: string, webgpu: boolean): Pro
   // `buildPixiShaderProgram`'s comment.
   const ext: 'wgsl' | 'glsl' = webgpu ? 'wgsl' : 'glsl';
   const plumbing = assetPlumbing.get();
-  const bodyRes = plumbing ? await fetch(plumbing.assetUrl(shaderBodyPath(manifestPath, ext)), plumbing.fetchInit).catch(() => null) : null;
-  const body = bodyRes?.ok ? (await bodyRes.text()).trim() : '';
+  // A body that is NOT THERE (404/410) is a missing variant and falls back, as it always has. One
+  // the server could not deliver (no response, a dropped body, a 5xx) REJECTS, transient, so
+  // `spriteMaterialCache` backs off and retries instead of falling back for the scene (#1397).
+  const bodyUrl = plumbing ? plumbing.assetUrl(shaderBodyPath(manifestPath, ext)) : '';
+  const bodyRes = plumbing ? await fetch(bodyUrl, plumbing.fetchInit).catch(rethrowAsNetworkError) : null;
+  if (bodyRes && !bodyRes.ok && !statusIsAbsent(bodyRes.status)) {
+    throw new MissingAssetError(`${bodyRes.status} ${bodyRes.statusText} for ${bodyUrl}`, { status: bodyRes.status, absent: false });
+  }
+  const body = bodyRes?.ok ? (await bodyRes.text().catch((e: unknown) => { throw new AssetNetworkError(e); })).trim() : '';
   if (!body) {
     console.warn(`[pixiShader] ${manifestPath}: missing ${ext.toUpperCase()} body for the active backend — falling back to the default sprite shader.`);
     return null;

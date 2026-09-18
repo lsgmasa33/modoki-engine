@@ -53,6 +53,9 @@ const { getFontTexturePixi } = await import('../../src/runtime/rendering/text/fo
 const { BakedFontProvider } = await import('../../src/runtime/rendering/text/fontProvider');
 const { DynamicFontProvider } = await import('../../src/runtime/rendering/text/dynamicFontProvider');
 const { getTextDirtyVersion, onTextDirty } = await import('../../src/runtime/rendering/text/textDirty');
+const { setManualNow, advanceManual, restoreRealClock } = await import('../../src/runtime/core/clock');
+const { RETRY_BASE_MS } = await import('../../src/runtime/core/loadFailureMemo');
+const { MissingAssetError } = await import('../../src/runtime/core/assetLoadErrors');
 
 /** How many text-dirty wakes attributed to `fontId` land from now on. */
 function wakesFor(fontId: string): () => number {
@@ -127,22 +130,85 @@ describe('getFontTexturePixi — concurrent renderers', () => {
     expect(loadCalls, 'so no second load is kicked').toBe(1);
   });
 
-  it('a FAILED load wakes nobody and frees the key for a retry', async () => {
+  it('a FAILED load wakes nobody, and backs off before re-attempting (#1397 — was: the very next call)', async () => {
+    setManualNow(0);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const p = provider('font-fail');
     const woke = wakesFor('font-fail');
     getFontTexturePixi(p, 0);
-    rejectLoad(new Error('404'));
+    rejectLoad(new TypeError('Failed to fetch'));
     await vi.waitFor(() => expect(warn).toHaveBeenCalled());
 
-    // Not woken: there is nothing to draw, and a wake would make a failing atlas a per-frame
-    // fetch loop. But the key must be free, or a later attempt would wait on a dead load forever.
+    // Not woken: there is nothing to draw. And not re-attempted on the next frame either — that
+    // was a request per Scene2D text pass for as long as the atlas stayed unreachable.
     expect(woke(), 'no wake-up for a load with no texture').toBe(0);
     getFontTexturePixi(p, 0);
-    expect(loadCalls, 'the next call re-attempts rather than joining the dead load').toBe(2);
+    expect(loadCalls, 'backing off: the next frame does not refetch').toBe(1);
+    advanceManual(RETRY_BASE_MS);
+    getFontTexturePixi(p, 0);
+    expect(loadCalls, 'the backoff expired: the next call re-attempts').toBe(2);
     resolveLoad(fakeTexture());
     await vi.waitFor(() => expect(woke()).toBe(1));
     warn.mockRestore();
+    restoreRealClock();
+  });
+
+  it('a 404 atlas stays failed until the provider is disposed (#1397)', async () => {
+    setManualNow(0);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const disposers: Array<() => void> = [];
+    const p = { ...(provider('font-404') as object), addDisposable: (fn: () => void) => { disposers.push(fn); } } as never;
+    getFontTexturePixi(p, 0);
+    rejectLoad(new MissingAssetError('404', { status: 404, absent: true }));
+    await vi.waitFor(() => expect(warn).toHaveBeenCalled());
+    advanceManual(60 * 60 * 1000);
+    getFontTexturePixi(p, 0);
+    expect(loadCalls).toBe(1);
+    for (const d of disposers) d(); // the font is released (invalidateFont / scene swap)
+    getFontTexturePixi(p, 0);
+    expect(loadCalls).toBe(2);
+    rejectLoad(new Error('settle'));
+    warn.mockRestore();
+    restoreRealClock();
+  });
+
+  it('a load that fails after its provider was disposed wakes the stranded successor, and does not block it (#1397 review)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fns: Array<() => void> = [];
+    let dead = false;
+    const p1 = { ...(provider('font-succ') as object), addDisposable: (fn: () => void) => { if (dead) fn(); else fns.push(fn); } } as never;
+    getFontTexturePixi(p1, 0);
+    const woke = wakesFor('font-succ');
+    dead = true; for (const f of fns.splice(0)) f(); // invalidateFont disposes P1 mid-load
+    getFontTexturePixi(provider('font-succ'), 0);      // P2's repaint finds P1 in flight
+    expect(loadCalls).toBe(1);
+    rejectLoad(new TypeError('Failed to fetch'));
+    await vi.waitFor(() => expect(woke(), 'the successor is woken').toBe(1));
+    getFontTexturePixi(provider('font-succ'), 0);
+    expect(loadCalls, 'and its repaint starts its own load').toBe(2);
+    rejectLoad(new Error('settle'));
+    warn.mockRestore();
+  });
+
+  it('a backing-off atlas repaints its font\'s text when the retry is due (#1397)', async () => {
+    setManualNow(0);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const p = provider('font-wake');
+      getFontTexturePixi(p, 0);
+      rejectLoad(new TypeError('Failed to fetch'));
+      await vi.advanceTimersByTimeAsync(0);
+      const woke = wakesFor('font-wake');
+      await vi.advanceTimersByTimeAsync(RETRY_BASE_MS - 10);
+      expect(woke()).toBe(0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(woke()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+      restoreRealClock();
+    }
   });
 });
 

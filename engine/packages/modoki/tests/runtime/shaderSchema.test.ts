@@ -1,7 +1,7 @@
 /** shaderSchema unit tests — param coercion + default merging. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { coerceParamValue, mergeParamDefaults, fetchShaderManifest, type ShaderParamSchema } from '../../src/runtime/loaders/shaderSchema';
+import { coerceParamValue, mergeParamDefaults, fetchShaderManifest, fetchShaderManifestClassified, type ShaderParamSchema } from '../../src/runtime/loaders/shaderSchema';
 import { shaderBodyPath, shaderManifestPathForBody } from '../../src/runtime/core/shaderSchema';
 import { completeResponse } from '../stubs/assetResponse';
 
@@ -116,5 +116,36 @@ describe('fetchShaderManifest — param-type validation (F10)', () => {
     expect((await fetchShaderManifest('/shaders/z.shader.json'))?.params).toEqual({});
     global.fetch = vi.fn(async () => ({ ok: false, json: async () => ({}) })) as never;
     expect(await fetchShaderManifest('/shaders/bad.shader.json')).toBeNull();
+  });
+});
+
+/** #1397 — the 2D material cache's plumbing needs to tell "not there" from "not reachable". */
+describe('fetchShaderManifestClassified — a transient failure rejects; an absent manifest is null (#1397)', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  const respond = (r: unknown) => vi.stubGlobal('fetch', vi.fn(() => (r instanceof Error ? Promise.reject(r) : Promise.resolve(r))));
+
+  it('404 → null (and the public fetchShaderManifest agrees)', async () => {
+    respond(new Response('nope', { status: 404 }));
+    expect(await fetchShaderManifestClassified('/s/a.shader.json')).toBeNull();
+    expect(await fetchShaderManifest('/s/a.shader.json')).toBeNull();
+  });
+
+  it('503 and no response REJECT — while the public fetchShaderManifest still resolves null', async () => {
+    respond(new Response('busy', { status: 503 }));
+    await expect(fetchShaderManifestClassified('/s/a.shader.json')).rejects.toBeTruthy();
+    expect(await fetchShaderManifest('/s/a.shader.json')).toBeNull();
+    respond(new TypeError('Failed to fetch'));
+    await expect(fetchShaderManifestClassified('/s/a.shader.json')).rejects.toBeTruthy();
+    expect(await fetchShaderManifest('/s/a.shader.json')).toBeNull();
+  });
+});
+
+describe('the assetPlumbing slot serves the CLASSIFIED manifest fetch (#1397 close-out review)', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  it('a 503 on the manifest rejects through the slot, so spriteMaterialCache can back off', async () => {
+    await import('../../src/runtime/loaders/registerProviders');
+    const { assetPlumbing } = await import('../../src/runtime/core/assetPlumbing');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response('busy', { status: 503 }))));
+    await expect(assetPlumbing.get()!.fetchShaderManifest('/s/a.shader.json')).rejects.toBeTruthy();
   });
 });

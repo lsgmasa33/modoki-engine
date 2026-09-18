@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { MaterialTexRetry } from '../../packages/modoki/src/runtime/loaders/materialTexRetry';
-import { RETRY_BASE_MS, RETRY_CAP_MS } from '../../packages/modoki/src/runtime/loaders/loadFailureMemo';
+import { RETRY_BASE_MS, RETRY_CAP_MS } from '../../packages/modoki/src/runtime/core/loadFailureMemo';
 import { setManualNow, advanceManual, restoreRealClock } from '../../packages/modoki/src/runtime/core/clock';
 
 const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
@@ -120,5 +120,68 @@ describe('#1374 — a failed material-sprite texture is not refetched every dirt
     await flush();
     retry.request('g.png'); // the newer load is still in flight — no third request
     expect(load).toHaveBeenCalledTimes(2);
+  });
+});
+
+/** #1397 — a sprite SLOT is built once (`Scene2D.makeSprite`) and never asks again, so a failed
+ *  load left it `Texture.EMPTY` until the slot was rebuilt. `whenResident` + `drain` keep the
+ *  waiting slot and re-ask on its behalf. `resident` stands in for Pixi's cache. */
+describe('#1397 — a sprite slot waiting on a texture recovers from a failed load', () => {
+  const resident = new Set<string>();
+  const isResident = (url: string) => resident.has(url);
+  beforeEach(() => { resident.clear(); });
+
+  it('binds once the texture lands, and not before', async () => {
+    let settle!: () => void;
+    load.mockImplementation(() => new Promise<void>((r) => { settle = () => { resident.add('s.png'); r(); }; }));
+    const bind = vi.fn();
+    retry.whenResident('s.png', () => false, bind);
+    expect(retry.drain(isResident)).toBe(false);
+    expect(bind).not.toHaveBeenCalled();
+    settle();
+    await flush();
+    expect(wakes).toBe(1); // the landed load wakes the frame the drain runs in
+    expect(retry.drain(isResident)).toBe(true);
+    expect(bind).toHaveBeenCalledTimes(1);
+    expect(retry.waitingUrls).toBe(0);
+  });
+
+  it('a failed load is retried after its backoff and the slot binds — was: blank until the slot was rebuilt', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    load.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    const bind = vi.fn();
+    retry.whenResident('s.png', () => false, bind);
+    await vi.advanceTimersByTimeAsync(0);
+    for (let frame = 0; frame < 10; frame++) retry.drain(isResident); // frames inside the backoff
+    expect(load).toHaveBeenCalledTimes(1);
+
+    advanceManual(RETRY_BASE_MS);
+    await vi.advanceTimersByTimeAsync(RETRY_BASE_MS);
+    expect(wakes).toBe(1); // the retry is due — wake the idle frame
+    load.mockImplementationOnce(async () => { resident.add('s.png'); });
+    retry.drain(isResident);  // that frame re-asks
+    await vi.advanceTimersByTimeAsync(0);
+    expect(load).toHaveBeenCalledTimes(2);
+    retry.drain(isResident);  // and the next one binds
+    expect(bind).toHaveBeenCalledTimes(1);
+  });
+
+  it('a waiter whose sprite was destroyed is dropped, never bound', async () => {
+    load.mockImplementation(async () => { resident.add('s.png'); });
+    let destroyed = false;
+    const bind = vi.fn();
+    retry.whenResident('s.png', () => destroyed, bind);
+    await flush();
+    destroyed = true; // the slot's ref changed before the frame ran
+    expect(retry.drain(isResident)).toBe(false);
+    expect(bind).not.toHaveBeenCalled();
+    expect(retry.waitingUrls).toBe(0);
+  });
+
+  it('clear() drops every waiter (world swap)', () => {
+    load.mockImplementation(() => new Promise(() => {}));
+    retry.whenResident('s.png', () => false, vi.fn());
+    retry.clear();
+    expect(retry.waitingUrls).toBe(0);
   });
 });

@@ -35,7 +35,7 @@ describe('loadMtsdfAtlasTexture — the real Pixi contract (#1045)', () => {
   beforeEach(() => {
     bitmap = fakeBitmap();
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
-      ok: true, status: 200, blob: () => Promise.resolve({} as Blob),
+      ok: true, status: 200, headers: new Headers({ 'content-type': 'image/png' }), blob: () => Promise.resolve({} as Blob),
     })));
     vi.stubGlobal('createImageBitmap', vi.fn(() => Promise.resolve(bitmap)));
   });

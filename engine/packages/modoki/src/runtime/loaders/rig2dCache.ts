@@ -16,7 +16,7 @@ import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { normalizeRig2D, type Rig2DFile, type ParsedRig2D } from '../skinning/rig2dTypes';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
+import { createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
 import { createTeardownToken } from '../core/liveness';
 import { fireDirtyListeners } from '../core/renderDirty';
 

@@ -103,6 +103,19 @@ describe('fetchAndStore', () => {
     await expect(c.fetchAndStore('k1', 'https://cdn/missing.mp4')).rejects.toThrow(/404/);
   });
 
+  it('types every failure for videoSystem\'s retry decision (#1397)', async () => {
+    const { classifyLoadFailure } = await import('../../src/runtime/core/loadFailureMemo');
+    const outcome = (p: Promise<unknown>) => p.then(() => 'resolved', (e: unknown) => classifyLoadFailure(e));
+    vi.stubGlobal('fetch', mockFetch(0, { ok: false, status: 404 }));
+    expect(await outcome(makeCache(100).fetchAndStore('k404', 'https://cdn/a.mp4')), 'a 404').toBe('permanent');
+    vi.stubGlobal('fetch', mockFetch(0, { ok: false, status: 503 }));
+    expect(await outcome(makeCache(100).fetchAndStore('k503', 'https://cdn/a.mp4')), 'a 503').toBe('transient');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('Failed to fetch'))));
+    expect(await outcome(makeCache(100).fetchAndStore('knet', 'https://cdn/a.mp4')), 'no response').toBe('transient');
+    vi.stubGlobal('fetch', mockFetch(200 * MB, { declared: 1 * MB }));
+    expect(await outcome(makeCache(100).fetchAndStore('kbig', 'https://cdn/a.mp4')), 'a cache refusal').toBe('unknown');
+  });
+
   it('refuses BEFORE downloading when the declared size cannot fit', async () => {
     // Downloading megabytes only to discard them is the worst possible ordering.
     const f = vi.fn(async () => new Response(blobOf(1), {

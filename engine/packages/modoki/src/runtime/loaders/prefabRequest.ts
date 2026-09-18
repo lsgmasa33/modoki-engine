@@ -9,12 +9,17 @@
  *
  * 1. **In-flight dedup** — at most one fetch per (owner, prefab), released on EVERY settle, success
  *    or not. Without it a per-frame caller fetches every frame (#1373).
- * 2. **A bounded attempt budget** — the give-up latch. ⚠️ It exists because the fetch seam cannot
- *    tell a DELETED prefab from a transient failure: `acquirePrefab` RESOLVES either way with the
- *    cache still empty (`fetchPrefab` swallows `!res.ok` and parse errors and never rejects — see
- *    docs/prefabs.md § "A prefab EDIT replaces the runtime cache entry"). Latching on the FIRST such
- *    settle makes one 5xx at boot permanent; never latching refetches a deleted prefab forever. Both
- *    shipped (#1359). The budget is refunded on a hit, so a LATER eviction gets a fresh run.
+ * 2. **A bounded attempt budget** — the give-up latch, for a prefab that is not coming: a DELETED
+ *    file, a bad one, or a cached document the caller's `isHit` rejects. `acquirePrefab` RESOLVES
+ *    either way with nothing usable (it never rejects — see docs/prefabs.md § "A prefab EDIT
+ *    replaces the runtime cache entry"). The budget is refunded on a hit, so a LATER eviction gets a
+ *    fresh run. ⚠️ **An OUTAGE is not an attempt** (#1397). The budget used to exist because the
+ *    fetch seam could not tell a deleted prefab from a transient failure, so a flat 3 fetches — about
+ *    1.5 s of dropped connection — gave a prefab up for the session in a built game. `fetchPrefab`
+ *    now classifies its failures (`prefabFetchRetryAt`): while one is backing off this does not
+ *    fetch, and an attempt that ends in a transient failure (or asks during its backoff) is refunded. Latching on the first settle
+ *    made one 5xx permanent, and never latching refetched a deleted prefab forever; both shipped
+ *    (#1359), and this keeps both closed.
  * 3. **A reset scope** — the budget is held per WORLD, so a Play/Stop (which swaps the world) is a
  *    fresh chance. The in-flight hold is deliberately NOT per world: the cache it fills is global,
  *    and releasing it on a swap let the old fetch's settle free the new fetch's hold.
@@ -35,7 +40,7 @@
  * holds the list of the ones in games and demos.
  */
 import type { World } from 'koota';
-import { acquirePrefab, getCachedPrefab, type SceneId } from './meshTemplateCache';
+import { acquirePrefab, getCachedPrefab, prefabFetchRetryAt, type SceneId } from './meshTemplateCache';
 import { peekCurrentWorld } from '../core/ecs/worldRegistry';
 import { journalWarn } from '../core/gameJournal';
 
@@ -112,6 +117,10 @@ export function requestPrefab(owner: SceneId, ref: string, opts: RequestPrefabOp
   budget.set(key, tried + 1);
   void acquirePrefab(owner, ref).finally(() => {
     inFlight.delete(key); // the in-flight hold ALWAYS ends; only the budget latches
+    // A TRANSIENT failure hands its attempt back (#1397): the budget is for prefabs that are not
+    // coming, not for a network that is down. This also covers an ask made WHILE it backs off —
+    // `fetchPrefab` refuses to fetch then, so the attempt is spent and handed straight back.
+    if (prefabFetchRetryAt(ref) !== undefined) { budget.set(key, Math.max(0, (budget.get(key) ?? 1) - 1)); return; }
     // ⚠️ The cache term is not redundant with the budget one: when the LAST allowed attempt is the
     // one that succeeds, the budget is exactly spent, and without it this would report a prefab
     // that just loaded as unavailable.

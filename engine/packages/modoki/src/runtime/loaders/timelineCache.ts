@@ -9,7 +9,7 @@ import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { createLoadFailureMemo, rethrowAsNetworkError } from './loadFailureMemo';
+import { createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
 import { normalizeTimeline, type TimelineDef } from '../timeline/types';
 import { createTeardownToken } from '../core/liveness';
 

@@ -355,7 +355,10 @@ adopted the dead entity's decoder, download progress and sticky failure. Fixed w
 `videoElementFor`/`seekEntityVideo` are a public addressing contract the texture surfaces,
 `UIVideoMount` and the `video.*` actions all call with a masked id. `owner` is dropped on a world
 swap but NOT on `stopWorldVideo`, so a sticky download failure still survives Stop→Play as
-intended. Background and the general rule:
+intended. Since #1397 only a PERMANENT failure is sticky: a 404/410, or a cache refusal. A
+transient one (no response, a dropped body, a 5xx) backs off per clip and is retried. That follows
+the owner ruling of 2026-09-18, and the rule is in [architecture.md](architecture.md) § "A load
+failure is classified before it is remembered". Background and the general rule:
 [engine-concepts.md](engine-concepts.md) § Entity. Regression test:
 `tests/video/videoSystemIdReuse.test.ts`.
 

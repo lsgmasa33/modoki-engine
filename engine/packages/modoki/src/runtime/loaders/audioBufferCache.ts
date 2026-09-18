@@ -21,6 +21,8 @@ import { getAssetEntry, getAudioLoadType, isGuid } from './assetManifest';
 import { getAudioContext } from '../audio/audioContext';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
 import { createTeardownToken } from '../core/liveness';
+import { createLoadFailureMemo } from '../core/loadFailureMemo';
+import { AssetNetworkError, MissingAssetError, statusIsAbsent } from '../core/assetLoadErrors';
 
 type SceneId = number;
 
@@ -34,6 +36,17 @@ const audioOwners = new Map<string, Set<SceneId>>();
 // still invalidates wholesale, so an in-flight fetch/decode that resolves after a teardown is
 // dropped instead of re-populating a dead cache.
 const audioLiveness = createTeardownToken();
+
+/** What a failed FETCH left behind (#1397) — the fetch only, never the decode. Every gesture runs
+ *  `retryFailedAudioDecodes`, which re-attempts every owned clip with no buffer: that is the iOS
+ *  decode unlock (`decodeAudioData` rejects while the context is suspended) and must keep working,
+ *  so a DECODE failure stays retried on the next gesture. But a clip whose file was missing was
+ *  also re-downloaded on every tap, key and pointerdown. A 404 is now remembered until the clip
+ *  is invalidated or its last scene lets go; a dropped connection or a 5xx backs off.
+ *  `unknownIs: 'transient'`: the capacitor:// scheme reports status 0 even on success, so an empty
+ *  status-0 body proves nothing about the file. No `onRetryDue`: the askers are the gestures and
+ *  scene loads themselves, and nothing can play audio before a gesture anyway. */
+const fetchFailures = createLoadFailureMemo({ label: 'AudioCache', unknownIs: 'transient' });
 
 const unknownGuidSeen = new Set<string>();
 function refToPath(ref: string | undefined | null): string | undefined {
@@ -99,6 +112,7 @@ export function releaseAudioForScene(sceneId: SceneId): void {
       if (wasLast) {
         audioBufferCache.delete(path);
         audioLoadPromises.delete(path);
+        fetchFailures.forget(path); // failure memory is scene-scoped, like the mesh cache's (#1371)
       }
     }
   }
@@ -132,6 +146,7 @@ export function invalidateAudio(ref: string): void {
   audioLiveness.invalidateKey(path);
   audioBufferCache.delete(path);
   audioLoadPromises.delete(path);
+  fetchFailures.forget(path); // a re-import may have fixed the file
   // Refill an OWNED buffer clip here (#1361) — a scene still plays it, and nothing else would:
   // `getCachedAudioBuffer` is read-only, so a miss just reads as "not decoded yet" to the audio
   // system, and the only other refill (`retryFailedAudioDecodes`) runs on the next user input.
@@ -160,6 +175,7 @@ export function disposeAllAudioBuffers(): void {
   audioBufferCache.clear();
   audioLoadPromises.clear();
   audioOwners.clear();
+  fetchFailures.clear();
 }
 
 /** Re-attempt every owned buffer clip that has no decoded buffer yet. iOS/WKWebView
@@ -173,6 +189,8 @@ export function retryFailedAudioDecodes(): void {
     // Only buffer clips are decoded; stream clips (played via HTMLMediaElement) are
     // owned but never cached, so skip them or we'd pointlessly try to decode music.
     if (getAudioLoadType(path) !== 'buffer') continue;
+    // A clip whose FETCH failed and is backing off (or is gone for good) is skipped inside
+    // `fetchAudioBuffer`; only a decode failure is re-attempted on every gesture (#1397).
     if (!audioBufferCache.has(path) && !audioLoadPromises.has(path)) void fetchAudioBuffer(path);
   }
 }
@@ -189,11 +207,22 @@ function xhrAudioBytes(url: string): Promise<ArrayBuffer> {
     xhr.open('GET', url, true);
     xhr.responseType = 'arraybuffer';
     xhr.onload = () => {
+      // Typed for `fetchFailures` (#1397). Before this any non-empty body was accepted, so a 404
+      // page — or the dev server's `index.html` SPA fallback — went on to `decodeAudioData` and
+      // was reported as a DECODE failure, which the gesture retry then re-downloaded on every tap.
+      if (xhr.status >= 400) {
+        reject(new MissingAssetError(`${xhr.status} ${xhr.statusText} for ${url}`, { status: xhr.status, absent: statusIsAbsent(xhr.status) }));
+        return;
+      }
+      if (/^\s*text\/html\b/i.test(xhr.getResponseHeader('content-type') ?? '')) {
+        reject(new MissingAssetError(`no audio at ${url} — the server answered with an HTML page (the SPA fallback)`, { status: xhr.status, absent: true }));
+        return;
+      }
       const buf = xhr.response as ArrayBuffer | null;
       if (buf && buf.byteLength > 0) resolve(buf);
       else reject(new Error(`empty audio response (HTTP ${xhr.status})`));
     };
-    xhr.onerror = () => reject(new Error(`XHR error (HTTP ${xhr.status})`));
+    xhr.onerror = () => reject(new AssetNetworkError(new Error(`XHR error (HTTP ${xhr.status})`)));
     xhr.send();
   });
 }
@@ -205,11 +234,21 @@ function fetchAudioBuffer(path: string): Promise<void> {
 
   const ctx = getAudioContext();
   if (!ctx) return Promise.resolve(); // headless — owner registered, no decode
+  if (fetchFailures.blocked(path)) return Promise.resolve();
 
   const stillLive = audioLiveness.capture(path);
   const promise = (async () => {
     try {
-      const bytes = await xhrAudioBytes(servedAudioUrl(path));
+      let bytes: ArrayBuffer;
+      try {
+        bytes = await xhrAudioBytes(servedAudioUrl(path));
+      } catch (fetchErr) {
+        // Owner-checked: the last release does not bump the token, so a failure landing after it
+        // would otherwise remember a path nobody holds.
+        fetchFailures.record(path, fetchErr, stillLive() && audioOwners.has(path));
+        return;
+      }
+      fetchFailures.forget(path); // the bytes arrived — a decode failure is the gesture retry's
       let buffer: AudioBuffer;
       try {
         buffer = await ctx.decodeAudioData(bytes);

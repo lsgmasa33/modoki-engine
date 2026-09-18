@@ -22,7 +22,7 @@ import { ensurePixiKtxTranscoder } from './pixiKtxTranscoder';
 import { assetPlumbing } from '../core/assetPlumbing';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT } from './assetFetch';
-import { fetchShaderManifest } from './shaderSchema';
+import { fetchShaderManifestClassified } from './shaderSchema';
 
 import { animationAssetProvider } from '../animation/assetProviders';
 import { getAnimationClip } from './animationClipCache';
@@ -56,7 +56,7 @@ textureProvider.provide({
   getSpriteEpoch, getAssetType, ensurePixiKtxTranscoder,
 });
 
-assetPlumbing.provide({ assetUrl, fetchInit: ASSET_FETCH_INIT, fetchShaderManifest });
+assetPlumbing.provide({ assetUrl, fetchInit: ASSET_FETCH_INIT, fetchShaderManifest: fetchShaderManifestClassified });
 
 animationAssetProvider.provide({
   getAnimationClip, getSpriteAnim, resolveSpriteClip, activeSpriteClip, spriteAnimHasClip,

@@ -14,6 +14,7 @@ import { Texture, CanvasSource } from 'pixi.js';
 import { loadMtsdfAtlasTexture } from '../pixiTextureLoad';
 import type { FontProvider } from './fontProvider';
 import { markTextDirty } from './textDirty';
+import { createLoadFailureMemo } from '../../core/loadFailureMemo';
 
 const cache = new Map<string, Texture>();
 /** In-flight atlas loads, keyed like `cache` — a dedupe marker so a second caller does not
@@ -28,6 +29,27 @@ const cache = new Map<string, Texture>();
  *  SceneView) and which also bumps that font's text version, so the woken frame re-lays out
  *  exactly this font's text. Same hub `fontAtlasLoader` and `dynamicFontProvider` already use. */
 const inFlight = new Set<string>();
+/** What a FAILED atlas load left behind (#1397). Before it, nothing: the `.catch` freed the key
+ *  and "the next call re-attempts" — and the next call is the next Scene2D text pass, every
+ *  running frame. A 404 or the SPA fallback is now remembered; a dropped connection or a 5xx backs
+ *  off, and `onRetryDue` repaints that font's text when the retry is due (an idle Scene2D would not
+ *  ask again on its own). `unknownIs: 'transient'` for the no-`createImageBitmap` fallback, whose
+ *  Pixi loader reports every failure the same opaque way. Keyed `fontId + '\n' + url`: the url
+ *  carries the content hash, so a re-bake arrives under a fresh key, and the font id is what the
+ *  wake needs. Forgotten when the provider is disposed. */
+const atlasFailures = createLoadFailureMemo({
+  label: 'fontTexturePixi',
+  unknownIs: 'transient',
+  onRetryDue: (key) => markTextDirty(key.slice(0, key.indexOf('\n'))),
+});
+/** Providers already watched for disposal, and the ones that have been disposed (#1397 review). */
+const watchedProviders = new WeakSet<FontProvider>();
+const disposedProviders = new WeakSet<FontProvider>();
+function watchDisposal(provider: FontProvider): void {
+  if (watchedProviders.has(provider)) return;
+  watchedProviders.add(provider);
+  provider.addDisposable(() => { disposedProviders.add(provider); });
+}
 /** Last atlasVersion uploaded into each dynamic canvas-backed Texture. */
 const uploadedVersion = new WeakMap<Texture, number>();
 
@@ -97,9 +119,12 @@ export function getFontTexturePixi(provider: FontProvider, page = 0): Texture | 
   else if (existing) return existing;
   // Already loading — its settle wakes every surface, this caller included (see `inFlight`).
   if (inFlight.has(key)) return null;
-  inFlight.add(key);
-
   const url = provider.atlasImageUrl;
+  const failureKey = `${provider.id}\n${url}`;
+  if (atlasFailures.blocked(failureKey)) return null;
+  inFlight.add(key);
+  watchDisposal(provider);
+
   // ⚠️ NOT `loadPixiTexture` (#1045): `Assets.load` decodes via a bare `createImageBitmap(blob)`,
   // and on iOS 16 the UA default for that is PREMULTIPLY — which destroys the distance field and
   // makes every glyph invisible. The three lines below cannot repair it, because the WebGL unpack
@@ -114,6 +139,7 @@ export function getFontTexturePixi(provider: FontProvider, page = 0): Texture | 
       tex.source.alphaMode = 'no-premultiply-alpha';
       tex.source.update();
       cache.set(key, tex);
+      atlasFailures.forget(failureKey);
       provider.addDisposable(() => {
         cache.delete(key);
         // This texture is normally OURS — `loadMtsdfAtlasTexture` builds it outside Pixi's
@@ -151,8 +177,8 @@ export function getFontTexturePixi(provider: FontProvider, page = 0): Texture | 
       //    same synchronous block — so the retry gets the LIVE P2 or no provider at all, never the
       //    disposed P1 that landed here. Bounded at one iteration.
       //
-      // The `.catch` below may settle without waking only because no successor is stranded there;
-      // the analogy between the two paths is false.
+      // The `.catch` below settles without waking EXCEPT when this provider was disposed mid-load:
+      // then a successor is stranded behind `inFlight` exactly as here, and it wakes too (#1397).
       //
       // Cache FIRST, then wake — a listener re-renders synchronously inside markDirty in some
       // hosts, and it must find the texture rather than kick a second load.
@@ -160,10 +186,22 @@ export function getFontTexturePixi(provider: FontProvider, page = 0): Texture | 
       markTextDirty(provider.id);
     })
     .catch((e: unknown) => {
-      // Free the key WITHOUT waking: there is nothing to draw, and the next call re-attempts the
-      // load. A wake here would make a failing atlas a per-frame fetch loop.
+      // Free the key WITHOUT waking: there is nothing to draw, and a wake here would make a failing
+      // atlas a per-frame fetch loop. The memo decides when the next call may re-attempt, and wakes
+      // for it itself (#1397).
       inFlight.delete(key);
-      console.warn(`[fontTexturePixi] atlas load failed: ${url}`, e);
+      if (disposedProviders.has(provider)) {
+        // Superseded mid-load (`invalidateFont`). Its failure is not the successor's to inherit, and
+        // the successor is stranded: its repaint found this load in flight and returned null, and
+        // nothing else will ask again on an idle Scene2D. Wake once, so it starts its own load —
+        // the same reason the success path above still wakes for a disposed provider (#481).
+        markTextDirty(provider.id);
+        return;
+      }
+      const firstOfStreak = atlasFailures.retryAt(failureKey) === undefined;
+      atlasFailures.record(failureKey, e);
+      // One disposer per streak, not per retry: a disposed font forgets its failures.
+      if (firstOfStreak) provider.addDisposable(() => atlasFailures.forget(failureKey));
     });
   return null;
 }

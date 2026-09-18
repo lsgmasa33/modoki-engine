@@ -11,6 +11,12 @@ export interface AssetPlumbing {
   /** Cache-policy fetch options — spread into `fetch(url, fetchInit)`. See
    *  `loaders/assetFetch.ts` for why dev/prod differ. */
   fetchInit: RequestInit;
+  /** Resolves null when the manifest is NOT THERE or unusable (404/410, the SPA fallback, a parse
+   *  error) — a failure the same bytes reproduce. REJECTS with a transient error
+   *  (`AssetNetworkError`, or a non-absent `MissingAssetError`) when the server could not be
+   *  reached or could not serve it, so the 2D material cache can back off instead of falling back
+   *  for the rest of the scene (#1397). Unlike the public `fetchShaderManifest`, which flattens
+   *  both to null. */
   fetchShaderManifest(path: string): Promise<ShaderManifest | null>;
 }
 

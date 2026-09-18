@@ -31,11 +31,11 @@
  *  Time is `rawNow()` (the sanctioned wall-clock seam): a retry delay is about the network, not
  *  simulation time, so it must keep running while the sim is paused. */
 
-import { rawNow } from '../core/clock';
-import { emit } from '../core/journal';
-import { peekCurrentWorld } from '../core/ecs/worldRegistry';
+import { rawNow } from './clock';
+import { emit } from './journal';
+import { peekCurrentWorld } from './ecs/worldRegistry';
 import type { World } from 'koota';
-import { AssetNetworkError, MissingAssetError } from './assetFetch';
+import { AssetNetworkError, MissingAssetError, statusIsAbsent } from './assetLoadErrors';
 
 /** First retry delay after a transient failure. Doubles per consecutive failure. */
 export const RETRY_BASE_MS = 1000;
@@ -56,6 +56,12 @@ export type LoadFailureClass = 'permanent' | 'transient' | 'unknown';
 export function classifyLoadFailure(e: unknown): LoadFailureClass {
   if (e instanceof AssetNetworkError) return 'transient';
   if (e instanceof MissingAssetError) return e.absent ? 'permanent' : 'transient';
+  // three's `FileLoader` (under GLTFLoader, HDRLoader, UltraHDRLoader, …) rejects a non-ok response
+  // with its own `HttpError`, carrying the Response. It is not exported, so match its shape. A bare
+  // `TypeError` from the same loader stays unknown: FileLoader routes a dropped connection AND a
+  // parse error through one `onError`, so nothing distinguishes them (#1397).
+  const status = (e as { response?: { status?: unknown } } | null)?.response?.status;
+  if (e instanceof Error && typeof status === 'number') return statusIsAbsent(status) ? 'permanent' : 'transient';
   return 'unknown';
 }
 
@@ -87,6 +93,8 @@ export interface LoadFailureMemo {
   /** The key loaded, or its cache entry was invalidated/reseeded: drop what was remembered. */
   forget(key: string): void;
   clear(): void;
+  /** How many `onRetryDue` timers are armed — a test seam. */
+  readonly pendingWakes: number;
 }
 
 interface Entry {
@@ -102,8 +110,28 @@ export function createLoadFailureMemo(opts: {
   /** Log/journal prefix, e.g. `rig2dCache`. */
   label: string;
   unknownIs: 'permanent' | 'transient';
+  /** Called once when a transient key's backoff expires (#1397). For a cache whose askers do not
+   *  come back on their own — a render-on-demand view, a slot built once, an idle Scene2D — so
+   *  without it a retry that is due waits for an unrelated edit. A per-frame asker does not need
+   *  it. One timer per backing-off key, cancelled by `forget`/`clear` and replaced by the next
+   *  `record`, so it fires at most once per retry step. */
+  onRetryDue?: (key: string) => void;
 }): LoadFailureMemo {
   const entries = new Map<string, Entry>();
+  const timers = new Map<string, ReturnType<typeof setTimeout>>();
+  const cancelTimer = (key: string): void => {
+    const t = timers.get(key);
+    if (t !== undefined) { clearTimeout(t); timers.delete(key); }
+  };
+  const armTimer = (key: string, at: number): void => {
+    const onRetryDue = opts.onRetryDue;
+    if (!onRetryDue) return;
+    cancelTimer(key);
+    timers.set(key, setTimeout(() => {
+      timers.delete(key);
+      onRetryDue(key);
+    }, Math.max(0, at - rawNow())));
+  };
 
   /** Journal half of an announcement. ⚠️ Per WORLD, not once: `SceneManager` acquires the next
    *  scene's assets BEFORE it makes that world current, so a failure during a load lands in the
@@ -148,6 +176,7 @@ export function createLoadFailureMemo(opts: {
         announcedIn: prev?.announcedIn ?? null,
       };
       entries.set(key, e);
+      if (permanent) cancelTimer(key); else armTimer(key, e.retryAt);
       // A new streak — or a transient streak that just turned permanent — is announced; a repeat is not.
       if (prev && prev.permanent === permanent) return;
       console.warn(
@@ -160,13 +189,19 @@ export function createLoadFailureMemo(opts: {
       const prev = entries.get(key);
       const e: Entry = { permanent: true, failures: (prev?.failures ?? 0) + 1, retryAt: Infinity, error: reason, announcedIn: null };
       entries.set(key, e);
+      cancelTimer(key);
       journal(key, e); // the caller already logged its own console.error
     },
     retryAt(key) {
       const e = entries.get(key);
       return e && !e.permanent ? e.retryAt : undefined;
     },
-    forget(key) { entries.delete(key); },
-    clear() { entries.clear(); },
+    forget(key) { entries.delete(key); cancelTimer(key); },
+    clear() {
+      entries.clear();
+      for (const t of timers.values()) clearTimeout(t);
+      timers.clear();
+    },
+    get pendingWakes() { return timers.size; },
   };
 }

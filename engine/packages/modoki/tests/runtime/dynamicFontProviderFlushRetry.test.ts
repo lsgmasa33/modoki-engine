@@ -36,6 +36,8 @@ vi.mock('../../src/runtime/rendering/text/msdfGenerate', () => ({
 }));
 
 import { DynamicFontProvider } from '../../src/runtime/rendering/text/dynamicFontProvider';
+import { AssetNetworkError } from '../../src/runtime/core/assetLoadErrors';
+import { RETRY_BASE_MS, RETRY_CAP_MS } from '../../src/runtime/core/loadFailureMemo';
 import type { GlyphAtlas } from '../../src/runtime/rendering/text/glyphAtlas';
 
 // Minimal canvas stub — the provider only needs createImageData/putImageData/clearRect.
@@ -254,5 +256,54 @@ describe('DynamicFontProvider — a SECOND failing batch merges into the pending
     expect(p.getGlyph(A)).toBeUndefined();
     expect(p.getGlyph(B)).toBeUndefined();
     warnSpy.mockRestore();
+  });
+});
+
+/** #1397 — the budget above is right for a font that is BROKEN and wrong for a network that is
+ *  down: ~1.5 s of outage spent it, and the glyphs stayed tofu until eviction. A network failure
+ *  (`AssetNetworkError`, typed at the `.ttf` fetch) now backs off on the shared schedule without
+ *  exhausting, and parks new batches instead of fetching during the backoff. */
+describe('DynamicFontProvider — a NETWORK failure backs off without exhausting (#1397)', () => {
+  it('recovers after more failures than MAX_FLUSH_RETRIES allows, one fetch per backoff step', async () => {
+    let calls = 0;
+    const loadFontBytes = vi.fn(async () => {
+      calls++;
+      if (calls <= 5) throw new AssetNetworkError(new TypeError('Failed to fetch'));
+      return new Uint8Array([1]);
+    });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const p = DynamicFontProvider.fromBaked('t', EMPTY_BAKED, 'atlas.png', loadFontBytes);
+
+    p.ensureGlyphs([A]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(1);
+    // Five network failures: 1 s + 2 s + 4 s + 8 s + 16 s of backoff. The old budget gave up after 3.
+    await vi.advanceTimersByTimeAsync(RETRY_BASE_MS * (1 + 2 + 4 + 8 + 16) + 100);
+    expect(calls).toBe(6);
+    expect(p.getGlyph(A)).toBeDefined();
+    vi.restoreAllMocks();
+  });
+
+  it('a per-frame caller and a new codepoint during the backoff do not fetch again', async () => {
+    let calls = 0;
+    const loadFontBytes = vi.fn(async () => { calls++; throw new AssetNetworkError(new TypeError('offline')); });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const p = DynamicFontProvider.fromBaked('t', EMPTY_BAKED, 'atlas.png', loadFontBytes);
+
+    p.ensureGlyphs([A]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(1);
+    for (let frame = 0; frame < 30; frame++) {
+      p.ensureGlyphs([A, 0x3044 + (frame % 3)]); // a countdown: same label + changing glyphs
+      await vi.advanceTimersByTimeAsync(16);
+    }
+    expect(calls).toBe(1); // ~0.5 s into a 1 s backoff: nothing fetched
+    await vi.advanceTimersByTimeAsync(RETRY_BASE_MS);
+    expect(calls).toBe(2); // ONE retry, carrying every parked codepoint
+    // And it never gives up: an hour later it is still retrying, at the cap.
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+    expect(calls).toBeGreaterThan(5);
+    expect(calls).toBeLessThan(2 + 12 + 60 / (RETRY_CAP_MS / 60000) + 1);
+    vi.restoreAllMocks();
   });
 });

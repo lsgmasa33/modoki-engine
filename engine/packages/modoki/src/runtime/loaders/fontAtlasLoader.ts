@@ -14,7 +14,8 @@
 
 import { resolveRef, getAssetEntry, isGuid, onFontInvalidated } from './assetManifest';
 import { assetUrl, withCacheBust } from './assetUrl';
-import { parseAssetJson } from './assetFetch';
+import { assetIsAbsent, checkAssetResponse, parseAssetJson, readAssetBytes } from './assetFetch';
+import { createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
 import { FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX } from '../core/fontSettings';
 import { parseChlumskyJson } from '../rendering/text/glyphAtlas';
 import { BakedFontProvider, type FontProvider } from '../rendering/text/fontProvider';
@@ -38,6 +39,19 @@ const unknownSeen = new Set<string>();                               // warn-onc
 // re-inserts an owner-less provider that releaseFontsForScene can never reclaim (leak). Full
 // teardown (`disposeAllFonts`) still invalidates wholesale. Mirrors audioBufferCache's liveness guard.
 const liveness = createTeardownToken();
+/** What a FAILED load left behind (#1397). Before it, nothing: `ensureFontLoaded` runs every frame
+ *  from both renderers, so a font whose metrics 404'd was fetched again every frame. A 404 or a
+ *  corrupt file is now remembered until the font is invalidated or its last scene lets go; a
+ *  dropped connection or a 5xx backs off. `unknownIs: 'permanent'` — every fetch below is typed at
+ *  the source, so an unknown is a parse throw or a generator failure, which the same bytes
+ *  reproduce. `onRetryDue` repaints dirty-gated Scene2D text when a retry is due. */
+const failures = createLoadFailureMemo({ label: 'fontAtlasLoader', unknownIs: 'permanent', onRetryDue: (guid) => markTextDirty(guid) });
+
+/** Fetch a binary font asset with every outcome typed for {@link failures}. */
+async function fetchFontBytes(url: string): Promise<Uint8Array> {
+  const res = checkAssetResponse(await fetch(url).catch(rethrowAsNetworkError), url);
+  return new Uint8Array(await readAssetBytes(res));
+}
 
 function addOwner(guid: string, sceneId: SceneId): void {
   let set = owners.get(guid);
@@ -74,6 +88,7 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
   if (existing) return existing;
   const inFlight = loadPromises.get(guid);
   if (inFlight) return inFlight;
+  if (failures.blocked(guid)) return null;
 
   // Resolve BEFORE the memo, because an unresolvable guid must NOT be memoized. `fontUrls` is
   // sync, so the old shape returned null from inside the promise body and then stored that
@@ -111,33 +126,36 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
         // load because fonts are awaited scene resources. Seeded from the bake this path is
         // as fast as a baked font, and the generator is touched only if something actually
         // asks for a glyph outside the baked charset.
-        const res = await fetch(urls.metricsUrl);
-        if (res.ok) {
-          const atlas = parseChlumskyJson(await parseAssetJson(res, urls.metricsUrl));
+        // Only a bake that is NOT THERE (404/410, or the dev server's SPA fallback) falls through
+        // to the WASM seed below. A 5xx or a dropped connection is the server failing to serve a
+        // bake that may exist: it throws to the catch as transient, rather than paying the slow
+        // seed path for a blip (#1397).
+        let bakedJson: unknown;
+        try {
+          bakedJson = await parseAssetJson(await fetch(urls.metricsUrl).catch(rethrowAsNetworkError), urls.metricsUrl);
+        } catch (e) {
+          if (!assetIsAbsent(e)) throw e;
+        }
+        if (bakedJson !== undefined) {
+          const atlas = parseChlumskyJson(bakedJson);
           if (!stillLive() || !owners.has(guid)) return null;
           provider = DynamicFontProvider.fromBaked(
             guid, atlas, urls.atlasUrl,
             // Deferred: not fetched at all unless a miss happens.
-            async () => {
-              const r = await fetch(urls.fontUrl);
-              if (!r.ok) throw new Error(`font fetch ${r.status}`);
-              return new Uint8Array(await r.arrayBuffer());
-            },
+            () => fetchFontBytes(urls.fontUrl),
             dynamicConfigFromSettings(fontBlock),
           );
         } else {
           // No usable bake (conversion failed) — fall back to generating the seed, which is
           // the only way this font renders at all. Slow, and now the exception.
-          const fontRes = await fetch(urls.fontUrl);
-          if (!fontRes.ok) throw new Error(`font fetch ${fontRes.status}`);
-          const bytes = new Uint8Array(await fontRes.arrayBuffer());
+          const bytes = await fetchFontBytes(urls.fontUrl);
           if (!stillLive() || !owners.has(guid)) return null;
           provider = await DynamicFontProvider.create(guid, bytes, dynamicConfigFromSettings(fontBlock));
         }
       } else {
-        const res = await fetch(urls.metricsUrl);
-        if (!res.ok) throw new Error(`metrics fetch ${res.status}`);
-        // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+        const res = await fetch(urls.metricsUrl).catch(rethrowAsNetworkError);
+        // parseAssetJson types a non-ok status, and the SPA fallback (a missing asset arriving as
+        // 200 OK index.html), so the failure memo can tell absent from unreachable.
         const atlas = parseChlumskyJson(await parseAssetJson(res, urls.metricsUrl));
         provider = new BakedFontProvider(guid, atlas, urls.atlasUrl);
       }
@@ -146,17 +164,23 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
       if (!provider) return null;
       if (!stillLive() || !owners.has(guid)) { provider.dispose(); return null; }
       providers.set(guid, provider);
+      failures.forget(guid);
       // Text that was waiting on this font can now lay out — nudge dirty-gated
       // renderers (Scene2D) to repaint. (Scene3D re-queries every frame anyway.)
       markTextDirty(guid);
       return provider;
     } catch (e) {
-      console.warn(`[fontAtlasLoader] failed to load font ${guid}:`, e);
+      failures.record(guid, e, stillLive() && owners.has(guid));
       return null;
-    } finally {
-      loadPromises.delete(guid);
     }
-  })();
+  })().finally(() => {
+    // IDENTITY-CHECKED, as `riggedModelCache` spells out at its twin: an `invalidateFont` or a
+    // last release mid-flight deletes this entry and the next frame starts a REPLACEMENT load,
+    // which an unconditional delete here would evict when this stale load settles — so the
+    // frame after that starts a third, and a failure the replacement is about to record is
+    // re-requested before it lands (#1397).
+    if (loadPromises.get(guid) === promise) loadPromises.delete(guid);
+  });
   loadPromises.set(guid, promise);
   return promise;
 }
@@ -185,6 +209,7 @@ export function invalidateFont(guid: string): void {
   if (p) p.dispose();
   providers.delete(guid);
   loadPromises.delete(guid);
+  failures.forget(guid); // a re-bake may have fixed the file
   liveness.invalidateKey(guid);
   markTextDirty(guid);
 }
@@ -203,6 +228,7 @@ export function releaseFontsForScene(sceneId: SceneId): void {
       providers.get(guid)?.dispose();
       providers.delete(guid);
       loadPromises.delete(guid);
+      failures.forget(guid); // failure memory is scene-scoped, like the mesh cache's (#1371)
       liveness.invalidateKey(guid); // invalidate any in-flight acquire for this guid
     }
   }
@@ -217,6 +243,7 @@ export function disposeAllFonts(): void {
   loadPromises.clear();
   owners.clear();
   unknownSeen.clear();
+  failures.clear();
   liveness.invalidateAll(); // invalidate every in-flight acquire
   void disposeMsdfGenerator();
 }

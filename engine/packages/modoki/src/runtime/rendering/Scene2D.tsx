@@ -889,7 +889,10 @@ export class Scene2DRenderer {
   private readonly _materialIdsScratch = new Set<number>();
   // Sprite-texture loads a material entity has kicked but that aren't resident yet — deduped so the
   // every-running-frame material pass doesn't re-issue them, and a FAILED url backs off instead of
-  // refetching every dirty frame (#1374). Settle wakes the rebuild via markDirty.
+  // refetching every dirty frame (#1374). Settle wakes the rebuild via markDirty. Also carries the
+  // skinned-part textures, which the SkinnedSprite2D pass asks for at the same rate, and the plain
+  // sprite slots' loads (`whenResident`) — every Pixi sprite-texture load in this renderer
+  // (#1397).
   private readonly _materialTex = new MaterialTexRetry(loadPixiTexture, () => this.markDirty());
   // Entity id → the packed entity (`entity.valueOf()`) that claimed it THIS pass. Cleared at the top
   // of the pass and consumed by the slot-disposal sweep at its end — and, between passes, by
@@ -1396,24 +1399,20 @@ export class Scene2DRenderer {
       sp.texture = frameTexture(cachedBase, resolved);
     } else {
       if (cachedBase) Assets.cache.remove(url);
-      loadPixiTexture(url).then((base: Texture) => {
-        // F12 — the `sp.destroyed` check is the LOAD-BEARING guard against a stale async
-        // load clobbering the wrong texture. A sprite is NEVER reused across URL changes:
-        // a ref change disposes the slot (sp.destroy()) + makes a FRESH Sprite, so an
-        // in-flight load for the OLD url always resolves onto an already-destroyed object
-        // and is dropped here; disposeSlot already released its refcount.
-        // ⚠️ Exception, one frame wide: a `texture`-mode MASK sprite's destroy is now DEFERRED
-        // (`pendingMaskDestroy`, #455), so a load landing in that window resolves onto a
-        // live-but-doomed detached sprite and this guard does NOT catch it. Consequence is
-        // benign — a spurious `markDirty` redraw on an object about to be destroyed anyway,
-        // never a wrong texture landing on screen.
-        if (sp.destroyed) return;
-        sp.texture = frameTexture(base, resolved);
-        // The texture's size feeds the sprite's scale — force a redraw so the gate
-        // recomputes it (and wakes an idle frame if the sim is stopped).
-        this.markDirty();
-      }).catch((e: unknown) => {
-        console.warn(`[Scene2D] Sprite texture load failed: ${url}`, e);
+      // Through the retrier (#1397). A bare load's failure used to leave the sprite
+      // `Texture.EMPTY` for as long as the slot lived — `makeSprite` runs once per slot, so nothing
+      // ever asked again. The retrier backs a failure off, wakes the frame when a retry is due, and
+      // `renderFrame`'s drain re-asks it and binds on arrival.
+      //
+      // F12 — the `sp.destroyed` check is the LOAD-BEARING guard against a stale load landing on the
+      // wrong sprite. A sprite is NEVER reused across URL changes: a ref change disposes the slot
+      // (`sp.destroy()`) + makes a FRESH Sprite, so a waiter for the OLD url is always dead by the
+      // time its texture lands, and is dropped; `disposeSlot` already released its refcount.
+      // ⚠️ Exception, one frame wide: a `texture`-mode MASK sprite's destroy is DEFERRED
+      // (`pendingMaskDestroy`, #455), so a texture landing in that window binds onto a
+      // live-but-doomed detached sprite. Benign — never a wrong texture on screen.
+      this._materialTex.whenResident(url, () => sp.destroyed, () => {
+        sp.texture = frameTexture(Assets.get(url) as Texture, resolved);
       });
     }
     return sp;
@@ -1562,6 +1561,9 @@ export class Scene2DRenderer {
     // A material uniform the driver wrote this frame counts too: its per-entity read is inside the
     // scan below, which this skip would otherwise make unreachable (#1141 sibling).
     if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D && !hasAny2DMaterialDirty()) return;
+    // Sprite slots waiting on a texture (#1397). Binding one changes its size, which feeds its
+    // scale, so a bind redraws everything.
+    if (this._materialTex.waitingUrls && this._materialTex.drain(isPixiTextureLive)) this._externalDirty = true;
     let forceAll = this._externalDirty; // external edit / load / resize / swap ⇒ redraw all
     this._externalDirty = false;
 
@@ -2264,9 +2266,10 @@ export class Scene2DRenderer {
           // `isPixiTextureLive`'s banner.
           if (!isPixiTextureLive(part.url)) {
             allLoaded = false;
-            loadPixiTexture(part.url).then(() => this.markDirty()).catch((e: unknown) => {
-              console.warn(`[Scene2D] Skinned mesh texture load failed: ${part.url}`, e);
-            });
+            // Through the material-sprite retrier, not a bare `loadPixiTexture` (#1397): this pass
+            // runs every frame while the rig is buffered, and Pixi's loader drops a rejected url
+            // from its promise cache, so a missing part texture was requested again every frame.
+            this._materialTex.request(part.url);
           }
         }
         if (!allLoaded) return;
