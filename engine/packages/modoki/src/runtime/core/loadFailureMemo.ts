@@ -35,7 +35,7 @@ import { rawNow } from './clock';
 import { emit } from './journal';
 import { peekCurrentWorld } from './ecs/worldRegistry';
 import type { World } from 'koota';
-import { AssetNetworkError, MissingAssetError, statusIsAbsent } from './assetLoadErrors';
+import { AssetNetworkError, MissingAssetError, absentIfBundled, statusIsAbsent } from './assetLoadErrors';
 
 /** First retry delay after a transient failure. Doubles per consecutive failure. */
 export const RETRY_BASE_MS = 1000;
@@ -44,11 +44,13 @@ export const RETRY_CAP_MS = 10 * 60 * 1000;
 
 export { AssetNetworkError };
 
-/** `fetch(...).catch(rethrowAsNetworkError)` — attached directly to the fetch promise, so it sees
+/** `fetch(url).catch(rethrowFetchFailure(url))`: attached directly to the fetch promise, so it sees
  *  ONLY the fetch's own rejection, never an error from the parse step after it. The body read is
- *  marked inside `parseAssetJson`. */
-export function rethrowAsNetworkError(e: unknown): never {
-  throw new AssetNetworkError(e);
+ *  marked inside `parseAssetJson`. A rejection is an {@link AssetNetworkError} (transient) unless
+ *  the app serves `url` itself, where it is the file missing from the bundle (`absentIfBundled`,
+ *  #1402). Curried, and the URL is required, because a rejection carries no URL of its own. */
+export function rethrowFetchFailure(url: string): (e: unknown) => never {
+  return (e: unknown) => { throw absentIfBundled(url, new AssetNetworkError(e)); };
 }
 
 export type LoadFailureClass = 'permanent' | 'transient' | 'unknown';

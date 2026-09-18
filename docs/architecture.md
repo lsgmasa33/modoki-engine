@@ -663,7 +663,7 @@ Three decisions that are easy to undo by accident:
 
 - **The network error is marked at the fetch, not recognised afterwards.** `fetch` rejects with a
   bare `TypeError`, and so does a bug in a normaliser. So every loader writes
-  `fetch(...).catch(rethrowAsNetworkError)`; that `.catch` sits directly on the fetch promise and
+  `fetch(url).catch(rethrowFetchFailure(url))`; that `.catch` sits directly on the fetch promise and
   sees only the fetch's own rejection. Classifying `TypeError` as network would turn every code
   bug into an endless retry. ⚠️ **The fetch is only half of the request.** A connection that drops
   after the headers makes `res.text()` reject, not `fetch`, so `parseAssetJson` wraps the body
@@ -765,15 +765,64 @@ them (fonts, HDR, prefabs), for the reason riggedModelCache spells out. A load s
 invalidation must not evict the replacement that took its key. If it does, the next frame starts a
 third load, and a failure the replacement was about to record is requested again first.
 
-⚠️ **On iOS native, a MISSING bundled file is classified as an outage.** Capacitor's
-`WebViewAssetHandler.swift` does not answer a missing file with a 404. `Data(contentsOf:)` throws,
-and the handler calls `urlSchemeTask.didFailWithError`, so `fetch` rejects exactly as it does
-offline and `rethrowAsNetworkError` marks it transient. So on a device, a bundled asset that is in
-the manifest but not in the bundle backs off forever: a local read every 10 minutes at the cap.
-It is never remembered as absent, and `requestPrefab` never reports it `prefab/unavailable`. That
-case is a build defect, and the retries cost no network. What it loses is the diagnosis:
-`@asset-load-failed` says `transient: true`. #1371's sites carried this before #1397. Android is
-unchecked. Tracked in #1402.
+**On a native build, a file the app serves ITSELF cannot have an outage (#1402).** iOS's
+`WebViewAssetHandler.swift` does not answer a missing bundled file with a 404: `Data(contentsOf:)`
+throws and the handler calls `urlSchemeTask.didFailWithError`, so `fetch` rejects exactly as it
+does offline. Measured on the iPhone 8 (iOS 16.7.16), 2026-09-18, by requesting a nonexistent
+path from inside the installed app: `fetch` rejects with `TypeError: Load failed`, XHR fires
+`onerror` with status 0, and `<img>` fires a plain `Event`. Marked as a network error, a file
+that was in the manifest but not in the bundle backed off forever. It was never remembered as
+absent, `requestPrefab` refunded every attempt so `prefab/unavailable` never fired, and
+`@asset-load-failed` said `transient: true`. Android is different by source reading (Capacitor
+8.5.0, `WebViewLocalServer.java`): a missing file with an extension gets a real **404**, which was
+already absent. Measured on the S22 the same day: `fetch` and XHR get 404, and `<img>` fires
+`error`.
+
+So a failure with **no status** is decided by the URL. `isAppBundleUrl(url)` is true on a native
+Capacitor build for a URL on the page's own scheme and host. That covers the embedded bundle, an
+OTA snapshot (the `serverBasePath` swap keeps the origin) and a sub-game's `_capacitor_file_`
+URL. `absentIfBundled(url, e)` turns such a failure into `MissingAssetError({absent: true})`.
+Three things the rule depends on:
+
+- **The URL is required at the fetch site.** A rejection carries no URL, which is why
+  `rethrowAsNetworkError(e)` became the curried `rethrowFetchFailure(url)`. Removing the old name
+  made the compiler list every site. The opaque loaders call `absentIfBundled` before `record`:
+  audio XHR, Pixi and three `TextureLoader` textures, font atlases, the rigged GLB and the env HDR.
+- **Scheme + host, not `URL.origin`.** iOS serves the page from `capacitor://localhost`, and the
+  URL standard gives a non-special scheme the opaque origin `"null"`. WebKit happens to report
+  `capacitor://localhost`, but scheme + host holds whichever way an engine answers.
+- **An error that already has a verdict is left alone.** That means a `MissingAssetError`, a
+  three `HttpError` with a status, or an `AbortError`, which is a caller's cancel. Look for the
+  abort *inside* the `AssetNetworkError` wrapper, because `rethrowFetchFailure` wraps first.
+
+- **Only a failed REQUEST is claimed.** That means a `TypeError` (from `fetch` or three's
+  `FileLoader`), a DOM `Event` (from `<img>` or XHR), an `AssetNetworkError`, or Pixi's
+  `[Loader.load] Failed to load <url>.\n<inner>` wrapper when the inner error is one of those
+  (Pixi keeps it only as text). Anything else passes through untouched: a KTX2 transcoder that
+  has not had `detectSupport` yet, a `createImageBitmap` refusal, or a parser's plain `Error`.
+  ⚠️ **The filter goes by shape, not cause**, so two failures that are not requests still get
+  claimed. An `<img>` decode failure fires the same `error` Event as a missing file. A `TypeError`
+  thrown inside a loader's own chain looks like a failed fetch: GLTFLoader runs `onLoad` inside its
+  promise, and Pixi wraps its parsers. The same bytes reproduce both, so permanent is still the
+  right verdict. Only the message overstates "missing".
+- **Hand the helper only the rejection of THIS url's own load.** A site that awaits something else
+  first in the same promise pins that failure on the url. Billboard pages did this: a failed KTX2
+  loader-module import is also a `TypeError`, and it was recorded as the page missing from the
+  build, permanently. So `loadBillboardPage` tags only `loader.loadAsync(url)`. The rigged and env
+  sites record a loader-import failure raw for the same reason.
+
+It is always false on the web, where the page's own server is as remote as a CDN. Probe-then-
+fallback sites now fall back on iOS as they do on a 404: the 2D shader variant body, the 3D
+`fileShaderBuilder` variant body, the dynamic font bake, and the processed GLB. The OTA client's
+embedded-manifest read made the same call first (#1132, `docs/ota-updates.md` § delta).
+
+**One app-origin reader keeps a rejection transient on purpose:** `engine/app/subgameLoader.ts`.
+A sub-game whose `subgame.json` is missing on iOS retries rather than being quarantined, because a
+quarantine can never be undone, while a missed one only retries at the next boot.
+
+Not handled, and measured on the S22: a Range request for a missing file returns **206 with a
+0-byte body** on Android. No classified loader sends a Range request. The `<video>` element does,
+so it matters only to video streaming. `new Audio(url)` streams and the video stream policy classify nothing.
 
 Left out on purpose: the 3D `fileShaderBuilder` fallback's lifetime (not traced), and re-downloading
 audio bytes on every decode retry.

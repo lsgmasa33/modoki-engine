@@ -9,7 +9,7 @@ import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { createLoadFailureMemo, rethrowFetchFailure } from '../core/loadFailureMemo';
 import { normalizeAnimationClip, type AnimationClipDef } from '../animation/types';
 import { createTeardownToken } from '../core/liveness';
 import { awaitLazyLoad } from './awaitLazyLoad';
@@ -57,7 +57,7 @@ export function getAnimationClip(ref: string, opts?: { load?: boolean }): Animat
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(path)))
       .then((r) => {
         return parseAssetJson(r, path);
       })

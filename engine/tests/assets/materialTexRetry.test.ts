@@ -185,3 +185,32 @@ describe('#1397 — a sprite slot waiting on a texture recovers from a failed lo
     expect(retry.waitingUrls).toBe(0);
   });
 });
+
+describe('#1402 — a texture missing from a native app bundle', () => {
+  // Android's page shape (every game sets `androidScheme: "http"`); the iOS `capacitor://` shape is
+  // driven in the package tests (prefabRequest, pixiShaderBuilder, audioBufferCache).
+  beforeEach(() => { vi.stubGlobal('location', { href: 'http://localhost/', protocol: 'http:', host: 'localhost' }); });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('is requested ONCE on a native build (the app serves it itself, so it is absent, not an outage)', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    load.mockRejectedValue(new Error('[Loader.load] Failed to load /built/a.png.\n[object Event]'));
+    retry.request('/built/a.png');
+    await flush();
+    advanceManual(RETRY_CAP_MS * 3);
+    retry.request('/built/a.png');
+    await flush();
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it('accept side: a REMOTE url on native still backs off and retries', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    load.mockRejectedValue(new Error('[Loader.load] Failed to load https://cdn.example.com/a.png.\n[object Event]'));
+    retry.request('https://cdn.example.com/a.png');
+    await flush();
+    advanceManual(RETRY_BASE_MS);
+    retry.request('https://cdn.example.com/a.png');
+    await flush();
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+});

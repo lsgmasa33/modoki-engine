@@ -262,6 +262,19 @@ describe('buildPixiShaderProgram (WebGPU backend, mocked fetch)', () => {
     vi.stubGlobal('fetch', realFetch);
   });
 
+  it('falls back (null) when the body is missing from a native app bundle, where iOS REJECTS instead of answering 404 (#1402)', async () => {
+    files.set('nbios.shader.json', manifest({ uSpeed: P('float', 1) }));
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    vi.stubGlobal('location', { href: 'capacitor://localhost/', protocol: 'capacitor:', host: 'localhost' });
+    vi.stubGlobal('fetch', vi.fn((url: string) => (String(url).endsWith('.wgsl')
+      ? Promise.reject(new TypeError('Load failed'))
+      : (realFetch as (u: string) => Promise<unknown>)(url))));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(await buildPixiShaderProgram('nbios.shader.json')).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/missing WGSL body/));
+  });
+
   it('falls back (null) when the active-backend body is missing', async () => {
     files.set('nb.shader.json', manifest({ uSpeed: P('float', 1) }));
     // no .wgsl body seeded

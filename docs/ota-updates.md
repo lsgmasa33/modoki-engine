@@ -375,7 +375,9 @@ an embedded base that is PRESENT and unusable (malformed JSON, a failed `validat
 non-404 error status) is reported too, since that is a broken build artifact costing every fresh
 install its first delta (#1132). `tryFetchEmbeddedManifest` reads it through `parseAssetJson` to
 tell the two apart; a rejected fetch counts as absent, because that is how iOS's scheme handler
-answers a file missing from the app bundle. (The SPA-fallback `index.html` case `parseAssetJson`
+answers a file missing from the app bundle. Every asset loader applies the same rule through
+`absentIfBundled` (#1402, docs/architecture.md § "A load failure is classified before it is
+remembered"). (The SPA-fallback `index.html` case `parseAssetJson`
 exists for cannot arise here today: OTA only runs on native, and both Capacitor asset servers
 route to `index.html` only for a path with no extension.)
 That base manifest is the ONLY request a device ever makes into a version other than its target —

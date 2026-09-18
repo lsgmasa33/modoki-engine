@@ -153,6 +153,25 @@ describe('getFontTexturePixi — concurrent renderers', () => {
     restoreRealClock();
   });
 
+  it('an atlas MISSING from a native app bundle (the request fails, no status) stays failed like a 404 (#1402)', async () => {
+    setManualNow(0);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    vi.stubGlobal('location', { href: 'capacitor://localhost/', protocol: 'capacitor:', host: 'localhost' });
+    try {
+      const p = { ...(provider('font-ios-missing') as object), addDisposable: () => {} } as never;
+      getFontTexturePixi(p, 0);
+      // What reaches this record site in production: the no-createImageBitmap fallback, Pixi's
+      // `<img>` path, wrapped by Pixi's Loader. (The createImageBitmap path is already typed at its
+      // fetch by rethrowFetchFailure.)
+      rejectLoad(new Error('[Loader.load] Failed to load capacitor://localhost/fonts/a.png.\n[object Event]'));
+      await vi.waitFor(() => expect(warn).toHaveBeenCalled());
+      advanceManual(60 * 60 * 1000);
+      getFontTexturePixi(p, 0);
+      expect(loadCalls).toBe(1);
+    } finally { vi.unstubAllGlobals(); warn.mockRestore(); restoreRealClock(); }
+  });
+
   it('a 404 atlas stays failed until the provider is disposed (#1397)', async () => {
     setManualNow(0);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

@@ -13,6 +13,7 @@
  *  classified before it is remembered". */
 
 import { createLoadFailureMemo } from '../core/loadFailureMemo';
+import { absentIfBundled } from '../core/assetLoadErrors';
 
 export class MaterialTexRetry {
   /** url → the generation of the load that owns it. A settle whose generation no longer matches
@@ -44,7 +45,7 @@ export class MaterialTexRetry {
       (e: unknown) => {
         const live = this.loading.get(url) === gen;
         if (live) this.loading.delete(url);
-        this.failed.record(url, e, live);
+        this.failed.record(url, absentIfBundled(url, e), live);
       },
     );
   }

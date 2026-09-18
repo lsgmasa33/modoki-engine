@@ -85,8 +85,12 @@ async function loadOneSubgame(bundle: { name: string; version: string; path: str
   const baseUrl = Capacitor.convertFileSrc(bundle.path).replace(/\/$/, '');
 
   // ⚠️ The fetch REJECTING and the response being non-ok are different evidence, and collapsing
-  // them into one catch charged a transport hiccup as a permanent quarantine. A missing file
-  // returns a clean 404 through Capacitor's local scheme (device-verified) — that is content.
+  // them into one catch charged a transport hiccup as a permanent quarantine. On Android a missing
+  // file returns a clean 404 through Capacitor's local scheme (device-verified) — that is content.
+  // ⚠️ iOS does NOT: its scheme handler fails the request for a missing file (measured on the
+  // iPhone 8, #1402), so there a missing `subgame.json` lands in the catch below as transient. Kept that way
+  // on purpose, unlike the engine's asset loaders (`absentIfBundled`), because the cost is lopsided:
+  // a missed quarantine retries next boot, a wrong one can never be undone.
   // A rejection is a WebView-loader `TypeError`, which says nothing about the bytes, and
   // `rejected` survives `resetForNewBinary`, so getting this wrong blocks a GOOD version on that
   // device with no un-quarantine path anywhere in the codebase. (That justification is about a

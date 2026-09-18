@@ -22,7 +22,7 @@ import { getAudioContext } from '../audio/audioContext';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
 import { createTeardownToken } from '../core/liveness';
 import { createLoadFailureMemo } from '../core/loadFailureMemo';
-import { AssetNetworkError, MissingAssetError, statusIsAbsent } from '../core/assetLoadErrors';
+import { AssetNetworkError, MissingAssetError, absentIfBundled, statusIsAbsent } from '../core/assetLoadErrors';
 
 type SceneId = number;
 
@@ -222,7 +222,9 @@ function xhrAudioBytes(url: string): Promise<ArrayBuffer> {
       if (buf && buf.byteLength > 0) resolve(buf);
       else reject(new Error(`empty audio response (HTTP ${xhr.status})`));
     };
-    xhr.onerror = () => reject(new AssetNetworkError(new Error(`XHR error (HTTP ${xhr.status})`)));
+    // No status on an error: offline, or (#1402) iOS failing the request for a clip missing from
+    // the app bundle, which `absentIfBundled` tells apart by the URL.
+    xhr.onerror = () => reject(absentIfBundled(url, new AssetNetworkError(new Error(`XHR error (HTTP ${xhr.status})`))));
     xhr.send();
   });
 }

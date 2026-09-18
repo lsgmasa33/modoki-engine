@@ -25,7 +25,7 @@ import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { defaultSpriteClip, type SpriteClip } from '../traits/SpriteAnimator';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { createLoadFailureMemo, rethrowFetchFailure } from '../core/loadFailureMemo';
 import { createTeardownToken } from '../core/liveness';
 
 /** The subset of a SpriteAnimator instance the resolvers below read. */
@@ -112,7 +112,7 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(path)))
       .then((r) => {
         return parseAssetJson(r, path);
       })

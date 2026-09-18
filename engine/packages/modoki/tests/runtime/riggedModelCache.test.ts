@@ -558,6 +558,19 @@ describe('riggedModelCache — a failed load is classified before it is remember
     expect(getRiggedModel(REF)).toBeDefined();
   });
 
+  it('both candidates MISSING from a native app bundle (bare TypeError, no status) are requested once each (#1402)', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    vi.stubGlobal('location', { href: 'capacitor://localhost/', protocol: 'capacitor:', host: 'localhost' });
+    try {
+      cfg.failWith = () => new TypeError('Load failed');
+      await frames(3);
+      advanceManual(60 * 60 * 1000);
+      await frames(2);
+      expect(loads.count[VARIANT]).toBe(1);
+      expect(loads.count[PATH]).toBe(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it('a variant the server could not serve is TRANSIENT even when the raw fallback 404s — the variant may yet load', async () => {
     // The LAST error is a permanent 404, so recording only it would stick for the session.
     cfg.failWith = (path) => (path === VARIANT ? httpError(503) : httpError(404));

@@ -10,7 +10,7 @@ import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { createLoadFailureMemo, rethrowFetchFailure } from '../core/loadFailureMemo';
 import { defaultParticleEffect, PARTICLE_FORMAT_VERSION, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
 import { particleDefProvider } from '../particles/particleDefProvider';
 import { resolveColliderShape } from '../particles/colliders';
@@ -150,7 +150,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path); // detects a cache clear or per-key invalidation during the async load
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(path)))
       .then((r) => {
         return parseAssetJson(r, path);
       })

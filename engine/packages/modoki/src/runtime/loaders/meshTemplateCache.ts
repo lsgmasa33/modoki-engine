@@ -12,7 +12,8 @@ import { registerBuiltinMaterialTypes } from './materialPresets';
 import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, getAssetEntry, getGuidForPath } from './assetManifest';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { classifyLoadFailure, createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { classifyLoadFailure, createLoadFailureMemo, rethrowFetchFailure } from '../core/loadFailureMemo';
+import { absentIfBundled } from '../core/assetLoadErrors';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { classifyFormatVersion } from '../core/formatVersion';
 import { MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION } from '../traits/Renderable3D';
@@ -1071,7 +1072,7 @@ function fetchMeshAsset(meshPath: string, revalidate?: { stale: MeshAsset }): Pr
 
   const promise = (async () => {
     try {
-      const res = await fetch(assetUrl(meshPath), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
+      const res = await fetch(assetUrl(meshPath), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(meshPath)));
       if (!stillLive()) return;
       if (!res.ok && revalidate) { console.warn(`[MeshCache] kept the previous ${meshPath}: re-read failed (${res.status})`); return; }
       // Any other non-ok status throws `MissingAssetError` from `parseAssetJson` below, and the
@@ -1412,7 +1413,7 @@ function fetchMaterial(matPath: string): Promise<void> {
 
   const promise = (async () => {
     try {
-      const res = await fetch(assetUrl(matPath), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
+      const res = await fetch(assetUrl(matPath), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(matPath)));
       // A non-ok status throws `MissingAssetError` from `parseAssetJson` below and lands in the
       // catch, which splits 404/410 (permanent `MATERIAL_FAILED`) from every other status
       // (back off and retry, #1371). This branch used to stamp the permanent sentinel for a 503.
@@ -2321,9 +2322,10 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
       envFailures.record(hdrPath, err, stillLive() && envOwners.has(hdrPath));
       return; // syncEnvironment falls back to no env — same degrade as a failed load
     }
+    const envUrl = resolveEnvVariantUrl(hdrPath) ?? assetUrl(hdrPath);
     await new Promise<void>((resolve) => {
       loader.load(
-        resolveEnvVariantUrl(hdrPath) ?? assetUrl(hdrPath),
+        envUrl,
         (texture) => {
           // If the cache was disposed or the owner released this HDR mid-load,
           // dispose the just-loaded texture instead of leaving it owner-less in
@@ -2354,7 +2356,7 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
         (err) => {
           // Owner-checked like the success path above: the last release does not bump the token,
           // so a failure landing after it would otherwise remember a path nobody holds.
-          envFailures.record(hdrPath, err, stillLive() && envOwners.has(hdrPath));
+          envFailures.record(hdrPath, absentIfBundled(envUrl, err), stillLive() && envOwners.has(hdrPath));
           resolve(); // resolve anyway — syncEnvironment will fall back to no env
         },
       );
@@ -2498,7 +2500,7 @@ function fetchPrefab(prefabPath: string): Promise<void> {
 
   const promise = (async () => {
     try {
-      const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
+      const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(prefabPath)));
       // parseAssetJson types a non-ok status and the SPA fallback (a missing asset arriving as
       // 200 OK index.html), so the failure memo can tell absent from unreachable (#1397).
       const data = await parseAssetJson(res, prefabPath) as { id?: string; entities?: { traits?: Record<string, unknown> }[] };

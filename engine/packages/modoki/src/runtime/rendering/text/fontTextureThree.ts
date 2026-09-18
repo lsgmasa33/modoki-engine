@@ -12,6 +12,7 @@ import * as THREE from 'three';
 import type { FontProvider } from './fontProvider';
 import { markTextDirty } from './textDirty';
 import { createLoadFailureMemo } from '../../core/loadFailureMemo';
+import { absentIfBundled } from '../../core/assetLoadErrors';
 
 const cache = new Map<string, THREE.Texture>();
 const loader = new THREE.TextureLoader();
@@ -112,7 +113,7 @@ export function getFontTexture(provider: FontProvider, page = 0): THREE.Texture 
       // of finding it cached. Identity-checked: a disposed-and-reacquired font may own the key now.
       if (cache.get(key) === tex) cache.delete(key);
       tex.dispose();
-      failures.record(failureKey, err, !disposedProviders.has(provider));
+      failures.record(failureKey, absentIfBundled(url, err), !disposedProviders.has(provider));
     },
   );
   styleFontTexture(tex);

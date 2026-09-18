@@ -9,7 +9,7 @@ import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { createLoadFailureMemo, rethrowFetchFailure } from '../core/loadFailureMemo';
 import { normalizeTimeline, type TimelineDef } from '../timeline/types';
 import { createTeardownToken } from '../core/liveness';
 
@@ -51,7 +51,7 @@ export function getTimeline(ref: string, opts?: { load?: boolean }): TimelineDef
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError)
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(path)))
       .then((r) => {
         return parseAssetJson(r, path);
       })
@@ -94,7 +94,7 @@ const LOAD_TIMELINE_NOW_MAX_ATTEMPTS = 3;
 async function loadTimelineNowAttempt(path: string, attempt: number): Promise<TimelineDef | null> {
   const stillLive = liveness.capture(path);
   try {
-    const r = await fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
+    const r = await fetch(assetUrl(path), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(path)));
     // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
     const json = (await parseAssetJson(r, path)) as Partial<TimelineDef>;
     if (!stillLive()) {

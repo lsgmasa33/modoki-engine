@@ -15,7 +15,7 @@
 import { resolveRef, getAssetEntry, isGuid, onFontInvalidated } from './assetManifest';
 import { assetUrl, withCacheBust } from './assetUrl';
 import { assetIsAbsent, checkAssetResponse, parseAssetJson, readAssetBytes } from './assetFetch';
-import { createLoadFailureMemo, rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { createLoadFailureMemo, rethrowFetchFailure } from '../core/loadFailureMemo';
 import { FONT_ATLAS_SUFFIX, FONT_METRICS_SUFFIX, FONT_INSTANCE_SUFFIX } from '../core/fontSettings';
 import { parseChlumskyJson } from '../rendering/text/glyphAtlas';
 import { BakedFontProvider, type FontProvider } from '../rendering/text/fontProvider';
@@ -49,7 +49,7 @@ const failures = createLoadFailureMemo({ label: 'fontAtlasLoader', unknownIs: 'p
 
 /** Fetch a binary font asset with every outcome typed for {@link failures}. */
 async function fetchFontBytes(url: string): Promise<Uint8Array> {
-  const res = checkAssetResponse(await fetch(url).catch(rethrowAsNetworkError), url);
+  const res = checkAssetResponse(await fetch(url).catch(rethrowFetchFailure(url)), url);
   return new Uint8Array(await readAssetBytes(res));
 }
 
@@ -132,7 +132,7 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
         // seed path for a blip (#1397).
         let bakedJson: unknown;
         try {
-          bakedJson = await parseAssetJson(await fetch(urls.metricsUrl).catch(rethrowAsNetworkError), urls.metricsUrl);
+          bakedJson = await parseAssetJson(await fetch(urls.metricsUrl).catch(rethrowFetchFailure(urls.metricsUrl)), urls.metricsUrl);
         } catch (e) {
           if (!assetIsAbsent(e)) throw e;
         }
@@ -153,7 +153,7 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
           provider = await DynamicFontProvider.create(guid, bytes, dynamicConfigFromSettings(fontBlock));
         }
       } else {
-        const res = await fetch(urls.metricsUrl).catch(rethrowAsNetworkError);
+        const res = await fetch(urls.metricsUrl).catch(rethrowFetchFailure(urls.metricsUrl));
         // parseAssetJson types a non-ok status, and the SPA fallback (a missing asset arriving as
         // 200 OK index.html), so the failure memo can tell absent from unreachable.
         const atlas = parseChlumskyJson(await parseAssetJson(res, urls.metricsUrl));

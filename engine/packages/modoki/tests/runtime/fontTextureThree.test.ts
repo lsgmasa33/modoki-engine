@@ -194,6 +194,21 @@ describe('a failed atlas load backs off and retries (#1397)', () => {
     expect(load).toHaveBeenCalledTimes(2);
   });
 
+  it('an atlas MISSING from a native app bundle (<img> error, no status) is loaded once, not backed off forever (#1402)', async () => {
+    setManualNow(0);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true }); // jsdom's page is the app origin
+    try {
+      const load = stubLoader(() => true);
+      const p = bakedProvider('font-3d-ios-missing');
+      getFontTexture(p, 0);
+      await Promise.resolve(); await Promise.resolve();
+      advanceManual(60 * 60 * 1000);
+      expect(getFontTexture(p, 0)).toBeNull();
+      expect(load).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it('repaints the font\'s text when the retry is due', async () => {
     setManualNow(0);
     vi.spyOn(console, 'warn').mockImplementation(() => {});

@@ -3,7 +3,7 @@
 
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
-import { classifyLoadFailure, rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { classifyLoadFailure, rethrowFetchFailure } from '../core/loadFailureMemo';
 import { warnUnknownParamTypes, type ShaderManifest } from '../core/shaderSchema';
 
 export {
@@ -24,7 +24,7 @@ export async function fetchShaderManifest(manifestPath: string): Promise<ShaderM
  *  null: those the same bytes reproduce. */
 export async function fetchShaderManifestClassified(manifestPath: string): Promise<ShaderManifest | null> {
   try {
-    const res = await fetch(assetUrl(manifestPath), ASSET_FETCH_INIT).catch(rethrowAsNetworkError);
+    const res = await fetch(assetUrl(manifestPath), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(manifestPath)));
     // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
     const json = (await parseAssetJson(res, manifestPath)) as ShaderManifest;
     if (!json.params) json.params = {};

@@ -15,6 +15,7 @@ import { loadMtsdfAtlasTexture } from '../pixiTextureLoad';
 import type { FontProvider } from './fontProvider';
 import { markTextDirty } from './textDirty';
 import { createLoadFailureMemo } from '../../core/loadFailureMemo';
+import { absentIfBundled } from '../../core/assetLoadErrors';
 
 const cache = new Map<string, Texture>();
 /** In-flight atlas loads, keyed like `cache` — a dedupe marker so a second caller does not
@@ -199,7 +200,7 @@ export function getFontTexturePixi(provider: FontProvider, page = 0): Texture | 
         return;
       }
       const firstOfStreak = atlasFailures.retryAt(failureKey) === undefined;
-      atlasFailures.record(failureKey, e);
+      atlasFailures.record(failureKey, absentIfBundled(url, e));
       // One disposer per streak, not per retry: a disposed font forgets its failures.
       if (firstOfStreak) provider.addDisposable(() => atlasFailures.forget(failureKey));
     });

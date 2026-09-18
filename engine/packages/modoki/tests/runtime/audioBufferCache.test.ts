@@ -349,6 +349,21 @@ describe('audioBufferCache — a failed FETCH is remembered; a failed DECODE is 
     vi.restoreAllMocks();
   });
 
+  it('a clip MISSING from a native app bundle (iOS fails the XHR, no status) is fetched once, not backed off forever (#1402)', async () => {
+    installAudioMocks();
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    vi.stubGlobal('location', { href: 'capacitor://localhost/', protocol: 'capacitor:', host: 'localhost' });
+    const { clock } = await withClock();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cache = await getCache();
+    xhrFail.set('missing.wav', 'network');
+    await cache.acquireAudio(1, 'missing.wav');
+    for (let i = 0; i < 4; i++) { clock.advanceManual(60 * 60 * 1000); cache.retryFailedAudioDecodes(); await flush(); }
+    expect(xhrUrls.filter((u) => u === 'missing.wav')).toHaveLength(1);
+    clock.restoreRealClock();
+    vi.restoreAllMocks();
+  });
+
   it('a DECODE failure is still retried on the next gesture — the iOS unlock path is untouched', async () => {
     installAudioMocks();
     vi.spyOn(console, 'warn').mockImplementation(() => {});

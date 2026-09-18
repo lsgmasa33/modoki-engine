@@ -30,11 +30,13 @@ async function setup() {
   vi.doMock('../../src/runtime/core/assetRefRules', () => ({ isGuid: (s: string) => !!s }));
   // Mock the KTX2 loader (billboards load part.url via getKTX2Loader / TextureLoader).
   const loadAsync = vi.fn(async () => ({ isTexture: true, colorSpace: '', flipY: false }));
+  /** The on-demand KTX2 loader module (#254); a test makes its import fail. */
+  const getKTX2Loader = vi.fn(async () => ({ loadAsync }));
   // `ensureKtx2Caps` too: `loadBillboardPage` gates a KTX2 page on it. Without it every page load
   // in this file REJECTED (a missing-export error, swallowed by the `.catch` warn), so no test here
   // ever saw a page land — found by #1368's G2 test, the first one to wait for one.
   vi.doMock('../../src/runtime/loaders/textureResolver', () => ({
-    getKTX2Loader: () => ({ loadAsync }),
+    getKTX2Loader,
     ensureKtx2Caps: async () => {},
   }));
 
@@ -44,7 +46,7 @@ async function setup() {
   const bufs = await import('../../src/runtime/skinning/skin2DBuffers');
   const T = await import('three');
   bufs.clearSkin2DBuffers();
-  return { world: createWorld(), traits, sync, bufs, T, loadAsync };
+  return { world: createWorld(), traits, sync, bufs, T, loadAsync, getKTX2Loader };
 }
 
 /** A one-part rig buffer: a quad in pixel space (0,0)-(100,200), 2 tris. */
@@ -357,5 +359,53 @@ describe('syncBillboardSprites — a failed page is retried after its backoff (#
       clock.restoreRealClock();
       warn.mockRestore();
     }
+  });
+});
+
+describe('syncBillboardSprites — a page MISSING from a native app bundle (#1402)', () => {
+  it('is requested once: iOS fails the request with no status, which is absent there, not an outage', async () => {
+    const { world, traits, sync, bufs, T, loadAsync } = await setup();
+    const clock = await import('../../src/runtime/core/clock');
+    clock.setManualNow(0);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    vi.stubGlobal('location', { href: 'capacitor://localhost/', protocol: 'capacitor:', host: 'localhost' });
+    try {
+      loadAsync.mockRejectedValue(new TypeError('Load failed'));
+      const e = spawnBillboard(world, traits);
+      bufs.putSkin2DBuffer(e.id(), { parts: [quadPart()] });
+      const state = sync.createRenderState();
+      const scene = new T.Scene();
+      const settle = () => new Promise((r) => setTimeout(r, 0));
+      sync.syncBillboardSprites(world, scene, state);
+      await settle();
+      for (let i = 0; i < 3; i++) { clock.advanceManual(60 * 60 * 1000); sync.syncBillboardSprites(world, scene, state); await settle(); }
+      expect(loadAsync).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllGlobals(); warn.mockRestore(); clock.restoreRealClock(); }
+  });
+
+  it('a failed KTX2 loader-module IMPORT is not blamed on the page: it backs off and retries (#1402 review)', async () => {
+    const { world, traits, sync, bufs, T, loadAsync, getKTX2Loader } = await setup();
+    const clock = await import('../../src/runtime/core/clock');
+    const { RETRY_BASE_MS } = await import('../../src/runtime/core/loadFailureMemo');
+    clock.setManualNow(0);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    vi.stubGlobal('location', { href: 'capacitor://localhost/', protocol: 'capacitor:', host: 'localhost' });
+    try {
+      getKTX2Loader.mockRejectedValueOnce(new TypeError('Importing a module script failed.'));
+      const e = spawnBillboard(world, traits);
+      bufs.putSkin2DBuffer(e.id(), { parts: [quadPart()] });
+      const state = sync.createRenderState();
+      const scene = new T.Scene();
+      const settle = () => new Promise((r) => setTimeout(r, 0));
+      sync.syncBillboardSprites(world, scene, state);
+      await settle();
+      clock.advanceManual(RETRY_BASE_MS);
+      sync.syncBillboardSprites(world, scene, state);
+      await settle();
+      expect(getKTX2Loader, 'retried after the backoff, not stuck as "missing from the build"').toHaveBeenCalledTimes(2);
+      expect(loadAsync).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllGlobals(); warn.mockRestore(); clock.restoreRealClock(); }
   });
 });

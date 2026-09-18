@@ -32,7 +32,8 @@ import { nprFragmentOutput } from '../rendering/npr/NPRPostProcess';
 import { getSceneLightUniforms, buildSceneDiffuseNode } from '../rendering/sceneLightUniforms';
 import { getWebGPUSupported } from '../rendering/gpuDetect';
 import { assetUrl } from './assetUrl';
-import { ASSET_FETCH_INIT } from './assetFetch';
+import { ASSET_FETCH_INIT, AssetNetworkError, MissingAssetError, statusIsAbsent } from './assetFetch';
+import { rethrowFetchFailure } from '../core/loadFailureMemo';
 import { sideOf } from './materialUtils';
 import { loadTexture3D } from './textureResolver';
 import { coerceParamValue, fetchShaderManifest, shaderBodyPath, type ShaderParam } from './shaderSchema';
@@ -117,9 +118,26 @@ export async function buildFileShaderMaterial(
   const webgpu = await getWebGPUSupported();
   const ext: 'wgsl' | 'glsl' = webgpu ? 'wgsl' : 'glsl';
 
-  const srcRes = await fetch(assetUrl(shaderBodyPath(manifestPath, ext)), ASSET_FETCH_INIT);
-  if (!srcRes.ok) return null; // variant missing for this backend → fall back to standard
-  const source = stripComments(await srcRes.text());
+  // A variant missing for this backend falls back to standard: a 404, or on a native build a
+  // rejection `rethrowFetchFailure` calls absent, since iOS fails the request for a file missing
+  // from the bundle instead of answering 404 (#1402). Any other rejection is an outage and throws.
+  const srcUrl = assetUrl(shaderBodyPath(manifestPath, ext));
+  const srcRes = await fetch(srcUrl, ASSET_FETCH_INIT).catch(rethrowFetchFailure(srcUrl)).catch((e: unknown) => {
+    if (e instanceof MissingAssetError && e.absent) return null;
+    throw e;
+  });
+  if (!srcRes) return null;
+  // A body the server could not deliver (a 5xx, a dropped body read) is an outage, not a missing
+  // variant, so it throws instead of falling back for the scene — the 2D twin's rule
+  // (`pixiShaderBuilder.ts`, #1397).
+  if (!srcRes.ok && !statusIsAbsent(srcRes.status)) {
+    throw new MissingAssetError(`${srcRes.status} ${srcRes.statusText} for ${srcUrl}`, { status: srcRes.status, absent: false });
+  }
+  if (!srcRes.ok) return null;
+  const source = stripComments(await srcRes.text().catch((e: unknown) => {
+    if ((e as { name?: unknown } | null)?.name === 'AbortError') throw e;
+    throw new AssetNetworkError(e);
+  }));
 
   const fn = (webgpu ? wgslFn(source) : glslFn(source)) as unknown as CallFn;
 

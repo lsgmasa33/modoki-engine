@@ -42,6 +42,7 @@ import { takeParsedGltf, disposePendingGltf } from './parsedGltfHandoff';
 import { fireDirtyListeners } from '../core/renderDirty';
 import { createTeardownToken } from '../core/liveness';
 import { classifyLoadFailure, createLoadFailureMemo } from '../core/loadFailureMemo';
+import { absentIfBundled } from '../core/assetLoadErrors';
 
 export interface RiggedModel {
   /** The parsed GLB scene graph — bones, SkinnedMeshes, materials. Cloned per
@@ -255,16 +256,18 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
     // whole load transient — the variant may have 404'd for good, but the raw file behind it was
     // never actually answered, so it may yet load.
     let transientFailure: unknown;
-    const tryLoad = (loader: GLTFLoader, i: number) => loader.load(
+    const tryLoad = (loader: GLTFLoader, i: number) => { const url = modelGlbUrl(candidates[i]); loader.load(
       // modelGlbUrl appends the model's content hash as ?v=<hash> (mirrors the static
       // modelGlbUrl path) so a re-import busts every cache keyed on that URL. Both
       // candidates (the `.processed.glb` variant and the raw fallback) resolve the hash
       // from the base model's manifest entry. ⚠️ Said "in PROD builds" until #1022
       // removed that gate — it applies in dev too now.
-      modelGlbUrl(candidates[i]),
+      url,
       (gltf) => finishLoad(gltf as { scene: THREE.Group; animations?: THREE.AnimationClip[] }, candidates[i]),
       undefined,
-      (err) => {
+      (rawErr) => {
+        // A bundled GLB that is not there rejects on iOS with no status (#1402).
+        const err = absentIfBundled(url, rawErr);
         if (transientFailure === undefined && classifyLoadFailure(err) !== 'permanent') transientFailure = err;
         if (i + 1 < candidates.length) {
           console.warn(`[RiggedCache] ${candidates[i]} failed; falling back to raw ${candidates[i + 1]}`);
@@ -274,7 +277,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
           resolve(); // resolve anyway — the render sync just skips an unloaded model
         }
       },
-    );
+    ); };
     // An optimized rigged GLB (`.processed.glb`) carries its textures as embedded
     // KTX2 (KHR_texture_basisu), decoded by the shared KTX2Loader the GLTFLoader
     // was handed above. That loader can't decode until GPU caps are known

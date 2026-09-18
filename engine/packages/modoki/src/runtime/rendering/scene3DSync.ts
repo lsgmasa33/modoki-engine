@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
 import { fireDirtyListeners } from '../core/renderDirty';
 import { createLoadFailureMemo } from '../core/loadFailureMemo';
+import { absentIfBundled } from '../core/assetLoadErrors';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { noteGpuContextCreated } from '../core/gpuContextTracking';
 import { installGlProgramReleaseHatch } from './glProgramRelease';
@@ -3334,7 +3335,9 @@ async function loadBillboardPage(url: string): Promise<THREE.Texture> {
   if (isKtx) await ensureKtx2Caps();
   // The KTX2 loader module is imported on demand (#254) — hence the await.
   const loader = isKtx ? await getKTX2Loader() : new THREE.TextureLoader();
-  return (loader.loadAsync(url) as Promise<THREE.Texture>).then((tex) => {
+  // Only the page's OWN load is asked whether the file is missing from a native bundle (#1402). A
+  // failed loader-module import or KTX2 caps race above says nothing about this url, and rejects raw.
+  return (loader.loadAsync(url) as Promise<THREE.Texture>).catch((e: unknown) => { throw absentIfBundled(url, e); }).then((tex) => {
     tex.colorSpace = THREE.SRGBColorSpace;
     if (!isKtx) { tex.flipY = false; tex.needsUpdate = true; }
     return tex;

@@ -24,7 +24,7 @@
  *  the Cache API is already exempt. */
 
 import { createTeardownToken } from '../core/liveness';
-import { rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { rethrowFetchFailure } from '../core/loadFailureMemo';
 import { AssetNetworkError, MissingAssetError, statusIsAbsent } from '../core/assetLoadErrors';
 import {
   planAdmission, explainRefusal, totalBytes, type CacheEntry,
@@ -191,7 +191,7 @@ export class VideoCache {
     // Typed for `videoSystem`'s retry decision (#1397): no response is an `AssetNetworkError`, a
     // non-ok status a `MissingAssetError` (absent only for 404/410). A cache REFUSAL below stays a
     // plain Error — the same bytes would be refused again, so it must not be retried.
-    const res = await fetch(url).catch(rethrowAsNetworkError);
+    const res = await fetch(url).catch(rethrowFetchFailure(url));
     if (!res.ok) {
       throw new MissingAssetError(`video download failed: ${res.status} ${res.statusText} — ${url}`, {
         status: res.status, absent: statusIsAbsent(res.status),

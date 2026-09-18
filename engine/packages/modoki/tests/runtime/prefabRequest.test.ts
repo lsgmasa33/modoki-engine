@@ -26,7 +26,7 @@ const DOC = { version: 1, id: GUID, entities: [{ localId: 'root', traits: {} }] 
 /** What the server does with the next fetch — each test sets it. `gone` is a prefab that is not
  *  coming (404, remembered by the cache until invalidated); `fail` is an OUTAGE (503, backed off,
  *  never an attempt — #1397). */
-let serve: 'gone' | 'fail' | 'ok' | 'empty' = 'gone';
+let serve: 'gone' | 'fail' | 'ok' | 'empty' | 'reject' = 'gone';
 /** When set, every fetch parks on this until the test releases it. */
 let gate: Promise<void> | null = null;
 let fetches = 0;
@@ -51,6 +51,8 @@ beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn(async () => {
     fetches++;
     if (gate) await gate;
+    // What iOS's scheme handler does for a file missing from the bundle, and what offline does anywhere.
+    if (serve === 'reject') throw new TypeError('Load failed');
     if (serve === 'gone') return { ok: false, status: 404, statusText: 'Not Found', text: async () => '' } as unknown as Response;
     if (serve === 'fail') return { ok: false, status: 503, statusText: 'Unavailable', text: async () => '' } as unknown as Response;
     const body = serve === 'ok' ? DOC : { ...DOC, entities: [] };
@@ -292,5 +294,29 @@ describe('fetchPrefab — a stale load settling (#1397)', () => {
     expect(fetches, 'was 3: the stale settle deleted the replacement\'s entry').toBe(2);
     releases[1]();
     await replacement;
+  });
+});
+
+/** An iOS native build (#1402): Capacitor present, and the page on `capacitor://localhost`. */
+function stubIosNative(): void {
+  vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+  vi.stubGlobal('location', { href: 'capacitor://localhost/', protocol: 'capacitor:', host: 'localhost' });
+}
+
+describe('a prefab MISSING from a native app bundle (#1402)', () => {
+  it('iOS fails the request instead of answering 404, and it is still given up and journalled prefab/unavailable', async () => {
+    stubIosNative();
+    serve = 'reject';
+    await ask(MAX);
+    await ask(5);
+    expect(fetches, 'remembered as absent, so not refetched').toBe(1);
+    expect(unavailable()).toHaveLength(1);
+  });
+
+  it('accept side: the same rejection on the WEB is an outage, which backs off and spends no budget', async () => {
+    serve = 'reject';
+    for (let i = 0; i < 4; i++) { await ask(MAX); advanceManual(10 * 60 * 1000); }
+    expect(fetches).toBe(4);
+    expect(unavailable()).toHaveLength(0);
   });
 });

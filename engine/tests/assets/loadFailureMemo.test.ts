@@ -29,8 +29,9 @@ import {
 } from '../../packages/modoki/src/runtime/loaders/timelineCache';
 import {
   createLoadFailureMemo, classifyLoadFailure, retryDelayMs, AssetNetworkError,
-  RETRY_BASE_MS, RETRY_CAP_MS,
+  RETRY_BASE_MS, RETRY_CAP_MS, rethrowFetchFailure,
 } from '../../packages/modoki/src/runtime/core/loadFailureMemo';
+import { absentIfBundled, isAppBundleUrl } from '../../packages/modoki/src/runtime/core/assetLoadErrors';
 import { MissingAssetError, parseAssetJson, checkAssetResponse, readAssetBytes } from '../../packages/modoki/src/runtime/loaders/assetFetch';
 import { createWorld } from 'koota';
 import { setCurrentWorld, getCurrentWorld } from '../../packages/modoki/src/runtime/core/ecs/worldRegistry';
@@ -478,5 +479,76 @@ describe('#1397 E1 — onRetryDue wakes a caller whose askers do not come back o
     expect(memo.pendingWakes).toBe(0);
     vi.advanceTimersByTime(RETRY_CAP_MS);
     expect(due).not.toHaveBeenCalled();
+  });
+});
+
+describe('#1402 — on a native build, a file missing from the app bundle is ABSENT, not an outage', () => {
+  // iOS's WebViewAssetHandler fails the request for a missing bundled file instead of answering 404,
+  // so `fetch` rejects exactly as it does offline. jsdom's page is http://localhost here, which is
+  // Android's shape; the iOS `capacitor://` shape is driven in the package tests (prefabRequest,
+  // pixiShaderBuilder, audioBufferCache), whose node environment lets `location` be stubbed.
+  const native = () => vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+  afterEach(() => { vi.stubGlobal('Capacitor', undefined); });
+  const rejection = (url: string, e: unknown = new TypeError('Load failed')) =>
+    Promise.reject(e).catch(rethrowFetchFailure(url)).then(() => undefined, (err: unknown) => err);
+
+  it('isAppBundleUrl: only on a native build, and only for the page\'s own scheme + host', () => {
+    expect(isAppBundleUrl('/assets/a.json'), 'web: the page server is remote').toBe(false);
+    native();
+    expect(isAppBundleUrl('/assets/a.json')).toBe(true);
+    expect(isAppBundleUrl(`${location.protocol}//${location.host}/assets/a.json`)).toBe(true);
+    expect(isAppBundleUrl('https://cdn.example.com/bundle.zip'), 'the OTA CDN').toBe(false);
+    expect(isAppBundleUrl(`${location.protocol}//elsewhere.test/a.json`)).toBe(false);
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
+    expect(isAppBundleUrl('/assets/a.json')).toBe(false);
+  });
+
+  it('rethrowFetchFailure: bundled → permanent; remote on native, and anything on the web → transient', async () => {
+    expect(classifyLoadFailure(await rejection('/assets/a.json')), 'web').toBe('transient');
+    native();
+    expect(classifyLoadFailure(await rejection('/assets/a.json'))).toBe('permanent');
+    expect(classifyLoadFailure(await rejection('https://cdn.example.com/a.json'))).toBe('transient');
+  });
+
+  it('a CANCELLED bundled fetch is not absent — the AbortError inside the wrapper passes through', async () => {
+    native();
+    const abort = new DOMException('aborted', 'AbortError');
+    expect(classifyLoadFailure(await rejection('/assets/a.json', abort))).toBe('transient');
+  });
+
+  it('absentIfBundled claims only a failed REQUEST: fetch/FileLoader TypeError, <img>/XHR Event, Pixi\'s wrapper of either', () => {
+    native();
+    const claimed = (e: unknown, url = '/assets/a.png') => classifyLoadFailure(absentIfBundled(url, e));
+    expect(claimed(new TypeError('Load failed'))).toBe('permanent');
+    expect(claimed(new Event('error'))).toBe('permanent');
+    // Pixi's Loader.mjs: `[Loader.load] Failed to load ${url}.\n${e}` — the fetch path, then the <img> path.
+    expect(claimed(new Error('[Loader.load] Failed to load /assets/a.png.\nTypeError: Load failed'))).toBe('permanent');
+    expect(claimed(new Error('[Loader.load] Failed to load /assets/a.png.\n[object Event]'))).toBe('permanent');
+    expect(claimed(new TypeError('Load failed'), 'https://cdn.example.com/a.png'), 'remote').toBe('unknown');
+  });
+
+  it('absentIfBundled leaves alone an error that has a verdict, or that is not a failed request (#1402 review)', () => {
+    native();
+    const status = Object.assign(new Error('HttpError'), { response: { status: 503 } });
+    expect(absentIfBundled('/assets/a.glb', status)).toBe(status);
+    // three's KTX2Loader before detectSupport — a caps race, not a missing file.
+    const caps = new Error('THREE.KTX2Loader: Missing initialization with `.detectSupport( renderer )`.');
+    expect(absentIfBundled('/assets/a.ktx2', caps)).toBe(caps);
+    const decode = new Error('[Loader.load] Failed to load /assets/a.png.\nInvalidStateError: The source image could not be decoded.');
+    expect(absentIfBundled('/assets/a.png', decode)).toBe(decode);
+  });
+
+  describe.each(CACHES)('$name', (c) => {
+    it('a rejected fetch of a bundled file stays failed, and its @asset-load-failed says transient: false', async () => {
+      native();
+      fetchMock.mockRejectedValue(new TypeError('Load failed'));
+      c.get(c.path);
+      await flush();
+      advanceManual(RETRY_CAP_MS * 3);
+      expect(c.get(c.path)).toBeNull();
+      await flush();
+      expect(fetchMock, 'absent — not re-read at the backoff cap').toHaveBeenCalledTimes(1);
+      expect(journalEvents({ type: '@asset-load-failed' })[0]?.payload).toMatchObject({ cache: c.name, key: c.path, transient: false });
+    });
   });
 });

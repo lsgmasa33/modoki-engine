@@ -58,7 +58,7 @@ import {
 import { assetPlumbing } from '../core/assetPlumbing';
 import { hasDocKey } from '../core/docKeys';
 import { AssetNetworkError, MissingAssetError, statusIsAbsent } from '../core/assetLoadErrors';
-import { rethrowAsNetworkError } from '../core/loadFailureMemo';
+import { rethrowFetchFailure } from '../core/loadFailureMemo';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -373,8 +373,15 @@ async function fetchPixiShaderSource(manifestPath: string, webgpu: boolean): Pro
   // A body that is NOT THERE (404/410) is a missing variant and falls back, as it always has. One
   // the server could not deliver (no response, a dropped body, a 5xx) REJECTS, transient, so
   // `spriteMaterialCache` backs off and retries instead of falling back for the scene (#1397).
+  // On a native build a body missing from the app bundle has no status at all (iOS fails the
+  // request), so a rejection `rethrowFetchFailure` calls absent is a missing variant too (#1402).
   const bodyUrl = plumbing ? plumbing.assetUrl(shaderBodyPath(manifestPath, ext)) : '';
-  const bodyRes = plumbing ? await fetch(bodyUrl, plumbing.fetchInit).catch(rethrowAsNetworkError) : null;
+  const bodyRes = plumbing
+    ? await fetch(bodyUrl, plumbing.fetchInit).catch(rethrowFetchFailure(bodyUrl)).catch((e: unknown) => {
+      if (e instanceof MissingAssetError && e.absent) return null;
+      throw e;
+    })
+    : null;
   if (bodyRes && !bodyRes.ok && !statusIsAbsent(bodyRes.status)) {
     throw new MissingAssetError(`${bodyRes.status} ${bodyRes.statusText} for ${bodyUrl}`, { status: bodyRes.status, absent: false });
   }

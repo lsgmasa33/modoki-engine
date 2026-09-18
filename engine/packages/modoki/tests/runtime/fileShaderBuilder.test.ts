@@ -101,7 +101,7 @@ describe('buildFileShaderMaterial — control flow', () => {
           : ({ ok: false, json: async () => ({}) } as Response);
       }
       if (u.endsWith('.wgsl') || u.endsWith('.glsl')) {
-        return ({ ok: bodyOk, text: async () => 'fn main() { return vec4(1.0); }' } as Response);
+        return ({ ok: bodyOk, status: bodyOk ? 200 : 404, text: async () => 'fn main() { return vec4(1.0); }' } as Response);
       }
       return ({ ok: false } as Response);
     }) as typeof fetch;
@@ -125,6 +125,39 @@ describe('buildFileShaderMaterial — control flow', () => {
   it('returns null when the backend body variant is missing', async () => {
     bodyOk = false; // .wgsl 404
     expect(await buildFileShaderMaterial('/a/x.shader.json', {})).toBeNull();
+  });
+
+  it('returns null when the body variant is missing from a native app bundle, where iOS REJECTS instead of answering 404 (#1402)', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    vi.stubGlobal('location', { href: 'capacitor://localhost/', protocol: 'capacitor:', host: 'localhost' });
+    try {
+      const inner = globalThis.fetch;
+      globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => (String(url).endsWith('.wgsl')
+        ? Promise.reject(new TypeError('Load failed'))
+        : inner(url, init))) as typeof fetch;
+      expect(await buildFileShaderMaterial('/a/x.shader.json', {})).toBeNull();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('accept side: the same rejection on the WEB is an outage, and rejects instead of falling back', async () => {
+    const inner = globalThis.fetch;
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => (String(url).endsWith('.wgsl')
+      ? Promise.reject(new TypeError('Failed to fetch'))
+      : inner(url, init))) as typeof fetch;
+    await expect(buildFileShaderMaterial('/a/x.shader.json', {})).rejects.toThrow(/network error/);
+  });
+
+  it('a body the server could not DELIVER (503, or a dropped body read) rejects as an outage instead of falling back for the scene (#1402 review)', async () => {
+    const { classifyLoadFailure } = await import('../../src/runtime/core/loadFailureMemo');
+    const inner = globalThis.fetch;
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => (String(url).endsWith('.wgsl')
+      ? ({ ok: false, status: 503, statusText: 'Service Unavailable' } as Response)
+      : inner(url, init))) as typeof fetch;
+    expect(await buildFileShaderMaterial('/a/x.shader.json', {}).then(() => 'resolved', (e: unknown) => classifyLoadFailure(e))).toBe('transient');
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => (String(url).endsWith('.wgsl')
+      ? ({ ok: true, status: 200, text: () => Promise.reject(new TypeError('network connection was lost')) } as unknown as Response)
+      : inner(url, init))) as typeof fetch;
+    expect(await buildFileShaderMaterial('/a/x.shader.json', {}).then(() => 'resolved', (e: unknown) => classifyLoadFailure(e))).toBe('transient');
   });
 
   it('routes colorPreserve:"alpha" into the two-arg nprFragmentOutput (color + mask)', async () => {
