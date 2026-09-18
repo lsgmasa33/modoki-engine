@@ -206,6 +206,15 @@ export function occlusionAt(owner: Element, x: number, y: number, gesture: AimGe
   return describeOccluder(top) ?? NOTHING_AT_POINT;
 }
 
+/** The same hit test as `occlusionAt`, answering with the covering ELEMENT rather than its name —
+ *  for a caller that must ask WHERE the cover sits before it counts it (the dispatch-action carrier
+ *  gate, #1418, counts only a cover inside the game's own UI host). `undefined` = cleanly hit;
+ *  `null` = nothing at the point (outside the window, or clipped away). */
+export function coveringElementAt(owner: Element, x: number, y: number, gesture: AimGesture | undefined): Element | null | undefined {
+  const top = effectiveHit(x, y, gesture);
+  return isOccluded(owner, top) ? top : undefined;
+}
+
 /** The element the gesture would REALLY reach — `elementFromPoint`, then the runtime's tap-zone
  *  redirect where it applies.
  *

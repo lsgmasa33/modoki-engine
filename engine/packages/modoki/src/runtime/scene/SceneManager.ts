@@ -177,6 +177,17 @@ export interface Scene {
   readonly state: SceneState;
 }
 
+/** What a successful `loadScene` did that its caller cannot see from the world alone. */
+export interface SceneLoadResult {
+  /** Guids of the base scenes this swap KEPT rather than reloaded: their entities were
+   *  snapshotted from the LIVE world and carried across, so any unsaved edit to them survived
+   *  the load (#1417). Every other scene in the new chain, the primary included, was loaded from
+   *  its file (or from `preloaded` data). Only an old BASE can be kept, and a base in
+   *  `forceReloadBases` never is. The editor clears dirty flags and
+   *  decides the undo drop from this, since nothing in the world records it. */
+  readonly keptBaseGuids: ReadonlySet<string>;
+}
+
 export interface LoadOptions {
   /** Reports progress as resources finish loading. */
   onProgress?: (loaded: number, total: number) => void;
@@ -254,8 +265,9 @@ export interface SceneManager {
   /** Load a scene file. Cancels any in-flight load. Resolves when the swap is
    *  complete and the new scene is active. Rejects if the load fails or is
    *  aborted — including by a concurrent/in-flight `unloadAll()` (#535, unload
-   *  wins) — leaving the current scene untouched on failure. */
-  loadScene(path: string, opts?: LoadOptions): Promise<void>;
+   *  wins) — leaving the current scene untouched on failure. Resolves to which bases
+   *  the swap KEPT (see `SceneLoadResult`). */
+  loadScene(path: string, opts?: LoadOptions): Promise<SceneLoadResult>;
   /** Replace every entity in the live world with freshly-spawned content, through the
    *  normal mint → populate → promote → release → destroy contract, so `onWorldSwap`
    *  fires (#853). `populate` spawns into the world it is handed. Not a scene load:
@@ -432,8 +444,9 @@ class SceneManagerImpl implements SceneManager {
   /** Load a scene file. Cancels any in-flight load. Resolves when the swap is
    *  complete and the new scene is active. Rejects if the load fails or is
    *  aborted — including by a concurrent/in-flight `unloadAll()` (#535, unload
-   *  wins) — leaving the current scene untouched on failure. */
-  async loadScene(path: string, opts: LoadOptions = {}): Promise<void> {
+   *  wins) — leaving the current scene untouched on failure. Resolves to which bases
+   *  the swap KEPT (see `SceneLoadResult`). */
+  async loadScene(path: string, opts: LoadOptions = {}): Promise<SceneLoadResult> {
     // 0. Teardown owns the world (#535): `unloadAll()` bumps `teardownInFlight`
     // at its own head, before any await. A load that starts while a teardown is
     // already running must not race it, so it rejects immediately — before
@@ -604,7 +617,11 @@ class SceneManagerImpl implements SceneManager {
       // happens to match the old primary's; that mirrors today's unconditional-
       // reload behavior for a same-path reload.
       const oldEntries = [...this.loadedScenes.entries()];
-      const oldGuidToSceneId = new Map(oldEntries.map(([sid, e]) => [e.guid, sid]));
+      // Only an old BASE can be kept. The old PRIMARY's entities carry `sourceScene: ''`, so
+      // `snapshotPersistentEntities` finds no roots for it: counting it as kept (opening
+      // `/base.json`, then a level whose baseScene is that file) carried nothing, deleted the
+      // base's content from the world, and left two `role:'primary'` entries (#1417 review).
+      const oldGuidToSceneId = new Map(oldEntries.filter(([, e]) => e.role === 'base').map(([sid, e]) => [e.guid, sid]));
       const forceReload = new Set(opts.forceReloadBases ?? []);
       const keptBaseGuids = new Set<string>();
       const keptSceneIds = new Set<SceneId>();
@@ -1221,6 +1238,7 @@ class SceneManagerImpl implements SceneManager {
       if (postSwapSuperseded) {
         throw new DOMException('Aborted', 'AbortError');
       }
+      return { keptBaseGuids };
     } catch (err) {
       // Failure or abort — clean up every sceneId allocated THIS attempt (the
       // primary plus any base newly entering the chain). Skip once the swap has

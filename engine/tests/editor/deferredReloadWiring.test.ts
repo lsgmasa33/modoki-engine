@@ -52,7 +52,7 @@ beforeEach(() => {
   const getCurrent = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: SCENE_PATH } as never);
   const getLoaded = vi.spyOn(sceneManager, 'getLoadedScenes')
     .mockReturnValue(new Map([['main', { path: SCENE_PATH, role: 'primary', guid: 'main' }]]) as never);
-  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
   prefabFetch = null;
   const fetchStub = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     if (String(input).includes('.prefab.json') && prefabFetch) return prefabFetch();

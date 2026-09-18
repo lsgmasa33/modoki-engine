@@ -489,7 +489,7 @@ export { loadSceneFile, collectResourceRefsFromEntities, instantiatePrefabIntoWo
 export { markOverride, getOverrideMarkSet, clearOverrideMarks, clearAllOverrideMarks } from './loaders/overrideMarks';
 export { resolveCanvas2DHost, type ResolveCanvas2DHostOptions } from './scene/canvas2DHost';
 export { loadedScenePath } from './core/ecs/sceneLoaded';
-export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
+export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneLoadResult, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
 export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult, type AssetRefVerdict, type AssetRefResolver, makeAssetRefResolver } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';
 export { applyOps, alsoDeletedTally, ALSO_DELETED_CAP, type AlsoDeletedFields, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
@@ -986,7 +986,7 @@ export {
   shouldFireActions, shouldRunSimTier, isPoseOnly, isLiveRender, canEdit, inPreviewSession,
 } from './core/playState';
 export { uiTreeProjection, markUIDirty, setEditorDirtyCallback, onEditorDirty } from './ui/uiTreeStore';
-export { actionControlOnScreen } from './ui/actionCarriers';
+export { actionControlOnScreen, uiEntityShownNow } from './ui/actionCarriers';
 export type { ActionControlReport } from './ui/actionCarriers';
 // A game that registers its OWN InputSource should call `noteUserInput` from it — see
 // `core/userActivity.ts`. Without it, quality-tier calibration reads that game as idle.

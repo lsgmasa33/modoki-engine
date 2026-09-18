@@ -33,8 +33,8 @@ const h = vi.hoisted(() => ({
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     loadScene: (path: string, opts: LoadCall['opts']) =>
-      new Promise<void>((resolve, reject) => {
-        h.loadCalls.push({ path, opts, resolve, reject });
+      new Promise<{ keptBaseGuids: Set<string> }>((resolve, reject) => {
+        h.loadCalls.push({ path, opts, resolve: () => resolve({ keptBaseGuids: new Set() }), reject });
       }),
     getCurrentBaseScene: () => undefined,
   },

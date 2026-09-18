@@ -51,7 +51,7 @@ beforeEach(() => {
   const getCurrent = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: SCENE_PATH } as never);
   const getLoaded = vi.spyOn(sceneManager, 'getLoadedScenes')
     .mockReturnValue(new Map([['main', { path: SCENE_PATH, role: 'primary', guid: 'main' }]]) as never);
-  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
   const fetchStub = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
     new Response(JSON.stringify({ version: 7, entities: [] }), { status: 200, headers: { 'content-type': 'application/json' } }));
   restores.push(() => { getCurrent.mockRestore(); getLoaded.mockRestore(); loadScene.mockRestore(); fetchStub.mockRestore(); });
@@ -88,18 +88,45 @@ describe('a hot reload over a dirty world drops its undo history (#1409)', () =>
     expect(undoLabel()).toBe('Move');
   });
 
-  it('a DIRTY BASE scene keeps everything — its edits survive the reload live (second review)', async () => {
-    // SceneManager KEEPS a base whose guid is unchanged, snapshotting its entities from the live
-    // world, so its unsaved edits outlive a primary/prefab reload (pinned by the A7 case in
-    // sceneManagerBaseSceneChain.test.ts). Clearing its flag made saveAll skip it: silent loss.
-    const BASE = 'bbbbbbbb-0000-4000-8000-00000000ba5e';
+  // #1417 replaced #1409's stopgap (adopt nothing while any base is dirty). SceneManager KEEPS a
+  // base whose guid is unchanged, snapshotting its entities from the live world, so its unsaved
+  // edits outlive a primary/prefab reload (A7 case, sceneManagerBaseSceneChain.test.ts), and it
+  // now REPORTS which bases it kept.
+  const BASE = 'bbbbbbbb-0000-4000-8000-00000000ba5e';
+  const keeping = (...guids: string[]) => loadScene.mockResolvedValueOnce({ keptBaseGuids: new Set(guids) });
+
+  it('a KEPT dirty base keeps its flag: its edit survived the reload, so saveAll must still write it', async () => {
     edit('Move base Camera');
     markSceneDirty(BASE);
+    keeping(BASE);
     await hotReload();
     expect(loadScene, 'fixture: the reload ran').toHaveBeenCalledTimes(1);
     expect(isSceneDirty(BASE)).toBe(true);
     expect(hasUnsavedChanges()).toBe(true);
+    // The edit version is one global counter, so it cannot tell this base edit from a primary one:
+    // the stack drops (the edit stays saveable, not undoable). See adoptReplacedWorld.
+    expect(canUndo()).toBe(false);
+  });
+
+  it('a kept dirty base with a CLEAN edit version (a half-failed Save All) keeps the stack too', async () => {
+    edit('Move base Camera');
+    markSceneSaved();
+    markSceneDirty(BASE);
+    keeping(BASE);
+    await hotReload();
+    expect(isSceneDirty(BASE)).toBe(true);
     expect(undoLabel()).toBe('Move base Camera');
+  });
+
+  it('a base the reload did NOT keep (its own file changed: forceReloadBases) loses its flag', async () => {
+    edit('Move base Camera');
+    markSceneSaved();
+    markSceneDirty(BASE);
+    keeping(); // disk wins for the changed base (#1164)
+    await hotReload();
+    expect(isSceneDirty(BASE)).toBe(false);
+    expect(hasUnsavedChanges()).toBe(false);
+    expect(canUndo()).toBe(false);
   });
 
   it('an ABORTED reload (superseded by a newer one) replaced nothing, so it adopts nothing', async () => {

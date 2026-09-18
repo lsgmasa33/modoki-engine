@@ -91,3 +91,19 @@ export function isSceneDirty(guid: string): boolean {
 export function clearAllSceneDirty(): void {
   dirtySceneGuids.clear();
 }
+
+/** The world-replacement form of `clearAllSceneDirty`: clear every flag EXCEPT a kept base's
+ *  (#1417). `SceneManager.loadScene` carries a kept base's entities over from the live world, so
+ *  its unsaved edits survive the swap. Clearing its flag then made `saveAll` skip the base and
+ *  the unsaved-work guard stop asking, which lost the edit silently while it was still on screen.
+ *  Every other flag goes, including a base that dropped out of the chain. */
+export function clearSceneDirtyExcept(keptGuids: ReadonlySet<string>): void {
+  for (const g of dirtySceneGuids) if (!keptGuids.has(g)) dirtySceneGuids.delete(g);
+}
+
+/** Is any scene dirty that is NOT in `keptGuids`? That is base-scene work a world replacement
+ *  throws away, as opposed to work it carries (#1417). */
+export function hasDirtySceneOutside(keptGuids: ReadonlySet<string>): boolean {
+  for (const g of dirtySceneGuids) if (!keptGuids.has(g)) return true;
+  return false;
+}

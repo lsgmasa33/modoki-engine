@@ -61,7 +61,7 @@ beforeEach(async () => {
   const getCurrent = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: SCENE_PATH } as never);
   const getLoaded = vi.spyOn(sceneManager, 'getLoadedScenes')
     .mockReturnValue(new Map([['main', { path: SCENE_PATH, role: 'primary', guid: 'main' }]]) as never);
-  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
   const fetchStub = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     if (fetchSuppressesOnScene && String(input).includes('.scene.json')) setSceneReloadSuppressor(() => 'game is playing');
     const body = String(input).includes('.prefab.json')
@@ -135,6 +135,7 @@ describe('the replay runs its reloads one at a time (#1164)', () => {
       inFlight += 1; maxInFlight = Math.max(maxInFlight, inFlight);
       await new Promise((r) => setTimeout(r, 5));
       inFlight -= 1;
+      return { keptBaseGuids: new Set<string>() };
     });
     setSceneReloadSuppressor(() => 'game is playing');
     emit(BASE_PATH, 'scene');
@@ -173,7 +174,7 @@ describe('a change that becomes suppressed DURING its fetch is deferred again (#
 describe('a prefab change evicts the cached prefab before its reload (#1169)', () => {
   it('while stopped: the cache entry is gone by the time the scene reloads', async () => {
     let cachedAtLoad: unknown = 'not-called';
-    loadScene.mockImplementation(async () => { cachedAtLoad = getCachedPrefab(PREFAB_GUID); });
+    loadScene.mockImplementation(async () => { cachedAtLoad = getCachedPrefab(PREFAB_GUID); return { keptBaseGuids: new Set<string>() }; });
     emit(PREFAB_PATH, 'prefab');
     await settle();
     expect(loadScene).toHaveBeenCalledTimes(1);
@@ -194,7 +195,7 @@ describe('a prefab change evicts the cached prefab before its reload (#1169)', (
 
     setSceneReloadSuppressor(null);
     let cachedAtLoad: unknown = 'not-called';
-    loadScene.mockImplementation(async () => { cachedAtLoad = getCachedPrefab(PREFAB_GUID); });
+    loadScene.mockImplementation(async () => { cachedAtLoad = getCachedPrefab(PREFAB_GUID); return { keptBaseGuids: new Set<string>() }; });
     await expect(replaySuppressedSceneReloads()).resolves.toBe(1);
     expect(cachedAtLoad).toBeUndefined();
   });

@@ -1368,7 +1368,9 @@ so existing callers don't break; don't pass it.
   maps it to `ok:false` + `reason` + the refusal's detail fields
   (the "A handler refuses by RETURNING" paragraph in [ui-system.md](ui-system.md)). Since #1406
   they also fail with `gate:'no-control-on-screen'` when no control that triggers the action is on
-  screen: open the screen that shows it first (the "An agent dispatch refuses" paragraph there);
+  screen: open the screen that shows it first (the "An agent dispatch refuses" paragraph there),
+  and since #1418 with `gate:'control-covered'` when every such control is drawn but covered, with
+  `coveredBy` naming the cover to close first;
   `reimport`/`import_file` fail on a no-match / unrecognized type; `timeline_set` fails when
   normalization drops a malformed item; `capture_gesture` requires the game Playing; and `diagnose`
   only counts console errors from the last 30s (a stale error no longer pins `ok:false`).

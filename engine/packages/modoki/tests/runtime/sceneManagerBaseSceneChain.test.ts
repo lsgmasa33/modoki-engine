@@ -247,8 +247,10 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     // The swap to a level sharing the base carries the base (no reload) and
     // respawns the snapshot — still exactly one clear for the new world.
     markCounters.clearAllCalls = 0;
-    await sceneManager.loadScene('/level2.json');
+    const swap = await sceneManager.loadScene('/level2.json');
     expect(markCounters.clearAllCalls).toBe(1);
+    // #1417: the level→level swap reports the carried base, the case the editor's dirty flag needs.
+    expect([...swap.keptBaseGuids]).toEqual([BASE_GUID]);
   });
 
   it('opening a level standalone still works — the base loads with it', async () => {
@@ -540,7 +542,8 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
   it('A7: a normal reload of the SAME primary keeps (carries) an unchanged-guid base — the fresh file content never reaches the world', async () => {
     const { sceneManager } = await getSceneManager();
-    await sceneManager.loadScene('/level1.json');
+    const first = await sceneManager.loadScene('/level1.json');
+    expect(first.keptBaseGuids.size, 'a first load has nothing to keep').toBe(0);
 
     // Edit the base's file on disk (guid unchanged) and reload the SAME primary.
     // Chain resolution still re-fetches the base's raw bytes (it needs to read the
@@ -555,7 +558,9 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
         { id: 2, traits: { Time: { delta: 0, elapsed: 0, frame: 0, timeScale: 1 }, EntityAttributes: { name: 'Time', parentId: 0 } } },
       ],
     };
-    await sceneManager.loadScene('/level1.json');
+    const second = await sceneManager.loadScene('/level1.json');
+    // #1417: the load REPORTS the keep, because the editor must keep this base's dirty flag.
+    expect([...second.keptBaseGuids]).toEqual([BASE_GUID]);
 
     const { getCurrentWorld } = await getWorld();
     const names: string[] = [];
@@ -576,7 +581,8 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
         { id: 2, traits: { Time: { delta: 0, elapsed: 0, frame: 0, timeScale: 1 }, EntityAttributes: { name: 'Time', parentId: 0 } } },
       ],
     };
-    await sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] });
+    const forced = await sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] });
+    expect(forced.keptBaseGuids.has(BASE_GUID), 'a forced base is reloaded, not kept (#1417)').toBe(false);
 
     expect(fetchCalls['/base.json'] ?? 0).toBeGreaterThan(fetchesAfterFirstLoad); // re-fetched
     const { getCurrentWorld } = await getWorld();

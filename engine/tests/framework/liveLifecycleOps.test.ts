@@ -358,15 +358,16 @@ describe('load-scene (runtime twin)', () => {
   it('a load that RESOLVES without switching is a failure — the readback, not the throw', async () => {
     game = createTestWorld({});
     // This is the branch P5 exists for and the one the throw-path test above does NOT reach:
-    // `loadScene` resolves `void`, so a load that quietly fails to switch is indistinguishable
-    // from success unless the op looks at the active path afterwards. Mutation-checked: deleting
+    // `loadScene` resolves without saying which scene is now active, so a load that quietly
+    // fails to switch is indistinguishable from success unless the op looks at the active path
+    // afterwards. Mutation-checked: deleting
     // the `after !== p.path` check in agentBridge turns this red (the throw test alone stayed
     // green, which is how this gap was found).
     //
     // `getNext()` is stubbed to null here too — it mimics the same "couldn't read our own id"
     // fallback path that a real superseded-detection miss would take, so this exercises the
     // ORIGINAL path-comparison check rather than the myId-based branches below.
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue(null);
     try {
       const r = await runAgentOp('load-scene', { path: '/looks/fine.scene.json' }) as
@@ -387,7 +388,7 @@ describe('load-scene (runtime twin)', () => {
     // `getNext()` hands back OUR allocated id (1); by the time the load resolves, `getCurrent()`
     // reports a DIFFERENT id whose path is a different scene — exactly what a later load winning
     // the swap looks like from the op's point of view.
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 1, path: '/requested.scene.json', state: 'loading' } as never);
     const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 2, path: '/other.scene.json', state: 'active' } as never);
     try {
@@ -412,7 +413,7 @@ describe('load-scene (runtime twin)', () => {
     // load simply never became primary — reporting that as "a LATER scene load won the swap"
     // would assert from evidence that only says "the current id is not mine", which is the very
     // over-claim #486 A is about. This case must keep the original bad-path wording.
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'loading' } as never);
     const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 3, path: '/old.scene.json', state: 'active' } as never);
     try {
@@ -433,7 +434,7 @@ describe('load-scene (runtime twin)', () => {
     game = createTestWorld({});
     // A different id won the swap, but it loaded the SAME requested path — the caller's requested
     // end state is actually true, just not because of THIS op's own load.
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 1, path: '/requested.scene.json', state: 'loading' } as never);
     const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 2, path: '/requested.scene.json', state: 'active' } as never);
     try {
@@ -453,7 +454,7 @@ describe('load-scene (runtime twin)', () => {
   it('ordinary success is UNCHANGED — no false "superseded", worldEntityTotal present', async () => {
     game = createTestWorld({});
     game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'a', name: 'A' }));
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     // getNext()/getCurrent() report the SAME id — our own load won, exactly like the ordinary case.
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'loading' } as never);
     const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'active' } as never);
@@ -477,7 +478,7 @@ describe('load-scene (runtime twin)', () => {
   it('a success decided by the path alone (no id to compare) also reports worldEntityTotal', async () => {
     game = createTestWorld({});
     game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'a', name: 'A' }));
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue(null as never);
     const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'active' } as never);
     try {

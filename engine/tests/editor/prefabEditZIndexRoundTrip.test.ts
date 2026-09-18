@@ -38,6 +38,7 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', () => ({
         }
         spawnEntity(getCurrentWorld(), ...(args as Parameters<typeof spawnEntity>[1][]));
       }
+      return { keptBaseGuids: new Set<string>() };
     },
     getLoadedScenes: () => new Map(),
   },

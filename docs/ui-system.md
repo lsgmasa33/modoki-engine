@@ -625,10 +625,42 @@ answers `ok:false, gate:'no-control-on-screen'`, with `carriers` naming the cont
   `EntityAttributes.isActive` is read through `deactivatedEntities`, which the transform pass
   refreshes once a frame: a subtree re-activated and dispatched into in the same turn (one
   `modoki_eval`) is refused until a frame runs.
-- **Not seen either: a control that is drawn but COVERED by a modal** (#1418). Only a game's own
-  check can refuse that today.
-- A game may keep a stricter check of its own on top. Court's `CONTROL_SHOWN` refuses a control
-  that is drawn but covered by a full-screen overlay (#1405).
+- **Shown is not reachable: a COVERED carrier refuses too** (#1418). An always-drawn HUD button
+  under a full-screen modal is shown, and a player's tap lands on the modal. Measured on Wordweave
+  before the fix: `wordweave.dictionaryOpen` opened the Dictionary UNDER the open Settings. So the
+  op hit-tests every shown carrier's DOM node at its centre with the aim tools' own occlusion
+  recipe (`coveringElementAt` in `engine/app/debug/domResolve.ts`, via `carrierCover.ts`) and,
+  when EVERY one is covered, answers `ok:false, gate:'control-covered'` with `carriers` and
+  `coveredBy` (the covering UI entity by name, e.g. `SettingsPanel`). Sharing the recipe is what
+  makes the gate agree with a tap: `pointer-events` pass-through (a `pointerThrough` FX canvas, a
+  painted backdrop with no `UIAction`/`swallowClicks`) is not a cover, and the `minTapSize`
+  tap-zone redirect applies.
+  - **It lives in the op, not in `actionCarriers.ts`**, because the hit test is DOM code in
+    `engine/app` and the runtime may not import it; `actionControlOnScreen` hands the op the shown
+    carriers by id (`shown`). A carrier is always a DOM node (nothing on the 2D/3D layers carries a
+    registry action), so the canvas branches of the occlusion test are not needed.
+  - ⚠️ **It refuses only on a positive observation and fails open everywhere else.** The DOM is the
+    LAST render: a carrier shown, or a modal opened, in the same agent turn is not drawn yet, so
+    both read as "cannot judge". **So does the converse: a cover CLOSED this turn is still drawn**,
+    so the cover is the first entity, walking the covering element's `[data-entity-id]` ancestors
+    OUTWARD, that the ECS still shows (`uiEntityShownNow`: not hidden, deactivated or destroyed),
+    and a cover with none left is not counted. Outward, not just the innermost: a child hidden this
+    frame inside a modal that stays up still leaves the modal covering. The walk stops at the
+    carrier's OWN ancestor (shown by construction, and never over its descendant): otherwise an
+    overlay closed this frame beside the carrier under a shared HUD root reads "under HUD Root". Without that, `modoki_batch [settingsClose, dictionaryOpen]`
+    was refused as "under SettingsPanel" one frame before a player's tap would reach the button
+    (found in close-out review, observed live). Likewise a zero rect, a centre off the window or
+    outside a scrolling ancestor's clip (a player can scroll to it), and a run with no document or
+    no hit test (jsdom implements no `elementFromPoint`).
+  - **Only a cover inside the game's own UI host counts.** In the editor that is the Game panel's
+    `[data-game-view-area]`: editor chrome over the Game panel is the editor's state, not the
+    game's. A shipped game has no host marker, so any cover counts. Where the editor mounts the
+    entity twice, SceneView's preview copy is never the one judged.
+- A game may keep a stricter check of its own on top. Court's `CONTROL_SHOWN` (#1405) is **not**
+  made redundant by #1418 and stays: it gates Pixi board targets (cells, the tray) that no engine
+  carrier describes, it reads game state and so is right in the same turn a modal opens, and it
+  also applies to real presses, e.g. the title intro, where `GameRoot` sits at alpha 0 and still
+  takes a tap (opacity is not a cover to a hit test).
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
 sim is stopped, so editor Stopped/Paused states never mutate the scene.)
 

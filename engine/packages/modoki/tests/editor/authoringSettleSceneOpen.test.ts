@@ -15,6 +15,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
     loadScene: async () => {
       await new Promise<void>((resolve) => { releaseLoad = resolve; });
       loadResolved = true;
+      return { keptBaseGuids: new Set<string>() };
     },
     getCurrent: () => null,
     getNext: () => null,

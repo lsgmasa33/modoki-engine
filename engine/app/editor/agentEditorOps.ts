@@ -2054,8 +2054,15 @@ export function registerEditorAgentOps(): void {
         const v = c[cause];
         return Array.isArray(v) ? v.length > 0 : Boolean(v);
       });
+    // ⚠️ Except a scene loaded AS A BASE that the TARGET chain shares (#1417 review): SceneManager
+    // keeps it and carries its entities from the live world, so its edits and its dirty flag
+    // survive. Not the open scene itself: an old PRIMARY is never kept, even when the target names
+    // it as its base. This guard never sees the target chain, so the qualifier lives in the words. Saying
+    // "destroyed" there sends the agent into the same loop as the parked half below.
     const consequence = liveHalf
-      ? ' The live-world scene edits would be DESTROYED (gone from the world, the file, and the undo stack).'
+      ? ' The live-world scene edits would be DESTROYED (gone from the world, the file, and the undo stack),'
+        + ' except edits to a scene currently loaded AS A BASE (not the open scene itself) that the target also uses:'
+        + ' that base is carried across live and stays unsaved.'
       : '';
     // The parked half is the honest surprise: it is why this refusal exists at all for a
     // parked-only cause, and it is the opposite of "would be lost".
@@ -2063,7 +2070,7 @@ export function registerEditorAgentOps(): void {
       ? ' The parked entries are keyed by PATH and SURVIVE the swap — they stay pending either way.'
       : '';
     const remedy = ' Run modoki_save_all to write all of it.'
-      + (liveHalf ? ' `discardUnsaved:true` deliberately discards the LIVE-WORLD edits.' : '')
+      + (liveHalf ? ' `discardUnsaved:true` deliberately discards the LIVE-WORLD edits (not those of a loaded base the target shares).' : '')
       + (parkedHalf
         ? ' ⚠️ `discardUnsaved:true` does NOT drop the parked entries — use'
           + ' modoki_discard_asset_edits (parked asset documents),'

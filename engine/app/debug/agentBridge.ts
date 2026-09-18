@@ -132,6 +132,7 @@ import { computeHandles, type HandlesDumpParams } from './handlesDump';
 import { resolveDomPointReport, type DomPointSpec } from './domResolve';
 import { layoutSettleReport } from './layoutSettle';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
+import { coveredCarriers } from './carrierCover';
 import { readConsoleSource } from './consoleSource';
 import { getConsoleRingEntries, getConsoleRingDropped, installConsoleRing } from '@modoki/engine/runtime/core/consoleRing';
 import { chromeHandles } from './chromeHandles';
@@ -661,13 +662,15 @@ export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>
   _prefabSourceRefresher = fn;
 }
 
-/** Editor-only: told when a hot reload has REPLACED the current world from disk (#1409), so the
- *  editor can drop a dirty world's undo entries and rebaseline — `adoptWorldReloadedFromDisk`.
+/** Editor-only: told when a hot reload has REPLACED the current world from disk (#1409), and which
+ *  bases it kept (#1417), so the editor can drop discarded work's undo entries and rebaseline —
+ *  `adoptWorldReloadedFromDisk`.
  *  Installed the way the suppressor is; unset in the game runtime, which has no undo. */
-let _worldReloadedFromDisk: ((scenePath: string) => void) | null = null;
+type WorldReloadedFromDisk = (scenePath: string, keptBaseGuids: ReadonlySet<string>) => void;
+let _worldReloadedFromDisk: WorldReloadedFromDisk | null = null;
 
 /** Editor-only: install the after-reload hook. Called from `agentEditorOps.ts`. */
-export function setWorldReloadedFromDiskHook(fn: ((scenePath: string) => void) | null): void {
+export function setWorldReloadedFromDiskHook(fn: WorldReloadedFromDisk | null): void {
   _worldReloadedFromDisk = fn;
 }
 
@@ -1068,13 +1071,27 @@ registerAgentOp('dispatch-action', (params) => {
   // control by construction, and the debug menu and headless tests have no screen to ask about. An
   // action no control carries opts out with `noControl` at registration (every engine built-in does).
   if (!isControlLessAction(p.name)) {
-    const seen = actionControlOnScreen(getCurrentWorld(), p.name);
+    const world = getCurrentWorld();
+    const seen = actionControlOnScreen(world, p.name);
     if (!seen.onScreen) {
       return {
         ok: false, dispatched: false, gate: 'no-control-on-screen', carriers: seen.carriers, simRunning: true,
         reason: seen.carriers.length > 0
           ? `no control that triggers '${p.name}' is on screen (${seen.carriers.slice(0, 5).join(', ')}${seen.carriers.length > 5 ? ` and ${seen.carriers.length - 5} more` : ''} ${seen.carriers.length === 1 ? 'is' : 'are'} hidden), so a player could not press it — open the screen that shows it first`
           : `no UI control in the current world triggers '${p.name}', so a player could not press it — open the screen that shows it first. If a timeline, a zone, a collision or code fires it instead, register it with \`noControl: true\``,
+      };
+    }
+    // #1418 — shown is not reachable: a HUD button under a full-screen modal is drawn, and a
+    // player's tap lands on the modal. Hit-test each shown carrier the way a tap would; refuse only
+    // when EVERY one is positively covered (anything the DOM cannot judge fails open — see
+    // carrierCover.ts).
+    const covers = coveredCarriers(world, seen.shown);
+    if (covers) {
+      const list = covers.slice(0, 5).map((c) => `${c.carrier} under ${c.coveredBy}`).join(', ');
+      return {
+        ok: false, dispatched: false, gate: 'control-covered', carriers: covers.map((c) => c.carrier),
+        coveredBy: [...new Set(covers.map((c) => c.coveredBy))], simRunning: true,
+        reason: `every control that triggers '${p.name}' is covered (${list}${covers.length > 5 ? ` and ${covers.length - 5} more` : ''}), so a player's tap would land on the cover instead — close it first`,
       };
     }
   }
@@ -2916,11 +2933,12 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
     const lateReason = sceneReloadSuppressedReason();
     if (lateReason) { defer(lateReason); return; }
     evictRuntimePrefabs();
-    await sceneManager.loadScene(current, {
+    // The kept bases carried their unsaved edits across, so the editor keeps their dirty flags (#1417).
+    const { keptBaseGuids } = await sceneManager.loadScene(current, {
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
     });
-    _worldReloadedFromDisk?.(current);
+    _worldReloadedFromDisk?.(current, keptBaseGuids);
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
     // A newer reload superseding this one aborts the in-flight load

@@ -594,6 +594,45 @@ await withCleanup(async () => {
 });
 }
 
+// ── SMOKE_DIR — the ONE folder every probe FILE below is written into (#1415) ──────────────────
+// Every write route mkdirs its target's parent (`writeJsonAtomic`, /api/write-file, the save-as
+// route, /api/import-file), while each case's cleanup trashes only the FILES it made. So a probe
+// under a type folder the open project lacks (`/assets/particles/` on games/anim-bug) left that
+// folder behind, empty. Finder then dropped a `.DS_Store` into it, and qaCaseReferences.test.ts
+// went red on a path a QA case declares it `creates:`. The run still printed
+// `save_all trashed its 2 probe file(s) ✓`, because it was cleaning files and never folders.
+//
+// One run-owned folder instead of a per-case "did the parent exist?" record. Four cases wrote
+// into three type folders, and the next probe case would have had to remember that pattern.
+// A case that writes a probe FILE puts it under SMOKE_DIR, and this run creates the folder and
+// trashes it whole at the end. The per-case file cleanups stay. They are what make each case
+// self-contained, and the REQUIRES_SAVE gate refuses a folder delete over a parked edit anyway.
+//
+// ⚠️ A folder that is already there is REFUSED, not trashed. It is either a crashed run's leftover or
+// ANOTHER smoke run live against this editor right now. Trashing it would break the second case.
+const SMOKE_DIR = '/assets/mcp-smoke';
+{
+  const made = await client.callTool({ name: 'modoki_create_folder', arguments: { path: SMOKE_DIR } });
+  if (made.isError) {
+    // Only a 409 means "it is already there". A 403 or 500 means the folder does NOT exist, so
+    // advice to trash it would send the reader after nothing.
+    const exists = /Folder exists|409/.test(text(made));
+    throw new Error(`cannot create the run's probe folder ${SMOKE_DIR}: ${text(made).slice(0, 200)}`
+      + (exists
+        ? ` — it already exists: a previous run was killed before its teardown, or another smoke run is live on this editor.`
+          + ` Trash it with modoki_delete_asset {paths:['${SMOKE_DIR}'], discardUnsaved:true} and re-run.`
+        : ''));
+  }
+}
+// Everything from here to the teardown runs inside this `try`, and that is load-bearing. The file has
+// no top-level catch, and `withCleanup` RETHROWS. So without it, any failing case ends the process
+// before the teardown, and the empty SMOKE_DIR then makes the NEXT run refuse at the create above.
+// This harness exists to fail, so that would have been the common path, not a crash-only one.
+// Only a killed process (or a second live run) should ever reach that refusal. No re-indent: the
+// cases stay at column 0, so this diff does not touch every line below.
+let runFailure = null;
+try {
+
 // UC10 — the ASSET LIFECYCLE: scaffold a probe asset, prove it is REACHABLE, trash it, prove it is
 // GONE. This closes the gap that made #288 gap 3 a QA finding: an agent could create an asset and
 // had nothing to remove it with, so the flagship animation case cleaned up with `rm` — a shell-out
@@ -609,7 +648,7 @@ await withCleanup(async () => {
 // The probe lives under the OPEN project's own asset root and is trashed (recoverable) rather than
 // unlinked, so a mid-run failure leaves one file in the OS trash, not a stray committed into
 // games/** (CLAUDE.md #18).
-const PROBE = '/assets/particles/mcp-smoke-probe.particle.json';
+const PROBE = `${SMOKE_DIR}/mcp-smoke-probe.particle.json`;
 const PROBE_NAME = 'mcp-smoke-probe';
 /** The manifest rows matching the probe, from one modoki_list_assets result.
  *  Throws rather than answering `[]` when the step was SUMMARIZED: a batch reports
@@ -816,7 +855,7 @@ await withCleanup(async () => {
 //
 // The path an agent would take is exactly this one, and it exists because the panel's own flow
 // opens a BLOCKING osascript save panel on macOS before writing anything.
-const REG_PROBE = '/assets/materials/mcp-smoke-registered';   // extension deliberately OMITTED
+const REG_PROBE = `${SMOKE_DIR}/mcp-smoke-registered`;   // extension deliberately OMITTED
 const REG_PROBE_FULL = `${REG_PROBE}.mat.json`;
 const kinds = JSON.parse(text(await client.callTool({ name: 'modoki_list_creatable_assets', arguments: {} })));
 if (!kinds.ok || !Array.isArray(kinds.kinds)) throw new Error(`UC13 could not list creatable kinds: ${JSON.stringify(kinds).slice(0, 300)}`);
@@ -850,9 +889,9 @@ if (!kinds.kinds.some((k) => k.kind === 'material' && k.agentCreatable === true)
 // 2. Compare `scenePathRef`, the normalized form every other case in this file already uses — that
 //    is immune to the spelling no matter how wide the window, where the bracket alone only makes a
 //    flip unlikely. It still fires on the real failure: a scene created at
-//    `/assets/scenes/mcp-smoke-NEVER.json` yields a DIFFERENT ref.
+//    `${SMOKE_DIR}/mcp-smoke-NEVER.json` yields a DIFFERENT ref.
 const beforeRefusal = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
-const refused = text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'scene', path: '/assets/scenes/mcp-smoke-NEVER.json' } }));
+const refused = text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'scene', path: `${SMOKE_DIR}/mcp-smoke-NEVER.json` } }));
 if (!/REFUSED_BY_OP/.test(refused) || !/modoki_new_scene/.test(refused)) {
   throw new Error(`UC13 a scene create must be refused and point at modoki_new_scene, got: ${refused.slice(0, 400)}`);
 }
@@ -1431,11 +1470,14 @@ if (canUC3) {
 // was clean when this run started, so everything in the world by now is the suite's own.
 {
   const st0 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
-  // Both probes sit at fixed locations under the asset ROOT, which every project has, so this runs
-  // on whatever project is open without assuming a folder layout. The scene probe's location is
-  // load-bearing, not a convenience — see the warning above. Named `mcp-smoke-save` so a leftover
-  // is identifiable as this case's.
-  const SAVE_SCENE = '/assets/scenes/mcp-smoke-save.scene.json';   // sorts BEFORE tropical-island — see the #1414 warning above
+  // Both probes sit in the run's own SMOKE_DIR, so this runs on whatever project is open without
+  // assuming a folder layout. They used to sit in `/assets/scenes/` and `/assets/particles/` under a
+  // comment claiming "every project has" them. games/anim-bug has no `particles/`, and the
+  // save left the folder behind (#1415). The scene probe's location is load-bearing, not a
+  // convenience: `…/assets/mcp-smoke/…` must still sort BEFORE `…/assets/scenes/tropical-island…`
+  // ('m' < 's') so the collision is the dangerous one (see the #1414 warning above). Named
+  // `mcp-smoke-save` so a leftover is identifiable as this case's.
+  const SAVE_SCENE = `${SMOKE_DIR}/mcp-smoke-save.scene.json`;   // sorts BEFORE scenes/tropical-island — see the #1414 warning above
   // A scene file's bytes as the backend serves its asset URL — straight off disk, through the same
   // path resolution the save used, so no guess about the project's asset-root layout is needed
   // (3d-test's is `runtime/assets`). Read before and after to prove the save-as never touched it.
@@ -1444,7 +1486,15 @@ if (canUC3) {
     return res.ok ? res.text() : null;
   };
   const originalBytes = SCENE ? await readSceneBytes(SCENE).catch(() => null) : null;
-  const SAVE_PART = '/assets/particles/mcp-smoke-save.particle.json';
+  const SAVE_PART = `${SMOKE_DIR}/mcp-smoke-save.particle.json`;
+  // The #1414 check only measures something when the COPY sorts first. Otherwise the healer keeps
+  // the original's id and rewrites the copy's, and "original byte-identical" passes on a regression
+  // too. A comment cannot enforce that across a SMOKE_DIR rename or an open scene at
+  // `/assets/main.scene.json`, so a run that cannot measure it says so (F12) instead of reporting it green.
+  // The healer compares with `localeCompare` (vite-asset-scanner.ts `buildManifest`), and so does this.
+  if (SCENE && SAVE_SCENE.localeCompare(SCENE) >= 0) {
+    skipped.push(`save_all's #1414 check — the probe ${SAVE_SCENE} does not sort before the open scene ${SCENE}, so a shared-id regression would re-mint the COPY and the byte-identity assertion could not fail`);
+  }
 
   // Four preconditions, each of which is about NOT damaging the human's editor — reported through
   // the SKIPPED mechanism (F12), never forced past.
@@ -1831,8 +1881,8 @@ if (!uc14Path) {
 // renderer. The router tests fake the unsaved-work probe; only a live editor proves that a parked
 // particle edit actually reaches the delete gate, and that the create refusal crosses the
 // renderer op → /api/write-file → 409 → REFUSED_BY_OP chain intact.
-const UC15_PART = '/assets/particles/mcp-smoke-1215.particle.json';
-const UC15_MAT = '/assets/materials/mcp-smoke-1215.mat.json';
+const UC15_PART = `${SMOKE_DIR}/mcp-smoke-1215.particle.json`;
+const UC15_MAT = `${SMOKE_DIR}/mcp-smoke-1215.mat.json`;
 const errCode = (r) => { try { return JSON.parse(text(r)).error?.code ?? ''; } catch { return ''; } };
 {
   const pre = JSON.parse(text(await client.callTool({ name: 'modoki_list_assets', arguments: { name: 'mcp-smoke-1215' } })));
@@ -1852,7 +1902,7 @@ await withCleanup(async () => {
   if (row?.guid !== first.guid) throw new Error(`UC15 the refused create changed the asset's guid (${first.guid} -> ${row?.guid})`);
 
   // A-2: a sidecar for an asset that is not there is NOT_FOUND, not an orphan written and "ok".
-  const orphan = await client.callTool({ name: 'modoki_write_asset_meta', arguments: { path: '/assets/textures/mcp-smoke-1215-NEVER.png', meta: {} } });
+  const orphan = await client.callTool({ name: 'modoki_write_asset_meta', arguments: { path: `${SMOKE_DIR}/mcp-smoke-1215-NEVER.png`, meta: {} } });
   if (!orphan.isError || errCode(orphan) !== 'NOT_FOUND') {
     throw new Error(`UC15 write_asset_meta on a missing asset must be NOT_FOUND, got: ${text(orphan).slice(0, 300)}`);
   }
@@ -1880,6 +1930,31 @@ await withCleanup(async () => {
   const swept = await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [UC15_PART, UC15_MAT], discardUnsaved: true } });
   if (swept.isError) throw new Error(`UC15 could not trash its probes — they are STILL in the project (${UC15_PART}, ${UC15_MAT}): ${text(swept).slice(0, 300)}`);
 });
+
+} catch (e) {
+  runFailure = e;
+}
+
+// SMOKE_DIR's teardown (#1415). It runs on a failed run too (see the `try` above). By now each case
+// has trashed its own probe files, so this removes the folder the run created, along with anything
+// a failed case did not sweep. `discardUnsaved:true`, because only this suite's probes live under
+// SMOKE_DIR, and a case that died mid-way can leave an edit parked on one, which would otherwise
+// refuse the delete with REQUIRES_SAVE. `trashed` counts only paths that really existed, so 1 proves
+// the folder was there and went. A refusal fails the run. If it did not, the run would end at
+// `SMOKE OK` with the folder still in the human's project, and the next run's refusal would blame
+// "a previous run" that was actually this one. Like `withCleanup`, a teardown failure never MASKS
+// the case failure that preceded it.
+try {
+  const sweptRaw = await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [SMOKE_DIR], discardUnsaved: true } });
+  if (sweptRaw.isError) throw new Error(`could not trash the run's probe folder ${SMOKE_DIR} — it is STILL in the project: ${text(sweptRaw).slice(0, 300)}`);
+  const swept = JSON.parse(text(sweptRaw));
+  if (swept.trashed !== 1) throw new Error(`trashing ${SMOKE_DIR} reported trashed=${swept.trashed}, expected 1: ${JSON.stringify(swept).slice(0, 300)}`);
+  console.log(`trashed the run's probe folder ${SMOKE_DIR} ✓`);
+} catch (e) {
+  if (runFailure) console.log(`  (the ${SMOKE_DIR} teardown ALSO failed: ${e.message})`);
+  else runFailure = e;
+}
+if (runFailure) throw runFailure;
 
 await client.close();
 

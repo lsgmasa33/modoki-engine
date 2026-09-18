@@ -120,7 +120,7 @@ describe('#1097 — Animator clips are preloaded at scene load', () => {
     try {
       await expect(
         sceneManager.loadScene('/assets/scenes/preload-fail.scene.json', { preloaded: stagedScene(clipGuid) as never }),
-      ).resolves.toBeUndefined();
+      ).resolves.toEqual({ keptBaseGuids: new Set() });
       expect(stagedOpacity()).toBe(1);
       animationSystem(getCurrentWorld());
       expect(stagedOpacity()).toBe(1);

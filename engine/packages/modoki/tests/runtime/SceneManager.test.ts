@@ -580,7 +580,7 @@ describe('SceneManager — concurrent loads (cancel-and-replace)', () => {
 
     // A's promise should reject (aborted); B's should resolve
     await expect(aPromise).rejects.toThrow();
-    await expect(bPromise).resolves.toBeUndefined();
+    await expect(bPromise).resolves.toEqual({ keptBaseGuids: new Set() });
 
     // Final state: only scene B's resources
     const stats = getResourceStats();
@@ -1095,7 +1095,7 @@ describe('#888: a throwing onWorldSwap listener must not abort loadScene', () =>
     // (1) The load resolves. Pre-fix it REJECTED — and a test asserting only this would be
     // satisfied by a fix that swallowed the throw and left the wreckage behind, so it is the
     // weakest of the five assertions here, not the point of the test.
-    await expect(sceneManager.loadScene('/sceneA.json')).resolves.toBeUndefined();
+    await expect(sceneManager.loadScene('/sceneA.json')).resolves.toEqual({ keptBaseGuids: new Set() });
 
     // (2) The scene is actually current, not half-installed.
     expect(sceneManager.getCurrent()?.path).toBe('/sceneA.json');

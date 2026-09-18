@@ -91,6 +91,21 @@ describe('REQUIRES_SAVE — the world swap would cross unsaved work (guardUnsave
   });
 });
 
+describe('REQUIRES_SAVE over a dirty BASE scene names the carry exception (#1417 review)', () => {
+  it('says a loaded base the target shares survives, and that the open scene itself is not one', async () => {
+    markSceneDirty('bbbbbbbb-0000-4000-8000-000000001417');
+    try {
+      const err = await runAgentOp('load-scene', { path: '/assets/scenes/elsewhere-1417.scene.json' })
+        .then(() => null, (e: unknown) => e as { code?: string; message?: string });
+      expect(err).toMatchObject({ code: 'REQUIRES_SAVE' });
+      expect(err?.message).toMatch(/loaded AS A BASE \(not the open scene itself\).*carried across live and stays unsaved/);
+      expect(err?.message).toMatch(/discards the LIVE-WORLD edits \(not those of a loaded base the target shares\)/);
+    } finally {
+      clearAllSceneDirty();
+    }
+  });
+});
+
 describe('save-all while PLAYING — the scene half is refused; the code follows what landed', () => {
   beforeEach(() => { setCurrentScenePath('/assets/scenes/opcodes-1012.scene.json'); });
 

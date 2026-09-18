@@ -537,9 +537,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
 
   tool(
     'modoki_create_folder',
-    'Create a folder under the project\'s asset roots — the prerequisite for the tools that take a '
-    + 'destination inside one (modoki_import_file `destFolder`, modoki_create_asset `path`), which '
-    + 'do not create it for you. Refuses a path outside the asset roots (403) and an existing '
+    'Create a folder under the project\'s asset roots. Only needed for an EMPTY folder: '
+    + 'modoki_import_file `destFolder` and modoki_create_asset `path` create a missing destination '
+    + 'themselves. Refuses a path outside the asset roots (403) and an existing '
     + 'folder (409). RECURSIVE: missing parents are created too, so a nested path needs one call.',
     { path: z.string().describe('Asset-root URL of the folder to create, e.g. /assets/textures/ui.') },
     async ({ path }) => postJson('/api/create-folder', { path }, undefined, `create the folder ${path}`),

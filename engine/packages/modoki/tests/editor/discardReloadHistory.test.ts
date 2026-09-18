@@ -12,11 +12,13 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld } from 'koota';
 
 /** Runs INSIDE the faked load's await — where a human or agent edit can still land (review F1). */
-const h = vi.hoisted(() => ({ duringLoad: null as null | (() => void) }));
+const h = vi.hoisted(() => ({ duringLoad: null as null | (() => void), kept: new Set<string>() }));
 
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
-    loadScene: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); },
+    // Which bases the load KEPT (#1417): SceneManager's own answer, pinned against the real
+    // SceneManager in sceneManagerBaseSceneChain.test.ts's A7 cases.
+    loadScene: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); return { keptBaseGuids: h.kept }; },
     replaceWorldContent: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); },
     getCurrentBaseScene: () => undefined,
     getCurrent: () => null, // not a prefab-edit world, so Create Scene is allowed
@@ -29,6 +31,7 @@ import {
   pushAction, canUndo, canRedo, undo, undoLabel, _resetHistoryContexts,
 } from '../../src/editor/undo/undoManager';
 import { loadScene, newScene, markSceneSaved, hasUnsavedChanges } from '../../src/editor/scene/serialize';
+import { markSceneDirty, isSceneDirty, clearAllSceneDirty, clearSceneDirty } from '../../src/editor/scene/sceneDirty';
 
 if (typeof globalThis.localStorage === 'undefined') {
   const store = new Map<string, string>();
@@ -53,6 +56,8 @@ beforeEach(async () => {
   setRunMode('stopped');
   setCurrentWorld(createWorld());
   _resetHistoryContexts();
+  h.kept = new Set();
+  clearAllSceneDirty();
   await loadScene(A); // bind the history to A, with a clean baseline
 });
 
@@ -127,6 +132,73 @@ describe('a discarding world swap drops the discarded work\'s undo history (#140
   it('Create Scene over a DIRTY scene drops that scene\'s stack', async () => {
     edit('Move');
     await newScene();
+    await loadScene(A);
+    expect(canUndo()).toBe(false);
+  });
+});
+
+/** #1417: SceneManager KEEPS a base whose guid is unchanged across the swap, carrying its entities
+ *  from the live world, so its unsaved edits survive the load. Its dirty flag must survive with
+ *  them, or `saveAll` (which writes a base only `if (isSceneDirty(guid))`) skips it and the
+ *  unsaved-work guard stops asking. */
+describe('a load that KEEPS a dirty base keeps its dirty flag (#1417)', () => {
+  const BASE = 'bbbbbbbb-0000-4000-8000-00000000ba5e';
+  const OTHER = 'bbbbbbbb-0000-4000-8000-0000000000e2';
+
+  it('a kept base stays dirty, so the unsaved guard still sees its edit', async () => {
+    edit('Move base Camera');
+    markSceneDirty(BASE);
+    h.kept = new Set([BASE]);
+    await loadScene(B);
+    expect(isSceneDirty(BASE)).toBe(true);
+    expect(hasUnsavedChanges()).toBe(true);
+  });
+
+  it('a base the load did NOT keep loses its flag with its edits', async () => {
+    markSceneDirty(OTHER); // a base of A that B's chain drops
+    h.kept = new Set([BASE]);
+    await loadScene(B);
+    expect(isSceneDirty(OTHER)).toBe(false);
+  });
+
+  it('a kept dirty base alone is not discarded work, so the outgoing stack is parked, not dropped', async () => {
+    // The state a Save All leaves when it wrote the primary and failed on the base: the edit
+    // version is clean, and only the base flag says the edit is unsaved.
+    edit('Move base Camera');
+    markSceneSaved();
+    markSceneDirty(BASE);
+    h.kept = new Set([BASE]);
+    await loadScene(B);
+    h.kept = new Set();
+    await loadScene(A);
+    expect(undoLabel()).toBe('Move base Camera');
+  });
+
+  it('the same dirty base, NOT kept, is discarded work and drops the stack', async () => {
+    edit('Move base Camera');
+    markSceneSaved();
+    markSceneDirty(BASE);
+    await loadScene(B);
+    await loadScene(A);
+    expect(canUndo()).toBe(false);
+  });
+
+  // The pre-await read (#1409): dirt CLEARED during the load (a save landing mid-load) must not make
+  // discarded work look clean. The after-read alone would see a clean world and park the stack.
+  it('a world edit whose dirt is cleared mid-load still drops the stack', async () => {
+    edit('Move');
+    h.duringLoad = () => markSceneSaved();
+    await loadScene(B);
+    await loadScene(A);
+    expect(canUndo()).toBe(false);
+  });
+
+  it('an unkept dirty base whose flag is cleared mid-load still drops the stack', async () => {
+    edit('Move base Camera');
+    markSceneSaved();
+    markSceneDirty(OTHER);
+    h.duringLoad = () => clearSceneDirty(OTHER);
+    await loadScene(B);
     await loadScene(A);
     expect(canUndo()).toBe(false);
   });

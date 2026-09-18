@@ -32,7 +32,7 @@ import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
-import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty } from './sceneDirty';
+import { clearAllSceneDirty, clearSceneDirty, clearSceneDirtyExcept, dirtySceneGuidsSnapshot, hasDirtyScenes, hasDirtySceneOutside, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
@@ -801,25 +801,49 @@ export function worldHasUnsavedEdits(): boolean {
   return CAUSE_SPECS.sceneDirty.has() || CAUSE_SPECS.dirtyScenes.has();
 }
 
-/** The editor's half of a scene HOT-RELOAD — an external write to the open scene or a prefab it
- *  uses, where disk wins over unsaved edits (owner, 2026-09-13, #1164). The runtime replaced the
- *  world from disk without going through `loadScene`, so the same two rules apply here that
- *  `loadScene`'s tail applies: a DIRTY world's undo entries are dropped with it (#1409 — observed
- *  live: after the reload the stack still offered to undo a reparent the file never had), and the
- *  reloaded world is the new clean baseline. Before this, `unsavedChanges` stayed true after the
- *  reload over a world that matched disk. Installed via `setWorldReloadedFromDiskHook`.
+/** The world-shaped unsaved work, read BEFORE a world replacement's await (#1409): the outgoing
+ *  world stays live and editable while the new one loads, so the adopt step reads it again after
+ *  and takes the union. */
+export interface WorldDirt {
+  readonly edited: boolean;
+  readonly scenes: ReadonlySet<string>;
+}
+
+export function readWorldDirt(): WorldDirt {
+  return { edited: CAUSE_SPECS.sceneDirty.has(), scenes: dirtySceneGuidsSnapshot() };
+}
+
+/** Adopt a world that `SceneManager.loadScene` just built: the ONE rule for `loadScene`'s tail and
+ *  a hot reload, so the two cannot drift (#1409, #1417).
  *
- *  ⚠️ **Does NOTHING while a base scene is dirty** (#1409 second review). A hot reload reloads the
- *  PRIMARY from disk, but a base whose guid is unchanged is KEPT, its entities snapshotted from the
- *  LIVE world (`SceneManager.loadScene`'s `keptBaseGuids`), so its unsaved edits survive the reload.
- *  Clearing its dirty flag then made `saveAll` skip the base and the unsaved-work guard stop
- *  asking, which lost those edits silently. And one stack mixes base and primary entries, so it
- *  cannot be dropped for the primary alone. That case keeps the pre-#1409 behaviour: stale primary
- *  entries stay on the stack, which is the lesser loss. */
-export function adoptWorldReloadedFromDisk(scenePath: string): void {
-  if (CAUSE_SPECS.dirtyScenes.has()) return;
-  swapHistory(scenePath, { discardOutgoing: CAUSE_SPECS.sceneDirty.has() });
+ *  - **The undo stack drops iff work was DISCARDED.** That is a world edit since the last save, or
+ *    a dirty base the swap did not keep. A kept base's edits survive the swap live, so they are not
+ *    discarded work. ⚠️ The edit version is ONE global counter, and a base edit bumps it too, so
+ *    it cannot tell a primary edit from a base edit. In the common case a kept base edit still
+ *    drops the stack: the edit stays on screen and flagged dirty (saveable), but not undoable,
+ *    which is the lesser loss next to a stack replaying discarded primary work (#1409). The stack
+ *    survives only when the counter is clean, e.g. after a Save All that wrote the primary and
+ *    failed on the base.
+ *  - **Only a kept base keeps its dirty flag** (#1417). Clearing it made `saveAll` skip the base
+ *    and the unsaved-work guard stop asking, which lost the surviving edit silently.
+ *  - The reloaded world is the new clean baseline (`markSceneSaved`). */
+function adoptReplacedWorld(scenePath: string, keptBaseGuids: ReadonlySet<string>, before?: WorldDirt): void {
+  const discarded = CAUSE_SPECS.sceneDirty.has() || hasDirtySceneOutside(keptBaseGuids)
+    || (before !== undefined && (before.edited || [...before.scenes].some((g) => !keptBaseGuids.has(g))));
+  swapHistory(scenePath, { discardOutgoing: discarded });
   markSceneSaved();
+  clearSceneDirtyExcept(keptBaseGuids);
+}
+
+/** The editor's half of a scene HOT-RELOAD: an external write to the open scene or a prefab it
+ *  uses, where disk wins over unsaved edits (owner, 2026-09-13, #1164). The runtime replaced the
+ *  world from disk without going through `loadScene`, so it owes `loadScene`'s rules, which
+ *  `adoptReplacedWorld` holds. Before #1409, `unsavedChanges` stayed true after the reload over a
+ *  world that matched disk, and the stack still offered to undo a reparent the file never had.
+ *  A changed BASE reloads through `forceReloadBases`, so it is not in `keptBaseGuids` and its
+ *  edits are discarded with its flag. Installed via `setWorldReloadedFromDiskHook`. */
+export function adoptWorldReloadedFromDisk(scenePath: string, keptBaseGuids: ReadonlySet<string>): void {
+  adoptReplacedWorld(scenePath, keptBaseGuids);
 }
 
 /** WHICH kinds of unsaved work exist, told apart. The causes themselves — what each one is, what
@@ -1383,12 +1407,11 @@ export async function loadScene(
   try {
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
-    // Unsaved world edits here are being DISCARDED, so their undo entries go with them (#1409).
-    // Read on BOTH sides of the await: the outgoing world stays live and editable while the new
-    // one loads, so an edit made mid-load is discarded too. Nothing resets the dirty state until
-    // `markSceneSaved` below — the swap itself does not.
-    const dirtyBeforeLoad = worldHasUnsavedEdits();
-    await sceneManager.loadScene(scenePath, {
+    // Read on BOTH sides of the await (#1409): the outgoing world stays live and editable while the
+    // new one loads, so an edit made mid-load is discarded too. Nothing resets the dirty state until
+    // `adoptReplacedWorld` below; the swap itself does not.
+    const dirtBeforeLoad = readWorldDirt();
+    const { keptBaseGuids } = await sceneManager.loadScene(scenePath, {
       ...(gameId !== undefined ? { gameId } : {}),
       // Resources acquire in parallel; each completion (on a cold cache, a finished
       // bake) advances the bar. The SceneLoadModal only shows past a ~400ms delay.
@@ -1416,15 +1439,12 @@ export async function loadScene(
     // ever applying here. (Play→Stop does NOT come through here — it reloads via
     // sceneManager directly — so its same-scene history is preserved.)
     //
-    // ⚠️ Unless the outgoing world was DIRTY (#1409): then its stack describes discarded work, and
-    // parking it — or, on a same-path discard-reload, keeping it live — let one undo replay that
-    // work onto the fresh world. A CLEAN outgoing world matches its file, so its stack stays valid.
-    swapHistory(scenePath, { discardOutgoing: dirtyBeforeLoad || worldHasUnsavedEdits() });
+    // ⚠️ Unless the outgoing world held work this load DISCARDED (#1409): then its stack
+    // describes that work, and parking it (or, on a same-path discard-reload, keeping it live) let
+    // one undo replay it onto the fresh world. A kept base's dirty flag survives (#1417). Both
+    // rules: `adoptReplacedWorld`.
+    adoptReplacedWorld(scenePath, keptBaseGuids, dirtBeforeLoad);
     const worldEntityTotal = getAllEntities().length;
-    markSceneSaved(); // the freshly loaded world matches disk — a new baseline (C7)
-    // A stale dirty guid from the PREVIOUS chain (e.g. a base no longer loaded) must
-    // not linger — the freshly loaded chain has no unsaved live-world work yet either.
-    clearAllSceneDirty();
     // Editor Percept (V2): the human opened a scene — correlate later game/edit events to it.
     // `worldEntityTotal`, the editor state's name for the same count (§2, #1223 D3).
     editorEmit('!scene-load', { path: scenePath, worldEntityTotal });

@@ -37,7 +37,7 @@
 export const COVERED_BY_SMOKE: readonly string[] = [
   'modoki_batch', 'modoki_mutate_scene', 'modoki_set_transform', 'modoki_create_entity',
   'modoki_delete_entities', 'modoki_prefab', 'modoki_particle_set', 'modoki_save_all',
-  'modoki_discard_asset_edits', 'modoki_create_asset', 'modoki_delete_asset',
+  'modoki_discard_asset_edits', 'modoki_create_asset', 'modoki_delete_asset', 'modoki_create_folder',
   'modoki_create_registered_asset',
   'modoki_write_player_prefs',
   'modoki_load_scene', 'modoki_set_selection', 'modoki_play_control', 'modoki_history',
@@ -113,9 +113,9 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   // SMOKE-COVERABLE (create -> verify -> clean up, exactly what create_asset/delete_asset already
   // do), so these belong in COVERED_BY_SMOKE once a case exists. Listed rather than claimed,
   // because an entry in COVERED_BY_SMOKE asserts that a real case is there and none is yet.
-  // ⚠️ ONE of the four has moved (`modoki_write_asset_meta` → COVERED_BY_SMOKE, UC14, #872). The
-  // other three are still listed rather than claimed, which is the honest state — not an oversight.
+  // ⚠️ TWO of the four have moved: `modoki_write_asset_meta` (UC14, #872) and `modoki_create_folder`
+  // (the smoke's run-owned SMOKE_DIR, #1415) are now in COVERED_BY_SMOKE. The other two are still listed
+  // rather than claimed, which is the honest state — not an oversight.
   modoki_duplicate_asset: 'writes a new asset file into the project. SMOKE-COVERABLE — duplicate, verify via list_assets, delete_asset',
   modoki_move_asset: "renames a file in the human's project. SMOKE-COVERABLE — move to a probe path, verify, move back",
-  modoki_create_folder: 'creates a folder in the project. SMOKE-COVERABLE — create, verify, remove',
 };

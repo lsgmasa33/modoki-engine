@@ -48,7 +48,8 @@ scene does NOT also use it. **Verify any disk edit by querying the live spawned 
 re-reading the file you wrote.**
 
 **A reload over unsaved edits discards them (disk wins) and drops their undo history with them**, then
-makes the reloaded world the clean baseline (#1409) — the rule and why:
+makes the reloaded world the clean baseline (#1409). The exception is a base scene the reload KEEPS:
+its edits survive live and so does its dirty flag (#1417). The rule and why:
 [scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history).
 
 **`mesh` (`.mesh.json`, #1380) needs more than an eviction, and it is the one kind here that is not an

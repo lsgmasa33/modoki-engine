@@ -1871,26 +1871,54 @@ visit, restored when you return to a previously-open scene), rather than
 dropping undo globally.
 **A parked stack is valid only if the scene was CLEAN when it was left** (#1409). The scene
 reloads from disk, so a stack recorded against unsaved edits describes a world that no longer
-exists. Every path that replaces the world applies one rule, through `worldHasUnsavedEdits()`
-(the two world-shaped unsaved causes: the primary scene and the other loaded scenes). When the
-world is dirty, the outgoing stack is **dropped** instead of parked:
-- **`loadScene`, `newScene` and prefab-edit entry** read it on BOTH sides of the swap's await. The
-  outgoing world stays live and editable while the new one loads, and nothing resets the dirty
-  state until `markSceneSaved` runs after the swap, so an edit made mid-load is discarded too.
-  This covers a same-path reload as well: `swapHistory` used to no-op on an unchanged key, so one
-  undo after `modoki_load_scene {discardUnsaved:true}` replayed the discarded work onto the fresh
-  world.
+exists. When the swap DISCARDED world work, the outgoing stack is **dropped** instead of parked.
+
+**But not every base reloads from disk** (#1417). `SceneManager.loadScene` KEEPS a base whose guid
+is unchanged across the swap and snapshots its entities from the live world, so a kept base's
+unsaved edits SURVIVE the load. `loadScene` resolves to `{ keptBaseGuids }` so the editor can tell
+the two apart; nothing in the world records it. A base in `forceReloadBases` is never kept. The
+editor's `loadScene` tail and the hot reload share ONE adopt rule, `adoptReplacedWorld` in
+`serialize.ts`:
+- **Only a kept base keeps its dirty flag** (`clearSceneDirtyExcept`). Before #1417 every load
+  cleared all flags, so `saveAll`, which writes a base only if it is dirty, skipped the surviving
+  edit, and the unsaved-work guard stopped asking. The edit stayed on screen, flagged clean.
+- **The stack drops iff work was discarded**: a world edit since the last save, or a dirty base
+  that was NOT kept. ⚠️ The edit version is one global counter and a base edit bumps it too, so
+  it cannot tell a primary edit from a base edit. In the common case a kept base's edit still
+  drops the stack: the edit stays saveable, not undoable. That is the lesser loss next to a stack
+  replaying discarded primary work, and filtering one mixed stack by scene would need per-entry
+  scene tags nobody records. The stack survives when only the flag is dirty, e.g. after a Save
+  All that wrote the primary and failed on the base.
+- ⚠️ **A kept flag can over-report, deliberately.** SceneManager snapshots a kept base before its
+  long resource-acquire awaits, so an edit to a CLEAN kept base made during that window is lost
+  with the outgoing world, yet the base's flag survives: the next Save All rewrites a base that
+  matches disk. The alternative, clearing the flag, would lose an edit made before the snapshot
+  silently, so the false positive is the safe side.
+- **Only an old BASE can be kept, never the old primary** (#1417 review). A primary's entities carry
+  `sourceScene: ''`, so there is nothing to carry them by. Before this, opening `/base.json` and
+  then a level whose base is that file counted it as kept, snapshotted nothing, and the base's
+  content vanished from the world next to two `role:'primary'` entries.
+- **The agent refusal says so**: `load_scene {discardUnsaved:true}` does NOT discard a scene loaded
+  AS A BASE that the target chain shares, and its refusal text names that exception rather than
+  promising "destroyed". The open scene itself is never that exception, even when the target uses
+  it as its base (see the bullet above). No agent op discards a kept base's edits today:
+  `load_scene` does not expose `forceReloadBases`.
+
+Where it applies:
+- **`loadScene`, `newScene` and prefab-edit entry** read the dirt on BOTH sides of the swap's
+  await. The outgoing world stays live and editable while the new one loads, and nothing resets
+  the dirty state until the adopt step runs after the swap, so an edit made mid-load is discarded
+  too. This covers a same-path reload as well: `swapHistory` used to no-op on an unchanged key, so
+  one undo after `modoki_load_scene {discardUnsaved:true}` replayed the discarded work onto the
+  fresh world. (`newScene` and prefab-edit entry keep no base, so they clear every flag.)
 - **A scene hot-reload** (an external write to the open scene or a prefab it uses) replaces the
-  world from disk without going through `loadScene`. Disk wins over unsaved edits (owner,
-  2026-09-13, #1164). `agentBridge.ts` calls the editor's `adoptWorldReloadedFromDisk` through
-  `setWorldReloadedFromDiskHook` once the reload lands. It applies the same drop and makes the
-  reloaded world the clean baseline. Before that, `unsavedChanges` stayed true over a world that
-  matched the file.
-  ⚠️ **Except while a base scene is dirty: then it does nothing.** The reload reloads the
-  primary, but SceneManager KEEPS an unchanged base and snapshots its entities from the live world
-  (`keptBaseGuids`), so a dirty base's edits survive the reload. Clearing its flag would make
-  `saveAll` skip it silently, and one stack mixes base and primary entries. Stale primary entries
-  stay on the stack in that case, which is the lesser loss.
+  world from disk without going through the editor's `loadScene`. Disk wins over unsaved edits
+  (owner, 2026-09-13, #1164), except in a kept base. `agentBridge.ts` hands the editor's
+  `adoptWorldReloadedFromDisk` the kept set through `setWorldReloadedFromDiskHook` once the reload
+  lands. Before #1409, `unsavedChanges` stayed true over a world that matched the file. #1409's
+  first version then did nothing at all while any base was dirty, which left stale primary
+  entries on the stack; #1417 replaced that with the rule above. A changed BASE reloads through
+  `forceReloadBases`, so it is not kept and its edits are discarded with its flag.
 - **Asset-document edits survive the drop.** `_isFileDirect` entries (material, clip, particle,
   skin, timeline…) target a file the swap does not touch, so `parkSurvivors` keeps them, in order.
 - **`newScene` starts its key empty** (`freshIncoming`), apart from those asset entries, because a

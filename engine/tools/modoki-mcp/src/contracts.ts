@@ -396,7 +396,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'load-scene',
     mutating: true, persists: 'live', requires: ['editor', 'project'], aim: 'asset',
     minimalArgs: { path: '/assets/scenes/main.scene.json' },
-    notes: 'SWAPS THE WORLD: refuses while unsaved live changes exist (they would be destroyed). `discardUnsaved` to discard them deliberately — NOT `force`, which is the non-destructive escape hatch on the build family and was renamed here for exactly that reason (§2).',
+    notes: 'SWAPS THE WORLD: refuses while unsaved live changes exist (they would be destroyed, except in a scene loaded as a base that the target shares, which is carried live). `discardUnsaved` to discard them deliberately — NOT `force`, which is the non-destructive escape hatch on the build family and was renamed here for exactly that reason (§2).',
   },
   modoki_new_scene: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'new-scene',
@@ -829,7 +829,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/create-folder',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/probe-folder' },
-    notes: 'The prerequisite for modoki_import_file `destFolder` and modoki_create_asset `path`, neither of which creates its destination. RECURSIVE (mkdir -p): missing parents are created. Refuses an existing folder (409) — the existence check is on the TARGET only, never its parents. It said "not recursive" until #1218; the code never was.',
+    notes: 'Only needed for an EMPTY folder: modoki_import_file `destFolder` and modoki_create_asset `path` both mkdir -p their destination (create-asset since QA-CTX-0008), which this note denied until #1415, and a live smoke that trusted it left an empty `particles/` folder behind. RECURSIVE (mkdir -p): missing parents are created. Refuses an existing folder (409) — the existence check is on the TARGET only, never its parents. It said "not recursive" until #1218; the code never was.',
   },
 
   modoki_capture_gesture: {

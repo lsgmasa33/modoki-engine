@@ -999,6 +999,20 @@ site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
   its own real path, which no argument redirects and no precondition can see. A case that saves must
   inspect `extraSaved` and fail loudly naming those files. General rule: verify a smoke case with
   `git status` after the run, not its own ✓.
+- **A smoke probe FILE goes under the run-owned `/assets/mcp-smoke/`, never under a type folder**
+  (#1415). Every write route mkdirs its target's parent (`writeJsonAtomic`, `/api/write-file`, the
+  save-as route, `/api/import-file`), and a case's cleanup trashes only the files it made. So a probe
+  at `/assets/particles/…` on a project without that folder (`games/anim-bug`) left an empty
+  `particles/` behind while printing "trashed its 2 probe file(s) ✓". Finder then dropped a `.DS_Store`
+  into it, and `qaCaseReferences.test.ts` read it as QA residue. `test-smoke.mjs` creates the folder
+  up front and trashes it whole at the end, asserting `trashed:1`. ⚠️ The teardown sits after a
+  top-level `try` around every case. The file has no top-level catch and `withCleanup` rethrows,
+  so without that `try` a failing case would skip the teardown, and the leftover would block every
+  later run. It **refuses** a folder that is already there rather than trashing it, because that is
+  either a killed run's leftover or a second smoke run live against the same editor.
+  Suffix-typed assets (`.particle.json`, `.mat.json`, `.scene.json`) register from any folder. The
+  #1414 save-as probe must sort before the open scene (`mcp-smoke/` < `scenes/`). The run checks this
+  with `localeCompare`, and a project where it does not hold reports SMOKE INCOMPLETE.
 - **A refusal the sweep expects is declared too** (`EXPECTED_REFUSALS`, matched on the refusal text
   with the reason it is correct). Without that, the sweep either flags three correct refusals every
   run — and gets ignored — or blanket-accepts `REFUSED_BY_OP` and stops seeing a real one. A stale

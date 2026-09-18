@@ -230,7 +230,7 @@ describe('#1162 — spriteanim / rig2d / animset / particle defs are preloaded a
     const before = Object.keys(getResourceStats().rigged).length;
     await expect(sceneManager.loadScene(`/assets/scenes/preload-bad-source-${newGuid()}.scene.json`, {
       preloaded: scene({ SkeletalAnimator: { animSet: guid } }) as never,
-    })).resolves.toBeUndefined();
+    })).resolves.toEqual({ keptBaseGuids: new Set() });
     expect(getAnimSet(guid, { load: false })).not.toBeNull();
     expect(Object.keys(getResourceStats().rigged)).toHaveLength(before);
   });
@@ -267,7 +267,7 @@ describe('#1162 — spriteanim / rig2d / animset / particle defs are preloaded a
           { id: 3, name: 'C', traits: { EntityAttributes: { name: 'C', guid: newGuid() }, Transform: {}, SkeletalAnimator: { animSet: guids.set } } },
           { id: 4, name: 'D', traits: { EntityAttributes: { name: 'D', guid: newGuid() }, Transform: {}, ParticleEmitter: { effect: guids.fx } } },
         ],
-      } as never })).resolves.toBeUndefined();
+      } as never })).resolves.toEqual({ keptBaseGuids: new Set() });
       for (const p of [SPRITEANIM_PATH, RIG_PATH, ANIMSET_PATH, PARTICLE_PATH]) expect(requested(p)).toBe(true);
     } finally {
       warn.mockRestore();
