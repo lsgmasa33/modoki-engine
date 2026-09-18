@@ -211,11 +211,19 @@ export function deriveGuid(seed: string): string {
 
 /** The guid a prefab-instance MEMBER derives on load: `anchor` is the durable guid of its nearest
  *  guid-carrying ancestor, `path` the step ids from just below that ancestor down to the member
- *  ({@link memberStepId}). The ONE spelling of the rule — `deriveInstanceMemberGuids` applies it on
+ *  ({@link memberStepId}; a keyed added node steps as `'+' + key` — `addedKeyStep`, #1387, which
+ *  cannot collide with a numeric step, so every numeric path hashes exactly as it always did). The ONE spelling of the rule — `deriveInstanceMemberGuids` applies it on
  *  load, and both duplicate paths (`remintSceneEntityGuids` for a scene file, `regenerateSnapshotGuids`
  *  for an editor subtree) predict it with it, so a copy's refs land where a reload puts the members. */
-export function deriveMemberGuid(anchor: string, path: readonly number[]): string {
+export function deriveMemberGuid(anchor: string, path: readonly (number | string)[]): string {
   return deriveGuid(`${anchor}|${path.join('.')}`);
+}
+
+/** A template-keyed added node's step in {@link deriveMemberGuid}'s path (#1387; see
+ *  `templateIdentity.ts`). The `+` keeps it disjoint from every numeric localId step, which is what
+ *  leaves every existing derived guid unchanged. */
+export function addedKeyStep(key: string): string {
+  return `+${key}`;
 }
 
 /** A member's step in {@link deriveMemberGuid}'s path: its `PrefabInstance.localId` — EXCEPT a
@@ -233,16 +241,24 @@ export function memberStepId(pi: { localId?: number; parentLocalId?: number } | 
  *  instance, a typed array) is returned as-is, because the editor hands the result to live trait
  *  stores. Callers must not put `''` in `remap`, or every empty string would be rewritten. */
 export function remapGuidValues(value: unknown, remap: ReadonlyMap<string, string>): unknown {
-  if (typeof value === 'string') return remap.get(value) ?? value;
+  return mapStringValues(value, (s) => remap.get(s) ?? s);
+}
+
+/** `value` with every string VALUE replaced by `fn(value)` — the walk under `remapGuidValues`, and
+ *  under the template member-token rebase (`templateRefs.ts`, #1352). Same copy-on-write rules:
+ *  object KEYS are not rewritten; arrays and PLAIN objects are copied only where something inside
+ *  them changed; anything else is returned as-is. */
+export function mapStringValues(value: unknown, fn: (s: string) => string): unknown {
+  if (typeof value === 'string') return fn(value);
   if (Array.isArray(value)) {
-    const out = value.map((v) => remapGuidValues(v, remap));
+    const out = value.map((v) => mapStringValues(v, fn));
     return out.some((v, i) => v !== value[i]) ? out : value;
   }
   if (value && typeof value === 'object') {
     const proto = Object.getPrototypeOf(value);
     if (proto !== Object.prototype && proto !== null) return value;
     const entries = Object.entries(value);
-    const mapped = entries.map(([, v]) => remapGuidValues(v, remap));
+    const mapped = entries.map(([, v]) => mapStringValues(v, fn));
     if (mapped.every((v, i) => v === entries[i]![1])) return value;
     // Every key is DEFINED, not assigned: a parsed document can carry an own `__proto__` key, which
     // `out[k] = v` would turn into a prototype assignment instead of a copied field.

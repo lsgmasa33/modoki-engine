@@ -1040,10 +1040,12 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
   target's own Swift uses none. The guard derives this from each game's `package.json`.
 - **Tracking: `false`, with no domains.** The SDKs that track (AppsFlyer; Facebook in Court's graph
   until #1062 stripped it) declare it in their own manifests.
-- **Collected data: only the game's OWN first-party collection** (owner, 2026-09-11). Court declares
-  User ID, Gameplay Content and Purchase History (its Firestore cloud save), each linked, App
-  Functionality, not tracking. Weaveling declares none, which is now behind: #927 (sign-in), #925 (purchases) and #932 (ads)
-  have all landed, so it owes the same three rows as Court (#933).
+- **Collected data: only the game's OWN first-party collection** (owner, 2026-09-11). Both games
+  declare User ID, Gameplay Content and Purchase History (their Firestore cloud save), each linked,
+  App Functionality, not tracking. Weaveling's were added by #1389 once sign-in (#927), purchases (#925)
+  and cloud save (#679) landed, each confirmed against a sender in its own code: the save keyed by the account uid,
+  the progress/settings sync groups, and the `wordweave.purchases` group's receipts. Ads (#932)
+  added no row — AdMob and UMP declare their own.
 - ⚠️ **GoogleAppMeasurement ships no manifest, so Firebase Analytics' own collection is declared by
   nothing in the graph.** That is App Store privacy-label work (#933), not something to paper over
   in the app's manifest. Confirmed in a built Court `App.app`, whose bundle carries ~45 SDK

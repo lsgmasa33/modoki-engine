@@ -980,6 +980,21 @@ reach WebDriverAgent ([trusted-device-input.md](./trusted-device-input.md)), and
 failed with `xcodebuild: Timed out waiting for all destinations…`, which latches for the rest of the
 lease. It was driven by a human finger.
 
+### Web builds in Safari keep the magnifier — accepted, not a bug (#1372)
+
+The fix above lives in the web view's preferences, and in mobile Safari we don't own the web view.
+So a **web** build played in iOS Safari still shows the double-tap magnifier. The owner checked this
+on 2026-09-18 on `modoki-engine.com/2d-physics-demo/` and **decided to accept it**: the web build is
+left as it is. Don't try to backstop it from the page. CSS provably can't reach it (measured above),
+and `preventDefault()` on a second `touchend` would swallow the synthesized click that
+double-tap-to-press (#466/#530) relies on.
+
+**Pinch-zoom is NOT a web-build problem, although it looks like one from the source.**
+`engine/index.html`'s `user-scalable=no` is ignored by mobile Safari, and #1372 therefore predicted
+that pinching a web build would zoom the page. It does not: in the same check, the owner confirmed
+that pinching the demo in Safari does not zoom. What blocks it in Safari hasn't been traced. Don't
+remove the viewport tag on the assumption that it is dead weight.
+
 ## Gotchas
 
 - **Read the resource, never the DOM.** Game/UI/gameplay code must go through the `Input` accessors;

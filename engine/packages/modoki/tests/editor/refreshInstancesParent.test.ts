@@ -44,6 +44,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
+  // rebuildInstance ends with the derive pass (#1387), which indexes each guid it mints.
+  indexEntityGuid: () => {},
+  findEntityById: (id: number) => index.get(id),
 }));
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => getAllEntitiesImpl(),

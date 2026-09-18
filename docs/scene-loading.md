@@ -1293,6 +1293,87 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   pace: `derivedMemberPathsByAnchor` starts a new `|`-separated segment after such a root, and
   `deriveMemberChain` derives the chain link by link. A committed-corpus walk (2026-09-17) found no
   nested-prefab `added[]` node at all, so no stored ref moved.
+- **Template identity: an added node written into a PREFAB carries a key, never a guid (#1387).**
+  A template has no per-instance identity. A flat member's guid is cleared and derived per instance
+  from its localId path, but an `added` node inside a nested ROW (a row's own `added`, a row's
+  `nestedStructure[*].added`, or a reference node's `added`) has no localId. It used to keep its
+  durable guid verbatim, so every instance of the prefab spawned an entity with that one guid. Such a
+  node now carries `AddedEntity.key` (template-local, guid-shaped, stable across saves) and
+  `guid: ''`. The mechanism, in `runtime/core/templateIdentity.ts`:
+  - **Load.** `applyStructureCore` spawns the node guid-less, carrying the UNREGISTERED
+    `TemplateAddedKey` marker, and a keyed reference node's root gets the same marker.
+    `deriveInstanceMemberGuids` derives both, stepping `'+' + key` (`addedKeyStep`). The `+` keeps
+    the step disjoint from every numeric one, so no existing derived guid moves.
+  - **Write.** Every prefab-file writer captures in TEMPLATE form:
+    - `planPrefabRows` passes `{ template: true }` to `captureInstanceReference` and
+      `captureNestedChannels`;
+    - `addedNodeIdentity` reads the key back off the marker. The marker is unregistered, so any
+      scene-form round trip of the edit world drops it (Play→Stop reloads a `serializeScene`
+      snapshot; delete→undo respawns from a registry-only snapshot). The key is then RECOVERED from
+      the node's guid, which both round trips keep (`recoverTemplateKey`): each ancestor is tried as
+      the anchor with each key the cached prefabs declare, until `deriveMemberGuid` reproduces the
+      guid. Only a node that never came from a template gets a fresh key. Minting one instead
+      re-keyed the node and pinned the inner prefab's untouched interior into the outer row on a
+      no-op save (#1387 review);
+    - promotion (`toTemplateNodes` in `insertAddedSubtree`) converts a scene-form subtree the same way.
+  - **Which kind a node is follows from its fields.** A node with a `guid` is spawned with it
+    verbatim, whether or not it carries a key. A scene capture never writes a key; it writes the
+    node's live, now per-instance guid. Because a scene restates every non-empty interior (#1358),
+    a scene that stores a ref into an interior also stores that node's guid.
+  - **Rebuilds derive.** `rebuildInstance` now ends with the derive pass. Before, a respawned keyed
+    node was left guid-less.
+  - **Legacy.** A pre-key row node keeps loading exactly as before. A node with no guid loads
+    guid-less. A node with a durable guid still gives every instance that one guid, until its OWN
+    prefab is re-saved and writes the key. `sameStructure` compares node identity (`key`, `guid`)
+    only when both sides key every node, so an OUTER no-op save never pins such an interior just to
+    migrate it. **Committed corpus (2026-09-18): 0 of 105 prefabs carry a row `added` node with a
+    guid**, so nothing moved here. Games copied out of the repo can still carry that shape (#29).
+  - **The duplicate walk mirrors the step.** `derivedMemberPathsByAnchor` and `deriveMemberChain`
+    use the same keyed step, pinned by `engine/tests/plugins/remintPrefabMemberRefs.test.ts`. It
+    still does not read a ROW's `nestedStructure` (#1381), which predates this change. That gap
+    rarely matters: a scene save restates every non-empty interior with each node's guid, so a scene
+    holding a ref into one also holds the guid it points at.
+  Tests: `engine/tests/editor/prefabTemplateIdentity.test.ts`.
+- **Template identity, refs: a ref between a prefab's own members is a MEMBER TOKEN (#1352).** A
+  template kept such a ref (a `UIAction.bindings[].target`, any `entityRef`) as the SOURCE world's
+  guid. So every instance drove the one source entity, or nothing once that was gone, and nothing
+  errored. The template now stores `@member:<path>` (`runtime/core/templateRefs.ts`): the target's
+  derive-step path (localIds, a row's localId, `'+key'`) below the root of the instance the value is
+  applied to. A leading `^` climbs one enclosing instance, and `@member:` alone is that root.
+  - **Frames.** A member's own bag is in its prefab's frame. A row's `overrides`/`added` are in the
+    nested child's frame. A `nestedOverrides`/`nestedStructure` entry is in the frame of the
+    instance its path addresses. A reference node's payload is its own frame and is never rewritten.
+  - **Write.** `serializePrefab` (`templateTokenizer`) rewrites a guid to the NEAREST frame that
+    names it. That keeps the spelling canonical, which #1381's no-op comparison relies on: MID's own
+    save and OUTER's save of the same MID interior must write the same token, or OUTER pins an
+    interior it never changed. That comparison now runs AFTER tokenizing (`captureNestedChannels`
+    `baselinesOut`). Apply's value overlay tokenizes in the instance's own frame, downward only,
+    because the file is used in other contexts.
+  - **Read.** Each instantiate call (loader and editor alike) takes its path from the top call
+    (`_segments`, one per nesting level) and rebases every value it applies. So every token in one
+    tree names a path from the top call's root. A top call whose tree carried a token registers that
+    root (a token SCOPE, so a spawn of a token-free prefab pays nothing), and
+    `deriveInstanceMemberGuids` resolves the tokens to the guids just derived. ⚠️ A STORED root under
+    the frame (a scene instance parented to another instance, a user-added nested one) is a target
+    but is never REWRITTEN by the enclosing pass. Its bag is in its own frame, and rewriting it once
+    made a button placed under a panel instance drive the panel's member on every load.
+  - **Unresolved.** A token that names nothing stays as it is: visibly unresolved, never re-pointed.
+    Examples are a ref into a user-added nested instance's interior (a frame boundary) and one past
+    the top.
+  - **Compare.** `getOverrideValues` resolves a base token (`baseTokenResolver`) before comparing,
+    in the save capture, the Apply/Revert list and the Inspector highlight. Otherwise every
+    token-bearing field reads as overridden on every instance. A SCENE stores the resolved guid,
+    which is derived and so stable.
+  - **Prefab editor.** The editor flattens the prefab's own rows, so `buildPrefabEditScene` maps
+    every token that climbs to the root onto an edit-world guid: a row's sentinel, or
+    `deriveMemberGuid(sentinel, rest)` past a nested row. The save maps them back.
+  - **Not covered.**
+    - A ref OUT of the prefab dangles in other scenes, as it always did.
+    - A token left unresolved and then stored into a SCENE override by a marked edit is rebased again
+      on the next load, so its path changes. It already named nothing.
+    - A ref to a node PROMOTED by Apply is left as a guid.
+    - A ref inside a reference node's payload is left as a guid.
+  Tests: `engine/tests/editor/prefabTemplateIdentity.test.ts` § "#1352".
 - **An owned nested instance ROOT that leaves its row is saved as REMOVED from the outer instance
   (#1355).** This is the depth-1 root case only. A structural edit INSIDE an owned nested instance
   is not saved at all, whether it deletes or moves a member or removes a depth-2 nested root,

@@ -56,8 +56,12 @@ Each `PrefabEntity` stores its traits with `EntityAttributes.parentId` remapped
 from ECS ids to `localId`s. `serializePrefab()` clears `EntityAttributes.guid`
 on every prefab entity — a prefab is a template, so per-instance identity is
 assigned on the live entity at instantiation, not baked into the file (otherwise
-every instance would start with the same stale guid). The prefab file never
-carries `PrefabInstance` traits; those are added programmatically on spawn.
+every instance would start with the same stale guid). The same holds for an `added` node inside a
+nested row: it carries a template `key` instead of a guid, and each instance derives the guid from
+that key (#1387). A ref from one member to another is written as a member token
+(`@member:<path>`) and resolved per instance (#1352). Both are in [scene-loading.md](scene-loading.md)
+§ "Guid uniqueness is a PER-FILE rule", "Template identity". The prefab file never carries
+`PrefabInstance` traits; those are added programmatically on spawn.
 
 ## localId stability — an external address space
 

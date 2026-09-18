@@ -9,7 +9,7 @@
  *     graph (FileTimestamp, SystemBootTime, more UserDefaults) is declared by the SDK that makes it.
  *   - **Tracking:** none of the app's own. AppsFlyer declares its own (Facebook did, in Court's graph, until #1062 stripped it).
  *   - **Collected data:** the game's OWN first-party collection, decided by the owner (2026-09-11):
- *     Court's cloud save (User ID, Gameplay Content, Purchase History); nothing for Weaveling yet.
+ *     each game's cloud save (User ID, Gameplay Content, Purchase History) — Weaveling's since #1389.
  * Coverage table and sources: `docs/native-and-sdks.md` § "iOS privacy manifest".
  *
  * ⚠️ A declaration the app does not need is still a false statement to Apple, so each check below
@@ -33,8 +33,12 @@ const SHIPPING_IOS: Readonly<Record<string, readonly string[]>> = {
     'NSPrivacyCollectedDataTypePurchaseHistory',
     'NSPrivacyCollectedDataTypeUserID',
   ],
-  // Revisit when sign-in, IAP or ads land (#927, #925, #932).
-  'games/wordweave': [],
+  // Sign-in, IAP and cloud save landed (#927, #925, #679); the rows were confirmed against its own senders (#1389).
+  'games/wordweave': [
+    'NSPrivacyCollectedDataTypeGameplayContent',
+    'NSPrivacyCollectedDataTypePurchaseHistory',
+    'NSPrivacyCollectedDataTypeUserID',
+  ],
 };
 
 type PlistValue = string | number | boolean | PlistValue[] | { [key: string]: PlistValue };

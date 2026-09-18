@@ -23,6 +23,8 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
+import { deriveMemberGuid, mapStringValues } from '../../runtime/core/assetRefRules';
+import { isMemberToken, parseMemberToken, type MemberStep } from '../../runtime/core/templateRefs';
 
 /** Sentinel guid stamped on the prefab root in the synthetic edit scene so the
  *  save path can locate it after the loader reassigns ECS ids. Lives only in the
@@ -170,9 +172,43 @@ function scaffold2DEntities(prefab: PrefabFile): SceneEntityEntry[] {
   ];
 }
 
+/** The guid the edit world gives the member at `path` below the prefab's root (#1352). A flat row is its
+ *  own sentinel. Past a nested row, the rest derives from that row's sentinel, because the row is a
+ *  top-level scene instance here. `null` when the path names no row. */
+function editGuidAt(prefab: PrefabFile, path: readonly MemberStep[]): string | null {
+  const sentinel = (localId: number) => localId === prefab.rootLocalId ? PREFAB_EDIT_ROOT_GUID : `${PREFAB_EDIT_LOCAL_GUID_PREFIX}${localId}`;
+  if (!path.length) return sentinel(prefab.rootLocalId);
+  const rows = new Map(prefab.entities.map((e) => [e.localId, e]));
+  for (let i = 0; i < path.length; i++) {
+    const row = typeof path[i] === 'number' ? rows.get(path[i] as number) : undefined;
+    if (!row) return null;
+    if (row.prefab) return i === path.length - 1 ? sentinel(row.localId) : deriveMemberGuid(sentinel(row.localId), path.slice(i + 1));
+    if (i === path.length - 1) return sentinel(row.localId);
+  }
+  return null;
+}
+
+/** A payload `depth` frames below the prefab's root, with every member token that climbs back to the
+ *  root replaced by the edit world's guid for it. The edit world flattens the root's own rows into
+ *  plain scene entities, so no instantiate call there has the root as a frame. A token relative to an
+ *  inner frame is left for the loader, which expands that row as a scene instance. */
+function editWorldRefs(prefab: PrefabFile, value: unknown, depth: number): unknown {
+  return mapStringValues(value, (s) => {
+    const t = isMemberToken(s) ? parseMemberToken(s) : null;
+    if (!t || t.up !== depth) return s;
+    return editGuidAt(prefab, t.path) ?? s;
+  });
+}
+
+/** `paths` with each entry mapped at its depth below the prefab's root: 1 for the row, plus one per path step. */
+function byPathDepth<T>(paths: Record<string, T> | undefined, fn: (v: T, depth: number) => unknown): Record<string, T> | undefined {
+  if (!paths) return paths;
+  return Object.fromEntries(Object.entries(paths).map(([k, v]) => [k, fn(v, 1 + k.split('.').length) as T]));
+}
+
 export function buildPrefabEditScene(prefab: PrefabFile): SceneData {
   const entities: SceneEntityEntry[] = prefab.entities.map((pe) => {
-    const traits: Record<string, Record<string, unknown> | boolean> = { ...pe.traits };
+    const traits = editWorldRefs(prefab, { ...pe.traits }, 0) as Record<string, Record<string, unknown> | boolean>;
     // Stamp the root so save can find it after id reassignment, and EVERY member with its
     // original localId so the save can put it back (see PREFAB_EDIT_LOCAL_GUID_PREFIX). The
     // root carries the root sentinel — findPrefabEditRoot keys off it — and its localId comes
@@ -191,12 +227,13 @@ export function buildPrefabEditScene(prefab: PrefabFile): SceneData {
     // edit session, not inline here.
     return {
       id: pe.localId, name: pe.name, traits,
-      prefab: pe.prefab, overrides: pe.overrides,
-      added: pe.added, removed: pe.removed, removedTraits: pe.removedTraits,
+      prefab: pe.prefab, overrides: editWorldRefs(prefab, pe.overrides, 1) as typeof pe.overrides,
+      added: editWorldRefs(prefab, pe.added, 1) as typeof pe.added, removed: pe.removed, removedTraits: pe.removedTraits,
       // Both nested channels too (#1381): the row becomes a top-level scene entry here, the carrier
       // that already reads them, so the edit world shows the row as instances of it expand. The
       // save re-captures them from this live expansion (`planPrefabRows`).
-      nestedOverrides: pe.nestedOverrides, nestedStructure: pe.nestedStructure,
+      nestedOverrides: byPathDepth(pe.nestedOverrides, (v, d) => editWorldRefs(prefab, v, d)),
+      nestedStructure: byPathDepth(pe.nestedStructure, (v, d) => editWorldRefs(prefab, v, d)),
     };
   });
   entities.push(...scaffoldEntities());

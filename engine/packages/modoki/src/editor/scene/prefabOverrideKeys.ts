@@ -21,7 +21,7 @@ import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegist
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import {
-  collectComparableTraits, getOverrideValues, captureInstanceStructure,
+  collectComparableTraits, getOverrideValues, captureInstanceStructure, baseTokenResolver,
   isTemplateExcludedField, type PrefabFile,
 } from './prefab';
 
@@ -72,6 +72,7 @@ export function collectInstanceOverrideFields(rootInstanceId: number, prefab: Pr
   const entityNameMeta = getTraitByName('EntityAttributes');
 
   const entries: EntityOverrideNode[] = [];
+  const resolveBase = baseTokenResolver(rootInstanceId); // #1352: a base ref held as a member token
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
     const piData = pi as Record<string, unknown>;
     if (piData.rootInstanceId !== rootInstanceId) return;
@@ -86,7 +87,7 @@ export function collectInstanceOverrideFields(rootInstanceId: number, prefab: Pr
     // comparison: the dialog reported it as un-overridden and the user could not apply it,
     // while the scene serializer stored it correctly. QA-CTX-0003 close-out sweep.
     const currentTraits = collectComparableTraits(ecsId, allTraits);
-    const diffs = getOverrideValues(localId, currentTraits, prefab);
+    const diffs = getOverrideValues(localId, currentTraits, prefab, resolveBase);
     if (Object.keys(diffs).length === 0) return;
 
     // Entity display name: prefer live EntityAttributes.name; fall back to prefab name.

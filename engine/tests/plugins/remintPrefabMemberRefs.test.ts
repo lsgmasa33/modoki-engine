@@ -153,6 +153,14 @@ const WB = 'aaaaaaaa-0000-4000-8000-000000000009';
 const faDoc = { id: FA, rootLocalId: 1, entities: [row(1, 'FaRoot', 0), row(2, 'FaSlot', 1, { prefab: INNER, added: [{ parentLocalId: 2, guid: '', name: 'X', prefab: INNER, traits: {}, children: [] }] })] };
 const fvDoc = { id: FV, rootLocalId: 1, entities: [row(1, 'FvRoot', 0), row(2, 'FvSlot', 1, { prefab: LEAFY, added: [{ parentLocalId: 2, guid: '', name: 'X', prefab: WB, traits: {}, children: [] }] })] };
 const wbDoc = { id: WB, rootLocalId: 1, entities: [row(1, 'WbRoot', 0), row(2, 'WbSlot', 1, { prefab: INNER, added: [{ parentLocalId: 2, guid: '', name: 'X', prefab: LEAFY, traits: {}, children: [] }] })] };
+// KY's nested INNER row adds TEMPLATE-keyed nodes (#1387): a plain one (with a plain keyed child) under
+// Leaf, and a reference to LEAFY under InnerRoot. Each derives, stepping by its key.
+const KY = 'aaaaaaaa-0000-4000-8000-00000000000a';
+const kyDoc = { id: KY, rootLocalId: 1, entities: [row(1, 'KyRoot', 0), row(2, 'KySlot', 1, { prefab: INNER, added: [
+  { parentLocalId: 2, guid: '', key: 'dddddddd-0000-4000-8000-000000000001', name: 'Kp', traits: { EntityAttributes: { name: 'Kp' } }, children: [
+    { parentLocalId: 0, guid: '', key: 'dddddddd-0000-4000-8000-000000000002', name: 'Kc', traits: { EntityAttributes: { name: 'Kc' } }, children: [] }] },
+  { parentLocalId: 1, guid: '', key: 'dddddddd-0000-4000-8000-000000000003', name: 'Kr', prefab: LEAFY, traits: {}, children: [] },
+] })] };
 const topDoc = { id: TOP, rootLocalId: 1, entities: [row(1, 'TopRoot', 0), row(2, 'TopSlot', 1, { prefab: MID })] };
 
 let n = 0;
@@ -166,6 +174,7 @@ beforeEach(() => {
   prefabs.set(LEAFY, leafyDoc);
   prefabs.set(MID, midDoc);
   prefabs.set(TOP, topDoc);
+  prefabs.set(KY, kyDoc);
   prefabs.set(BACK, backDoc);
   prefabs.set(FA, faDoc);
   prefabs.set(FV, fvDoc);
@@ -271,6 +280,10 @@ const SHAPES: ReadonlyArray<readonly [string, Record<string, unknown>, string]> 
   ['a file-borne reference whose file adds back the prefab of the row that added it',
     { prefab: FV },
     'FvRoot/LeafyRoot/Tip/WbRoot/InnerRoot/Leaf/LeafyRoot/Tip'],
+  // #1387: a template-keyed node derives by `'+key'`, and so does everything under it.
+  ['a template-keyed plain node in a row\'s added', { prefab: KY }, 'KyRoot/InnerRoot/Leaf/Kp'],
+  ['a template-keyed plain child of a keyed plain node', { prefab: KY }, 'KyRoot/InnerRoot/Leaf/Kp/Kc'],
+  ['a member of a template-keyed reference node', { prefab: KY }, 'KyRoot/InnerRoot/LeafyRoot/Tip'],
   ['an instance of the prefab being walked, added under one of its own members',
     { prefab: OUTER, added: [refNode(3, OUTER)] },
     'OuterRoot/Panel/Button/OuterRoot/Panel/Button'],

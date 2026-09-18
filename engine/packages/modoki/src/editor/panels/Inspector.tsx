@@ -15,7 +15,7 @@ import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { getAnimSet } from '../../runtime/loaders/animSetCache';
 import { useEditorStore } from '../store/editorStore';
-import { getPrefabSource, getCachedPrefabSync, getOverrides } from '../scene/prefab';
+import { getPrefabSource, getCachedPrefabSync, getOverrides, baseTokenResolver } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { isSkippedByPrimarySave } from '../scene/serialize';
 import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
@@ -1785,7 +1785,9 @@ export default function Inspector() {
         if (meta.category === 'tag' || !data) continue;
         currentTraits[meta.name] = data;
       }
-      setOverrides(getOverrides(lid, currentTraits, prefab));
+      // A base ref held as a member token compares against the guid it resolved to (#1352).
+      const root = (piNow?.['rootInstanceId'] as number) || 0;
+      setOverrides(getOverrides(lid, currentTraits, prefab, root ? baseTokenResolver(root) : undefined));
     };
 
     // Capture selection at fetch time; on resolution, only apply the result if

@@ -12,7 +12,8 @@ import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
-import { durableGuid } from '../../runtime/core/assetRefRules';
+import { durableGuid, deriveMemberGuid, memberStepId, addedKeyStep, mapStringValues } from '../../runtime/core/assetRefRules';
+import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { entityRef, type EntityRef } from '../undo/entityRef';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -21,8 +22,9 @@ import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZ
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { isTraitDefault } from './traitDefault';
-import type { AddedEntity, NestedOverridePaths, NestedStructurePaths } from '../../runtime/loaders/loadSceneFile';
-import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, prefabSubtreeLocalIds, deriveInstanceMemberGuids, applyStructureCore } from '../../runtime/loaders/loadSceneFile';
+import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData } from '../../runtime/loaders/loadSceneFile';
+import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, prefabSubtreeLocalIds, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens } from '../../runtime/loaders/loadSceneFile';
+import { rebaseMemberTokens, isMemberToken, parseMemberToken, memberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
 
 /** Fields that persist in a SCENE but must never be baked into a prefab TEMPLATE,
  *  keyed "Trait.field".
@@ -170,6 +172,8 @@ function collectTree(entityId: number, allEntities: EntityInfo[]): EntityInfo[] 
  *  nested channels (#1381). */
 interface PlannedNestedRow {
   ref: InstanceReference;
+  /** The baseline each `nestedStructure` path is compared against once tokenized (#1352). */
+  structureBaselines: Map<string, InstanceStructureData>;
   childPrefab: PrefabFile;
   nestedOverrides?: NestedOverridePaths;
   nestedStructure?: NestedStructurePaths;
@@ -208,13 +212,15 @@ function planPrefabRows(
         console.warn(`[Prefab] nested prefab "${source}" not cached; flattening instead of referencing`);
         continue;
       }
-      const ref = captureInstanceReference(e.id, source, childPrefab);
+      // TEMPLATE form: this is written into a prefab file (#1387).
+      const ref = captureInstanceReference(e.id, source, childPrefab, { template: true });
       // The row is the OUTERMOST layer for its own nested rows within this file, so it carries their
       // edits itself — the same writer a scene entry and a reference node use (#1381). Captured from
       // the live expansion rather than passed through from the file, or an edit made in the prefab
       // editor inside a nested row would be overwritten by the value it replaced.
-      const channels = captureNestedChannels(source, ref.ownedNested, { omitUnchanged: true });
-      nestedRefs.set(e.id, { ref, childPrefab, nestedOverrides: channels.nestedOverrides, nestedStructure: channels.nestedStructure });
+      const structureBaselines = new Map<string, InstanceStructureData>();
+      const channels = captureNestedChannels(source, ref.ownedNested, { omitUnchanged: true, template: true, baselinesOut: structureBaselines });
+      nestedRefs.set(e.id, { ref, childPrefab, structureBaselines, nestedOverrides: channels.nestedOverrides, nestedStructure: channels.nestedStructure });
       // Exclude the nested instance's members (except the root, which becomes a
       // reference row) and any added subtrees it folded in.
       for (const m of ref.memberEcsIds) if (m !== e.id) skip.add(m);
@@ -324,6 +330,146 @@ function authoringEntitiesFor(selectedEntityId: number, all: EntityInfo[]): { en
  *  child `prefab` GUID + captured overrides/structure — and their members are
  *  excluded from the flat output. The selection root itself is never collapsed
  *  this way (so "save instance as prefab" still flattens the instance). */
+/** Rewrites refs held in a TEMPLATE being written from the live tree under `rootEcsId` (#1352).
+ *
+ *  A payload is in the frame of the instance it is applied to: the written root for a flat row's bag,
+ *  a nested row's live root for its `overrides`/`added`, and the owned instance a `nestedOverrides` /
+ *  `nestedStructure` path addresses. A string value equal to the guid of an entity the payload's frame
+ *  can name becomes a member token. If only an ENCLOSING frame can name it, the token climbs `^` once
+ *  per level, and it always takes the NEAREST such frame. That makes the spelling canonical, which the
+ *  #1381 no-op comparison needs: MID's own save and OUTER's save of the same MID interior must write
+ *  the same token, or OUTER pins an interior it never changed. A ref out of the written tree is left
+ *  as it is.
+ *
+ *  Steps: the written root's frame names each row by its NEW localId (`ecsToLocal`). Any other frame
+ *  is a live instance whose members step as the derive pass walks them (`memberPathIndex`). A
+ *  reference node's payload is left whole, since it is applied in its own frame. */
+function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLocal: Map<number, number>) {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  const children = new Map<number, EntityInfo[]>();
+  for (const e of all) {
+    const list = children.get(e.parentId);
+    if (list) list.push(e);
+    else children.set(e.parentId, [e]);
+  }
+  const piOf = (id: number) => (piMeta ? readTraitData(id, piMeta) as { localId?: number; parentLocalId?: number; rootInstanceId?: number } | null : null);
+  const pathInRoot = new Map<string, MemberStep[]>();
+  const rootGuid = all.find((e) => e.id === rootEcsId)?.guid;
+  if (rootGuid) pathInRoot.set(rootGuid, []);
+  const stack: [number, MemberStep[]][] = [[rootEcsId, []]];
+  const seen = new Set<number>([rootEcsId]);
+  while (stack.length) {
+    const [id, path] = stack.pop()!;
+    for (const c of children.get(id) ?? []) {
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
+      const key = templateKeyOf(findEntity(c.id));
+      const pi = piOf(c.id);
+      const step: MemberStep | null = ecsToLocal.has(c.id) ? ecsToLocal.get(c.id)!
+        : key ? addedKeyStep(key)
+        : pi ? memberStepId(pi) : null;
+      if (step === null) continue;
+      const at = [...path, step];
+      if (c.guid) pathInRoot.set(c.guid, at);
+      const storedRoot = !!pi && pi.rootInstanceId === c.id && !pi.parentLocalId;
+      if (!storedRoot || ecsToLocal.has(c.id)) stack.push([c.id, at]);
+    }
+  }
+  const frames = new Map<number, Map<string, MemberStep[]>>([[rootEcsId, pathInRoot]]);
+  const pathsIn = (frame: number): Map<string, MemberStep[]> => {
+    let out = frames.get(frame);
+    if (out) return out;
+    out = new Map();
+    if (eaMeta) {
+      for (const [key, target] of memberPathIndex(getCurrentWorld(), frame)) {
+        const guid = target ? (target.get(eaMeta.trait) as { guid?: string }).guid : '';
+        if (guid) out.set(guid, key ? key.split('.').map((x) => (x.startsWith('+') ? x : Number(x))) : []);
+      }
+    }
+    frames.set(frame, out);
+    return out;
+  };
+  /** The frame one level out: a written row's frame is the root's, and an owned nested instance's
+   *  frame is the one its row sits in. */
+  const enclosing = (frame: number): number => {
+    if (frame === rootEcsId) return 0;
+    if (ecsToLocal.has(frame)) return rootEcsId;
+    const parent = eaMeta ? ((readTraitData(frame, eaMeta)?.parentId as number) || 0) : 0;
+    return (parent && piOf(parent)?.rootInstanceId) || rootEcsId;
+  };
+  /** token → the guid it was written for, so `undeclaredKeys` can put one back. */
+  const origin = new Map<string, string>();
+  const value = (v: unknown, frame: number): unknown => mapStringValues(v, (str) => {
+    if (!str) return str;
+    for (let f = frame, up = 0; f; f = enclosing(f), up++) {
+      const p = pathsIn(f).get(str);
+      if (p) { const t = memberToken(up, p); origin.set(t, str); return t; }
+    }
+    return str;
+  });
+  /** `v` with every token that steps through a key no file declares turned back into its guid. The key
+   *  was minted for a live node the write then left out, because the file's pre-key version of that
+   *  interior still counts as unchanged (`sameStructure`). A token for it would name nothing on
+   *  reload, where the guid still resolved (#1352 review). */
+  const undeclaredKeys = (v: unknown, declared: ReadonlySet<string>): unknown => mapStringValues(v, (str) => {
+    const t = isMemberToken(str) ? parseMemberToken(str) : null;
+    if (!t || !t.path.some((step) => typeof step === 'string' && !declared.has(step.slice(1)))) return str;
+    return origin.get(str) ?? str;
+  });
+  const added = (nodes: AddedEntity[] | undefined, frame: number): AddedEntity[] | undefined => nodes?.map((n) => (n.prefab ? n : {
+    ...n, traits: value(n.traits, frame) as AddedEntity['traits'], children: added(n.children, frame) ?? [],
+  }));
+  /** The live owned instance a `nestedOverrides`/`nestedStructure` path addresses below `rowRoot`
+   *  (each step a row localId), or 0. */
+  const frameAt = (rowRoot: number, pathKey: string): number => {
+    let cur = rowRoot;
+    for (const step of pathKey.split('.').map(Number)) {
+      let next = 0;
+      for (const e of all) {
+        const pi = piOf(e.id);
+        if (!pi || pi.rootInstanceId !== e.id || pi.parentLocalId !== step) continue;
+        if (piOf(e.parentId)?.rootInstanceId === cur) { next = e.id; break; }
+      }
+      if (!next) return 0;
+      cur = next;
+    }
+    return cur;
+  };
+  return { value, added, frameAt, undeclaredKeys, root: rootEcsId };
+}
+
+/** Resolves the member tokens in a prefab BASE value against the live instance rooted at
+ *  `rootInstanceId`, so it can be compared with the live value, which holds guids (#1352). A `^`
+ *  climbs to the instance whose row expanded this one. A token that names nothing stays as it is. */
+export function baseTokenResolver(rootInstanceId: number): (value: unknown) => unknown {
+  const world = getCurrentWorld();
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  const indexes = new Map<number, ReturnType<typeof memberPathIndex>>();
+  const frameUp = (root: number, up: number): number => {
+    let r = root;
+    for (let i = 0; i < up && r; i++) {
+      const pi = piMeta ? readTraitData(r, piMeta) : null;
+      if (!pi?.parentLocalId || !eaMeta) return 0; // a stored root is its own frame: nothing above it
+      const parent = (readTraitData(r, eaMeta)?.parentId as number) || 0;
+      r = parent && piMeta ? ((readTraitData(parent, piMeta)?.rootInstanceId as number) || 0) : 0;
+    }
+    return r;
+  };
+  const resolve = (token: string): string => {
+    const t = parseMemberToken(token);
+    const frame = t ? frameUp(rootInstanceId, t.up) : 0;
+    if (!t || !frame || !eaMeta) return token;
+    let index = indexes.get(frame);
+    if (!index) { index = memberPathIndex(world, frame); indexes.set(frame, index); }
+    const target = index.get(memberPathKey(t.path));
+    const guid = target ? ((target.get(eaMeta.trait) as { guid?: string }).guid ?? '') : '';
+    return guid || token;
+  };
+  return (value) => mapStringValues(value, (v) => (isMemberToken(v) ? resolve(v) : v));
+}
+
 export function serializePrefab(
   selectedEntityId: number,
   existingId?: string,
@@ -378,6 +524,9 @@ export function serializePrefab(
 
   const allTraits = getAllTraits();
   const prefabEntities: PrefabEntity[] = [];
+  // A ref from one member of the written tree to another becomes a member TOKEN (#1352): the file is a
+  // template, and the live guid it held names the SOURCE entity in every instance.
+  const tokens = templateTokenizer(selectedEntityId, allEntities, ecsToLocal);
 
   for (const entityInfo of flatTree) {
     const localId = ecsToLocal.get(entityInfo.id)!;
@@ -390,17 +539,30 @@ export function serializePrefab(
       const ea = readTraitData(entityInfo.id, piMeta!) && getTraitByName('EntityAttributes')
         ? readTraitData(entityInfo.id, getTraitByName('EntityAttributes')!) : null;
       const parentLocal = ea && ea.parentId !== undefined ? (ecsToLocal.get(ea.parentId as number) || 0) : 0;
+      // Each payload is in the frame of the instance it is applied to: the row's own in the child's
+      // (one level down), a nested path's in the instance that path addresses.
+      const frameOf = (pathKey: string) => tokens.frameAt(entityInfo.id, pathKey) || entityInfo.id;
+      let nestedStructure: NestedStructurePaths | undefined;
+      for (const [k, delta] of Object.entries(nested.nestedStructure ?? {})) {
+        const t = { ...delta, added: tokens.added(delta.added, frameOf(k)) ?? [] };
+        const baseline = nested.structureBaselines.get(k);
+        if (baseline && sameStructure(t, baseline)) continue; // #1381's no-op rule, over tokenized content
+        (nestedStructure ??= {})[k] = t;
+      }
+      const nestedOverrides = nested.nestedOverrides
+        ? Object.fromEntries(Object.entries(nested.nestedOverrides).map(([k, v]) => [k, tokens.value(v, frameOf(k))]))
+        : undefined;
       prefabEntities.push({
         localId,
         name: entityInfo.name,
         traits: { EntityAttributes: { name: entityInfo.name, parentId: parentLocal, guid: '' } },
         prefab: nested.ref.source,
-        overrides: nested.ref.overrides,
-        added: nested.ref.added,
+        overrides: tokens.value(nested.ref.overrides, entityInfo.id) as typeof nested.ref.overrides,
+        added: tokens.added(nested.ref.added, entityInfo.id),
         removed: nested.ref.removed,
         removedTraits: nested.ref.removedTraits,
-        nestedOverrides: nested.nestedOverrides,
-        nestedStructure: nested.nestedStructure,
+        nestedOverrides: nestedOverrides as NestedOverridePaths | undefined,
+        nestedStructure,
       });
       continue;
     }
@@ -467,7 +629,7 @@ export function serializePrefab(
           }
           (traitData as Record<string, unknown>)['guid'] = '';
         }
-        entry.traits[meta.name] = traitData;
+        entry.traits[meta.name] = tokens.value(traitData, tokens.root) as typeof traitData;
       }
     }
 
@@ -487,6 +649,16 @@ export function serializePrefab(
         const g = getGuidForPath(v);
         if (g) obj[field] = g;
       }
+    }
+  }
+
+  // A token may name a keyed node only if some file declares that key: this one, or a prefab it nests.
+  const declared = new Set<string>(templateKeysOf({ entities: prefabEntities } as PrefabFile));
+  for (const doc of new Set(prefabCache.values())) for (const k of templateKeysOf(doc)) declared.add(k);
+  for (const pe of prefabEntities) {
+    pe.traits = tokens.undeclaredKeys(pe.traits, declared) as typeof pe.traits;
+    for (const field of ['overrides', 'added', 'nestedOverrides', 'nestedStructure'] as const) {
+      if (pe[field]) (pe as unknown as Record<string, unknown>)[field] = tokens.undeclaredKeys(pe[field], declared);
     }
   }
 
@@ -698,10 +870,19 @@ export function instantiatePrefab(
    *  forwarded exactly like `_nestedOverrides` — the editor twin of `instantiatePrefabIntoWorld`'s
    *  parameter (#1369), so a reference node's `nestedStructure` expands the same in both. */
   _nestedStructure?: NestedStructurePaths,
+  /** This instance's path from the TOP call's root, one segment per nesting level — the loader
+   *  twin's parameter (#1352). Absent on a top call, which registers its root for member-token
+   *  resolution; callers run `deriveInstanceMemberGuids`, which resolves it. */
+  _segments?: MemberStep[][],
 ): number {
+  const segments = _segments ?? [];
+  // The loader twin's token scope: a tree holding no member token registers no frame (#1352 review).
+  const outerScope = _segments ? null : openTokenScope();
+  noteTokens(prefab.entities, _nestedOverrides, _nestedStructure);
   const stack = _stack ?? new Set<string>();
   if (prefab.id) {
     if (stack.has(prefab.id)) {
+      if (outerScope) closeTokenScope(outerScope);
       console.error(`[Prefab] cycle detected — prefab ${prefab.id} nests itself; aborting expansion`);
       return 0;
     }
@@ -747,7 +928,8 @@ export function instantiatePrefab(
       const { direct: structDirect, forward: outerStructForward } = descendPathKeyed(_nestedStructure, pe.localId);
       // The row's OWN deep structure (#1381) sits under the outer layer's — the loader's rule.
       const structForward = mergeNestedStructurePaths(pe.nestedStructure, outerStructForward);
-      const childRoot = instantiatePrefab(child, 0, stack, childNested, structForward);
+      const childSegments = [...segments, rowPathInPrefab(prefab, pe.localId)];
+      const childRoot = instantiatePrefab(child, 0, stack, childNested, structForward, childSegments);
       if (!childRoot) continue;
       setPrefabSource(childRoot, pe.prefab);
       // Stamp parentLocalId so serialize knows which row produced this nested
@@ -760,14 +942,16 @@ export function instantiatePrefab(
           });
         }
       }
+      // Applied HERE rather than inside the child call (the loader's shape), so rebased here, onto the
+      // child's segments: these values are in the child's frame (#1352).
       const childOverrides = outerDirect ? mergeOverrideMaps(pe.overrides, outerDirect) : pe.overrides;
-      if (childOverrides) applyOverridesByRootInstance(childRoot, childOverrides);
+      if (childOverrides) applyOverridesByRootInstance(childRoot, rebaseMemberTokens(childOverrides, childSegments) as typeof childOverrides);
       if (structDirect) {
         applyStructureByRootInstance(childRoot, child, {
-          added: structDirect.added ?? [], removed: structDirect.removed ?? [], removedTraits: structDirect.removedTraits ?? {},
+          added: rebaseAddedMemberTokens(structDirect.added ?? [], childSegments), removed: structDirect.removed ?? [], removedTraits: structDirect.removedTraits ?? {},
         });
       } else if (pe.added?.length || pe.removed?.length || pe.removedTraits) {
-        applyStructureByRootInstance(childRoot, child, { added: pe.added, removed: pe.removed, removedTraits: pe.removedTraits });
+        applyStructureByRootInstance(childRoot, child, { added: rebaseAddedMemberTokens(pe.added, childSegments), removed: pe.removed, removedTraits: pe.removedTraits });
       }
       localToEcs.set(pe.localId, childRoot);
       continue;
@@ -791,7 +975,7 @@ export function instantiatePrefab(
         // a localId, and left live it would name whichever entity holds that number — so the removal
         // cascade of a nested row's structure, which runs below mid-pass, would take this row (#1247).
         if (meta.name === 'EntityAttributes') data.parentId = 0;
-        traitArgs.push(meta.trait(data));
+        traitArgs.push(meta.trait(rebaseMemberTokens(data, segments) as Record<string, unknown>));
       }
     }
 
@@ -852,7 +1036,19 @@ export function instantiatePrefab(
   markUIDirty();
 
   if (prefab.id) stack.delete(prefab.id);
+  if (outerScope && closeTokenScope(outerScope) && rootEcsId) registerTemplateFrame(getCurrentWorld(), rootEcsId);
   return rootEcsId;
+}
+
+/** `rebaseMemberTokens` over `added` nodes; a reference node is left whole (it is its own frame).
+ *  The loader's `rebaseAddedTokens`, for the structure the editor applies at the parent level. */
+function rebaseAddedMemberTokens(nodes: AddedEntity[] | undefined, segments: MemberStep[][]): AddedEntity[] | undefined {
+  if (!nodes || !segments.length) return nodes;
+  return nodes.map((n) => (n.prefab ? n : {
+    ...n,
+    traits: rebaseMemberTokens(n.traits, segments) as AddedEntity['traits'],
+    children: rebaseAddedMemberTokens(n.children, segments) ?? [],
+  }));
 }
 
 /** Set the source path on all entities of a prefab instance */
@@ -1153,6 +1349,10 @@ export function getOverrideValues(
   entityLocalId: number,
   currentTraits: Record<string, Record<string, unknown>>,
   prefab: PrefabFile,
+  /** Resolves the member tokens a base value holds against this instance (`baseTokenResolver`), so a
+   *  ref the template names by path compares equal to the guid it resolved to (#1352). Without it a
+   *  token-bearing base field reads as overridden on every instance. */
+  resolveBase?: (value: unknown) => unknown,
 ): Record<string, Record<string, unknown>> {
   const result: Record<string, Record<string, unknown>> = {};
   const prefabEntity = prefab.entities.find((e) => e.localId === entityLocalId);
@@ -1206,7 +1406,8 @@ export function getOverrideValues(
       // back would write one instance's guid into the prefab base and make every
       // future instance collide on the same guid.
       if (traitName === 'EntityAttributes' && field === 'guid') continue;
-      const origValue = field in original ? original[field] : baseSchema?.[field];
+      const rawOrig = field in original ? original[field] : baseSchema?.[field];
+      const origValue = resolveBase ? resolveBase(rawOrig) : rawOrig;
       if (origValue !== undefined && !valuesEqual(value, origValue)) {
         if (!result[traitName]) result[traitName] = {};
         result[traitName][field] = value;
@@ -1253,9 +1454,10 @@ export function getOverrides(
   entityLocalId: number,
   currentTraits: Record<string, Record<string, unknown>>,
   prefab: PrefabFile,
+  resolveBase?: (value: unknown) => unknown,
 ): Set<string> {
   const overrides = new Set<string>();
-  const values = getOverrideValues(entityLocalId, currentTraits, prefab);
+  const values = getOverrideValues(entityLocalId, currentTraits, prefab, resolveBase);
   for (const [traitName, fields] of Object.entries(values)) {
     for (const field of Object.keys(fields)) {
       overrides.add(`${traitName}.${field}`);
@@ -1297,6 +1499,7 @@ export function captureInstanceOverrides(
 
   const allTraits = getAllTraits();
   const result: Record<number, Record<string, Record<string, unknown>>> = {};
+  const resolveBase = baseTokenResolver(rootInstanceId);
 
   // Walk every entity that belongs to this instance via PrefabInstance.rootInstanceId
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
@@ -1320,7 +1523,7 @@ export function captureInstanceOverrides(
     // as `{name: {}}`. See runtime/core/ecs/traitSchema.ts.
     const currentTraits = collectComparableTraits(entity.id(), allTraits);
 
-    const diffs = getOverrideValues(localId, currentTraits, prefab);
+    const diffs = getOverrideValues(localId, currentTraits, prefab, resolveBase);
     const markSet = getOverrideMarkSet(entity);
 
     // Mark-gate prefab-DEFINED field diffs. getOverrideValues reports every field
@@ -1534,11 +1737,109 @@ function snapshotAddedTraits(ecsId: number): { bag: Record<string, Record<string
   return { bag, guid };
 }
 
+/** Which document a structural capture is written INTO. */
+export interface StructureCaptureOpts {
+  /** TEMPLATE form (#1387): the capture is written into a prefab file, so an added node carries its
+   *  template `key` and `guid: ''` — never the live guid, which every instance of the prefab would
+   *  then spawn with. Default (scene form): the live durable guid, as a scene-authored node carries. */
+  template?: boolean;
+}
+
+/** An added node's identity in the document being written: the live durable guid (scene form), or
+ *  the template key (template form). The key comes off the live marker; failing that it is RECOVERED
+ *  from the node's derived guid (`recoverTemplateKey`); only a node that never came from a template
+ *  gets a fresh one. Stamped either way, so the next template write of the same live entity writes the
+ *  same key rather than churning it. */
+function addedNodeIdentity(ecsId: number, template: boolean | undefined): { guid: string; key?: string } {
+  if (!template) {
+    const eaMeta = getTraitByName('EntityAttributes');
+    return { guid: eaMeta ? durableGuid(readTraitData(ecsId, eaMeta)?.guid as string) : '' }; // #1210
+  }
+  const entity = findEntity(ecsId);
+  let key = templateKeyOf(entity);
+  if (!key) {
+    key = recoverTemplateKey(ecsId) || newGuid();
+    setTemplateKey(entity, key);
+  }
+  return { guid: '', key };
+}
+
+/** Every template key a prefab document declares — its rows' `added`, their `nestedStructure[*].added`,
+ *  and a reference node's own `added`/`nestedStructure`, recursively. Memoised per cached document. */
+const templateKeysByDoc = new WeakMap<PrefabFile, string[]>();
+function templateKeysOf(doc: PrefabFile): string[] {
+  const memo = templateKeysByDoc.get(doc);
+  if (memo) return memo;
+  const keys: string[] = [];
+  const nodes = (list: AddedEntity[] | undefined): void => {
+    for (const n of list ?? []) {
+      if (n.key) keys.push(n.key);
+      nodes(n.children);
+      nodes(n.added);
+      structure(n.nestedStructure);
+    }
+  };
+  const structure = (paths: NestedStructurePaths | undefined): void => {
+    for (const delta of Object.values(paths ?? {})) nodes(delta?.added);
+  };
+  for (const pe of doc.entities) { nodes(pe.added); structure(pe.nestedStructure); }
+  templateKeysByDoc.set(doc, keys);
+  return keys;
+}
+
+/** The template key a live added node had when it was spawned, recovered from its guid — for when
+ *  the marker is gone. Any scene-form round trip drops it: Play→Stop reloads a `serializeScene`
+ *  snapshot, and delete→undo respawns from a registry-only snapshot. Minting a fresh key then
+ *  re-keyed the node, moved every instance's derived guid, and pinned the inner prefab's untouched
+ *  interior into the outer row on a no-op save (the #1381 defect over again — #1387 review).
+ *
+ *  Both round trips keep the node's GUID, and a keyed node's guid is `deriveMemberGuid(anchor,
+ *  [...path, '+' + key])`. So each ancestor is tried as the anchor, with each key the cached prefab
+ *  files declare, until the derivation reproduces the live guid. A keyed ancestor that lost its marker
+ *  too recovers first. `''` when nothing matches: the node was not spawned from a template key. */
+function recoverTemplateKey(ecsId: number, memo = new Map<number, string>()): string {
+  const done = memo.get(ecsId);
+  if (done !== undefined) return done;
+  memo.set(ecsId, ''); // a parent cycle resolves to nothing instead of recursing
+  const eaMeta = getTraitByName('EntityAttributes');
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!eaMeta) return '';
+  const guid = durableGuid(readTraitData(ecsId, eaMeta)?.guid as string);
+  if (!guid) return '';
+  const keys = new Set<string>();
+  for (const doc of new Set(prefabCache.values())) for (const k of templateKeysOf(doc)) keys.add(k);
+  if (!keys.size) return '';
+  const steps: (number | string)[] = [];
+  let cur = (readTraitData(ecsId, eaMeta)?.parentId as number) || 0;
+  const seen = new Set<number>([ecsId]);
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const anchor = durableGuid(readTraitData(cur, eaMeta)?.guid as string);
+    if (anchor) {
+      for (const k of keys) {
+        if (deriveMemberGuid(anchor, [...steps, addedKeyStep(k)]) === guid) { memo.set(ecsId, k); return k; }
+      }
+    }
+    // This ancestor is on the path, not the anchor: prepend its step, as the derive pass does. A
+    // prefab member steps by its localId. Only a plain node can be a keyed one that lost its marker,
+    // and only that case recovers recursively. The memo keeps the whole walk linear in depth (a
+    // recursion at every ancestor was 2^depth: measured 1 s per node at depth 14 — #1352 review).
+    const ownKey = templateKeyOf(findEntity(cur));
+    const pi = piMeta ? readTraitData(cur, piMeta) : null;
+    const step = ownKey ? addedKeyStep(ownKey)
+      : pi ? memberStepId(pi as { localId?: number; parentLocalId?: number })
+      : (() => { const k = recoverTemplateKey(cur, memo); return k ? addedKeyStep(k) : 0; })();
+    steps.unshift(step);
+    cur = (readTraitData(cur, eaMeta)?.parentId as number) || 0;
+  }
+  return '';
+}
+
 /** Compute the structural diff between a live prefab instance and its source:
  *  child entities the instance added, prefab members it deleted, and prefab
  *  components it removed from surviving members. (Added components are already
  *  captured as added-trait overrides by captureInstanceOverrides.) */
-export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabFile): InstanceStructure {
+export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabFile, opts: StructureCaptureOpts = {}): InstanceStructure {
   const empty: InstanceStructure = { added: [], removed: [], removedTraits: {}, consumedEcsIds: new Set(), ownedNested: new Map() };
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return empty;
@@ -1573,7 +1874,6 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   if (localToEcs.size === 0) return empty;
 
   const isMember = (ecsId: number) => ecsToLocal.has(ecsId);
-  const eaMeta = getTraitByName('EntityAttributes');
   // Classify a non-member child that is a self-rooted prefab instance (a NESTED
   // instance hanging under one of our members):
   //  - 'owned'     — it expanded from THIS prefab's own definition (its
@@ -1724,17 +2024,16 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       console.warn(`[Prefab] user-added nested instance "${source}" not cached; exact placement not captured`);
       return null;
     }
-    const ref = captureInstanceReference(ecsId, source, childPrefab);
+    const ref = captureInstanceReference(ecsId, source, childPrefab, opts);
     for (const m of ref.memberEcsIds) consumedEcsIds.add(m);
     for (const c of ref.consumedEcsIds) consumedEcsIds.add(c);
-    const guid = eaMeta ? durableGuid(readTraitData(ecsId, eaMeta)?.guid as string) : ''; // #1210
     // The node is the OUTERMOST layer for its own nested rows, so it carries their scene edits itself
     // — the same two channels a top-level entry carries (#1369). Without them an edit inside a row
     // expansion of a DRAGGED-IN prefab was captured by nothing and came back on reload.
-    const channels = captureNestedChannels(source, ref.ownedNested);
+    const channels = captureNestedChannels(source, ref.ownedNested, { template: opts.template });
     for (const c of channels.consumedEcsIds) consumedEcsIds.add(c);
     return {
-      parentLocalId, guid, name: byId.get(ecsId)?.name || '', traits: {}, children: [],
+      parentLocalId, ...addedNodeIdentity(ecsId, opts.template), name: byId.get(ecsId)?.name || '', traits: {}, children: [],
       prefab: source,
       overrides: ref.overrides, added: ref.added, removed: ref.removed, removedTraits: ref.removedTraits,
       nestedOverrides: channels.nestedOverrides, nestedStructure: channels.nestedStructure,
@@ -1753,13 +2052,18 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   function snapshotSubtree(ecsId: number, parentLocalId: number): AddedEntity {
     consumedEcsIds.add(ecsId);
     const { bag, guid } = snapshotAddedTraits(ecsId);
+    // The bag's own copy of the guid goes with the node's: a template node's identity is its key.
+    const ea = bag['EntityAttributes'];
+    if (opts.template && ea && ea !== true) delete ea.guid;
     const children: AddedEntity[] = [];
     for (const child of childrenOf.get(ecsId) || []) {
       if (isMember(child.id)) continue;
       const node = captureChild(child.id, 0); // child of a plain added node → tree-shape parent
       if (node) children.push(node);
     }
-    return { parentLocalId, guid, name: byId.get(ecsId)?.name || '', traits: bag, children };
+    // Scene form keeps the snapshot's own guid; template form takes the key (#1387).
+    const identity = opts.template ? addedNodeIdentity(ecsId, true) : { guid };
+    return { parentLocalId, ...identity, name: byId.get(ecsId)?.name || '', traits: bag, children };
   }
 
   const added: AddedEntity[] = [];
@@ -1883,7 +2187,13 @@ function resolveEffectivePrefabStructure(
  *  writes `added` in anchor order, a hand-authored file in any order); and a file-authored trait bag
  *  is run through the capture's own compaction (`compactAddedTraitData`), so a legacy FULL bag
  *  matches the compacted capture of the entity it spawns. Anything still different writes the path,
- *  which is the safe direction. */
+ *  which is the safe direction.
+ *
+ *  Node IDENTITY (`key`, `guid`) is compared only when both sides key every node (#1387). A file written
+ *  before keys existed has none — a guid-less node, or one carrying the durable guid #1387 is about —
+ *  while the capture writes a key and `guid: ''` for each live node. That file's untouched interior is
+ *  still unchanged content, and pinning it into the OUTER row on a no-op save is the #1381 defect over
+ *  again. It migrates when its OWN prefab is re-saved, which writes the keys there. */
 function sameStructure(
   a: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> },
   b: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> },
@@ -1897,15 +2207,31 @@ function sameStructure(
     }
     return v;
   };
-  const asSet = (items: unknown[]): string[] => items.map((x) => JSON.stringify(x)).sort();
+  // Sorted BY their JSON but kept as values: nesting the JSON strings themselves re-escaped every level's
+  // quotes inside its parent's, so the text doubled per level of `children` (measured 1.4 s at 22 deep,
+  // out of memory at 24 — #1352 close-out).
+  const asSet = (items: unknown[]): unknown[] => items
+    .map((x) => [JSON.stringify(x), x] as const)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([, x]) => x);
+  const withoutBagGuid = (traits: Record<string, unknown>): Record<string, unknown> => {
+    const ea = traits['EntityAttributes'];
+    if (!ea || typeof ea !== 'object' || !('guid' in ea)) return traits;
+    const { guid: _drop, ...rest } = ea as Record<string, unknown>;
+    return { ...traits, EntityAttributes: rest };
+  };
+  const allKeyed = (nodes: AddedEntity[] | undefined): boolean =>
+    (nodes ?? []).every((n) => !!n.key && allKeyed(n.children) && allKeyed(n.added));
+  const withKeys = allKeyed(a.added) && allKeyed(b.added);
   const node = (n: AddedEntity): unknown => {
     const traits: Record<string, unknown> = {};
     for (const [name, data] of Object.entries(n.traits ?? {})) {
       const meta = getTraitByName(name);
       traits[name] = data === true || !meta ? data : compactAddedTraitData(meta, data as Record<string, unknown>);
     }
+    const { key, guid, ...rest } = n;
     return canon({
-      ...n, traits,
+      ...rest, ...(withKeys ? { key, guid } : {}), traits: withKeys ? traits : withoutBagGuid(traits),
       children: asSet((n.children ?? []).map(node)),
       ...(n.added ? { added: asSet(n.added.map(node)) } : {}),
     });
@@ -1952,6 +2278,13 @@ export function captureNestedChannels(
      *  live `parentId` that made them differ is no longer captured (#1377). A mismatch still writes,
      *  which is the conservative direction. */
     omitUnchanged?: boolean;
+    /** Capture each interior in TEMPLATE form (`StructureCaptureOpts`) — set by a prefab-file writer. */
+    template?: boolean;
+    /** With `omitUnchanged`: DEFER the omission — keep every path, and record the baseline it would
+     *  have been compared against. `serializePrefab` compares after rewriting refs into member tokens
+     *  (#1352): a live bag holds guids where the file holds tokens, so an early compare always differed
+     *  and pinned the interior. */
+    baselinesOut?: Map<string, InstanceStructureData>;
   } = {},
 ): {
   nestedOverrides?: NestedOverridePaths; nestedStructure?: NestedStructurePaths; consumedEcsIds: Set<number>;
@@ -2022,12 +2355,14 @@ export function captureNestedChannels(
       // (the two documents are not comparable — the live side is compacted by `snapshotAddedTraits` —
       // and dropping an empty list made "the row's own list no longer applies" unrepresentable, so
       // deleting the last member of a row-authored `added` came back on reload).
-      const structure = captureInstanceStructure(ecsId, childPrefab);
+      const structure = captureInstanceStructure(ecsId, childPrefab, { template: opts.template });
       for (const id of structure.consumedEcsIds) consumedEcsIds.add(id);
       const live = { added: structure.added, removed: structure.removed, removedTraits: structure.removedTraits };
       const baseline = resolveEffectivePrefabStructure(source, at);
       const unchanged = emptyStructure(live) && emptyStructure(baseline);
-      if (!unchanged && !(opts.omitUnchanged && sameStructure(live, baseline))) structures.set(key, live);
+      if (opts.omitUnchanged && opts.baselinesOut) {
+        if (!unchanged) { structures.set(key, live); opts.baselinesOut.set(key, baseline); }
+      } else if (!unchanged && !(opts.omitUnchanged && sameStructure(live, baseline))) structures.set(key, live);
       walk(structure.ownedNested, at);
     }
   };
@@ -2077,9 +2412,10 @@ export function captureInstanceReference(
   rootInstanceId: number,
   source: string,
   prefab: PrefabFile,
+  opts: StructureCaptureOpts = {},
 ): InstanceReference {
   const overrides = captureInstanceOverrides(rootInstanceId, prefab);
-  const structure = captureInstanceStructure(rootInstanceId, prefab);
+  const structure = captureInstanceStructure(rootInstanceId, prefab, opts);
   const memberEcsIds = new Set<number>();
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (PrefabInstanceMeta) {
@@ -2150,9 +2486,15 @@ export function applyStructureByRootInstance(
       spawnNestedInstance: (node, parentEcsId) => {
         const child = getCachedPrefabSync(node.prefab!);
         if (!child) { console.warn(`[Prefab] added nested instance "${node.prefab}" not cached`); return; }
+        // The node's own `overrides`/`added` are applied AFTER the expansion below closes its token scope,
+        // so this scope wraps the whole node: the loader's twin hands them INTO its top call, which notes
+        // them there (#1352 close-out review).
+        const scope = openTokenScope();
+        noteTokens(undefined, node.overrides, node.added);
         // The node's nested channels expand with it, as the loader's twin does (#1369).
         const childRoot = instantiatePrefab(child, parentEcsId, undefined, node.nestedOverrides, node.nestedStructure);
-        if (!childRoot) return;
+        if (!childRoot) { closeTokenScope(scope); return; }
+        if (closeTokenScope(scope)) registerTemplateFrame(getCurrentWorld(), childRoot);
         // RESTORE the node's own guid — the editor-side twin of the loader fix (QA-PREFAB-0004).
         // `captureNestedRef` reads the live guid onto the reference node precisely so a rebuild
         // can put it back, and `rebuildInstance` already does exactly this for the OUTER root
@@ -2165,6 +2507,9 @@ export function applyStructureByRootInstance(
           writeTraitField(childRoot, eaMeta, 'guid', node.guid);
           const ent = findEntity(childRoot);
           if (ent) indexEntityGuid(ent);
+        } else if (node.key) {
+          // A TEMPLATE reference node has no guid to restore; its root derives one from the key (#1387).
+          setTemplateKey(findEntity(childRoot), node.key);
         }
         setPrefabSource(childRoot, node.prefab!);
         if (node.overrides) applyOverridesByRootInstance(childRoot, node.overrides);
@@ -2556,6 +2901,32 @@ export async function installPrefabSnapshot(source: string, prefab: PrefabFile):
   await preloadNestedPrefabs(snap);
 }
 
+/** Scene-form added nodes rewritten into TEMPLATE form (#1387), recursively through `children`, a
+ *  reference node's `added` and its `nestedStructure`: `guid` cleared (the bag's copy too) and a `key`
+ *  given — the live entity's own marker when it still has one, else a fresh one. Promotion is where a
+ *  scene capture becomes a prefab row, so it is where the two forms meet. */
+function toTemplateNodes(nodes: AddedEntity[] | undefined): AddedEntity[] | undefined {
+  if (!nodes) return nodes;
+  return nodes.map((n) => {
+    const live = n.guid ? localToEcsGuid(n.guid) : 0;
+    const key = n.key || (live ? templateKeyOf(findEntity(live)) : '') || newGuid();
+    const traits = { ...n.traits };
+    const ea = traits['EntityAttributes'];
+    if (ea && ea !== true && 'guid' in ea) { const { guid: _drop, ...rest } = ea; traits['EntityAttributes'] = rest; }
+    const out: AddedEntity = { ...n, guid: '', key, traits, children: toTemplateNodes(n.children) ?? [] };
+    if (n.added) out.added = toTemplateNodes(n.added);
+    if (n.nestedStructure) out.nestedStructure = toTemplateStructure(n.nestedStructure);
+    return out;
+  });
+}
+
+function toTemplateStructure(paths: NestedStructurePaths | undefined): NestedStructurePaths | undefined {
+  if (!paths) return paths;
+  const out: NestedStructurePaths = {};
+  for (const [k, v] of Object.entries(paths)) out[k] = v.added ? { ...v, added: toTemplateNodes(v.added) } : v;
+  return out;
+}
+
 /** Insert an added subtree into `prefab` with fresh localIds (continuing the BFS
  *  counter). The subtree root's parentId(localId) is set to `parentLocalId`;
  *  nested children point at their freshly-minted parent localId. guid is cleared
@@ -2578,13 +2949,14 @@ function insertAddedSubtree(
       traits: { EntityAttributes: { name: node.name, parentId: parentLocalId, guid: '' } },
       prefab: node.prefab,
       overrides: node.overrides,
-      added: node.added,
+      // The node was captured in SCENE form (live guids); a prefab row is a template (#1387).
+      added: toTemplateNodes(node.added),
       removed: node.removed,
       removedTraits: node.removedTraits,
       // Both nested channels travel with the node (#1381): the node was the outermost layer for its
       // own nested rows, and once promoted the ROW is — so its slot becomes the row's.
       nestedOverrides: node.nestedOverrides,
-      nestedStructure: node.nestedStructure,
+      nestedStructure: toTemplateStructure(node.nestedStructure),
     });
     if (prefab.version < PREFAB_FORMAT_VERSION) prefab.version = PREFAB_FORMAT_VERSION;
     return;
@@ -2718,6 +3090,7 @@ export async function applyToPrefabSelective(
   const prefabBefore: PrefabFile = JSON.parse(JSON.stringify(oldPrefab));
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return NOOP_APPLY;
+  const eaMetaForApply = getTraitByName('EntityAttributes');
 
   // Build localId → ecsId map for this instance so we can read live values
   const localToEcs = new Map<number, number>();
@@ -2726,6 +3099,19 @@ export async function applyToPrefabSelective(
     if (piData.rootInstanceId !== rootInstanceId) return;
     const localId = piData.localId as number;
     if (localId) localToEcs.set(localId, entity.id());
+  });
+
+  // Live member guid → its path in this instance, for the value overlay below (#1352).
+  const instancePaths = new Map<string, MemberStep[]>();
+  if (eaMetaForApply) {
+    for (const [key, target] of memberPathIndex(getCurrentWorld(), rootInstanceId)) {
+      const guid = target ? (target.get(eaMetaForApply.trait) as { guid?: string }).guid : '';
+      if (guid) instancePaths.set(guid, key ? key.split('.').map((x) => (x.startsWith('+') ? x : Number(x))) : []);
+    }
+  }
+  const tokenizeForInstance = (v: unknown): unknown => mapStringValues(v, (str) => {
+    const p = instancePaths.get(str);
+    return p ? memberToken(0, p) : str;
   });
 
   // Capture the live structural diff so `+added`/`-removed`/`-trait` keys can be
@@ -2793,7 +3179,8 @@ export async function applyToPrefabSelective(
     // unaffected; the clone is per applied field, not per frame.
     const liveData = clonePersistable(readTraitDataFull(ecsId, meta));
     if (!liveData) continue;
-    const liveValue = liveData[fieldName];
+    // A ref to another member of this instance goes into the template as a member token (#1352).
+    const liveValue = tokenizeForInstance(liveData[fieldName]);
 
     const prefabEntity = newPrefab.entities.find((e) => e.localId === localId);
     if (!prefabEntity) continue;
@@ -3119,6 +3506,9 @@ export function rebuildInstance(
   applyOverridesByRootInstance(newRootId, overrides);
   applyStructureByRootInstance(newRootId, prefab, structure);
   reapplyNestedInstanceOverrides(newRootId, nestedCaptures);
+  // The respawned members and template-keyed added nodes are guid-less until derived (#1387). Only
+  // fills empty guids, so the root's carried guid above and every restored scene guid stand.
+  deriveInstanceMemberGuids(getCurrentWorld());
   return newRootId;
 }
 

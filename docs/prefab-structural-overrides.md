@@ -102,7 +102,8 @@ interface AddedEntity {
    *  the instance root). An added subtree never anchors to another added entity —
    *  that case is just nesting via `children`. */
   parentLocalId: number;
-  guid: string;                                       // EntityAttributes.guid, stable identity
+  guid: string;                                       // EntityAttributes.guid, stable identity ('' in a prefab file)
+  key?: string;                                       // template-local identity, in a prefab file only (#1387)
   name: string;
   traits: Record<string, Record<string, unknown> | boolean>;  // full snapshot, like a prefab entity
   children: AddedEntity[];                            // nested adds (parentLocalId omitted/ignored)

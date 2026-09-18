@@ -13,7 +13,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
-import { durableGuid, deriveMemberGuid, remapGuidValues } from '../packages/modoki/src/runtime/core/assetRefRules';
+import { durableGuid, deriveMemberGuid, remapGuidValues, addedKeyStep } from '../packages/modoki/src/runtime/core/assetRefRules';
 // The ONE subtree pre-flight (#883/#990/#989/#1004) — see engine/scripts/deleteBoundary.mjs. Used
 // only by the Linux `rmSync` fallback in `moveToTrash`; the darwin/win32 paths hand the delete to
 // the OS trash, which moves rather than unlinks and so cannot orphan a link's payload.
@@ -367,7 +367,7 @@ const MAX_MEMBER_PATHS = 100_000;
 class MemberWalkTooLarge extends Error {}
 
 /** The fields of a scene row or an `added[]` node that decide which members derive under it. */
-type AddedNode = { guid?: unknown; prefab?: unknown; added?: unknown; children?: unknown };
+type AddedNode = { guid?: unknown; key?: unknown; prefab?: unknown; added?: unknown; children?: unknown };
 type PrefabRow = { localId?: number; prefab?: string; added?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
 type PrefabDoc = { rootLocalId?: number; entities?: PrefabRow[] };
 
@@ -379,7 +379,9 @@ type AnchorTag = 'self' | 'parent' | 'skip';
 /** `path` is the steps below the last anchor; `done` the finished segments before it — one per
  *  guid-less stored root on the way down, each of which derives its own guid and anchors the next
  *  segment (#1349). */
-type Base = { tag: AnchorTag; done: number[][]; path: number[] };
+type Base = { tag: AnchorTag; done: Step[][]; path: Step[] };
+/** A numeric localId step, or a template-keyed added node's `'+key'` (`addedKeyStep`, #1387). */
+type Step = number | string;
 
 /** Every `path` (`deriveInstanceMemberGuids`'s step chain, dot-joined; `|` between segments, see
  *  {@link deriveMemberChain}) a member can derive at below
@@ -387,7 +389,9 @@ type Base = { tag: AnchorTag; done: number[][]; path: number[] };
  *  anchor it derives from. Mirrors the loader's parenting, not the prefab's intent:
  *  - a prefab row steps by its `localId` (a nested row too: its root's `parentLocalId` is that
  *    row's localId), a user-added nested instance's root by its prefab's root localId
- *    (`parentLocalId` stays 0), and a plain added node by 0 (it has no `PrefabInstance`);
+ *    (`parentLocalId` stays 0), and a plain added node by 0 (it has no `PrefabInstance`) — except a
+ *    node a prefab TEMPLATE keyed (`key`, no guid), which derives itself and steps by `'+key'`, as a
+ *    keyed reference node's root does (#1387);
  *  - a row whose `parentId` is 0, missing, or names no spawned row is parented by
  *    `instantiatePrefabIntoWorld` to the CALLER's parent: the scene parent for a top-level instance
  *    (→ `parent`), the anchor member for a user-added nested instance, and nothing for a nested
@@ -415,7 +419,7 @@ export function derivedMemberPathsByAnchor(
     set.add(key);
     if (++size > MAX_MEMBER_PATHS) throw new MemberWalkTooLarge();
   };
-  const under = (b: Base, ...steps: number[]): Base => ({ tag: b.tag, done: b.done, path: [...b.path, ...steps] });
+  const under = (b: Base, ...steps: Step[]): Base => ({ tag: b.tag, done: b.done, path: [...b.path, ...steps] });
   /** The base a derived stored root at `b` gives its members: its own guid is the next anchor. */
   const anchoredAt = (b: Base): Base => ({ tag: b.tag, done: [...b.done, b.path], path: [] });
   const SKIP: Base = { tag: 'skip', done: [], path: [] };
@@ -478,12 +482,14 @@ export function derivedMemberPathsByAnchor(
   /** One `added[]` node hanging at `base`. */
   const addedNode = (n: AddedNode, base: Base, depth: number): void => {
     const ownGuid = durableGuid(typeof n.guid === 'string' ? n.guid : '');
+    // A template-keyed node (no guid) derives itself, stepping by its key (#1387).
+    const key = !ownGuid && typeof n.key === 'string' && n.key ? addedKeyStep(n.key) : '';
     if (n.prefab) {
       const child = docOf(n.prefab);
       if (!child) return;
       // With its own guid it is its own anchor: its root and members belong to its own walk. Its
       // orphan rows do not — `spawnNestedInstance` parents them to `base`, which is ours.
-      const here = ownGuid ? SKIP : under(base, child.rootLocalId ?? 1);
+      const here = ownGuid ? SKIP : under(base, key || (child.rootLocalId ?? 1));
       emit(here);
       // A FRESH row chain, as `spawnNestedInstance` gives it (#1324 review). Guid-less, the root
       // still anchors its members on the guid it derives (#1349).
@@ -492,7 +498,8 @@ export function derivedMemberPathsByAnchor(
     }
     // A plain node with its own guid anchors everything below it (its own walk).
     if (ownGuid) return;
-    const here = under(base, 0);
+    const here = under(base, key || 0);
+    if (key) emit(here);
     if (Array.isArray(n.children)) for (const c of n.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, here, depth);
   };
 
@@ -519,7 +526,7 @@ export function derivedMemberPathsByAnchor(
 /** The guid a member at `key` (a {@link derivedMemberPathsByAnchor} path) derives from `anchor`:
  *  one `deriveMemberGuid` per `|`-separated segment, each result anchoring the next. */
 export function deriveMemberChain(anchor: string, key: string): string {
-  return key.split('|').reduce((a, seg) => deriveMemberGuid(a, seg.split('.').map(Number)), anchor);
+  return key.split('|').reduce((a, seg) => deriveMemberGuid(a, seg.split('.').map((s) => (s.startsWith('+') ? s : Number(s)))), anchor);
 }
 
 /** The member paths that derive from `node`'s own guid — {@link derivedMemberPathsByAnchor}'s `self`. */
