@@ -1202,10 +1202,10 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   const transformMeta = allTraitsList.find((m) => m.name === 'Transform');
   const piMeta = getTraitByName('PrefabInstance');
 
-  // Prefab-instance warn (informational, non-blocking — Phase 5's documented
-  // carried-instance bookkeeping limitation still applies once a base is
-  // savable; A8/A9 are fixed, so this is NOT "unsavable", just "may lose some
-  // editor bookkeeping across a later swap that keeps this base loaded").
+  // Prefab-instance warn (informational, non-blocking). A later swap that keeps this
+  // base loaded CARRIES the instance: its link and overrides survive and save (#1421),
+  // but the template-key marker on template-ADDED nodes is dropped — see
+  // docs/scene-loading.md § Gotchas.
   const instanceRootNames: string[] = [];
   if (piMeta) {
     for (const id of ids) {

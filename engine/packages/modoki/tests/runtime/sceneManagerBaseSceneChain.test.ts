@@ -142,7 +142,7 @@ function defineBase() {
 }
 
 /** Same as defineBase(), but the base ALSO contains a prefab-instance entity —
- *  used to test the "editor bookkeeping may not survive a carry" warning. */
+ *  used to test the carry warning (template-key marker dropped, #1421). */
 function defineBaseWithPrefabInstance() {
   fetchResponses['/base.json'] = {
     id: BASE_GUID,
@@ -376,7 +376,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     expect(base?.guid).toBe(BASE_GUID);
   });
 
-  // ── Phase 5 "editor bookkeeping" warning — fires on the CARRY, not on every fresh load ──
+  // ── The carry warning (#1421 reworded it) — fires on the CARRY, not on every fresh load ──
 
   it('a base with a prefab instance does NOT warn on its own fresh load', async () => {
     defineBaseWithPrefabInstance();
@@ -385,7 +385,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
     await sceneManager.loadScene('/level1.json');
 
-    expect(warn.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('editor'))).toBe(false);
+    expect(warn.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('is carried with a prefab instance'))).toBe(false);
     warn.mockRestore();
   });
 
@@ -396,13 +396,13 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
     // Fresh load of level1 — base loads fresh too. No carry has happened yet.
     await sceneManager.loadScene('/level1.json');
-    expect(warn.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('does not survive this carry'))).toBe(false);
+    expect(warn.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('is carried with a prefab instance'))).toBe(false);
 
     // Swap to level2, which shares the SAME base guid — the base is now CARRIED
-    // (kept, not freshly reloaded). This is the moment bookkeeping actually gets lost.
+    // (kept, not freshly reloaded). This is the moment the template-key marker is lost.
     await sceneManager.loadScene('/level2.json');
     expect(warn.mock.calls.some(([msg]) =>
-      typeof msg === 'string' && msg.includes('/base.json') && msg.includes('does not survive this carry'),
+      typeof msg === 'string' && msg.includes('/base.json') && msg.includes('is carried with a prefab instance'),
     )).toBe(true);
 
     warn.mockRestore();

@@ -1529,16 +1529,23 @@ above reaches only an entry not yet migrated, of which the committed corpus now 
 
 ### Gotchas
 
-- **A carried prefab instance loses its EDITOR bookkeeping** (Apply-to-Prefab,
-  structural overrides) across a swap that keeps its base loaded — the carry flattens
-  the instance structure and never calls `instantiatePrefabIntoWorld`. Documented,
-  accepted; the **runtime trait data is unaffected**, and `SceneManager` warns so it is
-  never silent — but only at the moment a carry actually happens (a base already known
-  to contain a prefab instance shows up in that load's `keptBaseGuids`), not on every
-  fresh load. A base with a prefab instance loading for the first time, or reloading
-  fresh (not carried), is silent — the loss only occurs on the carry itself. (Authored
-  *override values* on carried instances DO survive — the mark set is captured off the
-  old world and re-seeded per entity through the old→new id map.)
+- **A carried prefab instance loses ONE thing: the template-key marker on nodes its
+  prefab template ADDED.** The carry respawns a kept base from a trait snapshot and never
+  calls `instantiatePrefabIntoWorld`. Everything a save reads survives it: the
+  `PrefabInstance` trait, with `rootInstanceId` remapped through the old→new id map, and the
+  override mark set, captured off the old world and re-seeded per entity. So a dirty
+  carried base still saves as `prefab` + `overrides`, not as flattened members. That was
+  observed live on sling's `Base.scene.json` (#1421), for an edit made before the carry
+  and for one made after it.
+  What is dropped is `TemplateAddedKey` (#1387), which is deliberately unregistered, so a
+  snapshot never sees it. A Play→Stop round trip drops it the same way
+  (`runtime/core/templateIdentity.ts`). Template writes recover it (`recoverTemplateKey`).
+  `memberPathIndex` and the override walk in `editor/scene/prefab.ts` do not, so until
+  the base reloads fresh they cannot name such a node, and a member token pointing at one
+  stays unresolved. That case was read from the code, not driven: sling's base has no
+  template-added nodes. `SceneManager` warns so it is never silent, but only at the
+  moment a carry actually happens (a base already known to contain a prefab instance
+  shows up in that load's `keptBaseGuids`), not on every fresh load.
 - **The Time/Input singleton fallback must run AFTER the carry respawn.** A level whose
   Time lives in its base has no Time of its own, so a fallback running first spawns a
   phantom fresh Time and the carried one lands on top of it — two Time entities, which

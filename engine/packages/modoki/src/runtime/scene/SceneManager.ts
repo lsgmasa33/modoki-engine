@@ -320,8 +320,8 @@ class SceneManagerImpl implements SceneManager {
   private sceneCallbacks = new Map<string, () => void>();
   private beforeSwapHooks: BeforeSwapHook[] = [];
   // Which base-scene guids are known (from a prior FRESH load) to contain a prefab
-  // instance — checked against `keptBaseGuids` on the NEXT load so the Phase 5
-  // "editor bookkeeping may not survive a carry" warning fires at the moment the
+  // instance — checked against `keptBaseGuids` on the NEXT load so the carry
+  // warning (the template-key marker is dropped, #1421) fires at the moment the
   // carry actually happens, not on every fresh load (a base with a prefab instance
   // used to warn on every single editor boot, whether or not a carry ever followed).
   private basesWithPrefabInstance = new Set<string>();
@@ -631,16 +631,18 @@ class SceneManagerImpl implements SceneManager {
         if (oldSid !== undefined) {
           keptBaseGuids.add(ref.guid);
           keptSceneIds.add(oldSid);
-          // This is the actual moment the Phase 5 limitation bites: `ref` is being
-          // CARRIED (kept from the old chain) rather than freshly reloaded, so if a
-          // prior fresh load saw a prefab instance in it, its editor bookkeeping is
-          // about to be flattened away by the carry respawn below. Warning here
-          // (instead of on every fresh load) means this only fires when it's true.
+          // `ref` is being CARRIED (kept from the old chain) rather than freshly reloaded.
+          // The carry keeps a prefab instance's link, `rootInstanceId` and override marks,
+          // so it still saves as a link + overrides (#1421, observed live on sling). What it
+          // drops is the unregistered `TemplateAddedKey` marker on nodes a prefab template
+          // ADDED — the same loss as a Play→Stop round trip (templateIdentity.ts). Warning
+          // here (instead of on every fresh load) means this only fires on a real carry.
           if (this.basesWithPrefabInstance.has(ref.guid)) {
             console.warn(
-              `[SceneManager] Base scene "${ref.path}" contains a prefab instance — its editor ` +
-              `instance bookkeeping does not survive this carry (this base is kept, not freshly ` +
-              `reloaded, across the swap). (scene-loading.md Phase 5 known limitation).`,
+              `[SceneManager] Base scene "${ref.path}" is carried with a prefab instance in it. ` +
+              `Its link and override values survive; the template-key marker on any node a prefab ` +
+              `template ADDED does not (as after Play→Stop), so a member token naming such a node ` +
+              `stays unresolved until the base reloads fresh. (scene-loading.md § Gotchas)`,
             );
           }
         }
@@ -935,11 +937,11 @@ class SceneManagerImpl implements SceneManager {
             if (!ent.has(eaMeta.trait)) continue;
             ent.set(eaMeta.trait, { ...ent.get(eaMeta.trait), sourceScene: ref.guid });
           }
-          // Record rather than warn here — a base with a prefab instance is safe on
-          // ITS OWN fresh load (instantiatePrefabIntoWorld ran normally, full editor
-          // bookkeeping intact); the Phase 5 limitation only bites on a LATER load
-          // that CARRIES this same base instead of reloading it. That check (and the
-          // actual warning) lives where `keptBaseGuids` is computed, above.
+          // Record rather than warn here — a base with a prefab instance loses nothing on
+          // ITS OWN fresh load (instantiatePrefabIntoWorld ran normally and stamped every
+          // template-added node's key); the loss only happens on a LATER load that CARRIES
+          // this same base instead of reloading it. That check (and the actual warning)
+          // lives where `keptBaseGuids` is computed, above.
           if (sawPrefabInstance) this.basesWithPrefabInstance.add(ref.guid);
           else this.basesWithPrefabInstance.delete(ref.guid); // no longer has one — stale flag would false-warn later
         }

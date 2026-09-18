@@ -121,7 +121,7 @@ export function formatSceneMoveConfirm(pre: SceneMovePreflight, targetScene: str
   }
   if (targetScene) lines.push('• Every level that uses this base will now show it.');
   if (pre.prefabInstanceRoots.length > 0) {
-    lines.push(`• ${pre.prefabInstanceRoots.length} prefab instance${pre.prefabInstanceRoots.length === 1 ? '' : 's'} in the subtree: ${pre.prefabInstanceRoots.join(', ')} — its editor bookkeeping (Apply-to-Prefab, structural overrides) may not survive a later swap that keeps this base loaded (known Phase 5 limitation; the scene itself is still savable).`);
+    lines.push(`• ${pre.prefabInstanceRoots.length} prefab instance${pre.prefabInstanceRoots.length === 1 ? '' : 's'} in the subtree: ${pre.prefabInstanceRoots.join(', ')} — a later swap that keeps this base loaded carries them: links and overrides survive and save, but nodes a prefab template added lose their template key until the base reloads fresh.`);
   }
   if (pre.collisions.length > 0) {
     const names = pre.collisions.map((c) => c.name).join(', ');
