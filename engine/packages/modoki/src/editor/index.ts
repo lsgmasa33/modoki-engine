@@ -93,6 +93,7 @@ export {
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
   getLastSceneLoadFailureMessage, type SceneLoadOutcome,
 } from './scene/serialize';
+export { SCENE_EXT, correctedScenePath, isAcceptableScenePath } from './scene/sceneFileName';
 export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,
   discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,

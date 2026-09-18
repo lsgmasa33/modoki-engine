@@ -26,12 +26,33 @@
  *  `runtimeOnlyFieldsOffDisk.test.ts` fails on any committed scene or prefab holding a field the
  *  serializer would never emit. That direction needs only the trait registry's Inspector metadata
  *  — no world — and it is the direction that actually bit (#406).
+ *
+ *  ## The serializer's FIXED POINT, per trait object (#1412)
+ *
+ *  Two more slices need only the registry too, and they are the two that keep recurring. A
+ *  committed trait object the serializer would write DIFFERENTLY is rewritten by the next save, so
+ *  that save's diff buries its real edit under a content-neutral one:
+ *   - **key order** — a SoA trait is written in `Object.keys(schema)` order. Hand-edited JSON, or a
+ *     migration that appends a key, breaks it: #1177 (13 scenes), #1410 (Court's No Ads objects).
+ *   - **default-valued fields** — a SoA scalar equal to its schema default is omitted (#406).
+ *  Both are decided by `writtenTraitKeys`/`isFieldWritten` (`editor/scene/traitDefault.ts`),
+ *  the SAME functions `serializeScene` and prefab.ts's added-child writer call, so this guard cannot
+ *  pass a serializer whose rule moved. SCOPE, and it is a real limit: `entities[].traits` on ENGINE
+ *  SoA traits only. AoS traits (function schema: `SkinnedMeshRenderer`, `AnimationLibrary`,
+ *  `MaterialInstance`, `Input`, `UIAction`) have no static key order, and game-registered traits are
+ *  invisible to `registerAllTraits()` — the same limit `runtimeOnlyFieldsOffDisk` documents. Prefab
+ *  `added[]` subtrees are left out on purpose: older ones were written uncompacted (see
+ *  `legacyMarkersOf`), and a guard over them would fire on correct legacy content.
  */
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { hasInternalGames } from '../helpers/repoLayout';
-import { SCENE_FORMAT_VERSION } from '@modoki/engine/runtime';
+import { SCENE_FORMAT_VERSION, getAllTraits, soaSchema } from '@modoki/engine/runtime';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { registerAllTraits } from '../../app/ecs/registerTraits';
+// The LEAF module the serializer itself calls (import-free, so no editor graph comes with it).
+import { isFieldWritten, traitKeyOrder } from '../../packages/modoki/src/editor/scene/traitDefault';
 
 const REPO = path.resolve(__dirname, '../../..');
 const hasGames = hasInternalGames();
@@ -173,5 +194,142 @@ describe('legacyMarkersOf', () => {
     expect(legacyMarkersOf({ entities: [{ traits: { Transform: { isActive: true } } }] })).toHaveLength(1);
     expect(legacyMarkersOf({ entities: [{ traits: { Renderable: { isVisible: true } } }] })).toHaveLength(1);
     expect(legacyMarkersOf({ entities: [{ guid: 'g', traits: { Renderable: { isVisible: false } } }] })).toEqual([]);
+  });
+});
+
+// ─── #1412: the serializer's fixed point, per trait object ──────────────────────────────────────
+
+interface TraitShape { order: string[]; schema: Record<string, unknown>; fields: Record<string, { runtimeOnly?: boolean; entityId?: unknown }> }
+
+/** Engine SoA traits by name, from the same registry the serializer walks. */
+function soaTraitShapes(): Map<string, TraitShape> {
+  registerAllTraits();
+  const out = new Map<string, TraitShape>();
+  for (const meta of getAllTraits()) {
+    const schema = soaSchema(meta);
+    if (schema) out.set(meta.name, { order: traitKeyOrder(schema), schema, fields: meta.fields });
+  }
+  return out;
+}
+
+interface ShapeFindings {
+  /** Trait objects examined (the ledger's `scanned` — the goal state is zero offenders). */
+  scanned: number;
+  /** One per trait object whose keys are not a subsequence of its schema order. */
+  order: Array<{ item: string; site: string }>;
+  /** One per field the serializer would OMIT as a schema default. */
+  defaults: Array<{ item: string; site: string }>;
+}
+
+/** What the next save of this scene would rewrite, per trait object. `item` keys an occurrence as
+ *  `file::entity::Trait` (order) or `file::entity::Trait.field` (default) — entity by its durable
+ *  guid, else its name. Pure, so the synthetic tests below pin it without any committed scene. */
+function serializerShapeFindings(
+  data: { entities?: Array<Record<string, unknown>> },
+  file: string,
+  shapes: Map<string, TraitShape>,
+): ShapeFindings {
+  const found: ShapeFindings = { scanned: 0, order: [], defaults: [] };
+  for (const e of data.entities ?? []) {
+    const traits = (e.traits ?? {}) as Record<string, unknown>;
+    const ea = traits.EntityAttributes as Record<string, unknown> | undefined;
+    const who = (typeof ea?.guid === 'string' && ea.guid) || String(e.name ?? '?');
+    for (const [name, obj] of Object.entries(traits)) {
+      const shape = shapes.get(name);
+      if (!shape || !obj || typeof obj !== 'object') continue;
+      found.scanned++;
+      const bag = obj as Record<string, unknown>;
+      const keys = Object.keys(bag);
+      const positions = keys.map((k) => shape.order.indexOf(k)).filter((i) => i >= 0);
+      if (positions.some((p, i) => i > 0 && p < positions[i - 1])) {
+        found.order.push({ item: `${file}::${who}::${name}`, site: `${file}: ${e.name} ${name} {${keys.join(', ')}}` });
+      }
+      for (const k of keys) {
+        if (!(k in shape.schema)) continue;
+        // runtimeOnly is runtimeOnlyFieldsOffDisk's ban — one ledger per ban (#1123), not two here.
+        if (shape.fields[k]?.runtimeOnly) continue;
+        if (!isFieldWritten(bag[k], shape.schema, k, shape.fields[k])) {
+          found.defaults.push({ item: `${file}::${who}::${name}.${k}`, site: `${file}: ${e.name} ${name}.${k} = ${JSON.stringify(bag[k])}` });
+        }
+      }
+    }
+  }
+  return found;
+}
+
+describe.skipIf(!hasGames)('committed scenes are the serializer\'s fixed point (#1412)', () => {
+  const rel = (f: string) => path.relative(REPO, f).split(path.sep).join('/');
+  const shapes = soaTraitShapes();
+  const all: ShapeFindings = { scanned: 0, order: [], defaults: [] };
+  for (const f of sceneFiles()) {
+    const r = serializerShapeFindings(JSON.parse(fs.readFileSync(f, 'utf8')), rel(f), shapes);
+    all.scanned += r.scanned; all.order.push(...r.order); all.defaults.push(...r.defaults);
+  }
+  const RESAVE = 'Re-save the scene through the editor (engine/scripts/resave-scenes.sh <project>, or '
+    + 'open it and Cmd+S) and review the diff with check-scene-churn.mjs. Never hand-edit a scene\'s '
+    + 'JSON: this is what a hand edit leaves behind, and the next person\'s save pays for it.';
+
+  it('every engine SoA trait object lists its keys in the serializer\'s order', () => {
+    assertExemptionLedger({
+      label: 'trait-object key order in sceneFormatCanonical',
+      population: all.order,
+      // No rows, and none should be added: new drift gets a re-save, never a pardon. The 8 objects
+      // found when this guard landed (Court's No Ads UI, #1410; wordweave's ad-break UI; the #1398
+      // Player ID row) were canonicalized in the same change, values unchanged. A per-object ledger
+      // was tried first and dropped: other clones re-save or re-edit these scenes, so its rows went
+      // stale (over-blessed) or short at whichever merge came second.
+      exempt: [],
+      floor: 500,
+      scanned: all.scanned,
+      fix: RESAVE,
+    });
+  });
+
+  it('no committed field holds the schema default the serializer would omit (#406)', () => {
+    assertExemptionLedger({
+      label: 'default-valued trait fields in sceneFormatCanonical',
+      population: all.defaults,
+      floor: 500,
+      scanned: all.scanned,
+      fix: RESAVE,
+    });
+  });
+});
+
+// Outside the games gate, like `legacyMarkersOf`'s: the public snapshot must still prove the
+// detector works, and a clean tree reports zero either way.
+describe('serializerShapeFindings', () => {
+  const shapes = soaTraitShapes();
+  const t = shapes.get('Transform')!;
+  const [k0, k1] = t.order;
+
+  it('reads the order and the defaults from the registry (sanity: Transform is SoA with a numeric default)', () => {
+    expect(t.order.length).toBeGreaterThan(2);
+    expect(typeof t.schema[k0]).toBe('number');
+  });
+
+  it('flags a trait object whose keys are out of schema order, and not one in order', () => {
+    const bad = serializerShapeFindings({ entities: [{ name: 'E', traits: { Transform: { [k1]: 5, [k0]: 5 } } }] }, 'f', shapes);
+    expect(bad.order.map((o) => o.item)).toEqual(['f::E::Transform']);
+    const good = serializerShapeFindings({ entities: [{ name: 'E', traits: { Transform: { [k0]: 5, [k1]: 5 } } }] }, 'f', shapes);
+    expect(good.order).toEqual([]);
+  });
+
+  it('flags a scalar field equal to its schema default, and not a non-default value', () => {
+    const def = t.schema[k0] as number;
+    const bad = serializerShapeFindings({ entities: [{ name: 'E', traits: { Transform: { [k0]: def } } }] }, 'f', shapes);
+    expect(bad.defaults.map((d) => d.item)).toEqual([`f::E::Transform.${k0}`]);
+    const good = serializerShapeFindings({ entities: [{ name: 'E', traits: { Transform: { [k0]: def + 1 } } }] }, 'f', shapes);
+    expect(good.defaults).toEqual([]);
+  });
+
+  it('never flags an entityId field at its default (the serializer always writes those) nor an unregistered trait', () => {
+    // EntityAttributes.parentId is the entityId field every scene carries, written as '' for root.
+    const r = serializerShapeFindings({ entities: [{ name: 'E', traits: {
+      EntityAttributes: { parentId: '' },
+      NotARegisteredTrait: { b: 1, a: 0 },
+    } }] }, 'f', shapes);
+    expect(r.defaults).toEqual([]);
+    expect(r.order).toEqual([]);
   });
 });

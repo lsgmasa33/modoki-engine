@@ -21,7 +21,7 @@ import { invalidatePrefab, replaceCachedPrefab } from '../../runtime/loaders/mes
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
-import { isTraitDefault } from './traitDefault';
+import { writtenTraitKeys } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, prefabSubtreeLocalIds, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens } from '../../runtime/loaders/loadSceneFile';
 import { rebaseMemberTokens, isMemberToken, parseMemberToken, memberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
@@ -1669,9 +1669,11 @@ export interface InstanceStructure {
 function compactAddedTraitData(meta: TraitMeta, data: Record<string, unknown>): Record<string, unknown> {
   const schema = (meta.trait as { schema?: Record<string, unknown> }).schema;
   const soa = !!schema && typeof schema === 'object';
-  const keys = soa ? Object.keys(schema!).filter((k) => k in data) : Object.keys(data);
   const copy: Record<string, unknown> = {};
-  for (const key of keys) {
+  // `writtenTraitKeys` (traitDefault.ts) is the SAME rule serialize.ts writes a top-level entity
+  // with, and the one the committed-scene guard checks (#1412). Sharing it also closed a real gap:
+  // this loop claimed to mirror serialize.ts but never skipped `runtimeOnly` fields.
+  for (const key of writtenTraitKeys(soa ? schema! : null, data, meta.fields)) {
     // Skip a field still holding its schema default — the rule serialize.ts applies to a
     // top-level entity, which `snapshotAddedTraits`' note has always CLAIMED this mirrors and did not.
     //
@@ -1693,7 +1695,6 @@ function compactAddedTraitData(meta: TraitMeta, data: Record<string, unknown>): 
     // `snapshotAddedTraits`' note exists for (AudioSource.clips, SkinnedMeshRenderer.materials,
     // AnimationLibrary.animSets; the bone-map-lost-on-save bug). And an `entityId` field is
     // never skipped: a default entity reference is a meaningful value, not an absence.
-    if (soa && !meta.fields[key]?.entityId && isTraitDefault(data[key], schema![key])) continue;
     copy[key] = data[key];
   }
   // A runtime guid (#1210) is not a durable address — capture it as unguided, exactly as a

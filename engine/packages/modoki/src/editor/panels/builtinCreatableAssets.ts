@@ -14,6 +14,7 @@ import { defaultAtlasSource } from '../../runtime/loaders/spriteAtlas';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newScene, saveScene, NewSceneRefusedError } from '../scene/serialize';
+import { SCENE_EXT } from '../scene/sceneFileName';
 import { resolveExistingDocumentId } from '../scene/prefab';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { useEditorStore } from '../store/editorStore';
@@ -22,7 +23,7 @@ export function registerBuiltinCreatableAssets(): void {
   registerCreatableAsset({
     id: 'scene',
     label: 'Create Scene',
-    ext: '.json',
+    ext: SCENE_EXT, // `.scene.json` — was '.json' from before #54, so Create Scene wrote `<name>.json` (#1413)
     defaultName: 'New Scene',
     assetType: 'scene',
     prompt: 'Create Scene',

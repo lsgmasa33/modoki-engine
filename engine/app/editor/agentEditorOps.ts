@@ -39,6 +39,7 @@ import {
   enterPlay, stopPlay, pausePlay,
   undoStep, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
+  SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage,
   isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEditReport, exitPrefabEditing,
@@ -2139,6 +2140,22 @@ export function registerEditorAgentOps(): void {
   // opens a NATIVE Save panel, which is modal and only a human can dismiss — an agent call
   // hung ~60s to a 504 AND blocked every later renderer-bound call until someone clicked
   // Cancel. Take an explicit `path` instead, and say so when we need one.
+  /** Refuse `save-all`'s SCENE half after writing every parked doc anyway (#259), and name what
+   *  landed: `PARTIAL` when something did, `REFUSED_BY_OP` when nothing did. Shared by the exits
+   *  that never reach `saveAll` (where the flush otherwise lives). */
+  async function refuseSceneHalfAfterFlush(message: string): Promise<never> {
+    const before = await flushParked('before-scene');
+    const after = await flushParked('after-scene');
+    const flushedAll = [
+      ...before.dirtyAssetPaths.saved.map((pth) => `asset ${pth}`),
+      ...before.pendingImportSettings.saved.map((pth) => `import settings for ${pth}`),
+      ...after.pendingBaseScenes.saved.map((pth) => `base-scene ref on ${pth}`),
+    ];
+    const note = flushedAll.length
+      ? ` (${flushedAll.length} parked item(s) WERE written: ${flushedAll.join(', ')})`
+      : '';
+    throw new OpRefusal(flushedAll.length ? 'PARTIAL' : 'REFUSED_BY_OP', `${message}${note}`);
+  }
   registerAgentOp('save-all', async (params) => {
     const { path: savePath } = (params ?? {}) as { path?: string };
     // Prefab-edit mode deliberately NULLS the scene path so a normal save can't target a real
@@ -2162,23 +2179,22 @@ export function registerEditorAgentOps(): void {
       // (`saveCommand.ts` was migrated in P12; its guard scans that file only, so nothing saw this).
       // Both phases run back to back because this branch writes no scene — same shape as the
       // preview fast path.
-      const before = await flushParked('before-scene');
-      const after = await flushParked('after-scene');
-      const flushedAll = [
-        ...before.dirtyAssetPaths.saved.map((pth) => `asset ${pth}`),
-        ...before.pendingImportSettings.saved.map((pth) => `import settings for ${pth}`),
-        ...after.pendingBaseScenes.saved.map((pth) => `base-scene ref on ${pth}`),
-      ];
-      const note = flushedAll.length
-        ? ` (${flushedAll.length} parked item(s) WERE written: ${flushedAll.join(', ')})`
-        : '';
-      throw new OpRefusal(
-        flushedAll.length ? 'PARTIAL' : 'REFUSED_BY_OP',
+      await refuseSceneHalfAfterFlush(
         'save-all: the editor is in PREFAB-EDIT mode — its world is a synthetic prefab scene, ' +
         'not a real one, so saving it to a scene path would overwrite that scene with prefab ' +
-        'scaffolding. Use the prefab editor\'s own save (Save Prefab), or leave prefab-edit mode ' +
-        `first.${note}`,
-      );
+        'scaffolding. Use the prefab editor\'s own save (Save Prefab), or leave prefab-edit mode first.');
+    }
+    // A new scene file is `<name>.scene.json` — the suffix the manifest classifies scenes by (#1413).
+    // Refused, never silently renamed (owner 2026-09-18): the agent asked for this path, and a file
+    // landing somewhere else is worse than one round-trip. The open scene and a file the manifest
+    // already types `scene` (a legacy `/scenes/*.json`) stay re-savable under their own names.
+    // Like the prefab-edit refusal above, the parked docs are flushed FIRST (#259) — they have
+    // nothing to do with the scene's file name, and every other exit of this op writes them.
+    if (savePath && !isAcceptableScenePath(savePath, { currentPath: getCurrentScenePath(), existingType: getAssetEntry(savePath)?.type })) {
+      await refuseSceneHalfAfterFlush(
+        `save-all: "${savePath}" is not a scene file name — a scene is saved as <name>${SCENE_EXT}, which is how the ` +
+        `asset manifest recognises it (a plain .json is a scene only inside a /scenes/ folder, by a legacy rule, and a ` +
+        `.prefab.json/.mat.json name would be read as that kind). The scene was NOT written. Use "${correctedScenePath(savePath)}".`);
     }
     const r = await saveAll({ path: savePath, allowDialog: false });
     // Every parked item this save DID write, for the exits below. ⚠️ Named at ALL of them, not

@@ -14,6 +14,7 @@ import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
 import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { chooseNewAssetPath } from '../utils/saveDialog';
+import { SCENE_EXT } from './sceneFileName';
 import { writeNewAssetDocument } from './createAssetDocument';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -134,7 +135,7 @@ export interface SceneFile {
 // `isTraitDefault` moved to its own LEAF module so `prefab.ts` can share the rule without
 // importing this file's dependency graph. Re-exported here — this was its home, and
 // `@modoki/engine/editor` still surfaces it from this module.
-import { isTraitDefault } from './traitDefault';
+import { isTraitDefault, writtenTraitKeys } from './traitDefault';
 export { isTraitDefault };
 
 /** Whether a PRIMARY-scene save skips this entity: it or an ancestor is `Transient`, or it or an
@@ -453,12 +454,13 @@ export async function serializeScene(opts?: {
         // fall back to the live data's own keys for those.
         const schema = (meta.trait as { schema?: Record<string, unknown> }).schema;
         const soa = !!schema && typeof schema === 'object';
-        const keys = soa ? Object.keys(schema!) : Object.keys(data);
-        for (const key of keys) {
+        // WHICH keys are written, and in WHAT ORDER, is `writtenTraitKeys` (traitDefault.ts) —
+        // shared with prefab.ts's added-child writer and with the committed-scene guard
+        // (sceneFormatCanonical.test.ts, #1412), so none of the three can drift. Its two rules:
+        for (const key of writtenTraitKeys(soa ? schema! : null, data, meta.fields)) {
           // Skip pure runtime fields (e.g. Time.elapsed/frame): recomputed each
           // frame, so persisting them bakes a stale snapshot and churns the file
           // on every save. The loader re-derives them from the schema default.
-          if (meta.fields[key]?.runtimeOnly) continue;
           // Omit a field that still holds its trait default: the loader
           // reconstructs it from the same schema (`meta.trait(partialData)` — koota
           // fills every absent key), so this is lossless, and it keeps DEFAULTS LIVE.
@@ -471,7 +473,6 @@ export async function serializeScene(opts?: {
           // skipping one here would only move it to the END of the object — pure diff
           // noise across a bulk migration. Assigning in schema order now and
           // overwriting in place later keeps key order stable.
-          if (soa && !meta.fields[key]?.entityId && isTraitDefault(data[key], schema![key])) continue;
           traitData[key] = data[key];
         }
         // Snapshot path: the world wasn't mutated, so a freshly-minted guid for a
@@ -1121,8 +1122,8 @@ export async function saveScene(opts: {
   // `chooseNewAssetPath` uses the native macOS panel where available and an in-app
   // name prompt everywhere else.
   const pick = await chooseNewAssetPath({
-    defaultName: 'scene.json',
-    ext: '.json',
+    defaultName: 'New Scene' + SCENE_EXT,
+    ext: SCENE_EXT, // was '.json', which wrote `<name>.json` — a scene only by the legacy /scenes/ rule (#1413)
     defaultFolder: '/assets/scenes',
     prompt: 'Save Scene As',
   });
@@ -1136,7 +1137,9 @@ export async function saveScene(opts: {
   });
   if (written.outcome === 'declined') return { saved: false, path: null, reason: 'cancelled' };
   if (written.outcome === 'wrongKind') {
-    // Plain `.json` can name a prefab or material; replacing it would hand its guid to a scene.
+    // Replacing a file of another kind would hand its guid to a scene. Since #1413 the dialog always
+    // yields a `.scene.json` name, which the classifier can only type `scene`, so this fires only
+    // for a manifest entry that disagrees with its own suffix — kept because the write reports it.
     useEditorStore.getState().showToast(`${written.path} is not a scene (it is typed '${written.existingType}') — choose another name.`, 'warn');
     return { saved: false, path: null, reason: 'cancelled' };
   }

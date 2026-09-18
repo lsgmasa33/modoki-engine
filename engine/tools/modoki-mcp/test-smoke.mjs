@@ -1401,21 +1401,21 @@ if (canUC3) {
 // exists precisely so a save can name its own target, so the case uses it: the ONLY files this
 // writes are two probes it created, and the human's scene is never opened for writing at all.
 //
-// ⚠️⚠️ AND WHY THE PROBE SCENE IS `/assets/mcp-smoke-save.json` — NOT `.scene.json`, and NOT in
-// the scenes folder. This is a scar, measured on the first green run of this case, which left
-// `games/3d-test/.../tropical-island.scene.json` MODIFIED with a brand-new `id`:
-//   a save-as writes the CURRENT scene's own guid into the new file, so the probe and the human's
-//   scene briefly share one guid. The dev asset scanner auto-HEALS a guid collision by keeping
-//   the lexicographically-first path's id and REWRITING the other file's (vite-asset-scanner.ts,
+// ⚠️⚠️ AND WHY THE CASE STARTS WITH `new_scene`. This is a scar, measured on the first green run of
+// this case, which left `games/3d-test/.../tropical-island.scene.json` MODIFIED with a brand-new `id`:
+//   a save-as of the OPEN scene writes that scene's own guid into the new file, so the probe and the
+//   human's scene briefly share one guid. The dev asset scanner auto-HEALS a guid collision by
+//   keeping the lexicographically-first path's id and REWRITING the other file's (vite-asset-scanner.ts,
 //   `buildManifest(…, heal=true)`) — and `mcp-smoke-save` sorts before `tropical-island`, so the
 //   healer re-minted the guid of the committed scene. Every ref to that scene by guid would have
 //   broken, from a smoke test that reported OK.
-//   The fix is to keep the probe OUT of the manifest entirely: `detectType` classifies a plain
-//   `.json` as a scene only via the `.scene.json` suffix or the legacy `/scenes/` directory
-//   convention, so a plain `.json` elsewhere under the asset root is not an asset at all — no
-//   guid, nothing to collide with. `saveScene` writes whatever path it is handed, and
-//   `validate_scene` reads by path, so nothing else cares about the extension.
-//   Do NOT "tidy" this path to `/assets/scenes/mcp-smoke-save.scene.json`.
+//   The first fix kept the probe OUT of the manifest by naming it a plain `.json` outside
+//   `/scenes/`. #1413 closed that door on purpose: `save_all` now REFUSES a path that is not
+//   `<name>.scene.json` (owner, 2026-09-18). So the probe is a real `.scene.json` scene now, and
+//   the collision is avoided at its source instead: `new_scene` first gives the world a FRESH scene
+//   guid (and fresh entity guids), so the probe shares nothing with any committed scene. The
+//   save-as-of-an-open-scene collision itself is still open (#1414), which is why this case must
+//   not save the human's scene under another name.
 //
 // It still exercises both halves of what `save-all` does, which is the whole point — but they are
 // observed with DIFFERENT strength, and the difference is worth knowing before trusting this case:
@@ -1431,18 +1431,16 @@ if (canUC3) {
 //     #259 "flush never runs at all", IS caught), but it is not a disk proof and must not be
 //     described as one.
 //
-// ⚠️ The save-as also repoints the human's scene GUID at the probe IN MEMORY: `saveScene` calls
-// `registerAsset(scene.id, <probe path>, 'scene')`, and `registerAsset` drops the old path→guid
-// entry. Nothing on disk changes (the probe carries no guid of its own — see above), and the
-// cleanup's `load_scene` re-registers the real path. But if that reload ever fails, the editor is
-// left with the human's scene guid resolving to a file this case is about to trash.
+// The `new_scene` DISCARDS the live world. That is safe for the same reason the cleanup's reload
+// always was: the `pre.unsavedChanges` precondition below proves the human's editor was clean when
+// this run started, so everything in the world by now is the suite's own.
 {
   const st0 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
   // Both probes sit at fixed locations under the asset ROOT, which every project has, so this runs
   // on whatever project is open without assuming a folder layout. The scene probe's location is
   // load-bearing, not a convenience — see the warning above. Named `mcp-smoke-save` so a leftover
   // is identifiable as this case's.
-  const SAVE_SCENE = '/assets/mcp-smoke-save.json';   // see the extension/folder warning above
+  const SAVE_SCENE = '/assets/scenes/mcp-smoke-save.scene.json';   // a fresh scene — see the new_scene warning above
   const SAVE_PART = '/assets/particles/mcp-smoke-save.particle.json';
 
   // Four preconditions, each of which is about NOT damaging the human's editor — reported through
@@ -1472,9 +1470,8 @@ if (canUC3) {
     // A leftover from a previous run would make "the save wrote it" unfalsifiable — the file would
     // already be there. Same precheck UC10/UC11 make, for the same reason.
     // A leftover from a previous run would make "the save wrote it" unfalsifiable — the file would
-    // already be there. Each probe is checked through the route that can SEE it: the particle is a
-    // real asset (manifest), the probe scene deliberately is NOT (see above), so it is checked by
-    // the same from-disk read the assertion below uses.
+    // already be there. The probe scene is checked by the same from-disk read the assertion below
+    // uses, and the particle through the manifest.
     // `isError` is NOT the same as "absent": /api/validate-scene answers 404 for a missing file but
     // 500 for one that fails JSON.parse, so a TRUNCATED leftover from a killed run would otherwise
     // read as a clean project. Only a not-found is proof there is nothing there.
@@ -1495,6 +1492,11 @@ if (canUC3) {
     const made = JSON.parse(text(await client.callTool({ name: 'modoki_create_asset', arguments: { type: 'particle', path: SAVE_PART } })));
     if (!made.ok) throw new Error(`save_all could not scaffold its probe particle: ${JSON.stringify(made).slice(0, 300)}`);
     await withCleanup(async () => {
+      // A FRESH scene first — its own scene guid and entity guids — so the save below cannot collide
+      // with any committed scene (see the new_scene warning above). Before the park, so nothing the
+      // case parks is in flight across the world swap.
+      const fresh = await client.callTool({ name: 'modoki_new_scene', arguments: { discardUnsaved: true } });
+      if (fresh.isError) throw new Error(`save_all could not start a fresh scene: ${text(fresh).slice(0, 300)}`);
       // The def comes from `modoki_asset_schema`, not from reading the file back. ⚠️ Measured:
       // `read_asset_def` PEEKS the live cache and deliberately does not fetch, so a
       // freshly-scaffolded asset nothing has loaded is a refusal ("not in the live particle
@@ -1581,12 +1583,13 @@ if (canUC3) {
       console.log(`save_all writes the scene to an explicit path (verified on disk) and flushes ${saved.savedAssets.length} parked asset doc(s) ✓`);
     }, async () => {
       // 1. Put the editor back on the human's scene FIRST, so it is never left pointing at a file
-      //    the next step deletes. Conditional: if the case failed before the save, the path was
-      //    never re-pointed and a reload would only discard live state for nothing — and it would
-      //    be REFUSED anyway, since the suite leaves the world dirty by design.
+      //    the next step deletes — or on the untitled scene `new_scene` made, if the case failed
+      //    between it and the save. Conditional: if the case failed before `new_scene`, the editor
+      //    is still on the human's scene and a reload would only discard live state for nothing.
+      //    `discardUnsaved` is safe for the precondition's reason: the world is the suite's own.
       const now = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
-      if (now.scenePathRef === SAVE_SCENE) {
-        const back = JSON.parse(text(await client.callTool({ name: 'modoki_load_scene', arguments: { path: SCENE } })));
+      if (now.scenePathRef !== SCENE) {
+        const back = JSON.parse(text(await client.callTool({ name: 'modoki_load_scene', arguments: { path: SCENE, discardUnsaved: true } })));
         const restored = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
         if (restored.scenePathRef !== SCENE) {
           throw new Error(`save_all failed to restore the human's scene ${SCENE} (now ${restored.scenePathRef}): ${JSON.stringify(back).slice(0, 300)}`);

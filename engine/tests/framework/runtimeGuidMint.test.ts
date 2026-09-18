@@ -273,6 +273,23 @@ describe('copies and string refs under a real mint (#1210)', () => {
     expect(node.children[0].traits.EntityAttributes).not.toHaveProperty('parentId');
   });
 
+  // #1412. The added-child writer claimed to mirror serialize.ts but never skipped `runtimeOnly`
+  // fields; both now call `writtenTraitKeys`. Mutation: restore prefab.ts compactAddedTraitData's
+  // own `Object.keys(schema)` loop and this goes red while every unit test stays green.
+  it('an ADDED child\'s captured trait bag carries no runtimeOnly field (the shared write rule)', () => {
+    tw = createTestWorld({});
+    setPrefabCache(KIT, kit() as never);
+    const rootId = instantiatePrefab(kit() as never);
+    setPrefabSource(rootId, KIT);
+    const part = byName('Part');
+    // `sourceScene` is `runtimeOnly` in registerTraits.ts — SceneManager re-stamps it after a spawn.
+    spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Stamped', parentId: part.id(), sourceScene: '/assets/scenes/a.scene.json' }));
+    const node = captureInstanceStructure(rootId, kit() as never).added.find((n) => n.name === 'Stamped')!;
+    expect(node).toBeDefined();
+    expect(node.traits.EntityAttributes).not.toHaveProperty('sourceScene');
+    expect(node.traits.EntityAttributes).toHaveProperty('name', 'Stamped'); // the bag itself was captured
+  });
+
   it('a user-added NESTED instance holding a runtime guid is captured unguided', () => {
     tw = createTestWorld({});
     setPrefabCache(KIT, kit() as never);

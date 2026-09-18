@@ -4,6 +4,27 @@ A scene is a single `*.scene.json` file — positively identified by that suffix
 other JSON asset kind (issue #54) — that is the **sole source of truth** for what exists in
 the world. (A plain `.json` under a `scenes/` dir is still accepted as a LEGACY fallback, for
 an externally-authored project or an already-published demo snapshot predating the suffix.)
+
+**Every entry point that names a NEW scene file writes `<name>.scene.json`** (#1413): Assets →
+Create Scene, Save Scene As / a first save, and the agent's `modoki_save_all { path }`. The first
+two spelled it `'.json'` until #1413, so they wrote files that were scenes only through the legacy
+rule above, and not scenes at all outside `/scenes/`. The suffix now comes from the classifier's
+table through `SCENE_EXT` (`editor/scene/sceneFileName.ts`). An agent's explicit path that is not
+`.scene.json` is **refused**, with the corrected path in the error, and never silently renamed
+(owner, 2026-09-18). The exceptions are the open scene and a file the manifest already types
+`scene`, so a legacy scene stays re-savable under its own name. A guard test checks that every
+built-in "Create X" kind's extension classifies as its own asset type.
+
+Two consequences, both deliberate:
+- **Choosing an existing legacy `<name>.json` in the Save/Create dialog does not replace it.** The
+  path becomes `<name>.scene.json`, a new file next to the old one, and the old file is left
+  untouched. The panel's own "Replace?" was about the `.json` name, so nothing is destroyed. Delete
+  or rename the legacy file by hand if the copy is meant to supersede it.
+- **An agent Save As now always lands on a real scene asset**, so it meets the scene-id collision
+  that the old plain-`.json` probe used to side-step (#1414, open): a save-as of the open scene
+  writes that scene's id into the copy. Start from `modoki_new_scene` for a scene that must not
+  share an identity.
+
 Scenes load asynchronously into an isolated staging world, then swap in atomically so no
 system ever observes a half-built scene.
 
@@ -849,6 +870,32 @@ consumed with it by `clearScrollRequest`, while the authored `scrollBehavior` is
 runtime write lands on authored data, ask whether the write is a *different role* wearing the same
 field — `runtimeOnly` can only separate disk from memory, never two meanings of one value. The
 `GAINED` check above is what noticed it.
+
+**The serializer's fixed point, per trait object (#1412).** Two more slices of canonicality need only
+the registry, and they are the two that kept coming back as one-off re-saves (#268, #1177, #1410):
+a SoA trait is written in **schema key order** (`Object.keys` of the object passed to koota's
+`trait({...})`), and a **scalar at its schema default is omitted**. Hand-edited JSON, or a migration
+that appends a key, breaks the first. Both rules live in ONE place, `writtenTraitKeys` /
+`isFieldWritten` / `traitKeyOrder` in `editor/scene/traitDefault.ts`: `serializeScene` calls it for
+scene entities, prefab.ts's `compactAddedTraitData` for `added[]` children, and
+`sceneFormatCanonical.test.ts` checks every committed scene's `entities[].traits` against it. So the
+guard cannot pass a writer whose rule moved, which a restated `Object.keys(schema)` in the test
+could (mutation-checked: reversing `traitKeyOrder` turns the corpus guard red). Sharing it also
+fixed a real gap: the added-child writer claimed to mirror serialize.ts but never skipped
+`runtimeOnly` fields.
+- **Reach:** engine SoA traits only, the same limit as `runtimeOnlyFieldsOffDisk`. The 5 AoS traits
+  (`SkinnedMeshRenderer`, `AnimationLibrary`, `MaterialInstance`, `Input`, `UIAction`) have no static
+  key order, and game-registered traits are invisible to `registerAllTraits()`. `added[]` subtrees
+  are left out because older ones were written uncompacted.
+- **No ledger.** Measured 2026-09-18, the whole population was 8 hand-authored ad-UI objects out
+  of order (Court's No Ads UI, #1410; wordweave's ad-break UI; the #1398 Player ID row) plus 2
+  default-valued scalars. They were canonicalized in the same change: keys reordered and the two
+  defaults dropped, values unchanged, the `version` line untouched. A per-object
+  `assertExemptionLedger` was tried first and dropped: other clones re-save or re-edit these scenes,
+  so its rows went stale or short at whichever merge landed second. **New drift gets a re-save,
+  never a row.**
+- **Not covered:** trait order inside `traits` (registry insertion order interleaves game traits),
+  and prefab files (a different writer, `serializePrefab`).
 
 **Prefabs needed their own route (#125), and are now swept too** — see "Re-saving legacy
 prefabs" below.

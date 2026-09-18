@@ -336,7 +336,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'would hang an agent call).',
     {
       path: z.string().optional().describe(
-        'Save to this path instead of the current one, e.g. "/assets/scenes/my-scene.json". ' +
+        'Save to this path instead of the current one, e.g. "/assets/scenes/my-scene.scene.json". A new scene must be ' +
+        'named <name>.scene.json; any other name is REFUSED with the corrected path (the open scene keeps its own name). ' +
         'Required for a scene from new_scene (which has no path yet); the scene keeps it for later saves.',
       ),
     },

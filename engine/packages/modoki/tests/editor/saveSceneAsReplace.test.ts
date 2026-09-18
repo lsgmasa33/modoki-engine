@@ -28,7 +28,7 @@ if (typeof globalThis.localStorage === 'undefined') {
   } as Storage;
 }
 
-const TARGET = '/assets/scenes/level.json';
+const TARGET = '/assets/scenes/level.scene.json';
 const asked: string[] = [];
 let answer = true;
 const chooseNewAssetPath = vi.fn(async () => ({ path: TARGET, confirmReplace: async (p: string) => { asked.push(p); return answer; } }));
@@ -84,11 +84,16 @@ afterEach(() => {
   for (const p of [TARGET, ON_DISK]) for (let g = getGuidForPath(p); g; g = getGuidForPath(p)) unregisterAsset(g);
 });
 /** An existing scene whose name differs from TARGET by case alone. */
-const ON_DISK = '/assets/scenes/Level.json';
+const ON_DISK = '/assets/scenes/Level.scene.json';
 
 const idOf = (text: string) => (JSON.parse(text) as { id: string }).id;
 
 describe('Save Scene As', () => {
+  it('asks for a <name>.scene.json, not a plain .json (#1413)', async () => {
+    await saveScene();
+    expect(chooseNewAssetPath).toHaveBeenCalledWith(expect.objectContaining({ ext: '.scene.json', defaultName: 'New Scene.scene.json' }));
+  });
+
   it('a free name writes create-only and asks nothing', async () => {
     const r = await saveScene();
     expect(r).toMatchObject({ saved: true, path: TARGET });
@@ -108,7 +113,7 @@ describe('Save Scene As', () => {
     expect(getCurrentScenePath()).toBeNull();
   });
 
-  it('a taken name that is NOT a scene (Enemy.prefab.json is `.json` too) is refused — its guid never becomes a scene', async () => {
+  it('a taken name the manifest types as another kind is refused — its guid never becomes a scene (defensive since #1413)', async () => {
     onDisk.set(TARGET, `{"id":"${OLD}","entities":[]}\n`);
     registerAsset(OLD, TARGET, 'prefab');
     const r = await saveScene();
