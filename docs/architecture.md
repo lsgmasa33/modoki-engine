@@ -827,6 +827,42 @@ so it matters only to video streaming. `new Audio(url)` streams and the video st
 Left out on purpose: the 3D `fileShaderBuilder` fallback's lifetime (not traced), and re-downloading
 audio bytes on every decode retry.
 
+**A failure has to reach the main thread before it can be classified. On iOS 16, Pixi's worker
+path never delivers it (#1404).** Pixi 8 decodes PNG/WebP textures in a worker by default. The
+worker reports a failure as `postMessage({ error: e })`, and iOS 16 WebKit cannot structured-clone
+an `Error`, so that call throws `DataCloneError` inside the worker and no message arrives.
+`WorkerManager` both settles the job and returns the worker to its pool only from its `message`
+listener. It has no `error` listener. So the load never settles, and that worker is lost for good.
+Once `navigator.hardwareConcurrency` loads have failed, every later worker load hangs too, present
+files included. Measured on the iPhone 8 (iOS 16.7.16, `hardwareConcurrency` 4), 2026-09-18,
+against the installed Particle Demo's own Pixi `Assets`: five missing PNGs, then a present
+`favicon.png`, were all still pending after 3 s. With `preferWorkers: false`, the missing file
+rejected with `[Loader.load] Failed to load …` and the present one resolved. On the iPad (iOS 26),
+the worker posted the `Error` intact.
+
+So `loadPixiTexture` asks the browser once, before the first texture load: a tiny worker posts
+`{error: new Error()}`. If the `Error` does not arrive (the post throws, the worker errors, or it
+stays silent for 2 s), the shim sets `preferWorkers: false`, the same switch the playable `blob:`
+path already flips. A timeout on `Assets.load` would not fix this. It rejects the caller, but it
+never returns the worker, so the pool drains anyway. Neither would patching Pixi's worker, which
+would be a vendored patch to carry across Pixi upgrades.
+
+`preferWorkers` does not reach **KTX2**. Pixi transcodes KTX2 on its own single worker
+(`loadKTX2onWorker`), with no main-thread path, and that worker posts failures the same way,
+`{type: 'error', err}`. It is one worker, not a pool, so nothing drains, but a missing KTX2 still
+hangs. So where the probe said no, the shim fetches a `.ktx2` URL on the main thread first. It
+cancels the body unread and rejects through `rethrowFetchFailure` / `checkAssetResponse`, so the
+consumer gets a classified error (#1402). A live cache hit skips the check, and concurrent
+callers for one URL share a single check. So the cost is one extra request per uncached KTX2 load,
+only on affected browsers. **Still open:** a failure only the worker sees still hangs. That means
+a KTX2 that fetches fine but fails to transcode, or a transcoder (`libktx`) that fails to init.
+The init failure would hang every KTX2 load. It is unlikely because `/pixi-ktx/*` ships locally.
+
+Verified with the shim itself, 2026-09-18: a Particle Demo built from this change, running on the
+iPhone 8, called its own `loadPixiTexture`. Six missing PNGs all rejected, which is more than the
+4-worker pool could have held. A present PNG and a present KTX2 resolved. A missing KTX2 rejected
+as `MissingAssetError` with `absent: true`.
+
 ## Single source of truth — where a value lives is decided by what KIND of value it is
 
 A core Modoki philosophy: never hardcode game data in TS that duplicates the scene/prefab/config;

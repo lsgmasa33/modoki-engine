@@ -36,7 +36,9 @@ export function loadPixiTexture(url: string): Promise<Texture> {
     disablePixiTextureWorker();
     load = Assets.load<Texture>({ src: url, parser: 'texture' });
   } else {
-    load = Assets.load<Texture>(url);
+    // #1404: no load may reach a Pixi worker before we know a failure can come back out of it.
+    const gate = workerErrorProbeGate();
+    load = gate ? gate.then(() => loadPastWorkerGap(url)) : loadPastWorkerGap(url);
   }
   // The WAKE lives in the shim, not at each call site (#1368 G1): `pixiParticleBackend` reveals its
   // emitter off this promise and woke nothing, so on a stopped Scene2D a texture slower than the
@@ -153,9 +155,122 @@ function evictSourcelessEntry(url: string): void {
 // tool) workers are fine, so this only matters for the local file:// preview — but
 // forcing main-thread decode is harmless (a playable has a handful of textures) and
 // makes the double-click "just work". One-shot, set before the first blob texture load.
+// The second caller is the #1404 probe below.
 let workerDisabled = false;
 function disablePixiTextureWorker(): void {
   if (workerDisabled) return;
   workerDisabled = true;
   Assets.setPreferences({ preferWorkers: false });
+}
+
+/**
+ * #1404 — on a WebKit that cannot structured-clone an `Error` (iOS 16.7.16 on the iPhone 8,
+ * measured), a FAILED worker texture load never settles AND permanently removes a worker from
+ * Pixi's pool — so every texture load, present files included, hangs once `hardwareConcurrency`
+ * loads have failed.
+ *
+ * The mechanism, in pixi.js 8.20.1: the worker (`_virtual/loadImageBitmap.worker.mjs`) reports a
+ * failure as `postMessage({ error: e })`. That call THROWS `DataCloneError` there, so no message
+ * arrives, and `WorkerManager` both rejects the job and returns the worker to its pool only
+ * from its `message` listener (it has no `error` listener). The job's promise hangs; the worker
+ * is never reused.
+ *
+ * A timeout on `Assets.load` would NOT fix it: it rejects the caller, but the worker still never
+ * returns to the pool. So this asks the browser once, before the first texture load, whether a
+ * worker can post an `Error`, and falls back to Pixi's main-thread decode where it cannot.
+ * Browsers that can keep their workers and pay one tiny worker spawn at boot.
+ */
+export const WORKER_ERROR_PROBE_SRC =
+  "try{postMessage({error:new Error('modoki-probe')})}" +
+  'catch(e){postMessage({cloneFailed:String(e&&e.name)})}';
+
+/** A worker that never answers is treated as unable to report failures, the same as one that
+ *  cannot clone. Main-thread decode is always correct; the cost of a false verdict is only speed. */
+const WORKER_PROBE_TIMEOUT_MS = 2000;
+
+let probe: Promise<void> | undefined;
+let probeSettled = false;
+/** The probe's "no" verdict. Kept apart from `workerDisabled`, which the playable blob path sets too. */
+let workerErrorsLost = false;
+
+/**
+ * `preferWorkers: false` covers only PNG/WebP. Pixi decodes KTX2 on its own single worker
+ * (`loadKTX2onWorker`), with no main-thread path, and that worker reports a failure the same
+ * way: `postMessage({ type: 'error', err })`. So where errors cannot cross, a missing KTX2 would
+ * still hang. There is no pool to drain here, just that one URL. So the shim asks the question
+ * the worker cannot answer, on the main thread, first. A missing or unreachable file rejects
+ * with #1402's classified errors, and only a file that answers goes on to Pixi.
+ *
+ * The cost is one extra request per KTX2 load that is not already cached, on affected browsers
+ * only. The body is cancelled unread. What is still NOT covered: a failure only the worker sees,
+ * namely a KTX2 that fetches fine but fails to TRANSCODE, or a transcoder (`libktx`) that fails to
+ * init. Both still hang.
+ */
+function loadPastWorkerGap(url: string): Promise<Texture> {
+  // A live cache entry never reaches the worker, so it needs no check. Asked NOW, not from the
+  // `miss` taken before the probe: a cache hit costing a request (and failing offline) is the
+  // defect this guards against.
+  if (!workerErrorsLost || isPixiTextureLive(url) || !/\.ktx2(?:[?#]|$)/i.test(url)) return Assets.load<Texture>(url);
+  let check = ktx2Checks.get(url);
+  if (!check) {
+    // Shared by same-url callers in flight (N emitters on one texture), which Pixi's loader would
+    // otherwise de-duplicate for us.
+    check = fetch(url).catch(rethrowFetchFailure(url)).then((res) => {
+      res.body?.cancel().catch(() => {}); // status + headers are all the check reads
+      checkAssetResponse(res, url);
+    });
+    ktx2Checks.set(url, check);
+    const drop = () => { if (ktx2Checks.get(url) === check) ktx2Checks.delete(url); };
+    check.then(drop, drop);
+  }
+  return check.then(() => Assets.load<Texture>(url));
+}
+const ktx2Checks = new Map<string, Promise<void>>();
+
+/** `undefined` = load now, synchronously (verdict known, or no Worker to ask about). */
+function workerErrorProbeGate(): Promise<void> | undefined {
+  if (probeSettled || workerDisabled) return undefined;
+  if (!probe) {
+    if (typeof Worker !== 'function' || typeof URL.createObjectURL !== 'function') {
+      probeSettled = true; // no worker path to protect (Node, a worker-less host)
+      return undefined;
+    }
+    probe = workerCanPostErrors().then((ok) => {
+      probeSettled = true;
+      if (!ok) { workerErrorsLost = true; disablePixiTextureWorker(); }
+    });
+  }
+  return probe;
+}
+
+/** Never rejects: every failure to get a clean "yes" answer resolves `false`. */
+function workerCanPostErrors(): Promise<boolean> {
+  return new Promise((resolve) => {
+    let worker: Worker | undefined;
+    let url: string | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let done = false;
+    const finish = (ok: boolean, why: string) => {
+      if (done) return; // a late message after the timeout, or onerror after onmessage
+      done = true;
+      clearTimeout(timer);
+      worker?.terminate();
+      if (url) URL.revokeObjectURL(url);
+      if (!ok) console.info(`[pixiTextureLoad] a worker cannot post an Error here (${why}) — Pixi texture workers disabled (#1404)`);
+      resolve(ok);
+    };
+    try {
+      url = URL.createObjectURL(new Blob([WORKER_ERROR_PROBE_SRC], { type: 'application/javascript' }));
+      timer = setTimeout(() => finish(false, 'no answer'), WORKER_PROBE_TIMEOUT_MS);
+      worker = new Worker(url);
+      worker.onmessage = (e: MessageEvent) => {
+        // Only a cloned Error carries `error`; the probe's catch branch posts just the failure name.
+        const d = e.data as { error?: unknown; cloneFailed?: string } | undefined;
+        finish(d?.error !== undefined, d?.cloneFailed ?? 'no error in the message');
+      };
+      worker.onerror = () => finish(false, 'worker error');
+    } catch (e) {
+      finish(false, String(e)); // CSP-blocked blob worker, etc.
+    }
+  });
 }
