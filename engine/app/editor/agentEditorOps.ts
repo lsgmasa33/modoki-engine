@@ -25,7 +25,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, dumpSceneState, whereError } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, dumpSceneState, whereError } from '../debug/agentBridge';
 import { conditionError, waitForCondition, clampWaitTimeout, type WaitCondition, type WaitReaders } from '../debug/waitFor';
 import { getConsoleRingEntries } from '@modoki/engine/runtime/core/consoleRing';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
@@ -38,7 +38,7 @@ import {
   type AssetEditorKind, type AssetEditorMount, colliderEditBlocker,
   enterPlay, stopPlay, pausePlay,
   undoStep, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
-  loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
+  loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk,
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage,
@@ -1034,6 +1034,9 @@ export function registerEditorAgentOps(): void {
   // tears the human's preview down mid-pose.
   // ⚠️ `canEdit()`, NOT `getPlayState()` (#1148): the 3-value shim reads a preview as 'stopped', so
   // this used to let the reload through inside every envelope — #1122's mechanism, one gate over.
+  // #1409: a hot reload replaces the world from disk outside `loadScene`, so it owes the same
+  // undo-history and clean-baseline rules — see `adoptWorldReloadedFromDisk`.
+  setWorldReloadedFromDiskHook(adoptWorldReloadedFromDisk);
   setSceneReloadSuppressor(() => {
     // Stopped, but a snapshot restore, a scene open or a save cycle is still swapping the world
     // (#1164 review): a reload now supersedes that load — a scene open silently fails, or a Stop's

@@ -149,7 +149,7 @@ export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
 
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
 export {
-  hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, causeSpecs, flushParked,
+  hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, causeSpecs, flushParked, adoptWorldReloadedFromDisk,
   type SaveResult, type UnsavedCauses, type PathKeyedCause, type SceneWrittenCause,
   type FlushPhase, type ParkedFlushResults,
 } from './scene/serialize';

@@ -47,6 +47,10 @@ watcher event), and swapping to a different scene and back re-reads the prefab o
 scene does NOT also use it. **Verify any disk edit by querying the live spawned entity, never by
 re-reading the file you wrote.**
 
+**A reload over unsaved edits discards them (disk wins) and drops their undo history with them**, then
+makes the reloaded world the clean baseline (#1409) — the rule and why:
+[scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history).
+
 **`mesh` (`.mesh.json`, #1380) needs more than an eviction, and it is the one kind here that is not an
 `ASSET_SCHEMA_TYPE`.** Nothing agent-side writes one and it is never parked, so the only external
 writer is a plain file edit — which is why #842's "schema type ⊆ live-reload kind" check could not

@@ -792,6 +792,36 @@ export function hasUnsavedChanges(): boolean {
   return false;
 }
 
+/** Does the LIVE WORLD hold edits that a world swap would throw away? The two world-shaped causes
+ *  only — the primary scene and the other loaded scenes. A parked asset doc, base-scene ref or
+ *  import setting survives the swap (it is not in the world), so it does not make the outgoing
+ *  undo stack stale. It is what `swapHistory`'s `discardOutgoing` is decided from (#1409) — read
+ *  on both sides of the swap's await, since the outgoing world stays editable while it runs. */
+export function worldHasUnsavedEdits(): boolean {
+  return CAUSE_SPECS.sceneDirty.has() || CAUSE_SPECS.dirtyScenes.has();
+}
+
+/** The editor's half of a scene HOT-RELOAD — an external write to the open scene or a prefab it
+ *  uses, where disk wins over unsaved edits (owner, 2026-09-13, #1164). The runtime replaced the
+ *  world from disk without going through `loadScene`, so the same two rules apply here that
+ *  `loadScene`'s tail applies: a DIRTY world's undo entries are dropped with it (#1409 — observed
+ *  live: after the reload the stack still offered to undo a reparent the file never had), and the
+ *  reloaded world is the new clean baseline. Before this, `unsavedChanges` stayed true after the
+ *  reload over a world that matched disk. Installed via `setWorldReloadedFromDiskHook`.
+ *
+ *  ⚠️ **Does NOTHING while a base scene is dirty** (#1409 second review). A hot reload reloads the
+ *  PRIMARY from disk, but a base whose guid is unchanged is KEPT, its entities snapshotted from the
+ *  LIVE world (`SceneManager.loadScene`'s `keptBaseGuids`), so its unsaved edits survive the reload.
+ *  Clearing its dirty flag then made `saveAll` skip the base and the unsaved-work guard stop
+ *  asking, which lost those edits silently. And one stack mixes base and primary entries, so it
+ *  cannot be dropped for the primary alone. That case keeps the pre-#1409 behaviour: stale primary
+ *  entries stay on the stack, which is the lesser loss. */
+export function adoptWorldReloadedFromDisk(scenePath: string): void {
+  if (CAUSE_SPECS.dirtyScenes.has()) return;
+  swapHistory(scenePath, { discardOutgoing: CAUSE_SPECS.sceneDirty.has() });
+  markSceneSaved();
+}
+
 /** WHICH kinds of unsaved work exist, told apart. The causes themselves — what each one is, what
  *  it is keyed by, and which half of a save writes it — are documented on `CAUSE_SPECS` below,
  *  which this derives from; they are not re-listed here.
@@ -1262,6 +1292,11 @@ export async function loadScene(
   try {
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
+    // Unsaved world edits here are being DISCARDED, so their undo entries go with them (#1409).
+    // Read on BOTH sides of the await: the outgoing world stays live and editable while the new
+    // one loads, so an edit made mid-load is discarded too. Nothing resets the dirty state until
+    // `markSceneSaved` below — the swap itself does not.
+    const dirtyBeforeLoad = worldHasUnsavedEdits();
     await sceneManager.loadScene(scenePath, {
       ...(gameId !== undefined ? { gameId } : {}),
       // Resources acquire in parallel; each completion (on a cold cache, a finished
@@ -1289,7 +1324,11 @@ export async function loadScene(
     // stack. Per-scene keying also keeps another scene's actions (stale ids) from
     // ever applying here. (Play→Stop does NOT come through here — it reloads via
     // sceneManager directly — so its same-scene history is preserved.)
-    swapHistory(scenePath);
+    //
+    // ⚠️ Unless the outgoing world was DIRTY (#1409): then its stack describes discarded work, and
+    // parking it — or, on a same-path discard-reload, keeping it live — let one undo replay that
+    // work onto the fresh world. A CLEAN outgoing world matches its file, so its stack stays valid.
+    swapHistory(scenePath, { discardOutgoing: dirtyBeforeLoad || worldHasUnsavedEdits() });
     const worldEntityTotal = getAllEntities().length;
     markSceneSaved(); // the freshly loaded world matches disk — a new baseline (C7)
     // A stale dirty guid from the PREVIOUS chain (e.g. a base no longer loaded) must
@@ -1425,6 +1464,8 @@ export async function newScene(path: string | null = null): Promise<void> {
     // from a path that is still the OUTGOING scene's. Setting it first removes the ordering
     // dependency instead of racing it. ⚠️ This is also what makes the refusal above a LOCK
     // rather than a supersession token — see there.
+    // Read on both sides of the await, for the same reason as in `loadScene` (#1409).
+    const dirtyBeforeSwap = worldHasUnsavedEdits();
     setCurrentScenePath(path);
     setCurrentBaseScene(undefined);
     // Replace the world CONTENT through SceneManager rather than deleting and respawning in
@@ -1456,9 +1497,11 @@ export async function newScene(path: string | null = null): Promise<void> {
       );
     });
     // Keyed by the new scene's own path when it has one, so its undo stack is its own and the
-    // outgoing scene's is preserved under ITS key rather than dropped. '' is the untitled
+    // outgoing scene's is preserved under ITS key when clean rather than dropped. '' is the untitled
     // bootstrap context, which is what the agent `new-scene` op (no path) still gets.
-    swapHistory(path ?? '');
+    // `freshIncoming`: a starter world matches no stack ever recorded under this key — '' above all,
+    // which every untitled scene shares (#1409).
+    swapHistory(path ?? '', { discardOutgoing: dirtyBeforeSwap || worldHasUnsavedEdits(), freshIncoming: true });
     markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
     clearAllSceneDirty();
     console.log('[Editor] New scene created');

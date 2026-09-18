@@ -175,3 +175,9 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-17,work-qa,modoki_validate_prefab,29,1104,174914,87d13ee0f
 2026-09-17,work-qa,modoki_wait_for,164,2324,174914,87d13ee0f
 2026-09-17,work-qa,modoki_wait_for_edit,322,1807,174914,87d13ee0f
+2026-09-18,work-qa,modoki_delete_asset,-9,3802,174998,595ccde25
+2026-09-18,work-qa,modoki_load_scene,-9,1093,174998,595ccde25
+2026-09-18,work-qa,modoki_new_scene,-9,1505,174998,595ccde25
+2026-09-18,work-qa,modoki_prefab,-9,4943,174998,595ccde25
+2026-09-18,work-qa,modoki_write_asset,-9,2616,174998,595ccde25
+2026-09-18,work-qa,modoki_write_asset_meta,-9,3254,174998,595ccde25

@@ -659,6 +659,16 @@ export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>
   _prefabSourceRefresher = fn;
 }
 
+/** Editor-only: told when a hot reload has REPLACED the current world from disk (#1409), so the
+ *  editor can drop a dirty world's undo entries and rebaseline — `adoptWorldReloadedFromDisk`.
+ *  Installed the way the suppressor is; unset in the game runtime, which has no undo. */
+let _worldReloadedFromDisk: ((scenePath: string) => void) | null = null;
+
+/** Editor-only: install the after-reload hook. Called from `agentEditorOps.ts`. */
+export function setWorldReloadedFromDiskHook(fn: ((scenePath: string) => void) | null): void {
+  _worldReloadedFromDisk = fn;
+}
+
 /** Why scene hot-reload is currently suppressed (editor Play mode), or null when
  *  it may proceed. Also consulted by the backend to refuse mutate-while-playing. */
 export function sceneReloadSuppressedReason(): string | null {
@@ -2892,6 +2902,7 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
     });
+    _worldReloadedFromDisk?.(current);
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
     // A newer reload superseding this one aborts the in-flight load

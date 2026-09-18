@@ -10,10 +10,11 @@
 import type { PrefabFile } from './prefab';
 import { serializePrefab, warnInertPrefabSizes, writePrefabFile, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
 import { runtimeExcludedMessage } from './authoringScope';
-import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
+import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
+import { clearAllSceneDirty } from './sceneDirty';
 import type { SceneData, SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
@@ -317,6 +318,9 @@ export async function openPrefabForEditing(asset: { path: string; name: string }
     useEditorStore.getState().prefabReturnScenePath ?? null,
   );
   const sceneData = buildPrefabEditScene(prefab);
+  // Still dirty after the save above (an untitled scene, or a save that failed) → that work is
+  // discarded by this swap, and so is its undo stack (#1409). Read on both sides of the await.
+  const dirtyBeforeSwap = worldHasUnsavedEdits();
   try {
     await sceneManager.loadScene(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { preloaded: sceneData });
   } catch (e) {
@@ -328,7 +332,11 @@ export async function openPrefabForEditing(asset: { path: string; name: string }
   // Swap to this prefab-edit context's OWN undo stack (keyed by the synthetic
   // prefab-edit path). The main scene's stack is saved and restored when
   // exitPrefabEdit reloads the return scene (via the serialize.loadScene wrapper).
-  swapHistory(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`);
+  swapHistory(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { discardOutgoing: dirtyBeforeSwap || worldHasUnsavedEdits() });
+  // The prefab world IS its file — a clean baseline, like a load (#1409 review). Without it a dirty
+  // flag from an untitled scene rode into the prefab world, and leaving it then dropped a valid stack.
+  markSceneSaved();
+  clearAllSceneDirty();
   useEditorStore.getState().openPrefabEditor({ path: asset.path, guid, name: prefab.name }, returnScene);
   console.log(`[PrefabEdit] editing "${prefab.name}"`);
 }

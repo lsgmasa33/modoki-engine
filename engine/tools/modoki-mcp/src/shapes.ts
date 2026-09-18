@@ -271,14 +271,15 @@ export const unsavedForceParam = z.boolean().optional().describe(
  *  ⚠️ **That fix was HALF-APPLIED until #1218's close-out.** The opening sentence was rewritten and
  *  the undo-stack clause — the specific thing this comment says was false for `write_asset_meta` —
  *  was left in the string, so three more tools inherited it as they adopted the base. It now states
- *  what is true of every member: a world swap CLEARS the undo history, and a parked sidecar or
+ *  what is true of every member: the discarded work's undo entries go with it (#1409 — a world
+ *  swap drops a DIRTY scene's history; a clean one is parked per scene), and a parked sidecar or
  *  document edit was never ON it, so in both cases undo is not the way back. The containment guard
  *  could never have caught this: all six wordings contained the base verbatim, wrong clause and
  *  all. A shared constant makes one wrong clause wrong N times, silently. */
 export const DISCARD_UNSAVED_BASE =
   'Proceed even though this DESTROYS unsaved editor work. ⚠️ DESTRUCTIVE and IRREVERSIBLE: what '
-  + 'it destroys is gone from the editor and from the file, and undo is not the way back — a world '
-  + 'swap clears the undo history, and a parked edit was never on it. It destroys '
+  + 'it destroys is gone from the editor and from the file, and undo is not the way back — its '
+  + 'undo entries go with it, and a parked edit was never on it. It destroys '
   + 'only what THIS operation overwrites or replaces, NOT everything the editor is holding: a '
   + 'world swap leaves a parked .meta.json import-settings edit untouched, and a sidecar write '
   + 'leaves the live world untouched — so this is never a way to clear an unrelated '

@@ -1855,17 +1855,53 @@ scene currently in the chain, primary included. **Mutation is exactly one entry 
 `loadScene(path)` = "make this primary, resolve its chain, diff". There is deliberately
 no `unloadScene()` — see [Base scenes](#base-scenes-nestable-cross-scene-persistence).
 
-The editor wrapper `loadScene()` in `editor/scene/serialize.ts` delegates to
-`sceneManager.loadScene`, then tracks the scene path and swaps to **this
-scene's own** per-scene undo history (`swapHistory(scenePath)` — empty on first
-visit, restored when you return to a previously-open scene), rather than
-dropping undo globally.
 `unloadAll()` and `resetForTesting()` exist for shutdown + deterministic tests.
 `unloadAll()` is also the authoritative "unload wins" side of the #535 race
 described in step 9 above — it bumps `teardownInFlight`/`teardownGeneration` at
 its own head so any `loadScene()` racing it rejects rather than silently
 winning; `resetForTesting()` additionally resets both back to zero so a test
 run starts from a clean slate.
+
+#### Per-scene undo history
+
+The editor wrapper `loadScene()` in `editor/scene/serialize.ts` delegates to
+`sceneManager.loadScene`, then tracks the scene path and swaps to **this
+scene's own** per-scene undo history (`swapHistory(scenePath)` — empty on first
+visit, restored when you return to a previously-open scene), rather than
+dropping undo globally.
+**A parked stack is valid only if the scene was CLEAN when it was left** (#1409). The scene
+reloads from disk, so a stack recorded against unsaved edits describes a world that no longer
+exists. Every path that replaces the world applies one rule, through `worldHasUnsavedEdits()`
+(the two world-shaped unsaved causes: the primary scene and the other loaded scenes). When the
+world is dirty, the outgoing stack is **dropped** instead of parked:
+- **`loadScene`, `newScene` and prefab-edit entry** read it on BOTH sides of the swap's await. The
+  outgoing world stays live and editable while the new one loads, and nothing resets the dirty
+  state until `markSceneSaved` runs after the swap, so an edit made mid-load is discarded too.
+  This covers a same-path reload as well: `swapHistory` used to no-op on an unchanged key, so one
+  undo after `modoki_load_scene {discardUnsaved:true}` replayed the discarded work onto the fresh
+  world.
+- **A scene hot-reload** (an external write to the open scene or a prefab it uses) replaces the
+  world from disk without going through `loadScene`. Disk wins over unsaved edits (owner,
+  2026-09-13, #1164). `agentBridge.ts` calls the editor's `adoptWorldReloadedFromDisk` through
+  `setWorldReloadedFromDiskHook` once the reload lands. It applies the same drop and makes the
+  reloaded world the clean baseline. Before that, `unsavedChanges` stayed true over a world that
+  matched the file.
+  ⚠️ **Except while a base scene is dirty: then it does nothing.** The reload reloads the
+  primary, but SceneManager KEEPS an unchanged base and snapshots its entities from the live world
+  (`keptBaseGuids`), so a dirty base's edits survive the reload. Clearing its flag would make
+  `saveAll` skip it silently, and one stack mixes base and primary entries. Stale primary entries
+  stay on the stack in that case, which is the lesser loss.
+- **Asset-document edits survive the drop.** `_isFileDirect` entries (material, clip, particle,
+  skin, timeline…) target a file the swap does not touch, so `parkSurvivors` keeps them, in order.
+- **`newScene` starts its key empty** (`freshIncoming`), apart from those asset entries, because a
+  starter world matches no stack and every untitled scene shares the `''` key. Prefab-edit entry
+  also sets a clean baseline: before, an untitled scene's dirty flag rode into the prefab world, and
+  leaving it then dropped a valid stack.
+
+"Dirty" over-reports, deliberately: undo and redo bump the edit version, so a scene undone back to
+its saved state still reads dirty and its history is dropped rather than parked. That loses
+history, never correctness. Not covered: a scene FILE that changes on disk while its CLEAN stack is
+parked under a scene that is not open (a git checkout, an agent `write_asset`).
 
 ## Persistent entities
 

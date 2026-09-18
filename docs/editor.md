@@ -1932,8 +1932,8 @@ panels' bound root. The rule this follows is in [engine-concepts.md](engine-conc
   entities, [engine-concepts.md](engine-concepts.md) § Entity identity). Accepted: it is what lets a
   guid written without `indexEntityGuid` be followed.
 - **Selection undo** (`editorStore.ts` `resolveSnap`) resolves a durable guid first, then a HOLD
-  taken at capture when it belongs to the current world (undo history survives a same-scene reload and
-  A→B→A, and another world's number means nothing here) — never the bare raw id, which re-selected whatever took a destroyed entity's index
+  taken at capture when it belongs to the current world (undo history survives a CLEAN same-scene reload and
+  A→B→A — a discarding one drops it, [scene-loading.md](scene-loading.md) #1409 — and another world's number means nothing here) — never the bare raw id, which re-selected whatever took a destroyed entity's index
   (the capture keeps durable guids only, so that reached every runtime spawn). A primary that is gone
   falls back to the last remaining member.
 - **Hierarchy collapse** holds each id while it is in the set and re-resolves the holds before every

@@ -14,6 +14,8 @@ import { initAgentBridge, peekSuppressedSceneReloads, replaySuppressedSceneReloa
 import { beginWorldReplacement } from '../../packages/modoki/src/editor/scene/authoringSettle';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefab';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
+import { pushAction, canUndo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
+import { markSceneSaved, hasUnsavedChanges } from '../../packages/modoki/src/editor/scene/serialize';
 
 registerEditorAgentOps();
 
@@ -69,6 +71,18 @@ afterEach(async () => {
 });
 
 describe('registerEditorAgentOps wires the deferred hot reload', () => {
+  it('a reload over a DIRTY world drops its undo history and rebaselines (#1409)', async () => {
+    _resetHistoryContexts();
+    swapHistory(SCENE_PATH);
+    markSceneSaved();
+    pushAction({ label: 'Reparent', undo: () => {}, redo: () => {} });
+    emit(SCENE_PATH, 'scene');
+    await settle();
+    expect(loadScene, 'fixture: the reload ran').toHaveBeenCalledTimes(1);
+    expect(canUndo(), 'the editor never installed the after-reload hook').toBe(false);
+    expect(hasUnsavedChanges()).toBe(false);
+  });
+
   it('a change during Play is held, and the Stop edge replays it', async () => {
     setRunMode('playing');
     emit(SCENE_PATH, 'scene');
