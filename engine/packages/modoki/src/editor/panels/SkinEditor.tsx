@@ -824,7 +824,7 @@ export default function SkinEditor() {
             <span style={lbl}>x</span><BufferedNumberInput dataUiId="skin.inspector.bone.x" dataUiLabel="bone pos x" dataUiKind="field" value={posed.x} step={1} onChange={(v) => setBoneField('x', v)} style={{ ...inputStyle, width: 50 }} />
             <span style={lbl}>y</span><BufferedNumberInput dataUiId="skin.inspector.bone.y" dataUiLabel="bone pos y" dataUiKind="field" value={posed.y} step={1} onChange={(v) => setBoneField('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
           <div style={{ ...trowStyle, marginBottom: 0 }}><span style={{ ...lbl, width: 26 }}>rot°</span>
-            <BufferedNumberInput dataUiId="skin.inspector.bone.rot" dataUiLabel="bone rotation" dataUiKind="field" value={+(posed.rot * 180 / Math.PI).toFixed(2)} step={1} onChange={(v) => setBoneField('rot', v * Math.PI / 180)} style={{ ...inputStyle, width: 50 }} /></div>
+            <BufferedNumberInput dataUiId="skin.inspector.bone.rot" dataUiLabel="bone rotation" dataUiKind="field" value={posed.rot * 180 / Math.PI} precision={2} step={1} onChange={(v) => setBoneField('rot', v * Math.PI / 180)} style={{ ...inputStyle, width: 50 }} /></div>
         </div>
       </>
     );
@@ -1110,9 +1110,10 @@ export default function SkinEditor() {
             const hasMesh = verts.length > 0;
             const c = hasMesh ? centerOf(verts) : { x: 0, y: 0 };
             const aff = hasMesh ? uvToPosAffine(verts, ap.mesh?.uvs ?? [], ap.mesh?.tris ?? []) : null;
-            const rotDeg = aff ? +(Math.atan2(aff.m10, aff.m00) * 180 / Math.PI).toFixed(2) : 0;
-            const wPx = aff ? +Math.hypot(aff.m00, aff.m10).toFixed(1) : 0;
-            const hPx = aff ? +Math.hypot(aff.m01, aff.m11).toFixed(1) : 0;
+            // RAW, not rounded: each field rounds at its own `precision` and compares its echo there (#1407).
+            const rotDeg = aff ? Math.atan2(aff.m10, aff.m00) * 180 / Math.PI : 0;
+            const wPx = aff ? Math.hypot(aff.m00, aff.m10) : 0;
+            const hPx = aff ? Math.hypot(aff.m01, aff.m11) : 0;
             return (
               <>
                 {/* Name (generalized — part) */}
@@ -1138,13 +1139,13 @@ export default function SkinEditor() {
                     <div style={inspectorTitle}><span>Transform</span>
                       <InfoDot tip="The active part's placement — baked into the mesh verts (a part has no transform node). Position = mesh center; Rotation + Size read from the UV→vertex map. Edit here or with the canvas Parts gizmo. Size is width/height in px." /></div>
                     <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>pos</span>
-                      <span style={lbl}>x</span><BufferedNumberInput dataUiId="skin.part.center.x" dataUiLabel="part center x" dataUiKind="field" value={+c.x.toFixed(1)} step={1} onChange={(v) => setPartCenter('x', v)} style={{ ...inputStyle, width: 50 }} />
-                      <span style={lbl}>y</span><BufferedNumberInput dataUiId="skin.part.center.y" dataUiLabel="part center y" dataUiKind="field" value={+c.y.toFixed(1)} step={1} onChange={(v) => setPartCenter('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
+                      <span style={lbl}>x</span><BufferedNumberInput dataUiId="skin.part.center.x" dataUiLabel="part center x" dataUiKind="field" value={c.x} precision={1} step={1} onChange={(v) => setPartCenter('x', v)} style={{ ...inputStyle, width: 50 }} />
+                      <span style={lbl}>y</span><BufferedNumberInput dataUiId="skin.part.center.y" dataUiLabel="part center y" dataUiKind="field" value={c.y} precision={1} step={1} onChange={(v) => setPartCenter('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
                     <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>rot°</span>
-                      <BufferedNumberInput dataUiId="skin.part.rotation" dataUiLabel="part rotation" dataUiKind="field" value={rotDeg} step={1} onChange={(v) => setPartRotation(v)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} /></div>
+                      <BufferedNumberInput dataUiId="skin.part.rotation" dataUiLabel="part rotation" dataUiKind="field" value={rotDeg} precision={2} step={1} onChange={(v) => setPartRotation(v)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} /></div>
                     <div style={{ ...trowStyle, marginBottom: 0 }}><span style={{ ...lbl, width: 26 }}>size</span>
-                      <span style={lbl}>w</span><BufferedNumberInput dataUiId="skin.part.size.w" dataUiLabel="part width" dataUiKind="field" value={wPx} step={1} onChange={(v) => setPartSize('x', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
-                      <span style={lbl}>h</span><BufferedNumberInput dataUiId="skin.part.size.h" dataUiLabel="part height" dataUiKind="field" value={hPx} step={1} onChange={(v) => setPartSize('y', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
+                      <span style={lbl}>w</span><BufferedNumberInput dataUiId="skin.part.size.w" dataUiLabel="part width" dataUiKind="field" value={wPx} precision={1} step={1} onChange={(v) => setPartSize('x', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
+                      <span style={lbl}>h</span><BufferedNumberInput dataUiId="skin.part.size.h" dataUiLabel="part height" dataUiKind="field" value={hPx} precision={1} step={1} onChange={(v) => setPartSize('y', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
                       <button data-ui-id="skin.part.sizeLock" data-ui-kind="toggle" data-ui-label="aspect ratio lock" onClick={() => setSizeLocked((l) => !l)} title={sizeLocked ? 'Aspect ratio locked — w/h scale together. Click to unlock.' : 'Aspect ratio unlocked — w/h scale independently. Click to lock.'}
                         style={{ ...eyeBtn, color: sizeLocked ? '#4a9eff' : '#777', fontSize: 12 }}>{sizeLocked ? '🔒' : '🔓'}</button></div>
                   </div>

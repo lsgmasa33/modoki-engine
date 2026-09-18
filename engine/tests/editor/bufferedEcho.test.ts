@@ -5,7 +5,7 @@
  *  Each case replays a sequence the live editor produced; the #1411 one is the measured
  *  `…qr`-over-`…qrs` clobber. */
 import { describe, it, expect } from 'vitest';
-import { resyncBuffered, ECHO_WINDOW_MS, type PendingCommit } from '../../packages/modoki/src/editor/panels/bufferedEcho';
+import { resyncBuffered, roundedTo, ECHO_WINDOW_MS, type PendingCommit } from '../../packages/modoki/src/editor/panels/bufferedEcho';
 import { parseNumber, parseString } from '../../packages/modoki/src/editor/panels/fields';
 
 const commits = <T,>(...values: T[]): PendingCommit<T>[] => values.map((value) => ({ value, at: 0 }));
@@ -49,5 +49,56 @@ describe('resyncBuffered', () => {
     const stale = [{ value: 'ab', at: 0 }];
     expect(resyncBuffered('abc', 'ab', stale, parseString, ECHO_WINDOW_MS + 1).text).toBe('ab');
     expect(resyncBuffered('abc', 'ab', stale, parseString, ECHO_WINDOW_MS).text).toBeNull();
+  });
+
+  // #1407: a field DISPLAYED at a precision. Measured live: a two-entity Transform.y, `4.1256` typed,
+  // the store handed back the 2dp-rounded 4.13, and the field rewrote itself to "4.13" mid-edit.
+  describe('at a display precision (#1407)', () => {
+    const at2 = roundedTo(2);
+
+    it('⭐ a ROUNDED echo of this field\'s own commit keeps the text', () => {
+      const pending = commits(4, 4.1, 4.12, 4.125, 4.1256);
+      expect(resyncBuffered('4.1256', 4.13, pending, parseNumber, 10, at2).text).toBeNull();
+      // Exact matching, the pre-#1407 behaviour, is what overwrote it:
+      expect(resyncBuffered('4.1256', 4.13, pending, parseNumber, 10).text).toBe('4.13');
+    });
+
+    it('a unit round trip\'s float noise (30° → rad → 29.999999999999996°) is this field\'s echo', () => {
+      const echo = 30 * Math.PI / 180 * 180 / Math.PI;
+      expect(echo).not.toBe(30); // the premise: the round trip really is noisy
+      expect(resyncBuffered('30', echo, commits(3, 30), parseNumber, 10, at2).text).toBeNull();
+      // …and so is a LATE one (#1411's route, through the same comparator).
+      expect(resyncBuffered('30.5', echo, commits(3, 30, 30.5), parseNumber, 10, at2).text).toBeNull();
+    });
+
+    it('a genuine external change still re-syncs, and is WRITTEN at the precision', () => {
+      const r = resyncBuffered('4.1256', 7.891234, commits(4.1256), parseNumber, 10, at2);
+      expect(r.text).toBe('7.89');
+      expect(r.pending).toEqual([]);
+      // Noise from a round trip is not shown either — this is what the caller's toFixed used to do.
+      expect(resyncBuffered('', 30 * Math.PI / 180 * 180 / Math.PI, [], parseNumber, 10, at2).text).toBe('30');
+    });
+
+    it('a genuine external change INSIDE the precision re-syncs once nothing is pending — `means` is tight', () => {
+      // Review finding: with the #242 check at display precision, an undo from 4.1256 to 4.13 left
+      // "4.1256" on screen indefinitely, because that check has no expiry.
+      expect(resyncBuffered('4.1256', 4.13, [], parseNumber, 10, at2).text).toBe('4.13');
+      expect(resyncBuffered('4.1256', 4.1301, [], parseNumber, 10, at2).text).toBe('4.13');
+    });
+
+    it('…while a commit IS pending, a change equal to it at the precision is taken for its echo, for at most the window', () => {
+      const pending = [{ value: 4.1256, at: 0 }];
+      expect(resyncBuffered('4.1256', 4.13, pending, parseNumber, 10, at2).text).toBeNull();
+      expect(resyncBuffered('4.1256', 4.13, pending, parseNumber, ECHO_WINDOW_MS + 1, at2).text).toBe('4.13');
+    });
+
+    it('`means` still absorbs representation noise with nothing pending (30 vs 29.999999999999996)', () => {
+      expect(resyncBuffered('30', 30 * Math.PI / 180 * 180 / Math.PI, [], parseNumber, 10, at2).text).toBeNull();
+    });
+
+    it('a value that rounds to -0 matches, and shows as, 0', () => {
+      expect(at2.same(-0.001, 0)).toBe(true);
+      expect(at2.format(-0.001)).toBe('0');
+    });
   });
 });

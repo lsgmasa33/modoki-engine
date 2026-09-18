@@ -20,6 +20,7 @@ import { metaCameFromFailedRead } from '../../scene/metaReadFallback';
 // available here at all: `pendingMeta`'s own `refuseWithToast` could not be imported back from a
 // panel module without the cycle that produced `scene/metaReadFallback.ts`.
 import { useEditorStore } from '../../store/editorStore';
+import type { EchoMatch } from '../bufferedEcho';
 
 /** Single source of truth for the per-type color default (F11). White, not 0/black,
  *  so a newly-bound color `set`-value / un-set material color isn't a surprise
@@ -326,6 +327,34 @@ export function parseHexColor(raw: string): { color: number; alpha: number | nul
   };
 }
 
+/** Does the stored hex `b` match `a`, as the same colour ignoring case? When `anyAlpha` is true,
+ *  a 6-digit `a` matches any alpha in `b`, and ONLY that way round. A commit that carried no alpha
+ *  leaves the stored alpha alone, but an 8-digit commit echoed back WITHOUT its alpha means the
+ *  alpha was dropped (a colour with no alpha channel), so it must re-sync and show the truth. */
+function sameHex(a: string, b: string, anyAlpha: boolean): boolean {
+  const pa = parseHexColor(a), pb = parseHexColor(b);
+  if (!pa || !pb) return a === b;
+  if (pa.color !== pb.color) return false;
+  if (pa.alpha === null) return pb.alpha === null || anyAlpha;
+  if (pb.alpha === null) return false;
+  return alphaToByte(pa.alpha) === alphaToByte(pb.alpha);
+}
+
+/** How the hex box recognises its OWN commit coming back (#1407; the two comparators are
+ *  explained on `EchoMatch` in bufferedEcho.ts). The store hands back `hexText`, which is
+ *  RE-DERIVED from the stored colour: lower-case, with the alpha byte appended. That is a
+ *  projection of what was typed, not the typed text. Matched exactly, typing `#aabbcc80` committed
+ *  the colour at `#aabbcc`, the echo `#aabbccff` rewrote the text, and the `80` then built
+ *  `#aabbccff80`, which is invalid, so the alpha was never committed.
+ *  - `same` (a pending echo, for at most a second): a 6-digit commit leaves alpha alone
+ *    (`commitHex`), so its echo may carry ANY alpha.
+ *  - `means` (no expiry): the case may differ, but the alpha must match exactly. Otherwise a
+ *    6-digit text would hide a genuine external alpha change until the next blur. */
+export const HEX_ECHO: EchoMatch<string> = {
+  same: (a, b) => sameHex(a, b, true),
+  means: (a, b) => sameHex(a, b, false),
+};
+
 /** Alpha-checkerboard behind the swatch, so a low alpha reads at a glance instead of
  *  only as a number (an `<input type=color>` renders its value fully opaque). */
 const CHECKER: React.CSSProperties = {
@@ -389,7 +418,7 @@ export function ColorField({ label, value, onChange, mixed = false, alpha, onAlp
   const hexMixed = mixed || (hasAlpha && alphaMixed);
   const identity = useCallback((s: string) => s, []);
   const validate = useCallback((s: string) => parseHexColor(s) !== null, []);
-  const { localValue, onFocus, onBlur, handleChange, valid } = useBufferedValue(hexText, commitHex, identity, hexMixed, validate);
+  const { localValue, onFocus, onBlur, handleChange, valid } = useBufferedValue(hexText, commitHex, identity, hexMixed, validate, HEX_ECHO);
 
   const hexField = (
     <input type="text" spellCheck={false} value={localValue} placeholder={hexMixed ? MIXED_PLACEHOLDER : undefined}

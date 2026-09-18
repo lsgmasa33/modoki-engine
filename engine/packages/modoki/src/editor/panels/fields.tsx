@@ -3,9 +3,9 @@
  *  (jsdom + @testing-library/react) without dragging in the Inspector's heavy
  *  transitive deps (model import, texture resolver, three.js preview, store). */
 
-import { useState, useEffect, useCallback, useRef, createContext, useContext } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from 'react';
 import { MIXED_PLACEHOLDER } from '../../runtime/rendering/mixedPlaceholder';
-import { resyncBuffered, ECHO_WINDOW_MS, type PendingCommit } from './bufferedEcho';
+import { resyncBuffered, roundedTo, ECHO_WINDOW_MS, type PendingCommit, type EchoMatch } from './bufferedEcho';
 
 /** Shared monospace input style for Inspector-style field inputs. */
 export const inputStyle: React.CSSProperties = {
@@ -108,8 +108,12 @@ export const BufferedFieldScope = createContext<unknown>(null);
  *  When `mixed` is true (multi-select with differing values), the input shows
  *  empty (so the MIXED_PLACEHOLDER placeholder is visible) until the user types;
  *  whatever they commit then broadcasts to every selected entity. */
-export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, parse: (raw: string) => T, mixed = false, validate?: (raw: string) => boolean) {
-  const [localValue, setLocalValue] = useState<string>(mixed ? '' : String(externalValue));
+export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, parse: (raw: string) => T, mixed = false, validate?: (raw: string) => boolean, match?: EchoMatch<T>) {
+  // How this field recognises its own echo and formats a re-synced value — see `EchoMatch` (#1407).
+  // Read through a ref for the same reason as `parse` below: it must not be an effect dep.
+  const matchRef = useRef(match);
+  matchRef.current = match;
+  const [localValue, setLocalValue] = useState<string>(mixed ? '' : (match?.format ?? String)(externalValue));
   const focusedRef = useRef(false);
   // `parse` is an inline arrow at most call sites, so its identity changes every render and it
   // CANNOT be an effect dep — the re-sync would then run on every render and overwrite the buffer
@@ -140,7 +144,7 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
     // lost per run). `resyncBuffered` tells those apart from a real external change (a gizmo drag,
     // an undo, a selection change), which still re-syncs. Same shape as #233 (`qa/knowledge.md` §5:
     // nothing in the editor may depend on a focus event firing).
-    const r = resyncBuffered(localRef.current, externalValue, pendingRef.current, parseRef.current, performance.now());
+    const r = resyncBuffered(localRef.current, externalValue, pendingRef.current, parseRef.current, performance.now(), matchRef.current);
     pendingRef.current = r.pending;
     if (r.text !== null) setLocalValue(r.text);
   }, [externalValue, mixed, scope]);
@@ -148,7 +152,7 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
   const onBlur = useCallback(() => {
     focusedRef.current = false;
     pendingRef.current = [];
-    setLocalValue(mixed ? '' : String(externalValue)); // reconcile with ECS — reverts an unaccepted edit
+    setLocalValue(mixed ? '' : (matchRef.current?.format ?? String)(externalValue)); // reconcile with ECS — reverts an unaccepted edit
   }, [externalValue, mixed]);
   const handleChange = useCallback((raw: string) => {
     setLocalValue(raw);
@@ -248,7 +252,10 @@ export function BufferedTextInput({ value, onChange, style, placeholder, mixed, 
     data-ui-id={dataUiId} data-ui-label={dataUiLabel} data-ui-kind={dataUiKind} />;
 }
 
-export function BufferedNumberInput({ value, onChange, step, style, readOnly, mixed, min, max, dataUiId, dataUiLabel, dataUiKind }: { value: number; onChange: (v: number) => void; step?: number; style?: React.CSSProperties; readOnly?: boolean; mixed?: boolean; min?: number; max?: number; dataUiId?: string; dataUiLabel?: string; dataUiKind?: string }) {
+export function BufferedNumberInput({ value, onChange, step, style, readOnly, mixed, min, max, precision, dataUiId, dataUiLabel, dataUiKind }: { value: number; onChange: (v: number) => void; step?: number; style?: React.CSSProperties; readOnly?: boolean; mixed?: boolean; min?: number; max?: number;
+  /** Decimal places SHOWN. Pass the RAW value, never one rounded to this: the field compares its own
+   *  echo at this precision, and a caller-rounded value is an echo it cannot recognise (#1407). */
+  precision?: number; dataUiId?: string; dataUiLabel?: string; dataUiKind?: string }) {
   // Enforce the declared range on COMMIT (the field hint's min/max were previously
   // display-only — only the wheel respected them, so a typed value could exceed the
   // cap, e.g. glowSize past its 0.5 seam budget). Clamp inside `parse` so an
@@ -261,7 +268,8 @@ export function BufferedNumberInput({ value, onChange, step, style, readOnly, mi
   // selected texture to 1. `handleChange` refuses only `''` — enough for a `type="number"` box, which
   // reports `''` for these, but this one is `type="text"`. Scoped to mixed on purpose: an UNMIXED field
   // committing `-` → 0 is the one-entity path the echo guard above was built around.
-  const { localValue, onFocus, onBlur, handleChange } = useBufferedValue(value, onChange, parse, mixed, mixed ? parsesToNumber : undefined);
+  const match = useMemo(() => (precision === undefined ? undefined : roundedTo(precision)), [precision]);
+  const { localValue, onFocus, onBlur, handleChange } = useBufferedValue(value, onChange, parse, mixed, mixed ? parsesToNumber : undefined, match);
   const ref = useRef<HTMLInputElement>(null);
   // Mouse-wheel adjust (focused only). Replaces the spinner arrows we lost moving off
   // `type="number"`; Shift = ×10. Bases the step on the input's current shown value.

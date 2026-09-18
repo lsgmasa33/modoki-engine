@@ -9,8 +9,10 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, cleanup, fireEvent, screen } from '@testing-library/react';
+import { useState } from 'react';
 
-const { ColorField } = await import('../../src/editor/panels/assetViews/widgets');
+const { ColorField, HEX_ECHO } = await import('../../src/editor/panels/assetViews/widgets');
+const { resyncBuffered, ECHO_WINDOW_MS } = await import('../../src/editor/panels/bufferedEcho');
 
 afterEach(cleanup);
 
@@ -131,5 +133,79 @@ describe('ColorField — no alpha channel', () => {
     expect(box.value).toBe('nonsense');  // stays so the user can keep editing
     fireEvent.blur(box);
     expect(box.value).toBe('#fff4e0');   // reconciles back on blur
+  });
+});
+
+// #1407's sibling: the store hands back `hexText`, re-derived from the stored colour. That is a
+// PROJECTION of the commit (lower-case, with the alpha byte appended), not the typed text. Matched
+// exactly, the field's own echo reads as an external change. No focus event fires here: that is
+// the unfocused-window condition the bug needs.
+describe('ColorField — its own echo is re-derived hex, and still its own (#1407)', () => {
+  function StatefulColor({ initial = 0x112233, initialAlpha = 1 }: { initial?: number; initialAlpha?: number }) {
+    const [c, setC] = useState(initial);
+    const [a, setA] = useState(initialAlpha);
+    return (
+      <>
+        <ColorField dataUiId="test.color" label="bg" value={c} onChange={setC} alpha={a} onAlphaChange={setA} />
+        <output data-testid="alpha">{String(a)}</output>
+      </>
+    );
+  }
+  // A keystroke APPENDS to what the field shows NOW. Setting each prefix instead would paper over a
+  // rewrite, since the next "keystroke" would overwrite it with the text the test expected anyway.
+  const typeEach = (el: HTMLInputElement, text: string) => { type(el, ''); for (const ch of text) type(el, el.value + ch); };
+
+  it('⭐ typing #aabbcc80 commits the alpha: the #aabbccff echo of the 6-digit prefix does not rewrite the text', () => {
+    render(<StatefulColor />);
+    typeEach(hexBox('bg'), '#aabbcc80');
+    expect(hexBox('bg').value).toBe('#aabbcc80');
+    expect(Number(screen.getByTestId('alpha').textContent)).toBeCloseTo(0x80 / 255, 6);
+  });
+
+  it('…and from a NON-opaque alpha: a 6-digit prefix matches ANY alpha, not just ff', () => {
+    // Starting at alpha 1 cannot tell "6 digits match any alpha" from "6 digits mean ff". Here the
+    // echo of the prefix is #aabbcc40, and treating the prefix as ff would rewrite it into #aabbcc4080.
+    render(<StatefulColor initialAlpha={0x40 / 255} />);
+    typeEach(hexBox('bg'), '#aabbcc80');
+    expect(hexBox('bg').value).toBe('#aabbcc80');
+    expect(Number(screen.getByTestId('alpha').textContent)).toBeCloseTo(0x80 / 255, 6);
+  });
+
+  it('typing in UPPER case keeps the text as typed until blur', () => {
+    render(<StatefulColor />);
+    typeEach(hexBox('bg'), '#AABBCC');
+    expect(hexBox('bg').value).toBe('#AABBCC');
+    fireEvent.blur(hexBox('bg'));
+    expect(hexBox('bg').value).toBe('#aabbccff');
+  });
+
+  it('a 6-digit text does NOT hide a genuine external ALPHA change once nothing is pending (review finding)', () => {
+    const id = (s: string) => s;
+    // `means` has no expiry, so it must hold the alpha exactly: re-sync.
+    expect(resyncBuffered('#aabbcc', '#aabbcc80', [], id, 10, HEX_ECHO).text).toBe('#aabbcc80');
+    // Within the window, a pending 6-digit commit's echo may carry any alpha (commitHex left it alone).
+    const pending = [{ value: '#aabbcc', at: 0 }];
+    expect(resyncBuffered('#aabbcc', '#aabbcc80', pending, id, 10, HEX_ECHO).text).toBeNull();
+    expect(resyncBuffered('#aabbcc', '#aabbcc80', pending, id, ECHO_WINDOW_MS + 1, HEX_ECHO).text).toBe('#aabbcc80');
+    // Case is still not a difference.
+    expect(resyncBuffered('#AABBCC', '#aabbcc', [], id, 10, HEX_ECHO).text).toBeNull();
+  });
+
+  it('an 8-digit paste into a colour WITHOUT alpha shows what was stored, not the dropped alpha', () => {
+    // Second-review finding: with a symmetric match, the 6-digit echo "#aabbcc" matched the pending
+    // "#aabbcc80", so the box kept claiming an alpha nothing stored.
+    function NoAlpha() {
+      const [c, setC] = useState(0x112233);
+      return <ColorField dataUiId="test.color" label="light" value={c} onChange={setC} />;
+    }
+    render(<NoAlpha />);
+    type(hexBox('light'), '#aabbcc80');
+    expect(hexBox('light').value).toBe('#aabbcc');
+  });
+
+  it('a genuine external change still re-syncs', () => {
+    const { rerender } = render(<ColorField dataUiId="test.color" label="bg" value={0x112233} onChange={vi.fn()} alpha={1} onAlphaChange={vi.fn()} />);
+    rerender(<ColorField dataUiId="test.color" label="bg" value={0x445566} onChange={vi.fn()} alpha={1} onAlphaChange={vi.fn()} />);
+    expect(hexBox('bg').value).toBe('#445566ff');
   });
 });

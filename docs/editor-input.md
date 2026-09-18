@@ -487,6 +487,72 @@ Tests: `engine/tests/editor/bufferedEcho.test.ts` (the decision) and
 `engine/packages/modoki/tests/editor/fields.test.tsx` § #1411 (the hook's wiring: the record, the scope
 reset, the stamp order).
 
+### …and an echo ROUNDED by the caller: the field owns its display precision (#1407)
+
+Both rules above recognise an echo only if the value comes back EXACTLY as it was committed. The
+Inspector broke that by rounding before the field ever saw the value:
+`value={parseFloat(displayVal.toFixed(2))}`. Typing `4.1256` committed 4.1256 and got back `4.13`.
+That value was never committed and does not equal `parse(text)`, so the field's own commit looked
+like an external change and overwrote the text mid-edit. **Measured live** (`games/sling`
+block_showcase, two entities selected, focus guard disarmed to model the unfocused window):
+`modoki_type_text` refused with `valueAfter "4.13"` while both entities held 4.1256. It measured the
+field correctly; the field was the one that was wrong. This needs a keystroke that CHANGES the
+rounded value, so `1.2345` never shows it and `-12.125` does.
+
+**The fix: the field owns its display precision.** `BufferedNumberInput` takes `precision`, and the
+caller passes the **raw** value. `roundedTo(precision)` (`bufferedEcho.ts`) supplies `resyncBuffered`
+with a comparator (equal when rounded to the same value, for both the #242 check and the #1411 check)
+and a format (for the re-synced text, the initial text and the blur reconcile).
+
+⚠️ **Passing the raw value is only safe WITH the comparator.** A degree field stores radians, and the
+round trip is noisy: 30° → rad → `29.999999999999996`°. The caller's `toFixed` used to absorb that
+noise. With the raw value but exact matching, typing `30` left the field showing
+`29.999999999999996` mid-edit. That was a live revert-run, and it was the one observation that told
+this fix apart from "just stop rounding at the caller".
+
+**Two comparators, because the two checks have different lifetimes** (`EchoMatch` in
+`bufferedEcho.ts`):
+- `same` matches a pending commit (the #1411 check). It may be loose, at the displayed precision,
+  because an entry expires after `ECHO_WINDOW_MS`.
+- `means` is the #242 check. It has no expiry and holds until the next external change or a blur,
+  which in an unfocused window may never come, so it must be tight: float noise only (12
+  significant digits).
+
+The first version used the display precision for both, and the review caught it. An undo from
+`4.1256` to `4.13` left `4.1256` on screen with no time limit. The documented cost of the loose
+`same`: for up to one second after a commit, a genuine external change equal to that commit at the
+display precision is taken for its echo. That is the #1411 ambiguity again, and it has the same
+bound.
+
+**The same shape in a string field: `ColorField`'s hex box.** It is fed hex RE-DERIVED from the
+stored colour (lower-case, with the alpha byte appended). Typing `#aabbcc80` committed the colour at
+`#aabbcc`. The `#aabbccff` echo rewrote the text, and the `80` then built `#aabbccff80`, which is
+invalid, so the alpha was never committed. `HEX_ECHO` (`widgets.tsx`) is its `EchoMatch`, and the
+two comparators split on alpha:
+- `same` (pending, at most one second): the same colour, and a 6-digit COMMIT matches an echo with
+  ANY alpha, because `commitHex` leaves alpha alone for it. It works only in that direction. An
+  8-digit commit echoed back as 6 digits (pasted into a colour with no alpha channel) means the
+  alpha was dropped, so the field re-syncs to show that.
+- `means` (no expiry): the case may differ, but the alpha must match exactly. Otherwise a 6-digit
+  text would hide a genuine external alpha change until the next blur.
+
+Its test starts at a non-opaque alpha, because starting at 1 coincides with `alphaToByte(null)`
+and cannot tell "any alpha" apart from "ff".
+
+Rule for a new field: **never pre-round a `BufferedNumberInput`'s `value`. Pass `precision`.** More
+generally, if a field's `value` is a projection of what it commits (rounded, re-cased, re-derived),
+give `useBufferedValue` an `EchoMatch` that compares in that projection. When sweeping for this, grep
+the VARIABLES too, not just `value={…toFixed…}`. The first sweep missed the Skin Editor's part
+rotation and size (`rotDeg`/`wPx`/`hPx`), which were rounded into a `const` three lines above the
+fields it did convert. A review reproduced that one committing a WRONG value: typing `12.3456`
+stored 12.356.
+Rounding inside `onChange` (Skin tessellate cols/rows, texture border) is different. There the field
+really does reformat a fractional input, so a refusal is true.
+
+Tests: `bufferedEcho.test.ts` § "at a display precision", `fields.test.tsx` § #1407 and
+`colorFieldHex.test.tsx` § #1407. Seven
+mutations were checked, each caught by its own test only.
+
 ### And the mirror-image trap: Escape, in a window that IS focused
 
 The rule above is about a blur that never fires. The opposite state has its own bug, and the #233

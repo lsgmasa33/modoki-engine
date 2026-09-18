@@ -329,7 +329,7 @@ function VecField({ label, fields, data, onChange, overriddenKeys, mixedKeys, tr
           return (
             <div key={f.key} style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 2, minWidth: 0 }}>
               <span style={{ color: isOv ? '#5dade2' : '#666', fontSize: '10px', flexShrink: 0, fontWeight: isOv ? 'bold' : 'normal' }}>{labels[i]}</span>
-              <BufferedNumberInput value={parseFloat(displayVal.toFixed(2))} step={f.hint.step || 0.1} mixed={isMixed} readOnly={f.hint.readOnly}
+              <BufferedNumberInput value={displayVal} precision={2} step={f.hint.step || 0.1} mixed={isMixed} readOnly={f.hint.readOnly}
                 onChange={(v) => onChange(f.key, isDeg ? v * (Math.PI / 180) : v)}
                 min={isDeg ? undefined : f.hint.min} max={isDeg ? undefined : f.hint.max}
                 dataUiId={`inspector.field.${traitName}.${f.key}`}
