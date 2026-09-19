@@ -12,8 +12,9 @@ import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
-import { durableGuid, deriveMemberGuid, memberStepId, addedKeyStep, mapStringValues } from '../../runtime/core/assetRefRules';
+import { durableGuid, memberStepId, addedKeyStep, mapStringValues } from '../../runtime/core/assetRefRules';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
+import { templateKeysOf, recoverTemplateKey as recoverKeyFrom, type KeyRecoveryNode } from '../../runtime/loaders/templateKeyRecovery';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { entityRef, type EntityRef } from '../undo/entityRef';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -1765,75 +1766,24 @@ function addedNodeIdentity(ecsId: number, template: boolean | undefined): { guid
   return { guid: '', key };
 }
 
-/** Every template key a prefab document declares — its rows' `added`, their `nestedStructure[*].added`,
- *  and a reference node's own `added`/`nestedStructure`, recursively. Memoised per cached document. */
-const templateKeysByDoc = new WeakMap<PrefabFile, string[]>();
-function templateKeysOf(doc: PrefabFile): string[] {
-  const memo = templateKeysByDoc.get(doc);
-  if (memo) return memo;
-  const keys: string[] = [];
-  const nodes = (list: AddedEntity[] | undefined): void => {
-    for (const n of list ?? []) {
-      if (n.key) keys.push(n.key);
-      nodes(n.children);
-      nodes(n.added);
-      structure(n.nestedStructure);
-    }
-  };
-  const structure = (paths: NestedStructurePaths | undefined): void => {
-    for (const delta of Object.values(paths ?? {})) nodes(delta?.added);
-  };
-  for (const pe of doc.entities) { nodes(pe.added); structure(pe.nestedStructure); }
-  templateKeysByDoc.set(doc, keys);
-  return keys;
-}
-
 /** The template key a live added node had when it was spawned, recovered from its guid — for when
- *  the marker is gone. Any scene-form round trip drops it: Play→Stop reloads a `serializeScene`
- *  snapshot, and delete→undo respawns from a registry-only snapshot. Minting a fresh key then
- *  re-keyed the node, moved every instance's derived guid, and pinned the inner prefab's untouched
- *  interior into the outer row on a no-op save (the #1381 defect over again — #1387 review).
- *
- *  Both round trips keep the node's GUID, and a keyed node's guid is `deriveMemberGuid(anchor,
- *  [...path, '+' + key])`. So each ancestor is tried as the anchor, with each key the cached prefab
- *  files declare, until the derivation reproduces the live guid. A keyed ancestor that lost its marker
- *  too recovers first. `''` when nothing matches: the node was not spawned from a template key. */
+ *  the marker is gone (Play→Stop, delete→undo, a saved scene; #1387, #1426). The algorithm is the
+ *  runtime's (`runtime/loaders/templateKeyRecovery.ts`), shared with the loader's heal; the editor's
+ *  candidates are the keys its own prefab cache declares, which include a prefab being edited that no
+ *  world ever expanded. `''` when nothing matches. */
 function recoverTemplateKey(ecsId: number, memo = new Map<number, string>()): string {
-  const done = memo.get(ecsId);
-  if (done !== undefined) return done;
-  memo.set(ecsId, ''); // a parent cycle resolves to nothing instead of recursing
   const eaMeta = getTraitByName('EntityAttributes');
   const piMeta = getTraitByName('PrefabInstance');
   if (!eaMeta) return '';
-  const guid = durableGuid(readTraitData(ecsId, eaMeta)?.guid as string);
-  if (!guid) return '';
   const keys = new Set<string>();
   for (const doc of new Set(prefabCache.values())) for (const k of templateKeysOf(doc)) keys.add(k);
-  if (!keys.size) return '';
-  const steps: (number | string)[] = [];
-  let cur = (readTraitData(ecsId, eaMeta)?.parentId as number) || 0;
-  const seen = new Set<number>([ecsId]);
-  while (cur && !seen.has(cur)) {
-    seen.add(cur);
-    const anchor = durableGuid(readTraitData(cur, eaMeta)?.guid as string);
-    if (anchor) {
-      for (const k of keys) {
-        if (deriveMemberGuid(anchor, [...steps, addedKeyStep(k)]) === guid) { memo.set(ecsId, k); return k; }
-      }
-    }
-    // This ancestor is on the path, not the anchor: prepend its step, as the derive pass does. A
-    // prefab member steps by its localId. Only a plain node can be a keyed one that lost its marker,
-    // and only that case recovers recursively. The memo keeps the whole walk linear in depth (a
-    // recursion at every ancestor was 2^depth: measured 1 s per node at depth 14 — #1352 review).
-    const ownKey = templateKeyOf(findEntity(cur));
-    const pi = piMeta ? readTraitData(cur, piMeta) : null;
-    const step = ownKey ? addedKeyStep(ownKey)
-      : pi ? memberStepId(pi as { localId?: number; parentLocalId?: number })
-      : (() => { const k = recoverTemplateKey(cur, memo); return k ? addedKeyStep(k) : 0; })();
-    steps.unshift(step);
-    cur = (readTraitData(cur, eaMeta)?.parentId as number) || 0;
-  }
-  return '';
+  const nodeOf = (id: number): KeyRecoveryNode | undefined => {
+    const ea = readTraitData(id, eaMeta);
+    if (!ea) return undefined;
+    const pi = piMeta ? readTraitData(id, piMeta) as { localId?: number; parentLocalId?: number } | null : null;
+    return { guid: durableGuid(ea.guid as string), parentId: (ea.parentId as number) || 0, key: templateKeyOf(findEntity(id)), pi };
+  };
+  return recoverKeyFrom(ecsId, nodeOf, keys, memo);
 }
 
 /** Compute the structural diff between a live prefab instance and its source:

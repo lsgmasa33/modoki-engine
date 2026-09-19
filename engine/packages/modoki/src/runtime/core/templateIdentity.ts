@@ -12,12 +12,13 @@
  *  off the marker, so re-saving a prefab does not re-key it. A SCENE-authored node keeps its `guid`
  *  and never carries a key — which kind a node is follows from the field it carries.
  *
- *  Deliberately UNREGISTERED (the `Transient` precedent): no name-based serializer, snapshot or
- *  Inspector sees it, so a scene save, a duplicate or a paste never writes or copies it. Any
- *  scene-form round trip (Play→Stop, delete→undo) therefore drops it, and a template write then
- *  RECOVERS the key from the node's derived guid (`recoverTemplateKey` in editor/scene/prefab.ts);
- *  re-minting instead re-keyed the node and pinned untouched interiors. See docs/scene-loading.md
- *  § "Guid uniqueness is a PER-FILE rule". */
+ *  Deliberately UNREGISTERED (the `Transient` precedent): no name-based serializer or Inspector sees
+ *  it, so a scene save, a duplicate or a paste never writes or copies it. A save + reload (and so
+ *  Play→Stop) therefore drops it; the loader's derive pass then RECOVERS the key from the node's
+ *  derived guid (`runtime/loaders/templateKeyRecovery.ts`, #1426), and a template write does the
+ *  same. The two respawns of the SAME entity — the base-scene carry and delete→undo — carry it
+ *  outright (`carriedMarkers.ts`, #1427). Re-minting instead re-keyed the node and pinned untouched
+ *  interiors. See docs/scene-loading.md § "Guid uniqueness is a PER-FILE rule". */
 
 import { trait } from 'koota';
 

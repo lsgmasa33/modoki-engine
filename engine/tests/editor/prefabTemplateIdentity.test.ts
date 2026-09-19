@@ -27,16 +27,16 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, spawnEntity, Transform, EntityAttributes,
-  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, Transient as TransientTrait, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo } from '@modoki/engine/editor';
+import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo, duplicateEntity } from '@modoki/engine/editor';
 import {
   setPrefabCache, serializePrefab, applyToPrefabSelective, instantiatePrefabAsync, getOverrideValues, collectComparableTraits,
   baseTokenResolver, type PrefabFile,
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import type { AddedEntity } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
-import { setTemplateKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
+import { setTemplateKey, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -558,5 +558,200 @@ describe('close-out review findings (#1352)', () => {
     const saved = serializePrefab(root, OUTER)!;
     expect(midRowOf(saved).nestedStructure).toBeUndefined();
     expect((saved.entities.find((e) => e.name === 'Panel')!.traits.UIAction as { bindings: { target: string }[] }).bindings[0]!.target).toBe(DURABLE);
+  });
+});
+
+// ── #1426: a member token naming a template-ADDED node, across a scene save + reload ────────────────
+describe('a member token naming a template-added node survives a scene save + reload (#1426)', () => {
+  // OUTER's Panel binds to a node OUTER's MID row adds inside MID's nested INNER: Panel(2) → MidRoot(3)
+  // → Slot(2) → InnerRoot (nested root, steps by its parentLocalId 3) → '+' + KEY.
+  const TOKEN = `@member:2.3.2.3.+${KEY}`;
+  const outerWithRef = () => {
+    const doc = outerDoc({ nestedStructure: { '3': { added: [keyed('Extra', 1)] } } });
+    Object.assign(doc.entities[1]!.traits, bind(TOKEN));
+    return doc;
+  };
+  const rootGuidOf = (id: number): string => {
+    let cur = getAllEntities().find((e) => e.id === id);
+    while (cur && cur.parentId) cur = getAllEntities().find((e) => e.id === cur!.parentId);
+    return cur?.guid ?? '';
+  };
+  /** Each Panel targets the Extra of its OWN instance, and every Extra carries KEY again. */
+  const expectEachPanelOnItsOwnExtra = () => {
+    const extras = getAllEntities().filter((e) => e.name === 'Extra');
+    expect(extras).toHaveLength(2);
+    const extraByRoot = new Map(extras.map((x) => [rootGuidOf(x.id), x]));
+    for (const p of getAllEntities().filter((e) => e.name === 'Panel')) {
+      expect(targetOf(p.id)).toBe(extraByRoot.get(rootGuidOf(p.id))!.guid);
+    }
+    const tk = [...getCurrentWorld().entities].filter((e) => extras.some((x) => x.id === e.id()));
+    expect(tk.map((e) => (e.get(TemplateAddedKey) as { key: string } | undefined)?.key)).toEqual([KEY, KEY]);
+  };
+
+  // The save writes each Extra as scene form (its guid, no key), so the reload spawns it unkeyed and,
+  // before the heal, left both Panels on the literal token. Mutation: skip the heal block in
+  // `deriveInstanceMemberGuids`.
+  it('each instance\'s Panel still targets its own Extra after the reload', async () => {
+    install(outerWithRef());
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    expectEachPanelOnItsOwnExtra();
+
+    const saved = await serializeScene();
+    expect(JSON.stringify(saved)).not.toContain(`"key":"${KEY}"`); // the premise: scene form drops the key
+    await load(saved as unknown as SceneData);
+    expectEachPanelOnItsOwnExtra();
+  });
+
+  // The Inspector compares an instance against its prefab through `baseTokenResolver`, which names
+  // the node through its key. Unkeyed, the untouched binding read as an override.
+  it('an untouched instance reports no override on the binding after the reload', async () => {
+    const file = outerWithRef() as unknown as PrefabFile;
+    install(file);
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    await load(await serializeScene() as unknown as SceneData);
+    const root = getAllEntities().find((e) => e.guid === G1)!.id;
+    const panel = getAllEntities().find((e) => e.name === 'Panel' && rootGuidOf(e.id) === G1)!.id;
+    const current = collectComparableTraits(panel, (await import('@modoki/engine/runtime')).getAllTraits());
+    expect(getOverrideValues(2, current, file, baseTokenResolver(root)).UIAction).toBeUndefined();
+    expect(getOverrideValues(2, current, file).UIAction).toBeDefined(); // the resolver is what makes it equal
+  });
+
+  // Accept side: the heal names only a node a key derives. A scene-added child under a member has a
+  // random guid and stays unkeyed. Mutation: stamp the first candidate key without the derivation check.
+  it('a scene-added plain child under a member is not keyed by the heal', async () => {
+    install(outerWithRef());
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Plain', parentId: innerUnderMid(), guid: DURABLE }));
+    await load(await serializeScene() as unknown as SceneData);
+    const plain = getAllEntities().find((e) => e.name === 'Plain')!;
+    expect(plain.guid).toBe(DURABLE);
+    expect([...getCurrentWorld().entities].find((x) => x.id() === plain.id)!.has(TemplateAddedKey)).toBe(false);
+    expectEachPanelOnItsOwnExtra(); // and the real keyed nodes beside it still heal
+  });
+
+  // A recorded miss must not outlive the tree it was computed on. Move Extra out of its frame, save
+  // and reload (it comes back unkeyed and unrecoverable there — a miss is cached), then move it back:
+  // the next derive must heal it. Mutation: drop the ancestor chain from the miss signature.
+  it('a node moved back into its frame heals on the next derive, despite an earlier cached miss', async () => {
+    const { deriveInstanceMemberGuids } = await import('../../packages/modoki/src/runtime/loaders/loadSceneFile');
+    install(outerWithRef());
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    const extraOf = () => getAllEntities().find((e) => e.name === 'Extra' && rootGuidOf(e.id) === G1)!;
+    const inner = extraOf().parentId;
+    const slot = getAllEntities().find((e) => e.name === 'Slot' && rootGuidOf(e.id) === G1)!.id;
+    const eaMeta = getTraitByName('EntityAttributes')!;
+    const setParent = (id: number, parentId: number) => {
+      const e = [...getCurrentWorld().entities].find((x) => x.id() === id)!;
+      e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), parentId });
+    };
+    setParent(extraOf().id, slot);
+    await load(await serializeScene() as unknown as SceneData);
+    const live = () => [...getCurrentWorld().entities].find((x) => x.id() === extraOf().id)!;
+    expect(live().has(TemplateAddedKey)).toBe(false); // out of its frame, nothing derives its guid
+    const innerNow = getAllEntities().find((e) => e.name === 'InnerRoot' && rootGuidOf(e.id) === G1
+      && getAllEntities().find((s2) => s2.id === e.parentId)?.name === 'Slot')!.id;
+    expect(inner).toBeTruthy();
+    setParent(extraOf().id, innerNow);
+    deriveInstanceMemberGuids(getCurrentWorld());
+    expect((live().get(TemplateAddedKey) as { key: string } | undefined)?.key).toBe(KEY);
+  });
+});
+
+// ── #1427: an undo respawn keeps the unregistered markers; a copy drops them ────────────────────────
+describe('delete→undo carries unregistered markers, a duplicate does not (#1427)', () => {
+  const liveOf = (name: string) => [...getCurrentWorld().entities].find((x) => getAllEntities().find((a) => a.id === x.id())?.name === name)!;
+
+  // The undo snapshot walks the trait registry, which never sees `Transient`, so an undone delete
+  // brought a runtime node back SAVABLE. Mutation: drop `restoreMarkers` in `respawnFromSnapshot`.
+  it('an undone delete of a Transient node is still Transient', async () => {
+    await load({ id: 'e', version: 14, name: 'E', resources: [], entities: [] } as unknown as SceneData);
+    const id = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Runtime', guid: DURABLE })).id();
+    liveOf('Runtime').add(TransientTrait);
+    deleteEntitiesWithUndo([id]);
+    await undo();
+    expect(liveOf('Runtime').has(TransientTrait)).toBe(true);
+  });
+
+  // A copy is a new identity: a duplicated template-added node keeping the key would give two
+  // siblings one step, which names neither. Mutation: drop `markers: undefined` in
+  // `regenerateSnapshotGuids`.
+  it('a duplicate of a keyed node carries no key and no Transient', async () => {
+    await load({ id: 'e', version: 14, name: 'E', resources: [], entities: [] } as unknown as SceneData);
+    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Src', guid: DURABLE }));
+    const src = liveOf('Src');
+    src.add(TransientTrait);
+    setTemplateKey(src, KEY);
+    const copyId = duplicateEntity(src.id(), () => {})!;
+    const copy = [...getCurrentWorld().entities].find((x) => x.id() === copyId)!;
+    expect(copy.has(TemplateAddedKey)).toBe(false);
+    expect(copy.has(TransientTrait)).toBe(false);
+  });
+});
+
+// ── #1426 close-out: the heal is paid on EVERY runtime prefab spawn, so it must not scale with the world ──
+describe('the key heal is bounded to prefab instances (#1426 close-out)', () => {
+  // The first cut walked every plain entity in the world to the scene root, trying every key at every
+  // ancestor, on every spawn: measured 51 ms per spawn at 2000 entities × depth 8 × 5 keys. Here 5000
+  // plain entities in 16-deep chains, outside any instance, with 20 keys declared — the old walk is
+  // ~1.6M hashes (well over a second); the bounded heal touches none of them. The bound is loose on
+  // purpose so machine load cannot flake it. Mutation: drop `!inside(id)` from the heal's filter.
+  it('plain entities outside any instance cost the heal nothing', async () => {
+    const { noteTemplateDoc } = await import('../../packages/modoki/src/runtime/loaders/templateKeyRecovery');
+    const { deriveInstanceMemberGuids } = await import('../../packages/modoki/src/runtime/loaders/loadSceneFile');
+    await load({ id: 'e', version: 14, name: 'E', resources: [], entities: [] } as unknown as SceneData);
+    const world = getCurrentWorld();
+    const keys = Array.from({ length: 20 }, (_, i) => `dddddddd-0000-4000-8000-${String(i).padStart(12, '0')}`);
+    noteTemplateDoc(world, { entities: [{ added: keys.map((key) => ({ key })) }] });
+    for (let c = 0; c < 5000 / 16; c++) {
+      let parent = 0;
+      for (let d = 0; d < 16; d++) {
+        const g = `cccccccc-${String(c).padStart(4, '0')}-4000-8000-${String(d).padStart(12, '0')}`;
+        parent = spawnEntity(world, Transform(), EntityAttributes({ name: 'P', parentId: parent, guid: g })).id();
+      }
+    }
+    const t0 = performance.now();
+    deriveInstanceMemberGuids(world);
+    expect(performance.now() - t0).toBeLessThan(400);
+  });
+});
+
+describe('recoverTemplateKey stops at the top (#1426 close-out)', () => {
+  // The loader passes `isTop` = a top-level stored instance root, so a node never climbs past its
+  // instance trying keys at every level. Mutation: delete `if (isTop?.(cur)) break;`.
+  it('reads no ancestor above the top', async () => {
+    const { recoverTemplateKey } = await import('../../packages/modoki/src/runtime/loaders/templateKeyRecovery');
+    const read = new Set<number>();
+    // 1 = the node; 2 = its parent, the top; 3..52 = plain ancestors above the top.
+    const nodeOf = (id: number) => {
+      read.add(id);
+      if (id > 52) return undefined;
+      return { guid: `ffffffff-0000-4000-8000-${String(id).padStart(12, '0')}`, parentId: id + 1, key: '', pi: null };
+    };
+    expect(recoverTemplateKey(1, nodeOf, new Set([KEY]), new Map(), (id) => id === 2)).toBe('');
+    expect([...read].some((id) => id > 2)).toBe(false);
+  });
+});
+
+describe('the heal caches its misses (#1426 close-out)', () => {
+  // Every runtime spawn re-runs the derive pass; an unrecoverable node inside an instance must be
+  // tried once per (guid, key set, ancestor chain), not once per spawn. 6000 scene-added children
+  // under an instance member with 40 keys: the first pass pays ~700k hashes, a cached second pass
+  // none. Mutation: drop the `misses.get(id) === tried` skip.
+  it('a second derive pass skips the nodes the first could not heal', async () => {
+    const { noteTemplateDoc } = await import('../../packages/modoki/src/runtime/loaders/templateKeyRecovery');
+    const { deriveInstanceMemberGuids } = await import('../../packages/modoki/src/runtime/loaders/loadSceneFile');
+    install(outerDoc());
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    const world = getCurrentWorld();
+    const keys = Array.from({ length: 40 }, (_, i) => `dddddddd-1111-4000-8000-${String(i).padStart(12, '0')}`);
+    noteTemplateDoc(world, { entities: [{ added: keys.map((key) => ({ key })) }] });
+    const panel = getAllEntities().find((e) => e.name === 'Panel')!.id;
+    for (let i = 0; i < 6000; i++) {
+      spawnEntity(world, Transform(), EntityAttributes({ name: 'Kid', parentId: panel, guid: `cccccccc-1111-4000-8000-${String(i).padStart(12, '0')}` }));
+    }
+    deriveInstanceMemberGuids(world); // records the misses
+    const t0 = performance.now();
+    deriveInstanceMemberGuids(world);
+    expect(performance.now() - t0).toBeLessThan(150);
   });
 });

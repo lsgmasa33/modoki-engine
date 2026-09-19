@@ -141,21 +141,6 @@ function defineBase() {
   };
 }
 
-/** Same as defineBase(), but the base ALSO contains a prefab-instance entity —
- *  used to test the carry warning (template-key marker dropped, #1421). */
-function defineBaseWithPrefabInstance() {
-  fetchResponses['/base.json'] = {
-    id: BASE_GUID,
-    version: 10,
-    resources: [{ type: 'material', path: M('/materials/base.mat.json') }],
-    entities: [
-      { id: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Camera', parentId: 0, guid: BASE_CAMERA_GUID }, Renderable3D: { mesh: '', material: M('/materials/base.mat.json') } } },
-      { id: 2, traits: { Time: { delta: 0, elapsed: 0, frame: 0, timeScale: 1 }, EntityAttributes: { name: 'Time', parentId: 0 } } },
-      { id: 3, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'FishInstance', parentId: 0 }, PrefabInstance: true } },
-    ],
-  };
-}
-
 function defineLevel1() {
   fetchResponses['/level1.json'] = {
     id: '20000000-0000-4000-8000-000000000001',
@@ -387,36 +372,36 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     expect(base?.guid).toBe(BASE_GUID);
   });
 
-  // ── The carry warning (#1421 reworded it) — fires on the CARRY, not on every fresh load ──
-
-  it('a base with a prefab instance does NOT warn on its own fresh load', async () => {
-    defineBaseWithPrefabInstance();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  /** #1427 — the carry snapshot is built from the trait registry, so the UNREGISTERED markers were
+   *  silently dropped: `Transient` (what keeps a runtime subtree out of a save) and `TemplateAddedKey`
+   *  (how a template-added node is named). Asserted per entity, like the marks above, so a marker
+   *  landing on the wrong carried entity fails too. Mutation: drop the `restoreMarkers` call in the
+   *  carry respawn's `onEntitySpawned`. */
+  it('carries the unregistered markers across a swap, attributed to the right entity (#1427)', async () => {
     const { sceneManager } = await getSceneManager();
+    const { getCurrentWorld } = await getWorld();
+    const { Transient } = await import('../../src/runtime/core/traits/Transient');
+    const { TemplateAddedKey } = await import('../../src/runtime/core/templateIdentity');
+    const KEY = 'dddddddd-0000-4000-8000-00000000142a';
+    const byName = (world: any) => {
+      const out = new Map<string, any>();
+      world.query(EntityAttributes).updateEach(([attr]: any[], e: any) => out.set((attr as any).name, e));
+      return out;
+    };
 
     await sceneManager.loadScene('/level1.json');
+    const before = byName(getCurrentWorld());
+    before.get('Camera')!.add(Transient);
+    before.get('Time')!.add(TemplateAddedKey({ key: KEY }));
 
-    expect(warn.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('is carried with a prefab instance'))).toBe(false);
-    warn.mockRestore();
-  });
+    await sceneManager.loadScene('/level2.json'); // carries the base
 
-  it('warns exactly when a base containing a prefab instance is CARRIED across a swap, not before', async () => {
-    defineBaseWithPrefabInstance();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { sceneManager } = await getSceneManager();
-
-    // Fresh load of level1 — base loads fresh too. No carry has happened yet.
-    await sceneManager.loadScene('/level1.json');
-    expect(warn.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('is carried with a prefab instance'))).toBe(false);
-
-    // Swap to level2, which shares the SAME base guid — the base is now CARRIED
-    // (kept, not freshly reloaded). This is the moment the template-key marker is lost.
-    await sceneManager.loadScene('/level2.json');
-    expect(warn.mock.calls.some(([msg]) =>
-      typeof msg === 'string' && msg.includes('/base.json') && msg.includes('is carried with a prefab instance'),
-    )).toBe(true);
-
-    warn.mockRestore();
+    const after = byName(getCurrentWorld());
+    expect(after.get('Camera')).toBeDefined();
+    expect(after.get('Camera')!.has(Transient)).toBe(true);
+    expect(after.get('Camera')!.has(TemplateAddedKey)).toBe(false);
+    expect(after.get('Time')!.has(Transient)).toBe(false);
+    expect((after.get('Time')!.get(TemplateAddedKey) as { key: string } | undefined)?.key).toBe(KEY);
   });
 
   it('a resolved base hop re-registers its guid→path mapping, so a LATER chain walk referencing it by guid alone still resolves (338b1446 torn-read-race fix)', async () => {

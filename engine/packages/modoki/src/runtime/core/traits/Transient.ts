@@ -26,8 +26,13 @@
  *
  *  Carries no data; purely a "do not serialize" flag. Deliberately UNREGISTERED (not in
  *  `registerTraits`) — a pure runtime marker checked by trait identity (`entity.has(Transient)`),
- *  never via the name-based trait registry. (Distinct from Persistent, which does the opposite —
- *  it SURVIVES scene swaps and IS serialized; an entity should not carry both.) */
+ *  never via the name-based trait registry. Because the registry cannot see it, the two respawns of
+ *  the SAME entity — the base-scene carry and delete→undo — carry it explicitly
+ *  (`core/carriedMarkers.ts`, #1427); a copy does not.
+ *
+ *  Distinct from Persistent, which SURVIVES scene swaps. An entity CAN carry both, and a runtime one
+ *  usually does: every spawn inside a system tick is tagged Transient, so a player a game system
+ *  spawns and marks Persistent is carried across the swap and still never saved. */
 
 import { trait } from 'koota';
 

@@ -15,6 +15,7 @@ import { newGuid } from '../../runtime/loaders/assetManifest';
 import { remapGuidValues } from '../../runtime/core/assetRefRules';
 import { planCopyGuids } from '../../runtime/core/copyIdentity';
 import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
+import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { pushAction, type EditDetail } from './undoManager';
@@ -372,6 +373,9 @@ export interface EntitySnapshot {
   /** The entity's prefab override marks ("Trait.field"), when it has any. Marks are keyed by the
    *  packed entity (#868), so a respawn gets them only from here — see overrideMarks.ts. */
   marks?: string[];
+  /** Its unregistered markers (`Transient`, `TemplateAddedKey`), which the registry walk above never
+   *  sees (#1427). Restored by an undo's respawn; a copy drops them (`regenerateSnapshotGuids`). */
+  markers?: CarriedMarkers;
 }
 
 export function snapshotEntity(entityId: number): EntitySnapshot | null {
@@ -393,7 +397,12 @@ export function snapshotEntity(entityId: number): EntitySnapshot | null {
   const childEntities = getAllEntities().filter(e => e.parentId === entityId);
   const children = childEntities.map(c => snapshotEntity(c.id)).filter((s): s is EntitySnapshot => s !== null);
   const marks = getOverrideMarkSet(entity);
-  return marks && marks.size > 0 ? { id: entityId, traits, children, marks: [...marks] } : { id: entityId, traits, children };
+  const markers = captureMarkers(entity);
+  return {
+    id: entityId, traits, children,
+    ...(marks && marks.size > 0 ? { marks: [...marks] } : {}),
+    ...(markers ? { markers } : {}),
+  };
 }
 
 /** Deep-clone a snapshot as a COPY: a fresh `EntityAttributes.guid` for every entity in the subtree,
@@ -415,8 +424,10 @@ export function regenerateSnapshotGuids(snapshot: EntitySnapshot): EntitySnapsho
   };
   const { guidOf, remap } = planCopyGuids(snapshot, (s) => s.children, dataOf, (s) => s.id, newGuid);
   // Once every new guid is known: a parent's ref can name a child and vice versa.
+  // A copy is a new identity, so it carries no unregistered markers (`carriedMarkers.ts`).
   const copy = (s: EntitySnapshot): EntitySnapshot => ({
     ...s,
+    markers: undefined,
     traits: s.traits.map((t) => {
       if (t.data === true) return t;
       const data = remapGuidValues(t.data, remap) as Record<string, unknown>;
@@ -513,6 +524,7 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
     // Clear first: the 8-bit generation wraps, so a dead member's marks can match this packed value.
     clearOverrideMarks(entity);
     if (snap.marks) restoreOverrideMarks(entity, snap.marks);
+    restoreMarkers(entity, snap.markers);
     const id = entity.id();
     idMap.set(snap.id, id);
     spawned.push([snap, id]);
@@ -1200,27 +1212,6 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
 
   const allTraitsList = getAllTraits();
   const transformMeta = allTraitsList.find((m) => m.name === 'Transform');
-  const piMeta = getTraitByName('PrefabInstance');
-
-  // Prefab-instance warn (informational, non-blocking). A later swap that keeps this
-  // base loaded CARRIES the instance: its link and overrides survive and save (#1421),
-  // but its unregistered markers are dropped (#1427) — see docs/scene-loading.md § Gotchas.
-  const instanceRootNames: string[] = [];
-  if (piMeta) {
-    for (const id of ids) {
-      const e = findEntity(id);
-      const pd = e?.has(piMeta.trait) ? (e.get(piMeta.trait) as Record<string, unknown>) : null;
-      if (pd && (pd.rootInstanceId as number) === id) instanceRootNames.push(byId.get(id)?.name || `Entity ${id}`);
-    }
-  }
-  if (instanceRootNames.length > 0) {
-    console.warn(
-      `[moveEntityToScene] "${rootInfo.name}" carries ${instanceRootNames.length} prefab instance root(s) ` +
-      `(${instanceRootNames.join(', ')}) into ${targetScene ? 'a base scene' : 'the primary'}. A later swap ` +
-      `that keeps this base loaded carries them: links and overrides survive and save, but unregistered ` +
-      `markers do not, so the Inspector can show false overrides (#1427, scene-loading.md § Gotchas).`,
-    );
-  }
 
   // Re-root vs. reparent-under-a-row (owner decision, see SceneMoveOptions doc).
   const oldParentId = (oldAttr.parentId as number) || 0;

@@ -63,7 +63,7 @@ afterEach(() => {
 });
 
 describe('preflightSceneMove', () => {
-  it('reports subtree count, re-root-from name, and prefab instance roots (no scan on demote)', async () => {
+  it('reports subtree count and re-root-from name (no scan on demote)', async () => {
     const { preflightSceneMove } = await import('../../src/editor/scene/sceneMoveScan');
     const w = freshWorld();
     const parent = spawn(w, EntityAttributes({ name: 'Parent', guid: 'g-parent' }));
@@ -76,7 +76,6 @@ describe('preflightSceneMove', () => {
     expect(pre.entityName).toBe('Root');
     expect(pre.subtreeCount).toBe(2); // Root + Child
     expect(pre.reRootFrom).toBe('Parent');
-    expect(pre.prefabInstanceRoots).toEqual(['Root']);
     expect(pre.collisions).toEqual([]);
     expect(pre.scanned).toBe(0);
   });
@@ -137,16 +136,15 @@ describe('preflightSceneMove', () => {
 });
 
 describe('formatSceneMoveConfirm', () => {
-  it('names the re-root parent, prefab instances, and collisions', async () => {
+  it('names the re-root parent and collisions', async () => {
     const { formatSceneMoveConfirm } = await import('../../src/editor/scene/sceneMoveScan');
     const text = formatSceneMoveConfirm({
       entityName: 'HeartsRoot', subtreeCount: 3, reRootFrom: 'UIRoot',
-      prefabInstanceRoots: ['Fish'], collisions: [{ path: '/assets/scenes/Lvl-0002.json', name: 'Lvl-0002.json', guids: ['g1'] }],
+      collisions: [{ path: '/assets/scenes/Lvl-0002.json', name: 'Lvl-0002.json', guids: ['g1'] }],
       scanned: 1, scanFailed: [],
     }, 'base-1');
     expect(text).toContain('Promote "HeartsRoot"');
     expect(text).toContain('UIRoot');
-    expect(text).toContain('Fish');
     expect(text).toContain('Lvl-0002.json');
     expect(text).toContain('Nothing is written to disk now');
   });
@@ -154,7 +152,7 @@ describe('formatSceneMoveConfirm', () => {
   it('says "Demote" and omits the "every level" line for a demote (targetScene "")', async () => {
     const { formatSceneMoveConfirm } = await import('../../src/editor/scene/sceneMoveScan');
     const text = formatSceneMoveConfirm({
-      entityName: 'E', subtreeCount: 1, reRootFrom: null, prefabInstanceRoots: [], collisions: [], scanned: 0, scanFailed: [],
+      entityName: 'E', subtreeCount: 1, reRootFrom: null, collisions: [], scanned: 0, scanFailed: [],
     }, '');
     expect(text).toContain('Demote "E"');
     expect(text).not.toContain('Every level');

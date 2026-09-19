@@ -1351,15 +1351,32 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     `TemplateAddedKey` marker, and a keyed reference node's root gets the same marker.
     `deriveInstanceMemberGuids` derives both, stepping `'+' + key` (`addedKeyStep`). The `+` keeps
     the step disjoint from every numeric one, so no existing derived guid moves.
+  - **Load heals a lost key (#1426).** A scene save writes a keyed node as its guid and no key (see
+    "Which kind a node is" below), so a reload spawns it unkeyed. Before, a member token naming the
+    node then stayed a literal `@member:…` string in the live world, a dead reference in a shipped
+    build. `deriveInstanceMemberGuids` now ends with a heal: every plain node with a stored guid gets
+    its key back when one of the keys its world's expanded prefab documents declare derives that
+    guid (`runtime/loaders/templateKeyRecovery.ts`; the loader records each document's keys as it
+    expands it). It runs before member-token resolution, and a healed node was an anchor, never a
+    step, so no derived guid moves. Runtime never mints a key.
+    ⚠️ The derive pass runs on EVERY runtime prefab spawn, so the heal is bounded: only a node inside
+    a top-level instance is a candidate, its walk stops at that instance's stored root (the original
+    anchor is at or below it), and a node the world already failed to heal is skipped until its guid
+    or the world's key set or its ancestor chain changes. Unbounded, it measured ~2 s per spawn at
+    5000 entities × 20 keys. A world that expands no keyed prefab pays nothing. The prefab-edit world
+    never notes the EDITED prefab's own keys — its rows are flattened, not expanded — so those nodes
+    are not healed there; the editor's template write recovers them instead.
   - **Write.** Every prefab-file writer captures in TEMPLATE form:
     - `planPrefabRows` passes `{ template: true }` to `captureInstanceReference` and
       `captureNestedChannels`;
     - `addedNodeIdentity` reads the key back off the marker. The marker is unregistered, so any
       scene-form round trip of the edit world drops it (Play→Stop reloads a `serializeScene`
-      snapshot; delete→undo respawns from a registry-only snapshot). The key is then RECOVERED from
-      the node's guid, which both round trips keep (`recoverTemplateKey`): each ancestor is tried as
-      the anchor with each key the cached prefabs declare, until `deriveMemberGuid` reproduces the
-      guid. Only a node that never came from a template gets a fresh key. Minting one instead
+      snapshot; delete→undo respawns from a registry-only snapshot, though undo now carries the
+      marker — #1427). The key is then RECOVERED from the node's guid, which both round trips keep:
+      each ancestor is tried as the anchor with each key the cached prefabs declare, until
+      `deriveMemberGuid` reproduces the guid. It is the same algorithm as the load heal
+      (`recoverTemplateKey` in `runtime/loaders/templateKeyRecovery.ts`), fed the editor cache's keys,
+      which include a prefab being edited that no world expanded. Only a node that never came from a template gets a fresh key. Minting one instead
       re-keyed the node and pinned the inner prefab's untouched interior into the outer row on a
       no-op save (#1387 review);
     - promotion (`toTemplateNodes` in `insertAddedSubtree`) converts a scene-form subtree the same way.
@@ -1529,28 +1546,22 @@ above reaches only an entry not yet migrated, of which the committed corpus now 
 
 ### Gotchas
 
-- **A carried prefab instance keeps its link and overrides, but loses its UNREGISTERED
-  markers.** The carry respawns a kept base from a trait snapshot and never calls
-  `instantiatePrefabIntoWorld`. The `PrefabInstance` trait survives, with `rootInstanceId`
-  remapped through the old→new id map, and so does the override mark set, captured off the
-  old world and re-seeded per entity. So a dirty carried base still saves its instances as
-  `prefab` + `overrides`, not as flattened members. That was observed live on sling's
-  `Base.scene.json` (#1421), for an edit made before the carry and for one made after it.
-  The snapshot copies only REGISTERED traits, though, so every deliberately unregistered
-  marker is dropped (#1427, observed in a probe):
-  - **`TemplateAddedKey`** (#1387, `runtime/core/templateIdentity.ts`). A template-added
-    node can then no longer be named by `baseTokenResolver` → `memberPathIndex`, so the
-    Inspector and the Apply/Revert dialog show a member-reference field pointing at one as
-    a false override. A save is not affected (`captureInstanceOverrides` is mark-gated).
-    A Play→Stop round trip drops the key the same way, and a fresh reload does NOT
-    restore it once the scene has been saved (#1426).
-  - **`Transient`**. A runtime-spawned subtree in a kept base (a `UIEntries` pool) loses
-    the tag that is `serializeScene`'s only way to skip it. That consequence is read from
-    the code, not driven.
-
-  `SceneManager` warns at the moment a carry actually happens (a base already known to
-  contain a prefab instance shows up in that load's `keptBaseGuids`), not on every fresh
-  load.
+- **A carry keeps the unregistered markers (#1427).** The carry respawns a kept base (and every
+  `Persistent` root) from a snapshot of the trait REGISTRY, so a deliberately unregistered marker
+  was invisible to it and vanished: `Transient` (a runtime pool row under a `Persistent` root, or
+  inside a kept base's prefab member, came back savable and the next save wrote it into the scene
+  file) and `TemplateAddedKey` (a template-added node lost its name, and the Inspector showed a false
+  override on a member reference into it). `runtime/core/carriedMarkers.ts` lists the markers; the
+  carry captures them per old id beside the override marks and restores them in its
+  `onEntitySpawned`. Delete→undo does the same through `snapshotEntity` / `respawnFromSnapshot`. A
+  COPY (every duplicate and paste goes through `regenerateSnapshotGuids`) drops them: it is a new
+  identity, and two siblings sharing a template key name neither. ⚠️ That is too blunt for a keyed
+  node INSIDE a copied instance: `planCopyGuids` gives it a random guid, so no heal can recover its
+  key and a member token into it is dead after a save + reload (#1430, open). The architecture guard
+  `unregisteredTraitsCarried.test.ts` fails on a new unregistered engine trait until it is carried
+  or named with its reason. Everything else a carried prefab instance needs survived already: the
+  `PrefabInstance` trait with `rootInstanceId` remapped, and the override marks (observed live on
+  sling's `Base.scene.json`, #1421). There is no longer a carry warning.
 - **The Time/Input singleton fallback must run AFTER the carry respawn.** A level whose
   Time lives in its base has no Time of its own, so a fallback running first spawns a
   phantom fresh Time and the carried one lands on top of it — two Time entities, which
@@ -1995,7 +2006,14 @@ staging world. `SceneManager`:
    guid (`filterPersistentDuplicates`) — the live persistent entity shadows the
    file copy, preventing duplicates.
 4. Respawns the snapshots into the staging world (tagged `version:
-   SCENE_FORMAT_VERSION`, currently 13, so migrations don't needlessly re-run).
+   SCENE_FORMAT_VERSION`, currently 13, so migrations don't needlessly re-run),
+   restoring each entity's override marks and unregistered markers (`Transient`,
+   `TemplateAddedKey`) against its fresh id (#1427).
+
+A `Persistent` entity can be `Transient` too, and in a shipped build it usually is: the run mode
+defaults to `playing`, and `spawnEntity` tags every spawn made inside a system tick. So the carry
+PRESERVES the tag rather than skipping tagged subtrees — skipping would delete a runtime-spawned
+`Persistent` player at every swap.
 
 Each snapshotted field is the union of the trait's koota `.schema` keys and its
 registered `meta.fields` keys (not `meta.fields` alone, which is a curated Inspector

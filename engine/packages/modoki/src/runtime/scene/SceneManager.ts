@@ -98,6 +98,7 @@ import { markSceneLoaded, isSceneFilePath } from '../core/ecs/sceneLoaded';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { ensurePhysicsReady } from '../physics/physicsReady';
 import { clearAllOverrideMarks, getOverrideMarkSet, restoreOverrideMarks } from '../loaders/overrideMarks';
+import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../core/carriedMarkers';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 
@@ -330,13 +331,6 @@ class SceneManagerImpl implements SceneManager {
   // leak — prefer a Manager. (scene-managers F7)
   private sceneCallbacks = new Map<string, () => void>();
   private beforeSwapHooks: BeforeSwapHook[] = [];
-  // Which base-scene guids are known (from a prior FRESH load) to contain a prefab
-  // instance — checked against `keptBaseGuids` on the NEXT load so the carry
-  // warning (unregistered markers are dropped, #1427) fires at the moment the
-  // carry actually happens, not on every fresh load (a base with a prefab instance
-  // used to warn on every single editor boot, whether or not a carry ever followed).
-  private basesWithPrefabInstance = new Set<string>();
-
   /** Register an async hook that runs after entities are spawned into the
    *  staging world but before the atomic swap. Use for shader prewarm. */
   registerBeforeSwap(hook: BeforeSwapHook) {
@@ -651,20 +645,6 @@ class SceneManagerImpl implements SceneManager {
         if (oldSid !== undefined) {
           keptBaseGuids.add(ref.guid);
           keptSceneIds.add(oldSid);
-          // `ref` is being CARRIED (kept from the old chain) rather than freshly reloaded.
-          // The carry keeps a prefab instance's link, `rootInstanceId` and override marks,
-          // so it still saves as a link + overrides (#1421, observed live on sling). The
-          // snapshot copies only registered traits, so it drops the unregistered markers
-          // (`TemplateAddedKey`, `Transient` — #1427; docs/scene-loading.md § Gotchas).
-          // Warning here (instead of on every fresh load) means this only fires on a real carry.
-          if (this.basesWithPrefabInstance.has(ref.guid)) {
-            console.warn(
-              `[SceneManager] Base scene "${ref.path}" is carried with a prefab instance in it. ` +
-              `Its links and override values survive and save; unregistered markers do not, so ` +
-              `a member reference to a node a prefab template ADDED can show as a false override ` +
-              `in the Inspector (#1427, scene-loading.md § Gotchas).`,
-            );
-          }
         }
       }
       const toLoadRefs: SceneRef[] = [...baseRefs.filter((r) => !keptBaseGuids.has(r.guid)), primaryRef];
@@ -773,10 +753,16 @@ class SceneManagerImpl implements SceneManager {
       // docs/reviews/a9-carried-instance-overrides-investigation.md).
       // Marks are keyed by the packed entity (#868), so resolve each carried id in the old world.
       const carriedMarks = new Map<number, string[]>();
+      // The unregistered markers too (#1427): the snapshot is built from the trait registry, which
+      // never sees them, so `Transient` and `TemplateAddedKey` were silently dropped — a runtime pool
+      // was saved into the next scene, and a template-added node showed false overrides.
+      const carriedMarkers = new Map<number, CarriedMarkers>();
       for (const entry of carriedSnapshots) {
         const old = findEntityById(entry.id);
         const set = old ? getOverrideMarkSet(old) : undefined;
         if (set && set.size > 0) carriedMarks.set(entry.id, [...set]);
+        const markers = captureMarkers(old as Parameters<typeof captureMarkers>[0]);
+        if (markers) carriedMarkers.set(entry.id, markers);
       }
       const persistentOnlySnapshots = carriedSnapshots.filter((e) => e.traits['Persistent'] === true);
       const persistentResources = collectResourceRefsFromEntities(persistentOnlySnapshots);
@@ -821,7 +807,6 @@ class SceneManagerImpl implements SceneManager {
       clearAuthoredWritesWhileStopped();
       const stagingWorld = nextWorld; // captured for closures so TS narrows from null
       const eaMeta = getAllTraits().find((m) => m.name === 'EntityAttributes');
-      const piMeta = getAllTraits().find((m) => m.name === 'PrefabInstance');
 
       for (const ref of toLoadRefs) {
         const sid = sceneIdByPath.get(ref.path)!;
@@ -948,22 +933,13 @@ class SceneManagerImpl implements SceneManager {
         // onEntitySpawned — are covered too). The primary's entities keep the
         // schema default ''.
         if (!isPrimary && eaMeta) {
-          let sawPrefabInstance = false;
           for (const e of stagingWorld.entities) {
             const ent = e as unknown as { id(): number; has(t: unknown): boolean; get(t: unknown): Record<string, unknown>; set(t: unknown, d: unknown): void };
             const eid = ent.id();
             if (beforeIds.has(eid)) continue; // spawned by an earlier scene in the chain
-            if (piMeta && ent.has(piMeta.trait)) sawPrefabInstance = true;
             if (!ent.has(eaMeta.trait)) continue;
             ent.set(eaMeta.trait, { ...ent.get(eaMeta.trait), sourceScene: ref.guid });
           }
-          // Record rather than warn here — a base with a prefab instance loses nothing on
-          // ITS OWN fresh load beyond what loading the file already implies (#1426); the
-          // marker loss only happens on a LATER load that CARRIES
-          // this same base instead of reloading it. That check (and the actual warning)
-          // lives where `keptBaseGuids` is computed, above.
-          if (sawPrefabInstance) this.basesWithPrefabInstance.add(ref.guid);
-          else this.basesWithPrefabInstance.delete(ref.guid); // no longer has one — stale flag would false-warn later
         }
       }
 
@@ -1000,6 +976,7 @@ class SceneManagerImpl implements SceneManager {
             onEntitySpawned: (entity: { id(): number }, oldId: number) => {
               const keys = carriedMarks.get(oldId);
               if (keys) restoreOverrideMarks(entity as unknown as Entity, keys);
+              restoreMarkers(entity as unknown as Parameters<typeof restoreMarkers>[0], carriedMarkers.get(oldId));
             },
           },
         );
@@ -1734,7 +1711,6 @@ class SceneManagerImpl implements SceneManager {
     this.currentBaseScene = undefined;
     this.nextLoad = null;
     this.pendingForcedBases.clear();
-    this.basesWithPrefabInstance.clear();
     this.teardownInFlight = 0;
     this.teardownToken.invalidateAll();
   }

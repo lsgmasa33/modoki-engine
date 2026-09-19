@@ -25,6 +25,8 @@ import { parseAnimClipBankResult } from '../animation/animClipBank';
 import { getRunMode } from '../core/playState';
 import { Transient } from '../core/traits/Transient';
 import { TemplateAddedKey, addedKeyStep, templateKeyOf, setTemplateKey } from '../core/templateIdentity';
+import { noteTemplateDoc, templateKeysIn, recoverTemplateKey, healMissesIn, type KeyRecoveryNode } from './templateKeyRecovery';
+import { packedOf } from '../core/ecs/entityTable';
 import { rebaseMemberTokens, hasMemberToken, isMemberToken, parseMemberToken, memberPathKey, type MemberStep } from '../core/templateRefs';
 import { mapStringValues } from '../core/assetRefRules';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
@@ -932,6 +934,63 @@ export function deriveInstanceMemberGuids(world: World): void {
     indexEntityGuid(row.handle, world); // keep the guid index warm for this '' → guid mint
   }
 
+  // Heal a template key the node lost (#1426) before anything names it: a saved scene respawns a
+  // keyed node with its guid and no key, and without the marker neither member-token resolution below
+  // nor the editor's override comparison can step through it. A healed node has a STORED guid, so it
+  // was an anchor above, never a step — healing after the derive changes no derived guid.
+  const keys = templateKeysIn(world);
+  if (keys.size) {
+    const nodeOf = (id: number): KeyRecoveryNode | undefined => {
+      const row = rows.get(id);
+      if (!row) return undefined;
+      const pi = row.hasPI ? (row.handle.get(piMeta.trait) as { localId?: number; parentLocalId?: number }) : null;
+      const guid = durableGuid((row.handle.get(attrMeta.trait) as { guid?: string }).guid);
+      return { guid, parentId: row.parentId, key: templateKeyOf(row.handle), pi };
+    };
+    // Only a node INSIDE a top-level instance can be template-added, and its original anchor is at or
+    // below that instance's stored root — so candidates are bounded to instances and each walk stops
+    // at the root. Known misses are skipped until the node's guid or the world's key set changes.
+    const insideMemo = new Map<number, boolean>();
+    const inside = (id: number): boolean => {
+      const hit = insideMemo.get(id);
+      if (hit !== undefined) return hit;
+      insideMemo.set(id, false); // a parent cycle is not inside anything
+      const parent = rows.get(rows.get(id)?.parentId ?? 0);
+      const v = !!parent && (parent.storedRoot || inside(parent.handle.id()));
+      insideMemo.set(id, v);
+      return v;
+    };
+    const isTop = (id: number): boolean => !!rows.get(id)?.storedRoot;
+    const misses = healMissesIn(world);
+    const memo = new Map<number, string>();
+    // A miss is only reusable while everything the recovery read is unchanged: the node's guid, the
+    // key set, and its ancestor chain up to the instance root (a reparent — or an undone one — can
+    // make a failed recovery succeed with the guid and key count both unchanged). Walking ids hashes
+    // nothing, so the signature stays cheap next to the recovery it skips.
+    const chainOf = (id: number): string => {
+      const ids: number[] = [];
+      let cur = rows.get(id)?.parentId ?? 0;
+      const seen = new Set<number>();
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        ids.push(cur);
+        if (rows.get(cur)?.storedRoot) break;
+        cur = rows.get(cur)?.parentId ?? 0;
+      }
+      return ids.join('.');
+    };
+    for (const [id, row] of rows) {
+      if (row.keyed || row.hasPI || !row.origGuid) continue; // only a plain node with a stored guid can have lost one
+      if (!inside(id)) continue;
+      const tried = `${row.origGuid}|${keys.size}|${chainOf(id)}`;
+      const packed = packedOf(row.handle as unknown as Entity);
+      if (misses.get(packed) === tried) continue;
+      const key = recoverTemplateKey(id, nodeOf, keys, memo, isTop);
+      if (key) { setTemplateKey(row.handle, key); row.keyed = true; misses.delete(packed); }
+      else misses.set(packed, tried);
+    }
+  }
+
   // Member tokens resolve against the guids just derived (#1352).
   resolveTemplateFrames(world);
 }
@@ -1136,6 +1195,8 @@ export function instantiatePrefabIntoWorld(
   _segments?: MemberStep[][],
 ): number {
   const segments = _segments ?? [];
+  // The keys this document declares are the candidates a later heal of this world tries (#1426).
+  noteTemplateDoc(world, prefab as Parameters<typeof noteTemplateDoc>[1]);
   // A TOP call opens a token scope; nested calls report into it (#1352 review: resolution scans the
   // world, so a tree holding no token must not pay for it on every runtime spawn).
   const outerScope = _segments ? null : openTokenScope();

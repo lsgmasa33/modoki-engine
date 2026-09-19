@@ -230,7 +230,9 @@ describe('moveEntityToScene — promote (level → base)', () => {
     expect(pushedActions).toHaveLength(0);
   });
 
-  it('warns when the subtree contains a PrefabInstance root', async () => {
+  // A carried prefab instance used to lose its unregistered markers, so this warned. Since #1426 and
+  // #1427 a carry loses nothing, and the warning went with the loss.
+  it('promotes a PrefabInstance root without a carry warning', async () => {
     const { moveEntityToScene } = await getModule();
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const root = testWorld.spawn(Transform({}), EntityAttributes({ name: 'InstanceRoot', parentId: 0, guid: 'inst-1' }),
@@ -238,9 +240,9 @@ describe('moveEntityToScene — promote (level → base)', () => {
     entityIndex.set(root.id(), root);
     root.set(PrefabInstance, { ...root.get(PrefabInstance)!, rootInstanceId: root.id() });
 
-    moveEntityToScene(root.id(), BASE);
-    expect(warnSpy).toHaveBeenCalled();
-    expect(warnSpy.mock.calls[0][0]).toContain('InstanceRoot');
+    const res = moveEntityToScene(root.id(), BASE);
+    expect(res.ok).toBe(true);
+    expect(warnSpy.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('prefab instance'))).toBe(false);
     warnSpy.mockRestore();
   });
 
