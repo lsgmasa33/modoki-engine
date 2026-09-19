@@ -495,10 +495,10 @@ describe('nodes inside a nestedStructure slot are reminted too (#1358/#1369 slot
 //
 // Each case: load the unedited instance to learn the node's derived guid; write the scene-form edit;
 // load THAT and take refs to `targets`; duplicate; load the copy — every ref must land on the same
-// path, and the stored node must come back keyed exactly as the edited original does. (The load heal
-// re-keys a plain keyed node, not a keyed REFERENCE node — a gap in #1426's heal, filed separately;
-// the copy must not be worse than the original either way.)
+// path, and the stored node must come back keyed exactly as the edited original does (the load heal
+// re-keys a keyed plain node since #1426, and a keyed reference node since #1438).
 const K_P = 'dddddddd-0000-4000-8000-000000000001';
+const K_R = 'dddddddd-0000-4000-8000-000000000003';
 async function editedRoundTrip(
   unedited: Record<string, unknown>,
   edit: (guidAt: (path: string) => string) => Record<string, unknown>,
@@ -536,17 +536,15 @@ const sceneForm = (guid: string, name: string, parentLocalId: number, extra: Rec
 const slot = (added: unknown[]) => ({ added, removed: [], removedTraits: {} });
 
 describe('an edited template-keyed node follows a scene duplicate (#1430)', () => {
-  // Mutation: let a defined guid win over the derived one again (`if (!remap.has(k))` in
-  // `remintSceneEntityGuids`) — the first, second and fourth cases go red. The third stays green under
-  // it: the heal re-keys no reference node (#1438) and a random anchor keeps its members consistent,
-  // so only the one-pass mutation below reaches it.
+  // Mutation: let a defined guid win over the derived one again (`!remap.has(k)` for the carry's
+  // `remap.get(k) !== v` in `remintSceneEntityGuids`) — every case below but the accept side goes red.
   it('a keyed plain node', async () => expect(await editedRoundTrip({ prefab: KY },
     (at) => ({ prefab: KY, nestedStructure: { 2: slot([sceneForm(at('KyRoot/InnerRoot/Leaf/Kp'), 'Kp', 2)]) } }),
     ['KyRoot/InnerRoot/Leaf/Kp'], 'KyRoot/InnerRoot/Leaf/Kp')).toBe(K_P));
 
-  it('a keyed reference node, and its member', () => editedRoundTrip({ prefab: KY },
+  it('a keyed reference node, and its member', async () => expect(await editedRoundTrip({ prefab: KY },
     (at) => ({ prefab: KY, nestedStructure: { 2: slot([sceneForm(at('KyRoot/InnerRoot/LeafyRoot'), 'Kr', 1, { prefab: LEAFY, traits: {} })]) } }),
-    ['KyRoot/InnerRoot/LeafyRoot', 'KyRoot/InnerRoot/LeafyRoot/Tip'], 'KyRoot/InnerRoot/LeafyRoot'));
+    ['KyRoot/InnerRoot/LeafyRoot', 'KyRoot/InnerRoot/LeafyRoot/Tip'], 'KyRoot/InnerRoot/LeafyRoot')).toBe(K_R));
 
   // #1430 review, (a): the keyed anchor sits inside a user-added reference node that carries its own
   // guid, so the entry's walk stops there (SKIP) and nothing re-carries the anchor's members after the
@@ -570,5 +568,57 @@ describe('an edited template-keyed node follows a scene duplicate (#1430)', () =
     const plain = 'cccccccc-0000-4000-8000-0000000014a0';
     const copy = remintSceneEntityGuids(sceneOf({ prefab: KY, nestedStructure: { 2: slot([sceneForm(plain, 'Plain', 2)]) } }, [plain]) as never, gen, (g) => prefabs.get(g)) as unknown as SceneData;
     expect(refsIn(copy)[0]).toMatch(/^cccccccc-0000-4000-8000-0000000000/); // from `gen`
+  });
+});
+
+// ── #1438: the load heal re-keys a keyed REFERENCE node the scene edited ─────────────────────────────
+// A scene-form save writes Kr (KY's template reference to LEAFY) with its derived guid stored and its
+// key dropped. Its root carries `PrefabInstance`, and the #1426 heal once took plain nodes only, so Kr
+// reloaded unkeyed and a member token naming it by `'+' + key` stayed dead. (A token cannot reach PAST Kr:
+// a reference node is a stored root, its own frame.) KYT is KY plus a row whose binding names Kr by
+// token: KySlot's nested root steps 2, then Kr's key.
+const KYT = 'aaaaaaaa-0000-4000-8000-00000000000c';
+const KR_TOKEN = `@member:2.+${K_R}`;
+describe('the load heal re-keys an edited template-keyed reference node (#1438)', () => {
+  beforeEach(() => {
+    prefabs.set(KYT, { ...kyDoc, id: KYT, entities: [...kyDoc.entities, { localId: 3, traits: {
+      EntityAttributes: { name: 'Btn', parentId: 1, guid: '' }, Transform: { x: 0, y: 0, z: 0 },
+      UIAction: { bindings: [{ event: 'click', action: 'noop', target: KR_TOKEN }] },
+    } }] });
+  });
+  const pathMap = () => new Map([...guidToTreePath()].map(([g, p]) => [p, g]));
+  const liveAt = (path: string) => [...getCurrentWorld().entities].find((e) => (e.get(getTraitByName('EntityAttributes')!.trait) as { guid?: string } | undefined)?.guid === pathMap().get(path))!;
+  const keyAt = (path: string) => (liveAt(path).get(TemplateAddedKey) as { key: string } | undefined)?.key ?? '';
+  const btnTarget = () => (liveAt('KyRoot/Btn').get(getTraitByName('UIAction')!.trait) as { bindings: { target: string }[] }).bindings[0]!.target;
+  const editedKr = async () => {
+    await load(sceneOf({ prefab: KYT }, []));
+    const unedited = { kr: pathMap().get('KyRoot/InnerRoot/LeafyRoot')! };
+    expect(keyAt('KyRoot/InnerRoot/LeafyRoot')).toBe(K_R); // the premise: an unedited load keys Kr
+    expect(btnTarget()).toBe(unedited.kr);                  // and the token lands on Kr
+    await load(sceneOf({ prefab: KYT, nestedStructure: { 2: slot([sceneForm(unedited.kr, 'Kr', 1, { prefab: LEAFY, traits: {} })]) } }, []));
+    return unedited;
+  };
+
+  // Mutation: restore the heal's `row.hasPI` skip in `deriveInstanceMemberGuids` — Kr loads unkeyed and
+  // Btn keeps the literal token.
+  it('Kr keeps its guid, gets its key back, and the token through it resolves', async () => {
+    const unedited = await editedKr();
+    expect(pathMap().get('KyRoot/InnerRoot/LeafyRoot')).toBe(unedited.kr);
+    expect(keyAt('KyRoot/InnerRoot/LeafyRoot')).toBe(K_R);
+    expect(btnTarget()).toBe(unedited.kr);
+  });
+
+  // Accept side: a reference node the SCENE added (a random stored guid) derives from no key, and a
+  // prefab member inside Kr is never a candidate. A member has no guid on the first derive, so a SECOND
+  // one (any runtime spawn) is what makes it one. Mutations: stamp the first key without the derivation
+  // check; with it, also let the heal take a non-root member (`row.hasPI && !row.storedRoot`).
+  it('a scene-added reference node and Kr\'s own member stay unkeyed', async () => {
+    const added = 'cccccccc-0000-4000-8000-0000000014b0';
+    await load(sceneOf({ prefab: KYT, added: [{ parentLocalId: 1, guid: added, name: 'Mine', prefab: LEAFY, traits: {}, children: [] }] }, []));
+    expect(pathMap().get('KyRoot/LeafyRoot')).toBe(added);
+    expect(keyAt('KyRoot/LeafyRoot')).toBe('');
+    const { deriveInstanceMemberGuids } = await import('../../packages/modoki/src/runtime/loaders/loadSceneFile');
+    deriveInstanceMemberGuids(getCurrentWorld());
+    expect(keyAt('KyRoot/InnerRoot/LeafyRoot/Tip')).toBe('');
   });
 });

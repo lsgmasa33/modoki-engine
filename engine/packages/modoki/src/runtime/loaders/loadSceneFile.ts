@@ -981,7 +981,10 @@ export function deriveInstanceMemberGuids(world: World): void {
       return ids.join('.');
     };
     for (const [id, row] of rows) {
-      if (row.keyed || row.hasPI || !row.origGuid) continue; // only a plain node with a stored guid can have lost one
+      // Only a node with a stored guid can have lost one: a plain node, or a REFERENCE node's root — a
+      // stored root, stepped by its key exactly like a plain keyed node (#1438). A member below a root
+      // steps by its localId and never had a key.
+      if (row.keyed || (row.hasPI && !row.storedRoot) || !row.origGuid) continue;
       if (!inside(id)) continue;
       const tried = `${row.origGuid}|${keys.size}|${chainOf(id)}`;
       const packed = packedOf(row.handle as unknown as Entity);

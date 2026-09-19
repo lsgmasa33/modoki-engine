@@ -118,7 +118,8 @@ export function recoverTemplateKey(
     }
     if (isTop?.(cur)) break;
     // This ancestor is on the path, not the anchor: prepend its step, as the derive pass does. A
-    // prefab member steps by its localId; only a plain node can be a keyed one that lost its marker.
+    // prefab member steps by its localId. A keyed REFERENCE root that lost its marker (#1438) never
+    // reaches this line in the loader: it is a stored root, so `isTop` already tried it as the anchor.
     const step = node.key ? addedKeyStep(node.key)
       : node.pi ? memberStepId(node.pi)
       : (() => { const k = recoverTemplateKey(cur, nodeOf, keys, memo, isTop); return k ? addedKeyStep(k) : 0; })();

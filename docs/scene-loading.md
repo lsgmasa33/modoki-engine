@@ -1374,10 +1374,10 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   under. Re-pointing it moves its members, so the carry repeats until nothing moves, each pass
   against the anchors' final guids. A single pass left a member ref dangling whenever the entry's
   own walk could not reach the anchor.
-  ⚠️ The heal re-keys a scene-form keyed PLAIN node only. A keyed reference-node root carries
-  `PrefabInstance`, so the heal skips it, and it comes back unkeyed even in the original file. The
-  copy matches the original there. That gap belongs to the heal (#1426's code), not to the
-  duplicate, and is filed as #1438.
+  The heal re-keys a keyed reference-node root too (#1438). It carries `PrefabInstance`, but it is a
+  stored root that stepped by its key, so its guid derives exactly like a keyed plain node's, in the
+  original and in the copy. A member token can name the reference node itself, never a member past
+  it: a stored root is its own frame.
   ⚠️ **The walk mirrors the loader exactly, including the shapes the loader recurses on FOREVER** (a
   prefab whose file adds a reference leading back to it). Two structural rules for "which shapes
   are cycles" were each wrong in review, refusing shapes that load or missing ones that do not, so
@@ -1457,9 +1457,10 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   - **Load heals a lost key (#1426).** A scene save writes a keyed node as its guid and no key (see
     "Which kind a node is" below), so a reload spawns it unkeyed. Before, a member token naming the
     node then stayed a literal `@member:…` string in the live world, a dead reference in a shipped
-    build. `deriveInstanceMemberGuids` now ends with a heal: every plain node with a stored guid gets
-    its key back when one of the keys its world's expanded prefab documents declare derives that
-    guid (`runtime/loaders/templateKeyRecovery.ts`; the loader records each document's keys as it
+    build. `deriveInstanceMemberGuids` now ends with a heal: every node with a stored guid that could
+    have been template-added (a plain node, or a reference node's root, #1438) gets its key back
+    when one of the keys its world's expanded prefab documents declare derives that guid
+    (`runtime/loaders/templateKeyRecovery.ts`; the loader records each document's keys as it
     expands it). It runs before member-token resolution, and a healed node was an anchor, never a
     step, so no derived guid moves. Runtime never mints a key.
     ⚠️ The derive pass runs on EVERY runtime prefab spawn, so the heal is bounded: only a node inside
