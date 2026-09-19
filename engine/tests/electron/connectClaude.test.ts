@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -230,6 +230,23 @@ describe('detectClaudeCli', () => {
     if (a.found) expect(typeof a.path).toBe('string');
     // Second call returns the SAME memoized object (no re-spawn on every status poll).
     expect(detectClaudeCli()).toBe(a);
+  });
+
+  it('a not-found whose detection outlasted the TTL is still memoized (stamped at completion)', () => {
+    _resetClaudeMemo();
+    // Detection "takes" 20s: Date.now reads 0 at entry, 20_000 from then on — the Windows
+    // runner's measured `where` time, which exceeds the 15s not-found TTL.
+    let clock = 0;
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => { const t = clock; clock = 20_000; return t; });
+    try {
+      const env = { PATH: '', SHELL: '/nonexistent/shell' } as NodeJS.ProcessEnv;
+      const a = detectClaudeCli(env);
+      expect(a).toEqual({ found: false });
+      expect(detectClaudeCli(env)).toBe(a);
+    } finally {
+      spy.mockRestore();
+      _resetClaudeMemo();
+    }
   });
 
   it('a corrupt env does not throw (fail closed to not-found)', () => {

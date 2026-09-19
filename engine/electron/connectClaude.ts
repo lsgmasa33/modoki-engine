@@ -726,7 +726,10 @@ export function detectClaudeCli(env: NodeJS.ProcessEnv = process.env): { found: 
   }
   const resolved = whichClaude(env) ?? loginShellClaude(env);
   const result = resolved ? { found: true, path: resolved } : { found: false };
-  _claudeMemo = { at: now, result };
+  // Stamp when detection FINISHED, not when it started: an unbounded `where` took ~20s on a
+  // loaded Windows runner, so a start stamp stored a not-found that was already past its TTL
+  // and every poll re-spawned the probe the memo exists to prevent.
+  _claudeMemo = { at: Date.now(), result };
   return result;
 }
 
