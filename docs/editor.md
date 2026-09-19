@@ -618,6 +618,36 @@ flow falls back to the in-app prompt, Browse… alerts. Before #1440 both routes
 `execFileSync('osascript')` in every host, so the panel froze the Electron editor while it was open
 (QA-PARTICLE-0011), ⌘V did nothing, and every failure read as Cancel.
 
+**Where the save panel opens.** The caller's `defaultFolder` (an Assets-panel folder, or a kind's
+own, e.g. scenes → `/assets/scenes`); with none, `firstRootDir()` = `defaultSaveRootDir`: the first
+PROJECT asset root, never the engine's `/modoki/assets`. Until #1441 it was `assetRoots[0]`, which is
+the engine root, so Create ▸ Particle (and every toolbar create with no `defaultFolder`) opened in
+`engine/packages/modoki/src/runtime/assets/`, and the default name wrote there. macOS had hidden it:
+osascript reopened at its remembered location, while Electron's panel honours the directory it is
+given. Browse… passes no start folder, so its panel opens wherever the OS last left it.
+
+**On Windows (#1441, observed 2026-09-19 on the `win` box, Electron editor, `games/anim-bug`):**
+- The panel is the common Save dialog (`#32770`), owned by the editor. With "hide extensions for
+  known types" on (the Windows default), the default `New Scene.scene.json` shows as
+  `New Scene.scene`, and saving it unchanged writes `New Scene.scene.json`; a bare `Walk` becomes
+  `Walk.spriteanim.json` through `ensureExt`, with no doubled extension either way.
+- Saving over an existing file raises Windows' own "Confirm Save As … replace it?" (so
+  `showOverwriteConfirmation` being Linux-only does not matter here), and that check folds case: an
+  all-caps spelling of `…\SCENES\main.scene.json` was asked about, and the route answered
+  `/assets/scenes/main.scene.json`.
+- While the panel is up, the menu gate holds on Windows too: Edit shows the plain `undo`/`redo`
+  roles, and Save All, Open Project, Reload and Project Settings are disabled. It comes back whole
+  after Cancel and after Save.
+- A path outside every asset root gets the in-app `alert`. It shows as a native message box titled
+  "Electron".
+- Browse… returns native `D:\…` paths. Inside the project they are stored project-relative with `/`;
+  outside, `portablePath` rewrites `\` as `/`, because the SDK-path allowlist refuses a backslash
+  (`D:\Downloads` for JAVA_HOME used to fail Apply as "invalid characters").
+- ⚠️ **Driving the panel from a script:** `WM_SETTEXT` on the name field changes what it SHOWS but
+  not what the panel returns (the default name was saved instead). `WM_CHAR` per character works.
+  And never use `SendKeys`: a background process cannot take the foreground on Windows, so the
+  keys go to whatever window has focus.
+
 An agent never opens either panel — they are modal and only a human can answer one;
 `modoki_create_registered_asset` takes an explicit path instead (#288).
 

@@ -82,6 +82,13 @@ export function registerVerifyRun(
   },
 ): VerifyBudget;
 export function unregisterVerifyRun(opts?: RunsOpts & { pid?: number }): void;
+export const LEGACY_ENGINE_LANE_WORKERS: number;
+/** The engine lane's worker count on every run, solo included — one source for the lane and the
+ *  `context:` line (#1443). Reads `engineWorkers`, and `total` under the opt-out. */
+export function engineLaneWorkers(
+  budget: Pick<VerifyBudget, 'engineWorkers' | 'total'> | null | undefined,
+  env?: NodeJS.ProcessEnv,
+): number;
 /** ⚠️ Takes only the fields it PRINTS, not a whole `VerifyBudget`. Widening it to the full budget
  *  made adding `group` a breaking change for every caller that builds the argument by hand — the
  *  line reports context and has no business requiring a group id it never renders. */

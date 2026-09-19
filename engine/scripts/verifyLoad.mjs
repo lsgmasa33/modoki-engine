@@ -329,6 +329,36 @@ export function unregisterVerifyRun({ pid = process.pid, dir = verifyRegistryDir
   }
 }
 
+/** The engine lane's pinned count from before the budget existed — what `MODOKI_VERIFY_NO_BUDGET`
+ *  and a run with no budget fall back to. Sized on the Mac as half its 12 performance cores. */
+export const LEGACY_ENGINE_LANE_WORKERS = 6;
+
+/** How many workers `verify.mjs`'s engine lane RUNS with — the one number both the lane's env and
+ *  the `context:` line read, so the line cannot describe a pool nobody used (#1443).
+ *
+ *  ⚠️ **It applies on a SOLO run too, unlike the app lane's budget.** The app lane can fall through
+ *  to `testWorkers.ts` because that module sizes it per platform; the engine lane never could — it
+ *  was pinned to a Mac-sized 6, which on a 6-core Windows box is the whole cap, so the two lanes
+ *  overlapped at 12 workers on 6 cores while this line printed `engine=3`. `budget.engineWorkers`
+ *  is half of `perfCores()`, which already halves on Windows, and on the Mac solo it is still 6.
+ *  (Half, not less: on the Mac, 3 workers took this suite from ~25s to 64-80s and made it the pole.)
+ *
+ *  Precedence, most deliberate first: the lane's own knob, then `MODOKI_TEST_MAX_WORKERS` (which
+ *  `testWorkers.ts` documents as beating everything — the old pin silently outvoted it for this
+ *  lane), then the budget. `MODOKI_VERIFY_NO_BUDGET` stops the division ACROSS clones and takes the
+ *  solo share; only a run with no budget at all falls back to the legacy pin. */
+export function engineLaneWorkers(budget, env = process.env) {
+  for (const knob of ['MODOKI_VERIFY_ENGINE_WORKERS', 'MODOKI_TEST_MAX_WORKERS']) {
+    const n = Number(env[knob]);
+    if (env[knob] && Number.isFinite(n) && n > 0) return n;
+  }
+  if (!budget) return LEGACY_ENGINE_LANE_WORKERS;
+  // The opt-out stops the division ACROSS clones — it takes the solo share, never the Mac pin,
+  // which on the 6-core win box is exactly the 12-on-6 this function exists to prevent.
+  if (env.MODOKI_VERIFY_NO_BUDGET) return Math.max(MIN_WORKERS, Math.floor(budgetFor(budget.total, 1) / 2));
+  return budget.engineWorkers;
+}
+
 /** One line of context for any number this gate prints.
  *
  *  ⚠️ This is Phase 0 of the #1285 work and it is load-bearing, not decoration: a `verify` timing

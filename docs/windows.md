@@ -219,6 +219,16 @@ conversion never engaged".
 
 ## Paths
 
+- ⚠️ **A native Windows path can fail a validator written for POSIX paths.** `BUILD_FIELD_RULES`
+  (`load-project-config.ts`) allows only shell-safe characters in the SDK paths, and it allowed
+  neither `:` nor `\`, so every Windows absolute path failed. Project Settings ▸ Browse… for
+  JAVA_HOME returned `D:\Downloads`, and Apply refused it (#1441, observed). Fixed at both ends:
+  the rule allows a leading drive (`FS_PATH`) but still no backslash, since a backslash can swallow
+  a closing quote; and a picked path outside the project is stored as `D:/Downloads`
+  (`portablePath`, `projectPaths.ts`). Observed: Apply accepts and stores `D:/Downloads`. Not yet
+  observed: an Android build running with `JAVA_HOME=D:/…` (it's expected to work, since Node's `path`
+  and Gradle's launcher accept `/`). A hand-typed `\` still fails, with a hint to use `/`. Still
+  refused: `(x86)` and non-ASCII folders. And a stored gcloudPath can't be used on Windows yet (#1444).
 - ⚠️ **`fs.realpathSync` is NOT the canonicaliser you want on Windows — `fs.realpathSync.native`
   is.** The JS lstat-walk resolves symlinks and junctions but neither `subst` drive mappings nor
   drive-letter CASE, both of which are ordinary ways one directory acquires two spellings here.

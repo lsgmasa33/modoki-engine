@@ -30,13 +30,28 @@ function realDir(p: string): string {
   return path.join(canonicalPath(path.dirname(p)), path.basename(p));
 }
 
-/** The project-relative form of `chosenAbs` when it resolves under `projectRoot`, else
- *  `chosenAbs` unchanged. Separators in the relative form are always POSIX `/` — the value is
- *  written into JSON that other machines read, and `path.join` accepts `/` on every platform. */
+/** `p` with the platform separator spelled `/`, and a trailing separator dropped unless that
+ *  would leave a filesystem root (`/`, or a bare `C:`, which means "the current directory on C").
+ *
+ *  Why an ABSOLUTE path needs this too (#1441): the per-machine SDK paths are checked by
+ *  `BUILD_FIELD_RULES`' shell-safe allowlist, which admits `/` and never `\` — a backslash is the
+ *  one character that can swallow a closing quote. So a Windows folder picked for JAVA_HOME came
+ *  back as `D:\Downloads` and Apply refused it as "invalid characters", making Browse… useless on
+ *  Windows. `D:/Downloads` passes that allowlist and is stored (observed); a build consuming the
+ *  `/` spelling is expected, not yet observed (docs/windows.md § Paths, #1444). */
+export function portablePath(p: string, sep: string = path.sep): string {
+  const slashed = sep === '/' ? p : p.split(sep).join('/');
+  const trimmed = slashed.replace(/\/+$/, '');
+  return trimmed === '' || /^[A-Za-z]:$/.test(trimmed) ? slashed : trimmed;
+}
+
+/** The project-relative form of `chosenAbs` when it resolves under `projectRoot`, else the
+ *  absolute path in its `portablePath` spelling. Separators are always POSIX `/` either way — the
+ *  value is written into JSON that other machines read, and `path.join` accepts `/` on every platform. */
 export function relativiseUnderProject(projectRoot: string, chosenAbs: string): string {
   // The chooser returns folders with a trailing slash; `path.relative` treats `a/b/` and `a/b`
   // alike, but the stored string should not carry it.
-  const chosen = chosenAbs.length > 1 ? chosenAbs.replace(/\/+$/, '') : chosenAbs;
+  const chosen = portablePath(chosenAbs);
   const rel = path.relative(realDir(projectRoot), realDir(chosen));
   // `rel === ''` means the project root itself was picked. There is no relative spelling of that
   // an asset field could use, so it stays absolute rather than becoming an empty value that reads

@@ -306,7 +306,8 @@ export interface BackendContext {
    *  path the way the disk does rather than as `absPath` is — for a route answering about a request on
    *  a case-insensitive filesystem (#1261, #1273); see `absToAssetUrl` for why events must not. */
   absToAssetUrl(absPath: string, opts?: { onDisk?: boolean }): string | null;
-  /** Absolute dir of the first asset root (save-dialog default location), or null. */
+  /** Where the save dialog opens when no folder is named: the first PROJECT asset root, never the
+   *  engine's `/modoki/assets` (`defaultSaveRootDir`, #1441), or null. */
   firstRootDir(): string | null;
   /** Current cached asset manifest (kept fresh by the host's watcher). */
   getManifest(): Manifest;

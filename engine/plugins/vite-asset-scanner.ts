@@ -1513,6 +1513,21 @@ export function resolveModokiAssetsDir(
   ].find((d): d is string => !!d && exists(d));
 }
 
+/** URL prefix of the engine's built-in, read-only asset root. */
+export const ENGINE_ASSETS_URL_PREFIX = '/modoki/assets';
+
+/** Where a Save dialog opens when its caller names no folder: the first PROJECT root, never the
+ *  engine's. `findAssetRoots` pushes the engine root FIRST (it must resolve whatever project is
+ *  open), so `roots[0]` — the old answer — opened every toolbar "Create Particle" etc. inside
+ *  `engine/packages/modoki/src/runtime/assets/`, and accepting the default name wrote the new asset
+ *  into the engine's source (#1441). macOS hid it until #1440: osascript's panel reopened at its
+ *  remembered location, while Electron's honours the directory it is given. The renderer applies
+ *  the same rule for Create Prefab / Import (`firstAssetRoot`, assetRoots.ts). Null when the
+ *  project has no asset root — the caller then has nowhere writable to suggest. */
+export function defaultSaveRootDir(roots: readonly AssetRoot[]): string | null {
+  return roots.find((r) => r.urlPrefix !== ENGINE_ASSETS_URL_PREFIX)?.absDir ?? null;
+}
+
 /** Walk the project tree to find all directories named "assets".
  *  Returns URL prefix → absolute path mappings. */
 export function findAssetRoots(projectRoot: string): AssetRoot[] {
@@ -1523,7 +1538,7 @@ export function findAssetRoots(projectRoot: string): AssetRoot[] {
   // GUID-resolvable regardless of which project is open. See resolveModokiAssetsDir.
   const modokiAssets = resolveModokiAssetsDir(projectRoot);
   if (modokiAssets) {
-    roots.push({ urlPrefix: '/modoki/assets', absDir: modokiAssets });
+    roots.push({ urlPrefix: ENGINE_ASSETS_URL_PREFIX, absDir: modokiAssets });
   }
 
   // Flat one-game project: <projectRoot>/runtime/assets → /assets. A single-game
@@ -2130,7 +2145,7 @@ export function assetScannerPlugin(): Plugin {
             editorRoot,
             resolveAssetPath: (p) => resolveAssetPath(p, assetRoots),
             absToAssetUrl: (p, opts) => absToAssetUrl(p, assetRoots, opts),
-            firstRootDir: () => assetRoots[0]?.absDir ?? null,
+            firstRootDir: () => defaultSaveRootDir(assetRoots),
             getManifest: () => cachedManifest,
             rebuildManifest,
             requestBrowser,

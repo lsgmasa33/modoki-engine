@@ -116,8 +116,8 @@ type SaveAssetDialogOpts = {
 
 /** The save dialog, plus the `confirmReplace` a create at the chosen path should use (#1264).
  *
- *  The native panel runs its OWN "Replace?" check (macOS observed; Windows is assumed from Electron's
- *  docs — `showOverwriteConfirmation` is Linux-only, so the others always ask — and is #1441's to verify) — but against the name IT returned, before
+ *  The native panel runs its OWN "Replace?" check (macOS observed; Windows observed in #1441 — Windows'
+ *  own "Confirm Save As"; `showOverwriteConfirmation` is Linux-only, the others always ask) — but against the name IT returned, before
  *  `ensureExt`. When that name already is the real destination (`scene.json`, or a typed
  *  `Walk.anim.json`) the human has been asked once, and asking again in-app is a double prompt.
  *  When it is not (`Walk` → `Walk.anim.json`, the compound-extension collapse) the panel checked a
@@ -140,8 +140,9 @@ export async function chooseNewAssetPath(
     const path = ensureExt(res.path, ext);
     // The file the panel asked about, spelled as the create's 409 will name it (`existingPath`) — the
     // typed `level.json` over an existing `Level.json` reaches `confirmReplace` as `Level.json` (#1273).
-    // ⚠️ Unobserved premise, as it was before: that the panel's own "already exists" check folds case
-    // the way APFS does. Wrong, it would be a silent replace of a case variant.
+    // The premise that the panel's own "already exists" check folds case: observed on Windows (#1441 —
+    // an all-caps spelling of an existing scene raised the Replace prompt); still unobserved on APFS.
+    // Wrong there, it would be a silent replace of a case variant.
     const panelChecked = res.existingPath ?? res.path;
     return { path, confirmReplace: (p) => (p === panelChecked ? Promise.resolve(true) : confirmReplaceAsset(p)) };
   }

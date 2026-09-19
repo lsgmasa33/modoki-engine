@@ -13,7 +13,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import chokidar, { type FSWatcher } from 'chokidar';
 import {
-  findAssetRoots, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
+  findAssetRoots, defaultSaveRootDir, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
   normalizeWriteGuardKey, isUnderAssetRoot, pathToClassifyForChange, isSiblingRaisedChange,
   type AssetRoot,
   type LiveReloadKind,
@@ -167,7 +167,7 @@ export function createAssetBackend(opts: {
     projectRoot,
     resolveAssetPath: (p) => resolveAssetPath(p, assetRoots),
     absToAssetUrl: (p, opts) => absToAssetUrl(p, assetRoots, opts),
-    firstRootDir: () => assetRoots[0]?.absDir ?? null,
+    firstRootDir: () => defaultSaveRootDir(assetRoots),
     getManifest: () => cachedManifest,
     rebuildManifest,
     computeUnused: () => computeKeptAssets(projectRoot, assetRoots),

@@ -589,6 +589,28 @@ describe('validateBuildConfig', () => {
     expect(validateBuildConfig(withCfg({}, { appId: 'com.x && curl evil' }), DEFAULT_PROJECT_USER_CONFIG).length).toBeGreaterThan(0);
   });
 
+  // #1441, observed live: Project Settings ▸ Browse… for JAVA_HOME on Windows, then Apply, refused
+  // its own picked folder — the allowlist had no drive letter, so NO Windows absolute path passed.
+  it('accepts a Windows SDK path spelled with a drive and / separators', () => {
+    for (const p of ['D:/Downloads', 'C:/Program Files/Eclipse Adoptium/jdk-21.0.4.7-hotspot', 'c:/Users/x/AppData/Local/Android/Sdk']) {
+      expect(validateBuildConfig(DEFAULT_PROJECT_CONFIG, withUser(undefined, { javaHome: p, androidHome: p, gcloudPath: p })), p).toEqual([]);
+    }
+  });
+
+  it('still refuses a colon anywhere but a leading drive, and every backslash — with a hint for the latter', () => {
+    const errs = (javaHome: string) => validateBuildConfig(DEFAULT_PROJECT_CONFIG, withUser(undefined, { javaHome }));
+    expect(errs('/jdk:/x')).toHaveLength(1);
+    expect(errs('D:/x:y')).toHaveLength(1);
+    expect(errs('DD:/x')).toHaveLength(1);
+    expect(errs('D:/jdk"; touch pwned; "')).toHaveLength(1);
+    // The backslash is refused rather than rewritten — it is the character that can swallow a
+    // closing quote — but the message says what to type instead.
+    expect(errs('D:\\Downloads')).toEqual([expect.stringContaining('use / as the separator')]);
+    // The hint is for paths, not every field that happens to hold a backslash.
+    expect(validateBuildConfig(withCfg({ webCdnUrlMap: 'a\\b' }), DEFAULT_PROJECT_USER_CONFIG))
+      .toEqual([expect.not.stringContaining('use / as the separator')]);
+  });
+
   it('does NOT sanitize the custom deploy command (it is a trusted shell command)', () => {
     expect(validateBuildConfig(withCfg({ webDeployCommand: 'rsync -a {dist}/ host:/var/www && echo done' }), DEFAULT_PROJECT_USER_CONFIG)).toEqual([]);
   });

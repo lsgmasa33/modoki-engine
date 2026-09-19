@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { relativiseUnderProject, planDroppedFileDest } from '../../plugins/backend/projectPaths';
+import { relativiseUnderProject, planDroppedFileDest, portablePath } from '../../plugins/backend/projectPaths';
 import { canonicalPath } from '../../scripts/pathIdentity.mjs';
 import { makeDirLink, canMakeFileLink } from '../helpers/linkFixture';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
@@ -53,6 +53,15 @@ describe('relativiseUnderProject (#394)', () => {
       .toBe('art');
   });
 
+  // #1441, observed live: Browse… for JAVA_HOME on Windows returned `D:\Downloads`, and Apply
+  // refused it — the SDK-path allowlist admits `/`, never `\`. Runs only where `\` IS the separator;
+  // `portablePath` below carries the same rule on every platform.
+  it.runIf(path.sep === '\\')('stores an escaping Windows pick with / separators (win32)', () => {
+    const outside = path.join(path.parse(process.cwd()).root, 'Program Files', 'Java', 'jdk-21');
+    const stored = relativiseUnderProject(process.cwd(), outside + '\\');
+    expect(stored).toBe(outside.split('\\').join('/'));
+    expect(stored).not.toContain('\\');
+  });
   describe('with real symlinks on disk', () => {
     let tmp: string;
     let projectRoot: string;
@@ -169,5 +178,23 @@ describe('planDroppedFileDest', () => {
   it('normalises the destination folder rather than doubling its slashes', () => {
     expect(planDroppedFileDest('/art/', 'icon.png', probeFrom({})).path).toBe('art/icon.png');
     expect(planDroppedFileDest('', 'icon.png', probeFrom({})).path).toBe('icon.png');
+  });
+});
+
+describe('portablePath (#1441)', () => {
+  it('spells a Windows path with / and drops a trailing separator', () => {
+    expect(portablePath('D:\\Downloads', '\\')).toBe('D:/Downloads');
+    expect(portablePath('C:\\Program Files\\Java\\jdk-21\\', '\\')).toBe('C:/Program Files/Java/jdk-21');
+  });
+
+  it('never trims a path down to a bare drive or to nothing', () => {
+    // `C:` alone means "the current directory on drive C", not its root.
+    expect(portablePath('C:\\', '\\')).toBe('C:/');
+    expect(portablePath('/', '/')).toBe('/');
+  });
+
+  it('leaves a POSIX path alone apart from the trailing slash', () => {
+    expect(portablePath('/Library/Java/Home/', '/')).toBe('/Library/Java/Home');
+    expect(portablePath('/Library/Java/Home', '/')).toBe('/Library/Java/Home');
   });
 });

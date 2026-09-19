@@ -13,12 +13,14 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { readScannedSource } from '@modoki/engine/testing';
 import {
   perfCores, budgetFor, isLiveRun, readRuns, registerVerifyRun, unregisterVerifyRun, benchLine,
   parseVitestAggregates, registryPath, MIN_WORKERS, VERIFY_TTL_MS,
   groupOf, countGroups, isTestRun, registerTestRun, VERIFY_GROUP_ENV, VERIFY_REGISTERED_ENV,
-  verifyRegistryDir,
+  verifyRegistryDir, engineLaneWorkers, LEGACY_ENGINE_LANE_WORKERS,
 } from '../../scripts/verifyLoad.mjs';
 
 let dir: string;
@@ -352,5 +354,62 @@ describe('verifyRegistryDir — the registry must be visible to OTHER processes'
     // sandbox, and any test that wants isolation without injecting `dir`, opts out.
     expect(verifyRegistryDir({ env: { MODOKI_HOME: '/tmp/sandbox' } })).toBe('/tmp/sandbox');
     expect(verifyRegistryDir({ env: {}, home: '/home/x' })).toBe(path.join('/home/x', '.modoki'));
+  });
+});
+
+describe('engineLaneWorkers — the count the engine lane RUNS with (#1443)', () => {
+  const solo = (total: number) => registerVerifyRun({ pid: 1, dir, alive, total, env: {} });
+
+  it('sizes a SOLO run from the box, so a 6-core Windows box gets 3, not the Mac-sized 6', () => {
+    // ⚠️ THE REGRESSION TEST FOR #1443. The lane was pinned to '6' and the budget applied only when
+    // peers > 1, so a solo run on the `win` box (12 logical -> 6 perf) overlapped 6 + 6 = 12 workers
+    // on 6 cores while the context line printed engine=3.
+    const win = solo(6); // perfCores() on the win box: 12 logical, halved
+    expect(win.peers).toBe(1);
+    expect(engineLaneWorkers(win, {})).toBe(3);
+  });
+
+  it('leaves the Mac solo gate exactly where it was — 12 perf cores still gives 6', () => {
+    expect(engineLaneWorkers(solo(12), {})).toBe(LEGACY_ENGINE_LANE_WORKERS);
+  });
+
+  it('follows the budget down when the box is shared', () => {
+    registerVerifyRun({ pid: 2, dir, alive, total: 12, env: {} });
+    const shared = registerVerifyRun({ pid: 3, dir, alive, total: 12, env: {} });
+    expect(shared.peers).toBe(2);
+    expect(engineLaneWorkers(shared, {})).toBe(3);
+  });
+
+  it('lets a deliberate human setting win, the lane knob first', () => {
+    const b = solo(12);
+    expect(engineLaneWorkers(b, { MODOKI_VERIFY_ENGINE_WORKERS: '10' })).toBe(10);
+    expect(engineLaneWorkers(b, { MODOKI_TEST_MAX_WORKERS: '4' })).toBe(4);
+    expect(engineLaneWorkers(b, { MODOKI_VERIFY_ENGINE_WORKERS: '10', MODOKI_TEST_MAX_WORKERS: '4' })).toBe(10);
+    // Junk degrades to the budget rather than handing vitest NaN.
+    expect(engineLaneWorkers(solo(6), { MODOKI_VERIFY_ENGINE_WORKERS: 'banana' })).toBe(3);
+  });
+
+  it('the opt-out takes the SOLO share, not the Mac pin — on the win box the pin IS #1443', () => {
+    // Close-out review: the first version returned the legacy 6 here, so `MODOKI_VERIFY_NO_BUDGET=1`
+    // on a 6-core box re-created 6 + 6 on 6 cores. Shared, it must ignore the peers too.
+    expect(engineLaneWorkers(solo(6), { MODOKI_VERIFY_NO_BUDGET: '1' })).toBe(3);
+    registerVerifyRun({ pid: 2, dir, alive, total: 12, env: {} });
+    const shared = registerVerifyRun({ pid: 3, dir, alive, total: 12, env: {} });
+    expect(shared.peers).toBeGreaterThan(1);
+    expect(engineLaneWorkers(shared, {})).toBeLessThan(6); // divided across the peers
+    expect(engineLaneWorkers(shared, { MODOKI_VERIFY_NO_BUDGET: '1' })).toBe(6); // 12 cores, solo share
+  });
+
+  it('falls back to the pre-budget pin only when there is no budget at all', () => {
+    expect(engineLaneWorkers(null, {})).toBe(LEGACY_ENGINE_LANE_WORKERS);
+  });
+
+  it('is what verify.mjs passes to BOTH the engine lane and the context line', () => {
+    // The unit tests above prove the function; this proves the gate calls it on both sides. The bug
+    // was exactly the two drifting apart: the line read the budget, the lane read a constant.
+    const { code } = readScannedSource(fileURLToPath(new URL('../../scripts/verify.mjs', import.meta.url)));
+    expect(code).toMatch(/MODOKI_TEST_MAX_WORKERS:\s*String\(engineLaneWorkers\(budget\)\)/);
+    expect(code).toMatch(/benchLine\(\{\s*\.\.\.budget,\s*engineWorkers:\s*engineLaneWorkers\(budget\)\s*\}\)/);
+    expect(code).not.toMatch(/ENGINE_LANE_WORKERS/);
   });
 });

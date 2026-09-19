@@ -78,7 +78,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
-  registerVerifyRun, unregisterVerifyRun, benchLine, parseVitestAggregates,
+  registerVerifyRun, unregisterVerifyRun, benchLine, parseVitestAggregates, engineLaneWorkers,
   VERIFY_GROUP_ENV, VERIFY_REGISTERED_ENV,
 } from './verifyLoad.mjs';
 
@@ -90,14 +90,6 @@ const repoRoot = path.resolve(__dirname, '..', '..');
  * Run a single shell command, buffering stdout+stderr, and resolve with the result.
  * Never rejects — a failing command resolves with ok:false so the caller can keep going.
  */
-/**
- * The engine suite runs while the app suite still holds the full performance-core pool, so it takes
- * a modest budget rather than sizing itself from the whole machine — two unrestricted vitest pools
- * fight, and that fight is what made the wall-clock unreproducible before the lanes were merged.
- * Deliberately not tiny: at 3 workers this suite went from ~25s to 64-80s and became the pole.
- */
-const ENGINE_LANE_WORKERS = process.env.MODOKI_VERIFY_ENGINE_WORKERS ?? '6';
-
 /** This run's share of the box, filled in by `main()` before any lane starts (#1285).
  *
  *  ⚠️ Both lanes read it, so it must be registered BEFORE the first `spawn` — a lane launched
@@ -130,14 +122,11 @@ function laneGroupEnv() {
   return { [VERIFY_GROUP_ENV]: budget.group, [VERIFY_REGISTERED_ENV]: '1' };
 }
 
-function laneWorkerEnv(share, { respect } = {}) {
+// The APP lane's cap only. The engine lane is sized by `engineLaneWorkers()` on every run, solo
+// included, because it has no per-platform fallback to fall through to (#1443).
+function laneWorkerEnv(share) {
   if (process.env.MODOKI_TEST_MAX_WORKERS) return {};
   if (process.env.MODOKI_VERIFY_NO_BUDGET) return {};
-  // A lane-specific knob the caller names wins too. `MODOKI_VERIFY_ENGINE_WORKERS=10` used to be
-  // overwritten by the budget's spread, so the engine lane ran at 3 while the banner said 10 — the
-  // docblock above promised a deliberate human setting is never outvoted, and covered only one of
-  // the two knobs that sentence reads as covering.
-  if (respect && process.env[respect]) return {};
   if (!budget || budget.peers <= 1) return {};
   return { MODOKI_TEST_MAX_WORKERS: String(share) };
 }
@@ -197,7 +186,8 @@ function runCommand(cmd, extraEnv = {}) {
  * typecheck passed — it is cheap, and its result is only interesting when the types are sane.
  *
  * ⚠️ RE-MEASURED 2026-08-18 and the instability above no longer reproduces — the pinned
- * `ENGINE_LANE_WORKERS` is why. Chaining is kept for a DIFFERENT reason than it was adopted for:
+ * engine-lane worker count (now `engineLaneWorkers()`) is why. Chaining is kept for a DIFFERENT
+ * reason than it was adopted for:
  * splitting is now wall-clock-neutral rather than harmful, so it simply buys nothing. Note also
  * that chaining does not avoid the two pools overlapping — the engine suite runs t=~18s to t=~54s,
  * entirely inside the app lane — it only delays the overlap. See the header for the A/B.
@@ -252,11 +242,7 @@ async function checksAndEngineLane() {
   // Runs even if lint failed — a lint error says nothing about whether the tests pass, and finding
   // out both in one go beats a second full run.
   const engine = await runCommand('npm --prefix engine/packages/modoki test',
-    {
-      MODOKI_TEST_MAX_WORKERS: ENGINE_LANE_WORKERS,
-      ...laneGroupEnv(),
-      ...laneWorkerEnv(budget?.engineWorkers, { respect: 'MODOKI_VERIFY_ENGINE_WORKERS' }),
-    });
+    { MODOKI_TEST_MAX_WORKERS: String(engineLaneWorkers(budget)), ...laneGroupEnv() });
   parts.push(`--- engine tests ---\n${engine.output}`);
 
   return finish(scoped.ok && lint.ok && engine.ok);
@@ -344,7 +330,7 @@ async function main() {
   console.log(`[verify] running ${lanes.length} lanes concurrently: ${lanes.map((l) => l.name).join(' · ')}`);
   if (budget.peers > 1) {
     console.log(`[verify] ${budget.peers} verify runs share this box — sizing pools to `
-      + `app=${budget.appWorkers} engine=${budget.engineWorkers} (MODOKI_VERIFY_NO_BUDGET=1 opts out)`);
+      + `app=${budget.appWorkers} engine=${engineLaneWorkers(budget)} (MODOKI_VERIFY_NO_BUDGET=1 opts out)`);
   }
 
   const results = await Promise.all(
@@ -371,7 +357,7 @@ async function main() {
   // ⚠️ Printed on EVERY run, not behind a flag. A timing with no record of the contention it ran
   // under is not comparable to another one, and that is exactly how this script's header table came
   // to be quoted as current long after the box stopped being quiet (#1285).
-  console.log(benchLine(budget));
+  console.log(benchLine({ ...budget, engineWorkers: engineLaneWorkers(budget) }));
   for (const r of results) {
     const agg = parseVitestAggregates(r.output);
     if (!agg) continue;

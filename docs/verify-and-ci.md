@@ -477,6 +477,29 @@ gate is byte-identical to before — `testWorkers.ts` keeps deciding, which matt
 `MODOKI_TEST_MAX_WORKERS` still beats everything. It is advisory, not a mutex: serializing would make
 one clone wait on another's gate, and the goal is to stop the thrash, not the work.
 
+⚠️ **"Only when `peers > 1`" is the APP lane. The engine lane is sized on EVERY run** by
+`engineLaneWorkers()` in `verifyLoad.mjs`, which is also what the `context:` line prints (#1443). The
+engine lane has no per-platform fallback to fall through to: it used to be pinned to a Mac-sized
+`6`, which on the `win` box (12 logical → 6 perf cores) is the whole cap, so a solo gate overlapped
+6 + 6 = 12 workers on 6 cores while the line printed `engine=3`. Now it takes half of the app lane's
+pool everywhere: still 6 on a 12-P-core Mac, 3 on the `win` box. `MODOKI_VERIFY_ENGINE_WORKERS`, then
+`MODOKI_TEST_MAX_WORKERS`, override it; `MODOKI_VERIFY_NO_BUDGET=1` stops the cross-clone division
+and takes the solo share (half the box) — deliberately NOT the old pin of 6, which on the `win` box
+would re-create the oversubscription.
+
+Measured on the `win` box (i5-11400) 2026-09-19, solo, the same tree, interleaved 3/6/3 (a fourth
+run was killed for memory pressure; all three green):
+
+| engine | app lane | engine lane | engine agg `tests` / `import` | app agg `tests` |
+|---|---|---|---|---|
+| 3 | 573.2s | 492.0s | 308.6s / 258.4s | 1673.9s |
+| 6 | 577.1s | 333.5s | 399.9s / 339.6s | 1905.1s |
+| 3 | 567.9s | 459.3s | 310.3s / 252.9s | 1703.7s |
+
+The app lane is the pole either way, so wall clock is unchanged; at 3 the engine lane still finishes
+~80-110s before it, and both lanes do less contended work (app aggregate `tests` ~11% lower). Unlike
+the Mac, where 3 made the engine suite the pole, here 3 costs nothing. n=3: a trend, not a law.
+
 ⚠️ **It divides by the PEER COUNT and never looks at the load — so it charges you for a peer that
 is not costing you anything.** Three runs of the hub gate on 2026-09-16, same tree modulo doc
 commits, show the peer count setting the wall clock more than the load does:
