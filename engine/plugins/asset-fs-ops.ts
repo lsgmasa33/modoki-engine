@@ -14,6 +14,7 @@ import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
 import { durableGuid, deriveMemberGuid, remapGuidValues, addedKeyStep } from '../packages/modoki/src/runtime/core/assetRefRules';
+import { descendPathKeyed, mergeNestedStructurePaths } from '../packages/modoki/src/runtime/loaders/prefabOverrides';
 // The ONE subtree pre-flight (#883/#990/#989/#1004) — see engine/scripts/deleteBoundary.mjs. Used
 // only by the Linux `rmSync` fallback in `moveToTrash`; the darwin/win32 paths hand the delete to
 // the OS trash, which moves rather than unlinks and so cannot orphan a link's payload.
@@ -367,8 +368,11 @@ const MAX_MEMBER_PATHS = 100_000;
 class MemberWalkTooLarge extends Error {}
 
 /** The fields of a scene row or an `added[]` node that decide which members derive under it. */
-type AddedNode = { guid?: unknown; key?: unknown; prefab?: unknown; added?: unknown; children?: unknown };
-type PrefabRow = { localId?: number; prefab?: string; added?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
+type AddedNode = { guid?: unknown; key?: unknown; prefab?: unknown; added?: unknown; children?: unknown; nestedStructure?: unknown };
+type PrefabRow = { localId?: number; prefab?: string; added?: unknown; nestedStructure?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
+/** A path-keyed structural slot (`nestedStructure`): '<localId>[.<localId>…]' → that expansion's delta. */
+type NestedSlots = Record<string, { added?: unknown }>;
+const slotsOf = (v: unknown): NestedSlots | undefined => (v && typeof v === 'object' ? v as NestedSlots : undefined);
 type PrefabDoc = { rootLocalId?: number; entities?: PrefabRow[] };
 
 /** Which anchor a derived path hangs off. `self`: the walked node's own guid. `parent`: the guid the
@@ -432,8 +436,11 @@ export function derivedMemberPathsByAnchor(
   /** Members of `doc` below its root (the root sits at `root`), plus `added` applied to that
    *  instance; a row with no spawned parent hangs at `orphan`. `stack` is the loader's nested-ROW
    *  guard (`instantiatePrefabIntoWorld`'s `_stack`), which a reference node restarts
-   *  (`spawnNestedInstance` passes none). */
-  const expand = (doc: PrefabDoc, root: Base, orphan: Base, added: unknown, stack: string[], depth: number): void => {
+   *  (`spawnNestedInstance` passes none). `nested` is the path-keyed structure an outer layer
+   *  addressed INTO this expansion, split at each nested row exactly as the loader splits it
+   *  (`descendPathKeyed`, the row's own slots under what was forwarded) — a template-keyed node a
+   *  row writes into a deeper expansion lives only there (#1430). */
+  const expand = (doc: PrefabDoc, root: Base, orphan: Base, added: unknown, stack: string[], depth: number, nested?: NestedSlots): void => {
     if (depth > MAX_INSTANCE_DEPTH) throw new MemberWalkTooLarge();
     const rootLocalId = doc.rootLocalId ?? 1;
     // The rows the loader actually spawns and maps: a nested row only when its prefab resolves.
@@ -466,8 +473,14 @@ export function derivedMemberPathsByAnchor(
       if (!here) continue;
       if (localId !== rootLocalId) emit(here);
       if (row.prefab) {
+        const { direct, forward } = descendPathKeyed(nested, localId);
+        // The loader REPLACES the row's `added` with an outer layer's direct list. Both are walked:
+        // over-generating is harmless, and a node the scene saved in scene form (its derived guid,
+        // no key) is still named by the template path that derives it (#1430).
+        const rowAdded = [...(Array.isArray(row.added) ? row.added : []), ...(Array.isArray(direct?.added) ? direct.added : [])];
         // A nested row expands under parent 0, so ITS orphans are unaddressable.
-        expand(docOf(row.prefab)!, here, SKIP, row.added, [...stack, row.prefab], depth + 1);
+        expand(docOf(row.prefab)!, here, SKIP, rowAdded, [...stack, row.prefab], depth + 1,
+          mergeNestedStructurePaths(slotsOf(row.nestedStructure), forward));
       }
     }
     if (Array.isArray(added)) {
@@ -493,7 +506,7 @@ export function derivedMemberPathsByAnchor(
       emit(here);
       // A FRESH row chain, as `spawnNestedInstance` gives it (#1324 review). Guid-less, the root
       // still anchors its members on the guid it derives (#1349).
-      expand(child, ownGuid ? SKIP : anchoredAt(here), base, n.added, [n.prefab as string], depth + 1);
+      expand(child, ownGuid ? SKIP : anchoredAt(here), base, n.added, [n.prefab as string], depth + 1, slotsOf(n.nestedStructure));
       return;
     }
     // A plain node with its own guid anchors everything below it (its own walk).
@@ -510,7 +523,7 @@ export function derivedMemberPathsByAnchor(
         const orphan: Base = { tag: opts.orphans ?? 'skip', done: [], path: [] };
         const root: Base = opts.guidLess ? under(orphan, doc.rootLocalId ?? 1) : { tag: 'self', done: [], path: [] };
         emit(root);
-        expand(doc, opts.guidLess ? anchoredAt(root) : root, orphan, node.added, [node.prefab as string], 0);
+        expand(doc, opts.guidLess ? anchoredAt(root) : root, orphan, node.added, [node.prefab as string], 0, slotsOf(node.nestedStructure));
       }
     } else if (Array.isArray(node.children)) {
       // A plain added node anchors any guid-less nested instance added beneath it.
@@ -630,28 +643,40 @@ export function remintSceneEntityGuids(
   visit(scene.entities, true);
   if (remap.size === 0) return scene;
   if (readPrefab) {
-    const memberRemap = new Map<string, string>();
-    const carry = (oldAnchor: string, paths: string[]): void => {
-      const newAnchor = remap.get(oldAnchor);
-      if (!newAnchor) return;
-      for (const p of paths) memberRemap.set(deriveMemberChain(oldAnchor, p), deriveMemberChain(newAnchor, p));
-    };
-    for (const [anchor, node] of anchors) carry(anchor, derivedMemberPaths(node, readPrefab));
-    // A top-level instance's members derive from its own guid — and, for a row the loader parents to
-    // the SCENE parent or for a guid-less (pre-#1248) root, from that parent's anchor (#1339).
+    // Every (anchor, member paths) pair: the nested anchors this file defines, then each top-level
+    // instance — whose members derive from its own guid and, for a row the loader parents to the SCENE
+    // parent or a guid-less (pre-#1248) root, from that parent's anchor (#1339).
+    const carries: [string, string[]][] = anchors.map(([anchor, node]) => [anchor, derivedMemberPaths(node, readPrefab)]);
     const entries = (Array.isArray(scene.entities) ? scene.entities : []).filter((e): e is Row => !!e && typeof e === 'object');
     for (const entry of entries) {
       if (!entry.prefab && !Array.isArray(entry.children)) continue;
       const ownGuid = durableGuid(typeof entry.guid === 'string' ? entry.guid : '');
       const byAnchor = derivedMemberPathsByAnchor(entry, readPrefab, { guidLess: !!entry.prefab && !ownGuid, orphans: 'parent' });
-      if (ownGuid) carry(ownGuid, byAnchor.self);
+      if (ownGuid) carries.push([ownGuid, byAnchor.self]);
       if (!byAnchor.parent.length) continue;
       const up = sceneAnchorOf(entry, entries);
-      if (up) carry(up, byAnchor.parent);
+      if (up) carries.push([up, byAnchor.parent]);
     }
-    // A defined guid wins over a derived one — the two cannot coincide, but a stored identity is
-    // the one thing this function must never re-point.
-    for (const [k, v] of memberRemap) if (!remap.has(k)) remap.set(k, v);
+    // A derived guid wins where a node DEFINES it. The walk emits no path for a node that carries its
+    // own guid, so a defined guid meets a derivation only where a save stored the derived one: a
+    // template-keyed node in scene form, its key dropped. The load heal restores that key only while
+    // the guid still matches its derivation, so a random remint left the copy's node unkeyed for good
+    // (#1430). Such a node can itself be an ANCHOR (a keyed reference node, or a keyed plain node the
+    // scene hung a reference under), and re-pointing it moves every member below it — so carry until
+    // nothing moves, each pass against the anchors' guids as the last one left them. A pass settles at
+    // least one more level of that nesting; the bound only stops a pathological file.
+    // The OLD side of every carry never changes between passes — derive it once.
+    const froms = carries.map(([oldAnchor, paths]) => paths.map((p) => deriveMemberChain(oldAnchor, p)));
+    for (let pass = 0; pass <= MAX_INSTANCE_DEPTH; pass++) {
+      const next = new Map<string, string>();
+      carries.forEach(([oldAnchor, paths], i) => {
+        const newAnchor = remap.get(oldAnchor);
+        if (newAnchor) paths.forEach((p, j) => next.set(froms[i]![j]!, deriveMemberChain(newAnchor, p)));
+      });
+      let moved = false;
+      for (const [k, v] of next) if (remap.get(k) !== v) { remap.set(k, v); moved = true; }
+      if (!moved) break;
+    }
   }
   return remapGuidValues(scene, remap) as Record<string, unknown>;
 }

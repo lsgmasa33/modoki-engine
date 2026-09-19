@@ -16,41 +16,70 @@
  *    instance root, and every plain entity, is an ANCHOR that gets `mint()`. The copy's root is
  *    always an anchor. (Classifying by "the live guid equals its derivation" was wrong in both
  *    directions once a save had stored a derived guid — #1338 review.)
+ *  - **A node the prefab TEMPLATE added keeps its template key and derives through it** (#1430). It
+ *    has no `PrefabInstance`, so the rule above minted it a random guid, and the copy dropped its
+ *    `TemplateAddedKey`: a member token into it was dead after save + reload, since neither the load
+ *    heal nor `recoverTemplateKey` can find a key behind a random guid. It steps as `'+' + key`,
+ *    exactly as `deriveInstanceMemberGuids` derives a guid-less keyed node, and its descendants derive
+ *    THROUGH it — except a keyed reference-node root, a stored root whose members anchor on it.
+ *    Only BELOW an instance root the save STORES, inside the copy — the copy root itself, or any
+ *    such root under it (a plain group holding an instance) — and one that is not itself keyed: a
+ *    keyed reference-node root is a node of the OUTER template, which also writes the keys of its
+ *    payload (#1369). A key belongs to the frame of its nearest unkeyed stored root, and every such
+ *    root below the copy root is copied whole, so every key under it names a node of its own frame. Above any stored root — a member copy (which the editor
+ *    strips to plain added nodes), a copy of an owned nested root (an independent instance of the
+ *    inner prefab, #1354, which the outer template's keys do not describe), a copy of the keyed node
+ *    itself — a key would name a node no frame holds, or give two siblings one step: there the node
+ *    is an ordinary anchor, and `keyed` leaves it out so the caller drops the key.
  *  See docs/scene-loading.md § "Guid uniqueness is a PER-FILE rule, not a repo-wide one" (the subtree duplicate bullet). */
 
-import { deriveMemberGuid, memberStepId } from './assetRefRules';
+import { addedKeyStep, deriveMemberGuid, memberStepId } from './assetRefRules';
 
 export interface CopyGuidPlan<N> {
   /** The new guid for each node of the tree. */
   guidOf: Map<N, string>;
   /** Old guid → new guid, for every node that had a non-empty guid. Never contains `''`. */
   remap: Map<string, string>;
+  /** The template-added nodes whose copy KEEPS its template key. Any other node's key is dropped. */
+  keyed: Set<N>;
 }
 
+type Pi = { localId?: number; parentLocalId?: number; rootInstanceId?: number } | null;
+
 /** Plan the copy's guids. `dataOf(node, 'EntityAttributes' | 'PrefabInstance')` returns that trait's
- *  data on the node, or null when it has none. */
+ *  data on the node, or null when it has none; `keyOf(node)` its template key (`TemplateAddedKey`),
+ *  or `''`. */
 export function planCopyGuids<N>(
   root: N,
   childrenOf: (node: N) => readonly N[],
   dataOf: (node: N, trait: 'EntityAttributes' | 'PrefabInstance') => Record<string, unknown> | null,
   idOf: (node: N) => number,
   mint: () => string,
+  keyOf: (node: N) => string,
 ): CopyGuidPlan<N> {
   const guidOf = new Map<N, string>();
   const remap = new Map<string, string>();
-  const visit = (node: N, ctx: { anchor: string; path: number[] } | null): void => {
+  const keyed = new Set<N>();
+  // `inInstance`: some ancestor within the copy (or the node itself) is an instance root the
+  // serializer STORES and that is not itself template-added — not an owned nested root, which is
+  // copied as an independent instance (#1354), and not a keyed REFERENCE node, which belongs to the
+  // outer template: the keys that template writes into its payload are the outer frame's (#1369).
+  const visit = (node: N, ctx: { anchor: string; path: (number | string)[]; inInstance: boolean } | null): void => {
     const ea = dataOf(node, 'EntityAttributes');
-    const pi = dataOf(node, 'PrefabInstance') as { localId?: number; parentLocalId?: number; rootInstanceId?: number } | null;
+    const pi = dataOf(node, 'PrefabInstance') as Pi;
     const oldGuid = typeof ea?.guid === 'string' ? ea.guid : '';
+    const key = ctx?.inInstance ? keyOf(node) : '';
     const storedRoot = !!pi && pi.rootInstanceId === idOf(node) && !pi.parentLocalId;
-    const path = ctx && [...ctx.path, memberStepId(pi)];
-    const derived = !!ctx && !!pi && !storedRoot;
+    const inInstance = (storedRoot && !keyOf(node)) || !!ctx?.inInstance;
+    const path = ctx && [...ctx.path, key ? addedKeyStep(key) : memberStepId(pi)];
+    const derived = !!ctx && (!!key || (!!pi && !storedRoot));
     const guid = derived ? deriveMemberGuid(ctx!.anchor, path!) : mint();
     guidOf.set(node, guid);
+    if (key) keyed.add(node);
     if (oldGuid) remap.set(oldGuid, guid);
-    const next = derived ? { anchor: ctx!.anchor, path: path! } : { anchor: guid, path: [] };
+    const next = derived && !storedRoot ? { anchor: ctx!.anchor, path: path!, inInstance } : { anchor: guid, path: [], inInstance };
     for (const child of childrenOf(node)) visit(child, next);
   };
   visit(root, null);
-  return { guidOf, remap };
+  return { guidOf, remap, keyed };
 }

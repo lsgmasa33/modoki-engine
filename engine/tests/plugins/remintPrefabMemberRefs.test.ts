@@ -23,6 +23,7 @@ import {
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { remintSceneEntityGuids, derivedMemberPaths, derivedMemberPathsByAnchor } from '../../plugins/asset-fs-ops';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 
 registerAllTraits();
 
@@ -83,9 +84,11 @@ async function load(scene: SceneData): Promise<void> {
       const world = getCurrentWorld();
       for (const e of world.entities) if (e.id() === id) { destroyEntity(e, world); break; }
     },
-    onInstantiatePrefab: async (source, parentId, rootTf, _old, _extra, overrides, structure, nested, rootGuid) => {
+    // `nestedStructure` too — without it every scene-level slot in this file was silently not loaded
+    // (#1430 review), so a test of a slot compared against an unedited load it never checked.
+    onInstantiatePrefab: async (source, parentId, rootTf, _old, _extra, overrides, structure, nested, rootGuid, _folder, nestedStructure) => {
       const world = getCurrentWorld();
-      const rootId = instantiatePrefabIntoWorld(world, prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested);
+      const rootId = instantiatePrefabIntoWorld(world, prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure);
       if (!rootId || !rootGuid) return rootId || undefined;
       for (const e of world.entities) {
         if (e.id() !== rootId) continue;
@@ -161,6 +164,16 @@ const kyDoc = { id: KY, rootLocalId: 1, entities: [row(1, 'KyRoot', 0), row(2, '
     { parentLocalId: 0, guid: '', key: 'dddddddd-0000-4000-8000-000000000002', name: 'Kc', traits: { EntityAttributes: { name: 'Kc' } }, children: [] }] },
   { parentLocalId: 1, guid: '', key: 'dddddddd-0000-4000-8000-000000000003', name: 'Kr', prefab: LEAFY, traits: {}, children: [] },
 ] })] };
+// #1430: keyed nodes a prefab row writes into a NESTED expansion's `nestedStructure` — NS's row nests
+// OUTER and adds Kn under OUTER's nested INNER (path '4', OUTER's row 4); NS2 reaches the same node one
+// level further down (path '2.4', forwarded through NSX's row 2).
+const NS = 'aaaaaaaa-0000-4000-8000-00000000000b';
+const NS2 = 'aaaaaaaa-0000-4000-8000-00000000000c';
+const NSX = 'aaaaaaaa-0000-4000-8000-00000000000d';
+const kn = { parentLocalId: 2, guid: '', key: 'dddddddd-0000-4000-8000-000000000004', name: 'Kn', traits: { EntityAttributes: { name: 'Kn' } }, children: [] };
+const nsDoc = { id: NS, rootLocalId: 1, entities: [row(1, 'NsRoot', 0), row(2, 'NsSlot', 1, { prefab: OUTER, nestedStructure: { 4: { added: [kn] } } })] };
+const nsxDoc = { id: NSX, rootLocalId: 1, entities: [row(1, 'NsxRoot', 0), row(2, 'NsxSlot', 1, { prefab: OUTER })] };
+const ns2Doc = { id: NS2, rootLocalId: 1, entities: [row(1, 'Ns2Root', 0), row(2, 'Ns2Slot', 1, { prefab: NSX, nestedStructure: { '2.4': { added: [kn] } } })] };
 const topDoc = { id: TOP, rootLocalId: 1, entities: [row(1, 'TopRoot', 0), row(2, 'TopSlot', 1, { prefab: MID })] };
 
 let n = 0;
@@ -175,6 +188,9 @@ beforeEach(() => {
   prefabs.set(MID, midDoc);
   prefabs.set(TOP, topDoc);
   prefabs.set(KY, kyDoc);
+  prefabs.set(NS, nsDoc);
+  prefabs.set(NS2, ns2Doc);
+  prefabs.set(NSX, nsxDoc);
   prefabs.set(BACK, backDoc);
   prefabs.set(FA, faDoc);
   prefabs.set(FV, fvDoc);
@@ -284,6 +300,10 @@ const SHAPES: ReadonlyArray<readonly [string, Record<string, unknown>, string]> 
   ['a template-keyed plain node in a row\'s added', { prefab: KY }, 'KyRoot/InnerRoot/Leaf/Kp'],
   ['a template-keyed plain child of a keyed plain node', { prefab: KY }, 'KyRoot/InnerRoot/Leaf/Kp/Kc'],
   ['a member of a template-keyed reference node', { prefab: KY }, 'KyRoot/InnerRoot/LeafyRoot/Tip'],
+  // #1430: the walk descends a row's `nestedStructure` as the loader does. Mutation: drop the
+  // `nested` argument where `expand` recurses into a nested row — both go red.
+  ['a template-keyed node in a row\'s nestedStructure', { prefab: NS }, 'NsRoot/OuterRoot/Panel/InnerRoot/Leaf/Kn'],
+  ['a template-keyed node forwarded two rows down a nestedStructure', { prefab: NS2 }, 'Ns2Root/NsxRoot/OuterRoot/Panel/InnerRoot/Leaf/Kn'],
   ['an instance of the prefab being walked, added under one of its own members',
     { prefab: OUTER, added: [refNode(3, OUTER)] },
     'OuterRoot/Panel/Button/OuterRoot/Panel/Button'],
@@ -463,5 +483,92 @@ describe('nodes inside a nestedStructure slot are reminted too (#1358/#1369 slot
     const copy = JSON.stringify(remintSceneEntityGuids(scene as never, () => `dddddddd-0000-4000-8000-${String(++n).padStart(12, '0')}`));
     expect(copy).not.toContain(G_ENTRY);
     expect(copy).not.toContain(G_NODE);
+  });
+});
+
+// ── #1430: a template-keyed node the scene EDITED ────────────────────────────────────────────────────
+// The save writes it in scene form inside a `nestedStructure` slot: its derived guid STORED, its key
+// dropped. The load heal re-keys it only while that guid still matches its derivation, so a random
+// remint left the copy's node unkeyed for good — it must remint to the guid its template path
+// derives from the copy's anchor. Such a node can be an ANCHOR (a keyed reference node, or a keyed
+// plain node with a reference child), and then its members must follow its FINAL guid.
+//
+// Each case: load the unedited instance to learn the node's derived guid; write the scene-form edit;
+// load THAT and take refs to `targets`; duplicate; load the copy — every ref must land on the same
+// path, and the stored node must come back keyed exactly as the edited original does. (The load heal
+// re-keys a plain keyed node, not a keyed REFERENCE node — a gap in #1426's heal, filed separately;
+// the copy must not be worse than the original either way.)
+const K_P = 'dddddddd-0000-4000-8000-000000000001';
+async function editedRoundTrip(
+  unedited: Record<string, unknown>,
+  edit: (guidAt: (path: string) => string) => Record<string, unknown>,
+  targets: string[],
+  keyedAt: string,
+): Promise<string> {
+  const pathMap = () => new Map([...guidToTreePath()].map(([g, p]) => [p, g]));
+  await load(sceneOf(unedited, []));
+  const before = pathMap();
+  const instance = edit((path) => {
+    const g = before.get(path);
+    if (!g) throw new Error(`fixture: nothing at ${path} (have: ${[...before.keys()].join(', ')})`);
+    return g;
+  });
+  const keyAt = (): string => {
+    const node = [...getCurrentWorld().entities].find((e) => (e.get(getTraitByName('EntityAttributes')!.trait) as { guid?: string } | undefined)?.guid === pathMap().get(keyedAt))!;
+    return (node.get(TemplateAddedKey) as { key: string } | undefined)?.key ?? '';
+  };
+  await load(sceneOf(instance, []));
+  const edited = pathMap();
+  const originalKey = keyAt();
+  const refs = targets.map((t) => edited.get(t)!);
+  expect(refs.every(Boolean)).toBe(true); // the edited file loads every target
+  const copy = remintSceneEntityGuids(sceneOf(instance, refs) as never, gen, (g) => prefabs.get(g)) as unknown as SceneData;
+  const moved = refsIn(copy);
+  for (let i = 0; i < refs.length; i++) expect(moved[i]).not.toBe(refs[i]);
+  await load(copy);
+  const after = guidToTreePath();
+  expect(moved.map((g) => after.get(g))).toEqual(targets);
+  expect(keyAt()).toBe(originalKey);
+  return originalKey;
+}
+const sceneForm = (guid: string, name: string, parentLocalId: number, extra: Record<string, unknown> = {}) =>
+  ({ parentLocalId, guid, name, children: [], traits: { EntityAttributes: { name, parentId: 0, guid } }, ...extra });
+const slot = (added: unknown[]) => ({ added, removed: [], removedTraits: {} });
+
+describe('an edited template-keyed node follows a scene duplicate (#1430)', () => {
+  // Mutation: let a defined guid win over the derived one again (`if (!remap.has(k))` in
+  // `remintSceneEntityGuids`) — the first, second and fourth cases go red. The third stays green under
+  // it: the heal re-keys no reference node (#1438) and a random anchor keeps its members consistent,
+  // so only the one-pass mutation below reaches it.
+  it('a keyed plain node', async () => expect(await editedRoundTrip({ prefab: KY },
+    (at) => ({ prefab: KY, nestedStructure: { 2: slot([sceneForm(at('KyRoot/InnerRoot/Leaf/Kp'), 'Kp', 2)]) } }),
+    ['KyRoot/InnerRoot/Leaf/Kp'], 'KyRoot/InnerRoot/Leaf/Kp')).toBe(K_P));
+
+  it('a keyed reference node, and its member', () => editedRoundTrip({ prefab: KY },
+    (at) => ({ prefab: KY, nestedStructure: { 2: slot([sceneForm(at('KyRoot/InnerRoot/LeafyRoot'), 'Kr', 1, { prefab: LEAFY, traits: {} })]) } }),
+    ['KyRoot/InnerRoot/LeafyRoot', 'KyRoot/InnerRoot/LeafyRoot/Tip'], 'KyRoot/InnerRoot/LeafyRoot'));
+
+  // #1430 review, (a): the keyed anchor sits inside a user-added reference node that carries its own
+  // guid, so the entry's walk stops there (SKIP) and nothing re-carries the anchor's members after the
+  // anchor is re-pointed. Mutation: carry one pass only in `remintSceneEntityGuids` — the Tip ref dangles.
+  it('a keyed reference node inside a user-added reference node', () => {
+    const outer = (extra: Record<string, unknown>) => ({ prefab: INNER, added: [{ parentLocalId: 1, guid: ANCHORED, name: 'Ky', prefab: KY, traits: {}, children: [], ...extra }] });
+    return editedRoundTrip(outer({}),
+      (at) => outer({ nestedStructure: { 2: slot([sceneForm(at('InnerRoot/KyRoot/InnerRoot/LeafyRoot'), 'Kr', 1, { prefab: LEAFY, traits: {} })]) } }),
+      ['InnerRoot/KyRoot/InnerRoot/LeafyRoot', 'InnerRoot/KyRoot/InnerRoot/LeafyRoot/Tip'], 'InnerRoot/KyRoot/InnerRoot/LeafyRoot');
+  });
+
+  // #1430 review, (b): a guid-less reference child the SCENE added under the keyed plain node — no
+  // template path reaches it, so only the keyed node's own carry, run against its FINAL guid, can.
+  // Mutation: carry one pass only — the Tip ref dangles.
+  it('a keyed plain node with a scene-added reference child', async () => expect(await editedRoundTrip({ prefab: KY },
+    (at) => ({ prefab: KY, nestedStructure: { 2: slot([sceneForm(at('KyRoot/InnerRoot/Leaf/Kp'), 'Kp', 2, { children: [refNode(0, LEAFY)] })]) } }),
+    ['KyRoot/InnerRoot/Leaf/Kp', 'KyRoot/InnerRoot/Leaf/Kp/LeafyRoot/Tip'], 'KyRoot/InnerRoot/Leaf/Kp')).toBe(K_P));
+
+  // Accept side: a scene-added node in the same slot is no derivation, and gets a random guid as before.
+  it('a scene-added plain node in the slot still gets a fresh random guid', () => {
+    const plain = 'cccccccc-0000-4000-8000-0000000014a0';
+    const copy = remintSceneEntityGuids(sceneOf({ prefab: KY, nestedStructure: { 2: slot([sceneForm(plain, 'Plain', 2)]) } }, [plain]) as never, gen, (g) => prefabs.get(g)) as unknown as SceneData;
+    expect(refsIn(copy)[0]).toMatch(/^cccccccc-0000-4000-8000-0000000000/); // from `gen`
   });
 });

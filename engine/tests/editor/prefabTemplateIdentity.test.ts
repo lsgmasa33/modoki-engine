@@ -30,6 +30,7 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, Transient as TransientTrait, type SceneData,
 } from '@modoki/engine/runtime';
 import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo, duplicateEntity } from '@modoki/engine/editor';
+import { snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids } from '../../packages/modoki/src/editor/undo/entityActions';
 import {
   setPrefabCache, serializePrefab, applyToPrefabSelective, instantiatePrefabAsync, getOverrideValues, collectComparableTraits,
   baseTokenResolver, type PrefabFile,
@@ -37,7 +38,7 @@ import {
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import type { AddedEntity } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setTemplateKey, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
-import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { isRuntimeGuid, deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -562,31 +563,33 @@ describe('close-out review findings (#1352)', () => {
 });
 
 // ── #1426: a member token naming a template-ADDED node, across a scene save + reload ────────────────
+// OUTER's Panel binds to a node OUTER's MID row adds inside MID's nested INNER: Panel(2) → MidRoot(3)
+// → Slot(2) → InnerRoot (nested root, steps by its parentLocalId 3) → '+' + KEY.
+const TOKEN = `@member:2.3.2.3.+${KEY}`;
+const outerWithRef = () => {
+  const doc = outerDoc({ nestedStructure: { '3': { added: [keyed('Extra', 1)] } } });
+  Object.assign(doc.entities[1]!.traits, bind(TOKEN));
+  return doc;
+};
+const rootGuidOf = (id: number): string => {
+  let cur = getAllEntities().find((e) => e.id === id);
+  while (cur && cur.parentId) cur = getAllEntities().find((e) => e.id === cur!.parentId);
+  return cur?.guid ?? '';
+};
+/** Each Panel targets the Extra of its OWN instance, and every Extra carries KEY again. */
+const expectEachPanelOnItsOwnExtra = (instances = 2) => {
+  const extras = getAllEntities().filter((e) => e.name === 'Extra');
+  expect(extras).toHaveLength(instances);
+  const extraByRoot = new Map(extras.map((x) => [rootGuidOf(x.id), x]));
+  expect(extraByRoot.size).toBe(instances);
+  for (const p of getAllEntities().filter((e) => e.name === 'Panel')) {
+    expect(targetOf(p.id)).toBe(extraByRoot.get(rootGuidOf(p.id))!.guid);
+  }
+  const tk = [...getCurrentWorld().entities].filter((e) => extras.some((x) => x.id === e.id()));
+  expect(tk.map((e) => (e.get(TemplateAddedKey) as { key: string } | undefined)?.key)).toEqual(extras.map(() => KEY));
+};
+
 describe('a member token naming a template-added node survives a scene save + reload (#1426)', () => {
-  // OUTER's Panel binds to a node OUTER's MID row adds inside MID's nested INNER: Panel(2) → MidRoot(3)
-  // → Slot(2) → InnerRoot (nested root, steps by its parentLocalId 3) → '+' + KEY.
-  const TOKEN = `@member:2.3.2.3.+${KEY}`;
-  const outerWithRef = () => {
-    const doc = outerDoc({ nestedStructure: { '3': { added: [keyed('Extra', 1)] } } });
-    Object.assign(doc.entities[1]!.traits, bind(TOKEN));
-    return doc;
-  };
-  const rootGuidOf = (id: number): string => {
-    let cur = getAllEntities().find((e) => e.id === id);
-    while (cur && cur.parentId) cur = getAllEntities().find((e) => e.id === cur!.parentId);
-    return cur?.guid ?? '';
-  };
-  /** Each Panel targets the Extra of its OWN instance, and every Extra carries KEY again. */
-  const expectEachPanelOnItsOwnExtra = () => {
-    const extras = getAllEntities().filter((e) => e.name === 'Extra');
-    expect(extras).toHaveLength(2);
-    const extraByRoot = new Map(extras.map((x) => [rootGuidOf(x.id), x]));
-    for (const p of getAllEntities().filter((e) => e.name === 'Panel')) {
-      expect(targetOf(p.id)).toBe(extraByRoot.get(rootGuidOf(p.id))!.guid);
-    }
-    const tk = [...getCurrentWorld().entities].filter((e) => extras.some((x) => x.id === e.id()));
-    expect(tk.map((e) => (e.get(TemplateAddedKey) as { key: string } | undefined)?.key)).toEqual([KEY, KEY]);
-  };
 
   // The save writes each Extra as scene form (its guid, no key), so the reload spawns it unkeyed and,
   // before the heal, left both Panels on the literal token. Mutation: skip the heal block in
@@ -685,6 +688,162 @@ describe('delete→undo carries unregistered markers, a duplicate does not (#142
     const copy = [...getCurrentWorld().entities].find((x) => x.id() === copyId)!;
     expect(copy.has(TemplateAddedKey)).toBe(false);
     expect(copy.has(TransientTrait)).toBe(false);
+  });
+});
+
+// ── #1430: a copy of an instance keeps its template-added nodes' identity ────────────────────────────
+describe('a duplicated or pasted instance keeps its template-added nodes keyed and derived (#1430)', () => {
+  const liveOf = (id: number) => [...getCurrentWorld().entities].find((x) => x.id() === id)!;
+  const keyOn = (id: number) => (liveOf(id).get(TemplateAddedKey) as { key: string } | undefined)?.key;
+  const copyRoot = (): number => getAllEntities().find((e) => e.name === 'OuterRoot' && e.guid !== G1 && e.guid !== G2)!.id;
+  const extraUnder = (root: number) => getAllEntities().find((e) => e.name === 'Extra' && rootGuidOf(e.id) === getAllEntities().find((r) => r.id === root)!.guid)!;
+
+  /** The copy's Extra has KEY and the guid a reload derives; its Panel names it, with no false override. */
+  const expectCopyKeyed = async (file: PrefabFile) => {
+    const root = copyRoot();
+    const rootGuid = getAllEntities().find((e) => e.id === root)!.guid!;
+    const extra = extraUnder(root);
+    expect(keyOn(extra.id)).toBe(KEY);
+    expect(extra.guid).toBe(deriveMemberGuid(rootGuid, [2, 3, 2, 3, `+${KEY}`]));
+    expectEachPanelOnItsOwnExtra(3);
+    const panel = getAllEntities().find((e) => e.name === 'Panel' && rootGuidOf(e.id) === rootGuid)!.id;
+    const current = collectComparableTraits(panel, (await import('@modoki/engine/runtime')).getAllTraits());
+    expect(getOverrideValues(2, current, file, baseTokenResolver(root)).UIAction).toBeUndefined();
+  };
+
+  // Before the fix the copy's Extra had a random guid and no key: its Panel read as overridden, and
+  // after the reload the Panel held the literal token. Mutation: pass `() => ''` as `keyOf` in
+  // `regenerateSnapshotGuids` (or drop the `+key` step in `planCopyGuids`).
+  it('a duplicate — live, and after a scene save + reload', async () => {
+    const file = outerWithRef() as unknown as PrefabFile;
+    install(file);
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    duplicateEntity(getAllEntities().find((e) => e.guid === G1)!.id, () => {});
+    await expectCopyKeyed(file);
+    await load(await serializeScene() as unknown as SceneData);
+    await expectCopyKeyed(file);
+  });
+
+  // Paste respawns from a snapshot taken earlier — the source may be gone by then.
+  it('a paste after the source was deleted', async () => {
+    const file = outerWithRef() as unknown as PrefabFile;
+    install(file);
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    const src = getAllEntities().find((e) => e.guid === G1)!.id;
+    const snap = snapshotEntity(src)!;
+    deleteEntitiesWithUndo([src]);
+    respawnFromSnapshot(regenerateSnapshotGuids(snap), 0);
+    const root = getAllEntities().find((e) => e.name === 'OuterRoot' && e.guid !== G2)!.id;
+    const rootGuid = getAllEntities().find((e) => e.id === root)!.guid!;
+    expect(keyOn(extraUnder(root).id)).toBe(KEY);
+    expect(extraUnder(root).guid).toBe(deriveMemberGuid(rootGuid, [2, 3, 2, 3, `+${KEY}`]));
+    await load(await serializeScene() as unknown as SceneData);
+    expectEachPanelOnItsOwnExtra(2);
+  });
+
+  // Keyed REFERENCE nodes: each root derives through its '+key' step, and its members anchor on that
+  // root (a stored root), as the loader resolves them. Every guid in the copy must be the one the
+  // reload derives, or a ref carried into the copy dangles. Mutation: in `planCopyGuids`, pass a keyed
+  // stored root's chain through (`next` ignoring `storedRoot`) — the members' guids move on reload.
+  it('a copy holding keyed reference nodes: every guid survives a save + reload', async () => {
+    const refNode = (key: string): AddedEntity => ({ parentLocalId: 1, guid: '', key, name: 'Dropped', prefab: INNER, traits: {}, children: [] });
+    install(midDoc({ added: [refNode(REF_KEY), refNode(KEY)] }));
+    await load(twoInstances(MID, 'MidRoot'));
+    const copyId = duplicateEntity(getAllEntities().find((e) => e.guid === G1)!.id, () => {})!;
+    const copyGuid = getAllEntities().find((e) => e.id === copyId)!.guid!;
+    const inCopy = () => getAllEntities().filter((e) => rootGuidOf(e.id) === copyGuid).map((e) => `${e.name}:${e.guid}`).sort();
+    const before = inCopy();
+    expect(before).toHaveLength(8); // MidRoot, Slot, then an InnerRoot + Leaf for the row and each dropped node
+    const keys = getAllEntities().filter((e) => rootGuidOf(e.id) === copyGuid).map((e) => keyOn(e.id)).filter(Boolean).sort();
+    expect(keys).toEqual([KEY, REF_KEY].sort());
+    await load(await serializeScene() as unknown as SceneData);
+    expect(inCopy()).toEqual(before);
+    expect(new Set(getAllEntities().map((e) => e.guid)).size).toBe(getAllEntities().length);
+  });
+
+  // The copy's root need not BE the instance: a plain group holding one copies it whole too (#1430
+  // review — the first cut decided the scope from the copy root alone, and this copy still lost its
+  // key). Mutation: `const key = storedRoot || ctx?.inInstance ...` → decide from the root only
+  // (`inInstance` never set below a plain root).
+  it('a duplicate of a plain group holding an instance — live, and after a save + reload', async () => {
+    const GRP = 'bbbbbbbb-0000-4000-8000-0000000014c1';
+    const file = outerWithRef() as unknown as PrefabFile;
+    install(file);
+    const scene = twoInstances(OUTER, 'OuterRoot') as unknown as { entities: { traits: { EntityAttributes: { parentId: unknown } } }[] };
+    scene.entities[0]!.traits.EntityAttributes.parentId = GRP;
+    scene.entities.push({ id: 3, traits: { EntityAttributes: { name: 'Group', parentId: 0, guid: GRP }, Transform: { x: 0, y: 0, z: 0 } } } as never);
+    await load(scene as unknown as SceneData);
+    const groupCopy = duplicateEntity(getAllEntities().find((e) => e.guid === GRP)!.id, () => {})!;
+    const copiedRoot = () => getAllEntities().find((e) => e.name === 'OuterRoot' && e.parentId === getAllEntities().find((g) => g.name === 'Group' && g.guid !== GRP)!.id)!;
+    expect(copiedRoot().parentId).toBe(groupCopy);
+    const check = () => {
+      const root = copiedRoot();
+      const below = (id: number): boolean => {
+        for (let cur = getAllEntities().find((e) => e.id === id); cur; cur = getAllEntities().find((e) => e.id === cur!.parentId)) if (cur.id === root.id) return true;
+        return false;
+      };
+      const extra = getAllEntities().find((e) => e.name === 'Extra' && below(e.id))!;
+      expect(keyOn(extra.id)).toBe(KEY);
+      expect(extra.guid).toBe(deriveMemberGuid(root.guid!, [2, 3, 2, 3, `+${KEY}`]));
+      expectEachPanelOnItsOwnExtra(3);
+    };
+    check();
+    await load(await serializeScene() as unknown as SceneData);
+    check();
+  });
+
+  // A keyed REFERENCE node is a stored root, but a node of the OUTER template, which also writes the
+  // keys in its payload (#1369) — so it must not open the key scope. Here OUTER hangs one under MidRoot
+  // with a keyed Extra inside; copying MidRoot (an independent MID instance, #1354) must key neither.
+  // Mutation: `inInstance = storedRoot || …` in `planCopyGuids` (drop `!keyOf(node)`) — Extra keeps KEY.
+  it('a copy of an owned nested root holding a keyed reference node keys nothing', async () => {
+    install(outerDoc({ added: [{ parentLocalId: 3, guid: '', key: REF_KEY, name: 'Dropped', prefab: INNER, traits: {}, children: [], added: [keyed('Extra', 1)] }] }));
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    const mid = getAllEntities().find((e) => e.name === 'MidRoot' && rootGuidOf(e.id) === G1)!.id;
+    const copyId = duplicateEntity(mid, () => {})!;
+    const inCopy = (id: number): boolean => {
+      let cur = getAllEntities().find((e) => e.id === id);
+      while (cur && cur.id !== copyId) cur = getAllEntities().find((e) => e.id === cur!.parentId);
+      return !!cur;
+    };
+    const extra = getAllEntities().filter((e) => e.name === 'Extra' && inCopy(e.id));
+    expect(extra).toHaveLength(1);
+    const dropped = getAllEntities().filter((e) => e.name === 'InnerRoot' && inCopy(e.id) && keyOn(e.id) !== undefined);
+    expect(keyOn(extra[0]!.id)).toBeUndefined();
+    expect(dropped).toEqual([]);
+  });
+
+  // Accept side: a copy that is not a whole instance must not hand out the key — two siblings would
+  // share one step, or a plain added node would claim a template frame. Mutation: `const key =
+  // keyOf(node)` in `planCopyGuids` (the copy root has no ctx, so both conditions must go).
+  it('a duplicate of the keyed node itself carries no key and a fresh guid', async () => {
+    install(outerWithRef());
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    const extra = extraUnder(getAllEntities().find((e) => e.guid === G1)!.id);
+    const copyId = duplicateEntity(extra.id, () => {})!;
+    expect(liveOf(copyId).has(TemplateAddedKey)).toBe(false);
+    expect(getAllEntities().find((e) => e.id === copyId)!.guid).not.toBe(extra.guid);
+    expect(keyOn(extra.id)).toBe(KEY);
+  });
+
+  // Panel is a plain member (its copy is stripped to added nodes); MidRoot is an owned nested root
+  // (its copy becomes an independent MID instance, #1354, which OUTER's key does not describe).
+  // Mutation: let any instance root open the key scope in `planCopyGuids` (`inInstance` from
+  // `rootInstanceId === self`, ignoring `parentLocalId`) — the MidRoot case goes red. The Panel case is guarded twice here (`stripPrefabInstanceFromSnapshot` drops markers as
+  // well); the device op has no strip, so `liveLifecycleOps.test.ts` pins the instance scope alone.
+  it.each(['Panel', 'MidRoot'])('a duplicate of %s, holding a keyed node, carries no key', async (name) => {
+    install(outerWithRef());
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    const src = getAllEntities().find((e) => e.name === name && rootGuidOf(e.id) === G1)!.id;
+    const copyId = duplicateEntity(src, () => {})!;
+    const inCopy = (id: number): boolean => {
+      let cur = getAllEntities().find((e) => e.id === id);
+      while (cur && cur.id !== copyId) cur = getAllEntities().find((e) => e.id === cur!.parentId);
+      return !!cur;
+    };
+    const copied = getAllEntities().filter((e) => e.name === 'Extra' && inCopy(e.id));
+    expect(copied).toHaveLength(1);
+    expect(liveOf(copied[0]!.id).has(TemplateAddedKey)).toBe(false);
   });
 });
 

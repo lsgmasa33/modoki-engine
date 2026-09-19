@@ -15,7 +15,8 @@ import { createTestWorld, type TestWorld, Transform, EntityAttributes,
   stepOneFrame, Time, Input, UIAction, getTraitByName } from '@modoki/engine/runtime';
 import { Transient } from '../../packages/modoki/src/runtime/core/traits/Transient';
 import { updateContactIndex } from '../../packages/modoki/src/runtime/physics/physicsContactIndex';
-import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { isRuntimeGuid, deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { setTemplateKey, templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { createWorld } from 'koota';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp, hasAgentOp, listAgentOps, relayResponseFor, registerRelayResponder, simStepDefaultTimeout, SIM_STEP_MAX_TIMEOUT_MS, inferAssetDefType } from '../../app/debug/agentBridge';
@@ -165,6 +166,43 @@ describe('duplicate-entity (runtime twin)', () => {
     expect(a).not.toBe(uiActionOf(src).bindings);
     // …nor with each other: one call's copies are cloned one by one (#1338 review).
     expect(a).not.toBe(b);
+  });
+
+  // #1430 — a template-added node (a `TemplateAddedKey`, no PrefabInstance) inside a copied WHOLE
+  // instance keeps its key and gets the guid a reload derives; a copy of a member hands out no key.
+  // Mutations: drop `setTemplateKey` in `duplicateEntityLive` (the first red), or read the key
+  // unconditionally below the copy root in `planCopyGuids` (`const key = ctx ? keyOf(node) : ''` —
+  // the second red: the device has no member strip to hide it).
+  const KEY = 'dddddddd-0000-4000-8000-000000001430';
+  const keyedInstance = () => {
+    const PI = getTraitByName('PrefabInstance')!;
+    const root = game!.spawn(Transform(), EntityAttributes({ guid: 'aaaaaaaa-0000-4000-8000-0000000014d1', name: 'Root' }),
+      PI.trait({ source: 'p', localId: 1, rootInstanceId: 0 }));
+    root.set(PI.trait, { ...(root.get(PI.trait) as object), rootInstanceId: root.id() });
+    const member = game!.spawn(Transform(), EntityAttributes({ name: 'Member', parentId: root.id() }),
+      PI.trait({ source: 'p', localId: 2, rootInstanceId: root.id() }));
+    const extra = game!.spawn(Transform(), EntityAttributes({ name: 'Extra', parentId: member.id() }));
+    setTemplateKey(extra, KEY);
+    return { root, member, extra };
+  };
+  const copiedExtra = (sourceExtraId: number) => find((ea, id) => ea.name === 'Extra' && id !== sourceExtraId);
+
+  it('a copied instance keeps its template-added node keyed, on the guid a reload derives (#1430)', async () => {
+    game = createTestWorld({});
+    const { extra } = keyedInstance();
+    const r = await runAgentOp('duplicate-entity', { guid: 'aaaaaaaa-0000-4000-8000-0000000014d1' }) as DupReply;
+    const copy = copiedExtra(extra.id());
+    expect(templateKeyOf(copy)).toBe(KEY);
+    expect((copy.get(EntityAttributes) as { guid: string }).guid).toBe(deriveMemberGuid(r.roots![0]!.guid!, [2, `+${KEY}`]));
+  });
+
+  it('a copied member hands its template-added node no key (#1430)', async () => {
+    game = createTestWorld({});
+    const { member, extra } = keyedInstance();
+    const memberGuid = (member.get(EntityAttributes) as { guid: string }).guid;
+    const r = await runAgentOp('duplicate-entity', memberGuid ? { guid: memberGuid } : { id: member.id() }) as DupReply;
+    expect(r.ok).not.toBe(false);
+    expect(templateKeyOf(copiedExtra(extra.id()))).toBe('');
   });
 
   it('a copied prefab instance names ITS OWN roots in rootInstanceId (a nested instance, its own)', async () => {

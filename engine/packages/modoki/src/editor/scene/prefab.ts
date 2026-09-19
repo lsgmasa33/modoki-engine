@@ -23,7 +23,7 @@ import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZ
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { writtenTraitKeys } from './traitDefault';
-import { adoptParentScene } from './sceneDirty';
+import { adoptParentScene, resolveAffectedScenes } from './sceneDirty';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, prefabSubtreeLocalIds, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens } from '../../runtime/loaders/loadSceneFile';
 import { rebaseMemberTokens, isMemberToken, parseMemberToken, memberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
@@ -3614,6 +3614,19 @@ export function rebuildInstance(
   // The respawned members and template-keyed added nodes are guid-less until derived (#1387). Only
   // fills empty guids, so the root's carried guid above and every restored scene guid stand.
   deriveInstanceMemberGuids(getCurrentWorld());
+  // Scene OWNERSHIP is identity too (#1431): every respawn — members, nested expansions, the restored
+  // added nodes — comes back unstamped, i.e. primary-owned, so a BASE scene's instance left the base
+  // file on the next Save All and vanished from every other level using that base. Read off the old
+  // ROOT, not derived from the parent: a base instance usually sits at the scene root, with no parent
+  // to inherit from. The WHOLE subtree takes it, because that is where a save already puts every
+  // node under a base instance (the primary save drops a subtree with a base ancestor). A primary
+  // instance's '' is already what the respawn wrote, so only a base stamp is carried. Carrying it does
+  // not WRITE the base — the edit routes mark it dirty (`RevertResult.affectedScenes`, apply's undo).
+  const sourceScene = (oldRootEa?.sourceScene as string) || '';
+  if (eaMeta && sourceScene) {
+    const links = getAllEntities().map((e) => [e.id, e.parentId] as const);
+    for (const id of collectSubtreeIds(links, [newRootId])) writeTraitField(id, eaMeta, 'sourceScene', sourceScene);
+  }
   return newRootId;
 }
 
@@ -3666,6 +3679,22 @@ function refreshInstances(
   // Reports what was REBUILT, not what was listed. The two differ exactly when a root died
   // under another root's teardown, so this line is the only place that case becomes visible.
   console.log(`[Prefab] Refreshed ${refreshed} instance(s) of "${source}"`);
+}
+
+/** Re-derive every BASE scene's live instance of `source` from `fromPrefab` to `toPrefab` — the
+ *  refresh a prefab save runs, restricted to base-owned roots (#1431). For an undo/redo that swaps
+ *  the prefab back and restores only the PRIMARY: a base loaded with it is CARRIED live, so its
+ *  instances would stay built from the prefab being undone, and a dirty base would then be saved
+ *  against the restored one (a member the apply removed reads as a `removed` nobody authored).
+ *  `exceptGuid` names an instance the caller rebuilds itself. */
+export function refreshBaseInstances(source: string, fromPrefab: PrefabFile, toPrefab: PrefabFile, exceptGuid = ''): void {
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!eaMeta) return;
+  const roots = collectInstanceRoots(source).filter((id) => {
+    const ea = readTraitData(id, eaMeta);
+    return !!ea?.sourceScene && !(exceptGuid && ea.guid === exceptGuid);
+  });
+  refreshInstances(source, roots, fromPrefab, toPrefab);
 }
 
 /** Is `rootId` still the SAME live, self-rooted prefab-instance root it was when the caller
@@ -3798,6 +3827,10 @@ export interface RevertResult {
   fullStructure: InstanceStructure;
   reducedOverrides: Record<number, Record<string, Record<string, unknown>>>;
   reducedStructure: InstanceStructure;
+  /** The BASE scene(s) that own the instance — pass as the undo action's `affectedScenes`. A base's
+   *  file is written by Save All only when it is dirty, and nothing else marks it: without this a
+   *  revert on a base's instance reads saved and is lost on reload (#1431). [] for a primary one. */
+  affectedScenes: string[];
 }
 
 /** Revert selected overrides on a SINGLE prefab instance back to the prefab base
@@ -3842,6 +3875,6 @@ export async function revertOverridesSelective(
 
   const newRootId = rebuildInstance(rootInstanceId, source, prefab, reducedOverrides, reducedStructure);
 
-  return { newRootId, source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure };
+  return { newRootId, source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, affectedScenes: resolveAffectedScenes([newRootId]) };
 }
 

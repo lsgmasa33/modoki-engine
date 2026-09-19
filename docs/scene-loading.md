@@ -1189,6 +1189,47 @@ Two consumers:
 - **Editor grouping/ghosting** — `EntityInfo.sourceScene` (`runtime/core/ecs/entityUtils.ts`)
   drives the Hierarchy's scene groups and the ghost styling.
 
+⚠️ **Anything that RESPAWNS a base entity must carry the stamp, because a fresh spawn reads `''`,
+which means primary.** Losing it is silent data loss, not a cosmetic slip: the next Save All
+writes the entity into the primary and drops it from the base file, so it vanishes from every other
+level using that base. `rebuildInstance` (`editor/scene/prefab.ts`) is the case that shipped
+(#1431). Refreshing after a prefab save, Revert, and Apply to Prefab all rebuild, and all three
+brought a base's instance back primary-owned. It now reads the old ROOT's stamp before the
+teardown and writes it onto the whole new subtree (members, nested expansions, restored `added`
+nodes). The stamp comes off the root, not the parent, because a base instance usually sits at the
+scene root with no parent to inherit from (#1429 covers the parent-derived case at the reparent
+seam). The whole subtree takes it because that is where a save already puts every node under a
+base instance: the primary save drops any subtree with a base ancestor.
+
+⚠️ **The stamp is only half the chain: Save All writes a base only when the base is DIRTY.**
+Carrying the stamp keeps the instance in the base, but nothing rewrites the base's file unless an
+edit marks it. So Revert and Apply dirty it through their undo action's `affectedScenes`:
+`RevertResult.affectedScenes` for Revert (dialog and agent op), and a read before the apply in
+`applyToPrefabWithUndo`, since the apply tears the instance down. The undo manager marks those
+scenes on push, undo and redo. A plain refresh after a prefab save does not dirty the base, and
+the primary is not dirtied by one either: the instance's stored overrides are unchanged.
+
+⚠️ **Dirtying the base makes Apply's UNDO load-bearing, and its world restore does not reach a
+base.** `restoreSnapshot` rebuilds the primary from a primary-only snapshot, and a base loaded with
+it is CARRIED live. So the base's instance would keep its post-apply shape against the restored
+prefab, and the now-dirty base would be written from it. A promoted added node would then exist
+nowhere: out of the prefab, out of the base. The same carry leaves every OTHER base instance of
+that prefab built from the prefab being undone. A member the apply removed then reads as a
+`removed` nobody authored, and the dirty base's save writes it. So after each restore,
+`applyToPrefabWithUndo`'s undo and redo do two things:
+- `refreshBaseInstances` re-derives every carried base instance of the prefab against the
+  restored one. This is a prefab save's refresh, restricted to base-owned roots. It runs for a
+  PRIMARY instance's apply too, because that apply's refresh reached the base instances as well.
+  It does not dirty the base there: the base file was never stale. Primary instances are left to
+  the world restore, which rebuilt them from the snapshot.
+- The applied instance is rebuilt from a capture taken on its side of the apply. It is found
+  again by a DURABLE guid, minted with `ensureGuid` if the root held only a runtime one; a runtime
+  guid survives neither the rebuild nor the carry. The capture warms the nested cache first
+  (#1284), as Revert does.
+
+Tests: `engine/tests/editor/rebuildKeepsSourceScene.test.ts`,
+`applyPrefabDirtiesBase.test.ts`, and `agentPrefabRevertDirtiesBase.test.ts`.
+
 ### Editor authoring surface
 
 - **Set the ref** — `editor/panels/assetViews/SceneAssetView.tsx`: select a scene in
@@ -1246,18 +1287,17 @@ Two consumers:
   |---|---|
   | Hierarchy row drop, cut → paste | the editor's own modal (`confirmInEditor`), text from `formatSceneMoveConfirm` |
   | agent `reparent-entity` / `modoki_reparent_entity` | refused with that same text until re-sent with `moveToScene: true` |
-  | agent `apply-scene-ops` `setTrait parentId` | refused per op, naming `reparent-entity {moveToScene}`: a batch has no confirm step |
+  | agent `apply-scene-ops` `setTrait parentId` | refused per op, naming `reparent-entity {moveToScene}`: a batch has no confirm step. A SAME-scene write is a full `reparentEntity` (unpack on move, world-pose compensation, folder clear), not a bare field write — the bare write left a moved member linked, and the save dropped it (#1434). A string parent is a guid; one matching no live entity is refused |
 
-  Two prefab cases are **refused**, because a scene move cannot carry `reparentEntity`'s
-  "unpack on move":
-  - `instance-member`: something in the moved subtree is linked to an instance that stays
-    behind. That covers a member, an owned nested root whose outer instance is not moving, and
-    a member held under a plain added child. Moving it would split the instance across two
-    files.
-  - `into-instance`: a stored instance root dropped under an entity inside another instance. A
-    linked instance cannot be saved there (#1355/#1358).
+  One prefab case is **refused**, because a scene move cannot carry `reparentEntity`'s
+  "unpack on move": `instance-member`, where something in the moved subtree is linked to an
+  instance that stays behind. That covers a member, an owned nested root whose outer instance is
+  not moving, and a member held under a plain added child. Moving it would split the instance
+  across two files. Move the whole instance, or unpack it first. A whole stored instance dropped
+  under a base instance's member is NOT refused: it moves and becomes that instance's user-added
+  nested instance, exactly as in a same-scene drop (#1436, below).
 
-  Move the whole instance, or unpack it first. A subtree **created**
+  A subtree **created**
   under a base entity (create, paste-copy, prefab instantiate) is stamped into the parent's
   scene with no prompt, since nothing moves (`adoptParentScene`, owner option A).
   `reparentEntity` still hard-rejects a cross-scene parent as the backstop for any direct
@@ -1322,6 +1362,22 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   `engine/tests/plugins/remintPrefabMemberRefs.test.ts` pins the pair by loading the original and
   the copy through the real loader, never by hand-computing a guid. A prefab the reader cannot
   resolve maps nothing, so a ref into it still dangles.
+  **Template-added (keyed) nodes follow too (#1430).** A keyed node steps by `'+' + key`, and the
+  walk descends every `nestedStructure` (a row's, a reference node's, an entry's) the way the loader
+  splits it: `descendPathKeyed` at each nested row, with the row's own slots under whatever was
+  forwarded. Where an outer slot REPLACES a row's `added`, both lists are walked, because
+  over-generating is harmless. A keyed node the scene EDITED is saved in scene form, with its derived
+  guid stored and its key dropped, and the load heal (#1426) re-keys it by matching that guid against
+  its derivation. So this is the one place a guid the file DEFINES takes its derived counterpart
+  instead of a random one. A random guid would leave the copy's node unkeyed for good. Such a node
+  can itself be an anchor: a keyed reference node, or a keyed plain node the scene hung a reference
+  under. Re-pointing it moves its members, so the carry repeats until nothing moves, each pass
+  against the anchors' final guids. A single pass left a member ref dangling whenever the entry's
+  own walk could not reach the anchor.
+  ⚠️ The heal re-keys a scene-form keyed PLAIN node only. A keyed reference-node root carries
+  `PrefabInstance`, so the heal skips it, and it comes back unkeyed even in the original file. The
+  copy matches the original there. That gap belongs to the heal (#1426's code), not to the
+  duplicate, and is filed as #1438.
   ⚠️ **The walk mirrors the loader exactly, including the shapes the loader recurses on FOREVER** (a
   prefab whose file adds a reference leading back to it). Two structural rules for "which shapes
   are cycles" were each wrong in review, refusing shapes that load or missing ones that do not, so
@@ -1345,6 +1401,26 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     instance roots, plain entities, and the copy's root are anchors and get `newGuid()`. An earlier
     draft classified by "the live guid equals its derivation"; review showed that fails once a save
     has stored a derived guid (#1349), for the entity's descendants and for a legacy root's copy.
+  - **A template-added (keyed) node keeps its key and derives through it (#1430).** It has no
+    `PrefabInstance`, so the rule above minted it a random guid, and the copy dropped its
+    `TemplateAddedKey`. A member token into it (a Panel bound to `@member:…+KEY`) then read as an
+    override live and was dead after save + reload, because neither the heal nor
+    `recoverTemplateKey` can recover a key from a random guid. Inside a copy whose root is an
+    instance root the save stores, the node steps as `'+' + key`, which is exactly the loader's rule
+    for a guid-less keyed node. Its descendants derive through it; a keyed reference-node root is
+    itself a stored root, so its own members anchor on it. `planCopyGuids` reports these nodes as
+    `keyed`, and both callers keep the key on exactly those nodes. The rule applies BELOW any
+    unkeyed instance root the save stores, inside the copy. A keyed reference-node root does not
+    count: it is a node of the OUTER template, which also writes the keys in its payload (#1369). That is either the copy root itself, or a stored
+    root under it, such as a plain group holding an instance. The review of the first cut found that
+    deciding this from the copy root alone still lost the key on that group copy. A key belongs to
+    the frame of its nearest stored root, and every stored root below the copy root is copied whole.
+    Above every stored root, the node mints a fresh guid and drops the key, because the key would
+    name a node no frame holds, or give two siblings one step. That covers three kinds of copy:
+    - a copy of a member, which the editor strips to plain added nodes;
+    - a copy of the keyed node itself;
+    - a copy of an owned nested root, which becomes an independent instance of the inner prefab
+      (#1354).
   - **Numeric `entityId` fields follow too** (`carryEntityIdFields`, called by `respawnFromSnapshot`
     and by the device op). `PrefabInstance.rootInstanceId` is carried from the snapshot's ids to the
     respawned ones, within the subtree only. Before this, a copied
@@ -1494,11 +1570,19 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   its root guid is already stored. A STORED instance root (top-level or user-added) moved OUTSIDE every
   instance stays an instance, and the save writes it as a top-level entry. Before the review of
   #1355, every root drag unpacked the whole instance, because `isWithinInstanceSubtree` is false
-  for the root itself. Dropped INSIDE an instance, it still unpacks, because the save cannot
-  represent it there. A parent member that owns a row of its prefab makes it read as owned, so it is
-  dropped. An `added` reference node carries no nested overrides. Under an owned nested instance,
-  nothing captures it at all (#1358). Unpacking does not fully cure that last case: the entities
-  survive but reload at the scene root, until #1358 is fixed.
+  for the root itself. Dropped INSIDE another instance it also stays linked, and becomes that
+  instance's user-added nested instance (owner, #1436): the save writes it as an `added[]` prefab
+  reference carrying its own overrides, under a member or, inside an owned nested instance, in
+  `nestedStructure`. The same holds when the instance sits deeper in the moved subtree, under a
+  plain entity (#1433). It used to unpack there, because before #1367 (an unstamped root always
+  reads as user-added) and #1369 (nested channels on user-added nodes) the save lost it. The old
+  pin could not tell the difference, since a linked and an unpacked instance reload at the same
+  paths; the tests now assert the link itself.
+  A reparent keeps the world pose by rewriting the local Transform, and on an entity still linked to
+  an instance those values are OVERRIDES — which the save keeps only when marked. So
+  `reparentEntity` and `moveEntityToScene` mark the fields the compensation changed
+  (`markCompensatedTransform`), and undo puts the prior marks back. Unmarked, a linked root dropped
+  under a moved parent reloaded at the prefab's value, offset by the parent (#1436 review).
   `rebuildInstance` carries an owned root's `parentLocalId` across the respawn. Without it, a
   refresh left the root unstamped, which the save reads as a user-added instance.
 

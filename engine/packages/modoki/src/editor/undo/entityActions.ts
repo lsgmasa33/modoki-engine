@@ -374,7 +374,8 @@ export interface EntitySnapshot {
    *  packed entity (#868), so a respawn gets them only from here — see overrideMarks.ts. */
   marks?: string[];
   /** Its unregistered markers (`Transient`, `TemplateAddedKey`), which the registry walk above never
-   *  sees (#1427). Restored by an undo's respawn; a copy drops them (`regenerateSnapshotGuids`). */
+   *  sees (#1427). Restored by an undo's respawn; a copy drops them (`regenerateSnapshotGuids`), all
+   *  but the template key of a node inside a copied whole instance (#1430). */
   markers?: CarriedMarkers;
 }
 
@@ -422,12 +423,17 @@ export function regenerateSnapshotGuids(snapshot: EntitySnapshot): EntitySnapsho
     const t = s.traits.find((x) => x.meta.name === name);
     return t && t.data !== true ? t.data : null;
   };
-  const { guidOf, remap } = planCopyGuids(snapshot, (s) => s.children, dataOf, (s) => s.id, newGuid);
+  const keyOf = (s: EntitySnapshot): string => {
+    const tk = s.markers?.TemplateAddedKey;
+    return tk && tk !== true && typeof tk.key === 'string' ? tk.key : '';
+  };
+  const { guidOf, remap, keyed } = planCopyGuids(snapshot, (s) => s.children, dataOf, (s) => s.id, newGuid, keyOf);
   // Once every new guid is known: a parent's ref can name a child and vice versa.
-  // A copy is a new identity, so it carries no unregistered markers (`carriedMarkers.ts`).
+  // A copy is a new identity, so it carries no unregistered markers (`carriedMarkers.ts`) — except
+  // the template key of a node the plan derived through it, inside a copy of a whole instance (#1430).
   const copy = (s: EntitySnapshot): EntitySnapshot => ({
     ...s,
-    markers: undefined,
+    markers: keyed.has(s) ? { TemplateAddedKey: { key: keyOf(s) } } : undefined,
     traits: s.traits.map((t) => {
       if (t.data === true) return t;
       const data = remapGuidValues(t.data, remap) as Record<string, unknown>;
@@ -872,15 +878,31 @@ function isWithinInstanceSubtree(nodeId: number, rootId: number): boolean {
   return false;
 }
 
-/** Whether `id` or any ancestor carries `PrefabInstance` (i.e. `id` sits inside some instance). */
-function hasInstanceAncestorOrSelf(id: number, piMeta: { trait: unknown }): boolean {
-  const byId = new Map(getAllEntities().map((e) => [e.id, e]));
-  const seen = new Set<number>();
-  for (let cur = byId.get(id); cur && !seen.has(cur.id); cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
-    seen.add(cur.id);
-    if (findEntity(cur.id)?.has(piMeta.trait as never)) return true;
+/** A reparent keeps the world pose by rewriting the local Transform. On an entity still linked to a prefab
+ *  instance those local values are overrides, and the save keeps an instance field only when it is MARKED
+ *  (`captureInstanceOverrides`), so an unmarked compensated field reloaded at the prefab's value and the
+ *  entity jumped (#1436 review: a root dropped under a moved parent reloaded at that parent's origin).
+ *  Marks each field the compensation changed — on a STORED instance root only (top-level or user-added),
+ *  whose new parent the save records. A member moved inside its own instance is not marked: the save does
+ *  not record a member's new parent (#1437), so it reloads under its row parent, and a mark would carry an
+ *  offset computed for the new parent there — a pose it never had (#1436 second review). */
+function markCompensatedTransform(id: number, oldLocal: Record<string, unknown>, newLocal: Record<string, number>): void {
+  const piMeta = getTraitByName('PrefabInstance');
+  const entity = findEntity(id);
+  if (!piMeta || !entity?.has(piMeta.trait)) return;
+  const pi = entity.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number };
+  if (pi.rootInstanceId !== id || (pi.parentLocalId || 0) > 0) return;
+  for (const f of Object.keys(newLocal)) {
+    if (Math.abs(newLocal[f]! - Number(oldLocal[f] ?? 0)) > 1e-6) markOverride(entity, 'Transform', f);
   }
-  return false;
+}
+/** The entity's override marks, to put back on undo with {@link putBackMarks}. */
+const marksOf = (id: number): string[] => { const e = findEntity(id); return e ? [...(getOverrideMarkSet(e) ?? [])] : []; };
+function putBackMarks(id: number, keys: string[]): void {
+  const e = findEntity(id);
+  if (!e) return;
+  clearOverrideMarks(e);
+  restoreOverrideMarks(e, keys);
 }
 
 export function reparentEntity(entityId: number, newParentId: number, newSortOrder?: number): boolean {
@@ -897,7 +919,9 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   if (!oldAttr) return false;
   const oldParentId = (oldAttr.parentId as number) || 0;
   const oldSortOrder = (oldAttr.sortOrder as number) || 0;
-  const oldFolder = (oldAttr.editorFolder as string) || '';
+  // Off the trait itself: `readTraitData` returns only `meta.fields`, which leaves editorFolder out, so
+  // reading it from `oldAttr` was always '' and the folder clear below never ran (#1434).
+  const oldFolder = ((findEntity(entityId)?.get(attrMeta.trait as never) as { editorFolder?: string } | undefined)?.editorFolder) || '';
 
   const parentChanged = oldParentId !== newParentId;
   const orderChanged = newSortOrder !== undefined && newSortOrder !== oldSortOrder;
@@ -971,16 +995,14 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     if (moved?.has(piMeta.trait)) {
       const movedPi = moved.get(piMeta.trait) as Record<string, unknown>;
       const rootId = movedPi.rootInstanceId as number;
-      // A STORED instance root (top-level or user-added) moved OUTSIDE every instance stays an
-      // instance: the save writes it as a top-level entry wherever it lands. For the root itself
-      // `isWithinInstanceSubtree` is false for every legal parent, so without this every root drag
-      // unpacked the whole instance. Dropped INSIDE an instance it still unpacks: the save cannot
-      // represent it there — a parent member owning a row of its prefab classes it as owned and
-      // drops it, an added reference node carries no nested overrides, and under an owned nested
-      // instance nothing captures it at all (#1355 review, #1358).
+      // A STORED instance root (top-level or user-added) always stays an instance, wherever it lands.
+      // For the root itself `isWithinInstanceSubtree` is false for every legal parent, so without this
+      // every root drag unpacked the whole instance. Dropped INSIDE another instance it becomes that
+      // instance's user-added nested instance (owner, #1436): the save writes it as an `added[]` prefab
+      // reference carrying its own overrides, under a member or inside an owned nested instance alike
+      // (#1367, #1369). It used to unpack there, from before the save could represent it (#1355).
       const storedRoot = rootId === entityId && !((movedPi.parentLocalId as number) || 0);
-      const keepLinked = storedRoot && !hasInstanceAncestorOrSelf(newParentId, piMeta);
-      if (!keepLinked && !isWithinInstanceSubtree(newParentId, rootId)) {
+      if (!storedRoot && !isWithinInstanceSubtree(newParentId, rootId)) {
         const byParent = new Map<number, number[]>();
         for (const e of getAllEntities()) {
           if (!byParent.has(e.parentId)) byParent.set(e.parentId, []);
@@ -1030,6 +1052,8 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     }
   };
   if (detachTargets.length) applyDetach();
+  const oldMarks = marksOf(entityId);
+  if (oldLocal && newLocal) markCompensatedTransform(entityId, oldLocal, newLocal);
   markStructureDirty();
 
   const savedOldLocal = oldLocal ? { ...oldLocal } : null;
@@ -1059,6 +1083,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       writeTraitField(id, attrMeta!, 'sortOrder', oldSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', oldFolder);
       if (savedOldLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedOldLocal[f]); }
+      putBackMarks(id, oldMarks);
       markStructureDirty();
     },
     redo: () => {
@@ -1068,6 +1093,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', '');
       if (savedNewLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedNewLocal[f]); }
       if (detachTargets.length) applyDetach(); // re-strip after the move
+      if (savedOldLocal && savedNewLocal) markCompensatedTransform(id, savedOldLocal, savedNewLocal);
       markStructureDirty();
     },
     kind: '!reparent',
@@ -1284,6 +1310,7 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     writeTraitField(rid, attrMeta, 'sortOrder', newSortOrder);
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', '');
     if (newLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, newLocal[f]);
+    if (oldLocal && newLocal) markCompensatedTransform(rid, oldLocal, newLocal);
   };
   const undoStamps = () => {
     const idx = buildGuidIndex();
@@ -1295,7 +1322,9 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     writeTraitField(rid, attrMeta, 'sortOrder', oldSortOrder);
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', oldFolder);
     if (oldLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, oldLocal[f]);
+    putBackMarks(rid, rootMarks);
   };
+  const rootMarks = marksOf(entityId);
   applyStamps();
 
   // Rekey (owner decision D: machinery built, not wired to the Hierarchy confirm
@@ -1388,15 +1417,14 @@ export function demoteEntityToScene(entityId: number, opts?: Omit<SceneMoveOptio
  *  scene is a SCENE MOVE into the parent's scene (owner ruling on #1429, option C). It is prompted, and
  *  it is carried out by `moveEntityToScene`, the same move the scene-group drops make.
  *
- *  Two prefab refusals. They are the scene-move twins of `reparentEntity`'s "unpack on move", which
- *  a scene move cannot carry:
- *  - `instance-member`: something in the moved subtree is linked to an instance that stays behind.
- *    That is a member, an OWNED nested root (`parentLocalId` > 0) whose outer instance is not
- *    moving, or a member held under a plain added child. The instance would be split across two files.
- *  - `into-instance`: a stored instance root dropped under an entity inside another instance. The
- *    save cannot represent a linked instance there (#1355/#1358), and a same-scene reparent unpacks it. */
+ *  One prefab refusal, `instance-member`: the scene-move twin of `reparentEntity`'s "unpack on move",
+ *  which a scene move cannot carry. Something in the moved subtree is linked to an instance that stays
+ *  behind. That is a member, an OWNED nested root (`parentLocalId` > 0) whose outer instance is not
+ *  moving, or a member held under a plain added child. The instance would be split across two files.
+ *  A stored instance root dropped inside a base's instance is NOT refused: it becomes that instance's
+ *  user-added nested instance, as it does in a same-scene reparent (#1436). */
 export type ReparentPlan =
-  | { kind: 'refused'; reason: ReparentRefusal | 'instance-member' | 'into-instance' }
+  | { kind: 'refused'; reason: ReparentRefusal | 'instance-member' }
   | { kind: 'same-scene' }
   | { kind: 'scene-move'; from: string; to: string };
 
@@ -1409,13 +1437,13 @@ export function planReparent(entityId: number, newParentId: number): ReparentPla
   const to = rawSourceScene(newParentId);
   if (from === to) return { kind: 'same-scene' };
   const piMeta = getTraitByName('PrefabInstance');
-  const prefabRefusal = piMeta ? sceneMovePrefabRefusal(entityId, newParentId, piMeta) : null;
+  const prefabRefusal = piMeta ? sceneMovePrefabRefusal(entityId, piMeta) : null;
   if (prefabRefusal) return { kind: 'refused', reason: prefabRefusal };
   return { kind: 'scene-move', from, to };
 }
 
-/** The prefab half of `planReparent` (see its doc for the two reasons). */
-function sceneMovePrefabRefusal(entityId: number, newParentId: number, piMeta: TraitMeta): 'instance-member' | 'into-instance' | null {
+/** The prefab half of `planReparent` (see its doc for the refusal). */
+function sceneMovePrefabRefusal(entityId: number, piMeta: TraitMeta): 'instance-member' | null {
   const flat = getAllEntities();
   const byId = new Map(flat.map((e) => [e.id, e]));
   const moving = new Set(subtreeIds(flat, entityId));
@@ -1429,10 +1457,6 @@ function sceneMovePrefabRefusal(entityId: number, newParentId: number, piMeta: T
     const ownedNested = owner === id && (pd.parentLocalId || 0) > 0;
     if (ownedNested && !moving.has(byId.get(id)?.parentId ?? 0)) return 'instance-member';
   }
-  const root = findEntity(entityId);
-  const isStoredRoot = !!root?.has(piMeta.trait)
-    && (root.get(piMeta.trait) as { rootInstanceId?: number }).rootInstanceId === entityId;
-  if (isStoredRoot && hasInstanceAncestorOrSelf(newParentId, piMeta)) return 'into-instance';
   return null;
 }
 

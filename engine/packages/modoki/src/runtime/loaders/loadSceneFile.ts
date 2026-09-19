@@ -875,7 +875,8 @@ type PrefabFileEntry = {
  *  The guid rule itself is `deriveMemberGuid`/`memberStepId` (shared). ⚠️ The ANCESTOR walk is
  *  MIRRORED twice, because a duplicate must predict where a reload puts each member: over a scene
  *  FILE by `derivedMemberPaths` + `sceneAnchorOf` (engine/plugins/asset-fs-ops.ts, #1324/#1339), and
- *  over an editor SNAPSHOT by `regenerateSnapshotGuids` (#1338) — change all three. */
+ *  over a live subtree by `planCopyGuids` (`core/copyIdentity.ts`: the editor's duplicate/paste and
+ *  the device op, #1338) — change all three. Both mirrors step a keyed node by its key too (#1430). */
 export function deriveInstanceMemberGuids(world: World): void {
   const piMeta = getTraitByName('PrefabInstance');
   const attrMeta = getTraitByName('EntityAttributes');

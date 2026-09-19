@@ -12,9 +12,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, getCurrentWorld,
+  createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, getCurrentWorld, worldTransforms,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, serializeScene, undo, redo, planReparent } from '@modoki/engine/editor';
+import { getOverrideMarkSet } from '@modoki/engine/runtime';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
 import { isSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { PrefabInstance } from '../../packages/modoki/src/runtime/traits/PrefabInstance';
@@ -97,9 +98,10 @@ describe('planReparent — the one decision every reparent entry point asks (#14
     expect(planReparent(added.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'instance-member' });
   });
 
-  // Mutation: drop the `into-instance` return in sceneMovePrefabRefusal. (Review finding: reparentEntity
-  // unpacks a stored root dropped inside an instance; a scene move cannot, so it must refuse.)
-  it('a stored instance root may move under a plain base entity, but not under a base instance member', () => {
+  // #1436 (owner): a stored instance root dropped inside a base's instance is a scene move, not a
+  // refusal. It becomes that instance's user-added nested instance, as in a same-scene drop. The save
+  // side is pinned in the create-under-base block below. Mutation: restore the `into-instance` refusal.
+  it('a stored instance root may move under a plain base entity AND under a base instance member', () => {
     const coin = spawn('Coin');
     link(coin, 1, coin.id());
     const kit = spawn('Kit', { sourceScene: BASE });
@@ -107,7 +109,7 @@ describe('planReparent — the one decision every reparent entry point asks (#14
     link(kit, 1, kit.id());
     link(slot, 2, kit.id());
     const plainBase = spawn('BaseParent', { sourceScene: BASE });
-    expect(planReparent(coin.id(), slot.id())).toEqual({ kind: 'refused', reason: 'into-instance' });
+    expect(planReparent(coin.id(), slot.id())).toMatchObject({ kind: 'scene-move', to: BASE });
     expect(planReparent(coin.id(), plainBase.id())).toMatchObject({ kind: 'scene-move', to: BASE });
   });
 });
@@ -167,6 +169,83 @@ describe('apply-scene-ops: a cross-scene parentId write is refused, not applied 
   });
 });
 
+describe('apply-scene-ops: a same-scene parentId write is a real reparent (#1434)', () => {
+  const setParent = (e: Ent, parentId: number, extra: Record<string, unknown> = {}) => runAgentOp('apply-scene-ops', {
+    ops: [{ op: 'setTrait', entity: { guid: guidOf(e) }, trait: 'EntityAttributes', fields: { parentId, ...extra } }],
+  }) as Promise<{ errors: string[] }>;
+  const tf = (id: number) => getCurrentWorld().entities.find((e) => e.id() === id)!.get(Transform) as { x: number };
+
+  // Mutation: in apply-scene-ops' setTrait branch, write parentId as a plain field again (drop applyReparent).
+  it('a prefab member moved out of its instance is unpacked, and the save keeps it', async () => {
+    const root = spawn('InstRoot');
+    const member = spawn('Member', { parentId: root.id() });
+    link(root, 1, root.id());
+    link(member, 2, root.id());
+    const shelf = spawn('Shelf');
+    expect((await setParent(member, shelf.id())).errors).toEqual([]);
+    expect(attrs(member.id()).parentId).toBe(shelf.id());
+    expect(getCurrentWorld().entities.find((e) => e.id() === member.id())!.has(PrefabInstance)).toBe(false);
+    expect(await namesIn()).toMatch(/"Member"/);
+  });
+
+  // #1434 review. Mutation: drop the string-guid resolution in apply-scene-ops' setTrait branch (the guid is
+  // then written raw into the numeric field, past every check).
+  it('a guid-string parentId resolves to its entity and reparents like a numeric one', async () => {
+    const root = spawn('InstRoot');
+    const member = spawn('Member', { parentId: root.id() });
+    link(root, 1, root.id());
+    link(member, 2, root.id());
+    const shelf = spawn('Shelf');
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [{ op: 'setTrait', entity: { guid: guidOf(member) }, trait: 'EntityAttributes', fields: { parentId: guidOf(shelf) } }],
+    }) as { errors: string[] };
+    expect(r.errors).toEqual([]);
+    expect(attrs(member.id()).parentId).toBe(shelf.id());
+    expect(getCurrentWorld().entities.find((e) => e.id() === member.id())!.has(PrefabInstance)).toBe(false);
+  });
+
+  // Mutation: drop the no-live-entity refusal for a numeric parentId.
+  it('a parentId that matches no live entity is refused, and nothing is applied', async () => {
+    const kid = spawn('Kid');
+    for (const parentId of [987654, 'dddddddd-0000-4000-8000-000000000404']) {
+      const r = await setParent(kid, parentId as number, { name: 'Renamed' });
+      expect(r.errors.join('\n')).toMatch(/matched no live entity/);
+      expect(attrs(kid.id())).toMatchObject({ parentId: 0, name: 'Kid' });
+    }
+  });
+
+  // #1436 second review. Mutation: drop the type check (the value is then written raw into parentId).
+  it('a parentId that is neither a guid string nor an id is refused, and nothing is applied', async () => {
+    const kid = spawn('Kid');
+    const r = await setParent(kid, { guid: 'x' } as unknown as number);
+    expect(r.errors.join('\n')).toMatch(/must be a guid string or an entity id/);
+    expect(attrs(kid.id()).parentId).toBe(0);
+  });
+
+  // Mutation: count the op as changed whenever it names a parent (`changed++` unconditionally again).
+  it('a parentId equal to the current parent changes nothing and is not counted', async () => {
+    const shelf = spawn('Shelf');
+    const kid = spawn('Kid', { parentId: shelf.id() });
+    const r = await setParent(kid, shelf.id()) as unknown as { changed: number; errors: string[] };
+    expect(r.errors).toEqual([]);
+    expect(r.changed).toBe(0);
+  });
+
+  // Same mutation.
+  it('keeps the world position, clears the folder tag, and writes the other fields in the op', async () => {
+    const shelf = spawn('Shelf');
+    const kid = spawn('Kid', { editorFolder: 'Props' });
+    worldTransforms.set(shelf.id(), { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    worldTransforms.set(kid.id(), { x: 3, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    try {
+      expect((await setParent(kid, shelf.id(), { name: 'Renamed' })).errors).toEqual([]);
+      expect(attrs(kid.id())).toMatchObject({ parentId: shelf.id(), name: 'Renamed' });
+      expect((getCurrentWorld().entities.find((e) => e.id() === kid.id())!.get(EntityAttributes) as { editorFolder: string }).editorFolder).toBe('');
+      expect(tf(kid.id()).x).toBeCloseTo(-7);
+    } finally { worldTransforms.delete(shelf.id()); worldTransforms.delete(kid.id()); }
+  });
+});
+
 describe('a CREATE under a base entity is born in that base (#1429, owner option A)', () => {
   const PATH = '/p1429.prefab.json';
   afterEach(() => { setPrefabCache(PATH, null); });
@@ -190,6 +269,40 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
     clearHistory(); markSceneSaved(); clearAllSceneDirty();
     return { root: rootId, slot };
   }
+
+  // #1436: the move itself, end to end. The base saves the moved instance as a prefab reference in its
+  // Kit's `added`, still linked, and the primary no longer holds it.
+  // Mutation: restore the `into-instance` refusal in sceneMovePrefabRefusal (the op then refuses).
+  it('a stored instance moved into a base instance member stays linked, and the base saves it as a nested instance', async () => {
+    const { slot } = await baseInstance();
+    const COIN = '/p1436coin.prefab.json';
+    setPrefabCache(COIN, {
+      id: 'c1436000-0000-4000-8000-000000000001', version: 2, name: 'Coin', rootLocalId: 1,
+      entities: [{ localId: 1, name: 'Coin', traits: { EntityAttributes: { name: 'Coin', parentId: 0 }, Transform: {} } }],
+    } as never);
+    try {
+      const { rootId: coin } = await runAgentOp('prefab', { action: 'instantiate', path: COIN }) as { rootId: number };
+      // Slot sits at x=10 and the coin at the origin, so the move writes local x=-10: an override the base
+      // must save, or the coin reloads at Slot's origin. Mutation: drop the markCompensatedTransform call
+      // in moveEntityToScene's applyStamps.
+      worldTransforms.set(slot, { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+      worldTransforms.set(coin, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+      await runAgentOp('reparent-entity', { guid: attrs(coin).guid, parentGuid: attrs(slot).guid, moveToScene: true });
+      const live = getCurrentWorld().entities.find((e) => e.id() === coin)!;
+      expect(attrs(coin)).toMatchObject({ parentId: slot, sourceScene: BASE });
+      expect(live.has(PrefabInstance)).toBe(true);
+      const base = (await serializeScene({ scene: BASE_FILE })).entities as Array<{ name?: string; added?: Array<{ name?: string; prefab?: string; guid?: string }> }>;
+      const kitAdded = base.find((e) => e.name === 'Kit')?.added ?? [];
+      expect(kitAdded).toEqual([expect.objectContaining({ prefab: COIN, guid: attrs(coin).guid })]);
+      expect((kitAdded[0] as { overrides?: Record<string, { Transform?: { x?: number } }> }).overrides?.['1']?.Transform?.x).toBeCloseTo(-10);
+      expect(await namesIn()).not.toContain(attrs(coin).guid);
+      // Undo puts the coin's marks back as they were. Mutation: drop `putBackMarks` in moveEntityToScene's undo.
+      const marks = () => [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === coin)!) ?? [])];
+      expect(marks()).toContain('Transform.x');
+      await undo();
+      expect(marks()).not.toContain('Transform.x');
+    } finally { setPrefabCache(COIN, null); worldTransforms.clear(); }
+  });
 
   // Mutation: drop `adoptParentScene(currentId)` from entityActions.ts's createEntityWithUndo. This is
   // the issue's own shape: a primary child under a base prefab member, which the base's `added` would bake.

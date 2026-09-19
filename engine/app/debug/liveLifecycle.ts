@@ -27,6 +27,8 @@ import {
   cloneTraitValues,
   remapGuidValues,
   planCopyGuids,
+  templateKeyOf,
+  setTemplateKey,
   carryEntityIdFields,
   buildEntityCreateSpecs,
   resolveCreateEntitySpec,
@@ -169,7 +171,8 @@ export function duplicateEntityLive(params: unknown): unknown {
       traits.push({ name: meta.name, ...(data ? { data: cloneTraitValues(data) as Record<string, unknown> } : {}) });
     }
     const parent = getAllEntities().find((e) => e.id === id)?.parentId ?? 0;
-    return { id, parentId: parent, traits };
+    // The template key is an unregistered marker the registry walk above never sees (#1430).
+    return { id, parentId: parent, traits, key: templateKeyOf(entity) };
   });
 
   const roots: Array<{ id: number; guid: string | null }> = [];
@@ -195,7 +198,7 @@ export function duplicateEntityLive(params: unknown): unknown {
     // A copy must NOT inherit the original's guid — two entities answering to one address is the
     // addressing failure every Percept tool would then inherit — and a ref INSIDE the copy must
     // follow it, or the copy drives the source (#1338). One plan per copy: each gets its own guids.
-    const { guidOf, remap } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid);
+    const { guidOf, remap, keyed } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid, (node) => node.key);
     for (const src of snapshot) {
       const specs = src.traits.map((t) => {
         if (!t.data) return t;
@@ -221,6 +224,7 @@ export function duplicateEntityLive(params: unknown): unknown {
       if (newId == null) return rollback('a trait on the source entity is not registered in this build, so the copy would be incomplete.');
       spawned.push(newId);
       idMap.set(src.id, newId);
+      if (keyed.has(src)) setTemplateKey(findEntity(newId), src.key);
     }
     // Numeric refs (PrefabInstance.rootInstanceId) need the new ids, so they follow once the copy exists.
     carryEntityIdFields(snapshot.map((src) => ({ id: idMap.get(src.id)!, traits: src.traits })), idMap);

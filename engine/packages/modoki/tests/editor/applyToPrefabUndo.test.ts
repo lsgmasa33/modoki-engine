@@ -44,6 +44,9 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   installPrefabSnapshot: (...a: any[]) => installPrefabSnapshot(...a),
   guidForEntityId: (id: number) => (id === 1 ? 'g-root' : ''),
   entityIdForGuid: (guid: string) => (guid === 'g-root' ? 1 : 0),
+  // #1431: undo/redo re-derive carried BASE instances; this suite's instance is primary, and its
+  // subject is the prefab + primary scene pair — pinned in engine/tests/editor/applyPrefabDirtiesBase.test.ts.
+  refreshBaseInstances: vi.fn(),
 }));
 
 let currentBaseScene: string | undefined;

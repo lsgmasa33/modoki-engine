@@ -280,9 +280,10 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             // root across each rebuild AND across a world rebuild (Play→Stop).
             const ref = entityRef(result.newRootId);
             useEditorStore.getState().selectEntity(result.newRootId);
-            const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
+            const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, affectedScenes } = result;
             pushAction({
               label: 'Revert prefab overrides',
+              affectedScenes,
               undo: async () => {
                 const cur = ref.resolve(); if (cur == null) return;
                 // rebuildInstance -> captureNestedInstanceOverrides is a sync cache read with NO

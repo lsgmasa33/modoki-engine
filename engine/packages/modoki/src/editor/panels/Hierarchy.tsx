@@ -1033,8 +1033,6 @@ export default function Hierarchy() {
       // as a same-scene drop always was.
       if (plan.reason === 'instance-member') {
         useEditorStore.getState().showToast('This would split a prefab instance across two scene files: part of it belongs to an instance that stays behind. Move the whole instance, or unpack it first.', 'warn');
-      } else if (plan.reason === 'into-instance') {
-        useEditorStore.getState().showToast('A prefab instance cannot be moved into another scene inside another prefab instance. Unpack it first, or drop it outside every instance.', 'warn');
       }
       return false;
     }

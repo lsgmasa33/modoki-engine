@@ -614,7 +614,6 @@ function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>[
   switch (reason) {
     case 'resource': return `reparent-entity: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
     case 'instance-member': return `reparent-entity: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and something in ${id}'s subtree (${id} itself, or an entity under it) belongs to a prefab instance that would stay behind, splitting it across two scene files. Move that instance's root instead, or unpack that instance first.`;
-    case 'into-instance': return `reparent-entity: refused to move ${id} under ${parentId} — ${id} is a prefab instance root, and ${parentId} belongs to another scene AND sits inside a prefab instance. A linked instance cannot be saved there. Unpack ${id} first, or pick a parent outside every instance.`;
     default: return `reparent-entity: refused to move ${id} under ${parentId} — the move is illegal (${reason === 'self-parent' ? 'an entity cannot be its own parent' : `${parentId} is a descendant of ${id}`}).`;
   }
 }
@@ -912,14 +911,42 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             // traitWriteContainer comes for free from the existing helper, not reimplemented here.
             // A parentId write is a reparent in all but name, so it answers to the same rule (#1248). It
             // used to go straight to the trait, past the resource AND the cycle check.
-            const newParent = meta.name === 'EntityAttributes' ? (fields as Record<string, unknown>).parentId : undefined;
+            const rawParent = meta.name === 'EntityAttributes' ? (fields as Record<string, unknown>).parentId : undefined;
+            let newParent = rawParent;
+            const shown = typeof rawParent === 'string' ? `"${rawParent}"` : String(rawParent); // the caller's own input, in errors
+            // A string parent is a guid, as in addEntity. Unlike addEntity, a parent that matches nothing is
+            // refused rather than re-rooted: this moves an EXISTING entity, and a string written raw into the
+            // numeric field skipped every check below (#1434 review).
+            if (newParent !== undefined && typeof newParent !== 'string' && typeof newParent !== 'number') {
+              errors.push(`${where}: EntityAttributes.parentId must be a guid string or an entity id (got ${JSON.stringify(newParent)}) — nothing was applied to entity ${id}`);
+              continue;
+            }
+            if (typeof newParent === 'string') {
+              const pr = resolveLiveEntityRef({ guid: newParent });
+              if (!('id' in pr)) {
+                errors.push(`${where}: EntityAttributes.parentId ${shown} matched no live entity (${pr.error}) — nothing was applied to entity ${id}`);
+                unresolved.push({ guid: newParent }); if (code === undefined) { code = pr.code; first = pr; }
+                continue;
+              }
+              newParent = pr.id;
+            }
+            if (typeof newParent === 'number' && newParent !== 0 && !findEntity(newParent)) {
+              errors.push(`${where}: EntityAttributes.parentId ${newParent} matched no live entity (runtime ids are reassigned on every scene reload — prefer a guid) — nothing was applied to entity ${id}`);
+              continue;
+            }
             // Judged by the same plan as reparent-entity (#1429). A parent from another scene is a scene move,
             // and a batch has no step to confirm one, so it is refused here with the op that can.
             const plan = typeof newParent === 'number' ? planReparent(id, newParent) : null;
-            if (plan?.kind === 'refused') { errors.push(`${where}: EntityAttributes.parentId ${newParent} refused (${plan.reason}) for entity ${id} — nothing was applied to it`); continue; }
-            if (plan?.kind === 'scene-move') { errors.push(`${where}: EntityAttributes.parentId ${newParent} belongs to another scene (${loadedSceneName(plan.to)}), so this parent change is a scene move — use reparent-entity with moveToScene: true. Nothing was applied to entity ${id}`); continue; }
-            for (const [field, value] of Object.entries(fields)) writeTraitFieldWithUndo(id, meta, field, value);
-            changed++;
+            if (plan?.kind === 'refused') { errors.push(`${where}: EntityAttributes.parentId ${shown} refused (${plan.reason}) for entity ${id} — nothing was applied to it`); continue; }
+            if (plan?.kind === 'scene-move') { errors.push(`${where}: EntityAttributes.parentId ${shown} belongs to another scene (${loadedSceneName(plan.to)}), so this parent change is a scene move — use reparent-entity with moveToScene: true. Nothing was applied to entity ${id}`); continue; }
+            // A same-scene parent change goes through reparentEntity, like every other reparent (#1434). A bare
+            // field write skipped its unpack on move, so a prefab member moved out of its instance stayed linked
+            // and the next save dropped it; it also skipped the world-position compensation and the folder clear.
+            // A parent equal to the current one moves nothing, and is not counted as a change.
+            const moved = plan ? applyReparent(id, newParent as number).ok : false;
+            const rest = Object.entries(fields).filter(([field]) => !(plan && field === 'parentId'));
+            for (const [field, value] of rest) writeTraitFieldWithUndo(id, meta, field, value);
+            if (moved || rest.length) changed++;
           }
         } else if (op.op === 'removeTrait') {
           const resolved = resolveLiveEntityRef(op.entity);
@@ -2891,9 +2918,10 @@ export function registerEditorAgentOps(): void {
       }
       const ref = entityRef(result.newRootId);
       useEditorStore.getState().selectEntity(result.newRootId);
-      const { source, prefab: revertedPrefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
+      const { source, prefab: revertedPrefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, affectedScenes } = result;
       pushAction({
         label: 'Revert prefab overrides',
+        affectedScenes,
         undo: async () => {
           const cur = ref.resolve(); if (cur == null) return;
           // Same cold read as the dialog's closures (#1284); undoManager awaits undo/redo.

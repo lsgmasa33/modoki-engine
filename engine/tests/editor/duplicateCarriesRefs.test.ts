@@ -16,14 +16,14 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode,
-  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, worldTransforms, getOverrideMarkSet, type SceneData,
 } from '@modoki/engine/runtime';
 import {
   duplicateEntity, writeTraitFieldWithUndo, setActionCallback, pushAction, clearHistory, serializeScene,
   reparentEntity, deleteEntitiesWithUndo,
 } from '@modoki/engine/editor';
 import { setPrefabCache, captureInstanceStructure, captureInstanceOverrides, rebuildInstance, instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefab';
-import { undo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -397,49 +397,102 @@ describe('an owned nested instance that leaves its row stays gone after save + r
     expect(targetsOf(idAt('Shelf')).map((g) => treePaths().get(g))).toEqual(['Shelf/InnerRoot/Leaf']);
   });
 
-  // #1355 re-review, findings 1 and 3: a stored root dropped INSIDE an instance still unpacks, or the
-  // save loses it. Mutation: drop `!hasInstanceAncestorOrSelf(...)` from reparentEntity's keepLinked.
-  // The second case reloaded at the SCENE ROOT until #1358 gave the scene a structural channel for a
-  // row's own expansion; only survival was pinned then. Now that it round-trips in place, the
-  // expectation is the real path — this is the pin #1358 existed to tighten.
-  it.each([
+  // #1436 (owner): a stored instance dropped INSIDE another instance keeps its link and becomes that
+  // instance's user-added nested instance. #1355's review once made it unpack here, because the save
+  // lost it; #1367/#1369 made the save represent it. Survival alone could not pin either rule, since a
+  // linked and an unpacked instance reload at the same paths, so each case asserts the LINK and a
+  // member override. Mutation: in reparentEntity's detach, unpack a stored root whose new parent sits
+  // inside an instance (the pre-#1436 `keepLinked`).
+  const linked = (id: number) => [...getCurrentWorld().entities].find((x) => x.id() === id)!.has(getTraitByName('PrefabInstance')!.trait as never);
+  const leafX = (id: number) => ([...getCurrentWorld().entities].find((x) => x.id() === id)!.get(getTraitByName('Transform')!.trait) as { x: number }).x;
+  const INTO = [
     ['under a member that owns a row of its prefab', 'Holder/OuterRoot/Panel', 'Holder/OuterRoot/Panel/'],
     ['under a member of an owned nested instance', 'Holder/OuterRoot/Panel/InnerRoot/Leaf', 'Holder/OuterRoot/Panel/InnerRoot/Leaf/'],
-  ])('a top-level instance moved %s survives save + reload, under its exact parent', async (_label, target, reloadedAt) => {
+  ] as const;
+  it.each(INTO)('a top-level instance moved %s stays linked through save + reload, under its exact parent', async (_label, target, at) => {
     const sc = withShelf() as unknown as { entities: Array<Record<string, unknown>> };
     sc.entities.push({ id: 4, prefab: INNER, guid: 'bbbbbbbb-0000-4000-8000-0000000000c5', traits: { EntityAttributes: { name: 'InnerRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } });
     await load(sc as unknown as SceneData);
     const solo = idAt('InnerRoot');
     rename(solo, 'Solo'); // the prefab names the root; a rename is an override the save keeps
+    writeTraitFieldWithUndo(idAt('Solo/Leaf'), getTraitByName('Transform')!, 'x', 7);
     reparentEntity(solo, idAt(target));
+    expect(linked(idAt(`${at}Solo`))).toBe(true);
     await load(await serializeScene() as unknown as SceneData);
     expectUniqueGuids();
-    expect([...treePaths().values()].filter((p) => p.includes('Solo'))).toEqual([`${reloadedAt}Solo`, `${reloadedAt}Solo/Leaf`]);
+    expect([...treePaths().values()].filter((p) => p.includes('Solo'))).toEqual([`${at}Solo`, `${at}Solo/Leaf`]);
+    expect(linked(idAt(`${at}Solo`))).toBe(true);
+    expect(leafX(idAt(`${at}Solo/Leaf`))).toBe(7);
   });
 
-  // #1355 third review: the unpack's undo stored the numeric rootInstanceId, which a world rebuild
-  // reassigns. Mutation: restore `t.data` as captured in reparentEntity's undoDetach.
-  it('an unpack undone AFTER a world rebuild relinks the instance to its live root, and the save keeps it', async () => {
+  // #1436 review: the drop keeps the world pose by rewriting the root's local Transform, and on a LINKED root
+  // those values are overrides the save keeps only when marked. Unmarked, the root reloaded at the prefab's
+  // x, under a parent at x=10: it jumped by the parent's offset. y carries a file override (marked at load)
+  // and must keep it. Mutations: drop the markCompensatedTransform call in reparentEntity's apply, its
+  // `putBackMarks` on undo, or its re-mark on redo — each turns this red.
+  it('a top-level instance dropped under a moved parent keeps its world pose through save + reload; undo drops the marks, redo restores them', async () => {
     const sc = withShelf() as unknown as { entities: Array<Record<string, unknown>> };
-    sc.entities.push({ id: 4, prefab: INNER, guid: 'bbbbbbbb-0000-4000-8000-0000000000c5', traits: { EntityAttributes: { name: 'InnerRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } });
+    sc.entities.push({ id: 4, prefab: INNER, guid: 'bbbbbbbb-0000-4000-8000-0000000000c5', overrides: { 1: { Transform: { y: 4 } } }, traits: { EntityAttributes: { name: 'InnerRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } });
     await load(sc as unknown as SceneData);
     const solo = idAt('InnerRoot');
-    rename(solo, 'Solo');
-    reparentEntity(solo, idAt('Holder/OuterRoot/Panel/Button'));
-    // Rebuild the world with extra entities spawned first, so the ecs ids move (as a Play→Stop revert can).
-    const saved = await serializeScene() as unknown as { entities: unknown[] };
-    const pad = [1, 2, 3, 4, 5].map((i) => ({ id: 100 + i, traits: { EntityAttributes: { name: `Pad${i}`, parentId: 0, guid: `cccccccc-0000-4000-8000-00000000000${i}` } } }));
-    await load({ ...saved, entities: [...pad, ...saved.entities] } as unknown as SceneData);
-    expect(idAt('Holder/OuterRoot/Panel/Button/Solo')).not.toBe(solo); // precondition: the id moved
-    await undo();
-    const root = idAt('Solo');
-    const pi = [...getCurrentWorld().entities].find((e) => e.id() === root)!.get(getTraitByName('PrefabInstance')!.trait) as { rootInstanceId?: number };
-    expect(pi?.rootInstanceId).toBe(root);
+    rename(solo, 'Solo'); // Panel already holds an owned InnerRoot
+    const panel = idAt('Holder/OuterRoot/Panel');
+    const entityOf = (id: number) => [...getCurrentWorld().entities].find((x) => x.id() === id)!;
+    const before = [...(getOverrideMarkSet(entityOf(solo)) ?? [])].sort();
+    worldTransforms.set(panel, { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    worldTransforms.set(solo, { x: 0, y: 4, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    try {
+      reparentEntity(solo, panel);
+      expect(getOverrideMarkSet(entityOf(solo))?.has('Transform.x')).toBe(true);
+      await undo();
+      expect([...(getOverrideMarkSet(entityOf(solo)) ?? [])].sort()).toEqual(before);
+      await redo();
+      expect(getOverrideMarkSet(entityOf(solo))?.has('Transform.x')).toBe(true);
+    } finally { worldTransforms.delete(panel); worldTransforms.delete(solo); }
     await load(await serializeScene() as unknown as SceneData);
-    // By guid, not name: the rename's override mark does not survive the unpacked round trip.
-    const soloPath = treePaths().get('bbbbbbbb-0000-4000-8000-0000000000c5');
-    expect(soloPath).toBeDefined();
-    expect([...treePaths().values()].filter((p) => p.startsWith(`${soloPath}`))).toEqual([soloPath, `${soloPath}/Leaf`]);
+    const tf = entityOf(idAt('Holder/OuterRoot/Panel/Solo')).get(getTraitByName('Transform')!.trait) as { x: number; y: number };
+    expect(linked(idAt('Holder/OuterRoot/Panel/Solo'))).toBe(true);
+    expect(tf.x).toBeCloseTo(-10);
+    expect(tf.y).toBeCloseTo(4);
+  });
+
+  // #1436 second review: a MEMBER moved to another parent inside its own instance stays linked, but the save
+  // does not record its new parent (#1437), so it reloads under its row parent. Its compensated Transform
+  // must NOT be marked, or that offset lands under the old parent — a pose it never had. Until #1437 it
+  // snaps back to where it was. Mutation: drop the stored-root check in markCompensatedTransform.
+  it('a member moved inside its own instance is not given a compensated override: it reloads at its original pose', async () => {
+    await load(withShelf());
+    const button = idAt('Holder/OuterRoot/Panel/Button');
+    const panel = idAt('Holder/OuterRoot/Panel');
+    const outer = idAt('Holder/OuterRoot');
+    worldTransforms.set(panel, { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    worldTransforms.set(button, { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    worldTransforms.set(outer, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    try { reparentEntity(button, outer); } finally { for (const id of [panel, button, outer]) worldTransforms.delete(id); }
+    expect(linked(button)).toBe(true);
+    expect(getOverrideMarkSet([...getCurrentWorld().entities].find((x) => x.id() === button)!)?.has('Transform.x') ?? false).toBe(false);
+    await load(await serializeScene() as unknown as SceneData);
+    expect(leafX(idAt('Holder/OuterRoot/Panel/Button'))).toBeCloseTo(0);
+  });
+
+  // #1433: the same drop with the instance one level down, under a plain entity. It never unpacked
+  // (the old rule looked at the moved root only), and it needs no unpack: the plain entity is saved as
+  // an added node whose child is the instance's prefab reference. Mutation: make captureChild skip a
+  // user-added nested root.
+  it.each(INTO)('a plain entity holding a top-level instance, moved %s: the instance stays linked through save + reload', async (_label, target, at) => {
+    const CRATE = 'bbbbbbbb-0000-4000-8000-0000000000c6';
+    const sc = withShelf() as unknown as { entities: Array<Record<string, unknown>> };
+    sc.entities.push({ id: 4, traits: { EntityAttributes: { name: 'Crate', parentId: 0, guid: CRATE }, Transform: { x: 0, y: 0, z: 0 } } });
+    sc.entities.push({ id: 5, prefab: INNER, guid: 'bbbbbbbb-0000-4000-8000-0000000000c5', traits: { EntityAttributes: { name: 'InnerRoot', parentId: CRATE }, Transform: { x: 0, y: 0, z: 0 } } });
+    await load(sc as unknown as SceneData);
+    rename(idAt('Crate/InnerRoot'), 'Solo');
+    writeTraitFieldWithUndo(idAt('Crate/Solo/Leaf'), getTraitByName('Transform')!, 'x', 7);
+    reparentEntity(idAt('Crate'), idAt(target));
+    await load(await serializeScene() as unknown as SceneData);
+    expectUniqueGuids();
+    expect([...treePaths().values()].filter((p) => p.includes('Crate'))).toEqual([`${at}Crate`, `${at}Crate/Solo`, `${at}Crate/Solo/Leaf`]);
+    expect(linked(idAt(`${at}Crate/Solo`))).toBe(true);
+    expect(leafX(idAt(`${at}Crate/Solo/Leaf`))).toBe(7);
   });
 
   /** Save, then reload with five plain entities spawned first, so every ecs id moves. */
@@ -448,6 +501,26 @@ describe('an owned nested instance that leaves its row stays gone after save + r
     const pad = [1, 2, 3, 4, 5].map((i) => ({ id: 100 + i, traits: { EntityAttributes: { name: `Pad${i}`, parentId: 0, guid: `cccccccc-0000-4000-8000-00000000000${i}` } } }));
     await load({ ...saved, entities: [...pad, ...saved.entities] } as unknown as SceneData);
   };
+
+  // #1355 third review: the unpack's undo stored the numeric rootInstanceId, which a world rebuild
+  // reassigns. The unpacked entity here is an instance ROOT (its own owner): an owned nested root moved
+  // out of its instance. (This drove a stored root into a member until #1436 stopped that unpacking.)
+  // Mutation: restore `t.data` as captured in reparentEntity's undoDetach.
+  it('an unpack undone AFTER a world rebuild relinks the instance to its live root, and the save keeps it', async () => {
+    await load(withShelf());
+    const inner = idAt('Holder/OuterRoot/Panel/InnerRoot');
+    reparentEntity(inner, idAt('Shelf'));
+    expect(linked(idAt('Shelf/InnerRoot'))).toBe(false); // precondition: it unpacked
+    await rebuild();
+    expect(idAt('Shelf/InnerRoot')).not.toBe(inner); // precondition: the id moved
+    await undo();
+    const root = idAt('Holder/OuterRoot/Panel/InnerRoot');
+    const pi = [...getCurrentWorld().entities].find((e) => e.id() === root)!.get(getTraitByName('PrefabInstance')!.trait) as { rootInstanceId?: number };
+    expect(pi?.rootInstanceId).toBe(root);
+    await load(await serializeScene() as unknown as SceneData);
+    expectUniqueGuids();
+    expect([...treePaths().values()].filter((p) => p.includes('InnerRoot'))).toEqual(['Holder/OuterRoot/Panel/InnerRoot', 'Holder/OuterRoot/Panel/InnerRoot/Leaf']);
+  });
 
   // #1355 fourth review: a MEMBER's owner is outside the moved subtree. Same mutation as above.
   it('a MEMBER unpacked, then undone after a world rebuild, rejoins the live instance at its row', async () => {

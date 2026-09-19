@@ -126,6 +126,20 @@ describe('reparentEntity', () => {
     expect(tfAfter!['x']).toBe(tfBefore['x']);
   });
 
+  // #1434: editorFolder is only valid on roots, so a root that gains a parent drops its folder tag, and
+  // undo brings it back. The read went through `readTraitData`, which omits editorFolder, so the clear
+  // never ran. Mutation: read `oldFolder` from `oldAttr` again.
+  it('a root that gains a parent drops its folder tag, and undo restores it', async () => {
+    const folderOf = () => (getCurrentWorld().entities.find((e) => e.id() === siblingId)!.get(EntityAttributes) as { editorFolder: string }).editorFolder;
+    reparentEntity(siblingId, 0); // precondition: already a root, nothing to do
+    const e = getCurrentWorld().entities.find((x) => x.id() === siblingId)!;
+    e.set(EntityAttributes, { ...(e.get(EntityAttributes) as object), editorFolder: 'Props' });
+    reparentEntity(siblingId, parentId);
+    expect(folderOf()).toBe('');
+    await undo();
+    expect(folderOf()).toBe('Props');
+  });
+
   it('redo re-applies reparent', async () => {
     reparentEntity(childId, 0);
     await undo();
