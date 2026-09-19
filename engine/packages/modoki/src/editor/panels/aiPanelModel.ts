@@ -34,7 +34,8 @@ export interface ConnectStatus {
   isPackaged: boolean;
   backendReachable: boolean;
   viteReachable: boolean;
-  claude: { found: boolean; path?: string };
+  /** `probeTimedOut`: the check hit its time bound, so absence is UNKNOWN (#1448). */
+  claude: ClaudeCliStatus;
   /** A `.mcp.json` FILE exists (says nothing about whether it's usable). */
   mcpWritten: boolean;
   /** …and it actually carries our modoki server. False ⇒ corrupt, or someone else's
@@ -78,10 +79,20 @@ export interface ConnectResult {
   /** We copied the starter CLAUDE.md primer in (the project had none) so `claude` knows
    *  the tool surface. Never set when the project already had its own CLAUDE.md. */
   claudeMdWritten?: boolean;
-  claude?: { found: boolean; path?: string };
+  claude?: ClaudeCliStatus;
 }
 
 export type PortLevel = 'ok' | 'down' | 'off';
+
+/** Mirrors `ClaudeCliResult` in engine/electron/connectClaude.ts (the renderer cannot import it). */
+export interface ClaudeCliStatus { found: boolean; path?: string; probeTimedOut?: boolean }
+
+/** The claude-CLI row's state. A timed-out check is its own state, NOT "not found": the user
+ *  may well have it installed, so neither the row nor the install link may claim otherwise. */
+export function claudeCliState(c: ClaudeCliStatus): 'found' | 'not found' | 'check timed out' {
+  if (c.found) return 'found';
+  return c.probeTimedOut ? 'check timed out' : 'not found';
+}
 
 export interface PortRow {
   label: string;
@@ -197,6 +208,9 @@ export function connectionSummary(s: ConnectStatus | null): ConnectionSummary {
       message: `This project’s .mcp.json points chrome-devtools at port ${s.mcpChromePort ?? '?'}, which is NOT this editor — Claude would drive another editor’s renderer. Free that port and Reconnect, or remove the chrome-devtools entry.`,
       action: 'Reconnect',
     };
+  }
+  if (claudeCliState(s.claude) === 'check timed out') {
+    return { level: 'action', message: 'Config written, but checking for the `claude` CLI timed out, so this editor cannot tell whether it is installed. If it is, run it in the folder shown below.', action: 'Reconnect' };
   }
   if (!s.claude.found) {
     return { level: 'action', message: 'Config written, but the `claude` CLI wasn’t found — install Claude Code, then run it in the folder shown below.', action: 'Reconnect' };

@@ -207,6 +207,25 @@ Pure helpers (unit-testable, no Electron), consumed by IPC handlers:
 // detectClaudeCli() -> { found, path? }         // `command -v claude` / `where claude`
 ```
 
+`detectClaudeCli` runs **synchronously in the main process** on every ~2.5s status poll, so for as
+long as a probe runs, IPC, menus and window events all stall. Two rules keep that bounded (#1448):
+- **Every probe carries `CLAUDE_PROBE_TIMEOUT_MS` (4s).** `where claude` measured ~55ms on a
+  Windows desktop but ~10s on a loaded CI runner. ⚠️ On macOS/Linux the login-shell probe
+  (`-lic`) may outlive the bound, since an interactive shell can ignore SIGTERM. Unverified; see #1449.
+- **A timed-out probe means "unknown", not "absent".** spawnSync's own `ETIMEDOUT` is what
+  decides it, never the output: a killed probe can leave a truncated path on stdout. The result
+  carries `probeTimedOut: true`. The panel's claude row then reads "check timed out", with no
+  "Install Claude Code" link, because the user may already have it.
+- **The memo is stamped when detection FINISHES**, and how long it holds depends on the result:
+  - a found result: the whole session
+  - a real miss: 15s, so installing claude mid-session is picked up
+  - a timed-out check: 5 min (`CLAUDE_TIMED_OUT_MEMO_TTL_MS`). Re-probing every 15s would freeze
+    the editor for 4s every 15s on exactly the machine that is already slow. It is still not held
+    for the session, because the slowness may be passing load.
+
+  Stamping at the start once stored a result that had already expired, so every poll re-spawned
+  the slow probe.
+
 IPC handlers (registered by `main.ts` alongside the existing bridge handlers, same
 frame-guard):
 

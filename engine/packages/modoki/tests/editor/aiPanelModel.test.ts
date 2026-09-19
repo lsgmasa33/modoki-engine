@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { connectionSummary, portRows, runInstruction, isBackendDeferred, type ConnectStatus } from '../../src/editor/panels/aiPanelModel';
+import { claudeCliState, connectionSummary, portRows, runInstruction, isBackendDeferred, type ConnectStatus } from '../../src/editor/panels/aiPanelModel';
 
 /**
  * C3 — the AI ("Connect Claude Code") panel's pure display logic. The panel keys its
@@ -81,6 +81,15 @@ describe('connectionSummary', () => {
     const s = connectionSummary({ ...base, claude: { found: false } });
     expect(s.level).toBe('action');
     expect(s.message).toMatch(/claude/i);
+  });
+
+  it('a timed-out claude check never tells the user to install it (#1448)', () => {
+    const s = connectionSummary({ ...base, claude: { found: false, probeTimedOut: true } });
+    expect(s.level).toBe('action');
+    expect(s.message).toMatch(/timed out/);
+    expect(s.message).not.toMatch(/install Claude Code/i);
+    // …while a real miss still does — the two states must stay distinguishable.
+    expect(connectionSummary({ ...base, claude: { found: false } }).message).toMatch(/install Claude Code/i);
   });
 
   it('all good → ok, Reconnect available', () => {
@@ -182,5 +191,13 @@ describe('connectionSummary — C9 config location + expansion', () => {
     // someone else's and the panel pushed the user to overwrite it.
     const s = connectionSummary({ ...base, mcpOurs: true, mcpBackendRaw: '${MODOKI_BACKEND}' });
     expect(s.message).not.toContain('isn’t a usable Modoki config');
+  });
+});
+
+describe('claudeCliState (#1448)', () => {
+  it('separates a timed-out check from a real miss', () => {
+    expect(claudeCliState({ found: true, path: '/x/claude' })).toBe('found');
+    expect(claudeCliState({ found: false })).toBe('not found');
+    expect(claudeCliState({ found: false, probeTimedOut: true })).toBe('check timed out');
   });
 });

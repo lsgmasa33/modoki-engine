@@ -677,55 +677,86 @@ export function ensureGitignored(projectRoot: string, entry: string): boolean {
   return true;
 }
 
-/** `which`/`where claude` against the given env's PATH. Null if not found. */
-function whichClaude(env: NodeJS.ProcessEnv): string | null {
+/** Bound on each `claude` probe. Both run synchronously in the Electron MAIN process, so an
+ *  unbounded one stalls IPC, menus and window events for as long as it takes — `where` took
+ *  ~10s per call on a loaded CI runner (#1448) against ~55ms on a desktop. */
+export const CLAUDE_PROBE_TIMEOUT_MS = 4000;
+
+/** What detectClaudeCli reports. `probeTimedOut` means NOT-FOUND IS UNKNOWN, not "absent":
+ *  a probe hit CLAUDE_PROBE_TIMEOUT_MS before answering, so the panel must not tell the user
+ *  to install something they may already have. */
+export interface ClaudeCliResult { found: boolean; path?: string; probeTimedOut?: boolean }
+
+/** One probe's answer. `timedOut` is judged from spawnSync's own ETIMEDOUT, never from the
+ *  output — a killed probe can leave a TRUNCATED path on stdout, which is why a hit also
+ *  requires status 0. */
+interface ProbeAnswer { path: string | null; timedOut: boolean }
+
+function probeTimedOut(r: { error?: Error }): boolean {
+  return (r.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
+}
+
+/** `which`/`where claude` against the given env's PATH. */
+function whichClaude(env: NodeJS.ProcessEnv): ProbeAnswer {
   const finder = process.platform === 'win32' ? 'where' : 'which';
   try {
-    const r = spawnSync(finder, ['claude'], { encoding: 'utf8', env });
+    const r = spawnSync(finder, ['claude'], { encoding: 'utf8', env, timeout: CLAUDE_PROBE_TIMEOUT_MS });
     if (r.status === 0 && r.stdout) {
       const first = r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
-      if (first) return first;
+      if (first) return { path: first, timedOut: false };
     }
+    return { path: null, timedOut: probeTimedOut(r) };
   } catch { /* ignore */ }
-  return null;
+  return { path: null, timedOut: false };
 }
 
 /** Resolve `claude` via the user's LOGIN shell PATH (macOS/Linux). A DMG launched from
  *  Finder/Gatekeeper inherits a MINIMAL PATH that omits ~/.local/bin, /opt/homebrew/bin,
  *  npm-global, etc. — so a real install looks "not found". A login+interactive shell
  *  sources the user's profile and reports the true PATH. */
-function loginShellClaude(env: NodeJS.ProcessEnv): string | null {
-  if (process.platform === 'win32') return null;
+function loginShellClaude(env: NodeJS.ProcessEnv): ProbeAnswer {
+  if (process.platform === 'win32') return { path: null, timedOut: false };
   const shell = env.SHELL || '/bin/zsh';
   try {
     const r = spawnSync(shell, ['-lic', 'command -v claude'], {
-      encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
+      encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'ignore'], timeout: CLAUDE_PROBE_TIMEOUT_MS,
     });
     if (r.status === 0 && r.stdout) {
       const p = r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).pop();
-      if (p && p.startsWith('/')) return p;
+      if (p && p.startsWith('/')) return { path: p, timedOut: false };
     }
+    return { path: null, timedOut: probeTimedOut(r) };
   } catch { /* ignore */ }
-  return null;
+  return { path: null, timedOut: false };
 }
 
 // Memoize: the status panel polls ~every 2.5s and each poll calls this; without a cache
 // we'd spawn a login shell on every poll when claude isn't on the app's stripped PATH.
 // A found result is stable for the session; a not-found is re-checked at most every 15s
-// (so installing claude mid-session is picked up without a relaunch).
-let _claudeMemo: { at: number; result: { found: boolean; path?: string } } | null = null;
+// (so installing claude mid-session is picked up without a relaunch). A TIMED-OUT check is
+// held far longer: re-probing it every 15s would freeze the main process for the full
+// timeout every 15s on exactly the machine that is already slow — but not for the whole
+// session, because the slowness may be transient load (the CI case in #1448).
+let _claudeMemo: { at: number; result: ClaudeCliResult } | null = null;
 const CLAUDE_MEMO_TTL_MS = 15_000;
+export const CLAUDE_TIMED_OUT_MEMO_TTL_MS = 5 * 60_000;
 
 /** Is the `claude` CLI available? Checks the inherited PATH first (fast; correct in dev
  *  and terminal launches), then falls back to the login-shell PATH for a Finder-launched
  *  DMG. Result shape is stable so the panel can show "install Claude Code" when absent. */
-export function detectClaudeCli(env: NodeJS.ProcessEnv = process.env): { found: boolean; path?: string } {
+export function detectClaudeCli(env: NodeJS.ProcessEnv = process.env): ClaudeCliResult {
   const now = Date.now();
-  if (_claudeMemo && (_claudeMemo.result.found || now - _claudeMemo.at < CLAUDE_MEMO_TTL_MS)) {
-    return _claudeMemo.result;
+  if (_claudeMemo) {
+    const { at, result } = _claudeMemo;
+    const ttl = result.probeTimedOut ? CLAUDE_TIMED_OUT_MEMO_TTL_MS : CLAUDE_MEMO_TTL_MS;
+    if (result.found || now - at < ttl) return result;
   }
-  const resolved = whichClaude(env) ?? loginShellClaude(env);
-  const result = resolved ? { found: true, path: resolved } : { found: false };
+  const which = whichClaude(env);
+  const shell = which.path ? null : loginShellClaude(env);
+  const resolved = which.path ?? shell?.path ?? null;
+  const result: ClaudeCliResult = resolved
+    ? { found: true, path: resolved }
+    : which.timedOut || shell?.timedOut ? { found: false, probeTimedOut: true } : { found: false };
   // Stamp when detection FINISHED, not when it started: an unbounded `where` took ~20s on a
   // loaded Windows runner, so a start stamp stored a not-found that was already past its TTL
   // and every poll re-spawned the probe the memo exists to prevent.
