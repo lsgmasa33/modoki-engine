@@ -141,6 +141,25 @@ describe("#1428 — resume() recovers an iOS 'interrupted' AudioContext", () => 
     }
   });
 
+  it('…and the foreground resume() still restarts that bed, though the context is ALREADY running', async () => {
+    // The hidden-skip above is only safe because resume() re-kicks paused streams on EVERY call,
+    // not just when it had to resume the context. Moving that call into the `.then` would leave
+    // this case — WebKit resumed the context while hidden — silent through every later tap.
+    const el = await startBedThenBackground('interrupted');
+    const d = globalThis as unknown as { document?: unknown };
+    d.document = { visibilityState: 'hidden' };
+    try {
+      ctxInstance.state = 'running';
+      ctxInstance.fire('statechange');
+    } finally {
+      delete d.document;                       // foregrounded
+    }
+    audioService.resume();                     // useAudioResumeRearm's foreground call
+    await flush();
+    expect(ctxInstance.resumeCalls).toBe(0);   // nothing to resume…
+    expect(el.paused).toBe(false);             // …but the bed is kicked anyway
+  });
+
   it('a statechange to anything but running does not un-pause', async () => {
     const el = await startBedThenBackground('interrupted');
     ctxInstance.fire('statechange');

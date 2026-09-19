@@ -123,8 +123,9 @@ AudioListener trait ─┘        │
   resumes by itself, never while the page is hidden. **Device-verified** (owner,
   2026-09-19): the music now survives background/foreground in Weaveling. That confirms
   the FIX, not which branch of it did the work — no `ctx.state` was logged, so whether
-  the context really read `'interrupted'` is still inferred. Video (`videoService.ts`) shares the
-  context but still retries only on a gesture — not swept here. Pinned by
+  the context really read `'interrupted'` is still inferred. Video shares the context and
+  needs no gesture to recover — [video.md](./video.md) § "Backgrounding needs no gesture
+  to recover" (swept for #1428, device-verified). Pinned by
   `tests/framework/audioResumeInterrupted.test.ts`; re-test on a phone the same way
   (background mid-bed, foreground, repeat several times) — no headless test can.
 - **Tests** — `tests/runtime/audioSystem.test.ts` (record mode: autoplay, cues,

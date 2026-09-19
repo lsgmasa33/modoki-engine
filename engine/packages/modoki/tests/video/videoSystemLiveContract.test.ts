@@ -392,7 +392,8 @@ describe('#1428 sibling — a clip the OS paused on background resumes on foregr
   // paths: the reconcile's `handle.play()` (`attemptPlay` re-plays a PAUSED element) and
   // `setRate` → `applyRate`'s resume of a started, un-blocked clip. Test 1 goes red only with
   // BOTH broken; test 2 (a refused play, so `blocked` is set and `applyRate` skips it) needs only
-  // the first. Mutation-checked both ways, plus the `deliberatelyPaused` guards for test 3.
+  // the first. Tests 3 and 4 pin the two `deliberatelyPaused` guards: `applyRate`'s (3) and
+  // `retryBlockedPlay`'s (4 — only reachable on a clip that is ALSO blocked).
   function osPause(el: HTMLVideoElement): void {
     Object.defineProperty(el, 'paused', { value: true, configurable: true });
   }
@@ -439,6 +440,26 @@ describe('#1428 sibling — a clip the OS paused on background resumes on foregr
     osPause(el);
     videoSystem(world!); await flush();
     audioResume();                             // the foreground re-arm's signal
+    await flush();
+    expect(el.paused).toBe(true);
+  });
+
+  it('a clip that is autoplay-BLOCKED and then game-paused stays paused through the foreground signal', async () => {
+    // The only path to `retryBlockedPlay`'s own `deliberatelyPaused` guard: the clip must be
+    // blocked (or the `!this.blocked` return fires first) and paused by the game. The foreground
+    // re-arm fires the gesture-unlock signal with no tap, so without the guard a backgrounded
+    // game would restart a clip it had paused.
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    playBehaviour = 'block';
+    const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+    videoSystem(world!); await flush();        // refused → blocked
+    e.set(VideoPlayer, { playing: false });    // the game pauses it
+    videoSystem(world!); await flush();
+    const el = videoElementFor(e.id())!;
+    expect(el.paused).toBe(true);
+
+    playBehaviour = 'allow';
+    audioResume();
     await flush();
     expect(el.paused).toBe(true);
   });
