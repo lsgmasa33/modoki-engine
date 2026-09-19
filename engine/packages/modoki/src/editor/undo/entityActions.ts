@@ -921,22 +921,24 @@ function outermostInstanceRoot(nodeId: number): number {
 }
 
 /** Which links a move of `entityId` under `newParentId` cuts — decided BEFORE the move, while the mover still
- *  sits where it was (#1445). Null when the move stays inside its outermost instance (#1437: saved as a move).
- *  Otherwise the move carries a subtree out, and a link is cut exactly where it SPLITS: a member on the other
- *  side from its instance root is unpacked (`strip`), an owned nested root on the other side from the instance
- *  whose row expanded it is made standalone (`promote`, #1447). Stored roots keep everything. */
-function planLeaveInstance(entityId: number, newParentId: number): { strip: number[]; promote: number[] } | null {
+ *  sits where it was (#1445). Null when it cuts none. A move that stays inside its outermost instance is saved
+ *  as a move (#1437) and splits nothing. One that carries a subtree OUT cuts a link exactly where it SPLITS: a
+ *  member on the other side from its instance root is unpacked (`strip`), an owned nested root on the other
+ *  side from the instance whose row expanded it is made standalone (`promote`, #1447). Stored roots keep
+ *  everything. Either way, a member the move leaves ABOVE its frame is unpacked too (#1450). */
+function planMoveUnlinks(entityId: number, newParentId: number): { strip: number[]; promote: number[] } | null {
   const piMeta = getTraitByName('PrefabInstance');
   if (!piMeta) return null;
   const top = outermostInstanceRoot(entityId);
-  if (!top || outermostInstanceRoot(newParentId) === top) return null;
+  if (!top) return null;
+  const leaving = outermostInstanceRoot(newParentId) !== top;
   const all = getAllEntities();
   const inSub = new Set(collectSubtreeIds(all.map((e) => [e.id, e.parentId] as const), [entityId]));
   const byGuid = new Map(all.filter((e) => e.guid).map((e) => [e.guid!, e.id]));
   const parentOf = new Map(all.map((e) => [e.id, e.parentId]));
   const strip: number[] = [];
   const promote: number[] = [];
-  for (const e of all) {
+  if (leaving) for (const e of all) {
     const pi = findEntity(e.id)?.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number; homeParent?: string } | undefined;
     if (!pi) continue;
     const root = pi.rootInstanceId || 0;
@@ -950,11 +952,13 @@ function planLeaveInstance(entityId: number, newParentId: number): { strip: numb
       strip.push(e.id);
     }
   }
-  // A linked member of a PROMOTED instance is written nowhere, and vanishes on reload with the instance, in two
-  // shapes (close-out reviews): it sits ABOVE its frame — the first promoted root on its ownership chain, its own
-  // root or an owned one above it — or it ends up in a different outermost instance from that frame (a
-  // standalone instance is saved from its root down). Unpacked instead. A member merely BESIDE its frame inside
-  // the same outermost instance is a #1437 move and stays linked. Judged on the tree AFTER the move.
+  // A linked member is written by its FRAME's save — the first promoted root on its ownership chain, else the
+  // stored root the chain reaches — and a frame is saved from its root down. So a member is written nowhere, and
+  // vanishes on reload with the instance, in two shapes (close-out reviews, #1450): it sits ABOVE its frame, or
+  // it ends up in a different outermost instance from that frame. Unpacked instead. A member merely BESIDE its
+  // frame inside the same outermost instance is a #1437 move and stays linked, and so is one above an OWNED
+  // root that is not its frame (that root is saved inside the frame's instance). Judged on the tree AFTER the
+  // move — and on every move: one that stays inside the outermost instance can put a root under its own member.
   const promoted = new Set(promote);
   const stripped = new Set(strip);
   const after = new Map(parentOf);
@@ -972,32 +976,78 @@ function planLeaveInstance(entityId: number, newParentId: number): { strip: numb
     }
     return top;
   };
-  /** The first promoted root on `id`'s ownership chain, or 0 when a stored root comes first. */
-  const promotedFrameOf = (id: number): number => {
+  /** `id`'s frame: the first promoted root on its ownership chain, or the stored root the chain reaches. */
+  const frameOf = (id: number): number => {
     const seen = new Set<number>();
     for (let root = piOf(id)?.rootInstanceId || 0; root && !seen.has(root);) {
       seen.add(root);
       if (promoted.has(root)) return root;
       const rp = piOf(root);
-      if (!rp?.parentLocalId) return 0; // a stored root
+      if (!rp?.parentLocalId) return root; // a stored root
       const rowParent = identityParentId(parentOf.get(root) ?? 0, rp.homeParent, (g) => byGuid.get(g));
       root = piOf(rowParent)?.rootInstanceId || 0;
     }
     return 0;
   };
-  for (const e of all) {
-    if (stripped.has(e.id) || promoted.has(e.id)) continue;
-    const pi = piOf(e.id);
-    if (!pi?.rootInstanceId || (pi.rootInstanceId === e.id && !pi.parentLocalId)) continue;
-    const frame = promotedFrameOf(e.id);
-    if (!frame) continue;
-    let above = false;
+  /** Whether the save cannot write `id` as linked where the move leaves it: its identity parent is unpacked, or it
+   *  sits above its frame, or outside its outermost. The first is close-out review 3: a live child of an unpacked
+   *  member has no identity walk left — `rehomeDependents` re-points only a recorded home — so an owned root there
+   *  reloaded as a stored one under new guids, and a member reloaded plain while the editor still showed it linked. */
+  const unwritable = (id: number): boolean => {
+    const pi = piOf(id);
+    if (pi && !pi.homeParent && stripped.has(parentOf.get(id) ?? 0)) return true;
+    const frame = frameOf(id);
+    if (!frame || frame === id) return false;
     const seen = new Set<number>();
     for (let cur = after.get(frame) ?? 0; cur && !seen.has(cur); cur = after.get(cur) ?? 0) {
-      if (cur === e.id) { above = true; break; }
+      if (cur === id) return true;
       seen.add(cur);
     }
-    if (above || topAbove(e.id) !== (topAbove(frame) || frame)) strip.push(e.id);
+    return topAbove(id) !== (topAbove(frame) || frame);
+  };
+  /** The owned roots on `id`'s ownership chain below its frame — whose promotion would change that frame. */
+  const ownedChain = (id: number): number[] => {
+    const out: number[] = [];
+    const seen = new Set<number>();
+    for (let root = piOf(id)?.rootInstanceId || 0; root && !seen.has(root) && !promoted.has(root);) {
+      seen.add(root);
+      const rp = piOf(root);
+      if (!rp?.parentLocalId) break; // a stored root
+      out.push(root);
+      root = piOf(identityParentId(parentOf.get(root) ?? 0, rp.homeParent, (g) => byGuid.get(g)))?.rootInstanceId || 0;
+    }
+    return out;
+  };
+  // Settled ONE entity at a time, re-judging everything after each (close-out review 2): an unwritable OWNED root
+  // is PROMOTED — #1447's rule for an owned root split from its owner — and becomes the frame its members and the
+  // roots it owns are judged against; an unwritable member is unpacked, which can leave what hangs below it outside
+  // every instance. So each verdict can flip another, and a pass over the entity list in storage order decided by
+  // that order: a member under an unpacked one stayed linked and the save dropped it; an owned root under one was
+  // left owned and reloaded under new guids; an INNER was promoted along with the MID it would have followed. Each
+  // pass acts on an entity nothing else pending can flip — no unwritable tree ancestor, no unwritable owned root on
+  // its chain — or, failing that, the shallowest with no unwritable owned root on its chain. Promotion and unpacking
+  // only grow, so it ends.
+  const linkedMember = (id: number): boolean => {
+    const pi = piOf(id);
+    return !!pi?.rootInstanceId && !(pi.rootInstanceId === id && !pi.parentLocalId) && !promoted.has(id) && !stripped.has(id);
+  };
+  const ancestorsAfter = (id: number): number[] => {
+    const out: number[] = [];
+    const seen = new Set<number>([id]);
+    for (let cur = after.get(id) ?? 0; cur && !seen.has(cur); cur = after.get(cur) ?? 0) { seen.add(cur); out.push(cur); }
+    return out;
+  };
+  for (;;) {
+    const bad = all.map((e) => e.id).filter((id) => linkedMember(id) && unwritable(id));
+    if (!bad.length) break;
+    const badSet = new Set(bad);
+    const free = (id: number) => !ancestorsAfter(id).some((a) => badSet.has(a)) && !ownedChain(id).some((r) => r !== id && badSet.has(r));
+    // Nothing free: still an owner before the roots it owns (close-out review 3 — the shallowest alone promoted an
+    // INNER ahead of its MID), and among those the shallowest.
+    const unowned = bad.filter((id) => !ownedChain(id).some((r) => r !== id && badSet.has(r)));
+    const shallowest = (ids: number[]) => ids.reduce((a, b) => (ancestorsAfter(b).length < ancestorsAfter(a).length ? b : a));
+    const pick = bad.find(free) ?? shallowest(unowned.length ? unowned : bad);
+    if (piOf(pick)?.rootInstanceId === pick) { promote.push(pick); promoted.add(pick); } else { strip.push(pick); stripped.add(pick); }
   }
   return strip.length || promote.length ? { strip, promote } : null;
 }
@@ -1101,7 +1151,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
 
   // Taken BEFORE the parent write (#1445): afterwards the mover's own ancestry runs through its new parent, so a
   // drop into ANOTHER instance read as staying inside the one it had left.
-  const detachPlan = parentChanged ? planLeaveInstance(entityId, newParentId) : null;
+  const detachPlan = parentChanged ? planMoveUnlinks(entityId, newParentId) : null;
 
   if (parentChanged) writeTraitField(entityId, attrMeta, 'parentId', newParentId);
   if (newSortOrder !== undefined) writeTraitField(entityId, attrMeta, 'sortOrder', newSortOrder);
@@ -1112,8 +1162,9 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // instance separated from the instance whose row expanded it becomes a standalone instance of its own prefab
   // (owner ruling 2026-09-19 — it used to unpack too). Everything that moves together stays linked: a stored
   // root dropped anywhere stays an instance, and inside another instance becomes its user-added nested one
-  // (#1436). A move that stays inside the outermost instance cuts nothing — it is saved as a `moved` entry
-  // (#1437). All of it is part of this action's undo/redo.
+  // (#1436). A move that stays inside the outermost instance is saved as a `moved` entry (#1437) and cuts only a
+  // member it leaves above its frame — a root dropped under its own member unpacks that member (#1450, owner
+  // ruling 2026-09-19: unpack, not refuse). All of it is part of this action's undo/redo.
   const piMeta = getTraitByName('PrefabInstance');
   // `ownerRef` addresses the instance root by guid (null: the target IS the root): `data.rootInstanceId`
   // is a bare ecs id, which a world rebuild (Play→Stop) reassigns, and an undo restoring the stale id

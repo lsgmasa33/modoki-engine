@@ -551,7 +551,7 @@ is saved (owner rulings, #1437: (a) same frame, (b) across frames — under a sc
 nested instance's member, out of a nested instance into its outer one). Moved OUT of the outermost
 instance, a member is unpacked, while an owned nested instance stays an instance of its own prefab
 (#1447). The rule for that case is in docs/scene-loading.md § the #1355 note. `reparentEntity` decides
-by `outermostInstanceRoot`, before the parent write (`planLeaveInstance`, #1445).
+by `outermostInstanceRoot`, before the parent write (`planMoveUnlinks`, #1445).
 
 **Identity does not move.** A member's guid is derived from its row PATH (`deriveMemberGuid(anchor,
 path)`), so a moved member must keep deriving from where it was. `PrefabInstance.homeParent` holds the
@@ -655,6 +655,7 @@ row round-trips through save + reload.
 | Create / drag a plain entity under a nested member | plain, in `nestedStructure` | nothing to apply | becomes an **Inner** member (every Inner) |
 | Drag an outer member out of the instance | unpacked; the instance records it `removed` | removed from Outer | — |
 | Drag a member to another parent inside the instance | stays linked, a `moved` entry | re-parents the row | — |
+| Drop a user-added instance's root under its own member | that member is unpacked (#1450); the instance stays linked under it | — | — |
 | Drag a nested member into the outer instance | stays linked | Outer records the move (`moved` map) | refused, pointing outward |
 | Drag an outer member into the nested instance | stays linked | Outer records the move | — |
 | Drag a nested member out of everything | unpacked | nothing to apply | removed from Inner |
@@ -666,12 +667,58 @@ row round-trips through save + reload.
 | Drag a member into ANOTHER instance | unpacked (#1445): the old instance records it `removed`, the new one saves it as `added` | — | — |
 | Drag an instance into an instance of the SAME prefab | allowed, a reference node (#1436) | **refused**, with a reason: a prefab cannot contain itself (#1446) | — |
 
-When a leave promotes a nested instance, a linked member of it is unpacked in exactly the two shapes the save
-cannot write (`planLeaveInstance`): it sits ABOVE its frame (the first promoted root on its ownership chain), or
-the outermost instance it sits inside differs from its frame's. A standalone instance is saved from its root
-down, so such a member was written nowhere and both vanished on reload. A member merely BESIDE its frame inside
-the same outermost instance is an ordinary #1437 move and stays linked.
-The same shape reached by a move that does NOT leave the instance is #1450.
+A linked member is written by its **frame**'s save: the first promoted root on its ownership chain, or else
+the stored root (top-level or user-added) that chain reaches. A frame is saved from its root down. So after
+EVERY reparent (`planMoveUnlinks`), a linked member is unpacked in exactly the two shapes the save cannot
+write: it sits ABOVE its frame, or the outermost instance it sits inside differs from its frame's. Written
+nowhere, both it and the instance vanished on reload. A member merely BESIDE its frame inside the same
+outermost instance is an ordinary #1437 move and stays linked.
+
+This is also the rule for a move that stays INSIDE the instance (#1450, owner ruling 2026-09-19: unpack, not
+refuse as a cycle). Drag a user-added instance's member beside its root, then drop the root under that member:
+the member unpacks into a plain entity, saved as the outer instance's `added` node, and the instance hangs
+under it. An **owned** nested root is not a frame, because its members are saved by the stored root above it.
+So an owned root dropped under its own member keeps that member linked. The same holds two levels down (a
+`Mid` dropped under a member of the `Inner` its row expanded), and both reload as moves. The frame was once
+only a PROMOTED root, and only the leave path checked it.
+
+**An owned root the save cannot write is PROMOTED, never unpacked** (#1447's rule, #1450 close-out review).
+Drop a stored `Mid` under the `Inner` its own row expanded, and that `Inner` now sits above its frame. It
+becomes a standalone instance, and it is the frame its own members are judged against after that. The first
+version put the owned root through the member path and unpacked it. `Inner`'s `Leaf`, moved beside it, then
+named a plain entity as its root, and the save dropped it.
+
+**Verdicts are settled one at a time**, re-judging everything after each. This is because one verdict can flip
+another:
+- A promotion changes the frame for everything owned below it.
+- An unpack can leave whatever hangs below it outside every instance.
+
+The second review measured three failures when the loop instead acted on the whole list in storage order:
+- A member under an unpacked member stayed linked, and the save dropped it.
+- An owned root under an unpacked member stayed owned, and it reloaded under new guids.
+- With `Inner` ahead of its `Mid` in the entity list, both were promoted, which cut `Inner` off `Mid`'s row for
+  good.
+
+Each pass acts on an entity whose verdict nothing else pending can flip: nothing unwritable sits above it in
+the tree, and nothing unwritable sits on its ownership chain. Failing that, it acts on the shallowest entity
+that has no unwritable owned root on its chain, so an owner is still settled before the roots it owns. (The
+plain shallowest pick promoted an `Inner` ahead of its `Mid`.) Promotions and unpacks only ever grow, so the
+loop ends.
+
+A third way to be unwritable (close-out review 3): the entity's identity parent is being unpacked, and the
+entity has no recorded home. A LIVE child of an unpacked member has no identity walk left, because
+`rehomeDependents` only re-points a recorded `homeParent`. Take a move inside the instance, which changes no
+outermost instance: an owned root under the unpacked member used to reload as a stored root under new guids,
+and a member there reloaded as a plain entity while the editor still showed it linked.
+
+**The loader applies moves against the tree they describe** (#1452). The `moved` entries describe the tree
+after all of them, so a member moved under a member that was its row descendant (Button up to the root, then
+Panel under Button) passes through a cycle that exists only halfway. `drainAfterDerive` lets a move whose
+target still sits inside the member wait until the others land. Only a move that is still waiting once
+nothing else can move is refused, with the "inside it; left at its row" warning. Applied in order, Panel's
+move was refused and it reloaded at its row. The drain mixes the prefab's own moves with the instance's, and
+the same shape can be split across the two: Button's move is the prefab's and Panel's is the instance's. The
+wait covers that case as well.
 
 **Deleting a moved member's owner promotes or unlinks it, never re-homes it past the owner (#1451).** A delete
 re-points a surviving member whose home goes to that home's own identity parent (`rehomeDependents`). That walk

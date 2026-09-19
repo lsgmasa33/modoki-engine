@@ -866,8 +866,13 @@ function drainAfterDerive(world: World): void {
     if (!parentGuid) console.warn(`${m.logPrefix} a prefab's move names ${m.parentGuid}, which is no member; left at its row`);
     chosen.set(ecsId, { m: { ...m, ecsId }, parentGuid });
   }
-  for (const { m, parentGuid } of chosen.values()) {
-    if ((parentGuid && moveMemberHome(world, m.ecsId!, parentGuid, m.logPrefix)) || !doomedRows.size) continue;
+  // The moves describe the tree AFTER all of them, so one can pass through a cycle that exists only halfway: a
+  // member moved under a member that was its row descendant waits for that one to move out first (#1452). A
+  // move whose target still sits inside it waits for the others; one waiting once nothing else can move is a
+  // real cycle, refused by moveMemberHome with its warning. (While any wait, one is always ready: the path
+  // down to its target must hold another move, and a finite tree bottoms out.)
+  const settleMove = (m: AfterDerive['moves'][number], parentGuid: string): void => {
+    if ((parentGuid && moveMemberHome(world, m.ecsId!, parentGuid, m.logPrefix)) || !doomedRows.size) return;
     // The move failed, and the member still sits under a removed row that is about to go: lift it to the
     // nearest ancestor that stays, as a move, so the removal does not take it with it.
     const parentOf = new Map(links);
@@ -876,7 +881,18 @@ function drainAfterDerive(world: World): void {
     const target = to ? findEntityById(to, world) as EntityHandle | undefined : undefined;
     const guid = target && attrMeta?.trait && target.has(attrMeta.trait) ? (target.get(attrMeta.trait) as { guid?: string }).guid : '';
     if (guid) moveMemberHome(world, m.ecsId!, guid, m.logPrefix);
+  };
+  let pending = [...chosen.values()];
+  for (let progressed = true; progressed;) {
+    progressed = false;
+    pending = pending.filter(({ m, parentGuid }) => {
+      if (parentGuid && isInsideMember(world, m.ecsId!, parentGuid)) return true; // checked as it applies
+      settleMove(m, parentGuid);
+      progressed = true;
+      return false;
+    });
   }
+  for (const { m, parentGuid } of pending) settleMove(m, parentGuid);
   if (!q.deletes.length) return;
   // A member whose home is one of these rows keeps its path through it (core/ecs/memberHome.ts).
   const liveLinks: [number, number][] = [];
@@ -885,6 +901,18 @@ function drainAfterDerive(world: World): void {
   }
   rehomeDependents(new Set(collectSubtreeIds(liveLinks, [...doomedRows])), world);
   for (const d of q.deletes) d.ops.deleteEntities(d.ecsIds);
+}
+
+/** Whether the entity whose guid is `parentGuid` sits inside `ecsId`'s subtree (itself included) right now. */
+function isInsideMember(world: World, ecsId: number, parentGuid: string): boolean {
+  const attrMeta = getTraitByName('EntityAttributes');
+  if (!attrMeta) return false;
+  for (let cur = findEntityByGuid(parentGuid, world) as EntityHandle | undefined, n = 0; cur && n < 10_000; n++) {
+    if (cur.id() === ecsId) return true;
+    const up: number = cur.has(attrMeta.trait) ? ((cur.get(attrMeta.trait) as { parentId?: number }).parentId ?? 0) : 0;
+    cur = up ? findEntityById(up, world) as EntityHandle | undefined : undefined;
+  }
+  return false;
 }
 
 /** Reparent member `ecsId` under the entity whose guid is `parentGuid`, recording the parent it leaves as
@@ -898,11 +926,7 @@ function moveMemberHome(world: World, ecsId: number, parentGuid: string, logPref
   const target = findEntityByGuid(parentGuid, world) as EntityHandle | undefined;
   const ea = member.get(attrMeta.trait) as { parentId?: number; name?: string };
   if (!target) { console.warn(`${logPrefix} moved member "${ea.name}": its parent ${parentGuid} is gone; left at its row`); return false; }
-  for (let cur: EntityHandle | undefined = target, n = 0; cur && n < 10_000; n++) {
-    if (cur.id() === ecsId) { console.warn(`${logPrefix} moved member "${ea.name}": ${parentGuid} is inside it; left at its row`); return false; }
-    const up: number = cur.has(attrMeta.trait) ? ((cur.get(attrMeta.trait) as { parentId?: number }).parentId ?? 0) : 0;
-    cur = up ? findEntityById(up, world) as EntityHandle | undefined : undefined;
-  }
+  if (isInsideMember(world, ecsId, parentGuid)) { console.warn(`${logPrefix} moved member "${ea.name}": ${parentGuid} is inside it; left at its row`); return false; }
   const home = ea.parentId ? findEntityById(ea.parentId, world) as EntityHandle | undefined : undefined;
   const homeGuid = home?.has(attrMeta.trait) ? ((home.get(attrMeta.trait) as { guid?: string }).guid ?? '') : '';
   if (!homeGuid || homeGuid === parentGuid) return !!homeGuid; // no home to remember, or already there

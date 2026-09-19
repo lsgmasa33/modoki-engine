@@ -1563,7 +1563,7 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   plain. That happens under an unanchored (guid-less, scene-root) instance, whose owner guid was
   minted at move time and re-derived differently by the rebuild. Its stale id may name an unrelated
   entity, so relinking would make the save drop it.
-  **Leaving the outermost instance cuts only the links the move SPLITS** (`planLeaveInstance`, decided
+  **Leaving the outermost instance cuts only the links the move SPLITS** (`planMoveUnlinks`, decided
   before the parent write — #1445: taken after it, a member dropped into ANOTHER instance read as still
   inside its own and stayed linked to it there). A member on the other side of the move from its
   instance root is unpacked into a plain entity that keeps its guid. **An owned nested instance on the
