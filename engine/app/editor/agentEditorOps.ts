@@ -43,7 +43,8 @@ import {
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
   isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEditReport, exitPrefabEditing,
-  createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
+  createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, ensureGuid, type TraitSpec,
+  planReparent, applyReparent, type ReparentPlan, preflightSceneMove, formatSceneMoveConfirm,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
@@ -79,7 +80,7 @@ import {
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid,
-  getAllTraits, resolveCreateEntitySpec, reparentRefusal, parentRefusal, isResourceEntity, type MutateOp, type MutateEntityRef,
+  getAllTraits, resolveCreateEntitySpec, parentRefusal, isResourceEntity, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
   sceneManager, assetUrl, type AssetSchemaType, collectHandles, rawNow, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
@@ -600,6 +601,24 @@ function requireLiveId(ref: EntityAddress | undefined, op: string, accept: reado
   return r.ok ? r.id : throwAddressRefusal(r);
 }
 
+/** A loaded scene as a person knows it: its file name. `''` is the primary. */
+function loadedSceneName(sceneGuid: string): string {
+  for (const s of sceneManager.getLoadedScenes().values()) {
+    if ((s.role === 'primary' ? '' : s.guid) === sceneGuid) return s.path.split('/').pop() || s.path;
+  }
+  return sceneGuid || 'primary';
+}
+
+/** Why `planReparent` refused, in words an agent can act on (#1429). */
+function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>['reason'], id: number, parentId: number): string {
+  switch (reason) {
+    case 'resource': return `reparent-entity: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
+    case 'instance-member': return `reparent-entity: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and something in ${id}'s subtree (${id} itself, or an entity under it) belongs to a prefab instance that would stay behind, splitting it across two scene files. Move that instance's root instead, or unpack that instance first.`;
+    case 'into-instance': return `reparent-entity: refused to move ${id} under ${parentId} — ${id} is a prefab instance root, and ${parentId} belongs to another scene AND sits inside a prefab instance. A linked instance cannot be saved there. Unpack ${id} first, or pick a parent outside every instance.`;
+    default: return `reparent-entity: refused to move ${id} under ${parentId} — the move is illegal (${reason === 'self-parent' ? 'an entity cannot be its own parent' : `${parentId} is a descendant of ${id}`}).`;
+  }
+}
+
 /** The parent an entity should be created under / moved to, VALIDATED.
  *
  *  `parentGuid` was checked and `parentId` was not, so a stale or invented id sailed through as a
@@ -894,8 +913,11 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             // A parentId write is a reparent in all but name, so it answers to the same rule (#1248). It
             // used to go straight to the trait, past the resource AND the cycle check.
             const newParent = meta.name === 'EntityAttributes' ? (fields as Record<string, unknown>).parentId : undefined;
-            const linkRefusal = typeof newParent === 'number' ? reparentRefusal(id, newParent) : null;
-            if (linkRefusal) { errors.push(`${where}: EntityAttributes.parentId ${newParent} refused (${linkRefusal}) for entity ${id} — nothing was applied to it`); continue; }
+            // Judged by the same plan as reparent-entity (#1429). A parent from another scene is a scene move,
+            // and a batch has no step to confirm one, so it is refused here with the op that can.
+            const plan = typeof newParent === 'number' ? planReparent(id, newParent) : null;
+            if (plan?.kind === 'refused') { errors.push(`${where}: EntityAttributes.parentId ${newParent} refused (${plan.reason}) for entity ${id} — nothing was applied to it`); continue; }
+            if (plan?.kind === 'scene-move') { errors.push(`${where}: EntityAttributes.parentId ${newParent} belongs to another scene (${loadedSceneName(plan.to)}), so this parent change is a scene move — use reparent-entity with moveToScene: true. Nothing was applied to entity ${id}`); continue; }
             for (const [field, value] of Object.entries(fields)) writeTraitFieldWithUndo(id, meta, field, value);
             changed++;
           }
@@ -2540,23 +2562,36 @@ export function registerEditorAgentOps(): void {
     deleteEntitiesWithUndo(deleted, (sel) => setSelectionRaw(sel[0] ?? null, sel));
     return { ok: true, ...named, ...also, saved: false, ...(missing.length ? { skipped: missing, warning: `${missing.length} ref(s) matched no live entity and were skipped (ids are reassigned on scene reload — prefer guid)` } : {}) };
   });
-  registerAgentOp('reparent-entity', (params) => {
+  registerAgentOp('reparent-entity', async (params) => {
     // Both the moved entity and the new parent resolve through the shared resolver (#1223): one address
     // each, `{id}` only for a guid-less entity — a recycled id would silently move the wrong node.
-    const p = (params ?? {}) as { id?: number; guid?: string; parentId?: number; parentGuid?: string; sortOrder?: number };
+    const p = (params ?? {}) as { id?: number; guid?: string; parentId?: number; parentGuid?: string; sortOrder?: number; moveToScene?: boolean };
     const id = requireLiveId(p, 'reparent-entity');
     const parentId = resolveParentId(p, 'reparent-entity parent', { move: true });
-    // Name the rule that refused, from the one shared check, before reparentEntity folds it into `false`.
-    if (reparentRefusal(id, parentId) === 'resource') {
-      throw new Error(`reparent-entity: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`);
+    // The one decision every reparent entry point asks (#1429), so the refusal can name its rule.
+    const plan = planReparent(id, parentId);
+    if (plan.kind === 'refused') throw new OpRefusal('REFUSED_BY_OP', reparentRefusalText(plan.reason, id, parentId));
+    // A parent from another scene makes this a SCENE MOVE. A human answers the Hierarchy's prompt; the
+    // agent answers it with `moveToScene: true`, after reading the same text the human reads. Refusing
+    // first, rather than moving and reporting, is deliberate: the move changes what every level using
+    // that base shows, so it has to be chosen knowingly (the discardUnsaved shape, #1429 design).
+    if (plan.kind === 'scene-move' && p.moveToScene !== true) {
+      const pre = await preflightSceneMove(id, plan.to);
+      const parentName = getAllEntities().find((e) => e.id === parentId)?.name || `Entity ${parentId}`;
+      const text = formatSceneMoveConfirm(pre, plan.to, { parentName, sceneName: loadedSceneName(plan.to) });
+      throw new OpRefusal('REFUSED_BY_OP',
+        `reparent-entity: nothing was applied — the new parent belongs to another scene, so this reparent moves the entity into that scene. `
+        + `The editor asks a person first; re-send with moveToScene: true to make the move. What it would do:\n${text}`);
     }
-    const ok = reparentEntity(id, parentId, p.sortOrder);
-    // reparentEntity returns false for a no-op OR a rejected move (self-parent, or a cycle) —
-    // {ok:false} alone left the agent unable to tell "done nothing" from "refused, and why". (C7)
-    if (!ok) {
-      throw new Error(`reparent-entity: refused to move ${id} under ${parentId} — the move is illegal (self-parent, or ${parentId} is a descendant of ${id}).`);
+    const res = applyReparent(id, parentId, p.sortOrder);
+    // After a successful plan the only `false` left is a no-op: same parent, same sortOrder. (C7)
+    if (!res.ok) {
+      throw new OpRefusal('REFUSED_BY_OP', `reparent-entity: nothing changed — ${id} is already under ${parentId || 'the root'}${p.sortOrder !== undefined ? ` at sortOrder ${p.sortOrder}` : ''}.`);
     }
-    return { ok, saved: false };
+    const move = res.sceneMove && res.plan.kind === 'scene-move'
+      ? { movedToScene: { from: loadedSceneName(res.plan.from), to: loadedSceneName(res.plan.to), count: res.sceneMove.movedIds.length } }
+      : {};
+    return { ok: true, saved: false, ...move };
   });
 
   // ── Live-world scene mutation (mcp-persistence.md Phase 2) ──

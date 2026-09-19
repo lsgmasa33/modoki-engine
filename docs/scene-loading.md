@@ -1232,12 +1232,39 @@ Two consumers:
 
 ### Two guards that keep this safe
 
-- **No cross-scene parenting.** A level entity parented under a base entity breaks save
-  provenance (filtering keys off an entity's OWN `sourceScene`, not its parent's) and
-  teardown. `reparentEntity` hard-rejects it — the one interactive path both
-  `modoki_reparent_entity` and the Hierarchy drag go through — and `SceneManager` warns
-  at load time after the staging world is fully populated. Promote/demote *changes*
-  `sourceScene`, so it satisfies the guard rather than relaxing it.
+- **No cross-scene parenting: a parent from another scene is a SCENE MOVE** (#1429, owner
+  ruling). A level entity left under a base entity breaks save provenance and teardown, because
+  filtering keys off an entity's OWN `sourceScene`, not its parent's. Under a base prefab
+  MEMBER, `captureInstanceStructure` bakes the child into that base's `added` list. Under a base
+  non-member, `serializeScene`'s foreign-subtree exclusion drops it from BOTH files. So every
+  entry point asks one question, `planReparent` (`entityActions.ts`): same scene → a plain
+  `reparentEntity`; another scene → `moveEntityToScene` under the new parent, which re-stamps
+  the whole subtree. That move is **prompted**, because every level using that base will show
+  the entity:
+
+  | Entry point | How the move is confirmed |
+  |---|---|
+  | Hierarchy row drop, cut → paste | the editor's own modal (`confirmInEditor`), text from `formatSceneMoveConfirm` |
+  | agent `reparent-entity` / `modoki_reparent_entity` | refused with that same text until re-sent with `moveToScene: true` |
+  | agent `apply-scene-ops` `setTrait parentId` | refused per op, naming `reparent-entity {moveToScene}`: a batch has no confirm step |
+
+  Two prefab cases are **refused**, because a scene move cannot carry `reparentEntity`'s
+  "unpack on move":
+  - `instance-member`: something in the moved subtree is linked to an instance that stays
+    behind. That covers a member, an owned nested root whose outer instance is not moving, and
+    a member held under a plain added child. Moving it would split the instance across two
+    files.
+  - `into-instance`: a stored instance root dropped under an entity inside another instance. A
+    linked instance cannot be saved there (#1355/#1358).
+
+  Move the whole instance, or unpack it first. A subtree **created**
+  under a base entity (create, paste-copy, prefab instantiate) is stamped into the parent's
+  scene with no prompt, since nothing moves (`adoptParentScene`, owner option A).
+  `reparentEntity` still hard-rejects a cross-scene parent as the backstop for any direct
+  caller, and `SceneManager` warns at load time when a FILE already holds one.
+  Promote/demote *changes* `sourceScene`, so it satisfies the rule rather than relaxing it.
+  ⚠️ `captureInstanceStructure` deliberately has no `sourceScene` filter. A filter there
+  would turn a wrong-file save into a lost entity; the fix is to keep the state from existing.
 - **Duplicate guids across the chain.** `filterDuplicateChainGuids`
   (`SceneManager.ts`) drops a root (and its subtree) whose guid a chain scene already
   spawned, warning loudly. Chain order means the **first scene to spawn a guid keeps

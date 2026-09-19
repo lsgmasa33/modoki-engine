@@ -95,15 +95,27 @@ export async function preflightSceneMove(entityId: number, targetScene: string):
   return result;
 }
 
+/** A reparent that crosses scenes (#1429): the new parent, and the scene file it belongs to. */
+export interface SceneMoveInto { parentName: string; sceneName: string }
+
 /** Pure string builder for the promote/demote confirm dialog — separated from
- *  `preflightSceneMove` so it's unit-testable without a fetch mock. */
-export function formatSceneMoveConfirm(pre: SceneMovePreflight, targetScene: string): string {
+ *  `preflightSceneMove` so it's unit-testable without a fetch mock. With `into`, the move is a
+ *  reparent under a parent from another scene, and the text says so first: the person asked for a
+ *  new parent, not a new scene, so the scene change is the thing they must not miss. The agent's
+ *  `reparent-entity` refusal carries this same text. */
+export function formatSceneMoveConfirm(pre: SceneMovePreflight, targetScene: string, into?: SceneMoveInto): string {
   const verb = targetScene ? 'Promote' : 'Demote';
   const dest = targetScene ? 'into the base scene' : 'to the primary scene';
   const lines: string[] = [];
-  lines.push(`${verb} "${pre.entityName}" (${pre.subtreeCount} ${pre.subtreeCount === 1 ? 'entity' : 'entities'}) ${dest}?`);
-  lines.push('');
-  if (pre.reRootFrom) {
+  if (into) {
+    lines.push(`Move "${pre.entityName}" (${pre.subtreeCount} ${pre.subtreeCount === 1 ? 'entity' : 'entities'}) into scene "${into.sceneName}"?`);
+    lines.push('');
+    lines.push(`• Its new parent "${into.parentName}" belongs to scene "${into.sceneName}". An object and its parent must be saved in the same scene file, so it moves into that scene, and Save All writes it there.`);
+  } else {
+    lines.push(`${verb} "${pre.entityName}" (${pre.subtreeCount} ${pre.subtreeCount === 1 ? 'entity' : 'entities'}) ${dest}?`);
+    lines.push('');
+  }
+  if (pre.reRootFrom && !into) { // a reparent leaving its old parent is what was asked for
     lines.push(`• It leaves its parent "${pre.reRootFrom}" behind — that parent stays where it is, so the authored parent/child relationship is gone (its world position/rotation is preserved by the move).`);
   }
   if (targetScene) lines.push('• Every level that uses this base will now show it.');

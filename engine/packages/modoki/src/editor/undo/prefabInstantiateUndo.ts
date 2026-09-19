@@ -18,6 +18,7 @@
 import type { UndoAction } from './undoManager';
 import { entityRef, type EntityRef } from './entityRef';
 import { reportUndoFailure } from './undoFailure';
+import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { getAllEntities, readTraitData, writeTraitField, findEntity, type EntityInfo }
   from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -123,6 +124,8 @@ export function makePrefabInstantiateAction(opts: {
   let capturedGuids = captureSubtreeGuids(opts.initialId);
   return {
     label: opts.label,
+    // The scene the new instance belongs to: a base, when it was dropped under a base entity (#1429).
+    affectedScenes: resolveAffectedScenes([opts.initialId]),
     // Resolve by guid; fall back to the last-known id if it can't (remove is safe
     // to call on a stale/dead id — a no-op — matching the original contract).
     undo: () => { opts.remove(currentRef.resolve() ?? currentRef.rawId); },

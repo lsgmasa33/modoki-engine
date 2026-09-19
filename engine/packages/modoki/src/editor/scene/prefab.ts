@@ -23,6 +23,7 @@ import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZ
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { writtenTraitKeys } from './traitDefault';
+import { adoptParentScene } from './sceneDirty';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, prefabSubtreeLocalIds, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens } from '../../runtime/loaders/loadSceneFile';
 import { rebaseMemberTokens, isMemberToken, parseMemberToken, memberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
@@ -1246,6 +1247,9 @@ export async function instantiatePrefabInstance(
 ): Promise<number> {
   const rootId = await instantiatePrefabAsync(prefab, parentId);
   if (!rootId) return rootId;
+  // Under a base entity the new instance belongs to that base (#1429). Every caller's redo re-runs this
+  // helper, so the stamp comes back with it.
+  adoptParentScene(rootId);
   setPrefabSource(rootId, sourcePath);
   // Whatever ref setPrefabSource settled on — the guid when the manifest resolves it, the raw
   // path when it cannot (a freshly-instantiated instance before its scene is saved).

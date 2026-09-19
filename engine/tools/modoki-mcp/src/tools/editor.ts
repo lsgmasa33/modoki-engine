@@ -441,7 +441,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_reparent_entity',
     'Move an entity under a new parent (0 = root), optionally setting sortOrder. Preserves ' +
       'world transform (undoable). Address the entity AND the parent by `guid`/`parentGuid` ' +
-      '(PREFER — stable) or `id`/`parentId`. LIVE-world only: NOT saved to disk (run modoki_save_all).',
+      '(PREFER — stable) or `id`/`parentId`. LIVE-world only: NOT saved to disk (run modoki_save_all). ' +
+      'A parent from ANOTHER loaded scene (a base) makes this a scene move: it is refused with what the ' +
+      'move would do, and applied only when re-sent with moveToScene: true.',
     {
       id: z.number().optional().describe('Runtime id of the entity to move. Only for an entity with no guid — use guid.'),
       guid: z.string().optional().describe('Stable guid of the entity to move (preferred). Not together with id.'),
@@ -451,8 +453,12 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
         'Index among the NEW parent\'s children, 0-based — where the entity lands in Hierarchy '
         + 'order. Omit to append LAST. This is sibling order only; it has no effect on '
         + 'rendering or transform.'),
+      moveToScene: z.boolean().optional().describe(
+        'Confirm a move into the new parent\'s scene. An entity is saved in its parent\'s scene file, so a '
+        + 'parent from another scene moves the entity (and its subtree) into that scene; every level using '
+        + 'that base then shows it. Without this flag such a reparent is refused with the details.'),
     },
-    async ({ id, guid, parentId, parentGuid, sortOrder }) => editorAction('reparent-entity', { id, guid, parentId, parentGuid, sortOrder }),
+    async ({ id, guid, parentId, parentGuid, sortOrder, moveToScene }) => editorAction('reparent-entity', { id, guid, parentId, parentGuid, sortOrder, moveToScene }),
   );
 
   // ── prefab ops ──

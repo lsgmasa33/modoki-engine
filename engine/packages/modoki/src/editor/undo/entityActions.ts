@@ -5,7 +5,7 @@ import * as THREE from 'three';
 import { emptyDocMap, hasDocKey } from '../../runtime/core/docKeys';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { reparentRefusal, parentRefusal } from '../../runtime/core/ecs/hierarchy';
+import { reparentRefusal, parentRefusal, type ReparentRefusal } from '../../runtime/core/ecs/hierarchy';
 import {
   findEntity, readTraitData, readTraitDataFull, writeTraitField,
   getAllEntities, deleteEntity, markStructureDirty, cloneTraitValues, subtreeIds, carryEntityIdFields,
@@ -22,7 +22,7 @@ import { pushAction, type EditDetail } from './undoManager';
 import type { EditorJournalType } from '../editorJournal';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, journalRefOf, type EntityRef } from './entityRef';
 import { notifyFieldEdited } from '../animation/recording';
-import { resolveAffectedScenes, markSceneDirty } from '../scene/sceneDirty';
+import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
 
 /** Record a deliberate per-instance override when the user edits a field on a
  *  prefab-instance member, so the change survives serialize even if the prefab
@@ -582,6 +582,8 @@ export function createEntityWithUndo(
   }
   const entity = spawnEntity(getCurrentWorld(), ...traitInits);
   let currentId = entity.id();
+  // Under a base entity it belongs to that base (#1429) — before the snapshot, so redo keeps the stamp.
+  adoptParentScene(currentId);
   // Mint+persist a guid BEFORE snapshotting so the snapshot carries it: respawn
   // restores the same guid and the Play snapshot serializes it, so undo/redo can
   // re-find the entity after a world rebuild.
@@ -589,9 +591,7 @@ export function createEntityWithUndo(
   const snap = snapshotEntity(currentId);
   const guid = rootGuidOf(snap!);
   const parentRef = parentId ? entityRef(parentId) : null;
-  // A freshly-created entity has no sourceScene stamp (schema default '') — it is
-  // always primary-owned; a base-origin create doesn't exist yet (Phase 14's promote
-  // is the only way an entity ever becomes base-owned).
+  // Resolved AFTER adoptParentScene: a create under a base entity dirties that base, not the primary.
   const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
@@ -651,6 +651,7 @@ export function createEntitySubtreeWithUndo(
 ): number | null {
   const rootId = spawnEntitySubtree(parentId, root);
   if (rootId == null) return null;
+  adoptParentScene(rootId); // #1429 — see createEntityWithUndo
   let currentId = rootId;
   const snap = snapshotEntity(currentId);
   const guid = rootGuidOf(snap!);
@@ -903,7 +904,9 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   if (!parentChanged && !orderChanged) return false;
 
   // Base-scene persistence guard (Phase 6): refuse a reparent that would put an
-  // entity under a parent from a DIFFERENT source scene. Cross-scene parenting
+  // entity under a parent from a DIFFERENT source scene. The entry points reach a
+  // scene-crossing parent through `applyReparent`, which turns it into a prompted
+  // scene move (#1429); this stays the backstop for a direct caller. Cross-scene parenting
   // breaks save provenance (a foreign child silently vanishes from either
   // scene's save) and teardown (a scene-scoped subtree walk expects to stay
   // within one scene) — see scene-loading.md Phase 6.
@@ -1167,9 +1170,9 @@ export interface SceneMoveResult {
 
 export interface SceneMoveOptions {
   /** Reparent the moved root directly under this entity in the TARGET scene —
-   *  the cross-scene-group ROW-drop gesture (owner decision: a row drop takes
-   *  only the dragged subtree, reparented under the drop target; the old parent
-   *  is left behind untouched). Only honoured when this entity's OWN sourceScene
+   *  `applyReparent`'s scene move (#1429): the Hierarchy row drop, cut → paste and
+   *  the agent `reparent-entity {moveToScene}` all arrive here. Only the moved
+   *  subtree goes; the old parent is left behind untouched. Only honoured when this entity's OWN sourceScene
    *  already equals `targetScene` — otherwise it would recreate the cross-scene-
    *  parented state Phase 6's guard exists to prevent, so the move silently
    *  falls back to landing at the target scene's root (same as a group-header
@@ -1181,6 +1184,9 @@ export interface SceneMoveOptions {
    *  undo action. Not wired to the Hierarchy UI yet (owner decision: the confirm
    *  dialog is advisory-only) — this exists for a future caller/test. */
   rekeyGuids?: Set<string>;
+  /** The moved root's sortOrder under `newParentId` (a drop between two rows). Ignored when the move
+   *  re-roots. Absent: it lands after the target's existing children. */
+  sortOrder?: number;
   label?: string;
 }
 
@@ -1258,7 +1264,8 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     ? flat.filter((e) => e.parentId === newParentId)
     : flat.filter((e) => e.parentId === 0 && (e.sourceScene || '') === targetScene);
   const oldSortOrder = rootInfo.sortOrder;
-  const newSortOrder = siblingScope.length > 0 ? Math.max(...siblingScope.map((e) => e.sortOrder)) + 1 : 0;
+  const newSortOrder = newParentId !== 0 && opts?.sortOrder !== undefined ? opts.sortOrder
+    : siblingScope.length > 0 ? Math.max(...siblingScope.map((e) => e.sortOrder)) + 1 : 0;
 
   // Capture undo state for every entity in the subtree BEFORE mutating — guid
   // refs survive a world rebuild (entityRef.ts).
@@ -1369,4 +1376,84 @@ export function promoteEntityToScene(entityId: number, baseSceneGuid: string, op
 /** Demote: base → primary (Phase 3's "empty sourceScene = primary" convention). */
 export function demoteEntityToScene(entityId: number, opts?: Omit<SceneMoveOptions, 'label'>): SceneMoveResult {
   return moveEntityToScene(entityId, '', opts);
+}
+
+// ── Reparent across scenes (#1429) ──
+
+/** What putting `entityId` under `newParentId` means. It is the ONE decision every reparent entry point
+ *  asks: the Hierarchy row drop, cut → paste, the agent `reparent-entity` op and an `apply-scene-ops`
+ *  `parentId` write. An entity and its parent must belong to the same scene file. The save cannot
+ *  represent anything else: a foreign child under a base prefab MEMBER is baked into that base's
+ *  `added` list, and one under a base non-member is dropped from both files. So a parent from another
+ *  scene is a SCENE MOVE into the parent's scene (owner ruling on #1429, option C). It is prompted, and
+ *  it is carried out by `moveEntityToScene`, the same move the scene-group drops make.
+ *
+ *  Two prefab refusals. They are the scene-move twins of `reparentEntity`'s "unpack on move", which
+ *  a scene move cannot carry:
+ *  - `instance-member`: something in the moved subtree is linked to an instance that stays behind.
+ *    That is a member, an OWNED nested root (`parentLocalId` > 0) whose outer instance is not
+ *    moving, or a member held under a plain added child. The instance would be split across two files.
+ *  - `into-instance`: a stored instance root dropped under an entity inside another instance. The
+ *    save cannot represent a linked instance there (#1355/#1358), and a same-scene reparent unpacks it. */
+export type ReparentPlan =
+  | { kind: 'refused'; reason: ReparentRefusal | 'instance-member' | 'into-instance' }
+  | { kind: 'same-scene' }
+  | { kind: 'scene-move'; from: string; to: string };
+
+export function planReparent(entityId: number, newParentId: number): ReparentPlan {
+  const refusal = reparentRefusal(entityId, newParentId);
+  if (refusal) return { kind: 'refused', reason: refusal };
+  // Un-parenting keeps the entity's own scene: a root belongs to whichever file stamps it.
+  if (newParentId === 0) return { kind: 'same-scene' };
+  const from = rawSourceScene(entityId);
+  const to = rawSourceScene(newParentId);
+  if (from === to) return { kind: 'same-scene' };
+  const piMeta = getTraitByName('PrefabInstance');
+  const prefabRefusal = piMeta ? sceneMovePrefabRefusal(entityId, newParentId, piMeta) : null;
+  if (prefabRefusal) return { kind: 'refused', reason: prefabRefusal };
+  return { kind: 'scene-move', from, to };
+}
+
+/** The prefab half of `planReparent` (see its doc for the two reasons). */
+function sceneMovePrefabRefusal(entityId: number, newParentId: number, piMeta: TraitMeta): 'instance-member' | 'into-instance' | null {
+  const flat = getAllEntities();
+  const byId = new Map(flat.map((e) => [e.id, e]));
+  const moving = new Set(subtreeIds(flat, entityId));
+  for (const id of moving) {
+    const en = findEntity(id);
+    if (!en?.has(piMeta.trait)) continue;
+    const pd = en.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number };
+    const owner = pd.rootInstanceId as number;
+    if (!moving.has(owner)) return 'instance-member';
+    // An owned nested root is owned by the instance its PARENT belongs to; that one has to move too.
+    const ownedNested = owner === id && (pd.parentLocalId || 0) > 0;
+    if (ownedNested && !moving.has(byId.get(id)?.parentId ?? 0)) return 'instance-member';
+  }
+  const root = findEntity(entityId);
+  const isStoredRoot = !!root?.has(piMeta.trait)
+    && (root.get(piMeta.trait) as { rootInstanceId?: number }).rootInstanceId === entityId;
+  if (isStoredRoot && hasInstanceAncestorOrSelf(newParentId, piMeta)) return 'into-instance';
+  return null;
+}
+
+export interface ReparentResult {
+  ok: boolean;
+  plan: ReparentPlan;
+  /** Present when the plan was a scene move: what `moveEntityToScene` did. */
+  sceneMove?: SceneMoveResult;
+}
+
+/** Carry out `planReparent`'s answer. A same-scene plan is a plain `reparentEntity`, and a scene move is
+ *  `moveEntityToScene` under the new parent. Each is one undo entry. This applies WITHOUT asking: the
+ *  prompt belongs to the caller (the Hierarchy's modal, the agent op's `moveToScene` flag), because only
+ *  the caller knows how to ask. */
+export function applyReparent(entityId: number, newParentId: number, newSortOrder?: number): ReparentResult {
+  const plan = planReparent(entityId, newParentId);
+  if (plan.kind === 'refused') return { ok: false, plan };
+  if (plan.kind === 'same-scene') return { ok: reparentEntity(entityId, newParentId, newSortOrder), plan };
+  const name = getAllEntities().find((e) => e.id === entityId)?.name || `Entity ${entityId}`;
+  const sceneMove = moveEntityToScene(entityId, plan.to, {
+    newParentId, sortOrder: newSortOrder, label: `Move "${name}" into its new parent's scene`,
+  });
+  return { ok: sceneMove.ok, plan, sceneMove };
 }

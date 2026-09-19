@@ -29,11 +29,18 @@ export async function confirmReplaceAsset(path: string): Promise<boolean> {
   return answer !== null;
 }
 
+/** A yes/no question in the editor's own modal. `window.confirm` is not an option (see
+ *  `confirmReplaceAsset`). `message` keeps its line breaks. Resolves true only on an explicit OK;
+ *  Cancel, Escape and a backdrop click are all no. First used by the cross-scene reparent prompt (#1429). */
+export async function confirmInEditor(title: string, message: string, okLabel: string): Promise<boolean> {
+  return (await openModal(title, message, okLabel, undefined, true)) !== null;
+}
+
 /** The prompt and the confirmation, in the plain-DOM form of the editor's modal shell (#1270), so the
  *  editor underneath takes no key and no menu command while it waits. With `initial` it is a text
  *  prompt resolving the trimmed value (null when empty); without it, a confirmation resolving '' on
  *  OK. Null on Cancel, Escape or a backdrop click. */
-function openModal(title: string, message: string, okLabel: string, initial?: string): Promise<string | null> {
+function openModal(title: string, message: string, okLabel: string, initial?: string, multiline = false): Promise<string | null> {
   return new Promise((resolve) => {
     // Above every React dialog (99999): Create Prefab and the New buttons can ask from inside one.
     const { root: overlay, close } = openDomModalShell('save-dialog', { zIndex: 99999, onDismiss: () => done(null) });
@@ -45,6 +52,8 @@ function openModal(title: string, message: string, okLabel: string, initial?: st
     const label = document.createElement('div');
     label.textContent = message;
     label.style.cssText = 'color:#9a9aa8;font-size:11px;margin-bottom:8px';
+    // A multi-line message keeps its breaks and wraps inside a bounded box instead of stretching it.
+    if (multiline) { label.style.whiteSpace = 'pre-wrap'; box.style.maxWidth = '560px'; }
     const input = initial === undefined ? null : document.createElement('input');
     if (input) {
       input.value = initial ?? '';

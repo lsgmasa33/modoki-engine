@@ -17,7 +17,9 @@ export {
   writeTraitFieldWithUndo, deleteEntityWithUndo, deleteEntitiesWithUndo, duplicateEntity,
   reparentEntity, setActionCallback, createEntityWithUndo,
   addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, type TraitSpec,
+  planReparent, applyReparent, type ReparentPlan,
 } from './undo/entityActions';
+export { preflightSceneMove, formatSceneMoveConfirm } from './scene/sceneMoveScan';
 export {
   emptySpecs, primitiveSpecs, shape2DSpecs, canvas2DSpecs, uiSpecs, cameraSpecs, lightSpecs, environmentSpecs, particleSpecs,
   buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type LightKind,

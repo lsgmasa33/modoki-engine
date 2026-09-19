@@ -3433,7 +3433,7 @@ then `makeDeleteUndo` (`panels/assetUndo.ts`) writes the whole set back on undo.
 *"Move to Trash is a filesystem operation and undo does not cover it"* and proposed confirmation
 dialogs on the strength of it. Nothing in `docs/` contradicted that. The dialogs were declined —
 see `docs/todo.md` § Deferred decisions for that call and for why the one surviving
-`window.confirm` (cross-scene move) is not an inconsistency.
+confirmation (the cross-scene move, including a reparent across scenes since #1429) is not an inconsistency.
 
 **What undo does NOT survive is an editor relaunch** — `undoStack`/`redoStack` are module state
 in `undo/undoManager.ts`. That is normal and is deliberately not treated as a defect.
