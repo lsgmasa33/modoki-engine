@@ -549,8 +549,9 @@ root's derived guid is itself computed from this stamp (`memberStepId`).
 A prefab member moved to another parent **inside its outermost instance** stays linked, and the move
 is saved (owner rulings, #1437: (a) same frame, (b) across frames — under a scene-added node, into a
 nested instance's member, out of a nested instance into its outer one). Moved OUT of the outermost
-instance it is unpacked, as before (docs/scene-loading.md § the #1355 note). `reparentEntity` decides
-by `outermostInstanceRoot`.
+instance, a member is unpacked, while an owned nested instance stays an instance of its own prefab
+(#1447). The rule for that case is in docs/scene-loading.md § the #1355 note. `reparentEntity` decides
+by `outermostInstanceRoot`, before the parent write (`planLeaveInstance`, #1445).
 
 **Identity does not move.** A member's guid is derived from its row PATH (`deriveMemberGuid(anchor,
 path)`), so a moved member must keep deriving from where it was. `PrefabInstance.homeParent` holds the
@@ -640,6 +641,44 @@ and a carried pose under a non-uniformly scaled, rotated removed row is the near
 before. Tests: `engine/tests/editor/duplicateCarriesRefs.test.ts` (the #1437 describes),
 `engine/tests/plugins/remintPrefabMemberRefs.test.ts` (memberGuidRemap, the token rewrite and
 planMemberPathRepair against the loader), `engine/tests/plugins/prefabMemberPathsRoute.test.ts`.
+
+## What each hierarchy action does
+
+Measured headlessly with the real editor functions (`reparentEntity`, `deleteEntitiesWithUndo`, `serializeScene`
+→ `loadSceneFile`, `applyToPrefabSelective`). The fixture is `Outer` (`OuterRoot → Panel → {Button, nested Inner}`)
+and `Inner` (`InnerRoot → {Leaf, Leaf2}`), with a second `Outer` instance to confirm Apply reaches it. Every
+row round-trips through save + reload.
+
+| Action | The dragged thing afterwards | Apply on the outer instance | Apply on the nested instance |
+|---|---|---|---|
+| Create / drag a plain entity under an outer member | plain, an `added` node | becomes an Outer member | — |
+| Create / drag a plain entity under a nested member | plain, in `nestedStructure` | nothing to apply | becomes an **Inner** member (every Inner) |
+| Drag an outer member out of the instance | unpacked; the instance records it `removed` | removed from Outer | — |
+| Drag a member to another parent inside the instance | stays linked, a `moved` entry | re-parents the row | — |
+| Drag a nested member into the outer instance | stays linked | Outer records the move (`moved` map) | refused, pointing outward |
+| Drag an outer member into the nested instance | stays linked | Outer records the move | — |
+| Drag a nested member out of everything | unpacked | nothing to apply | removed from Inner |
+| **Drag a nested instance out of everything** | **stays an Inner instance** (#1447); Outer records the row `removed` | removes the row | — |
+| Drag a nested instance to another outer member | stays linked | re-parents the row | — |
+| Delete an outer member / the nested instance / a nested member | — | removes it from Outer / removes the row / nothing | — / — / removes it from Inner |
+| Drag a prefab instance into the outer instance | stays linked, a reference node | becomes a nested row | — |
+| Drag a prefab instance under a nested member | stays linked | nothing to apply | becomes a nested row of Inner |
+| Drag a member into ANOTHER instance | unpacked (#1445): the old instance records it `removed`, the new one saves it as `added` | — | — |
+| Drag an instance into an instance of the SAME prefab | allowed, a reference node (#1436) | **refused**, with a reason: a prefab cannot contain itself (#1446) | — |
+
+When a leave promotes a nested instance, a linked member of it is unpacked in exactly the two shapes the save
+cannot write (`planLeaveInstance`): it sits ABOVE its frame (the first promoted root on its ownership chain), or
+the outermost instance it sits inside differs from its frame's. A standalone instance is saved from its root
+down, so such a member was written nowhere and both vanished on reload. A member merely BESIDE its frame inside
+the same outermost instance is an ordinary #1437 move and stays linked.
+The same shape reached by a move that does NOT leave the instance is #1450.
+
+**Across scenes it is still refused.** A move to another scene file (`moveEntityToScene`) refuses anything that
+would split an instance (`instance-member`, docs/scene-loading.md), an owned nested root included, where the
+same drag inside one scene keeps it linked. Extending promotion to scene moves is not done.
+
+An edit inside a nested instance is applied to the nested prefab's own file, so every instance of it everywhere
+updates (owner, 2026-09-19). The outer instance's Apply offers nothing for it.
 
 ## Edge cases
 

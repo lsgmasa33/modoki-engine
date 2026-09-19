@@ -1543,14 +1543,13 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     - A ref inside a reference node's payload is left as a guid.
   Tests: `engine/tests/editor/prefabTemplateIdentity.test.ts` § "#1352".
 - **An owned nested instance ROOT that leaves its row is saved as REMOVED from the outer instance
-  (#1355).** This is the depth-1 root case only. A structural edit INSIDE an owned nested instance
-  is not saved at all, whether it deletes or moves a member or removes a depth-2 nested root,
-  because the owner's `nestedOverrides` carry value deltas only (#1358, open). `captureInstanceStructure` used to skip every nested prefab row in its removal pass,
+  (#1355).** This is the depth-1 root case; a structural edit INSIDE an owned nested instance rides the
+  owner's `nestedStructure` slot (#1358). `captureInstanceStructure` used to skip every nested prefab row in its removal pass,
   because reading a nested row's absence from the member map had once stripped the spaceship's
   flames on every save. Skipping the rows meant an owned nested instance that was deleted, or moved
-  out, re-expanded on reload. Moving it out unpacks it into plain entities that STORE the derived
-  guids (owner ruling 2026-09-17: keep unpack-on-move, don't refuse the move), so the reload also
-  produced two entities per guid. The row is now looked for where it expands: an instance root of
+  out, re-expanded on reload. Moved out, it used to unpack into plain entities that STORE the derived
+  guids (the 2026-09-17 ruling, since reversed — see below), so the reload also produced two entities
+  per guid. The row is now looked for where it expands: an instance root of
   the row's prefab directly under the row's parent member. The check is lenient on purpose. An
   unstamped (legacy) root counts as present, and so does a row whose prefab is not cached (it
   expanded to nothing) or whose parent member is gone (its own removal covers it). The moved
@@ -1564,10 +1563,21 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   plain. That happens under an unanchored (guid-less, scene-root) instance, whose owner guid was
   minted at move time and re-derived differently by the rebuild. Its stale id may name an unrelated
   entity, so relinking would make the save drop it.
-  Moving a MEMBER OUT of its outermost instance unpacks it, and any owned nested instance it holds,
-  recursively (`reparentEntity`'s detach walk). Left linked under a now-plain parent, such an
-  instance would be saved as a top-level instance that stores its derived guid, and the reload would
-  re-derive its members from that guid (#1349's shape). A move that stays INSIDE the outermost
+  **Leaving the outermost instance cuts only the links the move SPLITS** (`planLeaveInstance`, decided
+  before the parent write — #1445: taken after it, a member dropped into ANOTHER instance read as still
+  inside its own and stayed linked to it there). A member on the other side of the move from its
+  instance root is unpacked into a plain entity that keeps its guid. **An owned nested instance on the
+  other side from the instance whose row expanded it stays an instance of its own prefab** (#1447, owner
+  ruling 2026-09-19, reversing 2026-09-17's unpack), standalone, or a user-added nested instance when it
+  lands inside another instance; the outer instance records the row removed. That holds for a nested
+  root dragged out itself and for one inside a moved-out member. The obstacle the unpack avoided was
+  identity: an owned root's members derive their guids from the OUTER anchor, a stored root's from its
+  own guid, so left alone every ref to a member dangled after reload (#1349's shape).
+  `promoteOwnedRoots` (`core/ecs/memberHome.ts`) therefore renames each member to the guid the reload
+  derives under the root and rewrites every ref (`applyGuidRemap`), and the undo reverses the map. The
+  values the outer row set on it need nothing: every expansion marks the row overrides it applies, so
+  the save keeps them. `detachOrphanedMembers` (a delete whose home goes) promotes through the same
+  helper. A move that stays INSIDE the outermost
   instance keeps everything linked and is saved as a move (#1437 —
   [prefab-structural-overrides.md § Moved members](prefab-structural-overrides.md#moved-members-1437)). A user-added nested instance in the moved subtree stays linked, because
   its root guid is already stored. A STORED instance root (top-level or user-added) moved OUTSIDE every

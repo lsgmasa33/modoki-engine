@@ -2,7 +2,7 @@
 
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
-import { rehomeDependents, homeStepsOf } from '../../runtime/core/ecs/memberHome';
+import { rehomeDependents, homeStepsOf, remapWorldGuidRefs } from '../../runtime/core/ecs/memberHome';
 import { isPrefabEditRowGuid } from './prefabEditGuids';
 import { IDENTITY_TRS, mergeTrs, localToWorldTrs } from '../../runtime/scene/transformSpace';
 import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, type PrefabReader } from '../../runtime/loaders/memberPaths';
@@ -1455,10 +1455,33 @@ export function wouldCreateCycle(parentGuid: string, childGuid: string, _seen = 
   _seen.add(childGuid);
   const child = getCachedPrefabSync(childGuid);
   if (!child) return false; // not cached — can't verify here; instantiate guard backstops
-  for (const e of child.entities) {
-    if (e.prefab && wouldCreateCycle(parentGuid, e.prefab, _seen)) return true;
+  // Every prefab the file expands: its nested rows, and the reference nodes those rows add (#1446 close-out).
+  for (const ref of expandedPrefabRefs(child.entities)) {
+    if (wouldCreateCycle(parentGuid, ref, _seen)) return true;
   }
   return false;
+}
+
+/** Every prefab ref a list of rows or added nodes EXPANDS, at any depth: a node's own `prefab`, its `children`,
+ *  a reference node's own `added`, and the `added` lists of its `nestedStructure` slots. Never `traits` — a trait
+ *  field that happens to be called `prefab` (a spawner naming what it spawns) is data, not nesting. */
+function expandedPrefabRefs(nodes: readonly { prefab?: string; children?: AddedEntity[]; added?: AddedEntity[]; nestedStructure?: NestedStructurePaths }[]): string[] {
+  const out: string[] = [];
+  const walk = (n: (typeof nodes)[number]) => {
+    if (n.prefab) out.push(n.prefab);
+    for (const c of n.children ?? []) walk(c);
+    for (const c of n.added ?? []) walk(c);
+    for (const slot of Object.values(n.nestedStructure ?? {})) for (const c of slot.added ?? []) walk(c);
+  };
+  for (const n of nodes) walk(n);
+  return out;
+}
+
+/** Does this added subtree hold an instance of `target` — a promotion that would make the prefab contain
+ *  itself (#1446)? Only the slots that expand count ({@link expandedPrefabRefs}), never trait data. The expansion refuses a cyclic row, so the promoted instance came back empty after the refresh and
+ *  the user's instance was gone. A scene may hold one — it expands fine there; only the file cannot. */
+function addedNestsPrefab(node: AddedEntity, target: string): boolean {
+  return expandedPrefabRefs([node]).some((ref) => wouldCreateCycle(target, ref));
 }
 
 /** Structural equality with float tolerance, used by `getOverrideValues` to decide
@@ -3511,6 +3534,7 @@ export async function applyToPrefabSelective(
       const guid = key.slice('+added.'.length);
       const node = addedByGuid.get(guid);
       if (!node) continue;
+      if (addedNestsPrefab(node, oldPrefab.id || source)) { skipped.push({ key, reason: 'it holds an instance of this prefab, and a prefab cannot contain itself' }); continue; }
       const rowLid = nextLocalId.v;
       insertAddedSubtree(newPrefab, node, node.parentLocalId, nextLocalId, promotedRows);
       if (node.prefab && node.moved) promoteReferenceMoves(newPrefab, node, rowLid, localToEcs, instancePaths);
@@ -3882,23 +3906,6 @@ function liveMemberGuidRemap(prefabId: string, readOld: PrefabReader, readNew: P
     }
   }
   return remap;
-}
-
-/** Re-point every ref a live trait holds from a key of `remap` to its value — every field of every trait
- *  except an entity's own `EntityAttributes.guid` (the rebuilt members already carry their new ones). */
-function remapWorldGuidRefs(remap: ReadonlyMap<string, string>): void {
-  const traits = getAllTraits();
-  for (const e of getCurrentWorld().entities) {
-    for (const meta of traits) {
-      if (!e.has(meta.trait)) continue;
-      const data = e.get(meta.trait) as Record<string, unknown> | undefined;
-      if (!data || typeof data !== 'object') continue;
-      const next = remapGuidValues(data, remap) as Record<string, unknown>;
-      if (next === data) continue;
-      if (meta.name === 'EntityAttributes') next.guid = data.guid;
-      e.set(meta.trait, next);
-    }
-  }
 }
 
 /** Resolve a live entity id to its stable EntityAttributes.guid ('' if none). Used by

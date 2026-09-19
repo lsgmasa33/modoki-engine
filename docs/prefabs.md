@@ -650,7 +650,12 @@ the file.**
   pass sets `rootInstanceId` only on its *own* members so inner ids aren't
   stomped.
 - **Cycle safety** is two-layered: `wouldCreateCycle` rejects a *save* that would
-  nest a prefab inside one of its own descendants (A → B → A), and a `_stack` of
+  nest a prefab inside one of its own descendants (A → B → A) — a prefab-edit save,
+  Create Prefab's Replace, and Apply's promotion of an added node (`addedNestsPrefab`,
+  #1446: it used to write the row, which expanded to nothing, so the user's instance
+  vanished on the refresh). Both read every prefab a file EXPANDS (`expandedPrefabRefs`:
+  rows, and the reference nodes rows add, in `added` or `nestedStructure`), never trait
+  data — a spawner trait's `prefab` field is not nesting. A SCENE may hold such a nesting; only a file may not. A `_stack` of
   prefab GUIDs in the instantiate path is the backstop (an on-disk cycle can never
   hang the loader). Because a prefab can never transitively contain itself,
   refreshing every instance of one source is order-independent.

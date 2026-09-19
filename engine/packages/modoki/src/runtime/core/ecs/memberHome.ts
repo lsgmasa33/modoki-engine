@@ -12,9 +12,11 @@
  *  Every walk that derives or names a member goes through {@link identityParentId} and {@link homeStepsOf}. */
 
 import type { Entity, World } from 'koota';
-import { getCurrentWorld } from './world';
-import { getTraitByName } from './traitRegistry';
-import { memberStepId } from '../assetRefRules';
+import { getCurrentWorld, indexEntityGuid } from './world';
+import { getAllTraits, getTraitByName } from './traitRegistry';
+import { memberStepId, deriveMemberGuid, remapGuidValues } from '../assetRefRules';
+import { templateKeyOf, addedKeyStep } from '../templateIdentity';
+import { memberPathKey, type MemberStep } from '../templateRefs';
 
 /** The parent an entity's IDENTITY steps from: its home when it has one that still resolves, else its live parent. */
 export function identityParentId(parentId: number, homeParent: string | undefined, idOfGuid: (guid: string) => number | undefined): number {
@@ -71,7 +73,11 @@ export function rehomeDependents(gone: ReadonlySet<number>, world: World = getCu
 
 /** A member that outlives its instance: `data` is its `PrefabInstance` as it was, `guid` its own and
  *  `rootGuid` the root it belonged to, for an undo to relink it. */
-export type DetachedMember = { guid: string; rootGuid: string; data: Record<string, unknown> };
+export type DetachedMember = {
+  guid: string; rootGuid: string; data: Record<string, unknown>;
+  /** A promoted owned root's member rename ({@link promoteOwnedRoots}), `[old, new]` — reversed by the undo. */
+  renamed?: [string, string][];
+};
 
 /** Before the entities in `gone` are destroyed, detach every surviving member whose instance goes with them
  *  (#1437): a member MOVED out of its instance's subtree is not under the root being deleted, so it would
@@ -105,7 +111,11 @@ export function detachOrphanedMembers(gone: ReadonlySet<number>, world: World = 
     (ownedRoot ? promote : strip).push(e);
   }
   for (const e of strip) e.remove(piMeta.trait);
-  for (const e of promote) e.set(piMeta.trait, { ...(e.get(piMeta.trait) as Pi), parentLocalId: 0, homeParent: '', homeSteps: '' });
+  // Promoted with its members renamed to the guids a reload derives under it (#1447). The whole rename rides on
+  // the first promoted entry: one map, reversed as one by the undo.
+  const renamed = [...promoteOwnedRoots(promote.map((e) => e.id()), world)];
+  const first = out.find((d) => !d.rootGuid);
+  if (first && renamed.length) first.renamed = renamed;
   return out;
 }
 
@@ -114,6 +124,11 @@ export function relinkDetachedMembers(detached: readonly DetachedMember[], world
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
   if (!piMeta || !eaMeta || !detached.length) return;
+  // Undo a promotion's member rename first, so every guid below names what it did before the delete — one entry
+  // at a time, last first, so a guid two promotions renamed in turn (a → b → c) walks all the way back.
+  for (const d of [...detached].reverse()) {
+    if (d.renamed?.length) applyGuidRemap(new Map(d.renamed.map(([a, b]) => [b, a] as [string, string])), world);
+  }
   const byGuid = new Map<string, Entity>();
   for (const e of world.entities as Iterable<Entity>) {
     const g = e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid : '';
@@ -169,4 +184,149 @@ export function restoreRootLinks(links: readonly { guid: string; rootGuid: strin
     const pi = e.get(piMeta.trait) as Record<string, unknown>;
     if (pi.rootInstanceId !== root.id()) e.set(piMeta.trait, { ...pi, rootInstanceId: root.id() });
   }
+}
+
+/** An entity's step below its parent in the derive walk: `'+key'` for a template-keyed node,
+ *  `memberStepId` for a prefab member, and `null` for a node no template can name. */
+function memberStepOf(e: Entity, piTrait: Parameters<Entity['has']>[0]): MemberStep | null {
+  const key = templateKeyOf(e);
+  if (key) return addedKeyStep(key);
+  if (!e.has(piTrait)) return null;
+  return memberStepId(e.get(piTrait) as { localId?: number; parentLocalId?: number });
+}
+
+/** Every member a template frame rooted at `rootEcsId` can name: path key → entity. The root is `''`.
+ *  It does not descend into another STORED root, a user-added nested instance, which is its own frame;
+ *  that root itself is still a target. A step two siblings share names neither of them. */
+export function memberPathIndex(
+  world: World, rootEcsId: number,
+  /** The world's parent → children map, when the caller indexes several frames in one pass. */
+  children: Map<number, Entity[]> = childrenByParent(world),
+): Map<string, Entity | null> {
+  const piMeta = getTraitByName('PrefabInstance');
+  const out = new Map<string, Entity | null>();
+  // Found by the world walk rather than the entity index: the editor reaches this from Apply, whose
+  // tests stub the world module by an explicit export list.
+  let root: Entity | undefined;
+  for (const e of world.entities as Iterable<Entity>) if (e.id() === rootEcsId) { root = e; break; }
+  if (!piMeta || !root) return out;
+  out.set('', root);
+  const stack: [Entity, MemberStep[]][] = [[root, []]];
+  const seen = new Set<number>([rootEcsId]);
+  while (stack.length) {
+    const [e, path] = stack.pop()!;
+    for (const c of children.get(e.id()) ?? []) {
+      if (seen.has(c.id())) continue;
+      seen.add(c.id());
+      const step = memberStepOf(c, piMeta.trait);
+      if (step === null) continue;
+      const at = [...path, ...homeStepsOf(c.has(piMeta.trait) ? c.get(piMeta.trait) as { homeSteps?: string } : null), step];
+      const key = memberPathKey(at);
+      out.set(key, out.has(key) ? null : c);
+      const pi = c.has(piMeta.trait) ? c.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number } : null;
+      const storedRoot = !!pi && pi.rootInstanceId === c.id() && !pi.parentLocalId;
+      if (!storedRoot) stack.push([c, at]);
+    }
+  }
+  return out;
+}
+
+export function childrenByParent(world: World): Map<number, Entity[]> {
+  const attrMeta = getTraitByName('EntityAttributes');
+  const piMeta = getTraitByName('PrefabInstance');
+  const children = new Map<number, Entity[]>();
+  if (!attrMeta) return children;
+  const idOfGuid = new Map<string, number>();
+  for (const e of world.entities as Iterable<Entity>) {
+    const guid = e.has(attrMeta.trait) ? (e.get(attrMeta.trait) as { guid?: string }).guid : '';
+    if (guid) idOfGuid.set(guid, e.id());
+  }
+  for (const e of world.entities as Iterable<Entity>) {
+    if (!e.has(attrMeta.trait)) continue;
+    const live = (e.get(attrMeta.trait) as { parentId?: number }).parentId ?? 0;
+    const home = piMeta && e.has(piMeta.trait) ? (e.get(piMeta.trait) as { homeParent?: string } | undefined)?.homeParent : '';
+    const parent = identityParentId(live, home, (g) => idOfGuid.get(g));
+    const list = children.get(parent);
+    if (list) list.push(e);
+    else children.set(parent, [e]);
+  }
+  return children;
+}
+
+/** Re-point every ref a live trait holds from a key of `remap` to its value — every field of every trait
+ *  except an entity's own `EntityAttributes.guid`, which is the caller's to set. */
+export function remapWorldGuidRefs(remap: ReadonlyMap<string, string>, world: World = getCurrentWorld()): void {
+  if (!remap.size) return;
+  const traits = getAllTraits();
+  for (const e of world.entities as Iterable<Entity>) {
+    for (const meta of traits) {
+      if (!e.has(meta.trait)) continue;
+      const data = e.get(meta.trait) as Record<string, unknown> | undefined;
+      if (!data || typeof data !== 'object') continue;
+      const next = remapGuidValues(data, remap) as Record<string, unknown>;
+      if (next === data) continue;
+      if (meta.name === 'EntityAttributes') next.guid = data.guid;
+      e.set(meta.trait, next);
+    }
+  }
+}
+
+/** Rename entities and every ref to them: each entity whose guid is a key of `remap` takes its value, then
+ *  every ref in the world follows. Its own inverse, so an undo passes the map reversed. */
+export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World = getCurrentWorld()): void {
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!eaMeta || !remap.size) return;
+  const renamed: Entity[] = [];
+  for (const e of world.entities as Iterable<Entity>) {
+    if (!e.has(eaMeta.trait)) continue;
+    const ea = e.get(eaMeta.trait) as { guid?: string };
+    const next = ea.guid ? remap.get(ea.guid) : undefined;
+    if (next === undefined) continue;
+    e.set(eaMeta.trait, { ...ea, guid: next });
+    renamed.push(e);
+  }
+  remapWorldGuidRefs(remap, world);
+  for (const e of renamed) indexEntityGuid(e, world);
+}
+
+/** Make each OWNED nested root in `roots` a STORED root — a standalone instance of its own prefab — and
+ *  return the rename its members took (old guid → new), already applied (#1447).
+ *
+ *  An owned root's members derive their guids from the OUTER instance's anchor, through the row that
+ *  expanded them. A stored root is an anchor itself: the save writes its guid and the reload derives its
+ *  members from it. So without the rename, every member would reload under a guid no live ref names
+ *  (#1349's shape). The root keeps its guid, which becomes stored; each member below it — down to, not
+ *  into, another stored root — takes the guid the reload derives, and every ref follows.
+ *  Undo: {@link applyGuidRemap} with the map reversed, then put the roots' `PrefabInstance` back. */
+export function promoteOwnedRoots(roots: Iterable<number>, world: World = getCurrentWorld()): Map<string, string> {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  const remap = new Map<string, string>();
+  if (!piMeta || !eaMeta) return remap;
+  const byId = new Map<number, Entity>();
+  for (const e of world.entities as Iterable<Entity>) byId.set(e.id(), e);
+  const promoted: Entity[] = [];
+  for (const id of roots) {
+    const e = byId.get(id);
+    const pi = e?.has(piMeta.trait) ? (e.get(piMeta.trait) as Pi & { rootInstanceId?: number }) : undefined;
+    if (!e || !pi || pi.rootInstanceId !== id || !pi.parentLocalId) continue;
+    e.set(piMeta.trait, { ...pi, parentLocalId: 0, homeParent: '', homeSteps: '' });
+    promoted.push(e);
+  }
+  const guidOf = (e: Entity) => (e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '');
+  const children = childrenByParent(world);
+  for (const root of promoted) {
+    const anchor = guidOf(root);
+    if (!anchor) continue; // unaddressable before, and after: nothing derives from it
+    for (const [key, e] of memberPathIndex(world, root.id(), children)) {
+      if (!key || !e) continue;
+      const pi = e.has(piMeta.trait) ? (e.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number }) : null;
+      if (pi && pi.rootInstanceId === e.id() && !pi.parentLocalId) continue; // a stored root keeps its stored guid
+      const old = guidOf(e);
+      const next = deriveMemberGuid(anchor, key.split('.'));
+      if (old && old !== next) remap.set(old, next);
+    }
+  }
+  applyGuidRemap(remap, world);
+  return remap;
 }

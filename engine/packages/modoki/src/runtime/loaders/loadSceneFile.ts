@@ -31,8 +31,8 @@ import { rebaseMemberTokens, hasMemberToken, isMemberToken, parseMemberToken, me
 import { mapStringValues } from '../core/assetRefRules';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
-import { identityParentId, homeStepsOf, rehomeDependents } from '../core/ecs/memberHome';
-export { identityParentId } from '../core/ecs/memberHome';
+import { identityParentId, homeStepsOf, rehomeDependents, memberPathIndex, childrenByParent } from '../core/ecs/memberHome';
+export { identityParentId, memberPathIndex } from '../core/ecs/memberHome';
 
 /** The structural delta an OUTER layer (a scene, or an ancestor prefab) applies INSIDE a nested
  *  instance that expanded from one of its rows — the interior counterpart of `NestedOverridePaths`,
@@ -1259,72 +1259,8 @@ export function registerTemplateFrame(world: World, rootEcsId: number): void {
   else pendingFrames.set(world, [rootEcsId]);
 }
 
-/** An entity's step below its parent in the derive walk: `'+key'` for a template-keyed node,
- *  `memberStepId` for a prefab member, and `null` for a node no template can name. */
-function memberStepOf(e: EntityHandle, piTrait: unknown): MemberStep | null {
-  const key = templateKeyOf(e);
-  if (key) return addedKeyStep(key);
-  if (!e.has(piTrait)) return null;
-  return memberStepId(e.get(piTrait) as { localId?: number; parentLocalId?: number });
-}
-
-/** Every member a template frame rooted at `rootEcsId` can name: path key → entity. The root is `''`.
- *  It does not descend into another STORED root, a user-added nested instance, which is its own frame;
- *  that root itself is still a target. A step two siblings share names neither of them. */
-export function memberPathIndex(
-  world: World, rootEcsId: number,
-  /** The world's parent → children map, when the caller indexes several frames in one pass. */
-  children: Map<number, EntityHandle[]> = childrenByParent(world),
-): Map<string, EntityHandle | null> {
-  const piMeta = getTraitByName('PrefabInstance');
-  const out = new Map<string, EntityHandle | null>();
-  // Found by the world walk rather than the entity index: the editor reaches this from Apply, whose
-  // tests stub the world module by an explicit export list.
-  let root: EntityHandle | undefined;
-  for (const e of world.entities as Iterable<EntityHandle>) if (e.id() === rootEcsId) { root = e; break; }
-  if (!piMeta || !root) return out;
-  out.set('', root);
-  const stack: [EntityHandle, MemberStep[]][] = [[root, []]];
-  const seen = new Set<number>([rootEcsId]);
-  while (stack.length) {
-    const [e, path] = stack.pop()!;
-    for (const c of children.get(e.id()) ?? []) {
-      if (seen.has(c.id())) continue;
-      seen.add(c.id());
-      const step = memberStepOf(c, piMeta.trait);
-      if (step === null) continue;
-      const at = [...path, ...homeStepsOf(c.has(piMeta.trait) ? c.get(piMeta.trait) as { homeSteps?: string } : null), step];
-      const key = memberPathKey(at);
-      out.set(key, out.has(key) ? null : c);
-      const pi = c.has(piMeta.trait) ? c.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number } : null;
-      const storedRoot = !!pi && pi.rootInstanceId === c.id() && !pi.parentLocalId;
-      if (!storedRoot) stack.push([c, at]);
-    }
-  }
-  return out;
-}
-
-function childrenByParent(world: World): Map<number, EntityHandle[]> {
-  const attrMeta = getTraitByName('EntityAttributes');
-  const piMeta = getTraitByName('PrefabInstance');
-  const children = new Map<number, EntityHandle[]>();
-  if (!attrMeta) return children;
-  const idOfGuid = new Map<string, number>();
-  for (const e of world.entities as Iterable<EntityHandle>) {
-    const guid = e.has(attrMeta.trait) ? (e.get(attrMeta.trait) as { guid?: string }).guid : '';
-    if (guid) idOfGuid.set(guid, e.id());
-  }
-  for (const e of world.entities as Iterable<EntityHandle>) {
-    if (!e.has(attrMeta.trait)) continue;
-    const live = (e.get(attrMeta.trait) as { parentId?: number }).parentId ?? 0;
-    const home = piMeta && e.has(piMeta.trait) ? (e.get(piMeta.trait) as { homeParent?: string } | undefined)?.homeParent : '';
-    const parent = identityParentId(live, home, (g) => idOfGuid.get(g));
-    const list = children.get(parent);
-    if (list) list.push(e);
-    else children.set(parent, [e]);
-  }
-  return children;
-}
+// memberPathIndex (and the child map it walks) moved to core/ecs/memberHome.ts, beside the other identity
+// walks, so the core-layer promotion of an owned nested root can re-derive through it (#1447).
 
 /** Resolve every member token held inside each queued frame to the guid of the member it names. A
  *  token that names nothing is left as it is: visibly unresolved, never silently re-pointed.
@@ -1359,7 +1295,7 @@ function resolveTemplateFrames(world: World): void {
       const p = e.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number };
       return !(p.rootInstanceId === e.id() && !p.parentLocalId);
     };
-    for (const e of new Set([...index.values()].filter((x): x is EntityHandle => !!x && ownFrame(x)))) {
+    for (const e of new Set([...index.values()].filter((x): x is NonNullable<typeof x> => !!x && ownFrame(x)))) {
       for (const meta of traits) {
         if (!e.has(meta.trait)) continue;
         const data = e.get(meta.trait);
