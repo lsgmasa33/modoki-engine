@@ -915,8 +915,8 @@ catalog: [debug-tools-mcp.md](./debug-tools-mcp.md)). `edit-open` swaps the worl
 `load-scene` does — it refuses on unsaved work and takes `discardUnsaved` — and additionally **saves the
 current scene** on the way in; that is pre-existing `prefabEdit.ts` behaviour, kept deliberately,
 because it is what makes the return trip's reload-from-disk non-destructive.
-`modoki_save_all` refuses outright while the editor is in prefab-edit mode; `edit-save` is the
-save for that world.
+In prefab-edit mode `modoki_save_all` writes any parked work and refuses only the scene half;
+`edit-save` is the save for that world.
 
 **`engine/scripts/resave-prefabs.sh`** is the prefab sibling of `resave-scenes.sh`. Per project it
 launches this clone's editor, enumerates prefabs from `/api/scan-assets`, then runs

@@ -459,7 +459,8 @@ const DECLS: Record<string, Decl> = {
       + "The edit-* actions drive PREFAB-EDIT MODE: 'edit-open' swaps the world for a synthetic "
       + 'prefab scene (world-destructive, so it takes `discardUnsaved` like load-scene, and it saves the '
       + "current scene on the way in), 'edit-save' re-serializes the .prefab.json, 'edit-exit' "
-      + 'reloads the return scene. None of the three is undoable — they are scene swaps and a '
+      + 'reloads the return scene (also world-destructive, so it refuses on unsaved prefab edits and takes '
+      + '`discardUnsaved` too, #1424). None of the three is undoable — they are scene swaps and a '
       + 'file write, matching load-scene and create respectively.',
   },
   modoki_set_gizmo: {

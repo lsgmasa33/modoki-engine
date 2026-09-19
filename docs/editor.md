@@ -1957,7 +1957,9 @@ after answering the modal already on screen. A Save that throws counts as "stay"
 - The HMR game-code reload. It has its own countdown banner with Cancel (#850); it is a code
   change, not a gesture, and a blocking modal there would stall the agent that wrote the code.
 - Crash-recovery and error-boundary reloads, and the dev-only self-HMR reloads.
-- Every agent op. They keep `discardUnsaved` and never see the modal.
+- Every agent op. They keep `discardUnsaved` and never see the modal. The agent ops that swap
+  the world are `load_scene`, `new_scene`, and `modoki_prefab` `edit-open`/`edit-exit`; `edit-exit`
+  gained its refusal in #1424.
 
 **Known limits:**
 - The **browser-hosted** editor (Chrome, no Electron) has no `beforeunload`, so closing its tab is

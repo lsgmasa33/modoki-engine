@@ -482,7 +482,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'edit-open swaps the world for a synthetic scene holding the prefab in isolation (so it ' +
       'refuses on unsaved work like load_scene does, and SAVES the current scene on the way in), ' +
       'you edit its entities with modoki_mutate_scene / modoki_set_transform (omit `path` — it targets the prefab-edit world, reported as `prefabEditWorld` by modoki_get_editor_state) or the create/duplicate/delete/reparent entity tools, edit-save re-serializes the .prefab.json, ' +
-      'and edit-exit reloads the scene you came from so its instances re-expand from the new file. ' +
+      'and edit-exit reloads the scene you came from so its instances re-expand from the new file (it refuses on unsaved prefab edits — edit-save first, or discardUnsaved:true to drop them). ' +
       'While in that mode modoki_save_all REFUSES — edit-save is the save. In that world parent new entities UNDER the ' +
       "prefab root (edit-save serializes only the root's subtree, so a parentId:0 entity is dropped) and prefer " +
       "space:'local' — a 2D template sits under an editor-only stage, so 'world' coordinates bake its offset in.",
@@ -492,7 +492,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       path: z.string().optional().describe('instantiate / edit-open: prefab asset path. create: destination .prefab.json path.'),
       // EXTENDS the shared base rather than replacing it (§2 containment): the scope note is real
       // per-tool information, and it sits after the rule instead of forking it.
-      discardUnsaved: discardUnsavedParam.describe(`${DISCARD_UNSAVED_BASE}. edit-open ONLY — that action swaps the world like modoki_load_scene; the other prefab actions ignore this.`),
+      discardUnsaved: discardUnsavedParam.describe(`${DISCARD_UNSAVED_BASE}. edit-open and edit-exit — both swap the world like modoki_load_scene; the other prefab actions ignore this.`),
       parentId: z.number().optional().describe('instantiate: parent entity id (default root). Only for a parent with no guid — use parentGuid.'),
       parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred). Not together with parentId.'),
       entityId: z.number().optional().describe('create/detach/overrides/apply/revert: the entity id. Only for an entity with no guid — use entityGuid.'),

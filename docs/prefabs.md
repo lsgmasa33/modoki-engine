@@ -537,7 +537,17 @@ exposed as the `prefab` agent op / `modoki_prefab` MCP tool's `prefabAction: 'ed
 [debug-tools-mcp.md](./debug-tools-mcp.md)'s generated tool catalog. `edit-open` swaps the world
 exactly as `load-scene` does (refuses on unsaved work, takes `discardUnsaved`) and additionally saves the
 current scene on the way in, deliberately, so the return trip's reload-from-disk is
-non-destructive; `modoki_save_all` refuses outright while in prefab-edit mode.
+non-destructive. In prefab-edit mode `modoki_save_all` writes any parked work (asset docs, base-scene
+refs, import settings) and then refuses the scene half, because `edit-save` is the save for that
+world.
+`edit-exit` refuses the same way while the prefab world holds unsaved edits, because its reload of
+the return scene discards that world (#1424). Before that fix it answered `ok:true` over an unsaved
+delete, with the undo stack gone. `edit-save` first, or pass `discardUnsaved:true` to drop them
+deliberately. Inside prefab-edit mode the refusal's remedy is split by cause: `edit-save` for the
+prefab-world edits, `save_all` for parked work (`edit-save` does not write parked work). The human
+"Back to scene" button asks through the #1419 modal ([editor.md](./editor.md) § "The unsaved-work
+gate"). That modal counts only the world edits, because parked work survives the swap, while the
+agent refusal also counts parked work, as every agent world swap does.
 
 **Editing the template from an agent (#1254).** The prefab-edit world has no scene file. Prefab-edit
 sets the editor's scene path to `null`, so a normal save cannot target a real file. That world is

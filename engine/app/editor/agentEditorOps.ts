@@ -2075,7 +2075,15 @@ export function registerEditorAgentOps(): void {
     const survives = parkedHalf
       ? ' The parked entries are keyed by PATH and SURVIVE the swap — they stay pending either way.'
       : '';
-    const remedy = ' Run modoki_save_all to write all of it.'
+    // Inside prefab-edit mode the remedy is split BY CAUSE (#1424). The live half is the prefab
+    // world, and only `edit-save` writes it — save_all refuses the scene half there. The parked half
+    // is the opposite: `edit-save` does not touch it, and save_all DOES write it in prefab-edit mode
+    // (it flushes both parked phases, then refuses only the scene half). Naming edit-save for
+    // parked work sent the agent round a save → same refusal loop, towards the discard tools.
+    const remedy = (isEditingPrefab()
+      ? (liveHalf ? " Run modoki_prefab {action:'edit-save'} to write the prefab-world edits (modoki_save_all refuses the scene half in prefab-edit mode)." : '')
+        + (parkedHalf ? ' Run modoki_save_all to write the parked entries (in prefab-edit mode it writes them and refuses only the scene half).' : '')
+      : ' Run modoki_save_all to write all of it.')
       + (liveHalf ? ' `discardUnsaved:true` deliberately discards the LIVE-WORLD edits (not those of a loaded base the target shares).' : '')
       + (parkedHalf
         ? ' ⚠️ `discardUnsaved:true` does NOT drop the parked entries — use'
@@ -2138,7 +2146,9 @@ export function registerEditorAgentOps(): void {
   });
   registerAgentOp('new-scene', async (params) => {
     const p = (params ?? {}) as { discardUnsaved?: boolean; force?: boolean };
-    guardUnsaved('new-scene', p.discardUnsaved ?? p.force);
+    // In prefab-edit, `newScene` refuses whatever is dirty (below), so the unsaved-work refusal would
+    // only send the caller to save and then hit that one anyway (#1424 review). Let it speak first.
+    if (!isEditingPrefab()) guardUnsaved('new-scene', p.discardUnsaved ?? p.force);
     // Async since #853 — `newScene` now swaps the world through SceneManager instead of
     // respawning in place, so `onWorldSwap` fires and every id-keyed cache clears. It also
     // REFUSES during prefab edit; that throw carries its own message and propagates as this
@@ -2920,9 +2930,14 @@ export function registerEditorAgentOps(): void {
       return { ok: true, path: editing.path, guid: editing.guid, saved: true, ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'edit-exit') {
-      // Report not-editing rather than throwing: leaving a mode you are not in is a legitimate
-      // no-op, and an agent recovering from a failed edit-save should be able to call it blindly.
+      // Report not-editing rather than throwing: leaving a mode you are not in is a legitimate no-op.
       if (!isEditingPrefab()) return { ok: true, wasEditing: false, ...readEditorState() };
+      // Exiting reloads the return scene, which DISCARDS the prefab world — so it refuses on unsaved
+      // work exactly as edit-open and load-scene do (#1424: it answered ok:true over an unsaved
+      // delete, with the undo stack gone). This deliberately ends "call it blindly after a failed
+      // edit-save": after a failed save the edits ARE unsaved, and dropping them must be a choice
+      // the caller makes with discardUnsaved:true, not a side effect of tidying up.
+      guardUnsaved('prefab edit-exit', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
       const returned = await exitPrefabEditing();
       return { ok: true, wasEditing: true, returnedTo: returned, ...readEditorState() };
     }

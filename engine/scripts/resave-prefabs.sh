@@ -121,9 +121,10 @@ for PROJ in "$@"; do
            -d '{"action":"prefab","prefabAction":"edit-save"}')
     case "$sv" in *'"ok":true'*) echo "  saved $p";; *) echo "  SAVE FAILED $p -> $sv"; fail=1;; esac
     # Always leave edit mode, even after a failed save: the next edit-open would otherwise
-    # enter from the SYNTHETIC prefab world, whose scene path is null.
+    # enter from the SYNTHETIC prefab world, whose scene path is null. `force` because edit-exit
+    # refuses on unsaved prefab-world work (#1424), and this loop makes no edits of its own to keep.
     curl -s -X POST "$BE/api/editor-action" -H 'Content-Type: application/json' \
-      -d '{"action":"prefab","prefabAction":"edit-exit"}' > /dev/null
+      -d '{"action":"prefab","prefabAction":"edit-exit","force":true}' > /dev/null
     sleep 1
   done <<< "$prefabs"
 done
