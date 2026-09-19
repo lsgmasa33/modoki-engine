@@ -544,6 +544,103 @@ as one instance with its own guid, and its deep edits ride on the reference node
 The issue's proposed discriminator, the derived-vs-stored root guid, adds nothing: a nested
 root's derived guid is itself computed from this stamp (`memberStepId`).
 
+## Moved members (#1437)
+
+A prefab member moved to another parent **inside its outermost instance** stays linked, and the move
+is saved (owner rulings, #1437: (a) same frame, (b) across frames — under a scene-added node, into a
+nested instance's member, out of a nested instance into its outer one). Moved OUT of the outermost
+instance it is unpacked, as before (docs/scene-loading.md § the #1355 note). `reparentEntity` decides
+by `outermostInstanceRoot`.
+
+**Identity does not move.** A member's guid is derived from its row PATH (`deriveMemberGuid(anchor,
+path)`), so a moved member must keep deriving from where it was. `PrefabInstance.homeParent` holds the
+guid of the row parent it left, and `homeSteps` the steps through homes that were since deleted or
+unpacked (`runtime/core/ecs/memberHome.ts`). Every identity walk — `deriveInstanceMemberGuids`,
+`memberPathIndex`, `planCopyGuids`, `baseTokenResolver`, the template tokenizer — steps from the home
+(`identityParentId`, `homeStepsOf`). Moved back to its row parent, the stamp is cleared.
+
+**Save and load.** The save writes `moved: {rowLocalId: newParentGuid}` on the instance's entry, in a
+`nestedStructure` slot, or on a reference node (scene v15, which a v14 reader refuses). The loader
+expands the member at its row, derives every guid, and only then moves it (the per-World after-derive
+queue, drained at the end of `deriveInstanceMemberGuids`). A removed row holding a moved member stays
+until the drain, so the member derives through it first. Rebuild, delete, duplicate, revert and undo
+each keep the home pair: a member of another instance moved in is parked and put back, a moved-out
+member of a torn-down instance is torn down with it, and a delete detaches members whose instance goes.
+
+**A member's guid is never an anchor.** `deriveInstanceMemberGuids` used to anchor on the nearest
+ancestor with ANY guid. At load no member has one, so the walk reached the instance's anchor; a later
+pass did not. Rebuilding an owned nested instance found the outer members' derived guids and anchored
+there, so every member of the rebuild re-derived guids a reload does not reproduce. Measured with
+nothing moved: Slot's guid changed on a rebuild of its MidRoot. That predated #1437, and applying a
+move made it bite, because Apply rebuilds owned nested instances routinely. A member (linked to
+another root, or an owned nested root) is now always walked through.
+
+**Apply** (`applyToPrefabSelective`, key `~moved.<rowLocalId>`) writes the move where the prefab can
+say it, and always takes the member's live Transform with it (its pose relative to the new parent):
+- **The new parent is a row of the same frame**, or a plain node promoted by the same apply: the row
+  is RE-PARENTED. That changes the member's path, so its guid and every guid below it change, in every
+  instance. The references follow, in three places:
+  - live: `liveMemberGuidRemap` pairs old and new paths per live instance, the rebuild translates what
+    it looks up by guid, and `remapWorldGuidRefs` rewrites every trait value afterwards;
+  - the prefab's own `@member:` tokens (`rewritePrefabMemberTokens`, runtime/loaders/memberPaths.ts);
+  - every OTHER file: `/api/prefab-member-paths` runs `planMemberPathRepair` — scene guids through
+    `memberGuidRemap`, prefab tokens through the token rewrite — over every file naming the prefab,
+    transitively. A file an asset view holds unsaved is left and named (`ApplyResult.fileRepair`);
+    undo and redo run it back from the document the files were last repaired for.
+  Paths pair by IDENTITY (`memberPathRecords`: a localId per frame), so a row that goes from orphaned
+  (parentId 0, hung off the instance's parent) to row-parented is followed across anchors.
+- **The new parent is a member of a NESTED instance** (ruling (i): Handle → Lock/Bolt writes
+  Door.prefab only), or a nested instance's root: the prefab gets its own `moved` entry,
+  `"<member path>": "@member:<target path>"`. The row keeps its parent, so no guid changes. Hanging a
+  row under a nested root instead would give it the path of the nested prefab's own row with that
+  localId, and the two would derive one guid (review F1).
+- **The new parent was added in the scene**: skipped with that reason unless the same apply promotes it.
+- **A member of a NESTED instance moved out of it** (Lock's Bolt under Door's Frame): its own prefab cannot
+  name the parent, so applied on the nested instance it is skipped, with a pointer outward. The OUTER
+  instance offers it instead (owner, #1437 option B), as `~moved.<nested row chain>:<localId>`
+  (`nestedFrameMoves`): Apply writes the outer prefab's own `moved` entry, by path, and the member's pose as
+  an override on the nested row; the nested prefab is untouched and no guid moves. A move INSIDE the nested
+  instance is not offered outward — its own prefab records it. Revert rebuilds without it (`nestedMoves.drop`
+  on what the rebuild captures of the nested instance) and its undo sets it back. While a rebuild captures
+  nested instances, an enclosing instance's move base is read from the document it was EXPANDED from
+  (`expandedFrom`): read from the cache's newer copy during a refresh, a member not yet moved looked moved
+  back, and the capture cancelled the move being applied. The Apply dialog toasts every skip and every file left unrepaired
+  (`applyOutcomeNotice`).
+
+**A prefab's own moves** (prefab v4, `PrefabFile.moved`) are queued by `queuePrefabMoves` as BASE moves
+and resolved in the drain against the declaring instance's root. One move per member wins: an
+instance's own over any prefab's, and a prefab nesting the instance (queued later) over the nested
+prefab's. The capture compares against that base, so an instance at its prefab's target records
+nothing, and one moved back to its row records the move back. The base climbs the ENCLOSING instances'
+documents too (`prefabMoveTargets`), or a nested copy read its outer prefab's move as its own and saved it
+in every instance (review F4). The moved-Transform exemption from the override mark gate applies only away
+from the base, or every instance would pin its pose. Create Prefab / prefab-edit save (`serializePrefab` →
+`templateMoves`) writes the new prefab's own map for every nested member not under the parent the prefab
+would otherwise give it, and for a ROW sitting under a nested member: that row is written under the row it
+derives from (`rowParentsFor` — its home, the prefab-edit hint, or the nearest row ancestor), never with
+parent 0. Prefab-edit SHOWS the prefab's own moves (`applyEditWorldMoves`), and a nested row's edit-scene
+entry carries its sentinel as its stored guid so its members are found by the guids `editGuidAt` gives
+them; the nested capture never takes an edited prefab's row (`isPrefabEditRowGuid`) as its own addition.
+Applying a `-removed` row stops the cascade at a moved member and lifts its row to the nearest surviving row
+(a re-parent, so the ref repair follows), and drops a prefab move that names nothing any more. Promoting a user-added
+instance carries its interior moves the same way, and deletes its members that were moved out of its
+subtree, which the refresh respawns.
+
+A prefab's move of a nested member survives everything that rebuilds the nested instance alone (an
+apply or revert on it): `rebuildInstance` re-queues the moves of the documents around it
+(`enclosingFrames`). Once an outer prefab places a member, only the outer instance can move it again —
+back home included, which removes the entry; the nested instance's own Apply points outward. A row lifted
+past removed rows is carried through their poses, so it stays where it was in every instance.
+
+**Not covered.** An older build ignores a prefab's `moved` (the version is a writer-only stamp), so
+such a member sits at its row there. A prefab move whose member no longer exists — the nested prefab
+dropped that row — is skipped silently on load; the entry is cleaned up the next time the prefab that
+holds it is applied. A row lifted past removed rows without a `Transform` of its own gets no carried pose,
+and a carried pose under a non-uniformly scaled, rotated removed row is the nearest TRS, not exact. A ref into a node promoted by Apply still stays a guid, as
+before. Tests: `engine/tests/editor/duplicateCarriesRefs.test.ts` (the #1437 describes),
+`engine/tests/plugins/remintPrefabMemberRefs.test.ts` (memberGuidRemap, the token rewrite and
+planMemberPathRepair against the loader), `engine/tests/plugins/prefabMemberPathsRoute.test.ts`.
+
 ## Edge cases
 
 - **Reordering** prefab children is *not* a structural change — it's an

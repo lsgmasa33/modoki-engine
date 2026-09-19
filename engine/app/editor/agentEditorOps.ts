@@ -2893,18 +2893,27 @@ export function registerEditorAgentOps(): void {
         // applyToPrefabWithUndo pushes its OWN undo entry (before/after prefab + scene
         // snapshot — see applyPrefabUndo.ts) — do NOT push a second one here.
         const result = await applyToPrefabWithUndo(ctx.rootInstanceId, keySet);
+        // A move the prefab cannot express (#1437) is named with its reason, not echoed back as applied.
+        const notWritten = result.skipped ?? [];
         if (!result.applied) {
-          throw new Error(`prefab apply: nothing was written — the apply produced no change for entity ${entityId} (it may have stopped being a prefab instance mid-call).`);
+          const why = notWritten.length ? ` Not applied: ${notWritten.map((x) => `${x.key} (${x.reason})`).join('; ')}.` : '';
+          throw new Error(`prefab apply: nothing was written — the apply produced no change for entity ${entityId} (it may have stopped being a prefab instance mid-call).${why}`);
         }
         // apply WRITES the .prefab.json — say so honestly, mirroring how `create` reports `saved`.
         // `appliedKeys` excludes what the template cannot carry; `skippedKeys` names it rather
         // than leaving the caller to diff a second `overrides` call to notice. `warnings` carries the
         // prefab validation warnings for the written template, as `create` does (#1258).
-        const applied = [...keySet].filter((k) => !excluded.includes(k));
+        const skippedKeys = [...excluded, ...notWritten.map((x) => x.key)];
+        const applied = [...keySet].filter((k) => !skippedKeys.includes(k));
         return {
           ok: true, source: result.source, appliedKeys: applied,
-          ...(excluded.length > 0 ? { skippedKeys: excluded, skippedReason: 'not representable in a prefab template (scene-only / runtime-only field)' } : {}),
+          // skippedReason speaks for the excluded FIELDS only; each skipped move carries its own in skippedMoves.
+          ...(skippedKeys.length > 0 ? { skippedKeys } : {}),
+          ...(excluded.length > 0 ? { skippedReason: `fields ${excluded.join(', ')}: not representable in a prefab template (scene-only / runtime-only field)` } : {}),
+          ...(notWritten.length > 0 ? { skippedMoves: notWritten } : {}),
           promotedAdditions: result.promotedAdditions, saved: true,
+          // An applied move changed member paths (#1437): which other files had their refs repaired, and which not.
+          ...(result.memberPathsChanged ? { fileRepair: result.fileRepair ?? { failed: true } } : {}),
           ...(result.warnings?.length ? { warnings: result.warnings } : {}),
         };
       }

@@ -79,6 +79,10 @@ export interface KeyRecoveryNode {
   /** Its template key if it still carries the marker, else ''. */
   key: string;
   pi: { localId?: number; parentLocalId?: number } | null;
+  /** The steps between its identity parent and its own step, when its home was deleted or unpacked (#1437 —
+   *  `PrefabInstance.homeSteps`). `parentId` is its IDENTITY parent: its home, for a member moved inside its
+   *  instance — the chain its guid was derived along. */
+  extra?: number[];
 }
 
 /** The template key the node `ecsId` was spawned with, recovered from its guid. `''` when nothing
@@ -123,7 +127,7 @@ export function recoverTemplateKey(
     const step = node.key ? addedKeyStep(node.key)
       : node.pi ? memberStepId(node.pi)
       : (() => { const k = recoverTemplateKey(cur, nodeOf, keys, memo, isTop); return k ? addedKeyStep(k) : 0; })();
-    steps.unshift(step);
+    steps.unshift(...(node.extra ?? []), step);
     cur = node.parentId;
   }
   return '';

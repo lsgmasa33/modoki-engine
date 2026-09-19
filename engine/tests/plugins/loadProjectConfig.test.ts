@@ -597,6 +597,30 @@ describe('validateBuildConfig', () => {
     }
   });
 
+  // #1444: `(x86)` is where the Windows Cloud SDK installs by default, and an Android SDK sits under
+  // the user's own folder — non-ASCII for a Japanese user name. `ユーザー` in NFD carries a combining
+  // mark (U+3099), the spelling macOS file APIs hand back.
+  it('accepts a Program Files (x86) path and a non-ASCII user folder', () => {
+    for (const p of [
+      'C:/Program Files (x86)/Google/Cloud SDK/google-cloud-sdk/bin',
+      'C:/Users/山田太郎/AppData/Local/Android/Sdk',
+      'C:/Users/ユーサ\u3099ー/AppData/Local/Android/Sdk',
+      // An accented folder under a placeholder user: `/Users/<name>` with a real-looking name is a
+      // blocking finding in scan-publish-safety (it read `José` as the username `Jos`).
+      '/Users/me/Développement/Android/sdk',
+    ]) {
+      expect(validateBuildConfig(DEFAULT_PROJECT_CONFIG, withUser(undefined, { javaHome: p, androidHome: p, gcloudPath: p })), p).toEqual([]);
+    }
+  });
+
+  it('widened for #1444 by inert characters only — every shell-active one is still refused', () => {
+    const errs = (javaHome: string) => validateBuildConfig(DEFAULT_PROJECT_CONFIG, withUser(undefined, { javaHome }));
+    for (const bad of ['C:/x/$(reboot)', 'C:/x/`reboot`', 'C:/x;reboot', 'C:/x && reboot', 'C:/x | reboot',
+      "C:/x'y", 'C:/x"y', 'C:/x<y', 'C:/x>y', 'C:/x\nreboot', 'C:/x$HOME', 'C:/x~', 'C:/x*']) {
+      expect(errs(bad), JSON.stringify(bad)).toHaveLength(1);
+    }
+  });
+
   it('still refuses a colon anywhere but a leading drive, and every backslash — with a hint for the latter', () => {
     const errs = (javaHome: string) => validateBuildConfig(DEFAULT_PROJECT_CONFIG, withUser(undefined, { javaHome }));
     expect(errs('/jdk:/x')).toHaveLength(1);

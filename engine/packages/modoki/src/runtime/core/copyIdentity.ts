@@ -34,6 +34,7 @@
  *  See docs/scene-loading.md § "Guid uniqueness is a PER-FILE rule, not a repo-wide one" (the subtree duplicate bullet). */
 
 import { addedKeyStep, deriveMemberGuid, memberStepId } from './assetRefRules';
+import { homeStepsOf } from './ecs/memberHome';
 
 export interface CopyGuidPlan<N> {
   /** The new guid for each node of the tree. */
@@ -44,7 +45,7 @@ export interface CopyGuidPlan<N> {
   keyed: Set<N>;
 }
 
-type Pi = { localId?: number; parentLocalId?: number; rootInstanceId?: number } | null;
+type Pi = { localId?: number; parentLocalId?: number; rootInstanceId?: number; homeSteps?: string } | null;
 
 /** Plan the copy's guids. `dataOf(node, 'EntityAttributes' | 'PrefabInstance')` returns that trait's
  *  data on the node, or null when it has none; `keyOf(node)` its template key (`TemplateAddedKey`),
@@ -60,26 +61,55 @@ export function planCopyGuids<N>(
   const guidOf = new Map<N, string>();
   const remap = new Map<string, string>();
   const keyed = new Set<N>();
+  // Walk the copy in IDENTITY order: a member moved inside its instance hangs under its HOME parent
+  // (`PrefabInstance.homeParent`), which is where a reload derives it from (#1437 — `identityParentId`).
+  const liveOrder: N[] = [];
+  const liveParent = new Map<N, N>();
+  const collect = (node: N): void => {
+    liveOrder.push(node);
+    for (const child of childrenOf(node)) { liveParent.set(child, node); collect(child); }
+  };
+  collect(root);
+  const byGuid = new Map<string, N>();
+  for (const node of liveOrder) {
+    const guid = dataOf(node, 'EntityAttributes')?.guid;
+    if (typeof guid === 'string' && guid) byGuid.set(guid, node);
+  }
+  const identityChildren = new Map<N, N[]>();
+  for (const node of liveOrder) {
+    if (node === root) continue;
+    const home = dataOf(node, 'PrefabInstance')?.homeParent;
+    const homeNode = typeof home === 'string' && home ? byGuid.get(home) : undefined;
+    const parent = homeNode && homeNode !== node ? homeNode : liveParent.get(node)!;
+    const list = identityChildren.get(parent);
+    if (list) list.push(node);
+    else identityChildren.set(parent, [node]);
+  }
+  const visited = new Set<N>();
   // `inInstance`: some ancestor within the copy (or the node itself) is an instance root the
   // serializer STORES and that is not itself template-added — not an owned nested root, which is
   // copied as an independent instance (#1354), and not a keyed REFERENCE node, which belongs to the
   // outer template: the keys that template writes into its payload are the outer frame's (#1369).
   const visit = (node: N, ctx: { anchor: string; path: (number | string)[]; inInstance: boolean } | null): void => {
+    if (visited.has(node)) return;
+    visited.add(node);
     const ea = dataOf(node, 'EntityAttributes');
     const pi = dataOf(node, 'PrefabInstance') as Pi;
     const oldGuid = typeof ea?.guid === 'string' ? ea.guid : '';
     const key = ctx?.inInstance ? keyOf(node) : '';
     const storedRoot = !!pi && pi.rootInstanceId === idOf(node) && !pi.parentLocalId;
     const inInstance = (storedRoot && !keyOf(node)) || !!ctx?.inInstance;
-    const path = ctx && [...ctx.path, key ? addedKeyStep(key) : memberStepId(pi)];
+    const path = ctx && [...ctx.path, ...homeStepsOf(pi), key ? addedKeyStep(key) : memberStepId(pi)];
     const derived = !!ctx && (!!key || (!!pi && !storedRoot));
     const guid = derived ? deriveMemberGuid(ctx!.anchor, path!) : mint();
     guidOf.set(node, guid);
     if (key) keyed.add(node);
     if (oldGuid) remap.set(oldGuid, guid);
     const next = derived && !storedRoot ? { anchor: ctx!.anchor, path: path!, inInstance } : { anchor: guid, path: [], inInstance };
-    for (const child of childrenOf(node)) visit(child, next);
+    for (const child of identityChildren.get(node) ?? []) visit(child, next);
   };
   visit(root, null);
+  // A node whose home chain loops never hangs off the root; it keeps its live place.
+  for (const node of liveOrder) if (!visited.has(node)) visit(node, null);
   return { guidOf, remap, keyed };
 }

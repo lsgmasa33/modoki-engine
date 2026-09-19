@@ -27,6 +27,7 @@ import {
   type ApplyResult, type PrefabFile,
 } from '../scene/prefab';
 import { useEditorStore } from '../store/editorStore';
+import { repairPrefabMemberPaths } from '../backend/editorBackend';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { ensureGuid } from './entityRef';
 
@@ -41,8 +42,12 @@ async function restoreSnapshot(
   scene: SceneData,
   scenePath: string | null,
   selGuid: string,
+  /** The prefab document the files on disk were last repaired for, when the apply moved member paths
+   *  (#1437): they are repaired from it to `prefab`, the way the apply repaired them the other way. */
+  repairFrom?: PrefabFile,
 ): Promise<void> {
   await installPrefabSnapshot(source, prefab);
+  if (repairFrom && prefab.id) await repairPrefabMemberPaths(prefab.id, repairFrom);
   if (scenePath) {
     await sceneManager.loadScene(scenePath, { preloaded: clone(scene) });
     setCurrentScenePath(scenePath);
@@ -95,22 +100,24 @@ function makeApplyPrefabAction(opts: {
   sceneAfter: SceneData;
   scenePath: string | null;
   selGuid: string;
+  memberPathsChanged?: boolean;
   affectedScenes: string[];
   baseBefore: BaseInstanceSide | null;
   baseAfter: BaseInstanceSide | null;
 }): UndoAction {
+  const paths = opts.memberPathsChanged;
   return {
     label: 'Apply to Prefab',
     affectedScenes: opts.affectedScenes,
     // The world restore reaches only the primary; every carried base instance of the prefab is
     // re-derived against the prefab being restored, and the applied one rebuilt from its capture.
     undo: async () => {
-      await restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.scenePath, opts.selGuid);
+      await restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.scenePath, opts.selGuid, paths ? opts.prefabAfter : undefined);
       refreshBaseInstances(opts.source, opts.prefabAfter, opts.prefabBefore, opts.baseBefore?.rootGuid);
       await restoreBaseInstance(opts.source, opts.baseBefore);
     },
     redo: async () => {
-      await restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.scenePath, opts.selGuid);
+      await restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.scenePath, opts.selGuid, paths ? opts.prefabBefore : undefined);
       refreshBaseInstances(opts.source, opts.prefabBefore, opts.prefabAfter, opts.baseAfter?.rootGuid);
       await restoreBaseInstance(opts.source, opts.baseAfter);
     },
@@ -171,6 +178,7 @@ export async function applyToPrefabWithUndo(
     sceneAfter,
     scenePath,
     selGuid,
+    memberPathsChanged: result.memberPathsChanged,
     affectedScenes,
     baseBefore: baseBefore && liveAfter ? { ...baseBefore, prefab: result.prefabBefore } : null,
     baseAfter,

@@ -2,9 +2,13 @@
 
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { rehomeDependents, homeStepsOf } from '../../runtime/core/ecs/memberHome';
+import { isPrefabEditRowGuid } from './prefabEditGuids';
+import { IDENTITY_TRS, mergeTrs, localToWorldTrs } from '../../runtime/scene/transformSpace';
+import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, type PrefabReader } from '../../runtime/loaders/memberPaths';
 import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
-import { postWriteFile, jsonFileBody } from '../backend/editorBackend';
+import { postWriteFile, jsonFileBody, repairPrefabMemberPaths } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './authoringScope';
@@ -12,7 +16,7 @@ import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
-import { durableGuid, memberStepId, addedKeyStep, mapStringValues } from '../../runtime/core/assetRefRules';
+import { durableGuid, memberStepId, addedKeyStep, mapStringValues, deriveMemberGuid, remapGuidValues } from '../../runtime/core/assetRefRules';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import { templateKeysOf, recoverTemplateKey as recoverKeyFrom, type KeyRecoveryNode } from '../../runtime/loaders/templateKeyRecovery';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
@@ -25,7 +29,7 @@ import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/e
 import { writtenTraitKeys } from './traitDefault';
 import { adoptParentScene, resolveAffectedScenes } from './sceneDirty';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData } from '../../runtime/loaders/loadSceneFile';
-import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, prefabSubtreeLocalIds, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens } from '../../runtime/loaders/loadSceneFile';
+import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, identityParentId, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves } from '../../runtime/loaders/loadSceneFile';
 import { rebaseMemberTokens, isMemberToken, parseMemberToken, memberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
 
 /** Fields that persist in a SCENE but must never be baked into a prefab TEMPLATE,
@@ -102,8 +106,12 @@ export interface PrefabEntity {
  *  (meshTemplateCache.ts) both run `migrateUIAnchorZIndexStructured` on every entity,
  *  unconditionally, on every load — cheap and idempotent, so it costs nothing to apply to an
  *  already-migrated (or v3-native) file. The version bump here only makes freshly-written
- *  files honest about which serializer touched them, same as every bump before it. */
-export const PREFAB_FORMAT_VERSION = 3;
+ *  files honest about which serializer touched them, same as every bump before it.
+ *
+ *  v4: an optional top-level `moved` map (#1437 P3-b — a member the prefab places under a member of one of
+ *  its nested instances). Still no ladder, and still nothing on the loading path reads this field: an older
+ *  build loads a v4 file and ignores `moved`, so such a member sits at its row parent there. */
+export const PREFAB_FORMAT_VERSION = 4;
 
 export interface PrefabFile {
   /** Stable UUID — written once at save, never changes across renames/moves. */
@@ -124,6 +132,12 @@ export interface PrefabFile {
   name: string;
   rootLocalId: number;
   entities: PrefabEntity[];
+  /** Members the prefab places under a parent no row relation can express (#1437 P3-b/P3-c) — a member of
+   *  one of its NESTED instances, or a nested instance's member placed in this prefab: the member's path →
+   *  a member token for its new parent, both in this prefab's frame. Its row keeps its parent, so the
+   *  member's identity — its path — is unchanged. Resolved after the derive pass; an instance's own move of
+   *  the same member overrides it, and so does the move of a prefab nesting this one. */
+  moved?: Record<string, string>;
 }
 
 // ── Save as Prefab ──────────────────────────────────────
@@ -346,17 +360,22 @@ function authoringEntitiesFor(selectedEntityId: number, all: EntityInfo[]): { en
  *  Steps: the written root's frame names each row by its NEW localId (`ecsToLocal`). Any other frame
  *  is a live instance whose members step as the derive pass walks them (`memberPathIndex`). A
  *  reference node's payload is left whole, since it is applied in its own frame. */
-function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLocal: Map<number, number>) {
+function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLocal: Map<number, number>, rowParent: Map<number, number> = new Map()) {
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
+  const piOf = (id: number) => (piMeta ? readTraitData(id, piMeta) as { localId?: number; parentLocalId?: number; rootInstanceId?: number; homeParent?: string; homeSteps?: string } | null : null);
+  // A written ROW hangs where it lives; a nested instance's member by its IDENTITY — from its home when it
+  // was moved (#1437) — since that is where the written prefab's expansion derives it.
+  const idOfGuid = new Map(all.filter((e) => e.guid).map((e) => [e.guid!, e.id]));
   const children = new Map<number, EntityInfo[]>();
   for (const e of all) {
-    const list = children.get(e.parentId);
+    const parent = ecsToLocal.has(e.id) ? (rowParent.get(e.id) ?? e.parentId) : identityParentId(e.parentId, piOf(e.id)?.homeParent, (g) => idOfGuid.get(g));
+    const list = children.get(parent);
     if (list) list.push(e);
-    else children.set(e.parentId, [e]);
+    else children.set(parent, [e]);
   }
-  const piOf = (id: number) => (piMeta ? readTraitData(id, piMeta) as { localId?: number; parentLocalId?: number; rootInstanceId?: number } | null : null);
   const pathInRoot = new Map<string, MemberStep[]>();
+  const pathById = new Map<number, MemberStep[]>([[rootEcsId, []]]);
   const rootGuid = all.find((e) => e.id === rootEcsId)?.guid;
   if (rootGuid) pathInRoot.set(rootGuid, []);
   const stack: [number, MemberStep[]][] = [[rootEcsId, []]];
@@ -372,8 +391,9 @@ function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLocal: Map
         : key ? addedKeyStep(key)
         : pi ? memberStepId(pi) : null;
       if (step === null) continue;
-      const at = [...path, step];
+      const at = ecsToLocal.has(c.id) ? [...path, step] : [...path, ...homeStepsOf(pi), step];
       if (c.guid) pathInRoot.set(c.guid, at);
+      pathById.set(c.id, at);
       const storedRoot = !!pi && pi.rootInstanceId === c.id && !pi.parentLocalId;
       if (!storedRoot || ecsToLocal.has(c.id)) stack.push([c.id, at]);
     }
@@ -438,7 +458,9 @@ function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLocal: Map
     }
     return cur;
   };
-  return { value, added, frameAt, undeclaredKeys, root: rootEcsId };
+  /** A live entity's path in the written prefab's frame, or undefined when it is not one it can name. */
+  const pathOf = (id: number): MemberStep[] | undefined => pathById.get(id);
+  return { value, added, frameAt, undeclaredKeys, pathOf, root: rootEcsId };
 }
 
 /** Resolves the member tokens in a prefab BASE value against the live instance rooted at
@@ -454,7 +476,8 @@ export function baseTokenResolver(rootInstanceId: number): (value: unknown) => u
     for (let i = 0; i < up && r; i++) {
       const pi = piMeta ? readTraitData(r, piMeta) : null;
       if (!pi?.parentLocalId || !eaMeta) return 0; // a stored root is its own frame: nothing above it
-      const parent = (readTraitData(r, eaMeta)?.parentId as number) || 0;
+      const home = typeof pi.homeParent === 'string' ? pi.homeParent : ''; // a moved nested root's frame is its home's (#1437)
+      const parent = identityParentId((readTraitData(r, eaMeta)?.parentId as number) || 0, home, (g) => findEntityByGuid(g, world)?.id());
       r = parent && piMeta ? ((readTraitData(parent, piMeta)?.rootInstanceId as number) || 0) : 0;
     }
     return r;
@@ -497,6 +520,10 @@ export function serializePrefab(
      *  selection — with how many. The exclusion itself is not optional; this is only how a caller
      *  SURFACES it (a toast, an MCP response field). `serializePrefab` always logs it too. */
     onRuntimeExcluded?: (count: number) => void;
+    /** localId → the row parent that member had in the prefab being RE-saved (prefab-edit). A row whose live
+     *  parent is no row — the prefab's own move put it under a nested member (#1437) — is written back under
+     *  it, with the move kept in `moved`, instead of losing its parent. */
+    rowParents?: Map<number, number>;
   },
 ): PrefabFile | null {
   const rawEntities = getAllEntities();
@@ -519,16 +546,16 @@ export function serializePrefab(
   const tree = collectTree(selectedEntityId, allEntities);
   if (tree.length === 0) return null;
 
-  const piMeta = getTraitByName('PrefabInstance');
   const plan = planPrefabRows(tree, selectedEntityId, existingId, opts?.preserveLocalIds);
   if (!plan) return null; // cycle — planPrefabRows already reported it
   const { nestedRefs, flatTree, ecsToLocal } = plan;
 
   const allTraits = getAllTraits();
   const prefabEntities: PrefabEntity[] = [];
+  const rowParent = rowParentsFor(selectedEntityId, flatTree, allEntities, ecsToLocal, opts?.rowParents, new Set(nestedRefs.keys()));
   // A ref from one member of the written tree to another becomes a member TOKEN (#1352): the file is a
   // template, and the live guid it held names the SOURCE entity in every instance.
-  const tokens = templateTokenizer(selectedEntityId, allEntities, ecsToLocal);
+  const tokens = templateTokenizer(selectedEntityId, allEntities, ecsToLocal, rowParent);
 
   for (const entityInfo of flatTree) {
     const localId = ecsToLocal.get(entityInfo.id)!;
@@ -538,9 +565,7 @@ export function serializePrefab(
     // own traits come from the child file, edits ride in `overrides`.
     const nested = nestedRefs.get(entityInfo.id);
     if (nested) {
-      const ea = readTraitData(entityInfo.id, piMeta!) && getTraitByName('EntityAttributes')
-        ? readTraitData(entityInfo.id, getTraitByName('EntityAttributes')!) : null;
-      const parentLocal = ea && ea.parentId !== undefined ? (ecsToLocal.get(ea.parentId as number) || 0) : 0;
+      const parentLocal = ecsToLocal.get(rowParent.get(entityInfo.id) ?? 0) || 0;
       // Each payload is in the frame of the instance it is applied to: the row's own in the child's
       // (one level down), a nested path's in the instance that path addresses.
       const frameOf = (pathKey: string) => tokens.frameAt(entityInfo.id, pathKey) || entityInfo.id;
@@ -626,8 +651,7 @@ export function serializePrefab(
         // of the prefab would start with the same (stale) guid.
         if (meta.name === 'EntityAttributes') {
           if (traitData['parentId'] !== undefined) {
-            const ecsParentId = traitData['parentId'] as number;
-            (traitData as Record<string, unknown>)['parentId'] = ecsToLocal.get(ecsParentId) || 0;
+            (traitData as Record<string, unknown>)['parentId'] = ecsToLocal.get(rowParent.get(entityInfo.id) ?? 0) || 0;
           }
           (traitData as Record<string, unknown>)['guid'] = '';
         }
@@ -664,6 +688,8 @@ export function serializePrefab(
     }
   }
 
+  const moved = templateMoves(selectedEntityId, tree, ecsToLocal, tokens.pathOf, rowParent);
+
   const file: PrefabFile = {
     id: existingId ?? newGuid(),
     // The format version this serializer writes, unconditionally — see PREFAB_FORMAT_VERSION
@@ -675,9 +701,118 @@ export function serializePrefab(
     // the same table, so the two can't disagree.
     rootLocalId: ecsToLocal.get(selectedEntityId) ?? 1,
     entities: prefabEntities,
+    ...(moved ? { moved } : {}),
   };
   assertNoRuntimeGuids(file, 'a serialized prefab');
   return file;
+}
+
+/** Each written row's row parent: its live parent when that is a row (the ordinary case, a re-parent in the
+ *  editor included). A row whose live parent is NOT one — it sits under a member of a nested instance, where
+ *  a prefab's own move put it (#1437) — keeps the row it derives from: its home when it is linked, else the
+ *  prefab-edit `hints` (localId → parent localId), else its nearest row ancestor. */
+function rowParentsFor(
+  rootEcsId: number, flatTree: EntityInfo[], all: EntityInfo[], ecsToLocal: Map<number, number>, hints?: Map<number, number>,
+  /** The rows that are nested instances: never a row parent to fall back on — a row hung under one would share
+   *  a path with that prefab's own row of the same localId. */
+  nestedRows: ReadonlySet<number> = new Set(),
+): Map<number, number> {
+  const piMeta = getTraitByName('PrefabInstance');
+  const byId = new Map(all.map((e) => [e.id, e]));
+  const idOfGuid = new Map(all.filter((e) => e.guid).map((e) => [e.guid!, e.id]));
+  const ecsOfLocal = new Map([...ecsToLocal].map(([ecs, lid]) => [lid, ecs]));
+  const out = new Map<number, number>();
+  for (const e of flatTree) {
+    if (e.id === rootEcsId || ecsToLocal.has(e.parentId)) { out.set(e.id, e.parentId); continue; }
+    const home = piMeta ? (readTraitData(e.id, piMeta)?.homeParent as string | undefined) : undefined;
+    const identity = identityParentId(e.parentId, home, (g) => idOfGuid.get(g));
+    // Never a row inside its own live subtree now: that would write a parent cycle (identity parent or hint).
+    const underSelf = (id: number | undefined): boolean => {
+      for (let a = id, n = 0; a && n < 10_000; a = byId.get(a)?.parentId, n++) if (a === e.id) return true;
+      return false;
+    };
+    let hinted = hints ? ecsOfLocal.get(hints.get(ecsToLocal.get(e.id)!) ?? -1) : undefined;
+    if (underSelf(hinted)) hinted = undefined;
+    let up = e.parentId;
+    for (let n = 0; up && !(ecsToLocal.has(up) && !nestedRows.has(up)) && n < 10_000; n++) up = byId.get(up)?.parentId ?? 0;
+    out.set(e.id, ecsToLocal.has(identity) && !underSelf(identity) ? identity : hinted ?? (up || rootEcsId));
+  }
+  // Choices made row by row can still close a loop across several rows (a moved row's home now under another
+  // moved row). Any row on a loop falls back to its nearest live row ancestor; the live tree has none, so
+  // repeating until nothing loops ends.
+  const liveRowAncestor = (id: number): number => {
+    let up = byId.get(id)?.parentId ?? 0;
+    for (let n = 0; up && !(ecsToLocal.has(up) && !nestedRows.has(up)) && n < 10_000; n++) up = byId.get(up)?.parentId ?? 0;
+    return up || rootEcsId;
+  };
+  for (let changed = true, pass = 0; changed && pass < 1_000; pass++) {
+    changed = false;
+    for (const e of flatTree) {
+      if (e.id === rootEcsId) continue;
+      const seen = new Set<number>([e.id]);
+      for (let p = out.get(e.id); p !== undefined && p !== rootEcsId; p = out.get(p)) {
+        if (seen.has(p)) {
+          if (p === e.id && out.get(e.id) !== liveRowAncestor(e.id)) { out.set(e.id, liveRowAncestor(e.id)); changed = true; }
+          break;
+        }
+        seen.add(p);
+      }
+    }
+  }
+  return out;
+}
+
+/** The written prefab's own `moved` (#1437 P3-c): every member of a nested instance in the tree that sits
+ *  under a parent other than the one the written prefab would give it WITHOUT this map — its row parent,
+ *  or where one of its nested prefabs' own moves puts it (the outermost such prefab's). "Moved back" to its
+ *  row included. Member and parent are named by path in the written frame (`pathOf`). A written ROW needs
+ *  none: it is written under its live parent. `undefined` when there is nothing to write. */
+function templateMoves(
+  rootEcsId: number, tree: EntityInfo[], ecsToLocal: Map<number, number>, pathOf: (id: number) => MemberStep[] | undefined,
+  rowParent: Map<number, number>,
+): Record<string, string> | undefined {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta) return undefined;
+  const byId = new Map(tree.map((e) => [e.id, e]));
+  const idOfGuid = new Map(tree.filter((e) => e.guid).map((e) => [e.guid!, e.id]));
+  const piOf = (id: number) => readTraitData(id, piMeta) as { rootInstanceId?: number; source?: string; homeParent?: string } | null;
+  // The base each nested prefab's own moves give, the INNERMOST first so the outermost — which the loader
+  // applies last — overwrites.
+  const frames = tree
+    .filter((e) => e.id !== rootEcsId && piOf(e.id)?.rootInstanceId === e.id)
+    .map((e) => ({ id: e.id, doc: getCachedPrefabSync(piOf(e.id)!.source ?? ''), depth: pathOf(e.id)?.length ?? Infinity }))
+    .sort((a, b) => b.depth - a.depth);
+  const base = new Map<number, number>();
+  for (const f of frames) {
+    if (!f.doc?.moved) continue;
+    const index = memberPathIndex(getCurrentWorld(), f.id);
+    for (const [key, token] of Object.entries(f.doc.moved)) {
+      const t = parseMemberToken(token);
+      const member = index.get(key);
+      const target = t && !t.up ? index.get(memberPathKey(t.path)) : null;
+      if (member && target) base.set(member.id(), target.id());
+    }
+  }
+  const out: Record<string, string> = {};
+  // A written row whose live parent is no row: written under its row parent, and moved from there.
+  for (const e of tree) {
+    const row = rowParent.get(e.id);
+    if (e.id === rootEcsId || row === undefined || row === e.parentId) continue;
+    const member = pathOf(e.id);
+    const parent = pathOf(e.parentId);
+    if (member && parent) out[memberPathKey(member)] = memberToken(0, parent);
+  }
+  const candidates = new Set([...base.keys(), ...tree.filter((e) => piOf(e.id)?.homeParent).map((e) => e.id)]);
+  for (const id of candidates) {
+    const e = byId.get(id);
+    if (!e || ecsToLocal.has(id)) continue;
+    const at = base.get(id) ?? identityParentId(e.parentId, piOf(id)?.homeParent, (g) => idOfGuid.get(g));
+    if (e.parentId === at) continue;
+    const member = pathOf(id);
+    const parent = pathOf(e.parentId);
+    if (member && parent) out[memberPathKey(member)] = memberToken(0, parent);
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 // ── Rigged re-import merge (P7b-2b) ──────────────────────
@@ -951,6 +1086,7 @@ export function instantiatePrefab(
       if (structDirect) {
         applyStructureByRootInstance(childRoot, child, {
           added: rebaseAddedMemberTokens(structDirect.added ?? [], childSegments), removed: structDirect.removed ?? [], removedTraits: structDirect.removedTraits ?? {},
+          moved: structDirect.moved ?? {},
         });
       } else if (pe.added?.length || pe.removed?.length || pe.removedTraits) {
         applyStructureByRootInstance(childRoot, child, { added: rebaseAddedMemberTokens(pe.added, childSegments), removed: pe.removed, removedTraits: pe.removedTraits });
@@ -1029,6 +1165,10 @@ export function instantiatePrefab(
       }
     }
   }
+
+  // The prefab's own moves (#1437 P3-b), resolved after the derive pass; an instance's own move of the same
+  // member overrides one.
+  if (prefab.moved) queuePrefabMoves(getCurrentWorld(), rootEcsId, prefab.moved, '[Prefab]');
 
   // Refresh subscribers with the remapped parent links — refreshes fired during
   // the spawn loop saw stale local parentIds.
@@ -1495,6 +1635,58 @@ export function getOverrides(
 //
 /** Capture all per-localId overrides for every entity in a prefab instance.
  *  Returns `{}` if the root has no overrides anywhere. */
+/** The guid of the parent the prefab moves (P3-b) place a live entity under, in the instance rooted at
+ *  `rootInstanceId` — '' when none does, or its target names no member. `prefab` is that instance's document;
+ *  an ENCLOSING instance's document can move the same member too, and the outermost one wins, as the loader
+ *  applies it last. Without the enclosing ones a nested instance read the outer prefab's move as the
+ *  instance's own, and every copy saved it (review F4). Memoised. */
+/** While a rebuild captures nested instances: the document each enclosing instance root was EXPANDED from, when
+ *  the cache already holds a newer one (a refresh after Apply). Read against the new document, a member still at
+ *  its old place looked moved back, and the capture cancelled the very move being applied. */
+let expandedFrom: ReadonlyMap<number, PrefabFile> | null = null;
+
+/** The instance roots ENCLOSING an owned nested instance rooted at `rootInstanceId`, innermost first, each with
+ *  the document it was expanded from — up to the stored root. Empty for a stored root. */
+function enclosingFrames(rootInstanceId: number): { root: number; doc: PrefabFile | null }[] {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  const out: { root: number; doc: PrefabFile | null }[] = [];
+  if (!piMeta || !eaMeta) return out;
+  const world = getCurrentWorld();
+  for (let root = rootInstanceId, n = 0; root && n < 64; n++) {
+    const pi = readTraitData(root, piMeta);
+    if (!pi?.parentLocalId) break; // a stored root: nothing encloses it
+    const up = identityParentId((readTraitData(root, eaMeta)?.parentId as number) || 0, pi.homeParent as string | undefined, (g) => findEntityByGuid(g, world)?.id());
+    root = up ? ((readTraitData(up, piMeta)?.rootInstanceId as number) || 0) : 0;
+    if (root) out.push({ root, doc: expandedFrom?.get(root) ?? getCachedPrefabSync((readTraitData(root, piMeta)?.source as string) || '') });
+  }
+  return out;
+}
+
+function prefabMoveTargets(rootInstanceId: number, prefab: PrefabFile): (ecsId: number) => string {
+  const eaMeta = getTraitByName('EntityAttributes');
+  type Frame = { index: ReturnType<typeof memberPathIndex>; pathOf: Map<number, string>; doc: PrefabFile };
+  let frames: Frame[] | null = null;
+  const frameChain = (): Frame[] => {
+    const world = getCurrentWorld();
+    return [{ root: rootInstanceId, doc: prefab }, ...enclosingFrames(rootInstanceId)].filter((f) => f.doc?.moved).map((f) => {
+      const index = memberPathIndex(world, f.root);
+      return { index, pathOf: new Map([...index].filter(([, e]) => e).map(([k, e]) => [e!.id(), k])), doc: f.doc! };
+    });
+  };
+  return (ecsId) => {
+    if (!eaMeta) return '';
+    frames ??= frameChain();
+    let base = '';
+    for (const f of frames) {
+      const t = parseMemberToken(f.doc.moved?.[f.pathOf.get(ecsId) ?? '\0'] ?? '');
+      const target = t && !t.up ? f.index.get(memberPathKey(t.path)) : null;
+      if (target) base = (target.get(eaMeta.trait) as { guid?: string }).guid ?? '';
+    }
+    return base;
+  };
+}
+
 export function captureInstanceOverrides(
   rootInstanceId: number,
   prefab: PrefabFile,
@@ -1505,6 +1697,8 @@ export function captureInstanceOverrides(
   const allTraits = getAllTraits();
   const result: Record<number, Record<string, Record<string, unknown>>> = {};
   const resolveBase = baseTokenResolver(rootInstanceId);
+  const eaMetaForMoves = getTraitByName('EntityAttributes');
+  const moveBase = prefabMoveTargets(rootInstanceId, prefab);
 
   // Walk every entity that belongs to this instance via PrefabInstance.rootInstanceId
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
@@ -1542,10 +1736,19 @@ export function captureInstanceOverrides(
     // from stored overrides). So drop a diverged field that carries no mark. Added
     // traits (prefab doesn't define them at this localId) are structural, not
     // base-relative field diffs, so they're kept regardless.
+    //
+    // EXCEPT the Transform of a member moved inside its instance (#1437): its local pose is relative to a
+    // parent the prefab never gave it, so every field that differs from the base is part of the move, and
+    // none of it needs a mark. Moved back home, the stamp is gone and the gate applies again, so a round
+    // trip pins nothing.
+    // A member at the place its PREFAB moves it to (P3-b) is at its base: not moved, for this purpose.
+    const liveParentGuid = eaMetaForMoves ? ((readTraitData((readTraitData(entity.id(), eaMetaForMoves)?.parentId as number) || 0, eaMetaForMoves)?.guid as string) || '') : '';
+    const moved = !!piData.homeParent && liveParentGuid !== moveBase(entity.id());
     const prefabEntity = prefab.entities.find((e) => e.localId === localId);
     for (const [traitName, fields] of Object.entries(diffs)) {
       const prefabData = prefabEntity?.traits[traitName];
       if (prefabData === undefined || prefabData === true) continue; // added trait/tag — keep
+      if (moved && traitName === 'Transform') continue;
       for (const field of Object.keys(fields)) {
         if (!markSet?.has(`${traitName}.${field}`)) delete (fields as Record<string, unknown>)[field];
       }
@@ -1658,6 +1861,8 @@ export interface InstanceStructure {
   added: AddedEntity[];
   removed: number[];
   removedTraits: Record<number, string[]>;
+  /** Members moved to another parent inside the instance (#1437): row localId → live parent guid. */
+  moved: Record<number, string>;
   consumedEcsIds: Set<number>;
   /** ecsId → the nested-prefab ROW localId it is the expansion of, for the nested instances
    *  directly under this instance's members. This is the AUTHORITATIVE owned/independent split
@@ -1665,6 +1870,10 @@ export interface InstanceStructure {
    *  parentLocalId` itself, or the two disagree and an instance is written by neither — see the
    *  ⚠️ note on the partition in `captureInstanceStructure`. */
   ownedNested: Map<number, number>;
+  /** For a REBUILD only (#1437, owner's B): moves inside owned nested instances to drop from, or set on, what
+   *  the rebuild captures of them — keyed `~moved.<chain>:<lid>` (`nestedFrameMoves`). A revert drops the
+   *  ones it reverts; its undo sets them back. */
+  nestedMoves?: { drop?: string[]; set?: Record<string, string> };
 }
 
 /** The ONE compaction an added node's trait bag goes through (#1381 close-out): schema-default fields
@@ -1784,8 +1993,10 @@ function recoverTemplateKey(ecsId: number, memo = new Map<number, string>()): st
   const nodeOf = (id: number): KeyRecoveryNode | undefined => {
     const ea = readTraitData(id, eaMeta);
     if (!ea) return undefined;
-    const pi = piMeta ? readTraitData(id, piMeta) as { localId?: number; parentLocalId?: number } | null : null;
-    return { guid: durableGuid(ea.guid as string), parentId: (ea.parentId as number) || 0, key: templateKeyOf(findEntity(id)), pi };
+    const pi = piMeta ? readTraitData(id, piMeta) as { localId?: number; parentLocalId?: number; homeParent?: string; homeSteps?: string } | null : null;
+    // By IDENTITY, as the derive pass walked it (#1437): a member moved inside its instance steps from its home.
+    const parentId = identityParentId((ea.parentId as number) || 0, pi?.homeParent, (g) => findEntityByGuid(g)?.id());
+    return { guid: durableGuid(ea.guid as string), parentId, key: templateKeyOf(findEntity(id)), pi, extra: homeStepsOf(pi) };
   };
   return recoverKeyFrom(ecsId, nodeOf, keys, memo);
 }
@@ -1795,7 +2006,7 @@ function recoverTemplateKey(ecsId: number, memo = new Map<number, string>()): st
  *  components it removed from surviving members. (Added components are already
  *  captured as added-trait overrides by captureInstanceOverrides.) */
 export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabFile, opts: StructureCaptureOpts = {}): InstanceStructure {
-  const empty: InstanceStructure = { added: [], removed: [], removedTraits: {}, consumedEcsIds: new Set(), ownedNested: new Map() };
+  const empty: InstanceStructure = { added: [], removed: [], removedTraits: {}, moved: {}, consumedEcsIds: new Set(), ownedNested: new Map() };
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return empty;
 
@@ -1829,6 +2040,12 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   if (localToEcs.size === 0) return empty;
 
   const isMember = (ecsId: number) => ecsToLocal.has(ecsId);
+  // A member of ANOTHER instance moved in here (#1437): its own instance records the move, so capturing it
+  // as an added child too would spawn it twice.
+  const movedIn = (ecsId: number) => !isMember(ecsId) && !!(readTraitData(ecsId, PrefabInstanceMeta)?.homeParent);
+  // …and in a prefab-edit world, a ROW of the edited prefab that its own move placed under one of ours: it is
+  // written as that prefab's row, not captured as something added here.
+  const editRow = (ecsId: number) => isPrefabEditRowGuid(byId.get(ecsId)?.guid);
   // Classify a non-member child that is a self-rooted prefab instance (a NESTED
   // instance hanging under one of our members):
   //  - 'owned'     — it expanded from THIS prefab's own definition (its
@@ -1864,15 +2081,28 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   // Every self-rooted prefab instance hanging DIRECTLY under a member of this instance — the only
   // place a row of this prefab can expand. Sorted by ecsId so the assignment below is deterministic
   // rather than dependent on world-query order.
+  // A nested root MOVED inside this instance is looked for under its HOME member, where its row is (#1437).
+  const homeMember = (id: number): number | undefined => {
+    const home = (readTraitData(id, PrefabInstanceMeta)?.homeParent as string) || '';
+    return home ? findEntityByGuid(home)?.id() : undefined;
+  };
+  const identityChildrenOf = new Map<number, EntityInfo[]>();
+  for (const e of allEntities) {
+    const parent = (e.traits.includes('PrefabInstance') && homeMember(e.id)) || e.parentId;
+    if (!identityChildrenOf.has(parent)) identityChildrenOf.set(parent, []);
+    identityChildrenOf.get(parent)!.push(e);
+  }
   const nestedCandidates: { ecsId: number; key: string; stamp: number }[] = [];
   for (const [memberEcs, memberLocal] of ecsToLocal) {
-    for (const child of childrenOf.get(memberEcs) || []) {
+    for (const child of identityChildrenOf.get(memberEcs) || []) {
       if (!child.traits.includes('PrefabInstance')) continue;
       const pi = readTraitData(child.id, PrefabInstanceMeta);
       if (!pi || pi.rootInstanceId !== child.id) continue;
+      // Its home re-pointed past a deleted row parent (`homeSteps`): that row is still the one it anchors at.
+      const steps = homeStepsOf(pi as { homeSteps?: string });
       nestedCandidates.push({
         ecsId: child.id,
-        key: `${memberLocal}:${(pi.source as string) || ''}`,
+        key: `${steps.length ? steps[steps.length - 1] : memberLocal}:${(pi.source as string) || ''}`,
         stamp: (pi.parentLocalId as number) || 0,
       });
     }
@@ -1964,6 +2194,27 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     if (gone.length) removedTraits[localId] = gone;
   }
 
+  // ── moved members: linked, but under a parent other than their row's (#1437) ──
+  // A member or owned nested root carrying `homeParent` has left its row parent; the save records where it
+  // went, by the live parent's guid. Moved back home, the stamp is cleared and nothing is written.
+  // A TEMPLATE capture (a prefab written from a live tree) writes none: its values would be live scene guids,
+  // which name nothing in the prefab's own space — nor, in another instance, anything of that instance.
+  // A member the PREFAB itself moves (P3-b) has that target as its base instead: the instance records a move
+  // only when the member sits anywhere else — back at its row parent included.
+  const moved: Record<number, string> = {};
+  const baseTarget = prefabMoveTargets(rootInstanceId, prefab);
+  const noteMove = (ecsId: number, rowLocal: number): void => {
+    if (opts.template) return;
+    const pi = readTraitData(ecsId, PrefabInstanceMeta);
+    const home = (pi?.homeParent as string) || '';
+    const parentGuid = byId.get(byId.get(ecsId)?.parentId ?? 0)?.guid || '';
+    const base = baseTarget(ecsId);
+    if (base) { if (parentGuid && (parentGuid !== base || pi?.homeSteps)) moved[rowLocal] = parentGuid; return; }
+    if (home && parentGuid && (parentGuid !== home || pi?.homeSteps)) moved[rowLocal] = parentGuid;
+  };
+  for (const [localId, ecsId] of localToEcs) if (ecsId !== rootInstanceId) noteMove(ecsId, localId);
+  for (const [ecsId, rowLocal] of ownedByEcs) noteMove(ecsId, rowLocal);
+
   // ── added entities: non-member descendants of each member ──
   const consumedEcsIds = new Set<number>();
 
@@ -1990,7 +2241,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     return {
       parentLocalId, ...addedNodeIdentity(ecsId, opts.template), name: byId.get(ecsId)?.name || '', traits: {}, children: [],
       prefab: source,
-      overrides: ref.overrides, added: ref.added, removed: ref.removed, removedTraits: ref.removedTraits,
+      overrides: ref.overrides, added: ref.added, removed: ref.removed, removedTraits: ref.removedTraits, moved: ref.moved,
       nestedOverrides: channels.nestedOverrides, nestedStructure: channels.nestedStructure,
     };
   };
@@ -2012,7 +2263,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     if (opts.template && ea && ea !== true) delete ea.guid;
     const children: AddedEntity[] = [];
     for (const child of childrenOf.get(ecsId) || []) {
-      if (isMember(child.id)) continue;
+      if (isMember(child.id) || movedIn(child.id) || editRow(child.id)) continue;
       const node = captureChild(child.id, 0); // child of a plain added node → tree-shape parent
       if (node) children.push(node);
     }
@@ -2024,13 +2275,13 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   const added: AddedEntity[] = [];
   for (const [ecsId, localId] of ecsToLocal) {
     for (const child of childrenOf.get(ecsId) || []) {
-      if (isMember(child.id)) continue;
+      if (isMember(child.id) || movedIn(child.id) || editRow(child.id)) continue;
       const node = captureChild(child.id, localId);
       if (node) added.push(node);
     }
   }
 
-  return { added, removed, removedTraits, consumedEcsIds, ownedNested: ownedByEcs };
+  return { added, removed, removedTraits, moved, consumedEcsIds, ownedNested: ownedByEcs };
 }
 
 // ── Scene-level nested channels (moved from serialize.ts for #1369, so captureNestedRef can reach them) ──
@@ -2106,7 +2357,7 @@ export function resolveEffectivePrefabOverride(
 function resolveEffectivePrefabStructure(
   topSource: string | PrefabFile,
   path: number[],
-): { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> } {
+): { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> } {
   // The path-keyed descend, exactly as `resolveEffectivePrefabOverride` walks it (#1381). A prefab
   // ROW can carry `nestedStructure` (promotion writes a reference node's slot into it, and a
   // prefab-edit save captures one), so an intermediate row can own the interior of an instance
@@ -2118,7 +2369,7 @@ function resolveEffectivePrefabStructure(
   // removed as dead code — correctly at the time. It returned with its producer.)
   let prefab: PrefabFile | null = typeof topSource === 'string' ? getCachedPrefabSync(topSource) : topSource;
   let pending: NestedStructurePaths | undefined;
-  let result: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> } = {};
+  let result: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> } = {};
   for (let i = 0; i < path.length; i++) {
     if (!prefab) return result;
     const row = prefab.entities.find((e) => e.localId === path[i] && e.prefab);
@@ -2128,7 +2379,7 @@ function resolveEffectivePrefabStructure(
       // An outer row addressing this path OWNS the interior — all three lists, absent read as empty
       // (the loader's `structDirect` rule).
       result = direct
-        ? { added: direct.added ?? [], removed: direct.removed ?? [], removedTraits: direct.removedTraits ?? {} }
+        ? { added: direct.added ?? [], removed: direct.removed ?? [], removedTraits: direct.removedTraits ?? {}, moved: direct.moved ?? {} }
         : { added: row.added, removed: row.removed, removedTraits: row.removedTraits };
     }
     pending = mergeNestedStructurePaths(row.nestedStructure, forward);
@@ -2152,8 +2403,8 @@ function resolveEffectivePrefabStructure(
  *  still unchanged content, and pinning it into the OUTER row on a no-op save is the #1381 defect over
  *  again. It migrates when its OWN prefab is re-saved, which writes the keys there. */
 function sameStructure(
-  a: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> },
-  b: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> },
+  a: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> },
+  b: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> },
 ): boolean {
   const canon = (v: unknown): unknown => {
     if (Array.isArray(v)) return v.map(canon);
@@ -2198,15 +2449,16 @@ function sameStructure(
     removed: [...(d.removed ?? [])].sort((x, y) => x - y),
     removedTraits: Object.fromEntries(Object.entries(d.removedTraits ?? {})
       .filter(([, names]) => names.length).map(([k, names]) => [k, [...names].sort()])),
+    moved: d.moved ?? {},
   }));
   return norm(a) === norm(b);
 }
 
 /** Does this structural delta state nothing at all? */
 function emptyStructure(
-  v: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> },
+  v: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> },
 ): boolean {
-  return !v.added?.length && !v.removed?.length && !Object.keys(v.removedTraits ?? {}).length;
+  return !v.added?.length && !v.removed?.length && !Object.keys(v.removedTraits ?? {}).length && !Object.keys(v.moved ?? {}).length;
 }
 
 /** The SCENE-level nested channels of one instance — `nestedOverrides` and `nestedStructure`, both
@@ -2314,7 +2566,10 @@ export function captureNestedChannels(
       // deleting the last member of a row-authored `added` came back on reload).
       const structure = captureInstanceStructure(ecsId, childPrefab, { template: opts.template });
       for (const id of structure.consumedEcsIds) consumedEcsIds.add(id);
-      const live = { added: structure.added, removed: structure.removed, removedTraits: structure.removedTraits };
+      const live = {
+        added: structure.added, removed: structure.removed, removedTraits: structure.removedTraits,
+        ...(Object.keys(structure.moved).length ? { moved: structure.moved } : {}),
+      };
       const baseline = resolveEffectivePrefabStructure(source, at);
       const unchanged = emptyStructure(live) && emptyStructure(baseline);
       if (opts.omitUnchanged && opts.baselinesOut) {
@@ -2354,6 +2609,7 @@ export interface InstanceReference {
   added?: AddedEntity[];
   removed?: number[];
   removedTraits?: Record<number, string[]>;
+  moved?: Record<number, string>;
   /** All live members of this instance (PrefabInstance.rootInstanceId === root). */
   memberEcsIds: Set<number>;
   /** Added subtrees folded into `added` (their live ids — also skip on write). */
@@ -2386,6 +2642,7 @@ export function captureInstanceReference(
     added: structure.added.length ? structure.added : undefined,
     removed: structure.removed.length ? structure.removed : undefined,
     removedTraits: Object.keys(structure.removedTraits).length ? structure.removedTraits : undefined,
+    moved: Object.keys(structure.moved).length ? structure.moved : undefined,
     memberEcsIds,
     consumedEcsIds: structure.consumedEcsIds,
     ownedNested: structure.ownedNested,
@@ -2400,7 +2657,7 @@ export function captureInstanceReference(
 export function applyStructureByRootInstance(
   rootInstanceId: number,
   prefab: PrefabFile,
-  structure: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> },
+  structure: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> },
 ): void {
   if (!structure) return;
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
@@ -2431,6 +2688,7 @@ export function applyStructureByRootInstance(
   applyStructureCore(
     {
       logPrefix: '[Prefab]',
+      world: getCurrentWorld(),
       deleteEntities: (ecsIds) => deleteEntities(ecsIds),
       findEntity: (ecsId) => findEntity(ecsId) ?? undefined,
       spawnAdded: (traitArgs) => {
@@ -2470,8 +2728,8 @@ export function applyStructureByRootInstance(
         }
         setPrefabSource(childRoot, node.prefab!);
         if (node.overrides) applyOverridesByRootInstance(childRoot, node.overrides);
-        if (node.added?.length || node.removed?.length || node.removedTraits) {
-          applyStructureByRootInstance(childRoot, child, { added: node.added, removed: node.removed, removedTraits: node.removedTraits });
+        if (node.added?.length || node.removed?.length || node.removedTraits || node.moved) {
+          applyStructureByRootInstance(childRoot, child, { added: node.added, removed: node.removed, removedTraits: node.removedTraits, moved: node.moved });
         }
       },
       onComplete: () => {
@@ -2613,9 +2871,10 @@ export function untagEntityTreeAsInstance(rootEcsId: number, source: string): vo
     const pi = entity.get(PrefabInstanceMeta.trait) as Record<string, unknown>;
     sourceOf.set(info.id, pi.source as string | undefined);
     if (pi.source !== ref) continue; // a nested instance's OWN link — not ours
-    entity.remove(PrefabInstanceMeta.trait);
     removed.add(info.id);
   }
+  rehomeDependents(removed); // a member moved away from one of these keeps its path (#1437)
+  for (const id of removed) findEntity(id)?.remove(PrefabInstanceMeta.trait);
 
   // A kept nested root whose owning row we just removed is no longer owned by anything.
   {
@@ -2693,9 +2952,12 @@ export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean
     // snapshot that dropped it reattached a nested instance as top-level (0) on undo (#1264 close-out).
     snapshot.push({
       id: info.id, ref: entityRef(info.id), rootRef: entityRef(pi.rootInstanceId as number),
-      data: { source: pi.source, localId: pi.localId, rootInstanceId: pi.rootInstanceId, parentLocalId: pi.parentLocalId },
+      data: { source: pi.source, localId: pi.localId, rootInstanceId: pi.rootInstanceId, parentLocalId: pi.parentLocalId, homeParent: pi.homeParent ?? '', homeSteps: pi.homeSteps ?? '' },
     });
-    if (strip) entity.remove(PrefabInstanceMeta.trait);
+  }
+  if (strip) {
+    rehomeDependents(new Set(snapshot.map((s) => s.id))); // #1437, as above
+    for (const s of snapshot) findEntity(s.id)?.remove(PrefabInstanceMeta.trait);
   }
   if (snapshot.length) markStructureDirty();
   return snapshot;
@@ -2893,6 +3155,8 @@ function insertAddedSubtree(
   node: AddedEntity,
   parentLocalId: number,
   nextId: { v: number },
+  /** Filled with each promoted node's live guid → the row it became, for a move into it (#1437). */
+  rows?: Map<string, number>,
 ): void {
   const myLocalId = nextId.v++;
 
@@ -2954,7 +3218,147 @@ function insertAddedSubtree(
   (ea as Record<string, unknown>).parentId = parentLocalId;
   (ea as Record<string, unknown>).guid = '';
   prefab.entities.push({ localId: myLocalId, name: node.name, traits });
-  for (const child of node.children) insertAddedSubtree(prefab, child, myLocalId, nextId);
+  // A PLAIN row only: a reference node's row is a nested instance, whose children are another frame.
+  if (node.guid) rows?.set(node.guid, myLocalId);
+  for (const child of node.children) insertAddedSubtree(prefab, child, myLocalId, nextId, rows);
+}
+
+/** The members of the instance rooted at `rootId` — its own, and its owned nested instances' — that were moved
+ *  OUT of its subtree (#1437), with everything under them. A delete of the subtree leaves them standing, but
+ *  whatever respawns the instance respawns them, moved: a promotion must take them too. */
+function membersLivingOutside(rootId: number): number[] {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta) return [];
+  const all = getAllEntities();
+  const links = all.map((e) => [e.id, e.parentId] as const);
+  const inside = new Set(collectSubtreeIds(links, [rootId]));
+  const idOfGuid = new Map(all.filter((e) => e.guid).map((e) => [e.guid!, e.id]));
+  const frames = new Set([rootId]);
+  const out: number[] = [];
+  const frameOf = (id: number, pi: Record<string, unknown>): number => {
+    if (pi.rootInstanceId !== id) return (pi.rootInstanceId as number) || 0;
+    if (!pi.parentLocalId) return 0;
+    const byId = all.find((e) => e.id === id)!;
+    const up = identityParentId(byId.parentId, pi.homeParent as string | undefined, (g) => idOfGuid.get(g));
+    return up ? ((readTraitData(up, piMeta)?.rootInstanceId as number) || 0) : 0;
+  };
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const e of all) {
+      const pi = e.traits.includes('PrefabInstance') ? readTraitData(e.id, piMeta) : null;
+      if (!pi) continue;
+      if (pi.rootInstanceId === e.id && pi.parentLocalId && frames.has(frameOf(e.id, pi)) && !frames.has(e.id)) { frames.add(e.id); grew = true; }
+      if (inside.has(e.id) || !frames.has(frameOf(e.id, pi)) || e.id === rootId) continue;
+      for (const id of collectSubtreeIds(links, [e.id])) inside.add(id);
+      out.push(e.id);
+      grew = true;
+    }
+  }
+  return out;
+}
+
+/** A move made inside an owned NESTED instance of the instance at `rootInstanceId` to a parent outside that
+ *  nested instance (#1437, owner's B): its own prefab cannot name the parent, so it is offered to the OUTER
+ *  instance. `key` is `~moved.<nested row chain>:<row localId>` — the chain as `nestedStructure` keys it. */
+export interface NestedFrameMove { key: string; chain: number[]; lid: number; memberEcs: number; parentGuid: string; frameRoot: number }
+
+export function nestedFrameMoves(rootInstanceId: number): NestedFrameMove[] {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!piMeta || !eaMeta) return [];
+  const all = getAllEntities();
+  const byId = new Map(all.map((e) => [e.id, e]));
+  const idOfGuid = new Map(all.filter((e) => e.guid).map((e) => [e.guid!, e.id]));
+  const piOf = (id: number) => readTraitData(id, piMeta) as { rootInstanceId?: number; parentLocalId?: number; localId?: number; source?: string; homeParent?: string } | null;
+  /** The frame whose row expanded owned nested root `n`: the frame its identity parent belongs to. */
+  const frameAbove = (n: number): number => {
+    const up = identityParentId(byId.get(n)?.parentId ?? 0, piOf(n)?.homeParent, (g) => idOfGuid.get(g));
+    return up ? (piOf(up)?.rootInstanceId ?? 0) : 0;
+  };
+  const out: NestedFrameMove[] = [];
+  for (const e of all) {
+    const pi = piOf(e.id);
+    if (!pi || pi.rootInstanceId !== e.id || !pi.parentLocalId || e.id === rootInstanceId) continue;
+    const chain: number[] = [];
+    let f = e.id;
+    for (let n = 0; f && f !== rootInstanceId && n < 64; n++) {
+      const p = piOf(f);
+      if (!p?.parentLocalId) { f = 0; break; }
+      chain.unshift(p.parentLocalId);
+      f = frameAbove(f);
+    }
+    const doc = f === rootInstanceId ? getCachedPrefabSync(pi.source ?? '') : null;
+    if (!doc) continue;
+    const s = captureInstanceStructure(e.id, doc);
+    if (!Object.keys(s.moved).length) continue;
+    // A parent inside the nested instance — deeper nested ones included — is its own prefab's to record, UNLESS a
+    // prefab around it places the member: that prefab's move wins over any the nested one makes, so only it can
+    // take the member back (or elsewhere inside).
+    const aroundBase = prefabMoveTargets(e.id, { ...doc, moved: undefined });
+    const inFrame = new Set<string>();
+    for (const [, t] of memberPathIndex(getCurrentWorld(), e.id)) {
+      const g = t ? (t.get(eaMeta.trait) as { guid?: string }).guid : '';
+      if (g) inFrame.add(g);
+    }
+    for (const [lidStr, parentGuid] of Object.entries(s.moved)) {
+      const lid = Number(lidStr);
+      const memberEcs = [...s.ownedNested].find(([, row]) => row === lid)?.[0]
+        ?? all.find((m) => piOf(m.id)?.rootInstanceId === e.id && piOf(m.id)?.localId === lid && m.id !== e.id)?.id;
+      if (!memberEcs || (inFrame.has(parentGuid) && !aroundBase(memberEcs))) continue;
+      out.push({ key: `~moved.${chain.join('.')}:${lid}`, chain, lid, memberEcs, parentGuid, frameRoot: e.id });
+    }
+  }
+  return out;
+}
+
+/** Rows of `prefab` whose member lives under another parent: the instance's own moves (`instanceMoved`, keyed by
+ *  row) and the prefab's own moves of a ROW (a member path of rows only, ending in that row). */
+function movedRowsOf(prefab: PrefabFile, instanceMoved: Record<number, string>): Set<number> {
+  const out = new Set(Object.keys(instanceMoved).map(Number));
+  const rows = new Map(prefab.entities.map((e) => [e.localId, e]));
+  for (const key of Object.keys(prefab.moved ?? {})) {
+    // Every step before the last a plain row: the path stays in this prefab's frame, and ends at a row.
+    const steps = key.split('.').map(Number);
+    const last = steps[steps.length - 1]!;
+    if (rows.has(last) && steps.slice(0, -1).every((st) => rows.has(st) && !rows.get(st)!.prefab)) out.add(last);
+  }
+  return out;
+}
+
+/** A user-added nested instance's own moves (#1437 P3-c), carried into the prefab it is being promoted into
+ *  (as row `rowLid`): each becomes an entry of the prefab's own `moved`, the member addressed through the new
+ *  row, its new parent in the promoted instance or in the prefab's frame (`instancePaths`, live guid → path).
+ *  Read from the LIVE reference instance, which still stands. A move naming anything else is reported. */
+function promoteReferenceMoves(
+  prefab: PrefabFile, node: AddedEntity, rowLid: number, localToEcs: Map<number, number>, instancePaths: Map<string, MemberStep[]>,
+): void {
+  const refRoot = localToEcsGuid(node.guid);
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!refRoot || !piMeta || !eaMeta || !node.moved) return;
+  const parentGuid = localToEcs.get(node.parentLocalId) ? guidForEntityId(localToEcs.get(node.parentLocalId)!) : '';
+  const rowPath = [...(instancePaths.get(parentGuid) ?? []), rowLid];
+  const inRef = new Map<string, MemberStep[]>();
+  const byKey = memberPathIndex(getCurrentWorld(), refRoot);
+  for (const [k, e] of byKey) {
+    const g = e ? (e.get(eaMeta.trait) as { guid?: string }).guid : '';
+    if (g) inRef.set(g, k ? k.split('.').map((x) => (x.startsWith('+') ? x : Number(x))) : []);
+  }
+  for (const [lidStr, target] of Object.entries(node.moved)) {
+    const lid = Number(lidStr);
+    // The member: a row of the promoted instance, or one of its owned nested roots (stepping by that row).
+    const member = [...byKey.values()].find((e) => {
+      const pi = e?.get(piMeta.trait) as { rootInstanceId?: number; localId?: number; parentLocalId?: number } | undefined;
+      return !!pi && (pi.rootInstanceId === e!.id() ? pi.parentLocalId === lid : pi.rootInstanceId === refRoot && pi.localId === lid);
+    });
+    const memberPath = member ? inRef.get((member.get(eaMeta.trait) as { guid?: string }).guid ?? '') : undefined;
+    const targetPath = inRef.has(target) ? [...rowPath, ...inRef.get(target)!] : instancePaths.get(target);
+    if (!memberPath || !targetPath) {
+      console.warn(`[Prefab] a move inside the promoted instance "${node.name}" names something outside this prefab; it was not carried`);
+      continue;
+    }
+    prefab.moved = { ...prefab.moved, [memberPathKey([...rowPath, ...memberPath])]: memberToken(0, targetPath) };
+  }
 }
 
 /** Apply the selected overrides back to the source prefab file. `selectedKeys`
@@ -2985,6 +3389,14 @@ export interface ApplyResult {
    *  already shows them; this is for a caller whose reader is not the Console — the agent `apply` op
    *  answers with them (#1258). */
   warnings?: string[];
+  /** True when the apply re-parented a row (#1437: an applied move), which changes member PATHS and so the
+   *  guids refs derive: the files on disk were repaired for it, and an undo/redo must repair them back. */
+  memberPathsChanged?: boolean;
+  /** What the repair of the OTHER files on disk did, when `memberPathsChanged`: the files rewritten, the ones
+   *  left because an asset view holds them unsaved, or `null` when the backend could not do it at all. */
+  fileRepair?: { rewritten: string[]; held: string[] } | null;
+  /** Selected keys the apply could not write, each with the reason (a move it cannot express yet). */
+  skipped?: { key: string; reason: string }[];
 }
 
 /** Shared no-op result so every early return is consistent. */
@@ -3035,7 +3447,7 @@ export async function applyToPrefabSelective(
   // Deep-clone the old prefab and overlay selected live values onto it. A second
   // pristine clone is the `before` snapshot for undo (oldPrefab itself isn't mutated,
   // but cloning guards against any aliasing into the cache).
-  const newPrefab: PrefabFile = JSON.parse(JSON.stringify(oldPrefab));
+  let newPrefab: PrefabFile = JSON.parse(JSON.stringify(oldPrefab));
   // Stamp the format version: this rewrites the WHOLE document with today's serializer
   // semantics, so leaving a legacy `1` on it would be the #379 dishonesty in the other
   // direction — a v2-written file claiming v1. Found by the #379 close-out review, which
@@ -3080,25 +3492,85 @@ export async function applyToPrefabSelective(
   let writtenCount = 0;
   const liveAddedRootsToDelete: number[] = []; // live ecs roots whose adds were applied
   const nextLocalId = { v: Math.max(0, ...newPrefab.entities.map((e) => e.localId)) + 1 };
+  let rowsReparented = false;
+  const skipped: { key: string; reason: string }[] = [];
+  const movedKeys: string[] = [];
+  const promotedRows = new Map<string, number>(); // live guid of a promoted added node → its new row
+  // The row a live entity of THIS frame is: the root, a member, or an owned nested root (its row).
+  const rowOfEcs = new Map<number, number>([[rootInstanceId, newPrefab.rootLocalId ?? 1]]);
+  for (const [lid, ecs] of localToEcs) rowOfEcs.set(ecs, lid);
+  for (const [ecs, row] of structure.ownedNested) rowOfEcs.set(ecs, row);
+  const ecsOfRow = new Map([...rowOfEcs].map(([ecs, row]) => [row, ecs]));
 
   for (const key of selectedKeys) {
+    // Structural: a member moved inside its instance (#1437) — after every addition, below, since one of
+    // them may be the new parent.
+    if (key.startsWith('~moved.')) { movedKeys.push(key); continue; }
     // Structural: insert an added subtree.
     if (key.startsWith('+added.')) {
       const guid = key.slice('+added.'.length);
       const node = addedByGuid.get(guid);
       if (!node) continue;
-      insertAddedSubtree(newPrefab, node, node.parentLocalId, nextLocalId);
+      const rowLid = nextLocalId.v;
+      insertAddedSubtree(newPrefab, node, node.parentLocalId, nextLocalId, promotedRows);
+      if (node.prefab && node.moved) promoteReferenceMoves(newPrefab, node, rowLid, localToEcs, instancePaths);
       const liveEcs = localToEcsGuid(guid);
-      if (liveEcs) liveAddedRootsToDelete.push(liveEcs);
+      if (liveEcs) liveAddedRootsToDelete.push(liveEcs, ...(node.prefab ? membersLivingOutside(liveEcs) : []));
       writtenCount++;
       continue;
     }
     // Structural: remove a prefab member (and its descendants).
     if (key.startsWith('-removed.')) {
       const localId = Number(key.slice('-removed.'.length));
-      const drop = new Set(prefabSubtreeLocalIds(newPrefab, localId));
+      // The cascade stops at a MOVED member, as the loader's does (#1437): it lives elsewhere, and so does
+      // everything below it. Its row goes up to the nearest row that stays — a re-parent, so its refs follow.
+      const moved = movedRowsOf(newPrefab, structure.moved);
+      const parentOf = new Map(newPrefab.entities.map((e) => [e.localId, ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0]));
+      const drop = new Set<number>();
+      const kept: number[] = [];
+      const cut = (lid: number) => {
+        drop.add(lid);
+        for (const [child, parent] of parentOf) {
+          if (parent !== lid || drop.has(child)) continue;
+          if (moved.has(child)) kept.push(child);
+          else cut(child);
+        }
+      };
+      cut(localId);
       const before = newPrefab.entities.length;
+      const removedRows = new Map(newPrefab.entities.filter((e) => drop.has(e.localId)).map((e) => [e.localId, e]));
       newPrefab.entities = newPrefab.entities.filter((e) => !drop.has(e.localId));
+      // A row the PREFAB's own move places holds a pose relative to that target, not to the removed row — while
+      // the target survives: a move whose target this removal takes is dropped, and the row lands as the rows did.
+      const rowById = new Map(newPrefab.entities.concat([...removedRows.values()]).map((e) => [e.localId, e]));
+      const placedByPrefab = new Set<number>();
+      for (const [key, token] of Object.entries(newPrefab.moved ?? {})) {
+        const t = parseMemberToken(token);
+        const lid = Number(key.split('.').pop());
+        if (!t || t.up || !movedRowsOf({ ...newPrefab, entities: [...rowById.values()], moved: { [key]: token } }, {}).has(lid)) continue;
+        // The target's steps in THIS frame: rows up to and including the first nested one.
+        let dead = false;
+        for (const st of t.path) {
+          if (typeof st !== 'number' || drop.has(st)) { dead = typeof st === 'number'; break; }
+          if (rowById.get(st)?.prefab) break;
+        }
+        if (!dead) placedByPrefab.add(lid);
+      }
+      const trsOf = (lid: number) => {
+        const tf = removedRows.get(lid)?.traits.Transform;
+        return mergeTrs(IDENTITY_TRS, tf && tf !== true ? tf : {});
+      };
+      for (const lid of kept) {
+        const row = newPrefab.entities.find((e) => e.localId === lid)!;
+        // Its pose was relative to the removed rows: carried through them, so it stays where it was.
+        let up = parentOf.get(lid) ?? 0;
+        const tf = row.traits.Transform;
+        let pose = mergeTrs(IDENTITY_TRS, tf && tf !== true ? tf : {});
+        while (drop.has(up)) { if (!placedByPrefab.has(lid)) pose = localToWorldTrs(pose, trsOf(up)); up = parentOf.get(up) ?? 0; }
+        if (tf && tf !== true && !placedByPrefab.has(lid)) row.traits.Transform = { ...tf, ...pose };
+        row.traits.EntityAttributes = { ...(row.traits.EntityAttributes as Record<string, unknown>), parentId: up };
+        rowsReparented = true;
+      }
       if (newPrefab.entities.length !== before) writtenCount++;
       continue;
     }
@@ -3160,9 +3632,144 @@ export async function applyToPrefabSelective(
     writtenCount++;
   }
 
+  // Moves (#1437). The new parent decides how the prefab says it:
+  //  - a row of this frame, or a node promoted by this apply: the member's row is RE-PARENTED (its path, and so
+  //    its guid and every guid below, change — the ref repair after the write follows them);
+  //  - a member of a NESTED instance, which no row of this prefab is: a prefab-level `moved` entry names it by
+  //    member token (P3-b), and the row keeps its parent — and the member its identity.
+  // Either way the row takes the live Transform, which is relative to the new parent.
+  const addedGuids = new Set<string>();
+  const collectAdded = (nodes: AddedEntity[]) => { for (const n of nodes) { if (n.guid) addedGuids.add(n.guid); collectAdded(n.children ?? []); } };
+  collectAdded(structure.added);
+  let nestedMoves: Map<string, NestedFrameMove> | null = null;
+  for (const key of movedKeys) {
+    // A NESTED instance's member moved out of it (owner's B): this prefab records it as its own move, by path,
+    // and the member's pose as an override on the nested row. The nested prefab is not touched.
+    if (key.includes(':')) {
+      nestedMoves ??= new Map(nestedFrameMoves(rootInstanceId).map((m) => [m.key, m]));
+      const m: NestedFrameMove | undefined = nestedMoves.get(key);
+      if (!m) continue;
+      const memberPath = instancePaths.get(guidForEntityId(m.memberEcs));
+      const targetPath = addedGuids.has(m.parentGuid) ? undefined : instancePaths.get(m.parentGuid);
+      if (!memberPath || !targetPath) {
+        skipped.push({ key, reason: addedGuids.has(m.parentGuid) ? 'its new parent was added in this scene' : 'its new parent is not part of this prefab instance' });
+        continue;
+      }
+      // Back at the parent it derives from (its row's, or its home's): the outer prefab stops moving it.
+      const memberPi = readTraitData(m.memberEcs, PrefabInstanceMeta);
+      const liveParent = (readTraitData(m.memberEcs, getTraitByName('EntityAttributes')!)?.parentId as number) || 0;
+      const identityParent = identityParentId(liveParent, memberPi?.homeParent as string | undefined, (g) => localToEcsGuid(g) || undefined);
+      const pathKey = memberPathKey(memberPath);
+      // Home only when nothing was removed between: past a deleted home row, the parent it re-pointed to is a
+      // new place, not home (third-review F3).
+      if (!memberPi?.homeSteps && guidForEntityId(identityParent) === m.parentGuid) {
+        if (newPrefab.moved) { delete newPrefab.moved[pathKey]; if (!Object.keys(newPrefab.moved).length) delete newPrefab.moved; }
+      } else {
+        newPrefab.moved = { ...newPrefab.moved, [pathKey]: memberToken(0, targetPath) };
+      }
+      // The pose, as an override on the instance the member is a member of: a plain member's own frame (by its
+      // row), an owned nested ROOT's own instance (by that prefab's root row), below the nested row.
+      const tfMeta = getTraitByName('Transform');
+      const liveTf = tfMeta ? clonePersistable(readTraitDataFull(m.memberEcs, tfMeta)) : null;
+      const nestedRow = newPrefab.entities.find((e) => e.localId === m.chain[0] && e.prefab);
+      const ownRoot: boolean = memberPi?.rootInstanceId === m.memberEcs;
+      const poseChain = ownRoot ? [...m.chain, m.lid] : m.chain;
+      const poseLid = ownRoot ? (getCachedPrefabSync((memberPi?.source as string) || '')?.rootLocalId ?? 1) : m.lid;
+      if (tfMeta && liveTf && nestedRow) {
+        const bag: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(liveTf)) if (!isTemplateExcludedField(tfMeta, k)) bag[k] = v;
+        if (poseChain.length === 1) {
+          const ov = { ...nestedRow.overrides };
+          ov[poseLid] = { ...ov[poseLid], Transform: { ...ov[poseLid]?.Transform, ...bag } };
+          nestedRow.overrides = ov;
+        } else {
+          const path = poseChain.slice(1).join('.');
+          const paths = { ...nestedRow.nestedOverrides };
+          const at = { ...paths[path] };
+          at[poseLid] = { ...at[poseLid], Transform: { ...at[poseLid]?.Transform, ...bag } };
+          paths[path] = at;
+          nestedRow.nestedOverrides = paths;
+        }
+      }
+      writtenCount++;
+      continue;
+    }
+    const lid = Number(key.slice('~moved.'.length));
+    const parentGuid = structure.moved[lid];
+    const row = newPrefab.entities.find((e) => e.localId === lid);
+    const memberEcs = ecsOfRow.get(lid);
+    if (!parentGuid || !memberEcs) continue;
+    if (!row) { skipped.push({ key, reason: 'its row was removed by this apply' }); continue; }
+    if (prefabMoveTargets(rootInstanceId, { ...oldPrefab, moved: undefined })(memberEcs)) {
+      skipped.push({ key, reason: 'a prefab containing this instance places it — apply the move from that instance' });
+      continue;
+    }
+    // A nested instance's ROOT is a row too, but not one to hang a row under: its children are the nested
+    // prefab's frame, whose own rows step by the same localIds — a moved row's path would equal one of theirs,
+    // and the two would derive one guid. A move there is the prefab's own `moved`, like any nested member.
+    const targetEcs = localToEcsGuid(parentGuid);
+    const parentRow = (structure.ownedNested.has(targetEcs) ? undefined : rowOfEcs.get(targetEcs)) ?? promotedRows.get(parentGuid);
+    // Never a node the SCENE added: the index lists a user-added instance's root as a target, but no other
+    // instance of the prefab has it.
+    const token = parentRow === undefined && !addedGuids.has(parentGuid) && instancePaths.has(parentGuid)
+      ? memberToken(0, instancePaths.get(parentGuid)!) : '';
+    if (parentRow === undefined && !token) {
+      const promotedRef = structure.added.some((n) => n.prefab && n.guid === parentGuid) && selectedKeys.has(`+added.${parentGuid}`);
+      skipped.push({ key, reason: promotedRef
+        ? 'its new parent is a nested instance this apply adds to the prefab — apply the move again afterwards'
+        : addedGuids.has(parentGuid)
+          ? 'its new parent was added in this scene — apply that addition too'
+          : readTraitData(rootInstanceId, PrefabInstanceMeta)?.parentLocalId
+            ? 'its new parent is outside this nested instance — apply it from the instance that contains both'
+            : 'its new parent is not part of this prefab instance' });
+      continue;
+    }
+    const ea = row.traits.EntityAttributes;
+    const eaBag = { ...(ea && ea !== true ? ea : {}) } as Record<string, unknown>;
+    const memberPath = memberPathKey(instancePaths.get(guidForEntityId(memberEcs)) ?? []);
+    if (parentRow !== undefined) {
+      if (eaBag.parentId !== parentRow) rowsReparented = true;
+      row.traits.EntityAttributes = { ...eaBag, parentId: parentRow };
+      if (newPrefab.moved) delete newPrefab.moved[memberPath];
+    } else {
+      newPrefab.moved = { ...newPrefab.moved, [memberPath]: token };
+    }
+    if (newPrefab.moved && !Object.keys(newPrefab.moved).length) delete newPrefab.moved;
+    const tfMeta = getTraitByName('Transform');
+    const liveTf = tfMeta ? clonePersistable(readTraitDataFull(memberEcs, tfMeta)) : null;
+    if (tfMeta && liveTf) {
+      const bag: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(liveTf)) if (!isTemplateExcludedField(tfMeta, k)) bag[k] = v;
+      const had = row.traits.Transform;
+      row.traits.Transform = { ...(had && had !== true ? had : {}), ...bag };
+    }
+    writtenCount++;
+  }
+
+  for (const { key, reason } of skipped) console.warn(`[Prefab] ${key} was not applied: ${reason}`);
   if (writtenCount === 0) {
     console.log('[Prefab] No applicable overrides to apply.');
-    return NOOP_APPLY;
+    return skipped.length ? { ...NOOP_APPLY, skipped } : NOOP_APPLY;
+  }
+
+  // A re-parented row moves the PATH of it and everything below it, which is what a template's member
+  // tokens name them by (#1437): the prefab's own tokens follow first, then the guids live refs hold.
+  const prefabId = newPrefab.id;
+  const readOld: PrefabReader = (g) => (g === prefabId ? oldPrefab : getCachedPrefabSync(g));
+  const readNew: PrefabReader = (g) => (g === prefabId ? newPrefab : getCachedPrefabSync(g));
+  if (rowsReparented && prefabId) {
+    await preloadNestedPrefabs(newPrefab);
+    newPrefab = (rewritePrefabMemberTokens(newPrefab as never, prefabId, readOld, readNew) as PrefabFile | null) ?? newPrefab;
+  }
+  // A move of the prefab's own whose member or new parent this apply removed names nothing now.
+  if (newPrefab.moved && prefabId) {
+    const paths = new Set(['', ...memberPathRecords({ prefab: prefabId }, readNew).self.keys()]);
+    const live = Object.entries(newPrefab.moved).filter(([k, v]) => {
+      const t = parseMemberToken(v);
+      return paths.has(k) && !!t && !t.up && paths.has(memberPathKey(t.path));
+    });
+    if (live.length !== Object.keys(newPrefab.moved).length) newPrefab.moved = live.length ? Object.fromEntries(live) : undefined;
+    if (!newPrefab.moved) delete newPrefab.moved;
   }
 
   const warnings = warnInertPrefabSizes(newPrefab, source);
@@ -3186,7 +3793,12 @@ export async function applyToPrefabSelective(
   // newPrefab, so the file walk above never reaches it, and captureNestedInstanceOverrides
   // would then drop its per-copy overrides with no warning at all (#1284).
   for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
-  refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab);
+  const remap = rowsReparented && prefabId ? liveMemberGuidRemap(prefabId, readOld, readNew, rootsToRefresh) : new Map<string, string>();
+  refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap);
+  if (remap.size) remapWorldGuidRefs(remap);
+  // …and every other file that uses the prefab. The open scene's own file too: its live world is already
+  // repaired, and the next save writes that.
+  const fileRepair = rowsReparented && prefabId ? await repairPrefabMemberPaths(prefabId, oldPrefab) : undefined;
 
   // Those promoted additions are now prefab members in the live world, but the
   // scene file on disk still lists them as `added` structural overrides. The
@@ -3199,7 +3811,94 @@ export async function applyToPrefabSelective(
     prefabBefore,
     prefabAfter: newPrefab,
     warnings,
+    ...(rowsReparented ? { memberPathsChanged: true, fileRepair } : {}),
+    ...(skipped.length ? { skipped } : {}),
   };
+}
+
+/** Old → new guid of every LIVE member of an instance in `roots` whose derived path differs between the
+ *  two documents `readOld` and `readNew` give prefab `prefabId` (#1437: an applied move). Members pair by
+ *  identity (`memberPathRecords`). A member derives from the anchor the entity above its path gives: a
+ *  row's, from its instance root; an ORPHAN row's (parentId 0 or no row, hung off the instance's parent),
+ *  from that parent. An entity whose guid is not derived anchors what is below it on its own guid; a
+ *  derived one (a member, an owned nested root) hands on its own anchor and path, found by walking up as
+ *  `deriveInstanceMemberGuids` did, to the ancestor whose guid derives it. What cannot be recovered maps
+ *  nothing. */
+function liveMemberGuidRemap(prefabId: string, readOld: PrefabReader, readNew: PrefabReader, roots: readonly number[]): Map<string, string> {
+  const remap = new Map<string, string>();
+  type Place = { tag: 'self' | 'parent'; path: string };
+  const places = (read: PrefabReader): Map<string, Place> => {
+    const r = memberPathRecords({ prefab: prefabId }, read, { orphans: 'parent' });
+    const out = new Map<string, Place>();
+    for (const tag of ['self', 'parent'] as const) for (const [path, id] of r[tag]) if (!out.has(id)) out.set(id, { tag, path });
+    return out;
+  };
+  const before = places(readOld);
+  const after = places(readNew);
+  const moves: [Place, Place][] = [];
+  for (const [id, was] of before) {
+    const now = after.get(id);
+    if (now && (now.path !== was.path || now.tag !== was.tag)) moves.push([was, now]);
+  }
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!moves.length || !piMeta) return remap;
+  const all = getAllEntities();
+  const byId = new Map(all.map((e) => [e.id, e]));
+  const idByGuid = new Map(all.filter((e) => e.guid).map((e) => [e.guid!, e.id]));
+  const derived = (id: number): boolean => {
+    const pi = readTraitData(id, piMeta);
+    if (!pi || templateKeyOf(findEntity(id))) return false;
+    return pi.rootInstanceId === id ? !!pi.parentLocalId : !!pi.rootInstanceId;
+  };
+  /** The anchor and path prefix what hangs below `id` derives from. */
+  const below = (id: number): { anchor: string; prefix: string } | null => {
+    const top = byId.get(id);
+    if (!top?.guid) return null;
+    if (!derived(id)) return { anchor: top.guid, prefix: '' };
+    const steps: (number | string)[] = [];
+    for (let cur = top, n = 0; n < 10_000; n++) {
+      const pi = readTraitData(cur.id, piMeta);
+      const key = templateKeyOf(findEntity(cur.id));
+      steps.unshift(...homeStepsOf(pi as { homeSteps?: string } | null), key ? addedKeyStep(key) : memberStepId(pi as never));
+      const up = byId.get(identityParentId(cur.parentId, pi?.homeParent as string | undefined, (g) => idByGuid.get(g)));
+      if (!up) return null;
+      if (up.guid && deriveMemberGuid(up.guid, steps) === top.guid) return { anchor: up.guid, prefix: steps.join('.') };
+      cur = up;
+    }
+    return null;
+  };
+  for (const rootId of roots) {
+    const self = below(rootId);
+    // An owned nested root's orphan rows expand under nothing (the loader's rule): only a stored root has them.
+    const parent = readTraitData(rootId, piMeta)?.parentLocalId ? null : below(byId.get(rootId)?.parentId ?? 0);
+    const at = (p: Place): string | null => {
+      const ctx = p.tag === 'self' ? self : parent;
+      return ctx ? deriveMemberChain(ctx.anchor, ctx.prefix ? `${ctx.prefix}.${p.path}` : p.path) : null;
+    };
+    for (const [was, now] of moves) {
+      const from = at(was);
+      const to = at(now);
+      if (from && to && from !== to) remap.set(from, to);
+    }
+  }
+  return remap;
+}
+
+/** Re-point every ref a live trait holds from a key of `remap` to its value — every field of every trait
+ *  except an entity's own `EntityAttributes.guid` (the rebuilt members already carry their new ones). */
+function remapWorldGuidRefs(remap: ReadonlyMap<string, string>): void {
+  const traits = getAllTraits();
+  for (const e of getCurrentWorld().entities) {
+    for (const meta of traits) {
+      if (!e.has(meta.trait)) continue;
+      const data = e.get(meta.trait) as Record<string, unknown> | undefined;
+      if (!data || typeof data !== 'object') continue;
+      const next = remapGuidValues(data, remap) as Record<string, unknown>;
+      if (next === data) continue;
+      if (meta.name === 'EntityAttributes') next.guid = data.guid;
+      e.set(meta.trait, next);
+    }
+  }
 }
 
 /** Resolve a live entity id to its stable EntityAttributes.guid ('' if none). Used by
@@ -3257,6 +3956,8 @@ export async function applyToPrefab(selectedEntityId: number): Promise<void> {
   for (const [localId, names] of Object.entries(structure.removedTraits)) {
     for (const name of names) keys.add(`-trait.${localId}.${name}`);
   }
+  for (const localId of Object.keys(structure.moved)) keys.add(`~moved.${localId}`); // #1437
+  for (const m of nestedFrameMoves(rootInstanceId)) keys.add(m.key);
   await applyToPrefabSelective(rootInstanceId, keys);
 }
 
@@ -3286,6 +3987,12 @@ interface NestedInstanceCapture {
  *  `added` node is not idempotent and spawned twice, and a restated row value froze the OLD value over
  *  a refreshed one. What remains is the scene's own edit, which is the only thing the re-apply owes. */
 function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFile): NestedInstanceCapture[] {
+  const outer = expandedFrom;
+  expandedFrom = new Map([...(outer ?? []), [outerRootId, baseline]]);
+  try { return captureNestedInstanceOverridesIn(outerRootId, baseline); } finally { expandedFrom = outer; }
+}
+
+function captureNestedInstanceOverridesIn(outerRootId: number, baseline: PrefabFile): NestedInstanceCapture[] {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return [];
 
@@ -3309,6 +4016,7 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
   // instance from the outer root: a stamped instance under a plain node wrote its overrides onto the
   // real row's expansion. Such an instance is not a row expansion of this outer at all — the outer
   // structure capture carries it whole, as a reference node under that plain node.
+  const idOfGuid = new Map(all.filter((e) => e.guid).map((e) => [e.guid!, e.id]));
   const chainOf = (n: number): number[] | null => {
     const chain: number[] = [];
     let cur = n, guard = 0;
@@ -3316,7 +4024,9 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
       const pi = piOf(cur);
       if (!pi) break;
       chain.unshift((pi.parentLocalId as number) || 0);
-      cur = rootOf(byId.get(cur)?.parentId ?? 0); // climb to the parent instance's root
+      // Climb to the parent instance's root by IDENTITY: a nested root moved out of its frame (#1437) is still
+      // that frame's row, and a chain read from its live parent addressed a different instance.
+      cur = rootOf(identityParentId(byId.get(cur)?.parentId ?? 0, pi.homeParent as string | undefined, (g) => idOfGuid.get(g)));
     }
     return cur === outerRootId ? chain : null;
   };
@@ -3435,7 +4145,7 @@ function subtractChainOverrides(
  *  The rebuild did the same before this subtraction existed. */
 function subtractChainStructure(
   full: InstanceStructure,
-  chain: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]> },
+  chain: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> },
   keysByGuid: Map<string, string>,
 ): { structure: InstanceStructure; replace: { key: string; guid: string }[] } {
   const byKey = new Map<string, AddedEntity>();
@@ -3536,13 +4246,17 @@ export function rebuildInstance(
   source: string,
   prefab: PrefabFile,
   overrides: Record<number, Record<string, Record<string, unknown>>>,
-  structure: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; consumedEcsIds?: Set<number> },
+  structure: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; consumedEcsIds?: Set<number>; nestedMoves?: InstanceStructure['nestedMoves'] },
   /** The document the LIVE tree was expanded from, when it is not `prefab` — a refresh's old file. The
    *  nested re-apply subtracts what that document's chain applies (#1386, #1401). */
   baseline: PrefabFile = prefab,
+  /** Old → new member guid, when the rebuild changes member paths (#1437): a move's target and a parked
+   *  member's parent are looked up by guid AFTER the rebuild, so they are translated first. */
+  remap: ReadonlyMap<string, string> = new Map(),
 ): number {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return rootInstanceId;
+  if (remap.size) structure = remapGuidValues(structure, remap) as typeof structure;
 
   // Preserve the instance root's scene placement (its parent is not a member, so
   // it survives the teardown). instantiatePrefab defaults to parentId 0, which
@@ -3553,7 +4267,23 @@ export function rebuildInstance(
 
   // Snapshot live per-copy overrides on nested children BEFORE the teardown
   // (they get cascade-destroyed with the outer members and re-expanded fresh).
-  const nestedCaptures = captureNestedInstanceOverrides(rootInstanceId, baseline);
+  const nestedCaptures = remapGuidValues(captureNestedInstanceOverrides(rootInstanceId, baseline), remap) as NestedInstanceCapture[];
+  const nm = structure.nestedMoves;
+  if (nm) {
+    const at = (key: string) => {
+      const [chain, lid] = key.slice('~moved.'.length).split(':');
+      const cap = nestedCaptures.find((c) => c.chain.join('.') === chain);
+      return cap ? { cap, lid: Number(lid) } : null;
+    };
+    for (const key of nm.drop ?? []) {
+      const hit = at(key);
+      if (hit) hit.cap.structure = { ...hit.cap.structure, moved: Object.fromEntries(Object.entries(hit.cap.structure.moved ?? {}).filter(([l]) => Number(l) !== hit.lid)) };
+    }
+    for (const [key, guid] of Object.entries(nm.set ?? {})) {
+      const hit = at(key);
+      if (hit) hit.cap.structure = { ...hit.cap.structure, moved: { ...hit.cap.structure.moved, [hit.lid]: guid } };
+    }
+  }
 
   // Transience is a property of the IDENTITY, not of the id — the same reasoning that carries the
   // durable guid across the respawn below. Read before the teardown, re-applied after (#1301).
@@ -3585,18 +4315,66 @@ export function rebuildInstance(
     if (!childrenOf.has(e.parentId)) childrenOf.set(e.parentId, []);
     childrenOf.get(e.parentId)!.push(e.id);
   }
+  // A member of ANOTHER instance moved in under one of ours (#1437) is not ours to destroy: its own instance
+  // records the move, and nothing here would respawn it. It is parked at the scene root for the teardown and
+  // put back under the same parent (by guid — our members keep theirs) once the rebuild has derived them.
+  const parked: { id: number; parentGuid: string }[] = [];
+  // By a walk of the world, not the guid index: rebuild's tests stub the world module by an explicit export list.
+  const guidById = new Map(getAllEntities().map((e) => [e.id, e.guid ?? '']));
+  const idByGuid = new Map([...guidById].filter(([, g]) => g).map(([id, g]) => [g, id]));
   const toDestroy = new Set<number>(members);
   const stack = [...members];
   while (stack.length) {
     const id = stack.pop()!;
     for (const c of childrenOf.get(id) ?? []) {
       if (toDestroy.has(c)) continue;
+      if (!members.has(c) && readTraitData(c, PrefabInstanceMeta)?.homeParent && guidById.get(id)) {
+        parked.push({ id: c, parentGuid: remap.get(guidById.get(id)!) ?? guidById.get(id)! });
+        continue;
+      }
       toDestroy.add(c);
       stack.push(c);
     }
   }
+  // …unless its own instance is torn down here too (a user-added one nested in ours): that rebuild respawns
+  // it, moved, from its own record. An owned nested root's instance is the one its home belongs to.
+  const frameOf = (id: number): number => {
+    const pi = readTraitData(id, PrefabInstanceMeta);
+    if (!pi) return 0;
+    if (pi.rootInstanceId !== id || !pi.parentLocalId) return (pi.rootInstanceId as number) || 0;
+    const home = idByGuid.get((pi.homeParent as string) || '');
+    return home ? ((readTraitData(home, PrefabInstanceMeta)?.rootInstanceId as number) || 0) : 0;
+  };
+  for (let i = parked.length - 1; i >= 0; i--) {
+    const frame = frameOf(parked[i]!.id);
+    if (frame !== rootInstanceId && !toDestroy.has(frame)) continue;
+    toDestroy.add(parked[i]!.id);
+    parked.splice(i, 1);
+  }
+  // The reverse case: an entity of an instance torn down here that was moved OUT of this subtree — a member of
+  // a nested instance, or an owned nested root of ours — is respawned, moved, by the rebuild; left alive it
+  // would sit beside its own replacement. Fixpoint, since its own members may be further out still.
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const e of getAllEntities()) {
+      if (toDestroy.has(e.id) || parked.some((p) => p.id === e.id) || !e.traits.includes('PrefabInstance')) continue;
+      const frame = frameOf(e.id);
+      if (frame !== rootInstanceId && !toDestroy.has(frame)) continue;
+      if (frame === e.id) continue; // a stored root is its own instance, and it is not ours
+      const sub = [e.id];
+      while (sub.length) {
+        const id = sub.pop()!;
+        if (toDestroy.has(id)) continue;
+        toDestroy.add(id);
+        sub.push(...(childrenOf.get(id) ?? []));
+      }
+      grew = true;
+    }
+  }
+  for (const p of parked) if (eaMeta) writeTraitField(p.id, eaMeta, 'parentId', 0);
   deleteEntities([...toDestroy]);
 
+  const beforeSpawn = new Set(getAllEntities().map((e) => e.id));
   const newRootId = instantiatePrefab(prefab, parentId);
   // Preserve the instance root's stable guid across the teardown+respawn so refs
   // into the instance (UI bindings, guid-based undo) survive the rebuild — the
@@ -3611,6 +4389,22 @@ export function rebuildInstance(
   applyOverridesByRootInstance(newRootId, overrides);
   applyStructureByRootInstance(newRootId, prefab, structure);
   reapplyNestedInstanceOverrides(newRootId, nestedCaptures);
+  // A rebuilt OWNED nested instance re-expands from its own document only: the moves the prefabs around it make
+  // of its members are queued again, or an apply or revert on it undid them in every instance (#1437 review).
+  // Only for members THIS rebuild respawned: any other member is where the scene's own moves left it, and a
+  // base move replayed on it would record its current parent as its home (third-review F1).
+  if (oldParentLocalId) {
+    const respawned = new Set(getAllEntities().map((e) => e.id).filter((id) => !beforeSpawn.has(id)));
+    for (const f of enclosingFrames(newRootId)) {
+      if (!f.doc?.moved) continue;
+      const index = memberPathIndex(getCurrentWorld(), f.root);
+      const mine = Object.fromEntries(Object.entries(f.doc.moved).filter(([key]) => {
+        const member = index.get(key);
+        return !!member && respawned.has(member.id());
+      }));
+      if (Object.keys(mine).length) queuePrefabMoves(getCurrentWorld(), f.root, mine, '[Prefab]');
+    }
+  }
   // The respawned members and template-keyed added nodes are guid-less until derived (#1387). Only
   // fills empty guids, so the root's carried guid above and every restored scene guid stand.
   deriveInstanceMemberGuids(getCurrentWorld());
@@ -3625,7 +4419,34 @@ export function rebuildInstance(
   const sourceScene = (oldRootEa?.sourceScene as string) || '';
   if (eaMeta && sourceScene) {
     const links = getAllEntities().map((e) => [e.id, e.parentId] as const);
-    for (const id of collectSubtreeIds(links, [newRootId])) writeTraitField(id, eaMeta, 'sourceScene', sourceScene);
+    // …and every member moved OUT of the subtree (#1437): it is the instance's, wherever it hangs, and so is
+    // what hangs under it. Found through its home, to a fixpoint.
+    const stamped = new Set(collectSubtreeIds(links, [newRootId]));
+    const idOfGuid = new Map(getAllEntities().filter((e) => e.guid).map((e) => [e.guid!, e.id]));
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const e of getAllEntities()) {
+        const home = (readTraitData(e.id, PrefabInstanceMeta)?.homeParent as string) || '';
+        const at = home ? idOfGuid.get(home) : undefined;
+        if (stamped.has(e.id) || at === undefined || !stamped.has(at)) continue;
+        for (const id of collectSubtreeIds(links, [e.id])) stamped.add(id);
+        grew = true;
+      }
+    }
+    for (const id of stamped) writeTraitField(id, eaMeta, 'sourceScene', sourceScene);
+  }
+  // After the ownership stamp: a member of ANOTHER instance put back under ours keeps its own scene.
+  for (const p of parked) {
+    // Its parent gone from the rebuilt instance (the prefab lost that row), it goes back to its own home — still
+    // inside its own instance — rather than being left at the scene root, which is out of every instance.
+    const home = (readTraitData(p.id, PrefabInstanceMeta)?.homeParent as string) || '';
+    const live = new Map(getAllEntities().filter((e) => e.guid).map((e) => [e.guid!, e.id]));
+    const back = live.get(p.parentGuid);
+    const to = back ?? (home ? live.get(home) : undefined);
+    if (eaMeta && to) writeTraitField(p.id, eaMeta, 'parentId', to);
+    // Home again: nothing left to remember (a home reached through removed rows is not its row parent).
+    if (to && !back && !readTraitData(p.id, PrefabInstanceMeta)?.homeSteps) writeTraitField(p.id, PrefabInstanceMeta, 'homeParent', '');
+    if (!to) console.warn(`[Prefab] rebuild: the parent ${p.parentGuid} of a member moved in here is gone, and so is its home; it stays at the scene root`);
   }
   return newRootId;
 }
@@ -3638,6 +4459,8 @@ function refreshInstances(
   rootIds: number[],
   oldPrefab: PrefabFile,
   newPrefab: PrefabFile,
+  /** Old → new member guid (#1437): what the rebuild consumes by guid follows it. */
+  remap: ReadonlyMap<string, string> = new Map(),
 ): void {
   if (rootIds.length === 0) return;
 
@@ -3673,7 +4496,7 @@ function refreshInstances(
     // rebuildInstance (it walks the live non-member descendants).
     const captured = captureInstanceOverrides(oldRootId, oldPrefab);
     const capturedStructure = captureInstanceStructure(oldRootId, oldPrefab);
-    rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure, oldPrefab);
+    rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure, oldPrefab, remap);
   }
 
   // Reports what was REBUILT, not what was listed. The two differ exactly when a root died
@@ -3787,8 +4610,11 @@ function subtractRevertedStructure(
   const revertedAdded = new Set<string>();
   const revertedRemoved = new Set<number>();
   const revertedRemovedTraits = new Map<number, Set<string>>();
+  const revertedMoved = new Set<number>();
   for (const key of selectedKeys) {
-    if (key.startsWith('+added.')) {
+    if (key.startsWith('~moved.')) {
+      revertedMoved.add(Number(key.slice('~moved.'.length)));
+    } else if (key.startsWith('+added.')) {
       revertedAdded.add(key.slice('+added.'.length));
     } else if (key.startsWith('-removed.')) {
       revertedRemoved.add(Number(key.slice('-removed.'.length)));
@@ -3813,7 +4639,9 @@ function subtractRevertedStructure(
   // down; kept ones are re-spawned from `added`. So consumedEcsIds is unchanged.
   // `ownedNested` likewise: reverting an add or a removal does not change WHICH instance is a
   // given nested row's own expansion.
-  return { added, removed, removedTraits, consumedEcsIds: full.consumedEcsIds, ownedNested: full.ownedNested };
+  // A reverted move re-expands the member at its row parent (#1437).
+  const moved = Object.fromEntries(Object.entries(full.moved).filter(([lid]) => !revertedMoved.has(Number(lid))));
+  return { added, removed, removedTraits, moved, consumedEcsIds: full.consumedEcsIds, ownedNested: full.ownedNested };
 }
 
 /** Everything the dialog needs to wire undo/redo for a revert. The instance is
@@ -3869,9 +4697,16 @@ export async function revertOverridesSelective(
   // Capture the instance's current state against the prefab, then subtract the
   // reverted keys to get the state to re-apply after the rebuild.
   const fullOverrides = captureInstanceOverrides(rootInstanceId, prefab);
-  const fullStructure = captureInstanceStructure(rootInstanceId, prefab);
+  let fullStructure = captureInstanceStructure(rootInstanceId, prefab);
   const reducedOverrides = subtractRevertedOverrides(fullOverrides, selectedKeys);
-  const reducedStructure = subtractRevertedStructure(fullStructure, selectedKeys);
+  let reducedStructure = subtractRevertedStructure(fullStructure, selectedKeys);
+  // Moves inside nested instances live in what the rebuild captures of THEM (owner's B): dropped for the revert,
+  // set back for its undo, which rebuilds from `fullStructure`.
+  const revertedNested = nestedFrameMoves(rootInstanceId).filter((m) => selectedKeys.has(m.key));
+  if (revertedNested.length) {
+    reducedStructure = { ...reducedStructure, nestedMoves: { drop: revertedNested.map((m) => m.key) } };
+    fullStructure = { ...fullStructure, nestedMoves: { set: Object.fromEntries(revertedNested.map((m) => [m.key, m.parentGuid])) } };
+  }
 
   const newRootId = rebuildInstance(rootInstanceId, source, prefab, reducedOverrides, reducedStructure);
 

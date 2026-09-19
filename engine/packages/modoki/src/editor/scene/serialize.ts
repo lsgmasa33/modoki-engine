@@ -74,6 +74,8 @@ export interface SerializedEntity {
   removed?: number[];
   /** Per-localId component (trait) names the instance deleted from prefab members. */
   removedTraits?: Record<number, string[]>;
+  /** Members moved to another parent inside the instance (#1437): row localId → live parent guid. */
+  moved?: Record<number, string>;
   /** Scene-level overrides on this instance's NESTED prefab instances (a prefab's
    *  own internal nested instances, e.g. a ship's engine flames). Path-keyed so the
    *  scene can reach a member nested at ANY depth (see NestedOverridePaths). */
@@ -312,7 +314,7 @@ export async function serializeScene(opts?: {
   // entities + removed traits, and fold the added entities' live ECS ids into the
   // skip set so they aren't ALSO written as standalone scene entities (which is
   // how they used to leak out and orphan on reload).
-  const rootStructure = new Map<number, { added: AddedEntity[]; removed: number[]; removedTraits: Record<number, string[]> }>();
+  const rootStructure = new Map<number, { added: AddedEntity[]; removed: number[]; removedTraits: Record<number, string[]>; moved: Record<number, string> }>();
   // The nested channels, per top-level root — one top-down walk each (#1369; see captureNestedChannels).
   const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
   const nestedStructureByTop = new Map<number, NestedStructurePaths>();
@@ -328,8 +330,8 @@ export async function serializeScene(opts?: {
     for (const ecsId of channels.consumedEcsIds) prefabChildIds.add(ecsId);
     if (channels.nestedOverrides) nestedOverridesByTop.set(rootId, channels.nestedOverrides);
     if (channels.nestedStructure) nestedStructureByTop.set(rootId, channels.nestedStructure);
-    if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length) {
-      rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits });
+    if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length || Object.keys(s.moved).length) {
+      rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits, moved: s.moved });
     }
   }
 
@@ -387,6 +389,7 @@ export async function serializeScene(opts?: {
           if (struct.added.length) entry.added = struct.added;
           if (struct.removed.length) entry.removed = struct.removed;
           if (Object.keys(struct.removedTraits).length) entry.removedTraits = struct.removedTraits;
+          if (Object.keys(struct.moved).length) entry.moved = struct.moved;
         }
         const nested = nestedOverridesByTop.get(info.id);
         if (nested && Object.keys(nested).length) entry.nestedOverrides = nested;

@@ -1,8 +1,14 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
 import { buildStepEnv, resolveGcloudDir } from '../../plugins/vite-asset-scanner'
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+
+// Only the provisioned-branch tests reach ensureNode; a fake keeps them offline.
+vi.mock('../../toolchain', async (orig) => ({
+  ...(await orig<typeof import('../../toolchain')>()),
+  ensureNode: vi.fn(async (d: string) => ({ nodeBin: path.join(d, 'bin', 'node'), npmCli: path.join(d, 'npm-cli.js') })),
+}))
 
 /**
  * Guards the /api/build step-env helper's NO-PROVISION branches (dev / not opted in), which are
@@ -37,6 +43,41 @@ describe('buildStepEnv — no-provision branches', () => {
     const env = await buildStepEnv()
     expect(env.MODOKI_NODE).toBeUndefined()
     expect(env.PATH).toBe(process.env.PATH)
+  })
+})
+
+// The packaged editor's branch (#1444 close-out): the provisioned node dir goes FIRST and the rest
+// of PATH survives. On win32 the parent's env is keyed `Path` when the editor was launched from
+// Explorer/PowerShell; a `base.PATH` read off the spread then saw undefined and the build steps
+// lost every system tool. The test re-keys process.env to `Path` to be that parent.
+describe('buildStepEnv — provisioned branch', () => {
+  let saved: Record<string, string | undefined>
+  beforeEach(() => {
+    saved = { MODOKI_PROVISION_NODE: process.env.MODOKI_PROVISION_NODE, MODOKI_TOOLCHAIN_DIR: process.env.MODOKI_TOOLCHAIN_DIR, PATH: process.env.PATH }
+    process.env.MODOKI_PROVISION_NODE = '1'
+    process.env.MODOKI_TOOLCHAIN_DIR = path.join('/tc')
+  })
+  afterEach(() => {
+    for (const k of Object.keys(process.env)) if (k.toUpperCase() === 'PATH') delete process.env[k]
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v }
+  })
+
+  it('puts the provisioned node dir first and keeps the system PATH', async () => {
+    const sys = saved.PATH ?? ''
+    const env = await buildStepEnv({ MODOKI_PROJECT: '/p' })
+    expect(env.PATH).toBe(`${path.join('/tc', 'node', 'bin')}${path.delimiter}${sys}`)
+    expect(env.MODOKI_NODE).toBe(path.join('/tc', 'node', 'bin', 'node'))
+    expect(env.MODOKI_PROJECT).toBe('/p')
+  })
+
+  it.runIf(process.platform === 'win32')('reads a `Path`-keyed parent env and leaves ONE PATH key', async () => {
+    const sys = saved.PATH ?? ''
+    delete process.env.PATH
+    process.env.Path = sys
+    expect(Object.keys({ ...process.env }).filter((k) => k.toUpperCase() === 'PATH')).toEqual(['Path'])
+    const env = await buildStepEnv()
+    expect(Object.keys(env).filter((k) => k.toUpperCase() === 'PATH')).toEqual(['PATH'])
+    expect(env.PATH).toBe(`${path.join('/tc', 'node', 'bin')};${sys}`)
   })
 })
 

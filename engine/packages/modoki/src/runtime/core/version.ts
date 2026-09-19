@@ -49,7 +49,10 @@ export const ENGINE_VERSION = '0.1.0';
 // (docs/format-versioning.md), so an OLDER build must refuse a v14 scene rather
 // than read it, silently ignore the new key and drop it on the next save — which
 // is the exact data loss #1358 fixes.
-export const SCENE_FORMAT_VERSION = 14;
+// v15: no-op passthrough — adds an optional `moved` map beside `added`/`removed`/`removedTraits` on a
+// prefab-instance entry, a `nestedStructure` slot and an added reference node (#1437): a member moved to
+// another parent inside its instance. Required for the same reason as v14 (REFUSE disposition).
+export const SCENE_FORMAT_VERSION = 15;
 
 // The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
 // docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time

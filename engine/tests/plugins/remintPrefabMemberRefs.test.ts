@@ -21,8 +21,9 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { remintSceneEntityGuids, derivedMemberPaths, derivedMemberPathsByAnchor } from '../../plugins/asset-fs-ops';
+import { remintSceneEntityGuids, derivedMemberPaths, derivedMemberPathsByAnchor, planMemberPathRepair } from '../../plugins/asset-fs-ops';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { memberGuidRemap, rewritePrefabMemberTokens } from '../../packages/modoki/src/runtime/loaders/memberPaths';
 import { TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 
 registerAllTraits();
@@ -483,6 +484,183 @@ describe('nodes inside a nestedStructure slot are reminted too (#1358/#1369 slot
     const copy = JSON.stringify(remintSceneEntityGuids(scene as never, () => `dddddddd-0000-4000-8000-${String(++n).padStart(12, '0')}`));
     expect(copy).not.toContain(G_ENTRY);
     expect(copy).not.toContain(G_NODE);
+  });
+});
+
+/** #1437 P3-a: applying a move re-parents a prefab row, which changes the PATH its members derive their
+ *  guids from. `memberGuidRemap` predicts old → new from the two documents; every case is checked against
+ *  what the LOADER derives under each (names are unique in these fixtures, so a name is an identity). */
+describe('memberGuidRemap follows a re-parented row to its new derived guids (#1437 P3-a)', () => {
+  const DOOR = 'aaaaaaaa-0000-4000-8000-0000000000d1';
+  const LOCK = 'aaaaaaaa-0000-4000-8000-0000000000d2';
+  const HOUSE = 'aaaaaaaa-0000-4000-8000-0000000000d3';
+  const D_GUID = 'bbbbbbbb-0000-4000-8000-0000000000d1';
+  const lockDoc = { id: LOCK, rootLocalId: 1, entities: [row(1, 'LockRoot', 0), row(2, 'Bolt', 1)] };
+  /** Handle (3) under `handleParent`, Knob (4) under Handle, a nested Lock row (5) under `lockParent`. */
+  const doorDoc = (handleParent: number, lockParent = 1) => ({
+    id: DOOR, rootLocalId: 1, entities: [
+      row(1, 'DoorRoot', 0), row(2, 'Frame', 1), row(3, 'Handle', handleParent), row(4, 'Knob', 3),
+      row(5, 'Lock', lockParent, { prefab: LOCK }),
+    ],
+  });
+  const houseDoc = { id: HOUSE, rootLocalId: 1, entities: [row(1, 'HouseRoot', 0), row(2, 'Door', 1, { prefab: DOOR })] };
+  const holder = { id: 10, traits: { EntityAttributes: { name: 'Holder', parentId: 0, guid: HOLDER } } };
+  const inst = (extra: Record<string, unknown>) =>
+    ({ id: 20, traits: { EntityAttributes: { name: 'I', parentId: 10 }, Transform: { x: 0, y: 0, z: 0 } }, ...extra });
+  const scene = (entities: unknown[]): SceneData => ({ id: 's', version: 1, name: 'S', resources: [], entities: [holder, ...entities] }) as unknown as SceneData;
+  const guidsByName = (): Map<string, string> => new Map(getAllEntities().filter((e) => e.guid).map((e) => [e.name, e.guid!]));
+
+  /** The loader's own answer: every name whose guid differs between the two documents. */
+  async function loaderRemap(s: SceneData, before: unknown, after: unknown, docGuid = DOOR): Promise<Map<string, string>> {
+    prefabs.set(docGuid, before);
+    await load(s);
+    const a = guidsByName();
+    prefabs.set(docGuid, after);
+    await load(s);
+    const b = guidsByName();
+    const out = new Map<string, string>();
+    for (const [name, g] of a) if (b.get(name) && b.get(name) !== g) out.set(g, b.get(name)!);
+    return out;
+  }
+  const reader = (doc: unknown) => (g: string) => (g === DOOR ? doc : prefabs.get(g));
+
+  beforeEach(() => { prefabs.set(LOCK, lockDoc); prefabs.set(HOUSE, houseDoc); });
+
+  const CASES: ReadonlyArray<readonly [string, SceneData, unknown, unknown, number]> = [
+    ['a member moved to another row parent, and its child', scene([inst({ prefab: DOOR, guid: D_GUID })]), doorDoc(2), doorDoc(1), 2],
+    ['a member moved to parentId 0, which hangs it off the scene parent', scene([inst({ prefab: DOOR, guid: D_GUID })]), doorDoc(2), doorDoc(0), 2],
+    ['a nested row moved, and the members of its instance', scene([inst({ prefab: DOOR, guid: D_GUID })]), doorDoc(2, 1), doorDoc(2, 2), 2],
+    ['the prefab nested in another prefab', scene([inst({ prefab: HOUSE, guid: D_GUID })]), doorDoc(2), doorDoc(1), 2],
+    ['a guid-less user-added instance of it, anchored on the outer root',
+      scene([inst({ prefab: LOCK, guid: D_GUID, added: [{ parentLocalId: 2, guid: '', name: 'Added', prefab: DOOR, traits: {}, children: [] }] })]),
+      doorDoc(2), doorDoc(1), 2],
+    ['a user-added instance of it with its own guid',
+      scene([inst({ prefab: LOCK, guid: D_GUID, added: [{ parentLocalId: 2, guid: ANCHORED, name: 'Added', prefab: DOOR, traits: {}, children: [] }] })]),
+      doorDoc(2), doorDoc(1), 2],
+  ];
+
+  it.each(CASES)('%s', async (_name, s, before, after, count) => {
+    const expected = await loaderRemap(s, before, after);
+    expect(expected.size).toBe(count);
+    expect(memberGuidRemap(s as never, reader(before), reader(after))).toEqual(expected);
+  });
+
+  it('maps nothing when no path changed', () => {
+    const s = scene([inst({ prefab: DOOR, guid: D_GUID })]);
+    expect(memberGuidRemap(s as never, reader(doorDoc(2)), reader(doorDoc(2))).size).toBe(0);
+  });
+});
+
+/** #1437 P3-a: a template names its own members by PATH (`@member:`), so a re-parented row re-points the
+ *  tokens that name it or anything below it — in the prefab itself and in every prefab nesting it. Checked
+ *  by loading the rewritten documents and reading which entity each token resolved to. */
+describe('rewritePrefabMemberTokens re-points member tokens at a re-parented row (#1437 P3-a)', () => {
+  const DOOR = 'aaaaaaaa-0000-4000-8000-0000000000e1';
+  const HOUSE = 'aaaaaaaa-0000-4000-8000-0000000000e2';
+  const H_GUID = 'bbbbbbbb-0000-4000-8000-0000000000e1';
+  const bind = (...targets: string[]) => ({ UIAction: { bindings: targets.map((target) => ({ event: 'click', action: 'noop', target })) } });
+  const withTraits = (r: ReturnType<typeof row>, extra: Record<string, unknown>) => ({ ...r, traits: { ...r.traits, ...extra } });
+  const doorDoc = (handleParent: number, rootTargets: string[]) => ({
+    id: DOOR, rootLocalId: 1, entities: [
+      withTraits(row(1, 'DoorRoot', 0), bind(...rootTargets)), row(2, 'Frame', 1), row(3, 'Handle', handleParent), row(4, 'Knob', 3),
+    ],
+  });
+  const houseDoc = (door: string, climb: string) => ({
+    id: HOUSE, rootLocalId: 1, entities: [
+      withTraits(row(1, 'HouseRoot', 0), bind(door)),
+      row(2, 'Door', 1, { prefab: DOOR, overrides: { 2: bind(climb) } }),
+    ],
+  });
+  const readUi = (id: number): string[] => {
+    for (const ent of getCurrentWorld().entities) {
+      if (ent.id() !== id) continue;
+      return ((ent.get(getTraitByName('UIAction')!.trait) as { bindings: { target: string }[] }).bindings).map((b) => b.target);
+    }
+    return [];
+  };
+  const guidOf = (name: string): string => getAllEntities().find((e) => e.name === name)!.guid!;
+
+  it('in the prefab itself, and in a prefab that nests it (both frames, and a ^ climb)', async () => {
+    const oldDoor = doorDoc(2, ['@member:2.3', '@member:2.3.4', '@member:2']);
+    const newDoorRows = doorDoc(1, ['@member:2.3', '@member:2.3.4', '@member:2']);
+    const oldHouse = houseDoc('@member:2.2.3.4', '@member:^.2.2.3');
+    const readOld = (g: string) => (g === DOOR ? oldDoor : g === HOUSE ? oldHouse : prefabs.get(g));
+    const readNew = (g: string) => (g === DOOR ? newDoorRows : g === HOUSE ? oldHouse : prefabs.get(g));
+    const newDoor = rewritePrefabMemberTokens(newDoorRows as never, DOOR, readOld, readNew)!;
+    const newHouse = rewritePrefabMemberTokens(oldHouse as never, HOUSE, readOld, readNew)!;
+    expect(newDoor).not.toBeNull();
+    expect(newHouse).not.toBeNull();
+    // Frame (2) did not move, so its token is left alone.
+    expect((newDoor.entities as { traits: ReturnType<typeof bind> }[])[0]!.traits.UIAction.bindings.map((b) => b.target))
+      .toEqual(['@member:3', '@member:3.4', '@member:2']);
+
+    prefabs.set(DOOR, newDoor);
+    prefabs.set(HOUSE, newHouse);
+    await load({ id: 's', version: 1, name: 'S', resources: [], entities: [
+      { id: 20, prefab: HOUSE, guid: H_GUID, traits: { EntityAttributes: { name: 'HouseRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+    ] } as unknown as SceneData);
+    expect(readUi(getAllEntities().find((e) => e.name === 'DoorRoot')!.id)).toEqual([guidOf('Handle'), guidOf('Knob'), guidOf('Frame')]);
+    expect(readUi(getAllEntities().find((e) => e.name === 'HouseRoot')!.id)).toEqual([guidOf('Knob')]);
+    // The row override on Frame (2) of the nested Door, climbing to the House frame.
+    expect(readUi(getAllEntities().find((e) => e.name === 'Frame')!.id)).toEqual([guidOf('Handle')]);
+  });
+
+  // #1437 P3-b: a prefab's own `moved` names its member (the KEY) and the new parent (the value) by path.
+  // Mutation: stop rewriting the key.
+  it("the prefab's own moves follow too: member keys and target tokens", () => {
+    const withMove = (handleParent: number, key: string, target: string) => ({ ...doorDoc(handleParent, []), moved: { [key]: target } });
+    const readOld = (g: string) => (g === DOOR ? withMove(2, '2.3.4', '@member:2.3') : undefined);
+    const readNew = (g: string) => (g === DOOR ? withMove(1, '2.3.4', '@member:2.3') : undefined);
+    const out = rewritePrefabMemberTokens(withMove(1, '2.3.4', '@member:2.3') as never, DOOR, readOld, readNew)!;
+    expect(out.moved).toEqual({ '3.4': '@member:3' });
+  });
+
+  it('returns null when no token names a moved member', () => {
+    const d = doorDoc(2, ['@member:2']);
+    expect(rewritePrefabMemberTokens(doorDoc(1, ['@member:2']) as never, DOOR, (g) => (g === DOOR ? d : undefined), (g) => (g === DOOR ? doorDoc(1, []) : undefined))).toBeNull();
+  });
+});
+
+/** #1437 P3-a: the file-level repair the backend route runs after an applied move. */
+describe('planMemberPathRepair rewrites exactly the files that use the changed prefab (#1437 P3-a)', () => {
+  const DOOR = 'aaaaaaaa-0000-4000-8000-0000000000f1';
+  const HOUSE = 'aaaaaaaa-0000-4000-8000-0000000000f2';
+  const OTHER = 'aaaaaaaa-0000-4000-8000-0000000000f3';
+  const H_GUID = 'bbbbbbbb-0000-4000-8000-0000000000f1';
+  const bind = (...targets: string[]) => ({ UIAction: { bindings: targets.map((target) => ({ event: 'click', action: 'noop', target })) } });
+  const doorDoc = (handleParent: number) => ({
+    id: DOOR, rootLocalId: 1, entities: [row(1, 'DoorRoot', 0), row(2, 'Frame', 1), row(3, 'Handle', handleParent)],
+  });
+  const houseDoc = { id: HOUSE, rootLocalId: 1, entities: [{ ...row(1, 'HouseRoot', 0), traits: { ...row(1, 'HouseRoot', 0).traits, ...bind('@member:2.2.3') } }, row(2, 'Door', 1, { prefab: DOOR })] };
+  const otherDoc = { id: OTHER, rootLocalId: 1, entities: [{ ...row(1, 'O', 0), traits: { ...row(1, 'O', 0).traits, ...bind('@member:2.3') } }, row(2, 'A', 1), row(3, 'B', 2)] };
+  const sceneUsing = (ref: string) => ({ id: 's', version: 15, name: 'S', resources: [], entities: [
+    { id: 20, prefab: HOUSE, guid: H_GUID, traits: { EntityAttributes: { name: 'HouseRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+    { id: 30, traits: { EntityAttributes: { name: 'Ui', parentId: 0, guid: UI }, ...bind(ref) } },
+  ] });
+
+  it('re-points a scene that reaches the prefab only through another prefab, and that prefab\'s tokens', async () => {
+    prefabs.set(HOUSE, houseDoc);
+    prefabs.set(DOOR, doorDoc(2));
+    await load(sceneUsing('') as unknown as SceneData);
+    const oldHandle = getAllEntities().find((e) => e.name === 'Handle')!.guid!;
+    prefabs.set(DOOR, doorDoc(1));
+    await load(sceneUsing('') as unknown as SceneData);
+    const newHandle = getAllEntities().find((e) => e.name === 'Handle')!.guid!;
+    expect(newHandle).not.toBe(oldHandle);
+
+    const files = [
+      { key: 'door', type: 'prefab' as const, guid: DOOR, text: JSON.stringify(doorDoc(1)) },
+      { key: 'house', type: 'prefab' as const, guid: HOUSE, text: JSON.stringify(houseDoc) },
+      { key: 'other', type: 'prefab' as const, guid: OTHER, text: JSON.stringify(otherDoc) },
+      { key: 'scene', type: 'scene' as const, text: JSON.stringify(sceneUsing(oldHandle)) },
+      { key: 'unrelated', type: 'scene' as const, text: JSON.stringify({ ...sceneUsing(oldHandle), entities: [sceneUsing(oldHandle).entities[1]] }) },
+    ];
+    const plan = planMemberPathRepair(files, DOOR, doorDoc(2), (g) => (g === DOOR ? doorDoc(1) : prefabs.get(g)));
+    expect(plan.map((p) => p.key).sort()).toEqual(['house', 'scene']);
+    const byKey = new Map(plan.map((p) => [p.key, p.doc]));
+    expect(JSON.stringify(byKey.get('house'))).toContain('"@member:2.3"');
+    expect(JSON.stringify(byKey.get('scene'))).toContain(newHandle);
+    expect(JSON.stringify(byKey.get('scene'))).not.toContain(oldHandle);
   });
 });
 

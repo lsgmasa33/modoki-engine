@@ -21,14 +21,14 @@ import { entityRef } from '../undo/entityRef';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
-import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import { livePinnedId } from '../../runtime/core/ecs/entityPin';
 import { subjectGoneNotice, runOnPinnedSubject } from './prefabDialogSubject';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
 import { MixedCheckbox } from './assetViews/widgets';
 import {
-  collectInstanceOverrideFields, addedKey, removedEntityKey, removedTraitKey,
+  collectInstanceOverrideFields, addedKey, removedEntityKey, removedTraitKey, movedKey, applyOutcomeNotice, nestedFrameMoves,
   type EntityOverrideNode,
 } from '../scene/prefabOverrideKeys';
 import { ModalShell } from '../components/ModalShell';
@@ -40,10 +40,12 @@ type EntityNode = EntityOverrideNode;
 /** Structural diff nodes, alongside the per-field EntityNode list. */
 interface RemovedEntityNode { localId: number; name: string; key: string }   // "-removed.<localId>"
 interface RemovedTraitNode { localId: number; entityName: string; trait: string; key: string } // "-trait.<localId>.<name>"
+interface MovedNode { localId: number; name: string; parentName: string; key: string } // "~moved.<localId>" (#1437)
 interface Structural {
   added: AddedEntity[];                  // each subtree root keyed "+added.<guid>"
   removedEntities: RemovedEntityNode[];
   removedTraits: RemovedTraitNode[];
+  moved: MovedNode[];
 }
 
 type LoadState =
@@ -78,7 +80,17 @@ function buildStructural(rootInstanceId: number, prefab: PrefabFile): Structural
       removedTraits.push({ localId, entityName: prefabName(localId), trait, key: removedTraitKey(localId, trait) });
     }
   }
-  return { added: s.added, removedEntities, removedTraits };
+  const nameOfGuid = new Map(getAllEntities().filter((e) => e.guid).map((e) => [e.guid!, e.name]));
+  const moved: MovedNode[] = Object.entries(s.moved).map(([localIdStr, parentGuid]) => {
+    const localId = Number(localIdStr);
+    return { localId, name: prefabName(localId), parentName: nameOfGuid.get(parentGuid) || '(unknown)', key: movedKey(localId) };
+  });
+  // A nested instance's member moved out of it: recorded by THIS prefab (#1437).
+  const nameOfId = new Map(getAllEntities().map((e) => [e.id, e.name]));
+  for (const m of nestedFrameMoves(rootInstanceId)) {
+    moved.push({ localId: m.lid, name: nameOfId.get(m.memberEcs) || `localId ${m.lid}`, parentName: nameOfGuid.get(m.parentGuid) || '(unknown)', key: m.key });
+  }
+  return { added: s.added, removedEntities, removedTraits, moved };
 }
 
 /** Count the leaf trait/field names inside an added subtree (for the row label). */
@@ -196,6 +208,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       for (const node of structural.added) allKeys.add(addedKey(node.guid));
       for (const r of structural.removedEntities) allKeys.add(r.key);
       for (const r of structural.removedTraits) allKeys.add(r.key);
+      for (const r of structural.moved) allKeys.add(r.key);
       setChecked(allKeys);
       setCollapsed(new Set());
       setLoadState({ kind: 'ready', entities, structural });
@@ -212,6 +225,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     for (const node of loadState.structural.added) tally(addedKey(node.guid));
     for (const r of loadState.structural.removedEntities) tally(r.key);
     for (const r of loadState.structural.removedTraits) tally(r.key);
+    for (const r of loadState.structural.moved) tally(r.key);
     return { total, checked: checkedCount };
   }, [loadState, checked]);
 
@@ -257,7 +271,9 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
         act: async (liveId) => {
           // Applies the selected overrides to the prefab AND pushes one undo entry.
           // (Promotion-driven scene re-save now happens inside applyToPrefabWithUndo.)
-          await applyToPrefabWithUndo(liveId, checked);
+          const result = await applyToPrefabWithUndo(liveId, checked);
+          const notice = applyOutcomeNotice(result);
+          if (notice) useEditorStore.getState().showToast(notice, 'warn');
           closeDialog();
         },
       });
@@ -418,7 +434,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
           {loadState.kind === 'ready' && loadState.entities.length === 0
             && loadState.structural.added.length === 0
             && loadState.structural.removedEntities.length === 0
-            && loadState.structural.removedTraits.length === 0 && (
+            && loadState.structural.removedTraits.length === 0
+            && loadState.structural.moved.length === 0 && (
             <div style={{ color: '#888', fontSize: 12, padding: 8 }}>{emptyMsg}</div>
           )}
           {loadState.kind === 'ready'
@@ -491,6 +508,27 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <span style={{ color: '#888', margin: '0 6px' }}>on</span>
               <span style={{ color: '#ddd' }}>{r.entityName}</span>
               <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId}</span>
+            </div>
+          ))}
+
+          {loadState.kind === 'ready' && loadState.structural.moved.map((r) => (
+            <div key={r.key} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2 }}>
+              <span style={{ width: 14 }} />
+              <TriCheckbox
+                state={checked.has(r.key) ? 'on' : 'off'}
+                onChange={(next) => toggleKey(r.key, next)}
+                dataUiId={`prefab.dialog.item.${r.key}`} dataUiLabel={`${r.name} moved`}
+                title={isRevert
+                  ? 'Put this entity back under its prefab parent'
+                  : 'Move this entity in the prefab base, with its current position under the new parent — affects all instances'}
+              />
+              {isRevert
+                ? <span style={{ color: '#2ecc71' }}>↩ move back&nbsp;</span>
+                : <span style={{ color: '#f39c12' }}>↪ moved&nbsp;</span>}
+              <span style={{ color: '#ddd', fontWeight: 'bold' }}>{r.name}</span>
+              <span style={{ color: '#888', margin: '0 6px' }}>under</span>
+              <span style={{ color: '#ddd' }}>{r.parentName}</span>
+              <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId}{isRevert ? '' : ' · affects all instances'}</span>
             </div>
           ))}
         </div>

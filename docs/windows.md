@@ -51,6 +51,28 @@ probing) and `spawnable()` (decides `{shell}` and quotes accordingly), both in
 ⚠️ Node throws `EINVAL` on spawning a `.cmd`/`.bat` without `shell:true` (the CVE-2024-27980
 fix), so "just add a `.cmd` shim" is not a workaround for an unexecutable stub either.
 
+**gcloud is the same case (#1444).** On Windows the Cloud SDK's CLI is `gcloud.cmd` (beside an
+extensionless bash shim), so the two `execFileSync('gcloud', …)` calls (`/api/ota/status`, the
+OTA publish's CORS update) could never run there; they go through `execGcloudSync`
+(`engine/plugins/backend/gcloud.ts`), which is `whichSync` + `spawnable`. The same issue found the
+gcloud dir prepended to `PATH` with a literal `:` — on win32 that glues the dir onto the first
+entry, so the dir is never searched and the old first entry is lost. What still does NOT work on
+Windows: the built-in web GCS deploy (its steps are bash `find`/`for`), and gcloud auto-detection
+— a Windows user sets the gcloud path in Project Settings.
+
+### A COPY of `process.env` has no `PATH` key on Windows — it has `Path`
+
+`process.env` is case-insensitive on win32, so `process.env.PATH` always works. A **spread** of it
+is a plain object keyed however the parent spelled it — `Path` for an editor launched from Explorer
+or PowerShell (a Git Bash parent says `PATH`, which is why a terminal run hides this). So
+`{ ...process.env }.PATH` is `undefined`, and `{ ...copy, PATH: dir + ';' + copy.PATH }` hands the
+child both `Path` and `PATH`; Node keeps `PATH` — the prepended dir **alone** — and every system
+tool is gone (`'node' is not recognized`). Observed in the #1444 close-out: OTA publish's build step
+died exactly this way. Prepend onto a copied env with **`withPathEntry`**
+(`engine/toolchain/index.ts`), which reads any casing and writes one `PATH`. The
+`{ ...process.env, PATH: … process.env.PATH }` shape (read from `process.env` itself) is safe and
+is used in several places.
+
 ## A probed tool can be present and still lie about itself
 
 Two more instances of the doc's opening pattern — a probe answering confidently, and wrong —
@@ -227,8 +249,9 @@ conversion never engaged".
   a closing quote; and a picked path outside the project is stored as `D:/Downloads`
   (`portablePath`, `projectPaths.ts`). Observed: Apply accepts and stores `D:/Downloads`. Not yet
   observed: an Android build running with `JAVA_HOME=D:/…` (it's expected to work, since Node's `path`
-  and Gradle's launcher accept `/`). A hand-typed `\` still fails, with a hint to use `/`. Still
-  refused: `(x86)` and non-ASCII folders. And a stored gcloudPath can't be used on Windows yet (#1444).
+  and Gradle's launcher accept `/`). A hand-typed `\` still fails, with a hint to use `/`. #1444
+  then widened `FS_PATH` to `(x86)` and non-ASCII folders (inert characters only — every
+  shell-active one is still refused), and made a stored gcloud path usable on Windows (§ PATHEXT).
 - ⚠️ **`fs.realpathSync` is NOT the canonicaliser you want on Windows — `fs.realpathSync.native`
   is.** The JS lstat-walk resolves symlinks and junctions but neither `subst` drive mappings nor
   drive-letter CASE, both of which are ordinary ways one directory acquires two spellings here.

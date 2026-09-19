@@ -40,14 +40,14 @@ import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
+import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
 import { osascriptChooser, type NativeChooser } from './nativeChooser';
 import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
 
 import { readFontAxes } from '../font-instance';
-import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash, remintSceneEntityGuids } from '../asset-fs-ops';
+import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash, remintSceneEntityGuids, planMemberPathRepair, type RepairFile } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 
@@ -4602,6 +4602,47 @@ async function describeUnresolvedAgainstLiveWorld(
     }
   }
 
+  // ── POST /api/prefab-member-paths {prefab, before} (#1437) ── the prefab on disk changed from `before`
+  // in a way that moved member PATHS (an applied move re-parents a row). Every other scene and prefab
+  // that uses it, transitively, gets its stored member refs re-pointed: see `planMemberPathRepair`.
+  // Marked as the editor's own writes, so the open scene is not reloaded under its live edits — the
+  // editor repairs its live world itself.
+  if (urlPath === '/api/prefab-member-paths' && method === 'POST') {
+    try {
+      const { prefab, before } = (body ?? {}) as { prefab?: unknown; before?: unknown };
+      if (typeof prefab !== 'string' || !isGuid(prefab) || !before || typeof before !== 'object') {
+        return json({ error: 'expected { prefab: <guid>, before: <prefab document> }' }, 400);
+      }
+      const files: (RepairFile & { abs: string })[] = [];
+      for (const a of ctx.getManifest().assets) {
+        if (a.type !== 'scene' && a.type !== 'prefab') continue;
+        const abs = ctx.resolveAssetPath(a.path);
+        if (!abs || !fs.existsSync(abs)) continue;
+        files.push({ key: a.path, abs, type: a.type, guid: a.guid, text: fs.readFileSync(abs, 'utf-8') });
+      }
+      const plan = planMemberPathRepair(files, prefab, before, makePrefabResolver(ctx));
+      // A document an asset view holds unsaved would write its own copy back over this repair, so it is
+      // left alone and named. The LIVE scene is not asked about: the editor repairs its live world itself,
+      // and the next save writes that. A renderer that cannot answer is not "nothing held" — nothing is written.
+      const gate = await unsavedGate(ctx, plan.map((p) => p.key), { registries: ['dirtyAsset'] });
+      if (gate.kind === 'unknown') return json({ ok: false, error: `could not ask the editor about unsaved documents: ${gate.reason}`, rewritten: [] }, 503);
+      const held = new Set(gate.kind === 'held' ? gate.holds.map((h) => h.path) : []);
+      const byKey = new Map(files.map((f) => [f.key, f.abs]));
+      const rewritten: string[] = [];
+      for (const { key, doc } of plan) {
+        if (held.has(key)) continue;
+        const abs = byKey.get(key)!;
+        const bytes = assetJsonBytes(doc);
+        ctx.markEditorWrite(abs, crypto.createHash('sha1').update(bytes).digest('hex'));
+        writeJsonAtomic(abs, bytes);
+        rewritten.push(key);
+      }
+      return json({ ok: true, rewritten, held: [...held] });
+    } catch (e) {
+      return json({ error: String(e) }, 500);
+    }
+  }
+
   // ── POST /api/duplicate-asset {from, to} (M) ── copy + regenerate GUID.
   if (urlPath === '/api/duplicate-asset' && method === 'POST') {
     try {
@@ -5618,7 +5659,7 @@ async function describeUnresolvedAgainstLiveWorld(
     if (!gcloudDir) {
       return json({ ok: false, error: 'gcloud not found — install the Google Cloud SDK and run `gcloud auth login`, or set its path in Project Settings.' }, 500);
     }
-    const env = { ...process.env, PATH: `${gcloudDir}:${process.env.PATH ?? ''}` };
+    const env = withGcloudOnPath(process.env, gcloudDir);
     // "COULD NOT LOOK" IS NEVER REPORTED AS "NOTHING IS THERE" (conventions §5). This was a bare
     // `catch` that answered `{ok:true, release:null, note:'No release.json published yet'}` for
     // EVERY failure — expired auth, no network, a typo'd bucket, a missing IAM permission, even a
@@ -5626,7 +5667,7 @@ async function describeUnresolvedAgainstLiveWorld(
     // acts on it: re-publishing, or telling the human the rollout never landed.
     let raw: string;
     try {
-      raw = execFileSync('gcloud', ['storage', 'cat', `${bucket}/release.json`], { env, encoding: 'utf8' });
+      raw = execGcloudSync(['storage', 'cat', `${bucket}/release.json`], { env, encoding: 'utf8' }) as string;
     } catch (e) {
       const stderr = String((e as { stderr?: unknown })?.stderr ?? (e as Error)?.message ?? e);
       if (isGcsObjectMissing(stderr)) {

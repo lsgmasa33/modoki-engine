@@ -8,6 +8,7 @@
  *   - `"+added.<guid>"`               — an added child subtree.
  *   - `"-removed.<localId>"`          — a deleted prefab member.
  *   - `"-trait.<localId>.<name>"`     — a component removed from a surviving member.
+ *   - `"~moved.<localId>"`            — a member moved to another parent inside the instance (#1437).
  *
  *  This module used to be inlined in `ApplyPrefabDialog.tsx` (the human "Apply to
  *  Prefab" / "Revert Overrides" panel) — `buildTree()` + the four string templates.
@@ -22,7 +23,7 @@ import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import {
   collectComparableTraits, getOverrideValues, captureInstanceStructure, baseTokenResolver,
-  isTemplateExcludedField, type PrefabFile,
+  isTemplateExcludedField, nestedFrameMoves, type PrefabFile, type ApplyResult,
 } from './prefab';
 
 // ── Key-format helpers — the ONE place these four string shapes are written ──
@@ -38,6 +39,9 @@ export function removedEntityKey(localId: number): string {
 }
 export function removedTraitKey(localId: number, trait: string): string {
   return `-trait.${localId}.${trait}`;
+}
+export function movedKey(localId: number): string {
+  return `~moved.${localId}`;
 }
 
 // ── Per-field override tree (moved verbatim from ApplyPrefabDialog's buildTree) ──
@@ -134,6 +138,11 @@ export interface InstanceOverrideKeys {
   removedEntities: string[];
   /** `"-trait.<localId>.<name>"` keys. */
   removedTraits: string[];
+  /** `"~moved.<localId>"` keys — a member moved to another parent inside the instance (#1437) — and
+   *  `"~moved.<nested row chain>:<localId>"` for a NESTED instance's member moved out of it. Revert puts it
+   *  back; Apply writes it into this prefab (a move it cannot express comes back in `ApplyResult.skipped`,
+   *  with the reason). */
+  moved: string[];
   /** All of the above, concatenated — what `applyToPrefabSelective`/
    *  `revertOverridesSelective` accept as `selectedKeys`. */
   all: string[];
@@ -185,10 +194,27 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
     const localId = Number(localIdStr);
     for (const trait of names) removedTraits.push(removedTraitKey(localId, trait));
   }
+  // …and a nested instance's member moved OUT of it, which only this outer instance's prefab can record.
+  const moved = [...Object.keys(structure.moved).map((localId) => movedKey(Number(localId))), ...nestedFrameMoves(rootInstanceId).map((m) => m.key)];
 
   return {
-    fields, added, removedEntities, removedTraits,
-    all: [...fields, ...added, ...removedEntities, ...removedTraits],
+    fields, added, removedEntities, removedTraits, moved,
+    all: [...fields, ...added, ...removedEntities, ...removedTraits, ...moved],
     applyExcluded, unaddressableAdded,
   };
 }
+
+/** What an Apply did NOT do, in a sentence for the person who asked (#1437), or null when it did everything:
+ *  moves the prefab could not express, and other files whose refs to moved members were not repaired. */
+export function applyOutcomeNotice(result: Pick<ApplyResult, 'skipped' | 'memberPathsChanged' | 'fileRepair'>): string | null {
+  const parts: string[] = [];
+  const skipped = result.skipped ?? [];
+  if (skipped.length) parts.push(`${skipped.length} move${skipped.length === 1 ? ' was' : 's were'} not applied: ${skipped.map((x) => x.reason).join('; ')}`);
+  if (result.memberPathsChanged) {
+    if (result.fileRepair === null) parts.push('references to the moved members in other files could NOT be repaired — see the console');
+    else if (result.fileRepair?.held.length) parts.push(`references in ${result.fileRepair.held.join(', ')} were not repaired: open with unsaved edits`);
+  }
+  return parts.length ? `Apply to Prefab: ${parts.join('. ')}.` : null;
+}
+
+export { nestedFrameMoves };

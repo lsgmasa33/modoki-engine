@@ -11,6 +11,7 @@ import { inSystemTick } from '../systemTick';
 import { noteAuthoredWriteWhileStopped } from './authoredWrites';
 import { compareSiblings } from './entityOrder';
 import { collectSubtreeIds } from './subtreeCollect';
+import { rehomeDependents, detachOrphanedMembers, type DetachedMember } from './memberHome';
 // Re-exported for backward compatibility — every existing caller imports these from here.
 // The implementation lives in `renderDirty.ts` (a side-effect-free L0 module) so a module
 // that only needs the dirty signal (e.g. `loaders/assetManifest.ts`) doesn't have to import
@@ -616,10 +617,15 @@ export function subtreeIds(flat: EntityInfo[], rootId: number): number[] {
 /** Delete multiple entities and all their children in one pass.
  *  Builds the child index once (O(n)), then collects subtrees for all IDs. The shared walk has a visited
  *  set, so a parent cycle terminates (it used to loop forever here). */
-export function deleteEntities(entityIds: number[]) {
-  if (entityIds.length === 0) return;
+export function deleteEntities(entityIds: number[]): DetachedMember[] {
+  if (entityIds.length === 0) return [];
 
   const toDelete = collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), entityIds);
+  // A moved prefab member whose home is going keeps its identity path through it (#1437).
+  const gone = new Set(toDelete);
+  rehomeDependents(gone);
+  // …and one moved OUT of an instance being deleted outlives it, unlinked (#1437). Returned for an undo.
+  const detached = detachOrphanedMembers(gone);
 
   // Delete in reverse: within one walk, children before parents
   for (let i = toDelete.length - 1; i >= 0; i--) {
@@ -631,9 +637,10 @@ export function deleteEntities(entityIds: number[]) {
   }
   fireDirtyListeners();
   markStructureDirty();
+  return detached;
 }
 
 /** Delete an entity and all its children. Delegates to deleteEntities. */
-export function deleteEntity(entityId: number) {
-  deleteEntities([entityId]);
+export function deleteEntity(entityId: number): DetachedMember[] {
+  return deleteEntities([entityId]);
 }

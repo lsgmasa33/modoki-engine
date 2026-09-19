@@ -189,12 +189,19 @@ export function writeProjectUserConfig(user: RawProjectConfig | ProjectUserConfi
  *  absent — it is a full shell command the project author wrote, so it needs
  *  metacharacters and is trusted like the user's own terminal.
  *
- *  `FS_PATH` admits ONE colon, only as a leading Windows drive (`D:/Android/Sdk`), and never a
- *  backslash — the one character that can swallow a closing quote. Without the drive every Windows
- *  absolute path was refused, so Project Settings ▸ Browse… for an SDK folder produced a value its
- *  own Apply rejected (#1441). A picked path arrives with `/` separators (`portablePath`,
- *  projectPaths.ts); a hand-typed `\` gets a hint below rather than a silent rewrite. */
-const FS_PATH = /^(?:[A-Za-z]:)?[A-Za-z0-9 ._@\-/]*$/;
+ *  `FS_PATH` guards the three `sdk.*` fields, and those do NOT reach a shell string today: JAVA_HOME
+ *  and ANDROID_HOME go into the gradle step's spawn `env`, and the gcloud path only through `path`
+ *  ops and a PATH prepend (traced for #1444). The allowlist is kept as defence in depth — a future
+ *  consumer that interpolates one inside double quotes stays safe — so it is widened only by
+ *  characters that cannot inject there: any letter/digit/mark (a non-ASCII user folder,
+ *  `C:/Users/<日本語>/AppData/Local/Android/Sdk`) and `()` (`C:/Program Files (x86)/…`, the Windows
+ *  Cloud SDK's default home) — a paren does nothing without a `$` or backtick, both still refused.
+ *  It admits ONE colon, only as a leading Windows drive (`D:/Android/Sdk`), and never a backslash —
+ *  the one character that can swallow a closing quote. Without the drive every Windows absolute
+ *  path was refused, so Project Settings ▸ Browse… for an SDK folder produced a value its own Apply
+ *  rejected (#1441). A picked path arrives with `/` separators (`portablePath`, projectPaths.ts); a
+ *  hand-typed `\` gets a hint below rather than a silent rewrite. */
+const FS_PATH = /^(?:[A-Za-z]:)?[\p{L}\p{N}\p{M} ._@\-/()]*$/u;
 const BUILD_FIELD_RULES: { key: string; label: string; pattern: RegExp; allowEmpty: boolean; source: 'config' | 'user' }[] = [
   { key: 'app.appId',                 label: 'Bundle ID',              pattern: /^[A-Za-z0-9._-]+$/,          allowEmpty: false, source: 'config' },
   { key: 'build.appleTeamId',         label: 'Apple Team ID',          pattern: /^[A-Za-z0-9]+$/,             allowEmpty: true,  source: 'config' },

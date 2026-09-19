@@ -1564,14 +1564,16 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   plain. That happens under an unanchored (guid-less, scene-root) instance, whose owner guid was
   minted at move time and re-derived differently by the rebuild. Its stale id may name an unrelated
   entity, so relinking would make the save drop it.
-  Moving a MEMBER that holds an owned nested instance unpacks that instance too, recursively
-  (`reparentEntity`'s detach walk). Left linked under a now-plain parent, it would be saved as a
-  top-level instance that stores its derived guid, and the reload would re-derive its members from
-  that guid (#1349's shape). A user-added nested instance in the moved subtree stays linked, because
+  Moving a MEMBER OUT of its outermost instance unpacks it, and any owned nested instance it holds,
+  recursively (`reparentEntity`'s detach walk). Left linked under a now-plain parent, such an
+  instance would be saved as a top-level instance that stores its derived guid, and the reload would
+  re-derive its members from that guid (#1349's shape). A move that stays INSIDE the outermost
+  instance keeps everything linked and is saved as a move (#1437 —
+  [prefab-structural-overrides.md § Moved members](prefab-structural-overrides.md#moved-members-1437)). A user-added nested instance in the moved subtree stays linked, because
   its root guid is already stored. A STORED instance root (top-level or user-added) moved OUTSIDE every
   instance stays an instance, and the save writes it as a top-level entry. Before the review of
-  #1355, every root drag unpacked the whole instance, because `isWithinInstanceSubtree` is false
-  for the root itself. Dropped INSIDE another instance it also stays linked, and becomes that
+  #1355, every root drag unpacked the whole instance, because the containment test it used then was
+  false for the root itself (linkage is now decided by `outermostInstanceRoot`, #1437). Dropped INSIDE another instance it also stays linked, and becomes that
   instance's user-added nested instance (owner, #1436): the save writes it as an `added[]` prefab
   reference carrying its own overrides, under a member or, inside an owned nested instance, in
   `nestedStructure`. The same holds when the instance sits deeper in the moved subtree, under a

@@ -7,7 +7,9 @@
  *  plus throwaway lights + an HDR environment so the prefab is visible. On save we
  *  serialize the prefab subtree back out, excluding the scaffold entities. */
 
+import type { Entity } from 'koota';
 import type { PrefabFile } from './prefab';
+import { PREFAB_EDIT_LOCAL_GUID_PREFIX } from './prefabEditGuids';
 import { serializePrefab, warnInertPrefabSizes, writePrefabFile, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
@@ -41,7 +43,7 @@ export const PREFAB_EDIT_ROOT_GUID = '__prefab_edit_root__';
  *  them silently drops those overrides. Riding on `guid` is safe because serializePrefab
  *  CLEARS EntityAttributes.guid on every row it writes — a template carries no per-instance
  *  identity — so the sentinel can never reach the file. */
-export const PREFAB_EDIT_LOCAL_GUID_PREFIX = '__prefab_edit_local__';
+export { PREFAB_EDIT_LOCAL_GUID_PREFIX };
 /** Default HDR for the edit-mode environment (wooden_motel_2k — already in the
  *  asset manifest). Purely scaffolding; never written into the prefab. */
 export const PREFAB_EDIT_HDR_GUID = '984275f1-3ebd-4848-927f-012595c76500';
@@ -207,6 +209,39 @@ function byPathDepth<T>(paths: Record<string, T> | undefined, fn: (v: T, depth: 
   return Object.fromEntries(Object.entries(paths).map(([k, v]) => [k, fn(v, 1 + k.split('.').length) as T]));
 }
 
+/** Show the prefab's own moves (#1437) in the loaded edit world: each member goes under its target, found by
+ *  the guids the edit world gives both. A linked member (inside a nested row's instance) remembers the parent
+ *  it left, as a loaded move does; a flat row is plain here, and the save puts it back under its original
+ *  row parent (`serializePrefab`'s `rowParents`). A move naming nothing is reported and left out. */
+export function applyEditWorldMoves(prefab: PrefabFile): void {
+  if (!prefab.moved) return;
+  const eaMeta = getTraitByName('EntityAttributes');
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!eaMeta) return;
+  const byGuid = new Map<string, Entity>();
+  for (const e of getCurrentWorld().entities) {
+    const g = e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid : '';
+    if (g) byGuid.set(g, e);
+  }
+  const steps = (key: string): MemberStep[] => (key ? key.split('.').map((x) => (x.startsWith('+') ? x : Number(x))) : []);
+  for (const [key, token] of Object.entries(prefab.moved)) {
+    const t = parseMemberToken(token);
+    const memberGuid = editGuidAt(prefab, steps(key));
+    const targetGuid = t && !t.up ? editGuidAt(prefab, t.path) : null;
+    const member = memberGuid ? byGuid.get(memberGuid) : undefined;
+    const target = targetGuid ? byGuid.get(targetGuid) : undefined;
+    if (!member || !target) { console.warn(`[PrefabEdit] the prefab's move of ${key} names nothing here; not shown`); continue; }
+    const ea = member.get(eaMeta.trait) as { parentId?: number };
+    if (piMeta && member.has(piMeta.trait)) {
+      const pi = member.get(piMeta.trait) as { homeParent?: string };
+      const from = [...getCurrentWorld().entities].find((x) => x.id() === ea.parentId);
+      const fromGuid = from?.has(eaMeta.trait) ? (from.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '';
+      if (!pi.homeParent && fromGuid) member.set(piMeta.trait, { ...pi, homeParent: fromGuid, homeSteps: '' });
+    }
+    member.set(eaMeta.trait, { ...ea, parentId: target.id() });
+  }
+}
+
 export function buildPrefabEditScene(prefab: PrefabFile): SceneData {
   const entities: SceneEntityEntry[] = prefab.entities.map((pe) => {
     const traits = editWorldRefs(prefab, { ...pe.traits }, 0) as Record<string, Record<string, unknown> | boolean>;
@@ -228,6 +263,9 @@ export function buildPrefabEditScene(prefab: PrefabFile): SceneData {
     // edit session, not inline here.
     return {
       id: pe.localId, name: pe.name, traits,
+      // A nested row's instance root carries its sentinel as its STORED guid, so its members derive from it —
+      // what `editGuidAt` names them by (#1352, #1437). Left to derive, the root anchored on the scene parent.
+      ...(pe.prefab ? { guid: `${PREFAB_EDIT_LOCAL_GUID_PREFIX}${pe.localId}` } : {}),
       prefab: pe.prefab, overrides: editWorldRefs(prefab, pe.overrides, 1) as typeof pe.overrides,
       added: editWorldRefs(prefab, pe.added, 1) as typeof pe.added, removed: pe.removed, removedTraits: pe.removedTraits,
       // Both nested channels too (#1381): the row becomes a top-level scene entry here, the carrier
@@ -332,6 +370,7 @@ export async function openPrefabForEditing(
   const dirtyBeforeSwap = worldHasUnsavedEdits();
   try {
     await sceneManager.loadScene(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { preloaded: sceneData });
+    applyEditWorldMoves(prefab);
   } catch (e) {
     console.error('[PrefabEdit] failed to load edit scene:', e);
     return;
@@ -451,6 +490,8 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   const prefab = serializePrefab(rootId, editingPrefab.guid, {
     preserveLocalIds: collectPreservedLocalIds(previous.rootLocalId, rootId),
     name: previous.name,
+    // A row the prefab's own move placed under a nested member keeps its original row parent (#1437).
+    rowParents: new Map(previous.entities.map((e) => [e.localId, ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0])),
     onRuntimeExcluded: (n) => { runtimeExcluded = n; },
   });
   if (!prefab) { console.error('[PrefabEdit] serialize produced no prefab'); return NOT_SAVED; }

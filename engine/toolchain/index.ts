@@ -889,8 +889,30 @@ export function resolve(id: ToolId): DetectResult & { present: true } {
 export function withToolOnPath(id: ToolId, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const d = detect(id)
   if (!d.dir) return env
-  const sep = process.platform === 'win32' ? ';' : ':'
-  return { ...env, PATH: `${d.dir}${sep}${env.PATH ?? ''}` }
+  return withPathEntry(env, d.dir)
+}
+
+/** `dir` prepended to a PATH value with the platform's delimiter. A literal `:` on win32 glues the
+ *  dir onto the first entry (`C:/sdk/bin:C:\Windows\…` is ONE bogus entry), so the dir is never
+ *  searched AND the old first entry is lost (#1444). */
+export function prependPathEntry(dir: string, existing: string | undefined, platform: NodeJS.Platform = process.platform): string {
+  return `${dir}${platform === 'win32' ? ';' : ':'}${existing ?? ''}`
+}
+
+/** `env` with `dir` first on its PATH — use this, not `{ ...env, PATH: … env.PATH … }`, for any env
+ *  that is a COPY. On win32 `process.env` itself is case-insensitive, but a spread of it is a plain
+ *  object keyed by whatever the parent used — `Path` for an editor launched from Explorer or
+ *  PowerShell — so `copy.PATH` reads undefined, and writing `PATH` beside the old `Path` hands the
+ *  child two keys of which Node keeps `PATH`: the prepended dir ALONE, every system tool gone
+ *  (#1444 close-out, observed). So on win32 the value is read under any casing and every other
+ *  casing is dropped. POSIX env names are case-sensitive, so there only `PATH` is touched. */
+export function withPathEntry<E extends NodeJS.ProcessEnv>(env: E, dir: string, platform: NodeJS.Platform = process.platform): E {
+  const out: NodeJS.ProcessEnv = { ...env }
+  const keys = platform === 'win32' ? Object.keys(env).filter((k) => k.toUpperCase() === 'PATH') : []
+  const existing = env.PATH ?? (keys.length ? env[keys[0]] : undefined)
+  for (const k of keys) delete out[k]
+  out.PATH = prependPathEntry(dir, existing, platform)
+  return out as E
 }
 
 /**

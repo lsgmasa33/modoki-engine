@@ -207,9 +207,14 @@ In the scene file a whole instance collapses to **one entry** — an ordinary
   "prefab": "062bd887-…",                 // source .prefab.json GUID
   "overrides": { "3": { "Transform": { "px": 4.2 } } },  // localId → trait → field → value
   "removed": [7],                          // prefab-member localIds this instance deleted
-  "removedTraits": { "5": ["Light"] }      // localId → trait names deleted from a member
+  "removedTraits": { "5": ["Light"] },     // localId → trait names deleted from a member
+  "moved": { "3": "9f1c…" }                // localId → guid of the parent a linked member was moved to (#1437)
 }
 ```
+
+A prefab FILE can carry a `moved` map of its own (v4, #1437): `"<member path>": "@member:<path>"`,
+for a member it places under a parent no row relation can express. Both halves are member paths in
+the prefab's frame. See [prefab-structural-overrides.md § Moved members](./prefab-structural-overrides.md#moved-members-1437).
 
 The marking is **presence-based, not a flag**: a field is "overridden" purely by
 appearing in `overrides` (`localId → traitName → field → value`), and it stores **only

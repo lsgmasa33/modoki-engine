@@ -536,8 +536,10 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'build.webCdnUrlMap', label: 'Web CDN url-map', type: 'text', placeholder: 'empty = no CDN', help: 'gcloud compute url-maps invalidate-cdn-cache <name>', showIf: { key: 'build.webDeployMode', in: ['gcs'] } },
                 { key: 'build.webCdnBackendBucket', label: 'Web CDN backend-bucket', type: 'text', placeholder: 'empty = no ?v= cache-bust', help: 'whitelists ?v in the CDN cache key + marks glb/ktx2/webp immutable', showIf: { key: 'build.webDeployMode', in: ['gcs'] } },
                 // Per-machine (project.user.json — not committed): where the gcloud CLI lives. A
-                // Finder-launched packaged editor has a minimal PATH without the Cloud SDK.
-                { key: 'user.sdk.gcloudPath', label: 'gcloud path override', type: 'path', pathMode: 'file', placeholder: 'empty = auto-detect (Homebrew / Cloud SDK / login shell)', help: 'the gcloud binary (or its bin dir); set this if the deploy reports "gcloud not found"', showIf: { key: 'build.webDeployMode', in: ['gcs'] } },
+                // Finder-launched packaged editor has a minimal PATH without the Cloud SDK. Shown in
+                // EVERY deploy mode: OTA publish/status read it too, and on Windows it is their only
+                // way to find gcloud (no auto-detect there) while GCS web deploy is posix-only (#1444).
+                { key: 'user.sdk.gcloudPath', label: 'gcloud path override', type: 'path', pathMode: 'file', placeholder: 'empty = auto-detect on macOS/Linux; required on Windows', help: 'the gcloud binary (gcloud.cmd on Windows) or its bin dir — used by the GCS web deploy and OTA publish/status; set this if either reports "gcloud not found"' },
                 // Custom-only field
                 { key: 'build.webDeployCommand', label: 'Custom deploy command', type: 'text', placeholder: 'e.g. rsync -a {dist}/ host:/var/www', help: 'runs after build; {dist} {base}', showIf: { key: 'build.webDeployMode', in: ['custom'] } },
               ],

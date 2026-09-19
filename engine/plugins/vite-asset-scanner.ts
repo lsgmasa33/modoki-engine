@@ -6,7 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { spawn, execFileSync } from 'child_process';
+import { spawn } from 'child_process';
 import crypto, { randomUUID } from 'crypto';
 import { normalizePath, type Plugin } from 'vite';
 import { resolveModuleUrl } from './backend/moduleUrl';
@@ -19,14 +19,14 @@ import { findGamesEntry } from './findGamesEntry';
 // The leaf module, not './subgameBuild': that file's shared-key list would reach the Electron main bundle (#1035).
 import { subgameOutDir } from './subgameOutDir';
 import { samePath, canonicalPath, pathCaseKey } from '../scripts/pathIdentity.mjs';
-import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
+import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
 import { projectAssetRoots, discoverProjects, PROJECT_ROOT_DIRS } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 // Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
 // by one door, so a future caller cannot pick up a differently-typed view of the same rules.
 import { foreignClaimFor, describeConflict, adbDeviceId, adbSerialOf, iosDeviceId, ownAdbClaim } from './backend/deviceClaims';
 import { acquireBuildSlot, releasePolicy } from './backend/buildLock';
-import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, conversionToolchainDir, isPinnedConversionTool, type BuildTarget, type ToolId } from '../toolchain';
+import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, prependPathEntry, withPathEntry, wdaTeamId, writeToolchainSettings, conversionToolchainDir, isPinnedConversionTool, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 // From the standalone zero-import file, NOT assetManifest.ts — that module transitively
 // imports assetFetch.ts/assetUrl.ts (browser-only globals), which would drag DOM/vite-client
@@ -808,8 +808,8 @@ export async function buildStepEnv(extra: NodeJS.ProcessEnv = {}): Promise<NodeJ
   if (process.env.MODOKI_PROVISION_NODE !== '1' || !dir) return base;
   try {
     const { nodeBin, npmCli } = await ensureNode(path.join(dir, 'node'));
-    const sep = process.platform === 'win32' ? ';' : ':';
-    return { ...base, MODOKI_NODE: nodeBin, MODOKI_NPM_CLI: npmCli, PATH: `${path.dirname(nodeBin)}${sep}${base.PATH ?? ''}` };
+    // `base` is a SPREAD of process.env — on win32 its key may be `Path`, so never read `base.PATH`.
+    return withPathEntry({ ...base, MODOKI_NODE: nodeBin, MODOKI_NPM_CLI: npmCli }, path.dirname(nodeBin));
   } catch {
     return base; // offline / provisioning failed → fall back to system Node
   }
@@ -3123,7 +3123,7 @@ export function assetScannerPlugin(): Plugin {
             if (podEnv) {
               const basePath = (buildEnv as Record<string, string>).PATH ?? process.env.PATH ?? '';
               for (const step of steps) {
-                step.env = { ...step.env, GEM_HOME: podEnv.GEM_HOME, GEM_PATH: podEnv.GEM_PATH, PATH: `${podEnv.binPath}:${step.env?.PATH ?? basePath}` };
+                step.env = { ...step.env, GEM_HOME: podEnv.GEM_HOME, GEM_PATH: podEnv.GEM_PATH, PATH: prependPathEntry(podEnv.binPath, step.env?.PATH ?? basePath) };
               }
             }
           }
@@ -3145,7 +3145,7 @@ export function assetScannerPlugin(): Plugin {
             }
             const basePath = (buildEnv as Record<string, string>).PATH ?? process.env.PATH ?? '';
             for (const step of steps) {
-              step.env = { ...step.env, PATH: `${gcloudDir}:${step.env?.PATH ?? basePath}` };
+              step.env = { ...step.env, PATH: prependPathEntry(gcloudDir, step.env?.PATH ?? basePath) };
             }
           }
 
@@ -3549,7 +3549,7 @@ export function assetScannerPlugin(): Plugin {
           res.on('close', otaRelease.onResponseClose);
 
           const baseEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
-          const gcloudEnv = { ...baseEnv, PATH: `${gcloudDir}:${baseEnv.PATH ?? ''}` };
+          const gcloudEnv = withGcloudOnPath(baseEnv, gcloudDir);
           const steps = otaPublishSteps({
             target, projectRoot, subgameDir, gcloudEnv, buildCwd, bucket, bundleName, version, keyName,
             shellEngineApi: cfg.ota.engineApi, mandatory: mandatoryParam,
@@ -3621,7 +3621,7 @@ export function assetScannerPlugin(): Plugin {
               const corsFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-cors-')), 'cors.json');
               fs.writeFileSync(corsFile, JSON.stringify([{ origin: ['*'], method: ['GET', 'HEAD'], responseHeader: ['Content-Type'], maxAgeSeconds: 3600 }]));
               try {
-                execFileSync('gcloud', ['storage', 'buckets', 'update', bucketRoot, `--cors-file=${corsFile}`], { env: gcloudEnv, stdio: 'ignore' });
+                execGcloudSync(['storage', 'buckets', 'update', bucketRoot, `--cors-file=${corsFile}`], { env: gcloudEnv, stdio: 'ignore' });
                 send(`CORS verified on ${bucketRoot}.`);
               } catch (e) {
                 send(`⚠️  Could not set CORS on ${bucketRoot} (non-fatal, continuing): ${e instanceof Error ? e.message : String(e)}`);

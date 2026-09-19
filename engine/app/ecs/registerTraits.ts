@@ -977,6 +977,8 @@ export function registerAllTraits() {
       localId: { type: 'number', readOnly: true },
       rootInstanceId: { type: 'number', readOnly: true, entityId: { onMissing: 'stripTrait' } },
       parentLocalId: { type: 'number', readOnly: true },
+      homeParent: { type: 'string', readOnly: true },
+      homeSteps: { type: 'string', readOnly: true },
     },
   });
 

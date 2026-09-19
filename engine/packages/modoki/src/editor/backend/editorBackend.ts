@@ -128,6 +128,27 @@ export async function writeSceneCopy(filePath: string, content: string, openPath
   } catch { return null; }
 }
 
+/** After a prefab changed from `before` in a way that moved member PATHS (#1437: an applied move),
+ *  re-point the member refs stored in every OTHER scene and prefab file that uses it
+ *  (`/api/prefab-member-paths`). Resolves to what was rewritten and what was left because an asset view
+ *  holds it unsaved, or `null` when the backend could not do it (the reason is in the console). */
+export async function repairPrefabMemberPaths(prefab: string, before: unknown): Promise<{ rewritten: string[]; held: string[] } | null> {
+  try {
+    const res = await backendPostJson('/api/prefab-member-paths', { prefab, before });
+    const j = await res.json().catch(() => ({})) as { rewritten?: unknown; held?: unknown; error?: unknown };
+    if (!res.ok) { console.error(`[Prefab] member refs in other files were NOT repaired: ${String(j.error ?? res.status)}`); return null; }
+    const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+    const out = { rewritten: list(j.rewritten), held: list(j.held) };
+    // Said HERE, once, for every caller (apply, undo, redo): a held document's own save would write its old
+    // refs back, and nothing else tells the user which files those are.
+    if (out.held.length) console.warn(`[Prefab] member refs NOT repaired in ${out.held.join(', ')}: open with unsaved edits. Their refs to the moved members will dangle once saved.`);
+    return out;
+  } catch (e) {
+    console.error('[Prefab] member refs in other files were NOT repaired:', e);
+    return null;
+  }
+}
+
 /** Write a text or base64-encoded file via /api/write-file — the ONE client write wrapper every
  *  JSON write in the editor now routes through (#835; collapses five near-identical copies —
  *  `serialize.ts`'s `writeFileToServer`, this module's own prior duplicate, a third copy in
