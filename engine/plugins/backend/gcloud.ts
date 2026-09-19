@@ -5,8 +5,9 @@
 
 import fs from 'fs';
 import path from 'path';
-import { execSync, execFileSync, type ExecFileSyncOptions } from 'child_process';
+import { execFileSync, type ExecFileSyncOptions } from 'child_process';
 import { withPathEntry, spawnable, whichSync } from '../../toolchain';
+import { loginShellCommandPath } from './loginShellProbe';
 
 const GCLOUD_NAMES = ['gcloud', 'gcloud.cmd'];
 
@@ -49,12 +50,9 @@ export function resolveGcloudDir(override?: string): string | null {
   for (const d of dirs) {
     if (d && fs.existsSync(path.join(d, 'gcloud'))) return d;
   }
-  try {
-    const shell = process.env.SHELL || '/bin/zsh';
-    const out = execSync(`${shell} -ilc 'command -v gcloud'`, { timeout: 4000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    if (out && fs.existsSync(out)) return path.dirname(out);
-  } catch { /* not found via the login shell */ }
-  return null;
+  // The login shell runs the user's profile, which can ignore SIGTERM and hold a pipe (#1449).
+  const out = loginShellCommandPath('gcloud', process.env, 4000).path;
+  return out && fs.existsSync(out) ? path.dirname(out) : null;
 }
 
 /** OTA Phase 5a — `ota.baseUrl` (e.g. "https://storage.googleapis.com/bucket/prefix") is

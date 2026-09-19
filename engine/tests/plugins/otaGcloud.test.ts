@@ -240,3 +240,46 @@ describe('execGcloudSync', () => {
     expect(out).toContain('SYSTEM-PATH-KEPT');
   });
 });
+
+/**
+ * #1449 — the login-shell fallback runs the USER's profile, which can ignore SIGTERM and hold a
+ * pipe open. A real bash against a fixture HOME; the well-known install dirs are made to look
+ * empty so the fallback is what answers, even on a machine that has gcloud in /opt/homebrew.
+ */
+describe.skipIf(process.platform === 'win32')('resolveGcloudDir — the login-shell fallback survives the profile (#1449)', () => {
+  let home: string;
+  const realExists = fs.existsSync;
+
+  beforeEach(() => {
+    home = makeScratchDir('modoki-gcloud-1449-');
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('SHELL', '/bin/bash');
+    vi.stubEnv('PATH', '/usr/bin:/bin');
+    vi.spyOn(fs, 'existsSync').mockImplementation((p) =>
+      /(\/opt\/homebrew\/bin|\/usr\/local\/bin|google-cloud-sdk\/bin|\.local\/bin)\/gcloud$/.test(String(p)) ? false : realExists(p));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('finds gcloud through a profile that backgrounds a child, without waiting on it', () => {
+    const bin = path.join(home, 'sdk-bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'gcloud'), '#!/bin/sh\n', { mode: 0o755 });
+    // On a stdout pipe the backgrounded child held the probe for the full 4s bound.
+    fs.writeFileSync(path.join(home, '.bash_profile'), `(sleep 20 &)\nexport PATH="${bin}:$PATH"\n`);
+    const t = performance.now();
+    expect(resolveGcloudDir()).toBe(bin);
+    expect(performance.now() - t).toBeLessThan(3000);
+  }, 30_000);
+
+  it('a profile that ignores SIGTERM is cut off at the bound', () => {
+    fs.writeFileSync(path.join(home, '.bash_profile'), 'sleep 20\n');
+    const t = performance.now();
+    expect(resolveGcloudDir()).toBeNull();
+    expect(performance.now() - t).toBeLessThan(10_000);
+  }, 30_000);
+});

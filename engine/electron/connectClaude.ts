@@ -16,6 +16,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { atomicWriteFileSync } from './atomicWrite';
 import { checkToken } from './instanceToken';
+import { loginShellCommandPath, spawnTimedOut, type LoginShellAnswer } from '../plugins/backend/loginShellProbe';
 // The ONE 'same directory?' comparison (#869) — this file donated its body.
 import { samePath } from '../scripts/pathIdentity.mjs';
 
@@ -690,11 +691,7 @@ export interface ClaudeCliResult { found: boolean; path?: string; probeTimedOut?
 /** One probe's answer. `timedOut` is judged from spawnSync's own ETIMEDOUT, never from the
  *  output — a killed probe can leave a TRUNCATED path on stdout, which is why a hit also
  *  requires status 0. */
-interface ProbeAnswer { path: string | null; timedOut: boolean }
-
-function probeTimedOut(r: { error?: Error }): boolean {
-  return (r.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
-}
+type ProbeAnswer = LoginShellAnswer;
 
 /** `which`/`where claude` against the given env's PATH. */
 function whichClaude(env: NodeJS.ProcessEnv): ProbeAnswer {
@@ -705,29 +702,16 @@ function whichClaude(env: NodeJS.ProcessEnv): ProbeAnswer {
       const first = r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
       if (first) return { path: first, timedOut: false };
     }
-    return { path: null, timedOut: probeTimedOut(r) };
+    return { path: null, timedOut: spawnTimedOut(r) };
   } catch { /* ignore */ }
   return { path: null, timedOut: false };
 }
 
-/** Resolve `claude` via the user's LOGIN shell PATH (macOS/Linux). A DMG launched from
- *  Finder/Gatekeeper inherits a MINIMAL PATH that omits ~/.local/bin, /opt/homebrew/bin,
- *  npm-global, etc. — so a real install looks "not found". A login+interactive shell
- *  sources the user's profile and reports the true PATH. */
+/** Resolve `claude` via the user's LOGIN shell PATH (macOS/Linux) — a Finder-launched DMG's
+ *  PATH omits most install dirs. The probe's rules (SIGKILL, answer through a file) live in
+ *  `loginShellCommandPath` (#1449). */
 function loginShellClaude(env: NodeJS.ProcessEnv): ProbeAnswer {
-  if (process.platform === 'win32') return { path: null, timedOut: false };
-  const shell = env.SHELL || '/bin/zsh';
-  try {
-    const r = spawnSync(shell, ['-lic', 'command -v claude'], {
-      encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'ignore'], timeout: CLAUDE_PROBE_TIMEOUT_MS,
-    });
-    if (r.status === 0 && r.stdout) {
-      const p = r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).pop();
-      if (p && p.startsWith('/')) return { path: p, timedOut: false };
-    }
-    return { path: null, timedOut: probeTimedOut(r) };
-  } catch { /* ignore */ }
-  return { path: null, timedOut: false };
+  return loginShellCommandPath('claude', env, CLAUDE_PROBE_TIMEOUT_MS);
 }
 
 // Memoize: the status panel polls ~every 2.5s and each poll calls this; without a cache

@@ -210,10 +210,26 @@ Pure helpers (unit-testable, no Electron), consumed by IPC handlers:
 `detectClaudeCli` runs **synchronously in the main process** on every ~2.5s status poll, so for as
 long as a probe runs, IPC, menus and window events all stall. Two rules keep that bounded (#1448):
 - **Every probe carries `CLAUDE_PROBE_TIMEOUT_MS` (4s).** `where claude` measured ~55ms on a
-  Windows desktop but ~10s on a loaded CI runner. ⚠️ On macOS/Linux the login-shell probe
-  (`-lic`) may outlive the bound, since an interactive shell can ignore SIGTERM. Unverified; see #1449.
-- **A timed-out probe means "unknown", not "absent".** spawnSync's own `ETIMEDOUT` is what
-  decides it, never the output: a killed probe can leave a truncated path on stdout. The result
+  Windows desktop but ~10s on a loaded CI runner.
+- **The login-shell probe (`-lic`, macOS/Linux) must survive the user's profile** (#1449, observed
+  on macOS). An interactive zsh/bash **ignores SIGTERM**: a `sleep 10` profile held the probe
+  for 10s against the 4s bound, so it is killed with `SIGKILL`. And anything the profile
+  backgrounds inherits the shell's stdout: on a pipe, a ~10ms miss waited the full 4s and read as
+  timed out. So the probe runs with `stdio: 'ignore'` and writes its answer to a temp file
+  (`$MODOKI_PROBE_OUT`); with no pipes, spawnSync waits only for the shell. The shell is also
+  `detached` (its own session). Otherwise, under a terminal (`npm run dev`), an interactive zsh
+  takes the terminal's foreground and a SIGKILLed one never hands it back, so ^C stops reaching
+  the dev server. Its own process group also lets a timeout kill what the profile left in that
+  group instead of orphaning it: the foreground child, and `&` jobs, since with no tty there is no
+  job control. Self-daemonizing agents survive; a bash profile with `set -m` escapes. These rules live in
+  `loginShellCommandPath` (`engine/plugins/backend/loginShellProbe.ts`), which the `gcloud`
+  probe (`resolveGcloudDir`) shares, since it had both defects too. A genuinely slow
+  profile still blocks the main process for up to 4s, once per timed-out memo. Removing that
+  means making `detectClaudeCli` async, which has not been done.
+- **A timed-out probe means "unknown", not "absent".** spawnSync's own `ETIMEDOUT` **with
+  `status === null`** is what decides it, never the output: a killed probe can leave a truncated
+  path on stdout. ETIMEDOUT with a numeric status means the process exited by itself and something
+  else held the pipe, so its status is the answer (#1449). The result
   carries `probeTimedOut: true`. The panel's claude row then reads "check timed out", with no
   "Install Claude Code" link, because the user may already have it.
 - **The memo is stamped when detection FINISHES**, and how long it holds depends on the result:
