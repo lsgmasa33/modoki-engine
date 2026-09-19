@@ -68,7 +68,7 @@ const NO_TOOL_BY_DESIGN: Record<string, string> = {
   '/api/device/request': 'the device lease data plane — every device_* tool proxies through it, asserted in deviceToolCoverage.test.ts',
 
   // ── native OS dialogs: a BLOCKING panel an agent must never open ──
-  '/api/pick-path': 'opens a native file picker — modal, and only a human can dismiss one. #288 gap 5 routed the agent AROUND this (modoki_create_registered_asset takes an explicit path) precisely because a blocking osascript panel made the New-X surface agent-unreachable',
+  '/api/pick-path': 'opens a native file picker — modal, and only a human can dismiss one. #288 gap 5 routed the agent AROUND this (modoki_create_registered_asset takes an explicit path) precisely because a modal native panel made the New-X surface agent-unreachable (and until #1440 it was an osascript child that also blocked the backend)',
   '/api/save-dialog': 'native save panel — same blocking-modal reason',
   '/api/reveal-in-finder': 'opens Finder/Explorer on the human\'s desktop; nothing to read back',
   '/api/open-file': 'hands a file to the OS default application — a human affordance with no agent-observable result',

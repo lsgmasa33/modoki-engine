@@ -43,6 +43,7 @@ import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
+import { osascriptChooser, type NativeChooser } from './nativeChooser';
 import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
 
 import { readFontAxes } from '../font-instance';
@@ -353,6 +354,10 @@ export interface BackendContext {
    *  forwards to the child Vite that serves the renderer. Optional: a host with no route to a
    *  graph omits it, and `/api/module-url` says so instead of guessing a URL. */
   resolveModuleUrl?(spec: string): Promise<ModuleUrlResolution | ModuleUrlError>;
+  /** The native file choosers behind `/api/save-dialog` and `/api/pick-path` (#1440). Electron
+   *  injects window-parented `dialog` panels; omitted ⇒ the async osascript fallback (macOS only,
+   *  `{unsupported}` elsewhere). See `nativeChooser.ts` for why the two are not equivalent. */
+  nativeChooser?: NativeChooser;
 }
 
 /** What a handler returns. The host serializes it onto its response object. */
@@ -1322,7 +1327,7 @@ function describeHolds(holds: readonly UnsavedHold[]): string {
  *  create, and `ensureExt` builds a new name from it — the disk's spelling there would christen
  *  `Walk.anim.json` as `walk.anim.json` because a `walk.json` exists. `existingPath` is what the panel's own
  *  Replace question was about, spelled the way the create's 409 will spell it, so `chooseNewAssetPath` can
- *  tell it already asked. Only when something is there. Exported so it is testable without osascript. */
+ *  tell it already asked. Only when something is there. Exported so it is testable without a panel. */
 export function saveDialogReply(
   ctx: Pick<BackendContext, 'absToAssetUrl'>, chosenAbs: string,
 ): { path: string; existingPath?: string } | null {
@@ -3515,30 +3520,20 @@ async function describeUnresolvedAgainstLiveWorld(
     return json(exists ? { exists, path: ctx.absToAssetUrl(resolved, { onDisk: true }) } : { exists });
   }
 
-  // ── POST /api/save-dialog (M, native) ── macOS "Save As" panel. Returns the
-  // chosen location as an asset-root URL path.
+  // ── POST /api/save-dialog (M, native) ── the host's "Save As" panel (`ctx.nativeChooser`,
+  // #1440 — see nativeChooser.ts). Returns the chosen location as an asset-root URL path;
+  // `{cancelled}` only for a real Cancel, `{unsupported}` when the host has no panel.
   if (urlPath === '/api/save-dialog' && method === 'POST') {
     try {
       const { defaultName = 'Untitled', defaultFolder, prompt = 'Save As' } = (body ?? {}) as { defaultName?: string; defaultFolder?: string; prompt?: string };
       const startDir = (defaultFolder && ctx.resolveAssetPath(defaultFolder)) || ctx.firstRootDir();
       if (!startDir) return json({ error: 'no asset roots' }, 500);
-      if (process.platform !== 'darwin') return json({ unsupported: true });
-      let chosenAbs: string;
-      try {
-        const out = execFileSync('osascript', [
-          '-e', 'on run argv',
-          '-e', 'set f to choose file name with prompt (item 1 of argv) default name (item 2 of argv) default location (POSIX file (item 3 of argv))',
-          '-e', 'return POSIX path of f',
-          '-e', 'end run',
-          prompt, defaultName, startDir,
-        ], { encoding: 'utf-8' });
-        chosenAbs = out.trim();
-      } catch {
-        // osascript exits non-zero on user cancel (-128).
-        return json({ cancelled: true });
-      }
-      const reply = saveDialogReply(ctx, chosenAbs);
-      if (!reply) return json({ error: 'outside-asset-roots', abs: chosenAbs });
+      const outcome = await (ctx.nativeChooser ?? osascriptChooser()).saveFile({ prompt, defaultName, startDir });
+      if ('unsupported' in outcome) return json({ unsupported: true });
+      if ('canceled' in outcome) return json({ cancelled: true });
+      if ('error' in outcome) return json({ error: `save dialog failed: ${outcome.error}` }, 500);
+      const reply = saveDialogReply(ctx, outcome.path);
+      if (!reply) return json({ error: 'outside-asset-roots', abs: outcome.path });
       return json(reply);
     } catch (e) {
       return json({ error: String(e) }, 500);
@@ -4832,32 +4827,22 @@ async function describeUnresolvedAgainstLiveWorld(
     }
   }
 
-  // ── POST /api/pick-path {mode, prompt?} (M, native) ── macOS folder/file
-  // chooser for Project Settings path fields (icon source, SDK paths). Returns
-  // the chosen path RELATIVE to the project when it lives inside it (e.g. an icon
+  // ── POST /api/pick-path {mode, prompt?} (M, native) ── the host's folder/file
+  // chooser (`ctx.nativeChooser`, #1440) for Project Settings path fields (icon source, SDK
+  // paths). Returns the chosen path RELATIVE to the project when it lives inside it (e.g. an icon
   // under resources/), else the absolute path (e.g. a JAVA_HOME outside the repo).
   // That decision — and WHY a tracked `app.iconSource` must never be absolute — is
-  // `relativiseUnderProject` (#394); it lives in its own module because this route
-  // blocks on a modal panel and cannot itself be tested.
+  // `relativiseUnderProject` (#394).
   if (urlPath === '/api/pick-path' && method === 'POST') {
     try {
       const { mode = 'folder', prompt = 'Choose' } = (body ?? {}) as { mode?: 'file' | 'folder'; prompt?: string };
-      if (process.platform !== 'darwin') return json({ unsupported: true });
-      const chooser = mode === 'file' ? 'choose file' : 'choose folder';
-      let chosenAbs: string;
-      try {
-        const out = execFileSync('osascript', [
-          '-e', 'on run argv',
-          '-e', `set f to ${chooser} with prompt (item 1 of argv)`,
-          '-e', 'return POSIX path of f',
-          '-e', 'end run',
-          prompt,
-        ], { encoding: 'utf-8' });
-        chosenAbs = out.trim().replace(/\/$/, '');
-      } catch {
-        // osascript exits non-zero on user cancel (-128).
-        return json({ cancelled: true });
-      }
+      const outcome = await (ctx.nativeChooser ?? osascriptChooser()).pickPath({ mode, prompt });
+      if ('unsupported' in outcome) return json({ unsupported: true });
+      if ('canceled' in outcome) return json({ cancelled: true });
+      if ('error' in outcome) return json({ error: `file chooser failed: ${outcome.error}` }, 500);
+      // A trailing separator is dropped, but never from a bare root (`/`, `C:\\`), which it would
+      // turn into something else (`C:` is drive-RELATIVE).
+      const chosenAbs = outcome.path === path.parse(outcome.path).root ? outcome.path : outcome.path.replace(/[\\/]+$/, '');
       return json({ path: relativiseUnderProject(ctx.projectRoot, chosenAbs), abs: chosenAbs });
     } catch (e) {
       return json({ error: String(e) }, 500);

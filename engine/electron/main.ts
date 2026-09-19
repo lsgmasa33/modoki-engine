@@ -255,7 +255,8 @@ import { captureViewport, CaptureUnavailableError, captureRefusalBody, tap, drag
 import type { RenderSurfaceFacts } from './rendererOps';
 import { createInputRoutes, inputDeliverabilityResult, hiddenWindowRefusal } from './inputRoutes';
 import { reportFatalStartup } from './fatalDialog';
-import { showMessageBox, resolveDialogParent } from './mainDialog';
+import { showMessageBox, resolveDialogParent, setOpenDialogListener } from './mainDialog';
+import { createElectronChooser } from './electronChooser';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { explainMenuRefusal, MODAL_CAUSE } from './modalRefusal';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
@@ -1425,6 +1426,10 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: { openSet
 // Latest editor menu structure pushed by the renderer (R→M). The OS menu carries
 // the editor's own actions; before the first push it's a native-only File menu.
 let rendererMenuSpec: RendererMenuSpec | undefined;
+// A native dialog is open (#1440) — see installAppMenu's `nativeDialogOpen`. mainDialog.ts counts
+// every one of them (save/pick panels, the project pickers, message boxes).
+let nativeDialogOpen = false;
+setOpenDialogListener((open) => { nativeDialogOpen = open; rebuildMenu(); });
 
 function rebuildMenu(): void {
   installAppMenu({
@@ -1470,6 +1475,7 @@ function rebuildMenu(): void {
       });
     },
     rendererMenus: rendererMenuSpec,
+    nativeDialogOpen,
     // Relay an OS-menu click to the renderer, which dispatches the editor action.
     onMenuAction: (id) => mainWindow?.webContents.send('modoki:bridge-menu-action', id),
     onCheckForUpdates: () => checkForUpdatesInteractive(),
@@ -1691,6 +1697,9 @@ app.whenReady().then(async () => {
     // wrote the URLs the renderer imported. Forward to the same route there (status-preserving and
     // bounded — see forwardModuleUrl).
     resolveModuleUrl: (spec) => forwardModuleUrl(DEV_URL, spec),
+    // #1440: the save/pick panels as sheets of the editor window, not an osascript child that
+    // blocked this process and could not take ⌘V.
+    nativeChooser: createElectronChooser(() => mainWindow),
   };
 
   // ── Trusted-input routes. `ops` binds each primitive to the live window lazily —

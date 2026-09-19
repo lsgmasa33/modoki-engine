@@ -1,6 +1,8 @@
-/** Native "Save As" file selector via the dev server (macOS osascript). Returns an
- *  asset-root URL path for the chosen location, or null if the user cancelled.
- *  Falls back to an in-app modal on platforms without a native panel (Windows/Linux). */
+/** Native "Save As" file selector via the backend's `/api/save-dialog` — in the Electron editor a
+ *  sheet on the editor window, in a browser dev tab an osascript panel on macOS (#1440,
+ *  `plugins/backend/nativeChooser.ts`). Returns an asset-root URL path for the chosen location, or
+ *  null if the user cancelled. Falls back to an in-app modal where the host has no native panel, and
+ *  when the panel FAILED (a failure is no longer reported as a Cancel). */
 
 import { backendFetch } from '../backend/editorBackend';
 import { openDomModalShell } from '../components/modalBackdrop';
@@ -14,8 +16,8 @@ function promptPath(title: string, message: string, initial: string): Promise<st
 }
 
 /** In-app "Replace?" confirmation for a create whose destination already exists (#1215, #1264).
- *  Needed because neither save path reliably asks: the Windows/Linux fallback above is a text box
- *  with no existence check, and the macOS panel checks the COLLAPSED name (`rock.json`) while the
+ *  Needed because neither save path reliably asks: the in-app fallback above (a browser dev tab off
+ *  macOS, or a failed panel) is a text box with no existence check, and the native panel checks the COLLAPSED name (`rock.json`) while the
  *  write goes to `rock.mat.json` (see `ensureExt`) — and Create Prefab / Auto-Rig derive their path
  *  with no dialog at all. `window.confirm` is not an option for the same reason `window.prompt` is
  *  not. Resolves true only on an explicit Replace. The wording is shared by every create, so it names
@@ -114,7 +116,8 @@ type SaveAssetDialogOpts = {
 
 /** The save dialog, plus the `confirmReplace` a create at the chosen path should use (#1264).
  *
- *  The macOS panel runs its OWN "Replace?" check — but against the name IT returned, before
+ *  The native panel runs its OWN "Replace?" check (macOS observed; Windows is assumed from Electron's
+ *  docs — `showOverwriteConfirmation` is Linux-only, so the others always ask — and is #1441's to verify) — but against the name IT returned, before
  *  `ensureExt`. When that name already is the real destination (`scene.json`, or a typed
  *  `Walk.anim.json`) the human has been asked once, and asking again in-app is a double prompt.
  *  When it is not (`Walk` → `Walk.anim.json`, the compound-extension collapse) the panel checked a
@@ -146,8 +149,8 @@ export async function chooseNewAssetPath(
     alert('Please choose a location inside the project (a game\'s assets/ folder or modoki/assets).');
     return null;
   }
-  // Fallback: no native panel (Windows/Linux) or a server error — in-app modal (window.prompt
-  // throws in the Electron renderer).
+  // Fallback: no native panel (a browser dev tab off macOS), a failed panel, or a server error —
+  // in-app modal (window.prompt throws in the Electron renderer).
   const seed = `${(defaultFolder ?? '').replace(/\/$/, '')}/${defaultName}`.replace(/^\/+/, '/');
   const typed = await promptPath(prompt ?? 'Save As', 'Save as (project-relative path):', seed);
   if (!typed) return null;

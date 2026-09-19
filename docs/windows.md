@@ -978,17 +978,31 @@ conversion never engaged".
     comparison is what lets it see all three leak shapes at once, including one where no shared
     producer is involved. Current population: **0**; `floor` is on `scanned` (the number of path
     calls examined), not on the offenders, because the goal state is an empty population.
-    ⚠️ **Its reach is ONE EXPRESSION, and "Now GUARDED" must be read against that** — the walk climbs
-    from the producer call to the comparison and stops at the enclosing statement, so
-    `expect(path.relative(REPO, f)).toBe('games/x/y.ts')` is flagged while
-    `const rel = path.relative(REPO, f); expect(rel).toBe('games/x/y.ts')` is **invisible**. Measured
-    on the shipped scan: **1,795 of 4,501 scanned producer calls (~40%) bail at a statement boundary**,
-    overwhelmingly that binding shape — which is instance 10's own defect one refactor away. Zero live
-    instances today; following the value would mean dataflow along the binding (`boundIdentifier` +
-    `readsOf` exist for it) and is a deliberate follow-up. So the honest claim is **loud on the
-    single-expression shape**, not "this class can no longer be written" — the guard's own docblock
-    enumerates the other out-of-reach spellings (`.not.toBe`, a const-referenced literal,
-    `String.raw`, a regex literal, a nested array), each currently zero.
+    ⚠️ **Its reach is one expression PLUS the bindings that carry it — and "Now GUARDED" must be read
+    against that.** The first cut stopped at the enclosing statement, so
+    `const rel = path.relative(REPO, f); expect(rel).toBe('games/x/y.ts')` — instance 10's own defect
+    one refactor away — was invisible: **1,795 of 4,501 scanned producer calls (~40%) bailed there.**
+    #1439 made the walk follow the value: on reaching a declaration's initialiser it continues from
+    every read of the bound name (`readsOf`, resolved by symbol, so a same-spelled parameter in a
+    sibling function is not one), up to 4 bindings deep; the expected-value side reads through a bound
+    literal the same way (`const E = 'a/b'; …toBe(E)`). Measured after, same corpus: **4,316 producer
+    calls, 1,657 binding follows**, deepest chain 4 (the cap never reached), 56 values stopped by an
+    inline normaliser on the walk, 3 bindings refused as reassigned, population still **0**. (The
+    4,501 above over-counted by 190: a METHOD sharing a bare-imported producer's name, `xs.join(',')`,
+    was read as `node:path`'s `join` — and once bindings were followed, those fake producers were
+    carried through variables. A bare import is now matched only when it is called bare.)
+    ⚠️ **A reassigned `let`/`var` is deliberately NOT followed**
+    — any write counts (`=`, compound, a destructuring or type-assertion target, for-of, a `var`
+    redeclaration). The
+    walk is flow-insensitive, so the read after `rel = toPosix(rel)` resolves to the same declaration
+    as the one before it; refusing the binding is the honest bound, not a detection.
+    ⚠️ **Normalisation is judged by what the VALUE passes through, not by text** — the first cut
+    searched the operand's text for `toPosix(`, which pardoned `path.relative(toPosix(a), toPosix(b))`:
+    normalised inputs, a backslash output on win32. So the claim is **loud on a value that reaches its
+    comparison through expressions and stable bindings**, not "this class can no longer be written"
+    — the guard's own docblock enumerates the other out-of-reach spellings (`.not.toBe`, a `return`
+    inside a block-bodied callback, an assignment to an already-declared `let`, `String.raw`, a regex
+    literal), each currently zero.
     ⚠️ **One arm of it shipped DEAD, and only a per-shape test caught it.** The
     `.endsWith()`/`.startsWith()`/`.includes()` branch asked for
     `isCallExpression(parent) && parent.expression.expression === node`, which is unsatisfiable for

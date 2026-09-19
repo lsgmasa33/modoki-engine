@@ -304,17 +304,26 @@ export function installAppMenu(opts: {
   /** View → Reload / Force Reload. Custom items rather than the `reload`/`forceReload` roles, so
    *  main can ask the unsaved-work gate first (#1419). */
   onReload?(ignoringCache: boolean): void;
+  /** A native file chooser (`electronChooser.ts`) is open as a sheet on the editor window (#1440).
+   *  The sheet is modal to the document, so every item that would act on the editor behind it is
+   *  disabled — the #1270 `modal` rule, for a modal main owns — and Edit's Undo/Redo become the
+   *  standard `undo`/`redo` roles, which reach the panel's text field instead of the scene.
+   *  Measured before this: with the save panel up, Edit ▸ Undo undid a SCENE edit behind it, and
+   *  ⌘Z undid neither. */
+  nativeDialogOpen?: boolean;
 }): void {
   const recents = getRecentProjects();
   const isMac = process.platform === 'darwin';
+  const dialogOpen = opts.nativeDialogOpen === true;
 
   // Native (main-owned) File items: Open Project / Open Recent + window close.
   const fileHead: Electron.MenuItemConstructorOptions[] = [
-    { label: 'New Project…', accelerator: 'CmdOrCtrl+Shift+N', click: () => opts.onNewProject() },
+    { label: 'New Project…', accelerator: 'CmdOrCtrl+Shift+N', enabled: !dialogOpen, click: () => opts.onNewProject() },
     { type: 'separator' },
-    { label: 'Open Project…', accelerator: 'CmdOrCtrl+O', click: () => opts.onOpenProject() },
+    { label: 'Open Project…', accelerator: 'CmdOrCtrl+O', enabled: !dialogOpen, click: () => opts.onOpenProject() },
     {
       label: 'Open Recent',
+      enabled: !dialogOpen,
       submenu: recents.length
         ? recents.map((p) => ({ label: samePath(p, opts.currentRoot ?? p) && opts.currentRoot ? `✓ ${p}` : p, click: () => opts.onOpenRecent(p) }))
         : [{ label: '(none)', enabled: false }],
@@ -335,6 +344,10 @@ export function installAppMenu(opts: {
     if (it.submenu?.length) {
       return { label, enabled: !it.disabled, submenu: it.submenu.map(toItem) };
     }
+    // While a native chooser is open the item is disabled AND loses its accelerator: AppKit matches
+    // a key equivalent to the FIRST item carrying it, so a disabled ⌘Z here would swallow the key
+    // before the `undo` role below could take it.
+    if (dialogOpen) return { label, enabled: false, click: () => opts.onMenuAction?.(it.id!) };
     return { label, accelerator: toAccelerator(it.shortcut), enabled: !it.disabled, click: () => opts.onMenuAction?.(it.id!) };
   };
 
@@ -359,8 +372,8 @@ export function installAppMenu(opts: {
     // forceReload (Cmd+Shift+R) bypasses the HTTP cache — needed to pick up a
     // rebaked asset served at its stable immutable URL.
     { type: 'separator' },
-    { label: 'Reload', accelerator: 'CmdOrCtrl+R', click: () => opts.onReload?.(false) },
-    { label: 'Force Reload', accelerator: 'Shift+CmdOrCtrl+R', click: () => opts.onReload?.(true) },
+    { label: 'Reload', accelerator: 'CmdOrCtrl+R', enabled: !dialogOpen, click: () => opts.onReload?.(false) },
+    { label: 'Force Reload', accelerator: 'Shift+CmdOrCtrl+R', enabled: !dialogOpen, click: () => opts.onReload?.(true) },
     { role: 'toggleDevTools' }, { role: 'togglefullscreen' },
   ];
   // Native window roles appended after the editor's own Window items (show panel)
@@ -372,7 +385,11 @@ export function installAppMenu(opts: {
   const builtMenus: Electron.MenuItemConstructorOptions[] = rendererMenus.map(({ name, items }) => {
     const built = items.map(toItem);
     if (name === 'File') return { label: 'File', submenu: [...fileHead, { type: 'separator' }, ...built, ...fileTail] };
-    if (name === 'Edit') return { label: 'Edit', submenu: [...built, ...editRoleTail] };
+    // The editor's Undo/Redo act on the SCENE; with a native chooser open they give way to the text
+    // roles, so ⌘Z/⌘⇧Z and Edit ▸ Undo edit the panel's name field (#1440).
+    if (name === 'Edit') {
+      return { label: 'Edit', submenu: dialogOpen ? [{ role: 'undo' }, { role: 'redo' }, ...editRoleTail] : [...built, ...editRoleTail] };
+    }
     if (name === 'View') return { label: 'View', submenu: [...built, ...viewRoleTail] };
     // Merge native window roles into the editor's Window menu so it doubles as the
     // OS Window menu (role:'window' marks it as the standard macOS Window menu).

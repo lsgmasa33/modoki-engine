@@ -116,7 +116,7 @@ export function showMessageBox(
   policy: DialogParentPolicy = 'visibleNonSplash',
 ): Promise<Electron.MessageBoxReturnValue> {
   const win = liveParent(parent) ?? resolveDialogParent(policy);
-  return win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts);
+  return whileOpen(() => (win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts)));
 }
 
 /**
@@ -130,5 +130,53 @@ export function showOpenDialog(
   policy: DialogParentPolicy = 'visibleNonSplash',
 ): Promise<Electron.OpenDialogReturnValue> {
   const win = liveParent(parent) ?? resolveDialogParent(policy);
-  return win ? dialog.showOpenDialog(win, opts) : dialog.showOpenDialog(opts);
+  return whileOpen(() => (win ? dialog.showOpenDialog(win, opts) : dialog.showOpenDialog(opts)));
+}
+
+/**
+ * The same rule for the save panel (#1440). `/api/save-dialog` used to be an `osascript` child run
+ * with `execFileSync` inside this process — a panel owned by a menu-less process (⌘V could not
+ * paste) that froze the main loop while it was open. Parented here it is a sheet on the editor
+ * window: async, and covered by the app's own Edit menu.
+ */
+export function showSaveDialog(
+  opts: Electron.SaveDialogOptions,
+  parent?: BrowserWindow | null,
+  policy: DialogParentPolicy = 'visibleNonSplash',
+): Promise<Electron.SaveDialogReturnValue> {
+  const win = liveParent(parent) ?? resolveDialogParent(policy);
+  return whileOpen(() => (win ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts)));
+}
+
+// ── Open-dialog tracking (#1440) ────────────────────────────────────────────────────────────────
+// A parented dialog is a SHEET, and a sheet this app owns takes the app's main-menu key
+// equivalents — that is how ⌘V reaches a save panel's name field. So the editor's own menu items
+// fire through it too: measured with the save panel up, Edit ▸ Undo undid a SCENE edit behind the
+// sheet. Main listens here and rebuilds the menu gated (`installAppMenu`'s `nativeDialogOpen`).
+//
+// Counted HERE, not by each caller, because this module is already the one door every main-process
+// dialog goes through (the source guard in mainDialog.test.ts bans `dialog` everywhere else) — the
+// first version counted only in the save/pick chooser, and review found the Open Project pickers
+// and every message-box sheet on the same window ungated.
+//
+// A count, not a flag: dialogs overlap (a second request's sheet waits behind the first; a message
+// box can be raised while a picker is up), and the first closing must not re-arm the menu.
+let openDialogs = 0;
+let dialogListener: ((open: boolean) => void) | null = null;
+
+/** Main's hook: `true` as the first dialog opens, `false` as the last one closes. */
+export function setOpenDialogListener(fn: ((open: boolean) => void) | null): void {
+  dialogListener = fn;
+}
+
+/** The listener must never cost the user their dialog or its answer — nor leave the count wrong.
+ *  `fatalDialog`'s terminate path shows through here too (see the header), so a throwing menu
+ *  rebuild must not become a throwing error box. */
+function notify(open: boolean): void {
+  try { dialogListener?.(open); } catch (e) { console.error('[mainDialog] open-dialog listener threw:', e); }
+}
+
+async function whileOpen<T>(show: () => Promise<T>): Promise<T> {
+  if (openDialogs++ === 0) notify(true);
+  try { return await show(); } finally { if (--openDialogs === 0) notify(false); }
 }

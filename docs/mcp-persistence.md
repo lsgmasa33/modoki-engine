@@ -1166,7 +1166,7 @@ into a folder named in another case), and `/api/save-dialog`'s `existingPath`. T
 TWO spellings on purpose: `path` is what the human typed, which `ensureExt` builds the new file's name
 from, and `existingPath` is the file the panel's own Replace question was about, which
 `chooseNewAssetPath` compares against the create's 409 to skip asking twice (`saveDialogReply`, testable
-without osascript). ⚠️ That skip rests on an
+without a panel). ⚠️ That skip rests on an
 unobserved premise — that the macOS panel's "already exists" check folds case as APFS does. Four
 limits, each deliberate:
 - **The watcher never passes it** (observed by the close-out review). A chokidar path already IS the

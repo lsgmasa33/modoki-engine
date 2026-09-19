@@ -209,3 +209,57 @@ describe('installAppMenu — View reload items ask through onReload (#1419)', ()
     expect(onReload.mock.calls).toEqual([[false], [true]]);
   });
 });
+
+describe('installAppMenu — a native file chooser is open (#1440)', () => {
+  const spec = {
+    menus: [
+      { name: 'File', items: [{ id: 'save-all', label: 'Save All', shortcut: 'Cmd+S' }] },
+      { name: 'Edit', items: [
+        { id: 'undo', label: 'Undo Move', shortcut: 'Cmd+Z' },
+        { id: 'redo', label: 'Redo', shortcut: 'Cmd+Shift+Z' },
+      ] },
+      { name: 'View', items: [] },
+    ],
+  };
+  const build = (nativeDialogOpen: boolean) => {
+    const onMenuAction = vi.fn();
+    installAppMenu({ currentRoot: '/x', onNewProject() {}, onOpenProject() {}, onOpenRecent() {}, rendererMenus: spec, onMenuAction, onReload() {}, nativeDialogOpen });
+    const menu = (label: string) => ((cap.tpl ?? []).find((m) => m.label === label)?.submenu ?? []) as Electron.MenuItemConstructorOptions[];
+    return { onMenuAction, menu };
+  };
+
+  it("Edit's Undo/Redo become the TEXT roles, so ⌘Z edits the panel's field and never the scene", () => {
+    const { menu } = build(true);
+    const edit = menu('Edit');
+    expect(edit.slice(0, 2).map((i) => i.role)).toEqual(['undo', 'redo']);
+    // The editor's scene Undo is gone from Edit, not merely disabled beside the role.
+    expect(edit.some((i) => i.label === 'Undo Move')).toBe(false);
+    expect(edit.map((i) => i.role)).toEqual(expect.arrayContaining(['cut', 'copy', 'paste', 'selectAll']));
+  });
+
+  it('every other editor item is disabled AND carries no accelerator (a disabled ⌘S would still claim the key)', () => {
+    const { menu } = build(true);
+    const save = menu('File').find((i) => i.label === 'Save All')!;
+    expect(save.enabled).toBe(false);
+    expect(save.accelerator).toBeUndefined();
+  });
+
+  it('the main-owned items that would swap or reload the document under the sheet are disabled', () => {
+    const { menu } = build(true);
+    const file = menu('File');
+    for (const l of ['New Project…', 'Open Project…', 'Open Recent']) expect(file.find((i) => i.label === l)?.enabled, l).toBe(false);
+    const view = menu('View');
+    for (const l of ['Reload', 'Force Reload']) expect(view.find((i) => i.label === l)?.enabled, l).toBe(false);
+  });
+
+  it('closed: the editor items are back — scene Undo with ⌘Z, enabled, relaying its id', () => {
+    const { menu, onMenuAction } = build(false);
+    const undo = menu('Edit').find((i) => i.label === 'Undo Move')!;
+    expect(undo.accelerator).toBe('CmdOrCtrl+Z');
+    expect(undo.enabled).toBe(true);
+    (undo.click as () => void)();
+    expect(onMenuAction).toHaveBeenCalledWith('undo');
+    expect(menu('Edit').some((i) => i.role === 'undo')).toBe(false);
+    expect(menu('File').find((i) => i.label === 'Open Project…')?.enabled).toBe(true);
+  });
+});

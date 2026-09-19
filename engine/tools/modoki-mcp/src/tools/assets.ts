@@ -205,9 +205,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_create_registered_asset',
     'Create one of the Assets panel\'s "New X" assets at a path you supply. The agent-reachable ' +
-      'half of that surface: the panel\'s own flow opens the native save dialog FIRST, and on ' +
-      'macOS that is a BLOCKING osascript panel, so the whole "New X" surface was unreachable ' +
-      'from here. Passing the path routes around it; the human\'s dialog is untouched.\n\n' +
+      'half of that surface: the panel\'s own flow opens the native save dialog FIRST — a modal ' +
+      'panel only a human can answer — so the whole "New X" surface was unreachable from here. ' +
+      'Passing the path routes around it; the human\'s dialog is untouched.\n\n' +
       'DIFFERENT FROM modoki_create_asset, which takes a fixed enum of engine asset types. ' +
       'This drives the live, game-extensible registry — read modoki_list_creatable_assets for what ' +
       'is available in the OPEN project.\n\n' +

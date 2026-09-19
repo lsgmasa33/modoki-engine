@@ -13,12 +13,14 @@ let windows: FakeWin[] = [];
 let splash: FakeWin | null = null;
 const showMessageBoxSpy = vi.fn(() => Promise.resolve({ response: 0, checkboxChecked: false }));
 const showOpenDialogSpy = vi.fn(() => Promise.resolve({ canceled: true, filePaths: [] }));
+const showSaveDialogSpy = vi.fn(() => Promise.resolve({ canceled: true, filePath: '' }));
 
 vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => windows },
   dialog: {
     showMessageBox: (...a: unknown[]) => showMessageBoxSpy(...(a as [])),
     showOpenDialog: (...a: unknown[]) => showOpenDialogSpy(...(a as [])),
+    showSaveDialog: (...a: unknown[]) => showSaveDialogSpy(...(a as [])),
   },
 }));
 vi.mock('../../electron/splash', () => ({ isSplashWindow: (w: unknown) => w != null && w === splash }));
@@ -34,7 +36,7 @@ const mkWin = (tag: string, opts: Partial<FakeWin> = {}): FakeWin => {
 async function fresh() {
   vi.resetModules();
   windows = []; splash = null;
-  showMessageBoxSpy.mockClear(); showOpenDialogSpy.mockClear();
+  showMessageBoxSpy.mockClear(); showOpenDialogSpy.mockClear(); showSaveDialogSpy.mockClear();
   return import('../../electron/mainDialog');
 }
 
@@ -150,6 +152,64 @@ describe('showMessageBox / showOpenDialog — parent when we can', () => {
     await showOpenDialog({ properties: ['openDirectory'] });
     expect(showOpenDialogSpy).toHaveBeenCalledWith(win, { properties: ['openDirectory'] });
   });
+
+  it('showSaveDialog follows the same rule — the /api/save-dialog panel is a sheet (#1440)', async () => {
+    const { showSaveDialog } = await fresh();
+    const win = mkWin('editor'); windows = [win];
+    await showSaveDialog({ defaultPath: '/d/x.json' });
+    expect(showSaveDialogSpy).toHaveBeenCalledWith(win, { defaultPath: '/d/x.json' });
+  });
+});
+
+describe('open-dialog tracking — the menu gate (#1440)', () => {
+  it('reports true as the first dialog opens and false only when the LAST one closes — across kinds', async () => {
+    const m = await fresh();
+    const events: boolean[] = [];
+    m.setOpenDialogListener((open) => events.push(open));
+    windows = [mkWin('editor')];
+    let closeSave!: () => void; let closeBox!: () => void;
+    showSaveDialogSpy.mockImplementationOnce(() => new Promise((r) => { closeSave = () => r({ canceled: true, filePath: '' }); }));
+    showMessageBoxSpy.mockImplementationOnce(() => new Promise((r) => { closeBox = () => r({ response: 0, checkboxChecked: false }); }));
+    const a = m.showSaveDialog({});
+    const b = m.showMessageBox({ message: 'x' });
+    expect(events).toEqual([true]);
+    closeSave(); await a;
+    expect(events).toEqual([true]); // the message box is still up — the menu stays gated
+    closeBox(); await b;
+    expect(events).toEqual([true, false]);
+  });
+
+  it('the Open Project picker is counted too (review: it is a sheet on the same window)', async () => {
+    const m = await fresh();
+    const events: boolean[] = [];
+    m.setOpenDialogListener((open) => events.push(open));
+    windows = [mkWin('editor')];
+    await m.showOpenDialog({ properties: ['openDirectory'] });
+    expect(events).toEqual([true, false]);
+  });
+
+  it('a dialog that THROWS still closes the gate', async () => {
+    const m = await fresh();
+    const events: boolean[] = [];
+    m.setOpenDialogListener((open) => events.push(open));
+    showSaveDialogSpy.mockRejectedValueOnce(new Error('boom'));
+    await expect(m.showSaveDialog({})).rejects.toThrow('boom');
+    expect(events).toEqual([true, false]);
+  });
+
+  it('a THROWING listener costs neither the dialog, its answer, nor the count', async () => {
+    const m = await fresh();
+    const events: boolean[] = [];
+    let explode = true;
+    m.setOpenDialogListener((open) => { events.push(open); if (explode) throw new Error('menu'); });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    showSaveDialogSpy.mockResolvedValueOnce({ canceled: false, filePath: '/d/x.json' });
+    await expect(m.showSaveDialog({})).resolves.toEqual({ canceled: false, filePath: '/d/x.json' });
+    explode = false;
+    await m.showSaveDialog({});
+    expect(events).toEqual([true, false, true, false]); // the count recovered — no stuck gate
+    err.mockRestore();
+  });
 });
 
 /** ── The guard ────────────────────────────────────────────────────────────────────────────────
@@ -210,7 +270,7 @@ describe('every main-process dialog goes through mainDialog (#1044)', () => {
    *  could be clean because nothing anywhere opens a dialog at all. */
   it('the owning module DOES call the real electron dialog (the ban is not vacuous)', () => {
     const { code } = readScannedSource(nodePath.join(dir, OWNER));
-    expect([...code.matchAll(/\bdialog\.(showMessageBox|showOpenDialog)\b/g)].length).toBeGreaterThanOrEqual(2);
+    expect([...code.matchAll(/\bdialog\.(showMessageBox|showOpenDialog|showSaveDialog)\b/g)].length).toBeGreaterThanOrEqual(3);
   });
 
   /** ⚠️ **Bans the IMPORT, not the member access — and that is the whole point.**

@@ -745,7 +745,12 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ mode, prompt: mode === 'file' ? 'Choose a file' : 'Choose a folder' }),
           });
-          if (!r.ok) return null;
+          if (!r.ok) {
+            // A chooser that FAILED is not a Cancel (#1440) — say so, or Browse… just does nothing.
+            const msg = await r.json().then((j: { error?: string }) => j?.error).catch(() => undefined);
+            alert(msg || `Could not open the file chooser (${r.status}).`);
+            return null;
+          }
           const j = (await r.json()) as { path?: string };
           return j.path ?? null;
         } catch {

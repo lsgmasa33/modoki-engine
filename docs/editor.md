@@ -583,6 +583,44 @@ question the person in front of it was actually asking.
 
 ---
 
+## Native file choosers — Save As and Browse… (#1440)
+
+`chooseNewAssetPath` (Create Scene, Save Scene As, every "New X") asks `POST /api/save-dialog`, and
+Project Settings' Browse… asks `POST /api/pick-path`. The router decides what each ANSWERS (an
+asset-root URL; a project-relative path, #394); the host decides how the panel is SHOWN, through
+`BackendContext.nativeChooser` (`engine/plugins/backend/nativeChooser.ts`):
+
+- **Electron** injects `engine/electron/electronChooser.ts`: `showSaveDialog`/`showOpenDialog`
+  through `mainDialog.ts`, parented to the editor window — a sheet. That is what makes ⌘V paste
+  into the name field (the app's Edit menu reaches a panel this app owns), keeps the main process
+  — which also serves the backend — running while the panel is up, and gives Windows a panel.
+- **Anything else** (a browser tab on the Vite dev server) falls back to an async `osascript`
+  chooser on macOS and `{unsupported}` elsewhere, which the renderer answers with its in-app prompt.
+  ⚠️ ⌘V still does not paste there: the panel belongs to a faceless `osascript` process with no
+  menu, and nothing in its argv can change that.
+
+**While ANY native dialog is open, the app menu cannot act on the scene behind it.** A sheet this
+app owns takes the app's MAIN-MENU key equivalents — that is how ⌘V reaches it — so the editor's own
+items would fire through it too. Measured before the guard: with the save panel up, Edit ▸ Undo undid
+a SCENE edit behind the sheet (keyboard ⌘Z undid neither the scene nor the typing). So
+`engine/electron/mainDialog.ts` — the one door every main-process dialog goes through — counts open
+dialogs (save/pick panels, the Open/New Project pickers, message boxes; a count because they can
+overlap) and main rebuilds the menu with `installAppMenu`'s `nativeDialogOpen`: every editor item
+disabled and stripped of its accelerator, New/Open Project and Reload disabled, and Edit's Undo/Redo
+replaced by the standard `undo`/`redo` roles, which reach the panel's text field. Observed after: ⌘Z
+and ⌘⇧Z undo and redo the typing, Edit ▸ Undo undoes the text, the scene is untouched, and the full
+menu returns on Cancel. The same rule as the renderer's own modal gate (`RendererMenuSpec.modal`,
+#1270), for a modal main owns.
+
+**A failure is not a Cancel.** `{cancelled}` means the human pressed Cancel (Electron's `canceled`;
+osascript's `-128` and nothing else). A panel that failed answers a 500 with the reason: the save
+flow falls back to the in-app prompt, Browse… alerts. Before #1440 both routes ran
+`execFileSync('osascript')` in every host, so the panel froze the Electron editor while it was open
+(QA-PARTICLE-0011), ⌘V did nothing, and every failure read as Cancel.
+
+An agent never opens either panel — they are modal and only a human can answer one;
+`modoki_create_registered_asset` takes an explicit path instead (#288).
+
 ## Asset editors and the move gate (#1362)
 
 Seven asset editors, split by how they are mounted — and the split decides what a MOVE of the asset
