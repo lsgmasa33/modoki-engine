@@ -384,3 +384,62 @@ describe('#447 — a refused play request is reported once', () => {
     expect(warn).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('#1428 sibling — a clip the OS paused on background resumes on foreground, no tap', () => {
+  // iOS pauses every media element when the app backgrounds, behind the game's back: the
+  // trait still says `playing`, the handle was never `pause()`d, and no gesture follows the
+  // return. Audio needed #1428 for this; video already recovers, through TWO redundant per-frame
+  // paths: the reconcile's `handle.play()` (`attemptPlay` re-plays a PAUSED element) and
+  // `setRate` → `applyRate`'s resume of a started, un-blocked clip. Test 1 goes red only with
+  // BOTH broken; test 2 (a refused play, so `blocked` is set and `applyRate` skips it) needs only
+  // the first. Mutation-checked both ways, plus the `deliberatelyPaused` guards for test 3.
+  function osPause(el: HTMLVideoElement): void {
+    Object.defineProperty(el, 'paused', { value: true, configurable: true });
+  }
+
+  it('the first frame after foreground restarts it', async () => {
+    const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+    videoSystem(world!); await flush();
+    videoSystem(world!);                       // observes it playing: the steady state, start announced
+    expect(starts).toBe(1);
+    const el = videoElementFor(e.id())!;
+    expect(el.paused).toBe(false);
+
+    osPause(el);                               // backgrounded; no frames run while hidden
+    videoSystem(world!); await flush();        // first frame back
+    expect(el.paused).toBe(false);
+  });
+
+  it('a play() refused on the way back is retried by a later frame, still with no tap', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+    videoSystem(world!); await flush();
+    videoSystem(world!);
+    expect(starts).toBe(1);
+    const el = videoElementFor(e.id())!;
+
+    osPause(el);
+    playBehaviour = 'block';                   // WebKit refuses while the session is still waking
+    videoSystem(world!); await flush();
+    expect(el.paused).toBe(true);
+
+    playBehaviour = 'allow';
+    videoSystem(world!); await flush();
+    expect(el.paused).toBe(false);
+  });
+
+  it('a clip the GAME paused stays paused across the same background', async () => {
+    const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+    videoSystem(world!); await flush();
+    e.set(VideoPlayer, { playing: false });
+    videoSystem(world!); await flush();
+    const el = videoElementFor(e.id())!;
+    expect(el.paused).toBe(true);
+
+    osPause(el);
+    videoSystem(world!); await flush();
+    audioResume();                             // the foreground re-arm's signal
+    await flush();
+    expect(el.paused).toBe(true);
+  });
+});

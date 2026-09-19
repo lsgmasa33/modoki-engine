@@ -219,6 +219,16 @@ wrong regardless of the gesture — so the retry is deferred to the next `timeSc
 instead. **`@video.start` announces nothing while blocked** — see "`@video.start` means observed
 playback, not a request" below for what the event does and when it fires once the gesture arrives.
 
+**Backgrounding needs no gesture to recover** (checked for #1428, whose audio half did). iOS
+pauses every media element when the app backgrounds, behind the game's back. A clip whose trait
+still says `playing` restarts on the first frame back through two redundant per-frame paths:
+the reconcile's `handle.play()` (`attemptPlay` re-plays a paused element) and `setRate` →
+`applyRate`'s resume of a started, un-blocked clip. If that `play()` is refused while the session
+wakes, only the first path retries it, on the next frame. A clip the game paused stays paused.
+The clip's SOUND rides the shared `AudioContext`, which is #1428's `audioService.resume()`.
+Pinned by `videoSystemLiveContract.test.ts` § "#1428 sibling". **Device-verified** (owner, iPhone
+Air, 2026-09-19): video resumes after a background with no tap.
+
 ## Remote delivery
 
 A `delivery: "remote"` clip lives on a CDN and never enters the build. `policy` decides what happens
