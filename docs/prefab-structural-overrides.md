@@ -673,6 +673,20 @@ down, so such a member was written nowhere and both vanished on reload. A member
 the same outermost instance is an ordinary #1437 move and stays linked.
 The same shape reached by a move that does NOT leave the instance is #1450.
 
+**Deleting a moved member's owner promotes or unlinks it, never re-homes it past the owner (#1451).** A delete
+re-points a surviving member whose home goes to that home's own identity parent (`rehomeDependents`). That walk
+stops at any instance ROOT, stored or owned: a home is a member of the dependent's own frame, so a root home is
+the frame's root, and the frame dies with it. `detachOrphanedMembers` then promotes an owned nested root to a
+stored one, renaming its members to the guids a reload derives (the #1447 contract), and unlinks anything else.
+It promotes when the root's OWNER dies, meaning the frame of its identity parent, and not only when its home dies. A
+nested root that rode out inside a moved member of its owner has no home, and keying on the home left it linked to
+a dead frame; its members then re-derived new guids on reload and a ref to one dangled. Detach Prefab and
+unpack strip a frame without this step, so a member moved out of the stripped subtree is still lost there (#1453).
+Before the fix, the walk stepped through an OWNED root. A nested root moved beside its owner (Mid's `InnerRoot`
+under Panel), with the owner then deleted, was re-pointed into the grandparent frame. That frame records no move
+for it, and the one that did died with the owner, so the save wrote only `removed` and the nested root and its
+members vanished on reload.
+
 **Across scenes it is still refused.** A move to another scene file (`moveEntityToScene`) refuses anything that
 would split an instance (`instance-member`, docs/scene-loading.md), an owned nested root included, where the
 same drag inside one scene keeps it linked. Extending promotion to scene moves is not done.

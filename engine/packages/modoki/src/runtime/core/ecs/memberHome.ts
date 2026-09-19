@@ -59,9 +59,13 @@ export function rehomeDependents(gone: ReadonlySet<number>, world: World = getCu
     for (let h = byGuid.get(home), n = 0; h && gone.has(h.id()) && n < 10_000; h = byGuid.get(home), n++) {
       const hpi = h.has(piMeta.trait) ? (h.get(piMeta.trait) as Pi & { rootInstanceId?: number } | undefined) : undefined;
       if (!hpi) break; // a home is always a member; a plain one cannot be stepped through
-      // Nor a STORED root: the derive pass anchors there and takes no step through it. A member whose home
-      // chain dies at one lost its instance with it — `detachOrphanedMembers` handles that member.
-      if (hpi.rootInstanceId === h.id() && !hpi.parentLocalId) break;
+      // Nor any instance ROOT, stored or owned. A root home is the root of the frame the dependent's row lives
+      // in (its own frame for a member, its owner's for an owned nested root), and that frame dies with it. On
+      // a delete, `detachOrphanedMembers` handles that member: it promotes an owned nested root and unlinks
+      // anything else. The other callers (unpack, Detach Prefab) do not yet (#1453). Stepping through an OWNED
+      // root re-pointed a moved nested root at its grandparent frame, which records no move for it, so it
+      // vanished on reload (#1451).
+      if (hpi.rootInstanceId === h.id()) break;
       steps = [...homeStepsOf(hpi), memberStepId(hpi), ...steps];
       const liveParent = byId.get((h.get(eaMeta.trait) as { parentId?: number }).parentId ?? 0);
       home = hpi.homeParent || guidOf(liveParent);
@@ -96,6 +100,14 @@ export function detachOrphanedMembers(gone: ReadonlySet<number>, world: World = 
     if (g) byGuid.set(g, e);
   }
   const guidOf = (e: Entity | undefined) => (e?.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '');
+  // The root of the instance whose row an owned nested root expanded from: its identity parent's frame. Not its
+  // home alone — a nested root carried out inside a moved member has no home, and its owner still dies (#1451).
+  const ownerOf = (e: Entity, pi: Pi): number => {
+    const live = (e.get(eaMeta.trait) as { parentId?: number } | undefined)?.parentId ?? 0;
+    const parent = byId.get(identityParentId(live, pi.homeParent, (g) => byGuid.get(g)?.id()));
+    const ppi = parent?.has(piMeta.trait) ? (parent.get(piMeta.trait) as { rootInstanceId?: number } | undefined) : undefined;
+    return ppi?.rootInstanceId ?? 0;
+  };
   const out: DetachedMember[] = [];
   const strip: Entity[] = [];
   const promote: Entity[] = [];
@@ -105,8 +117,10 @@ export function detachOrphanedMembers(gone: ReadonlySet<number>, world: World = 
     if (!pi) continue;
     const root = pi.rootInstanceId ?? 0;
     const ownedRoot = root === e.id() && (pi.parentLocalId || 0) > 0;
-    const home = pi.homeParent ? byGuid.get(pi.homeParent) : undefined;
-    if (ownedRoot ? !(home && gone.has(home.id())) : !gone.has(root)) continue;
+    // An owned root also goes when its HOME is still dying after the rehome: the rehome stops only at a home it
+    // cannot step past (a root, or a plain entity a Detach Prefab left behind, #1453), and no frame records it there.
+    const homeGone = !!pi.homeParent && gone.has(byGuid.get(pi.homeParent)?.id() ?? -1);
+    if (ownedRoot ? !(gone.has(ownerOf(e, pi)) || homeGone) : !gone.has(root)) continue;
     out.push({ guid: guidOf(e), rootGuid: ownedRoot ? '' : guidOf(byId.get(root)), data: { ...pi } });
     (ownedRoot ? promote : strip).push(e);
   }
