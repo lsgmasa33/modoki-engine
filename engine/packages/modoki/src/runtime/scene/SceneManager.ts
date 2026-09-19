@@ -291,6 +291,12 @@ class SceneManagerImpl implements SceneManager {
   // the format field through so the editor can read/round-trip it.
   private currentBaseScene: string | undefined;
   private nextLoad: { id: SceneId; path: string; controller: AbortController } | null = null;
+  /** Base guids whose FILE changed on disk (`forceReloadBases`) and that no load has reloaded yet
+   *  (#1422). Owned by the manager, not by a load: a forced load can be superseded before its swap,
+   *  and the load that superseded it can fail in turn (a bad path, a scene format that is too new).
+   *  Either way the file is still changed, so ONLY a committed swap clears an entry. At a swap every
+   *  pending guid is either reloaded from disk (a forced base is never kept) or not loaded at all. */
+  private pendingForcedBases = new Set<string>();
   private nextSceneId: SceneId = 1;
   // Unload-wins concurrency (#535, see the class docblock). `teardownInFlight` is
   // incremented at the HEAD of `unloadAll()` (before any await) and decremented in
@@ -321,7 +327,7 @@ class SceneManagerImpl implements SceneManager {
   private beforeSwapHooks: BeforeSwapHook[] = [];
   // Which base-scene guids are known (from a prior FRESH load) to contain a prefab
   // instance — checked against `keptBaseGuids` on the NEXT load so the carry
-  // warning (the template-key marker is dropped, #1421) fires at the moment the
+  // warning (unregistered markers are dropped, #1427) fires at the moment the
   // carry actually happens, not on every fresh load (a base with a prefab instance
   // used to warn on every single editor boot, whether or not a carry ever followed).
   private basesWithPrefabInstance = new Set<string>();
@@ -464,7 +470,14 @@ class SceneManagerImpl implements SceneManager {
     // Boot timeline (#238): the whole load, plus a span per phase below. Always on — a cold boot
     // has nobody there to switch a profiler on, and the boot stall is only reproducible cold.
     const loadSpan = beginBootSpan('scene-load', path);
-    // 1. Cancel in-flight load
+    // 1. Cancel in-flight load. Every forced base still pending applies to THIS load too (#1422):
+    // a forced base means its FILE changed on disk, which stays true whoever loads next. Without
+    // this, a hot reload of a changed base overtaken before its swap by any other load (an editor
+    // scene open, a prefab hot reload) was lost: the overtaking load found the base in both chains
+    // and KEPT the stale live copy, and nothing re-queued the change, so a later save wrote the
+    // stale base over the external write. A guid the new chain does not use is ignored at step 5.
+    for (const g of opts.forceReloadBases ?? []) this.pendingForcedBases.add(g);
+    const forceReloadBases: ReadonlySet<string> = new Set(this.pendingForcedBases);
     if (this.nextLoad) {
       this.nextLoad.controller.abort();
       releaseAllForScene(this.nextLoad.id);
@@ -622,7 +635,7 @@ class SceneManagerImpl implements SceneManager {
       // `/base.json`, then a level whose baseScene is that file) carried nothing, deleted the
       // base's content from the world, and left two `role:'primary'` entries (#1417 review).
       const oldGuidToSceneId = new Map(oldEntries.filter(([, e]) => e.role === 'base').map(([sid, e]) => [e.guid, sid]));
-      const forceReload = new Set(opts.forceReloadBases ?? []);
+      const forceReload = forceReloadBases; // the caller's, plus any a superseded load was carrying (step 1)
       const keptBaseGuids = new Set<string>();
       const keptSceneIds = new Set<SceneId>();
       for (const ref of baseRefs) {
@@ -633,16 +646,16 @@ class SceneManagerImpl implements SceneManager {
           keptSceneIds.add(oldSid);
           // `ref` is being CARRIED (kept from the old chain) rather than freshly reloaded.
           // The carry keeps a prefab instance's link, `rootInstanceId` and override marks,
-          // so it still saves as a link + overrides (#1421, observed live on sling). What it
-          // drops is the unregistered `TemplateAddedKey` marker on nodes a prefab template
-          // ADDED — the same loss as a Play→Stop round trip (templateIdentity.ts). Warning
-          // here (instead of on every fresh load) means this only fires on a real carry.
+          // so it still saves as a link + overrides (#1421, observed live on sling). The
+          // snapshot copies only registered traits, so it drops the unregistered markers
+          // (`TemplateAddedKey`, `Transient` — #1427; docs/scene-loading.md § Gotchas).
+          // Warning here (instead of on every fresh load) means this only fires on a real carry.
           if (this.basesWithPrefabInstance.has(ref.guid)) {
             console.warn(
               `[SceneManager] Base scene "${ref.path}" is carried with a prefab instance in it. ` +
-              `Its link and override values survive; the template-key marker on any node a prefab ` +
-              `template ADDED does not (as after Play→Stop), so a member token naming such a node ` +
-              `stays unresolved until the base reloads fresh. (scene-loading.md § Gotchas)`,
+              `Its links and override values survive and save; unregistered markers do not, so ` +
+              `a member reference to a node a prefab template ADDED can show as a false override ` +
+              `in the Inspector (#1427, scene-loading.md § Gotchas).`,
             );
           }
         }
@@ -938,8 +951,8 @@ class SceneManagerImpl implements SceneManager {
             ent.set(eaMeta.trait, { ...ent.get(eaMeta.trait), sourceScene: ref.guid });
           }
           // Record rather than warn here — a base with a prefab instance loses nothing on
-          // ITS OWN fresh load (instantiatePrefabIntoWorld ran normally and stamped every
-          // template-added node's key); the loss only happens on a LATER load that CARRIES
+          // ITS OWN fresh load beyond what loading the file already implies (#1426); the
+          // marker loss only happens on a LATER load that CARRIES
           // this same base instead of reloading it. That check (and the actual warning)
           // lives where `keptBaseGuids` is computed, above.
           if (sawPrefabInstance) this.basesWithPrefabInstance.add(ref.guid);
@@ -1113,6 +1126,7 @@ class SceneManagerImpl implements SceneManager {
       this.primaryId = id;
       this.currentBaseScene = data.baseScene;
       this.nextLoad = null;
+      for (const g of forceReloadBases) this.pendingForcedBases.delete(g); // applied (#1422)
 
       // #1135 — BEFORE the promote, so the first GAME tick against this world already knows its scene
       // is here, and a host-resolving system cannot mistake it for the pre-scene boot window. Only a
@@ -1709,6 +1723,7 @@ class SceneManagerImpl implements SceneManager {
     this.primaryId = null;
     this.currentBaseScene = undefined;
     this.nextLoad = null;
+    this.pendingForcedBases.clear();
     this.basesWithPrefabInstance.clear();
     this.teardownInFlight = 0;
     this.teardownToken.invalidateAll();

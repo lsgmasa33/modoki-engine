@@ -37,6 +37,7 @@ import PublishOtaDialog from './panels/PublishOtaDialog';
 import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
 import { runSaveAll, toastForSave } from './scene/saveCommand';
+import { confirmDiscardUnsaved, answerUnsavedGateRequest } from './scene/unsavedGate';
 import { enterPlay, pausePlay } from './scene/playMode';
 import { getPlayState, setPlayState, getRunMode, onRunModeChange } from '../runtime/core/playState';
 import { useEditorStore } from './store/editorStore';
@@ -80,7 +81,9 @@ const PANELS: Record<string, React.ComponentType> = {
   ...Object.fromEntries(getCustomPanels().map(p => [p.id, p.component])),
 };
 
-function resetLayout() {
+async function resetLayout() {
+  // A reload unloads the page, so everything unsaved is lost — ask first (#1419).
+  if (!(await confirmDiscardUnsaved('reset the layout (the editor reloads)', 'page-unload'))) return;
   clearStoredLayout();
   console.log('[Editor] Layout reset to default');
   // Reload for a clean panel remount (live Three.js/Pixi viewports don't tear
@@ -682,7 +685,7 @@ export default function EditorApp() {
       { label: 'Save Layout As...', action: handleSaveLayoutAs },
       { label: 'Load Layout...', action: () => setShowLoad(true) },
       { label: '', separator: true },
-      { label: 'Reset Layout', action: () => resetLayout() },
+      { label: 'Reset Layout', action: () => { void resetLayout(); } },
     ],
     ...getExtraMenus(),
     // Window stays last (before Help) per the conventional menu-bar order. A ✓
@@ -732,6 +735,13 @@ export default function EditorApp() {
         showToast: (message, kind) => useEditorStore.getState().showToast(message, kind),
         warn: (message) => console.warn(message),
       });
+    });
+  }, []);
+  // Main asks before a window close / quit / project switch / reload discards this page (#1419).
+  useEffect(() => {
+    if (!electronBridge) return;
+    return electronBridge.on('unsaved-gate', (req) => {
+      void answerUnsavedGateRequest(req, (data) => electronBridge.send('unsaved-gate-reply', data));
     });
   }, []);
   // Cmd/Ctrl+wheel → whole-app UI zoom (VS Code–style). Forward the intent to main,
@@ -883,7 +893,8 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
       .catch(() => setLayouts([]));
   }, []);
 
-  const load = (name: string) => {
+  const load = async (name: string) => {
+    if (!(await confirmDiscardUnsaved(`load layout ${name} (the editor reloads)`, 'page-unload'))) return;
     localStorage.setItem(LAYOUT_NAME_KEY, name);
     window.location.reload(); // reload applies the layout via loadInitialModel (clean panel remount)
   };
@@ -911,7 +922,7 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
         if (!isLayoutJson(parsed)) { console.error('[Editor] Not a valid layout file (missing "layout")'); return; }
         const name = deriveLayoutBaseName(file.name);
         if (!(await writeLayoutJson(name, parsed))) { console.error('[Editor] Failed to import layout'); return; }
-        load(name);
+        await load(name);
       } catch (e) {
         console.error('[Editor] Failed to read layout file:', e);
       }
@@ -931,7 +942,7 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 320, overflowY: 'auto' }}>
             {layouts.map((l) => (
               <div key={l.name} style={{ display: 'flex', gap: 4 }}>
-                <button data-ui-id={`layout.load.${l.name}`} onClick={() => load(l.name)} style={{
+                <button data-ui-id={`layout.load.${l.name}`} onClick={() => { void load(l.name); }} style={{
                   flex: 1, textAlign: 'left', padding: '6px 10px', border: '1px solid #444', borderRadius: 3,
                   background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12,
                 }}

@@ -1204,8 +1204,7 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
 
   // Prefab-instance warn (informational, non-blocking). A later swap that keeps this
   // base loaded CARRIES the instance: its link and overrides survive and save (#1421),
-  // but the template-key marker on template-ADDED nodes is dropped — see
-  // docs/scene-loading.md § Gotchas.
+  // but its unregistered markers are dropped (#1427) — see docs/scene-loading.md § Gotchas.
   const instanceRootNames: string[] = [];
   if (piMeta) {
     for (const id of ids) {
@@ -1217,9 +1216,9 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   if (instanceRootNames.length > 0) {
     console.warn(
       `[moveEntityToScene] "${rootInfo.name}" carries ${instanceRootNames.length} prefab instance root(s) ` +
-      `(${instanceRootNames.join(', ')}) into ${targetScene ? 'a base scene' : 'the primary'} — its editor ` +
-      `bookkeeping (Apply-to-Prefab, structural overrides) may not survive a later swap that keeps this base ` +
-      `loaded (scene-loading.md Phase 5 limitation; the scene itself IS savable — A8/A9 fixed).`,
+      `(${instanceRootNames.join(', ')}) into ${targetScene ? 'a base scene' : 'the primary'}. A later swap ` +
+      `that keeps this base loaded carries them: links and overrides survive and save, but unregistered ` +
+      `markers do not, so the Inspector can show false overrides (#1427, scene-loading.md § Gotchas).`,
     );
   }
 

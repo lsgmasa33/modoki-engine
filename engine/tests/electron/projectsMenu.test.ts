@@ -186,3 +186,26 @@ describe('installAppMenu — Open Recent marks the OPEN project (#869)', () => {
     }
   });
 });
+
+// #1419: View → Reload / Force Reload are CUSTOM items routed through onReload so main can ask the
+// unsaved-work gate first — the native `reload`/`forceReload` roles would reload with no question.
+describe('installAppMenu — View reload items ask through onReload (#1419)', () => {
+  it('Reload and Force Reload call onReload(false/true) and are not native roles', () => {
+    const onReload = vi.fn();
+    installAppMenu({
+      currentRoot: '/x',
+      onNewProject() {}, onOpenProject() {}, onOpenRecent() {},
+      rendererMenus: { menus: [{ name: 'View', items: [] }] },
+      onReload,
+    });
+    const items = ((cap.tpl ?? []).find((m) => m.label === 'View')?.submenu ?? []) as Electron.MenuItemConstructorOptions[];
+    expect(items.some((i) => i.role === 'reload' || i.role === 'forceReload')).toBe(false);
+    const reload = items.find((i) => i.label === 'Reload');
+    const force = items.find((i) => i.label === 'Force Reload');
+    expect(reload?.accelerator).toBe('CmdOrCtrl+R');
+    expect(force?.accelerator).toBe('Shift+CmdOrCtrl+R');
+    (reload?.click as () => void)();
+    (force?.click as () => void)();
+    expect(onReload.mock.calls).toEqual([[false], [true]]);
+  });
+});

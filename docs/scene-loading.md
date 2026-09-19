@@ -1529,23 +1529,28 @@ above reaches only an entry not yet migrated, of which the committed corpus now 
 
 ### Gotchas
 
-- **A carried prefab instance loses ONE thing: the template-key marker on nodes its
-  prefab template ADDED.** The carry respawns a kept base from a trait snapshot and never
-  calls `instantiatePrefabIntoWorld`. Everything a save reads survives it: the
-  `PrefabInstance` trait, with `rootInstanceId` remapped through the old→new id map, and the
-  override mark set, captured off the old world and re-seeded per entity. So a dirty
-  carried base still saves as `prefab` + `overrides`, not as flattened members. That was
-  observed live on sling's `Base.scene.json` (#1421), for an edit made before the carry
-  and for one made after it.
-  What is dropped is `TemplateAddedKey` (#1387), which is deliberately unregistered, so a
-  snapshot never sees it. A Play→Stop round trip drops it the same way
-  (`runtime/core/templateIdentity.ts`). Template writes recover it (`recoverTemplateKey`).
-  `memberPathIndex` and the override walk in `editor/scene/prefab.ts` do not, so until
-  the base reloads fresh they cannot name such a node, and a member token pointing at one
-  stays unresolved. That case was read from the code, not driven: sling's base has no
-  template-added nodes. `SceneManager` warns so it is never silent, but only at the
-  moment a carry actually happens (a base already known to contain a prefab instance
-  shows up in that load's `keptBaseGuids`), not on every fresh load.
+- **A carried prefab instance keeps its link and overrides, but loses its UNREGISTERED
+  markers.** The carry respawns a kept base from a trait snapshot and never calls
+  `instantiatePrefabIntoWorld`. The `PrefabInstance` trait survives, with `rootInstanceId`
+  remapped through the old→new id map, and so does the override mark set, captured off the
+  old world and re-seeded per entity. So a dirty carried base still saves its instances as
+  `prefab` + `overrides`, not as flattened members. That was observed live on sling's
+  `Base.scene.json` (#1421), for an edit made before the carry and for one made after it.
+  The snapshot copies only REGISTERED traits, though, so every deliberately unregistered
+  marker is dropped (#1427, observed in a probe):
+  - **`TemplateAddedKey`** (#1387, `runtime/core/templateIdentity.ts`). A template-added
+    node can then no longer be named by `baseTokenResolver` → `memberPathIndex`, so the
+    Inspector and the Apply/Revert dialog show a member-reference field pointing at one as
+    a false override. A save is not affected (`captureInstanceOverrides` is mark-gated).
+    A Play→Stop round trip drops the key the same way, and a fresh reload does NOT
+    restore it once the scene has been saved (#1426).
+  - **`Transient`**. A runtime-spawned subtree in a kept base (a `UIEntries` pool) loses
+    the tag that is `serializeScene`'s only way to skip it. That consequence is read from
+    the code, not driven.
+
+  `SceneManager` warns at the moment a carry actually happens (a base already known to
+  contain a prefab instance shows up in that load's `keptBaseGuids`), not on every fresh
+  load.
 - **The Time/Input singleton fallback must run AFTER the carry respawn.** A level whose
   Time lives in its base has no Time of its own, so a fallback running first spawns a
   phantom fresh Time and the carried one lands on top of it — two Time entities, which
@@ -1926,6 +1931,30 @@ Where it applies:
   first version then did nothing at all while any base was dirty, which left stale primary
   entries on the stack; #1417 replaced that with the rule above. A changed BASE reloads through
   `forceReloadBases`, so it is not kept and its edits are discarded with its flag.
+  **A hot reload overtaken by another load** (#1422) splits at its swap:
+  - **Before the swap** it rejects with an AbortError and reloads nothing. The overtaking load (an
+    editor scene open, a prefab hot reload) **inherits the forced bases**, because a forced base
+    means its file changed on disk, whoever loads next. They live in `SceneManager`'s
+    `pendingForcedBases`, not on the load, and only a committed swap clears them. So they survive a
+    chain of supersedes (a base reload followed by two prefab reloads) and an inheriting load that
+    fails (a bad path, a scene format that is too new). Before that,
+    the overtaking load found the base in both chains and KEPT the stale live copy, and nothing
+    re-queued the change, so the external write was lost and a later save wrote the stale base over
+    it (reproduced in review). Now the base is not kept, so the editor's adopt treats its edits as
+    discarded: disk wins, as it does for any hot reload (#1164).
+  - **After the swap** the hot reload is not rejected: a newer load is not a teardown, so it resolves
+    and adopts. Its adopt has no supersede guard and needs none, because it always runs FIRST. The
+    tail's only yielding await is the scene managers' `init()`, and every overtaking load's own
+    `disposeActiveSceneManagers` waits for those same inits. The newer load then keeps the freshly
+    reloaded base, whose flag is already cleared. If the newer load adopted first, the late
+    hot-reload adopt would rebind the undo stack to a scene that is not open and rebaseline the
+    winner's world. If the dispose's wait ever goes, this adopt needs the `stillLive` guard the
+    editor's `loadScene` has.
+  Both halves are pinned in `sceneManagerBaseSceneChain.test.ts` § #1422. ⚠️ A token-holding editor
+  load (a scene open, a Play restore) cannot be overtaken BY a hot reload, because the reload defers
+  while the token is held (#1164). Prefab-edit entry and the prefab-undo restore take no token, so
+  a hot reload can overtake them. The ordering above still holds, since every load goes through
+  `disposeActiveSceneManagers`.
 - **Asset-document edits survive the drop.** `_isFileDirect` entries (material, clip, particle,
   skin, timeline…) target a file the swap does not touch, so `parkSurvivors` keeps them, in order.
 - **`newScene` starts its key empty** (`freshIncoming`), apart from those asset entries, because a

@@ -12,7 +12,7 @@
  *  sceneManagerLifecycle.test.ts's rationale — this needs its own careful world
  *  budget given how many loadScene calls a chain scenario drives. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { trait } from 'koota';
 import { completeResponse } from '../stubs/assetResponse';
 
@@ -205,9 +205,20 @@ beforeEach(async () => {
   manifest.registerAsset(BASE_GUID, '/base.json', 'scene');
 });
 
+// koota caps live worlds at 16 per process, and this file drives many loads: release each test's
+// last world, as sceneManagerLifecycle.test.ts does (its header says why a budget cannot be rationed
+// per `it`). Captured per test because `vi.resetModules()` gives each one its own world module.
+let releaseWorld: (() => void) | null = null;
+afterEach(() => {
+  try { releaseWorld?.(); } catch { /* a test destroyed it itself */ }
+  releaseWorld = null;
+});
+
 async function getSceneManager() {
   const mod = await import('../../src/runtime/scene/SceneManager');
   mod.sceneManager.resetForTesting();
+  const world = await import('../../src/runtime/core/ecs/world');
+  releaseWorld = () => { (world.getCurrentWorld() as { destroy?: () => void } | null)?.destroy?.(); };
   return mod;
 }
 async function getWorld() { return import('../../src/runtime/core/ecs/world'); }
@@ -594,5 +605,119 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     // reload doesn't turn the base into a second primary or drop its role.
     const base = [...sceneManager.getLoadedScenes().values()].find((e) => e.role === 'base');
     expect(base?.guid).toBe(BASE_GUID);
+  });
+});
+
+// #1422: a base hot reload (`forceReloadBases`) overtaken by a newer load in its POST-swap tail.
+// The editor adopts each load's outcome after it resolves (serialize.ts `adoptReplacedWorld`, and
+// agentBridge's hot reload through `adoptWorldReloadedFromDisk`), and adopting the hot reload
+// LAST would rebind the undo stack and rebaseline over the newer load's world. That cannot
+// happen, and this pins why: the post-swap tail's only yielding await is the scene managers'
+// `init()`, and the overtaking load's own post-swap `disposeActiveSceneManagers` waits for those
+// same inits. So the hot reload always RESOLVES (a newer load is not a teardown, so no
+// AbortError), and resolves FIRST.
+describe('a base hot reload overtaken in its post-swap tail (#1422)', () => {
+  it('resolves, and resolves BEFORE the load that overtook it, even though that load kept the fresh base', async () => {
+    const { sceneManager } = await getSceneManager();
+    const managers = await import('../../src/runtime/managers/managerRegistry');
+    managers.__resetManagersForTesting();
+    let release = () => {};
+    const hang = new Promise<void>((r) => { release = r; });
+    let inits = 0;
+    // Resolves for the first load; the hot reload's re-init (the 2nd) is held open.
+    managers.registerManager({ name: 'slowLevel1', scenes: ['level1'], init: () => (++inits === 2 ? hang : undefined) });
+    try {
+      await sceneManager.loadScene('/level1.json');
+      const order: string[] = [];
+      const hot = sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] })
+        .then((r) => { order.push('hot'); return r; }, (e: unknown) => { order.push('hot-rejected'); throw e; });
+      await vi.waitFor(() => { if (inits < 2) throw new Error('hot reload not yet in its post-swap tail'); });
+      const next = sceneManager.loadScene('/level2.json').then((r) => { order.push('next'); return r; });
+      // Let the overtaking load run as far as it can on its own before the held init settles.
+      for (let i = 0; i < 50; i++) await new Promise((r) => setTimeout(r, 0));
+      expect(order, 'the overtaking load must not finish while the hot reload is still in its tail').toEqual([]);
+      release();
+      const [hotResult, nextResult] = await Promise.all([hot, next]);
+      expect(order).toEqual(['hot', 'next']);
+      expect(hotResult.keptBaseGuids.has(BASE_GUID), 'the forced base was reloaded').toBe(false);
+      expect(nextResult.keptBaseGuids.has(BASE_GUID), 'the overtaking load kept the FRESH base').toBe(true);
+    } finally {
+      release();
+      managers.__resetManagersForTesting();
+    }
+  });
+
+  // The PRE-swap half (#1422 close-out review, reproduced): the hot reload is overtaken while still
+  // fetching, so it rejects with an AbortError and never reloads the changed base. The overtaking
+  // load (an editor scene open, with no `forceReloadBases` of its own) used to find the base in both
+  // chains and KEEP the stale live copy, and nothing re-queued the change, so the external write was
+  // lost and a later save wrote the stale base over it. The overtaking load now inherits the forced
+  // base (SceneManager step 1).
+  it('a load that overtakes it BEFORE its swap inherits the forced base, so the disk change is not lost', async () => {
+    const { sceneManager } = await getSceneManager();
+    await sceneManager.loadScene('/level1.json');
+    const base = fetchResponses['/base.json'] as { entities: Array<{ traits: { Transform: { x: number } } }> };
+    base.entities[0].traits.Transform.x = 99; // the external write to the base's file
+    const hot = sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] });
+    const hotSettled = hot.then(() => 'resolved', (e: unknown) => (e as { name?: string }).name);
+    const next = await sceneManager.loadScene('/level2.json');
+    expect(await hotSettled, 'fixture: the hot reload was overtaken before its swap').toBe('AbortError');
+    expect(next.keptBaseGuids.has(BASE_GUID), 'the base is reloaded from disk, not carried').toBe(false);
+    const { getCurrentWorld } = await getWorld();
+    let cameraX: number | undefined;
+    getCurrentWorld().query(EntityAttributes, Transform).updateEach(([attr, t]: any[]) => {
+      if ((attr as { name: string }).name === 'Camera') cameraX = (t as { x: number }).x;
+    });
+    expect(cameraX, 'the live base shows the external write').toBe(99);
+  });
+
+  const cameraXNow = async (): Promise<number | undefined> => {
+    const { getCurrentWorld } = await getWorld();
+    let x: number | undefined;
+    getCurrentWorld().query(EntityAttributes, Transform).updateEach(([attr, t]: any[]) => {
+      if ((attr as { name: string }).name === 'Camera') x = (t as { x: number }).x;
+    });
+    return x;
+  };
+  const writeBaseCameraX = (x: number) => {
+    (fetchResponses['/base.json'] as { entities: Array<{ traits: { Transform: { x: number } } }> }).entities[0].traits.Transform.x = x;
+  };
+  const settle = (p: Promise<unknown>) => p.then(() => 'resolved', (e: unknown) => (e as { name?: string }).name ?? 'rejected');
+
+  // Close-out §2d review: a base reload followed by two prefab reloads is a CHAIN — each supersedes
+  // the last before its swap, and only the forced one carries `forceReloadBases`.
+  it('the forced base survives a CHAIN of pre-swap supersedes (A forced → B → C)', async () => {
+    const { sceneManager } = await getSceneManager();
+    await sceneManager.loadScene('/level1.json');
+    writeBaseCameraX(99);
+    const a = settle(sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] }));
+    const b = settle(sceneManager.loadScene('/level1.json'));
+    const c = await sceneManager.loadScene('/level2.json');
+    expect([await a, await b], 'fixture: A and B were both overtaken before their swaps').toEqual(['AbortError', 'AbortError']);
+    expect(c.keptBaseGuids.has(BASE_GUID)).toBe(false);
+    expect(await cameraXNow()).toBe(99);
+  });
+
+  // Close-out §2d review: the load that inherited the forced base can itself FAIL (a bad path, a
+  // scene format that is too new). The file is still changed, so the next load must reload it.
+  it('the forced base survives an inheriting load that FAILS, and applies to the next load', async () => {
+    const { sceneManager } = await getSceneManager();
+    await sceneManager.loadScene('/level1.json');
+    writeBaseCameraX(99);
+    const hot = settle(sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] }));
+    await expect(sceneManager.loadScene('/nope.json'), 'fixture: the inheriting load fails').rejects.toBeTruthy();
+    expect(await hot).toBe('AbortError');
+    expect(await cameraXNow(), 'fixture: nothing reloaded the base yet').toBe(0);
+    const next = await sceneManager.loadScene('/level2.json');
+    expect(next.keptBaseGuids.has(BASE_GUID)).toBe(false);
+    expect(await cameraXNow()).toBe(99);
+  });
+
+  it('a load that overtakes nothing still KEEPS a shared base — the inheritance is only from a superseded load', async () => {
+    const { sceneManager } = await getSceneManager();
+    await sceneManager.loadScene('/level1.json');
+    await sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] }); // completes: nothing left to inherit
+    const next = await sceneManager.loadScene('/level2.json');
+    expect(next.keptBaseGuids.has(BASE_GUID)).toBe(true);
   });
 });

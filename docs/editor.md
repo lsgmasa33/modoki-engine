@@ -1887,6 +1887,94 @@ line numbers and the gate rejected all 37 of them — correctly, and pointedly: 
 a cleanup range that had already rotted by four lines** between filing and being picked up, which is
 the whole argument for the rule.
 
+## The unsaved-work gate — every human world swap asks first (#1419)
+
+**Any human gesture that replaces the world or unloads the page awaits
+`confirmDiscardUnsaved(action, scope)` (`scene/unsavedGate.ts`) before it acts.** If nothing that
+gesture would destroy is unsaved, it proceeds silently. Otherwise it shows a **Save / Discard /
+Cancel** modal listing what would be lost (owner's call: a modal, not a toast with undo and not
+auto-save):
+- **Save** runs `runSaveAll()`, then re-reads the causes. It proceeds only if nothing is left. A
+  cancelled Save As on an untitled scene, a failed write, or a refused save (Play mode) all return
+  without throwing, so trusting the save's own verdict would destroy exactly the work the human
+  asked to keep.
+- **Discard** proceeds.
+- **Cancel**, Escape, or a backdrop click does nothing.
+- **Enter** means Save, because it loses nothing.
+
+It is the human twin of the agent ops' `guardUnsaved` (`agentEditorOps.ts`), and both read
+`unsavedChangeCauses()`. **Before #1419 only the agent side existed.** An agent was refused and told
+what `discardUnsaved` would drop. A human opening a scene from Assets lost the open scene's edits
+without a word, and since #1409 the undo stack went with them.
+
+**Scope is derived from the cause table, never listed** (a list here would be #972 again):
+- **`'world-swap'`** counts only the causes the scene write carries (`writtenBy: 'scene-write'`,
+  meaning the live primary world and the other loaded scenes). Parked asset docs, base-scene refs
+  and import settings are path-keyed module state that **survives** a swap. A prompt about them
+  before a scene open would warn about work nothing is about to lose.
+- **`'page-unload'`** counts every cause.
+
+| Gesture | Where it asks | Scope |
+|---|---|---|
+| Assets double-click on a scene, Inspector "Open Scene" | `openAssetInEditor` (both routes go through it) | world-swap |
+| Assets → Create Scene | `Assets.tsx` `runCreate`, before the path picker (any `create` override replaces the world) | world-swap |
+| Open a prefab for editing | `openPrefabForEditing`'s `confirmDiscard` option. It asks only about what is still dirty **after** the existing auto-save: an untitled scene or a failed save. The agent op passes no gate and refuses up front instead | world-swap |
+| Prefab edit → "Back to scene" | `SceneView.tsx` `exitPrefabEdit` | world-swap |
+| View → Reset Layout / Load Layout | `EditorApp.tsx` (both reload the page) | page-unload |
+| AI panel → toggle renderer debugging (packaged: relaunches) | `AIPanel.tsx` `toggleCdp` | page-unload |
+| Window close, quit, New / Open / Open Recent Project, View → Reload / Force Reload, update "Restart Now" | Electron main → `unsavedGateClient.ts` → the renderer's `answerUnsavedGateRequest`. "Restart Now" asks from `autoUpdate.ts` BEFORE `quitAndInstall` (on Windows the installer is spawned before the quit), and Cancel there means "Later". The install's own window close then passes the close handler (`isUpdateInstalling()`), so it is not asked twice | page-unload |
+
+**The Electron half is two-phase, because one timeout cannot serve both jobs.** A human may take
+minutes over the modal, but a **hung** renderer never answers. A gate that waited forever on a hung
+renderer would make the window unclosable. So the renderer **acks** the moment the request lands,
+and only the ack has a deadline:
+- **no mounted editor → proceed at once.** Main asks only after the editor's first menu-structure
+  push (`gateRendererReady`); a boot-error page or an editor still booting has nothing to lose,
+  and asking it would add the ack wait to every Cmd+R.
+- **no ack within 15s → proceed.** The deadline is long on purpose: a mounted editor that is slow
+  to ack is BUSY (a scene load, a shader compile), not gone.
+- **acked → wait for the human's answer with no deadline.**
+- **the question can no longer be answered → proceed.** `releaseAll` runs on the window's
+  `unresponsive` event, `render-process-gone`, `did-navigate` (a committed reload of any kind,
+  including the HMR one), and `'closed'`/a project switch (`failPendingRenderer`). ⚠️ Not
+  `did-start-navigation`: that also fires for navigations that never replace the document (one
+  `will-navigate` blocks, a download, a 204), and clearing readiness there made the next quit skip
+  the prompt — observed on Electron 43.2. The first
+  cut released only on the last two. An HMR reload under an open modal then left the question
+  pending forever, and every later close and quit was silently dropped (#1419 review).
+
+Before asking, main restores, shows and focuses the window. The modal renders inside it, so a Dock
+Quit on a minimized or hidden window would otherwise ask a question nobody can see.
+
+The two View reload items are custom menu items rather than Electron's `reload`/`forceReload`
+roles, because a role cannot ask. A startup-failure quit (`quitExitCode` set) skips the gate.
+
+**One prompt at a time.** A second request while the modal is up is **refused, not queued**. For
+example, a window close or a quit during an Assets-open prompt is dropped, and the human repeats it
+after answering the modal already on screen. A Save that throws counts as "stay", with a toast.
+
+**Deliberately not gated:**
+- The HMR game-code reload. It has its own countdown banner with Cancel (#850); it is a code
+  change, not a gesture, and a blocking modal there would stall the agent that wrote the code.
+- Crash-recovery and error-boundary reloads, and the dev-only self-HMR reloads.
+- Every agent op. They keep `discardUnsaved` and never see the modal.
+
+**Known limits:**
+- The **browser-hosted** editor (Chrome, no Electron) has no `beforeunload`, so closing its tab is
+  still silent. A `beforeunload` cannot be added naively: under Electron it would silently block
+  the reloads that main has already gated, and in the browser it would pop a native dialog over
+  the HMR reload's own countdown.
+- A scene load that **keeps** a dirty base scene carries its edits across the swap (#1417), but
+  which bases the target keeps is only known once `SceneManager.loadScene` has read the target's
+  base chain. So the gate still counts every dirty base (`dirtyScenes`) as lost. The result is at
+  most one prompt more than needed, never one fewer.
+
+**Adding a new world-replacing gesture:** await `confirmDiscardUnsaved('<verb phrase>', scope)`
+before it acts, at the HUMAN entry point, not inside a function the agent ops share. The decision
+is unit-tested in `tests/editor/unsavedGate.test.ts`, main's client in
+`tests/electron/unsavedGateClient.test.ts`, and the live modal in
+`tests/e2e/editor-unsaved-gate.spec.ts`.
+
 ## Selection restore across world swaps
 
 koota entity ids are scoped to their owning world, so a `SceneManager` world swap (scene

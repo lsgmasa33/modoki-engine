@@ -4081,6 +4081,17 @@ of them worded and deliberate.
 ⚠️ **A tap on the dialog BODY must do nothing** — it is neither the ✕ nor "outside". This is the
 part the engine cannot yet express cleanly: see the gap below before you author it.
 
+⚠️ **A dimmed backdrop blocks NOTHING unless it takes the tap** (#1423). A container with neither a
+click `UIAction` nor `swallowClicks` keeps the UIRenderer root's inherited `pointer-events: none`,
+so a full-screen scrim is paint only: it looks modal, and a tap on the dimmed area lands on the HUD
+under it. Observed in wordweave: with the "Too easy?" card up, the zoom button stayed on top of the
+hit stack. So every backdrop picks one of three, per the rules above: a click `UIAction` (tapping
+outside dismisses), `swallowClicks` (it doesn't — a decision dialog, or one with a worded dismiss),
+or `pointerThrough: true` (taps are MEANT to reach the layer below — sling's "Tap to play again").
+`engine/tests/assets/overlayBackdropTakesTap.test.ts` fails on any painted full-screen overlay in
+`games/`/`demos/` that picks none — "overlay" meaning it or an ancestor has `zIndex > 0`, starts
+hidden, or is shown by a `UIBinding.visibleBinding`.
+
 ### Why a dialog body dismisses today, if nothing is done about it
 
 `UINode.tsx` treats a node as interactive only if it carries a click binding — `isInteractive` is

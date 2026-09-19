@@ -2941,9 +2941,10 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
     _worldReloadedFromDisk?.(current, keptBaseGuids);
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
-    // A newer reload superseding this one aborts the in-flight load
+    // A newer load superseding this one aborts the in-flight load
     // (SceneManager throws DOMException 'AbortError'). That's expected — the
-    // superseding reload logs its own success — not a failure. This fires
+    // superseding load logs its own success — not a failure, and it inherits this
+    // load's `forceReloadBases`, so a changed base is still reloaded (#1422). This fires
     // routinely when several files change at once (e.g. deleting a batch of
     // unused prefabs), so keep it quiet rather than an alarming "failed" warn.
     if (e instanceof DOMException && e.name === 'AbortError') {

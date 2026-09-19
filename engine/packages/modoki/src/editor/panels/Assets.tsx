@@ -40,6 +40,7 @@ import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
 import { openAssetInEditor } from './openAssetInEditor';
 import { chooseNewAssetPath, confirmReplaceAsset } from '../utils/saveDialog';
+import { confirmDiscardUnsaved } from '../scene/unsavedGate';
 import { mayCreateOver } from '../scene/createAssetDocument';
 import { createRegisteredAssetAskingToReplace } from './createRegisteredAsset';
 
@@ -928,6 +929,9 @@ export default function Assets() {
    *  right editor / selects the new asset. `folder` (a right-clicked folder path) wins
    *  over the def's own `defaultFolder`. */
   const runCreate = useCallback(async (def: CreatableAssetDef, folder?: string) => {
+    // A `create` override (Scene) replaces the live world — ask before the path picker, so a Cancel
+    // here costs nothing and the picker is not answered for a create that then does not happen (#1419).
+    if (def.create && !(await confirmDiscardUnsaved(`create ${def.label.replace(/^Create /, 'a new ').toLowerCase()}`, 'world-swap'))) return;
     const pick = await chooseNewAssetPath({
       defaultName: def.defaultName + def.ext, ext: def.ext,
       defaultFolder: folder ?? def.defaultFolder, prompt: def.prompt ?? def.label,

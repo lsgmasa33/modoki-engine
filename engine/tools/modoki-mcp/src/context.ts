@@ -532,9 +532,11 @@ export function createToolContext(config: { backend: string; token?: string }): 
       'LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)' },
     dirtyAssetPaths: { shape: 'list', say: (v: string[]) =>
       `${v.length} pending ASSET edit(s) awaiting a save: ${v.join(', ')}` },
+    // #1420: names the usual cause (an edit to a loaded base) rather than diagnosing a failed
+    // save_all. Same sentence as the editor's `CAUSE_REFUSALS.dirtyScenes` (agentEditorOps.ts).
     dirtyScenes: { shape: 'list', say: (v: string[]) =>
-      `${v.length} non-primary loaded scene(s) with edits still only in memory `
-      + `(guid(s): ${v.join(', ')}) — a previous save_all may have failed to write them` },
+      `${v.length} loaded base scene(s) with edits not yet saved `
+      + `(guid(s): ${v.join(', ')}) — usually an edit made to that base; a save_all that failed to write it leaves the same state` },
     pendingBaseScenes: { shape: 'list', say: (v: string[]) =>
       `${v.length} pending base-scene ref(s) awaiting a save: ${v.join(', ')}` },
     pendingImportSettings: { shape: 'list', say: (v: string[]) =>

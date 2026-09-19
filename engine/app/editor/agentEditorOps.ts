@@ -2003,10 +2003,13 @@ export function registerEditorAgentOps(): void {
       : null),
     dirtyAssetPaths: (v) => (v.length
       ? `${v.length} pending ASSET edit(s) awaiting a save: ${v.join(', ')}` : null),
-    // A non-primary loaded scene still dirty (a base whose write failed in a partial save_all).
-    // Without it a refusal driven by this alone would name no cause.
+    // A loaded BASE scene still dirty. Without it a refusal driven by this alone would name no
+    // cause. #1420: this once DIAGNOSED a failed save_all, the only way to leave a base dirty before
+    // #1417; since a load keeps a shared base's flag, the usual cause is an ordinary base edit, and
+    // a reader sent after a failure that never happened wastes the turn. Mirrored in the MCP's
+    // `CAUSE_PHRASES` (engine/tools/modoki-mcp/src/context.ts), which cannot import this.
     dirtyScenes: (v) => (v.length
-      ? `${v.length} non-primary loaded scene(s) with edits still only in memory (guid(s): ${v.join(', ')}) — a previous save_all may have failed to write them`
+      ? `${v.length} loaded base scene(s) with edits not yet saved (guid(s): ${v.join(', ')}) — usually an edit made to that base; a save_all that failed to write it leaves the same state`
       : null),
     // #831: a `baseScene` ref set in the Scene inspector on a scene the editor has not loaded.
     // Neither a live-world edit nor an asset document, so before this row a refusal driven by it
@@ -2057,12 +2060,15 @@ export function registerEditorAgentOps(): void {
     // ⚠️ Except a scene loaded AS A BASE that the TARGET chain shares (#1417 review): SceneManager
     // keeps it and carries its entities from the live world, so its edits and its dirty flag
     // survive. Not the open scene itself: an old PRIMARY is never kept, even when the target names
-    // it as its base. This guard never sees the target chain, so the qualifier lives in the words. Saying
+    // it as its base. Not a base whose file changed on disk either: a pending hot reload of it forces
+    // the next load to reload it, whoever issues that load (#1422). This guard never sees the target
+    // chain, so the qualifier lives in the words. Saying
     // "destroyed" there sends the agent into the same loop as the parked half below.
     const consequence = liveHalf
       ? ' The live-world scene edits would be DESTROYED (gone from the world, the file, and the undo stack),'
         + ' except edits to a scene currently loaded AS A BASE (not the open scene itself) that the target also uses:'
-        + ' that base is carried across live and stays unsaved.'
+        + ' that base is carried across live and stays unsaved, unless its FILE changed on disk since it loaded'
+        + ' (a pending hot reload of it): then disk wins and its edits go too.'
       : '';
     // The parked half is the honest surprise: it is why this refusal exists at all for a
     // parked-only cause, and it is the opposite of "would be lost".

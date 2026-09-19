@@ -947,8 +947,9 @@ const CAUSE_SPECS = {
     writtenBy: { flush: 'before-scene', run: flushDirtyAssets },
     label: { noun: 'unsaved asset edit' },
   },
-  // Non-primary loaded scenes whose edits are still only in memory — typically a base whose write
-  // failed in a partial `saveAll` (which keeps its dirty flag by design, so a later save retries).
+  // Loaded BASE scenes whose edits are still only in memory: usually an edit to a base, which a
+  // load that keeps the base carries across (#1417), and also a base whose write failed in a
+  // partial `saveAll` (which keeps its flag by design, so a later save retries). #1420.
   // Keyed by GUID, so a file rename cannot strand it.
   dirtyScenes: {
     has: hasDirtyScenes,

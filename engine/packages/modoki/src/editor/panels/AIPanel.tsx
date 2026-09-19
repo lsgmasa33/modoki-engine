@@ -13,6 +13,7 @@ import {
 } from './aiPanelModel';
 import DeviceConnectSection from './DeviceConnectSection';
 import AiCaptureSection from './AiCaptureSection';
+import { confirmDiscardUnsaved } from '../scene/unsavedGate';
 
 /** Access the whitelisted preload invoke bridge (null outside the Electron editor). */
 function electronInvoke<T = unknown>(channel: string, payload?: unknown): Promise<T> | null {
@@ -77,6 +78,9 @@ export default function AIPanel(): React.ReactElement {
   }, [refresh]);
 
   const toggleCdp = useCallback(async (on: boolean) => {
+    // Packaged, this RELAUNCHES the editor — ask before the page goes (#1419). (In dev main
+    // refuses the toggle, so the question costs a clean editor nothing.)
+    if (!(await confirmDiscardUnsaved('relaunch the editor to change renderer debugging', 'page-unload'))) return;
     const p = electronInvoke<{ ok: boolean; error?: string }>('modoki:set-cdp-enabled', on);
     if (!p) return;
     setBusy(true); setNote(on ? 'Enabling renderer debugging — the editor will relaunch…' : 'Disabling renderer debugging — the editor will relaunch…');

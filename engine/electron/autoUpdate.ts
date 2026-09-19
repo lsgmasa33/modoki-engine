@@ -45,6 +45,13 @@ let promptOpen = false;
 
 /** True while an update install is in progress (after "Restart Now"). main's
  *  before-quit checks this so it doesn't preempt Squirrel's quit-and-install. */
+/** Asked before "Restart Now" hands the app to the installer (#1419): the install quits the app
+ *  (and on Windows spawns the installer before it does), so the unsaved-work gate must answer
+ *  BEFORE `quitAndInstall`, not from the window close the installer later forces. Resolves true
+ *  to install. Installed by main; unset → install. */
+let beforeInstall: (() => Promise<boolean>) | null = null;
+export function setBeforeInstallGate(fn: (() => Promise<boolean>) | null): void { beforeInstall = fn; }
+
 export function isUpdateInstalling(): boolean {
   return installing;
 }
@@ -165,9 +172,11 @@ function promptRestart(version: string): void {
     title: 'Update Ready',
     message: `Modoki Editor ${version} has been downloaded.`,
     detail: 'Restart to install the update. It will also install automatically the next time you quit.',
-  }).then((r) => {
+  }).then(async (r) => {
     promptOpen = false;
     if (r.response !== 0) { setProgress(-1); return; } // "Later" — drop the indeterminate bar
+    // Unsaved work: Cancel is the same as "Later" — the update still installs on the next quit.
+    if (beforeInstall && !(await beforeInstall())) { setProgress(-1); return; }
     installing = true; // before-quit must defer to Squirrel from here
     autoUpdater.quitAndInstall();
     // Defence in depth (#1033). `whenInstallable` should mean the quit is immediate, but a click

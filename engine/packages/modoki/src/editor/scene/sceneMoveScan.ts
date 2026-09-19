@@ -28,7 +28,7 @@ export interface SceneMovePreflight {
   /** Name of the parent left behind, or null if the entity is already a root
    *  (no re-rooting will happen regardless of how the drop is routed). */
   reRootFrom: string | null;
-  /** Names of PrefabInstance ROOTS inside the moving subtree (Phase 5 limitation). */
+  /** Names of PrefabInstance ROOTS inside the moving subtree (a carry drops their unregistered markers — #1427). */
   prefabInstanceRoots: string[];
   /** Sibling scene files on disk (declaring the SAME base as `targetScene`) that
    *  already contain one of the moving guids. Only populated for a PROMOTE
@@ -121,7 +121,7 @@ export function formatSceneMoveConfirm(pre: SceneMovePreflight, targetScene: str
   }
   if (targetScene) lines.push('• Every level that uses this base will now show it.');
   if (pre.prefabInstanceRoots.length > 0) {
-    lines.push(`• ${pre.prefabInstanceRoots.length} prefab instance${pre.prefabInstanceRoots.length === 1 ? '' : 's'} in the subtree: ${pre.prefabInstanceRoots.join(', ')} — a later swap that keeps this base loaded carries them: links and overrides survive and save, but nodes a prefab template added lose their template key until the base reloads fresh.`);
+    lines.push(`• ${pre.prefabInstanceRoots.length} prefab instance${pre.prefabInstanceRoots.length === 1 ? '' : 's'} in the subtree: ${pre.prefabInstanceRoots.join(', ')} — a later swap that keeps this base loaded carries them: links and overrides survive and save, but the Inspector can show false overrides on member references afterwards (#1427).`);
   }
   if (pre.collisions.length > 0) {
     const names = pre.collisions.map((c) => c.name).join(', ');

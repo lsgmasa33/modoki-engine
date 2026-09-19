@@ -100,6 +100,14 @@ describe('REQUIRES_SAVE over a dirty BASE scene names the carry exception (#1417
       expect(err).toMatchObject({ code: 'REQUIRES_SAVE' });
       expect(err?.message).toMatch(/loaded AS A BASE \(not the open scene itself\).*carried across live and stays unsaved/);
       expect(err?.message).toMatch(/discards the LIVE-WORLD edits \(not those of a loaded base the target shares\)/);
+      // #1420: since #1417 the usual way a base is dirty here is an ordinary base edit carried
+      // through a load, so the cause names that, and no longer sends the reader after a save_all
+      // failure that never happened.
+      expect(err?.message).toMatch(/1 loaded base scene\(s\) with edits not yet saved \(guid\(s\): bbbbbbbb-0000-4000-8000-000000001417\) — usually an edit made to that base/);
+      expect(err?.message).not.toMatch(/may have failed/);
+      // #1422: the carry is not promised for a base whose file changed on disk (a pending hot
+      // reload), which the next load reloads whoever issues it.
+      expect(err?.message).toMatch(/stays unsaved, unless its FILE changed on disk since it loaded \(a pending hot reload of it\): then disk wins/);
     } finally {
       clearAllSceneDirty();
     }

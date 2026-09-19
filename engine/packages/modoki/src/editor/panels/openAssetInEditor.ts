@@ -65,10 +65,17 @@ export async function openAssetInEditor(asset: SelectedAsset): Promise<void> {
   switch (type) {
     case 'prefab': {
       const { openPrefabForEditing } = await import('../scene/prefabEdit');
-      openPrefabForEditing({ path, name });
+      // The human route asks before its swap discards anything the auto-save could not write
+      // (#1419); the agent op has its own `guardUnsaved` and passes no gate.
+      const { confirmDiscardUnsaved } = await import('../scene/unsavedGate');
+      openPrefabForEditing({ path, name }, { confirmDiscard: (action) => confirmDiscardUnsaved(action, 'world-swap') });
       return;
     }
     case 'scene': {
+      // Opening a scene replaces the world: ask first (#1419). Both human routes to this — the
+      // Assets double-click and the Inspector's Open Scene button — come through here.
+      const { confirmDiscardUnsaved } = await import('../scene/unsavedGate');
+      if (!(await confirmDiscardUnsaved(`open scene ${name}`, 'world-swap'))) return;
       const { loadScene } = await import('../scene/serialize');
       const outcome = await loadScene(path);
       if (outcome === 'loaded') console.log(`[openAssetInEditor] Opened scene: ${path}`);

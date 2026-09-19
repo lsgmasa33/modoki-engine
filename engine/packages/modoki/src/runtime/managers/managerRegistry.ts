@@ -250,6 +250,10 @@ export async function disposeActiveSceneManagers(ctx?: ManagerContext): Promise<
     owned.push([entry, entry.activationId]);
     if (entry.initPromise) pending.push(entry.initPromise);
   }
+  // ⚠️ Also load-bearing for the editor (#1422): a load overtaking another in ITS post-swap tail
+  // waits here for the inits that tail is awaiting, so the overtaken load always resolves first.
+  // docs/scene-loading.md § "Per-scene undo history" (the hot-reload bullet) says what breaks if
+  // it did not.
   if (pending.length) await Promise.all(pending);
   for (const [entry, id] of owned) {
     if (entry.active && entry.activationId === id) deactivate(entry, ctx);

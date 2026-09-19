@@ -280,7 +280,15 @@ export function resolveReturnScene(currentPath: string | null, recordedReturn: s
 
 /** Open `asset` (a prefab) for isolated editing. Remembers the current scene so
  *  exitPrefabEdit can restore it. */
-export async function openPrefabForEditing(asset: { path: string; name: string }): Promise<void> {
+export async function openPrefabForEditing(
+  asset: { path: string; name: string },
+  opts: {
+    /** Asked when the world still holds unsaved edits after the auto-save below (an untitled scene,
+     *  or a save that failed) — resolve false to abort before the swap discards them. The HUMAN
+     *  route passes the unsaved-work gate (#1419); the agent op refuses up front instead. */
+    confirmDiscard?: (action: string) => Promise<boolean>;
+  } = {},
+): Promise<void> {
   let prefab: PrefabFile;
   try {
     const res = await fetch(asset.path);
@@ -312,6 +320,7 @@ export async function openPrefabForEditing(asset: { path: string; name: string }
   // to write to — an unsaved new scene, or already inside prefab-edit opening a
   // NESTED prefab (both have a null current path) — which would pop a Save-As picker.
   if (getCurrentScenePath()) await saveScene();
+  if (opts.confirmDiscard && worldHasUnsavedEdits() && !(await opts.confirmDiscard(`edit prefab ${asset.name}`))) return;
 
   const returnScene = resolveReturnScene(
     sceneManager.getCurrent()?.path ?? null,

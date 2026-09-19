@@ -301,6 +301,9 @@ export function installAppMenu(opts: {
   onCheckForUpdates?(): void;
   onAbout?(): void;
   onZoom?(dir: 'in' | 'out' | 'reset'): void;
+  /** View → Reload / Force Reload. Custom items rather than the `reload`/`forceReload` roles, so
+   *  main can ask the unsaved-work gate first (#1419). */
+  onReload?(ignoringCache: boolean): void;
 }): void {
   const recents = getRecentProjects();
   const isMac = process.platform === 'darwin';
@@ -355,7 +358,10 @@ export function installAppMenu(opts: {
     { label: 'Actual Size', accelerator: 'CmdOrCtrl+0', click: () => opts.onZoom?.('reset') },
     // forceReload (Cmd+Shift+R) bypasses the HTTP cache — needed to pick up a
     // rebaked asset served at its stable immutable URL.
-    { type: 'separator' }, { role: 'reload' }, { role: 'forceReload' }, { role: 'toggleDevTools' }, { role: 'togglefullscreen' },
+    { type: 'separator' },
+    { label: 'Reload', accelerator: 'CmdOrCtrl+R', click: () => opts.onReload?.(false) },
+    { label: 'Force Reload', accelerator: 'Shift+CmdOrCtrl+R', click: () => opts.onReload?.(true) },
+    { role: 'toggleDevTools' }, { role: 'togglefullscreen' },
   ];
   // Native window roles appended after the editor's own Window items (show panel)
   // so OS window controls stay reachable in the same menu.

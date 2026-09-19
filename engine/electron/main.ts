@@ -275,7 +275,7 @@ import { acquireBuildClaim } from '../scripts/buildClaimsStore.mjs';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 // The ONE 'same directory?' comparison (#869).
 import { samePath } from '../scripts/pathIdentity.mjs';
-import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling } from './autoUpdate';
+import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling, setBeforeInstallGate } from './autoUpdate';
 import { restoreZoom, handleZoom, setUiPrefsDir } from './zoom';
 import { registerReimportHandler } from '../plugins/reimport-registry';
 import { textureReimportHandler } from '../plugins/reimport-texture';
@@ -291,6 +291,7 @@ import { releaseDeviceResourcesOnExit } from '../plugins/backend/deviceConnectio
 import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
 import { notifyListeners } from '../packages/modoki/src/runtime/core/notifyListeners';
+import { createUnsavedGateClient } from './unsavedGateClient';
 
 /**
  * Find the enclosing git repo/worktree root for a project path by walking up
@@ -767,6 +768,33 @@ let resetHeldPointerOnReload: (() => void) | null = null;
 // ── R→M: the renderer's pushed trait schema (undefined ⇒ ref-only validation). ──
 let cachedSchema: SceneSchema | undefined;
 
+/** Ask the renderer's unsaved-work gate before a window close, a quit, a project switch or a
+ *  reload discards it (#1419). The policy — two phases, and why a dead renderer proceeds — is in
+ *  `unsavedGateClient.ts`. */
+const unsavedGate = createUnsavedGateClient({
+  send: (req) => {
+    // Only a MOUNTED editor can answer (`gateRendererReady`, set by its menu-structure push). A
+    // boot-error page or an editor still booting has no gate and no authored work, so asking it
+    // would only cost the ack deadline on every Cmd+R and close.
+    if (!mainWindow || mainWindow.webContents.isDestroyed() || !gateRendererReady) return false;
+    // The modal renders INSIDE this window, so it must be visible — a Dock Quit on a minimized or
+    // hidden window would otherwise ask a question nobody can see (#1419 review).
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.webContents.send('modoki:bridge-unsaved-gate', req);
+    return true;
+  },
+  // Long, because a mounted editor that is slow to ack is BUSY (a scene load, a shader compile),
+  // not gone — proceeding on a busy one would discard its work. A truly hung renderer is released
+  // earlier by the window's `unresponsive` event, and a dead one by `render-process-gone`.
+  ackTimeoutMs: 15_000,
+});
+/** True from the editor's first menu-structure push (EditorApp mounted, gate subscribed) until
+ *  its document goes away (navigation, reload, crash, close). */
+let gateRendererReady = false;
+setBeforeInstallGate(() => unsavedGate.ask('restart to install the update'));
+
 // ── M→R: pending requestRenderer() calls keyed by a monotonic id. ──
 const pendingRenderer = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout; op: string }>();
 let nextRequestId = 1;
@@ -775,6 +803,9 @@ let nextRequestId = 1;
  *  project reload that swaps the renderer out from under them). Without this they
  *  only resolve via their timeout and leak the timer until then (P1-4). */
 function failPendingRenderer(reason: string): void {
+  // The unsaved-work gate's questions too: the renderer that would have answered is going away, and
+  // a question nobody can answer must not hold a close or a quit (#1419).
+  unsavedGate.releaseAll();
   // Isolated per call (#953), for uniformity with every other fan-out: `clearTimeout` and a Promise
   // `reject` cannot throw today, but that is a fact about the callee, which nothing enforces.
   notifyListeners(
@@ -987,8 +1018,27 @@ async function createWindow(backendBase: string) {
     } catch { /* best-effort */ }
   });
 
+  // A close asks the unsaved-work gate first (#1419). `closeApproved` is the re-entry pass: the
+  // approved close calls `win.close()` again, which lands back here. A second close while the first
+  // is still being asked is dropped — the human answers the modal that is already up.
+  let closeApproved = false;
+  win.on('close', (e) => {
+    // An update install closes the windows itself, AFTER "Restart Now" already asked the gate
+    // (`setBeforeInstallGate`) — asking again would show the same modal twice, with the Windows
+    // installer already running behind it.
+    if (closeApproved || isUpdateInstalling()) return;
+    e.preventDefault();
+    if (unsavedGate.pending()) return;
+    void unsavedGate.ask('close the editor window').then((proceed) => {
+      if (!proceed || win.isDestroyed()) return;
+      closeApproved = true;
+      win.close();
+    });
+  });
+
   win.on('closed', () => {
     mainWindow = null;
+    gateRendererReady = false;
     // Reject + clear any in-flight M→R requests so they don't hang to timeout
     // and leak their timers (P1-4 / P3-3).
     failPendingRenderer('editor window closed');
@@ -1064,6 +1114,8 @@ async function createWindow(backendBase: string) {
   // wrong with our code), 'launch-failed', or 'integrity-failure'. Those imply completely different
   // fixes, and guessing between them cost an afternoon.
   win.webContents.on('render-process-gone', (_e, details) => {
+    gateRendererReady = false;
+    unsavedGate.releaseAll(); // #1419 review: a dead renderer answers nothing
     console.error(
       `[modoki-electron] RENDERER GONE reason=${details.reason} exitCode=${details.exitCode} — ` +
       'the window is now blank while the backend stays up. If reason is "killed", something ' +
@@ -1092,6 +1144,8 @@ async function createWindow(backendBase: string) {
   // software" (an environment problem, no driver hang involved) from "everything enabled but
   // stuck" (points at a real GPU-side wedge) — the two look identical from `unresponsive` alone.
   win.webContents.on('unresponsive', () => {
+    // A question a hung renderer will never answer must not hold a close or a quit (#1419 review).
+    unsavedGate.releaseAll();
     console.error(
       '[modoki-electron] RENDERER UNRESPONSIVE — the process is alive but its main thread has ' +
       `stopped responding. GPU feature status: ${JSON.stringify(app.getGPUFeatureStatus())}`,
@@ -1101,6 +1155,19 @@ async function createWindow(backendBase: string) {
   // instead of looking permanent (nothing else marks the recovery).
   win.webContents.on('responsive', () => {
     console.log('[modoki-electron] renderer responsive again — the hang recovered on its own.');
+  });
+
+  // The document the gate lives in has been REPLACED — a reload (HMR's own, a crash-recovery
+  // reload), a project switch. Its questions can no longer be answered, and the next document is
+  // not ready until it pushes its menu again (#1419 review: an HMR reload under an open modal left
+  // main's question pending forever, and every later close and quit was dropped).
+  // ⚠️ `did-navigate`, NOT `did-start-navigation`: the start event fires (isSameDocument:false)
+  // for navigations that never replace the document — one `will-navigate` above BLOCKS, a
+  // download, a 204 — observed on Electron 43.2. Clearing readiness there made the next Cmd+Q
+  // skip the prompt on a still-dirty editor. `did-navigate` is main-frame and committed only.
+  win.webContents.on('did-navigate', () => {
+    gateRendererReady = false;
+    unsavedGate.releaseAll();
   });
 
   win.webContents.on('did-finish-load', () => {
@@ -1365,6 +1432,8 @@ function rebuildMenu(): void {
     onNewProject: async () => {
       const dir = await pickNewProjectFolder(mainWindow);
       if (!dir) return;
+      // Before the scaffold, so a Cancel leaves no half-made project behind (#1419).
+      if (!(await unsavedGate.ask('switch to a new project'))) return;
       try {
         scaffoldProject(dir, { name: path.basename(dir), templateDir: path.join(REPO_ROOT, 'engine', 'templates', 'starter') });
       } catch (e) {
@@ -1379,12 +1448,27 @@ function rebuildMenu(): void {
     },
     onOpenProject: async () => {
       const chosen = await pickProjectFolder(mainWindow);
-      if (chosen && !samePath(chosen, requestedRoot)) await setProject(chosen);
+      if (chosen && !samePath(chosen, requestedRoot)) {
+        if (await unsavedGate.ask('open another project')) await setProject(chosen);
+      }
     },
     // (#869) samePath, not `!==`: a recents entry is one of the two untrusted spelling
     // sources, so a differently-cased entry re-opened the project ALREADY open — a full
     // setProject, discarding whatever unsaved scene state that costs.
-    onOpenRecent: (root) => { if (!samePath(root, requestedRoot)) void setProject(root); },
+    onOpenRecent: (root) => {
+      if (!samePath(root, requestedRoot)) {
+        void unsavedGate.ask('open another project').then((proceed) => { if (proceed) void setProject(root); });
+      }
+    },
+    // View → Reload / Force Reload: custom items rather than Electron's roles, so they can ask (#1419).
+    onReload: (ignoringCache) => {
+      const w = mainWindow;
+      if (!w) return;
+      void unsavedGate.ask('reload the editor').then((proceed) => {
+        if (!proceed || w.webContents.isDestroyed()) return;
+        if (ignoringCache) w.webContents.reloadIgnoringCache(); else w.webContents.reload();
+      });
+    },
     rendererMenus: rendererMenuSpec,
     // Relay an OS-menu click to the renderer, which dispatches the editor action.
     onMenuAction: (id) => mainWindow?.webContents.send('modoki:bridge-menu-action', id),
@@ -1936,6 +2020,7 @@ app.whenReady().then(async () => {
       // Editor pushed its menu structure → rebuild the OS menu so its actions
       // (and dynamic labels/enabled state) show natively.
       rendererMenuSpec = msg.data as RendererMenuSpec;
+      gateRendererReady = true; // EditorApp is mounted, so its unsaved-gate subscription is live
       rebuildMenu();
       // This push == the editor renderer has mounted (painted, not just page-loaded):
       // hand off from the splash to the now-ready window (no black gap).
@@ -1964,6 +2049,8 @@ app.whenReady().then(async () => {
       // Renderer forwarded a Cmd/Ctrl+wheel intent (the menu/accelerator paths call
       // handleZoom directly in rebuildMenu). Whole-app UI zoom via webContents.
       handleZoom(mainWindow, msg.data as { dir?: 'in' | 'out' | 'reset'; deltaY?: number });
+    } else if (msg.event === 'unsaved-gate-reply') {
+      unsavedGate.onReply(msg.data);
     } else if (msg.event === 'response') {
       const { id, result, error, declined } = msg.data as
         { id: number; result?: unknown; error?: string; declined?: boolean };
@@ -2380,8 +2467,14 @@ app.on('before-quit', (e) => {
   if (isUpdateInstalling()) return;
   if (quitting) return;
   e.preventDefault();
-  quitting = true;
+  // A human quit asks the unsaved-work gate first (#1419). A startup-failure quit (`quitExitCode`
+  // set) does not: there is no authored work yet, and the failure must not wait on a modal. A
+  // second quit while a question is being asked is dropped, as a second close is.
+  if (quitExitCode === 0 && unsavedGate.pending()) return;
   void (async () => {
+    if (quitExitCode === 0 && !(await unsavedGate.ask('quit Modoki'))) return;
+    if (quitting) return;
+    quitting = true;
     // Bound the teardown so a wedged close() (e.g. a stuck SSE socket) can't hang
     // the quit, and always exit even if a step rejects. (E4)
     const teardown = (async () => {

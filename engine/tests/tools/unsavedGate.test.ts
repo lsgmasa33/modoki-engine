@@ -113,6 +113,24 @@ describe('unsaved-work gate: naming the ACTUAL cause (#844)', () => {
     });
   }
 
+  it('modoki_build names a dirty BASE as an unsaved base edit, not a failed save_all (#1420)', async () => {
+    // Since #1417 a load keeps a shared base's dirty flag, so the usual cause is an ordinary base
+    // edit carried through the load. The old sentence diagnosed a failed save_all that never ran.
+    surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-state') ? {
+        status: 200,
+        body: {
+          unsavedChanges: true,
+          unsavedCauses: { sceneDirty: false, dirtyAssetPaths: [], dirtyScenes: ['bbbbbbbb-0000-4000-8000-000000001420'] },
+        },
+      } : undefined);
+    const r = await surface.call('modoki_build', { platform: 'web' });
+    expect(refusedForSave(surface, r as never)).toBe(true);
+    const why = (JSON.parse(surface.text(r as never)) as { error?: { why?: string } }).error?.why ?? '';
+    expect(why).toMatch(/1 loaded base scene\(s\) with edits not yet saved \(guid\(s\): bbbbbbbb-0000-4000-8000-000000001420\) — usually an edit made to that base/);
+    expect(why).not.toMatch(/may have failed/);
+  });
+
   for (const [cause, wrongShape] of [
     ['dirtyAssetPaths', true],
     ['dirtyScenes', true],

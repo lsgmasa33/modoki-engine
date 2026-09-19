@@ -84,6 +84,7 @@ import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys
 import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, syncOutlineFor, disposeEdgeOutline, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID, exitPrefabEditing } from '../scene/prefabEdit';
+import { confirmDiscardUnsaved } from '../scene/unsavedGate';
 import { pushAction, subscribeUndo } from '../undo/undoManager';
 import { buildTransformUndoAction, buildGroupTransformUndoAction } from '../scene/gizmoUndo';
 import { applyGroupTransform3D, applyGroupTransform2D, filterOutDescendants, resolveGroupPivot2D, virtualDragDelta, groupMemberFields } from '../scene/multiTransform';
@@ -570,7 +571,11 @@ export default function SceneView() {
   // (`prefab` → 'edit-exit') and this breadcrumb button take the SAME path — the
   // return-scene reload is what re-expands every instance from the just-saved file,
   // and a second copy of it would be one to drift.
-  const exitPrefabEdit = useCallback(async () => { await exitPrefabEditing(); }, []);
+  // The button asks first (#1419): the return reload discards unsaved prefab-world edits.
+  const exitPrefabEdit = useCallback(async () => {
+    if (!(await confirmDiscardUnsaved('leave prefab edit', 'world-swap'))) return;
+    await exitPrefabEditing();
+  }, []);
   // ── 2D mode viewport zoom/pan ──
   const viewportRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef({ zoom: 1, panX: 0, panY: 0 });
