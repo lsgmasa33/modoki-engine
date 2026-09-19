@@ -1366,6 +1366,13 @@ export type SceneLoadOutcome = 'loaded' | 'superseded' | 'failed' | 'refused';
 let _lastLoadFailureMessage: string | null = null;
 export function getLastSceneLoadFailureMessage(): string | null { return _lastLoadFailureMessage; }
 
+/** The managers that failed to start during the last scene load this module ADOPTED, one line
+ *  each (`<manager>: <message>`). Empty for a clean load. The scene is still loaded: a failed
+ *  manager does not un-load it (#1425, `SceneLoadResult.startupErrors`). Read by the agent
+ *  `load-scene` op, so an agent learns it without scraping the console. */
+let _lastLoadStartupErrors: readonly string[] = [];
+export function getLastSceneLoadStartupErrors(): readonly string[] { return _lastLoadStartupErrors; }
+
 /** Load a scene from a JSON file. Delegates to SceneManager which handles the
  *  full async preload + atomic swap + refcount lifecycle. The editor wrapper
  *  layers on the editor-only concerns: tracking the current scene path and
@@ -1412,7 +1419,7 @@ export async function loadScene(
     // new one loads, so an edit made mid-load is discarded too. Nothing resets the dirty state until
     // `adoptReplacedWorld` below; the swap itself does not.
     const dirtBeforeLoad = readWorldDirt();
-    const { keptBaseGuids } = await sceneManager.loadScene(scenePath, {
+    const { keptBaseGuids, startupErrors = [] } = await sceneManager.loadScene(scenePath, {
       ...(gameId !== undefined ? { gameId } : {}),
       // Resources acquire in parallel; each completion (on a cold cache, a finished
       // bake) advances the bar. The SceneLoadModal only shows past a ~400ms delay.
@@ -1445,6 +1452,14 @@ export async function loadScene(
     // one undo replay it onto the fresh world. A kept base's dirty flag survives (#1417). Both
     // rules: `adoptReplacedWorld`.
     adoptReplacedWorld(scenePath, keptBaseGuids, dirtBeforeLoad);
+    _lastLoadStartupErrors = startupErrors.map(({ manager, error }) => `${manager}: ${(error as Error)?.message ?? String(error)}`);
+    if (_lastLoadStartupErrors.length) {
+      // The scene IS loaded, so this is not a failure toast; SceneManager already console.error'd each.
+      useEditorStore.getState().showToast(
+        `Scene loaded, but ${startupErrors.length} manager(s) failed to start: ${startupErrors.map((f) => f.manager).join(', ')} (see the console)`,
+        'warn',
+      );
+    }
     const worldEntityTotal = getAllEntities().length;
     // Editor Percept (V2): the human opened a scene — correlate later game/edit events to it.
     // `worldEntityTotal`, the editor state's name for the same count (§2, #1223 D3).

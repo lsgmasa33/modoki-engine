@@ -91,7 +91,7 @@ export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 export {
   saveScene, saveAll, serializeScene, loadScene, newScene, NewSceneRefusedError,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
-  getLastSceneLoadFailureMessage, type SceneLoadOutcome,
+  getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors, type SceneLoadOutcome,
 } from './scene/serialize';
 export { SCENE_EXT, correctedScenePath, isAcceptableScenePath } from './scene/sceneFileName';
 export {

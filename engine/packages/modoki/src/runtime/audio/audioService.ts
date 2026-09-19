@@ -188,6 +188,7 @@ interface Graph {
 let graph: Graph | null = null;
 const active = new Set<LiveHandle>();
 let muted = false; // persists across graph (re)creation
+const statechangeWired = new WeakSet<AudioContext>();
 
 function graphOrNull(): Graph | null {
   if (graph) return graph;
@@ -208,6 +209,20 @@ function graphOrNull(): Graph | null {
   graph.buses.music.gain.value = busVolumes.music;
   graph.buses.sfx.gain.value = busVolumes.sfx;
   graph.buses.ui.gain.value = busVolumes.ui;
+  // WebKit can bring an interrupted context back to `running` ON ITS OWN when the interruption
+  // ends — no gesture, no foreground event our re-arm sees — and a streamed bed the OS paused
+  // meanwhile stays paused through it (#1428). Re-kick on that edge. Optional-called: the
+  // headless fakes in the test suite are not EventTargets. Once per CONTEXT, not per graph:
+  // dispose() rebuilds the graph on the same shared context.
+  if (!statechangeWired.has(ctx)) {
+    statechangeWired.add(ctx);
+    ctx.addEventListener?.('statechange', () => {
+      // Never while hidden: a context that comes back to `running` in the background must not
+      // start a bed the OS paused there. The foreground re-arm covers the return.
+      const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      if (ctx.state === 'running' && !hidden) resumeActiveMedia();
+    });
+  }
   return graph;
 }
 
@@ -333,13 +348,34 @@ export function resume(): void {
   notifyListeners(gestureUnlockListeners, 'audioService:gestureUnlock', []); // a subsystem's retry must not break the unlock
   if (recording()) { log.push({ op: 'resume' }); return; }
   const g = graphOrNull();
-  if (g && g.ctx.state === 'suspended') {
+  // ⚠️ "Not running", NOT "=== 'suspended'" (#1428). WebKit has a fourth, non-standard state,
+  // `'interrupted'` — what backgrounding, screen lock, a call or Siri leave the context in on
+  // current iOS. The old equality skipped exactly that case, so every foreground re-arm and every
+  // tap was a no-op for it, and music stayed dead whenever WebKit did not happen to auto-resume
+  // the context itself (it does so inconsistently — WebKit bug 263627).
+  if (g && needsResume(g.ctx)) {
     // Retry buffer decodes ONLY after the context is running — iOS rejects
     // decodeAudioData while suspended (the scene-load decodes failed there).
-    g.ctx.resume().then(retryFailedAudioDecodes).catch(() => { /* ignore */ });
+    g.ctx.resume().then(() => {
+      retryFailedAudioDecodes();
+      // A stream re-kicked below, while the context was still interrupted, MAY be refused or
+      // re-paused by WebKit (modelled, not observed on a device); kick again once it is running.
+      resumeActiveMedia();
+    }).catch(() => { /* ignore — a later gesture retries */ });
   } else {
     retryFailedAudioDecodes();
   }
+  resumeActiveMedia();
+}
+
+/** Whether the context needs a `resume()` — anything but running or closed. Typed as a string
+ *  because `'interrupted'` is not in lib.dom's `AudioContextState`. */
+function needsResume(ctx: AudioContext): boolean {
+  const state: string = ctx.state;
+  return state !== 'running' && state !== 'closed';
+}
+
+function resumeActiveMedia(): void {
   for (const h of active) h.resumeMedia();
 }
 

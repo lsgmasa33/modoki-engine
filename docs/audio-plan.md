@@ -110,6 +110,23 @@ AudioListener trait ─┘        │
   stop it, foreground Court — audio returns with **no relaunch**. Re-test that way;
   no simulator or headless test reproduces an audio-session interruption, so this
   path's only real evidence is a phone.
+  ⚠️ **"Suspended" is not the only stopped state (#1428).** Current WebKit leaves a
+  backgrounded / locked / called context in a fourth, non-standard state,
+  `'interrupted'`, and `audioService.resume()` used to resume only `'suspended'` — so
+  on a new iOS the re-arm above fired and did nothing, and Weaveling's music stayed
+  dead after a background whenever WebKit did not auto-resume the context itself
+  (it does so inconsistently, WebKit bug 263627 — hence "not 100%"). The iPhone 8
+  verification above predates the state, which is why it passed. `resume()` now
+  resumes anything not `running`/`closed`, re-kicks paused streams once that resume
+  settles (in case a `play()` while still interrupted is refused — modelled, NOT observed
+  on a device), and re-kicks them on a `statechange` to `running` for a context WebKit
+  resumes by itself, never while the page is hidden. **Device-verified** (owner,
+  2026-09-19): the music now survives background/foreground in Weaveling. That confirms
+  the FIX, not which branch of it did the work — no `ctx.state` was logged, so whether
+  the context really read `'interrupted'` is still inferred. Video (`videoService.ts`) shares the
+  context but still retries only on a gesture — not swept here. Pinned by
+  `tests/framework/audioResumeInterrupted.test.ts`; re-test on a phone the same way
+  (background mid-bed, foreground, repeat several times) — no headless test can.
 - **Tests** — `tests/runtime/audioSystem.test.ts` (record mode: autoplay, cues,
   play-state gating, scene-swap teardown, Transform-less sources) + buffer-cache
   refcount tests.

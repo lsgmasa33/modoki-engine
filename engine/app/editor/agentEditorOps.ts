@@ -41,7 +41,7 @@ import {
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk,
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
-  getLastSceneLoadFailureMessage,
+  getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
   isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEditReport, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
@@ -2142,7 +2142,13 @@ export function registerEditorAgentOps(): void {
         ...readEditorState(),
       };
     }
-    return { ok: true, ...readEditorState() };
+    // #1425: the scene loaded, but a manager failed to start. Say so rather than a bare ok.
+    const startupErrors = getLastSceneLoadStartupErrors();
+    return {
+      ok: true,
+      ...(startupErrors.length ? { warnings: startupErrors.map((e) => `manager failed to start (the scene is still loaded): ${e}`) } : {}),
+      ...readEditorState(),
+    };
   });
   registerAgentOp('new-scene', async (params) => {
     const p = (params ?? {}) as { discardUnsaved?: boolean; force?: boolean };

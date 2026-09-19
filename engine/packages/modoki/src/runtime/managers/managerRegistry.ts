@@ -98,8 +98,8 @@ function activate(entry: Entry, scenePath: string): void | Promise<void> {
   const r = entry.def.init?.({ world: getCurrentWorld(), scenePath });
   if (r && typeof (r as Promise<unknown>).then === 'function') {
     // Track the in-flight init (errors swallowed here so the tracked promise
-    // never rejects; the raw `r` returned below still propagates to the caller,
-    // e.g. initSceneManagersFor, so a real init failure fails the scene load).
+    // never rejects). The raw `r` returned below still carries the failure to the caller,
+    // e.g. `initSceneManagersFor`, which REPORTS it rather than rejecting (#1425, `startManagers`).
     const tracked = Promise.resolve(r).then(() => {}, () => {}).finally(() => {
       if (entry.initPromise === tracked) entry.initPromise = null;
     });
@@ -263,16 +263,9 @@ export async function disposeActiveSceneManagers(ctx?: ManagerContext): Promise<
 /** Activate scene-scoped managers whose filter matches the new scene. Awaitable
  *  so SceneManager can let async init (e.g. entity spawning) finish before
  *  `loadScene` resolves. Sets the active scene path used by later registrations. */
-export async function initSceneManagersFor(scenePath: string): Promise<void> {
+export async function initSceneManagersFor(scenePath: string): Promise<ManagerStartupError[]> {
   activeScenePath = scenePath;
-  const pending: Promise<void>[] = [];
-  for (const entry of managers.values()) {
-    if (entry.scope !== 'scene' || entry.active) continue;
-    if (!sceneMatches(entry.def, scenePath)) continue;
-    const r = activate(entry, scenePath);
-    if (r) pending.push(r);
-  }
-  if (pending.length) await Promise.all(pending);
+  return startManagers((e) => e.scope === 'scene' && sceneMatches(e.def, scenePath), scenePath);
 }
 
 /** The active game id (null = no game). */
@@ -336,17 +329,48 @@ export async function disposeActiveGameManagers(ctx?: ManagerContext): Promise<v
  *  resolves. Idempotent for already-active managers. Pair with
  *  `disposeActiveGameManagers` when the game actually changes — this function
  *  only activates, it never disposes. */
-export async function initGameManagersFor(gameId: string | null, scenePath: string): Promise<void> {
+export async function initGameManagersFor(gameId: string | null, scenePath: string): Promise<ManagerStartupError[]> {
   activeGameId = gameId;
-  if (gameId === null) return;
+  if (gameId === null) return [];
+  return startManagers((e) => e.scope === 'game' && gameMatches(e.def, gameId), scenePath);
+}
+
+/** A manager whose `init()` threw or rejected while a scene or game was starting it. */
+export interface ManagerStartupError {
+  readonly manager: string;
+  readonly error: unknown;
+}
+
+/** Activate `entries` and wait for every async init, returning the failures instead of throwing
+ *  them (#1425).
+ *
+ *  ⚠️ **Both init functions run AFTER the world has been replaced** (SceneManager's post-swap tail,
+ *  `replaceWorldContent`, `unloadAll`), so a rejection here used to reach a caller whose world had
+ *  already changed and tell it the load FAILED. Every caller reads a rejection as "nothing was
+ *  replaced" and skipped the bookkeeping a replaced world is owed. The editor, for one, kept the OLD
+ *  scene path open over the NEW world, so Save All wrote the new scene into the old file. Same class
+ *  as #888 (a throw after the commit skipping the tail), and the same rule as the physics init: a
+ *  failed manager does not un-load a scene that is already loaded.
+ *
+ *  Each entry is isolated: a synchronous throw used to escape the loop and leave every manager after
+ *  it unactivated. A failed manager stays `active` (as a rejected async init always has), so a
+ *  later swap disposes it normally. */
+async function startManagers(wanted: (e: Entry) => boolean, scenePath: string): Promise<ManagerStartupError[]> {
+  const failures: ManagerStartupError[] = [];
   const pending: Promise<void>[] = [];
+  // The LIVE map, as the loops this replaced did: an entry an init unregisters mid-loop is skipped.
   for (const entry of managers.values()) {
-    if (entry.scope !== 'game' || entry.active) continue;
-    if (!gameMatches(entry.def, gameId)) continue;
-    const r = activate(entry, scenePath);
-    if (r) pending.push(r);
+    if (entry.active || !wanted(entry)) continue;
+    const manager = entry.def.name;
+    try {
+      const r = activate(entry, scenePath);
+      if (r) pending.push(Promise.resolve(r).then(() => {}, (error: unknown) => { failures.push({ manager, error }); }));
+    } catch (error) {
+      failures.push({ manager, error });
+    }
   }
   if (pending.length) await Promise.all(pending);
+  return failures;
 }
 
 /** Every in-flight manager `init()` promise across ALL scopes (app/game/scene),

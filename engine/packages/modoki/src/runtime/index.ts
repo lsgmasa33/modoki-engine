@@ -965,7 +965,7 @@ export {
   getRegisteredManagers,
   disposeActiveGameManagers, initGameManagersFor, getActiveGameId,
 } from './managers/managerRegistry';
-export type { ManagerDef, ManagerContext, ManagerScope } from './managers/managerRegistry';
+export type { ManagerDef, ManagerContext, ManagerScope, ManagerStartupError } from './managers/managerRegistry';
 export { timeManager, type TimeManager } from './managers/TimeManager';
 export { navigationManager, type NavigationManager } from './managers/NavigationManager';
 export { physics2DEvents, physics2DEventsManager } from './physics/Physics2DEvents';

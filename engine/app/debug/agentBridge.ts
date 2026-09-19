@@ -2446,12 +2446,13 @@ registerAgentOp('load-scene', async (params) => {
   }
   const before = sceneManager.getCurrent()?.path ?? null;
   const loading = sceneManager.loadScene(p.path);
+  let startupErrors: readonly { manager: string; error: unknown }[]; // assigned in the try; the catch always returns
   // SceneManager allocates THIS attempt's id into `nextLoad` synchronously, before loadScene's
   // first await (SceneManager.loadScene's step-2 `nextSceneId`/`nextLoad` allocation) — so reading it here, between the call and the await,
   // names OUR load specifically, not whichever load happens to win a later swap (#486 finding A).
   const myId = sceneManager.getNext()?.id ?? null;
   try {
-    await loading;
+    startupErrors = (await loading).startupErrors ?? [];
   } catch (e) {
     const cur = sceneManager.getCurrent();
     if (cur?.path === before) {
@@ -2470,7 +2471,12 @@ registerAgentOp('load-scene', async (params) => {
   if (myId !== null && cur !== null) {
     if (cur.id === myId) {
       // Our load won the swap — unchanged success reply.
-      return { ok: true, current: after, previous: before, worldEntityTotal: getAllEntities().length };
+      // #1425: a manager that failed to start is reported, not a failure; the scene IS loaded.
+      return {
+        ok: true, current: after, previous: before, worldEntityTotal: getAllEntities().length,
+        ...(startupErrors.length ? { warnings: startupErrors.map(({ manager, error }) =>
+          `manager "${manager}" failed to start (the scene is still loaded): ${(error as Error)?.message ?? String(error)}`) } : {}),
+      };
     }
     // ⚠️ `> myId`, NOT `!== myId`. Scene ids come from a monotonic `this.nextSceneId++`
     // (loadScene's `nextSceneId` bump), so only an id GREATER than ours is evidence that a LATER load won

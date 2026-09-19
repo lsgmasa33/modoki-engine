@@ -552,26 +552,20 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
   });
 
   it('#535: an unloadAll whose internals throw still leaves the teardown counter at zero', async () => {
-    const { sceneManager, managers } = await setup();
+    const { sceneManager, getCurrentWorld } = await setup();
 
     await sceneManager.loadScene('/sceneO.json', { preloaded: sceneOf('O') as never });
 
-    // Force unloadAll to throw partway through one of its five awaits. `dispose()`
-    // errors are swallowed by managerRegistry (see `deactivate` there), so that's
-    // not a real throw path — but `initSceneManagersFor('')`'s `Promise.all` awaits
-    // the RAW init promise (not the swallowed tracked one), and a manager with no
-    // `scenes` filter matches scenePath '' too, so it gets re-activated during
-    // unloadAll's tail-reset step and its rejecting init propagates out.
-    managers.registerManager({
-      name: 'mgrThrows',
-      init: () => Promise.reject(new Error('boom')),
-    });
+    // Force unloadAll to throw partway through its body. Neither a manager's `dispose()` nor
+    // (since #1425) its `init()` can: registry errors are reported, not thrown. So inject the
+    // throw into the engine's own world teardown, which unloadAll calls after its awaits.
+    const outgoing = getCurrentWorld();
+    const destroy = vi.spyOn(sceneManager as unknown as { destroyWorldWhenSafe: () => void }, 'destroyWorldWhenSafe')
+      .mockImplementationOnce(() => { throw new Error('boom'); });
 
     await expect(sceneManager.unloadAll()).rejects.toThrow('boom');
-    // Done its job — unregister before the next load, or its still-rejecting
-    // `init` (no `scenes` filter, matches any path) would fail loadScene(A) too,
-    // for reasons unrelated to what this test pins.
-    managers.unregisterManager('mgrThrows');
+    destroy.mockRestore();
+    (outgoing as { destroy?: () => void } | null)?.destroy?.(); // the throw replaced the free: do it here (koota cap)
 
     // Pins the try/finally: the counter must not stick at a nonzero value just
     // because unloadAll's body threw, or every loadScene() after this would reject
@@ -713,8 +707,10 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
   // still lists it. Needs a real acquired resource (not just entities) to make
   // that observable, so this test swaps in a scoped `global.fetch` for one
   // material fetch only, and restores it in `finally`.
-  it('#535 defect 1: a rejecting scene manager init does not strand the swapped-in scene\'s resources', async () => {
-    const { sceneManager, managers, getCurrentWorld } = await setup();
+  // #1425: a rejecting manager init no longer throws at all (it is reported, and the load resolves),
+  // so the post-swap throw is now injected into the engine's own tail. The guard pinned is the same.
+  it('#535 defect 1: a throw AFTER the swap does not strand the swapped-in scene\'s resources', async () => {
+    const { sceneManager, getCurrentWorld } = await setup();
     const { getResourceStats } = await import('../../src/runtime/loaders/meshTemplateCache');
     const manifest = await import('../../src/runtime/loaders/assetManifest');
 
@@ -744,15 +740,10 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
         resources: [{ type: 'material', path: MAT_A_GUID }],
       };
 
-      // Registered before A loads, scoped to 'A' — self-activates as part of A's
-      // own `initSceneManagersFor` call, AFTER A's atomic swap has already
-      // committed (`swapped = true`). Its rejecting init is what the `catch`
-      // block sees.
-      managers.registerManager({
-        name: 'mgrA',
-        scenes: ['A'],
-        init: () => Promise.reject(new Error('boom')),
-      });
+      // Thrown from the tail's world teardown, AFTER A's atomic swap has already committed
+      // (`swapped = true`). That throw is what the `catch` block sees.
+      vi.spyOn(sceneManager as unknown as { destroyWorldWhenSafe: () => void }, 'destroyWorldWhenSafe')
+        .mockImplementationOnce(() => { throw new Error('boom'); });
 
       await expect(
         sceneManager.loadScene('/sceneA.json', { preloaded: sceneA as never }),
@@ -764,13 +755,10 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
       expect(getResourceStats().materials[MAT_A_PATH]).toBe(1);
       expect(sceneManager.getCurrent()?.path).toBe('/sceneA.json');
       expect(getCurrentWorld()).not.toBe(worldO);
-      // Not manually destroyed: this is an ordinary successful swap (unlike the
-      // hang-based #535 tests above), so `loadScene`'s own tail already destroyed
-      // `worldO` synchronously in step 8, well before `mgrA`'s rejection below —
-      // no in-flight manager init existed yet to defer it behind.
+      (worldO as { destroy?: () => void }).destroy?.(); // the throw replaced the free: do it here (koota cap)
     } finally {
       global.fetch = realFetch;
-      managers.unregisterManager('mgrA');
+      vi.restoreAllMocks();
     }
   });
 });
@@ -914,5 +902,103 @@ describe('managerRegistry — register/unregister against an in-flight init (#51
     await new Promise((r) => setTimeout(r, 0));
 
     expect(dispose).toHaveBeenCalledTimes(1);
+  });
+});
+
+// #1425: a manager's init() runs in the POST-swap tail, after the world is replaced. It used to
+// reject the load there, and every caller reads a rejection as "nothing was replaced" (the editor
+// kept the OLD scene path open over the NEW world, so Save All wrote the new scene into the old
+// file). Now `loadScene` resolves exactly when the world was replaced, and reports the failure.
+describe('a manager that fails to start does not un-load a loaded scene (#1425)', () => {
+  it('an init that REJECTS: the load resolves on the new scene, names the manager, and still starts the others', async () => {
+    const { sceneManager, managers } = await setup();
+    const boom = new Error('init boom');
+    const others = vi.fn();
+    managers.registerManager({ name: 'rejects', scenes: ['sceneB'], init: () => Promise.reject(boom) });
+    managers.registerManager({ name: 'fine', scenes: ['sceneB'], init: others });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never });
+      const r = await sceneManager.loadScene('/sceneB.json', { preloaded: sceneOf('B') as never });
+      expect(sceneManager.getCurrent()?.path).toBe('/sceneB.json');
+      expect(r.startupErrors).toEqual([{ manager: 'rejects', error: boom }]);
+      expect(others).toHaveBeenCalledTimes(1);
+      expect(errSpy.mock.calls.some((c) => String(c[0]).includes('manager "rejects" failed to start for /sceneB.json'))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('an init that THROWS synchronously: same, and the managers after it in the registry still start', async () => {
+    const { sceneManager, managers } = await setup();
+    const boom = new Error('sync boom');
+    const after = vi.fn();
+    managers.registerManager({ name: 'throws', scenes: ['sceneB'], init: () => { throw boom; } });
+    managers.registerManager({ name: 'after', scenes: ['sceneB'], init: after });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never });
+      const r = await sceneManager.loadScene('/sceneB.json', { preloaded: sceneOf('B') as never });
+      expect(sceneManager.getCurrent()?.path).toBe('/sceneB.json');
+      expect(r.startupErrors).toEqual([{ manager: 'throws', error: boom }]);
+      expect(after).toHaveBeenCalledTimes(1);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('a GAME-scoped manager that fails to start is reported the same way, and the load resolves', async () => {
+    const { sceneManager, managers } = await setup();
+    const boom = new Error('game boom');
+    managers.registerManager({ name: 'gameBoom', scope: 'game', games: ['space'], init: () => Promise.reject(boom) });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const r = await sceneManager.loadScene('/Station.json', { preloaded: sceneOf('Station') as never, gameId: 'space' });
+      expect(sceneManager.getCurrent()?.path).toBe('/Station.json');
+      expect(r.startupErrors).toEqual([{ manager: 'gameBoom', error: boom }]);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('unloadAll: a filter-less manager failing its spurious \'\' activation is REPORTED, and the unload completes', async () => {
+    // unloadAll's reset step re-activates a manager with no `scenes` filter against '' (see there).
+    // Its failure used to reject the unload; now it is logged and the teardown finishes.
+    const { sceneManager, managers } = await setup();
+    await sceneManager.loadScene('/sceneO.json', { preloaded: sceneOf('O') as never });
+    managers.registerManager({ name: 'anyScene', init: () => Promise.reject(new Error('boom')) });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(sceneManager.unloadAll()).resolves.toBeUndefined();
+      expect(sceneManager.getCurrent()).toBeNull();
+      expect(errSpy.mock.calls.some((c) => String(c[0]).includes('manager "anyScene" failed to start:'))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+      managers.unregisterManager('anyScene');
+    }
+  });
+
+  it('replaceWorldContent (Create Scene): the same spurious \'\' activation failing is REPORTED, and the replace completes', async () => {
+    const { sceneManager, managers } = await setup();
+    await sceneManager.loadScene('/sceneO.json', { preloaded: sceneOf('O') as never });
+    managers.registerManager({ name: 'anyScene', init: () => Promise.reject(new Error('boom')) });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const populate = vi.fn();
+      await expect(sceneManager.replaceWorldContent(populate)).resolves.toBeUndefined();
+      expect(populate).toHaveBeenCalledOnce();
+      expect(errSpy.mock.calls.some((c) => String(c[0]).includes('manager "anyScene" failed to start:'))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+      managers.unregisterManager('anyScene');
+    }
+  });
+
+  it('a clean load reports no startup errors, and a failure BEFORE the swap still rejects with the old scene current', async () => {
+    const { sceneManager } = await setup();
+    const r = await sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never });
+    expect(r).not.toHaveProperty('startupErrors'); // absent means none: a clean result keeps its old shape
+    await expect(sceneManager.loadScene('/missing-1425.json')).rejects.toBeTruthy();
+    expect(sceneManager.getCurrent()?.path).toBe('/sceneA.json');
   });
 });

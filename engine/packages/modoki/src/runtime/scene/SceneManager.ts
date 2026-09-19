@@ -136,7 +136,7 @@ import {
 import { classifyFormatVersion } from '../core/formatVersion';
 import {
   disposeActiveSceneManagers, initSceneManagersFor,
-  disposeActiveGameManagers, initGameManagersFor, getActiveGameId,
+  disposeActiveGameManagers, initGameManagersFor, getActiveGameId, type ManagerStartupError,
   pendingManagerInits,
 } from '../managers/managerRegistry';
 
@@ -186,6 +186,11 @@ export interface SceneLoadResult {
    *  `forceReloadBases` never is. The editor clears dirty flags and
    *  decides the undo drop from this, since nothing in the world records it. */
   readonly keptBaseGuids: ReadonlySet<string>;
+  /** Managers whose `init()` threw or rejected while this load started them (#1425). The load
+   *  still RESOLVED, because it had already replaced the world: `loadScene` resolves exactly when
+   *  the world was replaced, and every caller's post-load bookkeeping depends on that. Each one is
+   *  also reported through `console.error`. Absent means none (a stub may omit it). */
+  readonly startupErrors?: readonly ManagerStartupError[];
 }
 
 export interface LoadOptions {
@@ -511,6 +516,8 @@ class SceneManagerImpl implements SceneManager {
     // before "12. Done" is what turns it into a rejection instead of a silent
     // resolve.
     let postSwapSuperseded = false;
+    // Managers that failed to start in the post-swap tail (#1425) — reported, never thrown.
+    const startupErrors: ManagerStartupError[] = [];
 
     try {
       // 3. Fetch + parse the PRIMARY's scene JSON (or use caller-supplied preloaded data)
@@ -1236,13 +1243,13 @@ class SceneManagerImpl implements SceneManager {
         // an in-game swap keeps them running), then the new scene's scene-scoped
         // managers. Awaited so async init (e.g. entity spawning) completes before
         // loadScene resolves.
-        if (gameChanged) await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path));
+        if (gameChanged) startupErrors.push(...await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path)));
         if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
         // Re-check `postSwapSuperseded` here too (#542) — a teardown can start and
         // flip it to true during the `initGameManagersFor` await just above,
         // between the outer guard's check and this one.
         if (!postSwapSuperseded && this.primaryId === id) {
-          await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path);
+          startupErrors.push(...await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path));
           if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
         }
       }
@@ -1254,7 +1261,10 @@ class SceneManagerImpl implements SceneManager {
       if (postSwapSuperseded) {
         throw new DOMException('Aborted', 'AbortError');
       }
-      return { keptBaseGuids };
+      reportStartupErrors(path, startupErrors);
+      // Only when there are some: "absent means none" (SceneLoadResult), which keeps the clean
+      // result the exact shape it always was.
+      return startupErrors.length ? { keptBaseGuids, startupErrors } : { keptBaseGuids };
     } catch (err) {
       // Failure or abort — clean up every sceneId allocated THIS attempt (the
       // primary plus any base newly entering the chain). Skip once the swap has
@@ -1513,7 +1523,7 @@ class SceneManagerImpl implements SceneManager {
       // a filter-less manager's `init()` would spawn its entities straight into the brand-new
       // scene the user is about to see, and the dispose below — holding `oldWorld` — could not
       // see them to clean up. Hence the second dispose, on the same world as the activation.
-      await initSceneManagersFor('');
+      reportStartupErrors('', await initSceneManagersFor(''));
       await disposeActiveSceneManagers({ world: oldWorld, scenePath: '' });
 
       // Rebuild bookkeeping BEFORE `setCurrentWorld` — it fires `onWorldSwap` synchronously and
@@ -1662,7 +1672,7 @@ class SceneManagerImpl implements SceneManager {
       // (matches any path), so dispose scene managers once more afterward to leave
       // everything inactive.
       await initGameManagersFor(null, '');
-      await initSceneManagersFor('');
+      reportStartupErrors('', await initSceneManagersFor(''));
       await disposeActiveSceneManagers({ world: oldWorld, scenePath: '' });
 
       // Release every loaded scene (today, a chain of one — Phase 5 is what makes
@@ -2161,6 +2171,14 @@ async function acquireResourceInner(sceneId: SceneId, ref: SceneResourceRef): Pr
       return acquireAudio(sceneId, ref.path, getAudioLoadType(ref.path));
     default:
       console.warn(`[SceneManager] Unknown resource type: ${(ref as { type: string }).type}`);
+  }
+}
+
+/** Report managers that failed to start (#1425). They do not reject the load — see
+ *  `SceneLoadResult.startupErrors` — so this line is what makes each one visible. */
+function reportStartupErrors(scenePath: string, errors: readonly ManagerStartupError[]): void {
+  for (const { manager, error } of errors) {
+    console.error(`[SceneManager] manager "${manager}" failed to start${scenePath ? ` for ${scenePath}` : ''}:`, error);
   }
 }
 

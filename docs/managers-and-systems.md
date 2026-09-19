@@ -211,6 +211,40 @@ setCurrentWorld(new)
 App-scoped managers are untouched by swaps — they init/dispose only at
 `registerManager`/`unregisterManager`.
 
+**A manager that fails to start does not un-load the scene (#1425).** Both inits run AFTER
+`setCurrentWorld`, so the scene is already loaded when an `init()` throws or rejects. The failure is
+reported rather than thrown:
+- `loadScene` resolves with `startupErrors: [{ manager, error }]`, and each failure is logged with
+  `console.error`.
+- The other matching managers still start. A synchronous throw used to skip every manager after it.
+- The editor shows a warn toast, and both agent `load-scene` ops return the failure as `warnings`.
+
+So **a caller can treat a rejection from `loadScene` as "not replaced"**, with one exception.
+It rejects when:
+- a failure happens before the swap;
+- a teardown wiped the swapped-in world (`AbortError`, #535).
+
+The exception is an engine-internal error in the post-swap tail. That is an engine defect, and the
+world WAS replaced (#535 defect 1 pins that the live scene keeps its resources then). A manager
+failure is never one of these.
+
+This covers the inits a load starts. `registerManager`'s immediate activation (a manager registered
+while its scene is already active) is not a load, and its failure still reaches the registrant.
+On a device, `console.error` is not silent: `globalErrors.ts` files it as a non-fatal Crashlytics
+issue. The game shell has no on-screen signal for it, deliberately (owner, 2026-09-19): the game
+stays playable with one feature missing, and Crashlytics is where a failed manager is found.
+
+Before this, a failed `init()` rejected the load over a world that had already changed. Every
+caller skipped the bookkeeping a replaced world is owed:
+- the editor kept the OLD scene path open over the new world, so Save All wrote the new scene into
+  the old file;
+- a hot reload never adopted;
+- the game shell stopped booting over a loaded scene.
+
+Same class as #888, and the same rule `SceneManager` applies to a physics init that fails. A failed
+manager stays `active`, so the next swap disposes it normally. The collection lives in
+`managerRegistry.ts` (`startManagers`).
+
 **App-scoped managers are never unregistered in production, and that is by design (#534).**
 
 There is no `teardownAll()`. One was built — the exact inverse of `registerAll()`, dropping all

@@ -12,13 +12,16 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld } from 'koota';
 
 /** Runs INSIDE the faked load's await — where a human or agent edit can still land (review F1). */
-const h = vi.hoisted(() => ({ duringLoad: null as null | (() => void), kept: new Set<string>() }));
+const h = vi.hoisted(() => ({
+  duringLoad: null as null | (() => void), kept: new Set<string>(),
+  startupErrors: [] as { manager: string; error: unknown }[],
+}));
 
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     // Which bases the load KEPT (#1417): SceneManager's own answer, pinned against the real
     // SceneManager in sceneManagerBaseSceneChain.test.ts's A7 cases.
-    loadScene: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); return { keptBaseGuids: h.kept }; },
+    loadScene: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); return { keptBaseGuids: h.kept, startupErrors: h.startupErrors }; },
     replaceWorldContent: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); },
     getCurrentBaseScene: () => undefined,
     getCurrent: () => null, // not a prefab-edit world, so Create Scene is allowed
@@ -30,7 +33,10 @@ import { setRunMode } from '../../src/runtime/core/playState';
 import {
   pushAction, canUndo, canRedo, undo, undoLabel, _resetHistoryContexts,
 } from '../../src/editor/undo/undoManager';
-import { loadScene, newScene, markSceneSaved, hasUnsavedChanges } from '../../src/editor/scene/serialize';
+import {
+  loadScene, newScene, markSceneSaved, hasUnsavedChanges, getCurrentScenePath, getLastSceneLoadStartupErrors,
+} from '../../src/editor/scene/serialize';
+import { useEditorStore } from '../../src/editor/store/editorStore';
 import { markSceneDirty, isSceneDirty, clearAllSceneDirty, clearSceneDirty } from '../../src/editor/scene/sceneDirty';
 
 if (typeof globalThis.localStorage === 'undefined') {
@@ -52,11 +58,16 @@ const edit = (label: string) => pushAction({ label, undo: noop, redo: noop });
 const A = '/assets/scenes/a.scene.json';
 const B = '/assets/scenes/b.scene.json';
 
+// koota caps live worlds at 16 per process: free each test's world before making the next.
+let world: ReturnType<typeof createWorld> | null = null;
 beforeEach(async () => {
   setRunMode('stopped');
-  setCurrentWorld(createWorld());
+  world?.destroy();
+  world = createWorld();
+  setCurrentWorld(world);
   _resetHistoryContexts();
   h.kept = new Set();
+  h.startupErrors = [];
   clearAllSceneDirty();
   await loadScene(A); // bind the history to A, with a clean baseline
 });
@@ -201,5 +212,31 @@ describe('a load that KEEPS a dirty base keeps its dirty flag (#1417)', () => {
     await loadScene(B);
     await loadScene(A);
     expect(canUndo()).toBe(false);
+  });
+});
+
+// #1425: SceneManager used to REJECT when a manager's init() failed after the swap, and this load's
+// failure branch then skipped all of the adopt below while the world was already the new scene: the
+// editor kept the OLD path open, so Save All wrote the new scene into the old file. SceneManager now
+// resolves with `startupErrors` (pinned against the real one in sceneManagerLifecycle.test.ts); this
+// pins that the editor adopts that world like any other and says what failed.
+describe('a load whose managers failed to start is still ADOPTED (#1425)', () => {
+  it('opens the new path, drops the discarded work, and reports the failed manager', async () => {
+    edit('Delete Entity');
+    h.startupErrors = [{ manager: 'boomManager', error: new Error('init boom') }];
+    expect(await loadScene(B)).toBe('loaded');
+    expect(getCurrentScenePath()).toBe(B);
+    expect(canUndo()).toBe(false);
+    expect(hasUnsavedChanges()).toBe(false);
+    expect(getLastSceneLoadStartupErrors()).toEqual(['boomManager: init boom']);
+    expect(useEditorStore.getState().toast).toMatchObject({ kind: 'warn', message: expect.stringContaining('boomManager') });
+  });
+
+  it('a clean load after it clears the report', async () => {
+    h.startupErrors = [{ manager: 'boomManager', error: new Error('init boom') }];
+    await loadScene(B);
+    h.startupErrors = [];
+    await loadScene(A);
+    expect(getLastSceneLoadStartupErrors()).toEqual([]);
   });
 });

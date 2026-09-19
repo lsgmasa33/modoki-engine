@@ -381,6 +381,30 @@ describe('load-scene (runtime twin)', () => {
     }
   });
 
+  // ── #1425 — a manager that failed to start is reported, not a failure: the scene IS loaded. ──
+
+  for (const [label, startupErrors, expected] of [
+    ['names the manager in `warnings`', [{ manager: 'boomManager', error: new Error('init boom') }],
+      ['manager "boomManager" failed to start (the scene is still loaded): init boom']],
+    ['a clean load carries no `warnings` key', [], undefined],
+  ] as const) {
+    it(`a load that swapped in: ok:true, and ${label}`, async () => {
+      game = createTestWorld({});
+      const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>(), startupErrors: [...startupErrors] });
+      const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 5, path: '/requested.scene.json', state: 'loading' } as never);
+      const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 5, path: '/requested.scene.json', state: 'active' } as never);
+      try {
+        const r = await runAgentOp('load-scene', { path: '/requested.scene.json' }) as { ok?: boolean; warnings?: string[] };
+        expect(r.ok).toBe(true);
+        expect(r.warnings).toEqual(expected);
+      } finally {
+        loadSpy.mockRestore();
+        nextSpy.mockRestore();
+        curSpy.mockRestore();
+      }
+    });
+  }
+
   // ── #486 finding A — a superseded load must not blame the requested path. ──
 
   it('superseded by a load of a DIFFERENT scene — ok:false, names the active scene, never blames the path', async () => {
