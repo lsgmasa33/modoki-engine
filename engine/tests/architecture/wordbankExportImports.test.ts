@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { hasInternalGames } from '../helpers/repoLayout';
+import { toPosix } from '../../scripts/pathPosix.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
 const EXPORTER = path.join(REPO, 'wordbank/export.mjs');
@@ -32,14 +33,17 @@ describe.skipIf(!hasInternalGames())('wordbank/export.mjs can still link against
   const imports = hasInternalGames() ? gameImports() : [];
 
   it('finds the game imports (the parse is not vacuous)', () => {
-    expect(imports.map((i) => path.relative(REPO, i.file)).sort()).toEqual([
+    // `toPosix` is load-bearing, not cosmetic: `path.relative` is backslash-separated on win32,
+    // and this clone is the ONLY place this body runs — the public snapshot ships neither
+    // wordbank/ nor games/wordweave, so the describe skips there and ci/main stayed green. #1435.
+    expect(imports.map((i) => toPosix(path.relative(REPO, i.file))).sort()).toEqual([
       'games/wordweave/runtime/lemmaTable.ts',
       'games/wordweave/runtime/rarity.ts',
     ]);
   });
 
   for (const { names, file } of imports) {
-    const rel = path.relative(REPO, file);
+    const rel = toPosix(path.relative(REPO, file));
 
     it(`${rel} still exports ${names.join(', ')}`, async () => {
       const mod = (await import(file)) as Record<string, unknown>;

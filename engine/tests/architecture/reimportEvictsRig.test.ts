@@ -130,7 +130,11 @@ describe('a re-import evicts the rigged prototype at every entry point (#1366)',
   it('every hand-composed half-reference is either an owner or an offender', () => {
     const population: Array<{ item: string; site: string }> = [];
     for (const f of files) {
-      const rel = f.rel ?? path.relative(process.cwd(), f.abs);
+      // `repoFiles` always sets `rel` (typed non-optional), and it is git's own repo-relative
+      // POSIX path. The `?? path.relative(process.cwd(), …)` fallback this replaced was dead, and
+      // wrong on two axes if it had ever fired: backslashed on win32, and cwd-relative rather
+      // than repo-relative, so every OWNERS row below would have missed. #1435.
+      const rel = f.rel;
       const sf = parseSource(readScannedSource(f.abs).code, path.basename(f.abs));
       for (const name of halfRefs(sf)) population.push({ item: `${rel}::${name}`, site: `${rel}: ${name}` });
     }

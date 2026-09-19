@@ -883,10 +883,12 @@ conversion never engaged".
       discriminate. The rule chosen instead (owner, 2026-09-07) makes the class **loud, not
       absent** — it can still be written; it can no longer pass green having matched nothing. The
       alternative considered and declined was making `rel` hard to drop at the `repoFiles` API,
-      which prevents it at authoring time on any platform but costs a 32-site migration; it stays
-      on the table if a tenth instance lands. Detection is not left to a human: a push to `main`
-      auto-runs the free public CI, whose `windows-latest` leg is where a vacuous guard goes red,
-      so it surfaces within one merge cycle.
+      which prevents it at authoring time on any platform but costs a 32-site migration;
+      ~~it stays on the table if a tenth instance lands~~ — **the tenth landed and did NOT come
+      through this shape (#1435, § Instance 10 below); left declined.** ~~Detection is not left to a
+      human: a push to `main` auto-runs the free public CI, whose `windows-latest` leg is where a
+      vacuous guard goes red, so it surfaces within one merge cycle.~~ — **false for a private-only
+      test; corrected under § Instance 10 below (#1435).**
       **The underlying fix remains to thread `{ rel, abs }` through and compare on `rel`**, as
       `abandonmentIsShared.test.ts` and (since #847) `livenessTokenIsShared.test.ts` do.
       ⚠️ **Re-deriving the census: append `-- ":!*.md"` to both queries.** Run verbatim they also
@@ -947,6 +949,77 @@ conversion never engaged".
       that gap. It did not** — instance 9 landed inside the region the bullet above called covered,
       and this one sent the #849 reader looking in a gap that no longer exists.
 
+  - ⚠️ **Instance 10 landed 2026-09-19 (#1435), and it came through NEITHER shape above** —
+    `wordbankExportImports.test.ts` compared `path.relative(REPO, file)` against
+    `'games/wordweave/runtime/rarity.ts'`. It never called `repoFiles()` at all: it regex-scraped
+    `../games/...` specifiers out of `wordbank/export.mjs` and resolved them with `path.resolve`. So
+    it did not discard a `rel` (limit 1) and it did not re-derive an `abs` (#849's other half) —
+    it is a **third leak shape: a path built from a SPECIFIER STRING, then compared as a repo-rel
+    path.** Both existing guards were out of scope by construction: `corpusProducerIsShared` asks
+    "do you use the shared producer", `corpusConsumerPins` asks "what did you do with its output",
+    and the answer here is that the producer was never in the picture.
+    ⚠️ **Which means the declined 32-site `repoFiles` API migration would NOT have prevented it,**
+    so "it stays on the table if a tenth instance lands" — in the instance-9 bullet above, under
+    "What this deliberately does NOT do is detect the defect" — does not cash out the way that
+    sentence expects: the tenth landed outside the region that migration covers. Left declined, and
+    struck in place there.
+  - ⚠️ **And "it surfaces within one merge cycle" is FALSE for a private-only test — corrected here**
+    (#1435). That claim rests on the free public CI's `windows-latest` leg, and the mirror's
+    `ci/main` run for `9291aeb0c` was **green on all three OS legs** with this defect in the tree.
+    The snapshot ships neither `wordbank/` nor `games/wordweave`, so the `describe.skipIf(
+    !hasInternalGames())` skips the whole body there. The public leg gates the engine, not
+    `games/**` or `wordbank/` — exactly the gap CLAUDE.md § Build names as ungated — so for a
+    private-only suite the only detector is a **private Windows clone running `verify`**, which is
+    how this one was found (merging `origin/main` into `win`, five days of drift).
+  - ✅ **Now GUARDED on the COMPARISON rather than the producer — `posixLiteralComparison.test.ts`**
+    (#1435, `win`). It flags a `node:path` producer (`relative`/`join`/`resolve`/`normalize`/
+    `dirname`) whose value reaches a forward-slash string literal through an equality or membership
+    test, across `engine/tests`, the package tests and every project's `tests/`. Keying on the
+    comparison is what lets it see all three leak shapes at once, including one where no shared
+    producer is involved. Current population: **0**; `floor` is on `scanned` (the number of path
+    calls examined), not on the offenders, because the goal state is an empty population.
+    ⚠️ **Its reach is ONE EXPRESSION, and "Now GUARDED" must be read against that** — the walk climbs
+    from the producer call to the comparison and stops at the enclosing statement, so
+    `expect(path.relative(REPO, f)).toBe('games/x/y.ts')` is flagged while
+    `const rel = path.relative(REPO, f); expect(rel).toBe('games/x/y.ts')` is **invisible**. Measured
+    on the shipped scan: **1,795 of 4,501 scanned producer calls (~40%) bail at a statement boundary**,
+    overwhelmingly that binding shape — which is instance 10's own defect one refactor away. Zero live
+    instances today; following the value would mean dataflow along the binding (`boundIdentifier` +
+    `readsOf` exist for it) and is a deliberate follow-up. So the honest claim is **loud on the
+    single-expression shape**, not "this class can no longer be written" — the guard's own docblock
+    enumerates the other out-of-reach spellings (`.not.toBe`, a const-referenced literal,
+    `String.raw`, a regex literal, a nested array), each currently zero.
+    ⚠️ **One arm of it shipped DEAD, and only a per-shape test caught it.** The
+    `.endsWith()`/`.startsWith()`/`.includes()` branch asked for
+    `isCallExpression(parent) && parent.expression.expression === node`, which is unsatisfiable for
+    every well-formed AST: if a node is the object of a property access then its parent IS that
+    property access, never the call around it. The corpus scan could not catch it — its healthy state
+    is an empty population, so every arm can break with the assertion still green — and the one
+    mutation run against the guard exercised the `expect()` arm only. The fix carries a
+    synthetic-source case per shape, accept and reject, because **the mutation bar is one per SHAPE,
+    not one per guard.**
+    ⚠️ **What made it adoptable was sizing the detector so the population is 0 rather than 62** —
+    #799 asked for this rule in 2026-09-06 and it was not written, because the naive shape flags
+    every benign site. Three exclusions, each measured rather than assumed:
+    - **A path interpolated into a MESSAGE is not an offender.** Only comparison operands are
+      examined, so a template literal and `expect`'s second argument are excluded structurally, not
+      by a ledger row each. That is ~20 sites (`reapScoping`, `mcpBundle`, `docCitations` and
+      friends): a backslash there reads oddly on one platform and changes no verdict.
+    - **A symmetric comparison is not an offender** — `toContain(path.join('android', 'app'))` is
+      separator-native on both sides.
+    - **A path handed to ANOTHER function as an argument is not the compared value.** The first cut
+      flagged twelve of these and all twelve were read and confirmed benign: `absToAssetUrl`,
+      `relativiseUnderProject` and `fs.readFileSync` consume the native path and what the literal
+      describes is their POSIX-producing return (one literal was a `#!/bin/sh` shebang — file
+      content, not a path). A `.map`/`.flatMap` callback, by contrast, IS value-preserving, and
+      that is the shape instance 10 wore — excluding it would have made the guard miss the very
+      defect it was written for. Confirmed by mutation: with the fix reverted, the guard names
+      `wordbankExportImports.test.ts`'s assertion as the offender.
+  - **The latent site went with it.** `reimportEvictsRig.test.ts` carried
+    `f.rel ?? path.relative(process.cwd(), f.abs)`; `repoFiles` types `rel` non-optional so it never
+    fired, but it was wrong on two axes if it ever had — backslashed on win32 **and** cwd-relative
+    rather than repo-relative, so every forward-slash `OWNERS` row would have missed at once. Dropped
+    rather than normalised: the fallback had no reachable caller to serve.
 - **A path-valued field on a PERSISTED record is normalised by the module that owns the record, on
   READ as well as on write — never by each caller** (#849). `deviceClaimsStore.mjs` does this
   (`foreignClaimFor`, `ownAdbClaim`: `path.resolve(held.clone) === clone`); `buildClaimsStore.mjs`
