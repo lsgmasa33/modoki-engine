@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { pinEntityAt } from '../../runtime/core/ecs/entityPin';
+import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
 
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
@@ -2110,8 +2111,8 @@ export default function Inspector() {
       <div style={{ flex: 1, overflow: 'auto', ...(ghosted && !unlocked ? { pointerEvents: 'none', opacity: 0.5 } : {}) }}>
         {components.map(({ meta, data, mixed }) => {
           if (!data) return null;
-          // Don't allow removing core traits
-          const isCore = ['Transform', 'EntityAttributes'].includes(meta.name);
+          // No remove button for a core trait or the prefab link (#1454: Detach Prefab cuts that)
+          const isCore = traitRemoveRefusal(meta.name) !== null;
           // Copy reads the FIRST selected entity's live values (see copyLabel);
           // Paste writes every selected entity that carries the trait.
           const menuItems: ContextMenuItem[] | undefined = isTraitCopyable(meta) ? [
@@ -2155,7 +2156,7 @@ export default function Inspector() {
         {/* Add Component picker */}
         <AddComponentPicker
           addable={getAllTraits().filter(t =>
-            t.category === 'component' && !new Set(traits.map(x => x.meta.name)).has(t.name)
+            t.category === 'component' && !traitWriteRefusal(t.name) && !new Set(traits.map(x => x.meta.name)).has(t.name)
           )}
           selectedIds={selectedIds}
           clipboard={clipboard}

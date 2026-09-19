@@ -24,6 +24,7 @@ import {
   writeTraitField,
   findEntity,
   reparentRefusal,
+  traitWriteRefusal,
 } from '@modoki/engine/runtime';
 import { resolveEntityAddress } from './entityRef';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
@@ -148,6 +149,8 @@ function parseWrites(
     const traitName = dot === -1 ? key : key.slice(0, dot);
     const field = dot === -1 ? null : key.slice(dot + 1);
     const meta = metaByName.get(traitName);
+    const refused = traitWriteRefusal(traitName); // #1454
+    if (refused) return { ok: false, error: `set key "${key}": ${refused} — nothing was applied.` };
     if (!meta) {
       return {
         ok: false,

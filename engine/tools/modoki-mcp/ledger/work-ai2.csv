@@ -114,3 +114,4 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-15,work-ai2,modoki_prefab,255,4795,163342,a1520df24
 2026-09-19,work-ai2,modoki_prefab,93,5036,175294,da8379f83
 2026-09-19,work-ai2,modoki_reparent_entity,456,1233,175750,a05fef3ef
+2026-09-19,work-ai2,modoki_mutate_scene,59,2775,175801,94ab9ad5a

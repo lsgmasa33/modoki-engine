@@ -720,15 +720,43 @@ move was refused and it reloaded at its row. The drain mixes the prefab's own mo
 the same shape can be split across the two: Button's move is the prefab's and Panel's is the instance's. The
 wait covers that case as well.
 
-**Deleting a moved member's owner promotes or unlinks it, never re-homes it past the owner (#1451).** A delete
+**Ending a moved member's frame promotes or unlinks it, never re-homes it past the owner (#1451, #1453).** A delete
 re-points a surviving member whose home goes to that home's own identity parent (`rehomeDependents`). That walk
 stops at any instance ROOT, stored or owned: a home is a member of the dependent's own frame, so a root home is
 the frame's root, and the frame dies with it. `detachOrphanedMembers` then promotes an owned nested root to a
 stored one, renaming its members to the guids a reload derives (the #1447 contract), and unlinks anything else.
 It promotes when the root's OWNER dies, meaning the frame of its identity parent, and not only when its home dies. A
 nested root that rode out inside a moved member of its owner has no home, and keying on the home left it linked to
-a dead frame; its members then re-derived new guids on reload and a ref to one dangled. Detach Prefab and
-unpack strip a frame without this step, so a member moved out of the stripped subtree is still lost there (#1453).
+a dead frame; its members then re-derived new guids on reload and a ref to one dangled.
+
+A frame also ends WITHOUT a delete, when a Detach Prefab or an unpack-on-leave strips `PrefabInstance` off it, and
+the same two steps apply. Every frame-ending path calls them together as **`endFrames(gone)`** (`memberHome.ts`),
+before the strip, because the owner walk reads the links being stripped. The callers are `deleteEntities`,
+`detachPrefabInstance` and `reparentEntity`'s `applyDetach`. Detach and unpack used to run only
+`rehomeDependents`, so a member moved OUT of the detached subtree kept its link to a frame that no longer
+existed. The save wrote it nowhere, and it vanished on reload (#1453). There were two shapes. One was a nested
+root moved beside its detached owner, left owned by a plain entity. The other was a plain member moved beside it,
+left linked to a plain root. Now Detach Prefab turns the first into a standalone instance, which is the #1447 rule,
+and unlinks the second where it stands. The unpack-on-leave runs `endFrames` too, so that every frame-ending
+path has one shape. Before #1450, `planLeaveInstance` could strip an owned ROOT while a member of it stayed linked.
+Since #1450, `planMoveUnlinks` sends every root to `promote`, never `strip`, so that orphan step currently has
+nothing to catch there. `detachPrefabInstance` returns `{ links, orphans }`, and `reattachPrefabInstance` relinks the orphans
+(`relinkDetachedMembers`) before it re-adds the links, because a promotion's member rename has to be reversed
+before any guid ref resolves. A redo re-detaches, and that is deterministic (the same promotions and the same
+renames), so the first snapshot still undoes it.
+
+**No generic trait edit touches `PrefabInstance` (#1454, owner chose to refuse).** It is a prefab LINK, not a
+component. It is made by instantiating a prefab and cut only by Detach Prefab, which ends the frame as above. The
+Inspector used to offer it a remove button, and the agent's `mutate_scene removeTrait` accepted it. Both cut the
+link without `endFrames`, so the members moved out of the instance vanished on reload. Removing it from one
+member also left that member's row expanding beside it on reload. So one policy, `traitEditPolicy.ts`
+(`traitRemoveRefusal` / `traitWriteRefusal`), now refuses to add, remove or write it on every generic path, and
+names Detach Prefab in the refusal. It also holds the core traits that can never be removed (Transform,
+EntityAttributes). The paths are: the Inspector remove button, the Add Component picker,
+`add`/`removeTraitFromEntitiesWithUndo` (the seam every editor caller goes through), the agent live
+`apply-scene-ops`, the file-direct `sceneMutate`, and the device `set-traits`. A per-member "unlink" command was
+considered and declined; dragging a member out of its instance already unpacks it (#1447). Not covered:
+`applyStructureCore`'s `removedTraits` at load, which the capture side never writes for `PrefabInstance`.
 Before the fix, the walk stepped through an OWNED root. A nested root moved beside its owner (Mid's `InnerRoot`
 under Panel), with the owner then deleted, was re-pointed into the grandparent frame. That frame records no move
 for it, and the one that did died with the owner, so the save wrote only `removed` and the nested root and its

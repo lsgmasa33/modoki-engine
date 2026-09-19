@@ -131,7 +131,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
         'ACTIVE scene — omit it unless you mean a scene that is not the open one.'),
       ops: z.array(mutateOpSchema).describe(
         'Ops. setTrait: {"op":"setTrait","entity":{"name":"Title"},"trait":"UIElement","fields":{"fontSize":56}}. ' +
-        'removeTrait (remove a component; core Transform/EntityAttributes refused): {"op":"removeTrait","entity":{"id":7},"trait":"Light"}. ' +
+        'removeTrait (remove a component; core Transform/EntityAttributes refused, and PrefabInstance on every op — use modoki_prefab detach): {"op":"removeTrait","entity":{"id":7},"trait":"Light"}. ' +
         'addEntity: {"op":"addEntity","name":"Box","parentId":0,"traits":{"Transform":{...},"EntityAttributes":{"layer":"3d"}}}. ' +
         'removeEntity: {"op":"removeEntity","entity":{"id":11}}. ' +
         'setBaseScene (base-scene persistence — scene-level, no entity ref; guid of a base scene to load additively, or null to clear): ' +

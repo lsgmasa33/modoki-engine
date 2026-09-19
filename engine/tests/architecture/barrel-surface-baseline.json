@@ -1139,6 +1139,8 @@
   "timelineSystem",
   "touchControlSource",
   "traitFieldOrDefault",
+  "traitRemoveRefusal",
+  "traitWriteRefusal",
   "transformName",
   "transformPropagationSystem",
   "trustedAnchorSource",

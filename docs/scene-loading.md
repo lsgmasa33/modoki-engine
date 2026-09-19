@@ -2467,6 +2467,9 @@ stability on disk" above) — they never round-trip to disk as-is.
   count as `changed`.
 - **`removeTrait`** — refuses the core traits `Transform` / `EntityAttributes`;
   removing an absent trait is a silent no-op, not an error.
+- **`PrefabInstance`** — refused by `setTrait`, `removeTrait` and `addEntity` alike: the prefab link is made by
+  instantiating a prefab and cut by Detach Prefab (`modoki_prefab` `detach`), never edited as a component (#1454,
+  `traitEditPolicy.ts`; the reason is in docs/prefab-structural-overrides.md).
 - **`addEntity`** — allocates the next free numeric id (real, not synthesized — it
   persists) and ensures `EntityAttributes` carries a stable `guid` + `name` +
   `parentId` so the entity round-trips through load/save + selection-restore.

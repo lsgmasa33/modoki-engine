@@ -25,7 +25,7 @@ const setPrefabCacheSpy = vi.fn();
 const tagSpy = vi.fn();
 const untagSpy = vi.fn();
 /** The links the tree held BEFORE Create Prefab tagged over them — what undo must put back. */
-const PRIOR_LINKS = [{ id: 7, data: { source: 'g-prior', localId: 1, rootInstanceId: 7, parentLocalId: 0 } }];
+const PRIOR_LINKS = { links: [{ id: 7, data: { source: 'g-prior', localId: 1, rootInstanceId: 7, parentLocalId: 0 } }], orphans: [] };
 const detachSpy = vi.fn(() => PRIOR_LINKS);
 const reattachSpy = vi.fn();
 const calls: string[] = [];

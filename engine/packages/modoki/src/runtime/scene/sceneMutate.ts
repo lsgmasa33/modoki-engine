@@ -11,6 +11,7 @@
  *  a fresh guid. */
 
 import { newGuid, durableGuid, findRuntimeGuids } from '../core/assetRefRules';
+import { traitRemoveRefusal, traitWriteRefusal } from '../core/ecs/traitEditPolicy';
 import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './transformSpace';
 
 /** Minimal on-disk entity shape (matches editor SerializedEntity / runtime
@@ -60,10 +61,6 @@ export type MutateOp =
   | { op: 'addEntity'; name?: string; parentId?: number | string; traits?: Record<string, Record<string, unknown> | boolean> }
   | { op: 'removeEntity'; entity: EntityRef }
   | { op: 'setBaseScene'; baseScene: string | null };
-
-/** Core traits every entity needs — refused by removeTrait (a human can't remove
- *  these in the Inspector either; dropping them corrupts the entity). */
-const CORE_TRAITS = new Set(['Transform', 'EntityAttributes']);
 
 export interface ApplyResult {
   scene: MutableScene;
@@ -174,6 +171,8 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         const entity = resolveEntity(scene, op.entity, errors, where, unresolved, codeOut);
         if (!entity) continue;
         if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
+        const writeRefused = traitWriteRefusal(op.trait);
+        if (writeRefused) { errors.push(`${where}: ${writeRefused}`); continue; }
         const fields = op.fields ?? {};
         // Check `space` BEFORE the empty-fields (tag) branch. It used to sit in the `else if`
         // after it, so `{op:'setTrait', trait:'<non-Transform>', space:'world'}` with no fields was
@@ -211,7 +210,8 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         const entity = resolveEntity(scene, op.entity, errors, where, unresolved, codeOut);
         if (!entity) continue;
         if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
-        if (CORE_TRAITS.has(op.trait)) { errors.push(`${where}: cannot remove core trait '${op.trait}'`); continue; }
+        const removeRefused = traitRemoveRefusal(op.trait);
+        if (removeRefused) { errors.push(`${where}: ${removeRefused}`); continue; }
         // Removing a trait the entity doesn't have is a genuine no-op (not an
         // error) — mirrors removeTraitFromEntitiesWithUndo's skip-if-absent.
         // Prefab-instance roots remove the override (same container as setTrait).
@@ -221,6 +221,9 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
           changed++;
         }
       } else if (op.op === 'addEntity') {
+        // A new entity cannot carry a hand-made prefab link either (#1454) — refused whole.
+        const linkRefused = Object.keys(op.traits ?? {}).map(traitWriteRefusal).find((r) => r);
+        if (linkRefused) { errors.push(`${where}: ${linkRefused}`); continue; }
         // Warn if the requested parent doesn't exist yet (ops apply in order, so a
         // parent added by an earlier op IS present here). An orphan won't render
         // under the expected parent and the agent gets no other signal. (F5)

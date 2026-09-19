@@ -16,7 +16,8 @@ import { remapGuidValues } from '../../runtime/core/assetRefRules';
 import { planCopyGuids } from '../../runtime/core/copyIdentity';
 import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
-import { rehomeDependents, relinkDetachedMembers, homeStepsOf, identityParentId, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
+import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
+import { endFrames, relinkDetachedMembers, homeStepsOf, identityParentId, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { memberStepId } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
@@ -221,6 +222,8 @@ export function addTraitToEntitiesWithUndo(
   values?: Record<string, unknown>,
   label = `Add ${meta.name}`,
 ) {
+  const refused = traitWriteRefusal(meta.name); // #1454: callers hide the action; this is the one seam they share
+  if (refused) { console.error(`[entityActions] ${refused}`); return; }
   const targets = entityIds.filter((id) => {
     const e = findEntity(id);
     return !!e && !e.has(meta.trait);
@@ -265,6 +268,8 @@ export function addTraitToEntitiesWithUndo(
  *  undo entry. Each entity's trait data is snapshotted so undo restores the
  *  original values. No-op if none carry the trait. */
 export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: TraitMeta) {
+  const refused = traitRemoveRefusal(meta.name); // #1454, as above
+  if (refused) { console.error(`[entityActions] ${refused}`); return; }
   const targets: { ref: EntityRef; data: Record<string, unknown> | null }[] = [];
   for (const id of entityIds) {
     const e = findEntity(id);
@@ -1182,18 +1187,24 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // What the last apply renamed, for its undo. (The values the outer row set on a promoted instance need no
   // re-marking: every expansion marks the row overrides it applies, so the save already keeps them.)
   let renamed = new Map<string, string>();
+  // …and what its frame-ending promoted or unlinked OUTSIDE the plan (#1453).
+  let orphans: DetachedMember[] = [];
   const applyDetach = () => {
     if (!piMeta) return;
     const idx = buildGuidIndex();
     const ids = detachTargets.map((t) => resolveWith(t.ref, idx)).filter((id): id is number => id != null);
-    rehomeDependents(new Set(ids)); // a member moved away from an unpacked one keeps its path (#1437)
+    // A member moved away from an unpacked one keeps its path (#1437), and one still linked to an unpacked
+    // owned root's frame is promoted or unlinked with it (#1453).
+    orphans = endFrames(new Set(ids));
     for (const id of ids) findEntity(id)?.remove(piMeta.trait);
     const roots = promoteTargets.map((t) => resolveWith(t.ref, idx)).filter((id): id is number => id != null);
     renamed = promoteOwnedRoots(roots);
   };
   const undoDetach = () => {
     if (!piMeta) return;
+    // Renames reversed last-applied first: the plan's promotions, then the orphans' (inside the relink).
     applyGuidRemap(new Map([...renamed].map(([a, b]) => [b, a])));
+    relinkDetachedMembers(orphans);
     const idx = buildGuidIndex();
     for (const t of promoteTargets) {
       const id = resolveWith(t.ref, idx);

@@ -1163,7 +1163,7 @@ export default function Hierarchy() {
     const pi = readTraitData(entity.id, piMeta);
     const rootId = (pi?.rootInstanceId as number) || entity.id;
     const snapshot = detachPrefabInstance(rootId);
-    if (!snapshot.length) return;
+    if (!snapshot.links.length) return;
     const name = getAllEntities().find(e => e.id === rootId)?.name ?? entity.name;
     // Resolve the instance root by guid so redo detaches the right entity after a
     // world rebuild (Play→Stop); undo rebuilds from the snapshot.

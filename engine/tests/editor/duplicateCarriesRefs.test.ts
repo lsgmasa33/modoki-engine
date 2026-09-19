@@ -21,9 +21,9 @@ import {
 } from '@modoki/engine/runtime';
 import {
   duplicateEntity, writeTraitFieldWithUndo, setActionCallback, pushAction, clearHistory, serializeScene,
-  reparentEntity, deleteEntitiesWithUndo,
+  reparentEntity, deleteEntitiesWithUndo, removeTraitFromEntitiesWithUndo,
 } from '@modoki/engine/editor';
-import { setPrefabCache, detachPrefabInstance, wouldCreateCycle, captureInstanceStructure, captureInstanceOverrides, rebuildInstance, instantiatePrefab, revertOverridesSelective, serializePrefab, applyToPrefabSelective, applyToPrefab, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, detachPrefabInstance, reattachPrefabInstance, wouldCreateCycle, captureInstanceStructure, captureInstanceOverrides, rebuildInstance, instantiatePrefab, revertOverridesSelective, serializePrefab, applyToPrefabSelective, applyToPrefab, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { collectInstanceOverrideKeys, applyOutcomeNotice } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { buildPrefabEditScene, applyEditWorldMoves } from '../../packages/modoki/src/editor/scene/prefabEdit';
@@ -2790,9 +2790,8 @@ describe('leaving the outermost instance cuts only the links the move splits (#1
     }, [row(1, 'MidRoot', 0), row(2, 'Holder2', 1), row(3, 'Nested', 2, { prefab: INNER })]);
   });
 
-  // …and the converse: after a Detach Prefab on the owner, its identity parent is plain (no owner to find), but its
-  // home is the detached root, and deleting that root still rescues it. Detach alone losing it is #1453. Mutation:
-  // key the promotion on the owner alone.
+  // …and the converse: a Detach Prefab on the owner, then a delete of it. Since #1453 the detach itself promotes the
+  // nested root (the delete then has nothing left to rescue), so this pins the end state of the pair, not the delete.
   it('#1451: deleting a detached owner still promotes the nested root moved out of it', async () => {
     await withOuter3(async () => {
       reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot'), idAt('Outer3Root/Panel'));
@@ -2804,6 +2803,114 @@ describe('leaving the outermost instance cuts only the links the move splits (#1
       expectUniqueGuidsHere();
       expect(targetsOf(idAt('Shelf')).map((g) => treePaths().get(g))).toEqual(['Outer3Root/Panel/InnerRoot/Leaf']);
     });
+  });
+
+  // #1453: Detach Prefab ends the instance's frame just as a delete does. A nested root moved out of it (still
+  // inside the outer instance) stayed owned by a plain entity and a plain member moved out stayed linked to one,
+  // so the save wrote neither and both vanished on reload. Mutation: detachPrefabInstance without endFrames
+  // (rehomeDependents alone, as before).
+  it('#1453: detaching the owner of a moved-out nested root promotes it, and it reloads with a ref to its member', async () => {
+    await withOuter3(async () => {
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot'), idAt('Outer3Root/Panel'));
+      await reloadWithShelfRef(guidAt('Outer3Root/Panel/InnerRoot/Leaf'));
+      const inner = guidAt('Outer3Root/Panel/InnerRoot');
+      detachPrefabInstance(idAt('Outer3Root/Panel/MidRoot'));
+      expect(piOf(idAt('Outer3Root/Panel/InnerRoot'))?.parentLocalId).toBe(0); // a standalone instance now
+      await load(await serializeScene() as unknown as SceneData);
+      expectUniqueGuidsHere();
+      expect(guidAt('Outer3Root/Panel/InnerRoot')).toBe(inner);
+      expect(piOf(idAt('Outer3Root/Panel/InnerRoot'))?.parentLocalId).toBe(0);
+      expect(targetsOf(idAt('Shelf')).map((g) => treePaths().get(g))).toEqual(['Outer3Root/Panel/InnerRoot/Leaf']);
+    });
+  });
+
+  const withKnob = [row(1, 'MidRoot', 0), row(2, 'Nested', 1, { prefab: INNER }), row(3, 'Knob', 1)];
+  it('#1453: detaching an instance unlinks a plain member moved out of it, and it reloads plain', async () => {
+    await withOuter3(async () => {
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/Knob'), idAt('Outer3Root/Panel'));
+      const knob = guidAt('Outer3Root/Panel/Knob');
+      detachPrefabInstance(idAt('Outer3Root/Panel/MidRoot'));
+      expect(piOf(idAt('Outer3Root/Panel/Knob'))).toBeUndefined();
+      await load(await serializeScene() as unknown as SceneData);
+      expectUniqueGuidsHere();
+      expect(guidAt('Outer3Root/Panel/Knob')).toBe(knob);
+      expect(piOf(idAt('Outer3Root/Panel/Knob'))).toBeUndefined();
+    }, withKnob);
+  });
+
+  // The undo (Hierarchy and the agent op both hand the result back to reattachPrefabInstance) takes it all back:
+  // the nested root is Mid's again with its member's old guid, and the member is linked again. Both reload as
+  // recorded moves. Mutation: reattachPrefabInstance without relinkDetachedMembers.
+  it('#1453: undoing the detach relinks a moved-out nested root and plain member, and both reload as moves', async () => {
+    await withOuter3(async () => {
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot'), idAt('Outer3Root/Panel'));
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/Knob'), idAt('Outer3Root/Panel'));
+      await reloadWithShelfRef(guidAt('Outer3Root/Panel/InnerRoot/Leaf'));
+      const leaf = guidAt('Outer3Root/Panel/InnerRoot/Leaf');
+      const before = piOf(idAt('Outer3Root/Panel/InnerRoot')) as { parentLocalId?: number; homeParent?: string } | undefined;
+      const snapshot = detachPrefabInstance(idAt('Outer3Root/Panel/MidRoot'));
+      expect(guidAt('Outer3Root/Panel/InnerRoot/Leaf')).not.toBe(leaf); // precondition: the promotion renamed it
+      expect(reattachPrefabInstance(snapshot)).toBe(0);
+      const after = piOf(idAt('Outer3Root/Panel/InnerRoot')) as typeof before;
+      expect([after?.parentLocalId, after?.homeParent]).toEqual([before?.parentLocalId, before?.homeParent]);
+      expect(piOf(idAt('Outer3Root/Panel/Knob'))?.rootInstanceId).toBe(idAt('Outer3Root/Panel/MidRoot'));
+      expect(guidAt('Outer3Root/Panel/InnerRoot/Leaf')).toBe(leaf);
+      await load(await serializeScene() as unknown as SceneData);
+      expectUniqueGuidsHere();
+      expect(guidAt('Outer3Root/Panel/InnerRoot/Leaf')).toBe(leaf);
+      expect(targetsOf(idAt('Shelf'))).toEqual([leaf]);
+      expect(piOf(idAt('Outer3Root/Panel/Knob'))?.rootInstanceId).toBe(idAt('Outer3Root/Panel/MidRoot'));
+    }, withKnob);
+  });
+
+  // The unpack on leave (applyDetach) runs `endFrames` too, so every frame-ending path has one shape. Before #1450 the
+  // plan could strip an owned ROOT (InnerRoot, above the MidRoot the move promotes) while a member of it stayed
+  // linked under that frame, written nowhere. Since #1450's `planMoveUnlinks` no root reaches `strip` (it promotes
+  // InnerRoot instead), so that orphan step has nothing to catch here today; this pins the shape's outcome.
+  it('#1453: the leave shape that once stripped an owned root keeps its member linked, and both reload', async () => {
+    await withOuter3(async () => {
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot/Leaf'), idAt('Outer3Root/Panel/MidRoot'));
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot'), idAt('Outer3Root/Panel'));
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot'), idAt('Outer3Root/Panel/InnerRoot'));
+      reparentEntity(idAt('Outer3Root/Panel/InnerRoot'), idAt('Shelf'));
+      expect(piOf(idAt('Shelf/InnerRoot'))?.parentLocalId).toBe(0);
+      expect(piOf(idAt('Shelf/InnerRoot/MidRoot'))?.parentLocalId).toBe(0);
+      expect(piOf(idAt('Shelf/InnerRoot/MidRoot/Leaf'))?.rootInstanceId).toBe(idAt('Shelf/InnerRoot'));
+      const leaf = guidAt('Shelf/InnerRoot/MidRoot/Leaf');
+      await load(await serializeScene() as unknown as SceneData);
+      expectUniqueGuidsHere();
+      expect(guidAt('Shelf/InnerRoot/MidRoot/Leaf')).toBe(leaf);
+      expect(piOf(idAt('Shelf/InnerRoot/MidRoot/Leaf'))?.rootInstanceId).toBe(idAt('Shelf/InnerRoot'));
+    });
+  });
+
+  // …and undoing that move puts the member back on the owned root it belonged to.
+  it('#1453: undoing that leave leaves the member linked to its owned root', async () => {
+    await withOuter3(async () => {
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot/Leaf'), idAt('Outer3Root/Panel/MidRoot'));
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot'), idAt('Outer3Root/Panel'));
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot'), idAt('Outer3Root/Panel/InnerRoot'));
+      const leaf = guidAt('Outer3Root/Panel/InnerRoot/MidRoot/Leaf');
+      reparentEntity(idAt('Outer3Root/Panel/InnerRoot'), idAt('Shelf'));
+      expect(await undo()).toBe(true);
+      expect(guidAt('Outer3Root/Panel/InnerRoot/MidRoot/Leaf')).toBe(leaf);
+      expect(piOf(idAt('Outer3Root/Panel/InnerRoot/MidRoot/Leaf'))?.rootInstanceId).toBe(idAt('Outer3Root/Panel/InnerRoot'));
+    });
+  });
+
+  // #1454: removing the PrefabInstance component off MidRoot (the Inspector's remove button) cut the link without
+  // ending the frame, and InnerRoot, Leaf and Knob, all moved out of MidRoot, vanished on reload. It is refused now;
+  // Detach Prefab cuts a link. Mutation: drop the refusal in removeTraitFromEntitiesWithUndo.
+  it('#1454: removing the PrefabInstance component is refused, and the moved-out members survive a reload', async () => {
+    await withOuter3(async () => {
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot'), idAt('Outer3Root/Panel'));
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/Knob'), idAt('Outer3Root/Panel'));
+      removeTraitFromEntitiesWithUndo([idAt('Outer3Root/Panel/MidRoot')], getTraitByName('PrefabInstance')!);
+      expect(piOf(idAt('Outer3Root/Panel/MidRoot'))).toBeDefined();
+      await load(await serializeScene() as unknown as SceneData);
+      expectUniqueGuidsHere();
+      expect([...treePaths().values()]).toEqual(expect.arrayContaining(['Outer3Root/Panel/InnerRoot/Leaf', 'Outer3Root/Panel/Knob']));
+    }, withKnob);
   });
 
   // Finding 5: several promotions in one multi-delete are reversed one at a time, last first — a guid two of them

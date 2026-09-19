@@ -80,7 +80,7 @@ import {
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid,
-  getAllTraits, resolveCreateEntitySpec, parentRefusal, isResourceEntity, type MutateOp, type MutateEntityRef,
+  getAllTraits, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
   sceneManager, assetUrl, type AssetSchemaType, collectHandles, rawNow, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
@@ -819,10 +819,6 @@ function resolveLiveEntityRef(ref: MutateEntityRef | undefined): { id: number } 
   return r.ok ? { id: r.id } : r;
 }
 
-/** Core traits every entity needs — mirrors sceneMutate.ts's CORE_TRAITS. removeTrait refuses
- *  to drop these live too (a human can't remove them in the Inspector either). */
-const LIVE_CORE_TRAITS = new Set(['Transform', 'EntityAttributes']);
-
 /** The live-world twin of sceneMutate.ts's `applyOps` — same {@link MutateOp} vocabulary
  *  (setTrait / removeTrait / addEntity / removeEntity), applied to the running ECS world via
  *  the existing undoable `*WithUndo` helpers instead of a scene-file JSON object, wrapped in
@@ -875,6 +871,8 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) { code = resolved.code; first = resolved; } continue; }
           const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
+          const writeRefused = traitWriteRefusal(op.trait); // the file path's refusal, live (#1454)
+          if (writeRefused) { errors.push(`${where}: ${writeRefused}`); continue; }
           const meta = allTraitsList.find((t) => t.name === op.trait);
           if (!meta) { errors.push(`${where}: unknown trait '${op.trait}' — list traits with modoki_list_traits`); continue; }
           if (op.space && op.trait !== 'Transform') {
@@ -953,13 +951,18 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) { code = resolved.code; first = resolved; } continue; }
           const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
-          if (LIVE_CORE_TRAITS.has(op.trait)) { errors.push(`${where}: cannot remove core trait '${op.trait}'`); continue; }
+          const removeRefused = traitRemoveRefusal(op.trait);
+          if (removeRefused) { errors.push(`${where}: ${removeRefused}`); continue; }
           const meta = allTraitsList.find((t) => t.name === op.trait);
           if (!meta) { errors.push(`${where}: unknown trait '${op.trait}'`); continue; }
           const entity = findEntity(id);
           if (entity?.has(meta.trait)) { removeTraitFromEntitiesWithUndo([id], meta); changed++; }
           // Removing an absent trait is a genuine no-op, not an error (mirrors sceneMutate.ts).
         } else if (op.op === 'addEntity') {
+          // A new entity cannot carry a hand-made prefab link either (#1454): it would name a root and a row
+          // nothing derived. Refused whole, before anything is created.
+          const linkRefused = Object.keys(op.traits ?? {}).map(traitWriteRefusal).find((r) => r);
+          if (linkRefused) { errors.push(`${where}: ${linkRefused}`); continue; }
           // The parent may arrive as `op.parentId` OR inside the authored EntityAttributes; both are
           // resolved and judged here, and the result is written back into the trait data below. Taking
           // only `op.parentId` let an authored `EntityAttributes.parentId` reach the entity unchecked (#1248).
@@ -2755,7 +2758,7 @@ export function registerEditorAgentOps(): void {
       // detachPrefabInstance returns [] for a plain (non-instance) entity. Reporting {ok:true,
       // detached:0} let an agent believe it had unpacked a prefab it hadn't — now a hard failure,
       // matching the other structural ops. (C7 re-audit.)
-      if (!snapshot.length) {
+      if (!snapshot.links.length) {
         throw new Error(`prefab detach: entity ${entityId} is not a prefab instance (nothing to unpack). Only an instantiated prefab can be detached.`);
       }
       // Same entry the Hierarchy "Detach Prefab" menu pushes: undo re-attaches from the
@@ -2772,7 +2775,7 @@ export function registerEditorAgentOps(): void {
         },
         redo: () => { const id = ref.resolve(); if (id != null) detachPrefabInstance(id); },
       });
-      return { ok: true, detached: snapshot.length, saved: false };
+      return { ok: true, detached: snapshot.links.length, saved: false };
     }
     // ── Override discovery/apply/revert (#2Tkw8CiWRATmHck2ze7q) ──
     // The human "Apply to Prefab" / "Revert Overrides" dialogs (ApplyPrefabDialog.tsx) were

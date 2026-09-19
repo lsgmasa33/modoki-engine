@@ -207,6 +207,32 @@ describe('applyOps — removeTrait', () => {
     expect(scene.entities[1].traits.Transform).toBeDefined();
   });
 
+  // #1454: the prefab link is not a component — neither removed nor written by a generic edit. Mutation: drop the
+  // removeTrait / setTrait refusal in applyOps.
+  it('refuses to remove or write the PrefabInstance link', () => {
+    const scene = freshScene();
+    (scene.entities[0].traits as Record<string, unknown>).PrefabInstance = { source: 'g', localId: 1 };
+    const res = applyOps(scene, [
+      { op: 'removeTrait', entity: { id: 1 }, trait: 'PrefabInstance' },
+      { op: 'setTrait', entity: { id: 2 }, trait: 'PrefabInstance', fields: { localId: 3 } },
+    ], mint);
+    expect(res.changed).toBe(0);
+    expect(res.errors).toHaveLength(2);
+    expect(res.errors.join('\n')).toMatch(/Detach Prefab/);
+    expect((scene.entities[0].traits as Record<string, unknown>).PrefabInstance).toEqual({ source: 'g', localId: 1 });
+    expect((scene.entities[1].traits as Record<string, unknown>).PrefabInstance).toBeUndefined();
+  });
+
+  // Close-out review: addEntity copied op.traits verbatim. Mutation: drop the addEntity refusal in applyOps.
+  it('refuses an addEntity carrying the PrefabInstance link, creating nothing', () => {
+    const scene = freshScene();
+    const before = scene.entities.length;
+    const res = applyOps(scene, [{ op: 'addEntity', name: 'Fake', traits: { PrefabInstance: { source: 'g', localId: 1 } } }], mint);
+    expect(res.changed).toBe(0);
+    expect(res.errors.join('\n')).toMatch(/Detach Prefab/);
+    expect(scene.entities).toHaveLength(before);
+  });
+
   it('errors when the entity is not found', () => {
     const scene = freshScene();
     const res = applyOps(scene, [{ op: 'removeTrait', entity: { name: 'Ghost' }, trait: 'Light' }], mint);

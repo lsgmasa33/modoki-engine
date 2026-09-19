@@ -112,7 +112,7 @@ describe('detachPrefabInstance', () => {
     const snapshot = detachPrefabInstance(root.id());
 
     // All four entities had PrefabInstance → four captured, none left.
-    expect(snapshot).toHaveLength(4);
+    expect(snapshot.links).toHaveLength(4);
     expect(hasPI(root)).toBe(false);
     expect(hasPI(child)).toBe(false);
     expect(hasPI(innerRoot)).toBe(false);
@@ -151,7 +151,7 @@ describe('detachPrefabInstance', () => {
     const plain = testWorld.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Plain', parentId: 0 }));
     index.set(plain.id(), plain);
 
-    expect(detachPrefabInstance(plain.id())).toHaveLength(0);
+    expect(detachPrefabInstance(plain.id()).links).toHaveLength(0);
   });
 
   it('reattach follows each entity by GUID — a delete+undo between detach and reattach can SWAP recycled ids (#1264 close-out)', async () => {

@@ -2,7 +2,7 @@
 
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
-import { rehomeDependents, homeStepsOf, remapWorldGuidRefs } from '../../runtime/core/ecs/memberHome';
+import { rehomeDependents, endFrames, relinkDetachedMembers, homeStepsOf, remapWorldGuidRefs, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { isPrefabEditRowGuid } from './prefabEditGuids';
 import { IDENTITY_TRS, mergeTrs, localToWorldTrs } from '../../runtime/scene/transformSpace';
 import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, type PrefabReader } from '../../runtime/loaders/memberPaths';
@@ -2928,6 +2928,10 @@ export function untagEntityTreeAsInstance(rootEcsId: number, source: string): vo
  *  through; `id` is the capture-time ECS id, kept for diagnostics only. */
 export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: EntityRef; data: Record<string, unknown>; }
 
+/** What a detach undoes: the links it stripped off the tree, and the members OUTSIDE the tree it promoted or
+ *  unlinked because their frame ended with it (#1453). */
+export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; }
+
 /** Detach a prefab instance — strip the `PrefabInstance` trait off the instance
  *  root and EVERY descendant in its subtree (nested instances included), turning
  *  the live tree into ordinary, unlinked entities. Mirrors Unity's "Unpack
@@ -2960,10 +2964,15 @@ export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: En
  *  `opts.strip: false` snapshots WITHOUT removing the traits — for a caller that is about to
  *  overwrite the links itself and only wants the undo record (#1278). Create Prefab is one:
  *  stripping first used to leave a held nested instance's members plain, because the tagging
- *  that followed deliberately does not retag them. Detach proper keeps the default. */
-export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean }): DetachedInstanceTrait[] {
+ *  that followed deliberately does not retag them. Detach proper keeps the default.
+ *
+ *  A member MOVED out of the tree (#1437) is not in `collectTree`, but its frame ends with the strip all
+ *  the same. The strip runs `endFrames` first, as a delete does: an owned nested root moved out becomes a
+ *  standalone instance, and anything else is unlinked where it stands. Left linked to a frame that no
+ *  longer exists, it was written nowhere and vanished on reload (#1453). Those go in `orphans`. */
+export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean }): DetachSnapshot {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  if (!PrefabInstanceMeta) return [];
+  if (!PrefabInstanceMeta) return { links: [], orphans: [] };
   const strip = opts?.strip !== false;
   const tree = collectTree(rootEcsId, getAllEntities());
   const snapshot: DetachedInstanceTrait[] = [];
@@ -2978,25 +2987,29 @@ export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean
       data: { source: pi.source, localId: pi.localId, rootInstanceId: pi.rootInstanceId, parentLocalId: pi.parentLocalId, homeParent: pi.homeParent ?? '', homeSteps: pi.homeSteps ?? '' },
     });
   }
+  let orphans: DetachedMember[] = [];
   if (strip) {
-    rehomeDependents(new Set(snapshot.map((s) => s.id))); // #1437, as above
+    orphans = endFrames(new Set(snapshot.map((s) => s.id))); // BEFORE the strip: the owner walk reads these links
     for (const s of snapshot) findEntity(s.id)?.remove(PrefabInstanceMeta.trait);
   }
   if (snapshot.length) markStructureDirty();
-  return snapshot;
+  return { links: snapshot, orphans };
 }
 
 /** Inverse of detachPrefabInstance — re-add the captured PrefabInstance traits
- *  (undo of a detach). */
+ *  (undo of a detach), and relink the members outside the tree it promoted or unlinked (#1453). */
 export function reattachPrefabInstance(
-  snapshot: DetachedInstanceTrait[],
+  detached: DetachSnapshot,
   /** The subtree undo is restoring. Given, an unresolved ref is only counted as LOST once the link
    *  is confirmed absent from the world. Omit it and every unresolved ref counts, which is right
    *  for a caller that stripped the whole tree (Detach). */
   opts?: { rootEcsId?: number },
 ): number {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  if (!PrefabInstanceMeta || !snapshot.length) return 0;
+  const { links: snapshot, orphans } = detached;
+  if (!PrefabInstanceMeta || (!snapshot.length && !orphans.length)) return 0;
+  // Orphans first: relinking reverses a promotion's member rename, and the refs below resolve by guid.
+  relinkDetachedMembers(orphans);
   const unresolvedEntries: DetachedInstanceTrait[] = [];
   for (const entry of snapshot) {
     const live = entry.ref.resolve();

@@ -60,11 +60,11 @@ export function rehomeDependents(gone: ReadonlySet<number>, world: World = getCu
       const hpi = h.has(piMeta.trait) ? (h.get(piMeta.trait) as Pi & { rootInstanceId?: number } | undefined) : undefined;
       if (!hpi) break; // a home is always a member; a plain one cannot be stepped through
       // Nor any instance ROOT, stored or owned. A root home is the root of the frame the dependent's row lives
-      // in (its own frame for a member, its owner's for an owned nested root), and that frame dies with it. On
-      // a delete, `detachOrphanedMembers` handles that member: it promotes an owned nested root and unlinks
-      // anything else. The other callers (unpack, Detach Prefab) do not yet (#1453). Stepping through an OWNED
-      // root re-pointed a moved nested root at its grandparent frame, which records no move for it, so it
-      // vanished on reload (#1451).
+      // in (its own frame for a member, its owner's for an owned nested root), and that frame dies with it.
+      // `detachOrphanedMembers` handles that member instead — every caller runs the two through `endFrames`
+      // (#1453) — promoting an owned nested root and unlinking anything else. Stepping through an OWNED root
+      // re-pointed a moved nested root at its grandparent frame, which records no move for it, so it vanished
+      // on reload (#1451).
       if (hpi.rootInstanceId === h.id()) break;
       steps = [...homeStepsOf(hpi), memberStepId(hpi), ...steps];
       const liveParent = byId.get((h.get(eaMeta.trait) as { parentId?: number }).parentId ?? 0);
@@ -83,8 +83,8 @@ export type DetachedMember = {
   renamed?: [string, string][];
 };
 
-/** Before the entities in `gone` are destroyed, detach every surviving member whose instance goes with them
- *  (#1437): a member MOVED out of its instance's subtree is not under the root being deleted, so it would
+/** Before the entities in `gone` are destroyed (or stripped, #1453), detach every surviving member whose
+ *  instance goes with them (#1437): a member MOVED out of its instance's subtree is not under the root being deleted, so it would
  *  otherwise stay linked to a dead root and vanish on the next reload. It stays where it was put, as a plain
  *  entity with its guid — what is on screen is what is saved. An OWNED nested root whose outer instance goes
  *  becomes a stored root instead, so its own members keep their instance. Returns what an undo needs. */
@@ -118,7 +118,8 @@ export function detachOrphanedMembers(gone: ReadonlySet<number>, world: World = 
     const root = pi.rootInstanceId ?? 0;
     const ownedRoot = root === e.id() && (pi.parentLocalId || 0) > 0;
     // An owned root also goes when its HOME is still dying after the rehome: the rehome stops only at a home it
-    // cannot step past (a root, or a plain entity a Detach Prefab left behind, #1453), and no frame records it there.
+    // cannot step past (a root, or a plain entity), and no frame records it there. Detach Prefab no longer leaves such
+    // a home (#1453), and a generic trait edit can no longer strip one (#1454); kept for a home already stripped.
     const homeGone = !!pi.homeParent && gone.has(byGuid.get(pi.homeParent)?.id() ?? -1);
     if (ownedRoot ? !(gone.has(ownerOf(e, pi)) || homeGone) : !gone.has(root)) continue;
     out.push({ guid: guidOf(e), rootGuid: ownedRoot ? '' : guidOf(byId.get(root)), data: { ...pi } });
@@ -131,6 +132,17 @@ export function detachOrphanedMembers(gone: ReadonlySet<number>, world: World = 
   const first = out.find((d) => !d.rootGuid);
   if (first && renamed.length) first.renamed = renamed;
   return out;
+}
+
+/** The entities in `gone` stop being part of any instance: deleted, or stripped of `PrefabInstance` by a
+ *  Detach Prefab or an unpack. Call it BEFORE they go (the owner walk reads their links). A member moved away
+ *  from one of them keeps its path ({@link rehomeDependents}), and one still linked to a frame that ends is
+ *  promoted or unlinked ({@link detachOrphanedMembers}). Every frame-ending path runs both halves through this
+ *  one call. Detach and unpack once ran only the first, and a member moved out of the instance vanished on
+ *  reload (#1453). Returns what an undo hands to {@link relinkDetachedMembers}. */
+export function endFrames(gone: ReadonlySet<number>, world: World = getCurrentWorld()): DetachedMember[] {
+  rehomeDependents(gone, world);
+  return detachOrphanedMembers(gone, world);
 }
 
 /** Undo {@link detachOrphanedMembers} once the deleted entities are back. */

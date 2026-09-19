@@ -11,7 +11,7 @@ import { inSystemTick } from '../systemTick';
 import { noteAuthoredWriteWhileStopped } from './authoredWrites';
 import { compareSiblings } from './entityOrder';
 import { collectSubtreeIds } from './subtreeCollect';
-import { rehomeDependents, detachOrphanedMembers, type DetachedMember } from './memberHome';
+import { endFrames, type DetachedMember } from './memberHome';
 // Re-exported for backward compatibility — every existing caller imports these from here.
 // The implementation lives in `renderDirty.ts` (a side-effect-free L0 module) so a module
 // that only needs the dirty signal (e.g. `loaders/assetManifest.ts`) doesn't have to import
@@ -621,11 +621,9 @@ export function deleteEntities(entityIds: number[]): DetachedMember[] {
   if (entityIds.length === 0) return [];
 
   const toDelete = collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), entityIds);
-  // A moved prefab member whose home is going keeps its identity path through it (#1437).
-  const gone = new Set(toDelete);
-  rehomeDependents(gone);
-  // …and one moved OUT of an instance being deleted outlives it, unlinked (#1437). Returned for an undo.
-  const detached = detachOrphanedMembers(gone);
+  // A moved prefab member whose home is going keeps its identity path through it, and one moved OUT of an
+  // instance being deleted outlives it, unlinked or promoted (#1437, #1451). Returned for an undo.
+  const detached = endFrames(new Set(toDelete));
 
   // Delete in reverse: within one walk, children before parents
   for (let i = toDelete.length - 1; i >= 0; i--) {
