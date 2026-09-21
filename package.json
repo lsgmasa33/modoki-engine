@@ -111,7 +111,7 @@
     "tar": "^7.5.22",
     "three": "0.185.1",
     "vite": "^8.0.5",
-    "yauzl": "^2.10.0",
+    "yauzl": "^3.4.0",
     "zustand": "^5.0.12"
   },
   "devDependencies": {
