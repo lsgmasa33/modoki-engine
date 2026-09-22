@@ -1,15 +1,47 @@
 version: 2
 updates:
-  # npm dependencies (root + workspaces). Minor/patch bumps are grouped into one
-  # low-risk PR per run; majors are excluded from the group so each lands as its
-  # own PR for individual review (a grouped major can silently break peer deps —
-  # see lsgmasa33/modoki-engine#19, typescript@7.0.2 vs typescript-eslint@8.65.0).
+  # npm dependencies (root + workspaces).
+  #
+  # ⚠️ THIS FILE DELIBERATELY DISAGREES WITH THE PRIVATE REPO'S `.github/dependabot.yml`,
+  # which has version-update PRs OFF (`open-pull-requests-limit: 0`). Owner ruling,
+  # 2026-09-22 (issue #1467): KEEP them here. The private `ci.yml` is `workflow_dispatch`-
+  # only and no longer runs on `pull_request:`, so these PRs are the ONLY automated answer
+  # left to "does this upgrade actually build?" — and a release is when dependency versions
+  # get DECIDED rather than drifted. Do not "fix" the divergence by aligning the two files;
+  # the divergence IS the ruling.
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # ⚠️ `three` is held to the releases VERIFIED by QA-RENDER-0008 — a clean-install first
+      # launch of a post-FX project on the iPad (#957). 0.186.0's GTAONode samples depth with
+      # `textureGather`, which WGSL has no overload for on a multisampled depth texture, so
+      # every AO pass under MSAA fails to compile. #956 black-screened every iOS device on a
+      # first launch with every automated gate green: the repro needs a cold pipeline cache.
+      #
+      # This entry was MISSING here while the private copy carried it, and on 2026-09-21 the
+      # `npm-minor-patch` group duly proposed three@0.186.0 — caught only by the peer range in
+      # package.json. three moves its MINOR every release, so without this it arrives inside
+      # the one PR whose entire purpose is to collapse low-risk bumps, wearing a "minor/patch"
+      # label. Belt-and-braces with engine/tests/architecture/threeVersionCeiling.test.ts,
+      # which also asserts THIS entry exists. Raise both together, after QA-RENDER-0008
+      # passes on the new version.
+      - dependency-name: "three"
+        versions: [">=0.186.0"]
     groups:
+      # ⚠️ MUST come before `npm-minor-patch` — Dependabot takes the FIRST matching group, and
+      # that one is `patterns: ["*"]`. `vitest` and `@vitest/coverage-v8` peer-pin each other
+      # EXACTLY (`peer vitest@"4.1.11"`), so a major that moves one without the other fails
+      # `npm ci` with ERESOLVE before a single test runs — observed 2026-09-21, vitest 4 -> 5.
+      # This group includes `major` precisely because the minor/patch group below excludes it.
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
+        update-types: ["minor", "patch", "major"]
+      # Minor/patch bumps collapse into one low-risk PR; majors are excluded so each lands as
+      # its own PR for individual review (a grouped major can silently break peer deps — see
+      # lsgmasa33/modoki-engine#19, typescript@7.0.2 vs typescript-eslint@8.65.0).
       npm-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]

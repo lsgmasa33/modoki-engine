@@ -15,10 +15,15 @@
  *  has NOT been through that run, and raising it is a deliberate edit made after the run passes.
  *
  *  **Why a test and not only a `dependabot.yml` ignore** (both exist; they cover disjoint vectors):
- *  Dependabot's version-update PRs are off (`open-pull-requests-limit: 0`), so an `ignore:` entry
- *  guards a dormant path gated on somebody re-enabling it. These are live today and it cannot touch
- *  any of them — `npm install three@latest` / `npm update`; a lockfile regeneration resolving
- *  against the peer range; another clone editing `package.json`.
+ *  ⚠️ There are TWO dependabot configs and they DELIBERATELY disagree (owner, 2026-09-22, #1467).
+ *  The private `.github/dependabot.yml` has version-update PRs off (`open-pull-requests-limit: 0`),
+ *  so its `ignore:` entry guards a dormant path. The PUBLIC overlay `oss/.github/dependabot.yml`
+ *  has them ON, weekly and grouped — so its ignore is LIVE, and it was MISSING until #1467: on
+ *  2026-09-21 the grouped PR duly proposed three@0.186.0, refused only by the peer range one layer
+ *  deeper. The case below asserts that entry exists and stays pinned to UNVERIFIED_FLOOR.
+ *  Neither config touches the vectors live in every clone — `npm install three@latest` /
+ *  `npm update`; a lockfile regeneration resolving against the peer range; another clone editing
+ *  `package.json` — which is why this test exists as well.
  *
  *  ⚠️ **`require('three/package.json')` THROWS** `ERR_PACKAGE_PATH_NOT_EXPORTED` — three's `exports`
  *  map does not expose it. The resolved-version check below reads the file through `createRequire`
@@ -29,7 +34,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import semver from 'semver';
-import { REPO_ROOT, hasQaSuite } from '../helpers/repoLayout';
+import { REPO_ROOT, hasQaSuite, hasOssOverlay } from '../helpers/repoLayout';
 
 /** THE CEILING (exclusive): the first `three` release NOT yet verified by QA-RENDER-0008.
  *
@@ -82,6 +87,14 @@ function resolvedThreeVersion(): string {
   );
 }
 
+/** The PUBLIC overlay published to the mirror's `.github/`. Its three ignore is LIVE (version PRs
+ *  are on there), unlike the private config's dormant one — see the header.
+ *  ⚠️ Presence is `hasOssOverlay()` from `helpers/repoLayout`, NOT a local `fs.existsSync`: that
+ *  helper's header requires one implementation so a broken predicate breaks loudly in one place.
+ *  The first version of this case hand-rolled it and `layoutConditionalTestLedger` caught it. */
+const OSS_DEPENDABOT = 'oss/.github/dependabot.yml';
+const ossDependabotPath = () => path.join(REPO_ROOT, OSS_DEPENDABOT);
+
 const HOW_TO_RAISE = `Run QA-RENDER-0008 (${GATE_CASE}) on the iPad against the new version first — a `
   + 'clean-install first launch is the only thing that observes this defect class (#956, #957) — '
   + 'then raise UNVERIFIED_FLOOR deliberately. Do not widen the range to make this pass.';
@@ -113,6 +126,29 @@ describe('three version ceiling (#966, #957)', () => {
   it.skipIf(!hasQaSuite())('the gate case every message points at exists', () => {
     expect(fs.existsSync(path.join(REPO_ROOT, GATE_CASE)), `${GATE_CASE} is gone — repoint GATE_CASE`)
       .toBe(true);
+  });
+
+  // ⚠️ Absent INSIDE the published snapshot, where `oss/` has already been merged into `.github/`
+  // and the overlay SOURCE is gone. It is present in every clone, which is where an edit to it
+  // happens — so this runs exactly where it can prevent the drift, and skips where it cannot.
+  it.skipIf(!hasOssOverlay())('the PUBLIC dependabot overlay ignores three at the same ceiling', () => {
+    expect(
+      fs.existsSync(ossDependabotPath()),
+      `the oss/ overlay exists but ${OSS_DEPENDABOT} does not — the mirror would inherit GitHub's `
+      + 'defaults (version PRs on, no ignores), which is the state #1467 fixed.',
+    ).toBe(true);
+    const yaml = fs.readFileSync(ossDependabotPath(), 'utf8');
+    expect(
+      /dependency-name:\s*["']?three["']?/.test(yaml),
+      `${OSS_DEPENDABOT} has no three ignore. The mirror opens grouped minor/patch PRs weekly and `
+      + 'three moves its MINOR every release, so without it an unverified three arrives inside the '
+      + 'one PR whose purpose is to collapse low-risk bumps (#1467).',
+    ).toBe(true);
+    expect(
+      yaml.includes(`>=${UNVERIFIED_FLOOR}`),
+      `${OSS_DEPENDABOT}'s three ignore is not pinned to ${UNVERIFIED_FLOOR}, so the two can drift. `
+      + `${HOW_TO_RAISE} Raise it in BOTH places.`,
+    ).toBe(true);
   });
 
   it('THE PROBE DETECTS THE POSITIVE CASE — an unverified version is actually rejected', () => {
