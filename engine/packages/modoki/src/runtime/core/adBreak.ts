@@ -3,20 +3,25 @@
  * #1330). Pure: no ECS, no PlayerPrefs, no SDK, no clock. Each game owns the dialogs, the purchase, the
  * stamps and the timers, and asks this module what to do next.
  *
- * Two triggers reach the same step:
- * - **`level_end`**: the player left a solved level. The ad plays straight away, as before.
- * - **`mid_level`**: the player has been on ONE level for a while (`midLevelBreakDue`). A short "Ad break"
- *   countdown runs first, so the ad never cuts in without warning.
+ * **The No Ads offer comes before EVERY ad** (owner, 2026-09-22, reversing the once-an-hour cap this
+ * module shipped with in #1329). It auto-dismisses into the ad after `countdownSec`, which is the same
+ * outcome as No thanks — the player is never held, and the card can earn where a bare countdown only
+ * announced. The cap is still HERE, as `offerCooldownSec`; the games author it as 0, so it is a knob the
+ * owner can take back rather than a rule that was deleted.
  *
- * Either trigger may be preceded by a **No Ads offer**, at most once per cooldown (`mayOfferNoAds`). When
- * the offer shows, it REPLACES the countdown: No thanks goes straight to the ad (owner, 2026-09-17).
+ * The offer needs something to sell, so two triggers still reach a different step when it cannot show:
+ * - **`level_end`**: the ad plays straight away.
+ * - **`mid_level`**: the player has been on ONE level for a while (`midLevelBreakDue`), so a short
+ *   "Ad break" countdown runs first — a mid-play ad must never cut in unannounced (#1330, kept
+ *   deliberately by the owner on 2026-09-22 when the rest of the countdown path was retired).
  *
  * Owner rulings (2026-09-17): a purchase from the offer skips the ad; a cancelled or failed one is No
  * thanks, so the ad still plays. The offer shows both No Ads products. Every number is the game's config.
  *
  * ⚠️ **`nowMs` is passed IN** — the offer cooldown is wall-clock (an hour of the player's life, surviving
- * a relaunch), the same reason `adPacing.ts` gives. The countdown and the play timer are NOT wall-clock:
- * they advance by the frame delta the caller passes, so a backgrounded app does not run them down.
+ * a relaunch), the same reason `adPacing.ts` gives. The two card clocks and the play timer are NOT
+ * wall-clock: they advance by the frame delta the caller passes, so a backgrounded app does not run
+ * them down.
  */
 
 export type AdBreakTrigger = 'level_end' | 'mid_level';
@@ -44,6 +49,10 @@ export type NoAdsOfferVerdict = { offer: true } | { offer: false; why: NoAdsOffe
  * ⚠️ `not-offerable` comes first and must NOT stamp: an offer skipped because prices had not loaded yet
  * would otherwise lock the offer out for an hour without the player ever seeing it.
  * A backwards clock fails OPEN (one extra offer), the same direction `mayShowInterstitial` takes.
+ *
+ * ⚠️ **`offerCooldownSec: 0` means EVERY time, not never** — the comparison is `<`, so a zero cooldown is
+ * satisfied by any elapsed time including none. This is the value both games ship (owner, 2026-09-22), so
+ * it is the live path rather than a degenerate one, and `adBreak.test.ts` pins it.
  */
 export function mayOfferNoAds(ctx: NoAdsOfferContext, policy: NoAdsOfferPolicy): NoAdsOfferVerdict {
   if (!ctx.offerable) return { offer: false, why: 'not-offerable' };
@@ -98,15 +107,27 @@ export function midLevelBreakDue(ctx: MidLevelBreakContext, policy: MidLevelBrea
   return ctx.idleSec >= policy.idleSec;
 }
 
-/** The flow's state. `idle` is "no break in progress"; the ad itself is an EFFECT, not a state. */
+/**
+ * The flow's state. `idle` is "no break in progress"; the ad itself is an EFFECT, not a state.
+ *
+ * ⚠️ **`offer.remainingSec` is `null` for "no auto-dismiss"**, not 0 — a ticking card reaches 0 on its
+ * way to the ad, so 0 cannot also mean "never leaves". `buying` deliberately carries NO clock: that is
+ * what makes a Buy cancel the auto-dismiss rather than race it (`tick` has nothing to advance), so the
+ * race cannot be reintroduced by a later edit without first inventing a field to hold it.
+ */
 export type AdBreakState =
   | { kind: 'idle' }
-  | { kind: 'offer'; trigger: AdBreakTrigger }
+  | { kind: 'offer'; trigger: AdBreakTrigger; remainingSec: number | null }
   | { kind: 'buying'; trigger: AdBreakTrigger }
   | { kind: 'countdown'; remainingSec: number };
 
 export type AdBreakEvent =
-  /** An ad is allowed; `step` is `planAdBreak`'s answer. */
+  /**
+   * An ad is allowed; `step` is `planAdBreak`'s answer. `countdownSec` is how long the card that step
+   * raises sits before the ad starts by itself — the countdown's length, or the offer's auto-dismiss.
+   * ⚠️ Its `<= 0` case reads OPPOSITELY on the two steps, by design: no countdown card at all, versus an
+   * offer card that waits for a tap. Both are tested.
+   */
   | { type: 'start'; trigger: AdBreakTrigger; step: AdBreakStep; countdownSec: number }
   /** No thanks on the offer. */
   | { type: 'decline' }
@@ -114,7 +135,7 @@ export type AdBreakEvent =
   | { type: 'buy' }
   /** The purchase started from the offer settled. */
   | { type: 'purchase-settled'; bought: boolean }
-  /** A frame passed, in seconds. Only the countdown uses it. */
+  /** A frame passed, in seconds. The countdown and the auto-dismissing offer use it. */
   | { type: 'tick'; dt: number }
   /** The break is abandoned without an ad (a level swap, a teardown). */
   | { type: 'cancel' };
@@ -144,7 +165,13 @@ export function stepAdBreak(state: AdBreakState, event: AdBreakEvent): AdBreakTr
   switch (event.type) {
     case 'start':
       if (state.kind !== 'idle') return stay;
-      if (event.step === 'offer') return { state: { kind: 'offer', trigger: event.trigger }, effect: 'offer-shown' };
+      if (event.step === 'offer') {
+        // ⚠️ `<= 0` is "no auto-dismiss", NOT "no card" — the opposite of the countdown's reading below.
+        // A card that offers a purchase and vanishes in the same frame would be a flicker, and the
+        // player would have been shown nothing; one that waits for a tap is #1329's behaviour intact.
+        const remainingSec = event.countdownSec > 0 ? event.countdownSec : null;
+        return { state: { kind: 'offer', trigger: event.trigger, remainingSec }, effect: 'offer-shown' };
+      }
       // A countdown of 0 or less is "no countdown": straight to the ad, rather than a card that flashes.
       if (event.step === 'countdown' && event.countdownSec > 0) {
         return { state: { kind: 'countdown', remainingSec: event.countdownSec }, effect: 'none' };
@@ -159,6 +186,14 @@ export function stepAdBreak(state: AdBreakState, event: AdBreakEvent): AdBreakTr
       // Owner, 2026-09-17: a cancelled or failed purchase is No thanks — the ad still plays.
       return { state: IDLE, effect: event.bought ? 'none' : 'show-ad' };
     case 'tick': {
+      // The offer expires to the SAME transition `decline` makes: waiting the card out and tapping No
+      // thanks are one outcome, not two, so nothing downstream has to tell them apart.
+      if (state.kind === 'offer') {
+        if (state.remainingSec === null) return stay;
+        const remainingSec = state.remainingSec - Math.max(0, event.dt);
+        if (remainingSec <= 0) return { state: IDLE, effect: 'show-ad' };
+        return { state: { ...state, remainingSec }, effect: 'none' };
+      }
       if (state.kind !== 'countdown') return stay;
       const remainingSec = state.remainingSec - Math.max(0, event.dt);
       if (remainingSec <= 0) return { state: IDLE, effect: 'show-ad' };
@@ -169,7 +204,11 @@ export function stepAdBreak(state: AdBreakState, event: AdBreakEvent): AdBreakTr
   }
 }
 
-/** The whole number the countdown card shows: 3, 2, 1 — never 0, which would read as "now" and linger. */
+/**
+ * The whole number a pre-ad card shows: 3, 2, 1 — never 0, which would read as "now" and linger. Both
+ * cards use it: the Ad break countdown, and the offer's own line (owner, 2026-09-22 — the offer tells the
+ * player what happens if they do nothing, rather than vanishing unannounced).
+ */
 export function adBreakCountdownLabel(remainingSec: number): number {
   return Math.max(1, Math.ceil(remainingSec));
 }

@@ -10,6 +10,8 @@ import {
 
 const T = 1_700_000_000_000;
 const OFFER = { offerCooldownSec: 3600 };
+/** What both games actually ship since #1465: no cap, the offer before every ad. */
+const NO_CAP = { offerCooldownSec: 0 };
 /** Passes every check, so each case can break exactly one thing. */
 const offerBase: NoAdsOfferContext = { lastOfferMs: 0, nowMs: T, offerable: true };
 
@@ -31,6 +33,17 @@ describe('mayOfferNoAds', () => {
 
   it('a clock that moved backwards fails OPEN, like the interstitial floor', () => {
     expect(mayOfferNoAds({ ...offerBase, lastOfferMs: T + 60_000 }, OFFER)).toEqual({ offer: true });
+  });
+
+  // #1465 — the shipped value. A cooldown of 0 is the one reading that could plausibly have gone the
+  // other way ("no offers at all"), and both games now depend on it going this way.
+  it('a cooldown of 0 offers EVERY time, including one millisecond after the last offer', () => {
+    expect(mayOfferNoAds({ ...offerBase, lastOfferMs: T - 1 }, NO_CAP)).toEqual({ offer: true });
+    expect(mayOfferNoAds({ ...offerBase, lastOfferMs: T }, NO_CAP)).toEqual({ offer: true });
+  });
+
+  it('a cooldown of 0 still withholds when there is nothing to sell', () => {
+    expect(mayOfferNoAds({ ...offerBase, offerable: false }, NO_CAP)).toEqual({ offer: false, why: 'not-offerable' });
   });
 });
 
@@ -77,11 +90,13 @@ describe('midLevelBreakDue', () => {
 
 describe('stepAdBreak', () => {
   const idle: AdBreakState = { kind: 'idle' };
-  const offer: AdBreakState = { kind: 'offer', trigger: 'mid_level' };
+  const offer: AdBreakState = { kind: 'offer', trigger: 'mid_level', remainingSec: 3 };
+  /** An offer that waits for a tap instead of leaving by itself (`countdownSec <= 0`). */
+  const offerHeld: AdBreakState = { kind: 'offer', trigger: 'mid_level', remainingSec: null };
 
   it('start: offer shows the card and asks for the stamp; show plays at once; countdown waits', () => {
     expect(stepAdBreak(idle, { type: 'start', trigger: 'level_end', step: 'offer', countdownSec: 3 }))
-      .toEqual({ state: { kind: 'offer', trigger: 'level_end' }, effect: 'offer-shown' });
+      .toEqual({ state: { kind: 'offer', trigger: 'level_end', remainingSec: 3 }, effect: 'offer-shown' });
     expect(stepAdBreak(idle, { type: 'start', trigger: 'level_end', step: 'show', countdownSec: 3 }))
       .toEqual({ state: idle, effect: 'show-ad' });
     expect(stepAdBreak(idle, { type: 'start', trigger: 'mid_level', step: 'countdown', countdownSec: 3 }))
@@ -91,6 +106,15 @@ describe('stepAdBreak', () => {
   it('a countdown of 0 plays the ad with no card', () => {
     expect(stepAdBreak(idle, { type: 'start', trigger: 'mid_level', step: 'countdown', countdownSec: 0 }))
       .toEqual({ state: idle, effect: 'show-ad' });
+  });
+
+  // #1465 — the SAME number, read the opposite way on the offer: the card is the thing being offered,
+  // so 0 cannot mean "skip it". It means the card waits for a tap, which is #1329's behaviour.
+  it('an auto-dismiss of 0 still SHOWS the offer — it just never leaves by itself', () => {
+    expect(stepAdBreak(idle, { type: 'start', trigger: 'level_end', step: 'offer', countdownSec: 0 }))
+      .toEqual({ state: { kind: 'offer', trigger: 'level_end', remainingSec: null }, effect: 'offer-shown' });
+    expect(stepAdBreak(idle, { type: 'start', trigger: 'level_end', step: 'offer', countdownSec: -1 }))
+      .toEqual({ state: { kind: 'offer', trigger: 'level_end', remainingSec: null }, effect: 'offer-shown' });
   });
 
   it('a start while a break is running is ignored', () => {
@@ -107,6 +131,34 @@ describe('stepAdBreak', () => {
     expect(buying).toEqual({ state: { kind: 'buying', trigger: 'mid_level' }, effect: 'none' });
     expect(stepAdBreak(buying.state, { type: 'purchase-settled', bought: true })).toEqual({ state: idle, effect: 'none' });
     expect(stepAdBreak(buying.state, { type: 'purchase-settled', bought: false })).toEqual({ state: idle, effect: 'show-ad' });
+  });
+
+  // #1465 — the offer auto-dismisses into the ad, and lands on the SAME transition `decline` makes.
+  it('the offer runs down on ticks and plays the ad when it reaches 0, exactly as No thanks does', () => {
+    let s: AdBreakState = offer;
+    let t = stepAdBreak(s, { type: 'tick', dt: 2 });
+    expect(t.effect).toBe('none');
+    s = t.state;
+    expect(s).toEqual({ kind: 'offer', trigger: 'mid_level', remainingSec: 1 });
+    t = stepAdBreak(s, { type: 'tick', dt: 1 });
+    expect(t).toEqual(stepAdBreak(offer, { type: 'decline' }));
+    expect(t).toEqual({ state: idle, effect: 'show-ad' });
+  });
+
+  it('an offer with no auto-dismiss sits through any tick', () => {
+    expect(stepAdBreak(offerHeld, { type: 'tick', dt: 1e6 })).toEqual({ state: offerHeld, effect: 'none' });
+  });
+
+  it('a negative tick does not wind the offer back', () => {
+    expect(stepAdBreak(offer, { type: 'tick', dt: -5 }).state)
+      .toEqual({ kind: 'offer', trigger: 'mid_level', remainingSec: 3 });
+  });
+
+  // #1465's own requirement: a tap on Buy must CANCEL the auto-dismiss, not race it. `buying` carries no
+  // clock, so the tick has nothing to advance — the guarantee is the state shape, not a flag.
+  it('a Buy stops the clock: the ad does not start under a purchase in flight', () => {
+    const buying = stepAdBreak(offer, { type: 'buy' }).state;
+    expect(stepAdBreak(buying, { type: 'tick', dt: 1e6 })).toEqual({ state: buying, effect: 'none' });
   });
 
   it('the countdown runs down on ticks and plays the ad when it reaches 0', () => {
@@ -133,7 +185,6 @@ describe('stepAdBreak', () => {
     ['a decline with no offer up', idle, { type: 'decline' }],
     ['a buy during a countdown', { kind: 'countdown', remainingSec: 2 }, { type: 'buy' }],
     ['a stale purchase answer on the offer', offer, { type: 'purchase-settled', bought: false }],
-    ['a tick on the offer', offer, { type: 'tick', dt: 10 }],
   ] as const)('ignores %s — no second ad', (_why, state, event) => {
     expect(stepAdBreak(state as AdBreakState, event)).toEqual({ state, effect: 'none' });
   });
