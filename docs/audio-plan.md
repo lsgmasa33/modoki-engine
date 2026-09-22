@@ -177,6 +177,15 @@ AudioListener trait ─┘        │
   `visibilitychange` paths go through one helper so they cannot drift. Nothing here changes
   recovery behaviour — only whether it is visible afterwards. Pinned by
   `tests/framework/audioHealthTrace.test.ts` + `tests/app/audioResumeRearm.test.tsx`.
+  ⚠️ **A `closed` context would be UNRECOVERABLE, and that is latent today.** `getAudioContext()`
+  caches the instance for the process with no liveness test, and `disposeAudioContext()` — the only
+  thing that can drop it, scoped by its own docblock to app teardown / error-boundary recovery —
+  has **zero production callers**, so nothing can rebuild a dead context and only a relaunch
+  restores audio. **Never observed** (measured to a 30-minute background, 2026-09-22 — the context
+  never left `interrupted`), which is why the owner chose to record it rather than file it
+  (2026-09-22). If it ever fires, the fix is a TRIGGER, not new machinery: `audioDispose()` +
+  `rearmAudioAutoplay(world)` was run on the iPad and restarted the bed from the top with a fresh
+  element. Detail in #1455's body.
   ⚠️ **A resumed context is only HALF the recovery — the media re-kick is the other half, and its
   refusal used to be swallowed too.** `resumeMedia()`'s `play()` rejection went into a bare
   `catch`, so a context that came back `running` while the bed stayed silent — candidate (2) of

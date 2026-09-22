@@ -27,7 +27,13 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    # ⚠️ 10, not the default 5 (owner, 2026-09-22). The cap is a SILENT ceiling: when it is
+    # full GitHub simply stops opening PRs, so a genuinely important upgrade does not appear
+    # and nothing says it was suppressed — you see a full queue and assume that is all there
+    # is. It WAS full (5 open against a cap of 5) at the moment the `vitest` group below was
+    # added, and that group takes a slot the minor/patch group used to absorb. A cap that
+    # suppresses defeats the only reason these PRs are kept here at all: the build signal.
+    open-pull-requests-limit: 10
     ignore:
       # ⚠️ `three` is held to the releases VERIFIED by QA-RENDER-0008 — a clean-install first
       # launch of a post-FX project on the iPad. 0.186.0's GTAONode samples depth with
