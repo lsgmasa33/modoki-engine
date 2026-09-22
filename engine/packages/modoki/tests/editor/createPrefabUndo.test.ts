@@ -24,6 +24,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 const setPrefabCacheSpy = vi.fn();
 const tagSpy = vi.fn();
 const untagSpy = vi.fn();
+const unstampSpy = vi.fn();
 /** The links the tree held BEFORE Create Prefab tagged over them — what undo must put back. */
 const PRIOR_LINKS = { links: [{ id: 7, data: { source: 'g-prior', localId: 1, rootInstanceId: 7, parentLocalId: 0 } }], orphans: [] };
 const detachSpy = vi.fn(() => PRIOR_LINKS);
@@ -48,7 +49,10 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   wouldCreateCycle: (parent: string, child: string) => parent === child,
   resolveExistingDocumentId: async () => OLD_ID,
   setPrefabCache: (...a: unknown[]) => setPrefabCacheSpy(...a),
-  tagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('tag'); return tagSpy(...a); },
+  tagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return new Map([['g-old', 'g-derived']]); },
+  // #1461: the tag stamps the members with the guid the reload derives, and undo reverses it. Recorded
+  // here because this file is the only place the undo's call ORDER is asserted — see the sequences below.
+  unstampMemberGuids: (...a: unknown[]) => { calls.push('unstamp'); return unstampSpy(...a); },
   untagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('untag'); return untagSpy(...a); },
   detachPrefabInstance: (...a: unknown[]) => { calls.push('detach'); return (detachSpy as (...x: unknown[]) => unknown)(...a); },
   reattachPrefabInstance: (...a: unknown[]) => { calls.push('reattach'); return reattachSpy(...a); },
@@ -308,7 +312,10 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
     const action = await makeAction();
     calls.length = 0;
     await action.undo();
-    expect(calls).toEqual(['untag', 'reattach']);
+    // #1461: the members' original guids go back BEFORE the links do — the snapshot addresses them by
+    // the guids they held before the tag. Mutation: move `unstamp()` after the reattach in assetOps.
+    expect(calls).toEqual(['unstamp', 'untag', 'reattach']);
+    expect(unstampSpy).toHaveBeenCalledWith(new Map([['g-old', 'g-derived']]));
     expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
   });
 
@@ -318,7 +325,7 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
     if (!res || res === 'declined') throw new Error(String(res));
     calls.length = 0;
     await res.action.undo();
-    expect(calls).toEqual(['untag', 'reattach']);
+    expect(calls).toEqual(['unstamp', 'untag', 'reattach']);
     expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
   });
 

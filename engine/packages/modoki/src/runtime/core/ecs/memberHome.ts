@@ -14,7 +14,7 @@
 import type { Entity, World } from 'koota';
 import { getCurrentWorld, indexEntityGuid } from './world';
 import { getAllTraits, getTraitByName } from './traitRegistry';
-import { memberStepId, deriveMemberGuid, remapGuidValues } from '../assetRefRules';
+import { memberStepId, deriveMemberGuid, remapGuidValues, durableGuid } from '../assetRefRules';
 import { templateKeyOf, addedKeyStep } from '../templateIdentity';
 import { memberPathKey, type MemberStep } from '../templateRefs';
 
@@ -313,6 +313,51 @@ export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World 
   }
   remapWorldGuidRefs(remap, world);
   for (const e of renamed) indexEntityGuid(e, world);
+}
+
+/** Give every member of the instance rooted at `rootEcsId` the guid a RELOAD will derive for it, and
+ *  return the rename it took (old guid → new), already applied (#1461).
+ *
+ *  Create Prefab tags a LIVE tree as an instance: the entities keep the random guids they had as plain
+ *  entities, while the prefab file just written says `guid: ''` on every row — so the reload derives each
+ *  member's guid from the anchor and its path, and the two disagree until the first save+reload. Anything
+ *  written in that window naming a member BY GUID (`moved`'s value, a ref into a member, an override
+ *  value) names a guid that will never exist again, and the load-time derive pass cannot repair it after
+ *  the fact: it fills EMPTY guids only. So the window is closed where it opens.
+ *
+ *  ⚠️ The rename is NOT a new identity change — the reload performs it today, silently and with no ref
+ *  repair at all. Doing it here makes it eager and repaired.
+ *
+ *  The root keeps its guid: it is the anchor, and both Create Prefab callers resolve the tagged subtree by
+ *  it across a world rebuild. A STORED root below (a user-added nested instance) keeps its own for the same
+ *  reason, exactly as {@link promoteOwnedRoots} skips one — this is that function run the other way.
+ *  Undo: {@link applyGuidRemap} with the map reversed, and BEFORE the prior links go back, because
+ *  `detachPrefabInstance`'s snapshot addresses every member by the guid it had when it was taken. */
+export function stampDerivedMemberGuids(rootEcsId: number, world: World = getCurrentWorld()): Map<string, string> {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  const remap = new Map<string, string>();
+  if (!piMeta || !eaMeta) return remap;
+  const guidOf = (e: Entity) => (e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '');
+  const index = memberPathIndex(world, rootEcsId, childrenByParent(world));
+  const root = index.get('');
+  // ⚠️ DURABLE only. A runtime guid (#1210) dies with its world, so deriving members from one would
+  // bake identities the next reload cannot reproduce — the very defect this closes, one level up.
+  // Both Create Prefab callers mint a durable guid (`entityRef` → `ensureGuid`) before tagging, so in
+  // production this is a floor, not a live branch.
+  const anchor = root ? durableGuid(guidOf(root)) : '';
+  if (!anchor) return remap; // unaddressable before, and after: nothing derives from it
+  for (const [key, e] of index) {
+    if (!key || !e) continue; // the root itself, and a step two siblings share
+    const pi = e.has(piMeta.trait) ? (e.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number }) : null;
+    if (pi && pi.rootInstanceId === e.id() && !pi.parentLocalId) continue; // a stored root keeps its stored guid
+    const old = guidOf(e);
+    // A member with NO guid is left alone: nothing can reference it, and the load-time pass fills it.
+    const next = deriveMemberGuid(anchor, key.split('.'));
+    if (old && old !== next) remap.set(old, next);
+  }
+  applyGuidRemap(remap, world);
+  return remap;
 }
 
 /** Make each OWNED nested root in `roots` a STORED root — a standalone instance of its own prefab — and

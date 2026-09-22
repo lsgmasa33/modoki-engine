@@ -17,7 +17,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, PrefabInstance,
-  deriveInstanceMemberGuids, getCurrentWorld, Transient,
+  deriveInstanceMemberGuids, getCurrentWorld, Transient, UIAction,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, undo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
@@ -96,8 +96,18 @@ describe('agent prefab create — undo restores the links the tree already had (
    *
    *  The reload is driven, not mimicked: blanking the members' guids and running the REAL
    *  `deriveInstanceMemberGuids` is exactly what `loadSceneFile` does at the end of a load. A test
-   *  that hand-wrote a different guid would prove only that a different string fails to resolve. */
-  it('survives a Play→Stop reload re-deriving the nested instance guids (#1272)', async () => {
+   *  that hand-wrote a different guid would prove only that a different string fails to resolve.
+   *
+   *  ⚠️ **#1461 removed the re-mint from this flow**, and this test caught it: Create Prefab now
+   *  stamps each member with the guid the reload derives, so blanking and re-deriving is IDEMPOTENT
+   *  and the premise this test used to assert ("the guid is NOT the one the snapshot captured") is
+   *  false here. Both guarantees are still pinned, separately, because they fail for different
+   *  reasons: the idempotence below is #1461's, and the surviving link after a guid DOES diverge is
+   *  #1272's. The divergence is hand-written now, with the caveat above answered — what it models is
+   *  a tree whose members were never stamped (a scene authored before #1461, or any other path that
+   *  re-mints), and what it proves is that the scoped untag never strips the held link in the first
+   *  place, so the reattach is not asked to resolve it. */
+  it('the derive is idempotent after the create (#1461), and the link survives a guid that diverges anyway (#1272)', async () => {
     const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-reload-r' }));
     const hull = game!.spawn(Transform(), EntityAttributes({ name: 'Hull', parentId: r.id(), guid: 'g-reload-hull' }));
     const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-reload-bolt' }));
@@ -114,9 +124,15 @@ describe('agent prefab create — undo restores the links the tree already had (
     }
     deriveInstanceMemberGuids(getCurrentWorld());
     const after = (hull.get(EntityAttributes) as { guid: string }).guid;
-    // The premise of the whole issue: the guid the snapshot captured is NOT the guid now live.
-    expect(after, 'the reload must actually re-mint the guid, or this test proves nothing').not.toBe(before);
+    // #1461: the create already gave it the guid the reload derives, so the round trip is a no-op.
+    // Mutation: drop the stamp from tagEntityTreeAsInstance and this goes red (it did, before the fix).
+    expect(after, 'the create must leave the derive nothing to change').toBe(before);
     expect(after).toBeTruthy();
+
+    // Now force the divergence #1272 was reported against — see the caveat in the docblock.
+    for (const e of [hull, bolt]) {
+      e.set(EntityAttributes, { ...(e.get(EntityAttributes) as object), guid: `stale-${(e.get(EntityAttributes) as { name: string }).name}` });
+    }
 
     await undo();
 
@@ -126,6 +142,36 @@ describe('agent prefab create — undo restores the links the tree already had (
     // A row this prefab owned is no longer owned by anything once the owner is removed.
     expect((hull.get(PrefabInstance) as { parentLocalId: number }).parentLocalId).toBe(0);
     expect(r.has(PrefabInstance), 'the created prefab tag must still be gone').toBe(false);
+  });
+
+  /** #1461's undo half. The create STAMPS each member with the guid the reload will derive, so undo
+   *  owes two things: the original guids back, and every ref that followed the rename back with them.
+   *
+   *  Mutation: drop `unstampMemberGuids(guidRemap)` — red.
+   *
+   *  ⚠️ The ORDER of the un-rename against `reattachPrefabInstance` is not pinned HERE — it is pinned in
+   *  `packages/modoki/tests/editor/createPrefabUndo.test.ts`, whose mock records the call sequence and
+   *  asserts `['unstamp', 'untag', 'reattach']`. An earlier version of this comment claimed nothing
+   *  pinned it, on a mutation run with `--config engine/vite.config.ts` — which, per CLAUDE.md § Tests,
+   *  is NOT the package suite, so the guard was simply absent from what was measured. */
+  it('undo puts the members\' original guids back, and every ref with them (#1461)', async () => {
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-undo-r' }));
+    const a = game!.spawn(Transform(), EntityAttributes({ name: 'A', parentId: r.id(), guid: 'g-undo-a' }));
+    // A ref from OUTSIDE the tree, aimed at the entity that is about to become a member.
+    const x = game!.spawn(Transform(), EntityAttributes({ name: 'X', guid: 'g-undo-x' }),
+      UIAction({ bindings: [{ event: 'click', kind: 'call' as const, action: 'noop', target: 'g-undo-a' }] }));
+    const targetOfX = () => ((x.get(UIAction) as { bindings: { target: string }[] }).bindings)[0].target;
+
+    await runAgentOp('prefab', { action: 'create', entityGuid: 'g-undo-r', path: NEW_PATH });
+
+    const stamped = (a.get(EntityAttributes) as { guid: string }).guid;
+    expect(stamped, 'the member takes the guid the reload derives').not.toBe('g-undo-a');
+    expect(targetOfX(), 'and the ref follows it').toBe(stamped);
+
+    await undo();
+
+    expect((a.get(EntityAttributes) as { guid: string }).guid).toBe('g-undo-a');
+    expect(targetOfX()).toBe('g-undo-a');
   });
 
   /** The report must not fire on the flow the fix makes WORK (close-out review F1).

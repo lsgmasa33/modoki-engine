@@ -2,7 +2,7 @@
 
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
-import { rehomeDependents, endFrames, relinkDetachedMembers, homeStepsOf, remapWorldGuidRefs, type DetachedMember } from '../../runtime/core/ecs/memberHome';
+import { rehomeDependents, endFrames, relinkDetachedMembers, homeStepsOf, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { isPrefabEditRowGuid } from './prefabEditGuids';
 import { IDENTITY_TRS, mergeTrs, localToWorldTrs } from '../../runtime/scene/transformSpace';
 import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, type PrefabReader } from '../../runtime/loaders/memberPaths';
@@ -2792,9 +2792,9 @@ export function applyStructureByRootInstance(
  *  overrides — it is simply gone on the next load. So the plan is checked against the file and a
  *  mismatch REFUSES to tag: an untagged entity round-trips as an `added` node, which is the
  *  degradation that loses nothing. */
-export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writtenPrefab?: PrefabFile): void {
+export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writtenPrefab?: PrefabFile): Map<string, string> {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  if (!PrefabInstanceMeta) return;
+  if (!PrefabInstanceMeta) return new Map();
 
   // Callers pass the prefab's asset PATH; store a GUID instead when one resolves
   // (callers register the new prefab before tagging). PrefabInstance.source is
@@ -2818,7 +2818,13 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
   const applyTag = (ecsId: number, localId: number) => {
     const entity = findEntity(ecsId);
     if (!entity) return;
-    const piData = { source: ref, localId, rootInstanceId: rootEcsId, parentLocalId: 0 };
+    // ⚠️ `homeParent`/`homeSteps` are CLEARED, not omitted — see the partial-merge warning above, which
+    //  #1437 added these two fields after and did not come back to. Tagging captures the tree AS IT
+    //  STANDS, so every member is at its row in the new prefab and none of them is "moved" relative to
+    //  it. Left stale, a member that had been moved under the PREVIOUS prefab derives from a path the
+    //  reload does not walk, and the stamp below repoints every ref onto that wrong guid (#1461
+    //  close-out F1).
+    const piData = { source: ref, localId, rootInstanceId: rootEcsId, parentLocalId: 0, homeParent: '', homeSteps: '' };
     if (entity.has(PrefabInstanceMeta.trait)) entity.set(PrefabInstanceMeta.trait, piData);
     else entity.add(PrefabInstanceMeta.trait(piData));
   };
@@ -2827,7 +2833,7 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
   // checked against the file before anything is written. (`planPrefabRows` only returns null for
   // a cycle, which needs `existingId`; this call passes none, so that cannot fire here.)
   const plan = planPrefabRows(tree, rootEcsId)!;
-  if (writtenPrefab && !planMatchesFile(plan, writtenPrefab, source)) return;
+  if (writtenPrefab && !planMatchesFile(plan, writtenPrefab, source)) return new Map();
   for (const info of plan.flatTree) {
     const localId = plan.ecsToLocal.get(info.id)!;
     const nested = plan.nestedRefs.get(info.id);
@@ -2845,7 +2851,28 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
     }
     applyTag(info.id, localId);
   }
+  // The tags above make these entities MEMBERS, whose identity the reload derives from the anchor and
+  // the path — but they still hold the random guids they had as plain entities, and the file written
+  // alongside says `guid: ''` on every row. Give them that identity now, or everything written before
+  // the first save+reload that names a member by guid names one that will never exist again (#1461).
+  // Returned so Create Prefab's undo can reverse it; the callers mint the root's guid before tagging,
+  // which is what gives this an anchor to derive from.
+  const guidRemap = stampDerivedMemberGuids(rootEcsId);
   markStructureDirty();
+  return guidRemap;
+}
+
+/** Undo of the member rename {@link tagEntityTreeAsInstance} returned (#1461): the map reversed and
+ *  applied, so every member is addressable by the guid it had before Create Prefab, refs included.
+ *
+ *  Run it BEFORE `reattachPrefabInstance`: Create Prefab snapshots the tree's prior links one line ahead
+ *  of the tag, and that snapshot addresses each member by the guid it held then, so reattaching first
+ *  would be asked to resolve guids that are not live yet. Untag is by ecs id and does not care.
+ *  The order is PINNED — `packages/modoki/tests/editor/createPrefabUndo.test.ts` asserts the undo
+ *  sequence as `['unstamp', 'untag', 'reattach']` on both the create and the replace branch. */
+export function unstampMemberGuids(remap: ReadonlyMap<string, string>): void {
+  if (!remap.size) return;
+  applyGuidRemap(new Map([...remap].map(([from, to]) => [to, from])));
 }
 
 /** Inverse of tagEntityTreeAsInstance — strip the PrefabInstance trait off the entities that

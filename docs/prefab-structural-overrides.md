@@ -560,6 +560,42 @@ unpacked (`runtime/core/ecs/memberHome.ts`). Every identity walk — `deriveInst
 `memberPathIndex`, `planCopyGuids`, `baseTokenResolver`, the template tokenizer — steps from the home
 (`identityParentId`, `homeStepsOf`). Moved back to its row parent, the stamp is cleared.
 
+**A created instance's members are stamped at tag time (#1461).** `moved`'s value is a member's live
+guid, and so is a ref into a member — both are written on the assumption that a member's live guid is
+the one the reload derives. **Create Prefab used to break that assumption and nothing else did.** It
+turns a LIVE tree into an instance (`tagEntityTreeAsInstance`) while `serializePrefab` writes `guid: ''`
+on every row, so the members kept the random guids they had as plain entities and the reload derived
+different ones. Everything written in that window — until the first save+reload — named a guid that
+would never exist again: the reported case was a member moved inside the new instance, lost on reload
+with the loader warning `moved member "X": its parent <guid> is gone`; a ref INTO a member and an owned
+NESTED instance's members failed the same way, unreported. The load-time pass cannot repair it, because
+it fills EMPTY guids only.
+
+So the tag now ends by giving every member the guid the reload will derive
+(`stampDerivedMemberGuids`, `runtime/core/ecs/memberHome.ts`) and carrying every ref onto it through
+`applyGuidRemap` — `promoteOwnedRoots` (#1447) run in the other direction, sharing its walk, its
+stored-root skip and its inverse. The ANCHOR keeps its guid (and must be durable: deriving from a
+runtime guid, #1210, would bake identities the next reload cannot reproduce, so both callers mint with
+`entityRef`→`ensureGuid` BEFORE tagging). A STORED root inside the tree keeps its guid too — it is the
+anchor its own members derive from, and they are below this walk's floor. The tag returns the rename;
+`unstampMemberGuids` reverses it for Create Prefab's undo.
+
+⚠️ **Tagging CLEARS `homeParent`/`homeSteps`**, and that is part of the fix rather than housekeeping.
+`applyTag` names every field of `PrefabInstance` because koota's setter is a partial merge, and #1437
+added those two after that rule was written. A tag captures the tree AS IT STANDS — every member is at
+its row in the NEW prefab — so a member that had been moved under the previous one must not keep
+pointing at the old row parent. Left stale, the stamp derives it from a path the reload does not walk
+and repoints every ref onto a guid nothing will mint (close-out review F1).
+
+⚠️ **The rename is not a new identity change** — the reload performed it already, silently and with no
+ref repair at all. This makes it eager and repaired. **`+added.<guid>` is NOT affected** (measured, and
+pinned by a negative control): an added node's identity is its own durable guid and the loader spawns it
+verbatim. **Not covered:** refs from OTHER FILES on disk to an entity that becomes a member — their guid
+already changed at every reload before this, and repairing them needs `planMemberPathRepair` as Apply
+does. Tests: `engine/tests/editor/createPrefabMemberIdentity.test.ts` (the round trips),
+`stampDerivedMemberGuids.test.ts` (the walk's floor and ceiling),
+`agentPrefabCreateUndo.test.ts` (undo, and the #1272 premise this fix removed).
+
 **Save and load.** The save writes `moved: {rowLocalId: newParentGuid}` on the instance's entry, in a
 `nestedStructure` slot, or on a reference node (scene v15, which a v14 reader refuses). The loader
 expands the member at its row, derives every guid, and only then moves it (the per-World after-derive

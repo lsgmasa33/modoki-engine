@@ -52,7 +52,7 @@ import {
   getPrefabSource, instantiatePrefabInstance, serializePrefab, writePrefabFile, warnInertPrefabSizes,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
-  resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
+  resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance,
   applyToPrefabWithUndo, revertOverridesSelective, rebuildInstance, resolveInstanceContext,
   collectInstanceOverrideFields, collectInstanceOverrideKeys,
@@ -2717,18 +2717,27 @@ export function registerEditorAgentOps(): void {
         // deliberately leaves a held nested instance linked to its OWN prefab, but the untag
         // below strips the WHOLE tree — without this the agent path's undo left that instance
         // permanently unlinked, with nothing recorded to restore it. Mirrors the human flow.
+        // ⚠️ Mint the root's guid BEFORE the tag: it is the ANCHOR every member's derived guid comes
+        // from (#1461), and `entityRef` is what mints it. Taken after, the stamp has nothing to derive
+        // from and leaves the create window open. (Its other job — resolving the subtree across a world
+        // rebuild — is unchanged.)
+        const ref = entityRef(entityId);
         const priorLinks = detachPrefabInstance(entityId, { strip: false });
-        tagEntityTreeAsInstance(entityId, path, prefab);
+        // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
+        let guidRemap = tagEntityTreeAsInstance(entityId, path, prefab);
         // Undo reverts the LIVE tagging only — deliberately NOT the file write. Deleting the
         // .prefab.json on undo (as the human path does for a brand-new prefab) is wrong here:
         // this op also OVERWRITES an existing prefab (`existingId` preserves its GUID), and
         // undoing an overwrite by deleting the file would destroy an asset the agent never
         // created. File-direct writes are not undoable anywhere else in the MCP surface either.
-        const ref = entityRef(entityId);
         pushAction({
           label: `Create prefab "${prefab.name ?? path}" (link only)`,
           undo: () => {
             const id = ref.resolve(); if (id == null) return;
+            // Put the members' ORIGINAL guids back FIRST, and every ref with them: `priorLinks` was
+            // snapshotted one line before the tag and addresses each member by the guid it held then,
+            // so reattaching ahead of this would resolve nothing (#1461).
+            unstampMemberGuids(guidRemap);
             // Scoped to THIS prefab (#1272): a held nested instance keeps its own link rather
             // than being stripped and restored from a guid that a Play→Stop may have re-minted.
             untagEntityTreeAsInstance(id, path);
@@ -2742,7 +2751,8 @@ export function registerEditorAgentOps(): void {
             // the file written warm, and the redo tags nothing at all.
             await preloadNestedPrefabsForSubtree(id);
             const after = ref.resolve(); if (after == null) return;
-            tagEntityTreeAsInstance(after, path, prefab);
+            guidRemap = tagEntityTreeAsInstance(after, path, prefab); // undo reverses THIS run's rename
+
           },
         });
       }
