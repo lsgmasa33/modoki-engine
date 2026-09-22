@@ -834,8 +834,17 @@ export {
   setAudioMuted, isAudioMuted,
   crossfade as crossfadeAudio,
   getAudioLog, clearAudioLog, setAudioRecordMode,
+  noteForeground as noteAudioForeground,
   type BusName, type AudioPlaySpec, type AudioHandle, type AudioLogEntry,
 } from './audio/audioService';
+// Audio-health trace — why a music bed went silent, kept in memory for the life of the realm.
+// Exported so an agent can read it over the device bridge (#1455): the failure it serves leaves
+// the app ALIVE and silent, so the realm holding the trace is still there to be asked.
+export {
+  getAudioHealthTrace, clearAudioHealthTrace,
+  type AudioHealthEntry, type AudioStreamHealth, type AudioHealthKind, type AudioResumeOutcome,
+  type AudioKickReason,
+} from './audio/audioHealth';
 // Video subsystem — playback core (HTMLVideoElement lifetime, timeScale coupling,
 // autoplay-block recovery). Its SOUND routes onto the audio bus above.
 export {

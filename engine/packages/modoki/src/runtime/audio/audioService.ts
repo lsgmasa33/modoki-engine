@@ -19,6 +19,9 @@ import { getAudioContext, hasAudioSupport } from './audioContext';
 import { audioAssetProvider } from './audioAssetProvider';
 import { hasDocKey } from '../core/docKeys';
 import { warnVocabOnce } from '../core/warnVocab';
+import {
+  recordAudioHealth, type AudioStreamHealth, type AudioResumeOutcome, type AudioKickReason,
+} from './audioHealth';
 function retryFailedAudioDecodes() { audioAssetProvider.get()?.retryFailedAudioDecodes(); }
 
 /** The mixer's buses — the ONE list. Enum pickers spread it rather than typing the four names out
@@ -220,6 +223,10 @@ function graphOrNull(): Graph | null {
       // Never while hidden: a context that comes back to `running` in the background must not
       // start a bed the OS paused there. The foreground re-arm covers the return.
       const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      // Traced on EVERY edge, including the ones this handler ignores. A context dropping to
+      // `interrupted` is half the story of a lost bed, and an entry only on the `running` edge
+      // would record the recoveries and none of the losses.
+      recordAudioHealth({ kind: 'statechange', state: ctx.state, ctxTime: ctx.currentTime, streams: snapshotStreams() });
       if (ctx.state === 'running' && !hidden) resumeActiveMedia();
     });
   }
@@ -348,24 +355,85 @@ export function resume(): void {
   notifyListeners(gestureUnlockListeners, 'audioService:gestureUnlock', []); // a subsystem's retry must not break the unlock
   if (recording()) { log.push({ op: 'resume' }); return; }
   const g = graphOrNull();
+  // Read BEFORE the attempt — `ctx.state` mutates under the resume, so a state read afterwards
+  // cannot say what the OS had left behind, which is the fact the trace exists to keep.
+  const before: string = g ? g.ctx.state : 'no-context';
   // ⚠️ "Not running", NOT "=== 'suspended'" (#1428). WebKit has a fourth, non-standard state,
   // `'interrupted'` — what backgrounding, screen lock, a call or Siri leave the context in on
   // current iOS. The old equality skipped exactly that case, so every foreground re-arm and every
   // tap was a no-op for it, and music stayed dead whenever WebKit did not happen to auto-resume
   // the context itself (it does so inconsistently — WebKit bug 263627).
   if (g && needsResume(g.ctx)) {
+    const ctx = g.ctx;
     // Retry buffer decodes ONLY after the context is running — iOS rejects
     // decodeAudioData while suspended (the scene-load decodes failed there).
-    g.ctx.resume().then(() => {
+    ctx.resume().then(() => {
+      traceResume(ctx, before, 'resolved');
       retryFailedAudioDecodes();
       // A stream re-kicked below, while the context was still interrupted, MAY be refused or
       // re-paused by WebKit (modelled, not observed on a device); kick again once it is running.
       resumeActiveMedia();
-    }).catch(() => { /* ignore — a later gesture retries */ });
+    }).catch((err: unknown) => {
+      // ⚠️ Recorded AND logged, where it used to be swallowed entirely. A rejected resume is the
+      // one outcome that leaves the app silent with nothing of ours having noticed, and the bare
+      // `catch {}` here is why #1455 could not be diagnosed from a report. A later gesture still
+      // retries — this does not change the recovery, only whether it is visible.
+      // Warn only when the trace actually recorded — otherwise a context that refuses every
+      // attempt writes a console line on every tap, for the life of the session.
+      if (traceResume(ctx, before, 'rejected')) {
+        console.warn('[audio] resume() rejected — the context stays', ctx.state, err);
+      }
+    });
   } else {
+    traceResume(g?.ctx, before, !g ? 'no-graph' : before === 'closed' ? 'skipped-closed' : 'skipped-running');
     retryFailedAudioDecodes();
   }
   resumeActiveMedia();
+}
+
+/** Snapshot every live STREAM's liveness. Buffer voices report `null` and are dropped — they have
+ *  no playhead to read back, and a streamed bed is what these failures are about. */
+function snapshotStreams(): AudioStreamHealth[] {
+  const out: AudioStreamHealth[] = [];
+  for (const h of active) {
+    const s = h.streamHealth();
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+/** ⚠️ **`collapseRepeat`, and it is load-bearing.** `resume()` runs on EVERY `pointerdown`, so a
+ *  healthy app writes `skipped-running` on every tap — 32 taps would evict every `foreground` and
+ *  `statechange` entry from the ring, leaving a trace that records only that the player was
+ *  tapping. A stuck context refusing every attempt does the same with `rejected`, plus a console
+ *  line each time. Collapsing a run of identical outcomes keeps the TRANSITIONS, which is all this
+ *  is for, and costs nothing when outcomes alternate.
+ *
+ *  Returns whether an entry was actually written, so the caller's log line collapses with it. */
+function traceResume(ctx: AudioContext | undefined, before: string, outcome: AudioResumeOutcome): boolean {
+  return recordAudioHealth({
+    kind: 'resume', state: before, stateAfter: ctx?.state, outcome,
+    ctxTime: ctx?.currentTime, streams: snapshotStreams(),
+  }, { collapseRepeat: true });
+}
+
+/** Record that the app has come back to the foreground, after `backgroundedMs` away (`null` when
+ *  no preceding hide was seen — a boot-time or gesture-driven foreground).
+ *
+ *  ⚠️ Call this BEFORE `resume()`, not after: the whole value of the entry is `ctx.state` as the OS
+ *  left it. Called after the recovery it would read `running` every time and say nothing.
+ *
+ *  The duration is the app layer's to measure — `runtime/**` sees no foreground event — so it is a
+ *  parameter rather than something this module tracks. `engine/app/useAudioResumeRearm.ts` is the
+ *  caller; it is also what dedupes the two events iOS fires for one transition, and
+ *  `tests/app/audioResumeRearm.test.tsx` pins that. */
+export function noteForeground(backgroundedMs: number | null): void {
+  if (recording()) return;
+  const ctx = graphOrNull()?.ctx;
+  recordAudioHealth({
+    kind: 'foreground', state: ctx ? ctx.state : 'no-context',
+    backgroundedMs, ctxTime: ctx?.currentTime, streams: snapshotStreams(),
+  });
 }
 
 /** Whether the context needs a `resume()` — anything but running or closed. Typed as a string
@@ -490,6 +558,9 @@ export function dispose(): void {
 class LiveHandle implements AudioHandle {
   ended = false;
   private deliberatelyPaused = false;
+  /** Whether this source's last play attempt was refused — so a wedged bed records ONE trace entry
+   *  per episode rather than one per tap. Cleared by the first success. */
+  private playRefused = false;
   /** `ctx.currentTime` when a BUFFER source started — a buffer node exposes no playhead,
    *  so its remaining time is derived from the audio clock rather than read back. */
   private bufStartedAt = 0;
@@ -543,6 +614,11 @@ class LiveHandle implements AudioHandle {
       const src = ctx.createMediaElementSource(el);
       src.connect(this.gain);
       el.onended = () => { if (!spec.loop) this.cleanup(); };
+      // ⚠️ Deliberately NOT routed through `kick()` — this one refusal is ROUTINE, not a symptom.
+      // On iOS every bed start before the first gesture is refused by the autoplay policy, and a
+      // shuffle playlist mints a fresh handle per clip, so tracing it would write an entry every
+      // few minutes forever and evict the foreground entries the trace exists for. The re-kick
+      // that follows IS traced, and that is the one that means something.
       el.play().catch(() => { /* gesture-gated; resume() will unlock */ });
       this.mediaEl = el;
       this.mediaSrc = src;
@@ -629,7 +705,34 @@ class LiveHandle implements AudioHandle {
     if (this.ended || !this.deliberatelyPaused) return;
     this.deliberatelyPaused = false;
     // Buffer gain is restored by the reconcile's setVolume on the same frame.
-    if (this.mediaEl) this.mediaEl.play().catch(() => { /* gesture-gated; resumeMedia retries */ });
+    if (this.mediaEl) this.kick('unpause');
+  }
+
+  /** Play the element, and RECORD a refusal instead of swallowing it (#1455 close-out sweep).
+   *
+   *  A refused `play()` is the other half of a lost bed: the context can come back `running` while
+   *  the element stays silent, and a context-only trace cannot tell that apart from a healthy
+   *  recovery. The rejection still does not propagate — a later gesture retries, exactly as before.
+   *
+   *  ⚠️ **At most one entry per stuck episode, not one per attempt.** `resumeActiveMedia()` runs on
+   *  every `resume()`, which fires on every pointerdown — so a bed that is wedged would otherwise
+   *  write an entry per tap and evict the foreground entries this trace exists for, from a ring
+   *  that only holds 32. The flag clears on the first success, so a NEW episode records again. */
+  private kick(reason: AudioKickReason): void {
+    const el = this.mediaEl;
+    if (!el) return;
+    el.play().then(
+      () => { this.playRefused = false; },
+      () => {
+        if (this.playRefused) return;
+        this.playRefused = true;
+        const s = this.streamHealth();
+        recordAudioHealth({
+          kind: 'play-refused', state: this.ctx.state, reason,
+          ctxTime: this.ctx.currentTime, streams: s ? [s] : [],
+        });
+      },
+    );
   }
 
   /** Re-kick a streaming element whose autoplay was gesture-blocked (called from
@@ -638,7 +741,26 @@ class LiveHandle implements AudioHandle {
     // Don't un-pause a source the game deliberately paused — only re-kick one whose
     // autoplay was gesture-blocked.
     if (this.ended || this.deliberatelyPaused || !this.mediaEl || !this.mediaEl.paused) return;
-    this.mediaEl.play().catch(() => { /* still gated — a later gesture retries */ });
+    this.kick('re-kick');
+  }
+
+  /** This voice's liveness for the audio-health trace, or `null` when it has nothing readable to
+   *  report — a buffer source (no playhead to read back) or a finished handle.
+   *
+   *  ⚠️ Reports `deliberatelyPaused` deliberately: without it a bed the GAME paused and a bed the
+   *  OS silently killed are the same two fields, and the whole point of the trace is telling those
+   *  apart after the fact. */
+  streamHealth(): AudioStreamHealth | null {
+    const el = this.mediaEl;
+    if (this.ended || !el) return null;
+    return {
+      paused: el.paused,
+      currentTime: el.currentTime,
+      duration: Number.isFinite(el.duration) ? el.duration : null,
+      readyState: el.readyState,
+      error: el.error ? el.error.code : null,
+      deliberatelyPaused: this.deliberatelyPaused,
+    };
   }
 
   setPosition(x: number, y: number, z: number): void {

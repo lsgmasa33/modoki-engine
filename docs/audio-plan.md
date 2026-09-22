@@ -128,6 +128,85 @@ AudioListener trait ─┘        │
   to recover" (swept for #1428, device-verified). Pinned by
   `tests/framework/audioResumeInterrupted.test.ts`; re-test on a phone the same way
   (background mid-bed, foreground, repeat several times) — no headless test can.
+  ⚠️ **`ctx.state` is no longer inferred — it was MEASURED (#1455, 2026-09-22).** On an iPad
+  mini 5 (`iPad11,1`, iOS 26.6.2), backgrounded for 1, 5 and 30 minutes with the context and every
+  bed element sampled on each foreground: the context reads **`'interrupted'`**, and **never
+  `'closed'`**, at every duration. That confirms #1428's diagnosis, which the paragraph above
+  correctly flagged as inferred. Two consequences worth keeping:
+  **(a)** `ctx.currentTime` **freezes while interrupted** — ~27 s advanced across a 1798 s
+  background — so the difference between two readings tells "the audio clock actually ran" apart
+  from "the context merely claims to be `running`". That is the only cheap discriminator for a
+  resumed-but-silent context, and nothing else can see it.
+  **(b)** the JS realm **survived** 30 minutes backgrounded intact, so the #590 jetsam class did
+  not fire either. A **long** background is therefore not, by itself, a distinct failure mode from
+  a short one — #1428's predicate recovered the context on every leg (resume resolved in 93–107 ms).
+  **Still untested and where #1455 now lives:** overnight; **screen LOCKED** (every leg above
+  backgrounded by switching apps, screen on throughout, which is not a phone in a pocket); and an
+  interruption of a different KIND — a call, Siri, or another app taking the audio session.
+  ⚠️ **A stale build on a device looks exactly like a current one, and it cost two legs of that
+  sweep.** The iPad's Weaveling predated #1428 and silently re-measured the OLD bug — visible only
+  once the shipped bundle was grepped (no `statechange` literal, one `suspended` literal, no
+  `!== 'running' && !== 'closed'` predicate). **Check the build before trusting any device result
+  here**: `app.buildNumberAuto` derives the iOS build number from the **git commit count**
+  (`resolveBuildNumber` in `engine/plugins/healNativeConfig.ts`), so `devicectl device info apps` dates an
+  installed build exactly — #1428 lands at count **11746**.
+- **Audio-health trace** (`runtime/audio/audioHealth.ts`, #1455) — the reason that sweep needed a
+  device in the first place was that **the audio path recorded nothing about its own recovery**, so
+  the owner's report could not carry evidence and the only way to learn anything was to hold a
+  phone and wait. It now records, per realm: every **foreground** (the state the OS left behind,
+  read BEFORE the resume, with how long the app was away), every **resume** and its outcome —
+  including `skipped-running`, `skipped-closed` and **`rejected`**, which a bare `catch {}` used to
+  swallow entirely — and every **statechange** edge, losses as well as recoveries. Each entry
+  carries `ctx.currentTime` (for (a) above) and each live stream's
+  `paused`/`currentTime`/`readyState`/`error` plus **`deliberatelyPaused`**, without which a bed the
+  GAME paused and a bed the OS killed are the same two fields.
+  **In memory, not persisted, on purpose:** the failure it serves leaves the app ALIVE and silent,
+  so the realm that must answer is still running; if iOS killed the app instead, the next launch
+  starts a fresh context and the music plays, which is not the bug.
+  ⚠️ **Reading it on a device is NOT "call the barrel export"** — the `modoki` object `device_eval`
+  injects carries one method per registered agent op and this registers none, so a bare
+  `return getAudioHealthTrace()` is a `ReferenceError`. The route that works, verified on the iPad
+  on 2026-09-22, is the shared-module registry:
+  `window.__MODOKI_SHARED__.modules['@modoki/engine/runtime'].getAudioHealthTrace()`. **Not** a
+  dynamic `import()` of the built chunk — that yields a second module instance with an empty
+  trace, which reads exactly like "nothing was recorded". `device_eval` also needs the debug
+  bridge at all (`__MODOKI_DEBUG_BUILD__ && isNativePlatform()`), true for Weaveling but not for
+  every build. The background duration is measured in
+  `engine/app/useAudioResumeRearm.ts` (only `runtime/**` is bound to the injectable clock; the app
+  layer reads `Date.now()` directly) and both the native `appStateChange` and web
+  `visibilitychange` paths go through one helper so they cannot drift. Nothing here changes
+  recovery behaviour — only whether it is visible afterwards. Pinned by
+  `tests/framework/audioHealthTrace.test.ts` + `tests/app/audioResumeRearm.test.tsx`.
+  ⚠️ **A resumed context is only HALF the recovery — the media re-kick is the other half, and its
+  refusal used to be swallowed too.** `resumeMedia()`'s `play()` rejection went into a bare
+  `catch`, so a context that came back `running` while the bed stayed silent — candidate (2) of
+  #1455's own list — read in the trace as a perfectly healthy resume. `LiveHandle.kick()` now
+  covers both refusable call sites (the foreground/gesture re-kick and a deliberate unpause) and
+  records a **`play-refused`** entry naming which. Two constraints it has to respect, both about
+  not drowning the thing the trace is for:
+  **(a)** **one entry per stuck episode, not per attempt** — `resumeActiveMedia()` runs on every
+  `resume()`, which fires on every `pointerdown`, so a wedged bed would otherwise write an entry
+  per tap and evict the foreground entries from a 32-entry ring. A per-handle flag clears on the
+  first success, so a NEW episode records again.
+  **(a-bis)** ⚠️ **the same hazard applies to `resume()` itself, and it is the one that nearly
+  shipped.** `resume()` runs on **every `pointerdown`**, so every tap on a healthy app recorded a
+  `skipped-running` entry — 32 taps evicted every `foreground` and `statechange` entry, leaving a
+  trace that faithfully recorded that the player had been tapping and nothing about the audio.
+  `recordAudioHealth` now takes **`collapseRepeat`**: an entry repeating the previous one's
+  kind/outcome/reason is dropped, so what survives is the TRANSITIONS, and the console line is
+  gated on whether the entry was actually written so it cannot spam separately. Callers that fire
+  on a real edge — a foreground, a statechange — deliberately do **not** collapse: two foregrounds
+  in a row are two different facts.
+  **(b)** the **constructor's initial autoplay is deliberately untraced** — on iOS every bed start
+  before the first gesture is refused by the autoplay policy, and a shuffle playlist mints a fresh
+  handle per clip, so tracing it would flood the ring with routine refusals every few minutes.
+  ⚠️ **The test for (a) originally passed for the wrong reason**, and the mutation check is what
+  found it: it drove refusals by setting `ctx.state = 'interrupted'`, but the fake's `resume()`
+  sets the state back to `running`, so nine of its ten re-kicks SUCCEEDED and the per-episode
+  guard could be deleted with the suite green. Refusals are now driven by a flag independent of
+  the context state, and both repeat-refusal tests assert a precondition that the attempts really
+  happened. The standing lesson is [falsifiable-tests.md](./falsifiable-tests.md)'s: a test that builds only one
+  instance of the axis it separates cannot fail.
 - **Tests** — `tests/runtime/audioSystem.test.ts` (record mode: autoplay, cues,
   play-state gating, scene-swap teardown, Transform-less sources) + buffer-cache
   refcount tests.
