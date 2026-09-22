@@ -566,10 +566,17 @@ stage comment). Revisit at r187.
 
 ⚠️ **The ceiling is "verified on a device", not "known bad".** No automated gate can see the #956
 defect class — it needs a cold pipeline cache — so `engine/tests/architecture/threeVersionCeiling.test.ts`
-(the installed version plus both manifests that declare `three`) and a `three` ignore entry in
-`.github/dependabot.yml` bound `three` below the first release that has NOT passed QA-RENDER-0008
+(the installed version, both manifests that declare `three`, and the OVERLAY's ignore entry) and a
+`three` ignore in BOTH dependabot configs bound `three` below the first release that has NOT passed QA-RENDER-0008
 (`qa/cases/rendering/ios-clean-install-postfx-first-launch.md`, a clean-install first launch on the
-iPad). Raising it means running that case against the new version first.
+iPad). Raising it means running that case against the new version first — in the test AND in the
+overlay's ignore, which `threeVersionCeiling.test.ts` now pins together.
+⚠️ **The ignore that MATTERS is `oss/.github/dependabot.yml`'s, not the private one.** Version
+updates are off in the private config, so its entry is dormant; the public mirror's overlay has
+them ON and is what actually proposed `three@0.186.0` (#1467) — though an edit to the overlay is
+inert until the next release publish, since Dependabot reads the mirror's default branch. Ownership
+of that divergence is
+[docs/engine-oss-publishing.md](engine-oss-publishing.md) § the overlay.
 
 **The env-leak record is historical.** Measured before the engine took ownership of the PMREM
 (`envPmrem.ts`, #739/#775/#779), on the same island ⟷ empty cycle:

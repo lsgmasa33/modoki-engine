@@ -4,11 +4,25 @@ updates:
   #
   # ⚠️ THIS FILE DELIBERATELY DISAGREES WITH THE PRIVATE REPO'S `.github/dependabot.yml`,
   # which has version-update PRs OFF (`open-pull-requests-limit: 0`). Owner ruling,
-  # 2026-09-22 (issue #1467): KEEP them here. The private `ci.yml` is `workflow_dispatch`-
+  # 2026-09-22 (tracked in the private repo): KEEP them here. The private `ci.yml` is `workflow_dispatch`-
   # only and no longer runs on `pull_request:`, so these PRs are the ONLY automated answer
   # left to "does this upgrade actually build?" — and a release is when dependency versions
-  # get DECIDED rather than drifted. Do not "fix" the divergence by aligning the two files;
-  # the divergence IS the ruling.
+  # get DECIDED rather than drifted.
+  #
+  # ⚠️ THIS FILE IS INERT UNTIL THE NEXT RELEASE PUBLISH. Dependabot reads its config only
+  # from the mirror's DEFAULT branch, and only a `publish-engine-oss.sh --push` release
+  # moves it; the CI-snapshot branch it is force-pushed to on every commit is NOT read.
+  # So an edit here changes nothing until the next release goes out, and any open PR the
+  # old config already produced stays open and stays red.
+  #
+  # ⚠️ EXACTLY WHICH DIFFERENCES ARE THE RULING, because the first version of this comment
+  # said "the divergence IS the ruling" and thereby blessed three ignores it had never
+  # examined — an omission reading as a decision is worse than the omission:
+  #   THE RULING (may differ):     open-pull-requests-limit, schedule, groups.
+  #   NOT THE RULING (must match): the `ignore:` SET. Every hold in the private config is a
+  #     hold on the dependency, not on a repo — and this is the only repo where the entries
+  #     do any work, since the limit here is raised. `threeVersionCeiling.test.ts` asserts
+  #     the two sets are identical; do not let them drift again.
   - package-ecosystem: npm
     directory: "/"
     schedule:
@@ -16,9 +30,9 @@ updates:
     open-pull-requests-limit: 5
     ignore:
       # ⚠️ `three` is held to the releases VERIFIED by QA-RENDER-0008 — a clean-install first
-      # launch of a post-FX project on the iPad (#957). 0.186.0's GTAONode samples depth with
+      # launch of a post-FX project on the iPad. 0.186.0's GTAONode samples depth with
       # `textureGather`, which WGSL has no overload for on a multisampled depth texture, so
-      # every AO pass under MSAA fails to compile. #956 black-screened every iOS device on a
+      # every AO pass under MSAA fails to compile. An earlier three bump black-screened every iOS device on a
       # first launch with every automated gate green: the repro needs a cold pipeline cache.
       #
       # This entry was MISSING here while the private copy carried it, and on 2026-09-21 the
@@ -30,6 +44,14 @@ updates:
       # passes on the new version.
       - dependency-name: "three"
         versions: [">=0.186.0"]
+      # ⚠️ HELD for the release by owner ruling (2026-09-14), and carried here because this
+      # is the repo where the limit is RAISED — the private entries are dormant, these are
+      # not. Unlike three, NONE of these is pinned exactly (`pixi.js` is `^8.17.1`, both
+      # Rapier are `^0.19.3`), so there is NO peer-range backstop: the layer that caught
+      # three@0.186.0 does not exist for them. Lift these with the hold.
+      - dependency-name: "pixi.js"
+      - dependency-name: "@dimforge/rapier2d-compat"
+      - dependency-name: "@dimforge/rapier3d-compat"
     groups:
       # ⚠️ MUST come before `npm-minor-patch` — Dependabot takes the FIRST matching group, and
       # that one is `patterns: ["*"]`. `vitest` and `@vitest/coverage-v8` peer-pin each other
