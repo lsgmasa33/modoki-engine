@@ -229,6 +229,17 @@ export function addedKeyStep(key: string): string {
   return `+${key}`;
 }
 
+/** The step between an identity parent that is a nested ROOT and a row of the frame that OWNS that root — a
+ *  nested row under a nested row, or a member under one (#1484). Such a row hangs under the inner instance's
+ *  root, as the inner document's own rows do, and it steps by a localId of the OUTER document; with nothing to
+ *  say whose, the two coincide whenever the numbers do, and the path gave both one guid. It is never a gone row
+ *  (`identityParents.ts`' `extra`), so {@link isFrameStep} is how a reader of those tells it apart. Disjoint
+ *  from every numeric and `+key` step, so no path without the shape derives differently. */
+export const FRAME_STEP = '@';
+export function isFrameStep(step: MemberStep): boolean {
+  return step === FRAME_STEP;
+}
+
 /** A member's step in {@link deriveMemberGuid}'s path: its `PrefabInstance.localId` — EXCEPT a
  *  nested-instance root, whose localId is the (shared) inner root id; its distinguishing position is
  *  `parentLocalId` (which OUTER row produced it). An entity with no `PrefabInstance` steps by 0. */
@@ -252,6 +263,7 @@ export type MemberStep = number | string;
  *  and nowhere else. ⚠️ It is NOT a hedge today — before Phase 1 eleven sites coerced a step back to
  *  a number by hand and this grammar rejected anything non-numeric outright. */
 export function parseStep(part: string): MemberStep | null {
+  if (part === FRAME_STEP) return part;
   if (part.startsWith('+') && part.length > 1) return part;
   return /^\d+$/.test(part) ? Number(part) : null;
 }

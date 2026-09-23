@@ -170,6 +170,8 @@ if (!__MODOKI_PLAYABLE__ && (import.meta.env.DEV || import.meta.env.VITE_DEBUG_B
 // is still guarded by import.meta.hot until Phase 2 swaps it for IPC.
 if (__MODOKI_EDITOR__) {
   import('./debug/agentBridge').then(({ initAgentBridge }) => initAgentBridge());
+  // Gameplay recorder replay (#1479): `?capture=1` hands the frame cadence to the CLI renderer.
+  import('./debug/captureDriver').then(({ initCaptureDriver }) => initCaptureDriver());
   // HMR staleness/recovery + the game-code reload. ACTIVE in the packaged editor too —
   // it runs a real Vite dev server, so import.meta.hot is defined there (see the module
   // header). Inert only where there is no hot context at all.

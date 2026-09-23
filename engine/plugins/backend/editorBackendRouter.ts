@@ -51,6 +51,7 @@ import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash, remintS
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite } from '../prefabWriteGuard';
+import { classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
 
 /** A validate route's file, parsed — or the parse failure as a WARNING (#1212 A-4).
  *  A file that does not parse is the most important thing a validator can report, and it used to
@@ -499,6 +500,58 @@ function resolveWritableFilePath(ctx: BackendContext, filePath: string): string 
     return (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) ? abs : null;
   }
   return ctx.resolveAssetPath(filePath);
+}
+
+/** The url the SCANNER will index `absPath` under: the disk's spelling of every folder that exists.
+ *  A file that is there answers for itself (#1273). A new one lands in whatever folder the disk
+ *  already has under that name in another case (APFS/NTFS fold it), and the scan reads THAT folder's
+ *  spelling — so `/assets/Scenes/x.json` beside an on-disk `scenes/` is typed by `scenes`. Only the
+ *  part that does not exist yet keeps the caller's spelling, because that is what gets created.
+ *  Null outside every asset root (the root itself included, which has no url). */
+function scannerUrlOf(ctx: BackendContext, absPath: string): string | null {
+  if (fs.existsSync(absPath)) return ctx.absToAssetUrl(absPath, { onDisk: true });
+  const tail = [path.basename(absPath)];
+  let dir = path.dirname(absPath);
+  while (!fs.existsSync(dir)) {
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    tail.unshift(path.basename(dir));
+    dir = up;
+  }
+  const dirUrl = ctx.absToAssetUrl(dir, { onDisk: true });
+  return dirUrl === null ? ctx.absToAssetUrl(absPath) : `${dirUrl}/${tail.join('/')}`.replace(/\/+/g, '/');
+}
+
+/** The asset kind of the JSON document at `absPath`, or null when nothing says. An existing file is
+ *  what the MANIFEST types it, looked up by the disk's own spelling so a case variant still finds
+ *  it (#1273); a file the manifest does not list (not scanned yet, or scanned before a rename) and a
+ *  file that does not exist yet get `classifyJsonAssetPath` on `scannerUrlOf` — the rule and the
+ *  spelling the scanner itself types by, so the answer is the type the next scan WILL give the file,
+ *  legacy `/scenes/` folder and case-folded folders included. With no url (outside every asset root)
+ *  only the name's suffix can say anything. */
+function assetKindAt(ctx: BackendContext, absPath: string): { kind: string | null; exists: boolean; url: string | null } {
+  const exists = fs.existsSync(absPath);
+  const url = scannerUrlOf(ctx, absPath);
+  const registered = exists && url ? ctx.getManifest().assets.find((a) => a.path === url) : undefined;
+  return { kind: registered?.type ?? (url ? classifyJsonAssetPath(url) : classifyJsonAssetSuffix(absPath)), exists, url };
+}
+
+/** Never cross kinds (#1264, #1472): a route that writes a document of kind `expected` to a path the
+ *  CALLER names refuses a path whose file is — or, when new, whose name makes it — another kind.
+ *  Every such route calls this rather than carrying its own copy: #1264 wrote the check inline in
+ *  `/api/scene-save-as`, and `/api/scene-mutate`, `/api/asset-write` and `/api/create-asset` got
+ *  nothing, so an agent could rewrite a prefab through the scene path.
+ *
+ *  A kind nothing can name (a plain `.json` outside the legacy `/scenes/`/`/materials/` folders) is
+ *  NOT refused: an unknown kind is not a wrong one, and refusing it would break a write this never
+ *  had grounds to judge. */
+function wrongKindRefusal(ctx: BackendContext, absPath: string, expected: string): BackendResult | null {
+  const { kind, exists, url } = assetKindAt(ctx, absPath);
+  if (kind === null || kind === expected) return null;
+  const shown = url ?? absPath;
+  return exists
+    ? json({ error: `${shown} is not a ${expected} (it is typed '${kind}'). Nothing was written.`, wrongKind: true, existingType: kind }, 409)
+    : json({ error: `${shown} would be typed '${kind}' by its name, not '${expected}'. Nothing was written.`, wrongKind: true, nameType: kind }, 409);
 }
 
 function rebuildManifestInline(ctx: BackendContext): boolean {
@@ -2631,6 +2684,9 @@ async function describeUnresolvedAgainstLiveWorld(
         const resolved = ctx.resolveAssetPath(scenePath);
         if (!resolved) return outsideAssetRoots('path outside allowed directories');
         if (!fs.existsSync(resolved)) return json({ error: `scene not found: ${scenePath}` }, 404);
+        // The file branch below parses whatever is here as a scene and writes it back (#1472).
+        const kindRefusal = wrongKindRefusal(ctx, resolved, 'scene');
+        if (kindRefusal) return kindRefusal;
         absPath = resolved;
       }
       if (!Array.isArray(ops)) return json({ error: 'ops must be an array' }, 400);
@@ -4203,6 +4259,9 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
       if (!abs) return outsideAssetRoots('path outside allowed directories');
+      // `type` only picks the schema `data` is validated against; the FILE decides what it is (#1472).
+      const kindRefusal = wrongKindRefusal(ctx, abs, type);
+      if (kindRefusal) return kindRefusal;
       // ── #889 phase 3: the dirty-asset gate. ──
       //
       // ⚠️ **`selfWrite` is the whole reason this route could not simply be gated**, and it is why
@@ -4458,6 +4517,9 @@ async function describeUnresolvedAgainstLiveWorld(
       const abs = ctx.resolveAssetPath(assetPath);
       if (!abs) return outsideAssetRoots('path outside allowed directories');
       if (fs.existsSync(abs)) return json({ error: `destination exists: ${assetPath}` }, 409);
+      // A name the manifest would type as another kind (#1472) — `x.scene.json` from `type:'material'`.
+      const kindRefusal = wrongKindRefusal(ctx, abs, type);
+      if (kindRefusal) return kindRefusal;
       const id = crypto.randomUUID();
       const data = defaultAssetData(type) as Record<string, unknown>;
       data.id = id;
@@ -4596,14 +4658,10 @@ async function describeUnresolvedAgainstLiveWorld(
       let scene: Record<string, unknown>;
       try { scene = JSON.parse(String(content).replace(/^\uFEFF/, '')); } catch { return json({ error: 'content is not valid JSON' }, 400); }
       // Never cross kinds (#1264): the client only sends a `.scene.json` name or a file the manifest
-      // already types `scene`, so this is the backstop for a manifest that disagrees.
-      if (fs.existsSync(absPath)) {
-        const onDisk = ctx.absToAssetUrl(absPath, { onDisk: true });
-        const existing = ctx.getManifest().assets.find((a) => a.path === onDisk);
-        if (existing && existing.type !== 'scene') {
-          return json({ error: `${onDisk} is not a scene (it is typed '${existing.type}')`, wrongKind: true, existingType: existing.type }, 409);
-        }
-      }
+      // already types `scene`, so this is the backstop for a manifest that disagrees — or that does
+      // not list the file at all, which the manifest-only check this replaced let through (#1472).
+      const kindRefusal = wrongKindRefusal(ctx, absPath, 'scene');
+      if (kindRefusal) return kindRefusal;
       const guid = crypto.randomUUID();
       const copy = remintSceneEntityGuids({ ...scene, id: guid }, () => crypto.randomUUID(), makePrefabResolver(ctx));
       const bytes = assetJsonBytes(copy);

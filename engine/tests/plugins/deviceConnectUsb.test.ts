@@ -96,10 +96,14 @@ afterEach(() => {
   fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
-/** `disconnectDelayMs` holds back the reply to a lease `disconnect`, so a hang-up stays in flight. */
-function startMockDevice(authority: DeviceLeaseAuthority, opts: { disconnectDelayMs?: number } = {}): Promise<{ port: number; close: () => Promise<void> }> {
+/** `disconnectDelayMs` holds back the reply to a lease `disconnect`, so a hang-up stays in flight.
+ *  `holdDisconnect` holds it until the test calls `releaseDisconnects()` — for a case that must act
+ *  WHILE the hang-up is in flight, where a delay would be a bet on the machine's scheduling (#1478). */
+type MockDevice = { port: number; close: () => Promise<void>; heldDisconnects: () => number; releaseDisconnects: () => void };
+function startMockDevice(authority: DeviceLeaseAuthority, opts: { disconnectDelayMs?: number; holdDisconnect?: boolean } = {}): Promise<MockDevice> {
   return new Promise((resolve) => {
     let live: net.Socket | null = null;
+    const held: Array<() => void> = [];
     const server = net.createServer((socket) => {
       live = socket;
       socket.setEncoding('utf8');
@@ -112,6 +116,13 @@ function startMockDevice(authority: DeviceLeaseAuthority, opts: { disconnectDela
           let msg: { id: string; method: string; params?: { guid?: string } };
           try { msg = JSON.parse(line); } catch { continue; }
           const now = Date.now(); const guid = msg.params?.guid ?? '';
+          if (msg.method === 'disconnect' && opts.holdDisconnect) {
+            const id = msg.id;
+            held.push(() => {
+              if (!socket.destroyed) socket.write(JSON.stringify({ id, result: authority.disconnect(guid, Date.now()) }) + '\n');
+            });
+            continue;
+          }
           if (msg.method === 'disconnect' && opts.disconnectDelayMs) {
             const id = msg.id;
             setTimeout(() => {
@@ -132,7 +143,12 @@ function startMockDevice(authority: DeviceLeaseAuthority, opts: { disconnectDela
     });
     server.listen(0, '127.0.0.1', () => {
       const port = (server.address() as net.AddressInfo).port;
-      resolve({ port, close: () => new Promise<void>((r) => { live?.destroy(); server.close(() => r()); }) });
+      resolve({
+        port,
+        close: () => new Promise<void>((r) => { live?.destroy(); server.close(() => r()); }),
+        heldDisconnects: () => held.length,
+        releaseDisconnects: () => { for (const reply of held.splice(0)) reply(); },
+      });
     });
   });
 }
@@ -162,7 +178,7 @@ async function launchWdaAgent(udid: string): Promise<FakeAgent> {
 }
 
 /** A connected USB lease against a mock device standing in for the host end of the tunnel. */
-async function connectedUsb(mgr: DeviceConnectionManager, opts: { disconnectDelayMs?: number } = {}) {
+async function connectedUsb(mgr: DeviceConnectionManager, opts: { disconnectDelayMs?: number; holdDisconnect?: boolean } = {}) {
   const device = await startMockDevice(new DeviceLeaseAuthority(), opts);
   process.env.MODOKI_DEVICE_HOST_PORT = String(device.port);
   const status = await mgr.connect({ useUsb: true });
@@ -230,21 +246,32 @@ describe('DeviceConnectionManager — useUsb branch (#1065)', () => {
     // The manager's own ownership guard cannot close this: it compares against the MANAGER's field,
     // which knows nothing about `wdaLauncher`'s module state.
     const mgr = new DeviceConnectionManager('g-usb-wda-1082', stateDir);
-    const { device } = await connectedUsb(mgr, { disconnectDelayMs: 300 });
+    const { device } = await connectedUsb(mgr, { holdDisconnect: true });
     try {
       expect(claimed()).toContain('ios:UDID-IPAD');
 
       // The teardown suspends inside the lease hangup, past its synchronous field-nulling. `stopWda`
       // runs at the HEAD of disconnect (#527), before this point, so it cannot reach the agent that
       // is about to launch.
+      // The device HOLDS that hang-up's reply until released, and this waits until it has one to
+      // hold (#1478). It used to sleep 30ms inside a 300ms reply delay — under load the reply could
+      // land before the agent launched, the interleaving never formed, and the case passed green
+      // without exercising #1082.
       const hangup = mgr.disconnect();
-      await new Promise((r) => setTimeout(r, 30));
+      await vi.waitFor(() => expect(device.heldDisconnects()).toBe(1));
 
       // …and meanwhile the agent starts on the same phone and claims the same key.
       const agent = await launchWdaAgent('UDID-IPAD');
       expect(claimed()).toContain('ios:UDID-IPAD');
       expect(holdersOf('ios:UDID-IPAD')).toContain('wda');
 
+      // Still suspended at the release: the lease transport times a request out at 5s, so a stall that
+      // long would let the hang-up resolve on its own and the case would pass on nothing (close-out review).
+      let hungUp = false;
+      void hangup.then(() => { hungUp = true; });
+      await Promise.resolve();
+      expect(hungUp, 'the hang-up must still be in flight when the agent has claimed').toBe(false);
+      device.releaseDisconnects();
       await hangup;   // the stale continuation now reaches its releaseDevice call
 
       expect(claimed(), 'an agent is still running on this phone, so the lease teardown must not '
@@ -344,11 +371,17 @@ describe('DeviceConnectionManager — useUsb branch (#1065)', () => {
     const mgr = new DeviceConnectionManager('g-usb-deadrace', stateDir);
     const { device } = await connectedUsb(mgr, { disconnectDelayMs: 300 });
     try {
+      const disconnect = vi.spyOn(mgr, 'disconnect');   // pass-through: the observable the continuation needs
       children[0].exitCode = 1;
       children[0].emit('exit', 1, null);      // onExit starts a disconnect whose hang-up waits 300ms for a reply
+      expect(disconnect).toHaveBeenCalledTimes(1);
+      const stale = disconnect.mock.results[0].value as Promise<unknown>;
       const again = await mgr.connect({ useUsb: true });
       expect(again.state).toBe('connected');
-      await new Promise((r) => setTimeout(r, 450));   // past the reply: the stale teardown's continuation has run
+      // The stale teardown's OWN promise, not a 450ms bet on it (#1478). onExit chained its `.then`
+      // before this await did, so resuming here means that continuation has already run — under load
+      // the sleep could end first and the case passed green without the continuation ever running.
+      await stale;
       expect(mgr.status().state).toBe('connected');
       expect(mgr.status().detail ?? '').not.toMatch(/mid-lease/);
     } finally {

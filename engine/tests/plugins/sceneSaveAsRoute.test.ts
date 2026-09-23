@@ -104,6 +104,17 @@ describe('/api/scene-save-as', () => {
     expect(fs.readFileSync(path.join(projectRoot, 'prefabs/enemy.json'), 'utf-8')).toBe(before);
   });
 
+  it('refuses an existing prefab the manifest does NOT list — the suffix decides (#1472)', async () => {
+    fs.mkdirSync(path.join(projectRoot, 'prefabs'), { recursive: true });
+    const before = JSON.stringify({ id: '55555555-5555-4555-8555-555555555555', entities: [] });
+    fs.writeFileSync(path.join(projectRoot, 'prefabs/enemy.prefab.json'), before);
+
+    const res = await post({ path: '/prefabs/enemy.prefab.json', content: JSON.stringify(openScene()) });
+    expect(res.status).toBe(409);
+    expect(res.body.wrongKind).toBe(true);
+    expect(fs.readFileSync(path.join(projectRoot, 'prefabs/enemy.prefab.json'), 'utf-8')).toBe(before);
+  });
+
   it('the open scene\'s OWN file under another spelling is refused as sameFile, and left byte-identical', async () => {
     fs.mkdirSync(path.join(projectRoot, 'scenes'), { recursive: true });
     const before = JSON.stringify(openScene());

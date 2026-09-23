@@ -904,8 +904,35 @@ referenced a scene replaced by Save As no longer resolves. It is not drift from 
 `Enemy.prefab.json`. Kept, that guid would be re-registered as a scene, and every `PrefabInstance.source`
 would resolve to a scene document. A destination the manifest types as another kind is refused
 before any question (`otherAssetKindAt`). Only the scene flows pass `kind`: every other create
-enforces a compound extension. A file the manifest has not indexed yet cannot be classified and is
-not refused.
+enforces a compound extension.
+
+**The same rule fronts every backend route that writes a caller-named JSON asset** (#1472), through
+ONE predicate, `wrongKindRefusal` in `editorBackendRouter.ts`: `/api/scene-mutate` (expects `scene`),
+`/api/scene-save-as` (`scene`), `/api/asset-write` and `/api/create-asset` (the body's `type`). Each
+answers `409 {wrongKind:true}` with `existingType` for a file that is there, or `nameType` for a new
+name, and writes nothing. Before it, #1264's check lived inline in save-as alone, so the other three
+decided the kind from the CALLER — the route, or the body's `type` — and never asked the file:
+`setTrait` posted to `/api/scene-mutate` at a `.prefab.json` answered `saved:true` and rewrote the
+prefab through the scene path (observed), and `write_asset {type:'material'}` would have done the
+same to any asset.
+
+A file's kind is asked in the same order on both sides — the client's `otherAssetKindAt` and the
+backend predicate: **the manifest's type** (looked up by the disk's spelling, #1273), **else
+`classifyJsonAssetPath`** on that same on-disk url — the function the scanner's `detectType` itself
+types JSON by, so a file the manifest has not indexed yet is judged by the type it is about to get.
+Both used to read an unindexed file as no conflict. ⚠️ **The SUFFIX table alone is not that rule**:
+the scan also types `.layout.json`, and a plain `.json` under a legacy `/scenes/` or `/materials/`
+folder (issue #54). The first version of this check used only the suffixes, and `create_asset
+{type:'particle', path:'/scenes/burst.json'}` answered `saved:true` for a file the next scan typed
+`scene` (close-out review). The url it classifies is the one the scan WILL index the file under
+(`scannerUrlOf`): the disk's spelling of every folder that already exists, because on APFS/NTFS a new
+`/assets/Scenes/x.json` lands in the on-disk `scenes/` and is typed by it (second close-out review).
+A path no kind claims — a plain `.json` outside those folders, or a `.meta.json` sidecar — is NOT
+refused: an unknown kind is not a wrong one. Deliberately outside the rule: `/api/write-file` (byte-
+opaque by design; its only kind-aware guard is the prefab format gate), and `duplicate-asset`,
+`move-file` and `adopt-file`, which never overwrite an existing file. Guarded by
+`tests/plugins/wrongKindRefusal.test.ts`, `tests/plugins/sceneSaveAsRoute.test.ts` and
+`tests/editor/otherAssetKindAt.test.ts`.
 
 **A case-variant name resolves to the file that is really there** (#1273). On APFS/NTFS the create-only
 check folds case, so `enemy.prefab.json` 409s over `Enemy.prefab.json` — while the manifest keys the

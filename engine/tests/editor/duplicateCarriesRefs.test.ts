@@ -3499,6 +3499,277 @@ describe('a nested row under a nested row (#1468 Phase 6 close-out)', () => {
   });
 });
 
+// #1484 / #1481: a nested row under a nested row, SUPPORTED in every capture and rebuild path (owner ruling
+// 2026-09-23). O: Root(1) > QRow(2, Q) > ZRow(3, Z), plus a plain row Plain(4) under QRow and Ctrl(5) under the root.
+// `ownZ` gives Q its OWN nested Z at row 3 under its root — the same row number and the same identity parent.
+describe('a nested row under a nested row is supported everywhere (#1484, #1481)', () => {
+  const O7 = 'aaaaaaaa-0000-4000-8000-0000000007b1';
+  const Q7 = 'aaaaaaaa-0000-4000-8000-0000000007b2';
+  const Z7 = 'aaaaaaaa-0000-4000-8000-0000000007b3';
+  const docsOf = (ownZ = false, zRowTf?: { x: number }) => ({
+    [Q7]: { id: Q7, rootLocalId: 1, entities: [row(1, 'QRoot', 0), row(2, 'QA', 1), ownZ ? row(3, 'QZRow', 1, { prefab: Z7 }) : row(3, 'QB', 2)] },
+    [Z7]: { id: Z7, rootLocalId: 1, entities: [row(1, 'ZRoot', 0), row(2, 'ZLeaf', 1)] },
+    [O7]: { id: O7, rootLocalId: 1, entities: [row(1, 'ORoot', 0), row(2, 'QRow', 1, { prefab: Q7 }), row(3, 'ZRow', 2, { prefab: Z7, ...(zRowTf ? { overrides: { 1: { Transform: zRowTf } } } : {}) }),
+      row(4, 'Plain', 2), row(5, 'Ctrl', 1)] },
+  });
+  let docs = docsOf();
+  const use = (d: typeof docs) => { docs = d; for (const [k, v] of Object.entries(d)) { prefabs.set(k, v); setPrefabCache(k, v as never); } };
+  const loadO = async () => load({ id: 'n7', version: 16, name: 'N7', resources: [], entities: [
+    { id: 1, prefab: O7, guid: ROOT, traits: { EntityAttributes: { name: 'ORoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+  ] } as unknown as SceneData);
+  const tfOf = (id: number) => [...getCurrentWorld().entities].find((e) => e.id() === id)!.get(getTraitByName('Transform')!.trait) as { x: number };
+  type Entry = { prefab?: string; removed?: number[] };
+  const oEntry = async () => viewEntry((await serializeScene() as unknown as { entities: Entry[] }).entities.find((e) => e.prefab === O7)!);
+  beforeEach(() => use(docsOf()));
+  afterEach(() => { for (const k of [O7, Q7, Z7]) { prefabs.delete(k); setPrefabCache(k, null); } });
+
+  // #1484 (1). Mutation: have `nestedRowPresent` look its parent up in `localToEcs` alone (the pre-fix lookup).
+  it('deleting the nested row under the nested row is saved, and stays deleted after a reload', async () => {
+    await loadO();
+    deleteEntitiesWithUndo([idAt('ORoot/QRoot/ZRoot')]);
+    expect((await oEntry()).removed).toEqual([3]);
+    await load(await serializeScene() as unknown as SceneData);
+    expect(getAllEntities().filter((e) => e.name === 'ZRoot' || e.name === 'ZLeaf')).toHaveLength(0);
+    expect(idAt('ORoot/QRoot/QA/QB')).toBeGreaterThan(0);
+  });
+  // A plain row under the nested row is O's row, not something Q added. Mutation: have `foreignRow` answer false for
+  // a member of another instance (Q's capture writes Plain as its own `added`, and a reload spawns it twice).
+  it('left in place, nothing is written as removed or added, and a reload holds one of each', async () => {
+    await loadO();
+    const entry = await oEntry() as Entry & { members?: Record<string, { added?: unknown[] }> };
+    expect(entry.removed).toBeUndefined();
+    expect(Object.values(entry.members ?? {}).flatMap((r) => r.added ?? [])).toEqual([]);
+    await load(await serializeScene() as unknown as SceneData);
+    for (const name of ['Plain', 'ZRoot', 'ZLeaf']) expect(getAllEntities().filter((e) => e.name === name)).toHaveLength(1);
+  });
+
+  // #1484 (2): an Apply or Revert on source Q rebuilds the nested Q alone. Mutation: drop `foreignOwned` from the
+  // park predicate in `rebuildInstance` (Z is torn down with Q's subtree and nothing respawns it).
+  it('rebuilding the inner instance keeps the outer frame\'s row under it, its guid and its edit', async () => {
+    await loadO();
+    const z = guidAt('ORoot/QRoot/ZRoot');
+    const leaf = guidAt('ORoot/QRoot/ZRoot/ZLeaf');
+    writeTraitFieldWithUndo(idAt('ORoot/QRoot/ZRoot/ZLeaf'), getTraitByName('Transform')!, 'x', 7);
+    const q = idAt('ORoot/QRoot');
+    const qDoc = docs[Q7] as never;
+    rebuildInstance(q, Q7, qDoc, captureInstanceOverrides(q, qDoc), captureInstanceStructure(q, qDoc));
+    expect(getAllEntities().filter((e) => e.name === 'ZRoot')).toHaveLength(1);
+    expect(getAllEntities().filter((e) => e.name === 'Plain')).toHaveLength(1); // a plain row of O's under Q, too
+    expect(guidAt('ORoot/QRoot/ZRoot')).toBe(z);
+    expect(tfOf(idAt('ORoot/QRoot/ZRoot/ZLeaf')).x).toBe(7);
+    await load(await serializeScene() as unknown as SceneData);
+    expect(guidAt('ORoot/QRoot/ZRoot/ZLeaf')).toBe(leaf);
+    expect(tfOf(idAt('ORoot/QRoot/ZRoot/ZLeaf')).x).toBe(7);
+  });
+  // …and a rebuild that tears the OWNER down too still destroys it, rather than parking a root whose frame is going.
+  // Mutation: return 0 from rebuildInstance's `frameOf` for an unmoved owned root (the pre-fix answer) — ZRoot is
+  // then parked through O's rebuild and survives beside its own respawn.
+  it('rebuilding the outer instance respawns the row once', async () => {
+    await loadO();
+    const o = idAt('ORoot');
+    const oDoc = docs[O7] as never;
+    rebuildInstance(o, O7, oDoc, captureInstanceOverrides(o, oDoc), captureInstanceStructure(o, oDoc));
+    expect(getAllEntities().filter((e) => e.name === 'ZRoot')).toHaveLength(1);
+    expect(getAllEntities().filter((e) => e.name === 'ZLeaf')).toHaveLength(1);
+  });
+
+  // One level further out: P nests O, so O's QRoot is an owned root of ANOTHER frame hanging under a nested root of
+  // P's — parked by P's rebuild, and destroyed with its owner O, which that rebuild respawns. Mutation: return 0 from
+  // rebuildInstance's `frameOf` for an unmoved owned root (the pre-fix answer): QRoot then stays parked through the
+  // teardown of its own frame and survives beside its respawn.
+  it('rebuilding an instance that nests the outer one respawns everything once', async () => {
+    const P7 = 'aaaaaaaa-0000-4000-8000-0000000007b5';
+    const pDoc = { id: P7, rootLocalId: 1, entities: [row(1, 'PRoot', 0), row(2, 'ORow', 1, { prefab: O7 })] };
+    prefabs.set(P7, pDoc); setPrefabCache(P7, pDoc as never);
+    try {
+      await load({ id: 'n7p', version: 16, name: 'N7P', resources: [], entities: [
+        { id: 1, prefab: P7, guid: ROOT, traits: { EntityAttributes: { name: 'PRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+      ] } as unknown as SceneData);
+      const p = idAt('PRoot');
+      rebuildInstance(p, P7, pDoc as never, captureInstanceOverrides(p, pDoc as never), captureInstanceStructure(p, pDoc as never));
+      for (const name of ['ORoot', 'QRoot', 'QA', 'Plain', 'ZRoot', 'ZLeaf']) expect(getAllEntities().filter((e) => e.name === name)).toHaveLength(1);
+    } finally { prefabs.delete(P7); setPrefabCache(P7, null); }
+  });
+
+  // Review finding 2: a Revert or Apply on O rebuilds it and re-applies its structure, whose row map was built from
+  // "the nested root's live parent is a member" — so the removed row 3, whose root hangs under Q's ROOT, was never
+  // mapped, and came back. Mutation: build `applyStructureByRootInstance`'s map from members only.
+  it('a deleted nested row under the nested row stays deleted through a rebuild of the outer instance', async () => {
+    await loadO();
+    deleteEntitiesWithUndo([idAt('ORoot/QRoot/ZRoot')]);
+    const o = idAt('ORoot');
+    const oDoc = docs[O7] as never;
+    rebuildInstance(o, O7, oDoc, captureInstanceOverrides(o, oDoc), captureInstanceStructure(o, oDoc));
+    expect(getAllEntities().filter((e) => e.name === 'ZRoot')).toHaveLength(0);
+    expect((await oEntry()).removed).toEqual([3]);
+  });
+
+  // Review finding 1: the FILE-side path walk (`memberPathRecords`) must agree with the live derive on the frame step,
+  // or an Apply that names a member by path finds nothing. P nests O; ZLeaf (O's Z's member) is moved under P's own
+  // row, and the Apply's `~moved` key must survive the "names nothing now" filter. Mutation: drop the FRAME_STEP
+  // unshift in `memberPaths.ts`' `baseOf` (the Apply reports applied and writes no move).
+  it('an Apply of a move of a member inside the nested row under the nested row writes the move', async () => {
+    const P7 = 'aaaaaaaa-0000-4000-8000-0000000007b6';
+    const pDoc = { id: P7, rootLocalId: 1, entities: [row(1, 'PRoot', 0), row(2, 'ORow', 1, { prefab: O7 }), row(3, 'PCtrl', 1)] };
+    prefabs.set(P7, pDoc); setPrefabCache(P7, pDoc as never);
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true, rewritten: [], held: [] }) }) as unknown as Response));
+    try {
+      await load({ id: 'n7a', version: 16, name: 'N7A', resources: [], entities: [
+        { id: 1, prefab: P7, guid: ROOT, traits: { EntityAttributes: { name: 'PRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+      ] } as unknown as SceneData);
+      reparentEntity(idAt('PRoot/ORoot/QRoot/ZRoot/ZLeaf'), idAt('PRoot/PCtrl'));
+      const moveKeys = collectInstanceOverrideKeys(idAt('PRoot'), pDoc as never).moved;
+      expect(moveKeys).toHaveLength(1);
+      const result = await applyToPrefabSelective(idAt('PRoot'), new Set(moveKeys));
+      expect(result.applied).toBe(true);
+      expect(Object.keys(result.prefabAfter!.moved ?? {})).toEqual(['2.2.@.3.2']);
+      expect(idAt('PRoot/PCtrl/ZLeaf')).toBeGreaterThan(0);
+    } finally { vi.unstubAllGlobals(); prefabs.delete(P7); setPrefabCache(P7, null); }
+  });
+
+  // Review finding 3: in PREFAB-EDIT, O's own rows under Q's root are the edited document's, not Q's; a Revert on Q
+  // rebuilt Q and tore them down, and the edit save then wrote O without them. Mutation: drop the `editRow` park in
+  // `rebuildInstance`.
+  it('prefab-edit: a Revert on the nested instance keeps the edited prefab\'s rows under it', async () => {
+    await load(buildPrefabEditScene(docs[O7] as unknown as PrefabFile));
+    writeTraitFieldWithUndo(idAt('ORoot/QRoot/QA'), getTraitByName('Transform')!, 'x', 3);
+    await revertOverridesSelective(idAt('ORoot/QRoot'), new Set(['2.Transform.x']));
+    expect(tfOf(idAt('ORoot/QRoot/QA')).x).toBe(0);
+    for (const path of ['ORoot/QRoot/Plain', 'ORoot/QRoot/ZRoot', 'ORoot/QRoot/ZRoot/ZLeaf']) expect(idAt(path)).toBeGreaterThan(0);
+  });
+
+  // #1481, the body: a plain row under a nested row, and the prefab's base changes under an un-edited instance (a
+  // re-import). Mutation: build `captureInstanceOverrides`' gate domain from members only (Plain then reads as moved
+  // and freezes x=0).
+  it('a member under a nested row is not read as moved: a base change freezes no override', async () => {
+    await loadO();
+    const changed = JSON.parse(JSON.stringify(docs[O7])) as PrefabFile;
+    for (const e of changed.entities) if (e.localId === 4 || e.localId === 5) (e.traits.Transform as { x: number }).x = 5;
+    expect(captureInstanceOverrides(idAt('ORoot'), changed)).toEqual({});
+  });
+
+  // #1481, the comment: an OWNED nested root moved inside its instance gets a compensated pose that is written
+  // unmarked. Its row is its owner's, so the gate must ask the owner's frame whether it moved. Mutation: return false
+  // from `ownedRootMoved` (the pose is dropped and the root reloads at its base, x=0).
+  it('an owned nested root moved with a compensated pose keeps it through save + reload; moved back, nothing is pinned', async () => {
+    await loadO();
+    const zRoot = idAt('ORoot/QRoot/ZRoot');
+    reparentEntity(zRoot, idAt('ORoot/Ctrl'));
+    const e = [...getCurrentWorld().entities].find((x) => x.id() === idAt('ORoot/Ctrl/ZRoot'))!;
+    e.set(getTraitByName('Transform')!.trait, { ...tfOf(e.id()), x: 7 }); // as the compensation writes it: unmarked
+    const moved = await serializeScene();
+    // Moved back before any reload (a reload re-seeds marks from what was saved): the gate applies again, and the
+    // unmarked compensation is not pinned.
+    reparentEntity(idAt('ORoot/Ctrl/ZRoot'), idAt('ORoot/QRoot'));
+    await load(await serializeScene() as unknown as SceneData);
+    expect(tfOf(idAt('ORoot/QRoot/ZRoot')).x).toBe(0);
+    await load(moved as unknown as SceneData);
+    expect(tfOf(idAt('ORoot/Ctrl/ZRoot')).x).toBe(7);
+  });
+
+  // …and when the ROW authors the root's position too (the spaceship's mirrored flames, where #1481's live loss was
+  // seen): the nested delta dropped a field the row sets by KEY, so the compensated position went and the root
+  // reloaded at the row's value under its new parent. Mutation: drop `byValue` in `captureNestedSceneDelta`.
+  it('a moved owned root keeps its compensated pose when its row authors the same fields', async () => {
+    use(docsOf(false, { x: 2 }));
+    await loadO();
+    expect(tfOf(idAt('ORoot/QRoot/ZRoot')).x).toBe(2);
+    reparentEntity(idAt('ORoot/QRoot/ZRoot'), idAt('ORoot/Ctrl'));
+    const e = [...getCurrentWorld().entities].find((x) => x.id() === idAt('ORoot/Ctrl/ZRoot'))!;
+    e.set(getTraitByName('Transform')!.trait, { ...tfOf(e.id()), x: 7 });
+    const moved = await serializeScene();
+    reparentEntity(idAt('ORoot/Ctrl/ZRoot'), idAt('ORoot/QRoot'));
+    await load(await serializeScene() as unknown as SceneData);
+    expect(tfOf(idAt('ORoot/QRoot/ZRoot')).x).toBe(2); // moved back: the row's value, nothing pinned
+    await load(moved as unknown as SceneData);
+    expect(tfOf(idAt('ORoot/Ctrl/ZRoot')).x).toBe(7);
+  });
+
+  // The known limit, closed: Q ALSO nests Z at row 3 under its own root. Both roots hang under QRoot at row 3, and the
+  // frame step is the only thing in the path that says whose row 3. Mutation: drop the FRAME_STEP unshift in
+  // `identityParents.of` (both ZRoots, and both ZLeafs, derive one guid).
+  it('two nested rows with one number under one nested root derive guids of their own, and keep them', async () => {
+    use(docsOf(true));
+    await loadO();
+    const guids = getAllEntities().map((e) => e.guid).filter((g): g is string => !!g);
+    expect(new Set(guids).size).toBe(guids.length);
+    expect(getAllEntities().filter((e) => e.name === 'ZRoot')).toHaveLength(2);
+    // Two entities share the path ORoot/QRoot/ZRoot here, so the tree is compared as guid → parent guid.
+    const edges = () => {
+      const guidOf = new Map(getAllEntities().map((e) => [e.id, e.guid ?? '']));
+      return getAllEntities().map((e) => `${e.guid}<${guidOf.get(e.parentId) ?? ''}`).sort();
+    };
+    const before = edges();
+    await load(await serializeScene() as unknown as SceneData);
+    expect(edges()).toEqual(before);
+    // …and a FIRST load re-derives the same answer (no stored rows to lean on).
+    await loadO();
+    expect(edges()).toEqual(before);
+  });
+
+  // …and with both there, deleting OURS is still saved: Q's own ZRoot shares our row's anchor, stamp and source, and
+  // is the only candidate left to claim row 3. Mutation: drop the owner check on a candidate under a nested anchor in
+  // `instanceRowDomain` (Q's root claims our row, and the delete is never written).
+  it('deleting the outer frame\'s row beside the inner frame\'s own row of the same number is saved', async () => {
+    use(docsOf(true));
+    await loadO();
+    const identity = worldIdentityParents(getCurrentWorld());
+    // By name, not path: the two ZRoots share one (`idAt` refuses that).
+    const oRoot = getAllEntities().find((e) => e.name === 'ORoot')!.id;
+    const ours = getAllEntities().filter((e) => e.name === 'ZRoot').find((e) => identity.ownerOf(e.id) === oRoot)!;
+    deleteEntitiesWithUndo([ours.id]);
+    expect((await oEntry()).removed).toEqual([3]);
+    await load(await serializeScene() as unknown as SceneData);
+    expect(getAllEntities().filter((e) => e.name === 'ZRoot')).toHaveLength(1);
+  });
+
+  // …and the mirror: deleting the INNER frame's own row is saved too. O's root under QRoot shares Q's row's anchor,
+  // stamp and source, and without the owner check under a MEMBER anchor it claimed Q's row, so the delete was never
+  // written and a reload brought Q's Z back. Mutation: drop that owner check in `instanceRowDomain`.
+  it('deleting the inner frame\'s own row beside the outer frame\'s row of the same number is saved', async () => {
+    use(docsOf(true));
+    await loadO();
+    const identity = worldIdentityParents(getCurrentWorld());
+    const qRoot = getAllEntities().find((e) => e.name === 'QRoot')!.id;
+    const inner = getAllEntities().filter((e) => e.name === 'ZRoot').find((e) => identity.ownerOf(e.id) === qRoot)!;
+    deleteEntitiesWithUndo([inner.id]);
+    await load(await serializeScene() as unknown as SceneData);
+    const zs = getAllEntities().filter((e) => e.name === 'ZRoot');
+    expect(zs).toHaveLength(1);
+    expect(worldIdentityParents(getCurrentWorld()).ownerOf(zs[0]!.id)).toBe(getAllEntities().find((e) => e.name === 'ORoot')!.id);
+  });
+
+  // The frame step in a WRITTEN prefab: a prefab-edit save tokenizes a ref into a row under a nested row, and an
+  // instance of the result must resolve it to that row's member. Mutation: drop `crosses` in `templateTokenizer` (the
+  // token names `2.3.2`, which no member answers to); and drop the `isFrameStep` exemption in `undeclaredKeys` (the
+  // `@` step reads as an undeclared template key, and the token is turned back into the edit world's guid).
+  it('prefab-edit: a ref to a row under a nested row round-trips through the written prefab', async () => {
+    const O_E = 'aaaaaaaa-0000-4000-8000-0000000007b4';
+    const oDoc = { ...docs[O7], id: O_E } as unknown as PrefabFile;
+    prefabs.set(O_E, oDoc); setPrefabCache(O_E, oDoc);
+    try {
+      await load(buildPrefabEditScene(oDoc));
+      // ZLeaf: a member of the nested row under the nested row, named by its live guid in the edit world (a ROW's
+      // edit-world guid is a sentinel, which the save resolves on its own).
+      const leaf = guidAt('ORoot/QRoot/ZRoot/ZLeaf');
+      const root = [...getCurrentWorld().entities].find((x) => x.id() === idAt('ORoot'))!;
+      root.add(getTraitByName('UIAction')!.trait({ bindings: [{ event: 'click', action: 'noop', target: leaf }] } as never));
+      const preserve = new Map(getAllEntities().filter((e) => e.guid?.startsWith('__prefab_edit_local__'))
+        .map((e) => [e.id, Number(e.guid!.slice('__prefab_edit_local__'.length))] as [number, number]));
+      preserve.set(idAt('ORoot'), 1);
+      const rowParents = new Map(oDoc.entities.map((e) => [e.localId, (e.traits.EntityAttributes as { parentId: number }).parentId]));
+      const file = serializePrefab(idAt('ORoot'), O_E, { preserveLocalIds: preserve, rowParents })!;
+      prefabs.set(O_E, file); setPrefabCache(O_E, file);
+      await load({ id: 'n7e', version: 16, name: 'N7E', resources: [], entities: [
+        { id: 1, prefab: O_E, guid: ROOT, traits: { EntityAttributes: { name: 'ORoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+      ] } as unknown as SceneData);
+      expect((file.entities.find((e) => e.localId === 1)!.traits.UIAction as { bindings: { target: string }[] }).bindings[0]!.target)
+        .toBe('@member:2.@.3.2');
+      expect(targetsOf(idAt('ORoot')).map((g) => treePaths().get(g))).toEqual(['ORoot/QRoot/ZRoot/ZLeaf']);
+    } finally { prefabs.delete(O_E); setPrefabCache(O_E, null); }
+  });
+});
+
 // #1468 Phase 6 close-out: a save builds the identity resolver once (`openIdentityScope`), and it must not serve a
 // stale one when the structure moves under the save's awaits. Mutation: drop the structure-version check.
 describe('the save-scoped identity resolver (#1468 Phase 6 close-out)', () => {

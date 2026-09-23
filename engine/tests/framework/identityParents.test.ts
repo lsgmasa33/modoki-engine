@@ -153,7 +153,8 @@ describe('identity parents — an OWNED nested root and its owner link', () => {
       ...outer(),
       { id: 105, parentId: 100, guid: 'x-under', pi: { source: 'OUTER', localId: 4, rootInstanceId: 100 } },
     ], reader({ OUTER: withChild, N }));
-    expect(r.of(105)).toEqual({ parentId: 103, extra: [] });
+    // Led by the frame step (#1484): row 4 is OUTER's, stepping from a root that stands for an OUTER row.
+    expect(r.of(105)).toEqual({ parentId: 103, extra: ['@'] });
   });
 
   it('its members walk its own document', () => {
@@ -184,7 +185,8 @@ describe('identity parents — a nested row under a nested row (close-out review
 
   it('the inner nested root belongs to the OUTER frame, where its row is — and reads as unmoved', () => {
     expect(r().ownerOf(105)).toBe(100);
-    expect(r().of(105)).toEqual({ parentId: 102, extra: [] });
+    // The frame step (#1484): row 3 is O's, not Q's own row 3, and the path has to say so.
+    expect(r().of(105)).toEqual({ parentId: 102, extra: ['@'] });
     expect(r().moved(105)).toBe(false);
   });
 

@@ -3,7 +3,7 @@
  *  engine/plugins/asset-fs-ops.ts so the editor can run the same walk on a live scene's serialized form
  *  (#1437: an applied move changes member paths, and every stored ref to a moved member follows). */
 
-import { durableGuid, deriveMemberGuid, addedKeyStep, mapStringValues, parseSteps, memberPathSteps, type MemberStep } from '../core/assetRefRules';
+import { durableGuid, deriveMemberGuid, addedKeyStep, mapStringValues, parseSteps, memberPathSteps, FRAME_STEP, type MemberStep } from '../core/assetRefRules';
 import { isMemberToken, parseMemberToken, memberToken, memberPathKey, MEMBER_TOKEN_PREFIX } from '../core/templateRefs';
 import { descendPathKeyed, mergeNestedStructurePaths } from './prefabOverrides';
 
@@ -141,7 +141,7 @@ export function memberPathRecords(
     // that is not a row is the root — the re-anchoring an `added` node gets.
     const baseOf = (localId: number): Base | null => {
       if (localId === rootLocalId || !rows.has(localId)) return root;
-      const chain: number[] = [];
+      const chain: Step[] = [];
       const seen = new Set<number>();
       let cur = localId;
       for (;;) {
@@ -151,6 +151,9 @@ export function memberPathRecords(
         const p = parentOf(rows.get(cur)!);
         if (p === rootLocalId) return under(root, idOf(localId), ...chain);
         if (!p || !rows.has(p)) return under(orphan, idOf(localId), ...chain);
+        // A row under a NESTED row steps across that frame, as the live derive does (`FRAME_STEP`, #1484): its
+        // identity parent is the nested root, and its localId is this document's, not the nested one's.
+        if (rows.get(p)!.prefab) chain.unshift(FRAME_STEP);
         cur = p;
       }
     };

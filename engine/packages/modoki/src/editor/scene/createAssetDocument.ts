@@ -21,6 +21,7 @@
  *  the next Cmd+S flushes the old edited document back over the replacement. */
 
 import { newGuid, getAssetEntry } from '../../runtime/loaders/assetManifest';
+import { classifyJsonAssetPath } from '../../runtime/loaders/assetTypeClassifier';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { backendFetch, postWriteFile } from '../backend/editorBackend';
 import { classifyExistingDocumentId } from './prefab';
@@ -127,9 +128,12 @@ export async function mayCreateOver(
  *  kind. The scene flows write plain `.json`, so their destination can be `Enemy.prefab.json`: kept,
  *  that prefab's guid would be re-registered as a scene and every `PrefabInstance.source` pointing at it
  *  would resolve to a scene document. Every other create enforces a compound extension that cannot
- *  land on another kind. A file the manifest has not indexed yet reads as no conflict. */
+ *  land on another kind. A file the manifest has not indexed yet is classified by its url with
+ *  `classifyJsonAssetPath`, the rule the scanner types by — the answer the manifest WILL give once it
+ *  indexes the file (#1472; the backend's `wrongKindRefusal` asks the same two questions in the same
+ *  order). A path no kind claims reads as no conflict. */
 export function otherAssetKindAt(path: string, kind: string): string | undefined {
-  const type = getAssetEntry(path)?.type;
+  const type = getAssetEntry(path)?.type ?? classifyJsonAssetPath(path);
   return type && type !== kind ? type : undefined;
 }
 

@@ -34,7 +34,7 @@ import type { Entity, World } from 'koota';
 import { getTraitByName } from './traitRegistry';
 import { getStructureVersion } from './entityUtils';
 import { packedOf, isPackedAlive, type PackedEntity } from './entityTable';
-import { durableGuid, isOwnedRoot, isStoredRoot, type MemberStep } from '../assetRefRules';
+import { durableGuid, isOwnedRoot, isStoredRoot, isFrameStep, FRAME_STEP, type MemberStep } from '../assetRefRules';
 
 /** What the resolver reads of a prefab document: its rows' localIds, parents and nested sources. */
 export type TemplateDoc = {
@@ -51,7 +51,8 @@ export type IdentityPi = { source?: string; localId?: number; parentLocalId?: nu
 /** One entity as the resolver sees it: a live one, or a node of a snapshot (`planCopyGuids`). */
 export interface IdentityNode { id: number; parentId: number; guid: string; pi: IdentityPi }
 
-/** An entity's identity parent, and the steps of the gone template rows between it and the entity. */
+/** An entity's identity parent, and the steps of the gone template rows between it and the entity — led by a
+ *  `FRAME_STEP` when that parent is a nested root standing for a row of the entity's frame (#1484). */
 export interface IdentityParent { parentId: number; extra: MemberStep[] }
 
 export interface IdentityParents {
@@ -272,7 +273,12 @@ export function resolveIdentityParents(nodes: Iterable<IdentityNode>, readDoc: T
           // the expanding call was given, which is a stored root's own parent and nothing (0) for a nested one.
           if (!p || !doc.parent.has(p)) { out = { parentId: isStoredRoot(byId.get(frame)?.pi, frame) ? byId.get(frame)!.parentId : 0, extra }; break; }
           const at = rows?.get(p);
-          if (at !== undefined) { out = { parentId: at, extra }; break; }
+          if (at !== undefined) {
+            // A nested ROOT of this frame, standing for its row: the step below it is ours, not its document's (#1484).
+            if (at !== frame && isRoot(byId.get(at))) extra.unshift(FRAME_STEP);
+            out = { parentId: at, extra };
+            break;
+          }
           seen.add(p);
           extra.unshift(p); // a gone row still steps by its localId — a nested row's root would step by it too
         }
@@ -285,7 +291,7 @@ export function resolveIdentityParents(nodes: Iterable<IdentityNode>, readDoc: T
   return {
     of,
     parentOf: (id) => of(id).parentId,
-    moved: (id) => { const r = of(id); return r.extra.length > 0 || r.parentId !== (byId.get(id)?.parentId ?? 0); },
+    moved: (id) => { const r = of(id); return r.extra.some((s) => !isFrameStep(s)) || r.parentId !== (byId.get(id)?.parentId ?? 0); },
     ownerOf,
   };
 }

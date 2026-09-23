@@ -1037,7 +1037,9 @@ function planMoveUnlinks(entityId: number, newParentId: number): { strip: number
  *  Marks each field the compensation changed — on a STORED instance root only (top-level or user-added).
  *  A member moved inside its own instance needs no mark: while it sits away from its template parent the
  *  save writes every Transform field that differs from the base (`captureInstanceOverrides`, #1437), and
- *  once it is moved back nothing is left pinned. A mark would outlive the move and pin the pose. */
+ *  once it is moved back nothing is left pinned. A mark would outlive the move and pin the pose. The same
+ *  holds for an OWNED nested root, whose "away from its template parent" is asked of its owner's frame
+ *  (`ownedRootMoved`, #1481). */
 function markCompensatedTransform(id: number, oldLocal: Record<string, unknown>, newLocal: Record<string, number>): void {
   const piMeta = getTraitByName('PrefabInstance');
   const entity = findEntity(id);

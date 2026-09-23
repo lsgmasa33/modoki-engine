@@ -51,7 +51,7 @@ import {
   SIDECAR_FORMAT_VERSION,
 } from './meta-sidecar';
 import { classifyPrefabWrite } from './prefabWriteGuard';
-import { classifyJsonAssetSuffix, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
+import { classifyJsonAssetPath, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
 import { getCacheDir, cachePathFor } from './texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from './audio-cache';
 import { convertAudio } from './audio-convert';
@@ -468,20 +468,12 @@ export function detectType(relPath: string, ext: string): string | null {
   if (ext === '.css') return null;
 
   if (ext === '.json') {
-    if (relPath.endsWith('.layout.json')) return 'layout';
-    // Shared JSON asset-kind classifier (see plugins/assetTypes.ts) — the single
-    // list the tree-shaker's classify() also uses, so the two can't drift. Scenes
-    // are matched here too, by the `.scene.json` suffix (issue #54).
-    const jsonAssetType = classifyJsonAssetSuffix(relPath);
-    if (jsonAssetType) return jsonAssetType;
-    // LEGACY fallback (issue #54): before the `.scene.json` suffix existed, a scene
-    // was any plain `.json` under a `/scenes/` directory (or a top-level `scene.json`).
-    // Keep honoring that convention so an externally-authored OSS project, or an
-    // already-published demo snapshot, whose scenes are still plain `.json` under
-    // `/scenes/` keeps working. New scenes are always `.scene.json`.
-    if (relPath.includes('/scenes/') || relPath.endsWith('/scene.json')) return 'scene';
-    if (relPath.includes('/materials/')) return 'material';
-    return null;
+    // Shared with every "never cross kinds" check (#1472), so a kind refusal cannot disagree with the
+    // type this scan gives the file. It keeps the LEGACY fallback (issue #54): before the `.scene.json`
+    // suffix existed, a scene was any plain `.json` under a `/scenes/` directory (or a top-level
+    // `scene.json`), and an externally-authored OSS project or a published demo snapshot may still
+    // use it. The suffix list inside it is the one the tree-shaker's classify() also uses.
+    return classifyJsonAssetPath(relPath);
   }
   return EXT_TYPE[ext] || null;
 }

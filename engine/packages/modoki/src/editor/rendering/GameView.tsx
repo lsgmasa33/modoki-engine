@@ -16,6 +16,7 @@ import SafeAreaOverlay from './SafeAreaOverlay';
 import { DebugMenu } from '../../runtime/debug';
 import { VideoOverlay } from '../../runtime/video/VideoOverlay';
 import { saveGameViewMuted, loadGameViewShowColliders, saveGameViewShowColliders, resolveInitialGameViewMute } from './gameViewPrefs';
+import { startTakeRecording, finishTakeRecording, isRecordingTake, onTakeRecordingChange } from '../recorder/takeRecorder';
 
 // ── Main GameView ───────────────────────────────────────
 
@@ -153,6 +154,16 @@ export default function GameView({ uiLayer }: GameViewProps) {
   const isStopped = playState === 'stopped';
   const isPaused = playState === 'paused';
 
+  // Record a take (#1479): snapshots the save + seed, presses Play, and records the pointer until
+  // the owner presses it again or Stop. `npm run record` renders the saved take to video.
+  const recordingTake = useSyncExternalStore(onTakeRecordingChange, isRecordingTake);
+  const toggleRecord = useCallback(() => {
+    if (isRecordingTake()) { void finishTakeRecording(); return; }
+    void startTakeRecording(safeArea)
+      .then((err) => { if (err) console.warn(`[takeRecorder] not recording: ${err}`); })
+      .catch((err: unknown) => console.error('[takeRecorder] could not start recording:', err));
+  }, [safeArea]);
+
   // Letterbox calculation — sole writer to the store's gameRect.
   useEffect(() => {
     if (isFree || !gameAreaRef.current) {
@@ -202,6 +213,12 @@ export default function GameView({ uiLayer }: GameViewProps) {
         <button data-ui-id="gameView.toolbar.step" onClick={stepOnce} style={{ ...iconBtnStyle, opacity: isPaused ? 1 : 0.4 }} title="Step Frame" disabled={!isPaused}>
           ⏭
         </button>
+        <button data-ui-id="gameView.toolbar.record" onClick={toggleRecord}
+          style={{ ...iconBtnStyle, color: recordingTake ? '#e74c3c' : '#c0392b', opacity: recordingTake || isStopped ? 1 : 0.4 }}
+          disabled={!recordingTake && !isStopped}
+          title={recordingTake ? 'Stop recording and save the take' : 'Record a take — plays from the start; press again or Stop to save'}>
+          {recordingTake ? '■' : '●'}
+        </button>
         <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
         <button data-ui-id="gameView.toolbar.colliders" onClick={toggleColliders} style={{ ...iconBtnStyle, color: showColliders ? '#2effa6' : '#888' }}
           title="Toggle 2D collider overlay">⬡</button>
@@ -209,7 +226,7 @@ export default function GameView({ uiLayer }: GameViewProps) {
           title={muted ? 'Unmute audio' : 'Mute audio'}>{muted ? '🔇' : '🔊'}</button>
         <span style={{ flex: 1 }} />
         <span data-ui-id="gameView.status" style={{ color: isStopped ? '#888' : isPaused ? '#f1c40f' : '#2ecc71', fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 }}>
-          {isStopped ? 'STOPPED' : isPaused ? 'PAUSED' : 'PLAYING'}
+          {(recordingTake ? 'REC · ' : '') + (isStopped ? 'STOPPED' : isPaused ? 'PAUSED' : 'PLAYING')}
         </span>
         <span style={{ color: '#555', fontSize: '11px', flexShrink: 0 }}>|</span>
         {/* The device readout is the least important thing here: in a narrow Game panel
@@ -235,7 +252,10 @@ export default function GameView({ uiLayer }: GameViewProps) {
             width: deviceW, height: deviceH,
             transform: `scale(${deviceW > 0 ? gameRect.width / deviceW : 1})`,
             transformOrigin: 'top left',
-            border: '1px solid #333',
+            // An OUTLINE, not a border: the app sets `box-sizing: border-box` globally, so a border
+            // ate 2px of the device size and the game laid out at (deviceW-2)×(deviceH-2) — a
+            // "540×960" preview was really 538×958, and a recorded take (#1479) inherited that size.
+            outline: '1px solid #333',
           }),
           // Simulate the device's safe area for everything inside this preview.
           // `anchorCss` emits `var(--ui-sa-top, env(safe-area-inset-top))`, so setting

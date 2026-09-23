@@ -33,6 +33,12 @@ const ALLOWED: Record<string, { count: number; why: string }> = {
     why: "stopPlay's no-op check: a scrub/preview is handled by the envelope branch directly above it, so "
       + "what is left is the Play question 'is there a Play to stop?'.",
   },
+  'engine/packages/modoki/src/editor/recorder/takeRecorder.ts': {
+    count: 3,
+    why: 'The gameplay recorder (#1479) records exactly one Play: it refuses to start unless there is no '
+      + 'Play running (it presses Play itself), ignores input once the Play has stopped, and ends the take '
+      + 'when it stops. All three are the Play question, not "is authoring safe?".',
+  },
   'engine/packages/modoki/src/editor/rendering/GameView.tsx': {
     count: 1,
     why: 'The Play/Pause toolbar and its STOPPED/PAUSED/PLAYING label. A preview is not a Play, so it '

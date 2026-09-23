@@ -885,6 +885,17 @@ export class Canvas2DPool {
     this.reclaimIfUnclaimed(slot);
   }
 
+  /** Slots claimed for an entity whose Pixi Application has not finished its async init — their
+   *  canvas is not in the DOM yet, so a frame captured now is missing that surface. The gameplay
+   *  recorder (#1479) waits on this before each step: a Pixi init completes in REAL time, so a
+   *  fixed-dt replay that did not wait would capture a blank board for however many frames the
+   *  machine took (measured on Court in headless Chromium: ~0.5 s, i.e. the first 15 frames). */
+  pendingInits(): number {
+    let n = 0;
+    for (const slot of this.entityMap.values()) if (!slot.initialized && !slot.destroyed) n++;
+    return n;
+  }
+
   /** Get the slot for an entity, or null if not allocated. */
   getSlot(entityId: number): Canvas2DSlot | null {
     return this.entityMap.get(entityId) ?? null;

@@ -5,6 +5,7 @@
 export {
   JSON_ASSET_SUFFIX_TYPE,
   classifyJsonAssetSuffix,
+  classifyJsonAssetPath,
   BINARY_EXT_TYPE,
   classifyBinaryExt,
   ID_BEARING_TYPES,

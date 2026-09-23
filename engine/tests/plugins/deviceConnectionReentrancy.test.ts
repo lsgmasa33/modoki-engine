@@ -602,7 +602,9 @@ describe('DeviceConnectionManager — disconnect() holds the machine-wide claim 
     // Slow the hangup itself — the same gating idiom the reentrancy tests above use on
     // `client.connect()` — so `disconnect()`'s `await client.disconnect()` stays suspended for as
     // long as the test wants, with the claim's fate observable on either side of it.
+    let hangupsSuspended = 0;
     const spy = vi.spyOn(DeviceLeaseClient.prototype, 'disconnect').mockImplementation(async function (this: DeviceLeaseClient) {
+      hangupsSuspended += 1;
       await hangupGate;
       return realDisconnect.call(this);
     });
@@ -613,8 +615,10 @@ describe('DeviceConnectionManager — disconnect() holds the machine-wide claim 
       expect(listClaims().length).toBeGreaterThan(0); // sanity: the connect actually claimed hardware
 
       const disconnectDone = mgr.disconnect();
-      // Give disconnect()'s synchronous head a turn to run and reach the gated client.disconnect().
-      await new Promise((r) => setTimeout(r, 20));
+      // Wait until disconnect() is actually SUSPENDED in the gated client.disconnect() (#1478). It
+      // was a 20ms sleep: under load the head had not arrived yet, the claim below was still held
+      // because nothing had reached the release, and the case passed without testing the window.
+      await vi.waitFor(() => expect(hangupsSuspended).toBe(1), { timeout: 2000 });
 
       // THE ASSERTION. Mid-teardown — `client.disconnect()` still suspended on the gate — the claim
       // must STILL be held: releasing it earlier would empty the claims file while
@@ -677,7 +681,9 @@ describe('DeviceConnectionManager — a stale disconnect() continuation cannot r
       // Session A's disconnect — suspends inside the gated `client.disconnect()`, after its
       // synchronous field-nulling has already run.
       const disconnectA = mgr.disconnect();
-      await new Promise((r) => setTimeout(r, 20)); // give the synchronous head + gate a turn to land
+      // A is SUSPENDED in its hangup before B starts — polled, not a 20ms bet on it (#1478). If B
+      // ran first, A's continuation would never be stale and the case would pass on nothing.
+      await vi.waitFor(() => expect(disconnectCalls).toBe(1), { timeout: 2000 });
 
       // Session B: a fresh connect() on the SAME manager instance, same target — re-claims the
       // SAME device id and completes fully while A's disconnect is still suspended.

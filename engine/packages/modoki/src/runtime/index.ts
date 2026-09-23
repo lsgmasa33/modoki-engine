@@ -607,7 +607,7 @@ export type { AgentToolDef, AgentToolParam } from './debug/agentToolRegistry';
 // ── Frame Driver (no heavy deps — safe for all importers) ──
 export {
   registerFrameCallback, unregisterFrameCallback,
-  startFrameDriver, stopFrameDriver, stepOneFrame,
+  startFrameDriver, stopFrameDriver, stepOneFrame, setFrameLoopHeld, isFrameLoopHeld,
   setTargetFPS, targetFPS, getCurrentFPS, getFrameLoopHealth,
   onFrameLoopUnrecoverable,
   PRIORITY_ECS, PRIORITY_RENDER_3D, PRIORITY_RENDER_2D,
@@ -765,7 +765,9 @@ export {
   type NoAdsOfferPolicy, type NoAdsOfferVerdict, type NoAdsOfferWithheld,
 } from './core/adBreak';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
-export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
+export { isCaptureMode, getCaptureMode, setCaptureMode, type CaptureMode } from './core/captureMode';
+export { takeClockDelta } from './core/takeClock';
+export { seedRng, pinFreshWorldSeed, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
   emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, journalTick, setJournalEnabled,
   JOURNAL_LEVELS, isJournalLevel,

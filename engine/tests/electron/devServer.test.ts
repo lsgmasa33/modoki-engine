@@ -1,7 +1,7 @@
 /** devServer.findFreePort — port selection + the pinned-port fail-loud contract
  *  (E6). Binds a real loopback listener to occupy a port.
  *  Plus waitForServer's #67 guard against adopting somebody else's dev server. */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import net from 'node:net';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -454,8 +454,10 @@ describe('#190 — proving the server on the port is OURS', () => {
       let settled: string | null = null;
       void p.then((r) => { settled = r; });
 
-      await new Promise((r) => setTimeout(r, 60));
-      expect(forcedAt).toBeGreaterThan(0);       // the force kill HAS run
+      // The force kill is an EVENT (it follows the 20ms grace), so this polls rather than betting 60ms
+      // on it (#1478). The poll is bounded BELOW the 500ms reap: waiting past it would let the reap
+      // settle `p` first, and the discriminating assertion below would be reading the wrong window.
+      await vi.waitFor(() => expect(forcedAt).toBeGreaterThan(0), { timeout: 300, interval: 5 });   // the force kill HAS run
       expect(settled).toBeNull();                // ...and we are still waiting for the reap
 
       exit();

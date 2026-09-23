@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { execSync, execFileSync } from 'node:child_process'
 import { resolveBuildStep, spawnBuildCommand, killBuildProcess, killBuildProcessSync, winKillTreeArgs, type BuildStep } from '../../plugins/buildStepShell'
 
@@ -125,11 +125,16 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
     killBuildProcess(proc, { graceMs: 400 })
     // Mid-grace: SIGTERM has been sent and IGNORED. Asserting survival here is what proves the
     // second death below came from the escalation and not from the SIGTERM.
+    // A fixed sleep on purpose (#1478): this one sits INSIDE the product's 400ms grace window, so it
+    // is a bet on a product timer with 250ms of margin, not a wait for an event — polling would pass
+    // on its first sample and prove nothing about the window.
     await new Promise((r) => setTimeout(r, 150))
     expect(kids.filter(alive), 'SIGTERM is ignored, so nothing should have died yet').toEqual(kids)
 
-    await new Promise((r) => setTimeout(r, 700))
-    expect(kids.filter(alive), 'the SIGKILL escalation should have reaped the group').toEqual([])
+    // The escalation's deaths are an EVENT, so this polls (#1478). It used to sleep 700ms and bet the
+    // SIGKILL and the reap both landed inside it. Survival mid-grace is already pinned above, so a
+    // death that comes early cannot satisfy this falsely; a missing escalation times out red.
+    await vi.waitFor(() => expect(kids.filter(alive), 'the SIGKILL escalation should have reaped the group').toEqual([]), { timeout: 5000, interval: 25 })
   })
 
   it('is a no-op on an already-exited child (never signals a REUSED pid/group)', async () => {

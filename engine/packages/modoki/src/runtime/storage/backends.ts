@@ -17,6 +17,7 @@
 import { Capacitor } from '@capacitor/core';
 import { Preferences } from '@capacitor/preferences';
 import type { ModokiSystemPlugin } from 'capacitor-modoki-system';
+import { PREFS_KEY_ROOT } from './prefsKey';
 
 export interface PrefsBackend {
   /** All entries whose full key starts with `prefix`, as `{ fullKey: envelopeString }`. */
@@ -179,10 +180,9 @@ export class BackupExcludedBackend implements PrefsBackend {
   }
 }
 
-/** The root every PlayerPrefs full key starts with (`mk:<namespace>:<logical>`). `playerPrefs.ts`
- *  builds its keys from this, and the migration below moves exactly these and nothing else a game
- *  may keep in Preferences. */
-export const PREFS_KEY_ROOT = 'mk:';
+/** The root every PlayerPrefs full key starts with (`mk:<namespace>:<logical>`) — owned by
+ *  `prefsKey.ts`; re-exported here for the migration below, which moves exactly these keys. */
+export { PREFS_KEY_ROOT };
 
 /** Written into the NEW store once the old one has been copied. It has no `mk:` prefix, so no
  *  `getAll` ever returns it. The new store is out of backup, so a phone restored from a backup has

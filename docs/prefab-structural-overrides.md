@@ -500,7 +500,11 @@ that anchor as independent (#1354).
   instance — the only place a row of this prefab can expand. Sorted by ecsId, so the
   assignment is deterministic rather than dependent on world-query order.
 - **The claim** — a candidate whose `PrefabInstance.parentLocalId` names a row *at its own
-  anchor* claims that row (first by ecsId when two carry the same stamp).
+  anchor* claims that row (first by ecsId when two carry the same stamp). Only an instance that OWNS the
+  candidate's root may take it, under any anchor (#1484). Two frames meet at a nested root, and each hangs
+  rows under it. When both documents nest the same prefab at the same localId, either root matches the
+  other's row by anchor, stamp and source. Claimed by the wrong instance, a row read present while its own
+  root was gone, and deleting it was never saved.
 - Everything unclaimed is `'userAdded'` and rides as a reference node — **including every
   unstamped instance.** Every path that expands a row stamps it: the loader
   (`instantiatePrefabIntoWorld`), the editor's `instantiatePrefab`, and Create Prefab's tag.
@@ -522,6 +526,39 @@ re-derive it before #1354:
 Present means CLAIMED: `nestedRowPresent` is strict. A row nobody claims is written into
 `removed[]` even when an unstamped instance of its prefab sits at the anchor, because that
 instance is written separately, as a reference node.
+
+**The row domain includes the owned roots (`instanceRowDomain`, #1484, #1481).** "Which live entity is row
+L of this document" is answered in one place: the members by `localId`, plus the nested roots this
+instance owns by the row that claimed them. Three captures once built it from members alone. Under a
+nested row under a nested row, or a plain row under one, the parent row is a nested ROOT. A members-only
+lookup cannot see it, so:
+
+- `nestedRowPresent` read the parent as gone, and a deleted nested row was never written as removed.
+- The Transform mark-gate in `captureInstanceOverrides` resolved no home for a member under a nested row,
+  read it as moved, and froze every Transform field a re-imported base had changed.
+- The gate never asked whether the frame ROOT moved, because an owned root's row is its OWNER's.
+  `ownedRootMoved` now asks that frame. Without it a moved owned root's compensated pose, which
+  `markCompensatedTransform` deliberately leaves unmarked, was dropped on save. The same root's Transform
+  is then subtracted from its ROW by VALUE in `captureNestedSceneDelta`, not by key. That function
+  otherwise drops every field the row sets, and the spaceship's rows set each flame's position, so a moved
+  flame still reloaded at its row's position (found by the live check, `games/space-console`). The rest
+  of that subtraction stays by key, because row values can hold member tokens, which never equal a live
+  guid (#1386).
+
+**A row of another frame is not ours (`foreignRow`, #1484).** Those same shapes hang the outer frame's row
+under the inner instance's root. So the inner instance's structure capture skips it, rather than
+writing it as its own `added` (which spawned it twice on reload). The inner instance's rebuild (an Apply
+or Revert on the inner source) parks it, as it parks a moved-in member, rather than tearing down a row
+its re-expansion cannot respawn. A parked owned root is destroyed after all when its own frame is torn
+down by the same rebuild: the rebuild's `frameOf` answers an owned root's OWNER whether or not it moved.
+In a prefab-edit world the rebuild also parks the edited document's own rows (their sentinel guids),
+which the capture already skips (`editRow`). And the structure re-apply (`applyStructureByRootInstance`)
+maps a nested row through the same row domain, so a removed nested row under a nested row stays removed
+through a Revert or Apply of the outer instance.
+
+The domain's world-wide half (every instance's members, owned roots by owner, and identity children) is
+built once per identity resolver (`worldRowIndex`). A save builds that resolver once per structure
+version, so each instance costs its own size. Built per call, a 1200-entity save measured 70% slower.
 
 **Duplicating an owned nested root produces an independent instance, saved separately**
 (owner ruling, 2026-09-18). `clearOwnedNestedStampFromSnapshot` clears the copy's row stamp
@@ -722,9 +759,22 @@ ends where the loader hangs one. That is the stored root's own parent, or nothin
   frame, when the row hangs under that document's root, and its owner, when the row hangs under that
   nested row. That second shape is a nested row under a nested row, which the prefab-edit save writes.
   The document picks between them, and where both sides are minted the row must be the one that
-  expanded it (`parentNodeGuid`). Promotion and tagging clear the link. ⚠️ If the inner prefab ALSO
-  nests the same prefab at the same row number under its own root, the two nested roots derive one
-  guid. Path-derived identity cannot tell them apart, and only stored rows can.
+  expanded it (`parentNodeGuid`). Promotion and tagging clear the link.
+- **The frame step (`FRAME_STEP`, `@`, #1484).** A row of the outer frame that hangs under a nested ROOT
+  (a nested row, or a plain row, under a nested row) has that root as its identity parent, and so do the
+  inner document's own rows. Both step by a localId, from two different documents. So when the inner
+  prefab also nests the same prefab at the same row number under its own root, the two paths were
+  identical and the two roots derived one guid. The resolver now leads `extra` with `@` whenever the
+  identity parent is a nested root standing for a row of the entity's own frame. It is not a gone row:
+  `moved`, the claim key and a prefab move's "back home" check skip it (`isFrameStep`), and the template
+  tokenizer writes it for a written row under a written nested root, so a token names the path the reload
+  derives. The FILE-side walk (`memberPathRecords` in `memberPaths.ts`, which Apply's "names nothing now"
+  filter, the guid remaps and the scene-duplicate remint all read) takes it too, for a row whose parent row
+  is a nested row. Without it an Apply of a move inside such a row reported success and wrote nothing
+  (close-out review). No path without the shape changes. The corpus has none, and every scene saved since v16 stores
+  these guids on its rows. ⚠️ Residual: a pre-v5 document (no `nodeGuid`s) holding the shape still
+  cannot pick the owner between the two frames. The prefab-edit save writes v5, so an authored shape
+  always has them.
 - Until Phase 6 all of this was REMEMBERED on the member at move time, in `PrefabInstance.homeParent`
   (the row parent it left) and `homeSteps` (steps through homes since deleted). `rehomeDependents`
   re-pointed a home whenever it died. The home was always the template parent, so every walk gets the

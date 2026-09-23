@@ -21,6 +21,19 @@ import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { conversionToolchainDir, conversionCliDist } from '../../toolchain';
 
 const { spawned, healCalls, scaffoldCalls, installs } = vi.hoisted(() => ({ spawned: [] as string[], healCalls: { n: 0 }, scaffoldCalls: { n: 0 }, installs: [] as Array<{ id: string; toolchainDir: string }> }));
+/** Every answer a route's slot gave `onPipelineStart` — the observable that a route's setup has
+ *  finished and it has DECIDED whether to start (#1478). Pass-through: the real policy answers. */
+const pipelineStarts = vi.hoisted(() => [] as boolean[]);
+vi.mock('../../plugins/backend/buildLock', async (importOriginal) => {
+  const orig = await importOriginal<typeof import('../../plugins/backend/buildLock')>();
+  return {
+    ...orig,
+    releasePolicy: (release: () => void) => {
+      const policy = orig.releasePolicy(release);
+      return { ...policy, onPipelineStart: () => { const ok = policy.onPipelineStart(); pipelineStarts.push(ok); return ok; } };
+    },
+  };
+});
 
 vi.mock('../../plugins/addNativeTarget', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../plugins/addNativeTarget')>();
@@ -274,9 +287,13 @@ describe('#1259 close-out: a client that leaves during setup starts no job', () 
     spawned.length = 0;
     healCalls.n = 0;
     scaffoldCalls.n = 0;
+    pipelineStarts.length = 0;
     drive(url, { disconnectDuringSetup: true });
-    // Let setup's await and anything the pipeline would do after it run.
-    await new Promise((r) => setTimeout(r, 50));
+    // Setup has run and the route has ASKED to start and been refused — rather than a 50ms bet that
+    // setup's await had finished (#1478). Under load the bet could end mid-setup, and the empty
+    // `spawned` below would then pass whether or not the route checks at all. A route that starts
+    // without asking never records an answer, and this times out red.
+    await vi.waitFor(() => expect(pipelineStarts).toEqual([false]));
     expect(spawned).toEqual([]);
     expect(healCalls.n).toBe(0);
     expect(scaffoldCalls.n).toBe(0);

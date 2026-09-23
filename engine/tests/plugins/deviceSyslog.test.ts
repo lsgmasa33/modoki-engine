@@ -117,6 +117,9 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
     // still `0` after the wait — so it would pass just as happily against the by-reference bug it
     // exists to catch. The stub ticks every 50ms, so a window that worked has many lines.
     expect(atResolve).toBeGreaterThan(0)
+    // A fixed sleep on purpose (#1478): this waits for a reading to STOP changing, not for an event
+    // to arrive, so a poll would return on its first sample and assert nothing. 600ms is 12 of the
+    // stub's 50ms ticks.
     await new Promise((r) => setTimeout(r, 600))
     expect(cap.lines.length).toBe(atResolve)
   })

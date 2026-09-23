@@ -640,3 +640,18 @@ describe('Pixi global resource pools (#1000)', () => {
     expect(livePixiApplicationCount()).toBe(0);
   });
 });
+
+describe('pendingInits — what the gameplay recorder waits on (#1479)', () => {
+  it('counts a claimed slot until its async Application init has finished', async () => {
+    const pool = await getModule();
+    expect(pool.defaultPool.pendingInits()).toBe(0);
+    const a = pool.allocate(1)!;
+    const b = pool.allocate(2)!;
+    // Claimed, canvas not yet usable — a frame captured now is missing both surfaces.
+    expect(pool.defaultPool.pendingInits()).toBe(2);
+    await a.ready;
+    await b.ready;
+    expect(a.initialized && b.initialized).toBe(true);
+    expect(pool.defaultPool.pendingInits()).toBe(0);
+  });
+});

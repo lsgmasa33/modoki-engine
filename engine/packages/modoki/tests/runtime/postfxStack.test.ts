@@ -1125,13 +1125,18 @@ describe('PostFXStack — stage nodes that own GPU resources are freed (leak reg
         .mockResolvedValue(undefined);
       let release!: () => void;
       const ahead = session.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
-      return { stack, inner, ahead, release: () => release(), clock };
+      return { stack, inner, ahead, release: () => release(), clock, renderer, session };
     }
 
     it('does not start while another compile holds the renderer', async () => {
-      const { stack, inner, ahead, release } = await queued();
+      const { stack, inner, ahead, release, renderer, session } = await queued();
       const kicked = stack.compileStagesAsync();
-      await new Promise((r) => setTimeout(r, 10));
+      // Registered on the renderer's chain behind the held turn — two turns — rather than a 10ms bet
+      // (#1478). The count proves the turn was QUEUED, not that it WAITS: a chain that ran `fn` off
+      // `Promise.resolve()` instead of the turn ahead still counts two. So yield one macrotask — every
+      // pending microtask drains first, whatever the load — and only then assert nothing started.
+      expect(session.pendingCompileTurns(renderer)).toBe(2);
+      await new Promise((r) => setTimeout(r, 0));
       expect(inner).not.toHaveBeenCalled();
       release();
       await Promise.all([ahead, kicked]);

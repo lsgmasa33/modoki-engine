@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import { getConsoleEntries, getConsoleErrorsSince, getConsoleVersion, subscribeConsole } from './consoleCapture';
+import { getCaptureMode } from '../core/captureMode';
 
 const TOAST_MS = 3000;
 const MAX_VISIBLE = 4;
@@ -72,7 +73,10 @@ export function ErrorToaster({ anchor }: { anchor: 'viewport' | 'container' }) {
     setToasts((prev) => prev.filter((x) => x.id !== id));
   };
 
-  if (toasts.length === 0) return null;
+  // A recorder RENDER (#1479) is ad footage, and a toast is debug chrome over it. The errors are not
+  // lost: the renderer collects every page error into its report. While a take is only being
+  // RECORDED the owner is at the screen, so toasts stay up.
+  if (toasts.length === 0 || getCaptureMode() === 'rendering') return null;
 
   return (
     <div style={{ ...containerStyle, position: anchor === 'container' ? 'absolute' : 'fixed' }} data-debug-toaster>

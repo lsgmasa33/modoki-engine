@@ -12,6 +12,9 @@ const mockGetGameConfig = vi.fn().mockReturnValue({
 });
 const mockLoadAllFonts = vi.fn().mockResolvedValue(undefined);
 const mockLoadScene = vi.fn().mockResolvedValue(undefined);
+/** Font loading is fire-and-forget. Its terminal status is the signal the failure case waits for;
+ *  the others poll their own assertion. Each used to sleep 10ms and bet on it (#1478). */
+const mockSetFontStatus = vi.fn();
 
 vi.mock('@modoki/engine/runtime', () => ({
   getGameConfig: () => mockGetGameConfig(),
@@ -19,7 +22,7 @@ vi.mock('@modoki/engine/runtime', () => ({
   loadManifestJson: vi.fn(),
   // init.ts reads useGameStore.getState().setFontStatus (the store moved into the
   // engine package — see gamePortability guard). A minimal stub is enough here.
-  useGameStore: { getState: () => ({ setFontStatus: vi.fn() }) },
+  useGameStore: { getState: () => ({ setFontStatus: (s: string) => mockSetFontStatus(s) }) },
   // Mirror the real memoized loader: fetch the URL, return parsed JSON (or null
   // on failure). init.ts now goes through this instead of fetching directly.
   ensureManifestLoaded: async (url: string) => {
@@ -60,10 +63,7 @@ describe('initWorldSync', () => {
     const { initWorldSync } = await import('../../app/ecs/init');
     initWorldSync();
 
-    // Font loading is fire-and-forget — give it a tick
-    await new Promise(r => setTimeout(r, 10));
-
-    expect(mockFetch).toHaveBeenCalledWith('/test-manifest.json');
+    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledWith('/test-manifest.json'));
   });
 
   it('uses default manifest path when config has none', async () => {
@@ -72,9 +72,7 @@ describe('initWorldSync', () => {
     const { initWorldSync } = await import('../../app/ecs/init');
     initWorldSync();
 
-    await new Promise(r => setTimeout(r, 10));
-
-    expect(mockFetch).toHaveBeenCalledWith('/assets.manifest.json');
+    await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledWith('/assets.manifest.json'));
   });
 
   it('calls loadAllFonts with manifest assets', async () => {
@@ -82,9 +80,7 @@ describe('initWorldSync', () => {
     const { initWorldSync } = await import('../../app/ecs/init');
     initWorldSync();
 
-    await new Promise(r => setTimeout(r, 10));
-
-    expect(mockLoadAllFonts).toHaveBeenCalledWith([{ path: '/fonts/test.ttf', type: 'font' }]);
+    await vi.waitFor(() => expect(mockLoadAllFonts).toHaveBeenCalledWith([{ path: '/fonts/test.ttf', type: 'font' }]));
   });
 
   it('handles fetch failure gracefully', async () => {
@@ -94,7 +90,9 @@ describe('initWorldSync', () => {
 
     // Should not throw
     initWorldSync();
-    await new Promise(r => setTimeout(r, 10));
+    // Reached its ERROR branch — not merely "10ms passed" — so the negative below is about a finished
+    // load (#1478); under load the sleep could end before the fetch rejected, and pass on nothing.
+    await vi.waitFor(() => expect(mockSetFontStatus).toHaveBeenLastCalledWith('error'));
 
     expect(mockLoadAllFonts).not.toHaveBeenCalled();
   });

@@ -39,10 +39,25 @@ function entropySeed(): number {
   return (Date.now() ^ 0x9e3779b9) >>> 0;
 }
 
+/** A seed pinned for every world seen from now on, in place of entropy — see `pinFreshWorldSeed`. */
+let pinnedFreshSeed: number | null = null;
+
+/** Seed every world first seen AFTER this call with `seed` instead of entropy; `null` restores
+ *  entropy. A world that already drew keeps its stream — this is for the moment before a world
+ *  exists, which `seedRng` cannot reach.
+ *
+ *  The gameplay recorder (#1479) needs exactly that moment: a take is recorded from a Play press
+ *  and replayed from a page boot, and in both the world is created, and may draw, before any code
+ *  outside the engine gets a turn. Seeding it afterwards would leave those first draws on entropy,
+ *  so the replay could diverge from the take before its first frame. */
+export function pinFreshWorldSeed(seed: number | null): void {
+  pinnedFreshSeed = seed === null ? null : seed >>> 0;
+}
+
 function rngStateFor(world: World): RngState {
   let s = rngStates.get(world);
   if (!s) {
-    s = { state: entropySeed() };
+    s = { state: pinnedFreshSeed ?? entropySeed() };
     rngStates.set(world, s);
   }
   return s;

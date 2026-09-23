@@ -1,6 +1,6 @@
 /** Seeded RNG service (Phase 2 — verification harness). */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createWorld } from 'koota';
 import { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from '../../src/runtime/core/rng';
 
@@ -102,5 +102,59 @@ describe('rng', () => {
     rngNext(a); rngNext(a);
     const bAfterAdraws = [rngNext(b), rngNext(b)];
     expect(bAfterAdraws).toEqual(bSolo);
+  });
+});
+
+describe('pinFreshWorldSeed (#1479)', () => {
+  it('seeds a world first seen after the pin with the pinned seed, not entropy', async () => {
+    const { pinFreshWorldSeed } = await import('../../src/runtime/core/rng');
+    try {
+      pinFreshWorldSeed(1234);
+      const a = createWorld();
+      const b = createWorld();
+      const seqA = [rngNext(a), rngNext(a), rngNext(a)];
+      const seqB = [rngNext(b), rngNext(b), rngNext(b)];
+      // Two fresh worlds under one pin replay the same stream — a take and its replay agree.
+      expect(seqA).toEqual(seqB);
+      const c = createWorld();
+      seedRng(1234, c);
+      expect([rngNext(c), rngNext(c), rngNext(c)]).toEqual(seqA);
+      a.destroy(); b.destroy(); c.destroy();
+    } finally {
+      pinFreshWorldSeed(null);
+    }
+  });
+
+  it('leaves a world that already drew on its own stream', async () => {
+    const { pinFreshWorldSeed } = await import('../../src/runtime/core/rng');
+    const w = createWorld();
+    seedRng(99, w);
+    rngNext(w);
+    const ref = createWorld();
+    seedRng(99, ref);
+    rngNext(ref);
+    try {
+      pinFreshWorldSeed(5);
+      expect(rngNext(w)).toBe(rngNext(ref));
+    } finally {
+      pinFreshWorldSeed(null);
+      w.destroy(); ref.destroy();
+    }
+  });
+
+  it('null restores entropy — two fresh worlds no longer agree', async () => {
+    const { pinFreshWorldSeed } = await import('../../src/runtime/core/rng');
+    pinFreshWorldSeed(7);
+    pinFreshWorldSeed(null);
+    const now = vi.spyOn(Date, 'now');
+    now.mockReturnValueOnce(1).mockReturnValueOnce(2);
+    const a = createWorld();
+    const b = createWorld();
+    try {
+      expect(rngNext(a)).not.toBe(rngNext(b));
+    } finally {
+      now.mockRestore();
+      a.destroy(); b.destroy();
+    }
   });
 });
