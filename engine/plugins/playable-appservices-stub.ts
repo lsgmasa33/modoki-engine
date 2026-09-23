@@ -117,6 +117,8 @@ export const ads = {
     };
   },
   bannerHeightPx(): number { return 0; },
+  // #1477 — a playable never requests a banner (its strip is always donated), so nothing ever fails.
+  bannerFailures(): number { return 0; },
   privacyOptionsRequired(): boolean { return false; },
   async showPrivacyOptions(): Promise<void> {},
   cleanupAds(): void {},

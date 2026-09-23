@@ -4,6 +4,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { getActiveReloadBlockers } from '../../../src/runtime/core/resumeReload';
+import { getBootTimeline, resetBootTimeline } from '../../../src/runtime/core/bootTimeline';
 import {
   createAdLifecycle, onFullscreenAdChange, type AdEventSink, type AdLifecycle, type AdLifecycleHooks, type AdSdk,
   type FullscreenKind,
@@ -77,6 +78,23 @@ describe('init', () => {
     await Promise.all([l.init(), l.init()]);
     expect(sdk.start).toHaveBeenCalledTimes(1);
     expect(l.isInitialized()).toBe(true);
+  });
+
+  it('start() is an `ads-start` boot span, open exactly while it runs (#1475)', async () => {
+    // start() can put a native consent form in front of the game; the timeline has to show when.
+    resetBootTimeline();
+    const gate = deferred();
+    const { sdk } = fakeSdk({ start: vi.fn(() => gate.promise) });
+    const l = make(sdk);
+    const done = l.init();
+    const open = getBootTimeline().spans.filter((s) => s.name === 'ads-start');
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({ endMs: -1, detail: 'test' });
+    gate.resolve();
+    await done;
+    // Closed — `-1` is the open sentinel. Not `>= 0`: this suite fakes timers, which moves the clock
+    // under the timeline's real-time origin, so a closed span's timestamps can read negative here.
+    expect(getBootTimeline().spans.find((s) => s.name === 'ads-start')!.endMs).not.toBe(-1);
   });
 
   it('a disabled SDK is never called — not by init, a show, or the banner (the crash guard)', async () => {
@@ -473,6 +491,41 @@ describe('review findings (#1309 close-out)', () => {
     l.setBannerVisible(true);
     await flush();
     expect(sdk.showBanner).toHaveBeenCalledTimes(2);
+  });
+
+  it('bannerFailures counts every way a banner fails to come up, and nothing else (#1477)', async () => {
+    // A caller compares against its own baseline, so the count must move on a real failure and ONLY there:
+    // a stray increment donates a strip the banner was about to fill.
+    let t = 0;
+    const { sdk, sink } = fakeSdk({ showBanner: vi.fn().mockRejectedValueOnce(new Error('not ready')).mockResolvedValue(undefined) });
+    const l = make(sdk, {}, () => t);
+    await l.init();
+    expect(l.bannerFailures()).toBe(0);
+    l.setBannerVisible(true);
+    await flush();
+    expect(l.bannerFailures(), 'a refused show').toBe(1);
+    t = 5000;
+    l.setBannerVisible(true);
+    await flush();
+    expect(sdk.showBanner).toHaveBeenCalledTimes(2);
+    expect(l.bannerFailures(), 'a show that resolves is not a failure').toBe(1);
+    sink().bannerLoaded();
+    expect(l.bannerFailures(), 'nor a load').toBe(1);
+    // Before the load failure below: that marks the banner down, and a hide of a banner already down is never called.
+    (sdk.hideBanner as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('gone'));
+    l.setBannerVisible(false);
+    await flush();
+    expect(sdk.hideBanner, 'setup: the hide really ran, and failed').toHaveBeenCalled();
+    expect(l.bannerFailures(), 'a failed HIDE is not a banner failing to come up').toBe(1);
+    sink().bannerFailed();
+    expect(l.bannerFailures(), 'a load failure — a no-fill, or a refresh').toBe(2);
+  });
+
+  it('an init that fails counts as a banner failure: no banner can come up until one succeeds (#1477)', async () => {
+    const { sdk } = fakeSdk({ start: vi.fn().mockRejectedValue(new Error('consent does not allow ad requests')) });
+    const l = make(sdk);
+    await l.init();
+    expect(l.bannerFailures()).toBe(1);
   });
 
   it('a banner that finishes loading after the game hid it is removed again (iOS adds the view late)', async () => {

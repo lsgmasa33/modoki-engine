@@ -17,6 +17,8 @@ import { pollGpuTimings } from '../core/gpuTimings';
 // it used to leave. `activeRenderer` imports only `three` types + `./clock`, so this is L2→L0
 // (rendering → core) and adds no cycle.
 import { getGpuFaultState, onRendererLost, type GpuFaultState } from '../core/activeRenderer';
+// #1475 — names what the OS was doing (a native prompt, a lost focus) when the chain stalled.
+import { describeAppActivity } from '../core/appActivity';
 // Split out to a DOM-free leaf (this file is not) so a Node-side consumer with no "DOM" lib can
 // type against the union without pulling this whole file's `document`/`requestAnimationFrame`
 // usage into its program — see that file's header for the concrete failure (editorBackendRouter.ts
@@ -511,6 +513,7 @@ function checkStall() {
       `app is alive but not pumping frames: no ECS system ticks, nothing renders, and trusted ` +
       `input will silently no-op.` +
       (gpuFault?.deviceLost ? ` GPU fault: ${gpuFault.reason ?? 'unknown reason'}.` : '') +
+      describeAppActivity() +
       (frameSinceArm
         ? ' Re-arming the requestAnimationFrame chain.'
         : ' The outstanding requestAnimationFrame callback has never fired — re-arming would ' +

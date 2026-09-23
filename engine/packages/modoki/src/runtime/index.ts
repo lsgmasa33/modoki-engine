@@ -380,6 +380,9 @@ export {
   bootSpansOverlapping, resetBootTimeline, MAX_BOOT_SPANS,
   type BootSpan, type BootTimeline,
 } from './core/bootTimeline';
+// App activity (#1475) — `app-inactive` / `page-hidden` / `window-blur` spans on the same timeline,
+// so a stall can be read against what the OS was doing. The app shell feeds the native edge.
+export { noteAppActive, installPageActivityTimeline } from './core/appActivity';
 export { readPerfProfile } from './debug/perfSources';
 // Profiler markers — the data model the Profiler panel and the MCP surface are both views of.
 // `profileScope` is public API: game code can name its own spans and they rank alongside the

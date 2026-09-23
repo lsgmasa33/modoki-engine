@@ -3,6 +3,7 @@ import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
 import { useBackgroundFlush } from './useBackgroundFlush';
+import { useAppActivityTimeline } from './useAppActivityTimeline';
 import { useResumeReload } from './useResumeReload';
 import { useDeadAudioReload } from './useDeadAudioReload';
 import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, holdTimeForLoading, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
@@ -830,6 +831,8 @@ function App() {
   useBackgroundFlush();
 
   useAudioResumeRearm();
+
+  useAppActivityTimeline();
 
   // Reload the app on resume after a long background (#574). A no-op unless the project authors
   // `runtime.reloadAfterBackgroundMinutes`. Registered AFTER `useBackgroundFlush` above deliberately:

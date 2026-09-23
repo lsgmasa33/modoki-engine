@@ -37,6 +37,8 @@
  * - **No method rejects into a caller.** Every failure is a `console.warn` and a resolved sentinel.
  */
 
+import { beginBootSpan, endBootSpan } from './bootTimeline';
+
 /** iOS IDFA / Android GAID, with `kind` naming which — see the plugin's own doc comment. */
 export type AdvertisingId = {
   id: string;
@@ -144,9 +146,13 @@ export function createAttribution({ config, sdk, platform, bundleId }: Attributi
       });
       // Retrying this call is safe: iOS shows the system dialog ONCE EVER, and a second request returns
       // the cached answer without UI. Not retrying would leave attribution off for the whole run.
+      // A boot-timeline span (#1475): on a fresh iOS install this is the system ATT alert, which takes
+      // the screen and withholds frames — the read has to be able to see that it was up.
+      const attSpan = beginBootSpan('att-prompt');
       try {
         await sdk.requestTrackingAuthorization();
       } finally {
+        endBootSpan(attSpan);
         settleAtt();
       }
       attPrompted = true;

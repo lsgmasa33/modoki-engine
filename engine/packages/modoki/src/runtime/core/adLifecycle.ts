@@ -41,6 +41,7 @@ import { createSupersessionToken, createTeardownToken } from './liveness';
 import { withTimeout } from './abandonment';
 import { rawEpochNow } from './clock';
 import { notifyListeners } from './notifyListeners';
+import { bootSpanAsync } from './bootTimeline';
 
 export type FullscreenKind = 'interstitial' | 'rewarded';
 
@@ -162,6 +163,12 @@ export interface AdLifecycle {
    *  the video is still up, so anything it raises plays out underneath the ad (#1379). */
   isFullscreenShowing(): boolean;
   isInitialized(): boolean;
+  /** How many times a banner could not be put up: a load that failed (a no-fill included, and a refresh's),
+   *  a show call that was refused, or an init that failed. MONOTONIC and never reset — a caller keeps its
+   *  own baseline and asks "has it failed since?" (#1477: Weaveling gives an unfillable strip to the
+   *  crossword). A count rather than a "failed now" flag because a flag set by the PREVIOUS attempt would
+   *  still read true before the next attempt had even started. */
+  bannerFailures(): number;
 }
 
 interface PendingShow {
@@ -229,6 +236,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
   let bannerShown = false;
   let bannerBusy = false;
   let bannerRetryAt = 0;
+  let bannerFailures = 0;
 
   function settlePending(shown: boolean): void {
     const p = pending;
@@ -311,6 +319,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     },
     bannerFailed() {
       if (!initialized) return;
+      bannerFailures++;
       bannerShown = false;
       bannerRetryAt = now() + retryMs;
       const live = lifetime.capture();
@@ -342,6 +351,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     } catch (e) {
       console.warn(`[${opts.tag}] ${target ? 'showBanner' : 'hideBanner'} failed:`, e);
       if (live()) {
+        if (target) bannerFailures++;
         bannerRetryAt = now() + retryMs;
         // A failed or timed-out SHOW may still put a view up later, and the game may have asked for none
         // meanwhile — `bannerShown` is still false, so the diff below would do nothing. Remove defensively.
@@ -369,7 +379,8 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     // Declared OUTSIDE the try so the catch can unwind it; `splice(0)` keeps both unwinds idempotent.
     const handles: AdListenerHandle[] = [];
     try {
-      await sdk.start();
+      // A boot-timeline span (#1475): `start()` can put a native consent form in front of the game.
+      await bootSpanAsync('ads-start', () => sdk.start(), opts.tag);
       // Sequential and STOPS on the first failure — the `registration` kind in `notifyIsShared.test.ts`'s
       // EXEMPT: isolating each call would publish a half-registered set that reports success.
       for (const register of sdk.listeners(sink)) {
@@ -405,6 +416,8 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
       console.warn(`[${opts.tag}] Init failed:`, e);
       // Only this run's own latch: clearing a newer run's would let two inits race again.
       if (live()) {
+        // No banner can come up until an init succeeds, whatever the reason (offline, consent refused).
+        bannerFailures++;
         starting = false;
         // Nothing else calls `init()` again before the next cold start (the engine calls it at boot and on
         // a realm-survived recovery), so a transient failure — offline at launch — would mean no ads for
@@ -515,5 +528,6 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     },
     isFullscreenShowing: () => fullscreenShowing,
     isInitialized: () => initialized,
+    bannerFailures: () => bannerFailures,
   };
 }
