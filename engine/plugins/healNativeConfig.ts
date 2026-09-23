@@ -1663,6 +1663,10 @@ function healIosOrientationStatusBar(projectRoot: string, cap: ProjectConfig['ca
   text = setPlistKey(text, 'UIStatusBarHidden', cap.statusBarHidden ? '<true/>' : '<false/>');
   // false = the app honors the Info.plist UIStatusBarHidden/UIStatusBarStyle keys
   // instead of per-view-controller code.
+  // ⚠️ Do not flip this to true to "let a full-screen ad own the status bar" — Google's forum
+  // workaround for an unreachable interstitial close button. Tried for #1473 on the iPhone Air: with
+  // true, the status bar SHOWED during play despite UIStatusBarHidden, and the stuck ad turned out
+  // to be a bad creative, not this key.
   text = setPlistKey(text, 'UIViewControllerBasedStatusBarAppearance', '<false/>');
   const styleMap: Record<string, string> = { default: 'UIStatusBarStyleDefault', light: 'UIStatusBarStyleLightContent', dark: 'UIStatusBarStyleDarkContent' };
   text = setPlistKey(text, 'UIStatusBarStyle', `<string>${styleMap[cap.statusBarStyle] ?? styleMap.default}</string>`);
