@@ -193,7 +193,7 @@ function scaffold2DEntities(prefab: PrefabFile): SceneEntityEntry[] {
  *    own nodes inside that template is the circularity `nodeGuid` already answers, on the row itself.
  *
  *  So a reader looking for the v16 fallback here should stop looking: it is deliberately absent, and
- *  the sentinel's retirement is § 4 Phase 5's item, not this one's. */
+ *  the sentinel was deliberately NOT retired (#1468 design record). */
 function editGuidAt(prefab: PrefabFile, path: readonly MemberStep[]): string | null {
   const sentinel = (localId: number) => localId === prefab.rootLocalId ? PREFAB_EDIT_ROOT_GUID : `${PREFAB_EDIT_LOCAL_GUID_PREFIX}${localId}`;
   if (!path.length) return sentinel(prefab.rootLocalId);
@@ -506,7 +506,7 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   // which row a given live entity is; without this every node would be re-minted on every Cmd+S, and
   // an identity that changes on each save is worse than none. A row of a pre-v5 document has no guid
   // to keep and is simply absent here, so the save mints it one — which is how a file migrates
-  // (docs/plans/prefab-member-identity-plan.md § 4 Phase 5: on next save, never on load).
+  // (#1468 design record: on next save, never on load).
   const nodeGuidByLocalId = new Map(previous.entities.map((e) => [e.localId, e.nodeGuid ?? '']));
   const preserveNodeGuids = new Map<number, string>();
   for (const [ecsId, localId] of preservedLocalIds) {

@@ -16,7 +16,7 @@
  *  recipe silently turns a template key of "1" into localId 1, naming a different node. Template
  *  keys are guid-shaped, which is the only reason that never fired.
  *
- *  The same sprawl made `localId`'s SPELLING load-bearing in eleven places at once. #1468 § 3.5
+ *  The same sprawl made `localId`'s SPELLING load-bearing in eleven places at once. #1468 (the #1468 design record, the node guid)
  *  needs a later localId → node-guid switch to be a sigil addition; with eleven hand-rolled parsers
  *  it was a restructure, and the `MemberStep = number | string` union did **not** make it cheap —
  *  every one of those sites coerced back to a number regardless.
@@ -47,7 +47,7 @@
  *  spaces — the nested-frame `chain`, the pose chain, `prefabOverrides`' own path grammar — because
  *  what separates them is the RECEIVER'S TYPE, which needs a `ts.Program` rather than the per-file
  *  parse these scans use. A guard that is mostly exemptions teaches people to add exemptions, so
- *  the floor is recorded here and in the plan instead. ⚠️ Phase 2B adds member ROWS and more path
+ *  the floor is recorded here instead. ⚠️ Phase 2B adds member ROWS and more path
  *  formatting; if a fifth copy appears there, pay for the type-aware scan rather than re-deciding
  *  this.
  *

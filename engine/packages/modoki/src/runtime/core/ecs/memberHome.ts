@@ -272,7 +272,7 @@ export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World 
  *  row exists only where the TEMPLATE minted a `nodeGuid`, so a member of a PRE-v5 template gets none
  *  and the window is still open for exactly those members. Retiring it needs every template it can
  *  meet at v5 — which is also why Phase 4 could not delete the localId key space: the repo's corpus
- *  is v5, but every prefab the released editor wrote is not (plan § 4 Phase 4's ruling), so neither
+ *  is v5, but every prefab the released editor wrote is not (#1468 design record, Finding B), so neither
  *  retires while such a prefab can be opened. Found by a TEST, not by reading: deleting the stamp
  *  reddened `createPrefabMemberIdentity.test.ts`'s nested-instance case, whose child template is a
  *  hand-written pre-v5 document. */
@@ -317,12 +317,12 @@ export function stampDerivedMemberGuids(rootEcsId: number, world: World = getCur
  *  into, another stored root — takes the guid the reload derives, and every ref follows.
  *  Undo: {@link applyGuidRemap} with the map reversed, then put the roots' `PrefabInstance` back.
  *
- *  ⚠️ **A member the save will write a ROW for is NOT renamed (scene v16, § 3.3 R7).** The rename's
+ *  ⚠️ **A member the save will write a ROW for is NOT renamed (scene v16, #1468 design record R7).** The rename's
  *  entire premise is *"the reload will DERIVE this member's guid, so the live one must match what it
  *  derives"*. Once a row states the guid, the reload reads it and the premise is gone — renaming
  *  anyway moves a guid for no reader and drags every external reference along with it.
  *
- *  ⚠️ This is the **deliberate divergence from a QA-measured contract** § 3.3 R7 flags:
+ *  ⚠️ This is the **deliberate divergence from a QA-measured contract** #1468 design record R7 flags:
  *  `qa/knowledge.md`'s promotion row records that promotion today re-derives its members' guids. That stops
  *  being true where the template mints identity, and stays true where it does not — a pre-v5
  *  template has no rows, so the reload really does derive and the rename is still what keeps the

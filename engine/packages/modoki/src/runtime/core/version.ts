@@ -70,7 +70,7 @@ export const ENGINE_VERSION = '0.1.0';
 // ⚠️ The row shape also RESERVES the slots Phases 3 and 4 collapse the localId-keyed channels into
 // (`parent`, `traits`, `removedTraits`, `removed`, `added`), so those phases are caller migrations
 // and not two more irreversible bumps. See `SceneMemberRow` for why they are declared and not
-// written, and docs/plans/prefab-member-identity-plan.md § 3.1 D2(b) for the ruling.
+// written, and the #1468 design record D2 (docs/prefab-structural-overrides.md) for the ruling.
 export const SCENE_FORMAT_VERSION = 16;
 
 /** The version stamped into newly written PREFAB JSON. Moved here from `editor/scene/prefab.ts`

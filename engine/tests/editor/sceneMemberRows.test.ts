@@ -165,7 +165,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     // The measured case, not a contrived one. Deleting the template's first child frees localId 2,
     // and the next save hands it to Badge — so on reload Badge DERIVES the guid Panel used to have.
     // A dangling key can be noticed; this one names a live, plausible, wrong member. It is the whole
-    // argument for minted identity (§ 3.5) and it is what the row has to survive.
+    // argument for minted identity (#1468 design record, the root cause) and it is what the row has to survive.
     const { scene } = await placedInstance();
     const storedBadge = guidOf('Badge');
     const panelsOldGuid = guidOf('Panel');

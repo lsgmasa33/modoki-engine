@@ -259,7 +259,7 @@ export type MemberStep = number | string;
  *
  *  A template key is guid-shaped, so `'+' + key` never parses as a number and the two shapes cannot
  *  collide — that is what {@link addedKeyStep}'s `+` buys, and it is the hedge a later
- *  localId → node-guid switch (#1468 § 3.5) spends: a guid-shaped step becomes a second sigil here
+ *  localId → node-guid switch (#1468 design record, the node guid) spends: a guid-shaped step becomes a second sigil here
  *  and nowhere else. ⚠️ It is NOT a hedge today — before Phase 1 eleven sites coerced a step back to
  *  a number by hand and this grammar rejected anything non-numeric outright. */
 export function parseStep(part: string): MemberStep | null {
@@ -280,7 +280,7 @@ export function formatStep(step: MemberStep): string {
  *  the engine itself, so a part that fits neither shape is already a corrupt file; `NaN` is a legal
  *  `MemberStep` that matches no member, so such a step names nothing and the caller's existing
  *  "names nothing" path reports it. Rejecting instead would be a behaviour change, and one that
- *  belongs with R2's orphan handling (#1468 § 3.3), not with a spelling unification.
+ *  belongs with R2's orphan handling (#1468 design record R2), not with a spelling unification.
  *
  *  ⚠️ **No empty-key guard — `''` yields `[0]`, not `[]`.** {@link deriveMemberChain} splits a
  *  multi-segment key and hands each segment here, and an empty segment has always seeded
@@ -320,7 +320,7 @@ export function isOwnedRoot(pi: MemberPi, selfId: number): boolean {
  *  derives by its key rather than through its instance (#1387).
  *
  *  ⚠️ `planCopyGuids` asks a DIFFERENT question with a similar name and is deliberately not a caller
- *  — see the exception recorded in `docs/plans/prefab-member-identity-plan.md` § 4 Phase 1. */
+ *  — see the exception recorded in the #1468 design record (`docs/prefab-structural-overrides.md`). */
 export function isDerivedMember(pi: MemberPi, selfId: number, key: string): boolean {
   return !!pi && !key && (pi.rootInstanceId === selfId ? !!pi.parentLocalId : !!pi.rootInstanceId);
 }
@@ -344,7 +344,7 @@ export type MemberNodePi = { nodeGuid?: string; parentNodeGuid?: string; parentL
  *  reason and in the same order. Written as a separate function rather than folded into that one
  *  because the two answer different questions — a POSITION that derives a guid, and an IDENTITY that
  *  stores one — and one function returning both would be the conflation R1 exists to prevent
- *  (docs/plans/prefab-member-identity-plan.md § 3.3).
+ *  (#1468 design record, `docs/prefab-structural-overrides.md`).
  *
  *  '' = no minted identity: a pre-v5 template, or a live tree that never came from a prefab.
  *
@@ -369,7 +369,7 @@ const ROW_KEY_SEP = '/';
  *  identity per instance FRAME, innermost last — joined by `/` and led by one, mirroring the identity
  *  string `memberPathRecords` already builds (`memberPaths.ts`, `idOf`). Flat WITHIN a frame: a
  *  member's own component is the only thing after its frame chain, so a template re-parent re-keys
- *  nothing (plan § 3.1 D1(a)).
+ *  nothing (#1468 design record D1).
  *
  *  ⚠️ **v16's key space is GUID-ONLY, and '' is returned for anything else.** An empty component
  *  means a node with no minted identity (a pre-v5 template), and a non-guid component means a node

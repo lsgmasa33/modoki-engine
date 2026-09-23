@@ -2,7 +2,7 @@
  *
  *  The module's docblock lists four things that get NO row. That list is a CLAIM, and a claim about
  *  a guard is wrong in two directions: a floor that is not real reads as permission, and a real floor
- *  left unstated reads as coverage (plan § 4 Phase 1's close-out found one of each, one pass apart).
+ *  left unstated reads as coverage (#1468 Phase 1's close-out found one of each, one pass apart).
  *  So there is a test per line here, asserting the exclusion actually happens rather than that the
  *  docblock says it does.
  *
@@ -101,7 +101,7 @@ describe('memberRowKeysIn — the keyed members of an instance', () => {
   });
 
   it('gives a member of a DIFFERENT instance no row, wherever it physically sits (R8)', () => {
-    // The illegal state § 3.1 D1 accepted cost 3 warns about: path-addressing could not express
+    // The illegal state #1468 design record D1's third accepted cost warns about: path-addressing could not express
     // "member of X living outside X", identity-addressing can, and the save path is what has to
     // refuse it. Here the foreign member sits right inside our subtree and still gets no key,
     // because its frame chain never reaches our root.
@@ -137,7 +137,7 @@ describe('memberRowKeysIn — the keyed members of an instance', () => {
   });
 
   it('follows an owned nested root`s OWNER link, so moving it inside its instance keeps its frame', () => {
-    // § 3.3 Case 1, at the frame level: a move INSIDE an instance keeps the link, so the frame a
+    // #1468 design record R8, at the frame level: a move INSIDE an instance keeps the link, so the frame a
     // moved owned root belongs to is the one its ROW is in — not the one it now hangs under. Since
     // #1468 Phase 6 that is `PrefabInstance.ownerGuid` (its HOME parent's frame, before).
     // Reading the live parent instead is only wrong when the two are in different frames, which is

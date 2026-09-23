@@ -4,10 +4,10 @@
  *
  *  A scene's member row exists only where the TEMPLATE minted a `nodeGuid` (prefab v5). So an
  *  instance of a prefab that has none has no member rows at all, and is addressable only through
- *  the `localId` key space that Phase 3 and Phase 4 of
- *  `docs/plans/prefab-member-identity-plan.md` delete. The plan's finding B is the ruling: the
- *  corpus migrates to v5 first (`engine/scripts/migrate-prefabs-v5.mjs`), and this gate is what
- *  keeps it there.
+ *  the `localId` key space, which #1468 kept only as a LEGACY channel for such members. Finding B
+ *  in the #1468 design record (`docs/prefab-structural-overrides.md`) is the ruling: this repo's
+ *  corpus migrates to v5 (`engine/scripts/migrate-prefabs-v5.mjs`), and this gate is what keeps it
+ *  there.
  *
  *  `serializePrefab` mints one for every row it writes, and `createPrefabMemberIdentity.test.ts`
  *  proves that. What a writer test cannot see is a document reaching the repo some OTHER way — a

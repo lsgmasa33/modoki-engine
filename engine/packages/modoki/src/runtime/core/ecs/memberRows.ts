@@ -12,7 +12,7 @@
  *  function, two callers, no mirror to keep in step.
  *
  *  ⚠️ **The key is an IDENTITY chain, not a path.** One component per instance FRAME, flat within a
- *  frame (plan § 3.1 D1(a)), so a member re-parented inside its instance — or a template row moved
+ *  frame (#1468 design record D1), so a member re-parented inside its instance — or a template row moved
  *  under a different parent — keeps its key. The PATH spelling (`.`-joined steps, `|`-joined frames)
  *  still exists and still derives the fallback guid; the two are R1's storage key and matching key
  *  and must not be collapsed.
@@ -63,7 +63,7 @@ type RowPi = (NonNullable<MemberPi> & { nodeGuid?: string; parentNodeGuid?: stri
  *    `planMoveUnlinks` keeps LINKED (#1437) — would be re-keyed into the nested frame, so its stored
  *    identity dangles and it silently re-derives. "A move re-keys nothing" is the point of the flat key;
  *  - a member of ANOTHER instance dragged into this subtree would be keyed as one of ours, which is
- *    the illegal state § 3.1 D1 accepted cost 3 warns about: path-addressing could not express
+ *    the illegal state #1468 design record D1's third accepted cost warns about: path-addressing could not express
  *    "member of X living outside X", and identity-addressing can. Here it is rejected by
  *    construction — its frame chain never reaches `rootEcsId`, so it gets no key.
  *

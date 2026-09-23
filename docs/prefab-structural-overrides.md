@@ -656,6 +656,19 @@ mark-gate in `captureInstanceOverrides` asks the same function, so the gate and 
   identity but NOT `parent`: re-asserting the carried rows put a reverted move straight back.
 - **Promotion keeps a keyed member's guid** (R7), and an unpack undone after a rebuild RELINKS — both
   follow from identity no longer changing under a member.
+- **A rebuild carries a REFERENCE node's rows too (#1482).** A user-added instance inside the rebuilt
+  one is its own row-writing root, so the outer carry (`captureInstanceMembers` →
+  `restoreInstanceMembers`) never reaches its members. Its rows ride on the node itself in the captured
+  structure, and the rebuild pins them from there, before the derive. It uses
+  `collectReferenceNodeRows`, the same collector the loader uses, so where such rows can sit is written
+  once. Until then those members re-derived, and an outer row's `parent` naming one of them dropped the
+  move for good.
+- **Promoting a reference node reads a pre-v5 move in its FRAME (#1480).** A legacy `moved` localId
+  means something only in the frame it was written for. `promoteReferenceMoves` looks it up through
+  `memberRowsIn`'s (frame, localId in that frame) index: the node's own frame for `node.moved`, and for
+  `nestedStructure[path].moved` the owned root that path walks to. Before, it matched an owned root's
+  `parentLocalId` at any depth (never triggered: spawn order found the right one), and it never read the
+  nested maps, so a pre-v5 move inside the node's nested row was lost.
 - **`PrefabInstance.homeParent`/`homeSteps` outlived Phase 3 and went in Phase 6.** Stored rows retired
   only their derivation role; the other two (which instance owns a moved owned nested root, and the
   template position prefab FILES name members by) now come from the document and an owner link — see
@@ -666,7 +679,7 @@ mark-gate in `captureInstanceOverrides` asks the same function, so the gate and 
 **A member's overrides, removed traits, its own removal and the subtrees added under it are written on
 its ROW, addressed by minted identity — so they survive a template that renumbers its localIds.** Before
 Phase 4 they were keyed by `localId`, a position in the template: a re-save that renumbered (re-import,
-Replace, the Skin Editor's update, a deleted-then-added sibling — the plan's § 3.4 lists five paths)
+Replace, the Skin Editor's update, a deleted-then-added sibling — the design record lists five paths)
 handed every edit to whichever member inherited the number, with nothing to say it had happened.
 
 - **One rule, at every seam: a localId means something only together with the document it was read
@@ -717,8 +730,7 @@ reports it as skipped, in the caller's own spelling like every skipped key; Reve
 agent op refuses it before either runs. `canonicalOverrideKey` makes two spellings of one key compare equal, which is
 what the agent op validates with.
 
-Full design, the eight reconciliation rules and the measurements:
-`docs/plans/prefab-member-identity-plan.md`. Tests: `engine/tests/editor/sceneMemberRows.test.ts`
+The decisions, the eight reconciliation rules and the measurements are in the design record below. Tests: `engine/tests/editor/sceneMemberRows.test.ts`
 (the round trip and R1-R8), `sceneMemberRowGestures.test.ts` (the gestures),
 `engine/tests/framework/memberRowKeys.test.ts` (which members are keyed, and which are not);
 Phase 4's `sceneMemberRowChannels.test.ts` (the loader), `sceneMemberRowWriter.test.ts` (the writer, the
@@ -909,6 +921,181 @@ and a carried pose under a non-uniformly scaled, rotated removed row is the near
 before. Tests: `engine/tests/editor/duplicateCarriesRefs.test.ts` (the #1437 describes),
 `engine/tests/plugins/remintPrefabMemberRefs.test.ts` (memberGuidRemap, the token rewrite and
 planMemberPathRepair against the loader), `engine/tests/plugins/prefabMemberPathsRoute.test.ts`.
+
+### The #1468 design record — why identity is stored this way
+
+The design, the decisions and the rules behind scene v16 and prefab v5. The plan that carried them
+(#1468's member-identity plan) was folded in here and deleted as its last two follow-ups (#1480,
+#1484) closed. Its handover notes, per-phase checklists and review transcripts are in git
+(`git log --all -- '*prefab-member-identity-plan.md'`). Code comments cite the labels below
+(**D1**-**D4**, **R1**-**R8**) as *"#1468 design record"*.
+
+**The bar** (owner, 2026-09-22): *"I want to make sure we implement this right, because I don't want to
+do another restructure for prefabs and nested prefabs."* A second restructure of this subsystem is the
+failure to avoid, more than lateness and more than an imperfect first cut.
+
+**The problem.** A member had no stored identity: its guid was derived at load as
+`deriveMemberGuid(anchor, path)`. That is not arbitrary, because a TEMPLATE cannot store member guids
+without every instance sharing them (#1387). The arithmetic had one spelling. The fragility was the
+ANCESTOR WALK around it, mirrored three times (the load-time derive, the file-side prediction
+`memberPathRecords`, the live-subtree prediction `planCopyGuids`) under a *"change all three"* comment.
+Five more sites answered *"which member is this?"* by re-deriving and comparing, and each failed silently
+when the equality did not hold. The payoff that justified a format bump was unifying the key space, not
+only preserving identity. No open issue beyond #1468 needed it; it was preventive.
+
+**Rejected, with reasons, so they are not re-proposed:**
+- **Warn, don't fix.** Dragging a member out of an instance already unpacks it (a plain entity keeps
+  its guid), so the only everyday way to lose identity was Create Prefab, and a warning naming the files
+  that would dangle was a real option. Rejected by the owner's bar.
+- **Store the guid in the existing `overrides` channel** (no format bump). It inherits the dead end's
+  first fault exactly: `remintSceneEntityGuids` is a KNOWN-FIELD walk and does not read guids there. Its
+  one real advantage was REVERSIBILITY (no bump, nothing spent), which is what D2 answers.
+- **The dead end: a bare per-instance `memberGuids` map**, written where the live guid differs from the
+  derivation. It was prototyped and worked (tag `proof/1468-guid-map`). It was still wrong, twice: the
+  remint walk could not see a novel field, so a duplicate copied pinned identities verbatim into two
+  files (the #1293 hazard); and "live guid differs from derivation" is the classifier
+  `copyIdentity.ts` records as wrong in both directions (#1338 review). Rows make the first fault a
+  one-line addition to the remint walk. Only D3 closes the second.
+
+**The root cause: `localId` is POSITIONAL, and five production paths renumber it.** `planPrefabRows`'
+positional branch numbers rows by BFS position whenever `preserveLocalIds` is absent, and only prefab
+edit passes it. The five: rigged model re-import (a name match that misses on a bone rename), the Skin
+Editor's update, Create Prefab → Replace, Assets → Import Model, and the agent's `modoki_prefab create`
+over an existing path. `prefabSerializeCallSites.test.ts` now makes every writer declare where its file
+guid comes from. Two hazards break the same key without renumbering anything: a freed number is REUSED
+(the allocation ceiling is the max over surviving rows), and a re-parented row changes a path without
+changing an id. **"Reused" is the argument that decided the node guid:** a stale number silently names a
+DIFFERENT node, and nothing can detect that; a minted guid is never recycled, so a stale one can only
+dangle, and R2 makes a dangle loud.
+
+**The node guid (prefab v5), stored ALONGSIDE `localId`** (owner ruling: in scope for this work, not a
+future ticket; alongside, not replacing). `localId` keeps its jobs as the array key and the numeric
+`parentId` wiring; removing it would rewrite ~165 references and every authored prefab to delete a
+field that becomes inert rather than wrong. Two parts, and neither is enough alone: identity is MINTED
+and stored (`nodeGuidsFor`, at the write and nowhere else, never on read), and re-association across a
+REGENERATION is content-derived (`riggedEntityIdentity` carries the node guid forward on a rigged
+re-import). ⚠️ **Nothing survives a DCC rename**: the GLB carries no modoki guid, so a renamed bone misses
+whatever it carries. The goal is containment: one orphaned row and a log line, not a silently re-pointed
+subtree. Minting also needs no seed change, because derivation still reads `localId`s, so no derived
+guid moved.
+
+**D1 — the row key is FLAT: one identity component per instance FRAME, not an ancestor chain** (owner,
+2026-09-22). A template re-parent re-keys nothing (the most common template edit there is), and a broken
+identity orphans ONE row instead of every descendant's. `memberPathRecords` already separated a path from
+an identity, and #1437 already paired two documents by identity, so the key consumes existing machinery.
+Accepted costs: size (below); resolving a member's actual position takes a lookup; and ⚠️ **an illegal
+state becomes REPRESENTABLE**. Under path addressing, *"a member of X living outside X"* could not be
+written down, because no route leaves the frame. Under identity addressing it is well-formed and wrong,
+so the invariant is enforced by code: R8.
+
+**D2 — the rows carry the collapsed channels FROM THE START** (owner, option (b)). One scene format
+change, not two: the later phases (`parent`, then the edits) became caller migrations onto slots v16
+already declared. The alternative was proving the later phase on paper and gating the bump on the proof.
+It was rejected because paper reasoning about this subsystem had failed three times. ⚠️ Accepted cost:
+the irreversible phase and the riskiest phase are the same phase.
+
+**D3 — a duplicate rebuilds every row's guid, unconditionally.** Closed by elimination rather than
+ruled: *inherit* is #1293 (two files naming one entity, which the owner ruled against), and anything
+between inherit and rebuild is the rejected live-value classifier. The decision is by STRUCTURE ("this
+is a member row"), so `copyIdentity.ts`'s rule stands.
+
+**D4 — prefabs got a format gate, AND a lost identity is loud** (owner: both, not either). This
+**reverses #365**, which chose a writer-only stamp on purpose; `docs/format-versioning.md` records the
+reversal. An older build saving a v5 prefab would drop every node guid while keeping the file guid, so
+instances stay linked to a document whose identity was erased. Disposition (owner, 2026-09-23):
+**refuse to SAVE, not to load**. Only the editor ever writes a prefab, so a save-side refusal covers the
+whole hazard and costs the runtime nothing. The gate is one-directional, `version > PREFAB_FORMAT_VERSION`,
+⚠️ **never `!==`**: every authored prefab was behind the constant when this was decided, so `!==` would
+have refused all 105 of them on first load. It is server-side at the byte-writing seam
+(`plugins/prefabWriteGuard.ts`, at `/api/write-file` and the watcher's `writeAssetGuid`), because a
+census found 17 write paths: 4 went through `writePrefabFile` and 8 through the client wrapper. The gate is prevention and R2 is
+detection. They fail in different directions, and a gate that is itself wrong fails silently again, so
+do not drop R2 as redundant. R2 is also the only protection for a shipped game on an older engine
+reading a newer prefab, because nothing there saves.
+
+**The reconciliation rules:**
+- **R1 — the storage key is not the matching key.** A row is STORED under its identity key (D1) and
+  MATCHED to a template member by identity. The PATH spelling (`.`-joined steps, `|`-joined frames) still
+  exists and still derives the fallback guid; the two must not be collapsed.
+- **R2 — a row with no template member** is kept across saves and logged once, by name, and never
+  silently dropped (a silent drop is #1468 reproduced). A member the instance REMOVED is still in the
+  template, so its row is not an orphan. This is why rows keep `name` (owner, 2026-09-23): an orphan's
+  template member is gone, so only the row can name it in the log.
+- **R3 — a template member with no row** derives, as before, and gets a row on the next save. This is
+  the v15 → v16 migration path and the normal state of every older scene. No warning.
+- **R4 — a template re-parent** is not a reconciliation case under D1: nothing re-keys. It is also why
+  `parent` is a DIFF, not the live parent (above).
+- **R5 — a renumbered `localId`** is survived by the node guid; where that also breaks, R2 applies.
+- **R6 — a duplicate** rebuilds every row's guid (D3).
+- **R7 — promoting an owned nested root** relocates its rows to the new entry and PRESERVES the guids.
+  ⚠️ A deliberate divergence from the QA-measured contract, which recorded the members as re-derived.
+- **R8 — frame containment.** A row's `parent` must resolve inside the row's own frame. A move INSIDE an
+  instance is a re-parent that keeps the link; a move OUT of it is an unpack. Enforced by code because
+  the encoding no longer enforces it. `memberRowsIn` follows IDENTITY, not the ECS parent chain, and that
+  one choice enforces R8 on the save and keeps a member moved beside its frame from being re-keyed.
+  Dragging out a nested ROOT is neither: it is a promotion (R7).
+
+**The row shape.** `members` is a MAP keyed by identity, not an array of rows carrying a `key`. Every
+other structural channel is already an identity-keyed map, a map is 17 B/row smaller, and a duplicate
+key is unrepresentable. A key component is a node guid iff `isGuid(component)`, ⚠️ **never judged by its
+first letter**: a guid can start with `a`, and `a+<key>` / `ar` / `a0` are disjoint from a guid by the
+`+` and by length. `nestedOverrides` and `nestedStructure` needed no slot on the row: they existed only
+because a member two frames down had no address, and the frame-chained key gives it one. **A row exists
+only where the template minted a `nodeGuid`.** That prunes on a FORMAT capability of the template, not
+on a live value, so it is not the rejected classifier. Keying a pre-v5 member's row by `localId` instead
+would orphan every such row the moment that prefab is re-saved and minted, and it is the positional
+address that repoints.
+
+**The cost, measured on the corpus with GUID keys (2026-09-23):** 1 042 rows over 29 instances in 13 of
+71 scenes; the shipped shape adds **+56%** overall and **+293%** (78 KB) to `alien-animal`, whose 516
+rows are almost all bones that nothing addresses by guid. The identity itself is 61% of that and no
+encoding avoids it. The cheaper bare `key → guid` map (+33%) is ruled out by D2, since a row with no
+object has nowhere to hold the channels. Every measured row sat at frame depth 1, so a nested frame's
+per-row cost (a 73-character key) is unmeasured, not zero.
+
+**What shaped the later phases:**
+- **Finding A:** the instance ROOT has no row (it IS the entry), so its overrides stay on the entry.
+- **Finding B, and the Phase 4 ruling (owner, option B):** the `localId` key space could not be
+  deleted, because the population is pre-v5. Every prefab the released editor wrote has no `nodeGuid`,
+  and every v15 scene stores its edits only by `localId`. This repo's corpus was migrated
+  (`migrate-prefabs-v5.mjs`, pinned by `prefabCorpusNodeGuids.test.ts` on the guid rather than the
+  version). A user's corpus cannot be. So the `localId` channels are LEGACY: always read, and written
+  only for what no row can key. Option B also moved the editor's own cross-call addressing (the
+  Apply/Revert keys, `modoki_prefab`) onto identity. Its real gain over rows-in-files-only is the KEY
+  grammar: an agent lists keys, a reload renumbers underneath it, and a numeric key then names another
+  member. (The first rationale given for it, a rebuild across a renumbering template, named a path
+  nothing takes today; it was corrected the same day.)
+- **No corpus rewrite for scenes.** Files move to the current version when someone saves them, as they
+  always have; rewriting scenes would make every older clone refuse them. The starter template's scene
+  is the one exception, so the scaffolder does not emit a migrating scene. Prefabs were rewritten
+  because a prefab has no refuse hazard (the gate refuses only a NEWER file).
+- **The home fields had three roles, and stored rows retired only one** (measured by neutralising them:
+  1 test red for derivation, 40 for the other two). Ownership of a moved owned nested root and the
+  template position prefab files name members by now come from the document and `ownerGuid` (Phase 6,
+  "Identity does not move" above).
+- **One step grammar and one anchor classifier** (Phase 1: `parseStep`/`memberPathSteps` and
+  `isStoredRoot`/`isOwnedRoot`/`isDerivedMember`/`entityStep` in `runtime/core/assetRefRules.ts`, guarded
+  by `memberStepGrammarIsShared.test.ts`). ⚠️ The file-side walk (`memberPathRecords`) takes the grammar
+  but NOT the classifier: it walks prefab DOCUMENTS, which have no `PrefabInstance`, and its equivalent
+  test is "this node carries its own guid". One function over both would need a fake `rootInstanceId`.
+  `planCopyGuids` asks a different question under a similar name and is deliberately not a caller of
+  `isDerivedMember`. ⚠️ `parseSteps('')` is `[0]` and `memberPathSteps('')` is `[]`. Do not collapse
+  them: derived guids are persisted and frozen, and an empty segment has always seeded `'0'`.
+- **The prefab-edit sentinel was NOT retired.** Prefab edit still smuggles a `localId` through
+  `EntityAttributes.guid` (`__prefab-edit-local-…`). Retiring it needs every document to carry a
+  `nodeGuid`, and a pre-v5 prefab opened for editing has none, so it would have meant shipping both
+  mechanisms. It works; it is not a defect. Prefab edit keeps derivation as its SOLE identity: there is
+  no scene entry to hold rows, and the document being edited is the one the rows would be about.
+- ⚠️ **OTA:** a bundle built with this engine carries v16 scenes, but the sub-game gate is
+  `ENGINE_API_VERSION` exact-equality, which a scene format bump does not move. An older host registers
+  such a sub-game and then refuses its scenes at load.
+
+**Lessons the work paid for, kept because they generalise:** a design bullet that reads as feasible is
+not feasible until someone reads what the code does (revision 2's Phase 1 was not). Three wrong facts
+entered the plan from reviews, and a one-line grep caught what two review passes missed. Across the
+close-outs, the best findings were not in the mechanisms. They were places where the author had
+asserted completeness ("every per-instance identity is dropped here"; "a test asserts the writer omits
+them") from the shape of a change rather than from the thing it described.
 
 ## What each hierarchy action does
 

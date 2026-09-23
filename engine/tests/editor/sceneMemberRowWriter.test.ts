@@ -161,7 +161,7 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
   });
 
   it('a row override that EQUALS the base survives a re-save — the load re-seeds its mark from the row', async () => {
-    // Plan § 4 Phase 2B's third mechanism: a stored override is a recorded override, even once it
+    // #1468 Phase 2B's third mechanism: a stored override is a recorded override, even once it
     // coincides with the template's value, and only its MARK can say so (the value diff cannot).
     install(template());
     await load(scene(P, { members: { [`/${gA}`]: { guid: 'ffffffff-0000-4000-8000-00000000b0a1', traits: { Transform: { x: 0 } } } } }));

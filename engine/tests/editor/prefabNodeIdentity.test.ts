@@ -9,7 +9,7 @@
  *  Every assertion here is against what the real serializer and the real tagger produce. The
  *  renumbering case is driven by actually deleting a member and re-saving, not by handing
  *  `serializePrefab` a contrived preserve map — the carry has to work through the path that
- *  forgets, which is the whole complaint (§ 3.4: four of five callers pass no preserve map). */
+ *  forgets, which is the whole complaint (#1468 design record, the root cause: four of five callers pass no preserve map). */
 
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
@@ -189,7 +189,7 @@ describe('a prefab row carries a minted node identity (#1468)', () => {
   });
 
   it('mints for the rows of a pre-v5 document, which has no identity to keep', async () => {
-    // How a file migrates: on the next SAVE, never on a load (plan § 4 Phase 5). The fixture is a
+    // How a file migrates: on the next SAVE, never on a load (#1468 design record). The fixture is a
     // v4 document — rows with a localId and no nodeGuid — instantiated and then saved back.
     const v4: PrefabFile = {
       id: PREFAB, version: 4, name: 'Old', rootLocalId: 1,
@@ -247,7 +247,7 @@ describe('a NESTED REFERENCE ROW carries its identity too (#1468 Phase 2B)', () 
     const rowLocalId = nestedRow(first).localId;
 
     // Delete an EARLIER member so the positional branch renumbers the nested row, then re-save over
-    // the same file — the four callers that pass no preserve map (§ 3.4).
+    // the same file — the four callers that pass no preserve map (#1468 design record, the root cause).
     const world = getCurrentWorld();
     const panel = [...world.entities].find((e) => e.id() === idOf('Panel'))!;
     destroyEntity(panel, world);

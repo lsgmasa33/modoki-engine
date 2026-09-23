@@ -136,7 +136,7 @@ describe('SceneMemberRow.parent — a member moved inside its instance (#1468 Ph
     const entry = instanceEntry(scene);
 
     // The moved member names where it now sits — by GUID, the only kind of entity reference this
-    // format has (§ 3.2).
+    // format has (docs/prefab-structural-overrides.md § A move is stored on the member's row).
     expect(rowNamed(entry, 'Badge')).toEqual({ guid: before, name: 'Badge', parent: guidOf('Panel') });
     // …and the members that did NOT move say nothing, which is what makes `parent` an override.
     expect(rowNamed(entry, 'Panel')).toEqual({ guid: guidOf('Panel'), name: 'Panel' });

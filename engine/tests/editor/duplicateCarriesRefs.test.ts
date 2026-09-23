@@ -2001,6 +2001,151 @@ describe('applying a move inside the instance re-parents the row and every ref f
     } finally { prefabs.delete(REFP); setPrefabCache(REFP, null); }
   });
 
+  // #1480 part 1: a pre-v5 member's move inside a reference node's NESTED row is a legacy `moved` on that
+  // row's `nestedStructure`, and the promotion never read it — Leaf reloaded back under its row. Mutation:
+  // drop the `nestedStructure` loop in promoteReferenceMoves (Leaf reloads at …/RRoot/InnerRoot/Leaf).
+  it('promoting a reference node keeps a pre-v5 move made inside its nested row (#1480)', async () => {
+    const REFP = 'aaaaaaaa-0000-4000-8000-0000000001b1';
+    const v4Inner = { id: INNER, version: 4, rootLocalId: 1, entities: innerDoc.entities.map(({ nodeGuid: _n, ...r }) => r) };
+    const refDoc = { id: REFP, rootLocalId: 1, entities: [row(1, 'RRoot', 0), row(2, 'Nested', 1, { prefab: INNER })] };
+    prefabs.set(INNER, v4Inner); setPrefabCache(INNER, v4Inner as never);
+    prefabs.set(REFP, refDoc); setPrefabCache(REFP, refDoc as never);
+    try {
+      const sc = JSON.parse(JSON.stringify(scene([]))) as { entities: Array<Record<string, unknown>> };
+      (sc.entities[1]!.added as Array<Record<string, unknown>>)[0] = { parentLocalId: 3, guid: ANCHORED, name: 'RRoot', prefab: REFP, traits: {}, children: [] };
+      await load(sc as unknown as SceneData);
+      reparentEntity(idAt('Holder/OuterRoot/Panel/Button/RRoot/InnerRoot/Leaf'), idAt('Holder/OuterRoot/Panel/Button/RRoot'));
+      const result = await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set([`+added.${ANCHORED}`]));
+      const promoted = result.prefabAfter!.entities.find((e) => e.prefab === REFP)!;
+      // Leaf is row 2 of INNER, reached through REFP's row 2, reached through the new row; its new parent is
+      // the promoted row's own root.
+      expect(result.prefabAfter!.moved).toEqual({ [`2.3.${promoted.localId}.2.2`]: `@member:2.3.${promoted.localId}` });
+      await reloadWith(OUTER, result.prefabAfter!);
+      expect(idAt('Holder/OuterRoot/Panel/Button/RRoot/Leaf')).toBeGreaterThan(0);
+      expect(() => idAt('Holder/OuterRoot/Panel/Button/RRoot/InnerRoot/Leaf')).toThrow();
+    } finally { prefabs.delete(REFP); setPrefabCache(REFP, null); }
+  });
+
+  // #1480 part 2: a legacy `moved` localId names a row of the reference node's OWN frame. The old lookup
+  // matched an owned nested root by `parentLocalId` at ANY depth, so a deeper frame's root at the same number
+  // could take the move. ⚠️ The old `find()` PASSES this fixture — its spawn order finds Kid first, as the reviewer's
+  // fixture did, so the defect is still untriggered — and what this pins is the new lookup's frame scoping.
+  // Mutation: drop the frame from the lookup (match `rowLocalId` alone) and InnerRoot takes the move.
+  it('promoting a reference node resolves a pre-v5 move in the node`s own frame, not a deeper one (#1480)', async () => {
+    const REFP = 'aaaaaaaa-0000-4000-8000-0000000001b3';
+    const MID = 'aaaaaaaa-0000-4000-8000-0000000001b4';
+    const strip = <T extends { nodeGuid?: string }>(r: T) => { const { nodeGuid: _n, ...rest } = r; return rest; };
+    // MID's row 3 is a nested INNER, so INNER's root is an owned root with parentLocalId 3 — the same number
+    // as REFP's own plain row 3 (Kid), which is the member actually moved. MID's row is listed FIRST in the
+    // reference prefab so its expansion is spawned (and indexed) before Kid.
+    const midDoc = { id: MID, version: 4, rootLocalId: 1, entities: [row(1, 'MidRoot', 0), row(3, 'InnerSlot', 1, { prefab: INNER })].map(strip) };
+    const refDoc = { id: REFP, version: 4, rootLocalId: 1, entities: [row(1, 'RRoot', 0), row(2, 'MidNested', 1, { prefab: MID }), row(3, 'Kid', 1)].map(strip) };
+    prefabs.set(MID, midDoc); setPrefabCache(MID, midDoc as never);
+    prefabs.set(REFP, refDoc); setPrefabCache(REFP, refDoc as never);
+    try {
+      const sc = JSON.parse(JSON.stringify(scene([]))) as { entities: Array<Record<string, unknown>> };
+      (sc.entities[1]!.added as Array<Record<string, unknown>>)[0] = { parentLocalId: 3, guid: ANCHORED, name: 'RRoot', prefab: REFP, traits: {}, children: [] };
+      await load(sc as unknown as SceneData);
+      reparentEntity(idAt('Holder/OuterRoot/Panel/Button/RRoot/Kid'), idAt('Holder/OuterRoot/Panel'));
+      const result = await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set([`+added.${ANCHORED}`]));
+      const promoted = result.prefabAfter!.entities.find((e) => e.prefab === REFP)!;
+      expect(result.prefabAfter!.moved).toEqual({ [`2.3.${promoted.localId}.3`]: '@member:2' });
+      await reloadWith(OUTER, result.prefabAfter!);
+      expect(idAt('Holder/OuterRoot/Panel/Kid')).toBeGreaterThan(0);
+      expect(idAt('Holder/OuterRoot/Panel/Button/RRoot/MidRoot/InnerRoot')).toBeGreaterThan(0);
+    } finally { prefabs.delete(REFP); setPrefabCache(REFP, null); prefabs.delete(MID); setPrefabCache(MID, null); }
+  });
+
+  // #1482: a rebuild of the OUTER instance (Refresh / Apply / Revert) respawns a user-added reference node
+  // inside it, and must put back the member guids that node's rows store — the loader pins them, and a
+  // rebuild that let them re-derive left anything naming them by guid dangling: here, an outer member's
+  // row `parent`. Mutation: drop the reference-node restore in rebuildInstance (Kid re-derives, InnerRoot
+  // falls back to its row).
+  describe('a rebuild keeps a reference node`s stored member guids (#1482)', () => {
+    const REFP = 'aaaaaaaa-0000-4000-8000-0000000001b2';
+    const KID = 'eeeeeeee-0000-4000-8000-000000000001';
+    const refDoc = { id: REFP, rootLocalId: 1, entities: [row(1, 'RRoot', 0), row(2, 'Kid', 1), row(3, 'Kid2', 1)] };
+    const refNode = (extra: Record<string, unknown> = {}) => ({
+      guid: ANCHORED, name: 'RRoot', prefab: REFP, traits: {}, children: [],
+      members: { [`/${refDoc.entities[1]!.nodeGuid}`]: { guid: KID, name: 'Kid' } }, ...extra,
+    });
+    const refresh = (path: string) => {
+      const id = idAt(path);
+      return rebuildInstance(id, OUTER, outerDoc as never, captureInstanceOverrides(id, outerDoc as never), captureInstanceStructure(id, outerDoc as never));
+    };
+    beforeEach(() => { prefabs.set(REFP, refDoc); setPrefabCache(REFP, refDoc as never); });
+    afterEach(() => { prefabs.delete(REFP); setPrefabCache(REFP, null); });
+
+    it('on a reference node under an outer member: the guid stands, and an outer move onto it survives', async () => {
+      const sc = JSON.parse(JSON.stringify(scene([]))) as { entities: Array<Record<string, unknown>> };
+      (sc.entities[1]!.added as Array<Record<string, unknown>>)[0] = refNode({ parentLocalId: 3 });
+      await load(sc as unknown as SceneData);
+      expect(guidAt('Holder/OuterRoot/Panel/Button/RRoot/Kid')).toBe(KID);   // precondition: the loader pinned it
+      reparentEntity(idAt('Holder/OuterRoot/Panel/InnerRoot'), idAt('Holder/OuterRoot/Panel/Button/RRoot/Kid'));
+      await load(await serializeScene() as unknown as SceneData);
+      refresh('Holder/OuterRoot');
+      expect(guidAt('Holder/OuterRoot/Panel/Button/RRoot/Kid')).toBe(KID);
+      expect(idAt('Holder/OuterRoot/Panel/Button/RRoot/Kid/InnerRoot/Leaf')).toBeGreaterThan(0);
+      await load(await serializeScene() as unknown as SceneData);
+      expect(guidAt('Holder/OuterRoot/Panel/Button/RRoot/Kid')).toBe(KID);
+      expect(idAt('Holder/OuterRoot/Panel/Button/RRoot/Kid/InnerRoot/Leaf')).toBeGreaterThan(0);
+    });
+
+    it('on a reference node inside an owned nested row`s expansion: the guid stands', async () => {
+      const sc = JSON.parse(JSON.stringify(scene([]))) as { entities: Array<Record<string, unknown>> };
+      sc.entities[1]!.added = [];
+      sc.entities[1]!.nestedStructure = { 4: { added: [refNode({ parentLocalId: 1 })] } };
+      await load(sc as unknown as SceneData);
+      expect(guidAt('Holder/OuterRoot/Panel/InnerRoot/RRoot/Kid')).toBe(KID);   // precondition
+      refresh('Holder/OuterRoot');
+      expect(guidAt('Holder/OuterRoot/Panel/InnerRoot/RRoot/Kid')).toBe(KID);
+    });
+
+    it('a move made INSIDE the reference node survives the outer rebuild', async () => {
+      const sc = JSON.parse(JSON.stringify(scene([]))) as { entities: Array<Record<string, unknown>> };
+      (sc.entities[1]!.added as Array<Record<string, unknown>>)[0] = refNode({ parentLocalId: 3 });
+      await load(sc as unknown as SceneData);
+      reparentEntity(idAt('Holder/OuterRoot/Panel/Button/RRoot/Kid2'), idAt('Holder/OuterRoot/Panel/Button/RRoot/Kid'));
+      refresh('Holder/OuterRoot');
+      expect(idAt('Holder/OuterRoot/Panel/Button/RRoot/Kid/Kid2')).toBeGreaterThan(0);
+      expect(guidAt('Holder/OuterRoot/Panel/Button/RRoot/Kid')).toBe(KID);
+    });
+
+    // The production seam (close-out review): Apply to Prefab rebuilds every instance of the source, and
+    // that rebuild is where the reference node's rows must be carried — not only a direct rebuildInstance.
+    it('Apply to Prefab on the outer instance keeps the reference node`s pinned guid, through a reload', async () => {
+      const sc = JSON.parse(JSON.stringify(scene([]))) as { entities: Array<Record<string, unknown>> };
+      (sc.entities[1]!.added as Array<Record<string, unknown>>)[0] = refNode({ parentLocalId: 3 });
+      await load(sc as unknown as SceneData);
+      writeTraitFieldWithUndo(idAt('Holder/OuterRoot/Panel'), getTraitByName('Transform')!, 'x', 5);
+      const result = await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set([`${outerDoc.entities[1]!.nodeGuid}.Transform.x`]));
+      expect(result.applied).toBe(true);
+      expect(guidAt('Holder/OuterRoot/Panel/Button/RRoot/Kid')).toBe(KID);
+      await reloadWith(OUTER, result.prefabAfter!);
+      expect(guidAt('Holder/OuterRoot/Panel/Button/RRoot/Kid')).toBe(KID);
+    });
+
+    // A reference node inside a reference node: the collector recurses through the node's own `added`,
+    // so the inner node's rows are pinned too (close-out review probe P-A).
+    it('a reference node INSIDE the reference node keeps its pinned guid as well', async () => {
+      const REFQ = 'aaaaaaaa-0000-4000-8000-0000000001b5';
+      const QKID = 'eeeeeeee-0000-4000-8000-000000000002';
+      const qDoc = { id: REFQ, rootLocalId: 1, entities: [row(1, 'QRoot', 0), row(2, 'QKid', 1)] };
+      prefabs.set(REFQ, qDoc); setPrefabCache(REFQ, qDoc as never);
+      try {
+        const inner = { parentLocalId: 2, guid: 'bbbbbbbb-0000-4000-8000-0000000000c9', name: 'QRoot', prefab: REFQ, traits: {}, children: [],
+          members: { [`/${qDoc.entities[1]!.nodeGuid}`]: { guid: QKID, name: 'QKid' } } };
+        const sc = JSON.parse(JSON.stringify(scene([]))) as { entities: Array<Record<string, unknown>> };
+        (sc.entities[1]!.added as Array<Record<string, unknown>>)[0] = refNode({ parentLocalId: 3, added: [inner] });
+        await load(sc as unknown as SceneData);
+        expect(guidAt('Holder/OuterRoot/Panel/Button/RRoot/Kid/QRoot/QKid')).toBe(QKID);   // precondition
+        refresh('Holder/OuterRoot');
+        expect(guidAt('Holder/OuterRoot/Panel/Button/RRoot/Kid/QRoot/QKid')).toBe(QKID);
+        expect(guidAt('Holder/OuterRoot/Panel/Button/RRoot/Kid')).toBe(KID);
+      } finally { prefabs.delete(REFQ); setPrefabCache(REFQ, null); }
+    });
+  });
+
   // Review F1: applying the removal of a row that held a moved member. The cascade stops at the member, whose
   // row goes up to the nearest row that stays. Mutation: cascade through moved rows (movedRowsOf → empty).
   it('removing the row a member was moved out of keeps the member, in every instance', async () => {

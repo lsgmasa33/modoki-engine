@@ -106,7 +106,7 @@ export interface AddedEntity {
   /** v16+: this nested instance's members, keyed by minted identity — see {@link SceneMemberRow}
    *  (#1468). A reference node IS an instance, and it carries the same channels a top-level entry
    *  does; without this slot a prefab instance dragged into another one, or PROMOTED inside one
-   *  (§ 3.3 R7), would be the one kind of instance whose members still had no stored identity.
+   *  (#1468 design record R7), would be the one kind of instance whose members still had no stored identity.
    *  ⚠️ Never written into a prefab TEMPLATE: these are per-instance scene guids, and a template
    *  that carried them would hand every instance the same ones (#1293). */
   members?: Record<string, SceneMemberRow>;
@@ -126,7 +126,7 @@ export interface AddedEntity {
  *  way (`overrides`, `removedTraits`, `moved`, `nestedOverrides`, `nestedStructure`).
  *
  *  **The key** is a `/`-joined chain of MINTED node identities, one component per instance FRAME and
- *  flat within a frame (plan § 3.1 D1(a)): a member of the top-level instance is one component; a
+ *  flat within a frame (#1468 design record D1): a member of the top-level instance is one component; a
  *  member of a nested instance is the nested ROW's identity then its own. A component is either a
  *  `PrefabEntity.nodeGuid` or an added node's `'a+' + key`. ⚠️ Tell them apart with `isGuid`, NOT by
  *  the leading letter — a guid may legitimately begin with `a`.
@@ -143,26 +143,26 @@ export interface SceneMemberRow {
    *  it as an orphan because its node is still in the template. */
   guid?: string;
   /** The member's name, for a readable scene file AND for the one consumer that cannot get it from
-   *  anywhere else — an ORPHANED row's log line (plan § 3.3 R2). An orphan is a row whose template
+   *  anywhere else — an ORPHANED row's log line (#1468 design record R2). An orphan is a row whose template
    *  member is gone, so the template cannot name it; only the row can. */
   name?: string;
   /** The guid of the parent this member was moved to inside its instance — WIRED in Phase 3, where
    *  it replaced the localId-keyed `moved` map. Absent = it sits where its own frame's template row
    *  puts it, which is the overwhelmingly common case and writes nothing.
    *
-   *  ⚠️ It is a DIFF, not "the live parent, always". § 3.3 R4 is why: a template that re-parents a
+   *  ⚠️ It is a DIFF, not "the live parent, always". #1468 design record R4 is why: a template that re-parents a
    *  member must move it in every instance that has not moved it itself, and a `parent` written
    *  unconditionally would pin the member at its old place for ever and silently defeat the most
    *  common template edit there is. `memberRowParents` computes the diff; its docblock carries the
    *  frame reasoning.
    *
-   *  ⚠️ R8 (§ 3.3) binds the MEMBER, not this field: a row exists only for a member that BELONGS to
+   *  ⚠️ R8 (#1468 design record) binds the MEMBER, not this field: a row exists only for a member that BELONGS to
    *  the frame (`memberRowKeysIn` keys by identity, so a member of another instance gets no row by
    *  construction), and a move OUT of the outermost instance is an unpack, never a `parent`. The
    *  parent itself may sit in ANOTHER frame of the same outermost instance — #1437 keeps a move under
    *  a sibling nested instance's member linked (`planMoveUnlinks`), and such a move is written here. */
   parent?: string;
-  // ── The collapsed channels (plan § 3.1 D2(b), wired in Phase 4). Declared in v16 so moving the
+  // ── The collapsed channels (#1468 design record D2, wired in Phase 4). Declared in v16 so moving the
   //    localId-keyed channels here was a CALLER migration, not a second format change. Each one is
   //    the member's own statement in THIS frame, and `foldMemberRowChannels` (prefabOverrides.ts)
   //    owns the rule: a field that is PRESENT replaces the lower layer's value for this member, an
@@ -181,7 +181,7 @@ export interface SceneMemberRow {
   added?: AddedEntity[];
   // ⚠️ `nestedOverrides` and `nestedStructure` get NO slot here, and that is not an omission. They
   //    exist only because a member two frames down had no address; the frame-chained key gives it
-  //    one, so they collapse into the nested members' OWN rows. Plan § 4 Phase 2B records it.
+  //    one, so they collapse into the nested members' OWN rows. The #1468 design record records it.
 }
 
 export interface SceneEntityEntry {
@@ -604,7 +604,7 @@ function migrateV14toV15(data: SceneData): void {
  *
  *  Nothing to walk, and — unusually for this ladder — nothing to migrate even in principle. A v15
  *  scene has no rows, so every member derives its guid exactly as it does today, which is that
- *  scene's correct current state (plan § 3.3 R3). Its first ordinary save pins the then-current
+ *  scene's correct current state (#1468 design record R3). Its first ordinary save pins the then-current
  *  derived values, which is the right moment: pinning them here would freeze whatever this build
  *  happens to derive into a file nobody asked to change.
  *
@@ -724,7 +724,7 @@ export interface InstanceStructureData {
    *  a Revert takes a move away — the channel for "these are the moves that still apply", which the
    *  carried rows cannot answer: they state what the instance had BEFORE the revert. Phase 4 KEPT it:
    *  it never leaves the document it was captured against, and only the seams where a localId crosses
-   *  to another document were moved onto identity (plan § 4 Phase 4). */
+   *  to another document were moved onto identity (#1468 Phase 4). */
   moved?: Record<number, string>;
   /** IN-MEMORY only, never a file field: the OUTER frame's row for this nested instance's own ROOT
    *  (Phase 4, #1468). An owned nested root is keyed in the frame around it, but what its row states
@@ -1253,7 +1253,7 @@ function templateNodeGuids(prefabRef: string): { guids: Set<string>; complete: b
  *  ⚠️ **Retained, not repaired.** A row orphans when its template node is GONE — a member deleted
  *  from the prefab, or a rigged re-import that could not re-associate a renamed bone. Keeping it
  *  means an undone template edit, or a re-import that matches again, restores the scene's identity
- *  for that member instead of silently minting a new one. That is the containment § 3.4 promises: a
+ *  for that member instead of silently minting a new one. That is the containment the #1468 design record promises: a
  *  rename costs one orphaned row and a log line, never a re-pointed subtree.
  *
  *  ⚠️ A member the INSTANCE removed is NOT an orphan — its node is still in the template, so its row
@@ -1277,6 +1277,33 @@ export function clearKeptMemberOrphans(): void {
   orphanMemberRows.clear();
 }
 
+/** One user-added REFERENCE node's stored member rows: its root's guid, the rows, the prefab it expands. */
+export type ReferenceNodeRows = [rootGuid: string, members: Record<string, SceneMemberRow>, source: string];
+
+/** Every user-added REFERENCE node in an `added[]` tree that stores member rows — the ONE spelling of
+ *  "where can a reference node's rows be", read by the loader to pin them and by `rebuildInstance` to
+ *  carry them across a respawn (#1482). A reference node is its own row-writing root (`memberRowsIn`
+ *  stops at it), so a walk of the instance around it never reaches these rows; each has to be pinned
+ *  from its own node, found by the guid the node stores.
+ *
+ *  Collected from the DOCUMENT rather than at the spawn, because those spawns happen several frames
+ *  down inside `applyStructureCore`'s ops and the node's own stored `guid` is a perfectly good handle
+ *  to the root once it exists. */
+export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[] = []): ReferenceNodeRows[] {
+  if (!Array.isArray(nodes)) return out;
+  for (const n of nodes as AddedEntity[]) {
+    if (!n || typeof n !== 'object') continue;
+    if (n.prefab && n.members && n.guid) out.push([n.guid, n.members, n.prefab]);
+    collectReferenceNodeRows(n.added, out);
+    collectReferenceNodeRows(n.children, out);
+    for (const delta of Object.values(n.nestedStructure ?? {})) collectReferenceNodeRows(delta?.added, out);
+    // …and a member row's `added` (Phase 4, #1468): a reference node hanging under a member now
+    // rides on that member's row, and its own rows must be pinned exactly as before.
+    for (const r of Object.values(n.members ?? {})) collectReferenceNodeRows(r?.added, out);
+  }
+  return out;
+}
+
 /** Put the GUIDS a scene stored for this instance's members back on them (v16, #1468) — the read half
  *  of `captureInstanceMembers`, and the reason a member's identity no longer depends on where it sits.
  *  A row's other field, `parent` (Phase 3), is not read here: `applyStructureCore` queues the move,
@@ -1284,7 +1311,7 @@ export function clearKeptMemberOrphans(): void {
  *
  *  Runs BEFORE `deriveInstanceMemberGuids`, so a pinned member arrives at that pass already carrying
  *  a guid and is simply skipped by it ("only fills EMPTY guids"). Derivation therefore becomes the
- *  FALLBACK it is meant to be (plan § 3.3 R3) with no change to the derive walk itself: a member with
+ *  FALLBACK it is meant to be (#1468 design record R3) with no change to the derive walk itself: a member with
  *  no row derives exactly what it derives today, including one BELOW a pinned member — the walk goes
  *  THROUGH a member either way, because `isDerivedMember` says a member is never an anchor.
  *
@@ -1346,7 +1373,7 @@ function applyStoredMemberRows(
   console.warn(`[loadSceneFile] ${count} member row${count === 1 ? '' : 's'} in instance ${rootGuid} name no node the template still declares: ${named}${count > 5 ? `, +${count - 5} more` : ''} — kept, in case the template edit is undone`);
 }
 
-/** The UNIQUENESS guard (#1468, plan § 4 Phase 2B): a guid a ROW pinned can be one another member
+/** The UNIQUENESS guard (#1468 Phase 2B): a guid a ROW pinned can be one another member
  *  DERIVES, and then two entities answer to one address — #1355's shape, which nothing in this
  *  format previously had any reason to check, because a member's guid was only ever derived and the
  *  derived set is internally collision-free (one hash per anchor+path).
@@ -2787,23 +2814,9 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   /** Rows to pin once EVERY instance has finished expanding (v16, #1468) — see the apply below.
    *  Declared out here so a base-scene chain's per-file calls each pin their own instances. */
   const storedMembers: [number, Record<string, SceneMemberRow>, string][] = [];
-  /** The same, for every nested instance a REFERENCE node spawns. Collected from the document rather
-   *  than at the spawn, because those spawns happen several frames down inside `applyStructureCore`'s
-   *  ops and the node's own stored `guid` is a perfectly good handle to the root once it exists. */
-  const addedInstanceRows: [string, Record<string, SceneMemberRow>, string][] = [];
-  const collectAddedRows = (nodes: unknown): void => {
-    if (!Array.isArray(nodes)) return;
-    for (const n of nodes as AddedEntity[]) {
-      if (!n || typeof n !== 'object') continue;
-      if (n.prefab && n.members && n.guid) addedInstanceRows.push([n.guid, n.members, n.prefab]);
-      collectAddedRows(n.added);
-      collectAddedRows(n.children);
-      for (const delta of Object.values(n.nestedStructure ?? {})) collectAddedRows(delta?.added);
-      // …and a member row's `added` (Phase 4, #1468): a reference node hanging under a member now
-      // rides on that member's row, and its own rows must be pinned exactly as before.
-      for (const r of Object.values(n.members ?? {})) collectAddedRows(r?.added);
-    }
-  };
+  /** The same, for every nested instance a REFERENCE node spawns (`collectReferenceNodeRows`). */
+  const addedInstanceRows: ReferenceNodeRows[] = [];
+  const collectAddedRows = (nodes: unknown): void => { collectReferenceNodeRows(nodes, addedInstanceRows); };
   // Re-instantiate prefab instances — delegated to caller (editor vs runtime specific)
   if (options.onInstantiatePrefab) {
     // Every placeholder a prefab entry below may still replace (#1353). Over-inclusive on purpose —

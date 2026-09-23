@@ -163,7 +163,7 @@ export interface FrameChannels<A> {
  *  override apply, `applyStructureCore`) keeps working on localIds that are right for THIS document.
  *
  *  A localId is only meaningful together with the document it was read from, and a template renumbers
- *  them (plan § 3.4). A row names its member by the minted `nodeGuid` instead, and this translates it
+ *  them (#1468 design record, the root cause). A row names its member by the minted `nodeGuid` instead, and this translates it
  *  against `doc` — the frame's CURRENT document — at the moment it is applied. That is the whole fix:
  *  an edit stored against identity lands on the same member however the template was renumbered since.
  *

@@ -2,7 +2,7 @@
  *
  *  Before this landed, eleven sites coerced a step back to a number by hand and six spelled the
  *  stored-root predicate inline. The duplication is what made `localId`'s spelling load-bearing in
- *  eleven places at once, and it is what a later localId → node-guid switch (#1468 § 3.5) would
+ *  eleven places at once, and it is what a later localId → node-guid switch (#1468 design record, the node guid) would
  *  have had to edit eleven times instead of once.
  *
  *  ⚠️ **These are pure and synchronous — no timers, so `docs/falsifiable-tests.md` § shape (I)
@@ -25,7 +25,7 @@ describe('parseStep — the one step grammar', () => {
   it('reads a localId step as a number', () => {
     expect(parseStep('3')).toBe(3);
     expect(parseStep('0')).toBe(0);
-    expect(parseStep('1030')).toBe(1030); // alien-animal's real ceiling (#1468 § 3.4)
+    expect(parseStep('1030')).toBe(1030); // alien-animal's real ceiling (#1468 design record, the root cause)
   });
 
   it("reads a template-keyed added node's '+key' step as the string, sigil included", () => {
@@ -51,7 +51,7 @@ describe('parseStep — the one step grammar', () => {
   });
 
   it('is the grammar a guid-shaped step would extend — it does NOT accept one today', () => {
-    // The hedge #1468 § 3.5 buys: a later localId → node-guid switch adds a shape HERE and nowhere
+    // The hedge #1468 bought: a later localId → node-guid switch adds a shape HERE and nowhere
     // else. This asserts the starting point honestly — a bare guid step is rejected today.
     expect(parseStep(newGuid())).toBeNull();
   });
@@ -102,7 +102,7 @@ describe('memberPathSteps vs parseSteps — the empty-key split is deliberate', 
 
   it('reads an unparseable part LENIENTLY, as a step that names nothing', () => {
     // NaN is a legal MemberStep that equals no member, so a corrupt key reaches the caller's existing
-    // "names nothing" path instead of throwing. Tightening this belongs with R2 (#1468 § 3.3).
+    // "names nothing" path instead of throwing. Tightening this belongs with R2 (#1468 design record R2).
     const [step] = memberPathSteps('zzz');
     expect(typeof step).toBe('number');
     expect(Number.isNaN(step)).toBe(true);

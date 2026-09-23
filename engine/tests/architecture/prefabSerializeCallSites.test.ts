@@ -19,7 +19,7 @@
  *
  *  ⚠️ The census scope deliberately includes `engine/app/`. A scan limited to
  *  `engine/packages/modoki/src` reports five sites and misses `agentEditorOps.ts` — a mistake made
- *  once already while verifying this very table (plan § 3.4). */
+ *  once already while verifying this very table (#1468 design record, the root cause). */
 
 import { describe, it, expect } from 'vitest';
 import { readScannedSource } from '@modoki/engine/testing';

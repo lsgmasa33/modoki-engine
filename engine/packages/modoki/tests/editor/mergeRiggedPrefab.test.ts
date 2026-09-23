@@ -142,7 +142,7 @@ describe('mergeRiggedPrefab', () => {
     expect(merged.futureField).toEqual({ some: 'v6 thing' });
   });
 
-  // ── Node identity across a regeneration (#1468 § 3.5 Part 2) ─────────────────────────────
+  // ── Node identity across a regeneration (#1468 design record: the node guid, part 2) ─────────────────────────────
   //
   // A minted id cannot survive a document rebuilt from a GLB that has never heard of it, so the
   // merge's CONTENT match — already here to keep a bone's localId — is what carries it.

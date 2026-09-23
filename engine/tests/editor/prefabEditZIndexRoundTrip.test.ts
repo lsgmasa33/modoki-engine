@@ -264,7 +264,7 @@ describe('a prefab-edit save keeps the node identity the file already had (#1468
 
   it('mints for the rows of a pre-v5 file it opened, which had none to keep', async () => {
     // The accept side, and how a file migrates: the save is the ONLY place identity is assigned
-    // (plan § 4 Phase 5). Opening it must not have minted anything.
+    // (#1468 design record: files migrate on next save). Opening it must not have minted anything.
     served = { ...withNodeGuids(), version: 4, entities: withNodeGuids().entities.map(({ nodeGuid: _drop, ...e }) => e) };
     await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });
     expect(await savePrefabEdit()).toBe(true);

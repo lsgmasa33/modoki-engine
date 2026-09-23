@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** Mint a `nodeGuid` on every row of every authored prefab — the prefab corpus's v2/v3/v4 → v5
- *  migration (#1468; the plan's § 4 Phase 2B "finding B").
+ *  migration (#1468; the #1468 design record's "Finding B").
  *
  *      node engine/scripts/migrate-prefabs-v5.mjs            # dry run — reports, writes nothing
  *      node engine/scripts/migrate-prefabs-v5.mjs --write
@@ -37,7 +37,7 @@
  *  document (`version > PREFAB_FORMAT_VERSION`), so an older build still OPENS a v5 file — and
  *  minting changes no derived guid, because derivation reads `localId`s.
  *
- *  ⚠️ This is a PREFAB rewrite, not a scene one. § 4 Phase 5 declines a scene corpus rewrite and
+ *  ⚠️ This is a PREFAB rewrite, not a scene one. the #1468 design record declines a scene corpus rewrite and
  *  declines it because scenes REFUSE to load a newer document; prefabs do not. The asymmetry is
  *  the whole reason one is safe and the other is not — do not read this script as a precedent for
  *  the other.

@@ -8,7 +8,7 @@
  *
  *  Until Phase 6 that answer was REMEMBERED on the member at move time (`PrefabInstance.homeParent` +
  *  `homeSteps`) and re-pointed whenever a home died. It is now COMPUTED from the document the frame was
- *  expanded from ({@link frameDocReader}), which is the plan's one invariant again: a localId means
+ *  expanded from ({@link frameDocReader}), which is #1468 Phase 4's one invariant again (`docs/prefab-structural-overrides.md`): a localId means
  *  something only together with the document it was read from. A home was always the template parent —
  *  a load records a freshly expanded member's live parent, the editor records the old parent only when
  *  there was no home, and moving back cleared it — so every walk gets the answer it got before, from a

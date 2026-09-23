@@ -1,4 +1,4 @@
-/** #1468 Phase 2B — the GESTURES, one test each (plan § 4 Phase 2B's list of ten).
+/** #1468 Phase 2B — the GESTURES, one test each (#1468 Phase 2B's list of ten).
  *
  *  A member's guid is stored in the scene now, so every gesture that rebuilds, copies or respawns an
  *  instance has to be asked what it does to that identity. Each test names its gesture and the
@@ -127,7 +127,7 @@ afterAll(() => { getCurrentWorld()?.destroy(); });
 
 describe('gesture: REFRESH (rebuildInstance) — the instance re-expands from a changed template', () => {
   it('keeps every member`s identity across the rebuild instead of re-deriving it', async () => {
-    // The gesture this plan exists for (§ 3.4): an artist changes the prefab, the designer refreshes,
+    // The gesture #1468 exists for (#1468 design record, the root cause): an artist changes the prefab, the designer refreshes,
     // and the members must not be re-identified. A rebuild destroys them and expands fresh ones,
     // which take DERIVED guids — so the identity has to be carried across explicitly.
     //
@@ -280,7 +280,7 @@ describe('gesture: UNDO / REDO RESPAWN — delete an instance, put it back', () 
 });
 
 describe('gesture: RIGGED MODEL RE-IMPORT — the prefab is regenerated from the GLB', () => {
-  // § 3.4 calls this the tenth gesture and arguably the most load-bearing: a rigged prefab is
+  // Rigged re-import is one of the five renumbering paths in the #1468 design record's root cause, and arguably the most load-bearing: a rigged prefab is
   // REGENERATED on every import, so `localId`s are only kept by a name match (`riggedEntityIdentity`)
   // and `alien-animal` already shows what a mass miss costs — 513 bones reallocated above the old max.
   //
@@ -305,14 +305,14 @@ describe('gesture: RIGGED MODEL RE-IMPORT — the prefab is regenerated from the
   it('carries the node guid through a re-import that MATCHES, so the scene rows still name the member', async () => {
     const { mergeRiggedPrefab } = await import('../../packages/modoki/src/editor/scene/prefab');
     // The regenerated side comes from the GLB and carries no modoki identity — that is the honest
-    // limit § 3.5 records. The merge is what puts it back, matched by bone NAME.
+    // limit the #1468 design record states (nothing survives a DCC rename). The merge is what puts it back, matched by bone NAME.
     const merged = mergeRiggedPrefab(rigged('Spine', FRESH_NODE), rigged('Spine', BONE_NODE));
     expect(merged.entities.find((e) => e.name === 'Spine')!.nodeGuid).toBe(BONE_NODE);
   });
 
   it('lets the FRESH identity stand on a rename, so the row dangles rather than naming another node', async () => {
     const { mergeRiggedPrefab } = await import('../../packages/modoki/src/editor/scene/prefab');
-    // An artist renames a bone. Neither part of the design survives that and nothing can (§ 3.5) —
+    // An artist renames a bone. Neither part of the design survives that and nothing can (#1468 design record, the node guid) —
     // the containment is that the renamed node keeps the identity the fresh import minted for it, so
     // the old row matches nothing instead of naming whichever node inherited the localId.
     const merged = mergeRiggedPrefab(rigged('Spine_01', FRESH_NODE), rigged('Spine', BONE_NODE));
