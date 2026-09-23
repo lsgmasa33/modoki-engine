@@ -5,7 +5,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { getActiveReloadBlockers } from '../../../src/runtime/core/resumeReload';
 import {
-  createAdLifecycle, type AdEventSink, type AdLifecycle, type AdLifecycleHooks, type AdSdk, type FullscreenKind,
+  createAdLifecycle, onFullscreenAdChange, type AdEventSink, type AdLifecycle, type AdLifecycleHooks, type AdSdk,
+  type FullscreenKind,
 } from '../../../src/runtime/core/adLifecycle';
 
 const BLOCKER = 'test.fullscreenAd';
@@ -628,3 +629,60 @@ describe('review findings (#1309 close-out)', () => {
   });
 });
 
+
+describe('the fullscreen-ad edge the audio hold listens to (#1455)', () => {
+  async function ready(l: AdLifecycle) {
+    await l.init();
+    await flush();
+  }
+  let unhook: (() => void) | null = null;
+  afterEach(() => { unhook?.(); unhook = null; });
+
+  it('goes UP before the SDK call (our audio is down before the ad\'s player starts) and DOWN on dismissal, once each', async () => {
+    const edges: boolean[] = [];
+    unhook = onFullscreenAdChange((showing) => edges.push(showing));
+    const { sdk, sink } = fakeSdk();
+    sdk.present = vi.fn(() => {
+      expect(edges, 'already announced while the native call is in flight').toEqual([true]);
+      return new Promise<unknown>(() => {});
+    });
+    const l = make(sdk);
+    await ready(l);
+    const result = l.showFullscreen('interstitial', 'p');
+    expect(sdk.present).toHaveBeenCalled();
+    sink().presented('interstitial');   // already up: no second edge
+    await result;
+    sink().dismissed('interstitial');
+    expect(edges).toEqual([true, false]);
+  });
+
+  it('comes down on a failure to present, and on a cleanup with an ad up — never left held', async () => {
+    const edges: boolean[] = [];
+    unhook = onFullscreenAdChange((showing) => edges.push(showing));
+    const { sdk, sink } = fakeSdk();
+    const l = make(sdk);
+    await ready(l);
+    const first = l.showFullscreen('interstitial', 'p');
+    sink().failedToPresent('interstitial');
+    expect(await first).toBe(false);
+    expect(edges).toEqual([true, false]);
+    await flush();
+    const second = l.showFullscreen('rewarded', 'p');
+    sink().presented('rewarded');
+    await second;
+    l.cleanup();
+    expect(edges).toEqual([true, false, true, false]);
+  });
+
+  it('an unsubscribed listener hears nothing more', async () => {
+    const fn = vi.fn();
+    const off = onFullscreenAdChange(fn);
+    off();
+    const { sdk, sink } = fakeSdk();
+    const l = make(sdk);
+    await ready(l);
+    void l.showFullscreen('interstitial', 'p');
+    sink().dismissed('interstitial');
+    expect(fn).not.toHaveBeenCalled();
+  });
+});

@@ -216,6 +216,78 @@ AudioListener trait ─┘        │
   the context state, and both repeat-refusal tests assert a precondition that the attempts really
   happened. The standing lesson is [falsifiable-tests.md](./falsifiable-tests.md)'s: a test that builds only one
   instance of the axis it separates cannot fail.
+- **Fullscreen-ad audio hold** (#1455, 2026-09-23) — `audioService.holdForFullscreenAd(held)`, driven
+  by the ad lifecycle's `onFullscreenAdChange` and wired once in `useAudioResumeRearm`, so every
+  game's ads get it with no game code. **Why:** until then the engine did nothing with its own audio
+  around an ad, so the music played UNDER every interstitial. On the iPhone Air an interstitial then
+  left the shared context reporting `running` with its **clock frozen**: a fresh `new AudioContext()`
+  in the same page did not advance either, and `suspend()`→`resume()` threw `InvalidStateError:
+  Failed to start the audio device`. So the page's audio output was dead, not our context. Google's
+  guidance for apps with their own audio is to pause it for the ad and resume after.
+  **Hold** (from BEFORE the SDK's show call, so our audio is down before the ad's player starts):
+  every playing stream is paused in place (not flagged deliberate), and the context is suspended.
+  While held, `resume()` traces `skipped-held`, and nothing plays under the ad: the media re-kick,
+  a stream the game STARTS or UN-PAUSES meanwhile (left paused for the release to kick), and a
+  CUE-BUS one-shot (dropped in `audioSystem`'s `playOneShot`; a suspended context would queue it
+  and chime at release). Only the cue bus: dropping in `play()` also hit scene sources, where a
+  non-loop autoplay source never played and a buffer-clip playlist would spin a track per frame.
+  The hold suspends whenever the context is not `closed`. A resume still in flight reads
+  `suspended` until it settles, and a real context orders the two control messages.
+  The release chains its resume after the hold's own `suspend()`. ⚠️ `ctx.state` reads
+  `suspended` only once that settles, so an SDK refusing the show within a round-trip used to
+  release first, skip the resume, and leave the audio off.
+  **Release** (dismissal, a failure to present, or the lifecycle's cleanup): `resume()`, then a
+  **clock check**. `ctx.currentTime` is sampled across 700 ms after a 300 ms settle and recorded as
+  `clock-check` in every visible state. It is not only `running`: a rejected resume ("Failed to
+  start the audio device") leaves the context `suspended`, which is the same failure. The check runs
+  only when the context was `running` when the ad took it, because a never-unlocked one would read
+  as the freeze. It starts after the release's resume, so a slow suspend cannot eat its window.
+  Anything but a running, advancing clock is retried ONCE (suspend→resume, or a plain resume when not running)
+  and sampled again. The retry never resumes under a newer ad and never outlives a cancel.
+  ⚠️ **Whether that retry revives a dead device is UNKNOWN.** On the Air a plain resume did not.
+  The check's first job is to make the failure visible in the trace. It is not yet a proven
+  recovery. ⚠️ **A stuck `fullscreenShowing` is now permanent SILENCE, not just a blocked reload.**
+  An ad whose `dismissed` never arrives holds the audio for the rest of the realm (the lifecycle's
+  `cleanup()` does release). No watchdog was added: a stuck ad (#1473) covers the page anyway. Dev
+  only: an HMR remount of `useAudioResumeRearm` while an ad is up releases the hold, because the
+  new subscription hears no edge. ⚠️ **VIDEO is not held.** `videoService` routes its sound into
+  the same bus, so the suspended context silences it, but the element is caller-owned. Its
+  playhead runs on under the ad, and an UNROUTED video (null bus route) would be audible. That is
+  unreachable today: neither ad-showing game (Court, Weaveling) uses `VideoPlayer` (swept
+  2026-09-23). It is a different fix, a gate in `videoSystem`'s per-frame reconcile, so it was
+  not folded in. ✅ **Device-verified on the iPhone Air, 2026-09-23** (a VIDEO interstitial via the
+  Weaveling debug tab, #1474). The ad **autoplayed**; before, in Court, it waited for a tap on its
+  own audio button. Our music was paused under it and came back after. Trace: `ad-hold` →
+  `resume skipped-held` (a foreground edge while the ad was up) → `ad-release` → `resume resolved`
+  → `clock-check advanced 0.70/0.7 s`. ⚠️ One healthy run shows the path works. It does NOT show
+  that the old frozen-clock state is now prevented, or that the retry would revive it. Tests: `tests/framework/audioAdHold.test.ts`,
+  the edge in `packages/modoki/tests/runtime/core/adLifecycle.test.ts`, the wiring in
+  `tests/app/audioResumeRearm.test.tsx` (27 mutations, all red: 13, then 14 more across two review rounds; the dead-audio reload added 14 more, `tests/runtime/core/deadAudioReload.test.ts`).
+- **Dead audio → reload** (#1455, 2026-09-23). ✅ **REPRODUCED without an ad** on the iPhone
+  Air: background the game, play Apple Music, come back → silence, even with Music then killed.
+  The trace showed the familiar signature. The foreground found the context `interrupted` or
+  `suspended`; the resume "resolved" (once, after a first REJECTION) to `running`; the clock
+  never moved again. **Recovery experiments on that state:**
+  - a resume: dead;
+  - a fresh `AudioContext`: dead;
+  - both of those inside a real trusted tap: dead;
+  - `location.reload()`: **audio back at once**;
+  - a screen lock/wake: back.
+  So the state belongs to the page's WebKit audio session, and a new document gets a working one.
+  Short backgrounds with no other app's audio recovered fine; "long background" was never the
+  axis, another app taking the session is.
+  **Detection:** `noteBackground()` (the rearm's first hide, traced as `background`) records
+  whether the context was running. The foreground then runs the ad release's clock check.
+  **Only the measured signature is `audio-dead`: `running` with a clock still frozen after the
+  one retry.** That fires a trace entry plus `onAudioDead` listeners. A context still
+  `interrupted`/`suspended` after the retry (a live call, Siri, an alarm) is only traced: a
+  reload cannot help it, and the next tap or WebKit's own auto-resume does.
+  **Recovery:** a page reload, opt-in per project (`runtime.reloadOnDeadAudio`; owner, 2026-09-23:
+  automatic, not a prompt). Rules and wiring: `docs/managers-and-systems.md`, next to the
+  resume-reload trigger. ✅ **Device-verified end to end** (owner, iPhone Air, build `f72a73e82`,
+  2026-09-23): Apple Music repro → the game reloaded itself and the audio came back. ⚠️ The
+  negative case (a plain background with no other app's audio must NOT reload) is covered by tests
+  and was not separately exercised on the device.
 - **Tests** — `tests/runtime/audioSystem.test.ts` (record mode: autoplay, cues,
   play-state gating, scene-swap teardown, Transform-less sources) + buffer-cache
   refcount tests.

@@ -68,7 +68,21 @@ export type AudioHealthKind =
    *  recovery: a context can come back `running` while the bed stays silent, which is exactly the
    *  candidate #1455's body lists second and which a context-only trace cannot tell apart from a
    *  healthy resume. `reason` says which call was refused. */
-  | 'play-refused';
+  | 'play-refused'
+  /** A fullscreen ad went up and the engine suspended its own audio for it (#1455). */
+  | 'ad-hold'
+  /** The ad came down and the engine resumed its audio. */
+  | 'ad-release'
+  /** After an `ad-release`: did the context's clock actually ADVANCE? `advanced` says by how much.
+   *  The failure this exists for is a context reporting `running` with a frozen clock — measured on
+   *  the iPhone Air, 2026-09-23 — which every state-based check reads as healthy. */
+  | 'clock-check'
+  /** The clock still did not advance after the one retry: the page's audio is dead, and only a
+   *  reload recovers it (measured). `onAudioDead` listeners fire alongside this entry. */
+  | 'audio-dead'
+  /** The app went to the background (the first hide of a transition). `state` says whether the
+   *  foreground will run a dead-audio check: only for `running`. */
+  | 'background';
 
 /** Which call asked a streamed element to play. */
 export type AudioKickReason =
@@ -87,7 +101,9 @@ export type AudioResumeOutcome =
   | 'skipped-closed'
   | 'no-graph'
   | 'resolved'
-  | 'rejected';
+  | 'rejected'
+  /** A fullscreen ad holds the audio (#1455): nothing resumes until it comes down. */
+  | 'skipped-held';
 
 export interface AudioHealthEntry {
   /** `rawNow()` milliseconds — monotonic within this realm, not an epoch. */
@@ -114,6 +130,12 @@ export interface AudioHealthEntry {
    *  context merely claims to be running" — which is the only way to catch a resumed-but-silent
    *  context. */
   ctxTime?: number;
+  /** For `clock-check`: seconds `ctx.currentTime` advanced across the sample window. 0 = frozen. */
+  advanced?: number;
+  /** For `clock-check`: whether this sample followed the one-shot suspend→resume retry. */
+  retried?: boolean;
+  /** For `clock-check`/`audio-dead`: what the check followed — an ad's release, or a foreground. */
+  after?: 'ad' | 'foreground';
   /** For `play-refused`: which call the element refused. */
   reason?: AudioKickReason;
   streams?: AudioStreamHealth[];

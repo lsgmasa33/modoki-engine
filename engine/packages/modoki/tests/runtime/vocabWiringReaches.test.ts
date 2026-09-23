@@ -27,7 +27,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createWorld, type World } from 'koota';
 
 import {
-  setAudioRecordMode, clearAudioLog, getAudioLog, play, type BusName,
+  setAudioRecordMode, clearAudioLog, getAudioLog, play, holdForFullscreenAd, type BusName,
 } from '../../src/runtime/audio/audioService';
 import { audioSystem, stopWorldAudio } from '../../src/runtime/audio/audioSystem';
 import { cueClip, cueSound } from '../../src/runtime/audio/audioCues';
@@ -151,6 +151,20 @@ describe('audioSystem reads the RESOLVED bus for the voice cap and the journal (
     world!.spawn(AudioSource({ clip: own, autoplay: true, bus: 'music' }), EntityAttributes({ guid: newGuid() }));
     audioSystem(world!);
     expect([startBuses(cue), startBuses(named), startBuses(own)]).toEqual([['ui'], ['music'], ['music']]);
+  });
+
+  it('a cue DROPPED under a fullscreen ad journals the resolved bus (#1455) — and a real one as itself', () => {
+    const [typoed, real] = [mintClip(), mintClip()];
+    holdForFullscreenAd(true);
+    try {
+      cueClip(typoed, { bus: typo('constructor') }, world!);
+      cueClip(real, { bus: 'ui' }, world!);
+      audioSystem(world!);
+    } finally {
+      holdForFullscreenAd(false);
+    }
+    const droppedBus = (clip: string) => events().filter((p) => p.phase === 'dropped' && p.clip === clip).map((p) => p.bus);
+    expect([droppedBus(typoed), droppedBus(real)]).toEqual([['sfx'], ['ui']]);
   });
 });
 

@@ -749,7 +749,7 @@ export {
   type LoginBonusSegmentId, type LoginBonusSubstitution, type LoginBonusVerdict,
 } from './core/loginBonus';
 export {
-  createAdLifecycle,
+  createAdLifecycle, onFullscreenAdChange,
   type AdEventSink, type AdLifecycle, type AdLifecycleHooks, type AdLifecycleOptions, type AdListenerHandle,
   type AdRevenue, type AdReward, type AdSdk, type FullscreenKind, type RewardHandler,
 } from './core/adLifecycle';
@@ -835,6 +835,8 @@ export {
   crossfade as crossfadeAudio,
   getAudioLog, clearAudioLog, setAudioRecordMode,
   noteForeground as noteAudioForeground,
+  holdForFullscreenAd as holdAudioForFullscreenAd,
+  noteBackground as noteAudioBackground, onAudioDead, isAudioStillDead, type AudioClockCheckAfter,
   type BusName, type AudioPlaySpec, type AudioHandle, type AudioLogEntry,
 } from './audio/audioService';
 // Audio-health trace — why a music bed went silent, kept in memory for the life of the realm.
@@ -920,6 +922,11 @@ export {
   type ResumeReloadDeps,
   type ResumeReloadHandler,
 } from './core/resumeReload';
+// Reload on DEAD audio (#1455) — the decision; the wiring is `engine/app/useDeadAudioReload.ts`.
+export {
+  createDeadAudioReloadHandler,
+  type DeadAudioReloadDeps, type DeadAudioReloadHandler, type DeadAudioReloadOutcome,
+} from './core/deadAudioReload';
 // Realm shutdown tasks (#587) — the seam that lets a reload destroy native SDK state (an AppLovin
 // banner/MREC/interstitial) before the reload destroys the JS realm. `runtime/**` cannot reach
 // `appServices()` (layering), so the app registers the task here and the reload sites

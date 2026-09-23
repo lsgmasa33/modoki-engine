@@ -20,6 +20,9 @@ import React from 'react';
 const spies = vi.hoisted(() => ({
   audioResume: vi.fn(),
   noteAudioForeground: vi.fn(),
+  holdAudioForFullscreenAd: vi.fn(),
+  noteAudioBackground: vi.fn(),
+  adListeners: new Set<(showing: boolean) => void>(),
   isNativePlatform: vi.fn(() => false),
   addListener: vi.fn(async (_event: string, _handler: (state: { isActive: boolean }) => void) => ({ remove: vi.fn() })),
 }));
@@ -37,6 +40,12 @@ vi.mock('@capacitor/app', () => ({
 vi.mock('@modoki/engine/runtime', () => ({
   audioResume: spies.audioResume,
   noteAudioForeground: spies.noteAudioForeground,
+  holdAudioForFullscreenAd: spies.holdAudioForFullscreenAd,
+  noteAudioBackground: spies.noteAudioBackground,
+  onFullscreenAdChange: (fn: (showing: boolean) => void) => {
+    spies.adListeners.add(fn);
+    return () => { spies.adListeners.delete(fn); };
+  },
 }));
 
 // Imported AFTER the mocks above so the hook resolves against the mocked modules.
@@ -259,3 +268,34 @@ describe('the foreground notes how long the app was away, before resuming (#1455
     expect(spies.noteAudioForeground).toHaveBeenCalledWith(900_000);
   });
 });
+
+describe('the fullscreen-ad audio hold (#1455)', () => {
+  it('forwards every ad edge to the audio hold, and on unmount unhooks and releases', () => {
+    const { unmount } = render(<AudioRearmProbe />);
+    expect(spies.adListeners.size).toBe(1);
+    for (const fn of spies.adListeners) fn(true);
+    expect(spies.holdAudioForFullscreenAd).toHaveBeenLastCalledWith(true);
+    for (const fn of spies.adListeners) fn(false);
+    expect(spies.holdAudioForFullscreenAd).toHaveBeenLastCalledWith(false);
+    for (const fn of spies.adListeners) fn(true);
+    unmount();
+    expect(spies.adListeners.size).toBe(0);
+    expect(spies.holdAudioForFullscreenAd, 'never left held by an ad nobody can hear end').toHaveBeenLastCalledWith(false);
+  });
+});
+
+describe('the background half of the dead-audio check (#1455)', () => {
+  it('notes the background ONCE per transition, on the first hide', () => {
+    render(<AudioRearmProbe />);
+    setVisibility('hidden');
+    fireEvent(document, new Event('visibilitychange'));
+    fireEvent(document, new Event('visibilitychange'));   // iOS can fire more than once going down
+    expect(spies.noteAudioBackground).toHaveBeenCalledTimes(1);
+    setVisibility('visible');
+    fireEvent(document, new Event('visibilitychange'));
+    setVisibility('hidden');
+    fireEvent(document, new Event('visibilitychange'));
+    expect(spies.noteAudioBackground).toHaveBeenCalledTimes(2);
+  });
+});
+

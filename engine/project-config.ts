@@ -584,6 +584,9 @@ export interface ProjectConfig {
     /** Minutes in the background after which a resume triggers a full app reload (#574).
      *  0 or absent = disabled. */
     reloadAfterBackgroundMinutes?: number;
+    /** Reload the page when the engine declares its audio DEAD (#1455) — a context reporting
+     *  `running` with a frozen clock that nothing in the page can revive. Absent/false = off. */
+    reloadOnDeadAudio?: boolean;
   };
 }
 
@@ -801,6 +804,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   // pruneProjectConfig above).
   runtime: {
     reloadAfterBackgroundMinutes: 0,
+    reloadOnDeadAudio: false,
   },
 };
 

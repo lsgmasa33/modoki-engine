@@ -205,12 +205,12 @@ describe('audioSystem journals the RESOLVED bus on every emission (#1069)', () =
     ).toEqual([]);
   });
 
-  it('every emission is covered — a sixth is not silently allowed', () => {
+  it('every emission is covered — a seventh is not silently allowed', () => {
     expect(
       fields.length,
       `audioSystem.ts gained a bus-carrying journalAudio call (${fields.length} now). Give it a `
       + 'behavioural case in vocabWiringReaches.test.ts, then update this number.',
-    ).toBe(5);
+    ).toBe(6);
   });
 
   it('the detector reads a wrapped payload, and a shorthand is vouched for only by ITS OWN binding (#1179)', () => {

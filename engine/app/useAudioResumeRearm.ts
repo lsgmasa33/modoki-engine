@@ -7,7 +7,9 @@
 import { useEffect } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
-import { audioResume, noteAudioForeground } from '@modoki/engine/runtime';
+import {
+  audioResume, holdAudioForFullscreenAd, noteAudioBackground, noteAudioForeground, onFullscreenAdChange,
+} from '@modoki/engine/runtime';
 
 /** Unlock/re-arm the AudioContext (mobile/WebView autoplay policy suspends it
  *  until a user gesture). This stays armed for the component's lifetime, NOT
@@ -21,6 +23,9 @@ import { audioResume, noteAudioForeground } from '@modoki/engine/runtime';
 export function useAudioResumeRearm() {
   useEffect(() => {
     const unlock = () => { audioResume(); };
+    // A fullscreen ad holds our audio for as long as it is up (#1455) — every game's ads, through the
+    // engine's ad lifecycle, with nothing for the game to wire.
+    const unhookAds = onFullscreenAdChange(holdAudioForFullscreenAd);
     for (const evt of ['pointerdown', 'touchstart', 'keydown']) {
       window.addEventListener(evt, unlock, { once: false });
     }
@@ -52,7 +57,12 @@ export function useAudioResumeRearm() {
     const onHidden = () => {
       // Only the FIRST hide counts: iOS can fire more than once on the way down, and taking the
       // last one would report a long background as a short one.
-      if (hiddenAt === null) hiddenAt = Date.now();
+      if (hiddenAt === null) {
+        hiddenAt = Date.now();
+        // Whether the context was running as we left — the foreground's dead-audio check needs it
+        // (#1455). Once per transition, like the timestamp.
+        noteAudioBackground();
+      }
       noted = false;
     };
     const onVisibility = () => {
@@ -80,6 +90,9 @@ export function useAudioResumeRearm() {
       }
       document.removeEventListener('visibilitychange', onVisibility);
       appListener?.remove();
+      unhookAds();
+      // Never leave the audio held by an ad this shell can no longer hear the end of.
+      holdAudioForFullscreenAd(false);
     };
   }, []);
 }

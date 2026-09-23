@@ -2874,6 +2874,14 @@ but equally indirect message. Before #199 nothing in the engine managed either n
 project shipped the scaffolder's hardcoded `1` — which only mattered once a project published, and
 then cost a diagnosis cycle.
 
+⚠️ **Change the marketing version in `app.version`, never by hand in `build.gradle` / `project.pbxproj`.**
+The marketing version syncs in BOTH directions from the RESOLVED config, and an absent `app.version`
+resolves to the default `1.0` — so a hand-edited native value is overwritten by the next build, while
+an Xcode archive (which skips the heal) ships the hand-edited one: two build paths, two versions. A
+game's store listing hit exactly this (native files `0.1.0`, config defaulted to `1.0`, and the
+uploaded build did not match the store's version page). `engine/tests/plugins/nativeMarketingVersion.test.ts`
+fails on any project whose committed native value differs from its resolved `app.version`.
+
 **The heal never LOWERS a build number.** Lowering is the one direction that is always a mistake,
 and it is exactly what a stale config, a fresh clone, or a forgotten bump would produce on a project
 that has already uploaded. A would-be lowering is reported instead — naming the current value and

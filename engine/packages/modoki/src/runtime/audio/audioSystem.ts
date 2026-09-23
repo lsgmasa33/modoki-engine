@@ -40,7 +40,7 @@ import { isTimelinePreviewActive } from '../core/timelinePreview';
 import { onWorldSwap } from '../core/ecs/world';
 import { EntityTable, packedOf, type PackedEntity } from '../core/ecs/entityTable';
 import {
-  play, updateListener, crossfade, resolveBus, type AudioHandle, type AudioPlaySpec, type BusName,
+  play, updateListener, crossfade, resolveBus, isAudioHeldForAd, type AudioHandle, type AudioPlaySpec, type BusName,
 } from './audioService';
 import { drainAudioCues, clearAudioCues, type AudioCue } from './audioCues';
 import { audioAssetProvider } from './audioAssetProvider';
@@ -511,14 +511,25 @@ function startOrSwap(world: World, state: AudioState, entity: Entity, a: TraitVa
  *  instant the cap engaged). See `AudioSettings` for the reasoning behind each exemption. */
 function playOneShot(
   world: World, state: AudioState, spec: AudioPlaySpec, limit: number, stealFadeSec: number,
-): void {
+): boolean {
   // ⚠️ `resolveBus`, NOT `?? 'sfx'` (#993 close-out § 2d). Once an unrecognised bus falls back
   // to `sfx` at the graph, deciding the cap from the raw field makes TWO readers of one field
   // disagree — structurally the same defect this change closed for the CPU/GPU particle backends.
   // Concretely: N entities authored `bus: "Sfx"` all play on the sfx bus while none is counted
   // against `sfxVoiceLimit`, so nothing ever steals.
+  // A one-shot asked for under a fullscreen ad is dropped (#1455): the suspended context would
+  // queue it and chime at release — stale by then. Only the cue bus: an entity's source or a
+  // playlist clip belongs to the scene and still starts (held), or a playlist would spin.
+  //
+  // Returns whether it PLAYED, so the caller journals `start` only for a cue that did — the journal
+  // is the headless observable, and a `start` for a dropped cue is a false "it fired" (#1455
+  // re-review 2). The drop journals itself.
+  if (isAudioHeldForAd()) {
+    journalAudio(world, 'dropped', undefined, { clip: spec.clip, bus: resolveBus(spec.bus), reason: 'ad-hold' });
+    return false;
+  }
   const bus = resolveBus(spec.bus);
-  if (bus !== 'sfx' || limit <= 0) { play(spec); return; }
+  if (bus !== 'sfx' || limit <= 0) { play(spec); return true; }
   // Oldest first: insertion order is age order, so the victim is always at the head.
   while (state.oneShots.length >= limit) {
     const victim = state.oneShots.shift();
@@ -545,6 +556,7 @@ function playOneShot(
   // An INERT handle (no graph / play threw) reports ended:true and would be swept next
   // frame anyway, but tracking it would let a dead voice hold a slot for a frame.
   if (!handle.ended) state.oneShots.push({ handle, clip: spec.clip ?? '' });
+  return true;
 }
 
 /** The authored voice-cap settings, falling back to the trait's own defaults when no scene
@@ -569,8 +581,9 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
     for (const p of state.pendingCues) {
       const spec = resolveSpec(p.cue.clip ?? '', { bus: p.cue.bus, volume: p.cue.volume, pitch: p.cue.pitch });
       if (spec) {
-        playOneShot(world, state, spec, limit, stealFadeSec);
-        journalAudio(world, 'start', undefined, { clip: p.cue.clip, bus: resolveBus(p.cue.bus) });
+        if (playOneShot(world, state, spec, limit, stealFadeSec)) {
+          journalAudio(world, 'start', undefined, { clip: p.cue.clip, bus: resolveBus(p.cue.bus) });
+        }
         continue;
       }
       if (--p.frames > 0) { still.push(p); continue; }
@@ -584,8 +597,9 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
     if (cue.clip) {
       const spec = resolveSpec(cue.clip, { bus: cue.bus, volume: cue.volume, pitch: cue.pitch });
       if (spec) {
-        playOneShot(world, state, spec, limit, stealFadeSec);
-        journalAudio(world, 'start', undefined, { clip: cue.clip, bus: resolveBus(cue.bus) });
+        if (playOneShot(world, state, spec, limit, stealFadeSec)) {
+          journalAudio(world, 'start', undefined, { clip: cue.clip, bus: resolveBus(cue.bus) });
+        }
         continue;
       }
       // Buffer clip not decoded yet (iOS: decode lands only after the first-gesture resume) → defer
@@ -619,8 +633,9 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
         // fire-and-forget one-shot (no handle is retained on the entity), so it counts
         // against the cap like any other. What is exempt is a source's OWN declarative
         // playback via `startOrSwap`, which the cap never touches.
-        playOneShot(world, state, spec, limit, stealFadeSec);
-        journalAudio(world, 'start', entity, { clip: a.clip, bus: resolveBus(cue.bus ?? a.bus), spatial: a.spatial });
+        if (playOneShot(world, state, spec, limit, stealFadeSec)) {
+          journalAudio(world, 'start', entity, { clip: a.clip, bus: resolveBus(cue.bus ?? a.bus), spatial: a.spatial });
+        }
       }
     });
   }

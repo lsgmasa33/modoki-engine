@@ -293,7 +293,20 @@ deliberate and was the owner's call, but it means the authored number is not wha
 perturbation test on that field ("edit it, watch the behaviour move") will read as inert. The boot
 log says which value is armed whenever the two disagree; believe it over the config.
 
-Four things about it are load-bearing, and each exists because of a measured trap:
+**A second trigger reloads on DEAD audio** (#1455): `runtime/core/deadAudioReload.ts` +
+`app/useDeadAudioReload.ts`, opt-in with `runtime.reloadOnDeadAudio` (Project Settings → "Reload
+when audio dies"; Weaveling and Court opt in). It fires on `audioService`'s `onAudioDead`, when a context
+reports `running` but its clock does not advance after a foreground or an ad release, even after a
+retry. On iOS nothing in the page recovers that state, and a reload does (measured; see
+`docs/audio-plan.md` § "Phase 1 — Runtime audio ✅ SHIPPED"). It honours the same reload blockers
+and waits up to 60 s for them to clear. It then **re-checks** the clock (`isAudioStillDead`),
+because the audio can come back by itself meanwhile. It flushes prefs first, and allows at most
+one reload per 10 minutes, remembered in `sessionStorage`, so a session still held by another app
+cannot loop it. ⚠️ **It is only as safe as the game's blockers.** This was Weaveling's first
+automatic reload, and Weaveling had no purchase blocker until #1455 added `wordweave.purchase`
+(Court has had `court.purchase` all along). A project opting in must check its own.
+
+Four things about the resume trigger are load-bearing, and each exists because of a measured trap:
 
 - **`registerReloadBlocker` is NOT `registerUIBusySource`**, though the shape is identical. They
   fail in *opposite* directions on a throwing predicate: a UI-busy source degrades to "not busy"

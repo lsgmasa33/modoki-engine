@@ -4,6 +4,7 @@ import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
 import { useBackgroundFlush } from './useBackgroundFlush';
 import { useResumeReload } from './useResumeReload';
+import { useDeadAudioReload } from './useDeadAudioReload';
 import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, holdTimeForLoading, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
@@ -836,6 +837,10 @@ function App() {
   // already queued by the time this samples the reload blockers. The trigger awaits its own
   // `PlayerPrefs.flush()` before reloading regardless — this ordering is belt, not braces.
   useResumeReload();
+
+  // Reload when the page's audio is DEAD (#1455) — a no-op unless the project authors
+  // `runtime.reloadOnDeadAudio`. Detection is the audio service's clock check.
+  useDeadAudioReload();
 
   // Editor route (omitted from game-only builds)
   if (!GAME_ONLY && hash === '#/editor' && EditorApp) {

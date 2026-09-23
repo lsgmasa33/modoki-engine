@@ -17,6 +17,7 @@ import { journalEvents } from '../../src/runtime/core/journal';
 import { cueSound, cueClip } from '../../src/runtime/audio/audioCues';
 import {
   getAudioLog, clearAudioLog, setAudioRecordMode, setBusVolume, resume, dispose, endRecordedVoices,
+  holdForFullscreenAd,
 } from '../../src/runtime/audio/audioService';
 import { getPlayState, setPlayState } from '../../src/runtime/core/playState';
 import { setTimelinePreviewActive } from '../../src/runtime/core/timelinePreview';
@@ -381,3 +382,39 @@ describe('audioSystem — recycled entity index (#868)', () => {
     expect(plays()).toHaveLength(2);
   });
 });
+
+describe('a fullscreen ad holds the cue bus (#1455)', () => {
+  afterEach(() => { holdForFullscreenAd(false); });
+
+  it('drops a one-shot cued under the ad, but still starts an entity source — then cues play again after', () => {
+    const cue = mintClip();
+    const bed = mintClip();
+    world = createWorld();
+    holdForFullscreenAd(true);
+    cueClip(cue, { bus: 'sfx' }, world);
+    cueClip(cue, { bus: 'ui' }, world);
+    // A scene-owned source is NOT a one-shot: dropping it would leave a non-loop autoplay source
+    // never played, and a playlist of buffer clips spinning one track per frame (re-review F2).
+    const e = world.spawn(Transform(), AudioSource({ clip: bed, autoplay: true, bus: 'music' }));
+    audioSystem(world);
+    const plays = getAudioLog().filter((l) => l.op === 'play');
+    expect(plays.map((p) => p.clip)).toEqual([bed]);
+    expect(e.get(AudioSource)!.playing).toBe(true);
+
+    holdForFullscreenAd(false);
+    cueClip(cue, { bus: 'sfx' }, world);
+    audioSystem(world);
+    expect(getAudioLog().filter((l) => l.op === 'play').map((p) => p.clip)).toEqual([bed, cue]);
+  });
+
+  it('journals a DROPPED cue as dropped/ad-hold, never as a start (the journal is the headless observable)', () => {
+    const cue = mintClip();
+    world = createWorld();
+    holdForFullscreenAd(true);
+    cueClip(cue, { bus: 'sfx' }, world);
+    audioSystem(world);
+    const audio = journalEvents({ type: '@audio' }, world).map((e) => e.payload as { phase: string; clip?: string; reason?: string });
+    expect(audio.filter((e) => e.clip === cue)).toEqual([expect.objectContaining({ phase: 'dropped', reason: 'ad-hold' })]);
+  });
+});
+

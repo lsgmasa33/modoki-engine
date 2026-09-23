@@ -106,6 +106,16 @@ export const ads = {
   interstitialReady(): boolean { return false; },
   // #1379 — the purchase card waits while an ad is up; a playable never shows one.
   fullscreenAdShowing(): boolean { return false; },
+  // #1474 — Weaveling's debug-menu ads tab. A playable has no debug menu and no SDK; these keep the
+  // namespace complete and inert.
+  debugSetAdOverride(_patch: Record<string, unknown>): void {},
+  async debugShowFullscreen(_kind: string): Promise<boolean> { return false; },
+  debugAdStatus() {
+    return {
+      initialized: false, interstitialLoaded: false, rewardedLoaded: false, fullscreenShowing: false,
+      gameWantsBanner: false, override: { banner: 'auto' as const, interstitial: true, rewarded: true },
+    };
+  },
   bannerHeightPx(): number { return 0; },
   privacyOptionsRequired(): boolean { return false; },
   async showPrivacyOptions(): Promise<void> {},
