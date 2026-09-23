@@ -2879,8 +2879,9 @@ The marketing version syncs in BOTH directions from the RESOLVED config, and an 
 resolves to the default `1.0` — so a hand-edited native value is overwritten by the next build, while
 an Xcode archive (which skips the heal) ships the hand-edited one: two build paths, two versions. A
 game's store listing hit exactly this (native files `0.1.0`, config defaulted to `1.0`, and the
-uploaded build did not match the store's version page). `engine/tests/plugins/nativeMarketingVersion.test.ts`
-fails on any project whose committed native value differs from its resolved `app.version`.
+uploaded build did not match the store's version page). `engine/tests/architecture/nativeVersionMatchesConfig.test.ts`
+fails on any project whose committed native value differs from its resolved `app.version` (it skips
+in a checkout with no committed native projects, such as the public engine snapshot).
 
 **The heal never LOWERS a build number.** Lowering is the one direction that is always a mistake,
 and it is exactly what a stale config, a fresh clone, or a forgotten bump would produce on a project
