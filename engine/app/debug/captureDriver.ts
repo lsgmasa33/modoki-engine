@@ -14,7 +14,7 @@
 
 import {
   setFrameLoopHeld, stepOneFrame, setManualNow, advanceManual, restoreRealClock, rawNow,
-  resetTimeBaseline, pinFreshWorldSeed, seedRng, setCaptureMode, getCurrentWorld, getTime, takeClockDelta,
+  resetTimeBaseline, pinFreshWorldSeed, seedRng, setCaptureMode, getCurrentWorld, getTime, takeClockDelta, isNextSceneLoading,
   journalEvents, isTimeHeldForLoading, sceneManager,
 } from '@modoki/engine/runtime';
 import type { World } from 'koota';
@@ -47,7 +47,7 @@ interface Session {
   dtMs: number;
   seed: number;
   steps: number;
-  /** The take clock: `takeClockDelta()` summed after every step — the function the editor recorder
+  /** The take clock: `takeClockDelta(sample)` summed after every step — the function the editor recorder
    *  sums too, which is what makes a take's stamps and this clock one axis (see `core/takeClock.ts`
    *  for why it is summed, unscaled, and 0 while the loading hold is up). */
   takeTime: number;
@@ -157,6 +157,15 @@ async function settle(s: Session): Promise<string[]> {
       // One more macrotask either way, so a `.then` queued by whatever just finished (Canvas2DMount
       // appends its canvas in one) has run before the frame is drawn.
       await new Promise((r) => setTimeout(r, 0));
+      // …and look again after it, because that macrotask can START work — a continuation calling
+      // `loadScene` is the one that matters (#1486): gone ahead with unseen, the step's frame begins
+      // mid-load, adds zero take time, and the fixed `frameCountFor` budget drops the take's last dt
+      // of input with nothing in `unsettled`. Returning synchronously after this check means nothing
+      // can run between it and the step's own sample.
+      if (!timedOut) {
+        const after = pendingWork(s.fetches);
+        if (Object.keys(after).length && !coveredBy(after, s.gaveUpOn)) continue;
+      }
       return timedOut ? describePending(pending) : [];
     }
     await new Promise((r) => setTimeout(r, 10));
@@ -253,9 +262,12 @@ function advanceOne(s: Session): void {
     seedRng(s.seed, getCurrentWorld());
     s.seededAtStart = true;
   }
+  // Sampled before the frame, as the editor recorder samples it: the frame that STARTS a load is a
+  // timed frame on both halves (`core/takeClock.ts` says why).
+  const loadInFlightAtStart = isNextSceneLoading();
   advanceManual(s.dtMs);
   stepOneFrame();
-  s.takeTime += takeClockDelta();
+  s.takeTime += takeClockDelta(loadInFlightAtStart);
   drainJournal(s, s.steps);
   s.steps++;
 }

@@ -769,7 +769,7 @@ export {
 } from './core/adBreak';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { isCaptureMode, getCaptureMode, setCaptureMode, type CaptureMode } from './core/captureMode';
-export { takeClockDelta } from './core/takeClock';
+export { takeClockDelta, isNextSceneLoading } from './core/takeClock';
 export { seedRng, pinFreshWorldSeed, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
   emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, journalTick, setJournalEnabled,

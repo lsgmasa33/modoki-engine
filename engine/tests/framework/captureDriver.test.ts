@@ -13,6 +13,7 @@ import {
 } from '@modoki/engine/runtime';
 import type { World } from 'koota';
 import { beginCapture, stepCapture, bootStepCapture, endCapture, initCaptureDriver } from '../../app/debug/captureDriver';
+import { frameCountFor, TakeCursor } from '../../packages/modoki/src/editor/recorder/take';
 
 type PoolHandle = { __2d?: { pool: { pendingInits: () => number } } };
 const win = window as unknown as PoolHandle;
@@ -150,6 +151,113 @@ describe('captureDriver', () => {
       // …and the take clock carries on — a clock read from Time.elapsed would say 0.05 here.
       expect(state.takeTime).toBeCloseTo(0.15, 9);
     });
+
+    type HeldLoad = { start(): void; release(): void; load: Promise<unknown> | null };
+    const emptyScene = () => ({ preloaded: { version: 8, resources: [], entities: [] } as never });
+    /** A REAL scene load from '/a' to '/b', held open at the swap by a before-swap hook until
+     *  `release()` — a stubbed getNext() would not prove it is SceneManager that tells the take clock
+     *  a load is in flight. The load is released and settled in `finally`, INSIDE the test: the
+     *  describe's afterEach restores the previous world, and onTestFinished runs after it — a swap
+     *  landing on the world afterEach put back fails the NEXT test instead of this one. */
+    async function withHeldLoad(body: (h: HeldLoad) => Promise<void>): Promise<void> {
+      await sceneManager.loadScene('/a.scene.json', emptyScene());
+      let release!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      const hook = () => held;
+      sceneManager.registerBeforeSwap(hook);
+      const h: HeldLoad = { release, load: null, start() { h.load ??= sceneManager.loadScene('/b.scene.json', emptyScene()); } };
+      try {
+        await body(h);
+      } finally {
+        release();
+        await h.load;
+        sceneManager.unregisterBeforeSwap(hook);
+        unregisterFrameCallback('captureDriverLoad');
+      }
+    }
+
+    it('a mid-take scene load costs zero take time, yet every timed step is still one dt (#1486)', () => withHeldLoad(async (h) => {
+      let startLoad = false;
+      registerFrameCallback('captureDriverLoad', () => { if (startLoad) h.start(); }, 0);
+      beginCapture({ dtMs: 25, seed: 1 });
+      expect((await stepCapture(1)).takeTime).toBeCloseTo(0.025, 9);
+      // This step's own frame starts the load. It is a timed frame on both halves — the load was
+      // not in flight when it began — so it counts its dt, exactly as the editor's does.
+      startLoad = true;
+      expect((await stepCapture(1)).takeTime).toBeCloseTo(0.05, 9);
+      expect(sceneManager.getNext()).not.toBeNull();
+      const next = stepCapture(1);
+      await new Promise((r) => setTimeout(r, 40));
+      expect(runs).toBe(2);   // the settle gate is waiting the load out
+      h.release();
+      await h.load;
+      // N timed steps are N dt, load or no load: the CLI renders `frameCountFor` frames on exactly
+      // that promise, and a step that added zero left the take's last dt of input undispatched.
+      expect((await next).takeTime).toBeCloseTo(0.075, 9);
+    }));
+
+    it('a take with a mid-take load still dispatches its closing event — the CLI loop, driven for real (#1486)', () => withHeldLoad(async (h) => {
+      // record-take.mjs's own loop: dispatch what is due, then step, for exactly frameCountFor frames.
+      // Found by review: with the load-start frame counting zero, the last frame's dispatch fell one
+      // dt short of `duration`, and the closing `up` (stamped AT duration) never went in.
+      h.release();   // not held: the settle gate waits the load out on its own
+      let startLoad = false;
+      registerFrameCallback('captureDriverLoad', () => { if (startLoad) h.start(); }, 0);
+      const take = { duration: 0.1, events: [
+        { t: 0.075, kind: 'down' as const, x: 1, y: 1 },
+        { t: 0.1, kind: 'up' as const, x: 1, y: 1 },
+      ] };
+      const cursor = new TakeCursor(take.events);
+      const dispatched: string[] = [];
+      beginCapture({ dtMs: 25, seed: 1 });
+      let takeTime = 0;
+      const total = frameCountFor(take, 40);
+      for (let f = 0; f < total; f++) {
+        for (const ev of cursor.due(takeTime)) dispatched.push(ev.kind);
+        if (f === 1) startLoad = true;
+        takeTime = (await stepCapture(1)).takeTime;
+      }
+      expect(h.load).not.toBeNull();
+      expect(dispatched).toEqual(['down', 'up']);
+      expect(cursor.remaining).toBe(0);
+    }));
+
+    it('waits out a load a continuation starts inside the settle gate\'s last macrotask (#1486)', () => withHeldLoad(async (h) => {
+      // Found by review: the gate awaited one more macrotask and went ahead without looking again,
+      // so a load started there was unseen — the step's frame began mid-load and added zero, with
+      // nothing in `unsettled`. A timer queued from a frame fires first inside that macrotask. Held
+      // for 50 ms: an empty preloaded load otherwise finishes within microtasks, before the step
+      // runs, and the gap never opens (this test was inert without the hold).
+      let queueLoad = false;
+      registerFrameCallback('captureDriverLoad', () => {
+        if (!queueLoad) return;
+        queueLoad = false;
+        setTimeout(() => { h.start(); setTimeout(h.release, 50); }, 0);
+      }, 0);
+      beginCapture({ dtMs: 25, seed: 1 });
+      await stepCapture(1);
+      queueLoad = true;
+      await stepCapture(1);
+      const state = await stepCapture(1);
+      expect(h.load).not.toBeNull();
+      expect(state.unsettled).toBe(0);
+      expect(state.takeTime).toBeCloseTo(0.075, 9);
+    }));
+
+    it('a step the settle gate lets past a stuck load adds no take time, and says so (#1486)', () => withHeldLoad(async (h) => {
+      // The one path where the replay's own frame-start sample decides the answer: every other step
+      // begins settled. The editor counts nothing for a frame that begins mid-load, so neither does
+      // this — and the give-up is in `unsettled`, where the report can show it.
+      let startLoad = false;
+      registerFrameCallback('captureDriverLoad', () => { if (startLoad) h.start(); }, 0);
+      beginCapture({ dtMs: 25, seed: 1, settleTimeoutMs: 30 });
+      await stepCapture(1);
+      startLoad = true;
+      expect((await stepCapture(1)).takeTime).toBeCloseTo(0.05, 9);
+      const state = await stepCapture(1);   // gives up on the held load and steps anyway
+      expect(state.unsettled).toBe(1);
+      expect(state.takeTime).toBeCloseTo(0.05, 9);
+    }));
 
     it('stays at zero while the loading hold freezes time — the take starts when the game is on screen', async () => {
       worldWithClock();

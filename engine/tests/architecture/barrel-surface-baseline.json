@@ -679,6 +679,7 @@
   "isLiveRender",
   "isManualClock",
   "isMonthInRange",
+  "isNextSceneLoading",
   "isPackedAlive",
   "isPassActive",
   "isPointerBlocked",

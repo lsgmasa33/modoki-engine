@@ -484,14 +484,29 @@ console.log('UC4 drives play + timescale and reads the journal in one batch →'
 
 // …and a mid-batch read WITHOUT `result:'full'`: the envelope must volunteer why the payload is
 // missing. This is the self-fixing half — the trap is fine, silence about it is not.
-// `list_traits({all})` and not `journal`: the journal's size depends on what has happened this
-// session (measured 1579 chars mid-play, 620 after a stop), so asserting on it would pass or fail
-// by run order. Every trait SCHEMA is fixed by the project and comfortably over the ack ceiling
-// (the names-only form is ~1.4k — under it, which is how this assertion first failed).
+// The probe step must land in a BAND: over the ack ceiling (1,500) so the batch summarizes it,
+// and under the single-result cap (60,000) so the tool does not elide it as TOO_LARGE first —
+// a TOO_LARGE reply is ~200 chars, so the batch never sees anything to summarize. Summarizing is
+// tool-agnostic (`batchReport.ts` reads only the length and the mode), so the step is an eval
+// whose size is fixed BY CONSTRUCTION. Every read tried before sized itself by something else:
+// `journal` by run order (1579 chars mid-play, 620 after a stop), `list_traits` names-only by the
+// project (~1.4k, under the ceiling), and `list_traits({all})` by the project too — 66,889 chars
+// on games/wordweave, over the cap (#1485).
+const UC4B_PROBE_CHARS = 4000;
 const uc4b = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
-  { tool: 'modoki_list_traits', args: { all: true } },
+  { tool: 'modoki_eval', args: { code: `return 'x'.repeat(${UC4B_PROBE_CHARS});` } },
   { tool: 'modoki_get_editor_state', args: {}, result: 'none' },
 ] } })));
+// Check the probe sat in the band BEFORE judging the hint, so a moved ceiling or cap reads as
+// "the probe is the wrong size", not as the summarized hint having gone missing.
+// The batch's summary is `{elided, bytes, preview}` with no `code`; the tool's own TOO_LARGE reply is
+// ALSO `elided: true`, but carries `code: 'TOO_LARGE'` and passes through the batch verbatim. So
+// `elided` without a `code` is the band — and no copy of either cap lives here to go stale.
+const probeStep = uc4b.steps?.find((st) => st.i === 0);
+if (probeStep && probeStep.ok === false) throw new Error(`UC4b's probe step itself failed: ${JSON.stringify(probeStep.error).slice(0, 600)}`);
+if (probeStep?.result?.elided !== true || probeStep.result.code !== undefined) {
+  throw new Error(`UC4b's probe step must be summarized by the batch (over the ack ceiling, under the TOO_LARGE cap) — resize UC4B_PROBE_CHARS: ${JSON.stringify(uc4b).slice(0, 600)}`);
+}
 if (uc4b.summarized?.[0] !== 0 || !/result:'full'/.test(uc4b.summarizedHint ?? '')) {
   throw new Error(`a summarized mid-batch read must say how to get it: ${JSON.stringify(uc4b)}`);
 }

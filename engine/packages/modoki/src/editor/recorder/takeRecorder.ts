@@ -15,7 +15,7 @@ import {
 import { getPlayState, onPlayStateChange } from '../../runtime/core/playState';
 import { seedRng, pinFreshWorldSeed } from '../../runtime/core/rng';
 import { setCaptureMode } from '../../runtime/core/captureMode';
-import { takeClockDelta } from '../../runtime/core/takeClock';
+import { takeClockDelta, isNextSceneLoading } from '../../runtime/core/takeClock';
 import { registerFrameCallback, unregisterFrameCallback } from '../../runtime/rendering/frameDriver';
 import { PlayerPrefs } from '../../runtime/storage/playerPrefs';
 import { prefsKeyPrefix } from '../../runtime/storage/prefsKey';
@@ -101,7 +101,7 @@ interface Recording {
   base: Omit<Take, 'duration' | 'events'>;
   /** Play has started — pointer input from here on belongs to the take. */
   started: boolean;
-  /** The take clock: `takeClockDelta()` summed after every frame — the same function the replay
+  /** The take clock: `takeClockDelta(sample)` summed after every frame — the same function the replay
    *  driver sums, which is what makes the two clocks one axis (`runtime/core/takeClock.ts` says why
    *  it is summed rather than read from `Time.elapsed`, and why unscaled). */
   takeTime: number;
@@ -182,9 +182,12 @@ export async function startTakeRecording(safeArea: Take['safeArea']): Promise<st
   window.addEventListener('pointercancel', onPointer, { capture: true });
 
   // After the ECS tier, so the delta summed is the one this frame's sim just ran with. 0 while
-  // paused, so a pause costs the take nothing.
+  // paused, so a pause costs the take nothing. The load sample is taken FIRST, before any callback
+  // can start a load — the replay samples at the same point (`core/takeClock.ts` says why).
+  let loadInFlightAtStart = false;
+  registerFrameCallback('takeRecorderFrameStart', () => { loadInFlightAtStart = isNextSceneLoading(); }, Number.MIN_SAFE_INTEGER);
   registerFrameCallback('takeRecorder', () => {
-    if (rec.started) rec.takeTime += takeClockDelta();
+    if (rec.started) rec.takeTime += takeClockDelta(loadInFlightAtStart);
   }, 5);
 
   const offPlay = onPlayStateChange(() => {
@@ -204,6 +207,7 @@ export async function startTakeRecording(safeArea: Take['safeArea']): Promise<st
     window.removeEventListener('pointermove', onPointer, { capture: true });
     window.removeEventListener('pointerup', onPointer, { capture: true });
     window.removeEventListener('pointercancel', onPointer, { capture: true });
+    unregisterFrameCallback('takeRecorderFrameStart');
     unregisterFrameCallback('takeRecorder');
     offPlay();
     pinFreshWorldSeed(null);

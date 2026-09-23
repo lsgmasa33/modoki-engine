@@ -104,6 +104,7 @@ import { SCENE_FORMAT_VERSION } from '../core/version';
 
 import { Persistent } from '../traits/Persistent';
 import { Time } from '../core/traits/Time';
+import { sceneLoadInFlight } from '../core/takeClock';
 import { Transient } from '../core/traits/Transient';
 import { Input } from '../traits/Input';
 import {
@@ -2160,6 +2161,11 @@ function reportStartupErrors(scenePath: string, errors: readonly ManagerStartupE
 
 /** The singleton SceneManager. Importers should generally just call sceneManager.loadScene(). */
 export const sceneManager: SceneManager = new SceneManagerImpl();
+
+// The take clock stops while a load is in flight (#1486) — answered from `getNext()`, the state the
+// replay's settle gate waits on, so the recorder and the replay read one thing. Looked up per call,
+// not bound, so a test that stubs `getNext` stubs this too.
+sceneLoadInFlight.provide({ inFlight: () => Boolean(sceneManager.getNext()) });
 
 /** The id of the currently-loaded scene (for scene-scoped resource ownership from
  *  the renderers — e.g. the Text sync acquiring a font not yet in the manifest).

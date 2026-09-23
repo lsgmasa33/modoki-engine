@@ -34,7 +34,7 @@ Neither the render's speed nor the screen it runs on affects the frames. The out
 
 ## How it works
 
-**The take clock.** Both halves call the same function after every frame, `takeClockDelta()`
+**The take clock.** Both halves call the same function after every frame, `takeClockDelta(sample)`
 (`runtime/core/takeClock.ts`), and sum the result, counted from the take's first timed frame. What it
 is, and why:
 - **Summed, not a world's `Time.elapsed`.** Every scene load spawns a fresh `Time` into the new
@@ -43,6 +43,38 @@ is, and why:
 - **Unscaled.** A video frame is 1/fps of *real* time, so slow-mo plays slowly in the video rather
   than shortening the take. A time-stop doesn't stamp every tap with one instant.
 - **Zero for a frame that didn't advance:** paused, or held by the loading hold.
+- **Zero for a frame that *started* with a scene load in flight (#1486).** The halves experience
+  a load differently. The editor keeps ticking the old world through the async load at display
+  rate, for however long that machine takes, while the replay's settle gate waits it out without
+  stepping. Counting the editor's frames put every event after a mid-take load early in the replay
+  by the editor's load time. So a load costs nothing on either clock. `SceneManager` answers "in
+  flight" through the `sceneLoadInFlight` provider slot from `getNext()`, the same state the
+  settle gate waits on.
+  - **Sampled at the frame's START** (`isNextSceneLoading()`), then passed to
+    `takeClockDelta()` after it. The editor samples from a frame callback at
+    `Number.MIN_SAFE_INTEGER`, and the replay samples just before `stepOneFrame`.
+  - **Why the start:** the frame that *starts* a load (a game system calling `loadScene`, which
+    marks it in flight before its first await) is a timed frame on both halves, so it counts one
+    dt. The first cut sampled after the frame, and that step added zero. `record-take` renders a
+    fixed `frameCountFor` frames on the promise that N timed steps are N dt, so every take with a
+    load lost its last dt of input, including the closing `up`. Review reproduced it.
+  - **The settle gate looks again after its last macrotask.** That macrotask exists so a `.then`
+    from finished work runs before the frame, but it can also *start* work. A continuation calling
+    `loadScene` there went unseen, and the step's frame began mid-load. Review reproduced it: the
+    step added zero, and `unsettled` stayed empty.
+  - **The result:** a timed replay step adds zero only when the gate went ahead past a load it gave
+    up on. The first give-up shows up in `unsettled`. The report's `undispatchedEvents` shows the
+    input it cost.
+  - **Known limit: the give-up latch counts kinds, not identities.** While any other stuck work
+    keeps the latch set, a second load is "covered" by the first give-up. It is not waited out and
+    not re-reported, and every step through it adds zero.
+  - **The price is deliberate:** the video cuts from the old scene to the new one, and taps made in
+    the editor *during* a load all replay together, at the take time the load began at.
+    Reproducing the editor's load duration instead would reproduce machine noise, and it would need
+    a format bump and a held swap.
+  - **Not the same gap:** the settle gate's other waits (fetches, images, fonts, 2D init). For
+    those, the replay still steps every frame, just later in real time, so events land at the same
+    take time.
 
 **Recording.** Pressing ● while stopped does the following:
 - Refuses if the scene has unsaved changes, because the replay loads the scene from disk.
@@ -79,7 +111,7 @@ is up would otherwise shift the stream by however many held frames this machine 
 The CLI then checks the booted scene is the take's scene and fails if not, because an unknown
 `?scene=` silently boots the default. Then, for each video frame:
 1. Dispatch the events due by now on the take clock, mapped into this page's root rect, as trusted CDP mouse input.
-2. `step(1)`: settle, advance exactly one dt, run every frame callback once, add `takeClockDelta()`, and drain the journal. The journal is deduped on its process-global `cap` sequence, not the tick: an event emitted *between* steps, such as a DOM click's UI action, carries the previous frame's tick. The old world is drained once more at a swap.
+2. `step(1)`: settle, sample `isNextSceneLoading()`, advance exactly one dt, run every frame callback once, add `takeClockDelta(sample)`, and drain the journal. The journal is deduped on its process-global `cap` sequence, not the tick: an event emitted *between* steps, such as a DOM click's UI action, carries the previous frame's tick. The old world is drained once more at a swap.
 3. Move `Date` on to the take clock.
 4. Screenshot.
 
@@ -93,7 +125,7 @@ waits, in real time, until nothing a frame could depend on is still in flight:
 - `fetch` calls in flight, counted from the start of the capture
 - incomplete `<img>`s
 - `document.fonts`
-- a scene load in flight (`sceneManager.getNext()`), so a mid-take load costs the same take time (zero) on every render
+- a scene load in flight (`sceneManager.getNext()`), so a mid-take load costs zero take time on every render, matching the editor, whose clock stops for a load too (see the take clock above)
 
 Sim time doesn't move while it waits, so slow content arrives "instantly" on the video's clock.
 
@@ -155,9 +187,6 @@ deliverables that get shared.
 - **The preview used to be 2 px short.** The GameView's device div had a `1px` border under the
   app's global `box-sizing: border-box`, so a 540×960 preset laid the game out at 538×958. It's
   an `outline` now.
-- **A mid-take scene load does not line up yet (#1486).** The editor keeps ticking the old world
-  through the async load, while the replay waits it out. Events after the load therefore land
-  earlier by the editor's load time. Court and Weaveling never load a scene mid-take.
 - **An editor take and its replay start from different places.** The editor presses Play on a
   live world, while the replay boots a page. Everything the game reads at start is carried over:
   the save, the seed, the wall clock and the time zone. Anything else a game reads at boot is not,
