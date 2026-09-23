@@ -28,8 +28,9 @@
  *  ⚠️ Do NOT reach for a dynamic `import()` of the built chunk instead: that hands back a SECOND
  *  module instance with an empty `trace`, which reads exactly like "nothing was recorded".
  *  ⚠️ `device_eval` needs the debug bridge at all, which is gated on
- *  `__MODOKI_DEBUG_BUILD__ && isNativePlatform()` (`engine/app/main.tsx`) — true for Weaveling
- *  today, but not a property of every build.
+ *  `__MODOKI_DEBUG_BUILD__ && isNativePlatform()` (`engine/app/main.tsx`) — and is NOT a property of
+ *  every build. Both shipping games turned it off on 2026-09-23, so a committed-config Court or
+ *  Weaveling build cannot be reached this way at all.
  *
  *  Time comes from `rawNow()`, the sanctioned wall-clock wrapper (`core/clock.ts`), so this module
  *  stays inside the determinism guard's rules like everything else under `runtime/**`. `rawNow()`
