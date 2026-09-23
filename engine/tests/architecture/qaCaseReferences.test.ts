@@ -490,6 +490,55 @@ function spendLedger(
 }
 
 /**
+ * Every place a text names a scene format version as a NUMBER (#1462).
+ *
+ * A case that names one is restating two numbers that each move on their own: the committed
+ * fixture's `version` moves whenever someone re-saves that scene, and `SCENE_FORMAT_VERSION` moves
+ * on every format bump. So each copy is true the day it is written and false afterwards. #900
+ * stranded 21 cases at 12→13 this way, and #1462 found 20 more that #900's sweep never reached.
+ * `qa/knowledge.md` § 8 owns the dated history. A case says what the serializer DOES (it stamps the
+ * current `SCENE_FORMAT_VERSION`) and cites § 8.
+ *
+ * ⚠️ **This is not the version-KEYED guard `qa/README.md` rejects (#1095).** That one would compare a
+ * case against today's number and need re-deriving at every bump. This one bans the number
+ * outright, so no bump can make it stale: it never reads the current version.
+ *
+ * Every pattern wants TWO digits, and that floor is what keeps them from flagging the wrong
+ * document. Scene formats passed 9 long ago and only go up, while a rig, a prefab and a `.meta.json`
+ * sidecar each carry a single-digit format (`"version": 2`, `rig format version 2`). PlayerPrefs,
+ * sync and OTA documents carry two-digit revision counters (`court.progress v17 → v18`), so the
+ * arrow pattern also needs a `scene`/`format` word right after it. The helper tests pin both sides.
+ * Still flagged by design, though no case says them: "committed at 12:30", "stamps 10 entities".
+ *
+ * ⚠️ The first cut matched only the four shapes the #1462 issue had grepped for, and passed four
+ * more stale cases phrased "committed at 13, and since `f84cfbd8b` the serializer stamps 14" (close-out
+ * review). The list is the phrasings the corpus actually used, plus the near variants the two
+ * close-out reviews wrote down ("committed at version 13", "scene is at version 13", "stamped 14").
+ */
+const SCENE_FORMAT_VERSION_LITERALS: ReadonlyArray<RegExp> = [
+  // "at format version 12", "at scene format\n**version 12**"
+  /\bformat\s+\**version\**\s*\d{2,}/gi,
+  // "a still-v12 fixture"
+  /\bstill[- ]v\d{2,}\b/gi,
+  // "bumped `SCENE_FORMAT_VERSION` to **13**", "`SCENE_FORMAT_VERSION` (13, …", "`SCENE_FORMAT_VERSION` 16"
+  /SCENE_FORMAT_VERSION`?\s*(?:\(|to\b|is\b|of\b|=)?\s*\**\d{2,}/g,
+  // a scene diff quoted in a fence: `-  "version": 12,`
+  /"version":\s*\d{2,}/g,
+  // "is committed at 13", "committed at v12", "committed at version 13"
+  /\bcommitted at\s+\**(?:v|version\s+)?\d{2,}\b/gi,
+  // "the serializer stamps 14", "(13, stamped 14 since …)"
+  /\bstamp(?:s|ed)\s+\**(?:v|version\s+)?\d{2,}\b/gi,
+  // "the v12 → v13 format-version migration", "version 12 → 13 scene bump"
+  /\b(?:v|version\s+)\d{2,}\s*(?:→|->)\s*v?\d{2,}\s+(?:scene|format)/gi,
+  // "the scene is v13", "its scene was at version 12"
+  /\bscene\s+(?:is|was)\s+(?:at\s+)?(?:v|version\s+)\d{2,}\b/gi,
+];
+
+function sceneFormatVersionLiterals(body: string): string[] {
+  return SCENE_FORMAT_VERSION_LITERALS.flatMap((re) => body.match(re) ?? []);
+}
+
+/**
  * Every `data-ui-id="…"` a case or doc cites.
  *
  * #723: the character class used to admit a SPACE and PARENTHESES. Without them,
@@ -1319,6 +1368,51 @@ function isIgnoredBuildOutput(path: string): boolean {
  * that is wrong is worse than no guard, because it reports "clean" either way.
  */
 describe('qa case guard helpers', () => {
+  describe('sceneFormatVersionLiterals (#1462)', () => {
+    // One per shape the corpus actually carried before #1462: each is a line that shipped.
+    it.each([
+      ["this project's scene is at format version 12, so the current one", 'format version 12'],
+      ['is at scene\nformat version 12, so', 'format version 12'],
+      ['normalized at scene format\n**version 12**, and', 'format\n**version 12'],
+      ['on a still-v12 fixture', 'still-v12'],
+      ['bumped `SCENE_FORMAT_VERSION` to **13**, which', 'SCENE_FORMAT_VERSION` to **13'],
+      ['below the current `SCENE_FORMAT_VERSION` (13, stamped', 'SCENE_FORMAT_VERSION` (13'],
+      ['```\n-  "version": 12,\n```', '"version": 12'],
+      // The four the first cut passed (close-out review): each shipped in a case.
+      ['`Station.scene.json` is committed at 13, and since', 'committed at 13'],
+      ['since `f84cfbd8b` (#1358) the serializer stamps 14, so', 'stamps 14'],
+      ['modified by the v12 → v13 format-version migration', 'v12 → v13 format'],
+      ['the version 12 -> 13 scene bump', 'version 12 -> 13 scene'],
+      ['the scene is v13 now', 'scene is v13'],
+      ['(committed at 13, stamped 14 since', 'committed at 13', 'stamped 14'],
+      ['the fixture is committed at version 13 today', 'committed at version 13'],
+      ['this scene is at version 13', 'scene is at version 13'],
+      ['the current `SCENE_FORMAT_VERSION` 16', 'SCENE_FORMAT_VERSION` 16'],
+    ])('flags %j', (text, ...literals) => {
+      expect(sceneFormatVersionLiterals(text)).toEqual(literals);
+    });
+
+    // The accept side: the rewritten wording, and the version numbers that are NOT scene formats.
+    it.each([
+      'a save stamps the current `SCENE_FORMAT_VERSION` over the committed one',
+      'must show exactly the two `"version"` lines',
+      '`court.progress` at v17 with their `lastSyncedVersion` matching the server',
+      'a device sat at v15 against a server at v16',
+      'qa/cases/assets/skin-add-part-migrates-v1-rig-on-save.md',
+      'the next `SCENE_FORMAT_VERSION` bump',
+      // Single-digit formats of OTHER documents: the two-digit floor is what spares these.
+      'the rig file\'s `"version": 1` becomes `"version": 2`',
+      'a rig format version 2 file',
+      'the sidecar .meta.json carries `"version": 2`',
+      '`PREFAB_FORMAT_VERSION` is 5',
+      // Two-digit revision counters: no `scene`/`format` word follows the arrow.
+      '`court.progress` went v17 → v18 after the sync',
+      'the device moved from iOS version 16 → 17 overnight',
+    ])('does not flag %j', (text) => {
+      expect(sceneFormatVersionLiterals(text)).toEqual([]);
+    });
+  });
+
   describe('codeTokens', () => {
     it('splits an inline span on whitespace so "script arg" citations are BOTH checked', () => {
       // The regression: this returned one token containing a space, which the caller's
@@ -2937,6 +3031,21 @@ describeCases('QA case references', () => {
       fix: 'derive the port (bare `launch-editor.sh`, or `node engine/scripts/editorPorts.mjs backend .`), '
         + 'or ledger it in CLONE_PORT_ALLOWED — per literal, with a reason that argues for each one.',
     });
+  });
+
+  it('no case names a scene format version — both numbers move on their own (#1462)', () => {
+    // Reach: the cases that talk about the scene's `version` line are the population this guards,
+    // and this floor proves only that the population is still THERE (measured 2026-09-23: 41
+    // cases). It says nothing about whether the detector works; the helper tests above carry that.
+    const reach = cases.filter((c) => /`"?version"?` lines?/.test(c.body)).length;
+    expect(reach).toBeGreaterThanOrEqual(35);
+    const sites = cases.flatMap((c) => sceneFormatVersionLiterals(c.body).map((lit) => `${c.rel} — "${lit}"`));
+    expect(
+      sites,
+      'Say what the serializer does instead: a save stamps the current `SCENE_FORMAT_VERSION` over '
+        + 'the committed one (`qa/knowledge.md` § 8). The fixture\'s number and the engine\'s both '
+        + 'move on their own, so any copy goes stale (#900, #1462).',
+    ).toEqual([]);
   });
 
   /**
