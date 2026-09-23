@@ -69,6 +69,20 @@ const midDoc = (rowExtra: Record<string, unknown> = {}) => ({ id: MID, version: 
 const outerDoc = (midRow: Record<string, unknown> = {}) => ({ id: OUTER, version: 3, name: 'Outer', rootLocalId: 1, entities: [
   row(1, 'OuterRoot', 0), row(2, 'Panel', 1), row(3, 'MidRoot', 2, { prefab: MID, ...midRow }),
 ] });
+/** The written bytes with every minted node identity blanked (#1468).
+ *
+ *  Both call sites below compare two serializations byte-for-byte to prove a TOKEN or a template KEY
+ *  round-trips unchanged. `nodeGuid` is minted fresh on every serialize that has no correspondence to
+ *  carry — which a bare `serializePrefab` over an edit world has, by design, since only
+ *  `savePrefabEditReport` holds the baseline document that knows which row each live entity is. So
+ *  the guid differing between two calls is the mechanism working, not a regression, and blanking it
+ *  keeps these assertions pointed at what they were written to guard.
+ *
+ *  ⚠️ It is NOT a licence to ignore identity: that node guids survive a real prefab-edit save is
+ *  asserted directly in `prefabNodeIdentity.test.ts`, against the save path these tests bypass. */
+const bytesIgnoringNodeGuids = (doc: unknown): string =>
+  JSON.stringify(doc).replace(/"nodeGuid":"[^"]*"/g, '"nodeGuid":"<minted>"');
+
 const install = <T extends { id?: string }>(doc: T) => { prefabs.set(doc.id!, doc); setPrefabCache(doc.id!, doc as never); };
 
 async function load(scene: SceneData): Promise<void> {
@@ -191,7 +205,7 @@ describe('a template write stores the key, never the live guid (#1387)', () => {
     expect((node.traits.EntityAttributes as Record<string, unknown>).guid).toBeUndefined();
     expect(JSON.stringify(saved)).not.toContain(DURABLE);
     // Mutation: drop `setTemplateKey` in `addedNodeIdentity` — the second save mints a new key.
-    expect(JSON.stringify(serializePrefab(root, OUTER))).toBe(JSON.stringify(saved));
+    expect(bytesIgnoringNodeGuids(serializePrefab(root, OUTER))).toBe(bytesIgnoringNodeGuids(saved));
 
     // The written file: two instances, two guids; and re-opening it re-saves the SAME key, read back
     // off the marker the loader stamped. Mutation: drop the `TemplateAddedKey` push in `spawnNode`.
@@ -199,7 +213,7 @@ describe('a template write stores the key, never the live guid (#1387)', () => {
     await load(twoInstances(OUTER, 'OuterRoot'));
     expectDistinct('Extra');
     const reopened = await openInEditor(saved);
-    expect(JSON.stringify(serializePrefab(reopened, OUTER))).toBe(JSON.stringify(saved));
+    expect(bytesIgnoringNodeGuids(serializePrefab(reopened, OUTER))).toBe(bytesIgnoringNodeGuids(saved));
   });
 
   // Promotion turns a SCENE capture into a prefab row. Mutation: pass `node.added` /
@@ -356,7 +370,7 @@ describe('a ref between a prefab\'s own members follows each instance (#1352)', 
     const file = serializePrefab(entity('Panel', undefined).id, PANEL_PREFAB)!;
     const root = await openInEditor(file);
     expect(targetOf(root)).toBe(entity('Child', undefined).guid);
-    expect(JSON.stringify(serializePrefab(root, PANEL_PREFAB))).toBe(JSON.stringify(file));
+    expect(bytesIgnoringNodeGuids(serializePrefab(root, PANEL_PREFAB))).toBe(bytesIgnoringNodeGuids(file));
   });
 
   // Apply to Prefab of a retargeted binding writes the token, not the live guid. Mutation: drop

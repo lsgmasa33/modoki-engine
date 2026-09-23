@@ -50,6 +50,7 @@ import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash, remintSceneEntityGuids, planMemberPathRepair, type RepairFile } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
+import { classifyPrefabWrite } from '../prefabWriteGuard';
 
 /** A validate route's file, parsed — or the parse failure as a WARNING (#1212 A-4).
  *  A file that does not parse is the most important thing a validator can report, and it used to
@@ -4494,6 +4495,22 @@ async function describeUnresolvedAgainstLiveWorld(
       // of doing its own read-then-write with a gap a second write can land in between. Absent
       // `ifMatch` ⇒ unconditional write, exactly as before. See `ifMatchRefusal` for why NOTHING
       // may `await` between here and the write below.
+      // ── The PREFAB FORMAT GATE (#1468 D4, owner ruling: refuse to SAVE, never to load). ──
+      // ⚠️ BEFORE `ifMatchRefusal`, never between it and the write: this READS the file, and the
+      // CAS window below must stay free of anything else. Same placement, and the same reason, as
+      // the sidecar gate at `/api/write-meta`.
+      // Keyed on the path suffix because this route is byte-opaque by design. That is not a wart
+      // here: a census of every path a `.prefab.json` can reach disk found 17 writers, 8 of which
+      // reach this route and only 4 of which go through the editor's own `writePrefabFile` — so
+      // this is where the client half stops being bypassable. See `prefabWriteGuard.ts`.
+      const prefabRefusal = classifyPrefabWrite(absPath);
+      if (prefabRefusal) {
+        console.error(`[Prefab] ${prefabRefusal.message}`);
+        return json({
+          ok: false, conflict: true, reason: 'prefab-format-too-new',
+          stored: prefabRefusal.stored, current: prefabRefusal.current, error: prefabRefusal.message,
+        }, 409);
+      }
       const refusal = ifMatchRefusal(absPath, ifMatch);
       if (refusal) return json(refusal, 409);
       // `ifNoneMatch: '*'` is the CREATE-only twin of `ifMatch` (#1215 A-1): refuse when anything

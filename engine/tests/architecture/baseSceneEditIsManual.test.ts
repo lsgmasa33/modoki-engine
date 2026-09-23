@@ -115,7 +115,11 @@ describe('the base-scene flush runs LAST, and that rule is DATA (#831, #972)', (
     const code = readScannedSource(path.join(SRC, 'scene/saveCommand.ts')).code;
     const branch = code.slice(code.indexOf('if (isEditingPrefab())'));
     const before = found(branch.indexOf("await flushParked('before-scene')"), "the prefab-edit branch's before-scene flush");
-    const prefabSave = found(branch.indexOf('await savePrefabEdit()'), "the prefab-edit branch's savePrefabEdit call");
+    // ⚠️ EITHER spelling (#1468). The branch calls `savePrefabEditReport()` now — the boolean wrapper
+    // cannot carry the format gate's refusal REASON out to the toast — and an exact match on the old
+    // name made `found()` fire, which is this guard working: the ordering rule below is unchanged,
+    // but its subject moved. Matching both means a later flip back does not silently break it either.
+    const prefabSave = found(branch.search(/await savePrefabEdit(?:Report)?\(\)/), "the prefab-edit branch's savePrefabEdit call");
     const after = found(branch.indexOf("await flushParked('after-scene')"), "the prefab-edit branch's after-scene flush "
       + '(without it Cmd+S there leaves the edit pending and says nothing)');
     expect(before).toBeLessThan(prefabSave);

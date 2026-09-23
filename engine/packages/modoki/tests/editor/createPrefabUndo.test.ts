@@ -47,7 +47,7 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   preloadNestedPrefabsForSubtree: async () => {},
   // The real guard, reduced to its direct case: the child IS the parent.
   wouldCreateCycle: (parent: string, child: string) => parent === child,
-  resolveExistingDocumentId: async () => OLD_ID,
+  classifyExistingDocumentId: async () => ({ kind: 'known', id: OLD_ID }),
   setPrefabCache: (...a: unknown[]) => setPrefabCacheSpy(...a),
   tagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return new Map([['g-old', 'g-derived']]); },
   // #1461: the tag stamps the members with the guid the reload derives, and undo reverses it. Recorded
@@ -288,7 +288,7 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     onDisk.set(PATH, OLD_TEXT);
     const err = spyError();
     const prefabMod = await import('../../src/editor/scene/prefab');
-    const spy = vi.spyOn(prefabMod, 'resolveExistingDocumentId').mockResolvedValue('g-child');
+    const spy = vi.spyOn(prefabMod, 'classifyExistingDocumentId').mockResolvedValue({ kind: 'known', id: 'g-child' });
     try {
       const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
       expect(res).toBeNull();

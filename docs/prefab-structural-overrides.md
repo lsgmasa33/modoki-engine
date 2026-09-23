@@ -248,11 +248,12 @@ same key set without a dialog to render into) gains two node kinds beside the fi
   prefab base — affects all instances)*, so the destructive semantics are
   explicit.
 
-Selection keys extend beyond `"localId.trait.field"`:
+Selection keys extend beyond `"<member>.trait.field"` — `<member>` being the member's `nodeGuid`, or
+its `localId` for a pre-v5 template (#1468 Phase 4, § Member identity below):
 
 - `"+added.<guid>"` — push this added subtree into the prefab base.
-- `"-removed.<localId>"` — delete this entity from the prefab base.
-- `"-trait.<localId>.<traitName>"` — delete this component from the prefab base
+- `"-removed.<member>"` — delete this entity from the prefab base.
+- `"-trait.<member>.<traitName>"` — delete this component from the prefab base
   (rendered as a *removed: TraitName* row under the member's node).
 
 ### Write (`applyToPrefabSelective`)
@@ -553,12 +554,185 @@ instance, a member is unpacked, while an owned nested instance stays an instance
 (#1447). The rule for that case is in docs/scene-loading.md § the #1355 note. `reparentEntity` decides
 by `outermostInstanceRoot`, before the parent write (`planMoveUnlinks`, #1445).
 
+## Member identity is STORED, not derived (scene v16, #1468)
+
+**A prefab instance's entry carries a `members` map: the member's minted identity → the guid it has.**
+Before v16 a member's guid was only ever *derived* from where the member sat, so any structural change
+to the template silently re-pointed or dropped every stored reference to it — and a freed `localId` is
+REUSED, so a stale key could name a *different* member rather than nothing at all. Derivation is now
+the FALLBACK, for a member no row names.
+
+| | |
+|---|---|
+| the row | `SceneMemberRow` (`runtime/loaders/loadSceneFile.ts`) — `guid`, `name`, `parent` (a move, below), and the member's EDITS: `traits`, `removedTraits`, `removed`, `added` (Phase 4, below) |
+| the key | a `/`-joined chain of minted node guids, ONE per instance FRAME, flat within a frame |
+| who decides the key | `memberRowKeysIn` (`runtime/core/ecs/memberRows.ts`) — one spelling, used by the save AND the load |
+| the writer | `captureInstanceMembers` (`editor/scene/prefab.ts`) for identity; `moveChannelsOntoRows` for the edits — on the entry and on a reference node |
+| the reader | `applyStoredMemberRows` (the guids), before `deriveInstanceMemberGuids`; `applyStructureCore` queues the moves; `foldMemberRowChannels` (`runtime/loaders/prefabOverrides.ts`) folds the edits in |
+
+**The frame chain follows IDENTITY, not the ECS tree.** A member's frame is the instance it BELONGS to
+(`PrefabInstance.rootInstanceId`; for an owned nested root, the instance of its *identity* parent),
+wherever it has been dragged to. Reading it off the ECS parent chain breaks the flat key in both
+directions: a member moved beside its frame gets re-keyed and loses its stored guid, and a member of
+ANOTHER instance sitting in this subtree gets keyed as one of ours — the state that could not be
+written down under path-addressing and can under identity-addressing.
+
+**A row exists only where the TEMPLATE minted a `nodeGuid`** (prefab v5). A member of a pre-v5 template
+gets none and derives as it always did. Keying such a row by `localId` instead looks like graceful
+degradation and is the opposite: the prefab's first re-save mints guids for every row, so every
+localId-keyed row in every scene would orphan at once. Two consequences worth knowing:
+
+- **the repo's prefab corpus IS v5** — migrated once by `engine/scripts/migrate-prefabs-v5.mjs`
+  (line surgery, so the ten hand-written files keep their layout) and pinned by
+  `engine/tests/architecture/prefabCorpusNodeGuids.test.ts` on the guid, not the version number. So
+  every scene gains rows on its first save under this build. A pre-v5 template — every prefab the
+  released editor wrote, so every project outside this repo until its prefabs are re-saved — still has
+  none, and a move inside such an instance is written to the legacy `moved` map instead (below);
+- **`stampDerivedMemberGuids` could not be retired** (#1468 tried): it still closes #1461's window for
+  the members rows do not cover. Both it and `promoteOwnedRoots` now SKIP a keyed member, because the
+  window they close is "the reload will derive a different guid" and a row means it will not.
+
+**What happens when identity breaks.** A row naming a node the template no longer declares is kept and
+logged once, by name — never silently dropped (R2). It is asked of the DOCUMENT, so a member the
+instance merely REMOVED keeps its row silently, and a template that could not be READ produces no
+claim either way. A pinned guid that collides with one another member derives loses the pin, loudly,
+and derives instead — the derived set is internally collision-free, so a collision can only ever be a
+pin meeting a derivation.
+
+### A move is stored on the member's row (Phase 3)
+
+**`SceneMemberRow.parent` is the guid of the parent a member was moved to — a DIFF against its own
+frame's template, not "the live parent, always".** A template that re-parents a member must move it in
+every instance that has not moved it itself (R4), and an unconditional `parent` would pin it at the old
+place for ever. `memberRowParents` computes the diff from the DOCUMENT; a row parent that is gone
+(removed or unpacked) counts as moved, and a template that cannot be read makes no claim. The Transform
+mark-gate in `captureInstanceOverrides` asks the same function, so the gate and the save cannot disagree.
+
+- **The scene-format `moved` map is LEGACY, not gone** (`SceneEntityEntry`, `AddedEntity`,
+  `NestedStructureDelta`). It is WRITTEN only for the moves no row can carry — a member of a pre-v5
+  template, or one with no durable guid (`InstanceStructure.unrowed`) — and READ always, because a file
+  from before Phase 3 has its moves nowhere else. A row wins where both move one member, and a keyed
+  member's move is never duplicated into the map, so a v5 instance's file migrates on its first save. `nestedStructure[path].moved` collapsed onto the rows
+  (`descendMemberRows` drops one leading key component per frame).
+- **`InstanceStructureData.moved` survives as an INTERNAL transport** — the editor's *"moves that still
+  apply"*, reduced by a Revert, which the carried rows cannot answer. A rebuild therefore carries
+  identity but NOT `parent`: re-asserting the carried rows put a reverted move straight back.
+- **Promotion keeps a keyed member's guid** (R7), and an unpack undone after a rebuild RELINKS — both
+  follow from identity no longer changing under a member.
+- **`PrefabInstance.homeParent`/`homeSteps` outlived Phase 3 and went in Phase 6.** Stored rows retired
+  only their derivation role; the other two (which instance owns a moved owned nested root, and the
+  template position prefab FILES name members by) now come from the document and an owner link — see
+  "Identity does not move" below.
+
+### A member's edits are stored on its row (Phase 4)
+
+**A member's overrides, removed traits, its own removal and the subtrees added under it are written on
+its ROW, addressed by minted identity — so they survive a template that renumbers its localIds.** Before
+Phase 4 they were keyed by `localId`, a position in the template: a re-save that renumbered (re-import,
+Replace, the Skin Editor's update, a deleted-then-added sibling — the plan's § 3.4 lists five paths)
+handed every edit to whichever member inherited the number, with nothing to say it had happened.
+
+- **One rule, at every seam: a localId means something only together with the document it was read
+  from.** The editor's in-memory maps stay localId-keyed — within one document that is a perfectly good
+  address, and the capture functions also write prefab TEMPLATES, whose format is frozen. What changed
+  is every place a localId used to cross from one document to another: the scene file (rows), a rebuild
+  handed a different `baseline` (`localIdTranslation` in `rebuildInstance`), and the Apply/Revert keys
+  (below).
+- **The loader translates, the writer moves.** `foldMemberRowChannels` turns a frame's direct rows into
+  that frame's localIds against its CURRENT document and folds them over the legacy channels before
+  anything is applied; `moveChannelsOntoRows` moves off the captured channels everything a row can key.
+- **Per member, per channel, a row field that is PRESENT replaces the lower layer's value.** `traits`
+  merges field by field; `removed: false`, `removedTraits: []` and `added: []` are real statements —
+  they are how a scene un-does, member by member, what an outer PREFAB layer did inside a nested frame,
+  which the legacy `nestedStructure[path]` could only say by restating the frame's whole list.
+- **An owned nested root's row is FORWARDED into its expansion** as that frame's `rootRow`: its
+  interior edits must merge under the nested expansion's own lower layer. Only `removed` (deleting the
+  whole instance) stays in the frame above.
+- **A removed member's row has no `guid`** — it is not live. R2 already leaves it alone: its node is
+  still in the template.
+- **The localId channels are LEGACY, not gone** — the same shape as `moved` in Phase 3. Always read,
+  and written for what no row can key: the instance ROOT's own edits (it has no row; it IS the entry),
+  a pre-v5 template's members (every prefab the released editor wrote), and a member with no durable
+  guid. A nested frame's STRUCTURE moves all-or-nothing: the legacy slot is a replace statement, and
+  half of it on rows would be one statement in two places.
+- **Rows are written only in the scene FILE form** (`StructureCaptureOpts.rows`, set by
+  `serializeScene` alone). Every other capture — a rebuild, Apply, Revert — is an in-memory transport
+  whose reference-node spawn reads the localId channels against the same document.
+- **Every reader of a scene's channels reads the rows too** — the resource preload, the save-time path
+  guard, the build's tree-shaker, a duplicate's guid remint, validation, the member-path walk, and the
+  loader's collection of a reference node's rows (a node hanging under a member now rides on that
+  member's row). Missing one drops an asset from the build or a guid from a reload with nothing
+  erroring.
+- **Residual:** a nested instance inside a PREFAB FILE keeps localId keys — the prefab format is frozen
+  and a reference row has no `members`. A renumber of that inner prefab still misplaces those edits.
+- **Residual, pre-existing (#1483):** a live instance expanded from an OLDER document than the editor's
+  cache (a kept base carried across a prefab reload, a deferred reload) is captured against the wrong
+  rows. Keys deliberately come from the cached document so they agree with that capture — a key naming
+  the member by its own identity was tried and made Revert move an edit onto another member.
+
+**Apply/Revert keys name a member by `nodeGuid`** (`editor/scene/overrideKeyGrammar.ts`): keys are the
+one editor address that crosses CALLS — an agent lists them with `modoki_prefab overrides` and acts on
+them later — so a template change in between used to redirect a key silently. The member part is the
+`nodeGuid`, or the `localId` for a pre-v5 template. Both spellings are accepted everywhere: Apply and
+Revert turn what they are handed into the localId form against the document in hand, a key naming a
+member the document no longer has names nothing (never a guess at who holds its number now) — Apply
+reports it as skipped, in the caller's own spelling like every skipped key; Revert drops it, and the
+agent op refuses it before either runs. `canonicalOverrideKey` makes two spellings of one key compare equal, which is
+what the agent op validates with.
+
+Full design, the eight reconciliation rules and the measurements:
+`docs/plans/prefab-member-identity-plan.md`. Tests: `engine/tests/editor/sceneMemberRows.test.ts`
+(the round trip and R1-R8), `sceneMemberRowGestures.test.ts` (the gestures),
+`engine/tests/framework/memberRowKeys.test.ts` (which members are keyed, and which are not);
+Phase 4's `sceneMemberRowChannels.test.ts` (the loader), `sceneMemberRowWriter.test.ts` (the writer, the
+rebuild translation and the keys, every case against a RENUMBERED template) and
+`sceneMemberRowReaders.test.ts` (the readers).
+
 **Identity does not move.** A member's guid is derived from its row PATH (`deriveMemberGuid(anchor,
-path)`), so a moved member must keep deriving from where it was. `PrefabInstance.homeParent` holds the
-guid of the row parent it left, and `homeSteps` the steps through homes that were since deleted or
-unpacked (`runtime/core/ecs/memberHome.ts`). Every identity walk — `deriveInstanceMemberGuids`,
-`memberPathIndex`, `planCopyGuids`, `baseTokenResolver`, the template tokenizer — steps from the home
-(`identityParentId`, `homeStepsOf`). Moved back to its row parent, the stamp is cleared.
+path)`), so a moved member must keep deriving from where it was, and the member paths prefab files name
+members by must not change either. Every identity walk — `deriveInstanceMemberGuids`, `memberPathIndex`,
+`planCopyGuids`, `baseTokenResolver`, the template tokenizer, the structure capture, `planMoveUnlinks` —
+asks one resolver where an entity's walk steps from (`runtime/core/ecs/identityParents.ts`, #1468 Phase
+6). The resolver reads the answer from the DOCUMENT the frame was expanded from: it takes the member's row
+and climbs its `parentId`s to the first row with a live member in the same frame. Each row on the way that
+is gone (deleted, or unpacked so it is no longer a member) adds its localId as a step, because a reload
+expands the removed row until the member is derived through it. An ORPHAN row (parent 0, or naming no row)
+ends where the loader hangs one. That is the stored root's own parent, or nothing for a nested frame.
+
+- **Which document.** The loader records, per world, the document each frame ROOT was expanded from
+  (keyed by the packed entity, #868), plus each source's latest. The editor records its own expansions
+  and Create Prefab's tag, and registers its prefab cache as a fallback. Under that is the runtime
+  prefab cache, which the loader registers, so a device still reads a document for a frame whose root
+  record a flat respawn lost. The root record comes first because Apply to Prefab rebuilds a source's
+  instances one at a time. Until an instance's turn, its live tree still follows the OLD document. A
+  first cut that read the source's latest there made that instance's unmoved members read as moved.
+  Records of dead roots are swept each time the map doubles, since every runtime spawn adds one.
+- **A save builds the resolver ONCE** (`openIdentityScope` in `serializeScene`). It reuses it for as long
+  as the structure version stands still. Built per instance and per capture step instead, it cost a
+  3000-entity save 30%.
+- **A document that does not expand the row is not walked.** An owned root walks its owner's document only
+  from the row that expanded it. A dropped or renumbered row names some other member at that number,
+  and walking it gave the root that member's guid. Such a root keeps its live parent.
+- **The owner of an owned nested root** is the one fact the document cannot give. Two instances of one
+  prefab inside one outermost instance share every row and every document. So a moved owned root
+  carries `PrefabInstance.ownerGuid`, the guid of the frame whose row expanded it. It is written
+  (`linkOwnerBeforeMove`) where a move happens, while the root still hangs at its row. The resolver
+  trusts it unless the owner's document contradicts it. An unmoved one needs none; its owner is read
+  from where it hangs. A MEMBER parent is in one frame. A nested ROOT parent offers two: its own
+  frame, when the row hangs under that document's root, and its owner, when the row hangs under that
+  nested row. That second shape is a nested row under a nested row, which the prefab-edit save writes.
+  The document picks between them, and where both sides are minted the row must be the one that
+  expanded it (`parentNodeGuid`). Promotion and tagging clear the link. ⚠️ If the inner prefab ALSO
+  nests the same prefab at the same row number under its own root, the two nested roots derive one
+  guid. Path-derived identity cannot tell them apart, and only stored rows can.
+- Until Phase 6 all of this was REMEMBERED on the member at move time, in `PrefabInstance.homeParent`
+  (the row parent it left) and `homeSteps` (steps through homes since deleted). `rehomeDependents`
+  re-pointed a home whenever it died. The home was always the template parent, so every walk gets the
+  answer it got before, now from a source that cannot go stale behind it. There is one deliberate
+  difference. A member whose template parent is a nested row that was DELETED used to keep the dead
+  root's guid as its home, so it fell back to its live parent. It now steps past that row, which is what
+  a reload derives. Since scene v16 a keyed member's guid is STORED on its row anyway, so only a member
+  no row covers can see the difference.
 
 **A created instance's members are stamped at tag time (#1461).** `moved`'s value is a member's live
 guid, and so is a ref into a member — both are written on the assumption that a member's live guid is
@@ -571,7 +745,7 @@ with the loader warning `moved member "X": its parent <guid> is gone`; a ref INT
 NESTED instance's members failed the same way, unreported. The load-time pass cannot repair it, because
 it fills EMPTY guids only.
 
-So the tag now ends by giving every member the guid the reload will derive
+So the tag ends by giving every member the guid the reload will derive
 (`stampDerivedMemberGuids`, `runtime/core/ecs/memberHome.ts`) and carrying every ref onto it through
 `applyGuidRemap` — `promoteOwnedRoots` (#1447) run in the other direction, sharing its walk, its
 stored-root skip and its inverse. The ANCHOR keeps its guid (and must be durable: deriving from a
@@ -580,12 +754,14 @@ runtime guid, #1210, would bake identities the next reload cannot reproduce, so 
 anchor its own members derive from, and they are below this walk's floor. The tag returns the rename;
 `unstampMemberGuids` reverses it for Create Prefab's undo.
 
-⚠️ **Tagging CLEARS `homeParent`/`homeSteps`**, and that is part of the fix rather than housekeeping.
-`applyTag` names every field of `PrefabInstance` because koota's setter is a partial merge, and #1437
-added those two after that rule was written. A tag captures the tree AS IT STANDS — every member is at
-its row in the NEW prefab — so a member that had been moved under the previous one must not keep
-pointing at the old row parent. Left stale, the stamp derives it from a path the reload does not walk
-and repoints every ref onto a guid nothing will mint (close-out review F1).
+⚠️ **Tagging records the NEW document at the root, and clears `ownerGuid`.** That is part of the fix
+rather than housekeeping. A tag captures the tree AS IT STANDS, with every member at its row in the NEW
+prefab, so a member that had been moved under the previous prefab must be read against the new document
+and not the old one. Left stale, the stamp derives it from a path the reload does not walk and repoints
+every ref onto a guid nothing will mint (close-out review F1). Until Phase 6 it was a stale
+`homeParent`: `applyTag` names every field of `PrefabInstance` because koota's setter is a partial
+merge. Now it would be a stale document, so a frame root's record answers only for the source it was
+recorded under.
 
 ⚠️ **The rename is not a new identity change** — the reload performed it already, silently and with no
 ref repair at all. This makes it eager and repaired. **`+added.<guid>` is NOT affected** (measured, and
@@ -595,6 +771,12 @@ already changed at every reload before this, and repairing them needs `planMembe
 does. Tests: `engine/tests/editor/createPrefabMemberIdentity.test.ts` (the round trips),
 `stampDerivedMemberGuids.test.ts` (the walk's floor and ceiling),
 `agentPrefabCreateUndo.test.ts` (undo, and the #1272 premise this fix removed).
+
+⚠️ **Scene v16 narrowed all of this to the members it still applies to** — see § *Member identity is
+STORED, not derived* above. Where the template minted identity, the save states each member's guid and
+the load pins it, so the stamp skips those members and nothing is re-identified at all: a created
+instance's members keep the guids they had as plain entities, and every ref keeps naming them. What
+remains is a member of a PRE-v5 template, for which the window is exactly as described here.
 
 **Save and load.** The save writes `moved: {rowLocalId: newParentGuid}` on the instance's entry, in a
 `nestedStructure` slot, or on a reference node (scene v15, which a v14 reader refuses). The loader
@@ -690,7 +872,7 @@ row round-trips through save + reload.
 | Create / drag a plain entity under an outer member | plain, an `added` node | becomes an Outer member | — |
 | Create / drag a plain entity under a nested member | plain, in `nestedStructure` | nothing to apply | becomes an **Inner** member (every Inner) |
 | Drag an outer member out of the instance | unpacked; the instance records it `removed` | removed from Outer | — |
-| Drag a member to another parent inside the instance | stays linked, a `moved` entry | re-parents the row | — |
+| Drag a member to another parent inside the instance | stays linked, its row records `parent` | re-parents the row | — |
 | Drop a user-added instance's root under its own member | that member is unpacked (#1450); the instance stays linked under it | — | — |
 | Drag a nested member into the outer instance | stays linked | Outer records the move (`moved` map) | refused, pointing outward |
 | Drag an outer member into the nested instance | stays linked | Outer records the move | — |
@@ -741,13 +923,14 @@ that has no unwritable owned root on its chain, so an owner is still settled bef
 plain shallowest pick promoted an `Inner` ahead of its `Mid`.) Promotions and unpacks only ever grow, so the
 loop ends.
 
-A third way to be unwritable (close-out review 3): the entity's identity parent is being unpacked, and the
-entity has no recorded home. A LIVE child of an unpacked member has no identity walk left, because
-`rehomeDependents` only re-points a recorded `homeParent`. Take a move inside the instance, which changes no
-outermost instance: an owned root under the unpacked member used to reload as a stored root under new guids,
-and a member there reloaded as a plain entity while the editor still showed it linked.
+A third way to be unwritable (close-out review 3): the entity's live parent is being unpacked, and the
+entity has not moved (it sits at its row). Take a move inside the instance, which changes no outermost
+instance: an owned root under the unpacked member used to reload as a stored root under new guids, and a
+member there reloaded as a plain entity while the editor still showed it linked. (Until Phase 6 this read
+"has no recorded home". "Not moved" is the same set, now read from the document.)
 
-**The loader applies moves against the tree they describe** (#1452). The `moved` entries describe the tree
+**The loader applies moves against the tree they describe** (#1452). The recorded moves (row `parent`s, and a
+prefab's own `moved`) describe the tree
 after all of them, so a member moved under a member that was its row descendant (Button up to the root, then
 Panel under Button) passes through a cycle that exists only halfway. `drainAfterDerive` lets a move whose
 target still sits inside the member wait until the others land. Only a move that is still waiting once
@@ -756,21 +939,21 @@ move was refused and it reloaded at its row. The drain mixes the prefab's own mo
 the same shape can be split across the two: Button's move is the prefab's and Panel's is the instance's. The
 wait covers that case as well.
 
-**Ending a moved member's frame promotes or unlinks it, never re-homes it past the owner (#1451, #1453).** A delete
-re-points a surviving member whose home goes to that home's own identity parent (`rehomeDependents`). That walk
-stops at any instance ROOT, stored or owned: a home is a member of the dependent's own frame, so a root home is
-the frame's root, and the frame dies with it. `detachOrphanedMembers` then promotes an owned nested root to a
-stored one, renaming its members to the guids a reload derives (the #1447 contract), and unlinks anything else.
-It promotes when the root's OWNER dies, meaning the frame of its identity parent, and not only when its home dies. A
-nested root that rode out inside a moved member of its owner has no home, and keying on the home left it linked to
-a dead frame; its members then re-derived new guids on reload and a ref to one dangled.
+**Ending a moved member's frame promotes or unlinks it, never re-homes it past the owner (#1451, #1453).** A
+surviving member whose template parent is deleted needs nothing: the resolver steps past the gone row. (Until
+Phase 6, `rehomeDependents` re-pointed its home.) The climb never passes the FRAME root, and that frame dies
+with it. `detachOrphanedMembers` then promotes an owned nested root to a stored one, renaming its members to the
+guids a reload derives (the #1447 contract), and unlinks anything else. It promotes when the root's OWNER dies:
+its owner link when it was moved, else its live parent's frame. A nested root that rode out inside a moved
+member of its owner was never moved itself. Keying on a home left it linked to a dead frame, so its members
+re-derived new guids on reload and a ref to one dangled.
 
 A frame also ends WITHOUT a delete, when a Detach Prefab or an unpack-on-leave strips `PrefabInstance` off it, and
-the same two steps apply. Every frame-ending path calls them together as **`endFrames(gone)`** (`memberHome.ts`),
-before the strip, because the owner walk reads the links being stripped. The callers are `deleteEntities`,
-`detachPrefabInstance` and `reparentEntity`'s `applyDetach`. Detach and unpack used to run only
-`rehomeDependents`, so a member moved OUT of the detached subtree kept its link to a frame that no longer
-existed. The save wrote it nowhere, and it vanished on reload (#1453). There were two shapes. One was a nested
+the same step applies. Every frame-ending path calls it as **`endFrames(gone)`** (`memberHome.ts`), before the
+strip, because the owner walk reads the links being stripped. The callers are `deleteEntities`,
+`detachPrefabInstance` and `reparentEntity`'s `applyDetach`. Detach and unpack used to run only the re-homing
+half (`rehomeDependents`, deleted in Phase 6), so a member moved OUT of the detached subtree kept its link to a
+frame that no longer existed. The save wrote it nowhere, and it vanished on reload (#1453). There were two shapes. One was a nested
 root moved beside its detached owner, left owned by a plain entity. The other was a plain member moved beside it,
 left linked to a plain root. Now Detach Prefab turns the first into a standalone instance, which is the #1447 rule,
 and unlinks the second where it stands. The unpack-on-leave runs `endFrames` too, so that every frame-ending

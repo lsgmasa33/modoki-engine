@@ -12,7 +12,7 @@ import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { spawnEntitySubtree, type SubtreeSpec } from '../undo/entityActions';
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
-import { serializePrefab, setPrefabCache, type PrefabFile } from './prefab';
+import { serializePrefab, setPrefabCache, classifyExistingPrefabId, type PrefabFile } from './prefab';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { writeAssetFile, deleteAssetFile } from '../panels/assetOps';
 import { jsonFileBody } from '../backend/editorBackend';
@@ -62,9 +62,17 @@ export async function makeRigPrefabAsset(
   const bones = coerceRigBones(rigDef.bones);
   if (!bones.length) { console.warn('[skinPrefab] rig has no bones to prefab'); return null; }
 
-  // Reuse the existing prefab's IDENTITY so placed instances stay linked (update in
-  // place). Only mint a fresh GUID when there's no prefab at this path yet.
-  const existingId = getGuidForPath(savePath) || undefined;
+  // Reuse the existing prefab's IDENTITY so placed instances stay linked (update in place). Only
+  // mint a fresh GUID when there's no prefab at this path yet.
+  //
+  // ⚠️ This asked the MANIFEST only (`getGuidForPath`) until #1468. A prefab the scanner has not
+  // indexed yet is on disk with an id this build never saw, so the update minted a fresh guid over
+  // it and unlinked every placed instance — the on-disk fallback exists precisely for that case.
+  // Going through the shared classifier also means an unreadable file (a 500, corrupt bytes, one a
+  // newer build wrote) stops the update instead of being treated as a free path.
+  const existing = await classifyExistingPrefabId(savePath);
+  if (existing.kind === 'refuse') { console.error(`[skinPrefab] not updating ${savePath} — ${existing.reason}`); return null; }
+  const existingId = existing.kind === 'known' ? existing.id : undefined;
   // Snapshot the current on-disk content so undo RESTORES the prior prefab (an update
   // must not delete a prefab that predated it). Absent ⇒ this was a fresh create.
   let prevContent: string | null = null;

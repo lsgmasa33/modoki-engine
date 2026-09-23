@@ -447,8 +447,11 @@ const DECLS: Record<string, Decl> = {
       + "'overrides' is READ-only discovery — it walks the SAME override-key enumeration "
       + "'apply'/'revert' consume (collectInstanceOverrideKeys) and hands back the exact key "
       + "strings, so an agent can pick `keys` without guessing the "
-      + '`"localId.trait.field"` / `"+added.<guid>"` / `"-removed.<localId>"` / '
-      + '`"-trait.<localId>.<name>"` shapes. `apply`/`revert` act on ALL current overrides when '
+      + '`"<member>.trait.field"` / `"+added.<guid>"` / `"-removed.<member>"` / '
+      + '`"-trait.<member>.<name>"` / `"~moved.<member>"` shapes, where `<member>` is the prefab '
+      + "member's minted nodeGuid (its localId only when the prefab predates format 5), so a key "
+      + 'listed before a template re-save still names the same member after it; a localId-spelled '
+      + 'key is still accepted. `apply`/`revert` act on ALL current overrides when '
       + '`keys` is omitted, and throw (never a silent ok:true) if ANY given key matches no '
       + 'override — a partial apply/revert would read as a success. An EXPLICIT empty `keys` '
       + 'array is refused rather than treated as omitted: a caller-side filter that matched '

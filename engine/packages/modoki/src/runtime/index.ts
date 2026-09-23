@@ -524,6 +524,7 @@ export { measureText2D, type MeasureText2DOptions } from './loaders/measureText2
 // Runtime guids (#1210): tell an entity's live-only address from its durable identity.
 export { isRuntimeGuid, durableGuid, remapGuidValues } from './core/assetRefRules';
 export { planCopyGuids, type CopyGuidPlan } from './core/copyIdentity';
+export { frameDocReader, type TemplateDocReader } from './core/ecs/identityParents';
 export { templateKeyOf, setTemplateKey } from './core/templateIdentity';
 export {
   isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,

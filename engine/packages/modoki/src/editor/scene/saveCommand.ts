@@ -19,7 +19,7 @@ import {
 } from './serialize';
 import { type FlushResult } from './dirtyAssets';
 import { type MetaFlushResult } from './pendingMeta';
-import { isEditingPrefab, savePrefabEdit } from './prefabEdit';
+import { isEditingPrefab, savePrefabEditReport } from './prefabEdit';
 import { getRunMode, canEdit, type RunMode } from '../../runtime/core/playState';
 import {
   hasTimelinePreviewSession, getPreviewSaveHandler, previewHasAuthoredEdits, whenPreviewRestoresLanded,
@@ -54,6 +54,9 @@ export interface SaveOutcome {
   scene?: SaveResult;
   /** `target:'prefab'` — did the prefab write land? */
   prefabSaved?: boolean;
+  /** Why the prefab save failed, when the backend said (#1468) — e.g. the format gate's refusal.
+   *  Empty when it failed for a reason that never reached this side. */
+  prefabFailReason?: string;
   /** `target:'prefab'` — the write was REFUSED by the run-mode guard, not attempted and failed.
    *  Different sentences for the human: one is "exit preview", the other is "look at the console". */
   prefabRefused?: boolean;
@@ -217,7 +220,13 @@ async function runSaveTargets(): Promise<SaveOutcome> {
     // sentences. Deliberate duplication: do not "simplify" it by deleting the guard down there.
     const refused = !canEdit();
     const mode = { runMode: getRunMode(), owner: getModeOwner() };
-    const prefabSaved = await savePrefabEdit();
+    // ⚠️ The REPORT form, not the boolean (#1468 close-out review R2). Under the format gate a save
+    // can fail for a reason only the human can act on — "this file was written by a newer build" —
+    // and the boolean throws it away, leaving a toast that says to check a console the reason may
+    // not even be in (the server logs it to the DEV-SERVER terminal). `savePrefabEditReport` returns
+    // it in `warnings` on a failure; the notice below names it.
+    const prefabReport = await savePrefabEditReport();
+    const prefabSaved = prefabReport.saved;
     // …and the pending base-scene refs, for the same #259 reason this branch already flushes
     // parked asset docs: a `baseScene` set on a scene the editor never loaded has nothing to do
     // with which world is open, and Cmd+S doing nothing for it is "the human pressed save and
@@ -227,7 +236,7 @@ async function runSaveTargets(): Promise<SaveOutcome> {
     // ordering rule as `saveAll`'s, for the same reason.
     const { pendingBaseScenes: baseScenes } = await flushParked('after-scene');
     return {
-      assets, target: 'prefab', prefabSaved,
+      assets, target: 'prefab', prefabSaved, prefabFailReason: prefabSaved ? undefined : prefabReport.warnings.join('; '),
       ...(baseScenes.saved.length || baseScenes.failed.length ? { baseScenes } : {}),
       ...(importSettings.saved.length || importSettings.failed.length ? { importSettings } : {}),
       ...(refused ? { prefabRefused: true, mode } : {}),
@@ -331,7 +340,10 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
       return { text: `${savedAny ? `${assetPhrase} — but the PREFAB was not saved: ` : 'The prefab was not saved: '}${why}${failSuffix}`, kind: 'warn' };
     }
     if (!o.prefabSaved) {
-      return { text: `Prefab save FAILED — nothing written to disk (see console)${savedAny ? `. ${assetPhrase}.` : ''}${failSuffix}`, kind: 'warn' };
+      // Name the cause when there is one. "See console" is a wrong instruction for the format
+      // gate's refusal, whose reason is logged by the SERVER to the dev-server terminal.
+      const why = o.prefabFailReason ? `: ${o.prefabFailReason}` : ' (see console)';
+      return { text: `Prefab save FAILED — nothing written to disk${why}${savedAny ? `. ${assetPhrase}.` : ''}${failSuffix}`, kind: 'warn' };
     }
     return {
       text: `Prefab saved${savedAny ? ` · ${assetPhrase}` : ''}${failSuffix}`,

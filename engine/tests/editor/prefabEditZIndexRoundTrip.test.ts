@@ -24,19 +24,39 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', () => ({
     getCurrent: () => null,
     loadScene: async (
       _key: string,
-      opts: { preloaded: { entities: { traits: Record<string, unknown> }[] } },
+      opts: { preloaded: { entities: { id?: number; traits: Record<string, unknown> }[] } },
     ) => {
       const { getAllTraits } = await import('@modoki/engine/runtime');
-      const { getCurrentWorld, spawnEntity } = await import('@modoki/engine/runtime');
+      const { getCurrentWorld, getTraitByName: byName, spawnEntity } = await import('@modoki/engine/runtime');
       const allTraits = getAllTraits();
+      const localToEcs = new Map<number, number>();
+      const spawned: { entry: { id?: number; traits: Record<string, unknown> }; ecsId: number }[] = [];
       for (const entry of opts.preloaded.entities) {
         const args: unknown[] = [];
         for (const meta of allTraits) {
           const saved = entry.traits[meta.name];
           if (saved === undefined) continue;
-          args.push(saved === true ? meta.trait() : meta.trait(saved as Record<string, unknown>));
+          // Spawn PARENTLESS, as the real loader does: the entry's `parentId` is a localId and
+          // would otherwise name whichever entity happens to hold that ECS number.
+          const data = meta.name === 'EntityAttributes'
+            ? { ...(saved as Record<string, unknown>), parentId: 0 }
+            : saved;
+          args.push(data === true ? meta.trait() : meta.trait(data as Record<string, unknown>));
         }
-        spawnEntity(getCurrentWorld(), ...(args as Parameters<typeof spawnEntity>[1][]));
+        const e = spawnEntity(getCurrentWorld(), ...(args as Parameters<typeof spawnEntity>[1][]));
+        if (entry.id) localToEcs.set(entry.id, e.id());
+        spawned.push({ entry, ecsId: e.id() });
+      }
+      // Second pass: remap each localId parent to the ECS id it spawned as. Without this a
+      // multi-row prefab loses its hierarchy here and `serializePrefab` writes only the root —
+      // which silently narrowed what a save-side test could see.
+      const eaMeta = byName('EntityAttributes');
+      if (eaMeta) for (const { entry, ecsId } of spawned) {
+        const ea = entry.traits.EntityAttributes as Record<string, unknown> | undefined;
+        const parentLocal = typeof ea?.parentId === 'number' ? ea.parentId : 0;
+        if (!parentLocal) continue;
+        const handle = [...getCurrentWorld().entities].find((x) => x.id() === ecsId);
+        if (handle) handle.set(eaMeta.trait, { ...(handle.get(eaMeta.trait) as object), parentId: localToEcs.get(parentLocal) ?? 0 });
       }
       return { keptBaseGuids: new Set<string>() };
     },
@@ -49,11 +69,20 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', () => ({
 // implementation (importOriginal) — it's a pure byte producer, not something this test needs to
 // fake, and faking it would silently stop this file from catching a #835 regression in it.
 let written: { path: string; content: string } | null = null;
+/** When set, the next `postWriteFile` answers 409 with this reason in its body, as the gate does. */
+let refuseNextWrite: string | null = null;
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../packages/modoki/src/editor/backend/editorBackend')>();
   return {
     ...actual,
     postWriteFile: async (path: string, content: string) => {
+      // A 409 WITH A BODY when a test asks for one — that is the shape the format gate answers with,
+      // and the reason lives in the body rather than the status (#1468).
+      if (refuseNextWrite) {
+        const reason = refuseNextWrite;
+        refuseNextWrite = null;
+        return { ok: false, status: 409, json: async () => ({ error: reason }), text: async () => reason } as Response;
+      }
       written = { path, content };
       return { ok: true, json: async () => ({}), text: async () => '' } as Response;
     },
@@ -107,6 +136,7 @@ let served: PrefabFile = RAW_PREFAB;
 
 beforeEach(() => {
   written = null;
+  refuseNextWrite = null;
   served = RAW_PREFAB;
   setRunMode('stopped');
   setCurrentScenePath(null);
@@ -156,6 +186,92 @@ describe('openPrefabForEditing → savePrefabEdit round trip (#762 follow-up clo
     const savedTraits = savedPrefab.entities[0].traits as unknown as Record<string, Record<string, unknown>>;
     expect(savedTraits.UIElement.zIndex).toBe(20);
     expect(savedTraits.UIAnchor?.zIndex).toBeUndefined();
+  });
+});
+
+// #1468: a prefab-edit save must carry every row's MINTED node identity, and it is the one save path
+// that cannot read it off the live world — `buildPrefabEditScene` flattens the document into PLAIN
+// entities with no prefab link, so the baseline file is the only thing that still knows which row a
+// given live entity is. Driven through the real open → spawn → serialize → write round trip for
+// exactly that reason: the carry lives at the seam between `collectPreservedLocalIds` and
+// `serializePrefab`, and a unit test of either half alone would not cross it.
+describe('a prefab-edit save keeps the node identity the file already had (#1468)', () => {
+  const NODE_ROOT = '11111111-2222-4333-8444-555555555555';
+  const NODE_CHILD = '66666666-7777-4888-8999-aaaaaaaaaaaa';
+  const withNodeGuids = (): PrefabFile => ({
+    id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    version: 5, name: 'Badge', rootLocalId: 1,
+    entities: [
+      { localId: 1, nodeGuid: NODE_ROOT, name: 'Badge', traits: { EntityAttributes: { name: 'Badge', parentId: 0, guid: '' } } },
+      { localId: 2, nodeGuid: NODE_CHILD, name: 'Dot', traits: { EntityAttributes: { name: 'Dot', parentId: 1, guid: '' } } },
+    ],
+  });
+
+  it('writes the same guids back, on a no-op save', async () => {
+    served = withNodeGuids();
+    await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });
+    expect(await savePrefabEdit()).toBe(true);
+    const saved = JSON.parse(written!.content) as PrefabFile;
+    expect(saved.entities.find((e) => e.name === 'Badge')!.nodeGuid).toBe(NODE_ROOT);
+    expect(saved.entities.find((e) => e.name === 'Dot')!.nodeGuid).toBe(NODE_CHILD);
+  });
+
+  it('carries the backend\'s REFUSAL out to the caller, not just to the console', async () => {
+    // #1468 close-out reviews F5 + R2. The owner's ruling is refuse-to-SAVE-never-to-LOAD, so a
+    // build WILL open a prefab a newer build wrote, edit it, and press Cmd+S — that is the
+    // designed-for case. `writePrefabFile` logged the status and threw the 409 body away, and the
+    // server's own error goes to the DEV-SERVER terminal, not the editor console, so the save failed
+    // silently. The first fix carried the reason into `warnings` and left it there: the human path
+    // called the boolean wrapper and the agent path threw a hard-coded string, so the new field was
+    // written by one line and read by zero — a producer with no consumer, in the same commit that
+    // fixed its mirror image. This asserts the value reaches the caller.
+    served = withNodeGuids();
+    await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });
+    refuseNextWrite = 'Badge.prefab.json was written by a newer build (prefab format 9; this build writes 5).';
+    const report = await savePrefabEditReport();
+    expect(report.saved).toBe(false);
+    expect(report.warnings.join(' ')).toContain('prefab format 9');
+  });
+
+  it('refuses to let two rows share one identity, even when the file says they do', async () => {
+    // The uniqueness branch in `nodeGuidsFor`. A close-out review called it dead code, having failed
+    // to build a collision from live-world shapes — duplicating a member strips `PrefabInstance`,
+    // duplicating an instance root is refused earlier by the cycle guard, another prefab's members
+    // fail the source gate. It missed the carrier that is not the live world: `preserveNodeGuids` is
+    // built from the BASELINE DOCUMENT (`prefabEdit`'s `nodeGuidByLocalId`, keyed by localId), so a
+    // hand-edited or damaged file with one guid on two rows maps two live entities onto one
+    // identity. The reviewer then drove this shape end-to-end and conceded the branch is reachable.
+    //
+    // ⚠️ Driven through the REAL open → spawn → serialize → write path, not by handing
+    // `serializePrefab` a contrived preserve map. A map passed straight in would keep passing if
+    // `savePrefabEditReport` were later changed to de-duplicate before calling — green under both
+    // hypotheses, which is the shape these files exist to avoid.
+    const SHARED = '11111111-2222-4333-8444-555555555555';
+    served = {
+      id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', version: 5, name: 'Badge', rootLocalId: 1,
+      entities: [
+        { localId: 1, nodeGuid: SHARED, name: 'Badge', traits: { EntityAttributes: { name: 'Badge', parentId: 0, guid: '' } } },
+        { localId: 2, nodeGuid: SHARED, name: 'Dot', traits: { EntityAttributes: { name: 'Dot', parentId: 1, guid: '' } } },
+      ],
+    };
+    await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });
+    expect(await savePrefabEdit()).toBe(true);
+    const saved = JSON.parse(written!.content) as PrefabFile;
+    const guids = saved.entities.map((e) => e.nodeGuid);
+    expect(new Set(guids).size).toBe(saved.entities.length);   // no two rows share one
+    expect(guids.filter((g) => g === SHARED)).toHaveLength(1);  // exactly one keeps it
+  });
+
+  it('mints for the rows of a pre-v5 file it opened, which had none to keep', async () => {
+    // The accept side, and how a file migrates: the save is the ONLY place identity is assigned
+    // (plan § 4 Phase 5). Opening it must not have minted anything.
+    served = { ...withNodeGuids(), version: 4, entities: withNodeGuids().entities.map(({ nodeGuid: _drop, ...e }) => e) };
+    await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });
+    expect(await savePrefabEdit()).toBe(true);
+    const saved = JSON.parse(written!.content) as PrefabFile;
+    const guids = saved.entities.map((e) => e.nodeGuid);
+    expect(guids.every((g) => typeof g === 'string' && /^[0-9a-f-]{36}$/.test(g!))).toBe(true);
+    expect(new Set(guids).size).toBe(saved.entities.length);
   });
 });
 

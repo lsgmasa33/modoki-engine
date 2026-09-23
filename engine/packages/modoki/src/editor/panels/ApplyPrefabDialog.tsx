@@ -28,7 +28,7 @@ import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
 import { MixedCheckbox } from './assetViews/widgets';
 import {
-  collectInstanceOverrideFields, addedKey, removedEntityKey, removedTraitKey, movedKey, applyOutcomeNotice, nestedFrameMoves,
+  collectInstanceOverrideFields, addedKey, removedEntityKey, removedTraitKey, movedKey, applyOutcomeNotice, nestedFrameMoves, documentMemberRefs,
   type EntityOverrideNode,
 } from '../scene/prefabOverrideKeys';
 import { ModalShell } from '../components/ModalShell';
@@ -38,9 +38,9 @@ import { ModalShell } from '../components/ModalShell';
 type EntityNode = EntityOverrideNode;
 
 /** Structural diff nodes, alongside the per-field EntityNode list. */
-interface RemovedEntityNode { localId: number; name: string; key: string }   // "-removed.<localId>"
-interface RemovedTraitNode { localId: number; entityName: string; trait: string; key: string } // "-trait.<localId>.<name>"
-interface MovedNode { localId: number; name: string; parentName: string; key: string } // "~moved.<localId>" (#1437)
+interface RemovedEntityNode { localId: number; name: string; key: string }   // "-removed.<member>" (prefabOverrideKeys.ts)
+interface RemovedTraitNode { localId: number; entityName: string; trait: string; key: string } // "-trait.<member>.<name>"
+interface MovedNode { localId: number; name: string; parentName: string; key: string } // "~moved.<member>" (#1437)
 interface Structural {
   added: AddedEntity[];                  // each subtree root keyed "+added.<guid>"
   removedEntities: RemovedEntityNode[];
@@ -66,29 +66,30 @@ function stringifyValue(v: unknown): string {
  *  for the dialog from the live instance + prefab. */
 function buildStructural(rootInstanceId: number, prefab: PrefabFile): Structural {
   const s = captureInstanceStructure(rootInstanceId, prefab);
+  const refOf = documentMemberRefs(prefab); // read from the document the capture diffs against (#1468 Phase 4)
   const prefabName = (localId: number) =>
     prefab.entities.find((e) => e.localId === localId)?.name || `localId ${localId}`;
 
   const removedEntities: RemovedEntityNode[] = s.removed.map((localId) => ({
-    localId, name: prefabName(localId), key: removedEntityKey(localId),
+    localId, name: prefabName(localId), key: removedEntityKey(refOf(localId)),
   }));
 
   const removedTraits: RemovedTraitNode[] = [];
   for (const [localIdStr, names] of Object.entries(s.removedTraits)) {
     const localId = Number(localIdStr);
     for (const trait of names) {
-      removedTraits.push({ localId, entityName: prefabName(localId), trait, key: removedTraitKey(localId, trait) });
+      removedTraits.push({ localId, entityName: prefabName(localId), trait, key: removedTraitKey(refOf(localId), trait) });
     }
   }
   const nameOfGuid = new Map(getAllEntities().filter((e) => e.guid).map((e) => [e.guid!, e.name]));
   const moved: MovedNode[] = Object.entries(s.moved).map(([localIdStr, parentGuid]) => {
     const localId = Number(localIdStr);
-    return { localId, name: prefabName(localId), parentName: nameOfGuid.get(parentGuid) || '(unknown)', key: movedKey(localId) };
+    return { localId, name: prefabName(localId), parentName: nameOfGuid.get(parentGuid) || '(unknown)', key: movedKey(refOf(localId)) };
   });
   // A nested instance's member moved out of it: recorded by THIS prefab (#1437).
   const nameOfId = new Map(getAllEntities().map((e) => [e.id, e.name]));
   for (const m of nestedFrameMoves(rootInstanceId)) {
-    moved.push({ localId: m.lid, name: nameOfId.get(m.memberEcs) || `localId ${m.lid}`, parentName: nameOfGuid.get(m.parentGuid) || '(unknown)', key: m.key });
+    moved.push({ localId: m.lid, name: nameOfId.get(m.memberEcs) || `localId ${m.lid}`, parentName: nameOfGuid.get(m.parentGuid) || '(unknown)', key: m.ref });
   }
   return { added: s.added, removedEntities, removedTraits, moved };
 }

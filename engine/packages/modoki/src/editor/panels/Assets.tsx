@@ -6,7 +6,7 @@ import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
 import {
-  instantiatePrefabInstance, type PrefabFile, serializePrefab,
+  instantiatePrefabInstance, type PrefabFile, serializePrefab, classifyExistingPrefabId,
 } from '../scene/prefab';
 import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { importModel } from '../scene/modelImport';
@@ -181,6 +181,23 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       return;
     }
 
+    const dir = assetPath.substring(0, assetPath.lastIndexOf('/'));
+    const baseName = assetPath.substring(assetPath.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
+    const prefabPath = `${dir}/${baseName}.prefab.json`;
+
+    // ⚠️ CLASSIFY THE PREFAB FIRST — before `importModel` writes anything (#1468 close-out review
+    // F3). Refusing after the import has already rewritten the model's generated files leaves the
+    // editor holding a half-done operation; refusing here means nothing has been touched. It costs
+    // nothing to move, because `prefabPath` derives from `assetPath` alone and this read depends on
+    // nothing the import produces — and it removes the `await` that otherwise sat between the
+    // import's temp spawn and `serializePrefab`, where a scene reload would have made the serialize
+    // see a different tree (review H1).
+    const existing = await classifyExistingPrefabId(prefabPath);
+    if (existing.kind === 'refuse') {
+      setImportError(`Import of "${assetName}" was aborted — ${existing.reason}`);
+      return;
+    }
+
     // Temporarily spawn entities to serialize as prefab, then clean up
     const rootId = await importModel(assetPath, prefix, postprocessorId, rootTransform);
     // #311: `importModel` returns 0 when a generated-file write failed and it aborted. This
@@ -203,16 +220,24 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       return;
     }
 
-    const prefab = serializePrefab(rootId);
+    // ⚠️ KEEP the existing prefab's stable id (#1468). This call used to be `serializePrefab(rootId)`
+    // with no id at all, so re-importing a model over an existing one minted a FRESH file guid and
+    // every scene whose `PrefabInstance.source` named the old one was orphaned outright — no
+    // mitigation, no repair pass. That is the tropical-island bug (`classifyExistingPrefabId`'s own
+    // reason for existing) reproduced at a second import entry point, and the asymmetry is the tell:
+    // `ModelAssetView`'s re-import has resolved the id all along. Same operation, two code paths, one
+    // of them asking. The classify itself is hoisted above the import — see the note up there.
+    //
+    // Node identity is a separate question and mints here either way: a freshly imported GLB tree has
+    // no correspondence to the old document's rows, so there is nothing to carry. What the file guid
+    // buys is that the instances still point AT this prefab, rather than at nothing.
+    const prefab = serializePrefab(rootId, existing.kind === 'known' ? existing.id : undefined);
 
     // Remove temporary entities from scene
     const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');
     deleteEntity(rootId);
 
     if (prefab) {
-      const dir = assetPath.substring(0, assetPath.lastIndexOf('/'));
-      const baseName = assetPath.substring(assetPath.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
-      const prefabPath = `${dir}/${baseName}.prefab.json`;
       const content = jsonFileBody(prefab);
       // #308 follow-up A: the forward write was unchecked too (not just undo/redo) —
       // pushing an undo entry for a prefab that was never actually written would make

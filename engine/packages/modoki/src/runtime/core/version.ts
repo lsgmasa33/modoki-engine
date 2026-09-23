@@ -6,17 +6,26 @@
  *  `runtime/loaders/loadSceneFile.ts` (each `migrateVNtoVN+1` step). Bump
  *  SCENE_FORMAT_VERSION in lockstep with adding a new migration there.
  *
- *  ⚠️ **Prefabs are NOT covered by this number.** `.prefab.json` carries its own, much smaller
- *  format version with its own constant — `PREFAB_FORMAT_VERSION` in
- *  `editor/scene/prefab.ts` — currently 3, where a scene is 13. This comment said
- *  "scene/prefab JSON" for a long time and was simply wrong; a prefab has never been stamped
- *  13. The prefab constant lives in `editor/` rather than here because prefab serialization is
- *  editor-only and nothing in `runtime/**` reads or writes it (#365, #379).
+ *  ⚠️ **`PREFAB_FORMAT_VERSION` now lives HERE, and that REVERSES a recorded decision.** This
+ *  docblock used to say the prefab constant belonged in `editor/scene/prefab.ts` "because prefab
+ *  serialization is editor-only and nothing in `runtime/**` reads or writes it (#365, #379)". That
+ *  premise was true and is no longer: #1468 gives prefabs a real format GATE, and a census of every
+ *  path a `.prefab.json` can reach disk found **5 server-side writers with no client call at all**
+ *  (the asset scanner's GUID heal, `/api/prefab-member-paths`, `/api/scene-mutate`,
+ *  `duplicateAssetFile`, `/api/import-file`) plus 4 Node migration scripts. The gate has to be
+ *  reachable from `engine/plugins/**`, which cannot import the editor scene module without dragging
+ *  koota and the trait registry into the dev server. **Kept beside `SCENE_FORMAT_VERSION` rather
+ *  than duplicated**, because a second copy of a format constant is the defect this file exists to
+ *  prevent. `editor/scene/prefab.ts` re-exports it, so every existing importer is unchanged.
  *
- *  (The two numbers in this note drifted once already — they were left at "2" and "12" through
- *  two bumps. They are stated here only to make the SIZE difference concrete; if you find them
- *  stale again, the fix is to check `PREFAB_FORMAT_VERSION` and `SCENE_FORMAT_VERSION`
- *  directly rather than to trust this line.) */
+ *  ⚠️ **The two numbers this note used to quote are GONE, deliberately.** It said "currently 3,
+ *  where a scene is 13" and warned that they had already drifted once; by 2026-09-23 they had
+ *  drifted again (4 and 15). A note that states a constant beside the constant will always rot —
+ *  read `PREFAB_FORMAT_VERSION` and `SCENE_FORMAT_VERSION` below instead. The SIZE difference the
+ *  numbers were there to convey survives without them: a scene has a migration ladder and a prefab
+ *  has none, which is why the prefab gate can only ever refuse a NEWER file and must never demand
+ *  an exact match (see docs/format-versioning.md).
+ */
 
 // Keep in sync with packages/modoki/package.json "version".
 export const ENGINE_VERSION = '0.1.0';
@@ -52,7 +61,37 @@ export const ENGINE_VERSION = '0.1.0';
 // v15: no-op passthrough — adds an optional `moved` map beside `added`/`removed`/`removedTraits` on a
 // prefab-instance entry, a `nestedStructure` slot and an added reference node (#1437): a member moved to
 // another parent inside its instance. Required for the same reason as v14 (REFUSE disposition).
-export const SCENE_FORMAT_VERSION = 15;
+// v16: no-op passthrough — adds an optional `members` map on a prefab-instance entry (#1468): one thin
+// row per member, keyed by MINTED identity, holding the guid that used to be re-derived from the
+// member's position on every load. Required for the same reason as v14 and v15, and the stakes are
+// higher: an older build reading a v16 scene would ignore `members` and drop every stored member
+// identity on the next save, which is the loss #1468 exists to stop arriving through the mechanism
+// built to prevent it.
+// ⚠️ The row shape also RESERVES the slots Phases 3 and 4 collapse the localId-keyed channels into
+// (`parent`, `traits`, `removedTraits`, `removed`, `added`), so those phases are caller migrations
+// and not two more irreversible bumps. See `SceneMemberRow` for why they are declared and not
+// written, and docs/plans/prefab-member-identity-plan.md § 3.1 D2(b) for the ruling.
+export const SCENE_FORMAT_VERSION = 16;
+
+/** The version stamped into newly written PREFAB JSON. Moved here from `editor/scene/prefab.ts`
+ *  by #1468 — see the reversal note at the top of this file for why the editor-only premise no
+ *  longer holds. `editor/scene/prefab.ts` re-exports it, so importing from either place is fine.
+ *
+ *  ⚠️ **Prefabs have NO migration ladder** (unlike scenes, above). Every authored prefab in the
+ *  repo is already BELOW this number and loads correctly, so a gate on this constant must refuse
+ *  only a STRICTLY NEWER document and accept every older one — `version > PREFAB_FORMAT_VERSION`,
+ *  never `!==`. Measured 2026-09-23: an exact-match gate would refuse all 105 authored prefabs.
+ *
+ *  v4: an optional top-level `moved` map (#1437 P3-b).
+ *
+ *  v5: a minted `nodeGuid` on every entity row (#1468), beside — not instead of — `localId`. It is the
+ *  first prefab bump that adds identity rather than a payload, and the first one an older build can
+ *  actively damage: a v4 serializer re-saving a v5 file drops every `nodeGuid` it does not know about,
+ *  and the guids cannot be recovered, because minting them again would produce different ones. That is
+ *  what the write gate exists for (`plugins/prefabWriteGuard.ts`), and it is why the gate had to land
+ *  BEFORE this bump rather than alongside it. Still no migration ladder and still nothing version-gated
+ *  on the loading path: a row with no `nodeGuid` is one the next SAVE mints for. */
+export const PREFAB_FORMAT_VERSION = 5;
 
 // The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
 // docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time

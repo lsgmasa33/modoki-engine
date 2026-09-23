@@ -1,79 +1,23 @@
-/** A prefab member's HOME — where its identity steps from once it has been moved inside its instance
- *  (#1437). A member's derived guid, and the member path a template token names it by, are walks up its
- *  ROW parents. A member moved to another parent keeps walking from the row parent it left:
+/** What happens to a prefab instance's members when part of it goes — deleted, or stripped of
+ *  `PrefabInstance` by a Detach Prefab or an unpack — and the walks that NAME a member by its path.
  *
- *  - `PrefabInstance.homeParent` — the guid of the entity its identity walk continues from; '' = not moved.
- *  - `PrefabInstance.homeSteps` — step ids that sit BETWEEN that entity and the member's own step, '.'-joined.
- *    Empty while the home is the row parent itself. It fills when a home stops being part of the walk (deleted,
- *    or unpacked): the member then walks from the home's own identity parent, carrying the home's step, so
- *    its path — and so its guid — is exactly what it was. That is also what a reload derives, since the
- *    loader expands a removed row until the member has been derived through it.
- *
- *  Every walk that derives or names a member goes through {@link identityParentId} and {@link homeStepsOf}. */
+ *  A member's derived guid, and the member path a template token names it by, are walks up its TEMPLATE
+ *  parents, which `identityParents.ts` reads from the document the frame was expanded from (#1468 Phase 6).
+ *  A member moved inside its instance (#1437) keeps walking from the row parent it left, and one whose row
+ *  parent is gone keeps that row's step — both without anything recorded on the member. This module used
+ *  to maintain that record (`PrefabInstance.homeParent` + `homeSteps`) and re-point it whenever a home
+ *  died; the document makes both unnecessary. */
 
 import type { Entity, World } from 'koota';
 import { getCurrentWorld, indexEntityGuid } from './world';
 import { getAllTraits, getTraitByName } from './traitRegistry';
-import { memberStepId, deriveMemberGuid, remapGuidValues, durableGuid } from '../assetRefRules';
-import { templateKeyOf, addedKeyStep } from '../templateIdentity';
-import { memberPathKey, type MemberStep } from '../templateRefs';
+import { deriveMemberGuid, remapGuidValues, durableGuid, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, type MemberStep, type MemberPi } from '../assetRefRules';
+import { templateKeyOf } from '../templateIdentity';
+import { memberRowsToWrite } from './memberRows';
+import { memberPathKey } from '../templateRefs';
+import { worldIdentityParents, type IdentityParents, type TemplateDocReader } from './identityParents';
 
-/** The parent an entity's IDENTITY steps from: its home when it has one that still resolves, else its live parent. */
-export function identityParentId(parentId: number, homeParent: string | undefined, idOfGuid: (guid: string) => number | undefined): number {
-  return (homeParent && idOfGuid(homeParent)) || parentId;
-}
-
-/** The step ids between a member's home and its own step (see the module doc). */
-export function homeStepsOf(pi: { homeSteps?: string } | null | undefined): number[] {
-  const s = pi?.homeSteps;
-  return s ? s.split('.').map(Number) : [];
-}
-
-type Pi = { homeParent?: string; homeSteps?: string; localId?: number; parentLocalId?: number };
-
-/** Before the entities in `gone` stop being part of any identity walk — destroyed, or stripped of
- *  `PrefabInstance` — re-point every surviving member whose home is one of them to that home's own identity
- *  parent, carrying the home's steps. Equivalence-preserving, so it needs no undo: a respawned home leaves the
- *  member's path unchanged. */
-export function rehomeDependents(gone: ReadonlySet<number>, world: World = getCurrentWorld()): void {
-  const piMeta = getTraitByName('PrefabInstance');
-  const eaMeta = getTraitByName('EntityAttributes');
-  if (!piMeta || !eaMeta || !gone.size) return;
-  const dependents: Entity[] = [];
-  for (const e of world.query(piMeta.trait) as Iterable<Entity>) {
-    if (!gone.has(e.id()) && (e.get(piMeta.trait) as Pi | undefined)?.homeParent) dependents.push(e);
-  }
-  if (!dependents.length) return;
-  const byGuid = new Map<string, Entity>();
-  const byId = new Map<number, Entity>();
-  for (const e of world.entities as Iterable<Entity>) {
-    byId.set(e.id(), e);
-    const guid = e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid : '';
-    if (guid) byGuid.set(guid, e);
-  }
-  const guidOf = (e: Entity | undefined) => (e?.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '');
-  for (const m of dependents) {
-    const pi = m.get(piMeta.trait) as Pi;
-    let home = pi.homeParent ?? '';
-    let steps = homeStepsOf(pi);
-    for (let h = byGuid.get(home), n = 0; h && gone.has(h.id()) && n < 10_000; h = byGuid.get(home), n++) {
-      const hpi = h.has(piMeta.trait) ? (h.get(piMeta.trait) as Pi & { rootInstanceId?: number } | undefined) : undefined;
-      if (!hpi) break; // a home is always a member; a plain one cannot be stepped through
-      // Nor any instance ROOT, stored or owned. A root home is the root of the frame the dependent's row lives
-      // in (its own frame for a member, its owner's for an owned nested root), and that frame dies with it.
-      // `detachOrphanedMembers` handles that member instead — every caller runs the two through `endFrames`
-      // (#1453) — promoting an owned nested root and unlinking anything else. Stepping through an OWNED root
-      // re-pointed a moved nested root at its grandparent frame, which records no move for it, so it vanished
-      // on reload (#1451).
-      if (hpi.rootInstanceId === h.id()) break;
-      steps = [...homeStepsOf(hpi), memberStepId(hpi), ...steps];
-      const liveParent = byId.get((h.get(eaMeta.trait) as { parentId?: number }).parentId ?? 0);
-      home = hpi.homeParent || guidOf(liveParent);
-    }
-    if (home === pi.homeParent && steps.join('.') === (pi.homeSteps ?? '')) continue;
-    m.set(piMeta.trait, { ...pi, homeParent: home, homeSteps: steps.join('.') });
-  }
-}
+type Pi = { localId?: number; parentLocalId?: number; ownerGuid?: string };
 
 /** A member that outlives its instance: `data` is its `PrefabInstance` as it was, `guid` its own and
  *  `rootGuid` the root it belonged to, for an undo to relink it. */
@@ -93,21 +37,12 @@ export function detachOrphanedMembers(gone: ReadonlySet<number>, world: World = 
   const eaMeta = getTraitByName('EntityAttributes');
   if (!piMeta || !eaMeta || !gone.size) return [];
   const byId = new Map<number, Entity>();
-  const byGuid = new Map<string, Entity>();
-  for (const e of world.entities as Iterable<Entity>) {
-    byId.set(e.id(), e);
-    const g = e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid : '';
-    if (g) byGuid.set(g, e);
-  }
+  for (const e of world.entities as Iterable<Entity>) byId.set(e.id(), e);
   const guidOf = (e: Entity | undefined) => (e?.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '');
-  // The root of the instance whose row an owned nested root expanded from: its identity parent's frame. Not its
-  // home alone — a nested root carried out inside a moved member has no home, and its owner still dies (#1451).
-  const ownerOf = (e: Entity, pi: Pi): number => {
-    const live = (e.get(eaMeta.trait) as { parentId?: number } | undefined)?.parentId ?? 0;
-    const parent = byId.get(identityParentId(live, pi.homeParent, (g) => byGuid.get(g)?.id()));
-    const ppi = parent?.has(piMeta.trait) ? (parent.get(piMeta.trait) as { rootInstanceId?: number } | undefined) : undefined;
-    return ppi?.rootInstanceId ?? 0;
-  };
+  // The root of the instance whose row an owned nested root expanded from — its owner link when it was moved,
+  // else its live parent's frame (`identityParents.ts`). A nested root carried out inside a moved member was
+  // never moved itself, and its owner still dies (#1451): its live parent is that member, still in the frame.
+  const parents = worldIdentityParents(world);
   const out: DetachedMember[] = [];
   const strip: Entity[] = [];
   const promote: Entity[] = [];
@@ -116,12 +51,10 @@ export function detachOrphanedMembers(gone: ReadonlySet<number>, world: World = 
     const pi = e.get(piMeta.trait) as (Pi & { rootInstanceId?: number }) | undefined;
     if (!pi) continue;
     const root = pi.rootInstanceId ?? 0;
-    const ownedRoot = root === e.id() && (pi.parentLocalId || 0) > 0;
-    // An owned root also goes when its HOME is still dying after the rehome: the rehome stops only at a home it
-    // cannot step past (a root, or a plain entity), and no frame records it there. Detach Prefab no longer leaves such
-    // a home (#1453), and a generic trait edit can no longer strip one (#1454); kept for a home already stripped.
-    const homeGone = !!pi.homeParent && gone.has(byGuid.get(pi.homeParent)?.id() ?? -1);
-    if (ownedRoot ? !(gone.has(ownerOf(e, pi)) || homeGone) : !gone.has(root)) continue;
+    const ownedRoot = isOwnedRoot(pi, e.id());
+    // (An owned root also went when its HOME was still dying after the rehome — a home the rehome could not step
+    // past. There is no home any more: its template parent is read from the document, which steps past a gone row.)
+    if (ownedRoot ? !gone.has(parents.ownerOf(e.id())) : !gone.has(root)) continue;
     out.push({ guid: guidOf(e), rootGuid: ownedRoot ? '' : guidOf(byId.get(root)), data: { ...pi } });
     (ownedRoot ? promote : strip).push(e);
   }
@@ -135,13 +68,13 @@ export function detachOrphanedMembers(gone: ReadonlySet<number>, world: World = 
 }
 
 /** The entities in `gone` stop being part of any instance: deleted, or stripped of `PrefabInstance` by a
- *  Detach Prefab or an unpack. Call it BEFORE they go (the owner walk reads their links). A member moved away
- *  from one of them keeps its path ({@link rehomeDependents}), and one still linked to a frame that ends is
- *  promoted or unlinked ({@link detachOrphanedMembers}). Every frame-ending path runs both halves through this
- *  one call. Detach and unpack once ran only the first, and a member moved out of the instance vanished on
- *  reload (#1453). Returns what an undo hands to {@link relinkDetachedMembers}. */
+ *  Detach Prefab or an unpack. Call it BEFORE they go (the owner walk reads their links). A member still
+ *  linked to a frame that ends is promoted or unlinked ({@link detachOrphanedMembers}). A member moved away
+ *  from one of them needs nothing: its path steps past a gone template row by the document
+ *  (`identityParents.ts`), which is what a `rehomeDependents` half used to record on it (#1468 Phase 6).
+ *  Every frame-ending path runs through this one call — Detach and unpack once skipped it, and a member moved
+ *  out of the instance vanished on reload (#1453). Returns what an undo hands to {@link relinkDetachedMembers}. */
 export function endFrames(gone: ReadonlySet<number>, world: World = getCurrentWorld()): DetachedMember[] {
-  rehomeDependents(gone, world);
   return detachOrphanedMembers(gone, world);
 }
 
@@ -212,13 +145,12 @@ export function restoreRootLinks(links: readonly { guid: string; rootGuid: strin
   }
 }
 
-/** An entity's step below its parent in the derive walk: `'+key'` for a template-keyed node,
- *  `memberStepId` for a prefab member, and `null` for a node no template can name. */
+/** An entity's step below its parent in the derive walk: `entityStep`, and `null` for a node no
+ *  template can name (no key and no `PrefabInstance`). */
 function memberStepOf(e: Entity, piTrait: Parameters<Entity['has']>[0]): MemberStep | null {
   const key = templateKeyOf(e);
-  if (key) return addedKeyStep(key);
-  if (!e.has(piTrait)) return null;
-  return memberStepId(e.get(piTrait) as { localId?: number; parentLocalId?: number });
+  if (!key && !e.has(piTrait)) return null;
+  return entityStep(e.has(piTrait) ? (e.get(piTrait) as MemberPi) : null, key);
 }
 
 /** Every member a template frame rooted at `rootEcsId` can name: path key → entity. The root is `''`.
@@ -226,9 +158,10 @@ function memberStepOf(e: Entity, piTrait: Parameters<Entity['has']>[0]): MemberS
  *  that root itself is still a target. A step two siblings share names neither of them. */
 export function memberPathIndex(
   world: World, rootEcsId: number,
-  /** The world's parent → children map, when the caller indexes several frames in one pass. */
-  children: Map<number, Entity[]> = childrenByParent(world),
+  /** The world's identity tree, when the caller indexes several frames in one pass. */
+  tree: IdentityTree = identityTree(world),
 ): Map<string, Entity | null> {
+  const { children, parents } = tree;
   const piMeta = getTraitByName('PrefabInstance');
   const out = new Map<string, Entity | null>();
   // Found by the world walk rather than the entity index: the editor reaches this from Apply, whose
@@ -246,37 +179,33 @@ export function memberPathIndex(
       seen.add(c.id());
       const step = memberStepOf(c, piMeta.trait);
       if (step === null) continue;
-      const at = [...path, ...homeStepsOf(c.has(piMeta.trait) ? c.get(piMeta.trait) as { homeSteps?: string } : null), step];
+      const at = [...path, ...parents.of(c.id()).extra, step];
       const key = memberPathKey(at);
       out.set(key, out.has(key) ? null : c);
-      const pi = c.has(piMeta.trait) ? c.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number } : null;
-      const storedRoot = !!pi && pi.rootInstanceId === c.id() && !pi.parentLocalId;
-      if (!storedRoot) stack.push([c, at]);
+      const pi = c.has(piMeta.trait) ? c.get(piMeta.trait) as MemberPi : null;
+      if (!isStoredRoot(pi, c.id())) stack.push([c, at]);
     }
   }
   return out;
 }
 
-export function childrenByParent(world: World): Map<number, Entity[]> {
+/** A world's IDENTITY tree: each entity under its identity parent (`identityParents.ts`), with the
+ *  resolver it was built from — whose `extra` steps a path walk needs beside the parent. */
+export interface IdentityTree { children: Map<number, Entity[]>; parents: IdentityParents }
+
+export function identityTree(world: World, fallback?: TemplateDocReader): IdentityTree {
   const attrMeta = getTraitByName('EntityAttributes');
-  const piMeta = getTraitByName('PrefabInstance');
+  const parents = worldIdentityParents(world, fallback);
   const children = new Map<number, Entity[]>();
-  if (!attrMeta) return children;
-  const idOfGuid = new Map<string, number>();
-  for (const e of world.entities as Iterable<Entity>) {
-    const guid = e.has(attrMeta.trait) ? (e.get(attrMeta.trait) as { guid?: string }).guid : '';
-    if (guid) idOfGuid.set(guid, e.id());
-  }
+  if (!attrMeta) return { children, parents };
   for (const e of world.entities as Iterable<Entity>) {
     if (!e.has(attrMeta.trait)) continue;
-    const live = (e.get(attrMeta.trait) as { parentId?: number }).parentId ?? 0;
-    const home = piMeta && e.has(piMeta.trait) ? (e.get(piMeta.trait) as { homeParent?: string } | undefined)?.homeParent : '';
-    const parent = identityParentId(live, home, (g) => idOfGuid.get(g));
+    const parent = parents.parentOf(e.id());
     const list = children.get(parent);
     if (list) list.push(e);
     else children.set(parent, [e]);
   }
-  return children;
+  return { children, parents };
 }
 
 /** Re-point every ref a live trait holds from a key of `remap` to its value — every field of every trait
@@ -332,14 +261,28 @@ export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World 
  *  it across a world rebuild. A STORED root below (a user-added nested instance) keeps its own for the same
  *  reason, exactly as {@link promoteOwnedRoots} skips one — this is that function run the other way.
  *  Undo: {@link applyGuidRemap} with the map reversed, and BEFORE the prior links go back, because
- *  `detachPrefabInstance`'s snapshot addresses every member by the guid it had when it was taken. */
+ *  `detachPrefabInstance`'s snapshot addresses every member by the guid it had when it was taken.
+ *
+ *  ⚠️ **A member the save will write a ROW for is SKIPPED** (scene v16, #1468). The window above is
+ *  "the reload will derive a different guid"; a stored row means the reload PINS the guid the member
+ *  already has, so there is no window and renaming would move identity for nothing — the same
+ *  reasoning, and the same skip, as {@link promoteOwnedRoots}'s.
+ *
+ *  ⚠️ **This is why the stamp still EXISTS.** #1468 Phase 2B set out to DELETE it, and could not: a
+ *  row exists only where the TEMPLATE minted a `nodeGuid`, so a member of a PRE-v5 template gets none
+ *  and the window is still open for exactly those members. Retiring it needs every template it can
+ *  meet at v5 — which is also why Phase 4 could not delete the localId key space: the repo's corpus
+ *  is v5, but every prefab the released editor wrote is not (plan § 4 Phase 4's ruling), so neither
+ *  retires while such a prefab can be opened. Found by a TEST, not by reading: deleting the stamp
+ *  reddened `createPrefabMemberIdentity.test.ts`'s nested-instance case, whose child template is a
+ *  hand-written pre-v5 document. */
 export function stampDerivedMemberGuids(rootEcsId: number, world: World = getCurrentWorld()): Map<string, string> {
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
   const remap = new Map<string, string>();
   if (!piMeta || !eaMeta) return remap;
   const guidOf = (e: Entity) => (e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '');
-  const index = memberPathIndex(world, rootEcsId, childrenByParent(world));
+  const index = memberPathIndex(world, rootEcsId, identityTree(world));
   const root = index.get('');
   // ⚠️ DURABLE only. A runtime guid (#1210) dies with its world, so deriving members from one would
   // bake identities the next reload cannot reproduce — the very defect this closes, one level up.
@@ -347,13 +290,17 @@ export function stampDerivedMemberGuids(rootEcsId: number, world: World = getCur
   // production this is a floor, not a live branch.
   const anchor = root ? durableGuid(guidOf(root)) : '';
   if (!anchor) return remap; // unaddressable before, and after: nothing derives from it
+  // The members the next save will STATE a guid for, so no reload has to derive one (v16).
+  // ⚠️ `memberRowsToWrite`, not `memberRowKeysIn`: a KEYED member with no durable guid gets no row,
+  // and skipping it here on the premise that a row covers it reopens #1461's window for it.
+  const keyed = memberRowsToWrite(rootEcsId, world);
   for (const [key, e] of index) {
     if (!key || !e) continue; // the root itself, and a step two siblings share
-    const pi = e.has(piMeta.trait) ? (e.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number }) : null;
-    if (pi && pi.rootInstanceId === e.id() && !pi.parentLocalId) continue; // a stored root keeps its stored guid
+    if (isStoredRoot(e.has(piMeta.trait) ? (e.get(piMeta.trait) as MemberPi) : null, e.id())) continue; // a stored root keeps its stored guid
+    if (keyed.has(e.id())) continue; // a stored row states its guid — see the docblock
     const old = guidOf(e);
     // A member with NO guid is left alone: nothing can reference it, and the load-time pass fills it.
-    const next = deriveMemberGuid(anchor, key.split('.'));
+    const next = deriveMemberGuid(anchor, memberPathSteps(key));
     if (old && old !== next) remap.set(old, next);
   }
   applyGuidRemap(remap, world);
@@ -368,7 +315,23 @@ export function stampDerivedMemberGuids(rootEcsId: number, world: World = getCur
  *  members from it. So without the rename, every member would reload under a guid no live ref names
  *  (#1349's shape). The root keeps its guid, which becomes stored; each member below it — down to, not
  *  into, another stored root — takes the guid the reload derives, and every ref follows.
- *  Undo: {@link applyGuidRemap} with the map reversed, then put the roots' `PrefabInstance` back. */
+ *  Undo: {@link applyGuidRemap} with the map reversed, then put the roots' `PrefabInstance` back.
+ *
+ *  ⚠️ **A member the save will write a ROW for is NOT renamed (scene v16, § 3.3 R7).** The rename's
+ *  entire premise is *"the reload will DERIVE this member's guid, so the live one must match what it
+ *  derives"*. Once a row states the guid, the reload reads it and the premise is gone — renaming
+ *  anyway moves a guid for no reader and drags every external reference along with it.
+ *
+ *  ⚠️ This is the **deliberate divergence from a QA-measured contract** § 3.3 R7 flags:
+ *  `qa/knowledge.md`'s promotion row records that promotion today re-derives its members' guids. That stops
+ *  being true where the template mints identity, and stays true where it does not — a pre-v5
+ *  template has no rows, so the reload really does derive and the rename is still what keeps the
+ *  live world honest.
+ *
+ *  ⚠️ It is sound only because a promoted root has somewhere to WRITE those rows wherever it lands:
+ *  its own scene entry if it ends up top-level, and `AddedEntity.members` if it stays inside another
+ *  instance as a reference node. The reference-node slot was added in the same change for this
+ *  reason — without it this skip silently loses the identity it is trying to keep. */
 export function promoteOwnedRoots(roots: Iterable<number>, world: World = getCurrentWorld()): Map<string, string> {
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
@@ -380,21 +343,24 @@ export function promoteOwnedRoots(roots: Iterable<number>, world: World = getCur
   for (const id of roots) {
     const e = byId.get(id);
     const pi = e?.has(piMeta.trait) ? (e.get(piMeta.trait) as Pi & { rootInstanceId?: number }) : undefined;
-    if (!e || !pi || pi.rootInstanceId !== id || !pi.parentLocalId) continue;
-    e.set(piMeta.trait, { ...pi, parentLocalId: 0, homeParent: '', homeSteps: '' });
+    if (!e || !pi || !isOwnedRoot(pi, id)) continue;   // `!pi` restores TS's proof for the spread below
+    e.set(piMeta.trait, { ...pi, parentLocalId: 0, parentNodeGuid: '', ownerGuid: '' });
     promoted.push(e);
   }
   const guidOf = (e: Entity) => (e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '');
-  const children = childrenByParent(world);
+  const tree = identityTree(world);
   for (const root of promoted) {
     const anchor = guidOf(root);
     if (!anchor) continue; // unaddressable before, and after: nothing derives from it
-    for (const [key, e] of memberPathIndex(world, root.id(), children)) {
+    // The members the next save will STATE a guid for, so no reload has to derive one (R7).
+    // `memberRowsToWrite`, not `memberRowKeysIn` — see the same note in `stampDerivedMemberGuids`.
+    const keyed = memberRowsToWrite(root.id(), world);
+    for (const [key, e] of memberPathIndex(world, root.id(), tree)) {
       if (!key || !e) continue;
-      const pi = e.has(piMeta.trait) ? (e.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number }) : null;
-      if (pi && pi.rootInstanceId === e.id() && !pi.parentLocalId) continue; // a stored root keeps its stored guid
+      if (isStoredRoot(e.has(piMeta.trait) ? (e.get(piMeta.trait) as MemberPi) : null, e.id())) continue; // a stored root keeps its stored guid
+      if (keyed.has(e.id())) continue; // a stored row states its guid — see the docblock
       const old = guidOf(e);
-      const next = deriveMemberGuid(anchor, key.split('.'));
+      const next = deriveMemberGuid(anchor, memberPathSteps(key));
       if (old && old !== next) remap.set(old, next);
     }
   }

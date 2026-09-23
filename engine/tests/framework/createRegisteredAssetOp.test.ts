@@ -41,7 +41,7 @@ let writes: Array<{ path: string; body: string; ifNoneMatch?: string }> = [];
 let rescans = 0;
 /** Files the stub backend treats as already on disk, keyed by path → the document's text. The
  *  stub honours `ifNoneMatch:'*'` against it the way `/api/write-file` does (409, nothing written),
- *  and serves it to a plain GET, which is how `resolveExistingDocumentId` reads an on-disk id. */
+ *  and serves it to a plain GET, which is how `classifyExistingDocumentId` reads an on-disk id. */
 let onDisk = new Map<string, string>();
 beforeEach(() => {
   writes = [];
@@ -60,13 +60,17 @@ beforeEach(() => {
     }
     const served = [...onDisk.entries()].find(([p]) => String(url).endsWith(p));
     if (served && !init?.body) {
-      return { ok: true, status: 200, json: async () => JSON.parse(served[1]) } as unknown as Response;
+      // `text` as well as `json` (#1468): the on-disk id is read through `parseAssetJson`, which
+      // reads the BODY so it can tell the dev server's SPA fallback apart from a real document.
+      // A stub that answers only `json()` is a Response nothing produces, and it made every read
+      // here classify as unreadable.
+      return { ok: true, status: 200, text: async () => served[1], json: async () => JSON.parse(served[1]) } as unknown as Response;
     }
     if (String(url).endsWith('/api/rescan-assets')) {
       rescans++;
       return { ok: true, json: async () => ({ assets: [] }) } as unknown as Response;
     }
-    return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+    return { ok: false, status: 404, text: async () => '', json: async () => ({}) } as unknown as Response;
   }));
 });
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });

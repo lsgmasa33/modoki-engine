@@ -50,6 +50,7 @@ import {
   CORRUPT_SIDECAR_SUFFIX,
   SIDECAR_FORMAT_VERSION,
 } from './meta-sidecar';
+import { classifyPrefabWrite } from './prefabWriteGuard';
 import { classifyJsonAssetSuffix, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
 import { getCacheDir, cachePathFor } from './texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from './audio-cache';
@@ -331,6 +332,17 @@ function shipPixiKtxTranscoder(projectRoot: string, distDir: string, ...fallback
 export function writeAssetGuid(absPath: string, type: string, guid: string): boolean {
   try {
     if (ID_BEARING_TYPES.has(type)) {
+      // ⚠️ Same reasoning as the sidecar refusal below, applied to the DOCUMENT (#1468 D4): this
+      // branch writes the JSON file directly, so it inherits neither `/api/write-file`'s prefab
+      // gate nor any other, and has to carry it itself. `prefab` IS in `ID_BEARING_TYPES`.
+      // What makes it the sharpest of the server-side writers: the GUID heal fires from the
+      // WATCHER, roughly 150ms after a file appears — so without this, dropping a newer-format
+      // prefab into the project re-serializes it before anyone has opened anything.
+      const prefabRefusal = classifyPrefabWrite(absPath);
+      if (prefabRefusal) {
+        console.warn(`[assets] not stamping a GUID into ${absPath}: ${prefabRefusal.message}`);
+        return false;
+      }
       const json = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
       if (isStampableObject(json)) {
         json.id = guid;

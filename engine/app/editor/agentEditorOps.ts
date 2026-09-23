@@ -52,10 +52,10 @@ import {
   getPrefabSource, instantiatePrefabInstance, serializePrefab, writePrefabFile, warnInertPrefabSizes,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
-  resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
+  classifyExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance,
   applyToPrefabWithUndo, revertOverridesSelective, rebuildInstance, resolveInstanceContext,
-  collectInstanceOverrideFields, collectInstanceOverrideKeys,
+  collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey,
   pushAction, makePrefabInstantiateAction, entityRef,
   getEditorViewportCamera, focusEntityInSceneView,
   upsertKey, findTrack, encodeValue,
@@ -480,8 +480,9 @@ interface PrefabParams {
   /** create/detach/overrides/apply/revert: the entity guid. Given together with `entityId`, the call is refused (#1223 D1). */
   entityGuid?: string;
   /** apply/revert: the override keys to act on (see `overrides`'s `keys.all` for the exact
-   *  strings — `"localId.trait.field"` / `"+added.<guid>"` / `"-removed.<localId>"` /
-   *  `"-trait.<localId>.<name>"`). Omitted ⇒ ALL current overrides on the instance. */
+   *  strings — `"<member>.trait.field"` / `"+added.<guid>"` / `"-removed.<member>"` /
+   *  `"-trait.<member>.<name>"` / `"~moved.<member>"`, `<member>` a nodeGuid or, for a pre-v5
+   *  template, a localId; `prefabOverrideKeys.ts`). Omitted ⇒ ALL current overrides on the instance. */
   keys?: string[];
 }
 
@@ -2696,8 +2697,15 @@ export function registerEditorAgentOps(): void {
       if ((p.entityId == null && !p.entityGuid) || !p.path) throw new Error('prefab create requires { entityId | entityGuid, path }');
       const path = p.path;
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // both given → refused (#1223 D1)
-      const existingId = await resolveExistingPrefabId(path);
-      // Same cold-cache flatten as the human path (#1284) — resolveExistingPrefabId fetches
+      const existing = await classifyExistingPrefabId(path);
+      // ⚠️ Refuse rather than mint a fresh file guid over a prefab that is THERE and unreadable — a
+      // 500, corrupt bytes, or one a newer build wrote (#1468, #896's class). The agent asked to
+      // create a prefab at a path, not to re-identify the asset already sitting on it, and every
+      // scene referencing the old id would dangle with the old bytes still on disk. Thrown, because
+      // this op's contract is that a refusal reaches the caller rather than the renderer console.
+      if (existing.kind === 'refuse') throw new Error(`prefab create refused: ${existing.reason}`);
+      const existingId = existing.kind === 'known' ? existing.id : undefined;
+      // Same cold-cache flatten as the human path (#1284) — classifyExistingPrefabId fetches
       // raw and never touches the editor prefab cache, so nothing here warms it.
       await preloadNestedPrefabsForSubtree(entityId);
       let runtimeExcluded = 0;
@@ -2868,7 +2876,10 @@ export function registerEditorAgentOps(): void {
         // most of what was asked, so the caller has no reason to look. One typo in a list of
         // five would then leave a field un-applied, and the next reader would conclude the
         // apply is flaky rather than that they mistyped a key.
-        const unknown = new Set(p.keys.filter((k) => !available.all.includes(k)));
+        // Compared in ONE spelling (#1468 Phase 4): a key names its member by `nodeGuid` where it can, and
+        // a caller holding the localId spelling of the same key is asking for the same thing.
+        const listed = new Set(available.all.map((k) => canonicalOverrideKey(k, prefab)));
+        const unknown = new Set(p.keys.filter((k) => !listed.has(canonicalOverrideKey(k, prefab))));
         if (unknown.size > 0) {
           const sample = available.all.slice(0, 5).join(', ');
           throw new OpRefusal(
@@ -2892,7 +2903,9 @@ export function registerEditorAgentOps(): void {
         // is `continue`d past by applyToPrefabSelective WITHOUT being counted, so the overall
         // `applied` flag can be true while a specific requested key was never written.
         // Echoing the request back as `appliedKeys` would report that key as applied.
-        const excluded = available.applyExcluded.filter((k) => keySet.has(k));
+        // In the CALLER's spelling, so the refusal and `skippedKeys` name what they passed.
+        const excludedCanon = new Set(available.applyExcluded.map((k) => canonicalOverrideKey(k, prefab)));
+        const excluded = [...keySet].filter((k) => excludedCanon.has(canonicalOverrideKey(k, prefab)));
         if (p.keys && excluded.length > 0) {
           // Explicitly asked for by name → refuse, rather than do less than was asked.
           throw new Error(
@@ -2909,6 +2922,10 @@ export function registerEditorAgentOps(): void {
         // A move the prefab cannot express (#1437) is named with its reason, not echoed back as applied.
         const notWritten = result.skipped ?? [];
         if (!result.applied) {
+          // A REFUSAL states its own cause; leading with the "may have stopped being a prefab
+          // instance" guess before appending the real reason sends the reader down the wrong path
+          // (#1468 close-out review F4). That guess is right only when nothing else explains it.
+          if (result.refused) throw new Error(`prefab apply refused: ${result.refused}`);
           const why = notWritten.length ? ` Not applied: ${notWritten.map((x) => `${x.key} (${x.reason})`).join('; ')}.` : '';
           throw new Error(`prefab apply: nothing was written — the apply produced no change for entity ${entityId} (it may have stopped being a prefab instance mid-call).${why}`);
         }
@@ -3011,10 +3028,15 @@ export function registerEditorAgentOps(): void {
       const editing = useEditorStore.getState().editingPrefab!;
       const { saved, warnings } = await savePrefabEditReport();
       if (!saved) {
+        // ⚠️ `warnings` carries the backend's own REASON on a failure now (#1468) — the format gate
+        // answers 409 with why, and without this the agent got three guesses and a pointer to a
+        // console it cannot read. A produced reason nobody reads is this repo's #1 defect class, and
+        // it shipped here once already (close-out review R2).
+        const why = warnings.length ? ` Reason: ${warnings.join('; ')}` : '';
         throw new Error(
           `prefab edit-save FAILED for ${editing.path} — NOTHING was written. Either the prefab root ` +
           'was not found in the edit world, serialization produced no prefab, or the file write was ' +
-          'rejected. See the editor console for the [PrefabEdit] error.',
+          `rejected.${why || ' See the editor console for the [PrefabEdit] error.'}`,
         );
       }
       // `warnings`: the prefab validation warnings for the written template, as `create` answers them (#1258).

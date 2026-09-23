@@ -56,6 +56,36 @@ describe('stampDerivedMemberGuids (#1461)', () => {
     expect([...remap.keys()]).toEqual(['g-a']);
   });
 
+  /** ⚠️ The input that distinguishes KEYED from "a row will be written" (#1468 Phase 2B).
+   *
+   *  The skip's premise is *"a stored row states this member's guid, so the reload will not derive
+   *  one"*. A member can be keyed — its template minted a `nodeGuid` — and still get NO row, because
+   *  `captureInstanceMembers` writes only a DURABLE guid: a runtime guid (#1210) is a per-session
+   *  handle, not an identity to write down. Skipping such a member leaves it with a guid the reload
+   *  will not reproduce and no row to state it, which is #1461's window reopened for exactly the
+   *  members neither mechanism covers.
+   *
+   *  A guid-LESS member cannot show this — the stamp leaves one alone anyway (`old &&`) — so the
+   *  fixture uses a runtime guid, which is truthy and not durable. Every other fixture in the suite
+   *  gives its members durable guids, so this is the one place the two predicates disagree. */
+  it('renames a keyed member whose guid is a RUNTIME guid — no row will state it', () => {
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-rt-r' }));
+    // ⚠️ Spawned with NO guid, then read back — the engine assigns the entity its own runtime guid
+    // (#1210), and passing one in is overwritten. A literal would have made the assertions below
+    // compare against a value the entity never held.
+    const m = game!.spawn(Transform(), EntityAttributes({ name: 'M', parentId: r.id() }));
+    r.add(PrefabInstance({ source: OUTER, localId: 1, nodeGuid: 'aaaaaaaa-0000-4000-8000-0000000000f1', rootInstanceId: r.id() }));
+    m.add(PrefabInstance({ source: OUTER, localId: 2, nodeGuid: 'aaaaaaaa-0000-4000-8000-0000000000f2', rootInstanceId: r.id() }));
+
+    const RUNTIME = guidOf(m);
+    expect(RUNTIME, 'fixture: the member must hold a RUNTIME guid, or the two predicates agree').toMatch(/^00000000-/);
+
+    const remap = stampDerivedMemberGuids(r.id(), getCurrentWorld());
+
+    expect(guidOf(m), 'a keyed member with no DURABLE guid still gets the derived one').not.toBe(RUNTIME);
+    expect(remap.get(RUNTIME)).toBe(guidOf(m));
+  });
+
   it('carries every ref onto the new guid', () => {
     const { r, a } = tree();
     const x = game!.spawn(Transform(), EntityAttributes({ name: 'X', guid: 'g-x' }),

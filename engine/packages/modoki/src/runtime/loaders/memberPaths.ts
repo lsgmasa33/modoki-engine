@@ -3,8 +3,8 @@
  *  engine/plugins/asset-fs-ops.ts so the editor can run the same walk on a live scene's serialized form
  *  (#1437: an applied move changes member paths, and every stored ref to a moved member follows). */
 
-import { durableGuid, deriveMemberGuid, addedKeyStep, mapStringValues } from '../core/assetRefRules';
-import { isMemberToken, parseMemberToken, memberToken, MEMBER_TOKEN_PREFIX } from '../core/templateRefs';
+import { durableGuid, deriveMemberGuid, addedKeyStep, mapStringValues, parseSteps, memberPathSteps, type MemberStep } from '../core/assetRefRules';
+import { isMemberToken, parseMemberToken, memberToken, memberPathKey, MEMBER_TOKEN_PREFIX } from '../core/templateRefs';
 import { descendPathKeyed, mergeNestedStructurePaths } from './prefabOverrides';
 
 /** Reads a prefab document by its asset guid; `null`/`undefined` when it cannot. */
@@ -21,8 +21,26 @@ const MAX_MEMBER_PATHS = 100_000;
 class MemberWalkTooLarge extends Error {}
 
 /** The fields of a scene row or an `added[]` node that decide which members derive under it. */
-export type AddedNode = { guid?: unknown; key?: unknown; prefab?: unknown; added?: unknown; children?: unknown; nestedStructure?: unknown };
-type PrefabRow = { localId?: number; prefab?: string; added?: unknown; nestedStructure?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
+export type AddedNode = { guid?: unknown; key?: unknown; prefab?: unknown; added?: unknown; children?: unknown; nestedStructure?: unknown; members?: unknown };
+type PrefabRow = { localId?: number; nodeGuid?: string; prefab?: string; added?: unknown; nestedStructure?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
+/** Scene member rows (v16), relative to one frame: `/<nodeGuid>[/…]` → a row whose `added` (#1468
+ *  Phase 4) holds nodes added under that member. Only `added` matters to this walk. */
+type MemberRows = Record<string, { added?: unknown } | null>;
+const rowsOf = (v: unknown): MemberRows | undefined => (v && typeof v === 'object' && !Array.isArray(v) ? v as MemberRows : undefined);
+/** A frame's DIRECT rows' added nodes, by the nodeGuid they hang under, and the rows one frame down
+ *  (`/<g>/…` → `/…`) for the nested row whose identity is `g` — the loader's `foldMemberRowChannels`
+ *  and `descendMemberRows`, as far as this walk needs them. */
+const directRowAdded = (rows: MemberRows | undefined, nodeGuid: string): unknown[] => {
+  const r = rows?.[`/${nodeGuid}`];
+  return nodeGuid && Array.isArray(r?.added) ? r.added : [];
+};
+const descendRows = (rows: MemberRows | undefined, nodeGuid: string | undefined): MemberRows | undefined => {
+  if (!rows || !nodeGuid) return undefined;
+  const prefix = `/${nodeGuid}/`;
+  let out: MemberRows | undefined;
+  for (const [k, v] of Object.entries(rows)) if (k.startsWith(prefix)) (out ??= {})[k.slice(prefix.length - 1)] = v;
+  return out;
+};
 /** A path-keyed structural slot (`nestedStructure`): '<localId>[.<localId>…]' → that expansion's delta. */
 type NestedSlots = Record<string, { added?: unknown }>;
 const slotsOf = (v: unknown): NestedSlots | undefined => (v && typeof v === 'object' ? v as NestedSlots : undefined);
@@ -37,8 +55,9 @@ type AnchorTag = 'self' | 'parent' | 'skip';
  *  guid-less stored root on the way down, each of which derives its own guid and anchors the next
  *  segment (#1349). */
 type Base = { tag: AnchorTag; done: Step[][]; path: Step[]; id: string };
-/** A numeric localId step, or a template-keyed added node's `'+key'` (`addedKeyStep`, #1387). */
-type Step = number | string;
+/** A numeric localId step, or a template-keyed added node's `'+key'` (`addedKeyStep`, #1387).
+ *  Aliased rather than re-declared: the type is `MemberStep` and lives in `assetRefRules` (#1468). */
+type Step = MemberStep;
 
 /** Every `path` (`deriveInstanceMemberGuids`'s step chain, dot-joined; `|` between segments, see
  *  {@link deriveMemberChain}) a member can derive at below
@@ -84,7 +103,7 @@ export function memberPathRecords(
   const emit = (b: Base): void => {
     if (b.tag === 'skip' || !b.path.length) return;
     const set = out[b.tag];
-    const key = [...b.done, b.path].map((seg) => seg.join('.')).join('|');
+    const key = [...b.done, b.path].map(memberPathKey).join('|');
     if (set.has(key)) return;
     set.set(key, b.id);
     if (++size > MAX_MEMBER_PATHS) throw new MemberWalkTooLarge();
@@ -106,7 +125,7 @@ export function memberPathRecords(
    *  structure an outer layer addressed INTO this expansion, split at each nested row exactly as the loader
    *  splits it (`descendPathKeyed`, the row's own slots under what was forwarded) — a template-keyed node a
    *  row writes into a deeper expansion lives only there (#1430). */
-  const expand = (doc: PrefabDoc, root: Base, orphan: Base, added: unknown, stack: string[], depth: number, frame: string, nested?: NestedSlots): void => {
+  const expand = (doc: PrefabDoc, root: Base, orphan: Base, added: unknown, stack: string[], depth: number, frame: string, nested?: NestedSlots, memberRows?: MemberRows): void => {
     if (depth > MAX_INSTANCE_DEPTH) throw new MemberWalkTooLarge();
     const rootLocalId = doc.rootLocalId ?? 1;
     // The rows the loader actually spawns and maps: a nested row only when its prefab resolves.
@@ -144,14 +163,28 @@ export function memberPathRecords(
         // The loader REPLACES the row's `added` with an outer layer's direct list. Both are walked:
         // over-generating is harmless, and a node the scene saved in scene form (its derived guid,
         // no key) is still named by the template path that derives it (#1430).
-        const rowAdded = [...(Array.isArray(row.added) ? row.added : []), ...(Array.isArray(direct?.added) ? direct.added : [])];
+        // …and so does a member ROW for this nested root (Phase 4, #1468), whose added nodes hang at the
+        // child's ROOT (no `parentLocalId`, which the child's walk reads as its root).
+        const fromRow = directRowAdded(memberRows, row.nodeGuid ?? '').map((n) => (n && typeof n === 'object' ? { ...n as object, parentLocalId: undefined } : n));
+        const rowAdded = [...(Array.isArray(row.added) ? row.added : []), ...(Array.isArray(direct?.added) ? direct.added : []), ...fromRow];
         // A nested row expands under parent 0, so ITS orphans are unaddressable.
         expand(docOf(row.prefab)!, here, SKIP, rowAdded, [...stack, row.prefab], depth + 1, here.id,
-          mergeNestedStructurePaths(slotsOf(row.nestedStructure), forward));
+          mergeNestedStructurePaths(slotsOf(row.nestedStructure), forward), descendRows(memberRows, row.nodeGuid));
       }
     }
-    if (Array.isArray(added)) {
-      for (const n of added as (AddedNode & { parentLocalId?: number })[]) {
+    // A member row's added nodes (Phase 4, #1468) hang under the member the row names — the same
+    // anchoring `parentLocalId` gives a legacy node, reached by identity instead.
+    const fromRows: unknown[] = [];
+    for (const [localId, row] of rows) {
+      // A nested root's row was walked by its expansion above — the route the loader takes. Walking it
+      // here as well would name the same paths again (`emit` dedups them), so this is one route, not a
+      // correctness guard: mutation confirms dropping it changes no output.
+      if (row.prefab && localId !== rootLocalId) continue;
+      for (const n of directRowAdded(memberRows, row.nodeGuid ?? '')) if (n && typeof n === 'object') fromRows.push({ ...n as object, parentLocalId: localId });
+    }
+    const allAdded = [...(Array.isArray(added) ? added : []), ...fromRows];
+    if (allAdded.length) {
+      for (const n of allAdded as (AddedNode & { parentLocalId?: number })[]) {
         if (!n || typeof n !== 'object') continue;
         const at = n.parentLocalId ?? rootLocalId;
         const b = baseOf(at);
@@ -175,7 +208,7 @@ export function memberPathRecords(
       emit(here);
       // A FRESH row chain, as `spawnNestedInstance` gives it (#1324 review). Guid-less, the root
       // still anchors its members on the guid it derives (#1349).
-      expand(child, ownGuid ? SKIP : anchoredAt(here), base, n.added, [n.prefab as string], depth + 1, id, slotsOf(n.nestedStructure));
+      expand(child, ownGuid ? SKIP : anchoredAt(here), base, n.added, [n.prefab as string], depth + 1, id, slotsOf(n.nestedStructure), rowsOf(n.members));
       return;
     }
     // A plain node with its own guid anchors everything below it (its own walk).
@@ -192,7 +225,7 @@ export function memberPathRecords(
         const orphan: Base = { tag: opts.orphans ?? 'skip', done: [], path: [], id: '' };
         const root: Base = opts.guidLess ? under(orphan, '', doc.rootLocalId ?? 1) : { tag: 'self', done: [], path: [], id: '' };
         emit(root);
-        expand(doc, opts.guidLess ? anchoredAt(root) : root, orphan, node.added, [node.prefab as string], 0, '', slotsOf(node.nestedStructure));
+        expand(doc, opts.guidLess ? anchoredAt(root) : root, orphan, node.added, [node.prefab as string], 0, '', slotsOf(node.nestedStructure), rowsOf(node.members));
       }
     } else if (Array.isArray(node.children)) {
       // A plain added node anchors any guid-less nested instance added beneath it.
@@ -208,7 +241,9 @@ export function memberPathRecords(
 /** The guid a member at `key` (a {@link derivedMemberPathsByAnchor} path) derives from `anchor`:
  *  one `deriveMemberGuid` per `|`-separated segment, each result anchoring the next. */
 export function deriveMemberChain(anchor: string, key: string): string {
-  return key.split('|').reduce((a, seg) => deriveMemberGuid(a, seg.split('.').map((s) => (s.startsWith('+') ? s : Number(s)))), anchor);
+  // `parseSteps`, not `memberPathSteps`: an empty SEGMENT has always seeded `deriveMemberGuid` with
+  // `'0'` rather than with nothing, and that output is persisted and frozen (#1468 Phase 1).
+  return key.split('|').reduce((a, seg) => deriveMemberGuid(a, parseSteps(seg)), anchor);
 }
 
 /** The member paths that derive from `node`'s own guid — {@link derivedMemberPathsByAnchor}'s `self`. */
@@ -266,6 +301,8 @@ export function sceneMemberAnchors(scene: Record<string, unknown>): SceneMemberA
       if (anchor && !topLevel) out.push({ node: row, opts: {}, self: anchor, parent: null });
       visit(row.children, false);
       visit(row.added, false);
+      // A member row's added nodes (Phase 4, #1468) define anchors exactly as `added` does.
+      for (const r of Object.values(rowsOf(row.members) ?? {})) visit(r?.added, false);
       const slot = (row as { nestedStructure?: unknown }).nestedStructure;
       if (slot && typeof slot === 'object') {
         for (const delta of Object.values(slot as Record<string, { added?: unknown } | null>)) visit(delta?.added, false);
@@ -351,12 +388,12 @@ export function rewritePrefabMemberTokens(
     const oldBase = before.pathOf.get(frame);
     const newBase = after.pathOf.get(frame);
     if (oldBase === undefined || newBase === undefined) return s;
-    const id = before.idOf.get(join(oldBase, t.path.join('.')));
+    const id = before.idOf.get(join(oldBase, memberPathKey(t.path)));
     const target = id === undefined ? undefined : after.pathOf.get(id);
     if (target === undefined) return s;
     if (newBase && target !== newBase && !target.startsWith(newBase + '.')) return s;
     const rel = newBase ? target.slice(newBase.length + 1) : target;
-    const next = memberToken(t.up, rel ? rel.split('.').map((x) => (x.startsWith('+') ? x : Number(x))) : []);
+    const next = memberToken(t.up, memberPathSteps(rel));
     if (next !== s) changed = true;
     return next;
   });
@@ -404,7 +441,7 @@ export function rewritePrefabMemberTokens(
   if (doc.moved && typeof doc.moved === 'object') {
     moved = {};
     for (const [key, value] of Object.entries(doc.moved as Record<string, unknown>)) {
-      const token = memberToken(0, key ? key.split('.').map((x) => (x.startsWith('+') ? x : Number(x))) : []);
+      const token = memberToken(0, memberPathSteps(key));
       const next = rewrite(token, ['']) as string;
       const nextKey = next.slice(MEMBER_TOKEN_PREFIX.length);
       if (nextKey !== key) changed = true;

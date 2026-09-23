@@ -115,8 +115,11 @@ function runAllowFail(repo: string, args: string[] = []): { status: number; out:
 }
 
 /** A minimal scene: one entity carrying a truthy `UIAnchor.zIndex` with a sibling `UIElement`. */
-const sceneWithAnchorZIndex = (zIndex: number) => ({
-  version: 9,
+/** `version` defaults to a legacy SCENE number. A PREFAB fixture must pass one of its OWN — the two
+ *  ladders are unrelated, and 9 is ABOVE every prefab version there has ever been, so a prefab
+ *  stamped 9 now reads as written-by-a-newer-build and the script refuses it (#1468). */
+const sceneWithAnchorZIndex = (zIndex: number, version = 9) => ({
+  version,
   entities: [
     {
       name: 'Node',
@@ -149,7 +152,7 @@ describe('migrate-anchor-zindex (end-to-end, throwaway repo)', () => {
   // future prefab bump would have been silently stamped back to 3 by every run (#1362 review).
   it('stamps the PREFAB format version on a .prefab.json, from the constant', () => {
     tmp = makeRepo();
-    const file = writeJson(tmp, 'games/x/runtime/assets/prefabs/p.prefab.json', sceneWithAnchorZIndex(7));
+    const file = writeJson(tmp, 'games/x/runtime/assets/prefabs/p.prefab.json', sceneWithAnchorZIndex(7, 2));
 
     const out = run(tmp, ['--write']);
     expect(out).toMatch(/1 UIAnchor\.zIndex key\(s\) in 1 file\(s\) rewritten/);
@@ -158,6 +161,42 @@ describe('migrate-anchor-zindex (end-to-end, throwaway repo)', () => {
     expect(after.version).toBe(PREFAB_FORMAT_VERSION);
     expect(after.version).not.toBe(SCENE_FORMAT_VERSION); // the two are distinct on purpose
     expect(after.entities[0].traits.UIElement.zIndex).toBe(7);
+  });
+
+  // ⚠️ #1468 — the stamp used to be UNCONDITIONAL, so this script would rewrite a document a NEWER
+  // build wrote and then stamp the older number onto it: the newer format's fields gone, and what
+  // remained mislabelled as this build's output. The script has no server and no client wrapper
+  // between it and the bytes, so `engine/plugins/prefabWriteGuard.ts` cannot see it at all — the
+  // refusal has to live in the script itself.
+  describe('a document a newer build wrote', () => {
+    it('is skipped untouched, and SAYS so rather than reporting a clean corpus', () => {
+      tmp = makeRepo();
+      const file = writeJson(tmp, 'games/x/runtime/assets/prefabs/p.prefab.json', sceneWithAnchorZIndex(7, PREFAB_FORMAT_VERSION + 1));
+
+      const out = run(tmp, ['--write']);
+      expect(out).toMatch(/SKIP .*p\.prefab\.json: format/);
+      expect(out).toMatch(/1 file\(s\) SKIPPED/);
+
+      const after = readJson(file);
+      expect(after.version).toBe(PREFAB_FORMAT_VERSION + 1);                 // stamp not lowered
+      expect(after.entities[0].traits.UIAnchor.zIndex).toBe(7);              // bytes not touched
+      expect(after.entities[0].traits.UIElement).not.toHaveProperty('zIndex');
+    });
+
+    it('applies the same rule to a SCENE, against the scene ladder', () => {
+      tmp = makeRepo();
+      const file = writeJson(tmp, 'games/x/runtime/assets/scenes/a.scene.json', sceneWithAnchorZIndex(5, SCENE_FORMAT_VERSION + 1));
+      expect(run(tmp, ['--write'])).toMatch(/1 file\(s\) SKIPPED/);
+      expect(readJson(file).version).toBe(SCENE_FORMAT_VERSION + 1);
+    });
+
+    it('accepts a document AT the target version — the refusal is one-sided', () => {
+      // The whole corpus is below the target; an exact-match check would refuse all of it.
+      tmp = makeRepo();
+      const file = writeJson(tmp, 'games/x/runtime/assets/prefabs/p.prefab.json', sceneWithAnchorZIndex(7, PREFAB_FORMAT_VERSION));
+      expect(run(tmp, ['--write'])).toMatch(/1 UIAnchor\.zIndex key\(s\) in 1 file\(s\) rewritten/);
+      expect(readJson(file).entities[0].traits.UIElement.zIndex).toBe(7);
+    });
   });
 
   it('dry-run (no --write) reports the same count and writes nothing', () => {

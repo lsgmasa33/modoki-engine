@@ -1561,6 +1561,33 @@ describe('asset-tree-shaker', () => {
     expect(result.unreachableRefs).toEqual([]);
   });
 
+  it('keeps refs held only in a MEMBER ROW — its traits and its added nodes (#1468 Phase 4)', () => {
+    // Since Phase 4 a member's overrides and the subtrees added under it live on its row, not in
+    // `overrides`/`added`. A ref there that this walker misses is dropped from the build, and — the
+    // guard below — fails it.
+    const rowGuid = 'abab1111-2222-4333-8444-555555555501';
+    const rowAddedGuid = 'abab1111-2222-4333-8444-555555555502';
+    fx.writeJson('/games/test/assets/mats/row.mat.json', { id: rowGuid, version: 1 });
+    fx.writeJson('/games/test/assets/mats/rowadded.mat.json', { id: rowAddedGuid, version: 1 });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 16,
+      entities: [{
+        id: 1, traits: {},
+        members: { '/abab1111-2222-4333-8444-5555555555ff': {
+          guid: 'abab1111-2222-4333-8444-5555555555fe',
+          traits: { Renderable3DPrimitive: { material: rowGuid } },
+          added: [{ parentLocalId: 0, guid: '', name: 'X', traits: { Renderable3DPrimitive: { material: rowAddedGuid } }, children: [] }],
+        } },
+      }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/mats/row.mat.json');
+    expect(result.kept).toContain('/games/test/assets/mats/rowadded.mat.json');
+    expect(result.unreachableRefs).toEqual([]);
+  });
+
   it('does NOT flag a video the module toggle dropped on purpose (ordering, not luck)', () => {
     // The guard runs BEFORE the excludeVideo prune for exactly this case. `build.modules.video:false`
     // removes clips from the keep-set AFTER the walk, so a scene that legitimately references one

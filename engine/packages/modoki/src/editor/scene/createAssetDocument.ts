@@ -23,7 +23,7 @@
 import { newGuid, getAssetEntry } from '../../runtime/loaders/assetManifest';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { backendFetch, postWriteFile } from '../backend/editorBackend';
-import { resolveExistingDocumentId } from './prefab';
+import { classifyExistingDocumentId } from './prefab';
 import { assetWrittenToDisk } from './dirtyAssets';
 
 export type NewAssetDocumentResult =
@@ -81,7 +81,17 @@ export async function writeNewAssetDocument(
   if (!(await opts.confirmReplace(at))) return { outcome: 'declined', path: at };
 
   // Both read BEFORE the replacing write, which is what destroys them.
-  const keptId = await resolveExistingDocumentId(at);
+  const existing = await classifyExistingDocumentId(at);
+  // ⚠️ REFUSE rather than mint over a document that is THERE and unreadable (#1468, #896's class).
+  // A 500, corrupt bytes or a file a newer build wrote used to arrive here as `undefined`, which
+  // this line read as "first-time import" and answered with a FRESH guid — orphaning everything
+  // that referenced the old one, with the old bytes still on disk. The human already confirmed
+  // replacing the file; they did not confirm re-identifying it.
+  if (existing.kind === 'refuse') {
+    console.error(`[Asset] not replacing ${at} — ${existing.reason}`);
+    return { outcome: 'failed', path: at };
+  }
+  const keptId = existing.kind === 'known' ? existing.id : undefined;
   const previousContent = opts.keepPrevious ? await readText(at) : null;
   const guid = keptId ?? fresh;
   const body = build(guid, keptId != null);

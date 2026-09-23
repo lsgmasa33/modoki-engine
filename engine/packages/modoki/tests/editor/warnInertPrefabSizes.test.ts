@@ -101,7 +101,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     // The reader must SEE the authoring writes, or an empty census would pass everything below.
     expect(census).toEqual(expect.arrayContaining([
       { file: 'packages/modoki/src/editor/scene/prefab.ts', in: 'applyToPrefabSelective', warned: true },
-      { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true },
+      { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true }, // via writePrefabFileReport
       { file: 'app/editor/agentEditorOps.ts', in: 'registerEditorAgentOps', warned: true }, // prefabAction:'create'
     ]));
     // An unwarned write is an offender unless it is a restore. Keyed `file::function` and SPENT per call, so a second
@@ -456,11 +456,20 @@ function prefabWriteCensus(): Array<{ file: string; in: string | undefined; warn
   return files.sort().flatMap((abs) => {
     const code = readScannedSource(abs).code;
     if (!code.includes('writePrefabFile')) return [];
-    return callsTo(parseSource(code, path.basename(abs)), 'writePrefabFile').map((call) => ({
-      file: path.relative(ENGINE, abs).split(path.sep).join('/'),
-      in: enclosingNamedFunction(call)?.name,
-      warned: warnedFirst(call),
-    }));
+    const sf = parseSource(code, path.basename(abs));
+    // ⚠️ BOTH names (#1468). The save choke point gained a report-returning sibling —
+    // `writePrefabFileReport` carries the backend's refusal reason out, which a boolean cannot — and
+    // `writePrefabFile` is now a thin wrapper over it. A census that knows only the old name stops
+    // seeing every caller that moves to the new one, which is this guard going quiet rather than
+    // green: `savePrefabEditReport` dropped straight out of it.
+    return [...callsTo(sf, 'writePrefabFile'), ...callsTo(sf, 'writePrefabFileReport')]
+      .map((call) => ({
+        file: path.relative(ENGINE, abs).split(path.sep).join('/'),
+        in: enclosingNamedFunction(call)?.name,
+        warned: warnedFirst(call),
+      }))
+      // The wrapper's own delegation is not a write SITE — it is the same write, named twice.
+      .filter((w) => w.in !== 'writePrefabFile');
   });
 }
 

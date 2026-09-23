@@ -71,7 +71,7 @@ export {
   captureInstanceOverrides, applyOverridesByRootInstance,
   applyToPrefab, applyToPrefabSelective,
   revertOverridesSelective, rebuildInstance,
-  writePrefabFile, warnInertPrefabSizes, resolveExistingPrefabId,
+  writePrefabFile, warnInertPrefabSizes, classifyExistingPrefabId,
   tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance,
   captureInstanceStructure, resolveInstanceContext,
@@ -82,7 +82,7 @@ export {
 // agent op both build their checkbox/discovery list from this ONE walk, so they cannot
 // silently drift from each other (see prefabOverrideKeys.ts's header comment).
 export {
-  fieldKey, addedKey, removedEntityKey, removedTraitKey,
+  fieldKey, addedKey, removedEntityKey, removedTraitKey, canonicalOverrideKey,
   collectInstanceOverrideFields, collectInstanceOverrideKeys,
   type FieldNode, type TraitNode, type EntityOverrideNode, type InstanceOverrideKeys,
 } from './scene/prefabOverrideKeys';

@@ -463,6 +463,11 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       { item: 'engine/plugins/inlinePlayable.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/load-project-config.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/model-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/prefabWriteGuard.ts', reason: "#1468: READS ONLY — one readFileSync of the "
+        + 'prefab already on disk, to classify its format version and refuse a write that would overwrite a '
+        + 'newer one. It never writes, so it cannot clobber a parked edit; the route it guards '
+        + '(/api/write-file) is byte-opaque and deliberately ungated, which is why the refusal lives here '
+        + 'rather than in that route body' },
       { item: 'engine/plugins/rigged-model-optimize.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/texture-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/vendorPlugins.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },

@@ -26,12 +26,14 @@
  *  readable path is what makes rebasing a prefix join and not a hash lookup. See docs/scene-loading.md
  *  § "Guid uniqueness is a PER-FILE rule", "Template identity". */
 
-import { mapStringValues } from './assetRefRules';
+import { mapStringValues, parseStep, formatStep, type MemberStep } from './assetRefRules';
 
 export const MEMBER_TOKEN_PREFIX = '@member:';
 
-/** A step: a numeric localId step, or `'+key'` for a template-keyed added node. */
-export type MemberStep = number | string;
+/** A step: a numeric localId step, or `'+key'` for a template-keyed added node. Declared in
+ *  `assetRefRules` beside the two functions that produce one (`memberStepId`, `addedKeyStep`) and
+ *  re-exported here, because a member token IS a step path and every token caller wants the type. */
+export type { MemberStep };
 
 const UP = '^';
 
@@ -55,20 +57,22 @@ export function parseMemberToken(token: string): { up: number; path: MemberStep[
     if (part === UP) {
       if (path.length) return null;
       up++;
-    } else if (part.startsWith('+') && part.length > 1) {
-      path.push(part);
-    } else if (/^\d+$/.test(part)) {
-      path.push(Number(part));
-    } else {
-      return null;
+      continue;
     }
+    // The step grammar is `parseStep`'s, not this function's (#1468 Phase 1). A token comes from a
+    // file, so it is the one reader that REJECTS a part fitting neither shape rather than letting it
+    // through as a step that names nothing.
+    const step = parseStep(part);
+    if (step === null) return null;
+    path.push(step);
   }
   return { up, path };
 }
 
-/** The key a step path is indexed under: the same text a token carries. */
+/** The key a step path is indexed under: the same text a token carries. `memberPathSteps` is its
+ *  inverse. */
 export function memberPathKey(path: readonly MemberStep[]): string {
-  return path.join('.');
+  return path.map(formatStep).join('.');
 }
 
 /** `value` with every member token rebased onto `segments`: the path from the top call's root to

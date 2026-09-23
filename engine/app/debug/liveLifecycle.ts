@@ -27,6 +27,7 @@ import {
   cloneTraitValues,
   remapGuidValues,
   planCopyGuids,
+  frameDocReader,
   templateKeyOf,
   setTemplateKey,
   carryEntityIdFields,
@@ -198,7 +199,7 @@ export function duplicateEntityLive(params: unknown): unknown {
     // A copy must NOT inherit the original's guid — two entities answering to one address is the
     // addressing failure every Percept tool would then inherit — and a ref INSIDE the copy must
     // follow it, or the copy drives the source (#1338). One plan per copy: each gets its own guids.
-    const { guidOf, remap, keyed } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid, (node) => node.key);
+    const { guidOf, remap, keyed } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid, (node) => node.key, frameDocReader(getCurrentWorld()));
     for (const src of snapshot) {
       const specs = src.traits.map((t) => {
         if (!t.data) return t;

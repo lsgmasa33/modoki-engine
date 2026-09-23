@@ -71,10 +71,12 @@ describe('an editor create writes through writeNewAssetDocument, never mint-then
       label: 'editor functions that mint a guid and write it with a plain write (#1264)',
       population: writes.filter((w) => w.mints).map(({ item, site }) => ({ item, site })),
       exempt: [{
-        item: 'scene/prefab.ts::writePrefabFile',
+        item: 'scene/prefab.ts::writePrefabFileReport',
         reason: 'the SAVE choke point for an existing template (Apply-to-Prefab, prefab edit mode, undo restore, the agent create op) — '
           + '`if (!prefab.id) prefab.id = newGuid()` heals a document with no id; it is not minting an identity for a new file. '
-          + 'Every caller hands it a prefab whose id was resolved from the existing file (resolveExistingPrefabId / the edited guid).',
+          + 'Every caller hands it a prefab whose id was resolved from the existing file (classifyExistingPrefabId / the edited guid). '
+          + 'Named `writePrefabFileReport` since #1468: the choke point gained a report-returning form so a refusal\'s REASON '
+          + 'survives the call, and `writePrefabFile` is now a thin boolean wrapper over it that mints nothing itself.',
       }],
       scanned: writes.length,
       floor: 10,

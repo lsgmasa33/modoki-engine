@@ -1,11 +1,12 @@
 {
   "id": "990e7e63-60eb-474d-97fb-86ae6af3f4e4",
-  "version": 2,
+  "version": 5,
   "name": "Terrain",
   "rootLocalId": 1,
   "entities": [
     {
       "localId": 1,
+      "nodeGuid": "88997ed7-d5dd-41f0-ae3d-ed47bd5a46b1",
       "name": "Terrain",
       "traits": {
         "Transform": {
@@ -36,6 +37,7 @@
     },
     {
       "localId": 2,
+      "nodeGuid": "d268f037-eb1c-4f5c-b032-75d2777cb83a",
       "name": "terrain",
       "traits": {
         "Transform": {

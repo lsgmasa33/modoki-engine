@@ -140,6 +140,111 @@ export function mergeNestedStructurePaths<T>(
   return out;
 }
 
+/** The channel fields of a scene member row (`SceneMemberRow`, scene v16) — the part
+ *  {@link foldMemberRowChannels} reads. Generic over the added-node type for the reason
+ *  `mergeNestedStructurePaths` is: the concrete types live in loadSceneFile.ts, which imports this. */
+export interface MemberRowChannels<A> {
+  traits?: Record<string, Record<string, unknown>>;
+  removedTraits?: string[];
+  removed?: boolean;
+  added?: A[];
+}
+
+/** The localId-keyed channels of ONE instance frame, as the spawner applies them. */
+export interface FrameChannels<A> {
+  overrides?: OverrideMap;
+  added?: A[];
+  removed?: number[];
+  removedTraits?: Record<number, string[]>;
+}
+
+/** Fold a frame's MEMBER ROWS onto its localId-keyed channels (#1468 Phase 4) — the one place a row's
+ *  identity is translated back into the document's own address space, so everything downstream (the
+ *  override apply, `applyStructureCore`) keeps working on localIds that are right for THIS document.
+ *
+ *  A localId is only meaningful together with the document it was read from, and a template renumbers
+ *  them (plan § 3.4). A row names its member by the minted `nodeGuid` instead, and this translates it
+ *  against `doc` — the frame's CURRENT document — at the moment it is applied. That is the whole fix:
+ *  an edit stored against identity lands on the same member however the template was renumbered since.
+ *
+ *  **Per member, per channel: a field that is PRESENT replaces the lower layer's value for that member;
+ *  an absent one leaves it.** `lower` is what the file's legacy channels (and, in a nested frame, the
+ *  prefab rows above it) already say. `traits` merges field by field, row winning — the rule
+ *  `nestedOverrides` has over a prefab row's own `overrides`. `removed: false` takes a member OUT of the
+ *  lower layer's removals, which is how a scene un-deletes a member an outer PREFAB layer deleted;
+ *  `removedTraits: []` and `added: []` are the same statement for their channels.
+ *
+ *  Only this frame's DIRECT rows are read (a key of one component); deeper keys belong to nested frames
+ *  and are handed down by `descendMemberRows`. A direct row naming a NESTED ROW of `doc` (an owned
+ *  nested instance's root) keeps only `removed` here — deleting the whole instance is this frame's
+ *  business — and is returned in `forwardRoot` for the recursion to fold as that frame's `rootRow`,
+ *  because its overrides, removed traits and added children must merge UNDER the nested expansion's own
+ *  lower layer, which an application after the recursion could not do (it cannot un-spawn an addition).
+ *
+ *  A row whose component names no row of `doc` is skipped: that is R2's orphan, reported elsewhere.
+ *  Inputs are never mutated — `lower` routinely aliases the prefab cache. */
+export function foldMemberRowChannels<A extends { parentLocalId: number }>(
+  doc: { entities?: readonly { localId?: number; nodeGuid?: string; prefab?: string }[]; rootLocalId?: number },
+  rows: Record<string, MemberRowChannels<A>> | undefined,
+  lower: FrameChannels<A>,
+  rootRow?: MemberRowChannels<A>,
+): FrameChannels<A> & { forwardRoot?: Map<number, MemberRowChannels<A>> } {
+  const direct: [string, MemberRowChannels<A>][] = [];
+  for (const [key, row] of Object.entries(rows ?? {})) {
+    // One component: `/<nodeGuid>`. A guid holds no `/`, so a second one means a deeper frame.
+    if (key.length > 1 && key[0] === '/' && key.indexOf('/', 1) < 0 && isRecord(row)) direct.push([key.slice(1), row]);
+  }
+  if (!direct.length && !rootRow) return lower;
+
+  const rootLocalId = doc.rootLocalId ?? 1;
+  const byGuid = new Map<string, { localId: number; nested: boolean }>();
+  for (const pe of doc.entities ?? []) {
+    if (pe.nodeGuid && pe.localId) byGuid.set(pe.nodeGuid, { localId: pe.localId, nested: !!pe.prefab && pe.localId !== rootLocalId });
+  }
+
+  let overrides = lower.overrides;
+  let added = lower.added;
+  const removed = new Set(lower.removed ?? []);
+  let removedTraits = lower.removedTraits;
+  let forwardRoot: Map<number, MemberRowChannels<A>> | undefined;
+
+  const apply = (lid: number, row: MemberRowChannels<A>, nested: boolean): void => {
+    if (typeof row.removed === 'boolean') {
+      if (row.removed) removed.add(lid);
+      else removed.delete(lid);
+    }
+    if (nested) {
+      if (row.traits || row.removedTraits || row.added) (forwardRoot ??= new Map()).set(lid, row);
+      return;
+    }
+    if (isRecord(row.traits)) overrides = mergeOverrideMaps(overrides, { [lid]: row.traits });
+    if (Array.isArray(row.removedTraits)) {
+      const next: Record<number, string[]> = { ...(removedTraits ?? {}) };
+      if (row.removedTraits.length) next[lid] = [...row.removedTraits];
+      else delete next[lid];
+      removedTraits = next;
+    }
+    if (Array.isArray(row.added)) {
+      added = [...(added ?? []).filter((n) => n.parentLocalId !== lid), ...row.added.map((n) => ({ ...n, parentLocalId: lid }))];
+    }
+  };
+
+  // The forwarded root row's `removed` is the OUTER frame's to apply — it deletes this whole instance —
+  // so only its interior channels land at this frame's root. ⚠️ NOT a falsifiable guard (close-out
+  // review): applied here too, the recursion deletes its own root and the outer frame deletes it again,
+  // with no observable difference. Kept because it states where each half of the row belongs.
+  if (rootRow) apply(rootLocalId, { ...rootRow, removed: undefined }, false);
+  for (const [component, row] of direct) {
+    const at = byGuid.get(component);
+    if (at) apply(at.localId, row, at.nested);
+  }
+  return {
+    overrides, added, removedTraits,
+    removed: [...removed].sort((a, b) => a - b),
+    ...(forwardRoot ? { forwardRoot } : {}),
+  };
+}
+
 /** Fold ONE trait's override fields onto its current values — the per-trait rule the spawner
  *  applies (`applyOverridesByLocalToEcs`) and `effectivePrefabMemberTraits` models, kept in one place
  *  so the two cannot disagree about precedence or about which fields count.

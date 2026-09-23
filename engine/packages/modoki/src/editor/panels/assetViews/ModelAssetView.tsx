@@ -12,7 +12,7 @@ import { useEditorStore } from '../../store/editorStore';
 import { importModel } from '../../scene/modelImport';
 import { glbDeclaresSkin } from '../../scene/rigBones';
 import { needsGLBConversion } from '../../scene/convertToGLB';
-import { serializePrefab, resolveExistingPrefabId, mergeRiggedPrefab, setPrefabCache, type PrefabFile } from '../../scene/prefab';
+import { serializePrefab, classifyExistingPrefabId, mergeRiggedPrefab, setPrefabCache, type PrefabFile } from '../../scene/prefab';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { DEFAULT_MODEL_SETTINGS, resolveModelSettings, type ModelImportSettings, type ModelCacheInfo, type LodCount, type ModelEncoder } from '../../../runtime/loaders/modelSettings';
 import { DEFAULT_TEXTURE_SETTINGS, TEXTURE_MAX_SIZES, DEFAULT_UASTC_LEVEL, DEFAULT_UASTC_RDO_LAMBDA, UASTC_LEVELS, resolveTextureSettings, resolveUastcRdoLambda, type TextureImportSettings, type TextureFormat } from '../../../runtime/loaders/textureSettings';
@@ -224,6 +224,40 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       // flush any still-parked edit first, or the bake would run against the OLD settings while
       // the UI already shows the new ones.
       await flushPendingMetaFor(path);
+
+      // ⚠️ DECIDE ABOUT THE PREFAB FIRST — before the bake and before `importModel` (#1468 close-out
+      // review F3). The refusal used to sit down beside the prefab write, by which point the
+      // re-import had already rewritten `.mesh.json`, `.mat.json`, the texture sidecars and the LOD
+      // bake, and the refusal then skipped `loadMeta`/`probePrefab`/`invalidateModelAndRig`, leaving
+      // the editor's caches pointed at the PRE-bake bytes of files that had just changed. Refusing
+      // up here means nothing has been touched yet, so there is no partial state to reason about.
+      // Both reads are pure and depend on nothing the import produces — `prefabPath` derives from
+      // `path` alone, and nothing in the import creates or rewrites a `.prefab.json`.
+      //
+      // ⚠️ AND IT ASKS ONLY WHEN THIS RUN WILL ACTUALLY WRITE THE PREFAB (review R1). The first cut
+      // of this hoist moved the classify up but left the two guards below behind, so it refused two
+      // paths that never touch the prefab: a SOURCE model (FBX/OBJ/DAE only bakes the GLB — the
+      // whole prefab block is inside `!isSourceModel`), and a STATIC GLB whose prefab already exists
+      // ("created once, no churn on a settings re-import"). A static `robot.glb` beside a
+      // `robot.prefab.json` a newer build wrote could then not be re-compressed at all — which
+      // inverts the owner's ruling, since that file is exactly the one that must stay usable. The
+      // guards move WITH the classify instead of being left behind it.
+      const prefabExists = isSourceModel ? false : await backendFetch(`/api/exists?path=${encodeURIComponent(prefabPath)}`)
+        .then((r) => (r.ok ? r.json() : { exists: false }))
+        .then((j: { exists?: boolean }) => !!j.exists)
+        .catch(() => false);
+      const willWritePrefab = !isSourceModel && (!prefabExists || isRigged);
+      const existingPrefab = willWritePrefab ? await classifyExistingPrefabId(prefabPath) : null;
+      if (existingPrefab?.kind === 'refuse') {
+        // ⚠️ `setImportError`, NOT a bare return (review F2). `setImportStatus(true, …)` is already
+        // up; returning past the `setImportStatus(false)` below leaves a full-screen ModalShell
+        // reading "Importing …" with NO dismiss button until a page reload — the dismiss only
+        // renders on the `failed` branch. That is the identical incident `Assets.tsx` records
+        // against its own early return, sixty lines from here, and this path repeated it.
+        setImportError(`Re-import of "${name}" was aborted — ${existingPrefab.reason}`);
+        return;
+      }
+
       // 1. Server-side bake (Stage A fixups + Stage B LOD simplification).
       const res = await backendFetch('/api/reimport', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -248,16 +282,18 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
           // rigged model's prefab is REGENERATED every import so it reflects the
           // current skeleton-expansion state (bones added/removed).
           if (!isSourceModel) {
-            const prefabExists = await backendFetch(`/api/exists?path=${encodeURIComponent(prefabPath)}`)
-              .then((r) => (r.ok ? r.json() : { exists: false }))
-              .then((j: { exists?: boolean }) => !!j.exists)
-              .catch(() => false);
+            // `prefabExists` and the classify are both read at the TOP of this callback now, so the
+            // refusal lands before anything is written — see the note there. `willWritePrefab` is
+            // this same pair of conditions, decided once.
             // Rigged → always regenerate (reflect the current expand state, bones in
             // or out). Static → only when missing.
-            if (!prefabExists || isRigged) {
-              // Reuse the prefab's existing stable id (manifest guid → on-disk id)
-              // so re-creating it keeps the guid scenes already reference.
-              const existingId = await resolveExistingPrefabId(prefabPath);
+            if (willWritePrefab) {
+              // Reuse the prefab's existing stable id (manifest guid → on-disk id) so re-creating it
+              // keeps the guid scenes already reference. Classified at the TOP of this callback, not
+              // here: a prefab that is there and unreadable used to arrive as `undefined`, which read
+              // as "first-time import" and minted a FRESH file guid over it, orphaning every scene
+              // that referenced the old one (#1468, #896's class).
+              const existingId = existingPrefab?.kind === 'known' ? existingPrefab.id : undefined;
               let prefab = serializePrefab(rootId, existingId);
               // P7b-2b: a rigged re-import refreshes the skeleton from source, but the
               // user's prefab edits (a child hung on a bone, an added Animator) must

@@ -2,6 +2,7 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { openIdentityScope, closeIdentityScope } from '../../runtime/core/ecs/identityParents';
 import { collectTransientSubtreeIds } from './authoringScope';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
@@ -24,10 +25,10 @@ import { setPlayState, getRunMode } from '../../runtime/core/playState';
 import { beginWorldReplacement } from './authoringSettle';
 import { swapHistory, forgetHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, preloadNestedPrefabs } from './prefab';
+import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefab';
-import type { AddedEntity, NestedOverridePaths, NestedStructurePaths } from '../../runtime/loaders/loadSceneFile';
+import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
@@ -74,7 +75,8 @@ export interface SerializedEntity {
   removed?: number[];
   /** Per-localId component (trait) names the instance deleted from prefab members. */
   removedTraits?: Record<number, string[]>;
-  /** Members moved to another parent inside the instance (#1437): row localId → live parent guid. */
+  /** LEGACY (#1437): row localId → live parent guid, for the moves NO member row carries — a member of
+   *  a pre-v5 template, which has no row. A member with a row states its move as `parent` there. */
   moved?: Record<number, string>;
   /** Scene-level overrides on this instance's NESTED prefab instances (a prefab's
    *  own internal nested instances, e.g. a ship's engine flames). Path-keyed so the
@@ -83,6 +85,11 @@ export interface SerializedEntity {
   /** Scene-level STRUCTURAL edits inside this instance's nested instances, path-keyed exactly like
    *  `nestedOverrides` (#1358). */
   nestedStructure?: NestedStructurePaths;
+  /** v16+: this instance's members, keyed by minted identity (#1468). One thin row per member,
+   *  carrying the guid that used to be re-derived from the member's position on every load. The
+   *  runtime shape and every rule about the key live on `SceneMemberRow` (`runtime/loaders/loadSceneFile.ts`) — this is the same type, re-exported, not a
+   *  second declaration of it. */
+  members?: Record<string, SceneMemberRow>;
 }
 
 /** A single resource the scene needs at load time. SceneManager acquires these
@@ -161,6 +168,16 @@ export function isSkippedByPrimarySave(entityId: number): boolean {
 }
 
 export async function serializeScene(opts?: {
+  assignGuids?: boolean;
+  scene?: { path: string; guid: string };
+}): Promise<SceneFile> {
+  // One identity resolver for the whole save, rebuilt only if the world's structure moves under an await
+  // (`identityParents.ts`).
+  openIdentityScope();
+  try { return await serializeSceneScoped(opts); } finally { closeIdentityScope(); }
+}
+
+async function serializeSceneScoped(opts?: {
   assignGuids?: boolean;
   scene?: { path: string; guid: string };
 }): Promise<SceneFile> {
@@ -318,20 +335,24 @@ export async function serializeScene(opts?: {
   // The nested channels, per top-level root — one top-down walk each (#1369; see captureNestedChannels).
   const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
   const nestedStructureByTop = new Map<number, NestedStructurePaths>();
+  const nestedFramesByTop = new Map<number, Map<string, { root: number; path: number[] }>>();
   for (const [rootId, { source }] of prefabRootInfo) {
     const prefab = await getPrefabSource(source);
     if (!prefab) continue;
     // A nested row whose instance is gone is recorded as removed only when its prefab is cached
     // (#1355), and a deleted instance's source is not among the live ones preloaded above.
     await preloadNestedPrefabs(prefab);
-    const s = captureInstanceStructure(rootId, prefab);
+    // Scene FILE form (#1468 Phase 4): a reference node inside writes its edits on its own rows.
+    const s = captureInstanceStructure(rootId, prefab, { rows: true });
     for (const ecsId of s.consumedEcsIds) prefabChildIds.add(ecsId);
-    const channels = captureNestedChannels(source, s.ownedNested);
+    const channels = captureNestedChannels(source, s.ownedNested, { rows: true });
     for (const ecsId of channels.consumedEcsIds) prefabChildIds.add(ecsId);
     if (channels.nestedOverrides) nestedOverridesByTop.set(rootId, channels.nestedOverrides);
     if (channels.nestedStructure) nestedStructureByTop.set(rootId, channels.nestedStructure);
-    if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length || Object.keys(s.moved).length) {
-      rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits, moved: s.moved });
+    nestedFramesByTop.set(rootId, channels.frames);
+    const unrowed = s.unrowed ?? {};
+    if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length || Object.keys(unrowed).length) {
+      rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits, moved: unrowed });
     }
   }
 
@@ -382,19 +403,30 @@ export async function serializeScene(opts?: {
       entry.prefab = rootInfo.source;
       const prefab = await getPrefabSource(rootInfo.source);
       if (prefab) {
-        const overrides = captureInstanceOverrides(info.id, prefab);
-        if (Object.keys(overrides).length > 0) entry.overrides = overrides;
         const struct = rootStructure.get(info.id);
-        if (struct) {
-          if (struct.added.length) entry.added = struct.added;
-          if (struct.removed.length) entry.removed = struct.removed;
-          if (Object.keys(struct.removedTraits).length) entry.removedTraits = struct.removedTraits;
-          if (Object.keys(struct.moved).length) entry.moved = struct.moved;
-        }
-        const nested = nestedOverridesByTop.get(info.id);
-        if (nested && Object.keys(nested).length) entry.nestedOverrides = nested;
-        const nestedStruct = nestedStructureByTop.get(info.id);
-        if (nestedStruct && Object.keys(nestedStruct).length) entry.nestedStructure = nestedStruct;
+        // v16 (#1468): each member's guid, STORED under its minted identity instead of re-derived
+        // from its position on the next load — plus, since Phase 3, `parent` for a member that has
+        // been moved inside the instance. Absent when the template predates prefab v5; see
+        // `memberRowKeysIn` for the full exclusion list.
+        // ⚠️ The template is passed, and it is what makes `parent` writable at all: the move is a
+        // DIFF against where this document puts the member, so a capture with no document can only
+        // carry the rows it is handed (`memberRowParents`).
+        // Since Phase 4 the rows also carry every EDIT they can key (`moveChannelsOntoRows`): what is
+        // left in the localId channels below is the root's own edits and what no row can address.
+        const moved = moveChannelsOntoRows(info.id, prefab, rootInfo.source, {
+          overrides: captureInstanceOverrides(info.id, prefab),
+          added: struct?.added, removed: struct?.removed, removedTraits: struct?.removedTraits,
+          nestedOverrides: nestedOverridesByTop.get(info.id), nestedStructure: nestedStructureByTop.get(info.id),
+        }, captureInstanceMembers(info.id, prefab), nestedFramesByTop.get(info.id));
+        const ch = moved.channels;
+        if (ch.overrides && Object.keys(ch.overrides).length) entry.overrides = ch.overrides;
+        if (ch.added?.length) entry.added = ch.added;
+        if (ch.removed?.length) entry.removed = ch.removed;
+        if (ch.removedTraits && Object.keys(ch.removedTraits).length) entry.removedTraits = ch.removedTraits;
+        if (struct && Object.keys(struct.moved).length) entry.moved = struct.moved;
+        if (ch.nestedOverrides && Object.keys(ch.nestedOverrides).length) entry.nestedOverrides = ch.nestedOverrides;
+        if (ch.nestedStructure && Object.keys(ch.nestedStructure).length) entry.nestedStructure = ch.nestedStructure;
+        if (Object.keys(moved.members).length) entry.members = moved.members;
         // Persist the root's stable guid on the node. The trait loop below writes
         // ONLY PrefabInstance for a captured root (EntityAttributes never gets
         // written, and guid is never an override), so this is the only place the
@@ -672,6 +704,15 @@ export function assertNoPathRefs(entry: SerializedEntity): void {
     flagNestedStructure(node.nestedStructure, `${ctx}.nestedStructure`); // a reference node's own slot (#1369)
     for (let i = 0; i < (node.children?.length ?? 0); i++) flagAdded(node.children[i], `${ctx}.child[${i}]`);
     for (let i = 0; i < (node.added?.length ?? 0); i++) flagAdded(node.added![i], `${ctx}.added[${i}]`);
+    flagRows(node.members, `${ctx}.members`);
+  };
+  // members: Record<key, SceneMemberRow> — since Phase 4 (#1468) a row carries a trait bag and added
+  // nodes, the two channels it took over, so it is walked for the same reason they are.
+  const flagRows = (members: Record<string, SceneMemberRow> | undefined, ctx: string) => {
+    for (const [key, r] of Object.entries(members ?? {})) {
+      if (r?.traits) flagTraits(r.traits, `${ctx}{${key}}.`);
+      for (let i = 0; i < (r?.added?.length ?? 0); i++) flagAdded(r.added![i], `${ctx}{${key}}.added[${i}]`);
+    }
   };
 
   flagTraits(entry.traits, '');
@@ -680,6 +721,7 @@ export function assertNoPathRefs(entry: SerializedEntity): void {
   flagNested(entry.nestedOverrides, 'nestedOverrides');
   flagNestedStructure(entry.nestedStructure, 'nestedStructure');
   for (let i = 0; i < (entry.added?.length ?? 0); i++) flagAdded(entry.added![i], `added[${i}]`);
+  flagRows(entry.members, 'members');
 }
 
 /** Walk serialized entities and extract every resource ref they reference.

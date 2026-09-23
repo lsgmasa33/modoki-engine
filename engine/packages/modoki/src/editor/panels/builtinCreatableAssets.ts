@@ -15,7 +15,7 @@ import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newScene, saveScene, NewSceneRefusedError } from '../scene/serialize';
 import { SCENE_EXT } from '../scene/sceneFileName';
-import { resolveExistingDocumentId } from '../scene/prefab';
+import { classifyExistingDocumentId } from '../scene/prefab';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { useEditorStore } from '../store/editorStore';
 
@@ -37,8 +37,15 @@ export function registerBuiltinCreatableAssets(): void {
       // one's guid, so what points at that scene keeps pointing at it (owner 2026-09-15). The save
       // below reads the id back through the manifest for `path`; registering the on-disk id first
       // covers a file the manifest has not indexed yet. Read BEFORE the save overwrites it.
-      const keptId = await resolveExistingDocumentId(path);
-      if (keptId) registerAsset(keptId, path, 'scene');
+      const existing = await classifyExistingDocumentId(path);
+      // ⚠️ Something is there and this build cannot read it: stop BEFORE `newScene` discards the
+      // live world (#1468). Carrying on would mint a fresh guid for a scene whose old id is still
+      // referenced — and this override writes last, so the damage would already be done.
+      if (existing.kind === 'refuse') {
+        useEditorStore.getState().showToast(`Cannot replace ${path} — ${existing.reason}`, 'warn');
+        return;
+      }
+      if (existing.kind === 'known') registerAsset(existing.id, path, 'scene');
       // `newScene(path)` sets the editor path itself, BEFORE the world swap it now performs
       // (#853) — the swap's listeners read it synchronously, so it cannot be set after.
       // A refusal (prefab-edit) is the human's to see: `runCreate` does not surface a throw,

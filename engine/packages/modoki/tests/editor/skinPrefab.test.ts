@@ -36,6 +36,15 @@ const serializePrefabSpy = vi.fn((..._args: unknown[]) => ({ id: 'g-new', root: 
 vi.mock('../../src/editor/scene/prefab', () => ({
   serializePrefab: (...args: unknown[]) => serializePrefabSpy(...args),
   setPrefabCache: (...args: unknown[]) => setPrefabCacheSpy(...args),
+  // #1468: the existing-id lookup moved off `getGuidForPath` (manifest only, so it minted a fresh
+  // guid over a prefab the scanner had not indexed yet) onto the shared classifier. Mirrored here
+  // against the same fixture path the mocked manifest answers for, so these tests keep driving the
+  // same two cases — fresh create, and update over an existing prefab.
+  classifyExistingPrefabId: async (path: string) => (
+    path === '/rigs/existing.prefab.json'
+      ? { kind: 'known', id: 'g-existing' }
+      : { kind: 'mintable', reason: 'absent' }
+  ),
 }));
 
 let writeResult = true;

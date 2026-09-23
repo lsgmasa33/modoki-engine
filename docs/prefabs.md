@@ -154,19 +154,44 @@ re-save:**
 - **`name: string`** — keep this as the file's `name` instead of defaulting to the root entity's
   name (see "renaming the root" below).
 
-Prefab-edit mode is the only caller that supplies them today. It is **not** the only path that
-re-serializes an existing file, so the other three are worth knowing:
+Prefab-edit mode is the only caller that supplies `preserveLocalIds`. It is **not** the only path
+that re-serializes an existing file — there are **six** writers, and the census that keeps them
+honest is `tests/architecture/prefabSerializeCallSites.test.ts`, which fails when a seventh appears
+without saying where its file guid comes from:
 
-| Path | Passes `existingId` | localId behaviour |
-|---|---|---|
-| **prefab-edit save** (`savePrefabEdit`) | yes | **preserved** — the mechanism below |
-| **rigged model re-import** (`ModelAssetView`) | yes | preserved by a *different* mechanism: serialize positionally, then `mergeRiggedPrefab` matches bones by NAME so their localIds stay stable and user-added children stay attached |
-| **2D skin rig write** (`skinPrefab.ts`) | yes | **renumbered** — the subtree is rebuilt from `rigDef.bones`, so ids follow the rig definition, not the file |
-| **`prefab` agent op, `create` over an existing path** | yes (`resolveExistingPrefabId`) | **renumbered** — it replaces the template with a scene entity tree, which is the intent |
+| Path | File guid | localId behaviour | Node identity (v5) |
+|---|---|---|---|
+| **prefab-edit save** (`savePrefabEdit`) | the open session's own | **preserved** — the mechanism below | **carried**, via `preserveNodeGuids` from the baseline document |
+| **rigged model re-import** (`ModelAssetView`) | `classifyExistingPrefabId` | preserved by a *different* mechanism: serialize positionally, then `mergeRiggedPrefab` matches bones by NAME so their localIds stay stable and user-added children stay attached | **carried** by that same content match |
+| **2D skin rig write** (`skinPrefab.ts`) | `classifyExistingPrefabId` | **renumbered** — the subtree is rebuilt from `rigDef.bones`, so ids follow the rig definition, not the file | **minted** — a rig subtree has no correspondence to the old rows |
+| **`prefab` agent op, `create` over an existing path** | `classifyExistingPrefabId` (throws on an unreadable file) | **renumbered** — it replaces the template with a scene entity tree, which is the intent | **carried** when the live tree is an instance of THIS prefab, else minted |
+| **Assets panel → Import Model** | `classifyExistingPrefabId` | **renumbered** — a fresh GLB tree | **minted** |
+| **Create Prefab → Replace** (`assetOps.ts`) | supplied later, by `writeNewAssetDocument`'s `build(guid, kept)` | **renumbered** | **minted**, even when the live tree is an instance of the prefab being replaced — the draft is serialized before the destination, and therefore the kept guid, is known |
 
-The last two are the same hazard this section describes, left as-is because both *regenerate* a
-template from a source of truth rather than round-tripping the authored file. Overrides keyed to
-a prefab written by either path can still be repointed by a structural change to its source.
+The renumbering rows are the same hazard this section describes, left as-is because they
+*regenerate* a template from a source of truth rather than round-tripping the authored file.
+
+⚠️ **What prefab v5 changes about that hazard, and what it does not** (#1468). Every row now carries
+a minted `nodeGuid` beside its `localId`. It does not stop the renumbering — `localId` is still the
+document's array key and still positional. What it removes is the *silent* failure: a freed localId
+is REUSED, so a stored key naming it comes back pointing at a **different member**, plausibly and
+with nothing to report it. A minted guid is never recycled, so the same key can only ever **dangle**,
+and a dangling key is something a reader can detect. Identity is carried where a real correspondence
+exists (the table above) and minted where none does — minting is the honest answer there, not a
+fallback.
+
+⚠️ **And a dangling key is now detected rather than merely detectable.** Scene v16 stores each
+member's guid in the instance's entry, keyed by that `nodeGuid`, so a key the template no longer
+declares is reported by name on load and kept in case the template edit is undone. That is the other
+half of the argument for minting: without a reader that notices, "can only dangle" is a property
+nobody observes. See `docs/prefab-structural-overrides.md` § *Member identity is STORED, not
+derived*.
+
+⚠️ **A NESTED reference row's identity lives in `PrefabInstance.parentNodeGuid`, not `nodeGuid`.**
+The live entity for such a row is the CHILD instance's root, whose `nodeGuid` is its identity in the
+child document — so the outer document's identity for that row rides beside `parentLocalId`, in the
+guid twin of it. Without that field a re-save of the outer prefab minted a fresh identity for the
+nested row every time, and every scene key naming anything inside that expansion dangled.
 
 The preserving mechanism, in `prefabEdit.ts`:
 
@@ -208,9 +233,20 @@ In the scene file a whole instance collapses to **one entry** — an ordinary
   "overrides": { "3": { "Transform": { "px": 4.2 } } },  // localId → trait → field → value
   "removed": [7],                          // prefab-member localIds this instance deleted
   "removedTraits": { "5": ["Light"] },     // localId → trait names deleted from a member
-  "moved": { "3": "9f1c…" }                // localId → guid of the parent a linked member was moved to (#1437)
+  "members": {                             // v16: member identity → its row (#1468)
+    "/5b2e…": { "guid": "0d7a…", "name": "Button", "parent": "9f1c…",  // `parent` only when moved (#1437)
+                "traits": { "Transform": { "px": 4.2 } } },           // its overrides (Phase 4)
+    "/77a0…": { "removed": true }          // a member this instance deleted — no guid, it is not live
+  }
 }
 ```
+
+⚠️ **Since #1468 Phase 4 the localId channels above are the LEGACY spelling.** A member whose template
+minted it an identity (prefab v5) has its edits on its `members` row instead — `traits`,
+`removedTraits`, `removed`, `added` — so they follow the member through a template renumber. The
+localId channels are still read, and still written for the instance ROOT's own edits and for a member
+no row can key (a pre-v5 template's). The rule and the reasons:
+[prefab-structural-overrides.md § A member's edits are stored on its row](./prefab-structural-overrides.md#a-members-edits-are-stored-on-its-row-phase-4).
 
 A prefab FILE can carry a `moved` map of its own (v4, #1437): `"<member path>": "@member:<path>"`,
 for a member it places under a parent no row relation can express. Both halves are member paths in
@@ -592,16 +628,30 @@ is stored in the parent prefab file as a single *reference row* — one
 instance. The child's members are **not** listed; they expand from the child
 file at load.
 
-Every file this serializer writes carries `PREFAB_FORMAT_VERSION` (currently **2**),
-stamped unconditionally — see `editor/scene/prefab.ts`. It used to be derived from
+Every file this serializer writes carries `PREFAB_FORMAT_VERSION` (**5** since #1468; this
+paragraph said **2** until then, which is the drift a hardcoded number in prose always ends in —
+read `runtime/core/version.ts`, which is where the constant lives now and which lists what each
+version added). It used to be derived from
 the document's content (`nestedRefs.size > 0 ? 2 : 1`, so flat prefabs stayed at 1),
 and that rule was replaced in #379 because it could **decrease**: deleting a prefab's
 last nested instance rewrote `2` back to `1`, which is not something a format version
 may do. v1 and v2 share the same shape — the nested fields are optional — so a v1 file
 still loads unchanged and no migration exists or is needed.
 
-⚠️ **Nothing on the loading path READS `version`, and writing that down is the
-point of this paragraph.** `fetchPrefab` (`runtime/loaders/meshTemplateCache.ts`)
+⚠️ **THE WRITE PATH NOW READS IT — that REVERSES what the rest of this section says, and the
+reversal is deliberate (#1468, owner 2026-09-23).** A server-side gate
+(`engine/plugins/prefabWriteGuard.ts`, wired into `/api/write-file` and the asset scanner's
+`writeAssetGuid`) refuses to OVERWRITE a `.prefab.json` stamped **newer** than this build writes,
+with a 409. Four client-side writers refuse earlier so the refusal lands before the live world has
+been mutated, and `migrate-assets.mjs` / `migrate-anchor-zindex.mjs` carry their own copies because
+they have no server between them and the bytes. Every comparison is `version > CURRENT`, never
+`!==`: the authored corpus is entirely BELOW the constant, so an exact-match gate would refuse all
+of it. What forced the reversal was v5 adding a field an older build destroys irrecoverably — a
+minted `nodeGuid` per row, which cannot be re-derived because re-minting produces different guids.
+Disposition and the wording it replaced: `docs/format-versioning.md` § 3.
+
+**The LOADING path still does not read it**, and everything below remains true of loading.
+`fetchPrefab` (`runtime/loaders/meshTemplateCache.ts`)
 fetches, parses and caches; there is no version comparison anywhere between the
 file and a spawned instance, and `getCachedPrefab` is a map lookup. The field is
 a marker for the SERIALIZER, and no consumer acts on it. (It used to record
