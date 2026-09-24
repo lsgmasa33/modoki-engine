@@ -147,7 +147,11 @@ an accelerator whose chord the dispatcher yielded, both land in `handleMenuActio
 `utils/saveDialog.ts` (which has no React by design). Mounting or opening pushes the modal entry, so
 the registration cannot be forgotten by a dialog that draws its own backdrop — the shape all 17 had.
 `onDismiss` is the backdrop dismiss, and it fires only for a press that starts AND ends on the scrim:
-a drag-select that starts in a field and is released outside does not close the dialog.
+a drag-select that starts in a field and is released outside does not close the dialog. Both forms
+stamp `data-modal-shell=<kind>` on the backdrop, so "which modals are open" is one DOM query —
+`modoki_dnd` reads it to report a drop that raised a confirm (`pendingModal`, #1471). The plain-DOM
+dialogs also name their box `<kind>` and each control `<kind>.<role>` (`save-dialog.confirm`,
+`<choice-kind>.<value>`, #1470) so an agent aims by name.
 
 **Agents are told.** `/api/input/key` warns when a press landed under a modal and no binding of the
 modal's own claimed it, instead of answering `ok:true` alone.

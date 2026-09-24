@@ -84,12 +84,26 @@ export interface DomDndResult {
    *  - `asset-document` — a skin/particle/atlas/material document, parked in the dirty-asset
    *    registry and flushed by save_all. */
   committedTo?: 'scene' | 'asset-document';
+  /** A modal APPEARED during the drop's settle window, and this is it (#1471). The case it exists
+   *  for: a handler that asks first — the cross-scene reparent confirm (#1429) — is parked waiting
+   *  on a person, so `committed:false` is CORRECT and the drop is not a no-op: answer the modal,
+   *  then verify. Read from the DOM, not reported by the handler: both forms of the editor's one
+   *  modal shell stamp `data-modal-shell=<kind>` on their root, and this names the shell that was
+   *  not open before the drop. ⚠️ That is timing, not causation — a modal something ELSE opened in
+   *  the same 400 ms would be reported too (none is reachable from a synthesized drop today). Set
+   *  whatever `committed` says; the modal warning replaces the no-op one only when it is false.
+   *  `controls` are the named buttons inside it — what to aim at next — capped; `controlCount` is
+   *  the uncapped total.
+   *  Only seen when it opens inside the settle window; a handler slower than that is still the
+   *  "still running" case of `warning`. Undefined when no witness was supplied (no settle ran). */
+  pendingModal?: { kind: string; controls: string[]; controlCount: number };
   /** Present only on a no-op (ok:false): why the drop didn't land. */
   error?: string;
-  /** The drop landed, but something about it should stop a verdict resting on it. Two causes,
-   *  joined with ` ALSO: ` when both apply: an endpoint was COVERED, so no human could have
-   *  performed this gesture (#260); or it was delivered + accepted but no edit was recorded —
-   *  see `committed`. */
+  /** The drop landed, but something about it should stop a verdict resting on it. Joined with
+   *  ` ALSO: ` when several apply: an endpoint was COVERED, so no human could have performed this
+   *  gesture (#260); it was delivered + accepted but opened a modal instead of committing — see
+   *  `pendingModal`; or it was delivered + accepted and neither committed nor asked — see
+   *  `committed`. */
   warning?: string;
 }
 
@@ -123,6 +137,13 @@ export interface DomDndOptions {
   witness?: () => EditWitness;
 }
 
+/** How many of a raised modal's named buttons `pendingModal.controls` lists. A confirm has two; the
+ *  cap is for a list dialog that names a button per row. */
+const PENDING_MODAL_CONTROL_CAP = 8;
+
+/** Every open modal shell, React or plain-DOM — both stamp `data-modal-shell` (modalBackdrop.ts). */
+const openModalShells = (): Element[] => Array.from(document.querySelectorAll('[data-modal-shell]'));
+
 /** Synthesize a full HTML5 drag-and-drop from → to.
  *
  *  ACCEPTED IS NOT COMMITTED (measured 2026-07-22). A Hierarchy entity row preventDefaults
@@ -155,6 +176,9 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
   const toAim = aimProvenance(dst.el, dst.x, dst.y, !!params.to.selector, 'drag');
   const dt = new DataTransfer();
   const before = opts?.witness?.();
+  // By ELEMENT, not by kind: a drop that opens a second confirm of the kind already showing is
+  // still a drop that opened a modal.
+  const modalsBefore = new Set(openModalShells());
 
   fireDnd(src.el, 'dragstart', src.x, src.y, dt);
   fireDnd(dst.el, 'dragenter', dst.x, dst.y, dt);
@@ -170,6 +194,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
   // anything changed. Only worth waiting when a commit was actually plausible.
   let committed: boolean | undefined;
   let committedTo: DomDndResult['committedTo'];
+  let pendingModal: DomDndResult['pendingModal'];
   if (before !== undefined && types.length > 0 && accepted) {
     await sleep(COMMIT_SETTLE_MS);
     const after = opts!.witness!();
@@ -192,6 +217,13 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     // The alternative — diffing the stack's top entry and the registry's contents — buys a
     // stronger signal than "did this drop do anything" needs.
     if (committed) committedTo = after.world !== before.world ? 'scene' : 'asset-document';
+    // The LAST new shell is the top-most: both forms append to <body>, so document order is stack
+    // order.
+    const raised = openModalShells().filter((el) => !modalsBefore.has(el)).pop();
+    if (raised) {
+      const ids = Array.from(raised.querySelectorAll('button[data-ui-id]'), (b) => b.getAttribute('data-ui-id')!);
+      pendingModal = { kind: raised.getAttribute('data-modal-shell') ?? '', controls: ids.slice(0, PENDING_MODAL_CONTROL_CAP), controlCount: ids.length };
+    }
   }
   // A COVERED endpoint is a warning, never a refusal, and the asymmetry with every other aimed
   // input op is deliberate (#260). `docs/mcp-tool-conventions.md` §3 refuses a covered aim because
@@ -243,9 +275,22 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
   // classic case. It no longer is — #306 made the Hierarchy refuse a non-prefab asset on
   // dragover, so that gesture now comes back `accepted:false` with the honest error below
   // instead of arriving here. The heuristic stays for the cases nothing has closed.
-  if (types.length > 0 && accepted && committed === false) {
+  //
+  // ⚠️ The no-edit warning's list of legitimate cases is EXAMPLES, and says so. It used to read
+  // "TWO legitimate drops also land here", which an agent reasonably took as the full set — so a
+  // drop that raised the cross-scene confirm, matching neither, read as a refusal while the gate
+  // was working (#1471). That case is now a checked fact (`pendingModal`), not a third bullet; the
+  // prose stays non-exhaustive for whatever nobody has enumerated yet.
+  if (types.length > 0 && accepted && committed === false && pendingModal) {
+    const ctl = pendingModal.controls.length > 0
+      ? ` Its named buttons: ${pendingModal.controls.join(', ')}${pendingModal.controlCount > pendingModal.controls.length ? ` (+${pendingModal.controlCount - pendingModal.controls.length} more)` : ''}.`
+      : '';
     warnings.push(
-      'the target accepted the payload TYPE but NEITHER the undo stack NOR the parked-asset registry moved, so the drop probably did nothing. Verify with get_scene_state/history before building on this. TWO legitimate drops also land here: one whose handler is still running after 400ms (a prefab fetch with nested-prefab preloading, or a Skin sprite drop reading back an alpha mask), and one that records in neither place (a Project Settings path field, which adopts the file server-side and holds the value in dialog state).',
+      `the drop OPENED A MODAL (data-modal-shell="${pendingModal.kind}") and its handler is waiting on the answer, so nothing has committed YET — this is not a refused or no-op drop. Answer the modal, then verify with get_scene_state/history.${ctl}`,
+    );
+  } else if (types.length > 0 && accepted && committed === false) {
+    warnings.push(
+      'the target accepted the payload TYPE but NEITHER the undo stack NOR the parked-asset registry moved and no modal opened, so the drop probably did nothing. Verify with get_scene_state/history before building on this. Legitimate drops can land here too — these are EXAMPLES, not the full set: a handler still running after 400ms (a prefab fetch with nested-prefab preloading, a Skin sprite drop reading back an alpha mask, or a confirm raised only after an await longer than that), and a drop that records in neither place (a Project Settings path field, which adopts the file server-side and holds the value in dialog state).',
     );
   }
   // `ok` must reflect what ACTUALLY happened, not just "we fired the sequence". An empty
@@ -263,6 +308,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     accepted,
     ...(committed !== undefined ? { committed } : {}),
     ...(committedTo ? { committedTo } : {}),
+    ...(pendingModal ? { pendingModal } : {}),
     ...(types.length === 0
       ? { error: 'drag-and-drop no-op: the source element wrote nothing to the DataTransfer — it is likely not a drag source (wrong `from` selector).' }
       : !accepted
@@ -271,9 +317,10 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     // Everything in `warnings` is a WARNING rather than an error, and `ok` deliberately stays
     // true for all of them. The no-edit case: the DnD sequence really was delivered and really
     // was accepted; what we cannot prove is that the handler acted, and some legitimate drops
-    // are not undoable edits (the warning text names the two that actually reach it — a file
-    // MOVE is not one of them: it pushes a plain undo action, so the STACK moves and it is
-    // reported committed), so downgrading them to ok:false would
+    // are not undoable edits (the warning text gives examples, and says they are not the full set
+    // — a file MOVE is not one of them: it pushes a plain undo action, so the STACK moves and it is
+    // reported committed; a drop that raised a confirm is `pendingModal`), so downgrading them to
+    // ok:false would
     // invent failures across drop targets nobody has enumerated — trading a false success for a
     // false failure. The covered case: the drop genuinely landed, it just landed somewhere a
     // human could not have put it. Say exactly what is known, in both cases.

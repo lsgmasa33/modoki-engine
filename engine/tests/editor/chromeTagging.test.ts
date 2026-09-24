@@ -286,6 +286,11 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
     ids: ['inspector.section.pooledRowNote'],
     why: 'the pooled-row / entry-prefab advisory note on the UIElement trait section — the only signal an author gets that these fourteen fields are inert (#671).',
   },
+  {
+    file: 'panels/Inspector.tsx',
+    ids: ['inspector.prefab.apply', 'inspector.prefab.revert'],
+    why: 'the two DOORS into the Apply/Revert prefab dialogs. The dialogs themselves were fully addressable (`prefab.dialog.*`) while these untagged buttons made the whole flow unreachable from its first click (#1470). The save-dialog shell\'s own ids are covered behaviourally in saveDialogIds.test.ts.',
+  },
 ];
 
 describe('data-ui-id tagging has not rotted', () => {

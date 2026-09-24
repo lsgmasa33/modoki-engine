@@ -202,6 +202,9 @@ is the worse failure — but the loss is always announced, and named for what it
   reported.
 - **Cancel** → `staleGameCode: true` and a persistent "Running STALE game code" banner. This is the
   one state where measurements silently lie, so it stays loud.
+- **Every banner button is named** — `hmr.banner.reload-now`, `.cancel`, `.reload`, `.dismiss` on a
+  box `hmr.banner` — so an agent that sees the countdown can press Cancel by name inside the 5 s
+  (`modoki_tap {selector:'[data-ui-id="hmr.banner.cancel"]'}`) rather than hunting it by text.
 
 **The cause set is ENUMERATED, not hand-listed (#850).** `app/debug/hmrStaleness.ts`'s `DirtyProbe`
 returns whatever `unsavedChangeCauses()` (`editor/scene/serialize.ts`) reports — a `Record<string,

@@ -69,10 +69,12 @@ let reload: ReturnType<typeof vi.fn>;
 
 const banner = () => document.getElementById(BANNER_ID);
 const bannerText = () => banner()?.textContent ?? '';
-const clickButton = (label: string): void => {
-  const btn = [...(banner()?.querySelectorAll('button') ?? [])]
-    .find((b) => b.textContent === label);
-  if (!btn) throw new Error(`no "${label}" button; banner reads: ${bannerText()}`);
+/** Aims by the button's `data-ui-id` (`hmr.banner.<id>`), the way an agent does, and checks the
+ *  label too — so every click test below also pins that each id sits on the button it names. */
+const clickButton = (id: string, label: string): void => {
+  const btn = banner()?.querySelector<HTMLButtonElement>(`button[data-ui-id="hmr.banner.${id}"]`);
+  if (!btn) throw new Error(`no "hmr.banner.${id}" button; banner reads: ${bannerText()}`);
+  expect(btn.textContent).toBe(label);
   btn.click();
 };
 /** Let the handler's awaits settle — the dirty probe is async by design. */
@@ -164,7 +166,7 @@ describe('game code changed — dirty scene', () => {
     hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
     await settle();
 
-    clickButton('Reload now');
+    clickButton('reload-now', 'Reload now');
     await settle();
 
     expect(reload).toHaveBeenCalledTimes(1);
@@ -177,7 +179,7 @@ describe('game code changed — dirty scene', () => {
     hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
     await settle();
 
-    clickButton('Cancel');
+    clickButton('cancel', 'Cancel');
     vi.advanceTimersByTime(10_000); // the countdown must be dead, not merely paused
 
     expect(reload).not.toHaveBeenCalled();
@@ -185,6 +187,9 @@ describe('game code changed — dirty scene', () => {
     // This is the state where measurements silently lie, so it must be reported.
     expect(getHmrStatus().staleGameCode).toBe(true);
     expect(bannerText()).toContain('STALE');
+    // The STALE banner's own button, aimed by name: it is the way back to a build that measures.
+    clickButton('reload', 'Reload');
+    expect(reload).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -197,6 +202,8 @@ describe('reporting a discard the PREVIOUS page took', () => {
 
     expect(getHmrStatus().discardedUnsavedEdits).toBe(true);
     expect(bannerText()).toContain('discarded');
+    clickButton('dismiss', 'Dismiss');
+    expect(banner()).toBeNull();
     // Consumed, so a later reload does not claim a second, phantom loss.
     expect(sessionStorage.getItem(DISCARDED_KEY)).toBeNull();
   });
@@ -257,7 +264,7 @@ describe('shader code changed (postfx/npr TSL)', () => {
     hot.emit('modoki:shader-code-changed', { file: '/e/runtime/rendering/postfx/PostFXStack.ts' });
     await settle();
 
-    clickButton('Cancel');
+    clickButton('cancel', 'Cancel');
     await settle();
 
     expect(reload).not.toHaveBeenCalled();

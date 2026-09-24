@@ -41,12 +41,22 @@ export async function confirmInEditor(title: string, message: string, okLabel: s
 /** The prompt and the confirmation, in the plain-DOM form of the editor's modal shell (#1270), so the
  *  editor underneath takes no key and no menu command while it waits. With `initial` it is a text
  *  prompt resolving the trimmed value (null when empty); without it, a confirmation resolving '' on
- *  OK. Null on Cancel, Escape or a backdrop click. */
+ *  OK. Null on Cancel, Escape or a backdrop click.
+ *
+ *  Named the way `components/choiceModal.ts` names its shell — the box by its kind `save-dialog`,
+ *  each control `save-dialog.confirm` / `.cancel` / `.input` — so an agent or e2e spec aims by NAME
+ *  (#1470). Every prompt and confirm routes through here, the cross-scene reparent confirm (#1429)
+ *  included, so these ids reach them all. ⚠️ Written as LITERALS on purpose: the QA reference guard
+ *  (`qaCaseReferences.test.ts` `knownUiIds`) derives citable ids from source text, and a template
+ *  that STARTS with an interpolation has no static prefix it can read — a case citing
+ *  `save-dialog.confirm` would then fail `npm test` against an id that exists. */
 function openModal(title: string, message: string, okLabel: string, initial?: string, multiline = false): Promise<string | null> {
   return new Promise((resolve) => {
     // Above every React dialog (99999): Create Prefab and the New buttons can ask from inside one.
     const { root: overlay, close } = openDomModalShell('save-dialog', { zIndex: 99999, onDismiss: () => done(null) });
     const box = document.createElement('div');
+    box.dataset.uiId = 'save-dialog';
+    box.setAttribute('role', initial === undefined ? 'alertdialog' : 'dialog');
     box.style.cssText = 'background:#1e1e30;border:1px solid #555;border-radius:6px;padding:16px 20px;min-width:380px;font-family:monospace';
     const heading = document.createElement('div');
     heading.textContent = title;
@@ -58,6 +68,7 @@ function openModal(title: string, message: string, okLabel: string, initial?: st
     if (multiline) { label.style.whiteSpace = 'pre-wrap'; box.style.maxWidth = '560px'; }
     const input = initial === undefined ? null : document.createElement('input');
     if (input) {
+      input.dataset.uiId = 'save-dialog.input';
       input.value = initial ?? '';
       input.style.cssText = 'width:100%;box-sizing:border-box;padding:6px 8px;border-radius:3px;border:1px solid #444;background:#11111c;color:#eee;font-family:monospace;font-size:12px';
     }
@@ -65,9 +76,11 @@ function openModal(title: string, message: string, okLabel: string, initial?: st
     row.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:12px';
     const cancel = document.createElement('button');
     cancel.textContent = 'Cancel';
+    cancel.dataset.uiId = 'save-dialog.cancel';
     cancel.style.cssText = 'padding:4px 16px;border:1px solid #555;border-radius:3px;background:#2a2a40;color:#ccc;cursor:pointer;font-family:monospace;font-size:11px';
     const ok = document.createElement('button');
     ok.textContent = okLabel;
+    ok.dataset.uiId = 'save-dialog.confirm';
     ok.style.cssText = 'padding:4px 16px;border:1px solid #3a6;border-radius:3px;background:#244;color:#cfc;cursor:pointer;font-family:monospace;font-size:11px';
     row.append(cancel, ok);
     box.append(heading, label, ...(input ? [input] : []), row);

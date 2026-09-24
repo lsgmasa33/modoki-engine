@@ -1343,6 +1343,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
               border: '1px solid #3a4a5a', borderRadius: 3, fontSize: '11px', cursor: 'pointer',
             }}
             title="Pick which overrides to push back to the source .prefab.json"
+            data-ui-id="inspector.prefab.apply" data-ui-kind="button" data-ui-label="apply to prefab"
           >
             Apply to Prefab…
           </button>
@@ -1359,6 +1360,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
               border: '1px solid #4a3a3a', borderRadius: 3, fontSize: '11px', cursor: 'pointer',
             }}
             title="Pick which overrides to reset back to the prefab base on this instance"
+            data-ui-id="inspector.prefab.revert" data-ui-kind="button" data-ui-label="revert overrides"
           >
             Revert Overrides…
           </button>

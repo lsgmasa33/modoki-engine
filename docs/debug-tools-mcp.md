@@ -2299,7 +2299,10 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
     not** — since #1270 every full-screen dialog is portalled to `<body>`, so the Sprite/9-slice
     editors and the animation pickers are NOT under the panel that opened them. Narrow those with
     `within:'[data-modal-shell="<kind>"]'` (`sprite-editor`, `nine-slice-editor`, `project-settings`,
-    …), which is the attribute the shell puts on every backdrop. Label together with
+    `save-dialog`, …), which is the attribute the shell puts on every backdrop — the plain-DOM form
+    too, since #1471. The plain-DOM prompt/confirm (`save-dialog`) names its controls
+    `save-dialog.confirm` / `save-dialog.cancel` / `save-dialog.input`, and a choice modal names
+    each button `<kind>.<value>` (#1470). Label together with
     `selector` or `entity` also refuses `AMBIGUOUS`.
   - **Limits.**
     - An untagged element has no label to aim at — tag it.

@@ -83,7 +83,9 @@ function isHookOrderError(message: string): boolean {
 
 const BANNER_ID = 'modoki-hmr-banner';
 
-interface BannerAction { label: string; onClick: () => void }
+/** `id` becomes the button's `data-ui-id`, `hmr.banner.<id>` — named, not found by its text, so an
+ *  agent can press Cancel inside the discard countdown by aiming at it (#1470's sibling). */
+interface BannerAction { id: string; label: string; onClick: () => void }
 
 /** Show (or replace) the HMR banner. Returns a handle so a countdown can retarget the
  *  text without rebuilding the node (which would drop the user's click target). */
@@ -94,6 +96,7 @@ function showBanner(text: string, actions: BannerAction[], tone: 'warn' | 'info'
   const el = document.createElement('div');
   el.id = BANNER_ID;
   el.setAttribute('role', 'status');
+  el.dataset.uiId = 'hmr.banner';
   const bg = tone === 'warn' ? '#7a3b00' : '#1f3a5f';
   const border = tone === 'warn' ? '#c26a10' : '#3d6ea8';
   el.style.cssText = [
@@ -109,6 +112,7 @@ function showBanner(text: string, actions: BannerAction[], tone: 'warn' | 'info'
   for (const a of actions) {
     const btn = document.createElement('button');
     btn.textContent = a.label;
+    btn.dataset.uiId = `hmr.banner.${a.id}`;
     btn.style.cssText =
       `padding:3px 10px;border-radius:4px;border:0;background:#fff;color:${bg};font-weight:600;cursor:pointer`;
     btn.onclick = a.onClick;
@@ -261,7 +265,7 @@ export function initHmrStaleness(
       journal('!hmr.discarded-unsaved', { file, causes });
       const b = showBanner(
         `${capitalize(lostShort)} discarded to load changed game code`,
-        [{ label: 'Dismiss', onClick: () => b.remove() }],
+        [{ id: 'dismiss', label: 'Dismiss', onClick: () => b.remove() }],
         'info',
       );
     }
@@ -312,8 +316,9 @@ export function initHmrStaleness(
     const text = (msLeft: number) =>
       `${capitalized} changed — reloading in ${Math.ceil(msLeft / 1000)}s; ${lost} will be LOST`;
     const banner = showBanner(text(DISCARD_GRACE_MS), [
-      { label: 'Reload now', onClick: () => { void discardNow(); } },
+      { id: 'reload-now', label: 'Reload now', onClick: () => { void discardNow(); } },
       {
+        id: 'cancel',
         label: 'Cancel',
         onClick: () => {
           if (countdown) clearInterval(countdown);
@@ -327,7 +332,7 @@ export function initHmrStaleness(
           );
           journal('!hmr.stale-game-code', { file, kind: label });
           showBanner(`Running STALE ${label} — reload to apply`, [
-            { label: 'Reload', onClick: () => location.reload() },
+            { id: 'reload', label: 'Reload', onClick: () => location.reload() },
           ]);
         },
       },

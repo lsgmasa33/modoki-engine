@@ -872,8 +872,31 @@ paragraph said it was: `createPrefabFromEntity` → `tagEntityTreeAsInstance` wr
 because the wrong version would have told an agent its entities were untouched when a trait had
 just been written to each of them.
 
-⚠️ **What still reaches the no-commit warning**, now that an asset-document drop does not. Both are
-real and neither is a defect in the probe:
+#### A drop that opened a modal is `pendingModal`, not a no-op (#1471)
+
+A handler that **asks first** records nothing until a person answers — the cross-scene reparent
+confirm (#1429, `Hierarchy.tsx` awaits `confirmInEditor`) is the one that bit. `committed:false` is
+correct there, and the warning used to call it "probably did nothing" from a list that read
+"TWO legitimate drops also land here" — so a QA session watching the gate work would have recorded
+it as a refusal. The fix is a checkable FACT, not a third bullet (the #1214 shape):
+`performDomDnd` snapshots every `[data-modal-shell]` element before the drop and again after the
+settle, and a shell that was not there before comes back as
+`pendingModal: { kind, controls, controlCount }` — `controls` being the `data-ui-id`s of the
+buttons inside it (capped), i.e. what to aim at next. The warning then says the drop opened a modal
+and names them.
+
+- **Read from the DOM, which is why it covers every modal.** Both forms of the one modal shell
+  stamp `data-modal-shell=<kind>` on their root (`ModalShell.tsx`, and `openDomModalShell` since
+  #1471), and `modalShellCoverage.test.ts` fails on a backdrop drawn anywhere else. No editor
+  dependency is added to `domDnd.ts`.
+- **Compared by element, not kind** — a drop that opens a second `save-dialog` over one already
+  showing still opened a modal.
+- **Not seen:** a modal that opens after the 400 ms settle. That is the "handler still running"
+  case below, and the no-op warning names it.
+
+⚠️ **What still reaches the no-commit warning**, now that an asset-document drop does not. The
+warning says these are EXAMPLES, not the full set — the complete-looking list is what made the modal
+case read as a refusal. Both are real and neither is a defect in the probe:
 - a handler still running after `COMMIT_SETTLE_MS` (400 ms) — a prefab fetch with nested-prefab
   preloading, or a Skin sprite drop's alpha-mask readback. ⚠️ **Not an OS-file import**: it is
   gated on `dataTransfer.files.length`, and `performDomDnd` builds a bare `new DataTransfer()` that
