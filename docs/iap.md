@@ -761,11 +761,51 @@ Reproduce, unchanged: `court.shopOpen`, `court.storeBuyCoins300`, leave Apple's 
   fails.
 - **One `BillingClient`, ever.** Building one per call produced four concurrent clients at boot; the
   plugin holds a single client with queued callers and reconnects rather than replacing.
+- **A disconnect mid-setup reconnects ONCE, then rejects what is queued (#1514).** Nothing guarantees an
+  `onBillingSetupFinished` for an attempt that disconnects before setup completes (javap on Billing
+  9.0.0: `zzbw.onServiceDisconnected` resets the client to DISCONNECTED and calls only the disconnect
+  listener; a setup callable already launched from `onServiceConnected` may still report late, and
+  the attempt generation handles both orders). The handler used to clear `connecting` and nothing else, so the boot calls — isAvailable,
+  products, entitlements, unfinished — waited until some LATER call happened to reconnect, and forever
+  if none did: no reconcile, and Court's boot IAP block never finished. Rejecting on the first blip
+  would lock a paying player out of their entitlements for a transient hiccup (`refreshEntitlements`
+  keeps the previous set, which at boot is EMPTY), hence one retry first. A queued call never reached
+  Play, so rejecting it cannot misreport a purchase. A disconnect AFTER setup is unchanged: nothing is
+  queued, and the next call reconnects. ⚠️ **And a disconnect with a purchase sheet OPEN does not
+  strand the parked `purchase()` (#515, device-measured on the A23, 2026-09-24):** with the slow-card
+  sheet up, `am force-stop com.android.vending` delivered `onBillingServiceDisconnected` and then,
+  about a second later, `onPurchasesUpdated code=6` (ERROR) with the call still parked, which the
+  non-OK branch rejected as `billing.6`. The sheet's result reaches us through `ProxyBillingActivity`,
+  which runs in OUR process, not over the service connection. The next `purchase()` reconnected
+  (attempt 2), was not refused as "already in progress", and completed on the always-approves card.
+  So nothing here releases a parked purchase on disconnect. The owner's ruling for the case where
+  Play did NOT report the result: never release it as cancelled; only stop the stale slot blocking
+  new purchases (#515 option B). That is unreachable as measured, so it is not built. Each attempt carries a generation, so the superseded state
+  listener cannot drain or reject the retry's queue. The policy is `IapCore.ConnectionQueue`, tested
+  on a JVM by the `android/iap-core` leg.
+- ⚠️ **Every Billing listener is wrapped, because Play Billing SWALLOWS a listener's throw (#1514).**
+  The query/consume/acknowledge listeners run inside `ExecutorService.submit`, so a throw lands in
+  the `Future`: no crash, no log, and Billing's own 30s timeout is skipped because the future is
+  done. The setup and disconnect listeners are called inside a catch that only LOGS
+  ("Exception while calling onBillingSetupFinished."): louder, and the call still never settles. An unwrapped listener that
+  throws is a call that never settles. So each runs through `guarded(call, …)` (reject; unpark first,
+  which is a no-op unless it is the parked purchase) or `IapCore.Join.branch(…)`, and the drain loop
+  isolates each queued call. `purchasesUpdatedListener` is the deliberate exception: it runs on main,
+  and it can hold a matched, PAID delivery that a reject would report as a failure. `purchase()` also
+  builds its flow params and checks for a foreground Activity BEFORE parking, so a null Activity is a
+  plain reject rather than a throw from `launchBillingFlow` with the slot taken.
+- **`products()` / `entitlements()` / `unfinished()` join two concurrent queries — through
+  `IapCore.Join` (#1517).** INAPP and SUBS must be queried separately, and their listeners run at the
+  same time on Billing's pool. They used to `put` into one shared, unsynchronised `JSONArray`: a racing
+  add could silently drop an element — an owned entitlement reading as NOT owned — or, rarely, throw at
+  a grow boundary into the swallowing executor and hang the call. Each branch now hands over its own
+  list, merged under the join's lock, and the join settles exactly once.
 - **The `purchase()` call is parked, not answered directly** — Play reports the outcome through
   `purchasesUpdatedListener`, not through `launchBillingFlow`'s return, so `purchase()` stashes the
-  call in `awaitingPurchase`/`awaitingProductId` and marks it `setKeepAlive(true)`. Every one of the
-  four places that can settle it (cancel, a non-OK/null delivery, a matched delivery, a launch
-  failure) routes through one `unpark()` helper, which clears both fields and the keep-alive flag
+  call in `awaitingPurchase`/`awaitingProductId` and marks it `setKeepAlive(true)`. Every place that
+  can settle it (cancel, a non-OK/null delivery, a matched delivery, a launch failure, the #586 reload
+  release, the #583 timeout, and since #1514 `settleOnThrow` — seven, pinned by
+  `iapParkedCallRelease.test.ts`) routes through one `unpark()` helper, which clears both fields and the keep-alive flag
   together, before resolve/reject. **Invariant: a settle path never touches `awaitingPurchase`,
   `awaitingProductId`, or `setKeepAlive` directly — always through `unpark()`.** ⚠️ On Android today
   that keep-alive flag is inert rather than a leak (`Bridge.java` only saves a kept-alive call at
@@ -918,6 +958,9 @@ Kept because each is a class, not an incident.
 | `dispose()` existed and was called, but raced the constructor's own `addListener` round-trip, so the native listener still outlived the swap (#487) | a teardown that cannot see the setup it is undoing |
 | Every purchase failure on iOS reported `"Request Canceled"` — the catch-all rejected with `localizedDescription` alone, discarding the domain, code and underlying error (#499) | **a diagnostic that erases the difference it exists to report** |
 | A game declared two consumable-backed products `non-consumable`; the mock answered `entitlements()` from that declaration, so the relaunch test passed and only the iPad sandbox showed `[]` (#1202, fixed at the mock in #1219) | **a test double that grades its own homework** |
+| A disconnect during Billing setup stranded every queued call — the handler cleared a flag, and nothing guarantees a setup callback for that attempt (#1514) | **a lifecycle event that clears state without settling what is queued** |
+| A throw inside any Billing listener hung its call silently — Billing runs listeners in `ExecutorService.submit`, whose `Future` swallows it (#1514) | an SDK that turns a crash into a hang |
+| `products()`/`entitlements()` joined two concurrent listeners through one unsynchronised list, so an owned entitlement could be dropped (#1517) | a join whose branches share state |
 | A *thrown* `StoreKitError.userCancelled` fell into that same generic arm, so a player who backed out was reported as a failure — and reached `purchase_failed` analytics, which the design says a cancel must never do (#499) | one outcome with two code paths, only one of them handled |
 
 Three shapes recur. **A correct mechanism with a missing consumer** (rows 4, 5) — when touching this

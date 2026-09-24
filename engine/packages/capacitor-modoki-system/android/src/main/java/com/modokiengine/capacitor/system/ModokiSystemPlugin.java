@@ -97,14 +97,23 @@ public class ModokiSystemPlugin extends Plugin {
         }
         try {
             final ReviewManager manager = ReviewManagerFactory.create(getContext());
+            // ⚠️ The outer try does NOT cover these listener bodies — they run later, on the main
+            // thread, where an uncaught throw (launchReviewFlow on an Activity destroyed since) is
+            // an app CRASH, and the call would never settle anyway (#1514). So the body resolves
+            // false on a throw, the same answer as every other failure here. (The inner listener
+            // only reads `isSuccessful()`, which cannot throw.)
             manager.requestReviewFlow().addOnCompleteListener(task -> {
-                if (!task.isSuccessful()) {
+                try {
+                    if (!task.isSuccessful()) {
+                        resolveRequested(call, false);
+                        return;
+                    }
+                    ReviewInfo info = task.getResult();
+                    manager.launchReviewFlow(activity, info)
+                        .addOnCompleteListener(flow -> resolveRequested(call, flow.isSuccessful()));
+                } catch (Exception e) {
                     resolveRequested(call, false);
-                    return;
                 }
-                ReviewInfo info = task.getResult();
-                manager.launchReviewFlow(activity, info)
-                    .addOnCompleteListener(flow -> resolveRequested(call, flow.isSuccessful()));
             });
         } catch (Exception e) {
             resolveRequested(call, false);

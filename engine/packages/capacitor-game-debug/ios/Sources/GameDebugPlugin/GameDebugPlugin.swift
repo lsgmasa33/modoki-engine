@@ -74,7 +74,94 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         let preferred = UInt16(call.getInt("port") ?? 9095)
         retryAnnounced = false
         let deadline = Date().addingTimeInterval(Double(Self.bindRetryWindowMs) / 1000.0)
-        startListener(on: preferred, allowFallback: true, retryUntil: deadline, call: call)
+        let settle = beginStart(call)
+        armStartDeadline(settle)
+        startListener(on: preferred, allowFallback: true, retryUntil: deadline, settle: settle)
+    }
+
+    // MARK: - Start settling (#1514)
+
+    /// One `startServer` call, settled EXACTLY ONCE across every retry and fallback (#1514).
+    ///
+    /// ⚠️ The call used to be settled only from `.ready` / `.failed` in the state handler, with a
+    /// `settled` flag that was PER ATTEMPT (every retry made a new one) and unsynchronised (the handler
+    /// runs on a concurrent global queue, the retry from `asyncAfter`). `.waiting` and `.cancelled` hit
+    /// `default: break`, and a released listener hit a silent `guard … else { return }` — so a start
+    /// could simply never answer. JS awaits it with a `busy` latch (`createPortLifecycleHandler`), so
+    /// one unanswered start left the device bridge dead until relaunch.
+    private final class StartSettle {
+        let generation: Int
+        private let lock = NSLock()
+        private var call: CAPPluginCall?
+        private var lastState = "setup"
+
+        init(call: CAPPluginCall, generation: Int) {
+            self.call = call
+            self.generation = generation
+        }
+
+        var isSettled: Bool { lock.lock(); defer { lock.unlock() }; return call == nil }
+
+        func note(_ state: String) { lock.lock(); lastState = state; lock.unlock() }
+
+        /// The call, if nobody has settled it yet — and nobody can after this returns it.
+        func take() -> CAPPluginCall? {
+            lock.lock(); defer { lock.unlock() }
+            let c = call
+            call = nil
+            return c
+        }
+
+        /// Reject if still unsettled. Returns whether this was the settle.
+        @discardableResult
+        func reject(_ message: String) -> Bool {
+            lock.lock()
+            let c = call
+            call = nil
+            let state = lastState
+            lock.unlock()
+            guard let c = c else { return false }
+            c.reject("\(message) (last listener state: \(state))")
+            return true
+        }
+    }
+
+    /// Bumped by `stopAll`, so a retry, fallback or deadline belonging to a start that was stopped
+    /// mid-flight knows it is stale instead of re-binding after the stop. Guarded by `startLock`.
+    private var startGeneration = 0
+    private var pendingStart: StartSettle?
+    private let startLock = NSLock()
+    /// How long one `startServer` may go without `.ready` or a terminal failure before it gives up.
+    /// A bind is normally ready in well under a second, and the EADDRINUSE retry window is
+    /// `bindRetryWindowMs`; this bounds the states that promise nothing — `.waiting`, and anything
+    /// `@unknown` — so the JS call always answers. A mechanism bound, not a tuning knob.
+    private static let startDeadlineSeconds: Double = 10
+
+    private func beginStart(_ call: CAPPluginCall) -> StartSettle {
+        startLock.lock(); defer { startLock.unlock() }
+        let settle = StartSettle(call: call, generation: startGeneration)
+        pendingStart = settle
+        return settle
+    }
+
+    private func isCurrent(_ settle: StartSettle) -> Bool {
+        startLock.lock(); defer { startLock.unlock() }
+        return settle.generation == startGeneration
+    }
+
+    private func armStartDeadline(_ settle: StartSettle) {
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + Self.startDeadlineSeconds) { [weak self] in
+            if settle.isSettled { return }
+            print("[GameDebug] TCP server not ready after \(Self.startDeadlineSeconds)s — giving up this start")
+            // Reject FIRST, so the `.cancelled` our cancel provokes finds the start already answered.
+            guard settle.reject("TCP server was not ready within \(Int(Self.startDeadlineSeconds))s") else { return }
+            // Then cancel our own listener: JS has been told this start failed, and a listener that
+            // turned ready afterwards would hold the port against the start JS retries with.
+            if let self = self, self.isCurrent(settle), !self.running {
+                self.listener?.cancel()
+                self.listener = nil
+            }
+        }
     }
 
     /// Bind the TCP server + resolve JS with the ACTUAL port — only once the listener is
@@ -91,8 +178,10 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
     /// No Bonjour advertisement: connection is by MANUAL IP through Modoki's
     /// lease (see docs/debug-tools-mcp.md), so nothing broadcasts on the LAN — this
     /// removes the auto-discovery attack surface that let idle Claude sessions storm the device.
-    /// Resolves/rejects the call exactly once (`settled`).
-    private func startListener(on port: UInt16, allowFallback: Bool, retryUntil: Date, call: CAPPluginCall) {
+    ///
+    /// Settles through `settle`, which every retry and fallback shares, so the JS call answers
+    /// exactly once however many listeners this start goes through (#1514).
+    private func startListener(on port: UInt16, allowFallback: Bool, retryUntil: Date, settle: StartSettle) {
         let newListener: NWListener
         do {
             let params = NWParameters.tcp
@@ -100,20 +189,37 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
             let endpoint: NWEndpoint.Port = port == 0 ? .any : (NWEndpoint.Port(rawValue: port) ?? .any)
             newListener = try NWListener(using: params, on: endpoint)
         } catch {
-            call.reject("Failed to create listener: \(error)")
+            settle.reject("Failed to create listener: \(error)")
             return
         }
         listener = newListener
+        // Set before every cancel THIS handler issues itself, so the `.cancelled` that follows it is
+        // not read as an outside stop. The EADDRINUSE retry cancels the failed listener and then
+        // binds a new one; without this flag that cancel would reject the start mid-retry. Written
+        // and read only from this listener's own state handler, whose calls NWListener serialises.
+        var retiredByUs = false
 
-        var settled = false
         // Capture the listener WEAKLY — it retains this handler, so a strong capture is a reference
-        // cycle that leaks the NWListener on the EADDRINUSE fallback path (P4).
+        // cycle that leaks the NWListener on the EADDRINUSE fallback path (P4). ⚠️ Settling must NOT
+        // depend on those weak refs: they are nil exactly when `stopAll` released the listener
+        // mid-start, which is a case that must still answer. Only `.ready` needs them, for the port.
         newListener.stateUpdateHandler = { [weak self, weak newListener] state in
-            guard let self = self, let newListener = newListener else { return }
+            settle.note("\(state)")
             switch state {
             case .ready:
-                if settled { return }
-                settled = true
+                guard let self = self, let newListener = newListener, self.isCurrent(settle) else {
+                    newListener?.cancel()
+                    settle.reject("TCP server was stopped before it became ready")
+                    return
+                }
+                guard let call = settle.take() else {
+                    // Already answered — the deadline gave up on this start. Do not hold the port
+                    // against the start JS will retry with.
+                    retiredByUs = true
+                    newListener.cancel()
+                    if self.listener === newListener { self.listener = nil }
+                    return
+                }
                 let actual = newListener.port?.rawValue ?? port
                 self.serverPort = actual
                 // Keyed on `allowFallback`, not on `actual != 9095` — only the port-0 retry passes
@@ -124,12 +230,16 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                 print("[GameDebug] TCP server listening on port \(actual)")
                 call.resolve(["port": Int(actual), "fallbackPort": self.onFallbackPort])
             case .failed(let err):
-                if settled { return }
-                settled = true
+                retiredByUs = true
+                newListener?.cancel()
+                if settle.isSettled { return }
                 print("[GameDebug] TCP server failed: \(err)")
+                guard let self = self else {
+                    settle.reject("TCP server failed: \(err)")
+                    return
+                }
                 self.running = false
-                newListener.cancel()
-                self.listener = nil
+                if self.listener === newListener { self.listener = nil }
                 if allowFallback, case .posix(let code) = err, code == .EADDRINUSE {
                     if Date() < retryUntil {
                         // Announce the WAIT, not just its outcome — the Android side gained this
@@ -143,18 +253,36 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                         // Async rather than a sleep: this runs on the listener's state-update
                         // handler, and blocking it would stall the very callback the retry needs.
                         let delay = DispatchTimeInterval.milliseconds(Self.bindRetryIntervalMs)
-                        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) {
-                            self.startListener(on: port, allowFallback: true, retryUntil: retryUntil, call: call)
+                        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
+                            // A stop during the retry window must not be undone by the retry.
+                            guard let self = self, self.isCurrent(settle) else {
+                                settle.reject("TCP server was stopped during the port retry")
+                                return
+                            }
+                            self.startListener(on: port, allowFallback: true, retryUntil: retryUntil, settle: settle)
                         }
                         return
                     }
                     print("[GameDebug] port \(port) still in use after \(Self.bindRetryWindowMs)ms — falling back to an OS-assigned port. Pass the port explicitly to device_connect.")
-                    self.startListener(on: 0, allowFallback: false, retryUntil: retryUntil, call: call)
+                    self.startListener(on: 0, allowFallback: false, retryUntil: retryUntil, settle: settle)
                 } else {
-                    call.reject("TCP server failed: \(err)")
+                    settle.reject("TCP server failed: \(err)")
                 }
-            default:
+            case .cancelled:
+                // Our own cancel (a failed attempt being retried, or a start already answered): not
+                // an ending. Anything else — `stopAll` already answers directly, but a cancel from
+                // anywhere else must not leave the start hanging.
+                if retiredByUs { return }
+                settle.reject("TCP server listener was cancelled before it became ready")
+            case .waiting(let err):
+                // May still turn `.ready` (the network or a permission can come back), so this does
+                // not settle — `armStartDeadline` bounds how long it may take.
+                print("[GameDebug] TCP server waiting: \(err)")
+            case .setup:
                 break
+            @unknown default:
+                // A state this SDK does not know. Not settled here; the start deadline bounds it.
+                print("[GameDebug] TCP server in an unknown listener state: \(state)")
             }
         }
 
@@ -665,6 +793,14 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         leaseGraceItem = nil
         leaseGuid = nil
         leaseLock.unlock()
+        // A start still in flight is over: bump the generation so its retry/fallback/deadline stands
+        // down, and answer its call now rather than trusting `.cancelled` to reach it (#1514).
+        startLock.lock()
+        startGeneration += 1
+        let pending = pendingStart
+        pendingStart = nil
+        startLock.unlock()
+        pending?.reject("TCP server was stopped before it became ready")
         listener?.cancel()
         listener = nil
         running = false

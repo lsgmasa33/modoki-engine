@@ -29,7 +29,6 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Modoki's Google Play Billing bridge (#196).
@@ -361,8 +360,10 @@ public class ModokiIapPlugin extends Plugin {
     }
 
     private final Object lock = new Object();
-    private boolean connecting = false;
-    private final List<Pending> waiting = new ArrayList<>();
+    /** The calls waiting for setup, and which connection attempt is live. Guarded by `lock`; the
+     *  transitions and their policy (reconnect once, then reject) live in
+     *  {@link IapCore.ConnectionQueue}, where the android/iap-core leg tests them (#1514). */
+    private final IapCore.ConnectionQueue<Pending> queue = new IapCore.ConnectionQueue<>();
 
     /**
      * Run `block` against a connected client, creating AT MOST ONE BillingClient for the app.
@@ -384,18 +385,12 @@ public class ModokiIapPlugin extends Plugin {
      */
     private void withBilling(PluginCall call, Ready block) {
         BillingClient ready = null;
+        int gen = -1;
         synchronized (lock) {
             if (billing != null && billing.isReady()) {
                 ready = billing;
                 Log.i(TAG, "withBilling: client already ready — running immediately");
             } else {
-                waiting.add(new Pending(call, block));
-                if (connecting) {
-                    Log.i(TAG, "withBilling: connection in flight — queued (" + waiting.size() + " waiting)");
-                    return;
-                }
-                connecting = true;
-                Log.i(TAG, "withBilling: starting connection (" + waiting.size() + " waiting)");
                 if (billing == null) {
                     billing = BillingClient
                         .newBuilder(getContext())
@@ -408,42 +403,144 @@ public class ModokiIapPlugin extends Plugin {
                         )
                         .build();
                 }
+                gen = queue.enqueue(new Pending(call, block));
+                if (gen < 0) {
+                    Log.i(TAG, "withBilling: connection in flight — queued (" + queue.waitingCount() + " waiting)");
+                    return;
+                }
+                Log.i(TAG, "withBilling: starting connection attempt " + gen + " (" + queue.waitingCount() + " waiting)");
             }
         }
-        if (ready != null) { block.run(ready); return; }
+        if (ready != null) {
+            final BillingClient client = ready;
+            guarded(call, "withBilling", () -> block.run(client));
+            return;
+        }
+        connect(gen);
+    }
 
+    /**
+     * Start connection attempt `gen` on the ONE client. The state listener carries `gen`, so a
+     * callback from an attempt that has since been superseded is ignored by the queue (#1514).
+     */
+    private void connect(final int gen) {
+        try {
+            startConnection(gen);
+        } catch (RuntimeException e) {
+            // `startConnection` calls `Context.bindService` outside any catch (javap,
+            // `BillingClientImpl.zzbl`), so a SecurityException escapes it. Left alone, the queue
+            // stays `connecting` and every later call waits behind an attempt that never reports —
+            // silently, on the RECONNECT path, since Billing swallows a disconnect listener's throw.
+            // ⚠️ This SETTLES, it does not RECOVER: Billing set the client to CONNECTING before the
+            // bind and resets nothing on the throw, so later calls hit startConnection's "already
+            // connecting" branch and are rejected at once, until relaunch. Rebuilding the client here
+            // would drop an open sheet's PurchasesUpdatedListener, so a reject is the chosen floor.
+            List<Pending> failed;
+            synchronized (lock) { failed = queue.onConnectFailed(gen); }
+            Log.e(TAG, "startConnection threw (attempt " + gen + ") — rejecting " + failed.size() + " queued call(s)", e);
+            BillingResult unavailable = BillingResult.newBuilder()
+                .setResponseCode(BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE)
+                .setDebugMessage("could not start the billing connection: " + e)
+                .build();
+            IapCore.drainEach(failed,
+                p -> rejectWithBilling(p.call, "billing unavailable: " + unavailable.getDebugMessage(), unavailable),
+                (p, t) -> settleOnThrow(p.call, "withBilling reject", t));
+        }
+    }
+
+    private void startConnection(final int gen) {
         billing.startConnection(new BillingClientStateListener() {
             @Override
             public void onBillingSetupFinished(@NonNull BillingResult result) {
                 List<Pending> batch;
                 BillingClient client;
                 synchronized (lock) {
-                    connecting = false;
-                    batch = new ArrayList<>(waiting);
-                    waiting.clear();
+                    batch = queue.onSetupFinished(gen);
                     client = billing;
                 }
                 boolean ok = result.getResponseCode() == BillingClient.BillingResponseCode.OK;
-                Log.i(TAG, "onBillingSetupFinished: code=" + result.getResponseCode()
+                Log.i(TAG, "onBillingSetupFinished: attempt=" + gen + " code=" + result.getResponseCode()
                     + " msg=" + result.getDebugMessage() + " draining=" + batch.size());
-                for (Pending p : batch) {
+                // Each item isolated: a throw from one block used to end this loop, and — this being
+                // a Billing listener — vanish, stranding the rest of the batch (#1514).
+                IapCore.drainEach(batch, p -> {
                     if (ok) p.block.run(client);
                     // Structured too, and this is the one that matters most for the shelf: every
                     // method reaches the store through this queue, so `products()` — whose failure
                     // Court reports as `store_products_failed` — has no other reject path (#499).
                     else rejectWithBilling(p.call, "billing unavailable: " + result.getDebugMessage(), result);
-                }
+                }, (p, e) -> settleOnThrow(p.call, "withBilling drain", e));
             }
 
             @Override
             public void onBillingServiceDisconnected() {
-                // Play drops the connection freely (Store updates, low memory). Clear the flag so
-                // the next call reconnects the SAME client; do not retry here, which would race
-                // with that call and could drain the queue twice.
-                Log.w(TAG, "onBillingServiceDisconnected — next call will reconnect");
-                synchronized (lock) { connecting = false; }
+                // Play drops the connection freely (Store updates, low memory). AFTER setup that is
+                // routine and nothing is queued: the next call reconnects the SAME client. MID-setup
+                // it used to strand every queued call, because nothing guarantees a setup callback
+                // for an attempt that disconnects — so reconnect once, then reject (#1514).
+                IapCore.ConnectionQueue.Disconnect<Pending> d;
+                synchronized (lock) { d = queue.onDisconnected(gen); }
+                switch (d.action) {
+                    case IGNORE:
+                        Log.w(TAG, "onBillingServiceDisconnected (attempt " + gen + ") — next call will reconnect");
+                        break;
+                    case RECONNECT:
+                        Log.w(TAG, "onBillingServiceDisconnected mid-setup (attempt " + gen
+                            + ") — reconnecting once as attempt " + d.generation);
+                        connect(d.generation);
+                        break;
+                    case REJECT:
+                        Log.w(TAG, "onBillingServiceDisconnected mid-setup again (attempt " + gen
+                            + ") — rejecting " + d.rejected.size() + " queued call(s)");
+                        BillingResult disconnected = BillingResult.newBuilder()
+                            .setResponseCode(BillingClient.BillingResponseCode.SERVICE_DISCONNECTED)
+                            .setDebugMessage("the billing service disconnected twice during setup")
+                            .build();
+                        IapCore.drainEach(d.rejected,
+                            p -> rejectWithBilling(p.call, "billing unavailable: " + disconnected.getDebugMessage(), disconnected),
+                            (p, e) -> settleOnThrow(p.call, "withBilling reject", e));
+                        break;
+                }
             }
         });
+    }
+
+    /**
+     * Run a Billing callback body so that a throw SETTLES its call instead of vanishing (#1514).
+     *
+     * ⚠️ Every Billing listener needs this, not just the ones that look risky: Play Billing runs
+     * its query/consume/acknowledge listeners inside `ExecutorService.submit`, so a throw is captured
+     * in the Future and never surfaces — no crash, no log — and its own 30s timeout is skipped because
+     * the future is done. (Setup/disconnect listeners are caught and only logged.)
+     * An unguarded throw is a PluginCall that never settles. `nativeSettleEveryPark.test.ts` fails if a
+     * listener goes unwrapped.
+     *
+     * ⚠️ Deliberately NOT used for `purchasesUpdatedListener`: that one runs on MAIN, so a throw
+     * there is a crash rather than a hang, and it can hold a MATCHED, PAID delivery — rejecting it
+     * would tell a paying player the purchase failed.
+     */
+    private void guarded(PluginCall call, String where, Runnable body) {
+        try {
+            body.run();
+        } catch (RuntimeException e) {
+            settleOnThrow(call, where, e);
+        }
+    }
+
+    /**
+     * Settle `call` after its body threw. `unpark` first: it is identity-checked, so it is a no-op
+     * unless `call` is the parked purchase — and a purchase body that throws has not opened a sheet
+     * (nothing runs after a successful `launchBillingFlow`, and a throw escaping it means no flow
+     * started), so a reject cannot misreport money that moved.
+     */
+    private void settleOnThrow(PluginCall call, String where, RuntimeException e) {
+        Log.e(TAG, where + " threw — rejecting the call rather than leaving it hung (#1514)", e);
+        unpark(call);
+        try {
+            call.reject(where + " failed: " + e);
+        } catch (RuntimeException again) {
+            Log.w(TAG, where + ": rejecting after the throw failed too", again);
+        }
     }
 
     // ── Methods ──────────────────────────────────────────────────────────────
@@ -497,16 +594,25 @@ public class ModokiIapPlugin extends Plugin {
         }
 
         withBilling(call, client -> {
-            final JSArray out = new JSArray();
             // Android must query one-time products and subscriptions SEPARATELY — a single query
-            // cannot mix product types. Two queries, joined once both land.
-            final AtomicInteger remaining = new AtomicInteger((inapp.isEmpty() ? 0 : 1) + (subs.isEmpty() ? 0 : 1));
+            // cannot mix product types. Two queries, joined once both land. The two listeners run
+            // CONCURRENTLY on Billing's pool, so they must not share a list (#1517), and a branch
+            // that throws must still settle the call (#1514): that is IapCore.Join.
+            final IapCore.Join<JSObject> join = new IapCore.Join<>(
+                (inapp.isEmpty() ? 0 : 1) + (subs.isEmpty() ? 0 : 1),
+                items -> {
+                    JSObject r = new JSObject();
+                    r.put("products", toArray(items));
+                    call.resolve(r);
+                },
+                e -> settleOnThrow(call, "products", e)
+            );
 
             if (!inapp.isEmpty()) {
-                queryDetails(client, inapp, BillingClient.ProductType.INAPP, out, remaining, call);
+                queryDetails(client, inapp, BillingClient.ProductType.INAPP, join);
             }
             if (!subs.isEmpty()) {
-                queryDetails(client, subs, BillingClient.ProductType.SUBS, out, remaining, call);
+                queryDetails(client, subs, BillingClient.ProductType.SUBS, join);
             }
         });
     }
@@ -515,9 +621,7 @@ public class ModokiIapPlugin extends Plugin {
         BillingClient client,
         List<String> ids,
         String type,
-        JSArray out,
-        AtomicInteger remaining,
-        PluginCall call
+        IapCore.Join<JSObject> join
     ) {
         List<QueryProductDetailsParams.Product> products = new ArrayList<>();
         for (String id : ids) {
@@ -531,24 +635,21 @@ public class ModokiIapPlugin extends Plugin {
         }
         client.queryProductDetailsAsync(
             QueryProductDetailsParams.newBuilder().setProductList(products).build(),
-            (billingResult, result) -> {
+            (billingResult, result) -> join.branch(() -> {
                 Log.i(TAG, "queryProductDetails(" + type + "): code=" + billingResult.getResponseCode()
                     + " msg=" + billingResult.getDebugMessage()
                     + " found=" + result.getProductDetailsList().size()
-                    + " asked=" + ids + " remaining=" + (remaining.get() - 1));
+                    + " asked=" + ids);
+                List<JSObject> mine = new ArrayList<>();
                 // An id the store does not know is simply omitted — a typo'd product should
                 // degrade to "not for sale", not take down the whole store screen.
                 if (billingResult.getResponseCode() == BillingClient.BillingResponseCode.OK) {
                     for (ProductDetails d : result.getProductDetailsList()) {
-                        out.put(serializeProduct(d));
+                        mine.add(serializeProduct(d));
                     }
                 }
-                if (remaining.decrementAndGet() == 0) {
-                    JSObject r = new JSObject();
-                    r.put("products", out);
-                    call.resolve(r);
-                }
-            }
+                return mine;
+            })
         );
     }
 
@@ -595,7 +696,7 @@ public class ModokiIapPlugin extends Plugin {
             );
             client.queryProductDetailsAsync(
                 QueryProductDetailsParams.newBuilder().setProductList(products).build(),
-                (billingResult, result) -> {
+                (billingResult, result) -> guarded(call, "purchase", () -> {
                     List<ProductDetails> list = result.getProductDetailsList();
                     // ⚠️ These two are DIFFERENT failures and must not share a message (#499). A
                     // non-OK response means the store did not answer — SERVICE_UNAVAILABLE(2) or
@@ -643,6 +744,15 @@ public class ModokiIapPlugin extends Plugin {
 
                     List<BillingFlowParams.ProductDetailsParams> flow = new ArrayList<>();
                     flow.add(pdp.build());
+                    // Built BEFORE the park, so a build that throws settles through guarded() with
+                    // nothing parked. Likewise the Activity: checked here rather than letting
+                    // launchBillingFlow throw on a null one after the slot is taken (#1514).
+                    BillingFlowParams flowParams = BillingFlowParams.newBuilder().setProductDetailsParamsList(flow).build();
+                    final android.app.Activity activity = getActivity();
+                    if (activity == null) {
+                        call.reject("no foreground activity to show the purchase sheet on");
+                        return;
+                    }
 
                     // Park the call: Play reports the purchase through the listener, not here.
                     // ⚠️ ONE flow at a time. There is a single awaiting slot, so a second
@@ -674,15 +784,14 @@ public class ModokiIapPlugin extends Plugin {
                     call.setKeepAlive(true);
 
                     Log.i(TAG, "launchBillingFlow: product=" + productId + " type=" + type);
-                    BillingResult launch = client.launchBillingFlow(
-                        getActivity(),
-                        BillingFlowParams.newBuilder().setProductDetailsParamsList(flow).build()
-                    );
+                    // A throw from here settles through guarded(), which unparks first: no sheet
+                    // opened, so the reject cannot misreport a purchase (#1514).
+                    BillingResult launch = client.launchBillingFlow(activity, flowParams);
                     if (launch.getResponseCode() != BillingClient.BillingResponseCode.OK) {
                         unpark(call);
                         rejectWithBilling(call, "could not open the purchase sheet: " + launch.getDebugMessage(), launch);
                     }
-                }
+                })
             );
         });
     }
@@ -706,27 +815,33 @@ public class ModokiIapPlugin extends Plugin {
      *  not owned by anyone until the money actually moves. */
     private void queryAll(PluginCall call, boolean entitlementsOnly) {
         withBilling(call, client -> {
-            final JSArray out = new JSArray();
-            final AtomicInteger remaining = new AtomicInteger(2);
+            // Same join as products(): two concurrent listeners, one once-settling merge (#1514,
+            // #1517). A lost element here is an owned entitlement reading as NOT owned.
+            final IapCore.Join<JSObject> join = new IapCore.Join<>(
+                2,
+                items -> {
+                    JSObject r = new JSObject();
+                    r.put("transactions", toArray(items));
+                    call.resolve(r);
+                },
+                e -> settleOnThrow(call, entitlementsOnly ? "entitlements" : "unfinished", e)
+            );
             for (String type : new String[] { BillingClient.ProductType.INAPP, BillingClient.ProductType.SUBS }) {
                 client.queryPurchasesAsync(
                     QueryPurchasesParams.newBuilder().setProductType(type).build(),
-                    (billingResult, purchases) -> {
+                    (billingResult, purchases) -> join.branch(() -> {
                         Log.i(TAG, "queryPurchases(" + type + "): code=" + billingResult.getResponseCode()
                             + " count=" + purchases.size() + " entitlementsOnly=" + entitlementsOnly);
+                        List<JSObject> mine = new ArrayList<>();
                         if (billingResult.getResponseCode() == BillingClient.BillingResponseCode.OK) {
                             for (Purchase p : purchases) {
                                 boolean purchased = p.getPurchaseState() == Purchase.PurchaseState.PURCHASED;
                                 if (entitlementsOnly && !purchased) continue;
-                                out.put(serialize(p));
+                                mine.add(serialize(p));
                             }
                         }
-                        if (remaining.decrementAndGet() == 0) {
-                            JSObject r = new JSObject();
-                            r.put("transactions", out);
-                            call.resolve(r);
-                        }
-                    }
+                        return mine;
+                    })
                 );
             }
         });
@@ -747,7 +862,7 @@ public class ModokiIapPlugin extends Plugin {
                 // because JS has confirmed the grant is durable.
                 client.consumeAsync(
                     ConsumeParams.newBuilder().setPurchaseToken(token).build(),
-                    (billingResult, outToken) -> {
+                    (billingResult, outToken) -> guarded(call, "consume", () -> {
                         Log.i(TAG, "consumeAsync: code=" + billingResult.getResponseCode()
                             + " msg=" + billingResult.getDebugMessage());
                         // ITEM_NOT_OWNED means it was already consumed — idempotent success, which
@@ -758,7 +873,7 @@ public class ModokiIapPlugin extends Plugin {
                         } else {
                             rejectWithBilling(call, "consume failed: " + billingResult.getDebugMessage(), billingResult);
                         }
-                    }
+                    })
                 );
             } else {
                 acknowledgeToken(client, call, token);
@@ -780,7 +895,7 @@ public class ModokiIapPlugin extends Plugin {
     private void acknowledgeToken(BillingClient client, PluginCall call, String token) {
         client.acknowledgePurchase(
             AcknowledgePurchaseParams.newBuilder().setPurchaseToken(token).build(),
-            billingResult -> {
+            billingResult -> guarded(call, "acknowledge", () -> {
                 int c = billingResult.getResponseCode();
                 Log.i(TAG, "acknowledgePurchase: code=" + c + " msg=" + billingResult.getDebugMessage());
                 // Already acknowledged is success — acknowledging twice is expected on a recovery
@@ -790,11 +905,17 @@ public class ModokiIapPlugin extends Plugin {
                 } else {
                     rejectWithBilling(call, "acknowledge failed: " + billingResult.getDebugMessage(), billingResult);
                 }
-            }
+            })
         );
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    private static JSArray toArray(List<JSObject> items) {
+        JSArray a = new JSArray();
+        for (JSObject o : items) a.put(o);
+        return a;
+    }
 
     private List<String> stringList(PluginCall call, String key) {
         List<String> out = new ArrayList<>();

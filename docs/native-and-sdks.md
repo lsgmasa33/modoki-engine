@@ -399,6 +399,66 @@ await GameDebug.startServer({ port: 9095 });
 const { running, connected } = await GameDebug.getStatus();
 ```
 
+## Every parked call must settle — on EVERY path (#1507, #1514)
+
+A plugin method that settles its `PluginCall` only from an async callback — an SDK completion, a
+listener, a state handler — hangs its JS promise for the life of the process if some path never
+reaches that callback. Nothing errors; whatever awaits the promise simply latches: the debug bridge's
+`busy` flag, Court's `storeInFlight`, the IAP boot reconcile. #1507 found it in
+`capacitor-applovin-max`; #1514's sweep of every other engine plugin found it in three more. **The
+rule: before a method parks a call, enumerate every way the callback can fail to arrive, and settle
+the call on each one in NATIVE code.** The three ways it happened:
+
+- **An unhandled state.** `GameDebugPlugin.swift`'s `NWListener` handler settled on `.ready` and
+  `.failed` only; `.waiting` and `.cancelled` fell to `default: break`, and a released listener hit
+  a silent `guard … else { return }`. Now one lock-protected `StartSettle` per `startServer` call is
+  threaded through every EADDRINUSE retry and the port-0 fallback (it used to be a per-attempt,
+  unsynchronised bool); `.cancelled` rejects unless the handler cancelled that listener itself for a
+  retry; a 10s start deadline bounds `.waiting` and `@unknown` states; `stopAll` bumps a start
+  generation so a retry pending in `asyncAfter` cannot re-bind after the stop. Device-observed on
+  the iPad (2026-09-24, `games/sling`): a `stopServer` landing while a start was still in `setup`
+  rejected with "TCP server was stopped before it became ready (last listener state: setup)", and
+  the next start bound 9095 with no fallback. ⚠️ **Not observed: the `.waiting` → 10s-deadline
+  path** — nothing drove a listener into `.waiting`; it is pinned by shape only.
+- **A throw the SDK swallows.** ⚠️ **Play Billing runs its query/consume/acknowledge listeners
+  inside `ExecutorService.submit`** (javap on Billing 9.0.0, `BillingClientImpl.zzN`), so a throw
+  from one is captured in the `Future` and never surfaces — no crash, no logcat line — and Billing's
+  own 30s timeout is skipped, because it checks `!future.isDone()` and a throw has made the future
+  done. Its setup and disconnect listeners are called inside a catch that only logs — louder, and
+  the call still never settles. The same goes for `startConnection` itself on our RECONNECT path:
+  `bindService` can throw out of it, and inside a disconnect listener that throw is swallowed, so
+  `connect()` catches it and rejects the queue. That settles, it does not recover: Billing leaves
+  the client CONNECTING, so later calls are rejected at once until relaunch — a reject, not a hang. Every Billing listener in `ModokiIapPlugin.java` therefore runs through `guarded(call, …)` or
+  `IapCore.Join.branch(…)`. Contrast `requestReview`'s gms Tasks listener, which runs on MAIN: a
+  throw there is a CRASH, not a hang — same fix, worse symptom.
+- **A lifecycle event that clears state without settling what is queued.** `withBilling`'s
+  `onBillingServiceDisconnected` only cleared `connecting`, and nothing guarantees a setup callback
+  for an attempt that disconnects mid-setup — so the boot calls waited for some later call to reconnect.
+  See [docs/iap.md](iap.md) § 7 for the reconnect-once policy.
+
+**Fix it natively, not with a JS timeout — with one exception.** A JS bound settles the promise but
+leaves the native state parked (the #583 lesson: the next `purchase()` still hits the hard reject),
+and a JS bound on top of a native fix is a second guard hiding the first. The exception is #1507's
+`adLifecycle` preload bound: the unsettled path there lives inside MAX, which the plugin cannot
+enumerate, and a preload is idempotent and retryable. A purchase is neither — see the
+`PARKED_PURCHASE_TIMEOUT_MS` doc for the measured double-charge risk of bounding one.
+
+**The JS side has a half too.** A native deadline turns a hang into a reject, and a reject is only
+better if something retries: `initNativeBridge` (`engine/app/debug/bridge.ts`) used to rethrow a
+failed boot `startServer` before registering its `appStateChange` and `request` listeners, so a
+bounded start would have become a permanent failure. It now registers both and rethrows at the end.
+
+Guarded by `engine/tests/architecture/nativeSettleEveryPark.test.ts` (shape, 13 mutations), the
+`android/iap-core` leg of `npm run test:native` (the `Join` / `ConnectionQueue` / `drainEach`
+behaviour, on a JVM) and `engine/tests/framework/bridgeBootStartFailure.test.ts`.
+
+⚠️ **Read and deliberately NOT fixed by #1514:** `games/3d-test/packages/capacitor-adjust`'s
+`getAdid` / `getAttribution` settle only from Adjust v5 callbacks that wait for the SDK to have an
+answer (never, if it is uninitialised, disabled or offline) — no runtime code awaits either today;
+`games/3d-test/packages/capacitor-applovin-max` is a diverged fork still in the pre-#1507 shape. Both
+are 3d-test testbed code. Read and ruled out: AppsFlyer, iOS ATT, IAP iOS (StoreKit 2), OTA on both
+platforms, game-debug Android (its bind is synchronous), modoki-system iOS.
+
 ## Removing a plugin listener — `remove()` is NOT idempotent
 
 ⚠️ **Calling `.remove()` twice on one `PluginListenerHandle` silently evicts somebody ELSE's

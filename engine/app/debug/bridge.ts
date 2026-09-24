@@ -1367,6 +1367,12 @@ async function initNativeBridge() {
   const { GameDebug } = await import('capacitor-game-debug');
   _log('[debug-bridge] Plugin loaded, starting server...');
 
+  // A failed boot start must NOT skip the listener registration below (#1514). It used to rethrow
+  // right here, so neither `appStateChange` nor `request` was ever registered and the bridge stayed
+  // dead until relaunch — no later foreground could retry, and nothing could have answered a request
+  // if one had. The failure is still reported loudly: it is rethrown at the END, into
+  // `initDebugBridge`'s catch, once the lifecycle handler that can recover from it is in place.
+  let bootStartError: unknown = null;
   try {
     const result = await GameDebug.startServer();
     _log('[debug-bridge] Native TCP server listening on port', result.port);
@@ -1385,7 +1391,7 @@ async function initNativeBridge() {
     }
   } catch (e) {
     _err('[debug-bridge] GameDebug.startServer failed:', (e as Error).message);
-    throw e;
+    bootStartError = e;
   }
 
   // THE FOREGROUND APP OWNS THE PORT (#95). Port 9095 is a fixed default shared by every Modoki
@@ -1525,6 +1531,9 @@ async function initNativeBridge() {
   } catch (e) {
     _log('[debug-bridge] getStatus failed:', (e as Error).message);
   }
+
+  // Reported only now, with the lifecycle handler registered: the next foreground retries the bind.
+  if (bootStartError !== null) throw bootStartError;
 }
 
 // --- Public API ---
@@ -1557,7 +1566,8 @@ export function initDebugBridge() {
       // and not the second, and every symptom points at the first.
       _err(
         '[debug-bridge] FAILED to start — the GameDebug TCP server is NOT listening, so every '
-        + 'device_* tool is unreachable for this app. Reason:', (e as Error).message,
+        + 'device_* tool is unreachable for this app until a later foreground re-binds it (#1514: '
+        + 'background and reopen the app to retry). Reason:', (e as Error).message,
         '\n  If that says the debug bridge is disabled, or the plugin is not implemented: the JS '
         + 'side is on (this ran) but the NATIVE gate is off. Reopen the project in the editor, or '
         + 'run healNativeConfig(projectRoot), to sync build.debugBuild into the native project — '
