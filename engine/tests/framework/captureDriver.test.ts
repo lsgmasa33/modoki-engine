@@ -368,11 +368,14 @@ describe('captureDriver', () => {
 
   it('gives up on a pending set ONCE — a permanently stuck init must not cost the timeout on every step', async () => {
     win.__2d = { pool: { pendingInits: () => 1 } };
+    initCaptureDriver('');
     beginCapture({ dtMs: 40, seed: 1, settleTimeoutMs: 60 });
-    const t = performance.now();
     await stepCapture(5);
-    // One timeout, then the same pending set no longer blocks.
-    expect(performance.now() - t).toBeLessThan(60 * 3);
+    // One timeout, then the same pending set no longer blocks. Counted by REPORTS, not wall clock:
+    // every timeout pushes one `unsettled` entry, so a re-wait shows as a second one — a bound on
+    // elapsed time went red on a loaded CI runner (47ms against a 30ms bound).
+    const api = (window as unknown as { __modokiCapture: { unsettled: () => unknown[] } }).__modokiCapture;
+    expect(api.unsettled()).toEqual([{ step: 0, pending: ['1 2D surface init'] }]);
     expect(runs).toBe(5);
   });
 
@@ -383,9 +386,7 @@ describe('captureDriver', () => {
     beginCapture({ dtMs: 40, seed: 1, settleTimeoutMs: 30 });
     await stepCapture(1);          // gives up on 2 inits
     inits = 1;                     // one of them finishes; the other stays stuck
-    const t = performance.now();
-    await stepCapture(3);
-    expect(performance.now() - t).toBeLessThan(30);
+    await stepCapture(3);          // a re-wait on the shrunk set would time out and report again
     const api = (window as unknown as { __modokiCapture: { unsettled: () => unknown[] } }).__modokiCapture;
     expect(api.unsettled()).toEqual([{ step: 0, pending: ['2 2D surface init'] }]);
   });
