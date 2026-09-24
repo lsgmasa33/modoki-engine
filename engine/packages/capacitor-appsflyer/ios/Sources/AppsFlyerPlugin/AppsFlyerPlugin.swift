@@ -336,7 +336,7 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
     // the app is `.active`. Asked earlier, it answers `.notDetermined` at once and draws NOTHING,
     // and the JS side then starts AppsFlyer and MAX without IDFA for a question nobody saw.
     // Observed on an iPhone 8 under `idevicedebug`. The gate's own header has the reasoning, and
-    // why the wait has no bound. With the gate in place, a `notDetermined` answer means iOS
+    // why the wait has no bound. Only an UNANSWERED status is held (#1532). With the gate in place, a `notDetermined` answer means iOS
     // declined to draw the prompt even though the app was active. attribution.ts warns on that.
     @objc func requestTrackingAuthorization(_ call: CAPPluginCall) {
         guard #available(iOS 14, *) else {
@@ -347,7 +347,12 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
         // didBecomeActive observer in load() depends on both running there.
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            let deferred = self.attGate.submit(isActive: UIApplication.shared.applicationState == .active) {
+            // #1532: an answered status cannot prompt, so the gate does not hold it. The gate maps the
+            // raw status itself (AttRequestGate.needsPrompt), which is where the tests reach it.
+            let outcome = self.attGate.submit(
+                isActive: UIApplication.shared.applicationState == .active,
+                attStatusRaw: UInt(ATTrackingManager.trackingAuthorizationStatus.rawValue)
+            ) {
                 ATTrackingManager.requestTrackingAuthorization { status in
                     let mapped: String
                     switch status {
@@ -362,7 +367,11 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
             }
             // NSLog, not CAPLog.print: CAPLog is stdout, which only a DEBUGGER launch shows, and the
             // launch this line has to be read from is the home-screen tap (device_native_logs reads os_log).
-            if deferred { NSLog("[AppsFlyerCap] ATT request held until the app is active (#1510)") }
+            switch outcome {
+            case .held: NSLog("[AppsFlyerCap] ATT request held until the app is active (#1510)")
+            case .ranAnswered: NSLog("[AppsFlyerCap] ATT already answered, asked while inactive without holding (#1532)")
+            case .ran: break
+            }
         }
     }
 

@@ -35,9 +35,9 @@
  *   the engine starts attribution and ads in the same tick (`engine/app/App.tsx`), so the two launch-time
  *   full-screen asks would race. It is armed synchronously, before the first await.
  * - **An iOS `notDetermined` answer means NO PROMPT WAS SHOWN** (#1510). iOS draws the ATT prompt only
- *   while the app is active and otherwise answers `notDetermined` at once. The plugin now holds the
- *   request until the app is active (`capacitor-appsflyer/att-core`), so this answer should not come
- *   back. If it does, iOS did not show the prompt for that request and AppsFlyer starts unanswered anyway,
+ *   while the app is active and otherwise answers `notDetermined` at once. The plugin now holds an
+ *   UNANSWERED request until the app is active (`capacitor-appsflyer/att-core`; an answered status runs
+ *   at once, #1532), so this answer should not come back. If it does, iOS did not show the prompt for that request and AppsFlyer starts unanswered anyway,
  *   so `warnIfPromptNotShown` says so in the log instead of passing it off as an answer.
  * - **No method rejects into a caller.** Every failure is a `console.warn` and a resolved sentinel.
  */

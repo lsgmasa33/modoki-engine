@@ -3198,6 +3198,20 @@ Both variants share everything up to the compile — the web bundle, the OTA man
 differ, which is why `variant` is a separate parameter rather than two more `BUILD_PLATFORMS`
 values: a release build must never miss a check the debug build gets.
 
+### iOS export compliance: `ITSAppUsesNonExemptEncryption`, per game
+
+A shipping game declares `<key>ITSAppUsesNonExemptEncryption</key><false/>` in its own
+`ios/App/App/Info.plist` if it uses only OS-provided HTTPS/TLS, which is exempt. Without the key,
+App Store Connect asks the encryption question on **every** uploaded build, and a build nobody
+answers sits in "Missing Compliance" (#1531).
+- **It is per game, not a heal default.** `healNativeConfig` patches `Info.plist` key by key and
+  never writes this one, because an engine default would assert an encryption fact about every
+  project.
+- **`npx cap add ios` regenerates `Info.plist` without it.** Court and Weaveling each guard the key
+  with `tests/exportCompliance.test.ts`: present, `false`, and present exactly once, since `plutil`
+  reads the last of any duplicates.
+- A new shipping game copies that test along with the key.
+
 ### The Android upload key
 
 Release signing reads `android/keystore.properties`, which the release build **generates** from the
