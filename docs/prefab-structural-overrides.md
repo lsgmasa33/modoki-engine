@@ -468,8 +468,40 @@ nestedStructure?: Record<string /* "4", "4.7" */, {
   (with the save alternating between the two shapes forever).
 - **Skipped only when both sides are empty** — the live interior AND what the prefab chain applies.
   That absence is what lets a member added to the inner prefab later still reach an untouched
-  instance. A row that authors its own structure is therefore always restated by the scene; that
-  asymmetry is deliberate and follows from the previous point.
+  instance. For the **legacy slot** a row that authors its own structure is therefore always restated
+  by the scene, which follows from the previous point.
+- **Scene v16 member rows state only what DIFFERS from the chain (#1511).** A member row is per
+  member and per channel, and an absent field falls back to the chain (`foldMemberRowChannels`), so
+  whole-frame ownership is not needed there. `moveChannelsOntoRows` writes a member's `removed`,
+  `removedTraits` or `added` only when it differs from the chain's baseline for that member.
+  Restating every member the chain touched pinned a template row's added nodes, removed members and
+  removed traits on a no-op save, so a later template change to them never reached the scene.
+  `added` compares the way the rebuild does (`chainAddedComparer` → `subtractChainStructure`): the
+  plain live capture, matched by template key, with the chain's member tokens resolved. A reference
+  node's live capture carries identity a template node does not: member rows' `guid`/`name`, and a
+  display `name` no spawn applies. `withoutLiveIdentity` drops that identity before the compare.
+  Without that, every template reference node read as edited, and the REBUILD respawned it from the
+  capture too, so a refresh never delivered a template change to one. It keeps a member's `guid`
+  only when a LIVE member holds it and does not derive it from the node's root. That is an identity
+  no reload reproduces: an earlier save stored it, or a Refresh kept it live, before the template
+  re-parented the member. Keeping it keeps the node edited, so scene refs into the member survive.
+  An orphan row's guid (the template dropped the member) names nothing live, so it goes; kept, it
+  pinned the node forever. It also fills a `nestedStructure` slot's absent lists with empty ones,
+  as the loader reads them.
+  ⚠️ **Some template node shapes still read as edited, and a save still pins them**, as every
+  reference node was pinned before #1511:
+  - an **all-empty** slot. The live capture omits a path whose interior and chain are both empty,
+    and the slot cannot be dropped to match: an absent slot falls back to the row, while an empty
+    one overrides it;
+  - a slot holding **`added` nodes**. The slot is compared raw, and its nodes are not run through
+    this normalisation.
+  The cost is one member-path walk per reference node per save or rebuild. A close-out
+  measurement put it at ~4-5 ms per node at 3.3k entities, about +15% on a save with 40 of them.
+  ⚠️ **`added` is one statement per member.** Once the scene changes one node in a member's list,
+  the whole list is written, and the chain's untouched nodes beside it are pinned with it (#1516). A frame
+  that falls back to the legacy slot (a member no row can key, or an unrowed move) keeps the
+  restate rule above. Scenes saved before #1511 keep their pins wherever the template has changed
+  since. A pin that still equals the template drops out on the next save.
   ⚠️ The first cut instead compared the live capture against the file-authored baseline and wrote
   only the differing fields. Those two documents are **not comparable** — `snapshotAddedTraits`
   compacts schema-default fields (and until #1377 carried a live `parentId`), the baseline is whatever the prefab

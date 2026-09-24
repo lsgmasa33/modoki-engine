@@ -3295,11 +3295,16 @@ export interface InstanceChannels {
  *    `nestedStructure[path]` REPLACES the frame's lists, so half of it on rows and half in the channel
  *    would be one statement in two places with nothing to say which half is authoritative.
  *
- *  A nested frame's structure moves as PER-MEMBER statements of the live state, for every member the
- *  live interior OR the prefab chain's baseline touches: the explicit `removed: false`,
+ *  A nested frame's structure moves as PER-MEMBER statements of the live state, for every member whose
+ *  live statement DIFFERS from the prefab chain's baseline (#1511): the explicit `removed: false`,
  *  `removedTraits: []` and `added: []` are what carry the legacy slot's "the prefab's list no longer
- *  applies" (see `foldMemberRowChannels`). A REMOVED member has no live entity, so its row is keyed from
- *  the frame's key and the member's `nodeGuid` in the frame's document, and carries no guid. */
+ *  applies" (see `foldMemberRowChannels`), and a member the scene did not change gets no statement, so a
+ *  later template change to it still reaches the scene. Writing every member the chain touched restated
+ *  the chain's own lists on a no-op save and pinned them. A REMOVED member has no live entity, so its row
+ *  is keyed from the frame's key and the member's `nodeGuid` in the frame's document, and carries no guid.
+ *
+ *  ⚠️ `added` is one statement per member: once the scene changes one node of a member's list, the whole
+ *  list is written, and the chain's untouched nodes beside it are pinned with it (#1516). */
 export function moveChannelsOntoRows(
   rootId: number,
   prefab: PrefabFile,
@@ -3409,15 +3414,28 @@ export function moveChannelsOntoRows(
       if (!f || Object.keys(live.moved ?? {}).length) { keep[path] = live; continue; }
       const base = resolveEffectivePrefabStructure(source, f.steps);
       const liveRemoved = new Set(live.removed ?? []);
+      const baseRemoved = new Set(base.removed ?? []);
+      const sameNames = (a: string[] | undefined, b: string[] | undefined) =>
+        new Set(a ?? []).size === new Set(b ?? []).size && (a ?? []).every((n) => (b ?? []).includes(n));
+      const sameAdded = chainAddedComparer(f.root, f.doc, base.added);
       const touched = new Map<number, { removed: boolean; traits: boolean; added: boolean }>();
       const touch = (lid: number, what: 'removed' | 'traits' | 'added') => {
         const t = touched.get(lid) ?? { removed: false, traits: false, added: false };
         t[what] = true;
         touched.set(lid, t);
       };
-      for (const lid of [...(live.removed ?? []), ...(base.removed ?? [])]) touch(lid, 'removed');
-      for (const lid of [...Object.keys(live.removedTraits ?? {}), ...Object.keys(base.removedTraits ?? {})]) touch(Number(lid), 'traits');
-      for (const n of [...(live.added ?? []), ...(base.added ?? [])]) touch(n.parentLocalId, 'added');
+      // Only what DIFFERS from the chain (#1511): an absent field falls back to it (`foldMemberRowChannels`), so a
+      // statement equal to the chain's only pins it — a later template change to that member never reached the scene.
+      for (const lid of new Set([...(live.removed ?? []), ...(base.removed ?? [])])) {
+        if (liveRemoved.has(lid) !== baseRemoved.has(lid)) touch(lid, 'removed');
+      }
+      for (const lid of new Set([...Object.keys(live.removedTraits ?? {}), ...Object.keys(base.removedTraits ?? {})])) {
+        if (!sameNames(live.removedTraits?.[Number(lid)], base.removedTraits?.[Number(lid)])) touch(Number(lid), 'traits');
+      }
+      for (const lid of new Set([...(live.added ?? []), ...(base.added ?? [])].map((n) => n.parentLocalId))) {
+        if (!sameAdded(lid)) touch(lid, 'added');
+      }
+      if (!touched.size) continue;
       const keys = new Map<number, string>();
       for (const lid of touched.keys()) {
         const k = keyFor(f.root, f.doc, f.key, lid, !liveRemoved.has(lid));
@@ -5332,6 +5350,58 @@ function subtractChainOverrides(
   return live;
 }
 
+/** `node` as a chain node states it, for comparing a live capture with the chain's own node. A REFERENCE node loses
+ *  what a live capture adds that is identity, not an edit:
+ *  - a member row's `guid`, unless a LIVE member holds it and does not derive it from the node's root. That one is an
+ *    identity no reload reproduces — an earlier save stored it, or a Refresh kept it live, before the template
+ *    re-parented the member — so it stays, and the node reads as edited and keeps it. Dropped, the node compared equal,
+ *    the save left it to the template, and the member re-derived a new guid under every scene ref into it (close-out
+ *    review). An ORPHAN row's guid (`keptMemberOrphans`: the template dropped the member) names nothing live, and
+ *    keeping it pinned the node on every save, so it goes;
+ *  - a member row's `name` (a row holding nothing else goes; a `parent`, a move, stays);
+ *  - its own `name`, which no spawn applies (the root is named by the child prefab), so that goes from both sides.
+ *  A `nestedStructure` slot's absent list is written as empty, which is how the loader reads it (`structDirect`).
+ *  A template node carries no member rows, so without this every template reference node read as EDITED: the rebuild
+ *  respawned it from the capture, and the save restated it (#1511). Either way a template change to the node never
+ *  reached the instance. Plain nodes pass through; their `children` and a reference node's `added` are walked. */
+function withoutLiveIdentity(node: AddedEntity): AddedEntity {
+  const walk = (list: AddedEntity[] | undefined) => list?.map(withoutLiveIdentity);
+  if (!node.prefab) return { ...node, children: walk(node.children) ?? [] };
+  const { name: _name, members, ...rest } = node as AddedEntity & { members?: Record<string, Record<string, unknown>> };
+  const rows: Record<string, Record<string, unknown>> = {};
+  if (members && Object.keys(members).length) {
+    const stored = storedMemberGuids(node.guid);
+    for (const [k, row] of Object.entries(members)) {
+      const { guid, name: _n, ...edit } = row;
+      if (typeof guid === 'string' && stored.has(guid)) edit.guid = guid;
+      if (Object.keys(edit).length) rows[k] = edit;
+    }
+  }
+  const slots = node.nestedStructure && Object.fromEntries(Object.entries(node.nestedStructure).map(([path, st]) =>
+    [path, { ...st, added: st.added ?? [], removed: st.removed ?? [], removedTraits: st.removedTraits ?? {}, moved: st.moved ?? {} }]));
+  return {
+    ...rest, children: walk(node.children) ?? [], ...(node.added ? { added: walk(node.added) } : {}),
+    ...(slots ? { nestedStructure: slots } : {}),
+    ...(Object.keys(rows).length ? { members: rows } : {}),
+  } as AddedEntity;
+}
+
+/** The guids the members of the live instance rooted at guid `rootGuid` hold that are NOT what they derive from it
+ *  (`stampDerivedMemberGuids`' computation) — the ones a member row states that a reload would not reproduce. */
+function storedMemberGuids(rootGuid: string): Set<string> {
+  const out = new Set<string>();
+  const anchor = durableGuid(rootGuid);
+  const root = anchor ? findEntityByGuid(anchor) : undefined;
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!root || !eaMeta) return out;
+  for (const [key, e] of memberPathIndex(getCurrentWorld(), root.id())) {
+    if (!key || !e) continue;
+    const guid = (e.get(eaMeta.trait) as { guid?: string } | undefined)?.guid;
+    if (guid && guid !== deriveMemberGuid(anchor, memberPathSteps(key))) out.add(guid);
+  }
+  return out;
+}
+
 /** The structural half of the subtraction. `removed`/`removedTraits` lose what the chain lists. An
  *  `added` node the chain authored is recognised by its TEMPLATE KEY (a guid is derived per instance
  *  since #1387; a legacy key-less file node by the durable guid it carried): unchanged, it is dropped,
@@ -5358,7 +5428,7 @@ function subtractChainStructure(
     const key = node.guid ? keysByGuid.get(node.guid) : undefined;
     const base = (key ? byKey.get(key) : undefined) ?? (node.guid ? byGuid.get(node.guid) : undefined);
     if (!base) { added.push(node); continue; }
-    if (sameStructure({ added: [node] }, { added: [base] })) continue;
+    if (sameStructure({ added: [withoutLiveIdentity(node)] }, { added: [withoutLiveIdentity(base)] })) continue;
     added.push(node);
     replace.push({ key: base.key ? key! : '', guid: node.guid });
   }
@@ -6138,20 +6208,32 @@ function enclosingLayer(rootInstanceId: number, depth = 0): {
  *  marker first, the guid-derived recovery when it was lost (Play→Stop, an undo respawn). The recovery scans every
  *  cached document's keys, so it runs only when the enclosing layer actually holds a keyed reference node.
  *
- *  ⚠️ Only a node directly in that layer's `added`: one inside another added node's `children`, or in a reference
- *  node's own `added` below a member of IT, hangs under something that is not a member of the frame, and reads as
- *  no template node at all — the pre-#1506 answer. */
+ *  The node may hang inside a plain added node's `children` (#1513): the frame is then the one the first MEMBER above
+ *  it belongs to, and the node is looked for through the layer's `children` too. Not through a reference node's own
+ *  `added`: that list is the layer of the node's OWN frame, which a node below one of its members reaches directly. */
 function templateReferenceNode(refRoot: number, depth: number): AddedEntity | null {
   const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
   const pi = piMeta ? readTraitData(refRoot, piMeta) : null;
-  if (!isStoredRoot(pi as MemberPi, refRoot)) return null; // a root no row expanded; a template's node is one
-  // The LIVE parent: a root no row expanded has no frame of its own, so its identity parent is exactly this
-  // (`identityParents.ts`). Read directly, not through a world identity walk, which an Inspector recompute of every
-  // scene-level instance paid for (close-out review: 0.004 → 0.63 ms at 3000 entities).
-  const parent = (readTraitData(refRoot, getTraitByName('EntityAttributes')!)?.parentId as number) || 0;
-  const frame = parent ? ((readTraitData(parent, piMeta!)?.rootInstanceId as number) || 0) : 0;
+  if (!eaMeta || !isStoredRoot(pi as MemberPi, refRoot)) return null; // a root no row expanded; a template's node is one
+  // The LIVE parents: a root no row expanded has no frame of its own, so its identity parent is exactly its live one
+  // (`identityParents.ts`), and so is a plain added node's. Read directly, not through a world identity walk, which an
+  // Inspector recompute of every scene-level instance paid for (close-out review: 0.004 → 0.63 ms at 3000 entities).
+  // Climbed past plain entities to the first instance entity: a template's plain node carries no PrefabInstance.
+  const parentOf = (id: number) => (readTraitData(id, eaMeta)?.parentId as number) || 0;
+  let frame = 0;
+  for (let at = parentOf(refRoot), hops = 0; at && hops < 64; at = parentOf(at), hops++) {
+    frame = (readTraitData(at, piMeta!)?.rootInstanceId as number) || 0;
+    if (frame) break;
+  }
   if (!frame || frame === refRoot) return null;
-  const candidates = (enclosingLayer(frame, depth + 1)?.structure.added ?? []).filter((n) => !!n.prefab && !!n.key);
+  const candidates: AddedEntity[] = [];
+  const collect = (nodes: readonly AddedEntity[] | undefined) => {
+    for (const n of nodes ?? []) {
+      if (n.prefab) { if (n.key) candidates.push(n); } else collect(n.children);
+    }
+  };
+  collect(enclosingLayer(frame, depth + 1)?.structure.added);
   if (!candidates.length) return null;
   const key = templateKeyOf(findEntity(refRoot)) || recoverTemplateKey(refRoot);
   return key ? candidates.find((n) => n.key === key) ?? null : null;
@@ -6183,23 +6265,52 @@ export function ownInstanceStructure(rootInstanceId: number, prefab: PrefabFile,
   const layer = enclosingLayer(rootInstanceId);
   if (!layer) return full;
   const { structure: s } = layer;
-  const keysByGuid = new Map<string, string>();
-  if (s.added?.length) {
-    const memo = new Map<number, string>();
-    for (const n of full.added) {
-      const e = n.guid ? findEntityByGuid(n.guid) : undefined;
-      const key = e ? (templateKeyOf(e as Parameters<typeof templateKeyOf>[0]) || recoverTemplateKey(e.id(), memo)) : '';
-      if (key) keysByGuid.set(n.guid, key);
-    }
-  }
   const added = resolveAddedNodeTokens(baseTokenResolver(rootInstanceId), s.added);
-  const { structure, replace } = subtractChainStructure(full, { ...s, added }, keysByGuid);
+  const { structure, replace } = subtractChainStructure(full, { ...s, added }, s.added?.length ? liveTemplateKeys(full.added) : new Map());
   // A node the layer authored and the scene EDITED is kept whole by that subtraction (the rebuild respawns it in place
   // of the fresh copy), but it is still the LAYER's node: listed, Apply copied it into `prefab`, and every other
   // instance of the enclosing prefab then showed it twice — the row's copy and the template's (close-out review). Its
   // edits are the scene's, saved with it.
   const edited = new Set(replace.map((r) => r.guid));
   return edited.size ? { ...structure, added: structure.added.filter((n) => !edited.has(n.guid)) } : structure;
+}
+
+/** guid → template key of each captured `added` node: the live marker, else the key its derived guid recovers
+ *  (Play→Stop, an undo respawn). Read only — nothing is minted or stamped, unlike a template-form capture. */
+function liveTemplateKeys(nodes: readonly AddedEntity[]): Map<string, string> {
+  const out = new Map<string, string>();
+  const memo = new Map<number, string>();
+  for (const n of nodes) {
+    const e = n.guid ? findEntityByGuid(n.guid) : undefined;
+    const key = e ? (templateKeyOf(e as Parameters<typeof templateKeyOf>[0]) || recoverTemplateKey(e.id(), memo)) : '';
+    if (key) out.set(n.guid, key);
+  }
+  return out;
+}
+
+/** For the scene writer (#1511): does member `lid` of nested frame `frameRoot` (document `doc`) hold exactly the
+ *  `added` nodes the prefab chain gives it (`chainAdded`, the frame's baseline) — every chain node present and
+ *  unchanged, and none of the scene's own? Then its `added` statement would only restate the chain.
+ *
+ *  Asked the way the rebuild asks it (`subtractChainStructure`): the live capture in plain scene form, so a
+ *  reference node carries the same localId channels a template node does, matched to a chain node by template key,
+ *  with the chain's member tokens resolved to the guids the live side holds. The capture runs once per frame, and
+ *  only when a member is asked about. */
+function chainAddedComparer(frameRoot: number, doc: PrefabFile, chainAdded: AddedEntity[] | undefined): (lid: number) => boolean {
+  const chain = resolveAddedNodeTokens(baseTokenResolver(frameRoot), chainAdded) ?? [];
+  let live: { full: InstanceStructure; keys: Map<string, string> } | undefined;
+  return (lid) => {
+    const chainAt = chain.filter((n) => n.parentLocalId === lid);
+    if (!chainAt.length) return false; // the scene's own nodes, or `added: []` over nothing: nothing to restate
+    if (!live) {
+      const full = captureInstanceStructure(frameRoot, doc);
+      live = { full, keys: liveTemplateKeys(full.added) };
+    }
+    const liveAt = live.full.added.filter((n) => n.parentLocalId === lid);
+    if (liveAt.length !== chainAt.length) return false; // one deleted, or one of the scene's own beside them
+    const { structure, replace } = subtractChainStructure({ ...live.full, added: liveAt }, { added: chainAt }, live.keys);
+    return !structure.added.length && !replace.length;
+  };
 }
 
 /** The structural keys (localId form) in capture `full` that the layers enclosing the instance author rather than the

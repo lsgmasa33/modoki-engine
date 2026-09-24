@@ -10,7 +10,11 @@
  *
  *  #1506 — that base is the enclosing layer WHOLE (`enclosingLayer`): a row's STRUCTURE is not the instance's own
  *  either (listed, Apply stripped a row's removed trait from every instance of P), and a reference node a template
- *  row authored has the node's channels as its layer, not nothing.
+ *  row authored has the node's channels as its layer, not nothing. #1513: also when the node hangs inside a plain added
+ *  node's `children`.
+ *
+ *  #1511 — a SAVE writes a nested frame's structure per member only where it differs from what the rows apply, so a
+ *  later template change to the rest still reaches the saved scene.
  *
  *  Driven through the real loader, the real capture and the real Apply. Each case names the mutation that turns
  *  it red. */
@@ -43,6 +47,7 @@ import {
 } from '@modoki/engine/editor';
 import {
   setPrefabCache, rebaseStaleInstances, applyToPrefabSelective, revertOverridesSelective, getCachedPrefabSync, type PrefabFile,
+  instantiatePrefab, setPrefabSource,
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { sameRotationScale } from '../../packages/modoki/src/runtime/scene/transformSpace';
@@ -541,18 +546,20 @@ describe('a nested instance\'s base is its enclosing layer WHOLE: structure, and
       { localId: 3, name: 'Inner', nodeGuid: gIn, prefab: P, traits: { EntityAttributes: { name: 'Inner', parentId: 1, guid: '' } } },
     ] });
     /** O's row N adds a reference node expanding P2 that sets XA.x = 3, and A.x = 4 inside P2's Inner row. */
-    const withRefNode = () => oRow({ added: [{
+    const refNode = (xv = 3) => ({
       parentLocalId: 1, guid: '', key: 'k-ref', name: 'Ref', prefab: P2, traits: {}, children: [],
-      overrides: { 2: { Transform: { x: 3 } } }, nestedOverrides: { 3: { 2: { Transform: { x: 4 } } } },
-    }] });
+      overrides: { 2: { Transform: { x: xv } } }, nestedOverrides: { 3: { 2: { Transform: { x: 4 } } } },
+    });
+    const withRefNode = (xv = 3) => oRow({ added: [refNode(xv)] });
     const xa = () => inInstance(ROOT1, 'XA');
     const refRoot = () => (readTraitData(xa(), meta('PrefabInstance')) as { rootInstanceId: number }).rootInstanceId;
     const xaKey = `${gXA}.Transform.x`;
 
     it('the node\'s own value is not listed; a scene edit over it is, and Revert gives the NODE\'s value', async () => {
-      // No reload half: a save pins the template node into the scene (#1511), so a reload would show 3 under either
-      // answer and could not fail.
       // Mutation: return null from `templateReferenceNode` — 3 is listed with nothing edited, and Revert gives P2's 0.
+      // The reload half (#1511): Revert's target lasts past a save — the saved scene leaves the node to the template,
+      // so a later change to the node reaches it. Mutation: drop the `sameAdded` test in `moveChannelsOntoRows` —
+      // the save restates the node and the reload shows 3.
       install(pDoc(), p2Doc(), withRefNode());
       await load(scene(O, [ROOT1]));
       expect(x(xa())).toBe(3); // precondition: the node applies
@@ -562,6 +569,64 @@ describe('a nested instance\'s base is its enclosing layer WHOLE: structure, and
       await revertOverridesSelective(refRoot(), new Set([xaKey]));
       expect(x(xa())).toBe(3);
       expect(keys(refRoot(), P2)).toEqual([]);
+      const { scene: sc } = await saved();
+      install(withRefNode(8));
+      await load(sc);
+      expect(x(xa())).toBe(8);
+    });
+
+    /** O's row N adds a plain Holder2 whose child is the reference node (#1513). */
+    const withHeldRefNode = (node: Record<string, unknown> = refNode()) => oRow({ added: [{
+      parentLocalId: 1, guid: '', key: 'k-holder', name: 'Holder2', children: [node],
+      traits: { EntityAttributes: { name: 'Holder2', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } },
+    }] });
+
+    it('inside a plain added node\'s children (#1513): the node\'s value is not listed, and Revert gives the NODE\'s value', async () => {
+      // Mutation: stop the climb in `templateReferenceNode` at the direct parent — `frame` is 0, 3 is listed with nothing
+      // edited, and Revert gives P2's 0. Mutation 2: collect only the layer's top-level `added` — the same.
+      install(pDoc(), p2Doc(), withHeldRefNode());
+      await load(scene(O, [ROOT1]));
+      expect(x(xa())).toBe(3); // precondition: the node applies
+      expect(keys(refRoot(), P2)).toEqual([]);
+      setTf(xa(), 'x', 5);
+      expect(keys(refRoot(), P2)).toEqual([xaKey]);
+      await revertOverridesSelective(refRoot(), new Set([xaKey]));
+      expect(x(xa())).toBe(3);
+    });
+
+    it('inside a plain added node\'s children, a node that LOST its key marker is still found', async () => {
+      // Mutation: drop the `recoverTemplateKey` fallback in `templateReferenceNode` — 3 is listed again.
+      install(pDoc(), p2Doc(), withHeldRefNode());
+      await load(scene(O, [ROOT1]));
+      getCurrentWorld().entities.find((e) => e.id() === refRoot())!.remove(TemplateAddedKey);
+      expect(keys(refRoot(), P2)).toEqual([]);
+    });
+
+    it('inside a plain added node\'s children, the node\'s own removed trait is not listed, and Revert refuses it', async () => {
+      // Mutation: as the first #1513 case — `-trait.<XA>.UIAction` is listed, and Revert puts UIAction back.
+      const p2 = p2Doc();
+      (p2.entities[1]!.traits as Record<string, unknown>).UIAction = {};
+      install(pDoc(), p2, withHeldRefNode({ ...refNode(), removedTraits: { 2: ['UIAction'] } }));
+      await load(scene(O, [ROOT1]));
+      expect(readTraitData(xa(), meta('UIAction'))).toBeFalsy(); // precondition: the node removes it
+      expect(keys(refRoot(), P2)).toEqual([]);
+      await revertOverridesSelective(refRoot(), new Set([`-trait.${gXA}.UIAction`]));
+      expect(readTraitData(xa(), meta('UIAction'))).toBeFalsy();
+    });
+
+    it('ACCEPT side: an instance the SCENE put inside the template\'s plain node is its own — its edit is listed, and Revert gives the template', async () => {
+      // Mutation: match any candidate when the root has no key (`candidates[0]`) in `templateReferenceNode` — the
+      // scene's instance takes the row's node as its base, and its x = 3 edit is not listed.
+      install(pDoc(), p2Doc(), withHeldRefNode());
+      await load(scene(O, [ROOT1]));
+      const holder = inInstance(ROOT1, 'Holder2');
+      const mine = instantiatePrefab(getCachedPrefabSync(P2) as PrefabFile, holder);
+      setPrefabSource(mine, P2);
+      const mineXa = getAllEntities().find((e) => e.name === 'XA' && e.parentId === mine)!.id;
+      setTf(mineXa, 'x', 3);
+      expect(keys(mine, P2)).toEqual([xaKey]);
+      await revertOverridesSelective(mine, new Set([xaKey]));
+      expect(x(mineXa)).toBe(0);
     });
 
     it('a node that LOST its key marker (Play→Stop, an undo respawn) is still found, by the key its guid derives from', async () => {
@@ -602,5 +667,203 @@ describe('a nested instance\'s base is its enclosing layer WHOLE: structure, and
       const innerRoot = pi(inner).rootInstanceId;
       expect(keys(innerRoot)).toEqual([]);
     });
+  });
+});
+
+describe('a save leaves what a TEMPLATE row authors inside its nested frame to the row (#1511)', () => {
+  // The scene wrote a statement for every member the row's structure touched, equal or not, and an explicit
+  // statement replaces the row's (`foldMemberRowChannels`) — so a no-op save pinned the row, and a later template
+  // change to it never reached the scene. Each case: save with nothing edited, change the template, reload.
+  const oRow = (extra: Record<string, unknown>) => { const d = oDoc(); Object.assign(d.entities[3] as Record<string, unknown>, extra); return d; };
+  const extra = (xv: number) => ({ parentLocalId: 1, guid: '', key: 'k-extra', name: 'Extra', children: [],
+    traits: { EntityAttributes: { name: 'Extra', parentId: 0, guid: '' }, Transform: { x: xv, y: 0, z: 0 } } });
+  const pWithAction = () => { const d = pDoc(); (d.entities[1]!.traits as Record<string, unknown>).UIAction = {}; return d; };
+  const rows = (entry: Record<string, unknown>) => entry.members as Record<string, Record<string, unknown>>;
+  const aRow = `/${gN}/${gA}`;
+  /** Save, install `next` as the new template, reload the SAVED scene; the saved entry. */
+  const reloadUnder = async (...next: Array<{ id?: string }>) => {
+    const { scene: sc, entry } = await saved();
+    install(...next);
+    await load(sc);
+    return entry;
+  };
+  const remove = (id: number) => {
+    const world = getCurrentWorld();
+    for (const e of world.entities) if (e.id() === id) { destroyEntity(e, world); break; }
+  };
+
+  it('an ADDED node: a later change to it reaches the saved scene', async () => {
+    // Mutation: drop the `sameAdded` test in `moveChannelsOntoRows` — R's row restates Extra and the reload shows 1.
+    install(pDoc(), oRow({ added: [extra(1)] }));
+    await load(scene(O, [ROOT1]));
+    const entry = await reloadUnder(oRow({ added: [extra(8)] }));
+    expect(rows(entry)[`/${gN}`]?.added).toBeUndefined();
+    expect(x(inInstance(ROOT1, 'Extra'))).toBe(8);
+  });
+
+  it('a REMOVED member: the template dropping the removal brings it back', async () => {
+    // Mutation: write `removed` whenever the chain touches the member (drop the `!==` test) — A stays removed.
+    install(pDoc(), oRow({ removed: [2] }));
+    await load(scene(O, [ROOT1]));
+    const entry = await reloadUnder(oDoc());
+    expect(rows(entry)[aRow]?.removed).toBeUndefined();
+    inInstance(ROOT1, 'A'); // throws unless exactly one
+  });
+
+  it('a REMOVED TRAIT: the template dropping the removal brings it back', async () => {
+    // Mutation: drop the `sameNames` test — A's row restates the removal and UIAction stays gone.
+    install(pWithAction(), oRow({ removedTraits: { 2: ['UIAction'] } }));
+    await load(scene(O, [ROOT1]));
+    const entry = await reloadUnder(oDoc());
+    expect(rows(entry)[aRow]?.removedTraits).toBeUndefined();
+    expect(readTraitData(inInstance(ROOT1, 'A'), meta('UIAction'))).toBeTruthy();
+  });
+
+  it('ACCEPT side: the scene DELETING the row\'s node is saved, and the node stays deleted', async () => {
+    // Mutation: drop the length test in `chainAddedComparer` — an empty live list compares equal, and Extra is back.
+    install(pDoc(), oRow({ added: [extra(1)] }));
+    await load(scene(O, [ROOT1]));
+    remove(inInstance(ROOT1, 'Extra'));
+    const entry = await reloadUnder(oRow({ added: [extra(8)] }));
+    expect(rows(entry)[`/${gN}`]?.added).toEqual([]);
+    expect(getAllEntities().filter((e) => e.name === 'Extra')).toEqual([]);
+  });
+
+  it('ACCEPT side: a node the scene put IN PLACE of the row\'s is saved', async () => {
+    // Mutation: ignore the scene's unmatched nodes in `chainAddedComparer` (drop `!structure.added.length`) — one node
+    // each side reads as equal, Mine is not saved, and the reload shows the row's Extra.
+    const MINE = 'eeeeeeee-0000-4000-8000-000000001511';
+    install(pDoc(), oRow({ added: [extra(1)] }));
+    await load(scene(O, [ROOT1]));
+    const { scene: sc, entry } = await saved();
+    rows(entry)[`/${gN}`]!.added = [{ parentLocalId: 1, guid: MINE, name: 'Mine', children: [],
+      traits: { EntityAttributes: { name: 'Mine', parentId: 0, guid: MINE }, Transform: { x: 2, y: 0, z: 0 } } }];
+    await load(sc);
+    expect(getAllEntities().filter((e) => e.name === 'Extra')).toEqual([]); // precondition: the scene's list replaced the row's
+    await reloadUnder(oRow({ added: [extra(8)] }));
+    expect(x(inInstance(ROOT1, 'Mine'))).toBe(2);
+  });
+
+  it('ACCEPT side: the scene UN-removing a member the row removes is saved', async () => {
+    // Mutation: never touch `removed` in `moveChannelsOntoRows` — the second save drops `removed: false` and A is gone.
+    install(pDoc(), oRow({ removed: [2] }));
+    await load(scene(O, [ROOT1]));
+    const { scene: sc, entry } = await saved();
+    rows(entry)[aRow] = { removed: false };
+    await load(sc);
+    inInstance(ROOT1, 'A'); // precondition: the scene brought it back
+    const again = await reloadUnder(oRow({ removed: [2] }));
+    expect(rows(again)[aRow]?.removed).toBe(false);
+    inInstance(ROOT1, 'A');
+  });
+
+  it('a template REFERENCE node: a refresh delivers the template\'s change to it, and so does a saved scene', async () => {
+    // A live capture of a reference node carries identity the template node does not (member rows' guid/name, a name no
+    // spawn applies), so it compared EDITED everywhere. Mutation: compare the raw nodes in `subtractChainStructure`
+    // (drop `withoutLiveIdentity`) — the rebuild respawns the old node (3), and the save restates it.
+    const P2 = 'cccccccc-0000-4000-8000-000000001511';
+    const gXA = 'eeeeeeee-0000-4000-8000-000000001512';
+    const p2 = { id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000001513'), row(2, 'XA', 1, gXA)] };
+    const withNode = (xv: number) => oRow({ added: [{ parentLocalId: 1, guid: '', key: 'k-ref', name: 'Ref', prefab: P2, traits: {}, children: [], overrides: { 2: { Transform: { x: xv } } } }] });
+    install(pDoc(), p2, withNode(3));
+    await load(scene(O, [ROOT1]));
+    const xa = () => inInstance(ROOT1, 'XA');
+    expect(x(xa())).toBe(3); // precondition
+    install(withNode(8));
+    expect(await rebaseStaleInstances()).toBe(1);
+    expect(x(xa())).toBe(8);
+    const entry = await reloadUnder(withNode(9));
+    expect(rows(entry)[`/${gN}`]?.added).toBeUndefined();
+    expect(x(xa())).toBe(9);
+  });
+
+  it('a row node holding a member TOKEN is compared as the guid it names: not restated, and a template change reaches it', async () => {
+    // Close-out review. Mutation: skip `resolveAddedNodeTokens` in `chainAddedComparer` — the live node holds A's guid
+    // where the chain holds the token, so it reads as edited and is pinned.
+    const withToken = (xv: number) => { const n = extra(xv); (n.traits as Record<string, unknown>).UIAction = { bindings: [{ target: '@member:2' }] }; return n; };
+    install(pDoc(), oRow({ added: [withToken(1)] }));
+    await load(scene(O, [ROOT1]));
+    const target = (readTraitData(inInstance(ROOT1, 'Extra'), meta('UIAction')) as { bindings: Array<{ target: string }> }).bindings[0]!.target;
+    expect(target).toBe(getAllEntities().find((e) => e.id === inInstance(ROOT1, 'A'))!.guid); // precondition: resolved
+    const entry = await reloadUnder(oRow({ added: [withToken(8)] }));
+    expect(rows(entry)[`/${gN}`]?.added).toBeUndefined();
+    expect(x(inInstance(ROOT1, 'Extra'))).toBe(8);
+  });
+
+  describe('a template REFERENCE node\'s member identity (close-out review)', () => {
+    const P4 = 'cccccccc-0000-4000-8000-000000001521';
+    const gXA4 = 'eeeeeeee-0000-4000-8000-000000001522';
+    const gXB4 = 'eeeeeeee-0000-4000-8000-000000001523';
+    /** P4: R4 → XA, and XB under R4 — or under XA once the template MOVES it. */
+    const p4 = (moved = false) => ({ id: P4, version: 5, name: 'P4', rootLocalId: 1, entities: [
+      row(1, 'R4', 0, 'eeeeeeee-0000-4000-8000-000000001524'), row(2, 'XA', 1, gXA4), row(3, 'XB', moved ? 2 : 1, gXB4)] });
+    const withNode4 = () => oRow({ added: [{ parentLocalId: 1, guid: '', key: 'k-ref4', name: 'Ref4', prefab: P4, traits: {}, children: [], overrides: { 2: { Transform: { x: 3 } } } }] });
+    const guidOf = (name: string) => getAllEntities().find((e) => e.name === name)!.guid;
+
+    it('a member guid the scene STORED, which the member no longer derives, is kept through a save the node is otherwise equal in', async () => {
+      // Mutation: strip every member row's `guid` in `withoutLiveIdentity` — the node compares equal, the save leaves it
+      // to the template, and XB re-derives a new guid under every scene ref into it.
+      install(pDoc(), p4(), withNode4());
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'XA'), 'x', 5); // an edit, so the save restates the node with its members' guids
+      await reloadUnder(p4(true)); // the template moves XB under XA: XB now derives a different guid
+      const stored = guidOf('XB');
+      setTf(inInstance(ROOT1, 'XA'), 'x', 3); // back to the node's value: only the stored identity differs now
+      await reloadUnder(p4(true));
+      expect(guidOf('XB')).toBe(stored);
+    });
+
+    it('an ORPHAN member row (the template dropped the member) does not pin the node', async () => {
+      // Scoped close-out review. Mutation: also keep a row guid that NO live member holds in `withoutLiveIdentity` (the
+      // first fix kept every guid not derived) — the orphan's guid pins the node on every save, and x = 7 never arrives.
+      const p4NoXb = () => ({ ...p4(), entities: p4().entities.slice(0, 2) });
+      const withX = (xv: number) => { const d = withNode4(); ((d.entities[3] as unknown as { added: Array<{ overrides: Record<number, unknown> }> }).added[0]!).overrides = { 2: { Transform: { x: xv } } }; return d; };
+      install(pDoc(), p4(), withNode4());
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'XA'), 'x', 5); // an edit, so the save restates the node with rows for XA and XB
+      await reloadUnder(p4NoXb()); // the template drops XB: its row is an orphan now
+      setTf(inInstance(ROOT1, 'XA'), 'x', 3); // back to the node's value
+      await reloadUnder(p4NoXb(), withX(7));
+      expect(x(inInstance(ROOT1, 'XA'))).toBe(7);
+    });
+
+    it('a node whose nested slot omits a list is still the template\'s: not restated on a save', async () => {
+      // Mutation: drop the slot fill in `withoutLiveIdentity` — the template's `{removedTraits}` never equals the live
+      // capture's three lists, and the node is pinned.
+      const P5 = 'cccccccc-0000-4000-8000-000000001525';
+      const p5 = { id: P5, version: 5, name: 'P5', rootLocalId: 1, entities: [row(1, 'R5', 0, 'eeeeeeee-0000-4000-8000-000000001526'),
+        { localId: 2, name: 'In5', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001527', prefab: P, traits: { EntityAttributes: { name: 'In5', parentId: 1, guid: '' } } }] };
+      const pA = pDoc();
+      (pA.entities[1]!.traits as Record<string, unknown>).UIAction = {};
+      install(pA, p5, oRow({ added: [{ parentLocalId: 1, guid: '', key: 'k-ref5', name: 'Ref5', prefab: P5, traits: {}, children: [],
+        nestedStructure: { 2: { removedTraits: { 2: ['UIAction'] } } } }] }));
+      await load(scene(O, [ROOT1]));
+      const inner = getAllEntities().filter((e) => e.name === 'A').find((e) => !readTraitData(e.id, meta('UIAction')));
+      expect(inner).toBeTruthy(); // precondition: the node's slot removes the inner A's UIAction
+      expect(rows((await saved()).entry)[`/${gN}`]?.added).toBeUndefined();
+    });
+
+    it('a member the scene MOVED inside the node is kept through a save', async () => {
+      // Mutation: strip `parent` from member rows too in `withoutLiveIdentity` — the move reads as identity, the node
+      // compares equal, and XB reloads under R4.
+      install(pDoc(), p4(), withNode4());
+      await load(scene(O, [ROOT1]));
+      reparentEntity(inInstance(ROOT1, 'XB'), inInstance(ROOT1, 'XA'));
+      await reloadUnder(p4());
+      const byId = new Map(getAllEntities().map((e) => [e.id, e]));
+      expect(byId.get(byId.get(inInstance(ROOT1, 'XB'))!.parentId)!.name).toBe('XA');
+    });
+  });
+
+  it('the row\'s node keeps its guid through a save and a reload it is no longer restated in', async () => {
+    // A scene ref into the node rode on the restated guid (`docs/scene-loading.md`); now the node re-derives it from
+    // its key. Not a guard of the save change (a restated node keeps its guid too): it pins what a ref now rests on.
+    // Mutation: re-key the node in the reloaded template (`k-extra` → `k-other`) — the guid moves.
+    install(pDoc(), oRow({ added: [extra(1)] }));
+    await load(scene(O, [ROOT1]));
+    const before = getAllEntities().find((e) => e.name === 'Extra')!.guid;
+    expect(before).toBeTruthy();
+    await reloadUnder(oRow({ added: [extra(1)] }));
+    expect(getAllEntities().find((e) => e.name === 'Extra')!.guid).toBe(before);
   });
 });

@@ -10,6 +10,11 @@ let package = Package(
             targets: ["AppsFlyerPlugin"])
     ],
     dependencies: [
+        // The ATT active-state gate (#1510), a nested standalone package so `swift test` can run it
+        // on the host, which `import Capacitor` makes impossible for THIS target. Same split as
+        // capacitor-modoki-iap's `iap-core`; package.json's `files` must keep shipping `att-core/`
+        // (capacitorPlatformDeclarations.test.ts enforces it).
+        .package(path: "att-core"),
         .package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", from: "8.0.0"),
         // ⚠️ AppsFlyer ships THREE SPM repos: -Static, -Dynamic, -Strict. This MUST stay
         // -Static. -Strict is the no-IDFA build (it strips ATT/IDFA support entirely) and
@@ -21,6 +26,7 @@ let package = Package(
         .target(
             name: "AppsFlyerPlugin",
             dependencies: [
+                .product(name: "AppsFlyerAttCore", package: "att-core"),
                 .product(name: "Capacitor", package: "capacitor-swift-pm"),
                 .product(name: "Cordova", package: "capacitor-swift-pm"),
                 // ⚠️ The PRODUCT is "AppsFlyerLib-Static"; the TARGET (and so the module you

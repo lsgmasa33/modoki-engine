@@ -2657,6 +2657,12 @@ No sudo, no tunnel, no manual Developer Disk Image mount is needed on 16.x — m
 8 (16.7.16): kill the running app, `ios install` + `ios launch`, whole cycle ~4s, verified by a new
 pid that outlives the tool.
 
+⚠️ **`ios launch` can fail too** (#1510, 2026-09-24, same iPhone 8, go-ios 1.3.2): it failed twice a
+minute apart with `failed starting process … write unix ->/var/run/usbmuxd: write: broken pipe`,
+and the phone stayed on the home screen. `idevicedebug -u <UDID> run <appId>` launched it fine
+right after. That is a DEBUGGER launch, though, so it is not a stand-in for a home-screen tap when the
+launch mode matters (the ATT prompt, for one; see `games/court/attribution.md` § Phase 3).
+
 ⚠️ **`ios install` is INTERMITTENT, and `ideviceinstaller` is the fallback that has never failed
 here** (2026-08-20, QA-BUILD-0004). The ~4s success above is real and reproducible at other times —
 but the same command also fails outright, and when it does the message points at the wrong thing:

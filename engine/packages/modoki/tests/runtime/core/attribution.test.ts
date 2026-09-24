@@ -333,3 +333,32 @@ describe('attribution — getAdvertisingId', () => {
     await expect(a.getAdvertisingId()).resolves.toEqual(NONE);
   });
 });
+
+/**
+ * #1510: iOS answers `notDetermined` at once, with no prompt drawn, when the app is not active. The
+ * plugin now holds the request until it is (`capacitor-appsflyer/att-core`). If the answer still comes
+ * back, the log has to say the player was never asked rather than pass it off as an answer.
+ */
+describe('attribution — an ATT answer that means no prompt was shown (#1510)', () => {
+  const warned = () =>
+    (console.warn as unknown as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[0]).includes('did not show the tracking prompt'));
+
+  it('warns on iOS when the answer is notDetermined, and still starts the SDK', async () => {
+    sdk.requestTrackingAuthorization.mockResolvedValueOnce({ status: 'notDetermined' });
+    await make(CONFIGURED, { os: 'ios' }).initAppsFlyer();
+    expect(warned()).toBe(true);
+    expect(sdk.start).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['authorized', 'denied', 'restricted'])('stays quiet for a real answer (%s)', async (status) => {
+    sdk.requestTrackingAuthorization.mockResolvedValueOnce({ status });
+    await make(CONFIGURED, { os: 'ios' }).initAppsFlyer();
+    expect(warned()).toBe(false);
+  });
+
+  it('stays quiet off iOS, where there is no prompt to miss', async () => {
+    sdk.requestTrackingAuthorization.mockResolvedValueOnce({ status: 'notDetermined' });
+    await make(CONFIGURED, { os: 'android' }).initAppsFlyer();
+    expect(warned()).toBe(false);
+  });
+});

@@ -126,6 +126,7 @@ function run(name, cmd, args, opts = {}) {
 // summary can name every leg that exists, including the ones this machine could not run.
 const otaDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-modoki-ota');
 const iapDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-modoki-iap');
+const appsflyerDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-appsflyer');
 
 // The ios/ota-core leg's OtaZipTests.swift cross-checks OtaZip against a REAL zip built by the
 // Node writer (engine/scripts/ota/zip.mjs) — that fixture used to be a hand-typed /tmp file
@@ -176,6 +177,9 @@ const SWIFT_LEGS = [
   // living in the test — see IapClassification.swift's header for why importing StoreKit is fine
   // here while importing Capacitor is not.
   { name: 'ios/iap-core', packagePath: path.join(iapDir, 'iap-core') },
+  // #1510. The SHIPPING ATT active-state gate. The plugin's UIKit half (reading applicationState,
+  // forwarding didBecomeActive) is not reachable from here; games/court/attribution.md records the device check.
+  { name: 'ios/att-core', packagePath: path.join(appsflyerDir, 'att-core') },
 ];
 
 for (const leg of SWIFT_LEGS) {

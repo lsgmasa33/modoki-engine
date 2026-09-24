@@ -1486,8 +1486,9 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     - promotion (`toTemplateNodes` in `insertAddedSubtree`) converts a scene-form subtree the same way.
   - **Which kind a node is follows from its fields.** A node with a `guid` is spawned with it
     verbatim, whether or not it carries a key. A scene capture never writes a key; it writes the
-    node's live, now per-instance guid. Because a scene restates every non-empty interior (#1358),
-    a scene that stores a ref into an interior also stores that node's guid.
+    node's live, now per-instance guid. A scene restates a nested interior only where it differs
+    from the chain (#1511). A ref into a template node the scene did not change therefore rests on
+    the guid the node re-derives from its key on every load, not on a guid the scene stores.
   - **Rebuilds derive.** `rebuildInstance` now ends with the derive pass. Before, a respawned keyed
     node was left guid-less.
   - **Legacy.** A pre-key row node keeps loading exactly as before. A node with no guid loads
@@ -1498,9 +1499,9 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     guid**, so nothing moved here. Games copied out of the repo can still carry that shape (#29).
   - **The duplicate walk mirrors the step.** `derivedMemberPathsByAnchor` and `deriveMemberChain`
     use the same keyed step, pinned by `engine/tests/plugins/remintPrefabMemberRefs.test.ts`. It
-    still does not read a ROW's `nestedStructure` (#1381), which predates this change. That gap
-    rarely matters: a scene save restates every non-empty interior with each node's guid, so a scene
-    holding a ref into one also holds the guid it points at.
+    reads a ROW's `nestedStructure` too (`memberPaths.ts`, since #1430). That matters more since
+    #1511: a scene no longer restates an interior it did not change, so a ref into an unchanged
+    row-authored node rests on the derived guid alone, and a duplicate follows it through this walk.
   Tests: `engine/tests/editor/prefabTemplateIdentity.test.ts`.
 - **Template identity, refs: a ref between a prefab's own members is a MEMBER TOKEN (#1352).** A
   template kept such a ref (a `UIAction.bindings[].target`, any `entityRef`) as the SOURCE world's

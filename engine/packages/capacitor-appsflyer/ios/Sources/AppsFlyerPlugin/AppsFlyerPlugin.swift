@@ -1,6 +1,11 @@
 import Capacitor
 import AppsFlyerLib
 import AppTrackingTransparency
+import UIKit
+// SPM builds the gate as its own module (att-core/); the CocoaPods fallback compiles it into this one.
+#if canImport(AppsFlyerAttCore)
+import AppsFlyerAttCore
+#endif
 
 @objc(AppsFlyerPlugin)
 public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate {
@@ -79,6 +84,28 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
     // own per-plugin serial queue (the `Queue name: bridge` frame in the Main-Thread-Checker trace
     // quoted on `start()` below), so a non-atomic check-and-set here has no concurrent writer.
     private static var hasStarted = false
+
+    /// Holds the ATT request until the app is active (#1510). Touched only on the main queue.
+    private let attGate = AttRequestGate()
+    private var didBecomeActiveObserver: NSObjectProtocol?
+
+    // MARK: - Load
+
+    public override func load() {
+        // Every activation goes to the gate. It runs a held request once and ignores the rest, so
+        // one permanent observer is simpler than arming one per request and cannot miss an
+        // activation that lands between the state read and the arming. Delivered on main, where
+        // requestTrackingAuthorization() below does its read.
+        didBecomeActiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.attGate.appDidBecomeActive()
+        }
+    }
+
+    deinit {
+        if let observer = didBecomeActiveObserver { NotificationCenter.default.removeObserver(observer) }
+    }
 
     // MARK: - Initialize
 
@@ -305,21 +332,37 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
 
     // MARK: - ATT
 
+    // ⚠️ THE REQUEST WAITS FOR THE APP TO BE ACTIVE (#1510). iOS shows the ATT prompt only while
+    // the app is `.active`. Asked earlier, it answers `.notDetermined` at once and draws NOTHING,
+    // and the JS side then starts AppsFlyer and MAX without IDFA for a question nobody saw.
+    // Observed on an iPhone 8 under `idevicedebug`. The gate's own header has the reasoning, and
+    // why the wait has no bound. With the gate in place, a `notDetermined` answer means iOS
+    // declined to draw the prompt even though the app was active. attribution.ts warns on that.
     @objc func requestTrackingAuthorization(_ call: CAPPluginCall) {
-        if #available(iOS 14, *) {
-            ATTrackingManager.requestTrackingAuthorization { status in
-                let mapped: String
-                switch status {
-                case .authorized: mapped = "authorized"
-                case .denied: mapped = "denied"
-                case .restricted: mapped = "restricted"
-                case .notDetermined: mapped = "notDetermined"
-                @unknown default: mapped = "notDetermined"
-                }
-                call.resolve(["status": mapped])
-            }
-        } else {
+        guard #available(iOS 14, *) else {
             call.resolve(["status": "notSupported"])
+            return
+        }
+        // Main queue: `applicationState` is UIKit, and the gate's ordering with the
+        // didBecomeActive observer in load() depends on both running there.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let deferred = self.attGate.submit(isActive: UIApplication.shared.applicationState == .active) {
+                ATTrackingManager.requestTrackingAuthorization { status in
+                    let mapped: String
+                    switch status {
+                    case .authorized: mapped = "authorized"
+                    case .denied: mapped = "denied"
+                    case .restricted: mapped = "restricted"
+                    case .notDetermined: mapped = "notDetermined"
+                    @unknown default: mapped = "notDetermined"
+                    }
+                    call.resolve(["status": mapped])
+                }
+            }
+            // NSLog, not CAPLog.print: CAPLog is stdout, which only a DEBUGGER launch shows, and the
+            // launch this line has to be read from is the home-screen tap (device_native_logs reads os_log).
+            if deferred { NSLog("[AppsFlyerCap] ATT request held until the app is active (#1510)") }
         }
     }
 

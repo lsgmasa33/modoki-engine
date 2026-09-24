@@ -398,18 +398,24 @@ edited it**. The subtraction keeps an edited node whole for the rebuild to respa
 copied it into the child prefab, and every other instance of the enclosing prefab then showed it twice.
 Its edits are the scene's, and the save keeps them.
 
+A reference node inside a plain added node's `children` is found too (#1513). The frame is the one the
+first MEMBER above it belongs to, since a plain node carries no `PrefabInstance`, and the key is looked
+for through the layer's `children`. A reference node in another reference node's `added`, under one of
+that node's members, needs neither: that member's frame is the outer node's instance, whose layer is the
+outer node's `added`.
+
 Limits:
-- A reference node inside another added node's `children` reads as having no template node, as before (#1513).
-- The same goes for a reference node in another reference node's `added`, under one of that node's
-  members.
-- So does a template node the scene moved out under a plain entity. Its identity parent is its live parent,
-  since no row expanded it (`identityParents.ts`), so `templateReferenceNode` reads that directly rather
-  than through a world identity walk.
+- A template node the scene moved out of the frame that authored it reads as having no template node. Its
+  identity parent is its live parent, since no row expanded it (`identityParents.ts`), so the climb reaches
+  another frame, or none, whose layer does not hold its key.
 - **A scene edit to a node the layer added has no key on any surface**, so it can be neither applied nor
   reverted to the row's version. It is saved and reloads as edited. Before #1506 it was listed, but Revert
   deleted the node, which was no better.
-- A **save** still pins a template reference node into the scene (#1511). A later change to the node does
-  not reach a saved scene, whatever Revert put back.
+- A save leaves the node to the template unless the scene changed it (#1511), so Revert's target lasts
+  past a save. Once the scene edits the node, the member's whole `added` list is saved. A node whose
+  template carries an all-empty `nestedStructure` slot, or one holding `added` nodes, is still saved
+  as edited. See
+  [prefab-structural-overrides.md](prefab-structural-overrides.md).
 
 The #1490 half: after Apply of a MOVED nested root, the pose is in the reference row's overrides, so the
 save's by-value subtraction drops it from the source. A later edit to that row pose moves the instance.
