@@ -16,6 +16,7 @@ import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './p
 import { bootSplashPlugin } from './plugins/bootSplash'
 import { earlyConsoleShimPlugin } from './plugins/earlyConsoleShim'
 import { projectLockfilesHash } from './plugins/projectLockfileHash'
+import { projectScanEntries } from './plugins/projectScanEntries'
 import { perfCoreWorkers } from './testWorkers'
 
 // C3: engine/ is the vite root (this config + index.html + app/ live here). The
@@ -501,6 +502,10 @@ export default defineConfig(({ command }) => {
   // into a chunk where those sibling files no longer sit. Excluding it keeps the lib served
   // from node_modules as-is.
   optimizeDeps: {
+    // #1520 — the cold scan crawls the open project's game.ts too, so the game's own packages are
+    // pre-bundled before the first page load instead of found mid-boot (a full reload). Dev AND
+    // packaged; the helper's docblock has the observation.
+    entries: projectScanEntries(engineDir, buildProjectRoot),
     exclude: ['@zappar/msdf-generator'],
     // #1502 — Vite keys this cache on the REPO ROOT lockfile only, so a game dropping a dep it had
     // pre-bundled left the cache "valid" and the next re-optimize failed on the missing source (the

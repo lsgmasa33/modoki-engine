@@ -30,6 +30,7 @@ Neither the render's speed nor the screen it runs on affects the frames. The out
 | `engine/packages/modoki/src/editor/rendering/GameView.tsx` | The ● Record button beside Step (`gameView.toolbar.record`), and `REC ·` in the status readout |
 | `engine/app/debug/captureDriver.ts` | The in-page replay driver, `window.__modokiCapture`: hold the loop, fixed-dt `step()`, and the settle gate |
 | `engine/scripts/record-take.mjs` | The renderer CLI (`npm run record`): starts its own dev server, runs Playwright, writes frames, encodes, writes `render.json`. `--ndjson` / `--watch-stdin` are the editor job's protocol |
+| `engine/scripts/recordTakeBoot.mjs` | The boot-retry policy (#1518): which attempts count as reloaded (`pageReloaded`) and when to boot again (`bootWithReloadRetry`) |
 | `engine/packages/modoki/src/editor/recorder/renderOptions.ts` | The render options: legal values (the fps floor), the output size, the defaults' precedence, the CLI arguments. Read by the dialog, the backend job AND the CLI |
 | `engine/packages/modoki/src/editor/recorder/renderFlow.ts` | Take saved → dialog → job → card, and re-attaching to a running job after a page reload |
 | `engine/packages/modoki/src/editor/recorder/renderJobModel.ts` | What the progress card shows: stage, bar, ETA, the warnings from `render.json` |
@@ -129,6 +130,34 @@ The CLI then checks the booted scene is the take's scene and fails if not, becau
 
 The frames span `[0, duration]` inclusive (`frameCountFor`), so the last one dispatches an event
 stamped at the very end. The closing `up` of a take stopped mid-gesture is stamped there.
+
+**A reload during boot starts the boot over (#1518).** On a cold dependency cache, which is the first
+render after any `npm install` that changes a lockfile, Vite finds the game's native-SDK deps
+mid-boot, re-optimises them and reloads the page (#1520). Before this, the render died with
+`Execution context was destroyed`. Now each boot attempt runs in its own fresh browser context: steps 3–6, the `bootStep` loop, and
+the game-root measurement, so everything before the take's first frame. A reloaded attempt is closed
+and booted again, up to 3 attempts (`recordTakeBoot.mjs`). Each attempt carries its own timeouts:
+`goto`'s 30 s default, 60 s for the capture driver to appear and 60 s for the boot loop. So a server
+that reloads every time costs minutes, not seconds, before the render gives up. The rules:
+- **A fresh context, not the same page.** The reloaded document boots on top of the first one's
+  `localStorage` writes, such as the game's prefs or a quality-probe verdict. That is state the take
+  never had.
+- **An attempt that finished after a reload is discarded too.** A reload that lands between two
+  evaluates throws nothing, so the boot finishes in the second document.
+- **The error text is what detects the Vite reload.** The old context is destroyed before the new
+  document commits, so the evaluate it killed rejects before `framenavigated` arrives. On a cold
+  cache, the navigation counter alone missed the reload (1/1) and the text alone caught it (1/1).
+  The counter only covers the no-throw case. The text also covers a `goto` that the reload
+  interrupted (`interrupted by another navigation`, `net::ERR_ABORTED`); that wording is from
+  Playwright and has not been observed here.
+- **An error with no reload behind it is thrown at once.** That is the game failing, and a retry would
+  only reach the same message three times slower.
+- **A reload after boot is still fatal,** now reported as "reloaded mid-take". The frames are being
+  stepped in the page it replaced. Each frame checks the navigation count before it steps, so a
+  reload that committed between two frames cannot step an un-booted document without throwing.
+
+`render.json` gains `bootReloads`. A discarded attempt's page errors are dropped, because a module
+fetch the reload cut off is not this render's error.
 
 **The settle gate.** A fixed-dt replay stops the *sim* clock, not the page. A Pixi Application
 init, a texture fetch or a font load still completes in real time. So before each step the driver
@@ -279,9 +308,11 @@ in `render.json`). Both halves drain the journal through one `TakeJournalTap`:
   shared cap dropped whichever side was drained second, and review reproduced both orders.
 - Only game events (no `@` prefix) are compared.
 
-**Known, unverified limits.** The replay drops events from its boot steps, while the editor keeps
-everything from the Play press on. A game that emits on its very first system tick could therefore
-read as `diverged` (Court does not). The Vite-hosted backend (a browser editor on `npm run dev`)
+**Known limits.** The replay drops events from its boot steps, while the editor keeps everything
+from the Play press on. So a game's boot-time async work (Court's IAP catalogue, trusted-clock fetch
+and session restore) lands on either side of that boundary depending on load timing, and a faithful
+replay can read as `diverged`. Observed on a Court take on 2026-09-24: `diverged` warm 3/3 (three IAP
+events replayed that the take never had), and a different verdict on each of two cold renders (#1524). The Vite-hosted backend (a browser editor on `npm run dev`)
 loses its job table if Vite restarts mid-render; the Electron main-process backend does not.
 
 The comparison was measured on a real Court take before its rule was chosen. Three things differ

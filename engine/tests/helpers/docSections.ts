@@ -43,3 +43,29 @@ export function headingIds(body: string): Set<string> {
  * so `§ 12` was never at risk of matching as `1` and the stricter tail bought nothing.
  */
 export const SECTION_CITE = /([A-Za-z0-9_./-]+\.md)`?\)?[^§]{0,60}§\s*([0-9]+[a-zA-Z]*(?:-bis)?)(?!\d)(?!\.\d)/g;
+
+/**
+ * The doc a `§` citation actually points at — the link's TARGET when the matched path is a
+ * markdown link's TEXT (#1519).
+ *
+ * `SECTION_CITE` and docCitations' `TITLE_CITE` both take the FIRST `.md` path before the `§`, and
+ * in a linked citation (Weaveling's store listing linked Court's legal-drafts README, with the link
+ * text naming `legal-drafts/README.md`) that is the text: a label, which may abbreviate the target
+ * or name a different file entirely. Read as the doc, it
+ * turned a correct citation red (the text resolved, from the citing folder, to a real file without
+ * the heading), and it can do the opposite: vouch for a stale citation whose TEXT happens to name a
+ * file that has the heading while the target does not. 259 lines in `*.md` use the linked shape.
+ *
+ * `match` must come from one of those patterns: group 1 is the path and opens the match. A path
+ * that is not inside `[…](…)` is returned as-is: a bare backticked path followed by `§ 3` names
+ * its doc directly. An in-page `(#anchor)` target has no doc to resolve, so the text is kept for it too.
+ */
+export function citedDoc(text: string, match: RegExpMatchArray): string {
+  const citedPath = match[1];
+  const start = match.index ?? 0;
+  const before = text.slice(text.lastIndexOf('\n', start - 1) + 1, start);
+  if (before.lastIndexOf('[') <= before.lastIndexOf(']')) return citedPath;
+  const link = /^[^\]\n]*\]\(<?([^)\s>#]+)[^)\n]*\)/.exec(text.slice(start + citedPath.length));
+  if (!link) return citedPath;
+  try { return decodeURIComponent(link[1]); } catch { return link[1]; }
+}

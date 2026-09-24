@@ -67,7 +67,7 @@ import {
 // The panel's OWN slug function, so a derived id and the rendered one cannot drift apart.
 import { particleFieldSlug } from '../../packages/modoki/src/editor/panels/particle/fieldIds.js';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
-import { SECTION_CITE, headingIds } from '../helpers/docSections';
+import { SECTION_CITE, citedDoc, headingIds } from '../helpers/docSections';
 import {
   CLONE_BACKEND_PORTS,
   vitePortForBackend,
@@ -2933,7 +2933,7 @@ describeCases('QA case references', () => {
       // DOC is the field manual, since a case legitimately cites other documents' sections too.
       const cited = new Set(
         [...c.body.matchAll(SECTION_CITE)]
-          .filter(([, doc]) => doc.endsWith('knowledge.md'))
+          .filter((m) => citedDoc(c.body, m).endsWith('knowledge.md')) // the link's target (#1519)
           .map(([, , section]) => section),
       );
       for (const m of cited) {

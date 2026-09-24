@@ -45,6 +45,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { loadRequiredEngineModules } from './loadVendorPlugins.mjs';
 import { defaultToolchainDir } from './toolchainHome.mjs';
+import { bootWithReloadRetry, failedAttemptReloaded, pageReloaded } from './recordTakeBoot.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TAG = '[record-take]';
@@ -252,7 +253,6 @@ const { chromium } = require('playwright-core');
 
 /** Replay the take and screenshot every frame. Returns the render report. */
 async function render() {
-  const pageErrors = [];
   try {
     emit({ stage: 'server' });
     server = opts.url ? { url: opts.url, stop: () => {} } : await startDevServer();
@@ -268,51 +268,16 @@ async function render() {
     });
     checkCancelled();
     emit({ stage: 'boot' });
-    const context = await browser.newContext({
-      viewport: take.viewport, deviceScaleFactor: opts.scale,
-      timezoneId: take.timezone, locale: take.locale,
+    // A page that reloads during boot is thrown away with its context and booted again (#1518) —
+    // `recordTakeBoot.mjs` has the policy and why a fresh context rather than the same page.
+    const { value: booted, reloads: bootReloads } = await bootWithReloadRetry(bootAttempt, {
+      discard: async (outcome) => { try { await outcome.context?.close(); } catch { /* browser gone */ } },
+      onReload: (n) => say(`${TAG} the game page reloaded during boot (attempt ${n}) — booting again in a fresh context. `
+        + 'On a cold dependency cache this is Vite re-optimising (#1520).'),
     });
-    // The take's starting state goes in BEFORE any app script runs, so the game boots into it:
-    // the saved data under the game's RUNTIME namespace (the editor keeps its own, `<game>@editor`),
-    // and the preset's safe-area insets as the same `--ui-sa-*` variables the editor sets.
-    await context.addInitScript(({ prefs, prefix, safeArea }) => {
-      for (const [key, raw] of Object.entries(prefs)) localStorage.setItem(prefix + key, raw);
-      const css = Object.entries(safeArea).map(([edge, px]) => `--ui-sa-${edge}: ${px}px;`).join(' ');
-      document.addEventListener('DOMContentLoaded', () => {
-        const style = document.createElement('style');
-        style.textContent = `:root { ${css} }`;
-        document.head.appendChild(style);
-      });
-    }, { prefs: take.prefs, prefix: prefsKeyMod.prefsKeyPrefix(take.game), safeArea: take.safeArea });
-    const page = await context.newPage();
-    // Games read the wall clock directly (Court's daily puzzle keys off today's local date). Pinned to
-    // when the take was played, and advanced by the take clock below, so a take replays into its own day.
-    await page.clock.setFixedTime(take.epochMs);
-    page.on('pageerror', (e) => pageErrors.push(e.message));
-    page.on('console', (m) => {
-      if (m.type() === 'error') pageErrors.push(`console.error: ${m.text()}`);
-      else if (m.type() === 'warning' && m.text().startsWith('[GameShell]')) pageErrors.push(`console.warn: ${m.text()}`);
-    });
-
-    const dtMs = 1000 / opts.fps;
-    const q = new URLSearchParams({ capture: '1', dt: String(dtMs), seed: String(take.seed), scene: take.scene });
-    // `#/game/<id>`, not `#/`: the bare route boots whichever game the server lists first, which with
-    // `--url` pointed at another project's server is not this take's game.
-    await page.goto(`${server.url}/?${q}#/game/${encodeURIComponent(take.game)}`);
-    await page.waitForFunction(() => window.__modokiCapture?.state().steps >= 0, null, { timeout: 60_000 });
-
-    // Boot: step until the game is on screen. `bootStep` settles, then steps ONLY if the game is still
-    // not on screen — checked after its own await, so a hold that releases mid-settle (GameShell lets go
-    // from a raw rAF wait, which keeps firing while the frame loop is held) cannot turn the take's first
-    // timed frame into a boot step. The loop stops with the take clock still at 0.
-    const bootDeadline = Date.now() + 60_000;
-    let state = await page.evaluate(() => window.__modokiCapture.state());
-    while (!state.ready) {
-      if (Date.now() > bootDeadline) throw new Error(`game did not finish loading: ${JSON.stringify(state)}`);
-      state = await page.evaluate(() => window.__modokiCapture.bootStep());
-      await page.waitForTimeout(5);
-    }
-    if (state.takeTime !== 0) throw new Error(`the take clock ran during boot (${state.takeTime}s) — frames would be off by that much`);
+    const { page, pageErrors, navigations, root } = booted;
+    let { state } = booted;
+    checkCancelled();
     const loaded = state.scene.split('/').pop();
     if (loaded !== take.scene) {
       throw new Error(`the game booted scene "${loaded}", but the take was played in "${take.scene}" `
@@ -322,16 +287,11 @@ async function render() {
     // The scene the take starts in. Read HERE, not after the loop: by then `state.scene` is wherever
     // the take ended, and a level change makes that another scene (#1509 review).
     const bootScene = state.scene;
+    // From here a reload is fatal: the take's frames are being stepped in the page it would replace.
+    const reloadedMidTake = (e) => (pageReloaded(navigations(), e)
+      ? new Error(`the game page reloaded mid-take, after ${state.steps - bootSteps} frame(s) — the render cannot continue in a new page (${e.message})`)
+      : e);
 
-    // Where the game root sits in THIS page, so a layout point lands on the same thing it did in the
-    // editor. A size mismatch means the game laid out differently and the take's points are off.
-    const root = await page.evaluate(() => {
-      const el = document.querySelector('[data-modoki-ui-root="runtime"]');
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { left: r.left, top: r.top, scale: el.offsetWidth ? r.width / el.offsetWidth : 1, width: el.offsetWidth, height: el.offsetHeight };
-    });
-    if (!root) throw new Error('no [data-modoki-ui-root="runtime"] on the game page — nothing to aim the take at');
     if (Math.abs(root.width - take.viewport.width) > 1 || Math.abs(root.height - take.viewport.height) > 1) {
       console.warn(`${TAG} ⚠️ the game root laid out at ${root.width}x${root.height}, the take was played at `
         + `${take.viewport.width}x${take.viewport.height} — pointer positions will not line up`);
@@ -349,7 +309,10 @@ async function render() {
         if (ev.kind === 'down') await page.mouse.down();
         else if (ev.kind === 'up') await page.mouse.up();
       }
-      state = await page.evaluate(() => window.__modokiCapture.step(1));
+      // A reload that committed between two steps throws nothing — the next `step` would run in a
+      // fresh, un-booted document. Refuse it before stepping.
+      if (navigations() > 1) throw reloadedMidTake(new Error('the main frame navigated'));
+      state = await page.evaluate(() => window.__modokiCapture.step(1)).catch((e) => { throw reloadedMidTake(e); });
       await page.clock.setFixedTime(take.epochMs + Math.round(state.takeTime * 1000));
       await page.screenshot({ path: path.join(framesDir, `${String(f).padStart(6, '0')}.png`) });
       emit({ stage: 'frames', frame: f + 1, total });
@@ -394,12 +357,93 @@ async function render() {
       audio: events.filter((e) => e.type === '@audio'),
       // Everything else kept from the journal — the game's own events, cues, scene loads.
       gameEvents,
+      // Only the page the frames came from: a discarded boot attempt's errors (a module fetch the
+      // reload cut off) are not this render's.
       pageErrors,
+      // Boot attempts thrown away because the page reloaded under them (#1518). Non-zero on the first
+      // render after a dependency change, until #1520 stops Vite from reloading.
+      bootReloads,
     };
   } finally {
     // Each in its own guard, so a browser that fails to close still lets the dev server go.
     try { await browser?.close(); } catch { /* already gone */ }
     server?.stop();
+  }
+}
+
+/** One boot, from a fresh browser context to the game on screen (#1518). Resolves the page and its
+ *  final boot state, or the error — with whether the page reloaded first, which decides whether
+ *  `bootWithReloadRetry` tries again. A fresh CONTEXT each time, so no attempt inherits another's
+ *  `localStorage`. */
+async function bootAttempt() {
+  checkCancelled();
+  const pageErrors = [];
+  let context = null;
+  // Main-frame navigations, for `pageReloaded` — which says why the error text matters more.
+  let navigations = 0;
+  try {
+    context = await browser.newContext({
+      viewport: take.viewport, deviceScaleFactor: opts.scale,
+      timezoneId: take.timezone, locale: take.locale,
+    });
+    // The take's starting state goes in BEFORE any app script runs, so the game boots into it:
+    // the saved data under the game's RUNTIME namespace (the editor keeps its own, `<game>@editor`),
+    // and the preset's safe-area insets as the same `--ui-sa-*` variables the editor sets.
+    await context.addInitScript(({ prefs, prefix, safeArea }) => {
+      for (const [key, raw] of Object.entries(prefs)) localStorage.setItem(prefix + key, raw);
+      const css = Object.entries(safeArea).map(([edge, px]) => `--ui-sa-${edge}: ${px}px;`).join(' ');
+      document.addEventListener('DOMContentLoaded', () => {
+        const style = document.createElement('style');
+        style.textContent = `:root { ${css} }`;
+        document.head.appendChild(style);
+      });
+    }, { prefs: take.prefs, prefix: prefsKeyMod.prefsKeyPrefix(take.game), safeArea: take.safeArea });
+    const page = await context.newPage();
+    page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) navigations++; });
+    // Games read the wall clock directly (Court's daily puzzle keys off today's local date). Pinned to
+    // when the take was played, and advanced by the take clock below, so a take replays into its own day.
+    await page.clock.setFixedTime(take.epochMs);
+    page.on('pageerror', (e) => pageErrors.push(e.message));
+    page.on('console', (m) => {
+      if (m.type() === 'error') pageErrors.push(`console.error: ${m.text()}`);
+      else if (m.type() === 'warning' && m.text().startsWith('[GameShell]')) pageErrors.push(`console.warn: ${m.text()}`);
+    });
+
+    const dtMs = 1000 / opts.fps;
+    const q = new URLSearchParams({ capture: '1', dt: String(dtMs), seed: String(take.seed), scene: take.scene });
+    // `#/game/<id>`, not `#/`: the bare route boots whichever game the server lists first, which with
+    // `--url` pointed at another project's server is not this take's game.
+    await page.goto(`${server.url}/?${q}#/game/${encodeURIComponent(take.game)}`);
+    await page.waitForFunction(() => window.__modokiCapture?.state().steps >= 0, null, { timeout: 60_000 });
+
+    // Boot: step until the game is on screen. `bootStep` settles, then steps ONLY if the game is still
+    // not on screen — checked after its own await, so a hold that releases mid-settle (GameShell lets go
+    // from a raw rAF wait, which keeps firing while the frame loop is held) cannot turn the take's first
+    // timed frame into a boot step. The loop stops with the take clock still at 0. The deadline is per
+    // attempt: a boot after a reload starts over, and may be the cold one.
+    const bootDeadline = Date.now() + 60_000;
+    let state = await page.evaluate(() => window.__modokiCapture.state());
+    while (!state.ready) {
+      if (Date.now() > bootDeadline) throw new Error(`game did not finish loading: ${JSON.stringify(state)}`);
+      checkCancelled();
+      state = await page.evaluate(() => window.__modokiCapture.bootStep());
+      await page.waitForTimeout(5);
+    }
+    if (state.takeTime !== 0) throw new Error(`the take clock ran during boot (${state.takeTime}s) — frames would be off by that much`);
+
+    // Where the game root sits in THIS page, so a layout point lands on the same thing it did in the
+    // editor. Measured inside the attempt: it is the last evaluate before the take's first frame, and
+    // a reload that lands on it is as safe to retry as one during `bootStep` (review of #1518).
+    const root = await page.evaluate(() => {
+      const el = document.querySelector('[data-modoki-ui-root="runtime"]');
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top, scale: el.offsetWidth ? r.width / el.offsetWidth : 1, width: el.offsetWidth, height: el.offsetHeight };
+    });
+    if (!root) throw new Error('no [data-modoki-ui-root="runtime"] on the game page — nothing to aim the take at');
+    return { reloaded: pageReloaded(navigations), context, value: { page, pageErrors, state, root, navigations: () => navigations } };
+  } catch (error) {
+    return { reloaded: failedAttemptReloaded({ navigations, error, cancelling }), context, error };
   }
 }
 

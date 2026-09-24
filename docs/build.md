@@ -123,6 +123,38 @@ bump stops hashing it, that test goes red, instead of #1502 quietly coming back.
 `npm install` never ran. That is RULE 1, and no cache key catches it. A cache written before this
 fix needs no manual wipe: adding the define changed the config hash, so the first boot re-optimizes.
 
+### Cold dependency scan: the open project's `game.ts` is a scan entry (#1520)
+
+On a cold cache, Vite's dep scan crawls its entries and pre-bundles every package it finds before the
+first page load. The editor loads the game at runtime by URL from the project registry, so with the
+default entries (the HTML only), the scan never saw a game's own packages. Vite found them while the
+game booted, re-optimised, and **reloaded the page**. Observed on Court with `node_modules/.vite`
+moved aside:
+
+```
+[vite] (client) dependencies optimized: @capacitor-firebase/analytics, … capacitor-applovin-max, capacitor-appsflyer, capacitor-modoki-system
+[vite] (client) optimized dependencies changed. reloading
+```
+
+A cold cache follows every lockfile change (see #1502 above), so this hit the first boot after most
+pulls:
+- the dev editor opened the project twice;
+- the gameplay recorder's first render died at boot (#1518; the recorder now also survives such a
+  reload, `docs/gameplay-recorder.md`).
+
+`engine/plugins/projectScanEntries.ts` adds the open project's `game.ts` to `optimizeDeps.entries`,
+in dev and packaged. Measured on the same cold boot: all nine packages are optimised at startup, and
+the recorder reports `bootReloads: 0`. The scan resolves each import from the importing file, as the
+live import does. That is why this needs none of the hand-resolving and aliasing the packaged-only
+`projectNativeSdkDeps` include list in `vite.config.ts` needed (its GOTCHA #2). The list is kept for
+now: the packaged editor has not been re-measured with the scan entry in place.
+
+The explicit list restates Vite's default crawl (`**/*.html` minus `__tests__/` and `coverage/`),
+because setting `entries` replaces it. Project paths are glob-escaped, so a folder named
+`My Game (copy)` matches itself. ⚠️ **Windows, not run:** a project on a different drive from the
+engine gives an absolute pattern. If it fails to match, the fallback is the old one-reload
+behaviour, not a crash.
+
 ## Native scaffolding: auto on first build
 
 A game with no `ios/`/`android/` yet is **auto-scaffolded on the first native build** —
