@@ -4977,6 +4977,12 @@ async function describeUnresolvedAgainstLiveWorld(
       // the same project/engine-root guard the code-editor endpoints use.
       const absPath = ctx.resolveAssetPath(assetPath) ?? resolveSourcePath(ctx, assetPath)?.abs ?? null;
       if (!absPath) return json({ error: 'path outside project/engine roots' }, 403);
+      // Answer a gone file HERE rather than handing it to the OS (#1515): the win32
+      // opener raises a modal dialog for a path the shell cannot open, and since
+      // `launchDetached` no longer waits for that dialog, an unchecked path would
+      // 200 while nothing opened. A row can outlive its file (deleted between the
+      // listing and the click), so this is reachable, not defensive.
+      if (!fs.existsSync(absPath)) return json({ error: `no such file: ${absPath}` }, 404);
       await revealInOS(absPath);
       return json({ ok: true });
     } catch (e) {
@@ -4991,6 +4997,9 @@ async function describeUnresolvedAgainstLiveWorld(
       const { path: assetPath } = (body ?? {}) as { path: string };
       const absPath = ctx.resolveAssetPath(assetPath) ?? resolveSourcePath(ctx, assetPath)?.abs ?? null;
       if (!absPath) return json({ error: 'path outside project/engine roots' }, 403);
+      // Same reason as /api/reveal-in-finder above (#1515) — a gone file is a 404
+      // here, not a modal dialog on the owner's desktop and a 200 that lied.
+      if (!fs.existsSync(absPath)) return json({ error: `no such file: ${absPath}` }, 404);
       await openInOS(absPath);
       return json({ ok: true });
     } catch (e) {

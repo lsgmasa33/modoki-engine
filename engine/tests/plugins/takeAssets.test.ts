@@ -123,10 +123,20 @@ describe('never fails the render (#1509 review)', () => {
 
   // Root reads anything, so the unreadable cases cannot be staged there.
   const asRoot = process.getuid?.() === 0;
+  // ...and neither can Windows, for the same reason one level down: `fs.chmodSync(p, 0o000)` there
+  // only toggles the READ-ONLY attribute, it cannot withdraw read permission. The file stays
+  // readable, `fingerprintAssets` hashes it, and the assertion compares a hash to 'unreadable'.
+  // Found on the win clone the day #1509 landed; these three were red on Windows and green on a Mac
+  // (#1054 — the private test files have no automated Windows leg, which is why nothing caught it).
+  // Skipped rather than restaged with an ACL deny: `icacls` needs privileges the gate should not
+  // assume. The PRODUCT path is platform-agnostic — `fingerprintAssets` marks UNREADABLE from a
+  // plain `catch` around `readFile` — so a genuinely unreadable file (an ACL deny, a file held by
+  // another process) is still handled on Windows; it is only the FIXTURE that cannot be built here.
+  const cannotDenyRead = asRoot || process.platform === 'win32';
   const lock = (rel: string) => fs.chmodSync(path.join(assets(), rel), 0o000);
   const unlock = (rel: string) => fs.chmodSync(path.join(assets(), rel), 0o644);
 
-  it.skipIf(asRoot)('marks a file it cannot read instead of throwing', async () => {
+  it.skipIf(cannotDenyRead)('marks a file it cannot read instead of throwing', async () => {
     const recorded = await fingerprintAssets(project);
     lock('textures/t1.png');
     try {
@@ -136,7 +146,7 @@ describe('never fails the render (#1509 review)', () => {
     } finally { unlock('textures/t1.png'); }
   });
 
-  it.skipIf(asRoot)('does not call a file NEW because it was unreadable when the take was recorded (review 2)', async () => {
+  it.skipIf(cannotDenyRead)('does not call a file NEW because it was unreadable when the take was recorded (review 2)', async () => {
     lock('materials/m1.material.json');
     let recorded;
     try { recorded = await fingerprintAssets(project); } finally { unlock('materials/m1.material.json'); }
@@ -145,7 +155,7 @@ describe('never fails the render (#1509 review)', () => {
     expect(r).toMatchObject({ status: 'unchanged' });
   });
 
-  it.skipIf(asRoot)('refuses to fingerprint an assets folder it cannot list — that would be {} again', async () => {
+  it.skipIf(cannotDenyRead)('refuses to fingerprint an assets folder it cannot list — that would be {} again', async () => {
     fs.chmodSync(assets(), 0o000);
     try {
       await expect(fingerprintAssets(project)).rejects.toThrow(/EACCES/);

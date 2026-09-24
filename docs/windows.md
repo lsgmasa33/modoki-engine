@@ -821,6 +821,16 @@ conversion never engaged".
 - Vite `/@fs/` URLs, `:`-joined PATH assumptions, and `chmod 0600` are the other members of this
   family. The repo has had a steady trickle of these; they are readable from any machine once you
   know to look, unlike the process-behaviour class below.
+  ⚠️ **`chmod` bites hardest in a TEST FIXTURE, where it fails by staging nothing.** Node's
+  `fs.chmodSync(p, 0o000)` on win32 only toggles the read-only attribute — it **cannot withdraw read
+  permission** — so a test that locks a file and asserts the code reports it unreadable instead
+  compares a real hash to `'unreadable'`. #1509's three "never fails the render" cases did exactly
+  that: green on a Mac, red here the day they landed. The fixture is the broken half, not the
+  product — `fingerprintAssets` marks unreadable from a plain `catch` around `readFile`, so a
+  genuinely unreadable file (an ACL deny, a handle held by another process) is still handled on
+  Windows. **Guard such a case by PLATFORM, like the `root` guard beside it** — root reads anything
+  for the same reason — rather than restaging it with `icacls`, which needs privileges a gate should
+  not assume. Nothing caught it automatically because those files have no Windows leg (#1054).
 - **A guard keyed by a hand-authored POSIX path will not match `node:path` output.** `relative()`
   and `join()` return `\`-separated on Windows, so an allowlist entry like
   `runtime/loaders/textureResolver.ts` — or a `split('/')` over a relative path — silently stops
@@ -1204,6 +1214,51 @@ degrades to system npm, so a dev machine boots fine and `smoke:packaged` reporte
 its own log said `Node provisioning failed`. When testing an extractor, do not build the fixture
 with the same tool — GNU tar's `-a -cf x.zip` writes a *tar* named `.zip` that extracts happily
 and proves nothing. Assert the `PK` magic bytes instead.
+
+### A GUI launcher's exit status is not the operation's outcome
+
+The same assumption, one level up: not *which* binary answers, but whether its **exit code means
+anything**. `osOpen.ts` awaited the OS file-manager/default-app launcher and mapped a non-zero exit
+to a 500. On Windows neither launcher it uses reports that way, and both were measured on real
+hardware (#1508, #1515 — a Mac can see neither):
+
+| invocation | exit | what actually happened |
+|---|---|---|
+| `explorer /select,<file that exists>` | **1** | window opened, file selected |
+| `explorer /select,<file that is missing>` | **1** | window opened at the parent |
+| `explorer <a directory>` | **1** | window opened |
+| `cmd /c start "" <file that exists>` | 0 | opened |
+| `cmd /c start "" <file that is missing>` | **never exits** | blocks on a modal "Windows cannot find…" dialog |
+
+So `explorer` has no success code *and no failure code* — every reveal in the editor answered 500
+with the window already open, for months. ⚠️ **Ignoring exit code 1 specifically is not the fix** —
+`1` is also what a genuine failure returns, so that is false precision. The exit status has to be
+dropped entirely: `spawn` detached, resolve on the `'spawn'` event, and keep only the one signal
+Windows still gives honestly — whether the opener could be **started** (`'error'`/`ENOENT`).
+
+`start`'s half is worse than a wrong answer: `cmd` waits for a human to dismiss a dialog the owner
+may never see, so the route never answered at all and held its socket open. Detaching stops the
+hang, and checking the path **before** handing it to the shell keeps the *common* case off the
+screen — which is why `/api/reveal-in-finder` and `/api/open-file` now 404 a file that is gone.
+
+⚠️ **That check covers the missing-file cause only.** A file that exists behind a **dangling
+association** — a `.ts` whose handler points at an uninstalled editor — still raises the modal, and
+now the `cmd` behind it is detached, `unref`'d and orphaned while the route has already answered
+`ok`. Accepted deliberately: the alternative is blocking the request forever, and a watchdog that
+killed the child would also kill a legitimately slow launcher.
+
+**darwin and linux deliberately still await the exit code** — there `open`/`xdg-open` return
+non-zero for a path they cannot open, and flattening the platforms would trade a real 500 for a
+silent 200 on the primary dev machine. The asymmetry is the correct shape; the module says so, so
+nobody tidies it away.
+
+**How it hid** is the part that generalises, and it is this repo's dominant test defect ([falsifiable-tests.md](falsifiable-tests.md)): the only test touching the module mocked the whole
+module away, so the stand-in always succeeded and a branch failing **100% of the time** on Windows
+stayed green. A mock cannot catch this class, because the defect *is* the gap between the stand-in
+and the real binary. The test that catches it spawns the real `explorer.exe`
+(`engine/tests/plugins/osOpenWin32.test.ts`) and runs in `verify` on win32 by the owner's call
+(2026-09-24), at the cost of an Explorer window opening during the gate — weighed against #968 and
+#1054, where this bug class is guarded by discipline rather than by a gate.
 
 ### `powershell -Command "<script>" a b` does NOT pass `a b` as arguments
 

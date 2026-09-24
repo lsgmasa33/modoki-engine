@@ -100,6 +100,31 @@ async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
   }
 }
 
+/** Show a path in the OS file manager. The three "Reveal in Finder" menu items used
+ *  to call `backendFetch` bare — no `ok` check, no `catch`, not even `void` — so the
+ *  route's failures were invisible and a rejection surfaced as an unhandled promise.
+ *  That mattered more once `/api/reveal-in-finder` started answering 404 for a row
+ *  that outlived its file (#1515): without this, a stale row reveals nothing and says
+ *  nothing. Mirrors `ScriptTree.tsx`'s `postPath`, the other consumer of this route —
+ *  the two disagreed, which is how one of them ended up silent. */
+function revealPathInFinder(assetPath: string): void {
+  void (async () => {
+    try {
+      const r = await backendFetch('/api/reveal-in-finder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: assetPath }),
+      });
+      if (!r.ok) {
+        const detail = await r.json().catch(() => ({}));
+        console.error(`[Assets] Reveal failed (${r.status})`, (detail as { error?: string }).error ?? '', assetPath);
+      }
+    } catch (e) {
+      console.error('[Assets] Reveal request failed', e, assetPath);
+    }
+  })();
+}
+
 /** Try live scan first (dev server), fall back to static manifest (production).
  *  Uses /api/rescan-assets so a refresh forces a fresh filesystem scan + GUID
  *  collision heal rather than serving the watcher's cached manifest. */
@@ -1505,10 +1530,7 @@ export default function Assets() {
     items.push({ label: `Cut${suffix}`, onClick: () => copySelection('cut') });
     if (clipboard) items.push({ label: `Paste${clipboard.paths.length > 1 ? ` (${clipboard.paths.length})` : ''}`, onClick: () => pasteClipboard() });
     if (!many) items.push({ label: 'Copy Path', onClick: () => navigator.clipboard.writeText(asset.path) });
-    items.push({ label: 'Reveal in Finder', onClick: () => backendFetch('/api/reveal-in-finder', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: asset.path }),
-    }) });
+    items.push({ label: 'Reveal in Finder', onClick: () => revealPathInFinder(asset.path) });
     // Inspection, not a mutation — GUID when we have one (the route also accepts a
     // virtual path, but a GUID is the stable address a moved/renamed file keeps).
     if (!many) items.push({ label: 'Find References', onClick: () => openFindReferences(asset.guid || asset.path, asset.name) });
@@ -2004,10 +2026,7 @@ export default function Assets() {
             ...(!folderCtx.createOnly && folderCtx.path !== '/' && folderCtx.path !== assetsRoot.path ? [{ label: 'Delete', onClick: () => handleDeleteFolder(folderCtx.path, folderCtx.name) }] : []),
             ...(!folderCtx.createOnly && clipboard ? [{ label: `Paste${clipboard.paths.length > 1 ? ` (${clipboard.paths.length})` : ''}`, onClick: () => pasteClipboard(folderCtx.path) }] : []),
             ...(!folderCtx.createOnly ? [{ label: 'Re-import all (recursive)', onClick: () => reimport(folderCtx.path, true) }] : []),
-            ...(!folderCtx.createOnly ? [{ label: 'Reveal in Finder', onClick: () => backendFetch('/api/reveal-in-finder', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ path: folderCtx.path }),
-            }) }] : []),
+            ...(!folderCtx.createOnly ? [{ label: 'Reveal in Finder', onClick: () => revealPathInFinder(folderCtx.path) }] : []),
           ]}
           x={folderCtx.x}
           y={folderCtx.y}
@@ -2183,10 +2202,7 @@ const EngineAssetsSection = React.memo(function EngineAssetsSection({ assets, fi
         <ContextMenu
           items={[
             { label: 'Copy Path', onClick: () => navigator.clipboard.writeText(ctx.asset.path) },
-            { label: 'Reveal in Finder', onClick: () => backendFetch('/api/reveal-in-finder', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ path: ctx.asset.path }),
-            }) },
+            { label: 'Reveal in Finder', onClick: () => revealPathInFinder(ctx.asset.path) },
           ]}
           x={ctx.x} y={ctx.y} onClose={() => setCtx(null)}
         />

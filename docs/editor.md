@@ -1117,8 +1117,9 @@ Panels live in `editor/panels/`:
   view (`ScriptTree.tsx`) — a lightweight collapsible tree of the project's source
   (`game.ts`, `runtime/**`, writable) plus a read-only **Engine** source root, fed by
   `GET /api/scripts/tree`. Scripts deliberately bypass the asset pipeline (no
-  GUID/`.meta.json`). Modoki has **no in-app code editor** — clicking a script *reveals*
-  it in the OS file manager (`/api/reveal-in-finder`) so you edit it in your own editor
+  GUID/`.meta.json`). Modoki has **no in-app code editor** — clicking a script *opens*
+  it in whatever app owns the file type (`/api/open-file`), and **Alt-click** *reveals* it
+  in the OS file manager (`/api/reveal-in-finder`) instead, so you edit it in your own editor
   (VS Code, …) and drive it with your own Claude Code (see
   [connect-claude-code](./connect-claude-code.md)).
 - **Console** (`Console.tsx`) — captured log output with a per-level filter (persisted in
