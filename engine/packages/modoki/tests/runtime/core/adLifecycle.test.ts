@@ -390,6 +390,33 @@ describe('the reward slot across a realm-survived recovery (Court #631)', () => 
     sink().rewardEarned({ kind: 'rewarded', type: 'c', amount: 1 });
     expect(pay).toHaveBeenCalledTimes(1);
   });
+
+  it('a reward the SDK RETAINED is paid when it is handed over during listener registration — restore only (#1496)', async () => {
+    // The MAX plugin retains `adRewardEarned` until a listener subscribes and hands it to the first one, so
+    // a reward earned while cleanup() had removed the listeners arrives INSIDE init()'s registration loop.
+    const retained: Array<{ kind: 'rewarded'; type: string; amount: number }> = [];
+    const base = fakeSdk();
+    const sdk = {
+      ...base.sdk,
+      listeners: vi.fn((s: AdEventSink) => base.sdk.listeners(s).map((register, i) => async () => {
+        const handle = await register();
+        if (i === 0) for (const r of retained.splice(0)) s.rewardEarned(r);
+        return handle;
+      })),
+    };
+    const pay = vi.fn();
+    const l = make(sdk);
+    l.onRewardEarned(pay);
+    await l.init();
+    l.cleanup();
+    retained.push({ kind: 'rewarded', type: 'c', amount: 1 });
+    await l.init();   // a plain init (a boot, a game swap) never inherits a payout
+    expect(pay).not.toHaveBeenCalled();
+    l.cleanup();
+    retained.push({ kind: 'rewarded', type: 'c', amount: 1 });
+    await l.restoreAfterRealmSurvived();
+    expect(pay).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('the banner is a desired state', () => {

@@ -3,8 +3,8 @@
  * in it. Written for Weaveling (#1309), promoted here when Court became the second consumer (#1312).
  *
  * ⚠️ **Imports nothing SDK-specific and nothing game-specific, and must stay that way.** The SDK arrives
- * as an `AdSdk` adapter (each game's `packages/app-services/src/ads.ts` is its AdMob one — the plugin is a
- * per-game dependency, so the adapter cannot live here), and everything a game decides — placements, the
+ * as an `AdSdk` adapter (each game's `packages/app-services/src/ads.ts` holds its own — AppLovin MAX in both
+ * since #1495 Weaveling / #1496 Court; the plugin is a per-game dependency, so the adapter cannot live here), and everything a game decides — placements, the
  * analytics taxonomy, pacing numbers — arrives through `AdLifecycleHooks` or stays in the caller. When to
  * show an interstitial is `./adPacing.ts`.
  *
@@ -89,11 +89,13 @@ export interface AdEventSink {
   dismissed(kind: FullscreenKind): void;
   rewardEarned(reward: AdReward): void;
   revenue(revenue: AdRevenue): void;
-  /** The banner's ad arrived, AFTER `showBanner` resolved. iOS adds the view only now (Android added it
-   *  before the load), so a remove issued in between removed nothing there. */
+  /** The banner's ad arrived, AFTER `showBanner` resolved. Under AdMob, iOS adds the view only now (Android
+   *  added it before the load), so a remove issued in between removed nothing there; the MAX plugin adds
+   *  its view at `showBanner`. Either way a hide asked for while the ad loaded is re-applied here. */
   bannerLoaded(): void;
-  /** The banner's load failed — including a refresh. Both native SDKs REMOVE the view on this, without
-   *  rejecting anything, so the lifecycle must stop believing a banner is up. */
+  /** The banner's load failed — including a refresh. The native side takes the banner off screen without
+   *  rejecting anything (AdMob removes the view; the MAX plugin hides it and stops its refresh), so the
+   *  lifecycle must stop believing a banner is up. */
   bannerFailed(): void;
 }
 
@@ -141,7 +143,8 @@ export interface AdLifecycleOptions {
   /** Ceiling of the init retry back-off. Default 10 min. */
   maxInitRetryMs?: number;
   /** A loaded fullscreen ad older than this is discarded and reloaded. AdMob's expire after an hour, and
-   *  an expired one fails to show or does not count. Default 55 min. */
+   *  an expired one fails to show or does not count. Default 55 min. An SDK that reloads its own expired
+   *  ads (AppLovin MAX) passes `Infinity`: the age rule would only refuse a show for an ad it still holds. */
   maxAdAgeMs?: number;
 }
 
@@ -381,6 +384,12 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     try {
       // A boot-timeline span (#1475): `start()` can put a native consent form in front of the game.
       await bootSpanAsync('ads-start', () => sdk.start(), opts.tag);
+      // A realm-survived recovery puts the payout back BEFORE the listeners register, not after: an SDK
+      // that RETAINS a reward earned while no listener was attached (the MAX plugin's `adRewardEarned`,
+      // `retainUntilConsumed`) hands it to the first listener that subscribes — inside the loop below, where
+      // a handler restored only on success would not be there to pay it. Harmless if the loop then fails:
+      // with no listener registered nothing can reach the handler, and the retry sets it again.
+      if (restorePayoutOnInit && lastRewardHandler && live()) rewardHandler = lastRewardHandler;
       // Sequential and STOPS on the first failure — the `registration` kind in `notifyIsShared.test.ts`'s
       // EXEMPT: isolating each call would publish a half-registered set that reports success.
       for (const register of sdk.listeners(sink)) {

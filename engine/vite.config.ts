@@ -529,7 +529,7 @@ export default defineConfig(({ command }) => {
         '@modoki/engine/runtime/core/dailyCalendar',
         // #926 — Court's and wordweave's login bonus wheels import its pure decisions the same way.
         '@modoki/engine/runtime/core/loginBonus',
-        // #1312 — both games' AdMob adapters import the promoted ad lifecycle, and their pacing
+        // #1312 — both games' ad adapters (AppLovin MAX since #1495 Weaveling / #1496 Court) import the promoted ad lifecycle, and their pacing
         // modules the interstitial rules, by narrow subpath.
         '@modoki/engine/runtime/core/adLifecycle',
         '@modoki/engine/runtime/core/adPacing',

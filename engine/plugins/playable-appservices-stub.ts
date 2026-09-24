@@ -98,7 +98,7 @@ export const review = {
  */
 export const ads = {
   async initAds(): Promise<void> {},
-  // The AdMob surface both games export (#1309, #1312): the banner as per-frame desired state, a synchronous readiness
+  // The ad surface both games export (#1309, #1312; AppLovin MAX in both since #1495/#1496): the banner as per-frame desired state, a synchronous readiness
   // read for the "watch a video" button, and UMP's privacy-options row — all "nothing here".
   setBannerVisible(_visible: boolean): void {},
   rewardedReady(): boolean { return false; },

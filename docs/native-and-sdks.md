@@ -253,7 +253,8 @@ Banner, MREC, interstitial and rewarded ads, Google UMP consent, and the mediati
 comes from SPM (iOS) and Gradle (Android), pinned EXACTLY to one version on all three manifests
 (`Package.swift`, the podspec, `android/build.gradle`) — 13.6.4 as of #1494. The call-by-call contract
 is `src/definitions.ts`; what follows is what it cannot say. Shaped in #1494 to be driven by the engine's
-`runtime/core/adLifecycle.ts` through a game's `AdSdk` adapter (#1495 Weaveling, #1496 Court).
+`runtime/core/adLifecycle.ts` through a game's `AdSdk` adapter: Weaveling's `maxSdk` since #1495 (the first
+consumer), Court's in #1496.
 
 ```typescript
 import { ApplovinMax } from 'capacitor-applovin-max';
@@ -289,8 +290,12 @@ const { heightPx } = await ApplovinMax.showBanner({ adUnitId });
   the ad is showing") and the call would hang — reachable when the lifecycle's show timeout schedules a
   preload while a late-presenting ad is still up, which would leave that kind loading forever. **Nothing reloads by itself after a dismissal** —
   the caller owns preloading (the lifecycle does it on `dismissed`, with its own back-off), because two
-  owners would double every load. MAX does refresh an EXPIRED loaded ad on its own
-  (`MAAdExpirationDelegate`), so an adapter need not age ads out the way AdMob's one-hour expiry forces.
+  owners would double every load. The MAX SDK refreshes an EXPIRED loaded ad on its own (this plugin
+  implements nothing for it — `MAAdExpirationDelegate` is only the SDK's notice that it happened), so an
+  adapter need not age ads out the way AdMob's one-hour expiry forces: Court passes the lifecycle
+  `maxAdAgeMs: Infinity`, because the age rule would only refuse a show for an ad MAX still holds. ⚠️ And
+  `initialize` settles only from the SDK's completion callback, which AppLovin does not document for a
+  second call in one process — an adapter must not call it twice (Court checks `isReady().initialized`).
 - **A failed show is `adDisplayFailed`, not `adLoadFailed`** — the ad HAD loaded; conflating the two
   made a failed presentation look like a no-fill. Every `AdInfo` carries `format` (`banner` covers the
   LEADER MAX serves through a banner unit on a tablet) and `currency: 'USD'`: **MAX's `revenue` is
@@ -543,7 +548,8 @@ four are fixed on `work-ai2`; check `git log`/the issues for whether that has re
 
 **#587's Court-side MAX wiring no longer exists** — Court moved to AdMob (#1312) and dropped the plugin
 (#342); ads teardown is now `adLifecycle.ts`'s `cleanup()`, reached from the same realm-shutdown task.
-MAX returns through that lifecycle (#1494-#1496), not through the wiring #587 described.
+MAX came back to Court through that lifecycle (#1496, 2026-09-24: `maxSdk` in Court's `ads.ts`, whose
+`teardown` destroys the banner), not through the wiring #587 described.
 
 ⚠️ **The `pagehide` backstop's `event.persisted === false` gate (`engine/app/useBackgroundFlush.ts`) is an ANDROID
 measurement shipping on iOS too, and the iOS behaviour is still UNOBSERVED (#611).** `pagehide`
@@ -793,7 +799,7 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 
 ⚠️ **`<project>/packages/app-services/` is a REQUIRED path, not a naming convention.** `projectNativeSdkDeps` in `engine/vite.config.ts` reads `<project>/packages/app-services/package.json` to force-prebundle the wrapped native-SDK deps, and returns `[]` when the path is missing — an app-service package placed anywhere else makes the editor's project-open flow silently skip the pre-bundle and visibly re-optimize/reload mid-session instead.
 
-⚠️ **Declare a native plugin dep in BOTH the game-root `package.json` and the app-services one** (as `games/court` and `games/3d-test` do for their real plugins). The root copy is not redundant: `healNativeConfig.ts`'s `usesCrashlytics()` reads only the project **root** `package.json` to gate the iOS dSYM upload phase, and **`cap sync` scans only the app's own root `package.json`**, never the nested one. A dep declared solely on the nested `app-services` package is exactly why `games/3d-test`'s `capacitor-applovin-max` — declared only in `packages/app-services/package.json` — is absent from both its generated `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` today. Only a JS-only SDK peer dep (e.g. `firebase` itself) legitimately stays app-services-only. ⚠️ **A vendored ENGINE plugin is the opposite exception: game root ONLY.** Court's `capacitor-appsflyer` (#632) and `capacitor-applovin-max` (#931) are declared in `games/court/package.json` alone. The root spec is a hashed tarball name that `vendor-plugins.mjs` rewrites on every re-vendor, and nothing rewrites a nested workspace's `package.json`, so an app-services copy would go stale on the first re-vendor. Node resolves the root copy by walking up from `packages/app-services/src`. The comment in Court's `app-services/package.json` carries the same argument. ⚠️ **In THIS repo a missing game-root declaration does not fail where you would look for it.** Every engine plugin is also a repo-root workspace, so `node_modules/<plugin>` at the repo root answers a bare import from ANY game by walking up: `require.resolve('capacitor-applovin-max')` from `games/wordweave`, which does not declare it, resolves to `engine/packages/capacitor-applovin-max`. Typecheck and the editor both pass; only `cap sync` (which reads the game root's `package.json`) leaves the plugin out, so the failure lands on a device. A game copied out of the repo would fail at import instead. Nothing guards this for any engine plugin today.
+⚠️ **Declare a native plugin dep in BOTH the game-root `package.json` and the app-services one** (as `games/court` and `games/3d-test` do for their real plugins). The root copy is not redundant: `healNativeConfig.ts`'s `usesCrashlytics()` reads only the project **root** `package.json` to gate the iOS dSYM upload phase, and **`cap sync` scans only the app's own root `package.json`**, never the nested one. A dep declared solely on the nested `app-services` package is exactly why `games/3d-test`'s `capacitor-applovin-max` — declared only in `packages/app-services/package.json` — is absent from both its generated `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` today. Only a JS-only SDK peer dep (e.g. `firebase` itself) legitimately stays app-services-only. ⚠️ **A vendored ENGINE plugin is the opposite exception: game root ONLY.** Court's `capacitor-appsflyer` (#632) and `capacitor-applovin-max` (#931) are declared in `games/court/package.json` alone. The root spec is a hashed tarball name that `vendor-plugins.mjs` rewrites on every re-vendor, and nothing rewrites a nested workspace's `package.json`, so an app-services copy would go stale on the first re-vendor. Node resolves the root copy by walking up from `packages/app-services/src`. The comment in Court's `app-services/package.json` carries the same argument. ⚠️ **In THIS repo a missing game-root declaration does not fail where you would look for it.** Every engine plugin is also a repo-root workspace, so `node_modules/<plugin>` at the repo root answers a bare import from ANY game by walking up: `require.resolve('capacitor-appsflyer')` from a game that does not declare it resolves to `engine/packages/capacitor-appsflyer`. Typecheck and the editor both pass; only `cap sync` (which reads the game root's `package.json`) leaves the plugin out, so the failure lands on a device. A game copied out of the repo would fail at import instead. Nothing guards this for any engine plugin today.
 
 ⚠️ **`cap sync` is a STEP in promoting a plugin, and its generated files are part of the commit** — not a follow-up. Wordweave's Firebase JS wiring once landed without regenerating `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` + `android/app/capacitor.build.gradle`, and nothing caught it: the files self-heal on whoever next runs a native build, so the tree only churns silently, and `npm run verify` is vitest — it compiles no native project. Both platforms shipped with no Firebase Capacitor plugin actually linked while every test stayed green. `npx cap update android` alone is not enough to regenerate them — it exits `ENOENT` on `assets/capacitor.plugins.json`, which only `cap copy` writes, so it needs a real `--target native` build first.
 
@@ -1091,7 +1097,7 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
 
 | Ships its own manifest | Does not |
 |---|---|
-| Capacitor and CapacitorCordova (both empty) · **GoogleMobileAds** and **UserMessagingPlatform** (Weaveling, #1309 — collected data and required-reason APIs declared, checked in the resolved artifacts 2026-09-17) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · ~~Facebook (tracking)~~ stripped from the graph by #1062 | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
+| Capacitor and CapacitorCordova (both empty) · **GoogleMobileAds** and **UserMessagingPlatform** (Weaveling, #1309 — collected data and required-reason APIs declared, checked in the resolved artifacts 2026-09-17) · **AppLovinSDK 13.6.4** and UserMessagingPlatform 3.1.0 (Court since #1496, through `capacitor-applovin-max` — AppLovin's manifest declares UserDefaults `CA92.1` and **no collected data**, read from the xcframework 2026-09-24) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · ~~Facebook (tracking)~~ stripped from the graph by #1062 | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
 
 - **Required-reason APIs: UserDefaults `CA92.1` only**, for `@capacitor/preferences`. The app
   target's own Swift uses none. The guard derives this from each game's `package.json`.
@@ -1102,7 +1108,11 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
   App Functionality, not tracking. Weaveling's were added by #1389 once sign-in (#927), purchases (#925)
   and cloud save (#679) landed, each confirmed against a sender in its own code: the save keyed by the account uid,
   the progress/settings sync groups, and the `wordweave.purchases` group's receipts. Ads (#932)
-  added no row — AdMob and UMP declare their own.
+  added no row — AdMob and UMP declare their own. ⚠️ **Court's MAX (#1496) added no row either, but for a
+  different reason:** AppLovin's manifest declares NO collected data, so nothing in Court's privacy report
+  covers the ad SDK's collection. By the first-party rule above that is App Store label work (#933), like
+  GoogleAppMeasurement's gap below — not something to add to the app's manifest. The
+  `capacitor-applovin-max` Swift calls no required-reason API.
 - ⚠️ **GoogleAppMeasurement ships no manifest, so Firebase Analytics' own collection is declared by
   nothing in the graph.** That is App Store privacy-label work (#933), not something to paper over
   in the app's manifest. Confirmed in a built Court `App.app`, whose bundle carries ~45 SDK
@@ -1388,9 +1398,11 @@ depends on it carries a `patch-package` patch (owner ruling, 2026-09-17). Forkin
   install. Each patch therefore needs an engine guard that reads the INSTALLED copy. It also only
   runs on a bare `npm install`: `npm install <pkg>` skips the project's own `postinstall`.
 
-The one live case is `@capacitor-community/admob` in Court and Weaveling, which fixes iOS paid-event
-revenue units ([Court ads.md](../games/court/ads.md) § "Ad revenue stops at Firebase"). Its guard is
-`engine/tests/architecture/admobRevenueUnitPatched.test.ts`.
+There is no live case since #1495 and #1496 moved both games to AppLovin MAX. The last was
+`@capacitor-community/admob`, whose patch fixed iOS paid-event
+revenue units ([Court ads.md](../games/court/ads.md) § "Ad revenue stops at Firebase"). Its guard,
+the `admobRevenueUnitPatched` architecture test, retired with it — git history keeps it as
+the template for the next patched plugin's installed-copy guard.
 
 ## App Identity & Build
 
