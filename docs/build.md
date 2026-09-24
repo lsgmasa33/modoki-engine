@@ -117,7 +117,9 @@ Measured 2026-09-24 with a headless dev server over Weaveling's graph:
 ⚠️ **This rests on Vite's PRIVATE hashing**: `getConfigHash` is not API, and the manifest's `"vite": "^8.0.5"` lets a
 lockfile refresh change what it serialises. `engine/tests/plugins/projectLockfileHash.test.ts` asks
 the INSTALLED Vite, through a real dev server, whether a changed define moves its cache key. If a
-bump stops hashing it, that test goes red, instead of #1502 quietly coming back.
+bump stops hashing it, that test goes red, instead of #1502 quietly coming back. It is skipped on
+win32 because it crashed the Windows CI worker. The hashing is platform-independent, so macOS and
+Linux cover it ([windows.md](windows.md) § Tests, gates and timings, #1529).
 
 **Not covered:** a package deleted from a game's `node_modules` WITHOUT a lockfile change, i.e.
 `npm install` never ran. That is RULE 1, and no cache key catches it. A cache written before this

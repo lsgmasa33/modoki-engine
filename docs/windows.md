@@ -1641,6 +1641,20 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
     sweeps **twice**, and it did not time out — which fits "the first sweep in a process is the
     expensive one" and rules out "every sweep costs ~20 s". One failure sample, so treat that as the
     best-supported reading rather than a settled fact.
+- **A real Vite dev server inside a vitest fork killed the Windows CI worker, and only there** (#1529).
+  `projectLockfileHash.test.ts`'s dep-cache-key test boots `createServer` with rolldown's NATIVE
+  dep optimizer, the only test in the suite that does. On `windows-latest` (Server 2025, Node
+  24.20) every run while it was enabled ended with one `Worker exited unexpectedly`, with every file
+  green: 4 reds out of 4. With it `skipIf(win32)`: 5 greens out of 5. In vitest 4 that error means
+  the fork died on its own after reporting and before the pool asked it to stop, which fits a
+  native crash during teardown.
+  **Not reproduced on this Windows 11 / Node 24.18 box** (2026-09-25): 3 isolated runs, one full
+  app-suite run (1192 files, exit 0), 10 vitest runs under 12 busy-loop processes, and 30 plain Node
+  runs of the same create → `init()` → close sequence (natural exit and `process.exit`, with and
+  without load) all exited 0. So the mechanism is unconfirmed, and it depends on the environment.
+  **The skip stays.** The property it checks is Vite's own JS config hashing, identical on every
+  platform, and macOS and Linux run it. The editor is not affected: it runs the same optimizer in a
+  long-lived process on Windows every day. Un-skipping it is a CI experiment, not a local one.
 - **Size time budgets from the slowest machine.** A budget tuned on a Mac is not a budget. An
   isolated timing is worth roughly a quarter of the real under-load cost. Worked example
   (2026-08-20): `rampProbeRunner.test.ts`'s `expect(performance.now() - started).toBeLessThan(5)`
