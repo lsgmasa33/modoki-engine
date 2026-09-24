@@ -66,7 +66,8 @@ describe('projectScanEntries (#1520)', () => {
     const entries = projectScanEntries(ENGINE_DIR, projectAt('g'))
     expect(entries.slice(0, DEFAULT_HTML_ENTRIES.length)).toEqual(['**/*.html', '!**/__tests__/**', '!**/coverage/**'])
     const html = await viteGlob(DEFAULT_HTML_ENTRIES)
-    expect(html).toContain(path.join(ENGINE_DIR, 'index.html'))
+    // Realpath both sides, as the tests above do: the glob answers with `/` on Windows, `path.join` with `\`.
+    expect(html.map((f) => fs.realpathSync(f))).toContain(fs.realpathSync(path.join(ENGINE_DIR, 'index.html')))
   })
 })
 

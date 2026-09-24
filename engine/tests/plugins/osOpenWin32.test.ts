@@ -40,13 +40,21 @@ const onWin32 = process.platform === 'win32';
 
 /** Is there an interactive desktop shell to open a window ON?
  *
- *  A CI runner (the OSS mirror's free `windows-latest` leg) runs in a service
- *  session with no `explorer.exe` shell, where `Shell.Application` enumerates
- *  nothing however well the reveal worked. Without this probe a desktop-less
- *  runner could not be told apart from a broken reveal, and the honest options
- *  are "skip loudly" or "assert something vacuous" — this picks the first. */
+ *  Without this probe a desktop-less machine could not be told apart from a
+ *  broken reveal, and the honest options are "skip loudly" or "assert something
+ *  vacuous" — this picks the first.
+ *
+ *  ⚠️ **A running `explorer.exe` is NOT enough, and GitHub Actions is excluded by
+ *  name.** This probe once assumed the OSS mirror's `windows-latest` runner had no
+ *  `explorer.exe`; it does, so the window test ran there and saw no window in
+ *  every public CI run since it landed (first observed in run 35973236586). WHY
+ *  the runner's window never shows up in `Shell.Application` is not known — that
+ *  needs a Windows host to diagnose (#1528). Until then the runner is named rather
+ *  than guessed at: a guessed probe that is wrong keeps `main`'s CI red, and the
+ *  win clone's own `verify` — a real desktop — still runs the window tests. */
 const shellRunning: boolean = (() => {
   if (!onWin32) return false;
+  if (process.env.GITHUB_ACTIONS === 'true') return false;
   try {
     const out = execFileSync(
       'powershell',

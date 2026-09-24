@@ -77,7 +77,11 @@ describe('vite.config wiring', () => {
 })
 
 describe("the installed Vite's dep-cache key", () => {
-  it('moves with optimizeDeps.rolldownOptions.transform.define, and ONLY with a changed value', async () => {
+  // Skipped on win32: the only test in the suite that boots a real dev server with rolldown's native
+  // dep optimizer, and the Windows CI worker running the suite has exited unexpectedly — every file
+  // green, one unhandled "Worker exited unexpectedly" — in every run since it landed (#1529). The
+  // property is Vite's own JS hashing, identical on every platform, so macOS and Linux keep it covered.
+  it.skipIf(process.platform === 'win32')('moves with optimizeDeps.rolldownOptions.transform.define, and ONLY with a changed value', async () => {
     // A real dev server over a one-dep fixture: the metadata hash IS Vite's cache key (getDepHash),
     // so this asks Vite itself rather than pattern-matching its bundled source.
     const root = makeScratchDir('modoki-vite-dephash-')
