@@ -23,7 +23,7 @@ import { serializeScene, saveScene, getCurrentScenePath, setCurrentScenePath, se
 import {
   applyToPrefabSelective, installPrefabSnapshot, guidForEntityId, entityIdForGuid,
   resolveInstanceContext, getPrefabSource, captureInstanceOverrides, captureInstanceStructure,
-  rebuildInstance, preloadNestedPrefabsForSubtree, refreshBaseInstances,
+  rebuildInstance, preloadNestedPrefabsForSubtree, refreshBaseInstances, rebaseStaleInstances,
   type ApplyResult, type PrefabFile,
 } from '../scene/prefab';
 import { useEditorStore } from '../store/editorStore';
@@ -55,6 +55,9 @@ async function restoreSnapshot(
     // the editor's own baseScene tracking (re-emitted by serializeScene) is separate
     // module state — must be re-synced explicitly, same as setCurrentScenePath above.
     setCurrentBaseScene(sceneManager.getCurrentBaseScene());
+    // The load CARRIES `Persistent` roots flat, still built from the document being undone; rebuild them
+    // against the one just restored before anything captures them — the save below included (#1483 review 3).
+    await rebaseStaleInstances();
     await saveScene(); // persist the restored world so disk matches the live state
   }
   const id = selGuid ? entityIdForGuid(selGuid) : 0;
@@ -66,14 +69,14 @@ async function restoreSnapshot(
  *  would keep its post-apply state against the restored prefab — and since the base is dirty, Save
  *  All would then write that into the base file (a promoted added node was lost exactly so). The
  *  instance is rebuilt from this capture instead, the same way Revert's own undo rebuilds it. */
-interface BaseInstanceSide {
+export interface BaseInstanceSide {
   rootGuid: string;
   prefab: PrefabFile;
   overrides: ReturnType<typeof captureInstanceOverrides>;
   structure: ReturnType<typeof captureInstanceStructure>;
 }
 
-function captureSide(rootInstanceId: number, rootGuid: string, prefab: PrefabFile): BaseInstanceSide {
+export function captureSide(rootInstanceId: number, rootGuid: string, prefab: PrefabFile): BaseInstanceSide {
   return {
     rootGuid, prefab,
     overrides: captureInstanceOverrides(rootInstanceId, prefab),
@@ -90,6 +93,19 @@ async function restoreBaseInstance(source: string, side: BaseInstanceSide | null
   await preloadNestedPrefabsForSubtree(id);
   const newId = rebuildInstance(id, source, side.prefab, side.overrides, side.structure);
   useEditorStore.getState().selectEntity(newId);
+}
+
+/** After the prefab is swapped from `fromPrefab` to `toPrefab`: rebuild the applied base instance from its
+ *  capture, THEN re-derive every other base instance of the prefab (#1431). In that order (#1483 review 3):
+ *  the applied instance can sit INSIDE another base instance, whose refresh captures it through
+ *  `captureNestedRef` against the cache — so it must already be built from `toPrefab`, or the enclosing
+ *  one reads it as a stale nested frame and is skipped, keeping a member the restored prefab lost. The
+ *  enclosing rebuild re-creates it with fresh ids, so it is re-selected by guid last. */
+export async function rederiveBaseInstances(source: string, fromPrefab: PrefabFile, toPrefab: PrefabFile, side: BaseInstanceSide | null): Promise<void> {
+  await restoreBaseInstance(source, side);
+  refreshBaseInstances(source, fromPrefab, toPrefab, side?.rootGuid);
+  const id = side?.rootGuid ? entityIdForGuid(side.rootGuid) : 0;
+  if (id) useEditorStore.getState().selectEntity(id);
 }
 
 function makeApplyPrefabAction(opts: {
@@ -113,13 +129,11 @@ function makeApplyPrefabAction(opts: {
     // re-derived against the prefab being restored, and the applied one rebuilt from its capture.
     undo: async () => {
       await restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.scenePath, opts.selGuid, paths ? opts.prefabAfter : undefined);
-      refreshBaseInstances(opts.source, opts.prefabAfter, opts.prefabBefore, opts.baseBefore?.rootGuid);
-      await restoreBaseInstance(opts.source, opts.baseBefore);
+      await rederiveBaseInstances(opts.source, opts.prefabAfter, opts.prefabBefore, opts.baseBefore);
     },
     redo: async () => {
       await restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.scenePath, opts.selGuid, paths ? opts.prefabBefore : undefined);
-      refreshBaseInstances(opts.source, opts.prefabBefore, opts.prefabAfter, opts.baseAfter?.rootGuid);
-      await restoreBaseInstance(opts.source, opts.baseAfter);
+      await rederiveBaseInstances(opts.source, opts.prefabBefore, opts.prefabAfter, opts.baseAfter);
     },
   };
 }

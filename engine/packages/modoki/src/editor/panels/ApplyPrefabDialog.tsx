@@ -13,6 +13,7 @@ import {
   preloadNestedPrefabsForSubtree,
   captureInstanceStructure,
   revertOverridesSelective,
+  staleInstanceRefusal,
   rebuildInstance,
   type PrefabFile,
 } from '../scene/prefab';
@@ -290,6 +291,9 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       await runOnPinnedSubject({
         subject, lookup: findEntity, world: getCurrentWorld(), mode, onGone: closeAsGone,
         act: async (liveId) => {
+          // Revert's own refusal is a bare null (#1483); say why here, as Apply's notice does.
+          const refusal = staleInstanceRefusal(liveId);
+          if (refusal) { useEditorStore.getState().showToast(`Revert: nothing was reverted — ${refusal}`, 'warn'); return; }
           const result = await revertOverridesSelective(liveId, checked);
           if (result) {
             // The rebuild assigns new ECS ids but preserves the instance root's guid

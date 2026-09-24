@@ -19,20 +19,22 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
-  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData, type SceneEntityEntry,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, findEntity, type SceneData, type SceneEntityEntry,
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import {
   setActionCallback, pushAction, writeTraitFieldWithUndo, deleteEntitiesWithUndo, removeTraitFromEntitiesWithUndo,
-  createEntityWithUndo, reparentEntity,
+  createEntityWithUndo, reparentEntity, duplicateEntity, staleInstanceRefusal,
 } from '@modoki/engine/editor';
+import { Transient } from '../../packages/modoki/src/runtime/core/traits/Transient';
 import {
   setPrefabCache, instantiatePrefab, setPrefabSource, rebuildInstance, captureInstanceOverrides, captureInstanceStructure,
-  revertOverridesSelective, applyToPrefabSelective, type PrefabFile,
+  revertOverridesSelective, applyToPrefabSelective, framesBuiltFromOtherRows, rebaseStaleInstances, getCachedPrefabSync, type PrefabFile,
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { collectInstanceOverrideKeys, canonicalOverrideKey } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
-import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
+import { serializeScene, adoptWorldReloadedFromDisk } from '../../packages/modoki/src/editor/scene/serialize';
+import { captureSide, rederiveBaseInstances } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -80,10 +82,10 @@ const scene = (source: string, entry: Record<string, unknown> = {}): SceneData =
   ],
 } as unknown as SceneData);
 
-async function load(data: unknown): Promise<void> {
+async function load(data: unknown, opts: { keepPrevious?: boolean } = {}): Promise<void> {
   const prev = getCurrentWorld();
   setCurrentWorld(createWorld());
-  prev?.destroy();
+  if (!opts.keepPrevious) prev?.destroy();
   const eaMeta = getTraitByName('EntityAttributes')!;
   await loadSceneFile(JSON.parse(JSON.stringify(data)) as SceneData, {
     loadModels: false,
@@ -368,19 +370,19 @@ describe('Apply/Revert keys name a member by identity (#1468 Phase 4)', () => {
     expect(tf('B')?.x).toBe(6);
   });
 
-  it('a listed key acts on the member the CAPTURE meant — even while the cached template is newer than the live tree', async () => {
+  it('Revert REFUSES while the cached template numbers the live tree`s rows differently (#1483)', async () => {
     // A kept base scene carried across a prefab reload, or a deferred reload, leaves the live tree in the
-    // OLD numbering while the cache holds the new document. The capture then diffs each live localId
-    // against the cache (#1169's class), and the consumers resolve keys in the cache too — so the key must
-    // come from the cache as well. The close-out tried the live member's own nodeGuid instead and this
-    // reddened: reverting every listed key moved A's override onto B (review of 50e489303).
+    // OLD numbering while the cache holds the new document. Every capture diffs a live localId against the
+    // cache, so each member is compared with another member's row. Before #1483 this case asserted the
+    // keys and the revert at least AGREED in that state; they agreed on the wrong rows, and Apply wrote A's
+    // value into B's row. A frame built from other rows is now refused, and nothing moves.
     install(template());
     await load(scene(P));
     writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
     install(renumbered());                                  // cache renumbered; live tree NOT reloaded
-    const keys = collectInstanceOverrideKeys(one('R').id, prefabs.get(P) as PrefabFile);
-    await revertOverridesSelective(one('R').id, new Set(keys.fields.filter((k) => k.endsWith('.Transform.x'))));
-    expect([tf('A')?.x, tf('B')?.x, tf('C')?.x]).toEqual([0, 0, 0]);
+    expect(framesBuiltFromOtherRows(one('R').id)).toEqual([P]);
+    expect(await revertOverridesSelective(one('R').id, new Set([`${gA}.Transform.x`]))).toBeNull();
+    expect([tf('A')?.x, tf('B')?.x, tf('C')?.x]).toEqual([5, 0, 0]);
   });
 
   it('still ACCEPTS the localId spelling — and both spellings of one key compare equal', async () => {
@@ -503,3 +505,299 @@ describe('a NESTED frame restates each member against the PREFAB baseline (#1468
     expect(has('A', 'Renderable3DPrimitive')).toBe(true);
   });
 });
+
+describe('a live frame built from another version of its template (#1483)', () => {
+  const written: unknown[] = [];
+  beforeEach(() => {
+    written.length = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_u: unknown, init?: RequestInit) => {
+      if (init?.method === 'POST') written.push(init.body);
+      return { ok: true, json: async () => ({}) } as unknown as Response;
+    }));
+  });
+  afterAll(() => { vi.unstubAllGlobals(); });
+
+  it('Apply REFUSES, and writes nothing — it would put A`s value into the row B now holds', async () => {
+    install(template());
+    await load(scene(P));
+    writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
+    install(renumbered());
+    const result = await applyToPrefabSelective(one('R').id, new Set([`${gA}.Transform.x`]));
+    expect(result.applied).toBe(false);
+    expect(result.refused).toMatch(/different version/);
+    expect(written).toEqual([]);
+  });
+
+  it('a template whose VALUES changed but whose rows did not is NOT refused', async () => {
+    install(template());
+    await load(scene(P));
+    writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
+    const retuned = template();
+    (retuned.entities[2]!.traits.Transform as { x: number }).x = 7;   // B's base moved; same numbering
+    install(retuned);
+    expect(framesBuiltFromOtherRows(one('R').id)).toEqual([]);
+    const result = await applyToPrefabSelective(one('R').id, new Set([`${gA}.Transform.x`]));
+    expect(result.applied).toBe(true);
+  });
+
+  it('a template that GAINED a row IS refused — the structure capture would read the new row as removed', async () => {
+    // Close-out review 2: every row of the cached document with no live member is captured as one this
+    // instance REMOVED, so a gained row is a false removal on the next save or Revert. (An earlier version let
+    // it through, on the evidence of a fixture that split the two caches production keeps in step.)
+    install(template());
+    await load(scene(P));
+    const grown = template();
+    grown.entities.push(row(5, 'D', 1, 'eeeeeeee-0000-4000-8000-000000000b08'));
+    install(grown);
+    expect(framesBuiltFromOtherRows(one('R').id)).toEqual([P]);
+  });
+
+  it('a template that DROPPED a row the live tree has IS refused — that member has no row to be read against', async () => {
+    install(template());
+    await load(scene(P));
+    const shrunk = template();
+    shrunk.entities = shrunk.entities.filter((e) => e.name !== 'C');
+    install(shrunk);
+    expect(framesBuiltFromOtherRows(one('R').id)).toEqual([P]);
+  });
+
+  it('a NESTED frame built from other rows is reported too', async () => {
+    install(template(), outer());
+    await load(scene(O));
+    install(renumbered());                                  // the nested template changed; the outer did not
+    expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([P]);
+  });
+
+  it('rebaseStaleInstances rebuilds it from the document it WAS expanded from — the edit stays on A', async () => {
+    install(template());
+    await load(scene(P));
+    writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
+    install(renumbered());
+    expect(await rebaseStaleInstances()).toBe(1);
+    expect([tf('A')?.x, tf('B')?.x, tf('C')?.x]).toEqual([5, 0, 0]);
+    expect(framesBuiltFromOtherRows(one('R').id)).toEqual([]);
+    const keys = collectInstanceOverrideKeys(one('R').id, prefabs.get(P) as PrefabFile);
+    expect(keys.fields).toEqual([`${gA}.Transform.x`]);    // no false override on any other member
+  });
+
+  it('a hot reload rebuilds a carried stale instance WHATEVER scene owns it — a kept base`s, or a Persistent root`s', async () => {
+    // The primary is re-expanded from disk by the reload and compares equal; only a carried root is stale, and
+    // a Persistent one belongs to no kept base (review of 4f0b839d0: the first version looked at kept bases only).
+    install(template());
+    await load(scene(P));
+    writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
+    install(renumbered());
+    await adoptWorldReloadedFromDisk('/scenes/level.json', new Set());
+    expect(framesBuiltFromOtherRows(one('R').id)).toEqual([]);
+    expect([tf('A')?.x, tf('B')?.x, tf('C')?.x]).toEqual([5, 0, 0]);
+  });
+
+  it('a world replaced while the rebuild waits for its prefabs rebuilds nothing', async () => {
+    // The replacement is the SAME scene reloaded from the new template — the root has the same id and guid
+    // there, so only the world check keeps the rebuild (from the OLD document) off a frame that is current.
+    install(template());
+    await load(scene(P));
+    writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
+    const entry = await entryOf();
+    install(renumbered());
+    await load(scene(P, entry as never));
+    const fresh = getCurrentWorld();                          // built from the renumbered template
+    install(template());
+    await load(scene(P, entry as never), { keepPrevious: true }); // built from the old one: stale once…
+    const staleWorld = getCurrentWorld();
+    install(renumbered());                                    // …the cache moves on
+    const pending = rebaseStaleInstances();                   // collects synchronously, then awaits preloads
+    setCurrentWorld(fresh);
+    expect(await pending).toBe(0);
+    staleWorld.destroy();
+    expect([tf('A')?.x, tf('B')?.x, tf('C')?.x]).toEqual([5, 0, 0]);
+  });
+
+  it('a DUPLICATE keeps the record of the document its source was expanded from', async () => {
+    // A respawn is a new entity, so the record keyed by the old one did not reach it: the copy read as
+    // current, was never rebuilt or refused, and Apply wrote B's value into A's row (review of 4f0b839d0).
+    install(template());
+    await load(scene(P));
+    const copy = duplicateEntity(one('R').id, () => {})!;
+    install(renumbered());
+    expect(framesBuiltFromOtherRows(copy)).toEqual([P]);
+  });
+
+  it('a delete + UNDO keeps the record too', async () => {
+    install(template());
+    await load(scene(P));
+    const { undo } = await import('@modoki/engine/editor');
+    deleteEntitiesWithUndo([one('R').id]);
+    await undo();
+    install(renumbered());
+    expect(framesBuiltFromOtherRows(one('R').id)).toEqual([P]);
+  });
+
+  it('a stale nested frame under a RUNTIME subtree is not authoring input, and refuses nothing', async () => {
+    install(template(), outer());
+    await load(scene(O));
+    findEntity(one('R').id)!.add(Transient);               // the nested P frame's root (named after P's root row)
+    install(renumbered());
+    expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([]);
+  });
+
+  it('the refusal names each stale source once, however many of its frames are stale', async () => {
+    const two = { ...outer(), entities: [...outer().entities, row(4, 'N2', 2, 'eeeeeeee-0000-4000-8000-000000000b09', { prefab: P })] };
+    install(template(), two);
+    await load(scene(O));
+    install(renumbered());
+    expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([P]);
+    expect(staleInstanceRefusal(one('OR').id)).toMatch(new RegExp(`^this instance was built from a different version of "${P}" than`));
+  });
+
+  it('an Apply on ANOTHER instance refreshes a stale nested P frame from the document IT was built from (review of 4f0b839d0)', async () => {
+    // Root1 = an O instance with P nested; Root2 = a plain P instance. The cache renumbers P; Root2 is rebased,
+    // Root1 is not (only its nested frame is stale). The Apply fan-out from Root2 lists the nested P root
+    // itself, and captured it against the CACHED rows — moving A's edit onto B for good. Each root is now
+    // captured against its own record.
+    install(template(), outer());
+    const two: SceneData = {
+      id: 'row-writer', version: SCENE_FORMAT_VERSION, name: 'S', resources: [],
+      entities: [
+        { id: 1, traits: { EntityAttributes: { name: 'Holder', parentId: 0, guid: HOLDER } } },
+        { id: 2, prefab: O, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: HOLDER } } },
+        { id: 3, prefab: P, guid: 'dddddddd-0000-4000-8000-000000000b03', traits: { EntityAttributes: { name: 'Root2', parentId: HOLDER } } },
+      ],
+    } as unknown as SceneData;
+    await load(two);
+    // Both P frames have a root named R: the plain one hangs off the Holder, the nested one under OR.
+    const holder = () => getAllEntities().find((e) => e.name === 'Holder')!.id;
+    const plainRoot = () => getAllEntities().find((e) => e.name === 'R' && e.parentId === holder())!.id;
+    const under = (topId: number, name: string) => {
+      const all = getAllEntities();
+      const inside = (id: number): boolean => { const e = all.find((x) => x.id === id); return !!e && (e.parentId === topId || inside(e.parentId)); };
+      return all.find((e) => e.name === name && inside(e.id))!;
+    };
+    const orId = () => getAllEntities().find((e) => e.name === 'OR')!.id;
+    writeTraitFieldWithUndo(under(orId(), 'A').id, meta('Transform'), 'x', 5);
+    install(renumbered());
+    expect(await rebaseStaleInstances()).toBe(1);            // the plain P instance only
+    writeTraitFieldWithUndo(under(plainRoot(), 'B').id, meta('Transform'), 'x', 7);
+    const result = await applyToPrefabSelective(plainRoot(), new Set([`${gB}.Transform.x`]));
+    expect(result.applied).toBe(true);
+    const nestedTf = (name: string) => readTraitData(under(orId(), name).id, meta('Transform')) as { x: number };
+    expect([nestedTf('A').x, nestedTf('B').x]).toEqual([5, 7]); // A keeps its edit; B follows the applied template
+    expect(framesBuiltFromOtherRows(orId())).toEqual([]);       // and the frame is current now
+  });
+
+  it('an Apply fan-out SKIPS an instance whose stale frame is NESTED — its capture would read the wrong rows', async () => {
+    // Root1 = an O instance built before P renumbered (its nested P frame is stale); Root2 = an O instance
+    // made after. An Apply of O from Root2 refreshes every O instance; Root1's nested capture reads the
+    // cached P, so rebuilding it would move A's edit onto B. It is left alone, and stays refused.
+    install(template(), outer());
+    await load(scene(O));
+    const r1 = one('OR').id;
+    const nestedA = () => getAllEntities().filter((e) => e.name === 'A');
+    writeTraitFieldWithUndo(nestedA()[0]!.id, meta('Transform'), 'x', 5);
+    install(renumbered());
+    const r2 = instantiatePrefab(getCachedPrefabSync(O)!, one('Holder').id);
+    setPrefabSource(r2, O);
+    expect(framesBuiltFromOtherRows(r2)).toEqual([]);
+    const slot2 = getAllEntities().find((e) => e.name === 'Slot' && e.parentId === r2)!.id;
+    writeTraitFieldWithUndo(slot2, meta('Transform'), 'x', 3);
+    const result = await applyToPrefabSelective(r2, new Set([`${gSlot}.Transform.x`]));
+    expect(result.applied).toBe(true);
+    const inR1 = (name: string) => {
+      const all = getAllEntities();
+      const inside = (id: number): boolean => { const e = all.find((x) => x.id === id); return !!e && (e.parentId === r1 || inside(e.parentId)); };
+      return readTraitData(all.find((e) => e.name === name && inside(e.id))!.id, meta('Transform')) as { x: number };
+    };
+    expect([inR1('A').x, inR1('B').x]).toEqual([5, 0]);        // not rebuilt against the wrong rows
+    expect(inR1('Slot').x).toBe(0);                             // …so not refreshed at all: that is the cost
+    expect(framesBuiltFromOtherRows(r1)).toEqual([P]);         // and it is still refused
+  });
+});
+
+describe('a P instance dropped inside another P instance, through an Apply fan-out (#1483 close-out review 2)', () => {
+  // The outer rebuild captures the inner instance through `captureNestedRef`, which reads the CACHED document,
+  // so the inner one must be refreshed first. Outer first, a node the apply had just promoted was captured as
+  // REMOVED in whichever instance was not current yet, and the save made it permanent.
+  beforeEach(() => { vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({}) }) as unknown as Response)); });
+  afterAll(() => { vi.unstubAllGlobals(); });
+  const ROOT2 = 'dddddddd-0000-4000-8000-000000000b03';
+  const gD = 'eeeeeeee-0000-4000-8000-000000000b0d';
+  const twoP = (order: 'outer-first' | 'inner-first'): SceneData => {
+    const a = { id: 2, prefab: P, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: HOLDER } } };
+    const b = { id: 3, prefab: P, guid: ROOT2, traits: { EntityAttributes: { name: 'Root2', parentId: HOLDER } } };
+    return {
+      id: 'row-writer', version: SCENE_FORMAT_VERSION, name: 'S', resources: [],
+      entities: [{ id: 1, traits: { EntityAttributes: { name: 'Holder', parentId: 0, guid: HOLDER } } }, ...(order === 'outer-first' ? [a, b] : [b, a])],
+    } as unknown as SceneData;
+  };
+  const guidOf = (id: number) => (readTraitData(id, meta('EntityAttributes')) as { guid: string }).guid;
+  const idOfGuid = (g: string) => getAllEntities().find((e) => guidOf(e.id) === g)!.id;
+  /** Load both, drop ROOT2's instance under ROOT's A, and add a plain node D under ROOT's root. */
+  const setUp = async (order: 'outer-first' | 'inner-first') => {
+    install(template());
+    await load(twoP(order));
+    const outer = idOfGuid(ROOT);
+    const a = getAllEntities().find((e) => e.name === 'A' && e.parentId === outer)!.id;
+    reparentEntity(idOfGuid(ROOT2), a);
+    createEntityWithUndo('Create', outer, [{ name: 'EntityAttributes', data: { name: 'D', parentId: outer, guid: gD } }], () => {});
+  };
+  const noneRemoved = async () => {
+    const saved = await serializeScene() as unknown as { entities: SceneEntityEntry[] };
+    return JSON.stringify(saved.entities.filter((e) => !!e.prefab)).includes('"removed":true');
+  };
+
+  it('undoing an Apply made from the INNER base instance re-derives the outer one too (#1483 review 3)', async () => {
+    // Both instances belong to a carried base. The undo rebuilds the applied (inner) one from its capture and
+    // re-derives every OTHER base instance; the outer one was judged while the inner was still built from the
+    // applied prefab, read as holding a stale nested frame, and skipped — keeping the promoted member.
+    await setUp('outer-first');
+    const BASE = 'ffffffff-0000-4000-8000-000000001483';
+    const stampAll = () => getCurrentWorld().query(meta('EntityAttributes').trait).updateEach(([d]) => { (d as { sourceScene: string }).sourceScene = BASE; });
+    stampAll();
+    const inner = idOfGuid(ROOT2);
+    const gE = 'eeeeeeee-0000-4000-8000-000000000b0f';
+    createEntityWithUndo('Create', inner, [{ name: 'EntityAttributes', data: { name: 'E', parentId: inner, guid: gE, sourceScene: BASE } }], () => {});
+    const before = prefabs.get(P) as PrefabFile;
+    const side = captureSide(idOfGuid(ROOT2), ROOT2, before);
+    const result = await applyToPrefabSelective(idOfGuid(ROOT2), new Set([`+added.${gE}`]));
+    expect(getAllEntities().filter((e) => e.name === 'E')).toHaveLength(2);   // the premise: both expanded it
+    stampAll();
+    setPrefabCache(P, before as never);                     // the undo's prefab restore
+    await rederiveBaseInstances(P, result.prefabAfter!, before, side);
+    expect(getAllEntities().filter((e) => e.name === 'E')).toHaveLength(1);   // back on the inner one only
+    expect(framesBuiltFromOtherRows(idOfGuid(ROOT))).toEqual([]);
+    expect(framesBuiltFromOtherRows(idOfGuid(ROOT2))).toEqual([]);
+  });
+
+  for (const order of ['outer-first', 'inner-first'] as const) {
+    it(`a REBASE after the template gained a row rebuilds both, inner first (${order})`, async () => {
+      await setUp(order);
+      const grown = template();
+      grown.entities.push(row(5, 'E', 1, 'eeeeeeee-0000-4000-8000-000000000b0e'));
+      install(grown);                                       // an external write; both instances were built before it
+      expect(await rebaseStaleInstances()).toBe(2);
+      expect(getAllEntities().filter((e) => e.name === 'E')).toHaveLength(2);
+      expect(await noneRemoved()).toBe(false);
+    });
+
+    it(`Apply of the promoted node from the OUTER instance reaches both (${order})`, async () => {
+      await setUp(order);
+      const result = await applyToPrefabSelective(idOfGuid(ROOT), new Set([`+added.${gD}`]));
+      expect(result.applied).toBe(true);
+      expect(getAllEntities().filter((e) => e.name === 'D')).toHaveLength(2);
+      expect(await noneRemoved()).toBe(false);
+      expect(framesBuiltFromOtherRows(idOfGuid(ROOT))).toEqual([]);
+    });
+
+    it(`Apply of a field from the INNER instance refreshes the outer too (${order})`, async () => {
+      await setUp(order);
+      const innerB = getAllEntities().find((e) => e.name === 'B' && e.parentId === idOfGuid(ROOT2))!.id;
+      writeTraitFieldWithUndo(innerB, meta('Transform'), 'x', 7);
+      await applyToPrefabSelective(idOfGuid(ROOT2), new Set([`${gB}.Transform.x`]));
+      const outerB = getAllEntities().find((e) => e.name === 'B' && e.parentId === idOfGuid(ROOT))!.id;
+      expect((readTraitData(outerB, meta('Transform')) as { x: number }).x).toBe(7);
+      expect(getAllEntities().filter((e) => e.name === 'D')).toHaveLength(1);   // the unapplied addition stays
+      expect(await noneRemoved()).toBe(false);
+    });
+  }
+});
+

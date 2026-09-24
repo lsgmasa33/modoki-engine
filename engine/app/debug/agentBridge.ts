@@ -666,7 +666,7 @@ export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>
  *  bases it kept (#1417), so the editor can drop discarded work's undo entries and rebaseline —
  *  `adoptWorldReloadedFromDisk`.
  *  Installed the way the suppressor is; unset in the game runtime, which has no undo. */
-type WorldReloadedFromDisk = (scenePath: string, keptBaseGuids: ReadonlySet<string>) => void;
+type WorldReloadedFromDisk = (scenePath: string, keptBaseGuids: ReadonlySet<string>) => void | Promise<void>;
 let _worldReloadedFromDisk: WorldReloadedFromDisk | null = null;
 
 /** Editor-only: install the after-reload hook. Called from `agentEditorOps.ts`. */
@@ -2944,7 +2944,7 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
     });
-    _worldReloadedFromDisk?.(current, keptBaseGuids);
+    await _worldReloadedFromDisk?.(current, keptBaseGuids);
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
     // A newer load superseding this one aborts the in-flight load

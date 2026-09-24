@@ -334,6 +334,104 @@ that was also losing `Animator.clips`.
 - **`applyToPrefab` / `applyToPrefabSelective`** — write live overrides back into
   the source file and refresh sibling instances.
 
+### Apply takes what it applied OUT of the source instance's overrides (#1469)
+
+Apply refreshes **every** instance of the source, the one it was applied from included: each is
+captured against the OLD document, rebuilt from the new one, and has its capture re-applied. A match
+with the new base is **not** what drops an applied field from the source instance. The field is still
+override-MARKED (`overrideMarks.ts`), and the capture keeps a marked field that differs from the old
+base. The rebuild then re-applies it through `applyOverridesByRootInstance`, which re-seeds the mark.
+The result was an override whose value equalled the base. It was invisible in the override list
+(a value diff), it was saved into the scene, and it **pinned** that instance: a later template edit
+to the field reached every instance except the one the author had applied from. An applied MOVE
+pinned the moved member's Transform the same way, because a moved member's Transform is captured
+without a mark.
+
+So `applyToPrefabSelective` records every `localId.Trait.field` it copies from the instance into a
+row: an applied field, every field of a component it seeds whole, and the Transform an applied move
+writes. `refreshInstances` subtracts that set from **that one instance's** capture before its
+rebuild (`subtractFieldOverrides`, which Revert uses for the fields it reverts). Other instances keep
+their own overrides of the same field. Tests: `engine/tests/editor/applyLeavesNoSourceOverride.test.ts`.
+
+### A capture reads the document the frame was EXPANDED from (#1483)
+
+A localId means something only together with the document it was read from. Every capture
+(`captureInstanceOverrides`, `captureInstanceStructure`, the override keys, Apply, Revert) diffs a
+member's `PrefabInstance.localId` against the editor's CACHED copy of its source. So the invariant
+is: **a live frame is expanded from the document currently in the editor cache.** Apply keeps it by
+refreshing every instance, and its undo/redo keep it through `refreshBaseInstances` (#1431).
+
+The hot reload broke it for a **kept base scene**. `SceneManager` carries a base with unsaved edits
+across the swap FLAT (`snapshotPersistentEntities`), so its instances keep the old document's
+numbering. Meanwhile `refreshPrefabSourceForPath` has already put the new document in the cache.
+After a renumbering write (a `git checkout`, a hand edit), each member was compared with another
+member's row: false overrides, and Apply wrote one member's value into another's row. Three pieces:
+
+- **Every respawn keeps the record.** `identityParents.ts` records, per frame ROOT, the document it
+  was expanded from (`noteFrameDoc`). A flat respawn is a new entity, and the record keyed by the old
+  one does not reach it. The base-scene carry re-records it on the respawned root (`noteFrameRootDoc`,
+  root only: the new world did not expand that source, so its per-source "latest" record is not
+  touched). `EntitySnapshot.frameDoc` does the same for duplicate, paste and delete-undo. A copy keeps
+  it too, because it was built from the same document. Without that, a respawned instance was
+  invisible to both guards below.
+- **The reload rebuilds stale carried instances.** `adoptWorldReloadedFromDisk` (the editor's
+  hot-reload hook, now awaited by `agentBridge.ts`) calls `rebaseStaleInstances()`. That runs the
+  refresh Apply uses on every stored instance root whose recorded document differs from the cache (by
+  content), deepest first. Kept bases are not the only carried roots: a `Persistent` root is carried
+  whatever scene owns it. Everything the reload re-expanded from disk compares equal and is left
+  alone. A world replaced while the nested prefabs load rebuilds nothing. A reload that is deferred
+  (Play, a preview envelope) rebuilds when it finally runs, because the record, not a remembered
+  baseline, says what each frame was built from.
+- **Every refresh captures a root against ITS document.** `refreshInstances` (Apply's fan-out, its
+  undo/redo, the rebase) uses each root's own record as the capture baseline, and falls back to the
+  caller's `oldPrefab` only when there is no record. `rebuildInstance` translates from that baseline by
+  `nodeGuid` (`localIdTranslation`). Before the close-out review, an Apply on one instance rebuilt a
+  stale nested frame in ANOTHER against the cached rows and moved its edits onto other members, for
+  good. A root whose stale frame is only NESTED is skipped, with a warning. The fan-out runs **deepest
+  first**: an instance the author dropped inside another instance of the same source is captured by
+  the outer rebuild through `captureNestedRef`, which reads the CACHED document. Outer first, it read
+  the not-yet-refreshed inner against the new rows, so a node the Apply had just promoted was saved as
+  removed. That predates #1483; the second close-out review found it.
+- **Apply's undo/redo rebuilds the applied base instance FIRST** (`rederiveBaseInstances`,
+  `applyPrefabUndo.ts`), then re-derives the other base instances, then re-selects by guid. The
+  applied instance can sit inside another base instance, whose refresh captures it through
+  `captureNestedRef` against the cache, so it must already be built from the restored prefab. Before
+  the third review, the enclosing instance read it as a stale nested frame, was skipped, and kept the
+  member the undo had taken away. The snapshot restore also rebases the `Persistent` roots its scene
+  load carries flat, before it saves.
+- **Leaving prefab-edit mode re-reads the edited prefab.** `refreshPrefabSourceForPath` skips the
+  prefab open in prefab-edit mode, so after an exit without saving, the editor's copy could be older
+  than the file the scene had just loaded from. Every instance of it was then refused, and a later
+  rebase rebuilt carried ones back to the old template. `exitPrefabEditing` re-reads it once the
+  editor is closed, then rebases, because a `Persistent` root is carried through prefab-edit mode and
+  back, so a SAVED edit reaches it only there.
+- **Apply and Revert refuse whatever is left** (`framesBuiltFromOtherRows`): any frame of the
+  instance, nested ones included, whose recorded document does not hold the same rows as the cache:
+  the same localIds, each naming the same `nodeGuid` where both carry one (`rowsMeanTheSame`). Both
+  directions matter. A row the cache GAINED is not harmless: `captureInstanceStructure` reads every
+  row with no live member as one the instance REMOVED, so it becomes a false removal on the next save
+  or Revert. A round of this close-out narrowed the check to let gained rows through, on the evidence
+  of a fixture (`duplicateCarriesRefs.test.ts`, #1437 P3-a) whose reload expanded the old document
+  under a cache holding the new one, a split production never makes. The second review drove the
+  false removal, and the fixture now resets its cache. Only row identity is compared, not content: a
+  template whose values changed is still captured on the right rows (the mark gate), and refusing on
+  content would block Apply over any byte difference between two copies of one file.
+
+⚠️ **Rebuilt: the TOP frame only.** An instance whose only stale frame is a NESTED one is left alone
+by the rebase and by every refresh, and refused by Apply/Revert until a reload rebuilds it. The
+refusal reaches the Apply dialog's Revert as a toast and the agent op as `prefab revert refused`,
+because Revert's own `null` cannot carry a reason. The nested capture
+(`captureNestedInstanceOverridesIn`) reads the cached CHILD document, so a rebuild would carry that
+frame's edits onto the wrong rows. A runtime (Transient) frame is never judged: no capture reads it,
+and nothing would rebuild it to clear a refusal. The save still captures such a frame against the cached child
+document, which is the open half: #1493.
+
+⚠️ **Wrong fix, reverted (#1468 Phase 4):** making the listed keys name members by their own live
+`nodeGuid` made it worse. The key then disagreed with the capture it named, and Revert moved A's
+override onto B. A key cannot be more right than the capture it names, so the fix has to make the
+capture right. Tests: `engine/tests/editor/sceneMemberRowWriter.test.ts` § "a live frame built from
+another version of its template", and `engine/packages/modoki/tests/editor/carryFrameRootDoc.test.ts`.
+
 ## Scene serialization integration
 
 In `editor/scene/serialize.ts`, a `SerializedEntity` carries two prefab fields:

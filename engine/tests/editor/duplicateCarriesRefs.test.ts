@@ -1852,6 +1852,10 @@ describe('applying a move inside the instance re-parents the row and every ref f
     const plainRow = both.prefabAfter!.entities.find((e) => e.name === 'Plain')!;
     expect((both.prefabAfter!.entities.find((e) => e.localId === 3)!.traits.EntityAttributes as { parentId: number }).parentId).toBe(plainRow.localId);
 
+    // The apply above left its written prefab in the editor cache while this file's loader reads the
+    // `prefabs` map: without the reset the reload expands the OLD document under a cache holding the new one —
+    // a split production never makes, and the stale frame the #1483 guard rightly refuses.
+    setPrefabCache(OUTER, outerDoc as never);
     await load(scene([]));
     reparentEntity(idAt('Holder/OuterRoot/Panel/InnerRoot'), idAt('Holder/OuterRoot/Panel/Button/InnerRoot'));
     const ref = await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set([`+added.${ANCHORED}`, '~moved.4']));

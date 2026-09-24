@@ -18,7 +18,7 @@ import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMa
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
 import { endFrames, relinkDetachedMembers, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
-import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader } from '../../runtime/core/ecs/identityParents';
+import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader, frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../../runtime/core/ecs/identityParents';
 import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
@@ -386,6 +386,11 @@ export interface EntitySnapshot {
    *  sees (#1427). Restored by an undo's respawn; a copy drops them (`regenerateSnapshotGuids`), all
    *  but the template key of a node inside a copied whole instance (#1430). */
   markers?: CarriedMarkers;
+  /** The document its frame was expanded from, when it is a prefab-instance root with a record of its own
+   *  (#1483). A respawn is a new entity, so the record keyed by the old one does not reach it; without this a
+   *  duplicated, pasted or undo-restored instance read as expanded from whatever the cache holds, and the
+   *  stale-frame guards could not see it. A copy keeps it too: it was built from the same document. */
+  frameDoc?: { source: string; doc: TemplateDoc };
 }
 
 export function snapshotEntity(entityId: number): EntitySnapshot | null {
@@ -408,10 +413,12 @@ export function snapshotEntity(entityId: number): EntitySnapshot | null {
   const children = childEntities.map(c => snapshotEntity(c.id)).filter((s): s is EntitySnapshot => s !== null);
   const marks = getOverrideMarkSet(entity);
   const markers = captureMarkers(entity);
+  const frameDoc = frameRootDoc(getCurrentWorld(), entity);
   return {
     id: entityId, traits, children,
     ...(marks && marks.size > 0 ? { marks: [...marks] } : {}),
     ...(markers ? { markers } : {}),
+    ...(frameDoc ? { frameDoc } : {}),
   };
 }
 
@@ -540,6 +547,7 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
     clearOverrideMarks(entity);
     if (snap.marks) restoreOverrideMarks(entity, snap.marks);
     restoreMarkers(entity, snap.markers);
+    if (snap.frameDoc) noteFrameRootDoc(getCurrentWorld(), entity, snap.frameDoc);
     const id = entity.id();
     idMap.set(snap.id, id);
     spawned.push([snap, id]);

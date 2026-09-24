@@ -47,6 +47,8 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   // #1431: undo/redo re-derive carried BASE instances; this suite's instance is primary, and its
   // subject is the prefab + primary scene pair — pinned in engine/tests/editor/applyPrefabDirtiesBase.test.ts.
   refreshBaseInstances: vi.fn(),
+  // #1483: the restore rebases carried roots; nothing here is carried.
+  rebaseStaleInstances: vi.fn(async () => 0),
 }));
 
 let currentBaseScene: string | undefined;

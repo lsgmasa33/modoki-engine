@@ -10,7 +10,7 @@
 import type { Entity } from 'koota';
 import type { PrefabFile } from './prefab';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX } from './prefabEditGuids';
-import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
+import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs, refreshPrefabSourceForPath, rebaseStaleInstances } from './prefab';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
@@ -581,8 +581,17 @@ export async function exitPrefabEditing(): Promise<string | null> {
   // candidate carries it, so the fallback can never reintroduce the same dead end.
   const target = [prefabReturnScenePath, stored]
     .find((p): p is string => !!p && !p.startsWith(PREFAB_EDIT_SCENE_PREFIX)) ?? null;
+  const edited = useEditorStore.getState().editingPrefab;
   if (target) await loadScene(target);
   closePrefabEditor();
+  // The editor's copy of the prefab that was OPEN skipped every external-write refresh while it was open
+  // (`refreshPrefabSourceForPath`), so after an exit without saving it can be older than the file — which the
+  // scene just loaded from. Left so, Apply/Revert refused every instance of it and a later hot reload rebuilt
+  // carried ones back to the old template (#1483 review). Re-read now that nothing is editing it.
+  if (edited) await refreshPrefabSourceForPath(edited.path);
+  // A `Persistent` root is carried into the prefab-edit world and back, so a SAVED edit reaches it only here
+  // — the scene load re-expands everything else (close-out review 2). Rebuilds nothing that is current.
+  await rebaseStaleInstances();
   return target;
 }
 

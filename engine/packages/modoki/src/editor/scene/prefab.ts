@@ -3,7 +3,7 @@
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
-import { worldIdentityParents, setFrameDocFallback, noteFrameDoc } from '../../runtime/core/ecs/identityParents';
+import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { memberRowKeysIn, memberRowsIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
 import { isPrefabEditRowGuid } from './prefabEditGuids';
 import { nestedMoveRef, toLocalIdKeys } from './overrideKeyGrammar';
@@ -4422,6 +4422,17 @@ export async function applyToPrefabSelective(
     };
   }
 
+  // ⚠️ REFUSE an instance built from a document that numbers its rows differently from `oldPrefab` (#1483):
+  // every live value below is read by `PrefabInstance.localId` and written into `oldPrefab`'s row of that
+  // number, which would be another member's. A hot reload rebuilds such an instance (`rebaseStaleInstances`);
+  // this is the backstop for any path that leaves one behind.
+  const staleFrames = framesBuiltFromOtherRows(rootInstanceId);
+  if (staleFrames.length) {
+    const why = staleFramesRefusal(staleFrames);
+    console.error(`[Prefab] cannot apply: ${why}`);
+    return { ...NOOP_APPLY, refused: why };
+  }
+
   // Warm THIS instance's live subtree before the structural capture below (#1284). The
   // per-root loop further down is a different set and comes far too late: `captureNestedRef`
   // runs inside the capture at `const structure = ...`, and on a cold cache it returns null
@@ -4474,6 +4485,9 @@ export async function applyToPrefabSelective(
   for (const node of structure.added) addedByGuid.set(node.guid, node);
 
   let writtenCount = 0;
+  // Every `localId.Trait.field` whose value this apply copied from THIS instance into its row (#1469). The
+  // refresh below subtracts them from this instance's capture: they are the template now, not an override.
+  const appliedFields = new Set<string>();
   const liveAddedRootsToDelete: number[] = []; // live ecs roots whose adds were applied
   const nextLocalId = { v: Math.max(0, ...newPrefab.entities.map((e) => e.localId)) + 1 };
   let rowsReparented = false;
@@ -4620,11 +4634,14 @@ export async function applyToPrefabSelective(
       // template must not carry one instance's read-back frame.
       traitBag = {};
       for (const [k, v] of Object.entries(liveData)) {
-        if (!isTemplateExcludedField(meta, k)) (traitBag as Record<string, unknown>)[k] = v;
+        if (isTemplateExcludedField(meta, k)) continue;
+        (traitBag as Record<string, unknown>)[k] = v;
+        appliedFields.add(`${localId}.${traitName}.${k}`);
       }
       prefabEntity.traits[traitName] = traitBag;
     }
     (traitBag as Record<string, unknown>)[fieldName] = liveValue;
+    appliedFields.add(`${localId}.${traitName}.${fieldName}`);
     writtenCount++;
   }
 
@@ -4736,7 +4753,11 @@ export async function applyToPrefabSelective(
     const liveTf = tfMeta ? clonePersistable(readTraitDataFull(memberEcs, tfMeta)) : null;
     if (tfMeta && liveTf) {
       const bag: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(liveTf)) if (!isTemplateExcludedField(tfMeta, k)) bag[k] = v;
+      for (const [k, v] of Object.entries(liveTf)) {
+        if (isTemplateExcludedField(tfMeta, k)) continue;
+        bag[k] = v;
+        appliedFields.add(`${lid}.Transform.${k}`);
+      }
       const had = row.traits.Transform;
       row.traits.Transform = { ...(had && had !== true ? had : {}), ...bag };
     }
@@ -4782,8 +4803,12 @@ export async function applyToPrefabSelective(
 
   prefabCache.set(source, newPrefab);
   // Every instance of this source, with NO exclusion — the clicked one goes through
-  // capture/restore too, so fields the user just applied drop out of its override set
-  // on the next render because they now match the prefab base.
+  // capture/restore too. ⚠️ Matching the new base is NOT what takes an applied field out of its
+  // override set (#1469): the field is still override-MARKED, the capture against the old document
+  // keeps it, and the rebuild re-seeds the mark — so it was saved as an override nobody could see
+  // (the listing diffs by value) and it pinned this instance against later template edits. The
+  // refresh subtracts `appliedFields` from THIS instance's capture instead; other instances keep
+  // their own overrides of the same field.
   const rootsToRefresh = collectInstanceRoots(source);
   // refreshInstances re-instantiates synchronously, so warm both halves first: the new
   // file's own reference rows...
@@ -4793,7 +4818,7 @@ export async function applyToPrefabSelective(
   // would then drop its per-copy overrides with no warning at all (#1284).
   for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
   const remap = rowsReparented && prefabId ? liveMemberGuidRemap(prefabId, readOld, readNew, rootsToRefresh) : new Map<string, string>();
-  refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap);
+  refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap, { rootId: rootInstanceId, fields: appliedFields });
   if (remap.size) remapWorldGuidRefs(remap);
   // …and every other file that uses the prefab. The open scene's own file too: its live world is already
   // repaired, and the next save writes that.
@@ -5556,8 +5581,11 @@ function refreshInstances(
   newPrefab: PrefabFile,
   /** Old → new member guid (#1437): what the rebuild consumes by guid follows it. */
   remap: ReadonlyMap<string, string> = new Map(),
-): void {
-  if (rootIds.length === 0) return;
+  /** The instance an Apply copied `fields` (`localId.Trait.field`, `oldPrefab`'s numbering) FROM (#1469):
+   *  they are subtracted from its capture, or their marks would carry them over as overrides. */
+  appliedFrom?: { rootId: number; fields: ReadonlySet<string> },
+): number {
+  if (rootIds.length === 0) return 0;
 
   // Pinned BEFORE the loop, because the loop is what invalidates ids: each rebuild deletes a
   // subtree and spawns a replacement, and a freed id can come straight back.
@@ -5566,6 +5594,13 @@ function refreshInstances(
   for (const id of rootIds) {
     guidOf.set(id, eaMetaForGuid ? ((readTraitData(id, eaMetaForGuid)?.guid as string) || '') : '');
   }
+  // DEEPEST FIRST (close-out review 2). An instance the author dropped inside another instance of the same
+  // source is captured by the outer rebuild through `captureNestedRef`, which reads the CACHED document; the
+  // inner one is only expanded from that document once its own refresh has run. Outer first, the capture read
+  // the not-yet-refreshed inner against the new rows and saved a node the apply had just promoted as REMOVED.
+  const parentOf = new Map(getAllEntities().map((e) => [e.id, e.parentId]));
+  const depth = (id: number) => { let n = 0; for (let at = parentOf.get(id) ?? 0; at && n < 10_000; at = parentOf.get(at) ?? 0) n++; return n; };
+  rootIds = [...rootIds].sort((a, b) => depth(b) - depth(a));
 
   let refreshed = 0;
   for (const oldRootId of rootIds) {
@@ -5584,19 +5619,155 @@ function refreshInstances(
     // ⚠️ Checked by GUID, not id — an id-only check is worse than none here. See
     // `isLiveInstanceRoot`.
     if (!isLiveInstanceRoot(oldRootId, guidOf.get(oldRootId) ?? '')) continue;
-    refreshed++;
     // Capture this instance's per-field overrides AND structural diffs against
     // the OLD prefab, then tear down + re-instantiate from the NEW prefab and
     // re-apply them. Structure must be captured before the teardown inside
     // rebuildInstance (it walks the live non-member descendants).
-    const captured = captureInstanceOverrides(oldRootId, oldPrefab);
-    const capturedStructure = captureInstanceStructure(oldRootId, oldPrefab);
-    rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure, oldPrefab, remap);
+    //
+    // ⚠️ Each root is captured against the document IT was expanded from, when it has a record of its own
+    // (#1483) — `oldPrefab` is only what the caller's cache held, and a root carried flat across a reload may
+    // be older. A root holding a stale NESTED frame is skipped: the nested capture reads the cached child
+    // document, so rebuilding it would move that frame's edits onto the wrong rows, silently and for good (it
+    // also clears the record the refusal reads). Left alone, it stays refused until a reload rebuilds it.
+    // Judged against the CACHE, because that is what the nested capture reads (`captureNestedRef`). A P
+    // instance the author dropped inside another P instance is current by now: the loop runs deepest first.
+    if (framesBuiltFromOtherRows(oldRootId, { nestedOnly: true }).length) {
+      console.warn(`[Prefab] not refreshing an instance of "${source}": a prefab nested in it has changed since it was built — reload its scene to update it`);
+      continue;
+    }
+    refreshed++;
+    const handle = findEntity(oldRootId);
+    const rec = handle ? frameRootDoc(getCurrentWorld(), handle) : undefined;
+    const baseline = rec && rec.source === source ? rec.doc as PrefabFile : oldPrefab;
+    let captured = captureInstanceOverrides(oldRootId, baseline);
+    if (appliedFrom && oldRootId === appliedFrom.rootId) captured = subtractFieldOverrides(captured, appliedFrom.fields);
+    const capturedStructure = captureInstanceStructure(oldRootId, baseline);
+    rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure, baseline, remap);
   }
 
   // Reports what was REBUILT, not what was listed. The two differ exactly when a root died
   // under another root's teardown, so this line is the only place that case becomes visible.
   console.log(`[Prefab] Refreshed ${refreshed} instance(s) of "${source}"`);
+  return refreshed;
+}
+
+// ── A live frame built from another version of its document (#1483) ────────────────────────────────
+
+/** A document's content, memoised by object — two copies of one file (the runtime's and the editor's, each
+ *  parsed and migrated the same way) compare equal. */
+const docText = new WeakMap<object, string>();
+function sameDocument(a: object, b: object): boolean {
+  if (a === b) return true;
+  const text = (d: object) => { let t = docText.get(d); if (t === undefined) { t = JSON.stringify(d); docText.set(d, t); } return t; };
+  return text(a) === text(b);
+}
+type RowDoc = { entities?: readonly { localId: number; nodeGuid?: string }[] };
+/** Do `built` (the document a live frame was expanded from) and `cached` hold the SAME rows — the same
+ *  localIds, each naming the same member (`nodeGuid`, where both carry one)? Both directions matter: the
+ *  override capture reads each live member's localId in `cached`, and the structure capture reads every row
+ *  of `cached` with no live member as one this instance REMOVED — so a row `cached` gained is a false removal
+ *  on the next save or Revert (close-out review 2; an earlier version let a gained row through). A row
+ *  without a `nodeGuid` on either side (a pre-v5 document, or one the next save minted) cannot be told apart
+ *  by identity and is compared by localId alone. */
+function rowsMeanTheSame(built: RowDoc, cached: RowDoc): boolean {
+  const b = built.entities ?? [];
+  const c = cached.entities ?? [];
+  if (b.length !== c.length) return false;
+  const at = new Map(c.map((e) => [e.localId, e.nodeGuid]));
+  return b.every((e) => at.has(e.localId) && (!e.nodeGuid || !at.get(e.localId) || at.get(e.localId) === e.nodeGuid));
+}
+
+/** Every frame of instance `rootInstanceId` — its root and each owned nested root below it — whose recorded
+ *  document does not hold the same rows as the editor's cached copy of its source (#1483,
+ *  {@link rowsMeanTheSame}). Every capture
+ *  (overrides, structure, the override keys, Apply, Revert) diffs a member's `PrefabInstance.localId` against
+ *  the cached copy, so in such a frame each member is compared with another member's row: false overrides,
+ *  and Apply writes one member's value into another's row. A frame with no record of its own, or no cached
+ *  copy, cannot be judged and is not reported. Only the row identity is compared, not the content: a
+ *  template whose VALUES changed is captured on the right rows (the mark gate keeps the values honest), and
+ *  refusing on content would block Apply over any byte difference between two copies of one file. */
+export function framesBuiltFromOtherRows(
+  rootInstanceId: number,
+  /** `nestedOnly`: skip the instance's own frame. */
+  opts: { nestedOnly?: boolean } = {},
+): string[] {
+  const pi = getTraitByName('PrefabInstance');
+  if (!pi) return [];
+  const world = getCurrentWorld();
+  const all = getAllEntities();
+  // A runtime frame (a pooled row, a timeline spawn) is not authoring input (docs/prefabs.md § Authoring
+  // scope): no capture reads it, and nothing would ever rebuild it to clear a refusal.
+  const runtimeIds = collectTransientSubtreeIds(all);
+  const parentOf = new Map(all.map((e) => [e.id, e.parentId]));
+  const inside = (id: number): boolean => {
+    for (let at = id, hops = 0; at && hops < 10_000; at = parentOf.get(at) ?? 0, hops++) if (at === rootInstanceId) return true;
+    return false;
+  };
+  const stale: string[] = [];
+  for (const e of all) {
+    const data = readTraitData(e.id, pi) as { rootInstanceId?: number; source?: string } | null;
+    if (!data?.source || data.rootInstanceId !== e.id || !inside(e.id) || runtimeIds.has(e.id)) continue;
+    if (opts.nestedOnly && e.id === rootInstanceId) continue;
+    const handle = findEntity(e.id);
+    const rec = handle ? frameRootDoc(world, handle) : undefined;
+    const cached = prefabCache.get(data.source);
+    if (!rec || rec.source !== data.source || !cached) continue;
+    if (!rowsMeanTheSame(rec.doc as RowDoc, cached) && !stale.includes(data.source)) stale.push(data.source);
+  }
+  return stale;
+}
+
+/** The refusal Apply and Revert give an instance {@link framesBuiltFromOtherRows} reports. */
+function staleFramesRefusal(stale: string[]): string {
+  return `this instance was built from a different version of ${stale.map((s) => `"${s}"`).join(', ')} than the ` +
+    'editor now holds, so its members would be matched with the wrong rows of the prefab. Reload the scene ' +
+    '(or the base scene holding it) and try again.';
+}
+/** Why Apply/Revert would refuse instance `rootInstanceId`, or null — for a caller that must say so itself
+ *  (the Apply dialog's Revert, the agent op), since Revert's own `null` cannot carry a reason. */
+export function staleInstanceRefusal(rootInstanceId: number): string | null {
+  const stale = framesBuiltFromOtherRows(rootInstanceId);
+  return stale.length ? staleFramesRefusal(stale) : null;
+}
+
+/** Rebuild every live STORED instance root whose own frame record says it was expanded from a document other
+ *  than the editor's cached copy of its source (#1483). A root carried FLAT across a hot reload — a kept base
+ *  scene's, or a `Persistent` one's — never sees the prefab change that caused the reload; everything else
+ *  was just re-expanded from disk, compares equal, and is left alone. This is the refresh an Apply gives
+ *  every instance, run from the document each one was really expanded from. Returns how many were rebuilt.
+ *
+ *  Deepest first (review of 4f0b839d0): a stale instance the author dropped INSIDE another stale one is
+ *  captured by the outer rebuild against the cached child document, so it must be current before that runs.
+ *  A root whose stale frame is only NESTED is left for {@link refreshInstances} to skip and Apply/Revert to
+ *  refuse: the nested capture reads the cached child document, so a rebuild would move that frame's edits
+ *  onto the wrong rows. If the world is replaced while the nested prefabs load, nothing is rebuilt — the ids
+ *  were collected in the world that is gone, and the new world's load recorded its own documents. */
+export async function rebaseStaleInstances(): Promise<number> {
+  const pi = getTraitByName('PrefabInstance');
+  if (!pi) return 0;
+  const world = getCurrentWorld();
+  const all = getAllEntities();
+  const runtimeIds = collectTransientSubtreeIds(all);
+  const parentOf = new Map(all.map((e) => [e.id, e.parentId]));
+  const depth = (id: number) => { let n = 0; for (let at = parentOf.get(id) ?? 0; at && n < 10_000; at = parentOf.get(at) ?? 0) n++; return n; };
+  const stale: { root: number; source: string; from: PrefabFile; to: PrefabFile; depth: number }[] = [];
+  world.query(pi.trait).updateEach(([data], entity) => {
+    const d = data as { source?: string };
+    if (!d.source || !isStoredRoot(data as MemberPi, entity.id()) || runtimeIds.has(entity.id())) return;
+    const rec = frameRootDoc(world, entity);
+    const cached = prefabCache.get(d.source);
+    if (!rec || rec.source !== d.source || !cached || sameDocument(rec.doc, cached)) return;
+    stale.push({ root: entity.id(), source: d.source, from: rec.doc as PrefabFile, to: cached, depth: depth(entity.id()) });
+  });
+  for (const s of stale) {
+    await preloadNestedPrefabs(s.to);
+    await preloadNestedPrefabsForSubtree(s.root);
+  }
+  if (getCurrentWorld() !== world) return 0;
+  stale.sort((a, b) => b.depth - a.depth);
+  let rebuilt = 0;
+  for (const s of stale) rebuilt += refreshInstances(s.source, [s.root], s.from, s.to);
+  return rebuilt;
 }
 
 /** Re-derive every BASE scene's live instance of `source` from `fromPrefab` to `toPrefab` — the
@@ -5675,11 +5846,12 @@ function cloneOverrides(
 
 /** Return a copy of `full` with the selected per-field override keys
  *  (`localId.trait.field` — the localId form `revertOverridesSelective` turned them into) removed.
- *  Structural keys are ignored here. Reverting
- *  every field of an added trait empties the trait, which also drops it. */
-function subtractRevertedOverrides(
+ *  Structural keys are ignored here. Removing
+ *  every field of an added trait empties the trait, which also drops it. Revert subtracts what it
+ *  reverts; Apply subtracts what it copied into the template (#1469). */
+function subtractFieldOverrides(
   full: Record<number, Record<string, Record<string, unknown>>>,
-  selectedKeys: Set<string>,
+  selectedKeys: ReadonlySet<string>,
 ): Record<number, Record<string, Record<string, unknown>>> {
   const out = cloneOverrides(full);
   for (const key of selectedKeys) {
@@ -5784,6 +5956,12 @@ export async function revertOverridesSelective(
     console.warn(`[Prefab] Cannot revert: source prefab not in cache: ${source}`);
     return null;
   }
+  // The same refusal as Apply's (#1483): the capture below would match members with other members' rows.
+  const staleFrames = framesBuiltFromOtherRows(rootInstanceId);
+  if (staleFrames.length) {
+    console.error(`[Prefab] cannot revert: ${staleFramesRefusal(staleFrames)}`);
+    return null;
+  }
   // Nested children must be cached for the synchronous re-instantiation.
   await preloadNestedPrefabs(prefab);
   // The file walk above misses a USER-ADDED nested instance (not a row of `prefab`),
@@ -5797,7 +5975,7 @@ export async function revertOverridesSelective(
   // reverted keys to get the state to re-apply after the rebuild.
   const fullOverrides = captureInstanceOverrides(rootInstanceId, prefab);
   let fullStructure = captureInstanceStructure(rootInstanceId, prefab);
-  const reducedOverrides = subtractRevertedOverrides(fullOverrides, selectedKeys);
+  const reducedOverrides = subtractFieldOverrides(fullOverrides, selectedKeys);
   let reducedStructure = subtractRevertedStructure(fullStructure, selectedKeys);
   // Moves inside nested instances live in what the rebuild captures of THEM (owner's B): dropped for the revert,
   // set back for its undo, which rebuilds from `fullStructure`.

@@ -25,7 +25,7 @@ import { setPlayState, getRunMode } from '../../runtime/core/playState';
 import { beginWorldReplacement } from './authoringSettle';
 import { swapHistory, forgetHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs } from './prefab';
+import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefab';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
@@ -886,9 +886,18 @@ function adoptReplacedWorld(scenePath: string, keptBaseGuids: ReadonlySet<string
  *  `adoptReplacedWorld` holds. Before #1409, `unsavedChanges` stayed true after the reload over a
  *  world that matched disk, and the stack still offered to undo a reparent the file never had.
  *  A changed BASE reloads through `forceReloadBases`, so it is not in `keptBaseGuids` and its
- *  edits are discarded with its flag. Installed via `setWorldReloadedFromDiskHook`. */
-export function adoptWorldReloadedFromDisk(scenePath: string, keptBaseGuids: ReadonlySet<string>): void {
+ *  edits are discarded with its flag. Installed via `setWorldReloadedFromDiskHook`.
+ *
+ *  A kept base (and any `Persistent` root) is CARRIED flat, so when the reload was a PREFAB change its
+ *  instances are still the old document's expansion while the editor's copy is already the new one — rebuilt
+ *  here from the document each was expanded from (#1483), or every capture would match its members with
+ *  another member's rows. */
+export async function adoptWorldReloadedFromDisk(scenePath: string, keptBaseGuids: ReadonlySet<string>): Promise<void> {
   adoptReplacedWorld(scenePath, keptBaseGuids);
+  // Not only kept bases: a `Persistent` root is carried too, whatever scene owns it (review of 4f0b839d0).
+  // Everything the reload re-expanded from disk compares equal and is left alone.
+  const rebuilt = await rebaseStaleInstances();
+  if (rebuilt) console.log(`[Prefab] rebuilt ${rebuilt} carried instance(s) from the prefab that changed`);
 }
 
 /** WHICH kinds of unsaved work exist, told apart. The causes themselves — what each one is, what

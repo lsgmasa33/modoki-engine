@@ -54,7 +54,7 @@ import {
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance,
-  applyToPrefabWithUndo, revertOverridesSelective, rebuildInstance, resolveInstanceContext,
+  applyToPrefabWithUndo, revertOverridesSelective, staleInstanceRefusal, rebuildInstance, resolveInstanceContext,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey,
   pushAction, makePrefabInstantiateAction, entityRef,
   getEditorViewportCamera, focusEntityInSceneView,
@@ -2951,6 +2951,9 @@ export function registerEditorAgentOps(): void {
       // which === 'revert' — mirrors ApplyPrefabDialog.handleRevert EXACTLY: revert itself
       // pushes NO undo entry (rebuildInstance is a raw teardown+rebuild), so the caller must,
       // with the same before/after rebuild-from-snapshot undo/redo the dialog wires.
+      // A refusal states its own cause (#1483) — Revert's bare null would be reported below as a lost instance.
+      const refusal = staleInstanceRefusal(ctx.rootInstanceId);
+      if (refusal) throw new Error(`prefab revert refused: ${refusal}`);
       const result = await revertOverridesSelective(ctx.rootInstanceId, keySet);
       if (!result) {
         throw new Error(`prefab revert: revertOverridesSelective returned nothing for entity ${entityId} — it stopped being a prefab instance, or the prefab source could not be re-loaded for the rebuild (see the editor console for the [Prefab] warning).`);

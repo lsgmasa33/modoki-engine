@@ -101,6 +101,21 @@ export function noteFrameDoc(world: World, source: string, doc: TemplateDoc, roo
   }
 }
 const pruneFloor = new WeakMap<object, number>();
+
+/** The document `root`'s OWN frame record says it was expanded from — `undefined` for a root with no record of
+ *  its own (the per-source fallback is not an answer about this root). What a flat respawn must carry (#1483). */
+export function frameRootDoc(world: World, root: Entity): { source: string; doc: TemplateDoc } | undefined {
+  return rootDocsByWorld.get(world)?.get(packedOf(root));
+}
+/** Re-record a CARRIED root's document in the world it was respawned into (#1483) — root only: a carried frame
+ *  is not what `world` last expanded its source from, so the per-source record is left to the world's own
+ *  loads. Without it a kept base's instance read as expanded from whatever the cache held, and a prefab that
+ *  changed across the carry had its members diffed against another member's row. */
+export function noteFrameRootDoc(world: World, root: Entity, rec: { source: string; doc: TemplateDoc }): void {
+  let roots = rootDocsByWorld.get(world);
+  if (!roots) { roots = new Map(); rootDocsByWorld.set(world, roots); }
+  roots.set(packedOf(root), rec);
+}
 /** How many frame-root records `world` holds — for the sweep's test. */
 export function frameDocRootCount(world: World): number {
   return rootDocsByWorld.get(world)?.size ?? 0;

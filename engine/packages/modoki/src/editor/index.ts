@@ -69,7 +69,7 @@ export {
   getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, getOverrides, getOverrideValues,
   preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
   captureInstanceOverrides, applyOverridesByRootInstance,
-  applyToPrefab, applyToPrefabSelective,
+  applyToPrefab, applyToPrefabSelective, staleInstanceRefusal,
   revertOverridesSelective, rebuildInstance,
   writePrefabFile, warnInertPrefabSizes, classifyExistingPrefabId,
   tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
