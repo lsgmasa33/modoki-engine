@@ -41,7 +41,7 @@ import { undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { legacyView, legacySceneView } from './memberRowView';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
-import { memberPathIndex, deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { memberPathIndex, deriveInstanceMemberGuids, clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { detachOrphanedMembers, relinkDetachedMembers } from '../../packages/modoki/src/runtime/core/ecs/memberHome';
 import { worldIdentityParents, openIdentityScope, closeIdentityScope } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
 
@@ -196,6 +196,7 @@ const scene = (holderRefs: string[], rootRefs: string[] = []): SceneData => ({
 const MEMBERS = ['OuterRoot/Panel/Button', 'OuterRoot/Panel/InnerRoot/Leaf', 'OuterRoot/Panel/Button/InnerRoot/Leaf'];
 
 beforeEach(() => {
+  clearKeptMemberOrphans(); // R2's kept rows are process state: a rebuild here keeps a dropped member's row (#1535), and it must not reach the next case
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();

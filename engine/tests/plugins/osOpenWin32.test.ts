@@ -168,8 +168,10 @@ async function probeRevealObservable(): Promise<boolean> {
   const file = path.join(dir, 'probe.txt');
   fs.writeFileSync(file, 'probe');
   // Detached and let go: explorer's exit code means nothing (docs/windows.md
-  // § "A GUI launcher's exit status is not the operation's outcome").
-  const child = spawn('explorer', [`/select,${file}`], { detached: true, stdio: 'ignore' });
+  // § "A GUI launcher's exit status is not the operation's outcome"). Quoted and
+  // verbatim for the same reason as `revealInOS`: under a `%TEMP%` with a space, the
+  // default quoting sent explorer to Documents and the probe skipped the reveal tests.
+  const child = spawn('explorer', [`/select,"${file}"`], { detached: true, stdio: 'ignore', windowsVerbatimArguments: true });
   child.on('error', () => { /* the poll reports the absence */ });
   child.unref();
   try {
@@ -180,7 +182,7 @@ async function probeRevealObservable(): Promise<boolean> {
 }
 
 /** Write the one PowerShell script both the open probe and the open test's handler run:
- *  a bare WinForms window titled with the file name of its argument. Shared so the probe
+ *  a bare WinForms window titled with its argument, verbatim. Shared so the probe
  *  establishes the capability the test actually needs — a `-File` script is gated by
  *  execution policy and AppLocker where `-Command` is not, so a probe using `-Command`
  *  would pass on a locked-down machine whose handler can never run, and the test would
@@ -191,7 +193,7 @@ function writeWindowScript(dir: string): string {
   fs.writeFileSync(
     script,
     'param([string]$p)\r\nAdd-Type -AssemblyName System.Windows.Forms\r\n$f = New-Object System.Windows.Forms.Form\r\n' +
-      '$f.Text = [IO.Path]::GetFileName($p)\r\n[void]$f.ShowDialog()\r\n',
+      '$f.Text = $p\r\n[void]$f.ShowDialog()\r\n',
   );
   return script;
 }
@@ -241,9 +243,15 @@ if (onWin32 && !(revealObservable && openObservable)) {
   );
 }
 
+/** A space AND an apostrophe in every folder the reveal tests show — the shapes a real
+ *  project path has ("My Game", "O'Brien") and a scratch dir normally does not. A path
+ *  with a space sent explorer to Documents for as long as the fixture had none, and
+ *  nothing noticed (#1534's close-out). */
+const REVEAL_PREFIX = "modoki reveal o'b,c-";
+
 describe.skipIf(!onWin32)('revealInOS against the real explorer.exe (win32)', () => {
   it('resolves for a file that exists — explorer\'s exit code must not be believed', async () => {
-    const dir = scratch('modoki-reveal-');
+    const dir = scratch(REVEAL_PREFIX);
     const file = path.join(dir, 'revealed.txt');
     fs.writeFileSync(file, 'hello');
 
@@ -262,7 +270,7 @@ describe.skipIf(!onWin32)('revealInOS against the real explorer.exe (win32)', ()
   }, 30_000);
 
   it.skipIf(!revealObservable)('actually opens a window showing the file\'s folder', async () => {
-    const dir = scratch('modoki-reveal-window-');
+    const dir = scratch(`${REVEAL_PREFIX}window-`);
     const file = path.join(dir, 'revealed.txt');
     fs.writeFileSync(file, 'hello');
 
@@ -291,11 +299,13 @@ describe.skipIf(!onWin32)('revealInOS against the real explorer.exe (win32)', ()
  *  the file (measured: 27 of 29 leftover gate tabs pointed at files that were already
  *  gone). So every `verify` left the owner a permanent tab, and cleanup would have
  *  meant driving the owner's own Notepad. The owner chose this instead (2026-09-24):
- *  the test still goes through the real `cmd /c start` → shell association → app
- *  launch, it just does not end in an app that belongs to the owner's session.
+ *  the test still goes through the real launcher → shell association → app launch,
+ *  it just does not end in an app that belongs to the owner's session.
  *
- *  The title comes from `%1`, so a matching window proves the PATH reached the app,
- *  not merely that something started. `%1` is QUOTED and handed to a `-File` script as
+ *  The title IS `%1`, so the test can require the exact path to have reached the app,
+ *  not merely that something started. The script lives in its own clean folder: the
+ *  shell reads `%` in the registered command as a placeholder, so a script path under
+ *  the test's hostile fixture folder (`%OS%`) broke the handler itself (measured). `%1` is QUOTED and handed to a `-File` script as
  *  an argument, never spliced into PowerShell source: an apostrophe in the path would
  *  break a `'%1'` literal, and an unquoted `%1` can arrive as an 8.3 short name
  *  without the stamp (found in review). Unique per run, so a concurrent gate on the
@@ -372,7 +382,7 @@ async function registryTracesOf(stamp: string): Promise<string[]> {
   return found;
 }
 
-/** Kill every process whose command line carries `stamp` — the handler, and a `cmd`
+/** Kill every process whose command line carries `stamp` — the handler, and a launcher
  *  still behind it. By command line rather than by window, so a handler whose window
  *  appeared only after the poll gave up is not left orphaned on the desktop (found in
  *  review). The querying PowerShell carries the stamp too, so it excludes itself. */
@@ -392,17 +402,24 @@ function killByStamp(stamp: string): void {
   }
 }
 
-describe.skipIf(!onWin32)('openInOS against the real cmd /c start (win32)', () => {
-  it.skipIf(!openObservable)('actually opens the file through its shell association', async () => {
-    const dir = scratch('modoki-open-');
+describe.skipIf(!onWin32)('openInOS against the real launcher (win32)', () => {
+  it.skipIf(!openObservable)('actually opens the file through its shell association, the path intact', async () => {
+    // Every character a shell would read: `&` (a second command), `%OS%` (expansion),
+    // `^` (escape), plus an apostrophe and explorer's own separator `,`. `cmd /c start`
+    // opened NOTHING for this folder, having run part of the path as a command —
+    // injection from a file name (#1534's close-out). NO SPACE, deliberately: Node
+    // quotes an argument only when it holds one, so a space hid the `,` bug — bare,
+    // explorer split the path and opened nothing (measured). A real project path can
+    // hold any of these.
+    const dir = scratch("modoki-open-R&D%OS%^x-o'b,c-");
     const stamp = `modokigate${Date.now()}`;
-    const handler = throwawayHandler(dir, stamp);
+    const handler = throwawayHandler(scratch('modoki-open-handler-'), stamp);
+    const file = path.join(dir, `${stamp}${handler.ext}`);
     let hit: WindowedProc | undefined;
     let beforeIds: Set<number> | undefined;
     try {
       // Inside the try: a register that fails half-way still reaches `unregister`.
       handler.register();
-      const file = path.join(dir, `${stamp}${handler.ext}`);
       fs.writeFileSync(file, "Opened by Modoki's test gate (engine/tests/plugins/osOpenWin32.test.ts).\n");
       beforeIds = new Set((await windowedProcesses()).map((p) => p.id));
 
@@ -417,6 +434,7 @@ describe.skipIf(!onWin32)('openInOS against the real cmd /c start (win32)', () =
     // The claim a mock cannot reach: something really opened our file. `openInOS`
     // resolving proves only that a process was spawned — #1508's shape exactly.
     expect(hit, 'no window appeared titled for the opened file').toBeTruthy();
+    expect(hit!.title, 'the app received a different path than the one opened').toBe(file);
     expect(beforeIds!.has(hit!.id), 'the handler window belongs to a process that was already running').toBe(false);
 
     // #1534's whole defect was residue nobody looked for. A run must leave NOTHING that

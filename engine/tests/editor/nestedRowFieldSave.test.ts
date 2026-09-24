@@ -1043,8 +1043,8 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
   // ── Close-out review findings (#1516). ──
 
   it('#1516 fork 2 through a REFRESH: the template dropping an edited node keeps its row, and restoring it brings the edit back', async () => {
-    // Close-out review F1. Mutation: drop the kept-orphan hand-off in `reapplyNestedInstanceOverrides` — the save
-    // after the Refresh loses the row, and the restored node reloads unedited.
+    // Close-out review F1. Mutation (since #1535, where the settle owns it): skip the `before` loop in
+    // `captureRowsForSettle` — the save after the Refresh loses the row, and the restored node reloads unedited.
     install(pDoc(), twoRow(1, 1));
     await load(scene(O, [ROOT1]));
     setTf(inInstance(ROOT1, 'Extra'), 'x', 5);
@@ -1210,6 +1210,338 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     await load((await saved()).scene);
     expect(getAllEntities().filter((e) => e.name === 'XA')).toEqual([]);
     expect(x(inInstance(ROOT1, 'Extra2'))).toBe(8);
+  });
+
+  describe('#1536: a template REFERENCE node\'s own traits and children are read by no spawn, so they are not an edit', () => {
+    const P2 = 'cccccccc-0000-4000-8000-000000001536';
+    const p2 = { id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000001537'), row(2, 'XA', 1, 'eeeeeeee-0000-4000-8000-000000001538')] };
+    /** A hand- or agent-written node: the live capture writes `traits: {}` and `children: []`, this one states both. */
+    const ref = { parentLocalId: 1, guid: '', key: 'k-ref', name: 'Ref', prefab: P2, children: [{ ...extra(4), key: 'k-inert', name: 'Inert' }],
+      traits: { EntityAttributes: { name: 'Ref', parentId: 0, guid: '' }, Transform: { x: 2, y: 0, z: 0 } } };
+
+    it('a no-edit save leaves the node to the row, before and after a Refresh', async () => {
+      // Mutation: keep `traits` (or, separately, `children`) in `withoutLiveIdentity`'s reference branch — the node never
+      // equals its live capture, and `/gN` restates the whole list, pinning Extra2 beside it.
+      install(pDoc(), p2, oRow({ added: [ref, extra2(1)] }));
+      await load(scene(O, [ROOT1]));
+      expect(rows((await saved()).entry)[`/${gN}`]?.added).toBeUndefined();
+      install(oRow({ added: [ref, extra2(8)] }));
+      expect(await rebaseStaleInstances()).toBe(1);
+      const { entry } = await saved();
+      expect(rows(entry)[`/${gN}`]?.added).toBeUndefined();
+      expect(nodeRowKeys(entry)).toEqual([]);
+      expect(x(inInstance(ROOT1, 'Extra2'))).toBe(8);
+    });
+
+    it('ACCEPT side: a scene edit inside the node still restates it, and reloads', async () => {
+      install(pDoc(), p2, oRow({ added: [ref, extra2(1)] }));
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'XA'), 'x', 5);
+      const entry = await reloadUnder(oRow({ added: [ref, extra2(1)] }));
+      expect(rows(entry)[`/${gN}`]?.added).toBeDefined();
+      expect(x(inInstance(ROOT1, 'XA'))).toBe(5);
+    });
+  });
+
+  describe('#1535: a rebuild leaves the kept-orphan store as a reload would — both directions, any depth', () => {
+    /** O without row N (P's instance), and P without A. */
+    const oNoN = () => { const d = oDoc(); d.entities = d.entities.slice(0, 3); return d; };
+    const pNoA = () => { const d = pDoc(); d.entities = d.entities.slice(0, 1); return d; };
+    const entryOf = async (source: string) => ((await serializeScene()) as unknown as SceneData).entities
+      .find((e) => (e as { prefab?: string }).prefab === source) as unknown as Record<string, unknown>;
+    const withN = () => oRow({ added: [extra(1)] });
+    /** The scene edits R (N's root), A inside N, and the row's node Extra. */
+    const editN = () => {
+      setTf(inInstance(ROOT1, 'R'), 'x', 7);
+      setTf(inInstance(ROOT1, 'A'), 'x', 6);
+      setTf(inInstance(ROOT1, 'Extra'), 'x', 5);
+    };
+    const shown = () => [x(inInstance(ROOT1, 'R')), x(inInstance(ROOT1, 'A')), x(inInstance(ROOT1, 'Extra'))];
+
+    it('a frame the Refresh spawns WHOLE gets its kept member, root and node rows back, live and on disk', async () => {
+      // Mutations: skip `replayRowsLive` in the settle (every row stays kept) — the editor shows 0, 0, 1 while the
+      // file reloads as 7, 6, 5; skip the forwarded root rows — R alone shows 0.
+      install(pDoc(), withN());
+      await load(scene(O, [ROOT1]));
+      editN();
+      await reloadUnder(oNoN()); // the template drops N: its rows are orphans now
+      install(withN());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(shown()).toEqual([7, 6, 5]);
+      await reloadUnder(withN());
+      expect(shown()).toEqual([7, 6, 5]);
+    });
+
+    it('depth 0: a direct member the template dropped and restored keeps its edit through the Refresh', async () => {
+      install(pDoc());
+      await load(scene(P, [ROOT1]));
+      setTf(inInstance(ROOT1, 'A'), 'x', 6);
+      const { scene: sc } = { scene: (await serializeScene()) as unknown as SceneData };
+      install(pNoA());
+      await load(sc);
+      install(pDoc());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(x(inInstance(ROOT1, 'A'))).toBe(6);
+      expect((rows(await entryOf(P))[`/${gA}`] as { traits?: unknown }).traits).toEqual({ Transform: { x: 6 } });
+    });
+
+    it('a frame the rebuild CAPTURED: its member dropped and restored by the inner template keeps its edit', async () => {
+      install(pDoc(), oDoc());
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'A'), 'x', 6);
+      await reloadUnder(pNoA());
+      install(pDoc());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(x(inInstance(ROOT1, 'A'))).toBe(6);
+      expect(rowOf((await saved()).entry, gA)?.traits).toEqual({ Transform: { x: 6 } });
+    });
+
+    it('a Refresh that DROPS a member keeps its row, and a Refresh restoring it (an undo) brings the edit back', async () => {
+      // Mutation: skip the `before` loop in the settle — the dropped member's row is thrown away, the save loses it,
+      // and the restore shows 0.
+      install(pDoc());
+      await load(scene(P, [ROOT1]));
+      setTf(inInstance(ROOT1, 'A'), 'x', 6);
+      install(pNoA());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect((rows(await entryOf(P))[`/${gA}`] as { traits?: unknown }).traits).toEqual({ Transform: { x: 6 } });
+      install(pDoc());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(x(inInstance(ROOT1, 'A'))).toBe(6);
+    });
+
+    it('a Refresh that drops a whole nested ROW keeps every row inside it, and one restoring it brings them back', async () => {
+      install(pDoc(), withN());
+      await load(scene(O, [ROOT1]));
+      editN();
+      install(oNoN());
+      expect(await rebaseStaleInstances()).toBe(1);
+      const kept = rows((await saved()).entry);
+      expect(kept[`/${gN}/${gA}`]?.traits).toEqual({ Transform: { x: 6 } });
+      expect(kept[`/${gN}/a+k-extra`]).toEqual({ traits: { Transform: { x: 5 } } });
+      install(withN());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(shown()).toEqual([7, 6, 5]);
+    });
+
+    it('a replayed row leaves the store: an edit back to the template value after the Refresh is saved as no edit', async () => {
+      // Mutation: keep the replayed rows in the store — the save re-emits `/gN/a+k-extra: {x: 5}`, and the reload shows 5.
+      install(pDoc(), withN());
+      await load(scene(O, [ROOT1]));
+      editN();
+      await reloadUnder(oNoN());
+      install(withN());
+      await rebaseStaleInstances();
+      setTf(inInstance(ROOT1, 'Extra'), 'x', 1);
+      const entry = await reloadUnder(withN());
+      expect(rows(entry)[`/${gN}/a+k-extra`]).toBeUndefined();
+      expect(x(inInstance(ROOT1, 'Extra'))).toBe(1);
+    });
+
+    it('ACCEPT side: a Refresh that does not bring the member back leaves its kept rows kept', async () => {
+      install(pDoc(), withN());
+      await load(scene(O, [ROOT1]));
+      editN();
+      await reloadUnder(oNoN());
+      const moved = oNoN(); (moved.entities[1]!.traits as { Transform: { x: number } }).Transform.x = 3; // an unrelated change
+      install(moved);
+      expect(await rebaseStaleInstances()).toBe(1);
+      const kept = rows((await saved()).entry);
+      expect(kept[`/${gN}/${gA}`]?.traits).toEqual({ Transform: { x: 6 } });
+      expect(kept[`/${gN}/a+k-extra`]).toEqual({ traits: { Transform: { x: 5 } } });
+    });
+
+    it('two rows of one prefab refreshed in turn: neither reads the other against the old document (`torn`)', async () => {
+      // P's own nested row Q3 adds Deep. Mutation: drop the `torn` filter in `captureRowsForSettle` — the second rebuild
+      // reads the first (rebuilt without Deep) against the old P, sees Deep as `removed`, and keeps that as an orphan,
+      // which the restore then replays as a deletion.
+      const Q = 'cccccccc-0000-4000-8000-000000001540';
+      const gQ3 = 'eeeeeeee-0000-4000-8000-000000001541';
+      const gN2 = 'eeeeeeee-0000-4000-8000-000000001542';
+      const q = { id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001543')] };
+      const deep = { ...extra(1), key: 'k-deep', name: 'Deep', traits: { EntityAttributes: { name: 'Deep', parentId: 0, guid: '' }, Transform: { x: 1, y: 0, z: 0 } } };
+      const pQ = (withDeep: boolean) => { const d = pDoc(); (d.entities as unknown[]).push({ localId: 3, name: 'Q3', nodeGuid: gQ3, prefab: Q, added: withDeep ? [deep] : [], traits: { EntityAttributes: { name: 'Q3', parentId: 2, guid: '' } } }); return d; };
+      const twoRows = () => { const d = oDoc(); (d.entities as unknown[]).push({ localId: 5, name: 'N2', nodeGuid: gN2, prefab: P, traits: { EntityAttributes: { name: 'N2', parentId: 3, guid: '' } } }); return d; };
+      const deeps = () => getAllEntities().filter((e) => e.name === 'Deep').length;
+      install(q, pQ(true), twoRows());
+      await load(scene(O, [ROOT1]));
+      expect(deeps()).toBe(2);
+      install(pQ(false));
+      expect(await rebaseStaleInstances()).toBe(2);
+      expect(deeps()).toBe(0);
+      install(pQ(true));
+      expect(await rebaseStaleInstances()).toBe(2);
+      expect(deeps()).toBe(2);
+      await load((await saved()).scene);
+      expect(deeps()).toBe(2);
+    });
+
+    /** A scene whose instance of O carries `members` while O has no row N — so every row is an orphan at load. */
+    const orphanedScene = (members: Record<string, unknown>) => {
+      const sc = scene(O, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+      sc.entities[1]!.members = members;
+      return sc as unknown as SceneData;
+    };
+    const hasAction = () => !!readTraitData(inInstance(ROOT1, 'A'), meta('UIAction'));
+
+    it('a kept `false` in traitRemovals restores the trait the row removes, live and on disk', async () => {
+      // Mutation: skip the `restored` add-back in `replayRowsLive` — the fold has nothing to take the name out of, the
+      // trait stays removed, and the row leaves the store: the save writes the chain's state and the restore is lost.
+      const removes = () => oRow({ removedTraits: { 2: ['UIAction'] } });
+      install(pWithAction(), oNoN());
+      await load(orphanedScene({ [`/${gN}/${gA}`]: { traitRemovals: { UIAction: false } } }));
+      install(removes());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(hasAction()).toBe(true);
+      await reloadUnder(removes());
+      expect(hasAction()).toBe(true);
+    });
+
+    it('a kept `removed: false` stays kept through the Refresh and applies on the next load (not replayed live)', async () => {
+      // Pins the documented gap: the chain already cut the member, so there is no live target, and the row is not lost.
+      const removesA = () => oRow({ removed: [2] });
+      install(pDoc(), oNoN());
+      await load(orphanedScene({ [`/${gN}/${gA}`]: { removed: false } }));
+      install(removesA());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(getAllEntities().filter((e) => e.name === 'A')).toEqual([]);
+      const entry = await reloadUnder(removesA());
+      expect(rows(entry)[`/${gN}/${gA}`]).toEqual({ removed: false });
+      expect(getAllEntities().filter((e) => e.name === 'A')).toHaveLength(1);
+    });
+
+    it('a scene-ADDED node under a member a Refresh drops is kept ONCE — re-homed live, not also in the kept row (review F1)', async () => {
+      // Mutation: keep the row whole in the settle (`unhomed` returning its input) — the save holds X twice, and the
+      // restore spawns a second X with the same guid.
+      const gX = 'ffffffff-0000-4000-8000-000000001535';
+      const xNode = { parentLocalId: 0, guid: gX, name: 'X', children: [],
+        traits: { EntityAttributes: { name: 'X', parentId: 0, guid: gX }, Transform: { x: 3, y: 0, z: 0 } } };
+      const sc = scene(P, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+      sc.entities[1]!.members = { [`/${gA}`]: { added: [xNode] } };
+      const xs = () => getAllEntities().filter((e) => e.name === 'X');
+      install(pDoc());
+      await load(sc as unknown as SceneData);
+      install(pNoA());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(xs()).toHaveLength(1);
+      const dropped = await entryOf(P);
+      expect((rows(dropped)[`/${gA}`] as { added?: unknown }).added).toBeUndefined();
+      install(pDoc());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(xs()).toHaveLength(1);
+      await load((await serializeScene()) as unknown as SceneData);
+      expect(xs()).toHaveLength(1);
+    });
+
+    it('a kept `false` on an owned nested ROOT restores the trait the row removes from it (review F2)', async () => {
+      // Mutation: target the member's frame document for a nested root (not its child document) — nothing is restored,
+      // and the row leaves the store.
+      const pRootAction = () => { const d = pDoc(); (d.entities[0]!.traits as Record<string, unknown>).UIAction = {}; return d; };
+      const removes = () => oRow({ removedTraits: { 1: ['UIAction'] } });
+      const rHas = () => !!readTraitData(inInstance(ROOT1, 'R'), meta('UIAction'));
+      install(pRootAction(), oNoN());
+      await load(orphanedScene({ [`/${gN}`]: { traitRemovals: { UIAction: false } } }));
+      install(removes());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(rHas()).toBe(true);
+      await reloadUnder(removes());
+      expect(rHas()).toBe(true);
+    });
+
+    it('a kept v16 `removedTraits` list restores what it leaves out of the row\'s removals (review F3)', async () => {
+      // Mutation: restore only `false` statements (ignore the list form) — A keeps the row's removal, and the row is lost.
+      const removes = () => oRow({ removedTraits: { 2: ['UIAction'] } });
+      install(pWithAction(), oNoN());
+      await load(orphanedScene({ [`/${gN}/${gA}`]: { removedTraits: [] } }));
+      install(removes());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(hasAction()).toBe(true);
+      await reloadUnder(removes());
+      expect(hasAction()).toBe(true);
+    });
+
+    it('a load of an entry with NO member rows leaves nothing kept for its root — no stale row to replay (review F4)', async () => {
+      // Mutation: push only entries with `members` in the loader (as before) — the kept Extra edit from the first world
+      // survives the second load, and the next Refresh replays it onto an Extra the scene never edited.
+      install(pDoc(), oNoN());
+      await load(orphanedScene({ [`/${gN}/a+k-extra`]: { traits: { Transform: { x: 5 } } } }));
+      install(pDoc(), withN());
+      await load(scene(O, [ROOT1])); // the same root guid, a file with no rows at all
+      const moved = withN(); (moved.entities[1]!.traits as { Transform: { x: number } }).Transform.x = 3; // an unrelated change
+      install(moved);
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(x(inInstance(ROOT1, 'Extra'))).toBe(1);
+    });
+
+    it('a nested row that keeps its guid but expands ANOTHER prefab keeps the scene edit inside the old one (re-review 1)', async () => {
+      // A document-only "does anything become unbacked" early-out missed the row's `prefab` ref. Mutation: skip the
+      // capture whenever nothing is kept (drop `prefab === baseline` from the early-out) — `/gN/gA` is lost.
+      const P2 = 'cccccccc-0000-4000-8000-000000001544';
+      const p2 = { id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000001545'), row(2, 'B2', 1, 'eeeeeeee-0000-4000-8000-000000001546')] };
+      const swapped = () => { const d = oDoc(); (d.entities[3] as Record<string, unknown>).prefab = P2; return d; };
+      install(pDoc(), p2, oDoc());
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'A'), 'x', 6);
+      install(swapped());
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      expect(await rebaseStaleInstances()).toBe(1);
+      warn.mockRestore();
+      expect(rowOf((await saved()).entry, gA)?.traits).toEqual({ Transform: { x: 6 } });
+    });
+
+    it('a Refresh dropping a node from row N\'s nestedStructure SLOT keeps the scene edit to it (re-review 3)', async () => {
+      // Mutation: as above — the slot's node row is lost, and the restore shows the template's 1.
+      const Q = 'cccccccc-0000-4000-8000-000000001547';
+      const gM = 'eeeeeeee-0000-4000-8000-000000001548';
+      const q = { id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001549')] };
+      const pWithM = () => { const d = pDoc(); (d.entities as unknown[]).push({ localId: 3, name: 'M', nodeGuid: gM, prefab: Q, traits: { EntityAttributes: { name: 'M', parentId: 2, guid: '' } } }); return d; };
+      const deep = { ...extra(1), key: 'k-deep', name: 'Deep', traits: { EntityAttributes: { name: 'Deep', parentId: 0, guid: '' }, Transform: { x: 1, y: 0, z: 0 } } };
+      const oSlot = () => oRow({ nestedStructure: { 3: { added: [deep] } } });
+      install(q, pWithM(), oSlot());
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'Deep'), 'x', 5);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      install(oRow({}));
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(rows((await saved()).entry)[`/${gN}/${gM}/a+k-deep`]).toEqual({ traits: { Transform: { x: 5 } } });
+      install(oSlot());
+      expect(await rebaseStaleInstances()).toBe(1);
+      warn.mockRestore();
+      expect(x(inInstance(ROOT1, 'Deep'))).toBe(5);
+    });
+
+    it('a load of a REFERENCE node with no rows leaves nothing kept for it — no stale row back on disk (re-review 2)', async () => {
+      // Mutation: collect only reference nodes WITH `members` in `collectReferenceNodeRows` — the Ghost row kept by the
+      // first load is written back by the save of the second.
+      const gRef = 'dddddddd-0000-4000-8000-000000001550';
+      const ghost = 'eeeeeeee-0000-4000-8000-000000001551';
+      const refNode = (members?: Record<string, unknown>) => ({ parentLocalId: 1, guid: gRef, name: 'Ref', prefab: P, children: [],
+        traits: {}, ...(members ? { members } : {}) });
+      const sceneWith = (members?: Record<string, unknown>) => {
+        const sc = scene(P, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+        sc.entities[1]!.added = [refNode(members)];
+        return sc as unknown as SceneData;
+      };
+      install(pDoc());
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await load(sceneWith({ [`/${ghost}`]: { guid: 'ffffffff-0000-4000-8000-000000001552', name: 'Ghost', traits: { Transform: { x: 9 } } } }));
+      await load(sceneWith());
+      warn.mockRestore();
+      expect(JSON.stringify(((await serializeScene()) as unknown as SceneData).entities)).not.toContain(ghost);
+    });
+
+    it('the loader\'s ORDER: a kept `added: []` on N\'s root takes the template\'s nodes away before its node rows look for them', async () => {
+      // Mutation: skip the fresh-template-node deletion for a row's v16 `added` in `replayRowsLive` — Extra stays.
+      install(pDoc(), oNoN());
+      const sc = scene(O, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+      sc.entities[1]!.members = { [`/${gN}`]: { added: [] }, [`/${gN}/a+k-extra`]: { traits: { Transform: { x: 5 } } } };
+      await load(sc as unknown as SceneData); // no N in the template: both rows are orphans
+      install(withN());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(getAllEntities().filter((e) => e.name === 'Extra')).toEqual([]);
+      await reloadUnder(withN());
+      expect(getAllEntities().filter((e) => e.name === 'Extra')).toEqual([]); // what a reload shows too
+    });
   });
 
   it('#1516 rider: a scene removing ANOTHER trait leaves the row\'s removed trait to the row', async () => {

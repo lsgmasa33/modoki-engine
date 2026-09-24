@@ -19,7 +19,7 @@ import {
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 import { memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
-import { parseMemberRowKey, parseNodeRowKey, memberRowNodes, NODE_ROW_PREFIX } from '../core/assetRefRules';
+import { parseMemberRowKey, parseNodeRowKey, memberRowNodes } from '../core/assetRefRules';
 import { classifyFormatVersion } from '../core/formatVersion';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
 import { parseClipBankResult } from '../audio/clipBank';
@@ -1247,19 +1247,43 @@ type PrefabFileEntry = {
   nestedStructure?: NestedStructurePaths;
 };
 
+/** A prefab cache to read documents from: the runtime's by default, the editor's for the editor's rebuild. */
+type PrefabDocReader = (ref: string) => unknown;
+
+/** R2's orphan test — does the template at `source` still declare what the scene row keyed `key` names? — the ONE
+ *  spelling, for the load (`applyStoredMemberRows`) and the editor's rebuild (`settleKeptOrphans`, #1535), which
+ *  must leave the kept store exactly as a reload of the same scene would. A member row is backed while every
+ *  component of its key is a node the template tree still declares; a NODE row (#1516) while its frame's row adds
+ *  its key (`templateFrameKeys`, per frame).
+ *
+ *  Asked of the DOCUMENT, not of the live world, and that is the load-bearing part: a member the instance REMOVED
+ *  is absent from the world but still in the template, and its row is not an orphan. `complete` is false when a
+ *  document on the way was not cached — the answer is then "cannot tell", which the load does not report. */
+export function rowBackedTest(source: string, read: PrefabDocReader = getCachedPrefab): { backed(key: string): boolean; complete: boolean } {
+  const { guids: known, complete } = templateNodeGuids(source, read);
+  return {
+    complete,
+    backed: (key) => {
+      const node = parseNodeRowKey(key);
+      const parts = node?.frame ?? parseMemberRowKey(key);
+      return !!parts.length && parts.every((c) => known.has(c)) && (!node || !!templateFrameKeys(source, node.frame, read)?.has(node.nodeKey));
+    },
+  };
+}
+
 /** Every minted node identity the template at `prefabRef` declares, following its nested rows.
  *
  *  A membership SET, deliberately not a key walk: it answers "does this document still contain that
  *  node" and nothing else, so it cannot disagree with `memberRowKeysIn` about what a key IS. A third
  *  spelling of the identity walk is exactly what #1468 Phase 1 spent itself removing. */
-function templateNodeGuids(prefabRef: string): { guids: Set<string>; complete: boolean } {
+function templateNodeGuids(prefabRef: string, read: PrefabDocReader = getCachedPrefab): { guids: Set<string>; complete: boolean } {
   const guids = new Set<string>();
   const seen = new Set<string>();
   let complete = true;
   const walk = (ref: string): void => {
     if (!ref || seen.has(ref)) return;
     seen.add(ref);
-    const doc = getCachedPrefab(ref) as { entities?: PrefabFileEntry[] } | null;
+    const doc = read(ref) as { entities?: PrefabFileEntry[] } | null;
     // ⚠️ A nested prefab that is not cached is "I cannot tell", NOT "those nodes are gone". Without
     // this the caller reports every member of an uncached nested instance as a lost row — a loud,
     // wrong claim caused by a cache miss, on exactly the documents least able to afford one.
@@ -1284,18 +1308,18 @@ function templateNodeGuids(prefabRef: string): { guids: Set<string>; complete: b
  *  Per FRAME, not template-wide: a prefab-editor re-parent keeps a node's key, so a node moved from one row's
  *  frame into another's would otherwise read as backed where the scene's row names it, apply nowhere, and drop
  *  on the next save (close-out review F5). */
-function templateFrameKeys(prefabRef: string, frame: readonly string[]): Set<string> | null {
+function templateFrameKeys(prefabRef: string, frame: readonly string[], read: PrefabDocReader = getCachedPrefab): Set<string> | null {
   const keys = new Set<string>();
   const add = (nodes: readonly AddedEntity[] | undefined): void => {
     for (const n of nodes ?? []) { if (n?.key) keys.add(n.key); if (!n?.prefab) add(n?.children); }
   };
   const rows: PrefabFileEntry[] = [];
-  let doc = getCachedPrefab(prefabRef) as { entities?: PrefabFileEntry[] } | null;
+  let doc = read(prefabRef) as { entities?: PrefabFileEntry[] } | null;
   for (const component of frame) {
     const row = doc?.entities?.find((r) => r.nodeGuid === component && r.prefab);
     if (!row?.localId) return null;
     rows.push(row);
-    doc = getCachedPrefab(row.prefab!) as { entities?: PrefabFileEntry[] } | null;
+    doc = read(row.prefab!) as { entities?: PrefabFileEntry[] } | null;
   }
   // Row i's slot for the frame is keyed by the localIds of the rows BELOW it on the way down (`nestedPathKey`).
   rows.forEach((row, i) => {
@@ -1329,18 +1353,13 @@ export function keptMemberOrphans(rootGuid: string): Record<string, SceneMemberR
   return orphanMemberRows.get(rootGuid);
 }
 
-/** The rebuild's write-back of one frame's NODE-row orphans (#1516, close-out review F1/F2): every kept node row
- *  of frame `frameKey` in the instance whose root guid is `rootGuid` is replaced by `missed` — the rows the re-apply
- *  found no node for. A Refresh is the other route a template change reaches an open scene by, and a row the NEW
- *  template no longer backs must be kept exactly as a load keeps it (fork 2); one it backs again was applied, and
- *  is no longer an orphan. Member rows are untouched. */
-export function setKeptNodeRowOrphans(rootGuid: string, frameKey: string, missed: Record<string, SceneMemberRow>): void {
-  if (!rootGuid || !frameKey) return;
-  const prefix = `${frameKey}/${NODE_ROW_PREFIX}`;
-  const next: Record<string, SceneMemberRow> = {};
-  for (const [k, row] of Object.entries(orphanMemberRows.get(rootGuid) ?? {})) if (!k.startsWith(prefix)) next[k] = row;
-  for (const [k, row] of Object.entries(missed)) next[k] = row;
-  if (Object.keys(next).length) orphanMemberRows.set(rootGuid, next);
+/** Replace the orphan rows kept for the instance root with guid `rootGuid` — the editor rebuild's write-back
+ *  (`settleKeptOrphans`, #1535). A Refresh is the other route a template change reaches an open scene by, so it
+ *  must leave this store as a reload would: every row the NEW template no longer backs kept (fork 2), whatever
+ *  frame it is in, and every one it backs again applied and gone. */
+export function setKeptMemberOrphans(rootGuid: string, rows: Record<string, SceneMemberRow>): void {
+  if (!rootGuid) return;
+  if (Object.keys(rows).length) orphanMemberRows.set(rootGuid, rows);
   else orphanMemberRows.delete(rootGuid);
 }
 
@@ -1353,7 +1372,7 @@ export function clearKeptMemberOrphans(): void {
 /** One user-added REFERENCE node's stored member rows: its root's guid, the rows, the prefab it expands. */
 export type ReferenceNodeRows = [rootGuid: string, members: Record<string, SceneMemberRow>, source: string];
 
-/** Every user-added REFERENCE node in an `added[]` tree that stores member rows — the ONE spelling of
+/** Every user-added REFERENCE node in an `added[]` tree, with its stored member rows (`{}` when it stores none) — the ONE spelling of
  *  "where can a reference node's rows be", read by the loader to pin them and by `rebuildInstance` to
  *  carry them across a respawn (#1482). A reference node is its own row-writing root (`memberRowsIn`
  *  stops at it), so a walk of the instance around it never reaches these rows; each has to be pinned
@@ -1366,7 +1385,9 @@ export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[
   if (!Array.isArray(nodes)) return out;
   for (const n of nodes as AddedEntity[]) {
     if (!n || typeof n !== 'object') continue;
-    if (n.prefab && n.members && n.guid) out.push([n.guid, n.members, n.prefab]);
+    // Every reference node, rows or not: the load resets the kept-orphan store per root (R2), and a node whose file
+    // states no rows keeps none (#1535 close-out re-review — a stale set otherwise went straight back to disk).
+    if (n.prefab && n.guid) out.push([n.guid, n.members ?? {}, n.prefab]);
     collectReferenceNodeRows(n.added, out);
     collectReferenceNodeRows(n.children, out);
     for (const delta of Object.values(n.nestedStructure ?? {})) collectReferenceNodeRows(delta?.added, out);
@@ -1405,6 +1426,12 @@ function applyStoredMemberRows(
 ): void {
   const attrMeta = getTraitByName('EntityAttributes');
   if (!attrMeta) return;
+  if (!Object.keys(members).length) {
+    const root = findEntityById(rootEcsId, world) as EntityHandle | undefined;
+    const guid = durableGuid(root?.has(attrMeta.trait) ? (root.get(attrMeta.trait) as { guid?: string }).guid : '');
+    if (guid) orphanMemberRows.delete(guid);
+    return;
+  }
   for (const [ecsId, key] of memberRowKeysIn(rootEcsId, world)) {
     const row = members[key];
     if (!row) continue;
@@ -1427,16 +1454,14 @@ function applyStoredMemberRows(
   const root = findEntityById(rootEcsId, world) as EntityHandle | undefined;
   const rootGuid = durableGuid(root?.has(attrMeta.trait) ? (root.get(attrMeta.trait) as { guid?: string }).guid : '');
   if (!rootGuid) return;
-  const { guids: known, complete } = templateNodeGuids(source);
+  const { backed, complete } = rowBackedTest(source);
   const orphans: Record<string, SceneMemberRow> = {};
   let count = 0;
   for (const [key, row] of Object.entries(members)) {
     // A NODE row (#1516) orphans when the template no longer adds its node, and is kept exactly as a member
     // row is (fork 2, owner 2026-09-24): the node vanishes with the template, and a template that brings it
     // back brings the scene's edit back with it.
-    const node = parseNodeRowKey(key);
-    const parts = node?.frame ?? parseMemberRowKey(key);
-    if (parts.length && parts.every((c) => known.has(c)) && (!node || templateFrameKeys(source, node.frame)?.has(node.nodeKey))) continue;
+    if (backed(key)) continue;
     orphans[key] = row;
     count++;
   }
@@ -2985,7 +3010,10 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         attachEntityIdRefs(refsTo, detached, rootEcsId);
         // Deferred, not applied here: a nested instance below this one may still be expanding, and
         // the walk that finds a member's row key reads the finished ECS parent tree.
-        if (entry.members) storedMembers.push([rootEcsId, entry.members, source]);
+        // Every instance, rows or not: a load is what makes the kept-orphan store current for this root (R2), and
+        // one whose entry states no rows keeps none — a stale set left behind would be replayed by the editor's
+        // next rebuild (`settleKeptOrphans`, #1535 close-out review F4).
+        storedMembers.push([rootEcsId, entry.members ?? {}, source]);
         collectAddedRows(entry.added);
         for (const delta of Object.values(entry.nestedStructure ?? {})) collectAddedRows(delta?.added);
         for (const r of Object.values(entry.members ?? {})) collectAddedRows(memberRowNodes<AddedEntity>(r));

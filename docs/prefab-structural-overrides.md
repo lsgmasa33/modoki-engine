@@ -481,6 +481,10 @@ nestedStructure?: Record<string /* "4", "4.7" */, {
   key, with the chain's member tokens resolved. A reference
   node's live capture carries identity a template node does not: member rows' `guid`/`name`, and a
   display `name` no spawn applies. `withoutLiveIdentity` drops that identity before the compare.
+  It also drops the node's own `traits` and `children` from both sides (#1536). No spawn reads
+  them: `applyStructureCore` hands a reference node to `spawnNestedInstance` before its trait loop,
+  and the root's pose rides in `overrides`. The live capture always writes them empty, so a
+  hand- or agent-written template node that stated either was restated on every save.
   Without that, every template reference node read as edited, and the REBUILD respawned it from the
   capture too, so a refresh never delivered a template change to one. It keeps a member's `guid`
   only when a LIVE member holds it and does not derive it from the node's root. That is an identity
@@ -1069,12 +1073,8 @@ all, and every untouched sibling was pinned: a later template change to it never
   an orphan, warned and KEPT across saves by R2 exactly as a member row is, judged against the keys the
   template adds in THAT frame (`templateFrameKeys` — per frame, because a prefab-editor re-parent keeps a
   node's key, and a template-wide set read a node moved into another row's frame as still backed). So a
-  template that brings the node back brings the edit back. **A Refresh keeps the same rule for a frame it
-  captured**: the rebuild carries the frame's kept orphans with its node rows, applies any whose node is
-  back, and hands the rest to the kept store (`setKeptNodeRowOrphans`), so an orphan the editor shows
-  applied is no longer kept (close-out review F1/F2). ⚠️ A frame the Refresh spawns WHOLE (the old template
-  lacked its row) goes through no capture, and its kept rows are not replayed until the next load — #1535.
-  The Refresh finds a template REFERENCE node's root by its key too, so a scene deletion of one survives
+  template that brings the node back brings the edit back. A Refresh keeps the same rule, for member rows
+  and node rows alike — see R2 below. The Refresh finds a template REFERENCE node's root by its key too, so a scene deletion of one survives
   it (re-review R3b).
 - **A scene-deleted template node stays deleted** even if the template later edits it (fork 3).
 - **Refresh.** The rebuild runs the same diff against the baseline (`captureNestedInstanceOverridesIn`,
@@ -1089,8 +1089,7 @@ all, and every untouched sibling was pinned: a later template change to it never
   each channel.
 - **Not covered:** the prefab-side twin — a prefab nested row's `nestedStructure` slot still owns a whole
   frame (#1533, designed to reuse `diffFrameAdded`/`applyNodeRows`); field-level edits inside a template
-  reference node (and, after a Refresh, a template reference node reads as edited and its member's list is
-  restated — #1536); per-field Apply/Revert of a node row; a template node anchored at an owned NESTED
+  reference node; per-field Apply/Revert of a node row; a template node anchored at an owned NESTED
   row's localId (the loader puts it under that row's root, the capture attributes it to the inner frame, so
   the diff reads it as re-parented — seen only in a hand-authored fixture, no writer known to produce it). **A scene saved before v17 is not un-pinned by
   resaving it:** the v16 list is read as the scene's state, so every field of a pinned node that has since
@@ -1196,6 +1195,40 @@ reading a newer prefab, because nothing there saves.
   silently dropped (a silent drop is #1468 reproduced). A member the instance REMOVED is still in the
   template, so its row is not an orphan. This is why rows keep `name` (owner, 2026-09-23): an orphan's
   template member is gone, so only the row can name it in the log.
+  **A rebuild (Refresh, Apply, Revert, and each one's undo) leaves the kept store exactly as a reload
+  of the same scene would (#1535)**, because it is the other route a template change reaches an open
+  scene by. It used to keep only half: a row's guid, and the node rows of a frame it captured. So a
+  template that dropped a member and brought it back lost the scene's edit to it in the editor, at any
+  depth, while the file still held it. And a Refresh that DROPPED a member threw its row away, where a
+  reload keeps it for the template edit to be undone. `captureRowsForSettle` reads, before the teardown,
+  what a save would write for every frame the teardown destroys. It reads against the document the tree
+  was built from, not the cache's new one. After the re-apply it asks the loader's own orphan test
+  (`rowBackedTest`, one spelling for both) of the new template:
+  - a row it no longer backs is kept, minus any `added`/`own` node the re-apply RE-HOMED. An addition
+    whose anchor is gone moves to the instance root live (the Refresh reconciliation rule), and is saved
+    there. Kept in the row too, a restore of the member spawned it a second time, with the same guid.
+    ⚠️ This is the one place a Refresh and a reload still differ: a reload leaves such a node inside the
+    orphan row (gone until the member returns), while a Refresh keeps it at the root;
+  - a kept row it backs again is replayed onto its target and leaves the store (`replayRowsLive`: the
+    loader's fold, outside in, then node rows, then guids and moves). Left in, a save would re-emit it
+    over a later live edit;
+  - the rest stay.
+
+  The replay folds over an empty lower layer, where the loader folds over the chain's. So a trait the
+  row keeps that the CHAIN removed is added back from the target's template row: named by a `false` in
+  `traitRemovals`, or left out of a v16 `removedTraits` list. For an owned nested root, that is its child
+  document's root row. ⚠️ **Not replayed live:** a kept `removed: false`. The chain has already cut the
+  member from the fresh expansion, so there is nothing to apply it to. The row stays kept, the save
+  writes it, and it applies on the next load.
+
+  The store must be CURRENT for this to be safe, since a replay acts on whatever holds the key. So every
+  load resets it for every instance root and reference node it loads, an entry with no rows included (it
+  keeps none). The save capture is skipped only for a rebuild onto the SAME document with nothing kept
+  (a Revert, an undo's direct rebuild). A cheaper "can any row become unbacked" test is a second copy of
+  `rowBackedTest`: the first try compared only the changed document, missed a nested row's `prefab`
+  ref, and lost an edit.
+  ⚠️ A restored trait comes from the raw template row. Its member tokens are not rebased, the legacy
+  migrations are not run, and an inner layer's field override on it is not applied, until a reload.
 - **R3 — a template member with no row** derives, as before, and gets a row on the next save. This is
   the v15 → v16 migration path and the normal state of every older scene. No warning.
 - **R4 — a template re-parent** is not a reconciliation case under D1: nothing re-keys. It is also why

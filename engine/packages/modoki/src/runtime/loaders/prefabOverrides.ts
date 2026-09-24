@@ -216,7 +216,7 @@ export function applyNodeRows<A extends KeyedNode<A>>(
 }
 
 /** Merge per-trait removal statements (`traitRemovals`) over a removal list. */
-function mergeTraitRemovals(list: readonly string[] | undefined, statements: Record<string, boolean>): string[] {
+export function mergeTraitRemovals(list: readonly string[] | undefined, statements: Record<string, boolean>): string[] {
   const out = new Set(list ?? []);
   for (const [t, v] of Object.entries(statements)) {
     if (v === true) out.add(t);

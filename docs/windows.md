@@ -1243,9 +1243,36 @@ screen — which is why `/api/reveal-in-finder` and `/api/open-file` now 404 a f
 
 ⚠️ **That check covers the missing-file cause only.** A file that exists behind a **dangling
 association** — a `.ts` whose handler points at an uninstalled editor — still raises the modal, and
-now the `cmd` behind it is detached, `unref`'d and orphaned while the route has already answered
+the launcher behind it is detached, `unref`'d and orphaned while the route has already answered
 `ok`. Accepted deliberately: the alternative is blocking the request forever, and a watchdog that
-killed the child would also kill a legitimately slow launcher.
+killed the child would also kill a legitimately slow launcher. (Measured with `cmd /c start`; the
+opener is `explorer` now — below — and this case has not been re-measured with it.)
+
+⚠️ **`openInOS` never hands a path to `cmd`.** `cmd /c start "" <path>` parses its command line as
+shell text, and Node only quotes an argument holding a space: a file or folder name containing `&`
+ran the rest of the path as a **second command**, `%OS%` expanded and `^` vanished — command
+injection from a file name, with the route still answering `ok` (found in review with a harmless
+`echo`, 2026-09-24). `explorer <file>` opens a file with its default app just as `start` does, and
+no shell reads the path: from a folder named `R&D %OS% ^x o'b`, `explorer` delivered the exact path
+to the app while `start` opened nothing. The real-binary open test now opens from a folder with
+every one of those characters and requires the path to arrive byte-for-byte.
+
+⚠️ **But explorer parses its OWN command line — pass the path quoted and verbatim, always.** `,` is
+its switch separator (`/select,`, `/root,`), and Node quotes an argument only when it holds a space,
+so `…\Game,v2\a.ts` reached explorer bare and opened **nothing** (measured; review finding). The
+first version of this fix passed every hostile test because each test folder had a space, which
+made Node quote it. `openInOS` now sends `"<path>"` with `windowsVerbatimArguments`, like reveal,
+and the open test's folder has a comma and deliberately NO space.
+
+⚠️ **`explorer /select,` needs the quotes around the PATH, not around the switch.** Node's
+default quoting wraps any argument containing a space whole — `"/select,C:\My Game\x.png"` — and
+explorer does not read that as `/select`: it opens the user's **Documents** folder instead, with
+the same meaningless exit code, so the reveal "succeeds" in the wrong place. So `revealInOS`
+passes `/select,"<path>"` with `windowsVerbatimArguments` (a Windows path cannot contain `"`).
+Measured: a space went to Documents, an apostrophe alone was fine, and the verbatim form reached
+the right folder for both. It hid because every fixture lived under a `%TEMP%` with no space —
+the real-binary reveal tests now use a folder named with a space AND an apostrophe, the shapes
+real project paths have.
 
 **darwin and linux deliberately still await the exit code** — there `open`/`xdg-open` return
 non-zero for a path they cannot open, and flattening the platforms would trade a real 500 for a
@@ -1281,7 +1308,7 @@ on the win clone: 29 leftover gate/probe tabs in Notepad's session store
 for files the scratch-dir cleanup had already removed. Cleaning up would have meant driving the owner's own
 Notepad, where a stray keystroke closes one of THEIR tabs. So the test registers a throwaway
 per-user association instead: a unique `HKCU\Software\Classes\.<stamp>` whose `open` verb shows a
-window titled from `%1`. It still exercises `cmd /c start` → shell association → app launch, the
+window titled from `%1`. It still exercises the real launcher → shell association → app launch, the
 title proves the path arrived, and the window is always a new process the test can kill. What it
 gives up — ".txt opens in Notepad" — is machine configuration, not the code under test (owner's
 call, 2026-09-24).

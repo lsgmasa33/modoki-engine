@@ -82,16 +82,34 @@ describe('win32 — the launcher is not awaited (#1508, #1515)', () => {
     await expect(done).rejects.toThrow(/ENOENT/);
   });
 
-  it('reveals with explorer /select, and a backslashed path', async () => {
+  it('reveals with explorer /select, a backslashed path quoted on its own, passed verbatim', async () => {
     const child = nextChild();
-    const done = revealInOS('C:/proj/assets/hero.png');
+    const done = revealInOS('C:/My Game/assets/hero.png');
     child.emit('spawn');
     await done;
+    // Only the SHAPE is pinnable here; that explorer honours it is measured against
+    // the real binary in osOpenWin32.test.ts (a scratch dir with a space in its name).
     expect(spawnMock).toHaveBeenCalledWith(
       'explorer',
-      ['/select,C:\\proj\\assets\\hero.png'],
-      expect.objectContaining({ detached: true, stdio: 'ignore' }),
+      ['/select,"C:\\My Game\\assets\\hero.png"'],
+      expect.objectContaining({ detached: true, stdio: 'ignore', windowsVerbatimArguments: true }),
     );
+  });
+
+  it('opens through explorer, never cmd, with the path quoted by us and passed verbatim', async () => {
+    const child = nextChild();
+    // No space, on purpose: Node would leave this bare, and explorer splits on `,`.
+    const done = openInOS('C:/Game,v2/R&D%OS%^x.ts');
+    child.emit('spawn');
+    await done;
+    // `cmd /c start` parsed the path as shell text (`&` ran the rest as a command,
+    // `%OS%` expanded); explorer is not a shell but splits its own line on `,`.
+    expect(spawnMock).toHaveBeenCalledWith(
+      'explorer',
+      ['"C:\\Game,v2\\R&D%OS%^x.ts"'],
+      expect.objectContaining({ detached: true, stdio: 'ignore', windowsVerbatimArguments: true }),
+    );
+    expect(spawnMock.mock.calls[0][2]).not.toHaveProperty('shell', true);
   });
 
   it('never awaits an exit code on this platform — execFile is not used', async () => {
