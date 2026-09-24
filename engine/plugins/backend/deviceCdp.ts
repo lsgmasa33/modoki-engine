@@ -36,6 +36,9 @@
  * Failure handling is deliberately NOT uniform, because "retry via synthetic" is only safe when
  * nothing landed:
  *   - no session / an app predating `resolve-aim` / nothing dispatched → fall back, WITH a reason;
+ *     that includes a process whose pages cannot be told apart (#1530, `pickAppPage`) — one devtools
+ *     socket serves every WebView in the app, an ad SDK's included, so the page is chosen by
+ *     identity and never by list position;
  *   - the page refused the aim (bad selector, occluded)                → that `Error: …`, verbatim;
  *   - a CDP failure AFTER at least one event landed                    → a refusal naming the risk,
  *     never a fallback: a half-sent gesture leaves a finger down, and falling back would deliver a
@@ -46,6 +49,7 @@ import { execFileSync } from 'child_process';
 import { adbArgs, adbBinary, forwardOwner } from './androidDevices';
 import { domCodeForKey, normalizeKeyName } from '../../tools/shared/inputVocabulary';
 import { SYNTHETIC_BANNER_OPENING } from '../../tools/shared/deviceRefusal';
+import { createTeardownToken } from '../../packages/modoki/src/runtime/core/liveness';
 
 import {
   decodeAimReply, resolveAimViaDevice, aimAsResolved, STALE_APP_REASON,
@@ -128,7 +132,7 @@ interface JsonListEntry { type?: string; webSocketDebuggerUrl?: string }
  *  sleeping device the socket can accept and then never answer — and this sits on the input path
  *  via `getDeviceCdpSession`, so an unbounded wait there hangs `device_tap` outright rather than
  *  merely making it slow. */
-const CDP_DISCOVERY_TIMEOUT_MS = 4000;
+export const CDP_DISCOVERY_TIMEOUT_MS = 4000;
 
 async function httpGetJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { signal: AbortSignal.timeout(CDP_DISCOVERY_TIMEOUT_MS) });
@@ -143,16 +147,42 @@ export interface DeviceCdpTarget {
   androidPackage?: string;
 }
 
+/** Real adb calls refused under vitest, for a test file to assert on (`_drainRefusedAdbForTests`). */
+const refusedAdbUnderTest: string[] = [];
+
+/** NO UNIT TEST MAY REACH REAL adb THROUGH THIS MODULE (#1530 close-out). Discovery's teardown runs
+ *  `removeForward` from places a test does not obviously reach — a `finally` inside discovery, a
+ *  `resetDeviceCdpSession` after a test restored its spies, a router test that leased an Android
+ *  mock and never stubbed this seam — and under vitest `MODOKI_BACKEND_PORT` is unset, so the port
+ *  was 9333 (the HUB's) or a sibling's, with no serial and so no #158 ownership check. `npm run
+ *  verify` on any clone could delete another clone's live CDP tunnel, silently, because every
+ *  teardown swallows adb errors. Stubbing each call site is the discipline that failed three times,
+ *  so the seam itself refuses. Checked BEFORE `adbBinary()`, so it holds on a machine with no
+ *  Android SDK too. Same shape as `wdaLauncher.ts` / `deviceClaimsStore.mjs` redirecting their
+ *  side effects under `process.env.VITEST`. A test that stubs a method replaces it whole and never
+ *  reaches this. */
+function refuseRealAdbUnderTest(what: string): void {
+  if (!process.env.VITEST) return;
+  refusedAdbUnderTest.push(what);
+  throw new Error(`deviceCdp: real adb (${what}) refused under vitest — stub deviceCdpAdb, and reset before restoring it`);
+}
+
+/** Test-only: the real adb calls refused since the last drain. Not called by production code. */
+export function _drainRefusedAdbForTests(): string[] { return refusedAdbUnderTest.splice(0); }
+
 /** adb calls behind an overridable seam (mirrors `adbRunner` in deviceConnection.ts) so discovery
  *  is unit-testable without a real device. */
 export const deviceCdpAdb = {
   listUnixSockets(serial?: string): string {
+    refuseRealAdbUnderTest('shell cat /proc/net/unix');
     return execFileSync(adbBinary(), adbArgs(serial, ['shell', 'cat', '/proc/net/unix']), { timeout: 4000, encoding: 'utf8' });
   },
   forward(localPort: number, socketName: string, serial?: string): void {
+    refuseRealAdbUnderTest(`forward tcp:${localPort}`);
     execFileSync(adbBinary(), adbArgs(serial, ['forward', `tcp:${localPort}`, `localabstract:${socketName}`]), { timeout: 4000, stdio: 'pipe' });
   },
   listForwards(): string {
+    refuseRealAdbUnderTest('forward --list');
     return execFileSync(adbBinary(), ['forward', '--list'], { timeout: 4000, encoding: 'utf8' });
   },
   /** Remove this clone's CDP tunnel — but ONLY if the rule on `localPort` belongs to `serial`.
@@ -166,6 +196,7 @@ export const deviceCdpAdb = {
    *  including a lease `disconnect()`, now goes through) and from `discoverDeviceCdpTarget` for a
    *  candidate that failed its probe (#160). */
   removeForward(localPort: number, serial?: string): void {
+    refuseRealAdbUnderTest(`forward --remove tcp:${localPort}`);
     if (serial) {
       let owner: string | undefined;
       try { owner = forwardOwner(deviceCdpAdb.listForwards(), localPort); }
@@ -202,16 +233,106 @@ function releaseCdpForward(): void {
   }
 }
 
+/** Why the most recent discovery declined an otherwise-reachable socket, when that reason is more
+ *  specific than "no socket" — read by `tryDeviceCdpInput` for the fallback banner. Reset at the
+ *  start of every discovery, so it never describes an older one. */
+let lastDiscoveryRefusal: string | null = null;
+
+/** What ONE page said when asked whether it is the app page (#1530). `no-answer` is every probe that
+ *  produced no verdict — a timeout, a refused connection, a dropped socket, or a CDP `error` reply
+ *  (Chrome answers "Cannot find default execution context" for a page mid-navigation, in about 1 ms).
+ *  It is kept apart from `other` because the two call for different readings: an ad WebView ANSWERS
+ *  `other`, while a game page that is reloading or stalled (a first-launch pipeline compile) gives no
+ *  verdict at all — and a banner calling that page "not the app page" would send the reader after the
+ *  wrong thing. */
+export type PageVerdict = 'app' | 'other' | 'no-answer';
+
+/** Why trusted input fell back when the app's process exposes several pages and they cannot be told
+ *  apart (#1530). Built from the verdicts so the banner says which case it was: no page claimed the
+ *  app, two did, or some never answered. It names "embedded WebViews" rather than blaming an ad SDK,
+ *  since the extra page is only known to be SOME WebView sharing the process. */
+export function ambiguousPageReason(verdicts: PageVerdict[]): string {
+  const app = verdicts.filter((v) => v === 'app').length;
+  const silent = verdicts.filter((v) => v === 'no-answer').length;
+  const found = app === 0 ? 'none of them answered as the Capacitor app page'
+    : `${app} of them answered as the Capacitor app page`;
+  const unanswered = silent ? ` (${silent} gave no verdict — timed out, refused the connection, or answered with a CDP error, `
+    + 'as a reloading or stalled page does, so not necessarily a foreign one)' : '';
+  return `the app's WebView process exposes ${verdicts.length} page targets (embedded WebViews, such as an ad `
+    + `SDK's, share its devtools socket) and ${found}${unanswered}, so a trusted touch could not be aimed `
+    + 'at the game without guessing which page it lands in (#1530)';
+}
+
+/** The expression that tells the app's page apart from every other WebView in its process (#1530).
+ *
+ *  Every WebView in an Android process shares ONE `webview_devtools_remote_<pid>` socket, so an app
+ *  that embeds an ad SDK (AppLovin MAX's banner, interstitial and consent form, and the idle
+ *  `about:blank` WebView it pre-creates) lists several `page` targets there. The aim is resolved by
+ *  the Modoki bridge, which answers through a Capacitor plugin — so the page that resolved it is, by
+ *  construction, the one carrying Capacitor's bridge. An SDK's WebView is a plain Android WebView
+ *  and has no `Capacitor` global. That makes this true on exactly the page the aim was computed in,
+ *  on every app build ever shipped, with no app-side marker to wait on. */
+const APP_PAGE_EXPRESSION = "typeof globalThis.Capacitor === 'object' && globalThis.Capacitor !== null "
+  + "&& typeof globalThis.Capacitor.getPlatform === 'function'";
+
+/** Ask ONE page whether it is the app page. Pure over a `CdpSender` so it is testable without a
+ *  socket. An ANSWER that is anything but a boolean `true` is `other` — an exception in the page, an
+ *  odd reply shape, a page whose Capacitor global is not defined (yet) — because a false "no" costs a synthetic fallback while a
+ *  false "yes" sends the touch to a page the game never sees, which is the defect this exists to
+ *  close. A send that throws (timeout, dropped socket, a CDP error reply) is left to the caller: that
+ *  is `no-answer`. */
+export async function isAppPage(sender: CdpSender): Promise<boolean> {
+  const reply = await sender.send('Runtime.evaluate', { expression: APP_PAGE_EXPRESSION, returnByValue: true }) as
+    { result?: { value?: unknown }; exceptionDetails?: unknown } | undefined;
+  return !reply?.exceptionDetails && reply?.result?.value === true;
+}
+
+/** The per-page probe behind an overridable seam (mirrors `deviceCdpAdb`), so discovery's CHOICE is
+ *  testable without opening a socket. Bounded by the discovery budget at both the connect and the
+ *  evaluate, for the reason `CDP_DISCOVERY_TIMEOUT_MS` gives, and the probe's own socket is closed on
+ *  every path — it is a second client on a page the session never uses. */
+export const deviceCdpPageProbe = {
+  async verdict(webSocketDebuggerUrl: string): Promise<PageVerdict> {
+    let session: DeviceCdpSession | null = null;
+    try {
+      session = await DeviceCdpSession.connect(webSocketDebuggerUrl, CDP_DISCOVERY_TIMEOUT_MS);
+      const probe = session;
+      return await isAppPage({ send: (m, p) => probe.send(m, p, CDP_DISCOVERY_TIMEOUT_MS) }) ? 'app' : 'other';
+    } catch {
+      return 'no-answer';
+    } finally {
+      session?.close();
+    }
+  },
+};
+
+/** Choose the page to dispatch into (#1530). ONE page is the app's by elimination and is taken
+ *  without a probe — that is every app without an embedded WebView, and it costs no extra round
+ *  trip. Several are probed IN PARALLEL, so discovery on the input path costs one probe budget
+ *  however many WebViews an SDK has open, and exactly one app page must answer: none or two is
+ *  ambiguous, and the answer is to refuse (→ synthetic, with the reason) rather than to fall back to
+ *  the first, because the first is precisely the guess that put a touch into an ad's WebView. */
+async function pickAppPage(pages: JsonListEntry[]): Promise<JsonListEntry | null> {
+  if (pages.length <= 1) return pages[0] ?? null;
+  const verdicts = await Promise.all(pages.map((page) => deviceCdpPageProbe.verdict(page.webSocketDebuggerUrl!)));
+  const appPages = pages.filter((_, i) => verdicts[i] === 'app');
+  if (appPages.length === 1) return appPages[0];
+  lastDiscoveryRefusal = ambiguousPageReason(verdicts);
+  return null;
+}
+
 /** Discover the ONE Modoki webview's CDP target on the connected Android device: enumerate
  *  `webview_devtools_remote_<pid>` sockets, forward each candidate to `localPort` in turn, and
  *  probe `/json/version` for its `Android-Package`. When `preferPackage` is given (the app the
  *  Modoki device lease already knows it's holding, via `app-identity`), the FIRST socket whose
  *  package matches wins; otherwise the single socket found wins (ambiguous with >1 candidate and
- *  no preference: refuse rather than guess which app to drive). Returns `null` — never throws —
+ *  no preference: refuse rather than guess which app to drive). Within the winning socket, the
+ *  PAGE is chosen by `pickAppPage` — one socket is one process, not one page (#1530). Returns `null` — never throws —
  *  on any failure (no adb, no device, no matching socket, port already in another use): the
  *  caller (`getDeviceCdpSession`) treats `null` as "no trusted route available", which is exactly
  *  the fallback-to-synthetic signal, not an error to surface. */
 export async function discoverDeviceCdpTarget(opts: { localPort: number; preferPackage?: string; serial?: string }): Promise<DeviceCdpTarget | null> {
+  lastDiscoveryRefusal = null;
   try {
     const sockets = parseWebviewSockets(deviceCdpAdb.listUnixSockets(opts.serial));
     if (sockets.length === 0) return null;
@@ -237,7 +358,7 @@ export async function discoverDeviceCdpTarget(opts: { localPort: number; preferP
         const pkg = version['Android-Package'];
         if (opts.preferPackage && pkg !== opts.preferPackage) continue;
         const list = await httpGetJson<JsonListEntry[]>(`http://127.0.0.1:${opts.localPort}/json/list`);
-        const page = list.find((e) => e.type === 'page' && e.webSocketDebuggerUrl);
+        const page = await pickAppPage(list.filter((e) => e.type === 'page' && e.webSocketDebuggerUrl));
         if (!page?.webSocketDebuggerUrl) continue;
         keep = true;
         ownedForward = { port: opts.localPort, ...(opts.serial ? { serial: opts.serial } : {}) };
@@ -311,11 +432,11 @@ export class DeviceCdpSession implements CdpSender {
    *  reference so the NEXT call re-discovers rather than reusing a dead socket. */
   onClose(cb: () => void): void { this.onCloseCb = cb; }
 
-  send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  send(method: string, params: Record<string, unknown> = {}, timeoutMs = CDP_REQUEST_TIMEOUT_MS): Promise<unknown> {
     if (this.closed) return Promise.reject(new Error('CDP session is closed'));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`CDP request timed out: ${method}`)); }, CDP_REQUEST_TIMEOUT_MS);
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`CDP request timed out: ${method}`)); }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try {
         this.ws.send(JSON.stringify({ id, method, params }));
@@ -414,6 +535,16 @@ let cachedPackage: string | null = null;
  *  lease holding phone B and drive the wrong device while reporting trusted input. */
 let cachedSerial: string | null = null;
 let inFlight: Promise<DeviceCdpSession | null> | null = null;
+/** Invalidated by every `resetDeviceCdpSession` (the shared #573 token). A reset cannot cancel a discovery already running — it
+ *  only drops `inFlight` — so a discovery that started before a lease let go would otherwise
+ *  finish after it and cache a session, and latch a forward, for a lease nobody holds any more. The
+ *  discovery captures it when it starts and checks it before it keeps anything.
+ *  (Pre-#1530 the window was two HTTP calls; #1530's per-page probes widened it to a probe budget.) */
+const sessionLiveness = createTeardownToken();
+/** The last discovery started, finished or not. Each new one waits for it: discovery forwards on
+ *  ONE per-clone port, and two running at once (a reset clears `inFlight`, so the next call starts a
+ *  second) would overwrite each other's rule on it. */
+let discoveryTail: Promise<unknown> = Promise.resolve();
 
 /** Get a live CDP session — reusing the cached one when it's still open, else discovering +
  *  connecting fresh. Returns `null` (never throws) when no trusted route is available for ANY
@@ -448,18 +579,38 @@ export async function getDeviceCdpSession(opts: CdpSessionOpts = {}): Promise<De
   if (cachedSession && !cachedSession.isClosed() && satisfies) return cachedSession;
   if (cachedSession && !satisfies) resetDeviceCdpSession();
   if (!inFlight) {
-    inFlight = (async () => {
+    const stillLive = sessionLiveness.capture();
+    const prior = discoveryTail;
+    // A holder, because the `finally` below must compare against the promise this very expression
+    // produces. It reads it only after the first `await`, by which time it has been stored.
+    const self: { run?: Promise<DeviceCdpSession | null> } = {};
+    self.run = (async () => {
       try {
+        await prior;   // never rejects: the body below catches everything
+        // Invalidated while QUEUED: nothing is latched yet, so there is nothing to release — and
+        // running anyway would shell to adb and open sockets for a lease that has let go, while the
+        // live caller queued behind this run waits for it. The refusal is cleared too: it can only
+        // be the stale run ahead of this one, describing pages of a lease that has let go.
+        if (!stillLive()) { lastDiscoveryRefusal = null; return null; }
         const localPort = resolveDeviceCdpPort();
         const target = await discoverDeviceCdpTarget({ localPort, preferPackage: opts.preferPackage, serial: opts.serial });
         if (!target) return null;
         let session: DeviceCdpSession;
+        // Invalidated during discovery: give back the forward it latched rather than connect a
+        // session nobody will keep.
+        if (!stillLive()) { releaseCdpForward(); return null; }
         try { session = await DeviceCdpSession.connect(target.webSocketDebuggerUrl); }
         catch (e) {
           // Discovery left a forward standing for a session that never opened — nothing else will
           // ever reference it, so release it here rather than leaking it until the next reset.
           releaseCdpForward();
           throw e;
+        }
+        if (!stillLive()) {
+          // Reset DURING the connect: keep nothing. The forward needs no release here — discovery
+          // latched it before this point, so the reset that invalidated this run already took it.
+          session.close();
+          return null;
         }
         session.onClose(() => { if (cachedSession === session) { cachedSession = null; cachedPackage = null; cachedSerial = null; } });
         cachedSession = session;
@@ -469,9 +620,11 @@ export async function getDeviceCdpSession(opts: CdpSessionOpts = {}): Promise<De
       } catch {
         return null;
       } finally {
-        inFlight = null;
+        if (inFlight === self.run) inFlight = null;  // a reset may already have made room for a newer one
       }
     })();
+    inFlight = self.run;
+    discoveryTail = self.run;
   }
   return inFlight;
 }
@@ -485,6 +638,8 @@ export async function getDeviceCdpSession(opts: CdpSessionOpts = {}): Promise<De
  *  webview pids — the same *mask a device swap* hazard the lease's own forward-removal exists to
  *  prevent. Closing the socket without removing the forward is half a teardown. */
 export function resetDeviceCdpSession(): void {
+  sessionLiveness.invalidateAll();
+  lastDiscoveryRefusal = null;
   cachedSession?.close();
   cachedSession = null;
   cachedPackage = null;
@@ -621,7 +776,12 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
   }
   const getSession = deps.getSession ?? getDeviceCdpSession;
   const session = await getSession({ preferPackage: deps.preferPackage, serial: deps.serial });
-  if (!session) return { handled: false, reason: NO_SESSION_REASON };
+  // A socket that was reached but whose pages could not be told apart gets its OWN reason (#1530):
+  // NO_SESSION_REASON says the socket is unreachable and sends the reader to adb and the build.
+  // Only when the REAL getter ran: the router injects `async () => null` for a non-Android lease,
+  // and a refusal left by an earlier Android discovery would then name pages that phone never had.
+  const refusal = deps.getSession ? null : lastDiscoveryRefusal;
+  if (!session) return { handled: false, reason: refusal ?? NO_SESSION_REASON };
 
   // How many CDP events actually LANDED. The distinction matters and a boolean set before the call
   // gets it wrong: `cdpTap`/`cdpDrag` send touchStart, hold, then touchEnd, so
