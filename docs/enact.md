@@ -144,6 +144,10 @@ the occlusion check could see, because `occluded:false` does not mean the same t
   engine has no business deciding what a game considers clickable. A game registers its own
   provider to opt in; only the editor's `scene-view` surface ships one today (its SceneView
   pointer-handler picking, hoisted into a shared function both the handler and the provider call).
+  The AIM must be computed in the same frame as that pick, or a clear aim is refused as covered:
+  SceneView's bounds provider projects through the same camera and draw rect the pick uses —
+  in "ui" mode the GAME camera into the letterbox, not the editor orbit camera (#1489;
+  [editor.md](editor.md) § SceneView modes).
   `scene-view` registers **two in general, three while the SceneView's "ui" preview mode is
   mounted** — the 2D canvas overlay (priority 10) and the 3D viewport, which overlap on screen —
   so `registerPickProvider` takes an explicit `priority` (higher consulted first, registration

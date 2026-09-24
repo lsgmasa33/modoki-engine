@@ -67,10 +67,11 @@ export function toLocalIdKey(key: string, doc: KeyDoc, readDoc: KeyDocReader): s
   };
   if (key.startsWith('+added.')) return key;
   if (key.startsWith('-removed.')) return one('-removed.', key.slice('-removed.'.length));
-  if (key.startsWith('-trait.')) {
-    const body = key.slice('-trait.'.length);
+  for (const prefix of ['-trait.', '+trait.']) {
+    if (!key.startsWith(prefix)) continue;
+    const body = key.slice(prefix.length);
     const dot = body.indexOf('.');
-    return dot < 0 ? key : one('-trait.', body.slice(0, dot), body.slice(dot));
+    return dot < 0 ? key : one(prefix, body.slice(0, dot), body.slice(dot));
   }
   if (key.startsWith('~moved.')) {
     const body = key.slice('~moved.'.length);

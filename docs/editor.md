@@ -1252,6 +1252,40 @@ derives basic hints from a koota schema's default values; it has no internal cal
 The gizmo mode (`translate | rotate | scale`) and space (`world | local`) live in
 `editorStore` and are shared by both modes via a toolbar.
 
+**The two modes draw the 3D layer through DIFFERENT cameras, and exactly one place picks which.**
+3D mode renders through the editor orbit camera over the whole canvas; UI mode renders the 3D
+layer through the **game** camera into a letterbox sized to the game aspect. `viewCamera()` /
+`viewProjection()` in `SceneView.tsx` return that camera and draw rect, and everything that maps
+between a client point and the scene reads them: the render loop, the click pick, the aim-rect
+bounds provider (`modoki_tap`, `get_scene_state bounds`), the gizmo's published handles and its
+pointer hit-test, and the marquee. The pure mapping is `viewportDrawRect` in
+`scene/sceneViewMath.ts`, which `computeUIModeNDC` is defined through. Two consequences are easy
+to miss:
+- **three's `TransformControls` listens to the canvas itself.** It maps its own hover and press
+  over the full canvas unless `gizmo.viewport` is set. The render loop sets it every frame from the
+  same draw rect (`transformControlsViewport`: lower-left origin, `null` in 3D mode). Without that, a
+  press in an empty letterbox bar grabbed a handle drawn elsewhere.
+- **Outside the draw rect is "nothing here".** A ray at NDC beyond ±1 still hits geometry, so a
+  click in a bar selected an entity the view does not show. The pick now returns nothing there.
+
+The UI-mode letterbox aspect comes from the store's `gameRect`, and GameView is its only writer.
+Its deferred ResizeObserver update is cancelled with the effect. Before that, a device → Free
+switch inside one frame let the old device's frame land after Free's zero rect, and the SceneView
+stayed letterboxed to a device no longer selected until the editor relaunched.
+
+Scar (#1489): the render, the pick and the gizmo camera switched on the mode, but the bounds
+provider kept the editor camera over the full canvas, and the gizmo pointer kept full-canvas NDC.
+In UI mode `modoki_tap` aimed where the editor camera would draw an entity and asked a pick that
+looks through the game camera. It was refused as OCCLUDED by whatever was behind, and passed or
+failed by coincidence. It looked like state building up on one editor, and two things did build
+up. The MODE is persisted, so an editor stays in `ui`. The stale `gameRect` above survived every
+smoke run's device-preset case, which shifted what the coincidence landed on. Two more things worth
+knowing:
+- In UI mode `modoki_focus_entity` moves the editor camera, which the view does not draw through.
+  It frames nothing you can see there, and the aim does not depend on it.
+- The smoke's UC3 taps in both modes. Its UI pass frames something ELSE on purpose, because an
+  aim that wrongly used the editor camera still passes while that camera happens to frame the target.
+
 ### ⚠️ The UI-mode measurement seam — THREE stacked coordinate spaces, and FOUR wrong fixes
 
 `UIResizeOverlay`'s drag math has produced a shipped defect four times, each fix plausible, each

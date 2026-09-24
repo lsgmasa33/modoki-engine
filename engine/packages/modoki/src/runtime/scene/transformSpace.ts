@@ -246,6 +246,17 @@ export function persistedTrsKeys(fields: Record<string, unknown>): (keyof TRS)[]
   return out;
 }
 
+const _qa = new THREE.Quaternion();
+const _qb = new THREE.Quaternion();
+/** Whether two Euler triples (XYZ) are the SAME orientation. Euler components are coupled, so a pose that
+ *  went through a matrix decomposition comes back in another spelling of one rotation — `ry: π` returns as
+ *  `(-π, ~0, -π)` — and a per-component compare reads two equal orientations as three different fields. */
+export function sameOrientation(a: Pick<TRS, 'rx' | 'ry' | 'rz'>, b: Pick<TRS, 'rx' | 'ry' | 'rz'>): boolean {
+  _qa.setFromEuler(_euler.set(a.rx, a.ry, a.rz));
+  _qb.setFromEuler(_euler.set(b.rx, b.ry, b.rz));
+  return 1 - Math.abs(_qa.dot(_qb)) <= 1e-9;
+}
+
 /** Merge only the fields the caller actually supplied over a base TRS.
  *
  *  A partial write must convert as a WHOLE POSE, not field-by-field: with a rotated parent, a

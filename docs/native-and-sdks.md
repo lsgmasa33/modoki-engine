@@ -6,7 +6,7 @@ See also [Architecture](./architecture.md).
 
 ## Standalone Capacitor Plugin Pattern (iOS SPM)
 
-Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 a plugin lives in one of two places. **Shared** plugins live under `engine/packages/` (`capacitor-game-debug`, `capacitor-modoki-ota`, `capacitor-modoki-iap`, `capacitor-appsflyer`, `capacitor-applovin-max`, `capacitor-modoki-system`) and reach each consuming game as a vendored tarball ([cross-game-infrastructure.md](./cross-game-infrastructure.md) § "The vendoring pipeline, and why it is tarballs"). **Per-game** plugins live under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-adjust`). ⚠️ `games/3d-test/packages/capacitor-applovin-max` is a per-game **fork** of the engine plugin: identical when Court's copy was promoted in #931, and deliberately not switched over, because vendoring it would put MAX into 3d-test's native build, where blank unit ids crash at init (#510). A package contains:
+Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 a plugin lives in one of two places. **Shared** plugins live under `engine/packages/` (`capacitor-game-debug`, `capacitor-modoki-ota`, `capacitor-modoki-iap`, `capacitor-appsflyer`, `capacitor-applovin-max`, `capacitor-modoki-system`) and reach each consuming game as a vendored tarball ([cross-game-infrastructure.md](./cross-game-infrastructure.md) § "The vendoring pipeline, and why it is tarballs"). **Per-game** plugins live under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-adjust`). ⚠️ `games/3d-test/packages/capacitor-applovin-max` is a per-game **fork** of the engine plugin: identical when Court's copy was promoted in #931, and deliberately not switched over, because vendoring it would put MAX into 3d-test's native build, where blank unit ids crash at init (#510). **It is frozen at the pre-#1494 API on purpose:** 3d-test never builds it natively, and its own `ads.ts`/`ads.test.ts` are written against the old surface, so syncing it would mean rewriting a non-shipping adapter for nobody. ⚠️ **Frozen means it still carries the defects #1494 fixed** — on iOS it never sets `revenueDelegate`, so `didPayRevenue` cannot fire; its load calls resolve before the ad loads; and it reloads natively on dismissal. Never ship it: move 3d-test onto the engine plugin instead. A package contains:
 
 - `Package.swift` — declares the native SDK as a **Swift Package Manager (SPM)** dependency (e.g. `AppLovin-MAX-Swift-Package`, `adjust/ios_sdk`).
 - `*.podspec` — CocoaPods fallback manifest (SPM is the primary path).
@@ -249,36 +249,100 @@ Current plugins and minimal usage:
 
 ### `capacitor-applovin-max` — AppLovin MAX
 
-Banner, MREC, interstitial, and rewarded ads + the mediation debugger. The core SDK is provided via SPM (iOS) / Gradle (Android).
+Banner, MREC, interstitial and rewarded ads, Google UMP consent, and the mediation debugger. The SDK
+comes from SPM (iOS) and Gradle (Android), pinned EXACTLY to one version on all three manifests
+(`Package.swift`, the podspec, `android/build.gradle`) — 13.6.4 as of #1494. The call-by-call contract
+is `src/definitions.ts`; what follows is what it cannot say. Shaped in #1494 to be driven by the engine's
+`runtime/core/adLifecycle.ts` through a game's `AdSdk` adapter (#1495 Weaveling, #1496 Court).
 
 ```typescript
 import { ApplovinMax } from 'capacitor-applovin-max';
 
-await ApplovinMax.showBanner({ adUnitId, position: 'bottom' });
-await ApplovinMax.loadInterstitial({ adUnitId });
-const { shown } = await ApplovinMax.showInterstitial();
-await ApplovinMax.showMediationDebugger();
+// Consent FIRST — after AppsFlyer's ATT prompt has settled, so the two launch-time asks never race.
+let consent = await ApplovinMax.requestConsentInfo();
+if (consent.status === 'REQUIRED' && consent.isConsentFormAvailable) consent = await ApplovinMax.showConsentForm();
+if (consent.canRequestAds) await ApplovinMax.initialize({ sdkKey, testDeviceAdvertisingIds });
+
+await ApplovinMax.loadInterstitial({ adUnitId });      // resolves when LOADED, rejects when it failed
+await ApplovinMax.showInterstitial({ placement });      // started — adDisplayed / adDisplayFailed / adHidden say the rest
+const { heightPx } = await ApplovinMax.showBanner({ adUnitId });
 ```
 
-⚠️ **A blank `adUnitId` is a CRASH, not a no-op** (#510). Loading or showing an ad with an
-empty id throws on the native **main thread** — outside any JS `try/catch` — and terminates the app.
-So a game's ad wrapper must gate on **the unit id it is about to pass**, per entry point; gating on
-the SDK key alone is not enough, because a configured key with unfilled unit ids is exactly the
-half-configured state that reaches the SDK.
+- **Consent is Google UMP, run by this plugin — not MAX's own Terms and Privacy Policy flow.** MAX's
+  flow can drive UMP itself, but AppLovin says that integration *"is opt-in and AppLovin will provide
+  you instructions on how you can enable this Google UMP integration"*, and the MAX dashboard has no
+  switch for it (checked 2026-09-24). So the plugin links `GoogleUserMessagingPlatform` (SPM) /
+  `com.google.android.ump:user-messaging-platform` directly, and exposes
+  `requestConsentInfo` / `showConsentForm` / `showPrivacyOptionsForm` — the same three steps as
+  `@capacitor-community/admob`, but NOT the same types: `debugGeography` is a string (`'eea'`), and the
+  result carries `privacyOptionsRequired: boolean` where AdMob's has a `privacyOptionsRequirementStatus`
+  string, so an adapter's `start()` ports step for step, not line for line. **MAX learns the answer from the IAB TCF string UMP writes on the
+  device** — there is no `setHasUserConsent` call to make. ⚠️ Two things outside the plugin make it
+  work: **UMP reads the AdMob app id** (`GADApplicationIdentifier` in Info.plist, the
+  `com.google.android.gms.ads.APPLICATION_ID` meta-data on Android), so a game dropping AdMob must KEEP
+  that key; and **the consent message published in the AdMob console must list AppLovin among its ad
+  partners**, or AppLovin gets no consent in the EEA.
+- **Loads settle on the AD, not on the call.** `loadInterstitial` / `loadRewardedAd` resolve on
+  `didLoad` and reject on `didFailToLoadAd` (code = MAX's error code); a second load while one is
+  pending rejects the first with code `superseded`. ⚠️ **A load while that ad is ON SCREEN rejects at
+  once with code `showing`**, because MAX ignores it without any callback ("Can not load another ad while
+  the ad is showing") and the call would hang — reachable when the lifecycle's show timeout schedules a
+  preload while a late-presenting ad is still up, which would leave that kind loading forever. **Nothing reloads by itself after a dismissal** —
+  the caller owns preloading (the lifecycle does it on `dismissed`, with its own back-off), because two
+  owners would double every load. MAX does refresh an EXPIRED loaded ad on its own
+  (`MAAdExpirationDelegate`), so an adapter need not age ads out the way AdMob's one-hour expiry forces.
+- **A failed show is `adDisplayFailed`, not `adLoadFailed`** — the ad HAD loaded; conflating the two
+  made a failed presentation look like a no-fill. Every `AdInfo` carries `format` (`banner` covers the
+  LEADER MAX serves through a banner unit on a tablet) and `currency: 'USD'`: **MAX's `revenue` is
+  already US dollars in major units**, the unit `AdRevenue.value` uses, so an adapter passes it straight
+  through — AdMob's micros are the ones that need dividing.
+- **The banner is anchored adaptive and sizes itself from the width it is actually given.** iOS pins a
+  host view to the view's SAFE AREA with Auto Layout (not a frame from `UIScreen` bounds, which is how
+  #1316's iPad-landscape overlap happened); Android puts a host at the bottom of the content view,
+  padded by the system-bar insets it is dispatched (edge-to-edge on Android 15+). Its height is
+  `adaptiveSize(forWidth:)` — 50–90 pt, never over 15% of the screen height — and every change of the
+  laid-out size arrives as **`bannerLayout { heightPx, widthPx }`** (CSS px: iOS points, Android dp;
+  the ad's own height, not the inset under it). `showBanner` resolves with the height too, and is
+  idempotent: create-and-load once, then un-hide + resume refresh (re-load if the last load failed).
+  `hideBanner` hides and stops the refresh. The banner is created with MAX's
+  `allow_pause_auto_refresh_immediately`, without which `stopAutoRefresh` is ignored until the first ad
+  has loaded and a manual `loadAd` after a stop is refused (read from the 13.6.4 Android bytecode,
+  `MaxAdViewImpl`). It does NOT abort a refresh already in flight: that one completes, and its failure
+  still arrives as `adLoadFailed` for a banner the game has hidden. **A banner load failure hides the view and stops
+  its refresh — the plugin does it, because MAX's SDK does not** (AdMob's removes its view). The
+  lifecycle's `bannerFailed` assumes the view is gone: left up, it could never be hidden again (the
+  game's later "no banner" diffs against a banner it believes is down), and an empty host over the
+  webview swallows every tap in the strip Weaveling gives back to the board (#1477). The next
+  `showBanner` re-loads and resumes the refresh.
+- **Unverified on a device (#1495/#1496 carry the checks):** the ad is requested for the WINDOW width
+  (`adaptiveWidth` is left at -1) while the view spans the safe-area width — equal in portrait, which is
+  all both games ship; under Weaveling's immersive Android mode, transient system bars may re-dispatch
+  insets and move the banner by the nav-bar height until they hide; after a FIRST-load failure on
+  Android, MAX schedules its own retry before the plugin's `stopAutoRefresh` runs, so a hidden banner
+  may retry and report a second failure (and a `showBanner` inside that window has its `loadAd`
+  refused until the retry fires); and `loadAd` + `startAutoRefresh` after a refresh failure may load
+  twice. None hangs anything — nothing awaits a banner load. Also a cost, not a defect: a
+  network-refresh failure hides a banner that was still showing a good ad, for the lifecycle's retry
+  wait (30 s), exactly as AdMob does.
+- ⚠️ **iOS revenue needs `revenueDelegate`, a separate property from `delegate`** — until #1494 the
+  plugin never set it, so `didPayRevenue` could not fire on iOS at all.
+- **Test devices are an `initialize` option** (IDFA / GAID). SDK 13 removed the setter after init, so
+  the old `setTestDeviceAdvertisingIds` (and `setIsAgeRestrictedUser`, also removed from the SDK) were
+  silent no-ops and are gone.
+- The reward event is emitted `retainUntilConsumed` on both platforms (#587), so a reward that lands
+  during a webview reload drains into the next realm instead of being dropped.
 
-⚠️ **Check the plugin signature — not every ad call takes an id, and the rule only bites on the
-ones that do.** **Read the plugin's `definitions.ts` for the call you are adding** rather than trusting a list
-here — this one has already been wrong once, and a hand-maintained enumeration in a doc whose
-thesis is "check the signature" is precisely what goes stale. As of writing, `loadInterstitial`,
-`loadRewardedAd`, `showBanner` and `showMRec` take an `adUnitId`, and those guards are crash
-guards; `showInterstitial`/`showRewardedAd` take only `{ placement }` and
-`hideBanner`/`showMediationDebugger` take nothing at all, so no blank id can reach the SDK through
-them — guarding those on the unit id is still right, but it is a *behavioural* "we never loaded
-one, so there is nothing to show", not a crash guard. Stating it as one (this doc did, briefly)
-teaches the next wrapper author to look for the wrong thing. `games/court/packages/app-services/src/ads.ts` is the
-reference shape (a `unit(kind)` accessor + a guard on every call that takes an id);
-`games/3d-test`'s had the warning in its banner and the check on the key only, which is how #510
-was filed. `hideBanner`/`showMediationDebugger` take no id and need no such guard.
+⚠️ **A blank `adUnitId` is a CRASH, not a no-op** (#510). Loading or showing an ad with an empty id
+throws on the native **main thread** — outside any JS `try/catch` — and terminates the app. So an
+adapter gates **per entry point on the unit id it is about to pass** (the `AdSdk.enabled()` +
+`has(kind)` pair in `adLifecycle.ts`); gating on the SDK key alone is not enough, because a configured
+key with unfilled unit ids is exactly the half-configured state that reaches the SDK. **Read
+`definitions.ts` for which calls take an id** rather than trusting a list here: `showInterstitial` /
+`showRewardedAd` / `hideBanner` take none, so a guard there is behavioural ("nothing was loaded"), not
+a crash guard.
+
+⚠️ `games/3d-test/packages/capacitor-applovin-max` is a fork frozen at the PRE-#1494 API on purpose —
+see the note at the top of this doc.
 
 ### `capacitor-adjust` — Adjust (SDK v5)
 
@@ -477,16 +541,9 @@ four are fixed on `work-ai2`; check `git log`/the issues for whether that has re
 | #588 | Crashlytics rate-limit budgets are module state, so a cap named "per session" was really per realm while native counted one session | The three session budgets seed from `sessionStorage`; a `[reload]` breadcrumb now explains the discontinuity in a post-reload report |
 | #585 | litert-lm re-loads an already-ready model — Android never closes the old `Engine`, iOS peaks at 2× resident | **Closed, not planned** — the plugin was deleted in #1191. The JS guard that would have prevented it was a realm-scoped `let`, exactly the class above |
 
-⚠️ **#587's Court-side wiring is DORMANT in every build today, and the fix's stated motivation is
-therefore fixed for nobody yet.** `maxEnabled()` requires `APP_CONFIG.applovin.sdkKey !== ''` and the
-shipped config has `sdkKey: ''`, so `initAds()` returns before it can
-`registerReloadBlocker('court.fullscreenAd', …)` or attach the `adHidden`/`adLoadFailed` listeners,
-and `cleanupAds()`'s three `destroy*` calls sit behind the same gate. Every test that exercises this
-forces the gate open with `vi.mock('./config', …)`. So the banner/MREC surviving a reload and
-under-counting `ad_revenue` — the defect #587 describes — cannot happen right now, and the first
-real exercise of the mechanism will be the day a key is added, with no device evidence behind it.
-The engine-side registry (`realmShutdown.ts`) IS live; it is the Court consumer that is gated off.
-Worth knowing before anyone reads #587 as "ads teardown is proven".
+**#587's Court-side MAX wiring no longer exists** — Court moved to AdMob (#1312) and dropped the plugin
+(#342); ads teardown is now `adLifecycle.ts`'s `cleanup()`, reached from the same realm-shutdown task.
+MAX returns through that lifecycle (#1494-#1496), not through the wiring #587 described.
 
 ⚠️ **The `pagehide` backstop's `event.persisted === false` gate (`engine/app/useBackgroundFlush.ts`) is an ANDROID
 measurement shipping on iOS too, and the iOS behaviour is still UNOBSERVED (#611).** `pagehide`

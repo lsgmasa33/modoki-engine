@@ -481,7 +481,7 @@ interface PrefabParams {
   entityGuid?: string;
   /** apply/revert: the override keys to act on (see `overrides`'s `keys.all` for the exact
    *  strings — `"<member>.trait.field"` / `"+added.<guid>"` / `"-removed.<member>"` /
-   *  `"-trait.<member>.<name>"` / `"~moved.<member>"`, `<member>` a nodeGuid or, for a pre-v5
+   *  `"-trait.<member>.<name>"` / `"+trait.<member>.<tag>"` / `"~moved.<member>"`, `<member>` a nodeGuid or, for a pre-v5
    *  template, a localId; `prefabOverrideKeys.ts`). Omitted ⇒ ALL current overrides on the instance. */
   keys?: string[];
 }
@@ -2937,10 +2937,11 @@ export function registerEditorAgentOps(): void {
         const applied = [...keySet].filter((k) => !skippedKeys.includes(k));
         return {
           ok: true, source: result.source, appliedKeys: applied,
-          // skippedReason speaks for the excluded FIELDS only; each skipped move carries its own in skippedMoves.
+          // skippedReason speaks for the excluded FIELDS only; every other key Apply did not write (a move it
+          // cannot express, a tag it cannot add — #1491) carries its own reason in notWritten.
           ...(skippedKeys.length > 0 ? { skippedKeys } : {}),
           ...(excluded.length > 0 ? { skippedReason: `fields ${excluded.join(', ')}: not representable in a prefab template (scene-only / runtime-only field)` } : {}),
-          ...(notWritten.length > 0 ? { skippedMoves: notWritten } : {}),
+          ...(notWritten.length > 0 ? { notWritten } : {}),
           promotedAdditions: result.promotedAdditions, saved: true,
           // An applied move changed member paths (#1437): which other files had their refs repaired, and which not.
           ...(result.memberPathsChanged ? { fileRepair: result.fileRepair ?? { failed: true } } : {}),

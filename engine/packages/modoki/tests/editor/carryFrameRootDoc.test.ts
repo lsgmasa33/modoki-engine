@@ -107,4 +107,37 @@ describe('a carried frame root keeps the document it was expanded from (#1483)',
     // Root only: the new world did not expand `kit`, so its per-source record stays empty.
     expect(ids.frameDocReader(getCurrentWorld(), () => undefined)('kit')).toBeUndefined();
   });
+
+  // #1493: the hot reload's rebase rebuilds a stale NESTED frame from this record, so a frame root BELOW the
+  // carried root must keep its own too. Mutation: skip the record for any entity but a carried top-level one.
+  it('a frame root INSIDE the carried subtree keeps its own record too — what a nested frame`s rebuild reads', async () => {
+    fetchResponses[L1] = {
+      id: '91000000-0000-4000-8000-000000000001', version: 12, baseScene: BASE_GUID, resources: [],
+      entities: [
+        { id: 1, traits: { EntityAttributes: { name: 'PRoot', guid: '91000000-0000-4000-8000-0000000000a1' }, Persistent: true } },
+        { id: 2, traits: { EntityAttributes: { name: 'NRoot', parentId: 1, guid: '91000000-0000-4000-8000-0000000000a2' } } },
+      ],
+    };
+    const sceneMod = await import('../../src/runtime/scene/SceneManager');
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const ids = await import('../../src/runtime/core/ecs/identityParents');
+    sceneMod.sceneManager.resetForTesting();
+
+    await sceneMod.sceneManager.loadScene(L1);
+    const find = (name: string) => {
+      let hit: unknown;
+      getCurrentWorld().query(EntityAttributes).updateEach(([a]: [{ name: string }], e: unknown) => { if (a.name === name) hit = e; });
+      return hit as Parameters<typeof ids.frameRootDoc>[1];
+    };
+    const outerDoc = { rootLocalId: 1, entities: [{ localId: 1 }, { localId: 2, prefab: 'inner' }] };
+    const innerDoc = { rootLocalId: 1, entities: [{ localId: 1 }, { localId: 2, nodeGuid: '91000000-0000-4000-8000-00000000d0c3' }] };
+    ids.noteFrameDoc(getCurrentWorld(), 'outer', outerDoc, find('PRoot'));
+    ids.noteFrameDoc(getCurrentWorld(), 'inner', innerDoc, find('NRoot'));
+
+    await sceneMod.sceneManager.loadScene(L2); // carries PRoot and everything under it
+    const nested = find('NRoot');
+    expect(nested).toBeDefined();
+    expect(ids.frameRootDoc(getCurrentWorld(), nested)).toEqual({ source: 'inner', doc: innerDoc });
+    expect(ids.frameRootDoc(getCurrentWorld(), find('PRoot'))).toEqual({ source: 'outer', doc: outerDoc });
+  });
 });

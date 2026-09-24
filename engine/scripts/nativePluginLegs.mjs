@@ -262,7 +262,9 @@ export const PLUGIN_CLASS_LEGS = [
   },
   { dir: 'engine/packages/capacitor-modoki-system', shape: 'spm' },
   // ⚠️ TWO copies of applovin-max still exist: the engine plugin above (promoted out of Court in
-  // #931) and 3d-test's game-owned fork, identical at the promotion but maintained by nobody since.
+  // #931) and 3d-test's game-owned fork, identical at the promotion but maintained by nobody since —
+  // and frozen at the pre-#1494 API ON PURPOSE: 3d-test's ads.ts/ads.test.ts use the old surface and
+  // nothing ships it (docs/native-and-sdks.md § top).
   // The fork keeps its own leg because it is on disk and compiles. It is NOT switched to the engine
   // tarball: 3d-test's root never declares the plugin, so it stays out of that game's native build,
   // and vendoring it in would put MAX there, where blank unit ids crash at init (#510).

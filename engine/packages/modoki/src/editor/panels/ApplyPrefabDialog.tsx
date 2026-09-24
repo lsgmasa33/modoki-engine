@@ -29,8 +29,8 @@ import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
 import { MixedCheckbox } from './assetViews/widgets';
 import {
-  collectInstanceOverrideFields, addedKey, removedEntityKey, removedTraitKey, movedKey, applyOutcomeNotice, nestedFrameMoves, documentMemberRefs,
-  type EntityOverrideNode,
+  collectInstanceOverrideTree, addedKey, removedEntityKey, removedTraitKey, movedKey, applyOutcomeNotice, nestedFrameMoves, documentMemberRefs,
+  type EntityOverrideNode, type AddedTagNode,
 } from '../scene/prefabOverrideKeys';
 import { ModalShell } from '../components/ModalShell';
 
@@ -52,7 +52,7 @@ interface Structural {
 type LoadState =
   | { kind: 'loading' }
   | { kind: 'error'; message: string }
-  | { kind: 'ready'; entities: EntityNode[]; structural: Structural };
+  | { kind: 'ready'; entities: EntityNode[]; addedTags: AddedTagNode[]; structural: Structural };
 
 function stringifyValue(v: unknown): string {
   if (typeof v === 'number') {
@@ -202,18 +202,19 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       // console.warn (#1284).
       await preloadNestedPrefabsForSubtree(rootInstanceId);
       if (cancelled) return;
-      const entities = collectInstanceOverrideFields(rootInstanceId, prefab);
+      const { entities, addedTags } = collectInstanceOverrideTree(rootInstanceId, prefab);
       const structural = buildStructural(rootInstanceId, prefab);
       if (cancelled) return;
       const allKeys = new Set<string>();
       for (const e of entities) for (const t of e.traits) for (const f of t.fields) allKeys.add(f.key);
+      for (const t of addedTags) allKeys.add(t.key);
       for (const node of structural.added) allKeys.add(addedKey(node.guid));
       for (const r of structural.removedEntities) allKeys.add(r.key);
       for (const r of structural.removedTraits) allKeys.add(r.key);
       for (const r of structural.moved) allKeys.add(r.key);
       setChecked(allKeys);
       setCollapsed(new Set());
-      setLoadState({ kind: 'ready', entities, structural });
+      setLoadState({ kind: 'ready', entities, addedTags, structural });
     })();
     return () => { cancelled = true; };
   }, [active, subject]);
@@ -224,6 +225,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     let checkedCount = 0;
     const tally = (key: string) => { total++; if (checked.has(key)) checkedCount++; };
     for (const e of loadState.entities) for (const t of e.traits) for (const f of t.fields) tally(f.key);
+    for (const t of loadState.addedTags) tally(t.key);
     for (const node of loadState.structural.added) tally(addedKey(node.guid));
     for (const r of loadState.structural.removedEntities) tally(r.key);
     for (const r of loadState.structural.removedTraits) tally(r.key);
@@ -437,6 +439,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             <div style={{ color: '#e74c3c', fontSize: 12, padding: 8 }}>{loadState.message}</div>
           )}
           {loadState.kind === 'ready' && loadState.entities.length === 0
+            && loadState.addedTags.length === 0
             && loadState.structural.added.length === 0
             && loadState.structural.removedEntities.length === 0
             && loadState.structural.removedTraits.length === 0
@@ -513,6 +516,27 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <span style={{ color: '#888', margin: '0 6px' }}>on</span>
               <span style={{ color: '#ddd' }}>{r.entityName}</span>
               <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId}</span>
+            </div>
+          ))}
+
+          {loadState.kind === 'ready' && loadState.addedTags.map((r) => (
+            <div key={r.key} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2 }}>
+              <span style={{ width: 14 }} />
+              <TriCheckbox
+                state={checked.has(r.key) ? 'on' : 'off'}
+                onChange={(next) => toggleKey(r.key, next)}
+                dataUiId={`prefab.dialog.item.${r.key}`} dataUiLabel={`${r.tag} on ${r.entityName}`}
+                title={isRevert
+                  ? 'Remove this tag from the instance'
+                  : 'Add this tag to the prefab base — affects all instances'}
+              />
+              {isRevert
+                ? <span style={{ color: '#e74c3c' }}>− remove&nbsp;</span>
+                : <span style={{ color: '#2ecc71' }}>+ added&nbsp;</span>}
+              <span style={{ color: '#5dade2' }}>{r.tag}</span>
+              <span style={{ color: '#888', margin: '0 6px' }}>on</span>
+              <span style={{ color: '#ddd' }}>{r.entityName}</span>
+              <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId} · tag</span>
             </div>
           ))}
 

@@ -121,7 +121,12 @@ export default function GameView({ uiLayer }: GameViewProps) {
     // Defer the store write to the next frame: a synchronous setState inside the
     // RO callback can re-lay-out within the same RO cycle ("ResizeObserver loop
     // completed with undelivered notifications").
+    // The deferred write dies with this effect — the same trap as the gameRect effect below: a
+    // Free → device switch inside one frame would otherwise let Free's panel size land after the
+    // device's size and stay (the device branch has no observer to correct it).
     let pending = false;
+    let raf = 0;
+    let disposed = false;
     let lastW = 0, lastH = 0;
     const ro = new ResizeObserver(([entry]) => {
       const { width, height } = entry.contentRect;
@@ -129,10 +134,10 @@ export default function GameView({ uiLayer }: GameViewProps) {
       lastW = width; lastH = height;
       if (pending) return;
       pending = true;
-      requestAnimationFrame(() => { pending = false; setGameViewSize(lastW, lastH); });
+      raf = requestAnimationFrame(() => { pending = false; if (!disposed) setGameViewSize(lastW, lastH); });
     });
     ro.observe(gameAreaRef.current);
-    return () => ro.disconnect();
+    return () => { disposed = true; cancelAnimationFrame(raf); ro.disconnect(); };
   }, [setGameViewSize, isFree, deviceW, deviceH]);
 
   // Play snapshots the authored world; Stop reverts to it (discarding play-mode
@@ -177,14 +182,23 @@ export default function GameView({ uiLayer }: GameViewProps) {
     update();
     // Defer to next frame — synchronous setStoreGameRect inside the RO callback
     // can re-lay-out within the same RO cycle (RO-loop warning).
+    // ⚠️ The deferred update must die with this effect. Disconnecting the observer does not cancel a
+    // frame it already scheduled, and that frame's `update` closes over THIS effect's device size:
+    // switching device → Free inside one frame (the smoke does iPhone-landscape → Custom → Free in
+    // ~25 ms) let it land AFTER Free's zero rect and pin a landscape letterbox in gameRect until the
+    // next relaunch. SceneView's UI mode letterboxes both its 3D render and its DOM preview to that
+    // aspect, so the stale rect squashed the scene under the HUD — the state that "built up across
+    // runs on one editor" in #1489.
     let pending = false;
+    let raf = 0;
+    let disposed = false;
     const ro = new ResizeObserver(() => {
       if (pending) return;
       pending = true;
-      requestAnimationFrame(() => { pending = false; update(); });
+      raf = requestAnimationFrame(() => { pending = false; if (!disposed) update(); });
     });
     ro.observe(gameAreaRef.current);
-    return () => ro.disconnect();
+    return () => { disposed = true; cancelAnimationFrame(raf); ro.disconnect(); };
   }, [isFree, deviceW, deviceH, setStoreGameRect]);
 
   const toggleOrientation = useCallback(

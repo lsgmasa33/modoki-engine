@@ -376,8 +376,8 @@ member's row: false overrides, and Apply wrote one member's value into another's
   invisible to both guards below.
 - **The reload rebuilds stale carried instances.** `adoptWorldReloadedFromDisk` (the editor's
   hot-reload hook, now awaited by `agentBridge.ts`) calls `rebaseStaleInstances()`. That runs the
-  refresh Apply uses on every stored instance root whose recorded document differs from the cache (by
-  content), deepest first. Kept bases are not the only carried roots: a `Persistent` root is carried
+  refresh Apply uses on every instance FRAME root, stored or owned nested (#1493), whose recorded
+  document differs from the cache (by content), deepest first. Kept bases are not the only carried roots: a `Persistent` root is carried
   whatever scene owns it. Everything the reload re-expanded from disk compares equal and is left
   alone. A world replaced while the nested prefabs load rebuilds nothing. A reload that is deferred
   (Play, a preview envelope) rebuilds when it finally runs, because the record, not a remembered
@@ -417,14 +417,66 @@ member's row: false overrides, and Apply wrote one member's value into another's
   template whose values changed is still captured on the right rows (the mark gate), and refusing on
   content would block Apply over any byte difference between two copies of one file.
 
-⚠️ **Rebuilt: the TOP frame only.** An instance whose only stale frame is a NESTED one is left alone
-by the rebase and by every refresh, and refused by Apply/Revert until a reload rebuilds it. The
-refusal reaches the Apply dialog's Revert as a toast and the agent op as `prefab revert refused`,
-because Revert's own `null` cannot carry a reason. The nested capture
-(`captureNestedInstanceOverridesIn`) reads the cached CHILD document, so a rebuild would carry that
-frame's edits onto the wrong rows. A runtime (Transient) frame is never judged: no capture reads it,
-and nothing would rebuild it to clear a refusal. The save still captures such a frame against the cached child
-document, which is the open half: #1493.
+**A stale NESTED frame is rebuilt by ITSELF (#1493), never through its outer instance.** The nested
+captures read the cached CHILD document: a rebuild's (`captureNestedInstanceOverridesIn`) and a save's
+(`captureNestedChannels`). So rebuilding the OUTER instance would carry a stale nested frame's edits
+onto the wrong rows. Rebuilding the nested root on its own does not have that problem, because its own
+capture reads its own record, like any other root's. That is also what Apply's fan-out already did to a
+nested root of the source it applied. The rebase lists every frame root and runs deepest first, so by
+the time an outer frame is rebuilt, every frame nested in it is current. The one exception is a frame the
+rebase skips, and the outer rebuild then refuses as well (see below). The issue's own proposal, which
+was to teach the outer nested capture to read each nested frame's record and translate its re-apply, was
+not needed. Before this, a nested frame was only detected. The rebase skipped it, and a dirty kept base
+was carried stale through every reload until it was saved. The save then wrote its edits onto other
+members: a nested member the scene had deleted came back on reload, and the member now holding its old
+number was deleted instead (OBSERVED, the "…so the SAVE" test below).
+
+⚠️ **Except a frame whose rebuild would reach OUTSIDE its own live subtree: it is left stale, not
+rebuilt (#1499).** `rebuildInstance`'s captures walk live children. Its teardown, though, also destroys
+three kinds of thing outside the subtree:
+- whatever the frame owns that was moved elsewhere in the instance (#1437);
+- a member of a user-added reference node that was moved out of that node, which stays linked;
+- every frame under either of those.
+
+All of these come back without their edits, or captured against the cached rows. There is also a
+fourth case: an OWNED root that was itself moved, rebuilt on its own, comes back unlinked from its
+row, and the save writes that row `removed`. The #1493 close-out reviews drove each of these. One
+of them was an edit in a stale frame under a moved member that landed on another member, after which
+the frame read as current, so Apply and Revert stopped refusing. So the rebase asks the teardown
+itself (`rebuildTeardown`, extracted from `rebuildInstance` for this, via `rebuildReachesOutside`)
+and skips such a frame, stored or owned, with a log naming #1499. That skip is also what keeps the
+loop safe. Every rebuild it runs destroys only its own subtree, which is deeper and already processed,
+so no later entry is dead or recycled at its turn. An earlier draft argued "a stored root owns nothing
+outside its subtree", and that was false: moving a member unlinks it only when it leaves the OUTERMOST
+instance. When the review drove the gap, a recycled id was rebuilt as the wrong prefab.
+
+⚠️ **A skipped frame keeps the pre-#1493 defect. That is not a neutral outcome.** It stays refused, and
+a save still captures it against the cache, so a renumbered prefab can put its edits on the wrong
+rows. The skip is chosen only because a rebuild there loses the edit outright. Apply's fan-out still
+rebuilds these shapes, which are older than #1493. A member moved WITHIN the frame's own subtree does
+not stop the rebuild. An earlier guard that skipped on any move left a common edit exposed to exactly
+that corruption. Allowing those moves exposed an ordering bug in the teardown, which the third review
+drove. The unpark pass ran once, ahead of the fixpoint. So a member of another frame, parked under one of
+ours, survived with its link stripped if that frame joined the teardown only later, for example a nested
+root moved under B while its member was moved under A. The save kept the stray copy. The unpark now runs
+inside the fixpoint, which fixes Apply's fan-out too.
+
+What still refuses: `refreshInstances` skips an outer root holding a stale nested frame, and Apply/Revert
+refuse it. That now happens only for a frame the rebase skipped (above), or while the cache has moved
+and no rebase has run: a direct cache write, or the window before the reload hook finishes. Otherwise a reload now
+clears it. The refusal reaches the Apply
+dialog's Revert as a toast and the agent op as `prefab revert refused`, because Revert's own `null`
+cannot carry a reason. A runtime (Transient) frame is never judged: no capture reads it, and nothing
+would rebuild it to clear a refusal.
+
+⚠️ **The save does not rebase for itself.** `serializeScene` is also the Play and timeline-preview
+snapshot and the before/after capture of Apply's undo, and a rebuild respawns entities, so it must not
+run inside them. A save is safe because every path that moves the cache under live instances brings
+those instances current first. The hot reload, leaving prefab-edit mode and Apply's undo call the rebase.
+Apply's fan-out refreshes each instance of the source from that instance's own record. NOT CHECKED: the cache writers that
+do not rebase, which are Create Prefab's Replace and its undo (`assetOps.ts`), the skin-rig prefab
+update (`skinPrefab.ts`) and the model regenerate (`ModelAssetView.tsx`), when other live instances of
+the prefab they rewrite exist. That applies to top frames and nested frames alike.
 
 ⚠️ **Wrong fix, reverted (#1468 Phase 4):** making the listed keys name members by their own live
 `nodeGuid` made it worse. The key then disagreed with the capture it named, and Revert moved A's

@@ -448,7 +448,7 @@ const DECLS: Record<string, Decl> = {
       + "'apply'/'revert' consume (collectInstanceOverrideKeys) and hands back the exact key "
       + "strings, so an agent can pick `keys` without guessing the "
       + '`"<member>.trait.field"` / `"+added.<guid>"` / `"-removed.<member>"` / '
-      + '`"-trait.<member>.<name>"` / `"~moved.<member>"` shapes, where `<member>` is the prefab '
+      + '`"-trait.<member>.<name>"` / `"+trait.<member>.<tag>"` (an added tag) / `"~moved.<member>"` shapes, where `<member>` is the prefab '
       + "member's minted nodeGuid (its localId only when the prefab predates format 5), so a key "
       + 'listed before a template re-save still names the same member after it; a localId-spelled '
       + 'key is still accepted. `apply`/`revert` act on ALL current overrides when '

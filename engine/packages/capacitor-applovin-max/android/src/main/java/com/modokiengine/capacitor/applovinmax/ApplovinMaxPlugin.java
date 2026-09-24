@@ -7,11 +7,16 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
 
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
+
 import com.applovin.mediation.MaxAd;
 import com.applovin.mediation.MaxAdFormat;
 import com.applovin.mediation.MaxAdListener;
 import com.applovin.mediation.MaxAdRevenueListener;
 import com.applovin.mediation.MaxAdViewAdListener;
+import com.applovin.mediation.MaxAdViewConfiguration;
 import com.applovin.mediation.MaxError;
 import com.applovin.mediation.MaxReward;
 import com.applovin.mediation.MaxRewardedAdListener;
@@ -21,35 +26,123 @@ import com.applovin.mediation.ads.MaxRewardedAd;
 import com.applovin.sdk.AppLovinPrivacySettings;
 import com.applovin.sdk.AppLovinSdk;
 import com.applovin.sdk.AppLovinSdkInitializationConfiguration;
+import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.google.android.ump.ConsentDebugSettings;
+import com.google.android.ump.ConsentInformation;
+import com.google.android.ump.ConsentRequestParameters;
+import com.google.android.ump.UserMessagingPlatform;
 
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * ⚠️ Threading: every field below is read and written on the UI thread only. Plugin methods arrive on
+ * Capacitor's background thread and hop to it; MAX delivers its callbacks there.
+ */
 @CapacitorPlugin(name = "ApplovinMax")
 public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, MaxAdListener, MaxRewardedAdListener, MaxAdRevenueListener {
 
+    /** Hosts the banner: pinned to the bottom (or top) of the content view, padded by the system bars. */
+    private FrameLayout bannerHost;
     private MaxAdView bannerAd;
+    /** The banner's last load failed, so the next `showBanner` re-loads rather than just resuming refresh. */
+    private boolean bannerLoadFailed = false;
+    /** The size last sent as `bannerLayout`, in dp. */
+    private int reportedBannerWidthDp = 0;
+    private int reportedBannerHeightDp = 0;
     private MaxAdView mrecAd;
     private MaxInterstitialAd interstitialAd;
     private MaxRewardedAd rewardedAd;
+    /** The `load*` call waiting for its ad's `onAdLoaded` / `onAdLoadFailed` — see `settleLoad`. */
+    private PluginCall pendingInterstitialLoad;
+    private PluginCall pendingRewardedLoad;
+
+    // MARK: - Helpers
+
+    /** A LEADER is what MAX serves through a banner unit on a tablet; to the caller it is the same slot. */
+    private static String formatName(MaxAdFormat format) {
+        if (format == MaxAdFormat.BANNER || format == MaxAdFormat.LEADER) return "banner";
+        if (format == MaxAdFormat.MREC) return "mrec";
+        if (format == MaxAdFormat.INTERSTITIAL) return "interstitial";
+        if (format == MaxAdFormat.REWARDED) return "rewarded";
+        return "unknown";
+    }
+
+    /** `onAdLoadFailed` carries only the unit id, so the format comes from which of OUR instances owns it. */
+    private String formatName(String adUnitId) {
+        if (interstitialAd != null && adUnitId.equals(interstitialAd.getAdUnitId())) return "interstitial";
+        if (rewardedAd != null && adUnitId.equals(rewardedAd.getAdUnitId())) return "rewarded";
+        if (bannerAd != null && adUnitId.equals(bannerAd.getAdUnitId())) return "banner";
+        if (mrecAd != null && adUnitId.equals(mrecAd.getAdUnitId())) return "mrec";
+        return "unknown";
+    }
 
     private JSObject adInfoToJson(MaxAd ad) {
         JSObject obj = new JSObject();
         obj.put("adUnitId", ad.getAdUnitId());
+        obj.put("format", formatName(ad.getFormat()));
         obj.put("networkName", ad.getNetworkName());
+        // MAX reports every network's revenue in US dollars, major units.
         obj.put("revenue", ad.getRevenue());
+        obj.put("currency", "USD");
         obj.put("revenuePrecision", ad.getRevenuePrecision());
         obj.put("creativeId", ad.getCreativeId() != null ? ad.getCreativeId() : "");
         obj.put("placement", ad.getPlacement() != null ? ad.getPlacement() : "");
         return obj;
     }
 
+    private static List<String> stringList(PluginCall call, String key) {
+        List<String> out = new ArrayList<>();
+        JSArray array = call.getArray(key);
+        if (array == null) return out;
+        for (int i = 0; i < array.length(); i++) {
+            String value = array.optString(i, null);
+            if (value != null) out.add(value);
+        }
+        return out;
+    }
+
     // MARK: - Banner
+
+    /** The anchored adaptive height, in dp, for a banner `widthPx` wide. */
+    private int bannerHeightDpFor(int widthPx) {
+        float density = getContext().getResources().getDisplayMetrics().density;
+        int widthDp = Math.round(widthPx / density);
+        if (widthDp <= 0 || bannerAd == null) return 0;
+        return bannerAd.getAdFormat().getAdaptiveSize(widthDp, getContext()).getHeight();
+    }
+
+    /**
+     * Size the ad view to the adaptive height for the width the host actually has, and report the size
+     * when it changed. Called on every host layout, so rotation and a resized window reach the banner.
+     */
+    private void applyBannerSize() {
+        if (bannerHost == null || bannerAd == null) return;
+        int widthPx = bannerHost.getWidth() - bannerHost.getPaddingLeft() - bannerHost.getPaddingRight();
+        int heightDp = bannerHeightDpFor(widthPx);
+        if (heightDp <= 0) return;
+        float density = getContext().getResources().getDisplayMetrics().density;
+        int heightPx = Math.round(heightDp * density);
+        ViewGroup.LayoutParams lp = bannerAd.getLayoutParams();
+        if (lp != null && lp.height != heightPx) {
+            lp.height = heightPx;
+            bannerAd.setLayoutParams(lp);
+        }
+        int widthDp = Math.round(widthPx / density);
+        if (widthDp != reportedBannerWidthDp || heightDp != reportedBannerHeightDp) {
+            reportedBannerWidthDp = widthDp;
+            reportedBannerHeightDp = heightDp;
+            JSObject data = new JSObject();
+            data.put("heightPx", heightDp);
+            data.put("widthPx", widthDp);
+            notifyListeners("bannerLayout", data);
+        }
+    }
 
     @PluginMethod
     public void showBanner(PluginCall call) {
@@ -58,30 +151,81 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
         Activity activity = getActivity();
 
         activity.runOnUiThread(() -> {
-            if (bannerAd == null) {
-                bannerAd = new MaxAdView(adUnitId, activity);
+            if (bannerAd != null) {
+                bannerHost.setVisibility(View.VISIBLE);
+                if (bannerLoadFailed) {
+                    bannerLoadFailed = false;
+                    bannerAd.loadAd();
+                }
+                // Always: a load does not resume a refresh that `hideBanner` or a failure paused.
+                bannerAd.startAutoRefresh();
+            } else {
+                boolean top = "top".equals(position);
+                ViewGroup content = activity.findViewById(android.R.id.content);
+
+                bannerAd = new MaxAdView(
+                    adUnitId,
+                    MaxAdViewConfiguration.builder().setAdaptiveType(MaxAdViewConfiguration.AdaptiveType.ANCHORED).build()
+                );
+                // Without this, `stopAutoRefresh` does nothing until the first ad has loaded, and a manual
+                // `loadAd` after a stop is refused — both of which the hide / re-load-after-failure paths
+                // need (AppLovin's documented stop → loadAd → startAutoRefresh sequence). A refresh already
+                // in flight when the banner is hidden still completes, and may still report a failure.
+                bannerAd.setExtraParameter("allow_pause_auto_refresh_immediately", "true");
                 bannerAd.setListener(this);
                 bannerAd.setRevenueListener(this);
 
-                int heightPx = (int) (50 * activity.getResources().getDisplayMetrics().density);
-                FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, heightPx);
-                params.gravity = "top".equals(position) ? Gravity.TOP : Gravity.BOTTOM;
-                bannerAd.setLayoutParams(params);
+                bannerHost = new FrameLayout(activity);
+                FrameLayout.LayoutParams hostParams = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                hostParams.gravity = top ? Gravity.TOP : Gravity.BOTTOM;
+                bannerHost.setLayoutParams(hostParams);
 
-                ViewGroup rootView = activity.findViewById(android.R.id.content);
-                rootView.addView(bannerAd);
+                // The first height, from the content view's current width, so the resolve below carries a
+                // real value; `applyBannerSize` corrects it on the host's own layout.
+                int initialHeightPx = Math.round(
+                    bannerHeightDpFor(content.getWidth()) * activity.getResources().getDisplayMetrics().density);
+                bannerAd.setLayoutParams(new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, initialHeightPx > 0 ? initialHeightPx : ViewGroup.LayoutParams.WRAP_CONTENT));
+                bannerHost.addView(bannerAd);
+
+                // Edge-to-edge (Android 15+ always): the window draws under the system bars, so the host
+                // pads itself by them. On an older, inset window these insets arrive already consumed
+                // (0), so the same code is a no-op there.
+                ViewCompat.setOnApplyWindowInsetsListener(bannerHost, (v, insets) -> {
+                    Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+                    v.setPadding(bars.left, top ? bars.top : 0, bars.right, top ? 0 : bars.bottom);
+                    // New side insets narrow the banner without changing the host's own width.
+                    v.post(this::applyBannerSize);
+                    return insets;
+                });
+                // A size change from inside a layout pass is applied on the next frame, not re-entrantly.
+                bannerHost.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+                    if (r - l != or - ol) v.post(this::applyBannerSize);
+                });
+
+                content.addView(bannerHost);
+                ViewCompat.requestApplyInsets(bannerHost);
+                bannerLoadFailed = false;
+                bannerAd.loadAd();
             }
-            bannerAd.loadAd();
-            bannerAd.setVisibility(View.VISIBLE);
-            call.resolve(ok());
+            JSObject result = ok();
+            int heightDp = reportedBannerHeightDp;
+            if (heightDp <= 0 && bannerAd != null && bannerAd.getLayoutParams() != null && bannerAd.getLayoutParams().height > 0) {
+                heightDp = Math.round(bannerAd.getLayoutParams().height / activity.getResources().getDisplayMetrics().density);
+            }
+            result.put("heightPx", heightDp);
+            call.resolve(result);
         });
     }
 
     @PluginMethod
     public void hideBanner(PluginCall call) {
         getActivity().runOnUiThread(() -> {
-            if (bannerAd != null) bannerAd.setVisibility(View.GONE);
+            if (bannerAd != null) {
+                bannerHost.setVisibility(View.GONE);
+                bannerAd.stopAutoRefresh();
+            }
             call.resolve(ok());
         });
     }
@@ -90,11 +234,17 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
     public void destroyBanner(PluginCall call) {
         getActivity().runOnUiThread(() -> {
             if (bannerAd != null) {
+                bannerAd.setListener(null);
+                bannerAd.setRevenueListener(null);
                 bannerAd.destroy();
-                ViewGroup parent = (ViewGroup) bannerAd.getParent();
-                if (parent != null) parent.removeView(bannerAd);
-                bannerAd = null;
+                ViewGroup parent = (ViewGroup) bannerHost.getParent();
+                if (parent != null) parent.removeView(bannerHost);
             }
+            bannerAd = null;
+            bannerHost = null;
+            bannerLoadFailed = false;
+            reportedBannerWidthDp = 0;
+            reportedBannerHeightDp = 0;
             call.resolve(ok());
         });
     }
@@ -113,8 +263,10 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
     @PluginMethod
     public void setBannerPlacement(PluginCall call) {
         String placement = call.getString("placement", "");
-        if (bannerAd != null) bannerAd.setPlacement(placement);
-        call.resolve(ok());
+        getActivity().runOnUiThread(() -> {
+            if (bannerAd != null) bannerAd.setPlacement(placement);
+            call.resolve(ok());
+        });
     }
 
     // MARK: - MREC
@@ -126,7 +278,7 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
 
         activity.runOnUiThread(() -> {
             if (mrecAd == null) {
-                mrecAd = new MaxAdView(adUnitId, com.applovin.mediation.MaxAdFormat.MREC, activity);
+                mrecAd = new MaxAdView(adUnitId, MaxAdFormat.MREC, activity);
                 mrecAd.setListener(this);
                 mrecAd.setRevenueListener(this);
 
@@ -167,32 +319,59 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
         });
     }
 
+    // MARK: - Fullscreen loads
+
+    /**
+     * Settle a pending `load*` call. A load RESOLVES on `onAdLoaded` and REJECTS on `onAdLoadFailed`, so the
+     * caller awaits the ad itself instead of racing its own listener against the call.
+     */
+    private void settleLoad(String format, MaxError error, String rejectMessage, String rejectCode) {
+        PluginCall call;
+        if ("interstitial".equals(format)) {
+            call = pendingInterstitialLoad;
+            pendingInterstitialLoad = null;
+        } else if ("rewarded".equals(format)) {
+            call = pendingRewardedLoad;
+            pendingRewardedLoad = null;
+        } else {
+            return;
+        }
+        if (call == null) return;
+        if (error != null) call.reject(error.getMessage(), String.valueOf(error.getCode()));
+        else if (rejectMessage != null) call.reject(rejectMessage, rejectCode);
+        else call.resolve(ok());
+    }
+
     // MARK: - Interstitial
 
     @PluginMethod
     public void loadInterstitial(PluginCall call) {
         String adUnitId = call.getString("adUnitId", "");
         getActivity().runOnUiThread(() -> {
-            // ⚠️ Deliberately NOT destroying the previous instance here. Court's ads.ts calls
-            // showInterstitial() then immediately calls loadInterstitial() again to preload the
-            // next one — and showInterstitial's promise resolves right after showAd() is invoked,
-            // NOT after the ad is actually dismissed (onAdHidden fires later, once the player closes
-            // it). So a destroy-before-reassign here runs while the PREVIOUS instance is still ON
-            // SCREEN, tearing down its revenue listener (setRevenueListener below) mid-impression and
-            // silently dropping that impression's onAdRevenuePaid. If a previous instance ever needs
-            // destroying, do it through `destroyInterstitial` (used correctly by cleanupAds()) or by
-            // moving the preload call to fire from the onAdHidden callback instead — never here.
-            interstitialAd = new MaxInterstitialAd(adUnitId, getActivity());
-            interstitialAd.setListener(this);
-            interstitialAd.setRevenueListener(this);
+            settleLoad("interstitial", null, "a newer loadInterstitial replaced this one", "superseded");
+            // MAX IGNORES a load while its ad is on screen — no callback at all — so the call would never
+            // settle. Reachable: the lifecycle's show timeout can schedule a preload while a late-presenting
+            // ad is still up. Refuse it; the caller's back-off retries.
+            if (interstitialAd != null && adUnitId.equals(interstitialAd.getAdUnitId()) && interstitialAd.isShowing()) {
+                call.reject("the interstitial is on screen; load again after it is dismissed", "showing");
+                return;
+            }
+            // One instance per unit id, re-used for every load — MAX's own pattern.
+            if (interstitialAd == null || !adUnitId.equals(interstitialAd.getAdUnitId())) {
+                if (interstitialAd != null) interstitialAd.destroy();
+                interstitialAd = new MaxInterstitialAd(adUnitId, getActivity());
+                interstitialAd.setListener(this);
+                interstitialAd.setRevenueListener(this);
+            }
+            pendingInterstitialLoad = call;
             interstitialAd.loadAd();
-            call.resolve(ok());
         });
     }
 
     @PluginMethod
     public void destroyInterstitial(PluginCall call) {
         getActivity().runOnUiThread(() -> {
+            settleLoad("interstitial", null, "the interstitial was destroyed", "destroyed");
             if (interstitialAd != null) {
                 interstitialAd.destroy();
                 interstitialAd = null;
@@ -207,8 +386,8 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
         getActivity().runOnUiThread(() -> {
             JSObject result = new JSObject();
             if (interstitialAd != null && interstitialAd.isReady()) {
-                if (placement != null) interstitialAd.showAd(placement);
-                else interstitialAd.showAd();
+                if (placement != null) interstitialAd.showAd(placement, getActivity());
+                else interstitialAd.showAd(getActivity());
                 result.put("shown", true);
             } else {
                 result.put("shown", false);
@@ -222,8 +401,10 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
     public void setInterstitialExtraParameter(PluginCall call) {
         String key = call.getString("key", "");
         String value = call.getString("value", "");
-        if (interstitialAd != null) interstitialAd.setExtraParameter(key, value);
-        call.resolve(ok());
+        getActivity().runOnUiThread(() -> {
+            if (interstitialAd != null) interstitialAd.setExtraParameter(key, value);
+            call.resolve(ok());
+        });
     }
 
     // MARK: - Rewarded
@@ -232,11 +413,17 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
     public void loadRewardedAd(PluginCall call) {
         String adUnitId = call.getString("adUnitId", "");
         getActivity().runOnUiThread(() -> {
+            settleLoad("rewarded", null, "a newer loadRewardedAd replaced this one", "superseded");
+            // See loadInterstitial: MAX ignores a load while its ad is on screen, and the call would hang.
+            if (rewardedAd != null && adUnitId.equals(rewardedAd.getAdUnitId()) && rewardedAd.isShowing()) {
+                call.reject("the rewarded ad is on screen; load again after it is dismissed", "showing");
+                return;
+            }
             rewardedAd = MaxRewardedAd.getInstance(adUnitId, getActivity());
             rewardedAd.setListener(this);
             rewardedAd.setRevenueListener(this);
+            pendingRewardedLoad = call;
             rewardedAd.loadAd();
-            call.resolve(ok());
         });
     }
 
@@ -246,8 +433,8 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
         getActivity().runOnUiThread(() -> {
             JSObject result = new JSObject();
             if (rewardedAd != null && rewardedAd.isReady()) {
-                if (placement != null) rewardedAd.showAd(placement);
-                else rewardedAd.showAd();
+                if (placement != null) rewardedAd.showAd(placement, getActivity());
+                else rewardedAd.showAd(getActivity());
                 result.put("shown", true);
             } else {
                 result.put("shown", false);
@@ -261,11 +448,94 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
     public void setRewardedExtraParameter(PluginCall call) {
         String key = call.getString("key", "");
         String value = call.getString("value", "");
-        if (rewardedAd != null) rewardedAd.setExtraParameter(key, value);
-        call.resolve(ok());
+        getActivity().runOnUiThread(() -> {
+            if (rewardedAd != null) rewardedAd.setExtraParameter(key, value);
+            call.resolve(ok());
+        });
     }
 
-    // MARK: - Privacy
+    // MARK: - Consent (Google UMP)
+
+    private static String consentStatusString(int status) {
+        switch (status) {
+            case ConsentInformation.ConsentStatus.REQUIRED: return "REQUIRED";
+            case ConsentInformation.ConsentStatus.NOT_REQUIRED: return "NOT_REQUIRED";
+            case ConsentInformation.ConsentStatus.OBTAINED: return "OBTAINED";
+            default: return "UNKNOWN";
+        }
+    }
+
+    private JSObject consentInfo(boolean includeFormAvailability) {
+        ConsentInformation info = UserMessagingPlatform.getConsentInformation(getContext());
+        JSObject result = new JSObject();
+        result.put("status", consentStatusString(info.getConsentStatus()));
+        result.put("canRequestAds", info.canRequestAds());
+        result.put("privacyOptionsRequired",
+            info.getPrivacyOptionsRequirementStatus() == ConsentInformation.PrivacyOptionsRequirementStatus.REQUIRED);
+        if (includeFormAvailability) result.put("isConsentFormAvailable", info.isConsentFormAvailable());
+        return result;
+    }
+
+    @PluginMethod
+    public void requestConsentInfo(PluginCall call) {
+        Activity activity = getActivity();
+        if (activity == null) {
+            call.reject("No activity to request consent info from");
+            return;
+        }
+        ConsentDebugSettings.Builder debug = new ConsentDebugSettings.Builder(getContext());
+        for (String id : stringList(call, "testDeviceIdentifiers")) debug.addTestDeviceHashedId(id);
+        // UMP's values: 1 = EEA, 2 = not EEA. Anything else leaves the real geography in charge.
+        String geography = call.getString("debugGeography");
+        if ("eea".equals(geography)) debug.setDebugGeography(1);
+        else if ("not_eea".equals(geography)) debug.setDebugGeography(2);
+        ConsentRequestParameters params = new ConsentRequestParameters.Builder()
+            .setConsentDebugSettings(debug.build())
+            .setTagForUnderAgeOfConsent(Boolean.TRUE.equals(call.getBoolean("tagForUnderAgeOfConsent", false)))
+            .build();
+        activity.runOnUiThread(() ->
+            UserMessagingPlatform.getConsentInformation(getContext()).requestConsentInfoUpdate(
+                activity,
+                params,
+                () -> call.resolve(consentInfo(true)),
+                formError -> call.reject("Request consent info failed: " + formError.getMessage())
+            )
+        );
+    }
+
+    @PluginMethod
+    public void showConsentForm(PluginCall call) {
+        Activity activity = getActivity();
+        if (activity == null) {
+            call.reject("No activity to show the consent form from");
+            return;
+        }
+        if (!UserMessagingPlatform.getConsentInformation(getContext()).isConsentFormAvailable()) {
+            call.reject("Consent form not available");
+            return;
+        }
+        activity.runOnUiThread(() ->
+            UserMessagingPlatform.loadAndShowConsentFormIfRequired(activity, formError -> {
+                if (formError != null) call.reject("Consent form failed: " + formError.getMessage());
+                else call.resolve(consentInfo(false));
+            })
+        );
+    }
+
+    @PluginMethod
+    public void showPrivacyOptionsForm(PluginCall call) {
+        Activity activity = getActivity();
+        if (activity == null) {
+            call.reject("No activity to show the privacy options form from");
+            return;
+        }
+        activity.runOnUiThread(() ->
+            UserMessagingPlatform.showPrivacyOptionsForm(activity, formError -> {
+                if (formError != null) call.reject("Privacy options form failed: " + formError.getMessage());
+                else call.resolve();
+            })
+        );
+    }
 
     @PluginMethod
     public void setHasUserConsent(PluginCall call) {
@@ -281,12 +551,6 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
         call.resolve(ok());
     }
 
-    @PluginMethod
-    public void setIsAgeRestrictedUser(PluginCall call) {
-        // setIsAgeRestrictedUser removed in AppLovin SDK 13.x — no-op for compatibility
-        call.resolve(ok());
-    }
-
     // MARK: - SDK Settings
 
     @PluginMethod
@@ -295,6 +559,8 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
         AppLovinSdkInitializationConfiguration initConfig =
             AppLovinSdkInitializationConfiguration.builder(sdkKey, getContext())
                 .setMediationProvider("max")
+                // SDK 13 takes test devices only here — there is no setter after init.
+                .setTestDeviceAdvertisingIds(stringList(call, "testDeviceAdvertisingIds"))
                 .build();
         AppLovinSdk.getInstance(getContext()).initialize(initConfig, config -> {
             call.resolve(ok());
@@ -323,13 +589,6 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
     }
 
     @PluginMethod
-    public void setTestDeviceAdvertisingIds(PluginCall call) {
-        // setTestDeviceAdvertisingIds removed in AppLovin SDK 13.x
-        // Use MAX dashboard for test device configuration instead
-        call.resolve(ok());
-    }
-
-    @PluginMethod
     public void showMediationDebugger(PluginCall call) {
         AppLovinSdk.getInstance(getContext()).showMediationDebugger();
         call.resolve(ok());
@@ -337,36 +596,53 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
 
     @PluginMethod
     public void isReady(PluginCall call) {
-        JSObject result = new JSObject();
-        result.put("initialized", AppLovinSdk.getInstance(getContext()).isInitialized());
-        result.put("interstitialReady", interstitialAd != null && interstitialAd.isReady());
-        result.put("rewardedReady", rewardedAd != null && rewardedAd.isReady());
-        call.resolve(result);
+        getActivity().runOnUiThread(() -> {
+            JSObject result = new JSObject();
+            result.put("initialized", AppLovinSdk.getInstance(getContext()).isInitialized());
+            result.put("interstitialReady", interstitialAd != null && interstitialAd.isReady());
+            result.put("rewardedReady", rewardedAd != null && rewardedAd.isReady());
+            call.resolve(result);
+        });
     }
 
     // MARK: - Ad Callbacks
 
-    @Override public void onAdLoaded(MaxAd ad) { notifyListeners("adLoaded", adInfoToJson(ad)); }
+    @Override public void onAdLoaded(MaxAd ad) {
+        String format = formatName(ad.getFormat());
+        if ("banner".equals(format)) bannerLoadFailed = false;
+        settleLoad(format, null, null, null);
+        notifyListeners("adLoaded", adInfoToJson(ad));
+    }
     @Override public void onAdLoadFailed(String adUnitId, MaxError error) {
+        String format = formatName(adUnitId);
+        if ("banner".equals(format) && bannerAd != null) {
+            // Take the view down, as AdMob's SDK does on a failure: the lifecycle now believes no banner is
+            // up (`bannerFailed`), so a view left behind could never be hidden by it. The next `showBanner`
+            // re-loads.
+            bannerLoadFailed = true;
+            bannerHost.setVisibility(View.GONE);
+            bannerAd.stopAutoRefresh();
+        }
+        settleLoad(format, error, null, null);
         JSObject data = new JSObject();
         data.put("adUnitId", adUnitId);
+        data.put("format", format);
         data.put("errorCode", error.getCode());
         data.put("errorMessage", error.getMessage());
         notifyListeners("adLoadFailed", data);
     }
     @Override public void onAdDisplayed(MaxAd ad) { notifyListeners("adDisplayed", adInfoToJson(ad)); }
-    @Override public void onAdHidden(MaxAd ad) {
-        if (ad.getFormat() == com.applovin.mediation.MaxAdFormat.INTERSTITIAL && interstitialAd != null) interstitialAd.loadAd();
-        if (ad.getFormat() == com.applovin.mediation.MaxAdFormat.REWARDED && rewardedAd != null) rewardedAd.loadAd();
-        notifyListeners("adHidden", adInfoToJson(ad));
-    }
+    // No reload here: the caller owns when to load the next ad (it preloads on dismissal, with its own
+    // back-off), and a second owner would double every load.
+    @Override public void onAdHidden(MaxAd ad) { notifyListeners("adHidden", adInfoToJson(ad)); }
     @Override public void onAdClicked(MaxAd ad) { notifyListeners("adClicked", adInfoToJson(ad)); }
     @Override public void onAdDisplayFailed(MaxAd ad, MaxError error) {
         JSObject data = new JSObject();
         data.put("adUnitId", ad.getAdUnitId());
+        data.put("format", formatName(ad.getFormat()));
         data.put("errorCode", error.getCode());
         data.put("errorMessage", error.getMessage());
-        notifyListeners("adLoadFailed", data);
+        notifyListeners("adDisplayFailed", data);
     }
     @Override public void onAdExpanded(MaxAd ad) {}
     @Override public void onAdCollapsed(MaxAd ad) {}

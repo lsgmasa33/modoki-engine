@@ -10,6 +10,9 @@
  *   - `"+added.<guid>"`                — an added child subtree.
  *   - `"-removed.<member>"`            — a deleted prefab member.
  *   - `"-trait.<member>.<name>"`       — a component removed from a surviving member.
+ *   - `"+trait.<member>.<tag>"`        — a TAG added to a member (#1491). A tag has no fields, so it
+ *                                        cannot ride a field key; an added COMPONENT still does, since
+ *                                        Apply seeds its whole bag from them.
  *   - `"~moved.<member>"`              — a member moved to another parent inside the instance (#1437).
  *   - `"~moved.<row>.<row>…:<member>"` — a NESTED instance's member moved out of it, the rows naming the
  *                                        nested instance frame by frame.
@@ -45,6 +48,9 @@ export function removedEntityKey(member: number | string): string {
 }
 export function removedTraitKey(member: number | string, trait: string): string {
   return `-trait.${member}.${trait}`;
+}
+export function addedTagKey(member: number | string, tag: string): string {
+  return `+trait.${member}.${tag}`;
 }
 export function movedKey(member: number | string): string {
   return `~moved.${member}`;
@@ -82,6 +88,13 @@ export interface TraitNode {
   trait: string;
   fields: FieldNode[];
 }
+/** A tag the instance's member has and its row does not (#1491) — keyed `+trait.<member>.<tag>`. */
+export interface AddedTagNode {
+  localId: number;
+  entityName: string;
+  tag: string;
+  key: string;
+}
 export interface EntityOverrideNode {
   ecsId: number;
   parentEcsId: number; // live EntityAttributes.parentId — lets a caller nest children under parents
@@ -96,12 +109,23 @@ export interface EntityOverrideNode {
  *  omitted entirely — same as the dialog's tree, which only ever showed overridden
  *  rows. */
 export function collectInstanceOverrideFields(rootInstanceId: number, prefab: PrefabFile): EntityOverrideNode[] {
+  return collectInstanceOverrideTree(rootInstanceId, prefab).entities;
+}
+
+/** {@link collectInstanceOverrideFields}, plus the member diffs that are not fields: an added TAG
+ *  (#1491). The capture holds one as `{Tag: {}}` — a real override the scene save keeps — and the field
+ *  walk used to drop it for having no fields, so no surface listed it and it could be neither applied nor
+ *  reverted. ONE walk yields both, so the dialog and the agent op cannot disagree about which tags exist. */
+export function collectInstanceOverrideTree(rootInstanceId: number, prefab: PrefabFile): {
+  entities: EntityOverrideNode[]; addedTags: AddedTagNode[];
+} {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  if (!PrefabInstanceMeta) return [];
+  if (!PrefabInstanceMeta) return { entities: [], addedTags: [] };
   const allTraits = getAllTraits();
   const entityNameMeta = getTraitByName('EntityAttributes');
 
   const entries: EntityOverrideNode[] = [];
+  const addedTags: AddedTagNode[] = [];
   const resolveBase = baseTokenResolver(rootInstanceId); // #1352: a base ref held as a member token
   const refOf = documentMemberRefs(prefab);
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
@@ -138,6 +162,10 @@ export function collectInstanceOverrideFields(rootInstanceId: number, prefab: Pr
     const prefabEntity = prefab.entities.find((e) => e.localId === localId);
     const traitNodes: TraitNode[] = [];
     for (const [traitName, fields] of Object.entries(diffs)) {
+      if (getTraitByName(traitName)?.category === 'tag') {
+        addedTags.push({ localId, entityName: name, tag: traitName, key: addedTagKey(refOf(localId), traitName) });
+        continue;
+      }
       const fieldNodes: FieldNode[] = [];
       const base = (prefabEntity?.traits[traitName] as Record<string, unknown>) || {};
       for (const [field, current] of Object.entries(fields)) {
@@ -149,7 +177,8 @@ export function collectInstanceOverrideFields(rootInstanceId: number, prefab: Pr
   });
 
   entries.sort((a, b) => a.localId - b.localId);
-  return entries;
+  addedTags.sort((a, b) => a.localId - b.localId || a.tag.localeCompare(b.tag));
+  return { entities: entries, addedTags };
 }
 
 // ── Flat key enumeration (fields + structural), for a caller that only needs the
@@ -165,6 +194,8 @@ export interface InstanceOverrideKeys {
   removedEntities: string[];
   /** `"-trait.<member>.<name>"` keys. */
   removedTraits: string[];
+  /** `"+trait.<member>.<tag>"` keys — a tag added to a member (#1491). */
+  addedTags: string[];
   /** `"~moved.<member>"` keys — a member moved to another parent inside the instance (#1437) — and
    *  `"~moved.<nested row chain>:<member>"` for a NESTED instance's member moved out of it. Revert puts it
    *  back; Apply writes it into this prefab (a move it cannot express comes back in `ApplyResult.skipped`,
@@ -197,7 +228,9 @@ export interface InstanceOverrideKeys {
 }
 
 export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: PrefabFile): InstanceOverrideKeys {
-  const entities = collectInstanceOverrideFields(rootInstanceId, prefab);
+  const tree = collectInstanceOverrideTree(rootInstanceId, prefab);
+  const entities = tree.entities;
+  const addedTags = tree.addedTags.map((t) => t.key);
   const fields: string[] = [];
   const applyExcluded: string[] = [];
   for (const e of entities) {
@@ -229,8 +262,8 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
   ];
 
   return {
-    fields, added, removedEntities, removedTraits, moved,
-    all: [...fields, ...added, ...removedEntities, ...removedTraits, ...moved],
+    fields, added, removedEntities, removedTraits, addedTags, moved,
+    all: [...fields, ...added, ...removedEntities, ...removedTraits, ...addedTags, ...moved],
     applyExcluded, unaddressableAdded,
   };
 }
@@ -239,12 +272,14 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
  *  moves the prefab could not express, and other files whose refs to moved members were not repaired. */
 export function applyOutcomeNotice(result: Pick<ApplyResult, 'skipped' | 'memberPathsChanged' | 'fileRepair' | 'refused'>): string | null {
   // A REFUSAL is not a partial outcome and must not be worded as one: nothing was applied, and the
-  // line below would call it a "move" because a move is the only thing that has ever populated
-  // `skipped` (#1468). Reported alone, and first, because there is nothing else to say.
+  // line below would call it a "move" or a "change" (#1468). Reported alone, and first, because there
+  // is nothing else to say.
   if (result.refused) return `Apply to Prefab: nothing was applied — ${result.refused}.`;
   const parts: string[] = [];
   const skipped = result.skipped ?? [];
-  if (skipped.length) parts.push(`${skipped.length} move${skipped.length === 1 ? ' was' : 's were'} not applied: ${skipped.map((x) => x.reason).join('; ')}`);
+  // "move" only when every skipped key IS one: a tag (#1491) or a key naming no member is not.
+  const noun = skipped.every((x) => x.key.startsWith('~moved.')) ? 'move' : 'change';
+  if (skipped.length) parts.push(`${skipped.length} ${noun}${skipped.length === 1 ? ' was' : 's were'} not applied: ${skipped.map((x) => x.reason).join('; ')}`);
   if (result.memberPathsChanged) {
     if (result.fileRepair === null) parts.push('references to the moved members in other files could NOT be repaired — see the console');
     else if (result.fileRepair?.held.length) parts.push(`references in ${result.fileRepair.held.join(', ')} were not repaired: open with unsaved edits`);

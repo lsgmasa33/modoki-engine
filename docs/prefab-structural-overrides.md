@@ -255,6 +255,13 @@ its `localId` for a pre-v5 template (#1468 Phase 4, § Member identity below):
 - `"-removed.<member>"` — delete this entity from the prefab base.
 - `"-trait.<member>.<traitName>"` — delete this component from the prefab base
   (rendered as a *removed: TraitName* row under the member's node).
+- `"+trait.<member>.<tag>"` — add this TAG to the prefab base (#1491). A tag has no fields, so no
+  field key can carry it. The capture holds an added tag as `{Tag: {}}`, and the field walk used to
+  drop that entry for having no fields. The scene save kept the tag, but no surface listed it, and
+  Apply skipped a tag key with no `skipped` entry. `collectInstanceOverrideTree` is the one walk that
+  yields both field nodes and added tags, for the dialog and the agent op alike. An added COMPONENT
+  still rides field keys, because Apply seeds its whole bag from them. A tag key Apply cannot write
+  is named in `skipped`, and so is a tag spelled as a field key.
 
 ### Write (`applyToPrefabSelective`)
 
@@ -272,6 +279,34 @@ Operate on the deep-cloned `newPrefab`:
   that's fine — localIds must be *stable*, not contiguous.
 - **Remove component** — delete the named trait from
   `newPrefab.entities[localId].traits`.
+- **A row's POSE** is read and written by `rowPoseRead`/`rowPoseWrite` (#1490), because a reference
+  row (`prefab: <child>`) does not hold it in its own traits. Both loaders place a nested root from the
+  child prefab's root row, overlaid by the row's `overrides[<child rootLocalId>].Transform`, and neither
+  reads the reference row's `traits`. Every writer of a reference row puts only `EntityAttributes`
+  there. A plain row keeps its pose in `traits.Transform`. An Apply that wrote a moved nested root's
+  pose into `row.traits.Transform` placed the root in every instance without posing it. The removal
+  branch, which carries a kept row's pose through the rows it removes, read `row.traits.Transform` and
+  so carried nothing for a reference row.
+- **Every pose Apply writes into ANOTHER document's override is a layer** (`layerPose`): the reference
+  row's own root pose, and a nested member moved out of its instance (`~moved.<rows>:<member>`, into
+  `overrides` or `nestedOverrides`). The layer holds only what differs from its BASE, the pose the
+  documents below give the member: the member's own row, under whatever the rows in between set
+  (`resolveEffectivePrefabOverride`). A field that now equals the base is dropped. Writing the full
+  TRS froze the lower documents' later edits in the row. It also lost scene edits, because
+  `captureNestedSceneDelta` subtracts every field a row's override holds (#1498), so a scene edit to
+  any of those fields was dropped on save.
+- **Rotation is one orientation, not three fields** (`sameOrientation`, transformSpace.ts). Euler
+  components are coupled, and a decomposed pose comes back in another spelling of the same rotation:
+  `ry: π` becomes `(-π, ~0, -π)`. A per-field diff then pinned an equal rotation, or dropped `ry ≈ 0`
+  from a row that turned its instance around, which let a later child edit turn it. `layerPose`
+  writes all three components or none. The removal branch keeps the row's own spelling when the carry
+  did not change the orientation. A root with no Transform on either side (a UI root) gets none.
+  ⚠️ **The trade-off, until #1498 is fixed.** A row that rotates its member at all now holds all three
+  rotation components. The scene capture subtracts every field the row holds, by key (#1498), so a
+  scene edit to ANY rotation component of that member is dropped on save. A row holding only `ry`
+  would lose only `ry` edits. That was accepted because a partial rotation override is not sound: a
+  component dropped for equalling the base lets a later child edit turn the instance. The loss is the
+  capture's defect, and #1498 fixes it.
 
 The live instance's applied **added** entities are deleted from the live world
 before refresh (so the re-instantiated prefab member replaces them rather than
@@ -718,7 +753,9 @@ handed every edit to whichever member inherited the number, with nothing to say 
 - **Residual, pre-existing (#1483):** a live instance expanded from an OLDER document than the editor's
   cache (a kept base carried across a prefab reload, a deferred reload) is captured against the wrong
   rows. Keys deliberately come from the cached document so they agree with that capture — a key naming
-  the member by its own identity was tried and made Revert move an edit onto another member.
+  the member by its own identity was tried and made Revert move an edit onto another member. The hot
+  reload closes it by REBUILDING every such frame from its own record, nested frames included (#1493):
+  `prefabs.md` § "A capture reads the document the frame was EXPANDED from".
 
 **Apply/Revert keys name a member by `nodeGuid`** (`editor/scene/overrideKeyGrammar.ts`): keys are the
 one editor address that crosses CALLS — an agent lists them with `modoki_prefab overrides` and acts on
