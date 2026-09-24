@@ -326,7 +326,8 @@ async function render() {
     // `?.()`: a `--url` server with an older capture driver has no such call, and a render whose
     // frames are done must not fail on the check — it compares without the skip instead.
     const appLifetime = await page.evaluate(() => window.__modokiCapture.appLifetimeTypes?.() ?? []);
-    const { timeline: events, replay } = takeMod.replayEvents(take.expectedEvents, allEvents, bootSteps, opts.fps, appLifetime);
+    // `ForTake`: whether the take's events carry app-lifetime marks is read off the take (#1527).
+    const { timeline: events, replay } = takeMod.replayEventsForTake(take, allEvents, bootSteps, opts.fps, appLifetime);
     // One entry per give-up of the settle gate. From its frame on, frames may lack that content — a
     // give-up during boot (videoFrame 0, `duringBoot`) means the whole video may.
     const unsettled = (await page.evaluate(() => window.__modokiCapture.unsettled()))

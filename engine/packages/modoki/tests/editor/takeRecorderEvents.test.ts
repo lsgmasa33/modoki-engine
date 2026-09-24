@@ -92,6 +92,20 @@ describe('expectedEvents', () => {
     expect(take.expectedEvents[0]).toEqual({ t: expect.closeTo(0.04, 9), type: 'court.place', payload: { cell: 'a2' } });
     expect(take.expectedEvents[2].t).toBeCloseTo(0.04, 9);
   });
+
+  it('keeps an emission\'s app-lifetime mark, and adds none to the others (#1527)', async () => {
+    expect(await startTakeRecording(NO_INSETS)).toBeNull();
+    frame();
+    emit('court.store.products', { summary: '6/6' }, w, 'info', { appLifetime: true });
+    emit('court.store.products', { summary: '6/6' }, w);
+    frame();
+    await finishTakeRecording();
+    const take = JSON.parse(h.written[0].body);
+    expect(take.expectedEvents.map((e: { appLifetime?: boolean }) => e.appLifetime)).toEqual([true, undefined]);
+    // The take says its events carry marks, so its render does not fall back to #1524's whole-type skip.
+    expect(take.appLifetimeMarks).toBe(true);
+    expect(Object.hasOwn(take.expectedEvents[1], 'appLifetime')).toBe(false);
+  });
 });
 
 describe('onTakeSaved', () => {

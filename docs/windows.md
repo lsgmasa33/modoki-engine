@@ -1260,6 +1260,19 @@ and the real binary. The test that catches it spawns the real `explorer.exe`
 (2026-09-24), at the cost of an Explorer window opening during the gate — weighed against #968 and
 #1054, where this bug class is guarded by discipline rather than by a gate.
 
+**Whether a window can be observed is decided by opening one, not by asking whether `explorer.exe`
+runs** (#1528). The first guard asked the latter; the public CI's `windows-latest` runner answered yes
+(explorer IS running there), yet no window the test opened ever appeared in `Shell.Application`, and
+every public CI run went red until the runner was excluded by name. The guard now opens its own
+probe window — `explorer /select,` for the reveal, a bare WinForms window with a stamped title for
+the open, never through `osOpen.ts`, so a broken `revealInOS`/`openInOS` still fails rather than
+skips — polls the same observable its test asserts on, and closes the window before returning.
+**Not Notepad for the probe:** Windows 11 Notepad restores its previous session on launch, so a
+killed Notepad's tab comes back on the owner's next launch. A skip writes session id, `UserInteractive`, explorer's session ids and the
+`Shell.Application` window count to stderr (not `console.warn`, which the default reporter hides for
+a passing file), so the runner's first skipped run records WHY its windows are invisible — still
+unknown when this was written.
+
 ### `powershell -Command "<script>" a b` does NOT pass `a b` as arguments
 
 It **appends them to the command line as more source**. `$args` is empty, and the trailing items

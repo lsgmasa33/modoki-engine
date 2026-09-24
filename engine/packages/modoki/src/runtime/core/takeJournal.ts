@@ -35,6 +35,8 @@ export interface TappedEvent {
   type: string;
   /** A JSON copy: a payload that is mutated later, or holds an entity, cannot change what was kept. */
   payload: unknown;
+  /** The emission was marked as the app boot's (#1527, `EmitOptions.appLifetime`). */
+  appLifetime?: true;
 }
 
 export class TakeJournalTap {
@@ -63,7 +65,9 @@ export class TakeJournalTap {
         if (e.cap <= last) continue;
         if (e.cap > max) max = e.cap;
         if (e.type.startsWith('@') && !KEEP_ENGINE_EVENTS.has(e.type)) continue;
-        taken.push({ cap: e.cap, e: { tick: e.tick, type: e.type, payload: JSON.parse(JSON.stringify(e.payload ?? null)) } });
+        const kept: TappedEvent = { tick: e.tick, type: e.type, payload: JSON.parse(JSON.stringify(e.payload ?? null)) };
+        if (e.appLifetime) kept.appLifetime = true;
+        taken.push({ cap: e.cap, e: kept });
       }
       this.lastCap.set(w, max);
     }

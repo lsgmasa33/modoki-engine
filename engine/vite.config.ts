@@ -547,10 +547,11 @@ export default defineConfig(({ command }) => {
         // modules the interstitial rules, by narrow subpath.
         '@modoki/engine/runtime/core/adLifecycle',
         '@modoki/engine/runtime/core/adPacing',
-        // #1501 — both games' ads.ts wrap that lifecycle in the promoted debug overrides, and their debug
-        // tabs import the shared Ads tab by its own side-effect-free subpath (not the `runtime/debug` index).
+        // #1501 — both games' ads.ts wrap that lifecycle in the promoted debug overrides.
+        // NOT `runtime/debug/adsTab` (#1526): it resolves to a `.tsx`, which Vite never pre-bundles, so
+        // listing it only printed "Cannot optimize dependency" on every boot. It is served as source,
+        // so it cannot trigger a re-optimize either. Guarded in viteConfigEngineOptimizeDeps.test.ts.
         '@modoki/engine/runtime/core/adDebug',
-        '@modoki/engine/runtime/debug/adsTab',
         // #1332 — both games' AppsFlyer wiring imports the promoted attribution lifecycle.
         '@modoki/engine/runtime/core/attribution',
         // #1274 — both games' auth wrappers hash login keys with the account-continuity module.

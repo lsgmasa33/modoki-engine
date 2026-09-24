@@ -60,6 +60,17 @@ export interface GameEvent {
   /** Triage severity, defaulting to `'info'`. Set via `gameJournal.ts`'s `journalWarn`/
    *  `journalError` helpers, or the raw `emit()` 4th arg. */
   level: JournalLevel;
+  /** This one emission came from an app-level service's boot, not from the scene (#1527,
+   *  `EmitOptions.appLifetime`). Absent otherwise. */
+  appLifetime?: true;
+}
+
+/** Per-emission options for `emit()` and the `gameJournal.ts` helpers. */
+export interface EmitOptions {
+  /** Mark THIS emission as the app boot's (#1527). The gameplay recorder's replay check skips it and
+   *  still counts the same type's other emissions. For a type that only the boot ever emits,
+   *  declaring the type with `appLifetimeEvent` says the same thing once. */
+  appLifetime?: boolean;
 }
 
 // ── Shared capture sequence (Percept V3) ─────────────────────────────────────
@@ -141,21 +152,28 @@ export function verboseCaptureState(): { types: string[]; active: string[] } {
   return { types: [...VERBOSE_TYPES], active: [...activeVerbose] };
 }
 
-// ── App-lifetime events (#1524) ──────────────────────────────────────────────
-// Some event types are emitted once per PAGE LOAD by an app-level service's boot (an IAP catalogue,
+// ── App-lifetime events (#1524, #1527) ───────────────────────────────────────
+// Some events are emitted once per PAGE LOAD by an app-level service's boot (an IAP catalogue,
 // a server-clock fetch), not by anything a scene does. The gameplay recorder has to know which. A
 // game's boot system runs on the first frame the sim runs, so in the editor that is the page's FIRST
 // Play: a take recorded then has them, and a take from any later Play does not. Every replay boots
 // a fresh page and always has them. Compared by count, a later-Play take read as a replay that
 // `diverged` when it did exactly what was played (`compareTakeEvents` skips them instead).
-// Declared at the emit site, so the set cannot drift from the code that emits it.
+//
+// Two ways to say it, both at the emit site so neither can drift from the code that emits:
+// - **Per emission** (`emit(..., { appLifetime: true })`), for a type the boot AND the scene emit.
+//   Court's price fetch is one: the boot asks once, and every board build past the ad unlock asks
+//   again. Declaring that type would stop the check counting the board builds' fetches (#1527).
+// - **Per type** (`appLifetimeEvent`), for a type only the boot emits, or one whose boot emissions
+//   the emit site cannot tell apart (`iap.not-configured`: any call made before the boot configured
+//   the store).
 const APP_LIFETIME_TYPES = new Set<string>();
 
 /** Declare `type` as emitted once per page load rather than by the scene, and return it, so the
  *  declaration sits where the event is emitted: `const PRODUCTS = appLifetimeEvent('court.iap.products')`.
- *  ⚠️ The whole TYPE is declared, so the replay check also skips a later, scene-driven emission of
- *  it (an entitlement refresh after a purchase) — declare only types whose count says nothing about
- *  what was played. */
+ *  ⚠️ The whole TYPE is declared, so the replay check also skips any later, scene-driven emission
+ *  of it. For a type the scene emits too, mark the boot's emissions instead
+ *  (`EmitOptions.appLifetime`, #1527). */
 export function appLifetimeEvent<T extends string>(type: T): T {
   APP_LIFETIME_TYPES.add(type);
   return type;
@@ -285,12 +303,14 @@ export function entityRef(entity: EntityLike): string | number | null {
  *  to `'info'`; prefer `gameJournal.ts`'s `journalWarn`/`journalError` over passing it
  *  here directly — this 4th positional arg exists mainly so those helpers stay thin
  *  wrappers over `emit()` instead of a parallel recording path. */
-export function emit(type: string, payload?: unknown, world: World = getCurrentWorld(), level: JournalLevel = 'info'): void {
+export function emit(
+  type: string, payload?: unknown, world: World = getCurrentWorld(), level: JournalLevel = 'info', options?: EmitOptions,
+): void {
   if (!_enabled) return;
   // Tier-2 (watch-gated) diagnostic events are dropped unless their capture window is open.
   if (VERBOSE_TYPES.has(type) && !activeVerbose.has(type)) return;
   const s = journalStateFor(world);
-  s.events.push({ tick: s.tick, type, payload, cap: nextCaptureSeq(), level });
+  s.events.push({ tick: s.tick, type, payload, cap: nextCaptureSeq(), level, ...(options?.appLifetime ? { appLifetime: true } : {}) });
   if (s.events.length - s.head > MAX_EVENTS) {
     s.head++; // drop the oldest (logically) — no array re-index
     if (s.head > MAX_EVENTS) { s.events = s.events.slice(s.head); s.head = 0; } // periodic compaction

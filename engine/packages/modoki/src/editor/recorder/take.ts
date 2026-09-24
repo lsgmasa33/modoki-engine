@@ -69,6 +69,10 @@ export interface Take {
    *  Optional: a take recorded before it existed has none, and its replay is reported `unchecked`.
    *  The render compares them with what the replay emitted (`compareTakeEvents`). */
   expectedEvents?: TakeGameEvent[];
+  /** The take's `expectedEvents` carry per-emission app-lifetime marks (#1527). Absent on a take
+   *  recorded before, whose boot events are unmarked: its check falls back to skipping every type
+   *  the replay marked (`compareTakeEvents`' `expectedMarked`). */
+  appLifetimeMarks?: true;
   /** A fingerprint of the project's assets when Play was pressed (#1509). The render loads assets
    *  as they are NOW — re-rendering after an art change is the point — and names the ones this take
    *  uses that changed since (`engine/plugins/takeAssets.ts`). Optional: an older take has none, and
@@ -89,6 +93,9 @@ export interface TakeGameEvent {
   t: number;
   type: string;
   payload: unknown;
+  /** The emission was the app boot's (#1527, `EmitOptions.appLifetime` in `runtime/core/journal.ts`),
+   *  so the replay check skips it. Absent on every other event, and on every take recorded before. */
+  appLifetime?: true;
 }
 
 const KINDS: ReadonlySet<string> = new Set(['down', 'move', 'up']);
@@ -148,9 +155,11 @@ export function parseTake(raw: unknown): Take {
         const ev = (e ?? {}) as Record<string, unknown>;
         if (!isFiniteNumber(ev.t) || ev.t < 0) problems.push(`expectedEvents[${i}].t must be a number >= 0`);
         if (typeof ev.type !== 'string' || !ev.type) problems.push(`expectedEvents[${i}].type must be a non-empty string`);
+        if (ev.appLifetime !== undefined && ev.appLifetime !== true) problems.push(`expectedEvents[${i}].appLifetime must be true when present`);
       });
     }
   }
+  if (o.appLifetimeMarks !== undefined && o.appLifetimeMarks !== true) problems.push('appLifetimeMarks must be true when present');
   if (o.assets !== undefined) {
     const a = o.assets as Record<string, unknown> | null;
     if (!a || typeof a !== 'object' || typeof a.dir !== 'string' || !a.dir
@@ -217,7 +226,9 @@ export type ReplayCheck =
   | { status: 'matched'; events: number; ignored?: string[] }
   | {
     status: 'diverged' | 'differs'; expected: number; replayed: number;
-    /** App-lifetime types (`appLifetimeEvent`) seen on either side and left out of the check. */
+    /** Types that had at least one event skipped as app-lifetime, on either side. A declared type is
+     *  skipped whole; for a type with a marked emission only the marked events are, and the rest of
+     *  that type is still compared. */
     ignored?: string[];
     /** Types whose COUNT differs. Empty for `differs`. */
     counts: { type: string; played: number; replayed: number }[];
@@ -248,7 +259,7 @@ export function samePayload(x: unknown, y: unknown): boolean {
   return (x ?? null) === (y ?? null);
 }
 
-type Ev = { type: string; payload: unknown };
+type Ev = { type: string; payload: unknown; appLifetime?: boolean };
 
 /** The leaf fields where `x` and `y` differ (by `samePayload`), as dotted paths. */
 export function payloadDifferences(x: unknown, y: unknown, at = '', out: ReplayFieldDifference[] = [], limit = 5): ReplayFieldDifference[] {
@@ -272,21 +283,30 @@ export function payloadDifferences(x: unknown, y: unknown, at = '', out: ReplayF
  *  in the editor and before it in the replay, in a replay that was otherwise identical — the same
  *  placement, the same heart lost. A global order called every such take diverged.
  *
- *  ⚠️ **`appLifetime` types are skipped on both sides (#1524).** They are emitted once per page load
- *  (`appLifetimeEvent` in `runtime/core/journal.ts`): in the editor only on the page's first Play,
- *  in every replay on its boot, so their counts differ however faithful the replay.
- *  Skipped types that occurred are reported as `ignored`. */
+ *  ⚠️ **App-lifetime events are skipped on both sides (#1524, #1527).** They are emitted once per page
+ *  load, in the editor only on the page's first Play and in every replay on its boot, so their counts
+ *  differ however faithful the replay. Two kinds: every event of a type in `appLifetime` (declared
+ *  with `appLifetimeEvent`), and any single event marked `appLifetime` (`EmitOptions.appLifetime`),
+ *  whose type's other events are still counted. Types with a skipped event are reported as `ignored`.
+ *
+ *  `expectedMarked: false` is a take recorded before the marks existed (`Take.appLifetimeMarks`): its
+ *  boot events are unmarked, while its replay marks them. For such a take, every type the replay
+ *  marked any event of is skipped WHOLE, on both sides. Otherwise a first-Play take would count its
+ *  unmarked boot events against a replay that skips them. ⚠️ This is not quite #1524's rule, which
+ *  skipped a fixed declared list: a boot type the REPLAY did not emit (a failure twin, when the
+ *  editor's boot failed and the replay's did not) is still counted. */
 export function compareTakeEvents(
-  expected: readonly Ev[] | undefined, replayed: readonly Ev[], appLifetime: Iterable<string> = [],
+  expected: readonly Ev[] | undefined, replayed: readonly Ev[], appLifetime: Iterable<string> = [], expectedMarked = true,
 ): ReplayCheck {
   if (!expected) return { status: 'unchecked', reason: 'the take has no expectedEvents (recorded before the replay check existed)' };
   const skip = new Set(appLifetime);
+  if (!expectedMarked) for (const e of replayed) if (e.appLifetime) skip.add(e.type);
   const ignoredSeen = new Set<string>();
   const group = (list: readonly Ev[]) => {
     const m = new Map<string, Ev[]>();
     for (const e of list) {
       if (!isTakeGameEvent(e.type)) continue;
-      if (skip.has(e.type)) { ignoredSeen.add(e.type); continue; }
+      if (e.appLifetime || skip.has(e.type)) { ignoredSeen.add(e.type); continue; }
       (m.get(e.type) ?? m.set(e.type, []).get(e.type)!).push(e);
     }
     return m;
@@ -311,7 +331,7 @@ export function compareTakeEvents(
 }
 
 /** One journal event the replay page captured (`captureDriver`), stamped with the step that emitted it. */
-export interface CapturedReplayEvent { step: number; type: string; payload: unknown }
+export interface CapturedReplayEvent { step: number; type: string; payload: unknown; appLifetime?: true }
 
 /** A replay's captured events, split by what each is FOR (#1524):
  *  - `timeline`: the events on the video, from the first frame on (`step >= bootSteps`), each
@@ -320,11 +340,22 @@ export interface CapturedReplayEvent { step: number; type: string; payload: unkn
  *    counterpart of the editor's Play press is the page boot, not the first video frame: a scene's
  *    boot events (Court's session restore, its first `court.level`) land a step either side of
  *    `bootSteps` depending on load timing, and a check over the timeline alone counted them or not
- *    by chance. Skips `appLifetime` types (see `compareTakeEvents`). */
+ *    by chance. Skips `appLifetime` types and marked events (see `compareTakeEvents`, which also
+ *    says what `expectedMarked` is). */
 export function replayEvents<E extends CapturedReplayEvent>(
   expected: readonly Ev[] | undefined, captured: readonly E[], bootSteps: number, fps: number, appLifetime: Iterable<string> = [],
+  expectedMarked = true,
 ): { timeline: (E & { videoFrame: number; seconds: number })[]; replay: ReplayCheck } {
   const timeline = captured.filter((e) => e.step >= bootSteps)
     .map((e) => ({ videoFrame: e.step - bootSteps, seconds: (e.step - bootSteps) / fps, ...e }));
-  return { timeline, replay: compareTakeEvents(expected, captured, appLifetime) };
+  return { timeline, replay: compareTakeEvents(expected, captured, appLifetime, expectedMarked) };
+}
+
+/** `replayEvents` for a whole take: whether its events carry marks is read off the take itself
+ *  (`Take.appLifetimeMarks`), so a caller cannot pass the wrong answer. What `record-take` calls. */
+export function replayEventsForTake<E extends CapturedReplayEvent>(
+  take: { expectedEvents?: readonly Ev[]; appLifetimeMarks?: true }, captured: readonly E[], bootSteps: number, fps: number,
+  appLifetime: Iterable<string> = [],
+): { timeline: (E & { videoFrame: number; seconds: number })[]; replay: ReplayCheck } {
+  return replayEvents(take.expectedEvents, captured, bootSteps, fps, appLifetime, take.appLifetimeMarks === true);
 }

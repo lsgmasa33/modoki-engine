@@ -3,7 +3,7 @@
  *  quantised gesture — or the divergence the check exists to catch. */
 
 import { describe, it, expect } from 'vitest';
-import { compareTakeEvents, replayEvents, samePayload, payloadDifferences, parseTake } from '../../src/editor/recorder/take';
+import { compareTakeEvents, replayEvents, replayEventsForTake, samePayload, payloadDifferences, parseTake } from '../../src/editor/recorder/take';
 
 const ev = (type: string, payload: unknown = null) => ({ type, payload });
 
@@ -73,6 +73,54 @@ describe('app-lifetime events (#1524)', () => {
     const r = compareTakeEvents(played, [...played, ev('court.heart.lost', { left: 2 })], IAP);
     expect(r).toMatchObject({ status: 'diverged', counts: [{ type: 'court.heart.lost', played: 0, replayed: 1 }] });
     expect(r).not.toHaveProperty('ignored');
+  });
+});
+
+describe('a marked boot emission of a type the scene emits too (#1527)', () => {
+  // Observed: a veteran Court take recorded on the editor's SECOND Play has the board build's price
+  // fetch; its replay has the boot's too, one step earlier, with the same payload.
+  const board = ev('court.store.products', { summary: '6/6', where: 'no-ads-offer' });
+  const boot = { ...board, appLifetime: true as const };
+
+  it('skips the marked emission and matches — was `diverged`, 1x played and 2x replayed', () => {
+    expect(compareTakeEvents([board], [boot, board]))
+      .toEqual({ status: 'matched', events: 1, ignored: ['court.store.products'] });
+  });
+
+  it('still counts the scene\'s emissions of the same type — a board build the replay never made', () => {
+    const r = compareTakeEvents([board, board], [boot, board]);
+    expect(r).toMatchObject({ status: 'diverged', counts: [{ type: 'court.store.products', played: 2, replayed: 1 }] });
+  });
+
+  it('skips a marked emission on the PLAYED side too — a take recorded on the page\'s first Play', () => {
+    expect(compareTakeEvents([boot, board], [boot, board]).status).toBe('matched');
+    expect(compareTakeEvents([boot, board], [board]).status).toBe('matched');
+  });
+
+  it('a take recorded BEFORE the marks falls back to skipping every type the replay marked', () => {
+    // Its first-Play boot events are unmarked; the replay marks them. Counted on one side and skipped
+    // on the other, this read `diverged` (review, on the real first-Play take court-20260924-111700).
+    const legacyPlayed = [ev('iap.entitlements', { productIds: [] }), board, board];
+    const replayed = [{ ...ev('iap.entitlements', { productIds: [] }), appLifetime: true as const }, boot, board];
+    expect(compareTakeEvents(legacyPlayed, replayed).status).toBe('diverged');
+    expect(compareTakeEvents(legacyPlayed, replayed, [], false))
+      .toEqual({ status: 'matched', events: 0, ignored: ['iap.entitlements', 'court.store.products'] });
+    // A type the replay never marked is still compared.
+    expect(compareTakeEvents([...legacyPlayed, ev('court.win')], replayed, [], false).status).toBe('diverged');
+  });
+
+  it('replayEvents carries the mark from the captured events through to the check', () => {
+    const captured = [{ step: 35, ...boot }, { step: 36, ...board }];
+    expect(replayEvents([board], captured, 36, 30).replay).toEqual({ status: 'matched', events: 1, ignored: ['court.store.products'] });
+    expect(replayEvents([board, board], captured, 36, 30, [], false).replay.status).toBe('matched');
+  });
+
+  it('replayEventsForTake reads whether the take carries marks off the take itself — what record-take calls', () => {
+    const captured = [{ step: 35, ...boot }, { step: 36, ...board }];
+    // The legacy first-Play take: its boot fetch is unmarked, so only the fallback matches it.
+    expect(replayEventsForTake({ expectedEvents: [board, board] }, captured, 36, 30).replay.status).toBe('matched');
+    // A marked take is compared per emission: the same two unmarked played events are one too many.
+    expect(replayEventsForTake({ expectedEvents: [board, board], appLifetimeMarks: true }, captured, 36, 30).replay.status).toBe('diverged');
   });
 });
 
@@ -146,5 +194,14 @@ describe('parseTake expectedEvents', () => {
     expect(() => parseTake({ ...base, expectedEvents: [{ t: 0, type: 'a', payload: null }] })).not.toThrow();
     expect(() => parseTake({ ...base, expectedEvents: {} })).toThrow(/expectedEvents must be an array/);
     expect(() => parseTake({ ...base, expectedEvents: [{ t: -1, type: '' }] })).toThrow(/2 problem/);
+  });
+  it('accepts the take-level appLifetimeMarks flag and refuses any other value for it (#1527)', () => {
+    expect(parseTake({ ...base, appLifetimeMarks: true }).appLifetimeMarks).toBe(true);
+    expect(() => parseTake({ ...base, appLifetimeMarks: 1 })).toThrow(/appLifetimeMarks must be true/);
+  });
+  it('accepts an app-lifetime mark and refuses any other value for it (#1527)', () => {
+    expect(() => parseTake({ ...base, expectedEvents: [{ t: 0, type: 'a', payload: null, appLifetime: true }] })).not.toThrow();
+    expect(() => parseTake({ ...base, expectedEvents: [{ t: 0, type: 'a', payload: null, appLifetime: 'yes' }] }))
+      .toThrow(/expectedEvents\[0\]\.appLifetime must be true/);
   });
 });

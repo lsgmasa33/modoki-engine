@@ -37,8 +37,9 @@ export interface CaptureState {
   ready: boolean;
 }
 
-/** One journal event, with the step that emitted it — the renderer turns steps into video frames. */
-export interface CapturedEvent { step: number; takeTime: number; tick: number; type: string; payload: unknown }
+/** One journal event, with the step that emitted it — the renderer turns steps into video frames.
+ *  `appLifetime`: the emission was the app boot's (#1527), which the replay check skips. */
+export interface CapturedEvent { step: number; takeTime: number; tick: number; type: string; payload: unknown; appLifetime?: true }
 
 interface FetchCounter { inFlight: number; restore: () => void }
 

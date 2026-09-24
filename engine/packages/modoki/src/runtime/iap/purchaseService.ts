@@ -33,22 +33,28 @@
  * change. Resist any refactor that splits them.
  */
 
-import { emit, appLifetimeEvent } from '../core/journal';
+import { emit, appLifetimeEvent, type EmitOptions } from '../core/journal';
 import { peekCurrentWorld } from '../core/ecs/worldRegistry';
 import { NoopStoreBackend, isStoreCancelled, type StoreBackend, type StoreCancelled } from './storeBackend';
 import { IapLedger, type IapLedgerStore } from './ledger';
 import { LocalVerifier, type PurchaseVerifier } from './verifier';
 import type { IapGrant, IapProduct, IapProductInfo, PurchaseResult, StoreTransaction } from './types';
 
-/** Emitted by every `refreshEntitlements()`, and so once per page load by the game's IAP boot, with
- *  its failure twins: the gameplay recorder's replay check skips them (#1524, `appLifetimeEvent`). */
-const IAP_ENTITLEMENTS_EVENT = appLifetimeEvent('iap.entitlements');
-const IAP_ENTITLEMENTS_FAILED_EVENT = appLifetimeEvent('iap.entitlements-failed');
-const IAP_RECONCILE_FAILED_EVENT = appLifetimeEvent('iap.reconcile-failed');
+/** Emitted by every `reconcile()`: once per page load by the game's IAP boot, and again by Restore
+ *  Purchases. The boot's emissions are marked app-lifetime (`reconcile({ atBoot: true })`), so the
+ *  gameplay recorder's replay check skips those and still counts a restore's (#1524, #1527). */
+const IAP_ENTITLEMENTS_EVENT = 'iap.entitlements';
+const IAP_ENTITLEMENTS_FAILED_EVENT = 'iap.entitlements-failed';
+const IAP_RECONCILE_FAILED_EVENT = 'iap.reconcile-failed';
+/** Any call made before `configureIap`. The emit site cannot tell the boot's race (a board build
+ *  asking for prices a frame before the store is configured) from a store that is never configured,
+ *  and after the editor's first Play the store stays configured, so a later-Play take never has it.
+ *  Declared by TYPE for the replay check (#1527). */
+const IAP_NOT_CONFIGURED_EVENT = appLifetimeEvent('iap.not-configured');
 
 /** Journal without requiring a world. `reconcile()` runs at boot, potentially before any scene has
  *  loaded, and a missing world must not turn recovery into a crash. */
-function journal(type: string, payload?: unknown, level: 'info' | 'warn' | 'error' = 'info'): void {
+function journal(type: string, payload?: unknown, level: 'info' | 'warn' | 'error' = 'info', options?: EmitOptions): void {
   // Mirrored to the console as well as the journal. The journal is the right home for assertions,
   // but it is in-memory only — unreadable on a device without the debug bridge attached. Billing
   // failures happen on phones, so this trace needs to reach logcat/Xcode unaided. The native
@@ -61,7 +67,7 @@ function journal(type: string, payload?: unknown, level: 'info' | 'warn' | 'erro
 
   const w = peekCurrentWorld();
   if (!w) return;
-  emit(type, payload, w, level);
+  emit(type, payload, w, level, options);
 }
 
 /**
@@ -101,9 +107,10 @@ function journalStoreFailure(
   payload: Record<string, unknown>,
   e: unknown,
   level: 'warn' | 'error' = 'warn',
+  options?: EmitOptions,
 ): void {
   const d = describeStoreError(e);
-  journal(type, { ...payload, error: d.message, code: d.code, detail: d.detail }, level);
+  journal(type, { ...payload, error: d.message, code: d.code, detail: d.detail }, level, options);
 }
 
 export function describeStoreError(e: unknown): { message: string; code?: string; detail?: unknown } {
@@ -248,7 +255,7 @@ export function resetIap(): void {
  * class of bug a unit test misses by calling the API only the way the code already expects.
  */
 function activeCfg(): IapConfig | null {
-  if (!cfg) journal('iap.not-configured', undefined, 'warn');
+  if (!cfg) journal(IAP_NOT_CONFIGURED_EVENT, undefined, 'warn');
   return cfg;
 }
 
@@ -593,7 +600,8 @@ export async function purchase(productId: string): Promise<PurchaseResult> {
  * Re-derive what the player owns from the store. The source of truth for non-consumables and
  * subscriptions — including expiry, refund and revocation, all of which the platform applies for us.
  */
-export async function refreshEntitlements(): Promise<ReadonlySet<string>> {
+export async function refreshEntitlements(options?: { atBoot?: boolean }): Promise<ReadonlySet<string>> {
+  const marks: EmitOptions = { appLifetime: options?.atBoot === true };
   const c = activeCfg();
   if (!c) return entitled;
   // Snapshot BEFORE the await — see the catch branch below. `entitled` is REASSIGNED, not mutated,
@@ -611,7 +619,7 @@ export async function refreshEntitlements(): Promise<ReadonlySet<string>> {
     const freshlyRead = new Set(active.map((t) => t.productId));
     if (!stillActive(c)) return freshlyRead;
     entitled = freshlyRead;
-    journal(IAP_ENTITLEMENTS_EVENT, { productIds: [...entitled] });
+    journal(IAP_ENTITLEMENTS_EVENT, { productIds: [...entitled] }, 'info', marks);
   } catch (e) {
     // Keep the previous set rather than revoking on a transient read failure — briefly stale beats
     // wrongly locking a paying player out of what they bought. But if a game swap landed in the
@@ -619,7 +627,7 @@ export async function refreshEntitlements(): Promise<ReadonlySet<string>> {
     // global — by the time the catch runs, `entitled` may already be the INCOMING game's live Set,
     // and handing that back to the outgoing caller by reference (#434's failure shape, on the
     // failure half this time) would let it read another game's entitlements as its own.
-    journalStoreFailure(IAP_ENTITLEMENTS_FAILED_EVENT, {}, e);
+    journalStoreFailure(IAP_ENTITLEMENTS_FAILED_EVENT, {}, e, 'warn', marks);
     if (!stillActive(c)) return startedWith;
   }
   return entitled;
@@ -633,21 +641,26 @@ export async function refreshEntitlements(): Promise<ReadonlySet<string>> {
  * interrupted by a crash, a kill, or a battery death is picked up here on the next run.
  *
  * Safe to call repeatedly — every step it performs is idempotent.
+ *
+ * `atBoot`: the game's IAP boot passes it, and this pass's entitlement and pending-count lines are
+ * journalled as app-lifetime, which the gameplay recorder's replay check skips (#1527). Restore
+ * Purchases runs the same pass without it, so a restore is still counted.
  */
-export async function reconcile(): Promise<PurchaseResult[]> {
+export async function reconcile(options?: { atBoot?: boolean }): Promise<PurchaseResult[]> {
   const c = activeCfg();
   if (!c) return [];
-  await refreshEntitlements();
+  const marks: EmitOptions = { appLifetime: options?.atBoot === true };
+  await refreshEntitlements(options);
 
   let pending: StoreTransaction[];
   try {
     pending = await c.backend.unfinished();
   } catch (e) {
-    journalStoreFailure(IAP_RECONCILE_FAILED_EVENT, {}, e, 'error');
+    journalStoreFailure(IAP_RECONCILE_FAILED_EVENT, {}, e, 'error', marks);
     return [];
   }
 
-  if (pending.length) journal('iap.reconcile', { count: pending.length });
+  if (pending.length) journal('iap.reconcile', { count: pending.length }, 'info', marks);
 
   const results: PurchaseResult[] = [];
   // Sequential on purpose: two settles racing would interleave their ledger writes, and the last

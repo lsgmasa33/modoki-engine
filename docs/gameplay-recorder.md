@@ -316,21 +316,54 @@ frames alone therefore counted them or not by chance: a Court take read a differ
 each of two cold renders. `replayEvents` (`take.ts`) splits the two: the timeline starts at frame
 0, and the check covers every step.
 
-**App-lifetime events are skipped on both sides (#1524).** Some types are emitted once per PAGE
-LOAD by an app-level service's boot, not by the scene: Court's IAP catalogue
-(`court.iap.products`), the engine's `iap.entitlements`, Court's trusted-clock fetch, and their
-failure twins. A game's boot system runs on the first frame the sim runs, so in the editor that is
-the page's FIRST Play: a take recorded then has them, and a take from any later Play does not. Every
-replay boots a fresh page, so it always does. No window lines these up, and the same Court take
-(recorded on a later Play) read `diverged` on every warm render. Such a type is declared where it is emitted, with
-`appLifetimeEvent('court.iap.products')` (`runtime/core/journal.ts`), which returns the type. The
-capture driver reports the page's declared set (`appLifetimeTypes()`), and `compareTakeEvents` skips
-those types, listing the ones that occurred as `replay.ignored`. The owner chose this over checking
-only after the first input (2026-09-24). That alternative stops checking the session restore, and a
-slow fetch landing after the first tap would still diverge. ⚠️ **The whole TYPE is skipped,** so a
-later, scene-driven emission of it (an entitlement refresh after a purchase, a trusted-clock fetch
-at a grant) is not counted either. Declare only a type whose count says nothing about what was
-played. A new game with boot-time services declares its own.
+**App-lifetime events are skipped on both sides (#1524, #1527).** Some events are emitted once per
+PAGE LOAD by an app-level service's boot, not by the scene. Examples are Court's IAP catalogue count
+(`court.iap.products`), the boot's entitlement read, and Court's trusted-clock fetch. A game's boot
+system runs on the first frame the sim runs, so in the editor that is the page's FIRST Play. A take
+recorded then has these events, and a take from any later Play does not. Every replay boots a fresh
+page, so it always has them. No window lines these up. The same Court take, recorded on a later Play,
+read `diverged` on every warm render. The owner chose skipping over checking only after the first
+input (2026-09-24). That alternative stops checking the session restore, and a slow fetch landing
+after the first tap would still diverge.
+
+Both declarations sit at the emit site (`runtime/core/journal.ts`), so they cannot drift from the
+code that emits:
+- **Per emission** (`emit(…, { appLifetime: true })`, or the same last argument on
+  `journalState`/`journalWarn`/`journalError`). Use it for a type that the boot AND the scene emit.
+  Court's `court.store.products` is one: the boot asks for prices once, and every board build past
+  the ad unlock asks again. A veteran take recorded on a later Play had 1 and its replay had 2, so
+  it read `diverged` (#1527). The mark travels with the event through `TakeJournalTap`, the take's
+  `expectedEvents[].appLifetime` and the capture driver, and `compareTakeEvents` skips that one
+  event while still counting the same type's others. The boot knows it is the boot:
+  `ShelfSession.refreshPrices(where, { atBoot: true })` hands `atBoot` back to both price hooks.
+  `reconcile({ atBoot: true })` marks its entitlement read and its pending count, and Restore
+  Purchases runs the same pass unmarked, so a restore is still checked. Court's
+  `refreshTrustedClock('boot')` marks its line, and a grant-time fetch does not.
+- **Per type** (`appLifetimeEvent('court.iap.products')`, which returns the type). Use it for a type
+  only the boot emits, or one whose boot emissions the emit site cannot tell apart.
+  `iap.not-configured` is one: any call made before `configureIap`, which after the editor's first
+  Play never happens again. ⚠️ **The whole TYPE is skipped,** so do not declare a type the scene
+  emits too. Mark the boot's emissions instead.
+
+The capture driver reports the page's declared types (`appLifetimeTypes()`). `replay.ignored` lists
+every type that had at least one event skipped. For a marked type, its unmarked events were still
+compared. A new game with boot-time services marks or declares its own.
+
+**A take recorded before #1527** has unmarked boot events, while its replay marks them. Counted on
+one side and skipped on the other, a first-Play take read `diverged` (the review measured it on
+`court-20260924-111700`). A take now says it carries marks (`appLifetimeMarks: true`, written by the
+recorder), and `record-take` reads the flag through `replayEventsForTake`. For a take without it,
+every type the replay marked any event of is skipped whole, on both sides. That is close to #1524's
+rule but not the same: #1524 skipped a fixed declared list, so a boot type the replay did not emit
+(a failure twin, when the editor's boot failed and the replay's did not) is still counted here. The
+mirror case is not handled either: a new, marked take rendered with `--url` against a server still
+running code from before #1527, whose replay emits no marks, counts the replay's boot events.
+
+⚠️ **Not covered: the replay's own boot order.** If a board build asks for prices before
+`configureIap` has run, the answer is `0/6`, while the editor's later-Play build answers `6/6`. The
+verdict is then `differs`. The boot's refresh can also supersede a board-build fetch that is still
+pending, and a superseded fetch never journals. Both are races inside the replay's boot. In the
+observed run the boot configured first (step 35, one step before the board build).
 
 **Known limit.** The Vite-hosted backend (a browser editor on `npm run dev`)
 loses its job table if Vite restarts mid-render; the Electron main-process backend does not.

@@ -120,7 +120,9 @@ interface Recording {
 /** Take the game events emitted since the last drain, stamped on the take clock. */
 function drainTakeJournal(rec: Recording): void {
   for (const e of rec.journal.drain(getCurrentWorld())) {
-    if (isTakeGameEvent(e.type)) rec.expectedEvents.push({ t: rec.takeTime, type: e.type, payload: e.payload });
+    if (isTakeGameEvent(e.type)) {
+      rec.expectedEvents.push({ t: rec.takeTime, type: e.type, payload: e.payload, ...(e.appLifetime ? { appLifetime: true as const } : {}) });
+    }
   }
 }
 
@@ -310,7 +312,7 @@ export async function finishTakeRecording(): Promise<string | null> {
   }
   const assets = await rec.assets;
   const take: Take = {
-    ...rec.base, duration: rec.takeTime, events: rec.builder.events, expectedEvents: rec.expectedEvents,
+    ...rec.base, duration: rec.takeTime, events: rec.builder.events, expectedEvents: rec.expectedEvents, appLifetimeMarks: true,
     ...(assets ? { assets } : {}),
   };
   const identity = await backendFetch('/api/identity').then((r) => r.ok ? r.json() : null).catch(() => null) as { projectRoot?: string } | null;

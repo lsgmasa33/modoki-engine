@@ -10,8 +10,9 @@
  *  does, so the only falsifiable test is one that spawns the real thing.
  *
  *  That is also why this runs in `verify` rather than behind a flag (owner,
- *  2026-09-24). It costs an Explorer window opening on the machine running the
- *  gate — the alternative is the gap #968 and #1054 already describe, where the
+ *  2026-09-24). It costs a few short-lived windows (two for the tests, two for
+ *  the probes that decide whether they can run — see `probeRevealObservable`)
+ *  on the machine running the gate — the alternative is the gap #968 and #1054 already describe, where the
  *  Windows bug class is guarded by discipline instead of by a gate, and five
  *  such defects in six months were all invisible from a Mac.
  *
@@ -27,7 +28,7 @@
  *  Skipped off win32: `explorer` exists nowhere else. */
 
 import { describe, it, expect, afterAll } from 'vitest';
-import { execFile, execFileSync } from 'child_process';
+import { execFile, execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
@@ -37,35 +38,6 @@ import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const execFileAsync = promisify(execFile);
 const onWin32 = process.platform === 'win32';
-
-/** Is there an interactive desktop shell to open a window ON?
- *
- *  Without this probe a desktop-less machine could not be told apart from a
- *  broken reveal, and the honest options are "skip loudly" or "assert something
- *  vacuous" — this picks the first.
- *
- *  ⚠️ **A running `explorer.exe` is NOT enough, and GitHub Actions is excluded by
- *  name.** This probe once assumed the OSS mirror's `windows-latest` runner had no
- *  `explorer.exe`; it does, so the window test ran there and saw no window in
- *  every public CI run since it landed (first observed in run 35973236586). WHY
- *  the runner's window never shows up in `Shell.Application` is not known — that
- *  needs a Windows host to diagnose (#1528). Until then the runner is named rather
- *  than guessed at: a guessed probe that is wrong keeps `main`'s CI red, and the
- *  win clone's own `verify` — a real desktop — still runs the window tests. */
-const shellRunning: boolean = (() => {
-  if (!onWin32) return false;
-  if (process.env.GITHUB_ACTIONS === 'true') return false;
-  try {
-    const out = execFileSync(
-      'powershell',
-      ['-NoProfile', '-NonInteractive', '-Command', '[bool](Get-Process -Name explorer -ErrorAction SilentlyContinue)'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    return out.trim().toLowerCase() === 'true';
-  } catch {
-    return false;
-  }
-})();
 
 /** PowerShell that enumerates Explorer windows currently showing `dir`. Shared by
  *  the assertion and the teardown so they cannot disagree about what "the window
@@ -133,6 +105,130 @@ afterAll(async () => {
   }
 });
 
+async function pollUntil<T>(tries: number, read: () => Promise<T | undefined>): Promise<T | undefined> {
+  for (let i = 0; i < tries; i++) {
+    const v = await read();
+    if (v !== undefined) return v;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return undefined;
+}
+
+/** Why a probe saw nothing: the facts that separate the candidate causes in #1528
+ *  (a different session from explorer, a non-interactive process, an empty
+ *  `Shell.Application`). Printed on a skip so a CI log records the answer. */
+function desktopDiagnostics(): string {
+  try {
+    return execFileSync(
+      'powershell',
+      [
+        '-NoProfile', '-NonInteractive', '-Command',
+        '"mySession=$((Get-Process -Id $PID).SessionId) interactive=$([Environment]::UserInteractive) ' +
+          'explorerSessions=$((@(Get-Process -Name explorer -ErrorAction SilentlyContinue) | ForEach-Object { $_.SessionId }) -join \',\') ' +
+          'shellWindows=$(@((New-Object -ComObject Shell.Application).Windows()).Count)"',
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    ).trim();
+  } catch (e) {
+    return `diagnostics failed: ${(e as Error).message}`;
+  }
+}
+
+/** Can a window opened from THIS process be seen by the observable each test
+ *  asserts on? Asked by doing it — once per observable, before the tests.
+ *
+ *  ⚠️ **A running `explorer.exe` is NOT the answer** (#1528). The probe this
+ *  replaced asked exactly that, and the OSS mirror's `windows-latest` runner said
+ *  yes — explorer IS running there — yet no window the test opened ever showed up
+ *  in `Shell.Application`, so every public CI run went red. It was then excluded
+ *  by NAME (`GITHUB_ACTIONS`), which hid the question instead of answering it.
+ *  A capability is only established by exercising it.
+ *
+ *  ⚠️ **Each probe opens its window ITSELF, never through `osOpen.ts`** — that is
+ *  what keeps the tests falsifiable. If `revealInOS`/`openInOS` stop opening
+ *  anything, the probe still sees its own window and the test goes red; only a
+ *  machine where NO window can be observed skips.
+ *
+ *  ⚠️ **Each probe cleans up INLINE, before it returns.** The probes run at import,
+ *  and vitest skips `afterAll` when a `-t` filter leaves no test in the file to run
+ *  — so a probe window left for `afterAll` leaked onto the desktop on every
+ *  filtered run (found in review).
+ *
+ *  ⚠️ **A probe that THROWS is not caught.** Only a window that never appears means
+ *  "not observable"; a broken observation helper (`windowedProcesses`,
+ *  `countRevealedWindows`) must fail the file, not turn into a green skip whose
+ *  message blames the environment (a catch-all wrapper did exactly that — found
+ *  in review). A failed SPAWN is already absorbed by the child's `error` handler.
+ *
+ *  A skip prints `desktopDiagnostics()`, so the first CI run that skips records why. */
+async function probeRevealObservable(): Promise<boolean> {
+  const dir = scratch('modoki-probe-reveal-');
+  const file = path.join(dir, 'probe.txt');
+  fs.writeFileSync(file, 'probe');
+  // Detached and let go: explorer's exit code means nothing (docs/windows.md
+  // § "A GUI launcher's exit status is not the operation's outcome").
+  const child = spawn('explorer', [`/select,${file}`], { detached: true, stdio: 'ignore' });
+  child.on('error', () => { /* the poll reports the absence */ });
+  child.unref();
+  try {
+    return (await pollUntil(40, async () => ((await countRevealedWindows(dir)) > 0 ? true : undefined))) === true;
+  } finally {
+    await closeRevealedWindows(dir);
+  }
+}
+
+/** The open test's observable is a top-level window TITLED after something, read
+ *  through `MainWindowTitle`. The probe shows a bare WinForms window with a stamp
+ *  as its title, owned by a child of this process.
+ *
+ *  ⚠️ **Not Notepad, though that is what the test ends up opening.** Windows 11
+ *  Notepad restores its previous session on launch, so killing a Notepad the probe
+ *  started does not remove the probe's tab — it comes back on the owner's next
+ *  launch, and a killed "new" Notepad may be holding the owner's restored unsaved
+ *  tabs too (found in review). A window this process owns outright has neither
+ *  problem: killing it is the whole cleanup.
+ *
+ *  ⚠️ **Not `detached`**, unlike the launchers: a detached PowerShell's form never
+ *  appeared in `MainWindowTitle` here (measured on the win clone, 2026-09-24),
+ *  while the same command attached showed it on the first poll.
+ *
+ *  ⚠️ **No `-WindowStyle Hidden`, and no `windowsHide`.** Attached, powershell
+ *  SHARES the console vitest inherited, so `-WindowStyle Hidden` hid the owner's
+ *  own terminal (a classic console host; Windows Terminal was unaffected) and the
+ *  kill left it hidden. `windowsHide` hides the form as well, so the probe never
+ *  sees it (both found in review). Nothing to hide: an attached child adds no
+ *  window of its own. */
+async function probeOpenObservable(): Promise<boolean> {
+  const stamp = `modokiprobe${Date.now()}`;
+  const child = spawn(
+    'powershell',
+    [
+      '-NoProfile', '-Command',
+      `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.Form; $f.Text = '${stamp}'; [void]$f.ShowDialog()`,
+    ],
+    { stdio: 'ignore' },
+  );
+  child.on('error', () => { /* the poll reports the absence */ });
+  try {
+    const hit = await pollUntil(40, async () => (await windowedProcesses()).find((p) => p.title.includes(stamp)));
+    return hit !== undefined;
+  } finally {
+    child.kill();
+  }
+}
+
+// Top-level so `it.skipIf` can read the answers at collection time.
+const revealObservable = onWin32 ? await probeRevealObservable() : false;
+const openObservable = onWin32 ? await probeOpenObservable() : false;
+if (onWin32 && !(revealObservable && openObservable)) {
+  // Straight to stderr, not console.warn: the default reporter swallows a passing
+  // file's console output, and this line is the only record of WHY a CI run skipped.
+  process.stderr.write(
+    `[osOpenWin32] window test(s) skipped — reveal observable: ${revealObservable}, open observable: ${openObservable}; ` +
+      `a probe window opened from this process was never seen (#1528). ${desktopDiagnostics()}\n`,
+  );
+}
+
 describe.skipIf(!onWin32)('revealInOS against the real explorer.exe (win32)', () => {
   it('resolves for a file that exists — explorer\'s exit code must not be believed', async () => {
     const dir = scratch('modoki-reveal-');
@@ -143,9 +239,17 @@ describe.skipIf(!onWin32)('revealInOS against the real explorer.exe (win32)', ()
     // — what the code did before — rejects here every time, because explorer returns
     // 1 whether or not it did what was asked.
     await expect(revealInOS(file)).resolves.toBeUndefined();
+
+    // Not an assertion — this test's window must not outlive the file. afterAll's
+    // close can run before explorer has CREATED it, which left a stray window on
+    // the desktop (found in review). Wait for it where it can be seen, then close it.
+    if (revealObservable) {
+      await pollUntil(20, async () => ((await countRevealedWindows(dir)) > 0 ? true : undefined));
+      await closeRevealedWindows(dir);
+    }
   }, 30_000);
 
-  it.skipIf(!shellRunning)('actually opens a window showing the file\'s folder', async () => {
+  it.skipIf(!revealObservable)('actually opens a window showing the file\'s folder', async () => {
     const dir = scratch('modoki-reveal-window-');
     const file = path.join(dir, 'revealed.txt');
     fs.writeFileSync(file, 'hello');
@@ -177,8 +281,12 @@ describe.skipIf(!onWin32)('openInOS against the real cmd /c start (win32)', () =
    *  not exist before the call. When the fixture is absorbed into an app the owner was
    *  already using, it is left alone and reported, and the fixture's own text says what
    *  it is so a stray tab explains itself. Losing a second of the owner's work is much
-   *  worse than leaving a tab they can close. */
-  it.skipIf(!shellRunning)('actually opens the file in its default app', async () => {
+   *  worse than leaving a tab they can close.
+   *
+   *  ⚠️ **Even the new-pid kill does not clean up on Windows 11 Notepad**, which
+   *  restores its previous session on launch — the fixture's tab comes back the
+   *  next time the owner opens Notepad. Open as #1534. */
+  it.skipIf(!openObservable)('actually opens the file in its default app', async () => {
     const dir = scratch('modoki-open-');
     // No dot in the stamp: some apps title the window without the extension.
     const stamp = `modokigate${Date.now()}`;
@@ -222,4 +330,4 @@ describe.skipIf(!onWin32)('openInOS against the real cmd /c start (win32)', () =
  *    window after the file — which Notepad, VS Code and every editor tried here do. An
  *    association pointing at something that does not would fail it; that is a machine
  *    configuration question, not a defect in the code under test, and the message says
- *    so. Off a desktop session it skips (`shellRunning`) rather than pretending. */
+ *    so. Where no window can be observed it skips (the probes above) rather than pretending. */

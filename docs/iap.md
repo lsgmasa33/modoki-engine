@@ -156,6 +156,14 @@ any refactor that splits them.
 `reconcile()` must be called **once on every launch, before the player can buy anything.** Without
 it, an interrupted purchase is never picked up.
 
+**The launch call passes `{ atBoot: true }`**, and so does a price fetch the IAP boot makes
+(`ShelfSession.refreshPrices(where, { atBoot: true })`, whose hooks receive `atBoot` to hand to the
+journal). The option changes no behaviour. It marks those journal lines as the boot's, which the
+gameplay recorder's replay check skips (#1527, [gameplay-recorder.md](gameplay-recorder.md) § The
+replay check): an editor take sees the boot only on the page's first Play, while every replay boots.
+A game that leaves it off gets a replay that reads `diverged` for any take recorded on a later Play.
+Restore Purchases calls `reconcile()` without it, so a restore is still checked.
+
 ### Concurrency: the ledger alone is not enough
 
 `settle()` can be entered twice for the same transaction, concurrently — the `purchase()` promise

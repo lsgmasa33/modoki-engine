@@ -155,6 +155,18 @@ because setting `entries` replaces it. Project paths are glob-escaped, so a fold
 engine gives an absolute pattern. If it fails to match, the fallback is the old one-reload
 behaviour, not a crash.
 
+### The packaged `@modoki/engine` include list takes only `.ts` entries (#1526)
+
+Vite pre-bundles a dependency entry only if it ends in `.js`/`.ts` (or a `c`/`m` form of either), or
+in an extension that `optimizeDeps.extensions` adds. It drops any other entry from `include` and
+prints `Cannot optimize dependency: …` on every boot. #1501 listed `runtime/debug/adsTab`, which
+resolves to `adsDebugTab.tsx`, so the entry did nothing except print that warning. Such a subpath is
+served as source, so a game importing it cannot trigger the mid-session re-optimize the list exists
+to prevent. It stays off the list, and `.tsx` stays off `extensions`, which would widen the optimizer
+for every dependency. `viteConfigEngineOptimizeDeps.test.ts` checks both directions: every listed
+engine subpath is one Vite can pre-bundle, and every one a game imports is listed unless its entry
+cannot be pre-bundled.
+
 ## Native scaffolding: auto on first build
 
 A game with no `ios/`/`android/` yet is **auto-scaffolded on the first native build** —

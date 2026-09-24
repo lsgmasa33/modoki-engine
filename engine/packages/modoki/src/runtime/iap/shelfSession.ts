@@ -38,11 +38,12 @@ export interface ShelfSessionOptions<Where extends string> {
   productInfo(): Promise<readonly IapProductInfo[]>;
   /** Redraw — called after every transition that changes what the screen shows. */
   onChange?(): void;
-  /** A price fetch threw. Fired for EVERY fetch, current or superseded, before the currency check. */
-  onPricesFailed?(error: unknown, where: Where): void;
+  /** A price fetch threw. Fired for EVERY fetch, current or superseded, before the currency check.
+   *  `atBoot`: the fetch was the app boot's (`refreshPrices`' option). */
+  onPricesFailed?(error: unknown, where: Where, atBoot: boolean): void;
   /** The CURRENT price fetch answered (success or failure). `priced` counts products with
-   *  a non-empty price. */
-  onPricesAnswered?(answer: { where: Where; priced: number; failed: boolean }): void;
+   *  a non-empty price. `atBoot`: the fetch was the app boot's (`refreshPrices`' option). */
+  onPricesAnswered?(answer: { where: Where; priced: number; failed: boolean; atBoot: boolean }): void;
   /** The watchdog marked the in-flight purchase stalled. */
   onStalled?(buying: { title: string; productId: string }): void;
   watchdogMs?: number;
@@ -144,7 +145,7 @@ export class ShelfSession<Where extends string = string> {
     this.clearWatchdog();
     this._state = { kind: 'loading' };
     this._refusal = null;
-    this.startFetch(stillCurrent, where);
+    this.startFetch(stillCurrent, where, false);
   }
 
   /**
@@ -152,10 +153,14 @@ export class ShelfSession<Where extends string = string> {
    * false, doing nothing, while the screen is `buying`: a refetch drops every price, and the rows
    * behind a live buy overlay must not vanish under it. A purchase released from the screen but still
    * in flight is NOT a reason to refuse — the refetch no longer touches its settle.
+   *
+   * `atBoot` marks a fetch the game's IAP boot makes. It changes nothing here and is handed back to
+   * both price hooks, so a game can journal the boot's answer as app-lifetime: the gameplay
+   * recorder's replay check skips it, and still counts the fetches the scene makes (#1527).
    */
-  refreshPrices(where: Where): boolean {
+  refreshPrices(where: Where, options?: { atBoot?: boolean }): boolean {
     if (this._state.kind === 'buying') return false;
-    this.startFetch(this.fetchEpoch.begin(), where);
+    this.startFetch(this.fetchEpoch.begin(), where, options?.atBoot === true);
     return true;
   }
 
@@ -266,15 +271,15 @@ export class ShelfSession<Where extends string = string> {
 
   /** The three fetch fields always move together — prices dropped, `pending`, the idle clock zeroed.
    *  A writer that cleared prices but left `'answered'` flashed "not available" (Court #463). */
-  private startFetch(stillCurrent: LivenessCheck, where: Where): void {
+  private startFetch(stillCurrent: LivenessCheck, where: Where, atBoot: boolean): void {
     this._prices = new Map();
     this.fetch = 'pending';
     this.idleWaitMs = 0;
     this.opts.onChange?.();
-    void this.fetchPrices(stillCurrent, where);
+    void this.fetchPrices(stillCurrent, where, atBoot);
   }
 
-  private async fetchPrices(stillCurrent: LivenessCheck, where: Where): Promise<void> {
+  private async fetchPrices(stillCurrent: LivenessCheck, where: Where, atBoot: boolean): Promise<void> {
     let priced = new Map<string, string>();
     let failed = false;
     try {
@@ -285,7 +290,7 @@ export class ShelfSession<Where extends string = string> {
     } catch (err) {
       failed = true;
       priced = new Map();
-      this.opts.onPricesFailed?.(err, where);
+      this.opts.onPricesFailed?.(err, where, atBoot);
     }
     // Only the current attempt may answer; a superseded fetch must not close a newer open's question.
     if (!stillCurrent()) return;
@@ -295,7 +300,7 @@ export class ShelfSession<Where extends string = string> {
     // needs a priced row, and a refetch refuses under `buying`, so in practice the fetch has already
     // answered — this states which state the answer owns rather than relying on that.
     if (this._state.kind === 'loading') this._state = { kind: 'shelf' };
-    this.opts.onPricesAnswered?.({ where, priced: priced.size, failed });
+    this.opts.onPricesAnswered?.({ where, priced: priced.size, failed, atBoot });
     this.opts.onChange?.();
   }
 

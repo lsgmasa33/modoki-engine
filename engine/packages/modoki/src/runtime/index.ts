@@ -777,7 +777,7 @@ export {
   JOURNAL_LEVELS, isJournalLevel,
   resolveRefName, setVerboseCapture, verboseCaptureState, isVerboseType,
   isJournalEnabled, appLifetimeEvent, appLifetimeEventTypes,
-  type GameEvent, type JournalLevel,
+  type GameEvent, type JournalLevel, type EmitOptions,
 } from './core/journal';
 export { journalState, journalDecision, journalWarn, journalError } from './core/gameJournal';
 export {
