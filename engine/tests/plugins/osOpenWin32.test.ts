@@ -43,7 +43,9 @@ const onWin32 = process.platform === 'win32';
  *  the assertion and the teardown so they cannot disagree about what "the window
  *  this test opened" means. */
 function windowMatcher(dir: string, action: 'count' | 'quit'): string {
-  const target = dir.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  // `''` is PowerShell's escape inside a single-quoted literal: a temp dir under a user
+  // name like O'Brien otherwise breaks the parse and fails the whole file (#1534 review).
+  const target = dir.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase().replace(/'/g, "''");
   return [
     '$n = 0;',
     '$shell = New-Object -ComObject Shell.Application;',
@@ -77,8 +79,8 @@ async function closeRevealedWindows(dir: string): Promise<void> {
 interface WindowedProc { id: number; name: string; title: string }
 
 /** Every process that currently owns a top-level window, with its title. The title is
- *  what identifies the app that opened our fixture — see the tab caveat on the
- *  `openInOS` test below for why the PROCESS alone is not enough. */
+ *  what identifies the window that opened our fixture: `throwawayHandler` titles it
+ *  from `%1`, so a match proves the path arrived, which a process name cannot. */
 async function windowedProcesses(): Promise<WindowedProc[]> {
   const ps = 'Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { "{0}|{1}|{2}" -f $_.Id, $_.ProcessName, $_.MainWindowTitle }';
   const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps]);
@@ -177,16 +179,32 @@ async function probeRevealObservable(): Promise<boolean> {
   }
 }
 
+/** Write the one PowerShell script both the open probe and the open test's handler run:
+ *  a bare WinForms window titled with the file name of its argument. Shared so the probe
+ *  establishes the capability the test actually needs — a `-File` script is gated by
+ *  execution policy and AppLocker where `-Command` is not, so a probe using `-Command`
+ *  would pass on a locked-down machine whose handler can never run, and the test would
+ *  go red blaming `openInOS` (found in review). `-ExecutionPolicy Bypass` does not beat a
+ *  Group Policy setting; there, both skip together. */
+function writeWindowScript(dir: string): string {
+  const script = path.join(dir, 'window.ps1');
+  fs.writeFileSync(
+    script,
+    'param([string]$p)\r\nAdd-Type -AssemblyName System.Windows.Forms\r\n$f = New-Object System.Windows.Forms.Form\r\n' +
+      '$f.Text = [IO.Path]::GetFileName($p)\r\n[void]$f.ShowDialog()\r\n',
+  );
+  return script;
+}
+
 /** The open test's observable is a top-level window TITLED after something, read
  *  through `MainWindowTitle`. The probe shows a bare WinForms window with a stamp
- *  as its title, owned by a child of this process.
+ *  as its title, owned by a child of this process, through `writeWindowScript`.
  *
- *  ⚠️ **Not Notepad, though that is what the test ends up opening.** Windows 11
- *  Notepad restores its previous session on launch, so killing a Notepad the probe
- *  started does not remove the probe's tab — it comes back on the owner's next
- *  launch, and a killed "new" Notepad may be holding the owner's restored unsaved
- *  tabs too (found in review). A window this process owns outright has neither
- *  problem: killing it is the whole cleanup.
+ *  ⚠️ **Never Notepad** — for the probe or the test (#1534, `throwawayHandler`).
+ *  Windows 11 Notepad restores its previous session on launch, so a probe tab comes
+ *  back on the owner's next launch, and a killed "new" Notepad may be holding the
+ *  owner's restored unsaved tabs too (found in review). A window this process owns
+ *  outright has neither problem: killing it is the whole cleanup.
  *
  *  ⚠️ **Not `detached`**, unlike the launchers: a detached PowerShell's form never
  *  appeared in `MainWindowTitle` here (measured on the win clone, 2026-09-24),
@@ -200,14 +218,8 @@ async function probeRevealObservable(): Promise<boolean> {
  *  window of its own. */
 async function probeOpenObservable(): Promise<boolean> {
   const stamp = `modokiprobe${Date.now()}`;
-  const child = spawn(
-    'powershell',
-    [
-      '-NoProfile', '-Command',
-      `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.Form; $f.Text = '${stamp}'; [void]$f.ShowDialog()`,
-    ],
-    { stdio: 'ignore' },
-  );
+  const script = writeWindowScript(scratch('modoki-probe-open-'));
+  const child = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, stamp], { stdio: 'ignore' });
   child.on('error', () => { /* the poll reports the absence */ });
   try {
     const hit = await pollUntil(40, async () => (await windowedProcesses()).find((p) => p.title.includes(stamp)));
@@ -269,50 +281,147 @@ describe.skipIf(!onWin32)('revealInOS against the real explorer.exe (win32)', ()
   }, 60_000);
 });
 
+/** A per-user file association that exists only for one run of the `openInOS` test: a
+ *  made-up extension whose `open` verb shows a window TITLED with the opened file's
+ *  name, owned by a process nobody else uses.
+ *
+ *  ⚠️ **Why not the machine's real `.txt` handler** (#1534). On Windows 11 that is
+ *  Notepad, which saves its tabs and restores them on the next launch — and the tab
+ *  survives a kill, a normal close (closing is what SAVES the session) and deleting
+ *  the file (measured: 27 of 29 leftover gate tabs pointed at files that were already
+ *  gone). So every `verify` left the owner a permanent tab, and cleanup would have
+ *  meant driving the owner's own Notepad. The owner chose this instead (2026-09-24):
+ *  the test still goes through the real `cmd /c start` → shell association → app
+ *  launch, it just does not end in an app that belongs to the owner's session.
+ *
+ *  The title comes from `%1`, so a matching window proves the PATH reached the app,
+ *  not merely that something started. `%1` is QUOTED and handed to a `-File` script as
+ *  an argument, never spliced into PowerShell source: an apostrophe in the path would
+ *  break a `'%1'` literal, and an unquoted `%1` can arrive as an 8.3 short name
+ *  without the stamp (found in review). Unique per run, so a concurrent gate on the
+ *  same machine cannot delete this run's keys. HKCU only — no elevation.
+ *
+ *  ⚠️ **The two `Classes` keys are not the whole footprint.** Resolving the
+ *  association makes the SHELL write two more per-user traces of its own —
+ *  `Explorer\FileExts\.<ext>` and an `ApplicationAssociationToasts` value — and
+ *  those outlived every run until `unregister` learned to delete them too (found in
+ *  review: one of each per `verify`, measured). A process killed mid-test still
+ *  leaves inert entries for an extension nothing else uses; accepted. */
+function throwawayHandler(dir: string, stamp: string): { ext: string; register: () => void; unregister: () => void } {
+  const ext = `.${stamp}`;
+  const progId = `Modoki.Gate.${stamp}`;
+  const hkcu = 'HKCU\\Software';
+  const explorer = `${hkcu}\\Microsoft\\Windows\\CurrentVersion`;
+  const reg = (...args: string[]) => execFileSync('reg', args, { stdio: 'ignore' });
+  /** Every trace a run can leave, as `reg` arguments naming a key or one value. */
+  const traces: string[][] = [
+    [`${hkcu}\\Classes\\${ext}`],
+    [`${hkcu}\\Classes\\${progId}`],
+    [`${explorer}\\Explorer\\FileExts\\${ext}`],
+    [`${explorer}\\ApplicationAssociationToasts`, '/v', `${progId}_${ext}`],
+  ];
+  return {
+    ext,
+    register: () => {
+      const script = writeWindowScript(dir);
+      // `-WindowStyle Hidden` hides only the handler's OWN console: it was started by the
+      // shell, not attached to vitest's, unlike the probe above.
+      const command = `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${script}" "%1"`;
+      reg('add', `${hkcu}\\Classes\\${ext}`, '/ve', '/d', progId, '/f');
+      reg('add', `${hkcu}\\Classes\\${progId}\\shell\\open\\command`, '/ve', '/d', command, '/f');
+    },
+    unregister: () => {
+      for (const t of traces) {
+        const [key, ...value] = t;
+        try {
+          reg('query', key, ...value);
+        } catch {
+          continue; // never written — a failed register, or the shell never resolved it
+        }
+        try {
+          reg('delete', key, ...value, '/f');
+        } catch {
+          // Not the assertion, but never silent: a leaked association is state on the owner's machine.
+          process.stderr.write(`[osOpenWin32] could not delete ${t.join(' ')} — remove it by hand.\n`);
+        }
+      }
+    },
+  };
+}
+
+/** Every per-user registry entry still naming `stamp`, found by SEARCHING rather than by
+ *  re-reading `unregister`'s list — a check driven by that list could never notice a
+ *  trace the list does not know about, which is how the shell's own two went unseen.
+ *  Covers where the shell keeps association state (`Classes`, and all of
+ *  `CurrentVersion`: FileExts, the toasts, and anything not yet found). ~5s here. */
+async function registryTracesOf(stamp: string): Promise<string[]> {
+  const roots = ['HKCU\\Software\\Classes', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion'];
+  const found: string[] = [];
+  for (const root of roots) {
+    try {
+      const { stdout } = await execFileAsync('reg', ['query', root, '/f', stamp, '/s']);
+      found.push(...stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.toLowerCase().includes(stamp)));
+    } catch (e) {
+      // `reg query /f` exits 1 with an EMPTY stderr when nothing matches — the answer we
+      // want. Any other failure (reg missing, key unreadable) writes stderr and must not
+      // read as "clean" (found in review). Not the stdout text: that is localized.
+      const { code, stderr } = e as { code?: unknown; stderr?: string };
+      if (code !== 1 || String(stderr ?? '').trim() !== '') throw e;
+    }
+  }
+  return found;
+}
+
+/** Kill every process whose command line carries `stamp` — the handler, and a `cmd`
+ *  still behind it. By command line rather than by window, so a handler whose window
+ *  appeared only after the poll gave up is not left orphaned on the desktop (found in
+ *  review). The querying PowerShell carries the stamp too, so it excludes itself. */
+function killByStamp(stamp: string): void {
+  try {
+    execFileSync(
+      'powershell',
+      [
+        '-NoProfile', '-NonInteractive', '-Command',
+        `Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*${stamp}*' } | ` +
+          'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }',
+      ],
+      { stdio: 'ignore' },
+    );
+  } catch {
+    /* tidying is not the assertion */
+  }
+}
+
 describe.skipIf(!onWin32)('openInOS against the real cmd /c start (win32)', () => {
-  /** ⚠️ Cleanup here is deliberately ASYMMETRIC, and the asymmetry is measured, not
-   *  cautious. Windows 11's Notepad is tabbed and single-instance: opening a file with
-   *  NO Notepad running starts a new process, but opening one while Notepad is ALREADY
-   *  running is absorbed as a TAB into the existing process and creates no new pid
-   *  (both observed on the win clone, 2026-09-24). So killing "the app that has our
-   *  title" would close the owner's other documents along with our fixture.
-   *
-   *  Hence: assert by TITLE, which holds in both cases — and kill ONLY a pid that did
-   *  not exist before the call. When the fixture is absorbed into an app the owner was
-   *  already using, it is left alone and reported, and the fixture's own text says what
-   *  it is so a stray tab explains itself. Losing a second of the owner's work is much
-   *  worse than leaving a tab they can close.
-   *
-   *  ⚠️ **Even the new-pid kill does not clean up on Windows 11 Notepad**, which
-   *  restores its previous session on launch — the fixture's tab comes back the
-   *  next time the owner opens Notepad. Open as #1534. */
-  it.skipIf(!openObservable)('actually opens the file in its default app', async () => {
+  it.skipIf(!openObservable)('actually opens the file through its shell association', async () => {
     const dir = scratch('modoki-open-');
-    // No dot in the stamp: some apps title the window without the extension.
     const stamp = `modokigate${Date.now()}`;
-    const file = path.join(dir, `${stamp}.txt`);
-    fs.writeFileSync(file, "Opened by Modoki's test gate (engine/tests/plugins/osOpenWin32.test.ts).\nNothing is wrong — this window can be closed.\n");
-
-    const before = await windowedProcesses();
-    const beforeIds = new Set(before.map((p) => p.id));
-
-    await openInOS(file);
-
+    const handler = throwawayHandler(dir, stamp);
     let hit: WindowedProc | undefined;
-    for (let i = 0; i < 24 && !hit; i++) {
-      hit = (await windowedProcesses()).find((p) => p.title.toLowerCase().includes(stamp));
-      if (!hit) await new Promise((r) => setTimeout(r, 250));
+    let beforeIds: Set<number> | undefined;
+    try {
+      // Inside the try: a register that fails half-way still reaches `unregister`.
+      handler.register();
+      const file = path.join(dir, `${stamp}${handler.ext}`);
+      fs.writeFileSync(file, "Opened by Modoki's test gate (engine/tests/plugins/osOpenWin32.test.ts).\n");
+      beforeIds = new Set((await windowedProcesses()).map((p) => p.id));
+
+      await openInOS(file);
+
+      hit = await pollUntil(24, async () => (await windowedProcesses()).find((p) => p.title.toLowerCase().includes(stamp)));
+    } finally {
+      killByStamp(stamp);
+      handler.unregister();
     }
 
     // The claim a mock cannot reach: something really opened our file. `openInOS`
     // resolving proves only that a process was spawned — #1508's shape exactly.
     expect(hit, 'no window appeared titled for the opened file').toBeTruthy();
+    expect(beforeIds!.has(hit!.id), 'the handler window belongs to a process that was already running').toBe(false);
 
-    if (hit && !beforeIds.has(hit.id)) {
-      try { process.kill(hit.id); } catch { /* it closed itself; tidying is not the assertion */ }
-    } else if (hit) {
-      console.warn(`[osOpenWin32] the fixture opened as a tab in ${hit.name} (pid ${hit.id}), which was already running — left alone on purpose; close the tab by hand.`);
-    }
+    // #1534's whole defect was residue nobody looked for. A run must leave NOTHING that
+    // names it behind — asserted, not tidied, so a new trace goes red instead of piling up.
+    expect(await registryTracesOf(stamp), 'the run left per-user registry entries behind').toEqual([]);
   }, 60_000);
 });
 
@@ -325,9 +434,8 @@ describe.skipIf(!onWin32)('openInOS against the real cmd /c start (win32)', () =
  *  - **The "opener could not be STARTED" branch**, which is the mocked case in
  *    `osOpen.test.ts`; there is no way to make the real explorer.exe vanish for one
  *    test.
- *  - **A `.txt` handler that is not Notepad.** The `openInOS` test above identifies
- *    what opened the fixture by WINDOW TITLE, so it holds for any app that titles its
- *    window after the file — which Notepad, VS Code and every editor tried here do. An
- *    association pointing at something that does not would fail it; that is a machine
- *    configuration question, not a defect in the code under test, and the message says
- *    so. Where no window can be observed it skips (the probes above) rather than pretending. */
+ *  - **The machine's REAL default apps.** The `openInOS` test opens its fixture through
+ *    a throwaway association it registers itself, never `.txt` → Notepad (#1534): which
+ *    app a type opens in is machine configuration, not the code under test, and the real
+ *    one keeps state the gate cannot clean up. Where no window can be observed it skips
+ *    (the probes above) rather than pretending. */

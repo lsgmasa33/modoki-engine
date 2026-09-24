@@ -1588,6 +1588,31 @@ describe('asset-tree-shaker', () => {
     expect(result.unreachableRefs).toEqual([]);
   });
 
+  it('keeps refs held only in a v17 row channel — `own`, a node row`s traits, a node row`s `own` (#1516)', () => {
+    // Mutation: read `r.added` only for `fromRows` — own.mat and nodeown.mat are shaken out, and the guard fails.
+    const guids = ['abab1111-2222-4333-8444-555555555511', 'abab1111-2222-4333-8444-555555555512', 'abab1111-2222-4333-8444-555555555513'];
+    const [ownG, nodeG, nodeOwnG] = guids;
+    fx.writeJson('/games/test/assets/mats/own.mat.json', { id: ownG, version: 1 });
+    fx.writeJson('/games/test/assets/mats/node.mat.json', { id: nodeG, version: 1 });
+    fx.writeJson('/games/test/assets/mats/nodeown.mat.json', { id: nodeOwnG, version: 1 });
+    const plain = (mat: string) => ({ parentLocalId: 0, guid: '', name: 'X', traits: { Renderable3DPrimitive: { material: mat } }, children: [] });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 17,
+      entities: [{
+        id: 1, traits: {},
+        members: {
+          '/abab1111-2222-4333-8444-5555555555ff': { guid: 'abab1111-2222-4333-8444-5555555555fe', own: [plain(ownG!)] },
+          '/abab1111-2222-4333-8444-5555555555ff/a+k-node': { traits: { Renderable3DPrimitive: { material: nodeG } }, own: [plain(nodeOwnG!)] },
+        },
+      }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    for (const f of ['own', 'node', 'nodeown']) expect(result.kept).toContain(`/games/test/assets/mats/${f}.mat.json`);
+    expect(result.unreachableRefs).toEqual([]);
+  });
+
   it('does NOT flag a video the module toggle dropped on purpose (ordering, not luck)', () => {
     // The guard runs BEFORE the excludeVideo prune for exactly this case. `build.modules.video:false`
     // removes clips from the keep-set AFTER the walk, so a scene that legitimately references one

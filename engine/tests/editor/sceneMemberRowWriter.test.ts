@@ -194,7 +194,8 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     expect(entry.nestedStructure).toBeUndefined();
     expect(entry.members![`/${gN}/${gA}`]!.traits).toEqual({ Transform: { x: 5 } });
     expect(entry.members![`/${gN}/${gB}`]).toEqual({ removed: true });
-    expect(entry.members![`/${gN}`]!.added!.map((n) => n.name)).toEqual(['Extra']);
+    // v17 (#1516): the scene's own node is appended (`own`), not a list that replaces the row's.
+    expect(entry.members![`/${gN}`]!.own!.map((n) => n.name)).toEqual(['Extra']);
 
     install(renumbered(), outer());
     await load(scene(O, entry as never));
@@ -486,7 +487,8 @@ describe('a NESTED frame restates each member against the PREFAB baseline (#1468
     expect(count('PrefabExtra')).toBe(1);
     deleteEntitiesWithUndo([one('PrefabExtra').id]);
     const e1 = strip(await entryOf());
-    expect(e1.members![`/${gN}`]).toMatchObject({ added: [] });
+    // v17 (#1516): the deletion is the node's own row, not an empty list over the member's.
+    expect(e1.members![`/${gN}/a+k-extra`]).toEqual({ removed: true });
     await load(scene(O, e1 as never));
     expect(count('PrefabExtra')).toBe(0);
   });
@@ -500,7 +502,8 @@ describe('a NESTED frame restates each member against the PREFAB baseline (#1468
     expect(has('A', 'Renderable3DPrimitive')).toBe(true);
     await load(await serializeScene());
     const e1 = strip(await entryOf());
-    expect(e1.members![`/${gN}/${gA}`]).toMatchObject({ removedTraits: [] });
+    // v17 (#1516): a per-trait statement restoring the chain's removal, not an empty list over it.
+    expect(e1.members![`/${gN}/${gA}`]).toMatchObject({ traitRemovals: { Renderable3DPrimitive: false } });
     await load(scene(O, e1 as never));
     expect(has('A', 'Renderable3DPrimitive')).toBe(true);
   });

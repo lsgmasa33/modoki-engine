@@ -3,7 +3,7 @@
  *  engine/plugins/asset-fs-ops.ts so the editor can run the same walk on a live scene's serialized form
  *  (#1437: an applied move changes member paths, and every stored ref to a moved member follows). */
 
-import { durableGuid, deriveMemberGuid, addedKeyStep, mapStringValues, parseSteps, memberPathSteps, FRAME_STEP, type MemberStep } from '../core/assetRefRules';
+import { durableGuid, memberRowNodes, deriveMemberGuid, addedKeyStep, mapStringValues, parseSteps, memberPathSteps, FRAME_STEP, type MemberStep } from '../core/assetRefRules';
 import { isMemberToken, parseMemberToken, memberToken, memberPathKey, MEMBER_TOKEN_PREFIX } from '../core/templateRefs';
 import { descendPathKeyed, mergeNestedStructurePaths } from './prefabOverrides';
 
@@ -31,8 +31,7 @@ const rowsOf = (v: unknown): MemberRows | undefined => (v && typeof v === 'objec
  *  (`/<g>/…` → `/…`) for the nested row whose identity is `g` — the loader's `foldMemberRowChannels`
  *  and `descendMemberRows`, as far as this walk needs them. */
 const directRowAdded = (rows: MemberRows | undefined, nodeGuid: string): unknown[] => {
-  const r = rows?.[`/${nodeGuid}`];
-  return nodeGuid && Array.isArray(r?.added) ? r.added : [];
+  return nodeGuid ? memberRowNodes(rows?.[`/${nodeGuid}`]) : [];
 };
 const descendRows = (rows: MemberRows | undefined, nodeGuid: string | undefined): MemberRows | undefined => {
   if (!rows || !nodeGuid) return undefined;
@@ -305,7 +304,7 @@ export function sceneMemberAnchors(scene: Record<string, unknown>): SceneMemberA
       visit(row.children, false);
       visit(row.added, false);
       // A member row's added nodes (Phase 4, #1468) define anchors exactly as `added` does.
-      for (const r of Object.values(rowsOf(row.members) ?? {})) visit(r?.added, false);
+      for (const r of Object.values(rowsOf(row.members) ?? {})) visit(memberRowNodes(r), false);
       const slot = (row as { nestedStructure?: unknown }).nestedStructure;
       if (slot && typeof slot === 'object') {
         for (const delta of Object.values(slot as Record<string, { added?: unknown } | null>)) visit(delta?.added, false);

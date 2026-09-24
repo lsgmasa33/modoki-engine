@@ -476,8 +476,9 @@ nestedStructure?: Record<string /* "4", "4.7" */, {
   `removedTraits` or `added` only when it differs from the chain's baseline for that member.
   Restating every member the chain touched pinned a template row's added nodes, removed members and
   removed traits on a no-op save, so a later template change to them never reached the scene.
-  `added` compares the way the rebuild does (`chainAddedComparer` → `subtractChainStructure`): the
-  plain live capture, matched by template key, with the chain's member tokens resolved. A reference
+  `added` compares the way the rebuild does (`frameAddedDiff` → `diffFrameAdded`, the rebuild's
+  `subtractChainStructure` for a list that falls back): the plain live capture, matched by template
+  key, with the chain's member tokens resolved. A reference
   node's live capture carries identity a template node does not: member rows' `guid`/`name`, and a
   display `name` no spawn applies. `withoutLiveIdentity` drops that identity before the compare.
   Without that, every template reference node read as edited, and the REBUILD respawned it from the
@@ -497,8 +498,8 @@ nestedStructure?: Record<string /* "4", "4.7" */, {
     this normalisation.
   The cost is one member-path walk per reference node per save or rebuild. A close-out
   measurement put it at ~4-5 ms per node at 3.3k entities, about +15% on a save with 40 of them.
-  ⚠️ **`added` is one statement per member.** Once the scene changes one node in a member's list,
-  the whole list is written, and the chain's untouched nodes beside it are pinned with it (#1516). A frame
+  Since v17 (#1516) a template's added nodes and removed traits are stated node by node and trait by
+  trait instead — see "A template-added node's edits are stored on its own row" below. A frame
   that falls back to the legacy slot (a member no row can key, or an unrowed move) keeps the
   restate rule above. Scenes saved before #1511 keep their pins wherever the template has changed
   since. A pin that still equals the template drops out on the next save.
@@ -1017,6 +1018,84 @@ and a carried pose under a non-uniformly scaled, rotated removed row is the near
 before. Tests: `engine/tests/editor/duplicateCarriesRefs.test.ts` (the #1437 describes),
 `engine/tests/plugins/remintPrefabMemberRefs.test.ts` (memberGuidRemap, the token rewrite and
 planMemberPathRepair against the loader), `engine/tests/plugins/prefabMemberPathsRoute.test.ts`.
+
+### A template-added node's edits are stored on its own row (scene v17, #1516)
+
+**A scene's edit to one node that a template row added is stored as that node's own row, holding only
+what the scene changed — so the template keeps owning everything else about it and about its siblings.**
+In v16 a member row's `added` was ONE statement for the whole list under a member, and it replaced the
+chain's list (`foldMemberRowChannels`). So the first edit to any of those nodes made the save write them
+all, and every untouched sibling was pinned: a later template change to it never reached the scene.
+`removedTraits` had the same shape — a scene removing one more trait pinned every trait the chain removed.
+
+- **Owner rule (2026-09-24): overwrites win, and a template change reaches every part the scene did not
+  overwrite.** v17 delivers it at field granularity for template-added nodes. Option A (a keyed merge of
+  whole edited nodes) was the smaller format and was rejected for this: under A, a scene that moved a
+  lamp would still miss a later colour change to it.
+- **The shapes.** A template-added plain node inside a nested frame gets a NODE row keyed
+  `<frame chain>/a+<key>` — the frame's member-row key plus the node's template key LAST
+  (`formatNodeRowKey`; `a+` is told from a guid by the `+`, never by the leading `a`). It carries
+  `traits` (only the differing fields, merged over the node's; a trait the node lacks is added),
+  `traitRemovals` (`true` drops a trait), `own` (the scene's children of that node, appended) and
+  `removed: true`. A member row gains `own` — the scene's nodes under the member, APPENDED where `added`
+  replaces — and `traitRemovals`, per-trait statements over the chain's list (`false` restores a trait
+  the chain removed, the trait twin of `removed: false`). `added` and `removedTraits` keep their exact v16
+  meaning: always read, written only as the fallback below.
+- **Save: `diffFrameAdded` (`nodeRowDiff.ts`), live capture against the chain's nodes.** Matched by
+  template key, children included (`liveTemplateKeys(…, deep)`). A field one side omits reads as its
+  schema default — the live capture drops default-valued fields, a template bag may state them. That
+  is also why no compaction step is needed: an earlier draft compacted both bags, and mutation showed it
+  changed nothing. The #1511 note above records why comparing against the raw file bag failed; the
+  default rule is what makes the two comparable.
+- ⚠️ **A template node matches only under its OWN parent** — the member the chain anchors it to, or the
+  template node whose `children` hold it. **Re-parenting a template-added node unlinks it (owner,
+  2026-09-24)**: it is written as the scene's own node where it now sits, and the template's copy as
+  `removed`, so only that node stops following the template, never its siblings. The owner's reason: the
+  node belongs to the OUTER prefab, and a drag under an inner prefab's member moves it into another
+  prefab. The same holds under a sibling template node — there is deliberately no `parent` channel on a
+  node row.
+- **Fallback to the v16 whole list** for a member whose list cannot be stated node by node: a chain node
+  there with no key (a file from before keys), a key used twice in the frame, or an EDITED template
+  REFERENCE node — its interior is a frame of its own and has no node-row address yet. That member's
+  list is pinned exactly as in v16, and nothing else is.
+- **Where the loader places a chain node is where the diff looks for it.** A node whose anchor row the
+  inner document no longer has is re-anchored to the frame root, as `applyStructureCore` does; a node
+  whose anchor is not LIVE (the scene deleted that member, or any member above it — `removed` lists only
+  the top-most) went with it and gets no statement (`chainNodesAsPlaced`). Without the first, a no-op
+  save read the loader's re-anchor as a re-parent and unlinked the node; without the second, a member
+  below a deleted one read as live-but-changed, and the frame fell back to the pinning whole slot
+  (close-out review F3/F4).
+- **The template drops a node the scene edited (fork 2, owner):** the node vanishes with it. Its row is
+  an orphan, warned and KEPT across saves by R2 exactly as a member row is, judged against the keys the
+  template adds in THAT frame (`templateFrameKeys` — per frame, because a prefab-editor re-parent keeps a
+  node's key, and a template-wide set read a node moved into another row's frame as still backed). So a
+  template that brings the node back brings the edit back. **A Refresh keeps the same rule for a frame it
+  captured**: the rebuild carries the frame's kept orphans with its node rows, applies any whose node is
+  back, and hands the rest to the kept store (`setKeptNodeRowOrphans`), so an orphan the editor shows
+  applied is no longer kept (close-out review F1/F2). ⚠️ A frame the Refresh spawns WHOLE (the old template
+  lacked its row) goes through no capture, and its kept rows are not replayed until the next load — #1535.
+  The Refresh finds a template REFERENCE node's root by its key too, so a scene deletion of one survives
+  it (re-review R3b).
+- **A scene-deleted template node stays deleted** even if the template later edits it (fork 3).
+- **Refresh.** The rebuild runs the same diff against the baseline (`captureNestedInstanceOverridesIn`,
+  shared deps `nodeDiffDeps`), lets the fresh expansion spawn the NEW template's nodes, and patches each
+  node row onto its fresh node (`applyNodeRowsLive`). So a Refresh delivers a template change to the
+  unedited fields of an edited node, and honours a deletion — both gaps before v17. Only a fallback
+  member keeps the #1386 whole-node replace.
+- **Every walker of a row's nodes reads `memberRowNodes(row)`** — `added` plus `own`: the runtime ref
+  collector, the reference-node and added-row collectors, the member-path walks and anchors, the build's
+  tree-shaker (a miss drops the asset from the build, #53), a duplicate's remint, the serializer's path
+  flags. Node rows ride the same loops. `sceneMemberRowReaders.test.ts` puts the only copy of a ref on
+  each channel.
+- **Not covered:** the prefab-side twin — a prefab nested row's `nestedStructure` slot still owns a whole
+  frame (#1533, designed to reuse `diffFrameAdded`/`applyNodeRows`); field-level edits inside a template
+  reference node (and, after a Refresh, a template reference node reads as edited and its member's list is
+  restated — #1536); per-field Apply/Revert of a node row; a template node anchored at an owned NESTED
+  row's localId (the loader puts it under that row's root, the capture attributes it to the inner frame, so
+  the diff reads it as re-parented — seen only in a hand-authored fixture, no writer known to produce it). **A scene saved before v17 is not un-pinned by
+  resaving it:** the v16 list is read as the scene's state, so every field of a pinned node that has since
+  drifted from the template is restated on that node's row and stays pinned. Only fields still equal to
+  the template, and nodes still equal throughout, go back to the template.
 
 ### The #1468 design record — why identity is stored this way
 

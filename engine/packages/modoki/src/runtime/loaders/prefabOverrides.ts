@@ -18,6 +18,7 @@
  *  `loadSceneFile.ts` re-exports the three override helpers, so their existing importers
  *  (`editor/scene/prefab.ts`, `editor/scene/serialize.ts`) are unchanged. */
 import { emptyDocMap } from '../core/docKeys';
+import { nodeRowKey } from '../core/assetRefRules';
 
 /** localId → trait name → field → value. */
 export type OverrideMap = Record<number, Record<string, Record<string, unknown>>>;
@@ -148,6 +149,80 @@ export interface MemberRowChannels<A> {
   removedTraits?: string[];
   removed?: boolean;
   added?: A[];
+  /** v17 (#1516): nodes the SCENE added under this member, APPENDED after what the lower layer puts
+   *  there — where `added` replaces it. What lets a scene add a node beside a template's without
+   *  restating (and so pinning) the template's. */
+  own?: A[];
+  /** v17 (#1516): per-trait removal statements, merged over `removedTraits` (or, absent that, the lower
+   *  layer's list): `true` removes the trait, `false` restores one a lower layer removed. Where
+   *  `removedTraits` states the whole list, and so pinned every name the chain removed beside the scene's. */
+  traitRemovals?: Record<string, boolean>;
+}
+
+/** The node shape {@link applyNodeRows} reads — the part of `AddedEntity` it touches. Generic for the
+ *  reason `MemberRowChannels` is. */
+export interface KeyedNode<A> {
+  key?: string;
+  prefab?: string;
+  traits: Record<string, Record<string, unknown> | boolean>;
+  children: A[];
+}
+
+/** Apply NODE ROWS to a frame's template-added nodes (#1516, scene v17) — the field-level twin of what a
+ *  member row does for a member. `rows` maps a template key to that node's row; every node carrying a key
+ *  in it, at any depth of `children`, gets:
+ *  - `removed: true` — dropped, with its subtree;
+ *  - `traits` — merged field by field over the node's own bag, the row winning (a trait the node lacks is
+ *    ADDED, which is how a scene adds a component to a template node);
+ *  - `traitRemovals` — a `true` name is deleted from the bag. `false` has nothing to restore on a plain
+ *    node (its bag IS its traits) and is ignored;
+ *  - `own` — the scene's own children, appended after the template's.
+ *  A REFERENCE node (`prefab`) takes only `removed`: its interior is a frame of its own, and the writer
+ *  never states field edits against one (it falls back to restating the member's list).
+ *
+ *  Returns the new list and the keys that found a node, so a caller can report the rest as orphans — a
+ *  row the template no longer backs (#1516 fork 2: the node vanishes, the row is kept and warned, and a
+ *  template that brings the node back brings the edit back with it). Inputs are never mutated. */
+export function applyNodeRows<A extends KeyedNode<A>>(
+  nodes: readonly A[] | undefined,
+  rows: ReadonlyMap<string, MemberRowChannels<A>>,
+  hit: Set<string> = new Set(),
+): { nodes: A[] | undefined; hit: Set<string> } {
+  if (!nodes || !rows.size) return { nodes: nodes as A[] | undefined, hit };
+  const walk = (list: readonly A[]): A[] => {
+    const out: A[] = [];
+    for (const node of list) {
+      const row = node.key ? rows.get(node.key) : undefined;
+      if (row) hit.add(node.key!);
+      if (row?.removed === true) continue;
+      const children = node.children?.length ? walk(node.children) : node.children;
+      if (!row || node.prefab) { out.push(children === node.children ? node : { ...node, children }); continue; }
+      const traits: Record<string, Record<string, unknown> | boolean> = emptyDocMap();
+      for (const [t, v] of Object.entries(node.traits ?? {})) traits[t] = v;
+      if (isRecord(row.traits)) {
+        for (const [t, fields] of Object.entries(row.traits)) {
+          if (!isRecord(fields)) continue;
+          const cur = traits[t];
+          traits[t] = { ...(isRecord(cur) ? cur : {}), ...fields };
+        }
+      }
+      if (isRecord(row.traitRemovals)) for (const [t, v] of Object.entries(row.traitRemovals)) if (v === true) delete traits[t];
+      const own = Array.isArray(row.own) ? row.own : [];
+      out.push({ ...node, traits, children: [...(children ?? []), ...own] });
+    }
+    return out;
+  };
+  return { nodes: walk(nodes), hit };
+}
+
+/** Merge per-trait removal statements (`traitRemovals`) over a removal list. */
+function mergeTraitRemovals(list: readonly string[] | undefined, statements: Record<string, boolean>): string[] {
+  const out = new Set(list ?? []);
+  for (const [t, v] of Object.entries(statements)) {
+    if (v === true) out.add(t);
+    else if (v === false) out.delete(t);
+  }
+  return [...out];
 }
 
 /** The localId-keyed channels of ONE instance frame, as the spawner applies them. */
@@ -182,6 +257,10 @@ export interface FrameChannels<A> {
  *  lower layer, which an application after the recursion could not do (it cannot un-spawn an addition).
  *
  *  A row whose component names no row of `doc` is skipped: that is R2's orphan, reported elsewhere.
+ *
+ *  v17 (#1516) adds two things. A member row's `own` APPENDS the scene's nodes and its `traitRemovals`
+ *  edits the removal list per trait, where `added`/`removedTraits` replace. And a direct key `/a+<key>`
+ *  is a NODE row, for the template-added node carrying that key — applied last by {@link applyNodeRows}.
  *  Inputs are never mutated — `lower` routinely aliases the prefab cache. */
 export function foldMemberRowChannels<A extends { parentLocalId: number }>(
   doc: { entities?: readonly { localId?: number; nodeGuid?: string; prefab?: string }[]; rootLocalId?: number },
@@ -190,11 +269,16 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
   rootRow?: MemberRowChannels<A>,
 ): FrameChannels<A> & { forwardRoot?: Map<number, MemberRowChannels<A>> } {
   const direct: [string, MemberRowChannels<A>][] = [];
+  const nodeRows = new Map<string, MemberRowChannels<A>>();
   for (const [key, row] of Object.entries(rows ?? {})) {
-    // One component: `/<nodeGuid>`. A guid holds no `/`, so a second one means a deeper frame.
-    if (key.length > 1 && key[0] === '/' && key.indexOf('/', 1) < 0 && isRecord(row)) direct.push([key.slice(1), row]);
+    // One component: `/<nodeGuid>`, or `/a+<key>` for a template-added node (#1516). Neither holds a `/`,
+    // so a second one means a deeper frame.
+    if (!(key.length > 1 && key[0] === '/' && key.indexOf('/', 1) < 0 && isRecord(row))) continue;
+    const nodeKey = nodeRowKey(key.slice(1));
+    if (nodeKey) nodeRows.set(nodeKey, row);
+    else direct.push([key.slice(1), row]);
   }
-  if (!direct.length && !rootRow) return lower;
+  if (!direct.length && !rootRow && !nodeRows.size) return lower;
 
   const rootLocalId = doc.rootLocalId ?? 1;
   const byGuid = new Map<string, { localId: number; nested: boolean }>();
@@ -214,18 +298,25 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
       else removed.delete(lid);
     }
     if (nested) {
-      if (row.traits || row.removedTraits || row.added) (forwardRoot ??= new Map()).set(lid, row);
+      if (row.traits || row.removedTraits || row.added || row.own || row.traitRemovals) (forwardRoot ??= new Map()).set(lid, row);
       return;
     }
     if (isRecord(row.traits)) overrides = mergeOverrideMaps(overrides, { [lid]: row.traits });
-    if (Array.isArray(row.removedTraits)) {
+    const statements = isRecord(row.traitRemovals) ? row.traitRemovals as Record<string, boolean> : undefined;
+    if (Array.isArray(row.removedTraits) || statements) {
+      // `removedTraits` states the whole list (v16); `traitRemovals` then edits it, or the lower layer's.
+      const base = Array.isArray(row.removedTraits) ? row.removedTraits : removedTraits?.[lid];
+      const list = statements ? mergeTraitRemovals(base, statements) : [...base!];
       const next: Record<number, string[]> = { ...(removedTraits ?? {}) };
-      if (row.removedTraits.length) next[lid] = [...row.removedTraits];
+      if (list.length) next[lid] = list;
       else delete next[lid];
       removedTraits = next;
     }
     if (Array.isArray(row.added)) {
       added = [...(added ?? []).filter((n) => n.parentLocalId !== lid), ...row.added.map((n) => ({ ...n, parentLocalId: lid }))];
+    }
+    if (Array.isArray(row.own) && row.own.length) {
+      added = [...(added ?? []), ...row.own.map((n) => ({ ...n, parentLocalId: lid }))];
     }
   };
 
@@ -238,6 +329,10 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
     const at = byGuid.get(component);
     if (at) apply(at.localId, row, at.nested);
   }
+  // Node rows LAST, over whatever the member rows left: a member's `added: []` (v16) or removal takes its
+  // template nodes with it. A row naming no node applies nowhere; R2 reports and keeps it
+  // (`applyStoredMemberRows`), since only the whole template can say the node is gone.
+  if (nodeRows.size) added = applyNodeRows(added as unknown as KeyedNode<never>[] | undefined, nodeRows as never).nodes as unknown as A[] | undefined;
   return {
     overrides, added, removedTraits,
     removed: [...removed].sort((a, b) => a - b),

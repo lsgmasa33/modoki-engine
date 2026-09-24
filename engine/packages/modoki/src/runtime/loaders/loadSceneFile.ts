@@ -19,7 +19,7 @@ import {
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 import { memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
-import { parseMemberRowKey } from '../core/assetRefRules';
+import { parseMemberRowKey, parseNodeRowKey, memberRowNodes, NODE_ROW_PREFIX } from '../core/assetRefRules';
 import { classifyFormatVersion } from '../core/formatVersion';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
 import { parseClipBankResult } from '../audio/clipBank';
@@ -177,8 +177,18 @@ export interface SceneMemberRow {
    *  an outer prefab layer deleted. */
   removed?: boolean;
   /** Subtrees this instance added UNDER this member; `[]` states "none". Each node's `parentLocalId`
-   *  is ignored on read (the row names the anchor) and written as 0. */
+   *  is ignored on read (the row names the anchor) and written as 0.
+   *  ⚠️ It REPLACES what the chain puts under the member, so since v17 (#1516) the writer uses it only as
+   *  the fallback for a list it cannot state node by node; the scene's own nodes go in `own`. */
   added?: AddedEntity[];
+  /** v17 (#1516): the scene's own nodes under this member, APPENDED after the chain's — the statement
+   *  `added` cannot make without restating, and so pinning, every template node beside them. On a NODE
+   *  row (key ending `a+<key>`), the scene's own children of that template node. */
+  own?: AddedEntity[];
+  /** v17 (#1516): per-trait removals over `removedTraits` or the chain's list — `true` removes, `false`
+   *  restores a trait the chain removed. `removedTraits` states the whole list and so pinned the chain's
+   *  names beside the scene's. On a node row, a `true` name is dropped from the node's traits. */
+  traitRemovals?: Record<string, boolean>;
   // ⚠️ `nestedOverrides` and `nestedStructure` get NO slot here, and that is not an omission. They
   //    exist only because a member two frames down had no address; the frame-chained key gives it
   //    one, so they collapse into the nested members' OWN rows. The #1468 design record records it.
@@ -614,6 +624,22 @@ function migrateV14toV15(data: SceneData): void {
  *  through the mechanism built to prevent it. */
 function migrateV15toV16(data: SceneData): void {
   if (data.version >= 16) return;
+  data.version = 16;
+}
+
+/** v16 → v17: no-op passthrough. Adds, on a scene member row (#1516), `own` — the scene's own nodes, APPENDED
+ *  after the chain's where `added` replaces them — and `traitRemovals` — per-trait removal statements over the
+ *  chain's list; and NODE rows, keyed `<frame chain>/a+<key>`, holding one template-added node's field edits,
+ *  trait additions and removals, own children, or its deletion. Together they let a scene edit ONE of the nodes a
+ *  template row added (or remove one more trait) without restating, and so pinning, everything beside it.
+ *
+ *  Nothing to migrate: `added` and `removedTraits` keep their exact v16 meaning, so a v16 file reads unchanged,
+ *  and its first ordinary save rewrites what it can node by node. ⚠️ The bump is required for the reason every
+ *  bump since v14 was: Scene's disposition is REFUSE, and an older build reading a v17 file would ignore node
+ *  rows, `own` and `traitRemovals` — losing the scene's edits to template nodes, its own nodes beside them, and
+ *  its trait removals — then drop them all on its next save. */
+function migrateV16toV17(data: SceneData): void {
+  if (data.version >= 17) return;
   // Terminal version of the migration chain. Sourced from SCENE_FORMAT_VERSION so
   // the constant is the single source of truth: bumping it (without chaining a new
   // migration) can't silently mislabel a freshly-migrated file as under-versioned.
@@ -1247,6 +1273,38 @@ function templateNodeGuids(prefabRef: string): { guids: Set<string>; complete: b
   return { guids, complete };
 }
 
+/** The template keys of the nodes the template adds in ONE nested frame (#1516) — the frame `frame` names, one
+ *  nested-row identity per level from `prefabRef` down — which is what a node row in that frame can name: its
+ *  row's own `added`, plus the `nestedStructure` slot of each row above it whose localId path addresses exactly
+ *  this frame. Only that slot: a key "backed" by any other slot applies nowhere, and read as backed it is dropped
+ *  on the next save — the loss this check exists to prevent (re-review R2). Plain nodes' `children` included;
+ *  not a reference node's own `added`, which is that node's frame. Null when a document on the way is not cached
+ *  or the frame's row is gone.
+ *
+ *  Per FRAME, not template-wide: a prefab-editor re-parent keeps a node's key, so a node moved from one row's
+ *  frame into another's would otherwise read as backed where the scene's row names it, apply nowhere, and drop
+ *  on the next save (close-out review F5). */
+function templateFrameKeys(prefabRef: string, frame: readonly string[]): Set<string> | null {
+  const keys = new Set<string>();
+  const add = (nodes: readonly AddedEntity[] | undefined): void => {
+    for (const n of nodes ?? []) { if (n?.key) keys.add(n.key); if (!n?.prefab) add(n?.children); }
+  };
+  const rows: PrefabFileEntry[] = [];
+  let doc = getCachedPrefab(prefabRef) as { entities?: PrefabFileEntry[] } | null;
+  for (const component of frame) {
+    const row = doc?.entities?.find((r) => r.nodeGuid === component && r.prefab);
+    if (!row?.localId) return null;
+    rows.push(row);
+    doc = getCachedPrefab(row.prefab!) as { entities?: PrefabFileEntry[] } | null;
+  }
+  // Row i's slot for the frame is keyed by the localIds of the rows BELOW it on the way down (`nestedPathKey`).
+  rows.forEach((row, i) => {
+    if (i === rows.length - 1) add(row.added);
+    else add(row.nestedStructure?.[nestedPathKey(rows.slice(i + 1).map((r) => r.localId!))]?.added);
+  });
+  return keys;
+}
+
 /** Member rows this load could not match to any node the template still declares (R2), kept per
  *  instance-root guid so the next SAVE can write them back rather than dropping them.
  *
@@ -1269,6 +1327,21 @@ const orphanMemberRows = new Map<string, Record<string, SceneMemberRow>>();
 /** The orphan rows kept for the instance root with this guid, for the writer to re-emit (R2). */
 export function keptMemberOrphans(rootGuid: string): Record<string, SceneMemberRow> | undefined {
   return orphanMemberRows.get(rootGuid);
+}
+
+/** The rebuild's write-back of one frame's NODE-row orphans (#1516, close-out review F1/F2): every kept node row
+ *  of frame `frameKey` in the instance whose root guid is `rootGuid` is replaced by `missed` — the rows the re-apply
+ *  found no node for. A Refresh is the other route a template change reaches an open scene by, and a row the NEW
+ *  template no longer backs must be kept exactly as a load keeps it (fork 2); one it backs again was applied, and
+ *  is no longer an orphan. Member rows are untouched. */
+export function setKeptNodeRowOrphans(rootGuid: string, frameKey: string, missed: Record<string, SceneMemberRow>): void {
+  if (!rootGuid || !frameKey) return;
+  const prefix = `${frameKey}/${NODE_ROW_PREFIX}`;
+  const next: Record<string, SceneMemberRow> = {};
+  for (const [k, row] of Object.entries(orphanMemberRows.get(rootGuid) ?? {})) if (!k.startsWith(prefix)) next[k] = row;
+  for (const [k, row] of Object.entries(missed)) next[k] = row;
+  if (Object.keys(next).length) orphanMemberRows.set(rootGuid, next);
+  else orphanMemberRows.delete(rootGuid);
 }
 
 /** Drop every kept orphan. For tests — production keeps them for the lifetime of the process,
@@ -1299,7 +1372,7 @@ export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[
     for (const delta of Object.values(n.nestedStructure ?? {})) collectReferenceNodeRows(delta?.added, out);
     // …and a member row's `added` (Phase 4, #1468): a reference node hanging under a member now
     // rides on that member's row, and its own rows must be pinned exactly as before.
-    for (const r of Object.values(n.members ?? {})) collectReferenceNodeRows(r?.added, out);
+    for (const r of Object.values(n.members ?? {})) collectReferenceNodeRows(memberRowNodes<AddedEntity>(r), out);
   }
   return out;
 }
@@ -1358,8 +1431,12 @@ function applyStoredMemberRows(
   const orphans: Record<string, SceneMemberRow> = {};
   let count = 0;
   for (const [key, row] of Object.entries(members)) {
-    const parts = parseMemberRowKey(key);
-    if (parts.length && parts.every((c) => known.has(c))) continue;
+    // A NODE row (#1516) orphans when the template no longer adds its node, and is kept exactly as a member
+    // row is (fork 2, owner 2026-09-24): the node vanishes with the template, and a template that brings it
+    // back brings the scene's edit back with it.
+    const node = parseNodeRowKey(key);
+    const parts = node?.frame ?? parseMemberRowKey(key);
+    if (parts.length && parts.every((c) => known.has(c)) && (!node || templateFrameKeys(source, node.frame)?.has(node.nodeKey))) continue;
     orphans[key] = row;
     count++;
   }
@@ -2208,7 +2285,7 @@ export function collectResourceRefsFromEntities(
     const walkRows = (members: Record<string, SceneMemberRow> | undefined): void => {
       for (const r of Object.values(members ?? {})) {
         if (r?.traits && typeof r.traits === 'object') flat.push({ traits: r.traits });
-        r?.added?.forEach(walkAdded);
+        memberRowNodes<AddedEntity>(r).forEach(walkAdded);
       }
     };
     entry.added?.forEach(walkAdded);
@@ -2583,6 +2660,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   migrateV13toV14(data);
   migrateV14toV15(data);
   migrateV15toV16(data);
+  migrateV16toV17(data);
   assignSyntheticEntityIds(data);
   stripLegacyCameraFrameShowGizmo(data);
   const { fetchPrefab, onEntitySpawned, loadModels = true } = options;
@@ -2910,7 +2988,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         if (entry.members) storedMembers.push([rootEcsId, entry.members, source]);
         collectAddedRows(entry.added);
         for (const delta of Object.values(entry.nestedStructure ?? {})) collectAddedRows(delta?.added);
-        for (const r of Object.values(entry.members ?? {})) collectAddedRows(r?.added);
+        for (const r of Object.values(entry.members ?? {})) collectAddedRows(memberRowNodes<AddedEntity>(r));
       } else {
         // Nothing replaced the placeholder: the detached references get their `onMissing` value, and a
         // later entry's numeric parent must resolve to 0 too, not to the freed id.

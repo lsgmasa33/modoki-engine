@@ -18,7 +18,7 @@ import { REF_FIELDS_BY_TRAIT } from '../packages/modoki/src/runtime/loaders/scen
 import { MATERIAL_TEXTURE_SLOTS } from '../packages/modoki/src/runtime/assets/materialTextureSlots';
 import { resolveTextureType } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { ULTRAHDR_VARIANT_SUFFIX } from '../packages/modoki/src/runtime/core/environmentSettings';
-import { deriveGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
+import { deriveGuid, memberRowNodes } from '../packages/modoki/src/runtime/core/assetRefRules';
 import { parseAnimClipBankResult } from '../packages/modoki/src/runtime/animation/animClipBank';
 import { parseClipBankResult } from '../packages/modoki/src/runtime/audio/clipBank';
 import { entityGuid } from '../packages/modoki/src/runtime/scene/sceneMutate';
@@ -699,8 +699,9 @@ interface OverrideCarrier {
   added?: unknown[];
   children?: unknown[];
   /** Member rows (scene v16). Since #1468 Phase 4 a row carries a member's overrides (`traits`, one
-   *  trait bag) and the subtrees added under it (`added`) — the two channels it took over. */
-  members?: Record<string, { traits?: Record<string, unknown>; added?: unknown[] }>;
+   *  trait bag) and the subtrees added under it (`added`) — the two channels it took over. Since v17
+   *  (#1516) also `own`, and a template-added node's NODE row carries the same two. */
+  members?: Record<string, { traits?: Record<string, unknown>; added?: unknown[]; own?: unknown[] }>;
 }
 
 function extractEntityRefs(
@@ -747,7 +748,7 @@ function extractEntityRefs(
     // …and so do member rows (#1468 Phase 4): the channels they took over carry refs as before.
     const rows = Object.values(node.members ?? {}).filter((r) => r && typeof r === 'object');
     for (const r of rows) if (r.traits && typeof r.traits === 'object') probeTraitRefs(r.traits, state, src);
-    const fromRows = rows.flatMap((r) => (Array.isArray(r.added) ? r.added : []));
+    const fromRows = rows.flatMap((r) => memberRowNodes(r));
     for (const child of [...(node.added ?? []), ...(node.children ?? []), ...fromStructure, ...fromRows]) {
       if (!child || typeof child !== 'object') continue;
       const c = child as OverrideCarrier;

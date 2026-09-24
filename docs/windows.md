@@ -1267,11 +1267,36 @@ every public CI run went red until the runner was excluded by name. The guard no
 probe window — `explorer /select,` for the reveal, a bare WinForms window with a stamped title for
 the open, never through `osOpen.ts`, so a broken `revealInOS`/`openInOS` still fails rather than
 skips — polls the same observable its test asserts on, and closes the window before returning.
-**Not Notepad for the probe:** Windows 11 Notepad restores its previous session on launch, so a
-killed Notepad's tab comes back on the owner's next launch. A skip writes session id, `UserInteractive`, explorer's session ids and the
+A skip writes session id, `UserInteractive`, explorer's session ids and the
 `Shell.Application` window count to stderr (not `console.warn`, which the default reporter hides for
 a passing file), so the runner's first skipped run records WHY its windows are invisible — still
 unknown when this was written.
+
+**A gate must never open a fixture in the owner's real default app** (#1534). The `openInOS` test
+first opened a `.txt`, which on Windows 11 means Notepad, and Notepad saves its tabs and restores
+them on the next launch. **The tab survives everything a test can do from outside:** killing the
+process, closing it normally (closing is what SAVES the session), and deleting the file. Measured
+on the win clone: 29 leftover gate/probe tabs in Notepad's session store
+(`%LOCALAPPDATA%\Packages\Microsoft.WindowsNotepad_8wekyb3d8bbwe\LocalState\TabState`), 27 of them
+for files the scratch-dir cleanup had already removed. Cleaning up would have meant driving the owner's own
+Notepad, where a stray keystroke closes one of THEIR tabs. So the test registers a throwaway
+per-user association instead: a unique `HKCU\Software\Classes\.<stamp>` whose `open` verb shows a
+window titled from `%1`. It still exercises `cmd /c start` → shell association → app launch, the
+title proves the path arrived, and the window is always a new process the test can kill. What it
+gives up — ".txt opens in Notepad" — is machine configuration, not the code under test (owner's
+call, 2026-09-24).
+
+⚠️ **Registering an association is not its whole footprint.** The first time the shell RESOLVES
+one it writes two per-user traces of its own — `HKCU\…\CurrentVersion\Explorer\FileExts\.<ext>`
+and a `<ProgID>_<ext>` value under `…\CurrentVersion\ApplicationAssociationToasts` — and both
+outlive deleting the `Classes` keys. The first version of this test deleted only what it had
+written and left one of each per `verify` (found in review, measured). Anything that registers a
+throwaway association has to delete all four.
+
+**Pass `%1` quoted, as an argument — never splice it into script source.** A `'%1'` inside a
+PowerShell literal breaks on an apostrophe in the path (a user name like `O'Brien` puts one in
+`%TEMP%`), and an unquoted `%1` can arrive as an 8.3 short name. The same splice in the test's
+own Explorer-window matcher failed the whole file under such a `%TEMP%`.
 
 ### `powershell -Command "<script>" a b` does NOT pass `a b` as arguments
 

@@ -71,7 +71,12 @@ export const ENGINE_VERSION = '0.1.0';
 // (`parent`, `traits`, `removedTraits`, `removed`, `added`), so those phases are caller migrations
 // and not two more irreversible bumps. See `SceneMemberRow` for why they are declared and not
 // written, and the #1468 design record D2 (docs/prefab-structural-overrides.md) for the ruling.
-export const SCENE_FORMAT_VERSION = 16;
+// v17: no-op passthrough — a member row gains `own` (the scene's nodes, appended after the chain's) and
+// `traitRemovals` (per-trait removals over the chain's list), and a template-added node gets a NODE row keyed
+// `<frame chain>/a+<key>` (#1516). They let a scene edit one template node, or remove one more trait, without
+// restating — and so pinning — everything beside it. Required for the REFUSE reason v14-v16 were: an older build
+// would ignore the new channels and drop them on its next save.
+export const SCENE_FORMAT_VERSION = 17;
 
 /** The version stamped into newly written PREFAB JSON. Moved here from `editor/scene/prefab.ts`
  *  by #1468 — see the reversal note at the top of this file for why the editor-only premise no

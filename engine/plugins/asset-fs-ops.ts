@@ -13,7 +13,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
-import { durableGuid, remapGuidValues } from '../packages/modoki/src/runtime/core/assetRefRules';
+import { durableGuid, memberRowNodes, remapGuidValues } from '../packages/modoki/src/runtime/core/assetRefRules';
 import {
   derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, sceneMemberAnchors, memberGuidRemap,
   rewritePrefabMemberTokens, MAX_INSTANCE_DEPTH, type PrefabReader,
@@ -432,8 +432,9 @@ export function remintSceneEntityGuids(
       if (members && typeof members === 'object' && !Array.isArray(members)) {
         for (const m of Object.values(members as Record<string, { guid?: unknown; added?: unknown } | null>)) {
           define(m?.guid);
-          // A row's `added` (Phase 4) holds scene-authored nodes with their own guids, like `added` below.
-          visit(m?.added);
+          // A row's `added` (Phase 4) and `own` (v17, #1516) hold scene-authored nodes with their own guids,
+          // like `added` below.
+          visit(memberRowNodes(m));
         }
       }
       visit(row.children);

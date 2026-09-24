@@ -34,6 +34,8 @@
  *     ⚠️ But a MEMBER of this instance that merely SITS under an added node keeps its row — its
  *     frame is decided by identity, not by where it hangs. An ECS-descent version of this walk got
  *     that wrong and dropped such a member's identity on the first save after the move.
+ *     (Scene v17's NODE rows, `<frame>/a+<key>` (#1516), are not an exception: they hold a template
+ *     node's EDITS, never its guid, and are computed by the writer's diff, not by this walk.)
  *  4. **A member of a pre-v5 template**, which minted no `nodeGuid`. Its component is '' and it
  *     derives exactly as it always did (R3) — and so does every member below a nested root whose
  *     OUTER document is pre-v5, since that root has no identity in the outer frame (`memberNodeId`).

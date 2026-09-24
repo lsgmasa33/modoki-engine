@@ -115,3 +115,52 @@ describe('readers of a scene`s instance channels walk the member rows (#1468 Pha
     expect(anchors.some((a) => a.self === ADDED_GUID)).toBe(true);
   });
 });
+
+describe('…and the v17 channels: a member row`s `own`, and a template node`s NODE row (#1516)', () => {
+  // Each walker reads a row's nodes through `memberRowNodes`; a walker that read only `added` would miss the scene's
+  // own nodes the moment v17 writes them there. Each case puts the ONLY copy on `own` or on a node row.
+  const OWN_MAT = 'abcd0000-0000-4000-8000-0000000000a3';
+  const NODE_MAT = 'abcd0000-0000-4000-8000-0000000000a4';
+  const NODE_OWN_MAT = 'abcd0000-0000-4000-8000-0000000000a5';
+  const NODE_OWN_GUID = 'abcd0000-0000-4000-8000-0000000000b2';
+  const plain = (guid: string, mat: string) => ({ parentLocalId: 0, guid, name: 'X', traits: { Renderable3DPrimitive: { material: mat } }, children: [] });
+  const v17Entry = () => ({
+    ...rowEntry({ own: [plain(ADDED_GUID, OWN_MAT)] }),
+    members: {
+      [`/${NODE}`]: { guid: 'abcd0000-0000-4000-8000-0000000000e2', own: [plain(ADDED_GUID, OWN_MAT)] },
+      [`/${NODE}/a+k-node`]: { traits: { Renderable3DPrimitive: { material: NODE_MAT } }, own: [plain(NODE_OWN_GUID, NODE_OWN_MAT)] },
+    },
+  });
+
+  it('the runtime resource walker acquires a ref held only in `own`, a node row`s traits, or a node row`s `own`', () => {
+    // Mutation: read `r.added` only in `walkRows` — OWN_MAT and NODE_OWN_MAT are not acquired.
+    const refs = collectResourceRefsFromEntities([v17Entry()] as never).map((r) => r.path);
+    expect(refs).toEqual(expect.arrayContaining([OWN_MAT, NODE_MAT, NODE_OWN_MAT]));
+  });
+
+  it('the save-time path guard flags a raw path in `own`', () => {
+    // Mutation: drop the `own` loop in `flagRows` — nothing is flagged.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    assertNoPathRefs(rowEntry({ own: [plain(ADDED_GUID, '/games/g/assets/mats/raw3.mat.json')] }) as never);
+    const flagged = err.mock.calls.map((c) => String(c[0]));
+    err.mockRestore();
+    expect(flagged.some((m) => m.includes(`members{/${NODE}}.own[0].Renderable3DPrimitive.material`))).toBe(true);
+  });
+
+  it('a duplicate remints the guids of nodes in `own`, on a member row and on a node row', () => {
+    // Mutation: `visit(m?.added)` in `remintSceneEntityGuids` — both keep their guids and two files share them.
+    const scene = { version: 17, entities: [v17Entry()] };
+    let n = 0;
+    const copy = remintSceneEntityGuids(scene as never, () => `abcd0000-0000-4000-8000-00000000c0${String(++n).padStart(2, '0')}`) as unknown as typeof scene;
+    const rows = copy.entities[0]!.members as Record<string, { own: { guid: string }[] }>;
+    expect(rows[`/${NODE}`]!.own[0]!.guid).not.toBe(ADDED_GUID);
+    expect(rows[`/${NODE}/a+k-node`]!.own[0]!.guid).not.toBe(NODE_OWN_GUID);
+  });
+
+  it('a reference node in `own` is a scene member ANCHOR', () => {
+    // Mutation: `visit(r?.added, false)` in `sceneMemberAnchors` — the anchor is missed.
+    const ref = { parentLocalId: 0, guid: ADDED_GUID, name: 'R', prefab: P, traits: {}, children: [] };
+    const anchors = sceneMemberAnchors({ entities: [rowEntry({ own: [ref] })] });
+    expect(anchors.some((a) => a.self === ADDED_GUID)).toBe(true);
+  });
+});

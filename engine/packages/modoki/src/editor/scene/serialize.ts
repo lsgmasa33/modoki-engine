@@ -712,6 +712,7 @@ export function assertNoPathRefs(entry: SerializedEntity): void {
     for (const [key, r] of Object.entries(members ?? {})) {
       if (r?.traits) flagTraits(r.traits, `${ctx}{${key}}.`);
       for (let i = 0; i < (r?.added?.length ?? 0); i++) flagAdded(r.added![i], `${ctx}{${key}}.added[${i}]`);
+      for (let i = 0; i < (r?.own?.length ?? 0); i++) flagAdded(r.own![i], `${ctx}{${key}}.own[${i}]`); // v17 (#1516)
     }
   };
 

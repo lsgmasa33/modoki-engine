@@ -802,6 +802,9 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
 
 /** Rows for the widened corpus (#1198), keyed `repo/relative/file::Owner.name`. Same tags as LEDGER. */
 const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
+  ...['FrameAddedDiff.own', 'FrameAddedDiff.whole'].map((f) => ({
+    item: `engine/packages/modoki/src/editor/scene/nodeRowDiff.ts::${f}`,
+    reason: 'not-entity: keyed by an anchor member\'s serialized localId (the nested frame\'s prefab document id space, an `AddedEntity.parentLocalId`), built and consumed within one scene save, never a runtime entity id (#1516); editor/scene/nodeRowDiff.ts:49' })),
   { item: 'engine/packages/modoki/src/editor/panels/assetViews/VideoAssetView.tsx::QUALITY_LABELS',
     reason: 'not-entity: ffmpeg CRF value -> label; editor/panels/assetViews/VideoAssetView.tsx:48' },
   ...['PrefabEntity.overrides', 'PrefabEntity.removedTraits', 'PrefabEntity.nestedOverrides'].map((f) => ({

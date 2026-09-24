@@ -377,9 +377,9 @@ const ROW_KEY_SEP = '/';
  *  (#1426/#1430/#1438) and so must not appear in a key either, its own or a descendant's frame chain.
  *  Callers read '' as "this member gets no row" and fall back to derivation (R3).
  *
- *  ⚠️ If a later phase does give added nodes rows, their component is `'a' + addedKeyStep(key)` and
- *  {@link isGuid} is how to tell the two apart — **never the first letter.** A guid may legitimately
- *  begin with `a` (`a0f1…`); `'a+…'` is disjoint from one because `+` is not a hex digit. */
+ *  A template-added node's NODE row (v17, #1516) is keyed by this frame chain plus one last `a+<key>`
+ *  component — {@link formatNodeRowKey}, never this function, which stays guid-only so a MEMBER key can
+ *  never end in one. */
 export function formatMemberRowKey(components: readonly string[]): string {
   if (!components.length || !components.every((c) => isGuid(c))) return '';
   return ROW_KEY_SEP + components.join(ROW_KEY_SEP);
@@ -392,6 +392,53 @@ export function parseMemberRowKey(key: string): string[] {
   if (!key.startsWith(ROW_KEY_SEP)) return [];
   const parts = key.slice(ROW_KEY_SEP.length).split(ROW_KEY_SEP);
   return parts.every((p) => isGuid(p)) ? parts : [];
+}
+
+/** The key component that names a TEMPLATE-ADDED node's row (#1516, scene v17): `a+` and the node's
+ *  template key. Disjoint from a member's component (a guid) because `+` is not a hex digit — told apart
+ *  by that `+`, **never by the leading `a`** (a guid may begin with one). */
+export const NODE_ROW_PREFIX = 'a+';
+
+/** The node-row component for template key `key`, or '' when it cannot name one (empty, or holding the
+ *  row-key separator). */
+export function nodeRowComponent(key: string | undefined): string {
+  return key && !key.includes(ROW_KEY_SEP) ? NODE_ROW_PREFIX + key : '';
+}
+
+/** The template key a node-row component names, or '' when `component` is not one. */
+export function nodeRowKey(component: string): string {
+  return component.startsWith(NODE_ROW_PREFIX) && component.length > NODE_ROW_PREFIX.length && !component.includes(ROW_KEY_SEP)
+    ? component.slice(NODE_ROW_PREFIX.length) : '';
+}
+
+/** A node row's key: the frame chain `frame` (guid components, as {@link formatMemberRowKey} takes) and
+ *  the node's template key LAST — a node is never a frame, so nothing follows it. '' when either half
+ *  cannot be formed. */
+export function formatNodeRowKey(frame: readonly string[], key: string | undefined): string {
+  const frameKey = formatMemberRowKey(frame);
+  const last = nodeRowComponent(key);
+  return frameKey && last ? frameKey + ROW_KEY_SEP + last : '';
+}
+
+/** Every node list a scene member row carries (#1516): `added` (v16, replaces the chain's) and `own` (v17,
+ *  appended after it) — node rows carry `own` too. The ONE spelling every walker of a row's nodes uses
+ *  (the loader's ref and reference-node collectors, the build's tree-shaker, a duplicate's remint, the
+ *  member-path walks, the serializer's flags), so none can learn one list and miss the other: a miss in
+ *  the tree-shaker drops the asset from the production build (#53). */
+export function memberRowNodes<T = unknown>(row: unknown): T[] {
+  if (!row || typeof row !== 'object') return [];
+  const r = row as { added?: unknown; own?: unknown };
+  return [...(Array.isArray(r.added) ? r.added : []), ...(Array.isArray(r.own) ? r.own : [])] as T[];
+}
+
+/** {@link formatNodeRowKey}'s inverse: the frame chain and template key, or null for anything that is not
+ *  a well-formed node-row key (a member key included). */
+export function parseNodeRowKey(key: string): { frame: string[]; nodeKey: string } | null {
+  const at = key.lastIndexOf(ROW_KEY_SEP);
+  if (at <= 0) return null;
+  const nodeKey = nodeRowKey(key.slice(at + 1));
+  const frame = parseMemberRowKey(key.slice(0, at));
+  return nodeKey && frame.length ? { frame, nodeKey } : null;
 }
 
 
