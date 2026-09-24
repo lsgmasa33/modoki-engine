@@ -7,7 +7,7 @@ import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, frameRootDoc }
 import { memberRowKeysIn, memberRowsIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
 import { isPrefabEditRowGuid } from './prefabEditGuids';
 import { nestedMoveRef, toLocalIdKeys } from './overrideKeyGrammar';
-import { IDENTITY_TRS, mergeTrs, localToWorldTrs, sameOrientation } from '../../runtime/scene/transformSpace';
+import { IDENTITY_TRS, mergeTrs, localToWorldTrs, sameOrientation, sameRotationScale } from '../../runtime/scene/transformSpace';
 import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, type PrefabReader } from '../../runtime/loaders/memberPaths';
 import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { collectUnknownFields, mergeUnknownFields } from '../../runtime/core/formatVersion';
@@ -2923,41 +2923,52 @@ export function captureNestedSceneDelta(
   rowOverrides: Record<number, Record<string, Record<string, unknown>>> | undefined,
 ): Record<number, Record<string, Record<string, unknown>>> {
   const all = captureInstanceOverrides(nestedRootId, childPrefab);
-  // The ROOT's Transform while it sits away from its row (#1481): its local pose is relative to a parent the row never
-  // gave it, so a field the row also sets is the scene's own value unless it EQUALS the row's — the rule the mark-gate
-  // applies to it. By key alone, a row that authors the root's position (the spaceship's mirrored flames) dropped a
-  // moved flame's compensated position, and it reloaded at the row's, under its new parent. Numbers only, so the
-  // token-bearing values that keep the rest of this subtraction by key (#1386) never reach the value compare.
-  const rootLid = childPrefab.rootLocalId ?? 1;
-  let rootMoved: boolean | undefined;
   for (const [lidStr, traits] of Object.entries(all)) {
     const lid = Number(lidStr);
     // A nested instance's member guids are regenerated from the prefab chain each
     // load — never scene-authored — so drop them; otherwise the serialize guid
     // pre-pass makes every nested member look "overridden".
     if (traits.EntityAttributes) delete (traits.EntityAttributes as Record<string, unknown>).guid;
-    const rowTraits = rowOverrides?.[lid];
     for (const [traitName, fields] of Object.entries(traits)) {
-      const rowFields = rowTraits?.[traitName];
-      // An added TAG is captured as `{Tag: {}}` — empty from the start, so the empty-trait drop below took
-      // every one, and a tag added to a nested instance's member was lost on save (#1491's sibling). It is
-      // the row's own only when the row adds it too.
-      if (getTraitByName(traitName)?.category === 'tag') { if (rowFields) delete traits[traitName]; continue; }
-      // `hasDocKey` (#986): `f` and `rowFields` both derive from scene/prefab JSON, so a
-      // prototype-named field tested TRUE against any rowFields object and was wrongly
-      // deleted from the serialized output.
-      const byValue = lid === rootLid && traitName === 'Transform'
-        && (rootMoved ??= ownedRootMoved(nestedRootId, worldIdentityParents(getCurrentWorld())));
-      if (rowFields) {
-        for (const f of Object.keys(fields)) {
-          if (hasDocKey(rowFields, f) && (!byValue || valuesEqual(fields[f], rowFields[f]))) delete fields[f];
-        }
+      // An added TAG is captured as `{Tag: {}}` — it has no value to compare, so it is the row's own only when
+      // the row adds it too, and it is exempt from the empty-trait drop, which took every one and lost a tag
+      // added to a nested instance's member on save (#1491's sibling).
+      if (getTraitByName(traitName)?.category === 'tag') {
+        if (rowOverrides?.[lid]?.[traitName]) delete traits[traitName];
+        continue;
       }
       if (Object.keys(fields).length === 0) delete traits[traitName];
     }
     if (Object.keys(traits).length === 0) delete all[lid];
   }
-  return all;
+  // What the chain applies comes off BY VALUE — the rebuild capture's rule, and now the only one (#1498). This
+  // subtracted by KEY, so a scene edit to a field the row also sets read as the row's own and was dropped on save
+  // (#1481 had carved out one case of it: the moved root's Transform). The row's member tokens are resolved first,
+  // as the rebuild resolves them (#1386), so an unchanged ref compares equal to the guid the live side holds.
+  if (!rowOverrides) return all;
+  const resolved = baseTokenResolver(nestedRootId)(rowOverrides) as Record<number, Record<string, Record<string, unknown>>>;
+  return subtractChainOverrides(all, resolved, childPrefab, memberTransforms(nestedRootId));
+}
+
+/** The live Transform of each member of the instance rooted at `rootInstanceId` (the root included), by localId. */
+function memberTransforms(rootInstanceId: number): (lid: number) => Record<string, unknown> | undefined {
+  let byLid: Map<number, Record<string, unknown>> | undefined;
+  return (lid) => {
+    if (!byLid) {
+      byLid = new Map();
+      const piMeta = getTraitByName('PrefabInstance');
+      const tfMeta = getTraitByName('Transform');
+      if (piMeta && tfMeta) {
+        getCurrentWorld().query(piMeta.trait).updateEach(([pi], entity) => {
+          const d = pi as { rootInstanceId?: number; localId?: number };
+          if (d.rootInstanceId !== rootInstanceId || !d.localId) return;
+          const tf = readTraitData(entity.id(), tfMeta);
+          if (tf) byLid!.set(d.localId, tf);
+        });
+      }
+    }
+    return byLid.get(lid);
+  };
 }
 
 /** The override map the PREFAB FILES alone would apply to a nested instance reached
@@ -5187,19 +5198,21 @@ function captureNestedInstanceOverridesIn(outerRootId: number, baseline: PrefabF
     }));
 
   const captures: NestedInstanceCapture[] = [];
-  const seen = new Set<number>();
-  const stack = [outerRootId];
-  while (stack.length) {
-    const id = stack.pop()!;
-    if (seen.has(id)) continue;
-    seen.add(id);
+  // Every nested frame the rebuild's TEARDOWN destroys — asked of the teardown itself, not of the live subtree
+  // (#1499). A frame owned here but moved out of that subtree (#1437) is destroyed by the teardown's reverse case
+  // and re-expanded at its row; walking live children never reached it, so its edits were lost. Shallowest first,
+  // the order the live walk gave: a frame is re-applied before the frames inside it.
+  const torn = [...rebuildTeardown(outerRootId).toDestroy]
+    .map((id) => ({ id, chain: isNestedRoot(id) ? chainOf(id) : null }))
+    .filter((t): t is { id: number; chain: number[] } => !!t.chain)
+    .sort((a, b) => a.chain.length - b.chain.length);
+  for (const { id, chain } of torn) {
     // Only instances reached through a chain of ROW expansions. A `0` in the chain is a user-added
     // (reference-node) instance, and everything under one is carried BY that node: the outer capture's
     // `structure.added` holds it with its own overrides, structure and nested channels (#1369), and
     // `rebuildInstance`'s `applyStructureByRootInstance` re-spawns it whole. Re-applying it here a
     // second time duplicated every subtree it had added — a rebuild turned one Bolt into two.
-    const chain = isNestedRoot(id) ? chainOf(id) : null;
-    if (chain && !chain.includes(0)) {
+    if (!chain.includes(0)) {
       const source = piOf(id)!.source as string;
       const childPrefab = getCachedPrefabSync(source);
       if (childPrefab) {
@@ -5213,30 +5226,54 @@ function captureNestedInstanceOverridesIn(outerRootId: number, baseline: PrefabF
           chain,
           source,
           overrides: subtractChainOverrides(
-            captureInstanceOverrides(id, childPrefab), resolve(resolveEffectivePrefabOverride(baseline, chain)) as Record<number, Record<string, Record<string, unknown>>>, childPrefab),
+            captureInstanceOverrides(id, childPrefab), resolve(resolveEffectivePrefabOverride(baseline, chain)) as Record<number, Record<string, Record<string, unknown>>>, childPrefab, memberTransforms(id)),
           structure,
           replace,
         });
       }
     }
-    for (const c of childrenOf.get(id) ?? []) stack.push(c);
   }
   return captures;
 }
 
-/** Drop every captured field whose live value EQUALS what the prefab chain applies. By value, not by
- *  key presence (`captureNestedSceneDelta`'s rule): a scene that changed a row-set field keeps its
- *  change across the rebuild.
+/** Drop every captured field whose live value EQUALS what the prefab chain applies — the ONE subtraction both a
+ *  save (`captureNestedSceneDelta`) and a rebuild (`captureNestedInstanceOverridesIn`) make of a nested
+ *  instance, with the chain's member tokens already resolved to live guids. By value, not by key presence: a
+ *  scene that changed a row-set field keeps its change across the rebuild and the save (#1498).
  *
- *  A trait the CHAIN adds (absent from `childPrefab` at that member) is captured whole, schema
- *  defaults included, because the capture sees an added trait. The loader builds it as
- *  `meta.trait(authored)`, so an unauthored field equal to its default is the chain's too; left in,
- *  it kept the trait alive after a refresh that removed it (#1386 review). */
+ *  - **A token the resolver cannot resolve** names nothing live, so the live side cannot equal it and the field is
+ *    kept — the value the instance really shows. (By key there would re-open #1498 for a scene edit to that field.)
+ *  - **Rotation is one value** (#1490's rule): `rx/ry/rz` come off together when the live orientation equals the
+ *    chain's, and are otherwise written whole. Compared per field, a re-spelled equal rotation (`ry: π` held as
+ *    `(-π, 0, -π)`) pinned every component. Scale is compared per field, like any other.
+ *  - **…unless the pose was RE-SPELLED** (`sameRotationScale`, the linear part as one matrix). A decomposition —
+ *    a move out and back, a world-space set — can also move a mirror's sign: `sz: -1` returns as `sx: -1` turned π
+ *    about y. The capture holds only the MARKED components, so the marked fields laid over the chain no longer
+ *    rebuild the pose on screen, and per component a mirrored flame moved out and back saved `sz: 1` alone and lost
+ *    its mirror (#1498 close-out review). Then, and only then, the six are decided together: dropped if the pose
+ *    equals the chain's, written whole from the live Transform if not. Widening every time instead pinned axes the
+ *    scene never touched — the row's own mirror or turn, and on the rebuild an OLD row's scale over a refreshed
+ *    one (second review). (A zero scale erases rotation from the matrix, but then the rebuilt and live poses compare
+ *    equal too, so it never reaches the widened branch: a row that hides a member keeps the scene's turn.)
+ *  - **A trait the CHAIN adds** (absent from `childPrefab` at that member) is captured whole, schema defaults
+ *    included, because the capture sees an added trait. The loader builds it as `meta.trait(authored)`, so an
+ *    unauthored field equal to its default is the chain's too; left in, it kept the trait alive after a refresh
+ *    that removed it (#1386 review).
+ *
+ *  `liveTransform` reads a member's live Transform by localId — the components the capture left out. */
 function subtractChainOverrides(
   live: Record<number, Record<string, Record<string, unknown>>>,
   chain: Record<number, Record<string, Record<string, unknown>>>,
   childPrefab: PrefabFile,
+  liveTransform: (lid: number) => Record<string, unknown> | undefined,
 ): Record<number, Record<string, Record<string, unknown>>> {
+  const RS = ['rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const;
+  const ROT = ['rx', 'ry', 'rz'] as const;
+  const schemaOf = (trait: string) => (getTraitByName(trait)?.trait as { schema?: Record<string, unknown> } | undefined)?.schema;
+  const defaultOf = (schema: Record<string, unknown> | undefined, f: string): unknown => {
+    const d = schema?.[f];
+    return typeof d === 'function' ? (d as () => unknown)() : d;
+  };
   for (const [lid, traits] of Object.entries(live)) {
     const chainTraits = chain[Number(lid)];
     if (!chainTraits) continue;
@@ -5245,13 +5282,43 @@ function subtractChainOverrides(
       const chainFields = chainTraits[trait];
       if (!chainFields || typeof chainFields !== 'object') continue;
       const chainAdded = member?.traits[trait] === undefined;
-      const schema = chainAdded ? (getTraitByName(trait)?.trait as { schema?: Record<string, unknown> } | undefined)?.schema : undefined;
+      const schema = chainAdded ? schemaOf(trait) : undefined;
+      const decided = new Set<string>();
+      if (trait === 'Transform' && RS.some((k) => hasDocKey(chainFields, k)) && RS.some((k) => hasDocKey(fields, k))) {
+        // The chain's pose is what it sets over the child's own row over the schema default; the live one is READ,
+        // since the capture holds only what was marked.
+        const base = member?.traits.Transform as Record<string, unknown> | undefined;
+        const baseOf = (k: string): number => {
+          const v = Number(base && hasDocKey(base, k) ? base[k] : defaultOf(schemaOf('Transform'), k));
+          return Number.isFinite(v) ? v : k.startsWith('s') ? 1 : 0;
+        };
+        const now = liveTransform(Number(lid));
+        type Rs = { rx: number; ry: number; rz: number; sx: number; sy: number; sz: number };
+        const pose = (over: Record<string, unknown>, under: (k: string) => number) =>
+          Object.fromEntries(RS.map((k) => [k, hasDocKey(over, k) ? Number(over[k]) : under(k)])) as Rs;
+        const chainPose = pose(chainFields, baseOf);
+        const livePose = pose(fields, (k) => Number(now?.[k] ?? baseOf(k)));
+        const rebuilt = pose(fields, (k) => chainPose[k as keyof Rs]); // what the reload gives, per component
+        if (!sameRotationScale(rebuilt, livePose)) {
+          // Re-spelled: the marked fields over the chain do not rebuild what is on screen.
+          if (sameRotationScale(livePose, chainPose)) for (const k of RS) delete fields[k];
+          else for (const k of RS) fields[k] = livePose[k];
+          for (const k of RS) decided.add(k);
+        } else if (ROT.some((k) => hasDocKey(chainFields, k)) && ROT.some((k) => hasDocKey(fields, k))) {
+          // From `rebuilt`, not the live read: they are one matrix here, but the live one may spell its UNMARKED axes
+          // another way (a template mirror moved out and back: `rz: -π` with the sign on `sx`), and its rotation
+          // written over the chain's scale reloaded turned 180° (third review).
+          if (sameOrientation(rebuilt, chainPose)) for (const k of ROT) delete fields[k];
+          else for (const k of ROT) fields[k] = rebuilt[k];
+          for (const k of ROT) decided.add(k);
+        }
+      }
       for (const f of Object.keys(fields)) {
+        if (decided.has(f)) continue; // decided as a whole, above
         if (hasDocKey(chainFields, f)) {
           if (valuesEqual(fields[f], chainFields[f])) delete fields[f];
         } else if (schema && f in schema) {
-          const def = typeof schema[f] === 'function' ? (schema[f] as () => unknown)() : schema[f];
-          if (valuesEqual(fields[f], def)) delete fields[f];
+          if (valuesEqual(fields[f], defaultOf(schema, f))) delete fields[f];
         }
       }
       if (Object.keys(fields).length === 0) delete traits[trait];
@@ -5396,24 +5463,33 @@ function rebuildTeardown(
   // row (#1484). Unmoved, but not ours either — our re-expansion cannot respawn another document's row, so it was
   // torn down with nothing to bring it back. Parked, it keeps its members and its edits.
   const foreign = (id: number): boolean => foreignRow(id, rootInstanceId, identity);
-  const toDestroy = new Set<number>(members);
-  const stack = [...members];
-  while (stack.length) {
-    const id = stack.pop()!;
-    for (const c of childrenOf.get(id) ?? []) {
-      if (toDestroy.has(c)) continue;
-      // …and in a prefab-edit world, a ROW of the edited prefab hanging under one of ours (a nested or plain row
-      // under a nested row, #1484): the edited document's own, which nothing this rebuild respawns — the capture
-      // skips it for the same reason (`editRow`).
-      const editRow = isPrefabEditRowGuid(guidById.get(c));
-      if (!members.has(c) && (editRow || (readTraitData(c, PrefabInstanceMeta) && (identity.moved(c) || foreign(c)))) && guidById.get(id)) {
-        parked.push({ id: c, parentGuid: remap.get(guidById.get(id)!) ?? guidById.get(id)! });
-        continue;
+  const toDestroy = new Set<number>();
+  const isParked = (id: number) => parked.some((p) => p.id === id);
+  // Take `from` and everything under it — except what is not ours to destroy, which is PARKED where it hangs. The
+  // one walk every part of the teardown takes: the unpark and reverse-case walks below took whole subtrees without
+  // this test, so a row of ANOTHER frame hanging under a member they took (a #1484 row under a member moved in
+  // from a torn-down frame) was destroyed with nothing to respawn it (#1499).
+  const take = (from: number[]): void => {
+    const stack: number[] = [];
+    for (const id of from) if (!toDestroy.has(id)) { toDestroy.add(id); stack.push(id); }
+    while (stack.length) {
+      const id = stack.pop()!;
+      for (const c of childrenOf.get(id) ?? []) {
+        if (toDestroy.has(c) || isParked(c)) continue;
+        // …and in a prefab-edit world, a ROW of the edited prefab hanging under one of ours (a nested or plain row
+        // under a nested row, #1484): the edited document's own, which nothing this rebuild respawns — the capture
+        // skips it for the same reason (`editRow`).
+        const editRow = isPrefabEditRowGuid(guidById.get(c));
+        if (!members.has(c) && (editRow || (readTraitData(c, PrefabInstanceMeta) && (identity.moved(c) || foreign(c)))) && guidById.get(id)) {
+          parked.push({ id: c, parentGuid: remap.get(guidById.get(id)!) ?? guidById.get(id)! });
+          continue;
+        }
+        toDestroy.add(c);
+        stack.push(c);
       }
-      toDestroy.add(c);
-      stack.push(c);
     }
-  }
+  };
+  take([...members]);
   // …unless its own instance is torn down here too (a user-added one nested in ours): that rebuild respawns
   // it, moved, from its own record. An OWNED nested root's instance is its owner, moved or not: an unmoved one
   // parked above belongs to a frame other than ours (#1484), and is ours to destroy only when that frame is.
@@ -5432,30 +5508,19 @@ function rebuildTeardown(
       const frame = frameOf(parked[i]!.id);
       if (frame !== rootInstanceId && !toDestroy.has(frame)) continue;
       // With its subtree, which the walk stopped at: a foreign-owned root parks with everything under it (#1484).
-      for (const sub = [parked[i]!.id]; sub.length;) {
-        const id = sub.pop()!;
-        if (toDestroy.has(id)) continue;
-        toDestroy.add(id);
-        sub.push(...(childrenOf.get(id) ?? []));
-      }
-      parked.splice(i, 1);
+      const [{ id }] = parked.splice(i, 1);
+      take([id]);
       grew = true;
     }
     // The reverse case: an entity of an instance torn down here that was moved OUT of this subtree — a member of
     // a nested instance, or an owned nested root of ours — is respawned, moved, by the rebuild; left alive it
     // would sit beside its own replacement. Fixpoint, since its own members may be further out still.
     for (const e of getAllEntities()) {
-      if (toDestroy.has(e.id) || parked.some((p) => p.id === e.id) || !e.traits.includes('PrefabInstance')) continue;
+      if (toDestroy.has(e.id) || isParked(e.id) || !e.traits.includes('PrefabInstance')) continue;
       const frame = frameOf(e.id);
       if (frame !== rootInstanceId && !toDestroy.has(frame)) continue;
       if (frame === e.id) continue; // a stored root is its own instance, and it is not ours
-      const sub = [e.id];
-      while (sub.length) {
-        const id = sub.pop()!;
-        if (toDestroy.has(id)) continue;
-        toDestroy.add(id);
-        sub.push(...(childrenOf.get(id) ?? []));
-      }
+      take([e.id]);
       grew = true;
     }
   }
@@ -5597,6 +5662,10 @@ export function rebuildInstance(
   // `memberNodeId` still fell back to the child document's `nodeGuid`, so the keys CHANGED instead;
   // the Phase 3 close-out removed that fallback. Either way the restore below is what keeps them.)
   const oldParentNodeGuid = (readTraitData(rootInstanceId, PrefabInstanceMeta)?.parentNodeGuid as string) || '';
+  // …and the THIRD identity field of an owned root: the owner link a move writes (`linkOwnerBeforeMove`). Without
+  // it the respawn's owner was read off where it hangs, which names the right frame only while that is a member of
+  // its own owner; moved under the OUTER frame, it read as user-added, and the save unlinked it from its row (#1499).
+  const oldOwnerGuid = (readTraitData(rootInstanceId, PrefabInstanceMeta)?.ownerGuid as string) || '';
 
   const { toDestroy, parked } = rebuildTeardown(rootInstanceId, remap);
   for (const p of parked) if (eaMeta) writeTraitField(p.id, eaMeta, 'parentId', 0);
@@ -5615,6 +5684,7 @@ export function rebuildInstance(
   setPrefabSource(newRootId, source);
   if (oldParentLocalId) writeTraitField(newRootId, PrefabInstanceMeta, 'parentLocalId', oldParentLocalId);
   if (oldParentNodeGuid) writeTraitField(newRootId, PrefabInstanceMeta, 'parentNodeGuid', oldParentNodeGuid);
+  if (oldOwnerGuid) writeTraitField(newRootId, PrefabInstanceMeta, 'ownerGuid', oldOwnerGuid);
   applyOverridesByRootInstance(newRootId, overrides);
   applyStructureByRootInstance(newRootId, prefab, structure);
   reapplyNestedInstanceOverrides(newRootId, nestedCaptures);
@@ -5767,7 +5837,9 @@ function refreshInstances(
     const rec = handle ? frameRootDoc(getCurrentWorld(), handle) : undefined;
     const baseline = rec && rec.source === source ? rec.doc as PrefabFile : oldPrefab;
     let captured = captureInstanceOverrides(oldRootId, baseline);
-    if (appliedFrom && oldRootId === appliedFrom.rootId) captured = subtractFieldOverrides(captured, appliedFrom.fields);
+    if (appliedFrom && oldRootId === appliedFrom.rootId) {
+      captured = subtractFieldOverrides(captured, appliedFieldsToDrop(oldRootId, captured, appliedFrom.fields));
+    }
     const capturedStructure = captureInstanceStructure(oldRootId, baseline);
     rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure, baseline, remap);
   }
@@ -5804,7 +5876,7 @@ function rowsMeanTheSame(built: RowDoc, cached: RowDoc): boolean {
   return b.every((e) => at.has(e.localId) && (!e.nodeGuid || !at.get(e.localId) || at.get(e.localId) === e.nodeGuid));
 }
 
-/** Every frame of instance `rootInstanceId` — its root and each owned nested root below it — whose recorded
+/** Every frame of instance `rootInstanceId` — its root and every nested frame its rebuild tears down — whose recorded
  *  document does not hold the same rows as the editor's cached copy of its source (#1483,
  *  {@link rowsMeanTheSame}). Every capture
  *  (overrides, structure, the override keys, Apply, Revert) diffs a member's `PrefabInstance.localId` against
@@ -5825,15 +5897,15 @@ export function framesBuiltFromOtherRows(
   // A runtime frame (a pooled row, a timeline spawn) is not authoring input (docs/prefabs.md § Authoring
   // scope): no capture reads it, and nothing would ever rebuild it to clear a refusal.
   const runtimeIds = collectTransientSubtreeIds(all);
-  const parentOf = new Map(all.map((e) => [e.id, e.parentId]));
-  const inside = (id: number): boolean => {
-    for (let at = id, hops = 0; at && hops < 10_000; at = parentOf.get(at) ?? 0, hops++) if (at === rootInstanceId) return true;
-    return false;
-  };
+  // The frames the instance's rebuild tears down — what every capture of it now reaches — not its live subtree: a
+  // frame it owns that was moved out of that subtree (#1437) is captured too, and a stale one there was captured
+  // against the cache with nothing refusing it (#1499 close-out review: a Revert saved a member the cache gained as
+  // REMOVED). A frame of another instance moved in is parked by the teardown, captured by nothing, and not judged.
+  const inside = rebuildTeardown(rootInstanceId).toDestroy;
   const stale: string[] = [];
   for (const e of all) {
     const data = readTraitData(e.id, pi) as { rootInstanceId?: number; source?: string } | null;
-    if (!data?.source || data.rootInstanceId !== e.id || !inside(e.id) || runtimeIds.has(e.id)) continue;
+    if (!data?.source || data.rootInstanceId !== e.id || !inside.has(e.id) || runtimeIds.has(e.id)) continue;
     if (opts.nestedOnly && e.id === rootInstanceId) continue;
     const handle = findEntity(e.id);
     const rec = handle ? frameRootDoc(world, handle) : undefined;
@@ -5866,9 +5938,9 @@ export function staleInstanceRefusal(rootInstanceId: number): string | null {
  *
  *  A nested frame is rebuilt BY ITSELF, as the Apply fan-out already rebuilds a nested root of the source it
  *  applied: its own capture reads its own record, where an outer rebuild's nested capture would read the cached
- *  child document and move that frame's edits onto the wrong rows. Deepest first (review of 4f0b839d0), so an
- *  outer rebuild — of a frame that is stale itself, or of a P instance the author dropped inside another —
- *  only ever captures nested frames that are current. If the world is replaced
+ *  child document and move that frame's edits onto the wrong rows. Inner frames first — by what each teardown
+ *  destroys, not by live depth (#1499) — so an outer rebuild (of a frame that is stale itself, or of a P instance the
+ *  author dropped inside another) only ever captures nested frames that are current. If the world is replaced
  *  while the nested prefabs load, nothing is rebuilt — the ids were collected in the world that is gone, and
  *  the new world's load recorded its own documents. */
 export async function rebaseStaleInstances(): Promise<number> {
@@ -5877,9 +5949,7 @@ export async function rebaseStaleInstances(): Promise<number> {
   const world = getCurrentWorld();
   const all = getAllEntities();
   const runtimeIds = collectTransientSubtreeIds(all);
-  const parentOf = new Map(all.map((e) => [e.id, e.parentId]));
-  const depth = (id: number) => { let n = 0; for (let at = parentOf.get(id) ?? 0; at && n < 10_000; at = parentOf.get(at) ?? 0) n++; return n; };
-  const stale: { root: number; source: string; from: PrefabFile; to: PrefabFile; depth: number }[] = [];
+  const stale: { root: number; source: string; from: PrefabFile; to: PrefabFile }[] = [];
   world.query(pi.trait).updateEach(([data], entity) => {
     const d = data as { source?: string; rootInstanceId?: number };
     // Every frame root — stored or owned (#1493) — not only the stored ones.
@@ -5887,43 +5957,48 @@ export async function rebaseStaleInstances(): Promise<number> {
     const rec = frameRootDoc(world, entity);
     const cached = prefabCache.get(d.source);
     if (!rec || rec.source !== d.source || !cached || sameDocument(rec.doc, cached)) return;
-    stale.push({ root: entity.id(), source: d.source, from: rec.doc as PrefabFile, to: cached, depth: depth(entity.id()) });
+    stale.push({ root: entity.id(), source: d.source, from: rec.doc as PrefabFile, to: cached });
   });
   for (const s of stale) {
     await preloadNestedPrefabs(s.to);
     await preloadNestedPrefabsForSubtree(s.root);
   }
   if (getCurrentWorld() !== world) return 0;
-  stale.sort((a, b) => b.depth - a.depth);
+  // ORDER: a frame is rebuilt only once no other stale frame is left in what its teardown destroys (#1499). Its
+  // nested capture reads every frame in that set against the CACHED rows, so a stale one captured there had its
+  // edits moved onto other members (a row the cache gained read as removed). Deepest-first by live depth got this
+  // right only while every frame hung inside its owner's subtree; a frame moved out of it (#1437) can sit
+  // shallower than the frame that owns it.
+  //
+  // RE-CHECK: an entry is rebuilt only while its id is still a root of the same source holding the very document
+  // collected — so a frame some earlier rebuild respawned (current now), or an id freed by one and handed straight
+  // back to a respawn, is left alone. (Rebuilt under a recycled id, another source's frame was rebuilt as this one:
+  // #1493 review 2.) ⚠️ TRACED, NOT DRIVEN: the order above never lets a rebuild destroy an entry still pending, so
+  // no fixture reaches this, and deleting it leaves every test green. It stays because the order is the only other
+  // thing standing between a damaged tree and a frame rebuilt as the wrong prefab, and it costs one lookup.
+  const pending = [...stale];
+  const liveRoot = (s: (typeof pending)[number]): number => {
+    const e = findEntity(s.root);
+    if (!e) return 0;
+    const d = readTraitData(e.id(), pi) as { source?: string; rootInstanceId?: number } | null;
+    return d?.source === s.source && d.rootInstanceId === e.id() && frameRootDoc(world, e)?.doc === s.from ? e.id() : 0;
+  };
   let rebuilt = 0;
-  // A rebuild runs only when its teardown stays inside the frame's own live subtree (`rebuildReachesOutside`),
-  // so it destroys nothing but deeper entries, which this deepest-first loop has already processed: every
-  // entry is alive at its turn, and no id is recycled under one. (Reaching outside, it rebuilt a later entry's
-  // recycled id as the wrong prefab — review 2 of this close-out.)
-  for (const s of stale) {
-    if (rebuildReachesOutside(s.root)) {
-      console.warn(`[Prefab] not rebuilding a "${s.source}" frame built from another version of it: something of it was moved out of its own subtree within its instance, which a rebuild cannot carry yet (#1499) — Apply/Revert stay refused for it`);
-      continue;
-    }
-    rebuilt += refreshInstances(s.source, [s.root], s.from, s.to);
+  while (pending.length) {
+    const roots = pending.map(liveRoot);
+    for (let i = pending.length - 1; i >= 0; i--) if (!roots[i]) { pending.splice(i, 1); roots.splice(i, 1); }
+    if (!pending.length) break;
+    const next = roots.findIndex((r, i) => {
+      const torn = rebuildTeardown(r).toDestroy;
+      return roots.every((o, j) => j === i || !torn.has(o));
+    });
+    // Two frames cannot each destroy the other, so `next` is found; if a damaged tree ever says otherwise, take the
+    // first — `refreshInstances` still refuses a frame whose teardown holds a stale one.
+    const at = Math.max(next, 0);
+    const [s] = pending.splice(at, 1);
+    rebuilt += refreshInstances(s!.source, [roots[at]!], s!.from, s!.to);
   }
   return rebuilt;
-}
-
-/** Would {@link rebuildInstance} on `root` reach OUTSIDE its live subtree? Its captures walk live children, so
- *  anything its teardown destroys out there — what a frame owns that was moved elsewhere in the instance (#1437),
- *  a user-added node's member moved out, and every frame under those — is respawned without its edits, or
- *  captured against the cached rows (review 1 and 2 of this close-out: an edit in a moved-out frame lost, one in a
- *  stale frame under it moved onto another member). And an OWNED root moved itself, rebuilt on its own, comes back
- *  unlinked from its row. The rebase leaves all of these stale (#1499). Asked of the teardown itself
- *  (`rebuildTeardown`), not a second model of it. */
-function rebuildReachesOutside(root: number): boolean {
-  const piMeta = getTraitByName('PrefabInstance');
-  if (!piMeta) return false;
-  if (isOwnedRoot(readTraitData(root, piMeta) as MemberPi, root) && worldIdentityParents(getCurrentWorld()).moved(root)) return true;
-  const inside = new Set(collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), [root]));
-  for (const id of rebuildTeardown(root).toDestroy) if (!inside.has(id)) return true;
-  return false;
 }
 
 /** Re-derive every BASE scene's live instance of `source` from `fromPrefab` to `toPrefab` — the
@@ -5998,6 +6073,90 @@ function cloneOverrides(
   m: Record<number, Record<string, Record<string, unknown>>>,
 ): Record<number, Record<string, Record<string, unknown>>> {
   return JSON.parse(JSON.stringify(m));
+}
+
+/** What the rows ENCLOSING instance `rootInstanceId` set on it — every prefab row from the outermost (stored)
+ *  instance down to this one, resolved outside-in (`resolveEffectivePrefabOverride`), with member tokens resolved
+ *  to live guids. So an instance's BASE — what it resolves to with no override of its own — is its template under
+ *  this. Null for a stored root, which nothing encloses, and for a frame whose chain cannot be read.
+ *
+ *  ONE answer for three questions about a NESTED instance (#1492): which applied fields Apply keeps on it
+ *  ({@link appliedFieldsToDrop}), what its override list compares against (`collectInstanceOverrideTree`), and what
+ *  Revert puts back (`revertOverridesSelective`). Each used to read the bare template, which a nested instance never
+ *  shows: a field the outer row sets was listed as the instance's override, reverted to the template's value, and an
+ *  Apply's shadowed value was dropped. */
+export function enclosingRowOverrides(rootInstanceId: number): Record<number, Record<string, Record<string, unknown>>> | null {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta) return null;
+  // The chain of rows down from the stored root, climbing by ownership (#1437: a moved root's owner is its frame).
+  // The resolver only once there is a row to climb: a stored root, the common case, costs one read.
+  let identity: ReturnType<typeof worldIdentityParents> | undefined;
+  const chain: number[] = [];
+  let top = rootInstanceId;
+  for (let hops = 0; hops < 64; hops++) {
+    const plid = (readTraitData(top, piMeta)?.parentLocalId as number) || 0;
+    if (!plid) break;
+    const owner = (identity ??= worldIdentityParents(getCurrentWorld())).ownerOf(top);
+    if (!owner) return null;
+    chain.unshift(plid);
+    top = owner;
+  }
+  const topSource = (readTraitData(top, piMeta)?.source as string) || '';
+  if (!chain.length || !topSource) return null;
+  return baseTokenResolver(rootInstanceId)(resolveEffectivePrefabOverride(topSource, chain)) as
+    Record<number, Record<string, Record<string, unknown>>>;
+}
+
+/** `prefab` as instance `rootInstanceId` resolves it with no override of its own: its members under the rows
+ *  enclosing it ({@link enclosingRowOverrides}). `prefab` itself for a stored root. What every "is this field an
+ *  override?" reader diffs a live member against — the override list and the Inspector's highlight (#1492). */
+export function instanceBase(rootInstanceId: number, prefab: PrefabFile): PrefabFile {
+  const rows = enclosingRowOverrides(rootInstanceId);
+  if (!rows || !Object.keys(rows).length) return prefab;
+  return {
+    ...prefab,
+    entities: prefab.entities.map((e) => {
+      const over = rows[e.localId];
+      if (!over) return e;
+      const traits: Record<string, unknown> = { ...e.traits };
+      for (const [trait, fields] of Object.entries(over)) {
+        const own = traits[trait];
+        traits[trait] = getTraitByName(trait)?.category === 'tag' ? true
+          : { ...(own && typeof own === 'object' ? own as Record<string, unknown> : {}), ...fields };
+      }
+      return { ...e, traits } as typeof e;
+    }),
+  };
+}
+
+/** Of the fields an Apply copied FROM instance `rootInstanceId` into its template (`localId.Trait.field`), the ones
+ *  whose override can go — THE rule for what the source keeps after an Apply (#1469, #1492): **an applied field keeps
+ *  its override only if dropping it would change the value the instance resolves to.**
+ *
+ *  Without its override a field resolves to the template, which now holds the applied value, under whatever the
+ *  enclosing rows set ({@link enclosingRowOverrides}). A stored root has none, so every applied field goes (#1469:
+ *  the leftover equalled the template, was invisible in the override list, and pinned the instance against later
+ *  template edits). On an OWNED nested root, a row that sets the field to another value would flip the instance to
+ *  that value, so the override is kept (#1492, owner ruling b): an ordinary one — listed, revertable to the row's
+ *  value, saved (#1498). Asked of the value the chain resolves to, not of which layers exist, so a row inside a row
+ *  answers the same way. `captured` holds the live values. */
+function appliedFieldsToDrop(
+  rootInstanceId: number,
+  captured: Record<number, Record<string, Record<string, unknown>>>,
+  applied: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const enclosing = enclosingRowOverrides(rootInstanceId);
+  if (!enclosing) return applied;
+  const drop = new Set<string>();
+  for (const key of applied) {
+    const [lid, trait, field] = key.split('.');
+    const row = enclosing[Number(lid)]?.[trait!];
+    const live = captured[Number(lid)]?.[trait!];
+    const shadowed = !!row && typeof row === 'object' && hasDocKey(row, field!) && !!live && hasDocKey(live, field!)
+      && !valuesEqual(row[field!], live[field!]);
+    if (!shadowed) drop.add(key);
+  }
+  return drop;
 }
 
 /** Return a copy of `full` with the selected per-field override keys
@@ -6141,6 +6300,16 @@ export async function revertOverridesSelective(
   const fullOverrides = captureInstanceOverrides(rootInstanceId, prefab);
   let fullStructure = captureInstanceStructure(rootInstanceId, prefab);
   const reducedOverrides = subtractFieldOverrides(fullOverrides, selectedKeys);
+  // A reverted field goes back to what the instance resolves to WITHOUT it: on a nested instance, the enclosing row's
+  // value where one sets it (#1492), not the template's. The rebuild re-expands from the template alone and carries
+  // the row's values only as captured (marked) overrides, so the one reverted here is put back from the row.
+  const enclosing = enclosingRowOverrides(rootInstanceId);
+  for (const key of enclosing ? selectedKeys : []) {
+    const [lid, trait, field] = key.split('.');
+    const row = enclosing![Number(lid)]?.[trait!];
+    if (!row || typeof row !== 'object' || !hasDocKey(row, field!)) continue;
+    ((reducedOverrides[Number(lid)] ??= {})[trait!] ??= {})[field!] = row[field!];
+  }
   let reducedStructure = subtractRevertedStructure(fullStructure, selectedKeys);
   // Moves inside nested instances live in what the rebuild captures of THEM (owner's B): dropped for the revert,
   // set back for its undo, which rebuilds from `fullStructure`.

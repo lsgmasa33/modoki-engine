@@ -1649,6 +1649,10 @@ show a notch bug at all. Always on, with the bands drawn over the frame. Mechani
 per-orientation data, and what is measured vs published:
 [UI system](./ui-system.md) § "The editor simulates the safe area".
 
+The toolbar's **● Record** plays a take for the gameplay recorder. Stopping it opens a render dialog,
+and a non-modal progress card follows the render. The flow, and why the render is a backend job the
+page polls: [Gameplay recorder](./gameplay-recorder.md) § "Rendering from the editor".
+
 ### Driving the preview screen from an agent (#367)
 
 The selected device and orientation live in the **editor store** (`gameViewDevice` /

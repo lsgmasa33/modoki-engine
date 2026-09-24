@@ -72,6 +72,7 @@ const NO_TOOL_BY_DESIGN: Record<string, string> = {
   '/api/pick-path': 'opens a native file picker — modal, and only a human can dismiss one. #288 gap 5 routed the agent AROUND this (modoki_create_registered_asset takes an explicit path) precisely because a modal native panel made the New-X surface agent-unreachable (and until #1440 it was an osascript child that also blocked the backend)',
   '/api/save-dialog': 'native save panel — same blocking-modal reason',
   '/api/reveal-in-finder': 'opens Finder/Explorer on the human\'s desktop; nothing to read back',
+  '/api/record/render/reveal': 'opens Finder/Explorer on the human\'s desktop at a finished render\'s video; nothing to read back',
   '/api/open-file': 'hands a file to the OS default application — a human affordance with no agent-observable result',
 
   // ── editor chrome: panel layout, pickers, per-session UI state ──
@@ -115,7 +116,13 @@ const NO_TOOL_BY_DESIGN: Record<string, string> = {
  *  `create-folder`. Keep the bucket. Its value is not the entries it happens to hold; it is that a
  *  route with no tool has somewhere honest to go that is NOT "by design", so the next one cannot
  *  quietly be filed as intentional. `docs/mcp-tool-conventions.md` §10. */
-const AGENT_GAPS: Record<string, string> = {};
+const AGENT_GAPS: Record<string, string> = {
+  // #1488: docs/gameplay-recorder.md § "Gotchas" (its "Not yet" list) lists an MCP wrapper, and says it should drive this
+  // same job so the editor and agents share one render path. Until then an agent renders a take with
+  // `npm run record -- <take>` from its shell, which is the same CLI.
+  '/api/record/render': 'the render job an MCP wrapper for the gameplay recorder would start and poll (docs/gameplay-recorder.md § "Gotchas" (its "Not yet" list))',
+  '/api/record/render/cancel': 'the cancel half of the same job',
+};
 
 function declaredRoutes(): Set<string> {
   const out = new Set<string>();

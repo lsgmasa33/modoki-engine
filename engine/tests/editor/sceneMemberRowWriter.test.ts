@@ -906,10 +906,11 @@ describe('a carried instance whose NESTED frame was built from another version o
     expect(framesBuiltFromOtherRows(one('QR').id)).toEqual([]);
   });
 
-  describe('a frame MOVED within its instance is left stale, not rebuilt — rebuildInstance cannot carry it (#1499)', () => {
+  describe('a frame MOVED within its instance is rebuilt with what it carries (#1499 — #1493 left it stale)', () => {
     // O = OR → Slot → N(P); P nests Q at row 5. QR is moved under OR and stays OWNED by the P frame (its row
     // writes `parent: OR`). Rebuilding the P frame alone destroyed the moved Q frame and its edit; rebuilding
-    // QR alone unlinked it from its row (review of d8de97f8f). Both are left exactly as before #1493.
+    // QR alone unlinked it from its row (review of d8de97f8f), so #1493 skipped both. #1499 fixed the rebuild
+    // (capture from the teardown's set; carry `ownerGuid`), and the rebase rebuilds them.
     const Q = 'cccccccc-0000-4000-8000-000000000b03';
     const q = (ids: [number, number]) => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
       row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000000b21'),
@@ -929,22 +930,27 @@ describe('a carried instance whose NESTED frame was built from another version o
     };
     const qLinked = (entry: SceneEntityEntry) => !JSON.stringify(entry).includes('"removed":true');
 
-    it('the P frame that OWNS the moved Q frame: skipped, and the Q edit survives a save and a reload', async () => {
+    it('the P frame that OWNS the moved Q frame: rebuilt, and the Q edit survives it, a save and a reload', async () => {
       await setUp();
       install(withQ(true));
-      expect(await rebaseStaleInstances()).toBe(0);
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect((tf('R') as { y?: number } | undefined)?.y).toBe(1); // the P frame really was rebuilt
       expect([tf('QX')?.x, parentName('QR')]).toEqual([8, 'OR']);
       const entry = await entryOf();
       await load(scene(O, entry as never));
       expect([count('QX'), tf('QX')?.x, parentName('QR')]).toEqual([1, 8, 'OR']);
     });
 
-    it('the moved Q frame itself: skipped, and the save keeps it linked to its row', async () => {
+    it('the moved Q frame itself: rebuilt alone, and the save keeps it linked to its row', async () => {
       await setUp();
       install(q([3, 2]));
-      expect(await rebaseStaleInstances()).toBe(0);
-      expect(qLinked(await entryOf())).toBe(true);
-      expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([Q]);   // still refused, as before #1493
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([]);   // current: Apply/Revert no longer refused
+      expect([tf('QX')?.x, parentName('QR')]).toEqual([8, 'OR']);
+      const entry = await entryOf();
+      expect(qLinked(entry)).toBe(true);
+      await load(scene(O, entry as never));
+      expect([count('QX'), tf('QX')?.x, parentName('QR')]).toEqual([1, 8, 'OR']);
     });
 
     it('a member moved WITHIN the stale frame`s own subtree does not stop the rebuild — the save stays right', async () => {

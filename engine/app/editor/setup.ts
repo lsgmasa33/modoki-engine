@@ -572,6 +572,12 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'build.playableMaxBytes', label: 'Max size (bytes)', type: 'number', placeholder: '5242880', help: 'build fails if the single HTML exceeds this — AppLovin caps at 5 MB' },
               ],
             },
+            {
+              title: 'Gameplay Recorder',
+              fields: [
+                { key: 'recording.outputHeight', label: 'Video height (px)', type: 'number', placeholder: '1920', help: 'pre-fills the render dialog\'s Scale as this ÷ the take\'s layout height (1920 on a 540×960 take = ×2, so 1080×1920). 0 = not set. What you last chose in the dialog for this project wins' },
+              ],
+            },
           ],
         },
         {

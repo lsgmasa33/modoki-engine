@@ -156,6 +156,7 @@
   "TOUCH_CONTROL_ACTIONS",
   "TOUCH_CONTROL_SHOW_ON",
   "TOUCH_OPACITY_ATTR",
+  "TakeJournalTap",
   "Text2D",
   "Text3D",
   "TextAnimation",

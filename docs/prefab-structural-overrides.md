@@ -292,21 +292,29 @@ Operate on the deep-cloned `newPrefab`:
   `overrides` or `nestedOverrides`). The layer holds only what differs from its BASE, the pose the
   documents below give the member: the member's own row, under whatever the rows in between set
   (`resolveEffectivePrefabOverride`). A field that now equals the base is dropped. Writing the full
-  TRS froze the lower documents' later edits in the row. It also lost scene edits, because
-  `captureNestedSceneDelta` subtracts every field a row's override holds (#1498), so a scene edit to
-  any of those fields was dropped on save.
+  TRS froze the lower documents' later edits in the row. It also lost scene edits while the save still
+  subtracted every field a row's override holds by KEY (#1498, since fixed): a scene edit to any of
+  those fields was dropped.
 - **Rotation is one orientation, not three fields** (`sameOrientation`, transformSpace.ts). Euler
   components are coupled, and a decomposed pose comes back in another spelling of the same rotation:
   `ry: π` becomes `(-π, ~0, -π)`. A per-field diff then pinned an equal rotation, or dropped `ry ≈ 0`
   from a row that turned its instance around, which let a later child edit turn it. `layerPose`
   writes all three components or none. The removal branch keeps the row's own spelling when the carry
   did not change the orientation. A root with no Transform on either side (a UI root) gets none.
-  ⚠️ **The trade-off, until #1498 is fixed.** A row that rotates its member at all now holds all three
-  rotation components. The scene capture subtracts every field the row holds, by key (#1498), so a
-  scene edit to ANY rotation component of that member is dropped on save. A row holding only `ry`
-  would lose only `ry` edits. That was accepted because a partial rotation override is not sound: a
-  component dropped for equalling the base lets a later child edit turn the instance. The loss is the
-  capture's defect, and #1498 fixes it.
+  So a row that rotates its member at all holds all three components. The save reads that the same way
+  (`subtractChainOverrides`, #1498). The scene's rotation comes off only when its orientation EQUALS the
+  row's, and is otherwise written as all three; scale is compared per field.
+  **One exception, for a RE-SPELLED pose** (`sameRotationScale`, the linear part as one matrix). A mirror's
+  sign is coupled to rotation too, so a decomposition (a move out and back) returns `sz: -1` as `sx: -1`
+  turned π about y. The capture holds only the MARKED components, so the marked fields over the row no
+  longer rebuild the pose on screen. Then, and only then, all six are decided together: dropped if the pose
+  equals the row's, written whole from the live Transform if not. (Close-out review: per component, a
+  mirrored member moved out and back saved `sz: 1` alone and lost its mirror. Second review: widening
+  EVERY time pinned axes the scene never touched, such as the row's own turn or mirror, and on a rebuild
+  an old row's scale over a refreshed one.) `sameRotationScale` judges each column at its own scale, so a
+  large scale on one axis does not hide a change on another.
+  (Before #1498 the save subtracted by key, and an edit to ANY rotation component of such a member was
+  dropped.)
 
 The live instance's applied **added** entities are deleted from the live world
 before refresh (so the re-instantiated prefab member replaces them rather than
@@ -368,8 +376,28 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   already applies everything the outer prefab's row chain authors, so the capture is the live instance
   **minus that chain**. The chain comes from the document the live tree was expanded FROM, which is
   `rebuildInstance`'s `baseline` (a refresh passes its old file). Only the scene's own edit is left:
-  - **values** are dropped when they EQUAL the chain's value. A scene that changed a row-set field
-    keeps its change, which the key-presence rule `captureNestedSceneDelta` uses for saving would lose.
+  - **values** are dropped when they EQUAL the chain's value (`subtractChainOverrides`), rotation as one
+    orientation and a re-spelled pose as one linear part (above). A scene that changed a row-set field keeps its change. Since #1498 the
+    save (`captureNestedSceneDelta`) makes the SAME subtraction: it used to drop every field the row sets
+    by KEY, so a scene edit to a row-set field read as the row's own and was lost on save.
+    ⚠️ **The save compares against the CACHED chain, not `baseline`, and that is sound only because of
+    the refresh ORDER.** A rebuild reaches the save's capture through one path, a user-added reference node
+    inside the rebuilt instance (`captureNestedRef` → `captureNestedChannels`). That node's frames are
+    instances of the refreshed source, so the refresh has rebuilt them before the outer capture reads them
+    (`refreshInstances` runs deepest first; `rebaseStaleInstances` rebuilds a frame only after every stale
+    frame its teardown reaches, #1499). Refreshed the other way
+    round, the outer capture read the node's OLD row value against the new row, restated it, and froze
+    the old value (#1401's shape): `tests/editor/nestedRowFieldSave.test.ts` pins it.
+    ⚠️ **The same compare makes a SAVE of a stale frame pin its old values.** If the cache holds a newer
+    version of a row than the one the live frame was expanded from, and a scene save runs before
+    `rebaseStaleInstances` rebuilds it, the capture reads the frame's old row values against the new row.
+    By value they differ, so they are written into the scene and override the new row on reload. (By key,
+    before #1498, they were dropped and the new row healed the instance.) This is not reachable today:
+    every path that moves the cache ahead of the live tree rebuilds before a save can run. That covers
+    Apply (its refresh), Apply's undo (`refreshBaseInstances`), the prefab-edit save, and the reload hook
+    (`adoptWorldReloadedFromDisk` → `rebaseStaleInstances`). A new path that writes the cache without
+    that refresh would open it. (Traced by the #1498 close-out's third review; a scratch test drove the
+    mechanism with the rebase skipped.)
     The chain's member tokens are first resolved by `baseTokenResolver` from the nested root: its own
     frame, with `^` climbing to the instance whose row expanded it. The loader applies every value in
     that frame, whichever layer authored it. A reference node's payload is in its own instance's frame
@@ -574,11 +602,10 @@ lookup cannot see it, so:
 - The gate never asked whether the frame ROOT moved, because an owned root's row is its OWNER's.
   `ownedRootMoved` now asks that frame. Without it a moved owned root's compensated pose, which
   `markCompensatedTransform` deliberately leaves unmarked, was dropped on save. The same root's Transform
-  is then subtracted from its ROW by VALUE in `captureNestedSceneDelta`, not by key. That function
-  otherwise drops every field the row sets, and the spaceship's rows set each flame's position, so a moved
-  flame still reloaded at its row's position (found by the live check, `games/space-console`). The rest
-  of that subtraction stays by key, because row values can hold member tokens, which never equal a live
-  guid (#1386).
+  must then be subtracted from its ROW by VALUE, not by key: the spaceship's rows set each flame's
+  position, so a moved flame reloaded at its row's position (found by the live check,
+  `games/space-console`). #1481 made that one case by value. Since #1498 every field is, with the row's
+  member tokens resolved first (they would never equal a live guid otherwise, #1386).
 
 **A row of another frame is not ours (`foreignRow`, #1484).** Those same shapes hang the outer frame's row
 under the inner instance's root. So the inner instance's structure capture skips it, rather than

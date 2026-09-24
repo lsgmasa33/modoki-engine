@@ -15,9 +15,8 @@
 import {
   setFrameLoopHeld, stepOneFrame, setManualNow, advanceManual, restoreRealClock, rawNow,
   resetTimeBaseline, pinFreshWorldSeed, seedRng, setCaptureMode, getCurrentWorld, getTime, takeClockDelta, isNextSceneLoading,
-  journalEvents, isTimeHeldForLoading, sceneManager,
+  TakeJournalTap, isTimeHeldForLoading, sceneManager,
 } from '@modoki/engine/runtime';
-import type { World } from 'koota';
 
 export interface CaptureState {
   /** Real ms spent waiting for the page to settle so far — see `settle`. */
@@ -62,14 +61,10 @@ interface Session {
   /** What the settle gate already gave up on, per kind of work. See `settle`. */
   gaveUpOn: PendingWork | null;
   fetches: FetchCounter;
-  /** Journal events drained after every step. The journal is per WORLD, so reading it once at the
-   *  end would lose every event from before the last scene load. */
+  /** Journal events drained after every step, by the tap the editor recorder uses too
+   *  (`runtime/core/takeJournal.ts` says why per world, and why keyed on `cap`). */
   events: CapturedEvent[];
-  journalWorld: World | null;
-  /** The journal's process-global capture sequence of the last event taken. NOT the tick: an event
-   *  emitted BETWEEN steps (a DOM click handler, a promise continuation) carries the previous
-   *  frame's tick, and a tick-keyed dedupe drops it for good. */
-  lastCap: number;
+  journal: TakeJournalTap;
 }
 
 let session: Session | null = null;
@@ -77,10 +72,6 @@ let session: Session | null = null;
 /** Default longest real wait for the page to settle before a step goes ahead anyway. A fetch that
  *  never returns must not hang a render; the step is recorded as unsettled instead. */
 const SETTLE_TIMEOUT_MS = 20_000;
-
-/** Engine journal events worth keeping in the render report: the game's own, and the audio/cue/scene
- *  events a soundtrack or an edit is built from. `@spawn`/`@despawn` run to hundreds per scene load. */
-const KEEP_ENGINE_EVENTS = new Set(['@audio', '@cue', '@scene-loaded', '@scene-swapped']);
 
 // ── Settling ─────────────────────────────────────────────────────────────────────────────────────
 // A fixed-dt replay stops the SIM clock, not the page: a Pixi Application init, a texture fetch, a
@@ -172,23 +163,9 @@ async function settle(s: Session): Promise<string[]> {
   }
 }
 
-function drainJournalOf(s: Session, world: World, step: number): void {
-  for (const e of journalEvents(undefined, world)) {
-    if (e.cap <= s.lastCap) continue;
-    s.lastCap = e.cap;
-    if (e.type.startsWith('@') && !KEEP_ENGINE_EVENTS.has(e.type)) continue;
-    s.events.push({ step, takeTime: s.takeTime, tick: e.tick, type: e.type, payload: JSON.parse(JSON.stringify(e.payload ?? null)) });
-  }
-}
-
-/** Take every journal event since the last drain. On a world swap the OLD world is drained one last
- *  time first — whatever it emitted between the last step and the swap (a teardown's `@audio stop`)
- *  would otherwise be lost with it. */
+/** Take every kept journal event since the last drain, stamped with the step that emitted it. */
 function drainJournal(s: Session, step: number): void {
-  const world = getCurrentWorld();
-  if (s.journalWorld && s.journalWorld !== world) drainJournalOf(s, s.journalWorld, step);
-  s.journalWorld = world;
-  drainJournalOf(s, world, step);
+  for (const e of s.journal.drain(getCurrentWorld())) s.events.push({ step, takeTime: s.takeTime, ...e });
 }
 
 function readState(): CaptureState {
@@ -219,7 +196,7 @@ export function beginCapture(opts: { dtMs: number; seed: number; settleTimeoutMs
   session = {
     dtMs: opts.dtMs, seed: opts.seed, steps: 0, takeTime: 0, seededAtStart: false,
     settleMs: 0, unsettled: [], settleTimeoutMs: opts.settleTimeoutMs ?? SETTLE_TIMEOUT_MS, gaveUpOn: null,
-    fetches: trackFetches(), events: [], journalWorld: null, lastCap: -1,
+    fetches: trackFetches(), events: [], journal: new TakeJournalTap(),
   };
   return readState();
 }

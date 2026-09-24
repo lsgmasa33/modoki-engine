@@ -65,6 +65,19 @@ export interface Take {
    *  than parsed so the replay stores byte-for-byte what the editor had, envelope version and all. */
   prefs: Record<string, string>;
   events: TakePointerEvent[];
+  /** The game's own journal events while the take was played (#1488), stamped on the take clock.
+   *  Optional: a take recorded before it existed has none, and its replay is reported `unchecked`.
+   *  The render compares them with what the replay emitted (`compareTakeEvents`). */
+  expectedEvents?: TakeGameEvent[];
+}
+
+/** One game journal event, as a take stores it and a render reports it. */
+export interface TakeGameEvent {
+  /** Take-clock seconds when it was drained. Informational: the comparison ignores it, because
+   *  pointer timing is quantised to the video's frame rate and would shift it by up to a frame. */
+  t: number;
+  type: string;
+  payload: unknown;
 }
 
 const KINDS: ReadonlySet<string> = new Set(['down', 'move', 'up']);
@@ -116,6 +129,17 @@ export function parseTake(raw: unknown): Take {
       if (!isFiniteNumber(ev.x) || !isFiniteNumber(ev.y)) problems.push(`events[${i}] needs numeric x and y`);
     });
   }
+  if (o.expectedEvents !== undefined) {
+    if (!Array.isArray(o.expectedEvents)) {
+      problems.push('expectedEvents must be an array when present');
+    } else {
+      o.expectedEvents.forEach((e: unknown, i: number) => {
+        const ev = (e ?? {}) as Record<string, unknown>;
+        if (!isFiniteNumber(ev.t) || ev.t < 0) problems.push(`expectedEvents[${i}].t must be a number >= 0`);
+        if (typeof ev.type !== 'string' || !ev.type) problems.push(`expectedEvents[${i}].type must be a non-empty string`);
+      });
+    }
+  }
   if (problems.length) throw new Error(`take: ${problems.length} problem(s):\n  - ${problems.join('\n  - ')}`);
   return raw as Take;
 }
@@ -152,4 +176,101 @@ export class TakeCursor {
 
   /** Events not yet handed out. */
   get remaining(): number { return this.events.length - this.next; }
+}
+
+/** A GAME event, as opposed to an engine one (`@audio`, `@scene-loaded`, …). The replay check
+ *  compares only these: the engine's own events describe how a scene was loaded and torn down, and
+ *  the editor's Play press and the replay's page boot legitimately differ there. */
+export function isTakeGameEvent(type: string): boolean { return !type.startsWith('@'); }
+
+/** One payload field that differs between the played and the replayed copy of an event. */
+export interface ReplayFieldDifference { path: string; played: unknown; replayed: unknown }
+
+/** The replay check's verdict, as `render.json` reports it.
+ *  - `diverged`: some event type happened a different number of times — the replay went somewhere
+ *    else (a piece never placed, a second heart lost).
+ *  - `differs`: every event happened, the same number of times, but some payloads differ. Often
+ *    input measurement the replay cannot reproduce (a gesture's travel or hold time — pointer moves
+ *    are coalesced per frame and dispatched at the video's frame rate); a differing OUTCOME field
+ *    (a cell, a score) means the replay did go elsewhere. The fields are listed so it can be told apart. */
+export type ReplayCheck =
+  | { status: 'unchecked'; reason: string }
+  | { status: 'matched'; events: number }
+  | {
+    status: 'diverged' | 'differs'; expected: number; replayed: number;
+    /** Types whose COUNT differs. Empty for `differs`. */
+    counts: { type: string; played: number; replayed: number }[];
+    /** Per type, the first occurrence whose payload differs, and its differing fields (up to 5). */
+    details: { type: string; occurrence: number; fields: ReplayFieldDifference[] }[];
+  };
+
+/** Whether two payloads say the same thing. Structural, so key order does not matter.
+ *
+ *  Numbers compare within an ABSOLUTE 0.01: a layout measurement differs in its last digits between
+ *  the editor, which lays the game out inside a CSS-scaled div, and the headless page (Court's
+ *  `court.relayout` measured 269.4687568551177 and 269.46875 for the same board). Absolute, so two
+ *  integers are equal only when they are equal — a count, a score, a date key or an epoch either
+ *  matches or the replay went elsewhere. A tolerance RELATIVE to the size was tried first, and
+ *  review showed it calling 12345 vs 12346, and 20260924 vs 20260925, the same. */
+export function samePayload(x: unknown, y: unknown): boolean {
+  if (typeof x === 'number' && typeof y === 'number') {
+    return Math.abs(x - y) <= 0.01;
+  }
+  if (Array.isArray(x) || Array.isArray(y)) {
+    return Array.isArray(x) && Array.isArray(y) && x.length === y.length && x.every((v, i) => samePayload(v, y[i]));
+  }
+  if (x && y && typeof x === 'object' && typeof y === 'object') {
+    const kx = Object.keys(x);
+    const ky = Object.keys(y);
+    return kx.length === ky.length && kx.every((k) => Object.hasOwn(y, k) && samePayload((x as Record<string, unknown>)[k], (y as Record<string, unknown>)[k]));
+  }
+  return (x ?? null) === (y ?? null);
+}
+
+type Ev = { type: string; payload: unknown };
+
+/** The leaf fields where `x` and `y` differ (by `samePayload`), as dotted paths. */
+export function payloadDifferences(x: unknown, y: unknown, at = '', out: ReplayFieldDifference[] = [], limit = 5): ReplayFieldDifference[] {
+  if (out.length >= limit || samePayload(x, y)) return out;
+  const bothObjects = x && y && typeof x === 'object' && typeof y === 'object' && Array.isArray(x) === Array.isArray(y);
+  if (!bothObjects) { out.push({ path: at || '(payload)', played: x, replayed: y }); return out; }
+  const keys = [...new Set([...Object.keys(x as object), ...Object.keys(y as object)])];
+  for (const k of keys) {
+    payloadDifferences((x as Record<string, unknown>)[k], (y as Record<string, unknown>)[k], at ? `${at}.${k}` : k, out, limit);
+  }
+  return out;
+}
+
+/** Compare the game events a take was played with against the ones its replay emitted: for EACH
+ *  event type, how many happened, and whether each occurrence's payload matches its counterpart
+ *  (the k-th of that type on each side). Engine events are skipped (`isTakeGameEvent`), and timing
+ *  is ignored (see `TakeGameEvent.t`). A take with no `expectedEvents` is `unchecked`.
+ *
+ *  ⚠️ **Per type, not one global order.** Events from independent async work interleave by timing:
+ *  measured on Court, `court.iap.trusted-clock` (a network fetch) landed after `court.session.restored`
+ *  in the editor and before it in the replay, in a replay that was otherwise identical — the same
+ *  placement, the same heart lost. A global order called every such take diverged. */
+export function compareTakeEvents(expected: readonly Ev[] | undefined, replayed: readonly Ev[]): ReplayCheck {
+  if (!expected) return { status: 'unchecked', reason: 'the take has no expectedEvents (recorded before the replay check existed)' };
+  const group = (list: readonly Ev[]) => {
+    const m = new Map<string, Ev[]>();
+    for (const e of list) if (isTakeGameEvent(e.type)) (m.get(e.type) ?? m.set(e.type, []).get(e.type)!).push(e);
+    return m;
+  };
+  const a = group(expected);
+  const b = group(replayed);
+  // Types in the order the owner first saw them, then any only the replay had.
+  const types = [...new Set([...a.keys(), ...b.keys()])];
+  const counts: { type: string; played: number; replayed: number }[] = [];
+  const details: { type: string; occurrence: number; fields: ReplayFieldDifference[] }[] = [];
+  for (const type of types) {
+    const xs = a.get(type) ?? [];
+    const ys = b.get(type) ?? [];
+    if (xs.length !== ys.length) counts.push({ type, played: xs.length, replayed: ys.length });
+    const k = xs.findIndex((x, i) => i < ys.length && !samePayload(x.payload, ys[i].payload));
+    if (k >= 0) details.push({ type, occurrence: k + 1, fields: payloadDifferences(xs[k].payload, ys[k].payload) });
+  }
+  const total = (m: Map<string, Ev[]>) => [...m.values()].reduce((n, l) => n + l.length, 0);
+  if (!counts.length && !details.length) return { status: 'matched', events: total(a) };
+  return { status: counts.length ? 'diverged' : 'differs', expected: total(a), replayed: total(b), counts, details };
 }

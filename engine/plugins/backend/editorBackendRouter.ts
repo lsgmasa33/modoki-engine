@@ -42,6 +42,8 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
+import { renderAvailability, renderJobs, renderScriptPath } from './recordRenderJob';
+import type { RenderOptions } from '../../packages/modoki/src/editor/recorder/renderOptions';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
 import { osascriptChooser, type NativeChooser } from './nativeChooser';
 import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
@@ -4909,6 +4911,47 @@ async function describeUnresolvedAgainstLiveWorld(
       if (fs.existsSync(absPath)) return json({ error: 'Folder exists' }, 409);
       createFolderAt(absPath);
       return json({ ok: true, saved: true });
+    } catch (e) {
+      return json({ error: String(e) }, 500);
+    }
+  }
+
+  // ── GET/POST /api/record/render, POST /api/record/render/cancel ── the gameplay recorder's render
+  // job (#1488): the editor's Stop → render dialog → progress card. A JOB the page polls rather than
+  // an SSE stream, so a game-code reload of the editor page does not cancel a render (recordRenderJob.ts
+  // says why, and why cancel is the CLI's stdin closing).
+  if (urlPath === '/api/record/render' && method === 'GET') {
+    return json({ ...renderAvailability(ctx.editorRoot), job: renderJobs.current(), now: Date.now() });
+  }
+  if (urlPath === '/api/record/render' && method === 'POST') {
+    const availability = renderAvailability(ctx.editorRoot);
+    if (!availability.available || !ctx.editorRoot) return json({ error: availability.reason }, 503);
+    const { take, options } = (body ?? {}) as { take?: unknown; options?: unknown };
+    // The take must be one of THIS project's: the CLI reads it, and by default writes beside it.
+    if (typeof take !== 'string' || !path.isAbsolute(take) || !take.endsWith('.take.json')) {
+      return json({ error: 'take must be the absolute path of a .take.json' }, 400);
+    }
+    if (!isUnderOrSame(ctx.projectRoot, take)) return json({ error: 'take must be inside the open project' }, 403);
+    if (!fs.existsSync(take)) return json({ error: `no take at ${take}` }, 404);
+    const started = renderJobs.start({ repoRoot: ctx.editorRoot, scriptPath: renderScriptPath(ctx.editorRoot), take, options: options as RenderOptions });
+    if (!started.ok) return json({ error: started.error }, started.status);
+    return json({ job: started.job, now: Date.now() });
+  }
+  if (urlPath === '/api/record/render/cancel' && method === 'POST') {
+    const job = renderJobs.cancel();
+    if (!job) return json({ error: 'no render is running' }, 409);
+    return json({ job, now: Date.now() });
+  }
+  // Reveal the video a finished job wrote, named by the job — not by a path the caller sends. The
+  // dialog's "Choose…" folder is usually outside the project, where /api/reveal-in-finder refuses.
+  if (urlPath === '/api/record/render/reveal' && method === 'POST') {
+    const { id } = (body ?? {}) as { id?: unknown };
+    const job = renderJobs.current();
+    if (!job || job.id !== id || !job.result?.video) return json({ error: 'that render has no video to show' }, 404);
+    if (!fs.existsSync(job.result.video)) return json({ error: `the video is gone: ${job.result.video}` }, 404);
+    try {
+      await revealInOS(job.result.video);
+      return json({ ok: true });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }

@@ -3818,7 +3818,8 @@ describe('a nested row under a nested row is supported everywhere (#1484, #1481)
 
   // …and when the ROW authors the root's position too (the spaceship's mirrored flames, where #1481's live loss was
   // seen): the nested delta dropped a field the row sets by KEY, so the compensated position went and the root
-  // reloaded at the row's value under its new parent. Mutation: drop `byValue` in `captureNestedSceneDelta`.
+  // reloaded at the row's value under its new parent. Since #1498 every field the row sets comes off by value, so
+  // this is no longer a special case. Mutation: compare by KEY in `subtractChainOverrides` (drop its value test).
   it('a moved owned root keeps its compensated pose when its row authors the same fields', async () => {
     use(docsOf(false, { x: 2 }));
     await loadO();
@@ -3828,6 +3829,10 @@ describe('a nested row under a nested row is supported everywhere (#1484, #1481)
     e.set(getTraitByName('Transform')!.trait, { ...tfOf(e.id()), x: 7 });
     const moved = await serializeScene();
     reparentEntity(idAt('ORoot/Ctrl/ZRoot'), idAt('ORoot/QRoot'));
+    // The raw `x: 7` above stands in for the move's compensation, so moving back takes it off again — as the real
+    // compensation would. (Left on, the root really sits at 7, and 7 is what a save now keeps.)
+    const back = [...getCurrentWorld().entities].find((x) => x.id() === idAt('ORoot/QRoot/ZRoot'))!;
+    back.set(getTraitByName('Transform')!.trait, { ...tfOf(back.id()), x: 2 });
     await load(await serializeScene() as unknown as SceneData);
     expect(tfOf(idAt('ORoot/QRoot/ZRoot')).x).toBe(2); // moved back: the row's value, nothing pinned
     await load(moved as unknown as SceneData);

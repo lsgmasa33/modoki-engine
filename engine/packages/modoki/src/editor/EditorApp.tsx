@@ -34,6 +34,7 @@ import BuildSupportDialog from './panels/BuildSupportDialog';
 import CleanupAssetsDialog from './panels/CleanupAssetsDialog';
 import FindReferencesDialog from './panels/FindReferencesDialog';
 import PublishOtaDialog from './panels/PublishOtaDialog';
+import RenderTakeUI from './panels/RenderTakeDialog';
 import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
 import { runSaveAll, toastForSave } from './scene/saveCommand';
@@ -805,6 +806,7 @@ export default function EditorApp() {
       <FindReferencesDialog />
       <BuildSupportDialog />
       <PublishOtaDialog />
+      <RenderTakeUI />
       <OtaKeysDialog />
       {showLoad && <LoadLayoutModal onClose={() => setShowLoad(false)} />}
       {showSaveAs && <SaveLayoutAsModal initial={currentLayoutName() || 'default'} onSave={saveLayoutAs} onExport={(name) => { const m = modelRef.current; if (m) downloadLayoutJson(name, m.toJson()); }} onClose={() => setShowSaveAs(false)} />}

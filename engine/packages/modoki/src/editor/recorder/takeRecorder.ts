@@ -10,12 +10,14 @@
  *  below it is the thin part. */
 
 import {
-  TAKE_FORMAT, TAKE_VERSION, type Take, type TakePointerEvent, type TakePointerKind,
+  TAKE_FORMAT, TAKE_VERSION, isTakeGameEvent, type Take, type TakeGameEvent, type TakePointerEvent, type TakePointerKind,
 } from './take';
 import { getPlayState, onPlayStateChange } from '../../runtime/core/playState';
 import { seedRng, pinFreshWorldSeed } from '../../runtime/core/rng';
 import { setCaptureMode } from '../../runtime/core/captureMode';
 import { takeClockDelta, isNextSceneLoading } from '../../runtime/core/takeClock';
+import { TakeJournalTap } from '../../runtime/core/takeJournal';
+import { getCurrentWorld } from '../../runtime/core/ecs/worldRegistry';
 import { registerFrameCallback, unregisterFrameCallback } from '../../runtime/rendering/frameDriver';
 import { PlayerPrefs } from '../../runtime/storage/playerPrefs';
 import { prefsKeyPrefix } from '../../runtime/storage/prefsKey';
@@ -105,7 +107,18 @@ interface Recording {
    *  driver sums, which is what makes the two clocks one axis (`runtime/core/takeClock.ts` says why
    *  it is summed rather than read from `Time.elapsed`, and why unscaled). */
   takeTime: number;
+  /** The game's journal events while the take plays — the replay check's expectation (#1488). The
+   *  replay driver drains with the same tap, so both halves collect by one rule. */
+  journal: TakeJournalTap;
+  expectedEvents: TakeGameEvent[];
   detach: () => void;
+}
+
+/** Take the game events emitted since the last drain, stamped on the take clock. */
+function drainTakeJournal(rec: Recording): void {
+  for (const e of rec.journal.drain(getCurrentWorld())) {
+    if (isTakeGameEvent(e.type)) rec.expectedEvents.push({ t: rec.takeTime, type: e.type, payload: e.payload });
+  }
 }
 
 let recording: Recording | null = null;
@@ -123,6 +136,17 @@ export function onTakeRecordingChange(fn: () => void): () => void {
   return () => listeners.delete(fn);
 }
 const notify = () => notifyListeners(listeners, 'takeRecorder', []);
+
+/** A take that was just written: its absolute path, and the take itself. */
+export interface SavedTake { file: string; take: Take }
+const savedListeners = new Set<(saved: SavedTake) => void>();
+
+/** Subscribe to takes being saved — by the Record button OR by Stop, which both end here. The
+ *  render dialog opens from this (#1488), so neither Stop path can skip it. */
+export function onTakeSaved(fn: (saved: SavedTake) => void): () => void {
+  savedListeners.add(fn);
+  return () => savedListeners.delete(fn);
+}
 
 /** The runtime UI root inside the GameView — the one element both the editor preview and the
  *  shipped page lay the game out in. SceneView's copy is marked `"editor"`, so it cannot match. */
@@ -154,6 +178,7 @@ export async function startTakeRecording(safeArea: Take['safeArea']): Promise<st
   const builder = new TakeBuilder();
   const rec: Recording = {
     builder, root, started: false, takeTime: 0, detach: () => {},
+    journal: new TakeJournalTap(), expectedEvents: [],
     base: {
       format: TAKE_FORMAT, version: TAKE_VERSION, game,
       scene: scenePath.split('/').pop()!,
@@ -187,7 +212,9 @@ export async function startTakeRecording(safeArea: Take['safeArea']): Promise<st
   let loadInFlightAtStart = false;
   registerFrameCallback('takeRecorderFrameStart', () => { loadInFlightAtStart = isNextSceneLoading(); }, Number.MIN_SAFE_INTEGER);
   registerFrameCallback('takeRecorder', () => {
-    if (rec.started) rec.takeTime += takeClockDelta(loadInFlightAtStart);
+    if (!rec.started) return;
+    rec.takeTime += takeClockDelta(loadInFlightAtStart);
+    drainTakeJournal(rec);
   }, 5);
 
   const offPlay = onPlayStateChange(() => {
@@ -196,6 +223,8 @@ export async function startTakeRecording(safeArea: Take['safeArea']): Promise<st
       // Synchronous inside setPlayState, before the first play frame: the seed is in place before
       // any system can draw — the same instant the replay seeds at (its first frame with time).
       seedRng(seed);
+      // What the scene emitted while it was being edited is not part of the take.
+      rec.journal.skipExisting(getCurrentWorld());
       rec.started = true;
     } else if (state === 'stopped' && rec.started) {
       void finishTakeRecording();
@@ -243,6 +272,9 @@ export async function finishTakeRecording(): Promise<string | null> {
   const rec = recording;
   if (!rec) return null;
   recording = null;
+  // Before Stop: whatever the game emitted since the last frame belongs to the take, and Stop
+  // reverts the world.
+  if (rec.started) drainTakeJournal(rec);
   rec.detach();
   notify();
   if (getPlayState() !== 'stopped') await stopPlay();
@@ -256,7 +288,7 @@ export async function finishTakeRecording(): Promise<string | null> {
     const last = rec.builder.events[rec.builder.events.length - 1];
     rec.builder.add('up', Math.max(last.t, rec.takeTime), last.x, last.y);
   }
-  const take: Take = { ...rec.base, duration: rec.takeTime, events: rec.builder.events };
+  const take: Take = { ...rec.base, duration: rec.takeTime, events: rec.builder.events, expectedEvents: rec.expectedEvents };
   const identity = await backendFetch('/api/identity').then((r) => r.ok ? r.json() : null).catch(() => null) as { projectRoot?: string } | null;
   if (!identity?.projectRoot) {
     console.error('[takeRecorder] no project root from /api/identity — the take was NOT saved:', take);
@@ -270,5 +302,6 @@ export async function finishTakeRecording(): Promise<string | null> {
   }
   console.info(`[takeRecorder] saved ${take.events.length} events, ${take.duration.toFixed(2)}s → ${file}`
     + `\n  render it: npm run record -- ${file}`);
+  notifyListeners(savedListeners, 'takeRecorder.saved', [{ file, take }]);
   return file;
 }

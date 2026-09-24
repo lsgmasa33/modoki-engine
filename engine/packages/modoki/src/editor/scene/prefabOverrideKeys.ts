@@ -29,7 +29,7 @@ import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegist
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import {
-  collectComparableTraits, getOverrideValues, captureInstanceStructure, baseTokenResolver,
+  collectComparableTraits, getOverrideValues, captureInstanceStructure, baseTokenResolver, instanceBase,
   isTemplateExcludedField, nestedFrameMoves, getCachedPrefabSync, type PrefabFile, type ApplyResult,
 } from './prefab';
 import { memberRef, toLocalIdKey } from './overrideKeyGrammar';
@@ -128,6 +128,10 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
   const addedTags: AddedTagNode[] = [];
   const resolveBase = baseTokenResolver(rootInstanceId); // #1352: a base ref held as a member token
   const refOf = documentMemberRefs(prefab);
+  // A NESTED instance's base is its template under the rows enclosing it (#1492) — what it shows with no override
+  // of its own. Against the bare template, a field the outer row sets was listed as this instance's override, and a
+  // value Apply kept because a row shadows it (equal to the template now) was not listed at all.
+  const base = instanceBase(rootInstanceId, prefab);
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
     const piData = pi as Record<string, unknown>;
     if (piData.rootInstanceId !== rootInstanceId) return;
@@ -142,7 +146,7 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
     // comparison: the dialog reported it as un-overridden and the user could not apply it,
     // while the scene serializer stored it correctly. QA-CTX-0003 close-out sweep.
     const currentTraits = collectComparableTraits(ecsId, allTraits);
-    const diffs = getOverrideValues(localId, currentTraits, prefab, resolveBase);
+    const diffs = getOverrideValues(localId, currentTraits, base, resolveBase);
     if (Object.keys(diffs).length === 0) return;
 
     // Entity display name: prefer live EntityAttributes.name; fall back to prefab name.
@@ -159,7 +163,7 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
       name = (prefabEntity?.name as string) || `localId ${localId}`;
     }
 
-    const prefabEntity = prefab.entities.find((e) => e.localId === localId);
+    const prefabEntity = base.entities.find((e) => e.localId === localId);
     const traitNodes: TraitNode[] = [];
     for (const [traitName, fields] of Object.entries(diffs)) {
       if (getTraitByName(traitName)?.category === 'tag') {
