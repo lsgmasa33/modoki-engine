@@ -3,7 +3,7 @@ import AppLovinSDK
 import UserMessagingPlatform
 
 @objc(ApplovinMaxPlugin)
-public class ApplovinMaxPlugin: CAPPlugin, MAAdViewAdDelegate, MAAdDelegate, MARewardedAdDelegate, MAAdRevenueDelegate, CAPBridgedPlugin {
+public class ApplovinMaxPlugin: CAPPlugin, MAAdViewAdDelegate, MAAdDelegate, MARewardedAdDelegate, MAAdRevenueDelegate, MAAdExpirationDelegate, CAPBridgedPlugin {
 
     public let identifier = "ApplovinMaxPlugin"
     public let jsName = "ApplovinMax"
@@ -45,6 +45,13 @@ public class ApplovinMaxPlugin: CAPPlugin, MAAdViewAdDelegate, MAAdDelegate, MAR
     /// The `load*` call waiting for its ad's `didLoad` / `didFailToLoadAd` — see `settleLoad`.
     private var pendingInterstitialLoad: CAPPluginCall?
     private var pendingRewardedLoad: CAPPluginCall?
+    /// `initialize` runs ONCE per app PROCESS: MAX drops the listener of a second initialise issued while the
+    /// first is still running (seen in the Android SDK; assumed of iOS, #1507), so every call waits here and
+    /// the one completion settles them all. Static because MAX's own init state is per process and this plugin
+    /// instance is not guaranteed to be. Main thread only.
+    private static var initState = InitState.idle
+    private static var pendingInitCalls: [CAPPluginCall] = []
+    private enum InitState { case idle, running, done }
 
     // MARK: - Helpers
 
@@ -254,10 +261,18 @@ public class ApplovinMaxPlugin: CAPPlugin, MAAdViewAdDelegate, MAAdDelegate, MAR
             if self.interstitialAd?.adUnitIdentifier != adUnitId {
                 self.interstitialAd?.delegate = nil
                 self.interstitialAd?.revenueDelegate = nil
+                self.interstitialAd?.expirationDelegate = nil
                 self.interstitialAd = MAInterstitialAd(adUnitIdentifier: adUnitId)
                 self.interstitialAd?.delegate = self
                 // ⚠️ Revenue is its OWN delegate. Without this line `didPayRevenue` never fires on iOS.
                 self.interstitialAd?.revenueDelegate = self
+                // A SUCCESSFUL expiry reload is reported only here, never as `didLoad` — see `didReloadExpiredAd`.
+                self.interstitialAd?.expirationDelegate = self
+            }
+            // Already loaded: settle now. What MAX does with a load on top of a loaded ad is not documented.
+            if self.interstitialAd?.isReady == true {
+                call.resolve(["ok": true])
+                return
             }
             self.pendingInterstitialLoad = call
             self.interstitialAd?.load()
@@ -269,6 +284,7 @@ public class ApplovinMaxPlugin: CAPPlugin, MAAdViewAdDelegate, MAAdDelegate, MAR
             self.settleLoad("interstitial", rejection: ("the interstitial was destroyed", "destroyed"))
             self.interstitialAd?.delegate = nil
             self.interstitialAd?.revenueDelegate = nil
+            self.interstitialAd?.expirationDelegate = nil
             self.interstitialAd = nil
             call.resolve(["ok": true])
         }
@@ -310,6 +326,12 @@ public class ApplovinMaxPlugin: CAPPlugin, MAAdViewAdDelegate, MAAdDelegate, MAR
             self.rewardedAd = MARewardedAd.shared(withAdUnitIdentifier: adUnitId)
             self.rewardedAd?.delegate = self
             self.rewardedAd?.revenueDelegate = self
+            self.rewardedAd?.expirationDelegate = self
+            // See loadInterstitial.
+            if self.rewardedAd?.isReady == true {
+                call.resolve(["ok": true])
+                return
+            }
             self.pendingRewardedLoad = call
             self.rewardedAd?.load()
         }
@@ -438,13 +460,27 @@ public class ApplovinMaxPlugin: CAPPlugin, MAAdViewAdDelegate, MAAdDelegate, MAR
         let sdkKey = call.getString("sdkKey") ?? ""
         let testDevices = call.getArray("testDeviceAdvertisingIds", String.self) ?? []
         DispatchQueue.main.async {
+            // A later call's sdkKey and test devices are ignored, as MAX itself ignores them after the first.
+            if ApplovinMaxPlugin.initState == .done || ALSdk.shared().isInitialized {
+                ApplovinMaxPlugin.initState = .done
+                call.resolve(["ok": true])
+                return
+            }
+            ApplovinMaxPlugin.pendingInitCalls.append(call)
+            if ApplovinMaxPlugin.initState == .running { return }
+            ApplovinMaxPlugin.initState = .running
             let initConfig = ALSdkInitializationConfiguration(sdkKey: sdkKey) { builder in
                 builder.mediationProvider = ALMediationProviderMAX
                 // SDK 13 takes test devices only here — there is no setter after init.
                 builder.testDeviceAdvertisingIdentifiers = testDevices
             }
             ALSdk.shared().initialize(with: initConfig) { _ in
-                call.resolve(["ok": true])
+                DispatchQueue.main.async {
+                    ApplovinMaxPlugin.initState = .done
+                    let calls = ApplovinMaxPlugin.pendingInitCalls
+                    ApplovinMaxPlugin.pendingInitCalls = []
+                    for waiting in calls { waiting.resolve(["ok": true]) }
+                }
             }
         }
     }
@@ -533,6 +569,14 @@ public class ApplovinMaxPlugin: CAPPlugin, MAAdViewAdDelegate, MAAdDelegate, MAR
             "errorCode": error.code.rawValue,
             "errorMessage": error.message
         ])
+    }
+
+    /// MAX reloads an expired fullscreen ad by itself and reports a SUCCESSFUL reload only here — `didLoad` is
+    /// not invoked (`MAAdExpirationDelegate.h`). The rest is read from the Android SDK 13.6.4 and assumed of
+    /// iOS: the ad stays READY during the reload, a load issued then is dropped without a callback, and a
+    /// FAILED reload arrives as the ordinary `didFailToLoadAd`. Without this the parked call never settles (#1507).
+    public func didReloadExpiredAd(_ expiredAd: MAAd, withNewAd newAd: MAAd) {
+        settleLoad(formatName(newAd.format))
     }
 
     public func didExpand(_ ad: MAAd) {}

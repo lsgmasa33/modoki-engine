@@ -6,7 +6,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { getActiveReloadBlockers } from '../../../src/runtime/core/resumeReload';
 import { getBootTimeline, resetBootTimeline } from '../../../src/runtime/core/bootTimeline';
 import {
-  createAdLifecycle, onFullscreenAdChange, type AdEventSink, type AdLifecycle, type AdLifecycleHooks, type AdSdk,
+  createAdLifecycle, onFullscreenAdChange, type AdEventSink, type AdLifecycle, type AdLifecycleHooks,
+  type AdLifecycleOptions, type AdSdk,
   type FullscreenKind,
 } from '../../../src/runtime/core/adLifecycle';
 
@@ -54,8 +55,8 @@ function fakeSdk(over: Partial<AdSdk> = {}) {
 const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
 
 let life: AdLifecycle | null = null;
-function make(sdk: AdSdk, hooks: AdLifecycleHooks = {}, now = () => 0) {
-  life = createAdLifecycle(sdk, hooks, { blockerId: BLOCKER, tag: 'test', now, presentTimeoutMs: 1000, retryMs: 5000 });
+function make(sdk: AdSdk, hooks: AdLifecycleHooks = {}, now = () => 0, over: Partial<AdLifecycleOptions> = {}) {
+  life = createAdLifecycle(sdk, hooks, { blockerId: BLOCKER, tag: 'test', now, presentTimeoutMs: 1000, retryMs: 5000, ...over });
   return life;
 }
 
@@ -371,6 +372,46 @@ describe('fullscreen shows', () => {
     await flush();
     expect(sdk.preload).toHaveBeenCalledTimes(2);
     expect(l.isReady('interstitial')).toBe(true);
+  });
+
+  // #1507: MAX drops a load issued while it reloads an expired ad, and reports that reload only to a listener
+  // the load never sees — so the adapter's promise never settles. Unbounded, `loading` latched that kind.
+  it('a load the SDK never settles counts as failed after the bound, and takes the retry (#1507)', async () => {
+    const { sdk } = fakeSdk();
+    sdk.preload = vi.fn()
+      .mockReturnValueOnce(new Promise<void>(() => {}))
+      .mockResolvedValue(undefined);
+    sdk.has = vi.fn((k: FullscreenKind | 'banner') => k === 'rewarded');
+    const l = make(sdk, {}, () => 0, { preloadTimeoutMs: 60_000 });
+    await ready(l);
+    vi.advanceTimersByTime(59_999);
+    await flush();
+    expect(sdk.preload).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);   // the bound: a failed load
+    await flush();
+    vi.advanceTimersByTime(5000);   // the retry back-off
+    await flush();
+    expect(sdk.preload).toHaveBeenCalledTimes(2);
+    expect(l.isReady('rewarded')).toBe(true);
+  });
+
+  it('a timed-out load that settles late marks nothing ready — the retry owns the kind now (#1507)', async () => {
+    const first = deferred<void>();
+    const { sdk } = fakeSdk();
+    sdk.preload = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValue(new Promise<void>(() => {}));
+    sdk.has = vi.fn((k: FullscreenKind | 'banner') => k === 'rewarded');
+    const l = make(sdk, {}, () => 0, { preloadTimeoutMs: 60_000 });
+    await ready(l);
+    vi.advanceTimersByTime(60_000);
+    await flush();
+    first.resolve();
+    await flush();
+    expect(l.isReady('rewarded')).toBe(false);
+    vi.advanceTimersByTime(5000);
+    await flush();
+    expect(sdk.preload).toHaveBeenCalledTimes(2);
   });
 });
 

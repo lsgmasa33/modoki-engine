@@ -2,6 +2,8 @@ package com.modokiengine.capacitor.applovinmax;
 
 import android.app.Activity;
 import android.graphics.Color;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -12,6 +14,7 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import com.applovin.mediation.MaxAd;
+import com.applovin.mediation.MaxAdExpirationListener;
 import com.applovin.mediation.MaxAdFormat;
 import com.applovin.mediation.MaxAdListener;
 import com.applovin.mediation.MaxAdRevenueListener;
@@ -45,7 +48,7 @@ import java.util.List;
  * Capacitor's background thread and hop to it; MAX delivers its callbacks there.
  */
 @CapacitorPlugin(name = "ApplovinMax")
-public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, MaxAdListener, MaxRewardedAdListener, MaxAdRevenueListener {
+public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, MaxAdListener, MaxRewardedAdListener, MaxAdRevenueListener, MaxAdExpirationListener {
 
     /** Hosts the banner: pinned to the bottom (or top) of the content view, padded by the system bars. */
     private FrameLayout bannerHost;
@@ -61,6 +64,15 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
     /** The `load*` call waiting for its ad's `onAdLoaded` / `onAdLoadFailed` — see `settleLoad`. */
     private PluginCall pendingInterstitialLoad;
     private PluginCall pendingRewardedLoad;
+    /**
+     * `initialize` runs ONCE per app PROCESS: MAX drops the listener of a second initialise issued while the
+     * first is still running ("already initialized … Ignoring", #1507), so every call waits here and the one
+     * completion settles them all. STATIC because MAX's own init state is per process and this plugin instance
+     * is not — a recreated Activity builds a new Bridge (a webview reload does not). Main thread only.
+     */
+    private static final int INIT_IDLE = 0, INIT_RUNNING = 1, INIT_DONE = 2;
+    private static int initState = INIT_IDLE;
+    private static final List<PluginCall> pendingInitCalls = new ArrayList<>();
 
     // MARK: - Helpers
 
@@ -362,6 +374,13 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
                 interstitialAd = new MaxInterstitialAd(adUnitId, getActivity());
                 interstitialAd.setListener(this);
                 interstitialAd.setRevenueListener(this);
+                // A SUCCESSFUL expiry reload is reported only here, never as `onAdLoaded` — see `onExpiredAdReloaded`.
+                interstitialAd.setExpirationListener(this);
+            }
+            // Already loaded: settle now (MAX would re-send `onAdLoaded` for the cached ad; this does not rely on it).
+            if (interstitialAd.isReady()) {
+                call.resolve(ok());
+                return;
             }
             pendingInterstitialLoad = call;
             interstitialAd.loadAd();
@@ -422,6 +441,12 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
             rewardedAd = MaxRewardedAd.getInstance(adUnitId, getActivity());
             rewardedAd.setListener(this);
             rewardedAd.setRevenueListener(this);
+            rewardedAd.setExpirationListener(this);
+            // See loadInterstitial.
+            if (rewardedAd.isReady()) {
+                call.resolve(ok());
+                return;
+            }
             pendingRewardedLoad = call;
             rewardedAd.loadAd();
         });
@@ -556,14 +581,31 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
     @PluginMethod
     public void initialize(PluginCall call) {
         String sdkKey = call.getString("sdkKey", "");
-        AppLovinSdkInitializationConfiguration initConfig =
-            AppLovinSdkInitializationConfiguration.builder(sdkKey, getContext())
-                .setMediationProvider("max")
-                // SDK 13 takes test devices only here — there is no setter after init.
-                .setTestDeviceAdvertisingIds(stringList(call, "testDeviceAdvertisingIds"))
-                .build();
-        AppLovinSdk.getInstance(getContext()).initialize(initConfig, config -> {
-            call.resolve(ok());
+        List<String> testDevices = stringList(call, "testDeviceAdvertisingIds");
+        getActivity().runOnUiThread(() -> {
+            AppLovinSdk sdk = AppLovinSdk.getInstance(getContext());
+            // A later call's sdkKey and test devices are ignored, as MAX itself ignores them after the first.
+            if (initState == INIT_DONE || sdk.isInitialized()) {
+                initState = INIT_DONE;
+                call.resolve(ok());
+                return;
+            }
+            pendingInitCalls.add(call);
+            if (initState == INIT_RUNNING) return;
+            initState = INIT_RUNNING;
+            AppLovinSdkInitializationConfiguration initConfig =
+                AppLovinSdkInitializationConfiguration.builder(sdkKey, getContext())
+                    .setMediationProvider("max")
+                    // SDK 13 takes test devices only here — there is no setter after init.
+                    .setTestDeviceAdvertisingIds(testDevices)
+                    .build();
+            // The main looper rather than the starting Activity's handler: the fields are process-wide, not that Activity's.
+            sdk.initialize(initConfig, config -> new Handler(Looper.getMainLooper()).post(() -> {
+                initState = INIT_DONE;
+                List<PluginCall> calls = new ArrayList<>(pendingInitCalls);
+                pendingInitCalls.clear();
+                for (PluginCall waiting : calls) waiting.resolve(ok());
+            }));
         });
     }
 
@@ -643,6 +685,15 @@ public class ApplovinMaxPlugin extends Plugin implements MaxAdViewAdListener, Ma
         data.put("errorCode", error.getCode());
         data.put("errorMessage", error.getMessage());
         notifyListeners("adDisplayFailed", data);
+    }
+    /**
+     * MAX reloads an expired fullscreen ad by itself, staying READY throughout, and reports a SUCCESSFUL reload
+     * only here — not as `onAdLoaded` (SDK 13.6.4 `MaxFullscreenAdImpl`). A load issued during that reload is
+     * dropped without a callback ("An ad is already loaded"), so without this the parked call would never
+     * settle (#1507). A FAILED reload arrives as the ordinary `onAdLoadFailed`.
+     */
+    @Override public void onExpiredAdReloaded(MaxAd expiredAd, MaxAd newAd) {
+        settleLoad(formatName(newAd.getFormat()), null, null, null);
     }
     @Override public void onAdExpanded(MaxAd ad) {}
     @Override public void onAdCollapsed(MaxAd ad) {}

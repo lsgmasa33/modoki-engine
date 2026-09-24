@@ -290,12 +290,32 @@ const { heightPx } = await ApplovinMax.showBanner({ adUnitId });
   the ad is showing") and the call would hang — reachable when the lifecycle's show timeout schedules a
   preload while a late-presenting ad is still up, which would leave that kind loading forever. **Nothing reloads by itself after a dismissal** —
   the caller owns preloading (the lifecycle does it on `dismissed`, with its own back-off), because two
-  owners would double every load. The MAX SDK refreshes an EXPIRED loaded ad on its own (this plugin
-  implements nothing for it — `MAAdExpirationDelegate` is only the SDK's notice that it happened), so an
-  adapter need not age ads out the way AdMob's one-hour expiry forces: Court passes the lifecycle
-  `maxAdAgeMs: Infinity`, because the age rule would only refuse a show for an ad MAX still holds. ⚠️ And
-  `initialize` settles only from the SDK's completion callback, which AppLovin does not document for a
-  second call in one process — an adapter must not call it twice (Court checks `isReady().initialized`).
+  owners would double every load. A load while the ad is already LOADED resolves at once. The MAX SDK
+  refreshes an EXPIRED loaded ad on its own, so an adapter need not age ads out the way AdMob's one-hour
+  expiry forces: both games pass the lifecycle `maxAdAgeMs: Infinity`, because the age rule would only
+  refuse a show for an ad MAX still holds.
+  ⚠️ **That reload is why the plugin sets the expiration listener/delegate (#1507).** Read from the Android
+  SDK 13.6.4 bytecode (`MaxFullscreenAdImpl`). On iOS, `MAAdExpirationDelegate.h` confirms only the second
+  bullet; the rest is assumed to match:
+  - During the reload the ad stays READY, not LOADING. A show in that window gets `{ shown: false }`, and
+    the lifecycle's preload is dropped by MAX with no callback ("An ad is already loaded").
+  - A SUCCESSFUL reload is reported ONLY to `onExpiredAdReloaded` / `didReloadExpiredAd`, never as
+    `didLoad`. So that callback settles the parked load; without it, the kind stays `loading` for the rest
+    of the session.
+  - A FAILED reload arrives as the ordinary `didFailToLoadAd`.
+  - Not killed: a READY ad that its network reports not-ready BEFORE MAX's expiry timer fires would drop
+    the load the same way, with no reload to settle it. The lifecycle's preload bound (2 min, then its
+    back-off) retries until the reload comes. That window is inferred, not seen.
+  ⚠️ **`initialize` is once per app PROCESS, and every call settles (#1507).** On Android, MAX drops the
+  listener of a second initialise issued while the first is still running ("already initialized …
+  Ignoring") and posts it after completion; iOS is assumed to match. The plugin therefore keeps the state
+  itself, in STATIC fields: the first call starts the init, and every call that arrives while it runs
+  waits for the one completion. Static, because MAX's state is per process while a plugin instance is not:
+  a webview reload keeps the instance, but a recreated Android Activity builds a new Bridge. This covers a
+  realm that reloads during the first realm's init, which no JS-side memo can see. Only the first call's
+  options count. ⚠️ Not killed: if MAX ever skipped its init callback, every `initialize` would wait for
+  the rest of the PROCESS, not just one Activity's life. No such case is known; a failed init still
+  calls back.
 - **A failed show is `adDisplayFailed`, not `adLoadFailed`** — the ad HAD loaded; conflating the two
   made a failed presentation look like a no-fill. Every `AdInfo` carries `format` (`banner` covers the
   LEADER MAX serves through a banner unit on a tablet) and `currency: 'USD'`: **MAX's `revenue` is

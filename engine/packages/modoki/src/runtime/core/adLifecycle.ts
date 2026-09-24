@@ -137,6 +137,10 @@ export interface AdLifecycleOptions {
   now?: () => number;
   /** How long a show waits for `presented`/`failedToPresent` before calling it not shown. */
   presentTimeoutMs?: number;
+  /** How long a preload may take before it counts as a failed load and takes the retry back-off. Default 2 min
+   *  — far past a real waterfall, so it only fires on an SDK that never answers (#1507: MAX drops a load
+   *  issued while it reloads an expired ad, and reports that reload to a listener the load never sees). */
+  preloadTimeoutMs?: number;
   /** Wait before re-trying a failed preload, and before re-trying a failed banner call. Also the first
    *  wait before re-trying a failed init, which then doubles up to `maxInitRetryMs`. */
   retryMs?: number;
@@ -186,6 +190,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
   // the app is backgrounded. `rawEpochNow` is the sanctioned wrapper (the determinism guard).
   const now = opts.now ?? rawEpochNow;
   const presentTimeoutMs = opts.presentTimeoutMs ?? 10_000;
+  const preloadTimeoutMs = opts.preloadTimeoutMs ?? 120_000;
   const retryMs = opts.retryMs ?? 30_000;
   const maxInitRetryMs = opts.maxInitRetryMs ?? 600_000;
   const maxAdAgeMs = opts.maxAdAgeMs ?? 55 * 60_000;
@@ -270,7 +275,10 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     if (!initialized || !sdk.enabled() || !sdk.has(kind) || ready[kind] || loading[kind]) return;
     loading[kind] = true;
     const live = lifetime.capture();
-    sdk.preload(kind).then(
+    // Bounded, or a load the SDK never settles holds `loading` — and so that kind — for the session.
+    withTimeout(sdk.preload(kind), preloadTimeoutMs, `${kind} preload`, {
+      discard: 'a late load result is superseded by the retry this timeout schedules; the SDK then re-reports readiness',
+    }).then(
       () => {
         if (!live()) return;
         loading[kind] = false;

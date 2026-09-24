@@ -105,7 +105,9 @@ export interface ApplovinMaxPlugin {
    * Load an interstitial. **Resolves when the ad has LOADED and rejects when the load failed** (the error's
    * `code` is MAX's error code). A second call while one is still loading rejects the first with code
    * `'superseded'`; a call while this ad is ON SCREEN rejects at once with code `'showing'` (MAX would
-   * silently ignore it, and the call would never settle). Nothing reloads by itself after a dismissal — the caller owns when to load the next one.
+   * silently ignore it, and the call would never settle). A call while an ad is already LOADED resolves at
+   * once. An expired ad MAX reloads by itself also settles a call waiting on it (#1507). Nothing reloads by
+   * itself after a dismissal — the caller owns when to load the next one.
    */
   loadInterstitial(options: { adUnitId: string }): Promise<{ ok: boolean }>;
 
@@ -162,6 +164,9 @@ export interface ApplovinMaxPlugin {
   /**
    * Initialise MAX. Run consent first: an ad requested before the player answered is requested without it.
    * `testDeviceAdvertisingIds` (IDFA / GAID) get test ads — SDK 13 accepts them only here, at init.
+   * **Safe to call again, from any realm** (#1507): the plugin initialises the SDK once per app process; a call
+   * while that is still running resolves with it, and a call after it resolves at once. Only the FIRST call's options
+   * count — MAX ignores a later configuration.
    */
   initialize(options: { sdkKey: string; testDeviceAdvertisingIds?: string[] }): Promise<{ ok: boolean }>;
 
