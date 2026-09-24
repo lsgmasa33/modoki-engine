@@ -750,12 +750,14 @@ Three things that bite:
   merely not included. This is why the build family kept the name `force` while the world-swapping
   tools (`load_scene`, `prefab`, `new_scene`) renamed theirs to `discardUnsaved` — they DESTROY
   that work. Prefer `modoki_save_all` first and pass nothing.
-- **The project must be OPEN in the editor**, and for a device build that open is load-bearing
-  beyond convenience: `healNativeConfig` runs on open and is what actually registers
-  `GameDebugPlugin` and the local-network keys after a `build.debugBuild` change. Set the flag →
-  reopen → *then* build. Build before the reopen and you get an app with no debug bridge, which
-  presents as a lease handshake failure and reads like a network fault. See
-  [qa/README.md](../qa/README.md) § "Device cases".
+- **The project must be OPEN in the editor.** After a `build.debugBuild` change, `healNativeConfig`
+  is what registers `GameDebugPlugin`, puts it in (or takes it out of) the iOS App target and
+  `includePlugins` (#1521), and sets the local-network keys. It runs on open and again at the start
+  of every native build, before `cap sync`, so a build right after flipping the flag picks the
+  change up. A hand-run `gradle`/`xcodebuild` with no heal and no sync in between does not. After
+  flipping ON, the result is an app with no debug bridge, which presents as a lease handshake
+  failure and reads like a network fault. After flipping OFF, it is worse: the store build still
+  carries the bridge, compiled in and registered. See [qa/README.md](../qa/README.md) § "Device cases".
 
 ⚠️ **Several phones of the same platform attached? The install target is whichever device this
 clone has CLAIMED**, and a raw `adb`/`devicectl` command against an unclaimed one is refused by the

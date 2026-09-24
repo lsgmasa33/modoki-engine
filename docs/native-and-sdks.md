@@ -35,7 +35,7 @@ Mixing CocoaPods and SPM produces duplicate-framework conflicts. Any SDK that ha
 
 SPM static linking **stripped `GameDebugPlugin` and `ModokiOtaPlugin`**: the class compiled and linked, then was simply absent at runtime, so Capacitor reported `"GameDebug" plugin is not implemented on ios`. The explanation once given — plugin classes with no external framework dependency get stripped — is contradicted on hardware (below), so treat the cause as unknown. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
 
-⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment on `healNativeConfig.ts`'s `healIosGameDebugRegistration`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
+⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the fenced registration block for `GameDebugPlugin` in every project, and the pbxproj reference that compiles `GameDebugPlugin.swift` only while `build.debugBuild` is on (#1521). It contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment on `healNativeConfig.ts`'s `healIosGameDebugRegistration`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
 
 **`MyViewController.swift` carries a SECOND fenced block**, `modoki:text-interaction-{begin,end}`, which disables the web view's text interaction to kill the iOS double-tap selection magnifier over the game (#1360). Unlike the game-debug fence it is **not** gated on `build.debugBuild` or on `usesGameDebug` — the magnifier is equally wrong in a release build of a project with no debug bridge — and it sits at class-body scope rather than inside `viewDidLoad`, because it is a method override. Guarded by `engine/tests/architecture/iosTextInteraction.test.ts`; the measurement, and the `<input>` constraint it carries, are in [input.md](./input.md) § "The iOS text-selection magnifier".
 
@@ -1080,8 +1080,10 @@ the three ways a run can report nothing while working correctly are in
 
 Two facts belong here rather than there, because they are about the native plugin:
 
-- **iOS had no native gate before this.** Android refuses every `GameDebugPlugin` method unless the
-  manifest meta-data is on; the Swift half checked nothing, and stayed out of shipped games only
+- **iOS had no native gate before this.** Android's `startServer` and `triggerFault` refuse unless
+  the manifest meta-data is on. Its other methods (`getDeviceIp`, `captureScreen`, `getNativeLogs`
+  and the rest) check nothing, and since #1521 a flag-off build does not contain the plugin at all.
+  The Swift half checked nothing, and stayed out of shipped games only
   because JS never called `startServer`. Harmless for a server nobody starts, not harmless for a
   method that kills the app — hence the `ModokiDebugBuild` Info.plist key, written both ways by
   `healNativeConfig` and read by `isDebugBuildEnabled()`.
@@ -1277,12 +1279,14 @@ just never arrives.
 | Tap/Drag | PixiJS EventSystem calls | PixiJS EventSystem calls |
 | Native logs | OSLogStore (iOS 15+) | logcat |
 | Debug gate | `modoki:game-debug-*` fenced registration in `MyViewController.swift` | `com.modokiengine.gamedebug.DEBUG_BUILD` manifest `<meta-data>` |
+| Plugin in the build at all (#1521) | the pbxproj entries that compile `GameDebugPlugin.swift` into the App target | the `capacitor-game-debug` entry in `capacitor.config.json` `includePlugins`, which `cap sync` turns into the gradle graph |
 
-**Both gates are written from the ONE project flag `build.debugBuild`** (Project Settings →
+**Every row is written from the ONE project flag `build.debugBuild`** (Project Settings →
 Developer) by `healNativeConfig`, not from the Xcode/Gradle configuration (#112) — so
 `debugBuild: true` + a Release configuration is a *working* debug build, which is what a TestFlight
-QA build is. Reopen the project after flipping the flag so the heal runs. Absent Android meta-data
-reads as false. Detail:
+QA build is. The heal runs on project open and at the start of every native build, before
+`cap sync`. Absent Android meta-data reads as false. A flag-OFF build carries no native debug
+bridge at all: the plugin is out of both native graphs, not just unregistered. Detail:
 [debug-tools-mcp.md](./debug-tools-mcp.md) § "Native Debug Bridge" (the "Debug vs Release — ONE flag decides" note).
 
 ### MCP tools
@@ -1357,7 +1361,7 @@ Opening a project in the Electron editor runs two idempotent "make it just work"
   has no inset to tell CSS about — which is how "Android has no safe-area insets" briefly got
   recorded as a platform fact instead of a symptom. With the flag: frame `[0,0][720,1560]`, no
   band, and `env()` reports the real cutout (28dp on an A23, 27dp on an S22).
-- **game-debug wiring** (only when the project depends on `capacitor-game-debug`): adds the `NSLocalNetworkUsageDescription` + `NSBonjourServices` Info.plist keys (iOS 14+ gates the device's inbound-LAN TCP listener behind the **Local Network permission**, prompted via these keys). *(`NSBonjourServices` predates the Bonjour removal and is likely now vestigial — the lease connects by direct IP, no mDNS — but it hasn't been re-verified on-device, so it's left in for now.)* Also writes `MyViewController.swift` + points the storyboard's bridge VC at it + adds the pbxproj file-refs that compile `MyViewController.swift` and the engine's `GameDebugPlugin.swift` into the App target (the SPM static-linking workaround — see the [iOS SPM static-linking gotcha](#ios-spm-static-linking-gotcha)). The Local Network keys and the plugin registration both track `build.debugBuild` **in both directions** — flip it off and the next heal removes them, so an App Store build ships without a Local Network prompt. (Pre-#112 the keys were added unconditionally and stripped from the BUILT plist by a `CONFIGURATION == Release` build phase; that phase is retired, and the heal deletes it from any project that still carries it.)
+- **game-debug wiring** (only when the project depends on `capacitor-game-debug`): adds the `NSLocalNetworkUsageDescription` + `NSBonjourServices` Info.plist keys (iOS 14+ gates the device's inbound-LAN TCP listener behind the **Local Network permission**, prompted via these keys). *(`NSBonjourServices` predates the Bonjour removal and is likely now vestigial — the lease connects by direct IP, no mDNS — but it hasn't been re-verified on-device, so it's left in for now.)* Also writes `MyViewController.swift` + points the storyboard's bridge VC at it + adds the pbxproj file-refs that compile `MyViewController.swift` and the engine's `GameDebugPlugin.swift` into the App target (the SPM static-linking workaround — see the [iOS SPM static-linking gotcha](#ios-spm-static-linking-gotcha)). The Local Network keys, the plugin registration, the `GameDebugPlugin.swift` pbxproj entries and the plugin's `includePlugins` entry all track `build.debugBuild` **in both directions** (the last two since #1521; a project with no `includePlugins` at all links every dependency, so the heal reports that case instead of writing an allowlist for it). The iOS strip refuses while App-target Swift still uses the class, and the ON registration is written only when the class is compiled in; the detail is in [debug-tools-mcp.md](./debug-tools-mcp.md) § "Native Debug Bridge" — flip it off and the next heal removes them, so an App Store build ships without a Local Network prompt. (Pre-#112 the keys were added unconditionally and stripped from the BUILT plist by a `CONFIGURATION == Release` build phase; that phase is retired, and the heal deletes it from any project that still carries it.)
 
 It is called explicitly on open — **not** buried inside `ensureProjectDeps` — so it runs even for a flat game with native folders but no `package.json`, can't be silently skipped by a dep-install refactor, and always logs (a "already up to date" line included).
 

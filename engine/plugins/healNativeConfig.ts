@@ -10,8 +10,9 @@
  *   - iOS DEVELOPMENT_TEAM       → from project.config.json build.appleTeamId
  *     (a fresh `cap add ios` sets none → device builds can't auto-sign).
  *
- *  NOT healed here: capacitor.config.json (committed, rarely drifts) and the
- *  `cap add` scaffold itself (a heavy, deliberate one-time action — see the
+ *  capacitor.config.json is healed for only two derived facts: the app identity, and whether
+ *  `capacitor-game-debug` is in `includePlugins` (#1521). NOT healed here: the rest of that file,
+ *  and the `cap add` scaffold itself (a heavy, deliberate one-time action — see the
  *  "Add Native Target" Build action). User-supplied secrets (Firebase configs)
  *  are detected + surfaced, not synthesized. */
 
@@ -47,10 +48,9 @@ const GD_REG_ON = [
   GD_REG_END,
 ].join('\n');
 
-/** The OFF form: markers kept (so re-enabling finds its anchor) with no registration.
- *  Unregistered means JS can never call `startServer`, so the TCP server never binds
- *  and `handleEval` is unreachable — the class is still linked into the binary (its
- *  pbxproj file-ref is unconditional), it simply has no way in. */
+/** The OFF form: markers kept (so re-enabling finds its anchor) with no registration, and
+ *  no reference to the `GameDebugPlugin` type, because flag-off also takes that class out of
+ *  the App target (#1521). This form has to compile without it. */
 const GD_REG_OFF = [
   GD_REG_BEGIN,
   '        // build.debugBuild is OFF — GameDebugPlugin is deliberately NOT registered, so',
@@ -170,7 +170,8 @@ const FRESH_DEBUG_ONLY_DOC = [
  *  scaffolds no such file — SPM static linking strips a plugin class with no
  *  external SDK dependency, so Capacitor never sees it ("GameDebug plugin is not
  *  implemented on ios"). Compiling the plugin straight into the App target (via a
- *  pbxproj file-ref) + registering the instance here keeps it discoverable.
+ *  pbxproj file-ref, only while `build.debugBuild` is on — #1521) + registering the instance here
+ *  keeps it discoverable.
  *  The registration itself is gated on `build.debugBuild`, not on `#if DEBUG`. */
 const myViewControllerSwift = (debugBuild: boolean) => `import UIKit
 import WebKit
@@ -179,7 +180,8 @@ import Capacitor
 /// Custom bridge VC so we can register plugins that SPM won't auto-discover.
 ///
 /// \`GameDebugPlugin\` (capacitor-game-debug) is compiled straight into the App
-/// target via a project-relative pbxproj file reference — NOT via SPM — because the
+/// target while \`build.debugBuild\` is on (and left out when it is off — a store build
+/// carries no debug bridge) via a project-relative pbxproj file reference — NOT via SPM — because the
 /// SPM static linker strips a plugin class that has no external SDK dependency, so
 /// Capacitor never sees it ("GameDebug plugin is not implemented on ios"). Manually
 /// registering the instance here keeps the class alive and wires it into the bridge.
@@ -752,7 +754,20 @@ function healIosGameDebugRegistration(projectRoot: string, debugBuild: boolean):
   const mvc = path.join(projectRoot, 'ios', 'App', 'App', 'MyViewController.swift');
   if (!fs.existsSync(mvc)) return undefined;
   const orig = fs.readFileSync(mvc, 'utf8');
-  const want = debugBuild ? GD_REG_ON : GD_REG_OFF;
+  // ON only when the class is actually compiled into the App target. Flag-off strips it (#1521),
+  // and flipping back on re-wires it only if the plugin source is found. Registering a class the
+  // target does not compile is "cannot find 'GameDebugPlugin' in scope", so the fence stays OFF.
+  const pbxPath = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  // The Sources-phase entry, not any mention: unchecking Target Membership in Xcode drops that entry
+  // and the build-file line but keeps the file reference and the group child.
+  const compiledIn = !fs.existsSync(pbxPath) || /GameDebugPlugin\.swift in Sources \*\/,/.test(fs.readFileSync(pbxPath, 'utf8'));
+  const on = debugBuild && compiledIn;
+  const notCompiled = debugBuild && !compiledIn
+    ? '⚠️ build.debugBuild is ON but GameDebugPlugin.swift is not compiled into the iOS App target, so the iOS '
+      + 'registration stays OFF (#1521). Usually the plugin source was not found: npm install in the project, then '
+      + 'reopen. If it persists, check the file\'s Target Membership in Xcode.'
+    : undefined;
+  const want = on ? GD_REG_ON : GD_REG_OFF;
 
   let text = orig;
   let migrated = false;
@@ -769,10 +784,10 @@ function healIosGameDebugRegistration(projectRoot: string, debugBuild: boolean):
   // The doc comment asserted the old guarantee; correct it in the same pass.
   if (STALE_DEBUG_ONLY_DOC.test(text)) text = text.replace(STALE_DEBUG_ONLY_DOC, FRESH_DEBUG_ONLY_DOC);
 
-  if (text === orig) return undefined;
+  if (text === orig) return notCompiled;
   fs.writeFileSync(mvc, text);
-  return `${migrated ? 'migrated iOS GameDebugPlugin registration off #if DEBUG; ' : ''}` +
-    `synced iOS GameDebugPlugin registration = ${debugBuild ? 'ON' : 'OFF'} (from build.debugBuild)`;
+  return `${notCompiled ? `${notCompiled}; ` : ''}${migrated ? 'migrated iOS GameDebugPlugin registration off #if DEBUG; ' : ''}` +
+    `synced iOS GameDebugPlugin registration = ${on ? 'ON' : 'OFF'} (from build.debugBuild)`;
 }
 
 /** Heal the text-interaction override into an EXISTING project's `MyViewController.swift`
@@ -1543,58 +1558,247 @@ function healIosGameDebugWiring(projectRoot: string, debugBuild: boolean): strin
     }
   }
 
+  // MyViewController.swift is compiled in whatever the flag says: it hosts the registration
+  // fence in both forms, and the web-view text-interaction heal (#1360) extends it too.
   if (!pbx.includes('MyViewController.swift')) {
+    const wired = insertAfterAnchors(pbx, 'AppDelegate', {
+      buildFile: `\t\t${GD_UUID.mvcBuildFile} /* MyViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ${GD_UUID.mvcFileRef} /* MyViewController.swift */; };`,
+      fileRef: `\t\t${GD_UUID.mvcFileRef} /* MyViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MyViewController.swift; sourceTree = "<group>"; };`,
+      groupChild: `\t\t\t\t${GD_UUID.mvcFileRef} /* MyViewController.swift */,`,
+      sourcesEntry: `\t\t\t\t${GD_UUID.mvcBuildFile} /* MyViewController.swift in Sources */,`,
+    });
+    if (wired !== undefined) {
+      pbx = wired;
+      fs.writeFileSync(pbxPath, pbx);
+      notes.push('wired MyViewController into the iOS App target (pbxproj)');
+    }
+  }
+
+  // GameDebugPlugin.swift itself is compiled in ONLY while the flag is on (#1521). A store build
+  // must carry no native debug bridge at all. Leaving the class unregistered but linked was the
+  // #112 stopping point, and "unreachable" was the whole of its argument. Taking it OUT is
+  // `healIosGameDebugPluginRemoval`, which has to run after the registration heal.
+  if (debugBuild && !pbx.includes('GameDebugPlugin.swift')) {
     // pbxproj path is relative to the .xcodeproj's SRCROOT (ios/App), sourceTree SOURCE_ROOT.
     // POSIX separators — the .pbxproj is an Xcode file (forward slashes only); path.relative
     // yields backslashes on Windows, which break the build when opened on macOS.
     const pluginRel = path.relative(iosApp, swiftSrc).replace(/\\/g, '/');
-    const lines = pbx.split('\n');
-
-    // Anchor every insert on AppDelegate.swift — present in every Capacitor app.
-    const inserts: Array<{ match: RegExp; add: string[] }> = [
-      { // PBXBuildFile section
-        match: /\/\* AppDelegate\.swift in Sources \*\/ = \{isa = PBXBuildFile;/,
-        add: [
-          `\t\t${GD_UUID.mvcBuildFile} /* MyViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ${GD_UUID.mvcFileRef} /* MyViewController.swift */; };`,
-          `\t\t${GD_UUID.pluginBuildFile} /* GameDebugPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = ${GD_UUID.pluginFileRef} /* GameDebugPlugin.swift */; };`,
-        ],
-      },
-      { // PBXFileReference section
-        match: /\/\* AppDelegate\.swift \*\/ = \{isa = PBXFileReference;/,
-        add: [
-          `\t\t${GD_UUID.mvcFileRef} /* MyViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MyViewController.swift; sourceTree = "<group>"; };`,
-          `\t\t${GD_UUID.pluginFileRef} /* GameDebugPlugin.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GameDebugPlugin.swift; path = "${pluginRel}"; sourceTree = SOURCE_ROOT; };`,
-        ],
-      },
-      { // App PBXGroup children (the group child ref — no "in Sources")
-        match: /\/\* AppDelegate\.swift \*\/,$/,
-        add: [
-          `\t\t\t\t${GD_UUID.mvcFileRef} /* MyViewController.swift */,`,
-          `\t\t\t\t${GD_UUID.pluginFileRef} /* GameDebugPlugin.swift */,`,
-        ],
-      },
-      { // PBXSourcesBuildPhase files
-        match: /\/\* AppDelegate\.swift in Sources \*\/,$/,
-        add: [
-          `\t\t\t\t${GD_UUID.mvcBuildFile} /* MyViewController.swift in Sources */,`,
-          `\t\t\t\t${GD_UUID.pluginBuildFile} /* GameDebugPlugin.swift in Sources */,`,
-        ],
-      },
-    ];
-
-    // Resolve every anchor FIRST — if any is missing, bail without writing.
-    const at = inserts.map((ins) => lines.findIndex((l) => ins.match.test(l)));
-    if (at.every((i) => i >= 0)) {
-      // Splice bottom-up so earlier indices stay valid.
-      const ordered = inserts.map((ins, k) => ({ idx: at[k], add: ins.add }))
-        .sort((a, b) => b.idx - a.idx);
-      for (const o of ordered) lines.splice(o.idx + 1, 0, ...o.add);
-      fs.writeFileSync(pbxPath, lines.join('\n'));
+    // After MyViewController's entries when they exist, which is where the original combined
+    // insert put them. Flipping the flag off and back on then restores the file byte-for-byte,
+    // rather than moving four lines around in a committed pbxproj.
+    const anchor = pbx.includes('MyViewController.swift') ? 'MyViewController' : 'AppDelegate';
+    const wired = insertAfterAnchors(pbx, anchor, {
+      buildFile: `\t\t${GD_UUID.pluginBuildFile} /* GameDebugPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = ${GD_UUID.pluginFileRef} /* GameDebugPlugin.swift */; };`,
+      fileRef: `\t\t${GD_UUID.pluginFileRef} /* GameDebugPlugin.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = GameDebugPlugin.swift; path = "${pluginRel}"; sourceTree = SOURCE_ROOT; };`,
+      groupChild: `\t\t\t\t${GD_UUID.pluginFileRef} /* GameDebugPlugin.swift */,`,
+      sourcesEntry: `\t\t\t\t${GD_UUID.pluginBuildFile} /* GameDebugPlugin.swift in Sources */,`,
+    });
+    if (wired !== undefined) {
+      fs.writeFileSync(pbxPath, wired);
       notes.push('wired GameDebugPlugin into the iOS App target (pbxproj)');
     }
   }
 
   return notes.length ? notes.join('; ') : undefined;
+}
+
+/** One file's four pbxproj entries, each inserted after the matching line of an already-wired
+ *  `<anchor>.swift` (AppDelegate.swift is present in every Capacitor app). Returns the new text, or
+ *  undefined if any anchor is missing: every anchor is resolved BEFORE anything is spliced, so a
+ *  half-wired file is never produced. */
+function insertAfterAnchors(
+  pbx: string,
+  anchor: 'AppDelegate' | 'MyViewController',
+  add: { buildFile: string; fileRef: string; groupChild: string; sourcesEntry: string },
+): string | undefined {
+  const lines = pbx.split('\n');
+  const inserts: Array<{ match: RegExp; line: string }> = [
+    { match: new RegExp(`/\\* ${anchor}\\.swift in Sources \\*/ = \\{isa = PBXBuildFile;`), line: add.buildFile },
+    { match: new RegExp(`/\\* ${anchor}\\.swift \\*/ = \\{isa = PBXFileReference;`), line: add.fileRef },
+    // The App PBXGroup child ref — no "in Sources".
+    { match: new RegExp(`/\\* ${anchor}\\.swift \\*/,$`), line: add.groupChild },
+    { match: new RegExp(`/\\* ${anchor}\\.swift in Sources \\*/,$`), line: add.sourcesEntry },
+  ];
+  const at = inserts.map((ins) => lines.findIndex((l) => ins.match.test(l)));
+  if (!at.every((i) => i >= 0)) return undefined;
+  // Splice bottom-up so earlier indices stay valid.
+  const ordered = inserts.map((ins, k) => ({ idx: at[k], line: ins.line })).sort((a, b) => b.idx - a.idx);
+  for (const o of ordered) lines.splice(o.idx + 1, 0, o.line);
+  return lines.join('\n');
+}
+
+/** The four single-line pbxproj entries that compile GameDebugPlugin.swift into the App target,
+ *  matched by the file's name rather than by GD_UUID. A project wired by hand before the heal
+ *  existed carries Xcode-minted UUIDs, and it has to leave the release build just the same. */
+const GD_PLUGIN_PBX_LINE = /^\s*[0-9A-F]{24} \/\* GameDebugPlugin\.swift(?: in Sources)? \*\/(?: = \{.*\};|,)\s*$/;
+
+/** Flag OFF: take GameDebugPlugin.swift out of the App target (#1521). Needs no plugin source, so
+ *  a standalone game whose node_modules is gone still builds clean for the store.
+ *
+ *  ⚠️ **Runs AFTER `healIosGameDebugRegistration`**, because until that heal rewrites the fence to
+ *  its OFF form, `MyViewController.swift` still calls `GameDebugPlugin()`. And it **refuses** while
+ *  any App-target Swift names the type in code: a hand-written registration with no fence markers
+ *  is left alone by the registration heal, and stripping the class under it turns a working build
+ *  into `cannot find 'GameDebugPlugin' in scope`. The refusal is loud, since that project then
+ *  ships the bridge. */
+function healIosGameDebugPluginRemoval(projectRoot: string, debugBuild: boolean): string | undefined {
+  if (debugBuild) return undefined;
+  const iosApp = path.join(projectRoot, 'ios', 'App');
+  const pbxPath = path.join(iosApp, 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbxPath)) return undefined;
+  const lines = fs.readFileSync(pbxPath, 'utf8').split('\n');
+  const kept = lines.filter((l) => !GD_PLUGIN_PBX_LINE.test(l));
+  if (kept.length === lines.length) return undefined;
+  const naming = swiftFilesNamingGameDebugPlugin(path.join(iosApp, 'App'));
+  if (naming.length) {
+    return `⚠️ build.debugBuild is OFF but ${naming.map((f) => path.relative(projectRoot, f).replace(/\\/g, '/')).join(', ')} `
+      + 'still uses GameDebugPlugin in code, so GameDebugPlugin.swift was LEFT in the iOS App target '
+      + '(removing it would break the compile) and this build ships the debug bridge. Move the '
+      + 'registration inside the modoki:game-debug fence, or delete it (#1521).';
+  }
+  fs.writeFileSync(pbxPath, kept.join('\n'));
+  return 'removed GameDebugPlugin.swift from the iOS App target (build.debugBuild is OFF)';
+}
+
+/** Swift files under `dir` that name `GameDebugPlugin` in code: not in a comment, not in a string
+ *  literal. The fence's OFF form and the generated header only mention it in comments.
+ *
+ *  ⚠️ **A file that cannot be read counts as naming it.** That makes the removal refuse, which is
+ *  the safe direction, and it must not throw: this runs mid-chain, and a throw here would skip every
+ *  heal after it, the Android flag-off ones included. */
+function swiftFilesNamingGameDebugPlugin(dir: string): string[] {
+  // Node's own recursion (it does not follow symlinked directories), not a hand-rolled walker: the
+  // repo's corpus guard forbids those. An unreadable directory lists nothing, which is harmless:
+  // xcodebuild cannot compile from it either.
+  let names: string[];
+  try { names = fs.readdirSync(dir, { recursive: true, encoding: 'utf8' }); } catch { return []; }
+  const out: string[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.swift')) continue;
+    const p = path.join(dir, name);
+    let src: string;
+    try {
+      if (fs.statSync(p).isDirectory()) continue;
+      src = fs.readFileSync(p, 'utf8');
+    } catch { out.push(p); continue; }
+    if (/\bGameDebugPlugin\b/.test(swiftCodeOnly(src))) out.push(p);
+  }
+  return out;
+}
+
+/** Swift source with comments and string literals blanked out, so a name search sees only code.
+ *  A regex cannot do this: Swift block comments NEST, and a string like `"http://x"` or
+ *  `"image/*"` looks like a comment opener. Handles `//`, nested `/* *\/`, `"..."` with escapes,
+ *  `"""` multi-line strings, and interpolation: the code inside `\( … )` is KEPT (it is code, and a
+ *  string literal inside it would otherwise end the outer string early and desync the scan).
+ *  Raw strings (`#"…"#`) and bare regex literals are not modelled; neither appears in a generated
+ *  or in-repo App-target file. */
+export function swiftCodeOnly(src: string): string {
+  let i = 0;
+  // Code up to EOF, or, inside an interpolation, up to the `)` that closes it.
+  const code = (inInterpolation: boolean): string => {
+    let out = '';
+    let depth = 0;
+    while (i < src.length) {
+      if (src.startsWith('//', i)) {
+        const nl = src.indexOf('\n', i);
+        i = nl < 0 ? src.length : nl;
+      } else if (src.startsWith('/*', i)) {
+        let nest = 0;
+        while (i < src.length) {
+          if (src.startsWith('/*', i)) { nest++; i += 2; }
+          else if (src.startsWith('*/', i)) { nest--; i += 2; if (nest === 0) break; }
+          else i++;
+        }
+        out += ' ';
+      } else if (src.startsWith('"""', i)) {
+        i += 3;
+        out += stringBody('"""');
+      } else if (src[i] === '"') {
+        i += 1;
+        out += stringBody('"');
+      } else if (inInterpolation && src[i] === '(') {
+        depth++;
+        out += src[i++];
+      } else if (inInterpolation && src[i] === ')') {
+        i++;
+        if (depth === 0) return out;
+        depth--;
+        out += ')';
+      } else {
+        out += src[i++];
+      }
+    }
+    return out;
+  };
+  // A string's text is dropped; the code of each interpolation in it is kept.
+  const stringBody = (close: string): string => {
+    let kept = ' ';
+    while (i < src.length) {
+      if (src.startsWith('\\(', i)) { i += 2; kept += code(true) + ' '; }
+      else if (src[i] === '\\') i += 2;
+      else if (src.startsWith(close, i)) { i += close.length; return kept; }
+      else if (close === '"' && src[i] === '\n') { i++; return kept; }
+      else i++;
+    }
+    return kept;
+  };
+  return code(false);
+}
+
+/** The Capacitor package name of the native debug bridge. */
+const GAME_DEBUG_PLUGIN = 'capacitor-game-debug';
+
+/** Flag decides whether `capacitor-game-debug` is in the Android plugin graph (#1521).
+ *
+ *  `cap sync` builds the graph from `includePlugins`. The committed config therefore carries the
+ *  decision, and every path that syncs (a Build menu build, `modoki_build`, `/api/build`, or a
+ *  hand-run `npx cap sync`) follows it. Each list present is healed: the top-level one and the
+ *  per-platform overrides, since an `android.includePlugins` list replaces the top-level one for
+ *  Android rather than adding to it.
+ *
+ *  ⚠️ **With no `includePlugins` at all, Capacitor links every dependency.** Capacitor has no
+ *  exclude list, and writing an allowlist on the project's behalf would freeze its plugin set, so
+ *  that a plugin added later is silently left out. So that case is reported, not rewritten. */
+function healIncludePluginsGameDebug(projectRoot: string, debugBuild: boolean): string | undefined {
+  const capPath = path.join(projectRoot, 'capacitor.config.json');
+  if (!fs.existsSync(capPath)) return undefined;
+  let json: Record<string, unknown>;
+  try {
+    json = JSON.parse(fs.readFileSync(capPath, 'utf8')) as Record<string, unknown>;
+  } catch {
+    return undefined; // the identity heal already reports an unparseable file
+  }
+  const lists: string[][] = [];
+  if (Array.isArray(json.includePlugins)) lists.push(json.includePlugins as string[]);
+  for (const platform of ['android', 'ios']) {
+    const sub = json[platform] as { includePlugins?: unknown } | undefined;
+    if (sub && Array.isArray(sub.includePlugins)) lists.push(sub.includePlugins as string[]);
+  }
+  if (lists.length === 0) {
+    return debugBuild ? undefined
+      : `⚠️ build.debugBuild is OFF but capacitor.config.json has no includePlugins, so cap sync links every `
+        + `dependency and ${GAME_DEBUG_PLUGIN} stays in the Android build. Add an includePlugins list to keep it out (#1521).`;
+  }
+  let changed = false;
+  for (const list of lists) {
+    const at = list.indexOf(GAME_DEBUG_PLUGIN);
+    if (!debugBuild && at >= 0) {
+      // Every occurrence: a duplicate from a bad merge would otherwise keep one copy in the graph.
+      for (let i = list.length - 1; i >= 0; i--) if (list[i] === GAME_DEBUG_PLUGIN) list.splice(i, 1);
+      changed = true;
+    } else if (debugBuild && at < 0) {
+      // Keep a sorted list sorted: insert before the first name that sorts after it.
+      const after = list.findIndex((p) => p > GAME_DEBUG_PLUGIN);
+      list.splice(after < 0 ? list.length : after, 0, GAME_DEBUG_PLUGIN);
+      changed = true;
+    }
+  }
+  if (!changed) return undefined;
+  fs.writeFileSync(capPath, JSON.stringify(json, null, 2) + '\n');
+  return debugBuild
+    ? `added ${GAME_DEBUG_PLUGIN} to capacitor.config.json includePlugins (build.debugBuild is ON)`
+    : `removed ${GAME_DEBUG_PLUGIN} from capacitor.config.json includePlugins (build.debugBuild is OFF)`;
 }
 
 /** Replace (or insert before the root `</dict>`) a top-level Info.plist key's
@@ -2735,6 +2939,9 @@ export function healNativeConfig(projectRoot: string): HealResult {
       // AFTER the wiring — it may have just scaffolded MyViewController.swift.
       const r = healIosGameDebugRegistration(projectRoot, debugBuild);
       if (r) notes.push(r);
+      // AFTER the registration: only once the fence is in its OFF form is the class unused.
+      const pr = healIosGameDebugPluginRemoval(projectRoot, debugBuild);
+      if (pr) notes.push(pr);
       // AFTER the wiring too: it may have just scaffolded the MyViewController this points at.
       const sd = healIosSceneDelegateBridgeVC(projectRoot);
       if (sd) notes.push(sd);
@@ -2742,6 +2949,8 @@ export function healNativeConfig(projectRoot: string): HealResult {
       if (s) notes.push(s);
       const am = healAndroidDebugBuildMetaData(projectRoot, debugBuild);
       if (am) notes.push(am);
+      const inc = healIncludePluginsGameDebug(projectRoot, debugBuild);
+      if (inc) notes.push(inc);
       const ip = healIosDebugBuildInfoPlist(projectRoot, debugBuild);
       if (ip) notes.push(ip);
       // Phase 2 — a WARNING, never a refusal (TestFlight ships with the flag on).

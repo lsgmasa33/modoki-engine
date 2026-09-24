@@ -2537,6 +2537,22 @@ holding onto — "Debug" is an overloaded word and this is exactly where a reade
 - **Android native plugin** — the `com.modokiengine.gamedebug.DEBUG_BUILD` AndroidManifest
   `<meta-data>`, healed from the flag and read by `GameDebugPlugin.startServer`. Absent reads as
   false (fail closed).
+- **The plugin itself** (#1521). Flag off takes `GameDebugPlugin.swift` out of the iOS App target
+  (its four pbxproj entries) and `capacitor-game-debug` out of `capacitor.config.json`
+  `includePlugins`. `cap sync` builds the Android gradle graph from that list. A flag-off build
+  therefore carries no native debug bridge at all, which is the owner's store-build ruling on #938.
+  The iOS removal runs after the registration heal, because the fence only stops naming the type
+  once it is in its OFF form. It **refuses**, with a loud note, while any App-target Swift still
+  uses `GameDebugPlugin` in code (a hand-written, unfenced registration): stripping the class
+  under it would break the compile. "In code" means outside comments and string literals, found by
+  a small Swift scanner (`swiftCodeOnly`), because nested block comments and interpolation defeat a
+  regex. A `.swift` that cannot be read counts as a use. The mirror rule holds for flag ON: the
+  fence is written ON only when the pbxproj compiles the class (its `in Sources` entry). A class
+  whose source was not found, or whose Target Membership was removed by hand, keeps the fence
+  OFF, with a note. One side effect: code that reads the plugin opportunistically
+  gets nothing in a flag-off build. `readDeviceModel` in `runtime/rendering/deviceCaps.ts` returns
+  `undefined` there, as it already did on iOS. `rampProbe`'s fingerprint includes that model, so an
+  Android install upgrading from a pre-#1521 flag-off build re-runs the probe once.
 
 Each of those used to key on something *else* — `#if DEBUG`, `CONFIGURATION == Release`,
 `FLAG_DEBUGGABLE` — and they could disagree. The combination that broke was one you would normally
@@ -2566,13 +2582,16 @@ holds it for the JS bundle by building a project twice and grepping `dist/` (mea
 `games/sling`: `app-identity` 1 → 0, `GameDebug` 9 → 0). Both carry a flag-ON control, so a green
 run cannot mean "the grep found nothing".
 
-The one honest limit on "stripped": `GameDebugPlugin.swift` is compiled into the iOS App target
-**unconditionally** — its pbxproj file-ref is not flag-gated — so the class is in the binary either
-way. What the flag removes is the *registration*, and since JS is the only caller, an unregistered
-plugin has no way in: Capacitor never exposes it, so `startServer` can never be called and no
-socket is ever bound. That is why the guard asserts registration rather than symbol absence
-(asserting absence would fail for a correct build). Gating the file-ref too is possible but is a
-larger, riskier pbxproj edit than #112 needed.
+Until #1521 "stripped" had a limit: `GameDebugPlugin.swift` was compiled into the iOS App target
+unconditionally, and `capacitor-game-debug` sat in every Android build's plugin list. The flag
+removed only the *registration*. Unreachable is not the same as absent, and the owner's ruling is
+that a store build ships no native debug bridge, so both now follow the flag.
+`debugBuildGates.test.ts` holds the pbxproj entries and the `includePlugins` entry with the other
+markers, and checks the committed gradle graph separately, because only a real `cap sync` produces
+it. One case stays open by design: a project with **no** `includePlugins` list. Capacitor then
+links every dependency and has no exclude list. Writing an allowlist for the project would freeze
+its plugin set, so the heal reports that case rather than rewriting it. For a project in this repo,
+`debugBuildGates.test.ts` turns that report into a red gate.
 
 **Known issues:**
 - iOS SPM static linking strips the plugin class — requires manual registration in MyViewController + Xcode file reference from App target to `engine/packages/capacitor-game-debug/ios/Sources/GameDebugPlugin/GameDebugPlugin.swift` (project-relative path in pbxproj, no copy). Edit the package source only.
