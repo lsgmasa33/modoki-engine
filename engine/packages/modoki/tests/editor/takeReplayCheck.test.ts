@@ -3,7 +3,7 @@
  *  quantised gesture — or the divergence the check exists to catch. */
 
 import { describe, it, expect } from 'vitest';
-import { compareTakeEvents, samePayload, payloadDifferences, parseTake } from '../../src/editor/recorder/take';
+import { compareTakeEvents, replayEvents, samePayload, payloadDifferences, parseTake } from '../../src/editor/recorder/take';
 
 const ev = (type: string, payload: unknown = null) => ({ type, payload });
 
@@ -48,6 +48,58 @@ describe('compareTakeEvents', () => {
       status: 'differs', expected: 1, replayed: 1, counts: [],
       details: [{ type: 'court.gesture', occurrence: 1, fields: [{ path: 'travelPx', played: 334, replayed: 312 }, { path: 'heldMs', played: 269, replayed: 267 }] }],
     });
+  });
+});
+
+// #1524: one Court take (court-20260924-112205) read `diverged` on every warm render, and a
+// different verdict on each cold one, from a replay that did exactly what was played.
+describe('app-lifetime events (#1524)', () => {
+  const IAP = ['iap.entitlements', 'court.iap.products', 'court.iap.trusted-clock'];
+  const played = [ev('court.session.restored', { placements: 1 }), ev('court.level', { id: 'L1' }), ev('court.place', { cell: 'a2' })];
+
+  it('a replay that also boots the IAP catalogue and the server clock matches — the warm 3/3', () => {
+    // The editor page booted IAP long before the Play press; every replay page boots it again.
+    const replayed = [ev('iap.entitlements', { productIds: [] }), ev('court.iap.products', { summary: '6/6' }),
+      ev('court.iap.trusted-clock', { reason: 'boot' }), ...played];
+    expect(compareTakeEvents(played, replayed, IAP)).toEqual({ status: 'matched', events: 3, ignored: IAP });
+  });
+
+  it('skips them on the PLAYED side too — a take that caught one mid-play', () => {
+    expect(compareTakeEvents([ev('court.iap.trusted-clock', { reason: 'grant' }), ...played], played, IAP))
+      .toEqual({ status: 'matched', events: 3, ignored: ['court.iap.trusted-clock'] });
+  });
+
+  it('still diverges on an extra event that is NOT declared', () => {
+    const r = compareTakeEvents(played, [...played, ev('court.heart.lost', { left: 2 })], IAP);
+    expect(r).toMatchObject({ status: 'diverged', counts: [{ type: 'court.heart.lost', played: 0, replayed: 1 }] });
+    expect(r).not.toHaveProperty('ignored');
+  });
+});
+
+describe('replayEvents (#1524)', () => {
+  const played = [ev('court.session.restored', { placements: 1 }), ev('court.level', { id: 'L1' }), ev('court.place', { cell: 'a2' })];
+  // Measured on a cold render: the session restore landed in the last boot step, one step before
+  // the first video frame, and the check over the frames alone called it missing.
+  const captured = [
+    { step: 78, type: 'court.session.restored', payload: { placements: 1 } },
+    { step: 79, type: 'court.level', payload: { id: 'L1' } },
+    { step: 400, type: 'court.place', payload: { cell: 'a2' } },
+  ];
+
+  it('checks events from the boot steps — the replay\'s Play press is the page boot', () => {
+    expect(replayEvents(played, captured, 79, 30).replay).toEqual({ status: 'matched', events: 3 });
+  });
+
+  it('puts only frame-0-on events on the timeline, stamped with their video frame', () => {
+    const { timeline } = replayEvents(played, captured, 79, 30);
+    expect(timeline.map((e) => [e.type, e.videoFrame])).toEqual([['court.level', 0], ['court.place', 321]]);
+    expect(timeline[1].seconds).toBeCloseTo(321 / 30);
+  });
+
+  it('passes the app-lifetime types through to the check', () => {
+    const withIap = [{ step: 79, type: 'court.iap.products', payload: { summary: '6/6' } }, ...captured];
+    expect(replayEvents(played, withIap, 79, 30, ['court.iap.products']).replay)
+      .toEqual({ status: 'matched', events: 3, ignored: ['court.iap.products'] });
   });
 });
 

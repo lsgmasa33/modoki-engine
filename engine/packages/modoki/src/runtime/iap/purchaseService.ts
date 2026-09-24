@@ -33,12 +33,18 @@
  * change. Resist any refactor that splits them.
  */
 
-import { emit } from '../core/journal';
+import { emit, appLifetimeEvent } from '../core/journal';
 import { peekCurrentWorld } from '../core/ecs/worldRegistry';
 import { NoopStoreBackend, isStoreCancelled, type StoreBackend, type StoreCancelled } from './storeBackend';
 import { IapLedger, type IapLedgerStore } from './ledger';
 import { LocalVerifier, type PurchaseVerifier } from './verifier';
 import type { IapGrant, IapProduct, IapProductInfo, PurchaseResult, StoreTransaction } from './types';
+
+/** Emitted by every `refreshEntitlements()`, and so once per page load by the game's IAP boot, with
+ *  its failure twins: the gameplay recorder's replay check skips them (#1524, `appLifetimeEvent`). */
+const IAP_ENTITLEMENTS_EVENT = appLifetimeEvent('iap.entitlements');
+const IAP_ENTITLEMENTS_FAILED_EVENT = appLifetimeEvent('iap.entitlements-failed');
+const IAP_RECONCILE_FAILED_EVENT = appLifetimeEvent('iap.reconcile-failed');
 
 /** Journal without requiring a world. `reconcile()` runs at boot, potentially before any scene has
  *  loaded, and a missing world must not turn recovery into a crash. */
@@ -605,7 +611,7 @@ export async function refreshEntitlements(): Promise<ReadonlySet<string>> {
     const freshlyRead = new Set(active.map((t) => t.productId));
     if (!stillActive(c)) return freshlyRead;
     entitled = freshlyRead;
-    journal('iap.entitlements', { productIds: [...entitled] });
+    journal(IAP_ENTITLEMENTS_EVENT, { productIds: [...entitled] });
   } catch (e) {
     // Keep the previous set rather than revoking on a transient read failure — briefly stale beats
     // wrongly locking a paying player out of what they bought. But if a game swap landed in the
@@ -613,7 +619,7 @@ export async function refreshEntitlements(): Promise<ReadonlySet<string>> {
     // global — by the time the catch runs, `entitled` may already be the INCOMING game's live Set,
     // and handing that back to the outgoing caller by reference (#434's failure shape, on the
     // failure half this time) would let it read another game's entitlements as its own.
-    journalStoreFailure('iap.entitlements-failed', {}, e);
+    journalStoreFailure(IAP_ENTITLEMENTS_FAILED_EVENT, {}, e);
     if (!stillActive(c)) return startedWith;
   }
   return entitled;
@@ -637,7 +643,7 @@ export async function reconcile(): Promise<PurchaseResult[]> {
   try {
     pending = await c.backend.unfinished();
   } catch (e) {
-    journalStoreFailure('iap.reconcile-failed', {}, e, 'error');
+    journalStoreFailure(IAP_RECONCILE_FAILED_EVENT, {}, e, 'error');
     return [];
   }
 

@@ -320,10 +320,13 @@ async function render() {
     }
     if (!opts.ndjson) process.stdout.write('\n');
 
-    // Step s drew video frame s - bootSteps; events from boot steps predate the take and are dropped.
-    const onVideo = (e) => ({ videoFrame: e.step - bootSteps, seconds: (e.step - bootSteps) / opts.fps, ...e });
+    // Step s drew video frame s - bootSteps. The timeline starts at frame 0, but the replay check
+    // covers the boot steps too — `replayEvents` says why (#1524).
     const allEvents = await page.evaluate(() => window.__modokiCapture.events());
-    const events = allEvents.filter((e) => e.step >= bootSteps).map(onVideo);
+    // `?.()`: a `--url` server with an older capture driver has no such call, and a render whose
+    // frames are done must not fail on the check — it compares without the skip instead.
+    const appLifetime = await page.evaluate(() => window.__modokiCapture.appLifetimeTypes?.() ?? []);
+    const { timeline: events, replay } = takeMod.replayEvents(take.expectedEvents, allEvents, bootSteps, opts.fps, appLifetime);
     // One entry per give-up of the settle gate. From its frame on, frames may lack that content — a
     // give-up during boot (videoFrame 0, `duringBoot`) means the whole video may.
     const unsettled = (await page.evaluate(() => window.__modokiCapture.unsettled()))
@@ -348,7 +351,7 @@ async function render() {
       // Did the replay do what the owner played? The game's own events, in order, against the ones the
       // editor recorded while the take was played (#1488). Timing is not compared: pointer input is
       // quantised to the video's frame rate.
-      replay: takeMod.compareTakeEvents(take.expectedEvents, gameEvents),
+      replay,
       // The take's assets that changed between recording and this render (#1509). A report, never
       // a refusal: the change is usually the art update the re-render is for.
       assets,

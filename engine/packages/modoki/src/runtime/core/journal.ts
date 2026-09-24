@@ -141,6 +141,28 @@ export function verboseCaptureState(): { types: string[]; active: string[] } {
   return { types: [...VERBOSE_TYPES], active: [...activeVerbose] };
 }
 
+// ── App-lifetime events (#1524) ──────────────────────────────────────────────
+// Some event types are emitted once per PAGE LOAD by an app-level service's boot (an IAP catalogue,
+// a server-clock fetch), not by anything a scene does. The gameplay recorder has to know which. A
+// game's boot system runs on the first frame the sim runs, so in the editor that is the page's FIRST
+// Play: a take recorded then has them, and a take from any later Play does not. Every replay boots
+// a fresh page and always has them. Compared by count, a later-Play take read as a replay that
+// `diverged` when it did exactly what was played (`compareTakeEvents` skips them instead).
+// Declared at the emit site, so the set cannot drift from the code that emits it.
+const APP_LIFETIME_TYPES = new Set<string>();
+
+/** Declare `type` as emitted once per page load rather than by the scene, and return it, so the
+ *  declaration sits where the event is emitted: `const PRODUCTS = appLifetimeEvent('court.iap.products')`.
+ *  ⚠️ The whole TYPE is declared, so the replay check also skips a later, scene-driven emission of
+ *  it (an entitlement refresh after a purchase) — declare only types whose count says nothing about
+ *  what was played. */
+export function appLifetimeEvent<T extends string>(type: T): T {
+  APP_LIFETIME_TYPES.add(type);
+  return type;
+}
+/** Every type declared by `appLifetimeEvent` in this page. */
+export function appLifetimeEventTypes(): string[] { return [...APP_LIFETIME_TYPES]; }
+
 function journalStateFor(world: World): JournalState {
   let s = journalStates.get(world);
   if (!s) {

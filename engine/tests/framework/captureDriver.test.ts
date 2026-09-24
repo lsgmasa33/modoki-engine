@@ -9,7 +9,7 @@ import { createWorld } from 'koota';
 import {
   isFrameLoopHeld, isCaptureMode, getCaptureMode, isManualClock, rawNow, registerFrameCallback, unregisterFrameCallback,
   rngNext, seedRng, Time, timeSystem, getCurrentWorld, setCurrentWorld, setPlayState, getPlayState, holdTimeForLoading,
-  emit, sceneManager, setTimeScale,
+  emit, sceneManager, setTimeScale, appLifetimeEvent,
 } from '@modoki/engine/runtime';
 import type { World } from 'koota';
 import { beginCapture, stepCapture, bootStepCapture, endCapture, initCaptureDriver } from '../../app/debug/captureDriver';
@@ -105,6 +105,13 @@ describe('captureDriver', () => {
     expect(state.unsettled).toBe(1);
     const api = (window as unknown as { __modokiCapture: { unsettled: () => unknown } }).__modokiCapture;
     expect(api.unsettled()).toEqual([{ step: 0, pending: ['2 2D surface init'] }]);
+  });
+
+  it('reports the event types the page declared app-lifetime, for the replay check to skip (#1524)', () => {
+    expect(appLifetimeEvent('probe.boot-once')).toBe('probe.boot-once');
+    initCaptureDriver('?scene=main');
+    const api = (window as unknown as { __modokiCapture: { appLifetimeTypes: () => string[] } }).__modokiCapture;
+    expect(api.appLifetimeTypes()).toContain('probe.boot-once');
   });
 
   it('starts a capture from the URL only when asked', () => {

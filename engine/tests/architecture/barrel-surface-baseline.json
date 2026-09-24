@@ -218,6 +218,8 @@
   "angEcsToPhys",
   "angPhysToEcs",
   "animationSystem",
+  "appLifetimeEvent",
+  "appLifetimeEventTypes",
   "appServices",
   "apply2D",
   "applyBindings",

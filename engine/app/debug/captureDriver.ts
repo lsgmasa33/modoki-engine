@@ -15,7 +15,7 @@
 import {
   setFrameLoopHeld, stepOneFrame, setManualNow, advanceManual, restoreRealClock, rawNow,
   resetTimeBaseline, pinFreshWorldSeed, seedRng, setCaptureMode, getCurrentWorld, getTime, takeClockDelta, isNextSceneLoading,
-  TakeJournalTap, isTimeHeldForLoading, sceneManager,
+  TakeJournalTap, appLifetimeEventTypes, isTimeHeldForLoading, sceneManager,
 } from '@modoki/engine/runtime';
 
 export interface CaptureState {
@@ -283,6 +283,8 @@ export function initCaptureDriver(search: string = window.location.search): void
   (window as unknown as { __modokiCapture: unknown }).__modokiCapture = {
     begin: beginCapture, step: stepCapture, bootStep: bootStepCapture, end: endCapture, state: readState,
     events: () => session?.events ?? [],
+    /** The event types this page declared as emitted once per page load — the replay check skips them (#1524). */
+    appLifetimeTypes: () => appLifetimeEventTypes(),
     unsettled: () => session?.unsettled ?? [],
     /** What the settle gate is currently NOT waiting for, having given up on it. */
     givenUp: () => (session?.gaveUpOn ? describePending(session.gaveUpOn) : []),

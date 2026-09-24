@@ -25,10 +25,10 @@ Neither the render's speed nor the screen it runs on affects the frames. The out
 
 | File | Role |
 |---|---|
-| `engine/packages/modoki/src/editor/recorder/take.ts` | The take format (`Take`), its validator (`parseTake`), `frameCountFor`, and the replay's event cursor (`TakeCursor`). Has no dependencies, so the CLI loads it directly |
+| `engine/packages/modoki/src/editor/recorder/take.ts` | The take format (`Take`), its validator (`parseTake`), `frameCountFor`, the replay's event cursor (`TakeCursor`), and the replay check (`compareTakeEvents`, `replayEvents`). Has no dependencies, so the CLI loads it directly |
 | `engine/packages/modoki/src/editor/recorder/takeRecorder.ts` | Record mode: `startTakeRecording` / `finishTakeRecording`, plus the pure pieces (`clientToLayout`, `TakeBuilder`, `snapshotPrefs`) |
 | `engine/packages/modoki/src/editor/rendering/GameView.tsx` | The ● Record button beside Step (`gameView.toolbar.record`), and `REC ·` in the status readout |
-| `engine/app/debug/captureDriver.ts` | The in-page replay driver, `window.__modokiCapture`: hold the loop, fixed-dt `step()`, and the settle gate |
+| `engine/app/debug/captureDriver.ts` | The in-page replay driver, `window.__modokiCapture`: hold the loop, fixed-dt `step()`, the settle gate, and the page's app-lifetime event types |
 | `engine/scripts/record-take.mjs` | The renderer CLI (`npm run record`): starts its own dev server, runs Playwright, writes frames, encodes, writes `render.json`. `--ndjson` / `--watch-stdin` are the editor job's protocol |
 | `engine/scripts/recordTakeBoot.mjs` | The boot-retry policy (#1518): which attempts count as reloaded (`pageReloaded`) and when to boot again (`bootWithReloadRetry`) |
 | `engine/packages/modoki/src/editor/recorder/renderOptions.ts` | The render options: legal values (the fps floor), the output size, the defaults' precedence, the CLI arguments. Read by the dialog, the backend job AND the CLI |
@@ -308,11 +308,31 @@ in `render.json`). Both halves drain the journal through one `TakeJournalTap`:
   shared cap dropped whichever side was drained second, and review reproduced both orders.
 - Only game events (no `@` prefix) are compared.
 
-**Known limits.** The replay drops events from its boot steps, while the editor keeps everything
-from the Play press on. So a game's boot-time async work (Court's IAP catalogue, trusted-clock fetch
-and session restore) lands on either side of that boundary depending on load timing, and a faithful
-replay can read as `diverged`. Observed on a Court take on 2026-09-24: `diverged` warm 3/3 (three IAP
-events replayed that the take never had), and a different verdict on each of two cold renders (#1524). The Vite-hosted backend (a browser editor on `npm run dev`)
+**The check covers the replay's boot steps (#1524).** The video starts at the first frame the game
+is on screen (`bootSteps`), but the replay's counterpart of the editor's Play press is the page
+boot, not that frame. A scene's boot events (Court's `court.session.restored` and its first
+`court.level`) land a step either side of `bootSteps` depending on load timing. A check over the
+frames alone therefore counted them or not by chance: a Court take read a different verdict on
+each of two cold renders. `replayEvents` (`take.ts`) splits the two: the timeline starts at frame
+0, and the check covers every step.
+
+**App-lifetime events are skipped on both sides (#1524).** Some types are emitted once per PAGE
+LOAD by an app-level service's boot, not by the scene: Court's IAP catalogue
+(`court.iap.products`), the engine's `iap.entitlements`, Court's trusted-clock fetch, and their
+failure twins. A game's boot system runs on the first frame the sim runs, so in the editor that is
+the page's FIRST Play: a take recorded then has them, and a take from any later Play does not. Every
+replay boots a fresh page, so it always does. No window lines these up, and the same Court take
+(recorded on a later Play) read `diverged` on every warm render. Such a type is declared where it is emitted, with
+`appLifetimeEvent('court.iap.products')` (`runtime/core/journal.ts`), which returns the type. The
+capture driver reports the page's declared set (`appLifetimeTypes()`), and `compareTakeEvents` skips
+those types, listing the ones that occurred as `replay.ignored`. The owner chose this over checking
+only after the first input (2026-09-24). That alternative stops checking the session restore, and a
+slow fetch landing after the first tap would still diverge. ⚠️ **The whole TYPE is skipped,** so a
+later, scene-driven emission of it (an entitlement refresh after a purchase, a trusted-clock fetch
+at a grant) is not counted either. Declare only a type whose count says nothing about what was
+played. A new game with boot-time services declares its own.
+
+**Known limit.** The Vite-hosted backend (a browser editor on `npm run dev`)
 loses its job table if Vite restarts mid-render; the Electron main-process backend does not.
 
 The comparison was measured on a real Court take before its rule was chosen. Three things differ

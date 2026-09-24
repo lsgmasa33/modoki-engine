@@ -214,9 +214,11 @@ export interface ReplayFieldDifference { path: string; played: unknown; replayed
  *    (a cell, a score) means the replay did go elsewhere. The fields are listed so it can be told apart. */
 export type ReplayCheck =
   | { status: 'unchecked'; reason: string }
-  | { status: 'matched'; events: number }
+  | { status: 'matched'; events: number; ignored?: string[] }
   | {
     status: 'diverged' | 'differs'; expected: number; replayed: number;
+    /** App-lifetime types (`appLifetimeEvent`) seen on either side and left out of the check. */
+    ignored?: string[];
     /** Types whose COUNT differs. Empty for `differs`. */
     counts: { type: string; played: number; replayed: number }[];
     /** Per type, the first occurrence whose payload differs, and its differing fields (up to 5). */
@@ -268,12 +270,25 @@ export function payloadDifferences(x: unknown, y: unknown, at = '', out: ReplayF
  *  ⚠️ **Per type, not one global order.** Events from independent async work interleave by timing:
  *  measured on Court, `court.iap.trusted-clock` (a network fetch) landed after `court.session.restored`
  *  in the editor and before it in the replay, in a replay that was otherwise identical — the same
- *  placement, the same heart lost. A global order called every such take diverged. */
-export function compareTakeEvents(expected: readonly Ev[] | undefined, replayed: readonly Ev[]): ReplayCheck {
+ *  placement, the same heart lost. A global order called every such take diverged.
+ *
+ *  ⚠️ **`appLifetime` types are skipped on both sides (#1524).** They are emitted once per page load
+ *  (`appLifetimeEvent` in `runtime/core/journal.ts`): in the editor only on the page's first Play,
+ *  in every replay on its boot, so their counts differ however faithful the replay.
+ *  Skipped types that occurred are reported as `ignored`. */
+export function compareTakeEvents(
+  expected: readonly Ev[] | undefined, replayed: readonly Ev[], appLifetime: Iterable<string> = [],
+): ReplayCheck {
   if (!expected) return { status: 'unchecked', reason: 'the take has no expectedEvents (recorded before the replay check existed)' };
+  const skip = new Set(appLifetime);
+  const ignoredSeen = new Set<string>();
   const group = (list: readonly Ev[]) => {
     const m = new Map<string, Ev[]>();
-    for (const e of list) if (isTakeGameEvent(e.type)) (m.get(e.type) ?? m.set(e.type, []).get(e.type)!).push(e);
+    for (const e of list) {
+      if (!isTakeGameEvent(e.type)) continue;
+      if (skip.has(e.type)) { ignoredSeen.add(e.type); continue; }
+      (m.get(e.type) ?? m.set(e.type, []).get(e.type)!).push(e);
+    }
     return m;
   };
   const a = group(expected);
@@ -290,6 +305,26 @@ export function compareTakeEvents(expected: readonly Ev[] | undefined, replayed:
     if (k >= 0) details.push({ type, occurrence: k + 1, fields: payloadDifferences(xs[k].payload, ys[k].payload) });
   }
   const total = (m: Map<string, Ev[]>) => [...m.values()].reduce((n, l) => n + l.length, 0);
-  if (!counts.length && !details.length) return { status: 'matched', events: total(a) };
-  return { status: counts.length ? 'diverged' : 'differs', expected: total(a), replayed: total(b), counts, details };
+  const ignored = ignoredSeen.size ? { ignored: [...ignoredSeen] } : {};
+  if (!counts.length && !details.length) return { status: 'matched', events: total(a), ...ignored };
+  return { status: counts.length ? 'diverged' : 'differs', expected: total(a), replayed: total(b), counts, details, ...ignored };
+}
+
+/** One journal event the replay page captured (`captureDriver`), stamped with the step that emitted it. */
+export interface CapturedReplayEvent { step: number; type: string; payload: unknown }
+
+/** A replay's captured events, split by what each is FOR (#1524):
+ *  - `timeline`: the events on the video, from the first frame on (`step >= bootSteps`), each
+ *    stamped with its `videoFrame` and `seconds`. Events from boot steps precede frame 0.
+ *  - `replay`: the replay check, over EVERY captured event, boot steps included. The replay's
+ *    counterpart of the editor's Play press is the page boot, not the first video frame: a scene's
+ *    boot events (Court's session restore, its first `court.level`) land a step either side of
+ *    `bootSteps` depending on load timing, and a check over the timeline alone counted them or not
+ *    by chance. Skips `appLifetime` types (see `compareTakeEvents`). */
+export function replayEvents<E extends CapturedReplayEvent>(
+  expected: readonly Ev[] | undefined, captured: readonly E[], bootSteps: number, fps: number, appLifetime: Iterable<string> = [],
+): { timeline: (E & { videoFrame: number; seconds: number })[]; replay: ReplayCheck } {
+  const timeline = captured.filter((e) => e.step >= bootSteps)
+    .map((e) => ({ videoFrame: e.step - bootSteps, seconds: (e.step - bootSteps) / fps, ...e }));
+  return { timeline, replay: compareTakeEvents(expected, captured, appLifetime) };
 }

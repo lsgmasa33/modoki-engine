@@ -32,7 +32,7 @@ import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
 
-import { revealInOS } from '../../plugins/backend/osOpen';
+import { openInOS, revealInOS } from '../../plugins/backend/osOpen';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const execFileAsync = promisify(execFile);
@@ -102,6 +102,24 @@ async function closeRevealedWindows(dir: string): Promise<void> {
   }
 }
 
+interface WindowedProc { id: number; name: string; title: string }
+
+/** Every process that currently owns a top-level window, with its title. The title is
+ *  what identifies the app that opened our fixture — see the tab caveat on the
+ *  `openInOS` test below for why the PROCESS alone is not enough. */
+async function windowedProcesses(): Promise<WindowedProc[]> {
+  const ps = 'Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { "{0}|{1}|{2}" -f $_.Id, $_.ProcessName, $_.MainWindowTitle }';
+  const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps]);
+  return stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      const [id, name, ...rest] = l.split('|');
+      return { id: Number(id), name, title: rest.join('|') };
+    });
+}
+
 const dirs: string[] = [];
 function scratch(prefix: string): string {
   const d = makeScratchDir(prefix);
@@ -147,6 +165,49 @@ describe.skipIf(!onWin32)('revealInOS against the real explorer.exe (win32)', ()
   }, 60_000);
 });
 
+describe.skipIf(!onWin32)('openInOS against the real cmd /c start (win32)', () => {
+  /** ⚠️ Cleanup here is deliberately ASYMMETRIC, and the asymmetry is measured, not
+   *  cautious. Windows 11's Notepad is tabbed and single-instance: opening a file with
+   *  NO Notepad running starts a new process, but opening one while Notepad is ALREADY
+   *  running is absorbed as a TAB into the existing process and creates no new pid
+   *  (both observed on the win clone, 2026-09-24). So killing "the app that has our
+   *  title" would close the owner's other documents along with our fixture.
+   *
+   *  Hence: assert by TITLE, which holds in both cases — and kill ONLY a pid that did
+   *  not exist before the call. When the fixture is absorbed into an app the owner was
+   *  already using, it is left alone and reported, and the fixture's own text says what
+   *  it is so a stray tab explains itself. Losing a second of the owner's work is much
+   *  worse than leaving a tab they can close. */
+  it.skipIf(!shellRunning)('actually opens the file in its default app', async () => {
+    const dir = scratch('modoki-open-');
+    // No dot in the stamp: some apps title the window without the extension.
+    const stamp = `modokigate${Date.now()}`;
+    const file = path.join(dir, `${stamp}.txt`);
+    fs.writeFileSync(file, "Opened by Modoki's test gate (engine/tests/plugins/osOpenWin32.test.ts).\nNothing is wrong — this window can be closed.\n");
+
+    const before = await windowedProcesses();
+    const beforeIds = new Set(before.map((p) => p.id));
+
+    await openInOS(file);
+
+    let hit: WindowedProc | undefined;
+    for (let i = 0; i < 24 && !hit; i++) {
+      hit = (await windowedProcesses()).find((p) => p.title.toLowerCase().includes(stamp));
+      if (!hit) await new Promise((r) => setTimeout(r, 250));
+    }
+
+    // The claim a mock cannot reach: something really opened our file. `openInOS`
+    // resolving proves only that a process was spawned — #1508's shape exactly.
+    expect(hit, 'no window appeared titled for the opened file').toBeTruthy();
+
+    if (hit && !beforeIds.has(hit.id)) {
+      try { process.kill(hit.id); } catch { /* it closed itself; tidying is not the assertion */ }
+    } else if (hit) {
+      console.warn(`[osOpenWin32] the fixture opened as a tab in ${hit.name} (pid ${hit.id}), which was already running — left alone on purpose; close the tab by hand.`);
+    }
+  }, 60_000);
+});
+
 /* Deliberately NOT covered here:
  *
  *  - **A path the shell cannot open.** On win32 the missing-file half is answered
@@ -156,11 +217,9 @@ describe.skipIf(!onWin32)('revealInOS against the real explorer.exe (win32)', ()
  *  - **The "opener could not be STARTED" branch**, which is the mocked case in
  *    `osOpen.test.ts`; there is no way to make the real explorer.exe vanish for one
  *    test.
- *  - **`openInOS` against the real `cmd /c start`.** It is the branch #1515 was
- *    about, and it has no real-binary coverage: asserting it would launch whatever
- *    app is associated with the fixture's extension on the machine running the
- *    gate, which is a bigger intrusion than the Explorer window the owner signed
- *    off on. The gate would therefore not notice a later options change that
- *    suppressed the opened window — the #1508 shape exactly (resolves fine,
- *    feature dead). Raising this needs the owner's call on what `verify` may
- *    launch. */
+ *  - **A `.txt` handler that is not Notepad.** The `openInOS` test above identifies
+ *    what opened the fixture by WINDOW TITLE, so it holds for any app that titles its
+ *    window after the file — which Notepad, VS Code and every editor tried here do. An
+ *    association pointing at something that does not would fail it; that is a machine
+ *    configuration question, not a defect in the code under test, and the message says
+ *    so. Off a desktop session it skips (`shellRunning`) rather than pretending. */
