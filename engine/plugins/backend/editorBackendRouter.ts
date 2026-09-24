@@ -43,6 +43,7 @@ import { execFileSync } from 'child_process';
 import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { renderAvailability, renderJobs, renderScriptPath } from './recordRenderJob';
+import { fingerprintAssets } from '../takeAssets';
 import type { RenderOptions } from '../../packages/modoki/src/editor/recorder/renderOptions';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
 import { osascriptChooser, type NativeChooser } from './nativeChooser';
@@ -4911,6 +4912,16 @@ async function describeUnresolvedAgainstLiveWorld(
       if (fs.existsSync(absPath)) return json({ error: 'Folder exists' }, 409);
       createFolderAt(absPath);
       return json({ ok: true, saved: true });
+    } catch (e) {
+      return json({ error: String(e) }, 500);
+    }
+  }
+
+  // ── POST /api/record/fingerprint ── the open project's asset fingerprint, which a take stores at
+  // the Play press so its render can name the assets that changed since (#1509, takeAssets.ts).
+  if (urlPath === '/api/record/fingerprint' && method === 'POST') {
+    try {
+      return json(await fingerprintAssets(ctx.projectRoot));
     } catch (e) {
       return json({ error: String(e) }, 500);
     }

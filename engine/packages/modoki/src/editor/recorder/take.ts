@@ -69,6 +69,17 @@ export interface Take {
    *  Optional: a take recorded before it existed has none, and its replay is reported `unchecked`.
    *  The render compares them with what the replay emitted (`compareTakeEvents`). */
   expectedEvents?: TakeGameEvent[];
+  /** A fingerprint of the project's assets when Play was pressed (#1509). The render loads assets
+   *  as they are NOW — re-rendering after an art change is the point — and names the ones this take
+   *  uses that changed since (`engine/plugins/takeAssets.ts`). Optional: an older take has none, and
+   *  so does one whose fingerprint failed; its render reports the check `unchecked`. */
+  assets?: TakeAssets;
+}
+
+/** Every file under `dir` (relative to the project root) → a short content hash. */
+export interface TakeAssets {
+  dir: string;
+  files: Record<string, string>;
 }
 
 /** One game journal event, as a take stores it and a render reports it. */
@@ -138,6 +149,14 @@ export function parseTake(raw: unknown): Take {
         if (!isFiniteNumber(ev.t) || ev.t < 0) problems.push(`expectedEvents[${i}].t must be a number >= 0`);
         if (typeof ev.type !== 'string' || !ev.type) problems.push(`expectedEvents[${i}].type must be a non-empty string`);
       });
+    }
+  }
+  if (o.assets !== undefined) {
+    const a = o.assets as Record<string, unknown> | null;
+    if (!a || typeof a !== 'object' || typeof a.dir !== 'string' || !a.dir
+      || typeof a.files !== 'object' || a.files === null || Array.isArray(a.files)
+      || !Object.values(a.files).every((h) => typeof h === 'string')) {
+      problems.push('assets must be { dir, files: { path: hash } } when present');
     }
   }
   if (problems.length) throw new Error(`take: ${problems.length} problem(s):\n  - ${problems.join('\n  - ')}`);

@@ -35,6 +35,7 @@ Neither the render's speed nor the screen it runs on affects the frames. The out
 | `engine/packages/modoki/src/editor/recorder/renderJobModel.ts` | What the progress card shows: stage, bar, ETA, the warnings from `render.json` |
 | `engine/packages/modoki/src/editor/panels/RenderTakeDialog.tsx` | The options dialog and the progress card (drawing only) |
 | `engine/plugins/backend/recordRenderJob.ts` | The backend's render job: spawns the CLI, folds its progress lines, cancels. Routes: `/api/record/render` (GET poll, POST start), `/api/record/render/cancel` |
+| `engine/plugins/takeAssets.ts` | The asset fingerprint a take stores, and the render's check of which of the take's assets changed since (#1509). Loaded by the backend (`POST /api/record/fingerprint`) and by the CLI |
 | `engine/packages/modoki/src/runtime/core/takeJournal.ts` | `TakeJournalTap`: the one rule both halves drain the journal by, so the replay check compares like with like |
 | `engine/packages/modoki/src/runtime/rendering/frameDriver.ts` | `setFrameLoopHeld`: the rAF chain keeps firing but runs nothing, and `stepOneFrame` drives it |
 | `engine/packages/modoki/src/runtime/core/rng.ts` | `pinFreshWorldSeed`: seeds a world before it exists |
@@ -88,6 +89,9 @@ is, and why:
 - Refuses if the scene has unsaved changes, because the replay loads the scene from disk.
 - Flushes PlayerPrefs, then snapshots every stored key of the editor's namespace (`<game>@editor`) as its **raw** stored string.
 - Picks a seed, pins it for fresh worlds, and enters capture mode `'recording'`.
+- Asks the backend for a fingerprint of the project's assets (`POST /api/record/fingerprint`). It
+  is awaited only when the take is written, so the hashing runs while you play. A failed request
+  costs the render its assets check, not the take (§ Assets changed since the take).
 - Presses Play. The `onPlayStateChange` listener fires synchronously inside `setPlayState`, before the first play frame. It seeds the world and starts the take clock.
 
 A Play that declines (a scene swap in flight) or throws disarms the recorder. Otherwise the next
@@ -172,7 +176,8 @@ deliverables that get shared.
 - the game's own journal events, plus `@audio`, `@cue`, `@scene-loaded` and `@scene-swapped`, each placed on the video frame whose step emitted it (collected after every step, since the journal is per world);
 - the settle gate's give-ups (`unsettled`, with `stillGivenUp`), each also printed as a warning;
 - page errors, including GameShell's warnings;
-- `replay`: the replay check's verdict (§ The replay check).
+- `replay`: the replay check's verdict (§ The replay check);
+- `assets`: which assets this take uses changed since it was recorded (§ Assets changed since the take).
 
 **What it measured** (Court, 2026-09-24):
 - A 47 s take recorded in the editor (a queen dragged to an illegal square, costing a heart) replayed with the same level restored from the save and the same gesture (673 px of travel). The same `court.place`, `court.heart.lost` and `court.illegal` events landed.
@@ -305,6 +310,66 @@ That Court take replayed as `differs`: the same placement on a2, the same heart 
 `court.gesture`'s travel and hold plus a blocked pointer's coordinates differed. A take recorded
 before #1488 has no `expectedEvents`, and its replay is `unchecked`.
 
+## Assets changed since the take (#1509)
+
+**A render uses the project's assets as they are NOW, not as they were when the take was played.
+That is the owner's call (2026-09-24), and it is deliberate.** Re-rendering a take after an art
+change is what the recorder is for, and much of a game's art (colour, size, position) is authored
+in the scene itself. Storing the scene in the take would have frozen that art too. So a render
+never refuses and never substitutes: it **reports**.
+
+The cost is that an edit made between the take and the render can change the video without
+anyone noticing. The replay check (above) catches an edit that changes what the game DOES, like a
+moved button that makes a recorded tap miss. A purely visual edit emits the same events and
+passes it. The assets check is what names that second kind.
+
+How it works (`engine/plugins/takeAssets.ts`):
+- **At the Play press** the take stores a fingerprint of every file under the project's
+  `runtime/assets`: a 64-bit slice of each file's SHA-256, keyed by its path in that folder. Court's
+  folder is about 1,400 files and 50 MB, and hashing it took about 0.3 s.
+- **After the render** the CLI fingerprints the folder again and compares only the files this take
+  used: the **GUID closure** of the scenes the render loaded (`takeSceneUrls`).
+  - **Which scenes:** the scene the take booted, read before the frame loop, plus every
+    `@scene-loaded` path and every `@scene-swapped` `to`. Two traps:
+    - The page's current scene after the last frame is wherever the take *ended*. The first cut
+      read that, so a sling take that won level 1 was checked against level 2 only.
+    - A level change emits `@scene-swapped`, not `@scene-loaded`. The first cut listened for the
+      wrong one, and a unit test that passed the URLs by hand could not see it (#1509 review).
+  - **What each scene pulls in:** every JSON asset's GUID references, followed transitively (scene
+    → prefab → material → texture), and each asset's `.meta.json` sidecar, because a texture's
+    import settings change how it looks. A sidecar's sub-asset `guid`s (a sliced sprite's frames)
+    resolve to the sheet beside it.
+  - **It errs toward reporting too much.** The closure follows *every* GUID, so a level that names
+    the next one (sling's `nextScene`) pulls that level in, whether or not the take got there. An
+    edit to a scene nothing in the take references is not reported.
+- **The verdict** is `render.json` → `assets`:
+  - `unchanged`, with how many files it `checked`;
+  - `changed`, listing `changed` (different bytes) and `added` (a file created since the take that
+    the scenes now use);
+  - `unchecked`, for a take recorded before #1509 or one whose fingerprint failed.
+
+  A `changed` verdict is also printed by the CLI and shown on the progress card.
+- **It never fails a render.** The check runs after every frame is captured and before the encode,
+  so anything that goes wrong reads `unchecked` with the reason, including a malformed URL or a
+  folder that cannot be listed. One file that cannot be read (the atomic writers rename
+  `<file>.tmp` inside this folder; on Windows a scanner can hold a file) is fingerprinted as
+  `unreadable` and left out of the comparison on either side. It is not dropped: a file missing
+  from the take's fingerprint reads as new, and the first fix reported exactly that false `(new)`
+  (#1509 review 2).
+- **A project with no `runtime/assets` of its own gets no fingerprint.** An editor on a bare
+  `npm run dev` has the repo root as its project. Fingerprinting that folder is an error rather
+  than an empty map, which would have listed every asset the take uses as new. Its takes carry no
+  fingerprint, and their renders read `unchecked`.
+
+**Not covered:**
+- game CODE, and `project.config.json`;
+- the engine's own assets (`/modoki/assets`);
+- an asset reached only through a GUID written in code. The build cannot see that one either
+  (CLAUDE.md § Single source of truth, #53).
+
+A file the scene still references but that no longer exists is not reported here: that is a
+broken reference, and the scene load reports it.
+
 ## Gotchas
 
 - ⚠️ **Capture mode is on while you PLAY the take, not only while it renders.** A game hides capture
@@ -342,7 +407,9 @@ before #1488 has no `expectedEvents`, and its replay is `unchecked`.
   live world, while the replay boots a page. Everything the game reads at start is carried over:
   the save, the seed, the wall clock and the time zone. Anything else a game reads at boot is not,
   and that is where a replay can diverge. The replay check (above) catches it automatically.
-  It also catches a scene saved between Stop and the render, which the replay loads from disk.
+  A scene saved between Stop and the render is used as it is now. The replay check catches that
+  when it changes what the game emits, and the assets check names it either way (§ Assets changed
+  since the take).
 - **Pointer timing is quantised to the video's frame rate.** Events are dispatched between steps,
   so a gesture's `heldMs` can differ by up to a frame (Court: 384 ms live, 400 ms replayed at
   30 fps). A game that reads gesture speed from `e.timeStamp` sees the replay's timing, not the
@@ -355,8 +422,6 @@ before #1488 has no `expectedEvents`, and its replay is `unchecked`.
   - audio (`render.json` already places every `@audio` event on a frame; mixing is phase 2);
   - an MCP wrapper. It should start and poll the same backend job (`/api/record/render`), so the
     editor and agents share one render path; `routeCoverage.test.ts` lists those routes as an agent gap;
-  - snapshotting the scene into the take (#1509). The replay check detects a scene edited after the
-    take when it changes what the game emits, but nothing prevents it;
   - an end-to-end spec. The recorder needs an active game, and the e2e suite plays fixture scenes
     that belong to none (`[takeRecorder] not recording: no game is active`), so the dialog flow was
     verified against the live editor instead;

@@ -109,11 +109,12 @@ process.stdout.on('error', onOutputGone);
 process.stderr.on('error', onOutputGone);
 
 process.env.MODOKI_TOOLCHAIN_DIR ??= defaultToolchainDir();
-const [takeMod, renderOptionsMod, ffmpegMod, prefsKeyMod] = await loadRequiredEngineModules(REPO_ROOT, [
+const [takeMod, renderOptionsMod, ffmpegMod, prefsKeyMod, takeAssetsMod] = await loadRequiredEngineModules(REPO_ROOT, [
   path.join('packages', 'modoki', 'src', 'editor', 'recorder', 'take.ts'),
   path.join('packages', 'modoki', 'src', 'editor', 'recorder', 'renderOptions.ts'),
   path.join('plugins', 'ffmpeg-tool.ts'),
   path.join('packages', 'modoki', 'src', 'runtime', 'storage', 'prefsKey.ts'),
+  path.join('plugins', 'takeAssets.ts'),
 ], 'record-take.mjs');
 
 // ⚠️ 30 is a FLOOR, not a default: `timeSystem` clamps every frame's delta to 1/30 s (so a GC pause
@@ -318,6 +319,9 @@ async function render() {
         + '(an unknown ?scene= falls back to the default) — the replay would not match the take');
     }
     const bootSteps = state.steps;
+    // The scene the take starts in. Read HERE, not after the loop: by then `state.scene` is wherever
+    // the take ended, and a level change makes that another scene (#1509 review).
+    const bootScene = state.scene;
 
     // Where the game root sits in THIS page, so a layout point lands on the same thing it did in the
     // editor. A size mismatch means the game laid out differently and the take's points are off.
@@ -355,14 +359,20 @@ async function render() {
 
     // Step s drew video frame s - bootSteps; events from boot steps predate the take and are dropped.
     const onVideo = (e) => ({ videoFrame: e.step - bootSteps, seconds: (e.step - bootSteps) / opts.fps, ...e });
-    const events = (await page.evaluate(() => window.__modokiCapture.events()))
-      .filter((e) => e.step >= bootSteps).map(onVideo);
+    const allEvents = await page.evaluate(() => window.__modokiCapture.events());
+    const events = allEvents.filter((e) => e.step >= bootSteps).map(onVideo);
     // One entry per give-up of the settle gate. From its frame on, frames may lack that content — a
     // give-up during boot (videoFrame 0, `duringBoot`) means the whole video may.
     const unsettled = (await page.evaluate(() => window.__modokiCapture.unsettled()))
       .map((u) => ({ videoFrame: Math.max(0, u.step - bootSteps), duringBoot: u.step < bootSteps, pending: u.pending }));
     const stillGivenUp = await page.evaluate(() => window.__modokiCapture.givenUp());
     const gameEvents = events.filter((e) => e.type !== '@audio');
+    // The render used the project's assets as they are NOW — on purpose, so an art change is a
+    // re-render (#1509). Name the ones this take uses that changed since it was recorded: the
+    // scene it booted plus every scene loaded or swapped to, followed through their GUID references.
+    // Never throws: a failure reads `unchecked` rather than failing a render whose frames are done.
+    const assets = await takeAssetsMod.checkTakeAssets(path.resolve(REPO_ROOT, project), take.assets,
+      takeAssetsMod.takeSceneUrls(bootScene, allEvents));
     return {
       take: path.relative(outDir, takePath), scene: loaded, frames: total, fps: opts.fps, size,
       takeSeconds: state.takeTime, renderSeconds: (Date.now() - started) / 1000,
@@ -376,6 +386,9 @@ async function render() {
       // editor recorded while the take was played (#1488). Timing is not compared: pointer input is
       // quantised to the video's frame rate.
       replay: takeMod.compareTakeEvents(take.expectedEvents, gameEvents),
+      // The take's assets that changed between recording and this render (#1509). A report, never
+      // a refusal: the change is usually the art update the re-render is for.
+      assets,
       // Phase 2's audio track is built from these: every sound the game played, on the video frame
       // whose step played it.
       audio: events.filter((e) => e.type === '@audio'),
@@ -454,12 +467,19 @@ async function main() {
         ...report.replay.details.map((d) => `"${d.type}" ${d.fields.map((f) => f.path).join(', ')}`)].join('; ')
       + ' (render.json: replay)');
   }
+  if (report.assets.status === 'changed') {
+    console.warn(`${TAG} ⚠️ ${report.assets.changed.length + report.assets.added.length} asset(s) this take uses changed since it was recorded — `
+      + 'the video shows them as they are now: '
+      + [...report.assets.changed, ...report.assets.added.map((a) => `${a} (new)`)].slice(0, 8).join(', ')
+      + ' (render.json: assets)');
+  }
   // What the editor's progress card shows — the full lists stay in render.json.
   emit({
     stage: 'done', video, reportFile, size: report.size, frames: report.frames, fps: report.fps,
     renderSeconds: report.renderSeconds, undispatchedEvents: report.undispatchedEvents,
     unsettled: report.unsettled, pageErrors: report.pageErrors.length, pageErrorSample: report.pageErrors.slice(0, 3),
     replay: report.replay,
+    assets: report.assets,
   });
 }
 

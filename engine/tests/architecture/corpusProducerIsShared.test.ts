@@ -290,6 +290,13 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
       + 'for equality-checking around the generator\'s product dir — not a source corpus.',
   },
   {
+    file: 'engine/plugins/takeAssets.ts', rule: 'walker', walker: 'walk',
+    reason: 'Walks ONE project\'s runtime/assets folder to hash every file in it for a take\'s '
+      + 'fingerprint (#1509). The editor opens projects from outside this repo (a game is portable, '
+      + '#29), where repoFiles() — git-tracked-or-untracked files of THIS repo — cannot reach, and '
+      + 'the population must include whatever the render will load, tracked or not.',
+  },
+  {
     file: 'engine/scripts/ota/buildManifest.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks a built dist/ directory (build output) to hash files for the OTA manifest — '
       + 'not repo/tracked content.',

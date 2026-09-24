@@ -36,6 +36,8 @@ export interface RenderJobWire {
       counts?: { type: string; played: number; replayed: number }[];
       details?: { type: string; occurrence: number; fields: { path: string; played: unknown; replayed: unknown }[] }[];
     };
+    /** `TakeAssetsCheck` in `engine/plugins/takeAssets.ts` (#1509). Optional: an older CLI sends none. */
+    assets?: { status: string; reason?: string; checked?: number; changed?: string[]; added?: string[] };
   } | null;
   error: string | null;
   log: string[];
@@ -119,6 +121,14 @@ export function resultWarnings(r: NonNullable<RenderJobWire['result']>): RenderC
   if (r.undispatchedEvents) out.push({ level: 'warn', text: `${r.undispatchedEvents} input event(s) fell after the last frame` });
   if (r.pageErrors) {
     out.push({ level: 'warn', text: `${r.pageErrors} page error(s)${r.pageErrorSample.length ? `, e.g. ${r.pageErrorSample[0].slice(0, 160)}` : ''} (render.json: pageErrors)` });
+  }
+  if (r.assets?.status === 'changed') {
+    const names = [...(r.assets.changed ?? []), ...(r.assets.added ?? []).map((a) => `${a} (new)`)];
+    out.push({
+      level: 'warn',
+      text: `${names.length} asset(s) this take uses changed since you recorded it, and the video shows them as they are now: `
+        + `${names.slice(0, 4).join(', ')}${names.length > 4 ? `, +${names.length - 4} more` : ''} (render.json: assets)`,
+    });
   }
   if (r.replay.status === 'unchecked') out.push({ level: 'info', text: 'Replay not checked: this take was recorded before takes stored their game events' });
   return out;

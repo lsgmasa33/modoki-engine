@@ -431,6 +431,7 @@ describe('the sidecar park gate covers every Node route that could clobber a par
     const ALLOWED: ReadonlyArray<{ item: string; reason: string }> = [
       { item: 'engine/plugins/meta-sidecar.ts', reason: 'the sidecar helper module itself' },
       { item: 'engine/plugins/asset-fs-ops.ts', reason: 'the sidecar helper module itself' },
+      { item: 'engine/plugins/takeAssets.ts', reason: '#1509: READS .meta.json bytes (hashing + GUID index), writes nothing, so it cannot clobber a parked edit. Behind POST /api/record/fingerprint, which the recorder calls only after refusing to record on hasUnsavedChanges() — every cause, parked asset docs and import settings included — so disk IS what the take plays' },
       { item: 'engine/plugins/reimport-registry.ts', reason: 'declares getReimportHandler; dispatches, never writes' },
       { item: 'engine/plugins/asset-tree-shaker.ts', reason: 'a build-time / static path with no editor attached' },
       { item: 'engine/plugins/vite-asset-scanner.ts', reason: 'a build-time / static path with no editor attached' },

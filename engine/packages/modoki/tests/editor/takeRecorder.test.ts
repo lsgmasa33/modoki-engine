@@ -35,6 +35,18 @@ describe('parseTake', () => {
     expect(() => parseTake(t)).toThrow(/earlier than the event before it/);
   });
 
+  it('accepts an asset fingerprint, and a take without one (#1509)', () => {
+    const fp = { dir: 'runtime/assets', files: { 'scenes/main.scene.json': '0123456789abcdef' } };
+    expect(parseTake({ ...valid(), assets: fp }).assets).toEqual(fp);
+    expect(parseTake(valid()).assets).toBeUndefined();
+  });
+
+  it('refuses a malformed asset fingerprint', () => {
+    expect(() => parseTake({ ...valid(), assets: { dir: 'runtime/assets', files: { 'a.png': 1 } } })).toThrow(/assets must be/);
+    expect(() => parseTake({ ...valid(), assets: { files: {} } })).toThrow(/assets must be/);
+    expect(() => parseTake({ ...valid(), assets: [] })).toThrow(/assets must be/);
+  });
+
   it('refuses a non-object', () => {
     expect(() => parseTake([])).toThrow(/JSON object/);
   });

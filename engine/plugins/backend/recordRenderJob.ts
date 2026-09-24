@@ -25,6 +25,7 @@ import fs from 'fs';
 import path from 'path';
 import { createRequire } from 'module';
 import { killBuildProcess } from '../buildStepShell';
+import type { TakeAssetsCheck } from '../takeAssets';
 import { renderCliArgs, renderOptionProblems, type RenderOptions } from '../../packages/modoki/src/editor/recorder/renderOptions';
 
 export type RenderStage = 'starting' | 'server' | 'boot' | 'frames' | 'encode' | 'done' | 'error' | 'cancelled';
@@ -44,6 +45,9 @@ export interface RenderResult {
   pageErrors: number;
   pageErrorSample: string[];
   replay: { status: string; [k: string]: unknown };
+  /** Assets the take uses that changed since it was recorded (#1509, `takeAssets.ts`). Absent from a
+   *  render by a CLI older than it. */
+  assets?: TakeAssetsCheck;
 }
 
 /** One render job as the editor sees it (`GET /api/record/render`). */

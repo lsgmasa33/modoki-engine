@@ -5,7 +5,12 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const h = vi.hoisted(() => ({ written: [] as { url: string; body: string }[] }));
+const h = vi.hoisted(() => ({
+  written: [] as { url: string; body: string }[],
+  /** What `POST /api/record/fingerprint` answers (#1509): a body, or null for a failed request. */
+  fingerprint: null as unknown,
+  fingerprintAsked: 0,
+}));
 
 vi.mock('../../src/editor/scene/playMode', async () => {
   const ps = await import('../../src/runtime/core/playState');
@@ -17,7 +22,11 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: { getCurrent: () => ({ path: '/assets/scenes/main.scene.json' }) },
 }));
 vi.mock('../../src/editor/backend/editorBackend', () => ({
-  backendFetch: async () => ({ ok: true, json: async () => ({ projectRoot: '/proj' }) }),
+  backendFetch: async (url: string) => {
+    if (url !== '/api/record/fingerprint') return { ok: true, json: async () => ({ projectRoot: '/proj' }) };
+    h.fingerprintAsked++;
+    return h.fingerprint === null ? { ok: false, status: 500, json: async () => ({ error: 'boom' }) } : { ok: true, json: async () => h.fingerprint };
+  },
   jsonFileBody: (x: unknown) => JSON.stringify(x),
   writeAssetFile: async (url: string, body: string) => { h.written.push({ url, body }); return true; },
 }));
@@ -42,6 +51,8 @@ beforeEach(() => {
   setPlayState('stopped');
   document.body.innerHTML = '<div data-game-view-area><div data-modoki-ui-root="runtime"></div></div>';
   h.written = [];
+  h.fingerprint = null;
+  h.fingerprintAsked = 0;
   prev = getCurrentWorld();
   w = createWorld();
   w.spawn(Time());
@@ -114,5 +125,31 @@ describe('onTakeSaved', () => {
       await finishTakeRecording();
       expect(saved).toEqual([]);
     } finally { off(); }
+  });
+});
+
+describe('the asset fingerprint (#1509)', () => {
+  it("is asked for at the Play press and saved in the take, for the render to compare against", async () => {
+    const fp = { dir: 'runtime/assets', files: { 'scenes/main.scene.json': '0123456789abcdef' } };
+    h.fingerprint = fp;
+    expect(await startTakeRecording(NO_INSETS)).toBeNull();
+    // Requested when recording starts, not when the take is written: hashing runs while the owner plays.
+    expect(h.fingerprintAsked).toBe(1);
+    frame();
+    await finishTakeRecording();
+    expect(JSON.parse(h.written[0].body).assets).toEqual(fp);
+  });
+
+  it('still saves the take when the fingerprint fails — the render then reports the check unchecked', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(await startTakeRecording(NO_INSETS)).toBeNull();
+      frame();
+      expect(await finishTakeRecording()).not.toBeNull();
+      const take = JSON.parse(h.written[0].body);
+      expect(take).not.toHaveProperty('assets');
+      expect(take.events).toBeDefined();
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/no asset fingerprint/), 500);
+    } finally { warn.mockRestore(); }
   });
 });

@@ -2215,6 +2215,22 @@ describeCases('QA case references', () => {
   // tests. So every load here must survive `qa/` being absent, or the OSS snapshot (which does
   // not ship qa/) throws during collection and the "skip" protects nothing.
   const cases = HAS_CASES ? loadCases() : [];
+  /**
+   * Every doc a runner reads a REFERENCE from: the cases, plus `suiteDocs()` (#1512).
+   *
+   * The existence checks below (a `data-ui-id`, an MCP tool, an `npm run` script) iterated `cases`
+   * alone while the path and line-number checks already walked `suiteDocs()`, so `qa/knowledge.md`
+   * — which tells every runner which ids to aim at (§ 25j) and which scripts to run (§ 1) — could
+   * name a renamed id, tool or script with nothing red. Mutation-measured: a misspelled id in § 25j
+   * was 158/158 green. One list, so a check that reads references cannot pick a narrower set by hand.
+   *
+   * Deliberately NOT used by the procedure-shape scans (play ordering, asset-row reveal, the port
+   * check): those judge a case's STEPS, and knowledge.md is not a procedure.
+   */
+  const referenceDocs: Array<{ rel: string; body: string }> = [
+    ...cases.map((c) => ({ rel: c.rel, body: c.body })),
+    ...suiteDocs(),
+  ];
   // #723: the committed grandfather list of citations that resolve only via a shape pattern for a
   // family that now has a deriver — see `shapeOnlyCitedIds` and the ratchet tests below.
   //
@@ -3079,8 +3095,10 @@ describeCases('QA case references', () => {
     // there propagates further than in any single case. It already did — `modoki_tap`'s docstring
     // taught `inspector.header.kebab` (an Inspector kebab menu that has never existed), the README
     // quoted the docstring as its worked example, and a case brief copied the README.
+    // The README is added HERE rather than in `referenceDocs`: the tool check must not read it,
+    // because it names `modoki_set_trait` as the specimen of a tool that never existed.
     const docs = [
-      ...cases.map((c) => ({ rel: c.rel, body: c.body })),
+      ...referenceDocs,
       { rel: 'qa/README.md', body: readScannedSource(join(REPO_ROOT, 'qa', 'README.md'), README_AS_PROSE).raw },
     ];
     corpusScanCache = { known, docs };
@@ -3093,7 +3111,7 @@ describeCases('QA case references', () => {
    * parameter is real, only the target is missing. Wave 2 of the suite drives the editor through its
    * actual chrome, so this became the highest-value check to add.
    */
-  it('every `data-ui-id` a case aims at exists in the editor source', () => {
+  it('every `data-ui-id` a case or a suite doc aims at exists in the editor source', () => {
     const { known: { ids, patterns }, docs } = getCorpusScan();
     // A vacuous pass would be worse than no check — the editor really does tag its chrome.
     expect(ids.size).toBeGreaterThan(30);
@@ -3341,9 +3359,9 @@ describeCases('QA case references', () => {
     });
   });
 
-  it('every MCP tool named in a case exists on the tool surface', () => {
+  it('every MCP tool named in a case or a suite doc exists on the tool surface', () => {
     const unknown: string[] = [];
-    for (const c of cases) {
+    for (const c of referenceDocs) {
       for (const m of c.body.matchAll(/\b(modoki_[a-z0-9_]+)\b/g)) {
         if (!modokiTools.has(m[1])) unknown.push(`${c.rel}: ${m[1]}`);
       }
@@ -3356,9 +3374,9 @@ describeCases('QA case references', () => {
     expect(unknown).toEqual([]);
   });
 
-  it('every `npm run <script>` named in a case exists in package.json', () => {
+  it('every `npm run <script>` named in a case or a suite doc exists in package.json', () => {
     const unknown: string[] = [];
-    for (const c of cases) {
+    for (const c of referenceDocs) {
       for (const m of c.body.matchAll(/npm run ([a-zA-Z0-9:_-]+)/g)) {
         if (!npmScripts.has(m[1])) unknown.push(`${c.rel}: npm run ${m[1]}`);
       }

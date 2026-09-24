@@ -80,6 +80,17 @@ describe('resultWarnings', () => {
     ]);
   });
 
+  it('warns that assets the take uses changed since it was recorded, naming them (#1509)', () => {
+    const w = resultWarnings(result({ assets: { status: 'changed', checked: 12, changed: ['scenes/main.scene.json', 'textures/a.png', 'b', 'c', 'd'], added: ['materials/new.material.json'] } }));
+    expect(w).toEqual([{ level: 'warn', text: expect.stringMatching(/^6 asset\(s\) this take uses changed since you recorded it/) }]);
+    expect(w[0].text).toMatch(/scenes\/main\.scene\.json, textures\/a\.png, b, c, \+2 more/);
+  });
+
+  it('says nothing about assets that did not change, or a take that predates the check', () => {
+    expect(resultWarnings(result({ assets: { status: 'unchanged', checked: 7 } }))).toEqual([]);
+    expect(resultWarnings(result({ assets: { status: 'unchecked', reason: 'old take' } }))).toEqual([]);
+  });
+
   it('notes an unchecked replay quietly', () => {
     expect(resultWarnings(result({ replay: { status: 'unchecked' } }))).toEqual([{ level: 'info', text: expect.stringMatching(/Replay not checked/) }]);
   });

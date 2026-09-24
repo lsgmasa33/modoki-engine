@@ -73,6 +73,7 @@ const NO_TOOL_BY_DESIGN: Record<string, string> = {
   '/api/save-dialog': 'native save panel — same blocking-modal reason',
   '/api/reveal-in-finder': 'opens Finder/Explorer on the human\'s desktop; nothing to read back',
   '/api/record/render/reveal': 'opens Finder/Explorer on the human\'s desktop at a finished render\'s video; nothing to read back',
+  '/api/record/fingerprint': 'internal to the gameplay recorder (#1509): the take stores it at the Play press so its render can name the assets changed since. The render CLI hashes in-process, and an agent reads the result in render.json',
   '/api/open-file': 'hands a file to the OS default application — a human affordance with no agent-observable result',
 
   // ── editor chrome: panel layout, pickers, per-session UI state ──

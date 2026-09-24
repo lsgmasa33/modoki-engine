@@ -10,7 +10,7 @@
  *  below it is the thin part. */
 
 import {
-  TAKE_FORMAT, TAKE_VERSION, isTakeGameEvent, type Take, type TakeGameEvent, type TakePointerEvent, type TakePointerKind,
+  TAKE_FORMAT, TAKE_VERSION, isTakeGameEvent, type Take, type TakeAssets, type TakeGameEvent, type TakePointerEvent, type TakePointerKind,
 } from './take';
 import { getPlayState, onPlayStateChange } from '../../runtime/core/playState';
 import { seedRng, pinFreshWorldSeed } from '../../runtime/core/rng';
@@ -111,6 +111,9 @@ interface Recording {
    *  replay driver drains with the same tap, so both halves collect by one rule. */
   journal: TakeJournalTap;
   expectedEvents: TakeGameEvent[];
+  /** The project's asset fingerprint, requested at the Play press and awaited only when the take is
+   *  written (#1509) — hashing runs while the owner plays. Null when the backend could not make one. */
+  assets: Promise<TakeAssets | null>;
   detach: () => void;
 }
 
@@ -154,6 +157,22 @@ function findGameRoot(): HTMLElement | null {
   return document.querySelector<HTMLElement>('[data-game-view-area] [data-modoki-ui-root="runtime"]');
 }
 
+/** Ask the backend to fingerprint the project's assets (#1509). A failure costs the render its
+ *  changed-assets check, not the take, so it resolves null rather than refusing to record. */
+function requestAssetFingerprint(): Promise<TakeAssets | null> {
+  return backendFetch('/api/record/fingerprint', { method: 'POST' })
+    .then(async (r) => {
+      const body = r.ok ? await r.json() as Partial<TakeAssets> : null;
+      if (body && typeof body.dir === 'string' && body.files && typeof body.files === 'object') return body as TakeAssets;
+      console.warn('[takeRecorder] no asset fingerprint — the render will not report assets changed since the take', r.status);
+      return null;
+    })
+    .catch((err) => {
+      console.warn('[takeRecorder] no asset fingerprint — the render will not report assets changed since the take', err);
+      return null;
+    });
+}
+
 /** Snapshot the starting state, press Play, and record until stopped. Resolves with an error
  *  message when it cannot start, or null when it did. */
 export async function startTakeRecording(safeArea: Take['safeArea']): Promise<string | null> {
@@ -179,6 +198,7 @@ export async function startTakeRecording(safeArea: Take['safeArea']): Promise<st
   const rec: Recording = {
     builder, root, started: false, takeTime: 0, detach: () => {},
     journal: new TakeJournalTap(), expectedEvents: [],
+    assets: requestAssetFingerprint(),
     base: {
       format: TAKE_FORMAT, version: TAKE_VERSION, game,
       scene: scenePath.split('/').pop()!,
@@ -288,7 +308,11 @@ export async function finishTakeRecording(): Promise<string | null> {
     const last = rec.builder.events[rec.builder.events.length - 1];
     rec.builder.add('up', Math.max(last.t, rec.takeTime), last.x, last.y);
   }
-  const take: Take = { ...rec.base, duration: rec.takeTime, events: rec.builder.events, expectedEvents: rec.expectedEvents };
+  const assets = await rec.assets;
+  const take: Take = {
+    ...rec.base, duration: rec.takeTime, events: rec.builder.events, expectedEvents: rec.expectedEvents,
+    ...(assets ? { assets } : {}),
+  };
   const identity = await backendFetch('/api/identity').then((r) => r.ok ? r.json() : null).catch(() => null) as { projectRoot?: string } | null;
   if (!identity?.projectRoot) {
     console.error('[takeRecorder] no project root from /api/identity — the take was NOT saved:', take);
