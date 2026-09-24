@@ -2980,11 +2980,14 @@ function memberTransforms(rootInstanceId: number): (lid: number) => Record<strin
 export function resolveEffectivePrefabOverride(
   topSource: string | PrefabFile,
   path: number[],
+  seed?: NestedOverridePaths,
 ): Record<number, Record<string, Record<string, unknown>>> {
   // A DOCUMENT names the top level directly: a refresh resolves against the file the live tree was
   // expanded from, which the cache no longer holds (#1401).
   let prefab: PrefabFile | null = typeof topSource === 'string' ? getCachedPrefabSync(topSource) : topSource;
-  let pending: NestedOverridePaths | undefined;
+  // `seed`: what a layer ABOVE the top instance forwards into it — a template's reference node's own
+  // `nestedOverrides` (#1506). The top of a chain is otherwise a stored root, which nothing forwards into.
+  let pending: NestedOverridePaths | undefined = seed;
   let result: Record<number, Record<string, Record<string, unknown>>> = {};
   for (let i = 0; i < path.length; i++) {
     if (!prefab) return result;
@@ -3011,6 +3014,7 @@ export function resolveEffectivePrefabOverride(
 function resolveEffectivePrefabStructure(
   topSource: string | PrefabFile,
   path: number[],
+  seed?: NestedStructurePaths,
 ): { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> } {
   // The path-keyed descend, exactly as `resolveEffectivePrefabOverride` walks it (#1381). A prefab
   // ROW can carry `nestedStructure` (promotion writes a reference node's slot into it, and a
@@ -3022,7 +3026,7 @@ function resolveEffectivePrefabStructure(
   // (Before #1381 only a scene capture wrote the slot, so this descend had no producer and was
   // removed as dead code — correctly at the time. It returned with its producer.)
   let prefab: PrefabFile | null = typeof topSource === 'string' ? getCachedPrefabSync(topSource) : topSource;
-  let pending: NestedStructurePaths | undefined;
+  let pending: NestedStructurePaths | undefined = seed; // as `resolveEffectivePrefabOverride`'s seed (#1506)
   let result: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> } = {};
   for (let i = 0; i < path.length; i++) {
     if (!prefab) return result;
@@ -4599,6 +4603,11 @@ export async function applyToPrefabSelective(
   const canon = toLocalIdKeys(selectedKeys, oldPrefab, getCachedPrefabSync);
   selectedKeys = canon.keys;
   for (const key of canon.unresolved) skipped.push({ key, reason: 'it names no member of this prefab — the template has changed since the key was listed' });
+  // Written into this prefab, an outer row's removal reaches every instance of it (#1506).
+  for (const key of layerAuthoredStructureKeys(rootInstanceId, oldPrefab, structure)) {
+    if (!selectedKeys.delete(key)) continue;
+    skipped.push({ key: canon.original.get(key) ?? key, reason: 'the prefab enclosing this instance authors it, not this instance' });
+  }
 
   for (const key of selectedKeys) {
     // Structural: a member moved inside its instance (#1437) — after every addition, below, since one of
@@ -5190,12 +5199,7 @@ function captureNestedInstanceOverridesIn(outerRootId: number, baseline: PrefabF
   // root's own frame, `^` climbing to the instance whose row expanded it). The loader applies every
   // value an instance receives — its row's, and whatever an outer layer forwarded — in THAT frame.
   // The live capture holds guids, so an unresolved token never compared equal: a token-bearing row
-  // value or node read as a scene edit and froze the old template (#1386 review). A REFERENCE node's
-  // payload is in its own instance's frame, so it is left whole, as `rebaseAddedTokens` leaves it.
-  const resolveNodes = (resolve: (v: unknown) => unknown, nodes: AddedEntity[] | undefined): AddedEntity[] | undefined =>
-    nodes?.map((n) => (n.prefab ? n : {
-      ...n, traits: resolve(n.traits) as AddedEntity['traits'], children: resolveNodes(resolve, n.children) ?? [],
-    }));
+  // value or node read as a scene edit and froze the old template (#1386 review) — `resolveAddedNodeTokens`.
 
   const captures: NestedInstanceCapture[] = [];
   // Every nested frame the rebuild's TEARDOWN destroys — asked of the teardown itself, not of the live subtree
@@ -5220,7 +5224,7 @@ function captureNestedInstanceOverridesIn(outerRootId: number, baseline: PrefabF
         const chainStructure = resolveEffectivePrefabStructure(baseline, chain);
         const { structure, replace } = subtractChainStructure(
           captureInstanceStructure(id, childPrefab),
-          { ...chainStructure, added: resolveNodes(resolve, chainStructure.added) },
+          { ...chainStructure, added: resolveAddedNodeTokens(resolve, chainStructure.added) },
           chainStructure.added?.length ? addedKeysOf(id) : new Map());
         captures.push({
           chain,
@@ -6075,21 +6079,30 @@ function cloneOverrides(
   return JSON.parse(JSON.stringify(m));
 }
 
-/** What the rows ENCLOSING instance `rootInstanceId` set on it — every prefab row from the outermost (stored)
- *  instance down to this one, resolved outside-in (`resolveEffectivePrefabOverride`), with member tokens resolved
- *  to live guids. So an instance's BASE — what it resolves to with no override of its own — is its template under
- *  this. Null for a stored root, which nothing encloses, and for a frame whose chain cannot be read.
+/** A layer's structural lists, in the shape `resolveEffectivePrefabStructure` returns them. */
+type StructureLayer = ReturnType<typeof resolveEffectivePrefabStructure>;
+
+/** What the layers ENCLOSING instance `rootInstanceId` author on it — the part of what it shows that is NOT its own:
+ *  the field `overrides` and the `structure` lists. Member tokens are left unresolved. Two kinds of enclosing layer:
  *
- *  ONE answer for three questions about a NESTED instance (#1492): which applied fields Apply keeps on it
- *  ({@link appliedFieldsToDrop}), what its override list compares against (`collectInstanceOverrideTree`), and what
- *  Revert puts back (`revertOverridesSelective`). Each used to read the bare template, which a nested instance never
- *  shows: a field the outer row sets was listed as the instance's override, reverted to the template's value, and an
- *  Apply's shadowed value was dropped. */
-export function enclosingRowOverrides(rootInstanceId: number): Record<number, Record<string, Record<string, unknown>>> | null {
+ *  - **A ROW frame** (`parentLocalId ≠ 0`): every prefab row from the outermost instance down to this one, resolved
+ *    outside-in (`resolveEffectivePrefabOverride` / `resolveEffectivePrefabStructure`).
+ *  - **A REFERENCE node a prefab TEMPLATE authored** (#1506): a keyed `added` node with `prefab`, in the layer of the
+ *    frame it hangs in ({@link templateReferenceNode}). Its own channels are its layer, and a chain of rows UNDER it
+ *    starts from its nested channels. Before #1506 such a root read as a stored one — nothing enclosing it — so the
+ *    node's overrides were listed as the instance's own and Revert took them to the bare template.
+ *
+ *  Null for a stored root, which nothing encloses; for a SCENE-authored reference node, whose node the scene writes
+ *  as this instance's own; and for a frame whose chain cannot be read. */
+function enclosingLayer(rootInstanceId: number, depth = 0): {
+  overrides: Record<number, Record<string, Record<string, unknown>>>;
+  structure: StructureLayer;
+} | null {
   const piMeta = getTraitByName('PrefabInstance');
-  if (!piMeta) return null;
-  // The chain of rows down from the stored root, climbing by ownership (#1437: a moved root's owner is its frame).
-  // The resolver only once there is a row to climb: a stored root, the common case, costs one read.
+  if (!piMeta || depth > 16) return null;
+  // The chain of rows down from the top of this frame, climbing by ownership (#1437: a moved root's owner is its frame).
+  // The resolver only once there is a row to climb. A stored root, the common case, also asks whether it is a template
+  // reference node — two reads when its parent is no instance member (`templateReferenceNode`).
   let identity: ReturnType<typeof worldIdentityParents> | undefined;
   const chain: number[] = [];
   let top = rootInstanceId;
@@ -6101,10 +6114,116 @@ export function enclosingRowOverrides(rootInstanceId: number): Record<number, Re
     chain.unshift(plid);
     top = owner;
   }
+  const node = templateReferenceNode(top, depth);
+  if (!chain.length) {
+    if (!node) return null;
+    // A template node carries no `members` and no `moved`: both are live scene identity, stripped on the way into a
+    // template (`toTemplateNodes`). Its localId channels are the whole of it.
+    return {
+      overrides: node.overrides ?? {},
+      structure: { added: node.added ?? [], removed: node.removed ?? [], removedTraits: node.removedTraits ?? {} },
+    };
+  }
   const topSource = (readTraitData(top, piMeta)?.source as string) || '';
-  if (!chain.length || !topSource) return null;
-  return baseTokenResolver(rootInstanceId)(resolveEffectivePrefabOverride(topSource, chain)) as
-    Record<number, Record<string, Record<string, unknown>>>;
+  if (!topSource) return null;
+  return {
+    overrides: resolveEffectivePrefabOverride(topSource, chain, node?.nestedOverrides),
+    structure: resolveEffectivePrefabStructure(topSource, chain, node?.nestedStructure),
+  };
+}
+
+/** The template node that expanded reference-node root `refRoot` — a keyed `added` node with `prefab` that the layer
+ *  enclosing the frame it hangs in authored — or null when `refRoot` is not one (a stored root, a row expansion, a node
+ *  the SCENE added). Matched by template KEY, as the rebuild matches a chain's nodes (`subtractChainStructure`): the
+ *  marker first, the guid-derived recovery when it was lost (Play→Stop, an undo respawn). The recovery scans every
+ *  cached document's keys, so it runs only when the enclosing layer actually holds a keyed reference node.
+ *
+ *  ⚠️ Only a node directly in that layer's `added`: one inside another added node's `children`, or in a reference
+ *  node's own `added` below a member of IT, hangs under something that is not a member of the frame, and reads as
+ *  no template node at all — the pre-#1506 answer. */
+function templateReferenceNode(refRoot: number, depth: number): AddedEntity | null {
+  const piMeta = getTraitByName('PrefabInstance');
+  const pi = piMeta ? readTraitData(refRoot, piMeta) : null;
+  if (!isStoredRoot(pi as MemberPi, refRoot)) return null; // a root no row expanded; a template's node is one
+  // The LIVE parent: a root no row expanded has no frame of its own, so its identity parent is exactly this
+  // (`identityParents.ts`). Read directly, not through a world identity walk, which an Inspector recompute of every
+  // scene-level instance paid for (close-out review: 0.004 → 0.63 ms at 3000 entities).
+  const parent = (readTraitData(refRoot, getTraitByName('EntityAttributes')!)?.parentId as number) || 0;
+  const frame = parent ? ((readTraitData(parent, piMeta!)?.rootInstanceId as number) || 0) : 0;
+  if (!frame || frame === refRoot) return null;
+  const candidates = (enclosingLayer(frame, depth + 1)?.structure.added ?? []).filter((n) => !!n.prefab && !!n.key);
+  if (!candidates.length) return null;
+  const key = templateKeyOf(findEntity(refRoot)) || recoverTemplateKey(refRoot);
+  return key ? candidates.find((n) => n.key === key) ?? null : null;
+}
+
+/** What the layers enclosing instance `rootInstanceId` set on its FIELDS ({@link enclosingLayer}), with member tokens
+ *  resolved to live guids. So an instance's BASE — what it resolves to with no override of its own — is its template
+ *  under this. Null for an instance nothing encloses.
+ *
+ *  ONE answer for three questions about a NESTED instance (#1492): which applied fields Apply keeps on it
+ *  ({@link appliedFieldsToDrop}), what its override list compares against (`collectInstanceOverrideTree`), and what
+ *  Revert puts back (`revertOverridesSelective`). Each used to read the bare template, which a nested instance never
+ *  shows: a field the outer row sets was listed as the instance's override, reverted to the template's value, and an
+ *  Apply's shadowed value was dropped. */
+export function enclosingRowOverrides(rootInstanceId: number): Record<number, Record<string, Record<string, unknown>>> | null {
+  const layer = enclosingLayer(rootInstanceId);
+  return layer ? baseTokenResolver(rootInstanceId)(layer.overrides) as Record<number, Record<string, Record<string, unknown>>> : null;
+}
+
+/** Instance `rootInstanceId`'s structural diff against `prefab` that is its OWN: the live capture minus what the
+ *  layers enclosing it already author ({@link enclosingLayer}, #1506). The subtraction the rebuild makes of a nested
+ *  instance (`subtractChainStructure`), made here for the surfaces that ask "what did THIS instance change": the
+ *  override list, and Apply, which writes a listed structural key into `prefab`. Against the bare template, a member
+ *  an outer row removes was listed as this instance's removal, and Apply of it deleted the member from `prefab` —
+ *  from every instance of it. `full` is the capture, when the caller already holds it.
+ *
+ *  An `added` node the layer authored is never the instance's own, edited or not — see the end of the body. */
+export function ownInstanceStructure(rootInstanceId: number, prefab: PrefabFile, full = captureInstanceStructure(rootInstanceId, prefab)): InstanceStructure {
+  const layer = enclosingLayer(rootInstanceId);
+  if (!layer) return full;
+  const { structure: s } = layer;
+  const keysByGuid = new Map<string, string>();
+  if (s.added?.length) {
+    const memo = new Map<number, string>();
+    for (const n of full.added) {
+      const e = n.guid ? findEntityByGuid(n.guid) : undefined;
+      const key = e ? (templateKeyOf(e as Parameters<typeof templateKeyOf>[0]) || recoverTemplateKey(e.id(), memo)) : '';
+      if (key) keysByGuid.set(n.guid, key);
+    }
+  }
+  const added = resolveAddedNodeTokens(baseTokenResolver(rootInstanceId), s.added);
+  const { structure, replace } = subtractChainStructure(full, { ...s, added }, keysByGuid);
+  // A node the layer authored and the scene EDITED is kept whole by that subtraction (the rebuild respawns it in place
+  // of the fresh copy), but it is still the LAYER's node: listed, Apply copied it into `prefab`, and every other
+  // instance of the enclosing prefab then showed it twice — the row's copy and the template's (close-out review). Its
+  // edits are the scene's, saved with it.
+  const edited = new Set(replace.map((r) => r.guid));
+  return edited.size ? { ...structure, added: structure.added.filter((n) => !edited.has(n.guid)) } : structure;
+}
+
+/** The structural keys (localId form) in capture `full` that the layers enclosing the instance author rather than the
+ *  instance itself — `full` minus {@link ownInstanceStructure}. Empty for an instance nothing encloses. The listing
+ *  never offers them; this is what Apply and Revert refuse, for a caller that still holds one (an older listing, a
+ *  hand-built set, a direct API call). */
+function layerAuthoredStructureKeys(rootInstanceId: number, prefab: PrefabFile, full: InstanceStructure): string[] {
+  if (!enclosingLayer(rootInstanceId)) return [];
+  const keysOf = (st: InstanceStructure) => new Set([
+    ...st.added.map((n) => `+added.${n.guid}`),
+    ...st.removed.map((lid) => `-removed.${lid}`),
+    ...Object.entries(st.removedTraits).flatMap(([lid, names]) => names.map((t) => `-trait.${lid}.${t}`)),
+  ]);
+  const own = keysOf(ownInstanceStructure(rootInstanceId, prefab, full));
+  return [...keysOf(full)].filter((k) => !own.has(k));
+}
+
+/** `nodes` with their member tokens resolved by `resolve` (`baseTokenResolver`), for comparing with a live capture,
+ *  which holds guids. A REFERENCE node's payload is in its own instance's frame, so it is left whole, as
+ *  `rebaseAddedTokens` leaves it (#1386 review). */
+function resolveAddedNodeTokens(resolve: (v: unknown) => unknown, nodes: AddedEntity[] | undefined): AddedEntity[] | undefined {
+  return nodes?.map((n) => (n.prefab ? n : {
+    ...n, traits: resolve(n.traits) as AddedEntity['traits'], children: resolveAddedNodeTokens(resolve, n.children) ?? [],
+  }));
 }
 
 /** `prefab` as instance `rootInstanceId` resolves it with no override of its own: its members under the rows
@@ -6299,6 +6418,11 @@ export async function revertOverridesSelective(
   // reverted keys to get the state to re-apply after the rebuild.
   const fullOverrides = captureInstanceOverrides(rootInstanceId, prefab);
   let fullStructure = captureInstanceStructure(rootInstanceId, prefab);
+  // Reverted, an outer row's removal came back and its added node was DELETED — neither is what the instance shows
+  // with no override of its own (#1492's ruling, #1506 close-out review).
+  for (const key of layerAuthoredStructureKeys(rootInstanceId, prefab, fullStructure)) {
+    if (selectedKeys.delete(key)) console.warn(`[Prefab] not reverting ${key}: the prefab enclosing this instance authors it`);
+  }
   const reducedOverrides = subtractFieldOverrides(fullOverrides, selectedKeys);
   // A reverted field goes back to what the instance resolves to WITHOUT it: on a nested instance, the enclosing row's
   // value where one sets it (#1492), not the template's. The rebuild re-expands from the template alone and carries

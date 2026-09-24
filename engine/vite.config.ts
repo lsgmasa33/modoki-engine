@@ -15,6 +15,7 @@ import { msdfWorkerAssetStripPlugin } from './plugins/msdfWorkerAssetStrip'
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
 import { bootSplashPlugin } from './plugins/bootSplash'
 import { earlyConsoleShimPlugin } from './plugins/earlyConsoleShim'
+import { projectLockfilesHash } from './plugins/projectLockfileHash'
 import { perfCoreWorkers } from './testWorkers'
 
 // C3: engine/ is the vite root (this config + index.html + app/ live here). The
@@ -501,6 +502,14 @@ export default defineConfig(({ command }) => {
   // from node_modules as-is.
   optimizeDeps: {
     exclude: ['@zappar/msdf-generator'],
+    // #1502 — Vite keys this cache on the REPO ROOT lockfile only, so a game dropping a dep it had
+    // pre-bundled left the cache "valid" and the next re-optimize failed on the missing source (the
+    // game booted DEGRADED). The define is inert — no dependency names that identifier — but
+    // `getConfigHash` serialises `rolldownOptions`, so every project lockfile now keys the cache.
+    // The helper's docblock has the mechanism.
+    rolldownOptions: {
+      transform: { define: { __MODOKI_PROJECT_LOCKFILES__: JSON.stringify(projectLockfilesHash(repoRoot, buildProjectRoot)) } },
+    },
     // PACKAGED-ONLY: pre-bundle the @modoki/engine subpaths the DYNAMICALLY-loaded game
     // module imports but the editor's own startup graph does NOT (notably
     // `runtime/rendering`). In a packaged app electron-builder dereferences the
@@ -533,6 +542,10 @@ export default defineConfig(({ command }) => {
         // modules the interstitial rules, by narrow subpath.
         '@modoki/engine/runtime/core/adLifecycle',
         '@modoki/engine/runtime/core/adPacing',
+        // #1501 — both games' ads.ts wrap that lifecycle in the promoted debug overrides, and their debug
+        // tabs import the shared Ads tab by its own side-effect-free subpath (not the `runtime/debug` index).
+        '@modoki/engine/runtime/core/adDebug',
+        '@modoki/engine/runtime/debug/adsTab',
         // #1332 — both games' AppsFlyer wiring imports the promoted attribution lifecycle.
         '@modoki/engine/runtime/core/attribution',
         // #1274 — both games' auth wrappers hash login keys with the account-continuity module.

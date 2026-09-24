@@ -106,15 +106,23 @@ export const ads = {
   interstitialReady(): boolean { return false; },
   // #1379 — the purchase card waits while an ad is up; a playable never shows one.
   fullscreenAdShowing(): boolean { return false; },
-  // #1474 — Weaveling's debug-menu ads tab. A playable has no debug menu and no SDK; these keep the
-  // namespace complete and inert.
-  debugSetAdOverride(_patch: Record<string, unknown>): void {},
-  async debugShowFullscreen(_kind: string): Promise<boolean> { return false; },
-  debugAdStatus() {
-    return {
-      initialized: false, interstitialLoaded: false, rewardedLoaded: false, fullscreenShowing: false,
-      gameWantsBanner: false, override: { banner: 'auto' as const, interstitial: true, rewarded: true },
-    };
+  // #1474/#1501 — both games' debug-menu Ads tab is built over `ads.adsDebug` (the engine's `createAdDebug`).
+  // A playable has no debug menu and no SDK, so the tab is never rendered; this keeps the value both
+  // games hand to `createAdsDebugTab` at module load complete and inert.
+  adsDebug: {
+    setBannerVisible(_visible: boolean): void {},
+    async showFullscreen(_kind: string, _placement: string): Promise<boolean> { return false; },
+    isReady(_kind: string): boolean { return false; },
+    setOverride(_patch: Record<string, unknown>): void {},
+    async showNow(_kind: string): Promise<boolean> { return false; },
+    status() {
+      return {
+        initialized: false, interstitialLoaded: false, rewardedLoaded: false, fullscreenShowing: false,
+        gameWantsBanner: false, override: { banner: 'auto' as const, interstitial: true, rewarded: true },
+      };
+    },
+    hasMediationDebugger: false,
+    async openMediationDebugger() { return { opened: false, message: 'no ad SDK in a playable' }; },
   },
   bannerHeightPx(): number { return 0; },
   // #1477 — a playable never requests a banner (its strip is always donated), so nothing ever fails.

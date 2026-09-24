@@ -29,7 +29,7 @@ import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegist
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import {
-  collectComparableTraits, getOverrideValues, captureInstanceStructure, baseTokenResolver, instanceBase,
+  collectComparableTraits, getOverrideValues, ownInstanceStructure, baseTokenResolver, instanceBase,
   isTemplateExcludedField, nestedFrameMoves, getCachedPrefabSync, type PrefabFile, type ApplyResult,
 } from './prefab';
 import { memberRef, toLocalIdKey } from './overrideKeyGrammar';
@@ -247,7 +247,9 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
     }
   }
 
-  const structure = captureInstanceStructure(rootInstanceId, prefab);
+  // Only what THIS instance changed (#1506): a nested instance's enclosing rows author structure of their own, and a
+  // key for it here is one Apply writes into `prefab` — a row's removed trait stripped from every instance of it.
+  const structure = ownInstanceStructure(rootInstanceId, prefab);
   // Drop unguided additions rather than emit an ambiguous `+added.` — see the field's doc above.
   const addressableAdded = structure.added.filter((node) => !!node.guid);
   const unaddressableAdded = structure.added.length - addressableAdded.length;

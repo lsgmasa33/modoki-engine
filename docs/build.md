@@ -94,6 +94,35 @@ died on a package none of them import. **Check `dist/plugin.cjs.js` exists, not 
 if a plugin build fails, run it directly (`npm --prefix <pkg> run build`) — the root install hides
 the real error. Guarded now by `engine/tests/architecture/ambientTypesOptOut.test.ts`.
 
+### A game's lockfile keys the editor's Vite dep cache (#1502)
+
+Vite keys its dep-optimizer cache (`node_modules/.vite/deps/_metadata.json`, or `vite-cache` under
+userData when packaged) on its config plus ONE lockfile: the first one found walking up from its
+root, `engine/`, which is the repo root's. A `games/<id>/package-lock.json` is never that lockfile. So when a game **dropped** a dependency the cache had pre-bundled, the cache stayed
+"valid". The next re-optimize, which fires the first time a new dependency is discovered, rebuilt the
+cached list, hit `ENOENT` on the removed package's source, and wrote nothing. The game then booted
+**DEGRADED**, with 504s on the new dependency's chunk. Seen when #1495/#1496 swapped AdMob for
+AppLovin MAX in Weaveling and Court.
+
+`engine/plugins/projectLockfileHash.ts` now hashes every project's lockfile, plus the open project's
+when it lives outside the repo. `vite.config.ts` puts that hash in
+`optimizeDeps.rolldownOptions.transform.define`. The identifier is inert, since no dependency names
+it. But Vite's `getConfigHash` serialises `rolldownOptions`, so any project's lockfile change now
+logs `Re-optimizing dependencies because vite config has changed`, and `browserHash` moves with it.
+Measured 2026-09-24 with a headless dev server over Weaveling's graph:
+- the pre-fix config reproduces the `ENOENT`;
+- the fixed config re-optimizes clean;
+- an unchanged tree reuses the cache.
+
+⚠️ **This rests on Vite's PRIVATE hashing**: `getConfigHash` is not API, and the manifest's `"vite": "^8.0.5"` lets a
+lockfile refresh change what it serialises. `engine/tests/plugins/projectLockfileHash.test.ts` asks
+the INSTALLED Vite, through a real dev server, whether a changed define moves its cache key. If a
+bump stops hashing it, that test goes red, instead of #1502 quietly coming back.
+
+**Not covered:** a package deleted from a game's `node_modules` WITHOUT a lockfile change, i.e.
+`npm install` never ran. That is RULE 1, and no cache key catches it. A cache written before this
+fix needs no manual wipe: adding the define changed the config hash, so the first boot re-optimizes.
+
 ## Native scaffolding: auto on first build
 
 A game with no `ios/`/`android/` yet is **auto-scaffolded on the first native build** —

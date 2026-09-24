@@ -8,6 +8,10 @@
  *  (`appliedFieldsToDrop`): keep an applied field only if dropping it would change what the instance resolves to,
  *  its template under the enclosing rows (`enclosingRowOverrides`), which the listing and Revert read too.
  *
+ *  #1506 — that base is the enclosing layer WHOLE (`enclosingLayer`): a row's STRUCTURE is not the instance's own
+ *  either (listed, Apply stripped a row's removed trait from every instance of P), and a reference node a template
+ *  row authored has the node's channels as its layer, not nothing.
+ *
  *  Driven through the real loader, the real capture and the real Apply. Each case names the mutation that turns
  *  it red. */
 
@@ -43,6 +47,7 @@ import {
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { sameRotationScale } from '../../packages/modoki/src/runtime/scene/transformSpace';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
+import { TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -426,5 +431,176 @@ describe('rotation and scale widen to ONE value only for a re-spelled pose (#149
     expect(sameRotationScale({ ...I, sx: 10000 }, { ...I, sx: 10000, rx: 0.005 })).toBe(false);
     expect(sameRotationScale({ ...I, sx: 1e6 }, { ...I, sx: 1e6, sy: 1.5 })).toBe(false);
     expect(sameRotationScale({ ...I, sx: 10000 }, { ...I, sx: 10000.000001 })).toBe(true);
+  });
+});
+
+describe('a nested instance\'s base is its enclosing layer WHOLE: structure, and a template reference node (#1506)', () => {
+  const P2 = 'cccccccc-0000-4000-8000-000000001506';
+  const gR2 = 'eeeeeeee-0000-4000-8000-000000001506';
+  const gXA = 'eeeeeeee-0000-4000-8000-000000001507';
+  const gIn = 'eeeeeeee-0000-4000-8000-000000001508';
+  const nestedRoot = () => inInstance(ROOT1, 'R');
+  const keys = (root: number, src = P) => collectInstanceOverrideKeys(root, getCachedPrefabSync(src) as PrefabFile).all;
+  /** P with UIAction on A (localId 2). */
+  const pWithAction = () => { const d = pDoc(); (d.entities[1]!.traits as Record<string, unknown>).UIAction = {}; return d; };
+  /** O whose row N carries `extra` (structure lists, beside or instead of `overrides`). */
+  const oRow = (extra: Record<string, unknown>) => { const d = oDoc(); Object.assign(d.entities[3] as Record<string, unknown>, extra); return d; };
+  const writtenP = () => writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === P).pop();
+  const aTraits = (doc: PrefabFile | undefined) => Object.keys(doc?.entities.find((e) => e.localId === 2)?.traits ?? {});
+
+  it('a ROW\'s removed trait is not listed, and Apply of everything leaves it on P', async () => {
+    // Mutation: list against the bare capture in `collectInstanceOverrideKeys` (`captureInstanceStructure` for
+    // `ownInstanceStructure`) — `-trait.<A>.UIAction` is listed, and applying it strips UIAction from P.
+    install(pWithAction(), oRow({ removedTraits: { 2: ['UIAction'] } }));
+    await load(scene(O, [ROOT1]));
+    expect(readTraitData(inInstance(ROOT1, 'A'), meta('UIAction'))).toBeFalsy(); // precondition: the row removes it
+    expect(keys(nestedRoot())).toEqual([]);
+    setTf(inInstance(ROOT1, 'A'), 'x', 9); // something to apply, so the apply writes P
+    expect((await applyToPrefabSelective(nestedRoot(), new Set(keys(nestedRoot())))).applied).toBe(true);
+    expect(aTraits(writtenP())).toContain('UIAction');
+  });
+
+  it('Apply REFUSES the row\'s removed trait from a caller that still holds its key, and says why', async () => {
+    // Mutation: drop the enclosing-layer refusal in `applyToPrefabSelective` — P is written with A stripped.
+    install(pWithAction(), oRow({ removedTraits: { 2: ['UIAction'] } }));
+    await load(scene(O, [ROOT1]));
+    const key = `-trait.${gA}.UIAction`;
+    const r = await applyToPrefabSelective(nestedRoot(), new Set([key]));
+    expect(r.skipped).toEqual([{ key, reason: expect.stringMatching(/enclosing/) }]);
+    expect(aTraits(writtenP() ?? (getCachedPrefabSync(P) as PrefabFile))).toContain('UIAction');
+  });
+
+  it('a ROW\'s removed member and a ROW\'s added node are not listed', async () => {
+    // Mutation: as the first case — `-removed.<A>` and `+added.<derived guid>` are listed.
+    install(pDoc(), oRow({ removed: [2] }));
+    await load(scene(O, [ROOT1]));
+    expect(keys(nestedRoot())).toEqual([]);
+    install(oRow({ added: [{ parentLocalId: 1, guid: '', key: 'k-extra', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0, guid: '' }, Transform: { x: 1, y: 0, z: 0 } }, children: [] }] }));
+    await load(scene(O, [ROOT1]));
+    inInstance(ROOT1, 'Extra'); // precondition: the row's node spawned
+    expect(keys(nestedRoot())).toEqual([]);
+  });
+
+  it('a ROW\'s added node the scene EDITED is still not listed, and Apply of everything does not copy it into P', async () => {
+    // Close-out review: `subtractChainStructure` keeps an edited chain node, so it was listed and Apply wrote it into P —
+    // every other instance of O then showed Extra twice. Mutation: drop the `edited` filter in `ownInstanceStructure`.
+    install(pDoc(), oRow({ added: [{ parentLocalId: 1, guid: '', key: 'k-extra', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0, guid: '' }, Transform: { x: 1, y: 0, z: 0 } }, children: [] }] }));
+    await load(scene(O, [ROOT1, ROOT2]));
+    setTf(inInstance(ROOT1, 'Extra'), 'x', 7);
+    expect(keys(nestedRoot())).toEqual([]);
+    setTf(inInstance(ROOT1, 'A'), 'x', 9); // something to apply, so the apply writes P
+    expect((await applyToPrefabSelective(nestedRoot(), new Set(keys(nestedRoot())))).applied).toBe(true);
+    expect(writtenP()!.entities.map((e) => e.name)).toEqual(['R', 'A']);
+    expect(x(inInstance(ROOT2, 'Extra'))).toBe(1); // one copy, the row's
+  });
+
+  it('ACCEPT side of the edited-node filter: a node the SCENE added is listed beside an edited row node', async () => {
+    // Scoped close-out review. Mutation: drop EVERY added node once one layer node is edited (`added: []` for the
+    // `edited` filter in `ownInstanceStructure`) — the scene's own node goes unlisted.
+    const MINE = 'eeeeeeee-0000-4000-8000-000000001509';
+    install(pDoc(), oRow({ added: [{ parentLocalId: 1, guid: '', key: 'k-extra', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0, guid: '' }, Transform: { x: 1, y: 0, z: 0 } }, children: [] }] }));
+    await load(scene(O, [ROOT1]));
+    setTf(inInstance(ROOT1, 'Extra'), 'x', 7);
+    const { scene: sc, entry } = await saved();
+    const rowR = (entry.members as Record<string, { added?: unknown[] }>)[`/${gN}`]!;
+    rowR.added = [...(rowR.added ?? []), { parentLocalId: 1, guid: MINE, name: 'Mine', traits: { EntityAttributes: { name: 'Mine', parentId: 0, guid: MINE }, Transform: { x: 2, y: 0, z: 0 } }, children: [] }];
+    await load(sc);
+    expect([x(inInstance(ROOT1, 'Extra')), x(inInstance(ROOT1, 'Mine'))]).toEqual([7, 2]); // precondition: both live
+    expect(keys(nestedRoot())).toEqual([`+added.${MINE}`]);
+  });
+
+  it('Revert REFUSES the row\'s removed trait: the row\'s removal is what the instance shows with nothing of its own', async () => {
+    // Scoped close-out review: a direct caller's revert of the key put UIAction back. Mutation: drop the
+    // `layerAuthoredStructureKeys` loop in `revertOverridesSelective`.
+    install(pWithAction(), oRow({ removedTraits: { 2: ['UIAction'] } }));
+    await load(scene(O, [ROOT1]));
+    await revertOverridesSelective(nestedRoot(), new Set([`-trait.${gA}.UIAction`]));
+    expect(readTraitData(inInstance(ROOT1, 'A'), meta('UIAction'))).toBeFalsy();
+  });
+
+  it('ACCEPT side: what the SCENE changes on the nested instance is still listed, beside the row\'s own', async () => {
+    // Mutation: subtract every captured list whole in `ownInstanceStructure` — the scene's own edits vanish too.
+    const p = pWithAction();
+    (p.entities[0]!.traits as Record<string, unknown>).UIAction = {};
+    install(p, oRow({ removedTraits: { 2: ['UIAction'] } }));
+    await load(scene(O, [ROOT1]));
+    const rTrait = `-trait.${gR}.UIAction`;
+    const scene1 = (await saved()).scene;
+    // The scene removes R's UIAction (the row does not): hand-edit the saved scene's member row, then reload.
+    const entry = (scene1.entities as unknown as Array<Record<string, unknown>>).find((e) => e.prefab === O)!;
+    entry.members = { ...(entry.members as object), [`/${gN}`]: { removedTraits: ['UIAction'] } };
+    await load(scene1);
+    expect(readTraitData(inInstance(ROOT1, 'R'), meta('UIAction'))).toBeFalsy();
+    expect(keys(nestedRoot())).toEqual([rTrait]);
+  });
+
+  describe('a reference node a TEMPLATE row authored', () => {
+    /** P2: R2 → XA, and R2 → Inner (a row expanding P). */
+    const p2Doc = () => ({ id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [
+      row(1, 'R2', 0, gR2), row(2, 'XA', 1, gXA),
+      { localId: 3, name: 'Inner', nodeGuid: gIn, prefab: P, traits: { EntityAttributes: { name: 'Inner', parentId: 1, guid: '' } } },
+    ] });
+    /** O's row N adds a reference node expanding P2 that sets XA.x = 3, and A.x = 4 inside P2's Inner row. */
+    const withRefNode = () => oRow({ added: [{
+      parentLocalId: 1, guid: '', key: 'k-ref', name: 'Ref', prefab: P2, traits: {}, children: [],
+      overrides: { 2: { Transform: { x: 3 } } }, nestedOverrides: { 3: { 2: { Transform: { x: 4 } } } },
+    }] });
+    const xa = () => inInstance(ROOT1, 'XA');
+    const refRoot = () => (readTraitData(xa(), meta('PrefabInstance')) as { rootInstanceId: number }).rootInstanceId;
+    const xaKey = `${gXA}.Transform.x`;
+
+    it('the node\'s own value is not listed; a scene edit over it is, and Revert gives the NODE\'s value', async () => {
+      // No reload half: a save pins the template node into the scene (#1511), so a reload would show 3 under either
+      // answer and could not fail.
+      // Mutation: return null from `templateReferenceNode` — 3 is listed with nothing edited, and Revert gives P2's 0.
+      install(pDoc(), p2Doc(), withRefNode());
+      await load(scene(O, [ROOT1]));
+      expect(x(xa())).toBe(3); // precondition: the node applies
+      expect(keys(refRoot(), P2)).toEqual([]);
+      setTf(xa(), 'x', 5);
+      expect(keys(refRoot(), P2)).toEqual([xaKey]);
+      await revertOverridesSelective(refRoot(), new Set([xaKey]));
+      expect(x(xa())).toBe(3);
+      expect(keys(refRoot(), P2)).toEqual([]);
+    });
+
+    it('a node that LOST its key marker (Play→Stop, an undo respawn) is still found, by the key its guid derives from', async () => {
+      // Mutation: drop the `recoverTemplateKey` fallback in `templateReferenceNode` — the node's 3 is listed again.
+      install(pDoc(), p2Doc(), withRefNode());
+      await load(scene(O, [ROOT1]));
+      const root = getCurrentWorld().entities.find((e) => e.id() === refRoot())!;
+      expect(root.has(TemplateAddedKey)).toBe(true); // precondition: the loader stamped it
+      root.remove(TemplateAddedKey);
+      expect(keys(refRoot(), P2)).toEqual([]);
+    });
+
+    it('a row UNDER the node reads the node\'s nested STRUCTURE as its base', async () => {
+      // Close-out review. Mutation: drop the `seed` of `resolveEffectivePrefabStructure` in `enclosingLayer` — the node's
+      // removal is listed as the inner instance's own.
+      const p = pWithAction();
+      const node = (withRefNode().entities[3] as unknown as { added: Array<Record<string, unknown>> }).added[0]!;
+      node.nestedStructure = { 3: { removedTraits: { 2: ['UIAction'] } } };
+      install(p, p2Doc(), oRow({ added: [node] }));
+      await load(scene(O, [ROOT1]));
+      const pi = (id: number) => readTraitData(id, meta('PrefabInstance')) as { rootInstanceId: number; parentLocalId: number };
+      const inner = getAllEntities().filter((e) => e.name === 'A').map((e) => e.id)
+        .find((id) => pi(pi(id).rootInstanceId).parentLocalId === 3)!;
+      expect(readTraitData(inner, meta('UIAction'))).toBeFalsy(); // precondition: the node removes it
+      expect(keys(pi(inner).rootInstanceId)).toEqual([]);
+    });
+
+    it('a row UNDER the node reads the node\'s nested overrides as its base', async () => {
+      // Mutation: drop the `seed` in `enclosingLayer`'s row branch — the node's A.x = 4 is listed as the inner
+      // instance's own override.
+      install(pDoc(), p2Doc(), withRefNode());
+      await load(scene(O, [ROOT1]));
+      // P's A twice: in row N's expansion, and in P2's Inner row (parentLocalId 3) under the node.
+      const pi = (id: number) => readTraitData(id, meta('PrefabInstance')) as { rootInstanceId: number; parentLocalId: number };
+      const inner = getAllEntities().filter((e) => e.name === 'A').map((e) => e.id)
+        .find((id) => pi(pi(id).rootInstanceId).parentLocalId === 3)!;
+      expect(x(inner)).toBe(4); // precondition: the node forwards into its row
+      const innerRoot = pi(inner).rootInstanceId;
+      expect(keys(innerRoot)).toEqual([]);
+    });
   });
 });

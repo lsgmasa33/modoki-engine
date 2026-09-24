@@ -474,6 +474,7 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       { item: 'engine/plugins/video-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/stripFirebaseAuthFacebook.ts', reason: '#1062: build heal step 6 (reached from /api/build via healNativeProject, under the build claim) — reads capacitor.config.json and reads/writes node_modules/@capacitor-firebase/authentication/Package.swift only; no asset, sidecar or document a panel can hold unsaved' },
       { item: 'engine/plugins/backend/loginShellProbe.ts', reason: '#1449: reads back only the one-line answer file its own login-shell probe wrote into a fresh mkdtemp dir; no asset, sidecar or document a panel can hold unsaved' },
+      { item: 'engine/plugins/projectLockfileHash.ts', reason: '#1502: READS ONLY each project\'s package-lock.json, at vite.config evaluation, to key the dep-optimizer cache; behind no editor route, writes nothing, touches no sidecar' },
       { item: 'engine/plugins/backend/iosUsbForward.ts', reason: '#1065: reads/writes only this clone\'s .modoki/ios-forward.json pid record for the go-ios forward' },
     ];
     assertExemptionLedger({

@@ -313,6 +313,41 @@ The `Component` may import the shared `Sparkline` (`@modoki/engine/runtime/debug
 but a tab registered from the pure runtime path keeps the game's eager bundle clean; only the lazy
 debug chunk pulls the UI.
 
+### The shared Ads tab — `createAdDebug` + `createAdsDebugTab` (#1474, #1501, #1500)
+
+Both shipping games register the same **Ads** tab: show a banner, interstitial or rewarded video NOW,
+switch each kind on or off for the rest of the process, and open the ad SDK's **mediation debugger**
+(for AppLovin MAX, the SDK's own screen of which networks are integrated, initialized and serving).
+Written for Weaveling (#1474), promoted when Court needed it (#1501).
+
+- **The decisions are `runtime/core/adDebug.ts`** (`@modoki/engine/runtime/core/adDebug`).
+  `createAdDebug(lifecycle, { openMediationDebugger })` wraps a game's `createAdLifecycle` instance.
+  The game routes its OWN `setBannerVisible` / `showInterstitial` / `showRewardedAd` /
+  `*Ready` through it, so a withheld kind reads not-ready and its show resolves `false` without
+  reaching the SDK, and a banner mode pins the game's wish. **Show now** (`showNow`) bypasses pacing
+  and the override, but still goes through the lifecycle, so the game's own dismiss, payout and
+  reload handling is what gets exercised. The defaults are "no override", so a build that never
+  registers the tab behaves as if the wrapper were not there.
+- ⚠️ **A factory, one instance per game — not module state.** An override set while one project is
+  open must not carry into the next project the editor opens. Within a game it lasts until relaunch.
+- **The mediation debugger is an adapter HOOK**, because the plugin is a per-game dependency the
+  engine cannot import. `openMediationDebugger()` never throws. It resolves with the reason when
+  nothing opened: *not initialized* (which also covers web and the editor, where the adapter's
+  `enabled()` is false and init never runs), *the plugin could not*, or the error. The initialized
+  check matters because both natives call the SDK singleton unconditionally.
+- **The tab is `runtime/debug/adsDebugTab.tsx`**, on its OWN subpath:
+  `@modoki/engine/runtime/debug/adsTab`. ⚠️ **Not the `runtime/debug` index**: importing that index
+  registers every built-in tab and installs console capture, and Court imports its debug tabs
+  statically. A game builds the component once (`createAdsDebugTab(ads.adsDebug)` in its
+  `runtime/debugTab.tsx`) and registers it inside its `isDebugMenuEnabled()` block, like every other
+  game tab.
+- **A playable carries it too:** the playable build's app-services stub has an inert `ads.adsDebug`,
+  because both games hand it to `createAdsDebugTab` when the module loads. The stub guard cannot
+  follow calls made inside the engine, so those two handoffs are reviewed rows in
+  `playableAppServicesStub.test.ts`.
+- Tests: `engine/packages/modoki/tests/runtime/core/adDebug.test.ts` (the decisions, per-instance
+  isolation, every mediation-debugger reason) plus each game's `ads.test.ts` for the wiring.
+
 ### A custom floating stat widget — `registerStatWidget`
 
 To add your own spawnable floating widget (like FPS/Memory/GPU):

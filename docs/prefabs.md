@@ -370,10 +370,46 @@ It must be an ordinary override, and three surfaces make it one by reading the s
   reverted is subtracted from those;
 - **the save** keeps it, since #1498 compares a nested field with the row by value.
 
-⚠️ **The resolved base covers the enclosing rows' FIELD overrides only (#1506, open).** A row's structure
-(`removed`, `removedTraits`, `added`) is still listed as the nested instance's own override, and Apply
-of such a key writes it into the child template for every instance. A row-authored REFERENCE node's layer
-is not seen at all, so its row-set fields are listed as its own and revert to the template.
+**The resolved base is the enclosing layer WHOLE (#1506).** `enclosingLayer` answers what the layers
+enclosing an instance author on it: field overrides AND structure lists. `enclosingRowOverrides` is its
+field half, with tokens resolved. The layer can be one of two things:
+- **a row frame**: every row from the top down, as above, plus `resolveEffectivePrefabStructure` of the
+  same chain;
+- **a reference node that a prefab TEMPLATE authored** (a keyed `added` node with `prefab`, in a row of the
+  frame it hangs in): the node's own channels (`overrides`, `added`, `removed`, `removedTraits`, `moved`,
+  with its `members` folded as the loader folds them). A chain of rows UNDER such a node starts from the
+  node's `nestedOverrides`/`nestedStructure` (the `seed` argument of both `resolveEffective…` walkers).
+  The node is found by template key (`templateReferenceNode`), using the marker first and the
+  guid-derived recovery if the marker was lost. A node the SCENE added has no enclosing layer: the scene
+  writes it as that instance's own.
+
+Before this, only the rows' fields counted. A row's structure was listed as the nested instance's own,
+and **Apply of the listed keys wrote it into the child template**: an outer row's removed trait was
+stripped from every instance of the child prefab. A row-authored reference node read as a stored root, so
+its node-set fields were listed as its own, and Revert took them to the template's value.
+
+The listing (the agent op and the dialog both) now diffs structure through `ownInstanceStructure`: the
+capture minus the layer's lists, with the rebuild's own subtraction (`subtractChainStructure`, `added`
+nodes matched by template key). Apply and Revert also **refuse** a layer-authored structural key that a
+caller still holds (`layerAuthoredStructureKeys`). Apply reports it in `skipped`, and Revert warns. A
+revert of one put an outer row's removal back, or DELETED its added node, and neither is what the
+instance shows with nothing of its own. An `added` node the layer authored is never the instance's own, **even once the scene has
+edited it**. The subtraction keeps an edited node whole for the rebuild to respawn, but listed, Apply
+copied it into the child prefab, and every other instance of the enclosing prefab then showed it twice.
+Its edits are the scene's, and the save keeps them.
+
+Limits:
+- A reference node inside another added node's `children` reads as having no template node, as before (#1513).
+- The same goes for a reference node in another reference node's `added`, under one of that node's
+  members.
+- So does a template node the scene moved out under a plain entity. Its identity parent is its live parent,
+  since no row expanded it (`identityParents.ts`), so `templateReferenceNode` reads that directly rather
+  than through a world identity walk.
+- **A scene edit to a node the layer added has no key on any surface**, so it can be neither applied nor
+  reverted to the row's version. It is saved and reloads as edited. Before #1506 it was listed, but Revert
+  deleted the node, which was no better.
+- A **save** still pins a template reference node into the scene (#1511). A later change to the node does
+  not reach a saved scene, whatever Revert put back.
 
 The #1490 half: after Apply of a MOVED nested root, the pose is in the reference row's overrides, so the
 save's by-value subtraction drops it from the source. A later edit to that row pose moves the instance.

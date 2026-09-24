@@ -11,7 +11,7 @@ import { useEditorStore } from '../store/editorStore';
 import {
   getPrefabSource,
   preloadNestedPrefabsForSubtree,
-  captureInstanceStructure,
+  ownInstanceStructure,
   revertOverridesSelective,
   staleInstanceRefusal,
   rebuildInstance,
@@ -66,7 +66,8 @@ function stringifyValue(v: unknown): string {
 /** Build the structural diff (added subtrees, removed entities, removed traits)
  *  for the dialog from the live instance + prefab. */
 function buildStructural(rootInstanceId: number, prefab: PrefabFile): Structural {
-  const s = captureInstanceStructure(rootInstanceId, prefab);
+  // Only what THIS instance changed (#1506): a structural row the enclosing prefab authors is not its to apply.
+  const s = ownInstanceStructure(rootInstanceId, prefab);
   const refOf = documentMemberRefs(prefab); // read from the document the capture diffs against (#1468 Phase 4)
   const prefabName = (localId: number) =>
     prefab.entities.find((e) => e.localId === localId)?.name || `localId ${localId}`;
@@ -195,7 +196,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
         if (!cancelled) setLoadState({ kind: 'error', message: `Could not load prefab ${source}` });
         return;
       }
-      // `buildStructural` -> `captureInstanceStructure` -> `captureNestedRef` reads nested
+      // `buildStructural` -> `ownInstanceStructure` -> `captureInstanceStructure` -> `captureNestedRef` reads nested
       // children from the editor cache SYNCHRONOUSLY. The fetch above warms only the OUTER
       // prefab, so on a cold cache a nested instance the author dragged in by hand is dropped
       // from `added[]` and is simply MISSING from this dialog — unpromotable, with only a
