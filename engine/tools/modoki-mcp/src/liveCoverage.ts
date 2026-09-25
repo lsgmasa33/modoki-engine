@@ -94,7 +94,6 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_play_clip: 'plays a clip on a live entity',
   modoki_persistence: "changes the editor's persistence mode",
   modoki_project_settings: "action:'set' rewrites project.config.json in the human's open project (identity, signing, build flags). The action:'get' half IS swept — see minimalArgsMutates",
-  modoki_editor_journal: "clear:true would destroy the human's activity buffer (the read form is safe, but the tool is declared mutating because of it)",
   modoki_drag: "a real drag on the human's viewport",
   modoki_pointer: 'leaves a pointer HELD across calls',
   modoki_hover: 'harmless, but there is nothing to assert without a target',

@@ -337,7 +337,11 @@ describe('a cursor from an earlier journal life is reset, not trusted (#1214 B-3
     const r = await runAgentOp('editor-journal', { merged: true, sinceCap: 1e9, epoch: 'an-earlier-life' }) as { timeline: unknown[]; cursorReset?: string };
     expect(r.timeline.length).toBeGreaterThan(0);
     expect(r.cursorReset).toMatch(/sinceCap=1000000000 was issued under epoch an-earlier-life/);
-    const same = await runAgentOp('editor-journal', { merged: true, sinceCap: 1e9, epoch: (r as unknown as { epoch: string }).epoch }) as { timeline: unknown[]; cursorReset?: string };
+    // With the current epoch and a REAL cursor (the reply's own nextCap), nothing is reset. This used
+    // to pass `sinceCap: 1e9` here — a cursor ahead of the counter, which no read can have issued; the
+    // shared cap resolver (#1561) now resets that too, as `modoki_journal`'s always did.
+    const cur = r as unknown as { epoch: string; nextCap: number };
+    const same = await runAgentOp('editor-journal', { merged: true, sinceCap: cur.nextCap, epoch: cur.epoch }) as { timeline: unknown[]; cursorReset?: string };
     expect(same.timeline).toHaveLength(0);
     expect(same.cursorReset).toBeUndefined();
   });
@@ -356,5 +360,119 @@ describe('a cursor from an earlier journal life is reset, not trusted (#1214 B-3
     const r = await runAgentOp('wait-for-edit', { timeoutMs: 50 }) as Record<string, unknown>;
     expect(r).toMatchObject({ timedOut: true });
     expect(r).not.toHaveProperty('skipped');
+  });
+});
+
+describe('editor-journal: a read never deletes — `clear` is retired, `nextSeq` is the baseline (#1561)', () => {
+  it('REFUSES clear with the replacement, and the buffer is untouched', async () => {
+    editorEmit('!edit', { i: 1 });
+    for (const clear of [true, false, '1']) {
+      await expect(runAgentOp('editor-journal', { clear }), String(clear)).rejects.toMatchObject({
+        code: 'UNKNOWN_PARAM', message: expect.stringMatching(/nextSeq as since/),
+      });
+    }
+    expect(readEditorJournal()).toHaveLength(1);
+  });
+
+  it('every reply carries nextSeq, so a limit:0 read is a baseline for since=', async () => {
+    editorEmit('!edit', { i: 1 });
+    const base = await runAgentOp('editor-journal', { limit: 0 }) as Result & { nextSeq: number; epoch: string };
+    expect(base.editor).toEqual([]);
+    editorEmit('!create', { i: 2 });
+    const after = await runAgentOp('editor-journal', { since: base.nextSeq, epoch: base.epoch }) as Result & { nextSeq: number };
+    expect(after.editor.map((e) => e.type)).toEqual(['!create']);
+    // An un-truncated read advances to the tip, so the NEXT poll starts after this one.
+    expect(after.nextSeq).toBe(after.editor[0].seq);
+  });
+
+  it('a cursored limit:0 read is cut short with nothing returned, so nextSeq stays at the cursor', async () => {
+    const base = await runAgentOp('editor-journal', { limit: 0 }) as Result & { nextSeq: number };
+    editorEmit('!edit', { i: 1 });
+    const r = await runAgentOp('editor-journal', { since: base.nextSeq, limit: 0 }) as Result & { nextSeq: number };
+    expect(r.truncated).toBe(true);
+    expect(r.nextSeq).toBe(base.nextSeq);
+  });
+});
+
+describe('one capture counter, one epoch — a cap cursor crosses between the two journals (#1561 review)', () => {
+  type G = { nextCap: number; epoch: string; events: Array<{ type: string }>; cursorReset?: string };
+  type M = Result & { nextCap?: number; epoch: string; cursorReset?: string };
+
+  it('a modoki_journal baseline windows the merged timeline, with no false reset', async () => {
+    emit('before', {});
+    const base = await runAgentOp('journal-events', { limit: 0 }) as G;
+    editorEmit('!edit', { i: 1 });
+    emit('after', {});
+    const m = await runAgentOp('editor-journal', { merged: true, sinceCap: base.nextCap, epoch: base.epoch }) as M;
+    expect(m.cursorReset).toBeUndefined();
+    expect(m.timeline!.map((e) => e.type)).toEqual(['!edit', 'after']);
+  });
+
+  it('...and the editor journal\'s epoch is accepted by modoki_journal for a cap cursor', async () => {
+    const m = await runAgentOp('editor-journal', { merged: true, limit: 0 }) as M;
+    expect(typeof m.nextCap).toBe('number');   // a merged limit:0 read is a baseline too
+    emit('later', {});
+    const g = await runAgentOp('journal-events', { sinceCap: m.nextCap, epoch: m.epoch }) as G;
+    expect(g.cursorReset).toBeUndefined();
+    expect(g.events.map((e) => e.type)).toEqual(['later']);
+  });
+
+  it('a genuinely different capture life still resets both', async () => {
+    const m = await runAgentOp('editor-journal', { merged: true, sinceCap: 0, epoch: 'zzz-9~abc' }) as M;
+    expect(m.cursorReset).toMatch(/restarted/);
+    const g = await runAgentOp('journal-events', { sinceCap: 0, epoch: 'zzz-9' }) as G;
+    expect(g.cursorReset).toMatch(/restarted/);
+  });
+});
+
+describe('the merged timeline shares the game ring\'s cursor, so it shares its disclosures (#1561 re-review)', () => {
+  type M = Result & { nextCap?: number; nextSeq?: number; epoch: string; cursorReset?: string; gapNote?: string; timelineGapNote?: string; droppedThroughCap?: number; droppedThroughSeq?: number; hint?: string; editor: Array<{ type: string; seq: number }> };
+
+  it('game events evicted after a modoki_journal baseline are disclosed on the merged read too', async () => {
+    const base = await runAgentOp('journal-events', { limit: 0 }) as { nextCap: number; epoch: string };
+    for (let i = 0; i < 10_050; i++) emit('tick', { i });
+    const m = await runAgentOp('editor-journal', { merged: true, sinceCap: base.nextCap, epoch: base.epoch, limit: 2 }) as M;
+    expect(m.timelineGapNote).toMatch(/were lost/);
+    expect(m.droppedThroughCap).toBeGreaterThan(base.nextCap);
+    expect(m.hint).not.toMatch(/with no gap/);
+    // accept side: a cursor after the loss has none
+    const fresh = await runAgentOp('editor-journal', { merged: true, limit: 0 }) as M;
+    emit('x', {});
+    expect((await runAgentOp('editor-journal', { merged: true, sinceCap: fresh.nextCap, epoch: fresh.epoch }) as M).timelineGapNote).toBeUndefined();
+  });
+
+  it('a modoki_journal (capture-only) epoch does not reset a valid editor `since`', async () => {
+    editorEmit('!edit', { i: 1 });
+    const ed = await runAgentOp('editor-journal', { limit: 0 }) as M & { nextSeq: number };
+    const g = await runAgentOp('journal-events', { limit: 0 }) as { nextCap: number; epoch: string };
+    editorEmit('!create', { i: 2 });
+    const m = await runAgentOp('editor-journal', { merged: true, since: ed.nextSeq, sinceCap: g.nextCap, epoch: g.epoch }) as M;
+    expect(m.cursorReset).toBeUndefined();
+    expect(m.editor.map((e) => e.type)).toEqual(['!create']);
+    // ...but a capture-only epoch from a DIFFERENT capture life still resets it.
+    const stale = await runAgentOp('editor-journal', { since: ed.nextSeq, epoch: 'zzz-9' }) as M;
+    expect(stale.cursorReset).toMatch(/restarted/);
+  });
+});
+
+describe('the editor ring\'s own losses are disclosed too (#1561 re-review)', () => {
+  type M = Result & { nextCap?: number; nextSeq: number; epoch: string; gapNote?: string; timelineGapNote?: string; droppedThroughSeq?: number; droppedThroughCap?: number; hint?: string };
+
+  it('editor events shifted out past 2,000 after a `since` or a merged `sinceCap` are said out loud', async () => {
+    const base = await runAgentOp('editor-journal', { merged: true, limit: 0 }) as M;
+    for (let i = 0; i < 2_050; i++) editorEmit('!edit', { i });
+    const bySeq = await runAgentOp('editor-journal', { since: base.nextSeq, epoch: base.epoch, limit: 2 }) as M;
+    expect(bySeq.gapNote).toMatch(/lost from the editor ring/);
+    expect(bySeq.droppedThroughSeq).toBeGreaterThan(base.nextSeq);
+    expect(bySeq.hint).not.toMatch(/with no gap/);
+    const byCap = await runAgentOp('editor-journal', { merged: true, sinceCap: base.nextCap, epoch: base.epoch, limit: 2 }) as M;
+    expect(byCap.timelineGapNote).toMatch(/were lost/);
+    expect(byCap.hint).not.toMatch(/with no gap/);
+    // accept side: cursors taken after the loss carry no note
+    const fresh = await runAgentOp('editor-journal', { merged: true, limit: 0 }) as M;
+    editorEmit('!edit', { i: -1 });
+    const ok = await runAgentOp('editor-journal', { merged: true, since: fresh.nextSeq, sinceCap: fresh.nextCap, epoch: fresh.epoch }) as M;
+    expect(ok.gapNote).toBeUndefined();
+    expect(ok.timelineGapNote).toBeUndefined();
   });
 });

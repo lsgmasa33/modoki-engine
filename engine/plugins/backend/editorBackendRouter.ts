@@ -1554,10 +1554,10 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     return relayJson(ctx, 'console-logs', params);
   }
 
-  // ── GET /api/journal[?type=&clear=1] (M→R) ── the tick-stamped game-event trace
+  // ── GET /api/journal[?type=&level=&sinceCap=&epoch=] (M→R) ── the tick-stamped game-event trace
   // (emit/journalEvents) — verify game LOGIC (match/score/win) without screenshots.
   if (urlPath === '/api/journal' && method === 'GET') {
-    const params: { type?: string; level?: string; clear?: boolean; limit?: number; action?: string } = {};
+    const params: { type?: string; level?: string; clear?: string; limit?: number; action?: string; sinceCap?: number | string; epoch?: string } = {};
     const type = query.get('type');
     if (type) params.type = type;
     // ⚠️ `level` and `action` are forwarded RAW — never narrowed to the values this route knows
@@ -1570,9 +1570,18 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     if (level) params.level = level;
     const action = query.get('action');
     if (action) params.action = action;
-    if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;
+    // `clear` is RETIRED (#1561) and forwarded RAW, whatever its value, so the op refuses it — dropped
+    // here, a caller that meant "start clean" would get a full ring it believed empty.
+    const clear = query.get('clear');
+    if (clear != null) params.clear = clear;
     const jLimit = query.get('limit');
     if (jLimit != null && jLimit !== '' && !Number.isNaN(Number(jLimit))) params.limit = Number(jLimit);
+    // `sinceCap` goes through as a number when it is one and RAW otherwise, so `?sinceCap=abc` is
+    // refused by the op instead of silently becoming an uncursored read of the whole ring.
+    const jSinceCap = query.get('sinceCap');
+    if (jSinceCap != null && jSinceCap !== '') params.sinceCap = Number.isNaN(Number(jSinceCap)) ? jSinceCap : Number(jSinceCap);
+    const jEpoch = query.get('epoch'); // the capture counter's life the cursor belongs to
+    if (jEpoch) params.epoch = jEpoch;
     return relayJson(ctx, 'journal-events', params);
   }
 
@@ -5461,7 +5470,7 @@ async function describeUnresolvedAgainstLiveWorld(
   // Percept: the human-activity stream (!-prefixed). merged also returns the game journal
   // + a single-axis `timeline` windowed by `sinceCap` (a shared `cap` cursor).
   if (urlPath === '/api/editor-journal' && method === 'GET') {
-    const params: { type?: string; source?: string; since?: number; epoch?: string; sinceCap?: number; merged?: boolean; clear?: boolean; limit?: number } = {};
+    const params: { type?: string; source?: string; since?: number; epoch?: string; sinceCap?: number; merged?: boolean; clear?: string; limit?: number } = {};
     const type = query.get('type');
     const source = query.get('source');
     const since = query.get('since');
@@ -5476,7 +5485,9 @@ async function describeUnresolvedAgainstLiveWorld(
     if (ejLimit != null && ejLimit !== '' && !Number.isNaN(Number(ejLimit))) params.limit = Number(ejLimit);
     if (sinceCap != null && sinceCap !== '' && !Number.isNaN(Number(sinceCap))) params.sinceCap = Number(sinceCap);
     if (query.get('merged') === '1' || query.get('merged') === 'true') params.merged = true;
-    if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;
+    // RETIRED (#1561), forwarded raw so the op refuses it — see /api/journal.
+    const ejClear = query.get('clear');
+    if (ejClear != null) params.clear = ejClear;
     return relayJson(ctx, 'editor-journal', params);
   }
 

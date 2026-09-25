@@ -11,7 +11,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { loadSurface, type Surface } from './mcpSurface';
 import { loadDeviceSurface, type DeviceSurface } from './deviceSurface';
 import { runBatch, type BatchOutcome, type BatchRejection } from '../../tools/modoki-mcp/src/batch';
-import { nestedHomesOf } from '../../tools/shared/unknownParam';
+import { nestedHomesOf, RETIRED_PARAMS } from '../../tools/shared/unknownParam';
 import { z as z3 } from '../../tools/modoki-mcp/node_modules/zod';
 import { z as z4 } from '../../tools/game-debug-mcp/node_modules/zod';
 
@@ -205,6 +205,57 @@ describe('nestedHomesOf — the same walk in zod 3 and zod 4', () => {
       expect(nestedHomesOf(shape, 'b').map((h) => h.path)).toEqual(['dflt']);
       expect(nestedHomesOf(shape, 'c').map((h) => h.path)).toEqual(['refined']);
       expect(nestedHomesOf(shape, 'd')).toEqual([]);   // a record's values are not named fields
+    }
+  });
+});
+
+describe('a RETIRED param is refused with what replaced it (#1561)', () => {
+  /** The journals' `clear:true` made a READ delete the ring it read (§7). It was removed with no
+   *  alias, and its replacement is a different MOVE (read a baseline, then pass the cursor), which
+   *  the accepted-params list cannot say on its own. */
+  const EDITOR_JOURNALS = ['modoki_journal', 'modoki_editor_journal'] as const;
+
+  for (const tool of EDITOR_JOURNALS) {
+    it(`editor: ${tool} {clear:true} names the replacement, and nothing is sent`, async () => {
+      const s = (surface = loadSurface());
+      await expect(s.call(tool, { clear: true })).rejects.toThrow(
+        tool === 'modoki_editor_journal' ? /'clear' was removed.*nextSeq as since/s : /'clear' was removed.*nextCap as sinceCap/s,
+      );
+      expect(s.requests.length).toBe(0);
+    });
+  }
+
+  it('device: device_journal {clear:true} names the replacement (zod 4 path)', async () => {
+    const d = (device = await loadDeviceSurface());
+    const v = d.validate('device_journal', { clear: true });
+    expect(v.ok).toBe(false);
+    expect(v.error).toMatch(/'clear' was removed.*nextCap as sinceCap/s);
+  });
+
+  it('batch: a journal step with clear is refused with the same text, nothing runs', async () => {
+    surface = loadSurface();
+    const r = await runBatch({ steps: [{ tool: 'modoki_journal', args: { clear: true } }] }, { sleep: async () => {} });
+    expect((r as BatchRejection).rejected).toMatch(/step 0.*'clear' was removed/s);
+    expect(surface.requests.length).toBe(0);
+  });
+
+  it('accept side: the table is per TOOL — `clear` is still live where it means something else', async () => {
+    const d = (device = await loadDeviceSurface());
+    expect(d.validate('device_watch', { action: 'read', clear: true }).ok).toBe(true);
+  });
+
+  it('every retired entry names a real tool that really refuses the key — no dead rows', async () => {
+    const s = (surface = loadSurface());
+    const d = (device = await loadDeviceSurface());
+    const rows = Object.entries(RETIRED_PARAMS).flatMap(([tool, keys]) => Object.keys(keys).map((key) => ({ tool, key })));
+    expect(rows.length).toBeGreaterThan(0);
+    for (const { tool, key } of rows) {
+      if (tool.startsWith('device_')) {
+        const v = d.validate(tool, { [key]: true });
+        expect(v.error, `${tool}.${key}`).toContain(RETIRED_PARAMS[tool][key]);
+      } else {
+        await expect(s.call(tool, { [key]: true }), `${tool}.${key}`).rejects.toThrow(RETIRED_PARAMS[tool][key]);
+      }
     }
   });
 });

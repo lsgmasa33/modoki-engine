@@ -327,6 +327,10 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_menu: {
     kind: 'control', method: 'POST', route: '/api/menu', mutating: true, persists: 'session', requires: ['editor', 'electron'],
+    // A read half and a fire half on ONE route (§7 offender, 2026-09-25 audit C-11): `{}`/`list:true`
+    // returns the menu tree, `path`/`id` clicks an item. Not split — the bare call is the safe one.
+    // NOT `minimalArgsMutates:false`: that guard proves a read by its GET, and both halves are POST.
+    notes: 'Two jobs on one POST route (§7): {} or list:true reads the menu tree; path/id fires the item.',
   },
   modoki_eval: {
     kind: 'control', method: 'POST', route: '/api/eval', mutating: true, requires: ['editor', 'renderer'],
@@ -351,9 +355,8 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_editor_journal: {
     kind: 'read', method: 'GET', route: '/api/editor-journal',
-    mutating: true, persists: 'session',
     filters: ['type', 'source', 'since', 'limit'],
-    notes: 'IMPURE READ, and a mutating GET: clear:true empties the editor-activity buffer via GET.',
+    notes: 'A pure read since #1561 retired clear:true (§7): a baseline is a limit:0 read, then since=nextSeq.',
   },
   modoki_wait_for: {
     kind: 'read', method: 'POST', route: '/api/wait-for', requires: ['editor', 'renderer'],
@@ -540,7 +543,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_get_console_logs: {
     kind: 'read', method: 'GET', route: '/api/console-logs', filters: ['level', 'limit', 'since'],
-    notes: 'The clean comparison for the two journals: same job, purely a read, no clear mode. ' +
+    notes: 'Same job as the two journals, and like them (since #1561) purely a read. ' +
       'A non-zero `dropped` in the response means entries between the pinned boot prefix and the ' +
       'recent tail were evicted from the ring — the log is NOT contiguous, so do not read a gap in ' +
       'it as "nothing happened there".',
@@ -590,11 +593,11 @@ const DECLS: Record<string, Decl> = {
   modoki_journal: {
     kind: 'read', method: 'GET', route: '/api/journal',
     mutating: true, persists: 'session', requires: ['editor', 'renderer'],
-    filters: ['type', 'level', 'limit'],
+    filters: ['type', 'level', 'limit', 'sinceCap'],
     notes: "IMPURE READ, and a mutating GET: action:'start'/'stop' opens/closes a Tier-2 capture " +
-      'window and clear:true empties the 10,000-event ring — both via GET, which the tool runs through ' +
-      'the failure check at its call site (conventions §4), so a refusal cannot arrive as success. ' +
-      'No `since` filter, unlike modoki_editor_journal.',
+      'window via GET, which the tool runs through the failure check at its call site (conventions §4), ' +
+      'so a refusal cannot arrive as success. clear:true is retired (#1561): nothing a read does deletes ' +
+      'events, and a baseline is a limit:0 read, then sinceCap=nextCap.',
   },
   modoki_resolve_refs: {
     kind: 'read', method: 'GET', route: '/api/resolve-refs', requires: ['project'],

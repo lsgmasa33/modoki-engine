@@ -49,6 +49,11 @@ import {
   hasSceneRenderer,
   journalEvents,
   clearJournal,
+  captureEpoch,
+  currentCaptureSeq,
+  resolveCapCursor,
+  journalDroppedThroughCap,
+  journalGapNote,
   setJournalEnabled,
   JOURNAL_LEVELS,
   isJournalLevel,
@@ -125,11 +130,11 @@ import { classifyWorldAbsence } from './sceneQueryAbsence';
 import { applyLiveMutate } from './liveMutate';
 import { createEntityLive, duplicateEntityLive, deleteEntitiesLive, liveGuidOf } from './liveLifecycle';
 import { resolveEntityAddress, type EntityAddress } from './entityRef';
-import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { ERROR_CODES, codeFromBody, isFailureBody, type ErrorCode } from '../../tools/shared/errorCodes';
 import { INVALIDATABLE_ASSET_TYPES, type InvalidatableAssetType } from '../../tools/shared/invalidateAssets';
 import { describeFilter, emptyFilterHint, histogram } from '../../tools/shared/filterDisclosure';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
-import { tailWithCounts, takeHead, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
+import { tailWithCounts, headWithCounts, takeHead, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
 import { computeHandles, type HandlesDumpParams } from './handlesDump';
 import { resolveDomPointReport, type DomPointSpec } from './domResolve';
@@ -962,8 +967,29 @@ const isJournalCaptureAction = (a: unknown): a is typeof JOURNAL_CAPTURE_ACTIONS
   (JOURNAL_CAPTURE_ACTIONS as readonly unknown[]).includes(a);
 
 registerAgentOp('journal-events', (params) => {
-  const p = (params ?? {}) as { type?: string; level?: unknown; clear?: boolean; limit?: number; action?: unknown };
+  const p = (params ?? {}) as { type?: string; level?: unknown; clear?: unknown; limit?: number; action?: unknown; sinceCap?: unknown; epoch?: unknown };
   setJournalEnabled(true);
+  // ⚠️ `clear` is RETIRED, and refused rather than ignored (#1561). It made a READ destroy the ring
+  // it read — the evidence the next verification read depends on (mcp-tool-conventions.md §7) — and
+  // its one real use was a clean baseline, which `sinceCap` now gives without deleting anything.
+  // Ignoring it would be worse than the old behaviour: a caller that meant "start clean" would read
+  // a full ring believing it empty. The MCP tools' strict schemas refuse it first; this catches the
+  // dev-server curl API and in-process callers.
+  if (p.clear !== undefined) {
+    return {
+      ok: false, code: 'UNKNOWN_PARAM',
+      error: 'clear was removed — a journal read no longer deletes anything. For a clean baseline, '
+        + 'read once (limit:0 is enough) and pass the returned nextCap as sinceCap (with its epoch): '
+        + 'that read returns only the events after it. Nothing was read and nothing was cleared.',
+      options: ['sinceCap', 'epoch'],
+    };
+  }
+  if (p.sinceCap !== undefined && (typeof p.sinceCap !== 'number' || !Number.isFinite(p.sinceCap) || p.sinceCap < 0)) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `sinceCap must be a non-negative number (a nextCap from an earlier read), got ${JSON.stringify(p.sinceCap)} — nothing was read.`,
+    };
+  }
   // ⚠️ These two vocabulary refusals carry a §5 CODE and `options`, and that is load-bearing, not
   // decoration (#1072). This op answers a GET relay: `relayJson` sends a coded envelope as a 400, and
   // the MCP client fails any status ≥400 — but a plain read's 200 body is NOT checked for `ok:false`
@@ -973,7 +999,7 @@ registerAgentOp('journal-events', (params) => {
   if (p.action !== undefined && !isJournalCaptureAction(p.action)) {
     return {
       ok: false, code: 'REFUSED_BY_OP',
-      error: `unknown action ${JSON.stringify(p.action)} — nothing was started, stopped, read or cleared. Omit action to just read.`,
+      error: `unknown action ${JSON.stringify(p.action)} — nothing was started, stopped or read. Omit action to just read.`,
       options: [...JOURNAL_CAPTURE_ACTIONS], captures: verboseCaptureState(),
     };
   }
@@ -995,37 +1021,30 @@ registerAgentOp('journal-events', (params) => {
   if (p.level !== undefined && (typeof p.level !== 'string' || !isJournalLevel(p.level))) {
     return {
       ok: false, code: 'REFUSED_BY_OP',
-      error: `unknown level ${JSON.stringify(p.level)} — nothing was read and nothing was cleared. `
+      error: `unknown level ${JSON.stringify(p.level)} — nothing was read. `
         + 'A level filter means that severity AND ABOVE.',
       options: [...JOURNAL_LEVELS],
     };
   }
   const level = p.level as JournalLevel | undefined;
   const filtered = !!(p.type || level);
-  const all = journalEvents();
-  const events = filtered ? journalEvents({ type: p.type, level }) : all;
-  // `clear` used to wipe the ENTIRE 10,000-event ring even when the read was FILTERED — so
-  // `journal {type:'match', clear:true}` returned 100 match events and silently destroyed every
-  // @contact / score / win event alongside them, including the human's. There is no selective
-  // clear (the journal is a flat ring), so the honest move is to refuse rather than to
-  // over-delete: destroying data the caller did not ask about, and did not see, is not something
-  // to do on a best guess. An UNFILTERED clear is unchanged — that one really does mean "all".
-  if (p.clear && filtered) {
-    return {
-      ok: false,
-      error:
-        `REFUSED: clear:true with a filter (${[p.type && `type=${p.type}`, p.level && `level=${p.level}`].filter(Boolean).join(', ')}) ` +
-        'would clear the WHOLE journal, not just the events returned — the ring has no selective ' +
-        'clear. Nothing was cleared and the events were NOT returned.',
-      hint: 'Read with the filter and no clear, then clear deliberately with a bare clear:true (which means ALL events); or clear first and re-read from a known-empty ring.',
-    };
-  }
-  if (p.clear) clearJournal();
+  // The cursor WINDOWS the ring: with `sinceCap`, "the ring" is every event after it, exactly as if
+  // the caller had cleared at that point — which is the job `clear` used to do, destructively (#1561).
+  // The filters then narrow the returned rows inside that window. A cursor from an earlier life of the
+  // capture counter (a reload) is reset and said so, rather than filtering every new event out.
+  const cursor = resolveCapCursor(p.sinceCap as number | undefined, typeof p.epoch === 'string' ? p.epoch : undefined);
+  const sinceCap = cursor.sinceCap;
+  const cursored = sinceCap != null;
+  const inWindow = (e: { cap: number }) => !cursored || e.cap > sinceCap;
+  const all = journalEvents().filter(inWindow);
+  const events = filtered ? journalEvents({ type: p.type, level }).filter(inWindow) : all;
   // Tail at the op. `journalEvents()` stays whole for JournalTab, which slices its own view.
   // A busy physics Play session fills the 10,000-event ring with ~226-byte `@contact` events
   // — ~582k tokens if returned entire.
-  const r = tailWithCounts(events, (e) => String((e as { type?: string }).type ?? '?'), { limit: p.limit, defaultLimit: JOURNAL_TAIL_DEFAULT });
-  // `byType`/`ringTotal` describe the WHOLE RING, which is what the tool description and
+  // A CURSORED read takes the OLDEST events after the cursor (C7: a tail would drop the block
+  // between the cursor and the tail for good); a bare read keeps the newest tail.
+  const r = (cursored ? headWithCounts : tailWithCounts)(events, (e) => String((e as { type?: string }).type ?? '?'), { limit: p.limit, defaultLimit: JOURNAL_TAIL_DEFAULT });
+  // `byType`/`ringTotal` describe the WHOLE RING (after `sinceCap`, when cursored), which is what the tool description and
   // docs/debug-tools-mcp.md both promise. They used to be computed over the FILTERED slice, so
   // `journal {type:'match'}` answered `byType:{match:N}` — indistinguishable from "this ring
   // contains nothing but match events", which is the opposite of a histogram's purpose (§2: one
@@ -1037,6 +1056,18 @@ registerAgentOp('journal-events', (params) => {
   // opened a watch — otherwise an empty @contact result reads as "no contacts" not "not capturing".
   const captures = verboseCaptureState();
   const idle = captures.types.filter((t) => !captures.active.includes(t));
+  // Where the NEXT read should start. A cursored read cut short continues from its last returned
+  // event (contiguous, no gap); anything else has seen everything up to the counter's tip, so the
+  // next read starts there — which is what makes a bare `limit:0` read a baseline.
+  const lastCap = (r.items[r.items.length - 1] as { cap?: number } | undefined)?.cap;
+  // (A cut-short read that returned nothing — limit:0 — read nothing, so it stays where it was.)
+  const nextCap = cursored && r.truncated ? (lastCap ?? sinceCap) : currentCaptureSeq();
+  // Events after the cursor that the ring has LOST (evicted past its cap, or cleared) — said out loud,
+  // because nothing in the returned caps can show it (#1561 review).
+  const dropped = journalDroppedThroughCap();
+  const gap = cursored && sinceCap! < dropped
+    ? { droppedThroughCap: dropped, gapNote: journalGapNote(sinceCap!, dropped) }
+    : undefined;
   return {
     // §2 (#1217, #1223 D3, #1266): `returnedCount`/`totalCount` everywhere; `ringTotal` below is a
     // THIRD population (the whole ring, filter ignored) and keeps its own name.
@@ -1047,11 +1078,20 @@ registerAgentOp('journal-events', (params) => {
      *  a filtered read still shows what else is in there. */
     ringTotal: ring.total,
     byType: ring.byType,
+    nextCap,
+    epoch: captureEpoch(),
+    ...(gap ?? {}),
+    ...(cursor.cursorReset ? { cursorReset: cursor.cursorReset } : {}),
     ...(filtered ? { filter: { ...(p.type ? { type: p.type } : {}), ...(p.level ? { level: p.level } : {}) } } : {}),
     events: r.items,
     captures,
     ...(idle.length ? { captureHint: `${idle.join(', ')} ${idle.length > 1 ? 'are' : 'is'} watch-gated and NOT capturing — start with action:'start', type:'${idle[0]}' before the moment you want to trace.` } : {}),
-    ...(r.truncated ? { truncated: true, hint: tailHint('events', r.items.length, r.total, ', or narrow with type=') } : {}),
+    ...(r.truncated ? {
+      truncated: true,
+      hint: cursored
+        ? `Showing the OLDEST ${r.items.length} of ${r.total} events after sinceCap=${sinceCap} (oldest first). Read again with sinceCap=${nextCap} to continue ${gap ? 'from here (see gapNote: earlier events were already lost)' : 'with no gap'}; raise limit=N for more per read.`
+        : tailHint('events', r.items.length, r.total, ', or narrow with type='),
+    } : {}),
   };
 });
 // Resolve journal/contact refs (GUIDs and/or numeric ids) to entity display names —
@@ -1206,23 +1246,24 @@ registerAgentOp('game-tools', () => ({
 // Invoke one. The handler's return value is passed through UNTOUCHED: a game tool answers its
 // own question, and wrapping it in an envelope here would bury that answer one level deeper for
 // every caller. A refusal follows the same convention as the rest of the surface (§5) —
-// `ok:false` + a `reason` + the options — so the MCP client's isFailureBody surfaces it as a
-// failed call rather than a cheerful 200.
+// `ok:false` + a `code` + a `reason` + the `options` — so both MCP servers surface it as a failed
+// call carrying THAT code (`codeFromBody`), not a blanket REFUSED_BY_OP (#1561).
 registerAgentOp('game-tool-call', async (params) => {
   const p = (params ?? {}) as { name?: string; args?: Record<string, unknown> };
-  if (!p.name) return { ok: false, reason: 'missing tool name' };
+  const known = () => listAgentTools().map((t: AgentToolDef) => t.name);
+  if (!p.name) return { ok: false, code: 'REFUSED_BY_OP', reason: 'missing tool name', options: known() };
   const tool = getAgentTool(p.name);
   if (!tool) {
     // Name the alternatives. An unknown name is nearly always a stale tool list (the project was
     // switched, or the game unregistered on a hot-reload), and the recovery is to look at what IS
     // registered — so answer that question in the same call instead of making the agent ask it.
-    const known = listAgentTools().map((t: AgentToolDef) => t.name);
+    const options = known();
     return {
-      ok: false,
-      reason: known.length
+      ok: false, code: 'NOT_FOUND',
+      reason: options.length
         ? `unknown game tool '${p.name}'`
         : `unknown game tool '${p.name}' — this project registers no agent tools (or the debug menu is disabled, which suppresses them)`,
-      known,
+      options,
     };
   }
   // String-encoded numbers/booleans are decoded against the declaration first (#1560).
@@ -1231,15 +1272,40 @@ registerAgentOp('game-tool-call', async (params) => {
   // modoki.call, and the device relays all land on this op, and only the editor MCP rebuilds a
   // zod schema of its own. A declaration honoured by one caller in four is not a contract.
   const invalid = validateAgentToolArgs(tool, args);
-  if (invalid) return { ok: false, reason: invalid, params: Object.keys(tool.params ?? {}) };
+  if (invalid) {
+    const declared = Object.keys(tool.params ?? {});
+    // An undeclared key is §1's UNKNOWN_PARAM, as it is for every engine tool; a declared key with a
+    // bad value is the op declining the call. Own-key check, never `in` (the #986 prototype trap).
+    const undeclared = Object.keys(args).some((k) => !Object.prototype.hasOwnProperty.call(tool.params ?? {}, k));
+    return { ok: false, code: undeclared ? 'UNKNOWN_PARAM' : 'REFUSED_BY_OP', reason: invalid, params: declared, options: declared };
+  }
+  let result: unknown;
   try {
-    return await tool.handler(args);
+    result = await tool.handler(args);
   } catch (e) {
     // A throwing handler is the game's bug, but it must not present as a transport failure: a 504
     // reads as "the editor is gone" and sends the agent diagnosing the wrong layer entirely.
-    return { ok: false, reason: `game tool '${p.name}' threw: ${e instanceof Error ? e.message : String(e)}` };
+    return { ok: false, code: 'REFUSED_BY_OP', reason: `game tool '${p.name}' threw: ${e instanceof Error ? e.message : String(e)}` };
   }
+  return checkGameToolCode(p.name, result);
 });
+
+/** A game handler's refusal `code` must be one of §5's closed set. One outside it used to be
+ *  dropped SILENTLY — `codeFromBody` falls back to REFUSED_BY_OP on both servers — so a game that
+ *  wrote `code:'INVALID'` believed its callers could branch on it while every caller saw the
+ *  generic code. Say so in the reply instead, where the game's own author reads it (#1561). */
+function checkGameToolCode(name: string, result: unknown): unknown {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const r = result as { ok?: unknown; code?: unknown; reason?: unknown };
+  // Only a REFUSAL's code is §5's: a successful reply may carry a `code` of its own (a key code, a
+  // locale, a promo code) and is passed through untouched like every other answer. "A refusal" is
+  // whatever the SERVERS will fail the call for — `isFailureBody`, the one predicate, so a body
+  // failing on `error`/`errors` without `ok:false` is covered too (#1561 re-review). Then
+  // `codeFromBody` hands back the body's code only when it is in the set — the one membership test.
+  if (r.code === undefined || isFailureBody(r) === null || codeFromBody(r, 'REFUSED_BY_OP') === r.code) return result;
+  const note = `game tool '${name}' returned code ${JSON.stringify(r.code)}, which is not a §5 error code (${ERROR_CODES.join(', ')}) — sent as REFUSED_BY_OP.`;
+  return { ...r, code: 'REFUSED_BY_OP', reason: typeof r.reason === 'string' ? `${r.reason} (${note})` : note };
+}
 // Trigger a game intent directly (no pixel-hunting a button). Dispatch is inert
 // unless the sim is playing, and throws in dev on an unknown name — so guard both.
 registerAgentOp('dispatch-action', (params) => {

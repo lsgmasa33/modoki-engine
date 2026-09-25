@@ -213,14 +213,11 @@ describe('tool contracts', () => {
     }
   });
 
-  /** IMPURE READS — tools whose primary job is answering a question, but which carry an optional
-   *  DESTRUCTIVE mode: `modoki_journal` (action:'start'/'stop' + clear:true empties a 10,000-event
-   *  ring), `modoki_editor_journal` (clear:true empties the activity buffer). Both reach it by GET.
-   *
-   *  `read` is the promise Percept makes, and `modoki_get_console_logs` keeps it for the same job —
-   *  so this is a real inconsistency, not a necessity. Phase 3 decides whether a read may destroy
-   *  (probably: split the clear into its own call); the list may only SHRINK. */
-  const IMPURE_READS = ['modoki_journal', 'modoki_editor_journal'];
+  /** IMPURE READS — tools whose primary job is answering a question, but which carry a mutating
+   *  mode. `modoki_journal` is the one left: action:'start'/'stop' opens/closes a Tier-2 capture
+   *  window, by GET. The DESTRUCTIVE modes are gone — #1561 retired both journals' clear:true, the
+   *  one that made verification itself destroy evidence. The list may only SHRINK. */
+  const IMPURE_READS = ['modoki_journal'];
 
   it('a `read` tool never mutates', () => {
     // A read that mutates is the worst thing on an agent surface — it makes VERIFICATION itself
@@ -232,7 +229,7 @@ describe('tool contracts', () => {
     assertExemptionLedger({
       label: 'IMPURE_READS in mcpToolContracts',
       population: offenders.map((n) => ({ item: n, site: n })),
-      exempt: IMPURE_READS.map((item) => ({ item, reason: 'a read with an optional destructive clear — Phase 3 decides; the list may only SHRINK' })),
+      exempt: IMPURE_READS.map((item) => ({ item, reason: 'capture-window control (action:start/stop) on a read; clear was retired in #1561 — the list may only SHRINK' })),
       scanned: Object.keys(CONTRACTS).length,
       floor: 50,
       fix: 'new impure read — a `read` tool must not mutate. A row blessing more than exists was fixed: delete it from IMPURE_READS.',
@@ -357,16 +354,16 @@ describe('tool contracts', () => {
    *     apply to them: they never touch `getJson`. `consumeBuildStream` fails on a non-2xx open, an
    *     `event:status FAILED`, a mid-run break, and a close with NO final status (outcome unknown is
    *     a failure, not a success).
-   *   - `journal` / `editor_journal` keep their mutating GET (the `curl` ergonomics are the point)
-   *     but now pass `checkFailure` at the call site, so a `200 {ok:false}` refusal IS a failed tool
-   *     call. Asserted behaviourally below, not just declared.
+   *   - `journal` keeps its mutating GET (the `curl` ergonomics are the point) but passes
+   *     `checkFailure` at the call site, so a `200 {ok:false}` refusal IS a failed tool call.
+   *     Asserted behaviourally below, not just declared. `editor_journal` left the list when #1561
+   *     retired its `clear` — it is a pure read now.
    *  The list may only SHRINK. */
   const MUTATING_GETS = [
     'modoki_build', 'modoki_add_native_target', 'modoki_ota_publish',
     // Found while writing this table, and NOT in the original route inventory — these mutate
-    // through QUERY PARAMS on a GET (`?clear=1`, `?action=start`), so a scan of route methods
-    // alone missed them.
-    'modoki_journal', 'modoki_editor_journal',
+    // through QUERY PARAMS on a GET (`?action=start`), so a scan of route methods alone missed it.
+    'modoki_journal',
     // Added 2026-08-21. It was ALWAYS a mutating GET — `action:'show'|'hide'` flips the overlay
     // and `/api/hit-regions` has one arm, `method === 'GET'` — but it declared `varies:'both'`,
     // and the filter below excludes `varies` tools, so it was in none of the three guards here
@@ -397,7 +394,6 @@ describe('tool contracts', () => {
    *  argument turns this read into a write" is exactly the fact that must not be inferred. */
   const MUTATING_GET_ARGS: Record<string, Record<string, unknown>> = {
     modoki_journal: { action: 'start', type: '@contact' },
-    modoki_editor_journal: { clear: true },
     modoki_hit_regions: { action: 'show' },
   };
 

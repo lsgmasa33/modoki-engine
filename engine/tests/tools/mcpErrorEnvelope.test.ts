@@ -851,12 +851,13 @@ describe('Phase 6 — a MUTATING GET\'s ok:false is a failure, a plain read\'s i
     expect(e.why).toMatch(/action needs type=/);
   });
 
-  it('editor_journal {clear:true} likewise', async () => {
+  it('editor_journal is a PURE read since #1561 retired clear — its ok:false body is an answer, not a failure', async () => {
+    // The mirror of the journal case above: with no mutating form left, `ok` in this tool's body is
+    // not a success flag, so it must not be failure-checked (getJson's docblock).
     const s = (surface = loadSurface((req) =>
-      req.path.startsWith('/api/editor-journal') ? { body: { ok: false, error: 'REFUSED: clear with a filter' } } : undefined));
-    const e = envelope(s, await s.call('modoki_editor_journal', { clear: true }));
-    expect(e.code).toBe('REFUSED_BY_OP');
-    expect(e.why).toMatch(/REFUSED/);
+      req.path.startsWith('/api/editor-journal') ? { body: { ok: false, editor: [], editorTotal: 0 } } : undefined));
+    const r = await s.call('modoki_editor_journal', {});
+    expect(r.isError, JSON.stringify(r)).toBeFalsy();
   });
 
   it('a PLAIN journal read is NOT failed by an ok:false body — there `ok` can be the answer', async () => {

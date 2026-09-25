@@ -25,9 +25,10 @@ function effect(name: string): string {
   if (!c.mutating) return 'read-only';
   const where = c.persists === 'none' ? 'no persistence' : c.persists;
   const undo = c.undoable ? ' · undoable' : '';
-  // A `read` that mutates is the surface's sharpest edge — it makes VERIFICATION destructive — so it
-  // must be impossible to skim past in the row that otherwise sits under "never changes anything".
-  const impure = c.kind === 'read' ? ' · **IMPURE READ** (an optional arg destroys state)' : '';
+  // A `read` that mutates is the surface's sharpest edge — it can make VERIFICATION change what it
+  // verifies — so it must be impossible to skim past in the row that otherwise sits under "never
+  // changes anything". (No read DESTROYS state any more: #1561 retired the journals' clear.)
+  const impure = c.kind === 'read' ? ' · **IMPURE READ** (an optional arg changes state)' : '';
   return `${where}${undo}${impure}`;
 }
 

@@ -22,6 +22,7 @@ import { simStepDefaultTimeout, SIM_STEP_MAX_FRAMES } from '../../shared/simStep
 import { DEVICE_KEY_MODIFIERS, KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../shared/inputVocabulary.js';
 import { ALLOW_OCCLUDED_BASE, ALLOW_OCCLUDED_NESTED, ENTITY_AIM_BASE, SURFACE_AIM_BASE, sameAs } from '../../shared/aimVocabulary.js';
 import { nestedUnknownKeyMessage } from '../../shared/unknownParam.js';
+import { EPOCH_BASE } from '../../shared/sinceCursor.js';
 import { aimAddresses, ambiguousAimMessage } from '../../shared/aimAddresses.js';
 import { CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, vocabularyProse, type CreateEntityKind } from '../../shared/createEntityVocabulary.js';
 import { ignoredHandleFilter, parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../shared/handlesReply.js';
@@ -1113,6 +1114,8 @@ export function registerTools(server: McpServer) {
       'screenshot-free way to verify game LOGIC (console output: device_console_logs). Returns the last 100 events + byType counts over the ' +
       'whole ring, plus `captures` (Tier-2 diagnostic state). Narrow with type= and/or level=, raise ' +
       'limit=N; pair with device_dispatch_action to drive the game.\n' +
+      'BASELINE: read once (limit:0 is enough), then pass the returned `nextCap` (+ `epoch`) as ' +
+      '`sinceCap` — that read covers only the events after it. Nothing is ever deleted.\n' +
       'LEVEL: every event carries a triage severity, `info` (default) / `warn` / `error`. ' +
       'level:"warn" returns warn AND error, skipping normal-gameplay noise.\n' +
       'TIERS: lean events (semantic + @collision/@sensor/@zone transitions) are always recorded. ' +
@@ -1124,7 +1127,8 @@ export function registerTools(server: McpServer) {
       level: z.enum(['info', 'warn', 'error']).optional().describe('Read: only events at this severity OR ABOVE (e.g. "warn" returns warn + error).'),
       action: z.enum(['start', 'stop']).optional().describe('Open ("start") or close ("stop") a Tier-2 capture window for type=. Omit to just read.'),
       limit: z.number().optional().describe('Return the last N events (default 100).'),
-      clear: z.boolean().optional().describe('Clear the journal after reading. REFUSED when combined with type=/level= — the ring has no selective clear, so clearing a FILTERED read would destroy every other event too.'),
+      sinceCap: z.number().int().min(0).optional().describe('Forward cursor: only events after this — the `nextCap` of an earlier read. A cursored read returns the OLDEST events after it (contiguous, oldest-first).'),
+      epoch: z.string().optional().describe(`${EPOCH_BASE}.`),
     },
     async (args) => perceptCall('device_journal', 'journal-events', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
       'read the device event journal'),

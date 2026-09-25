@@ -77,7 +77,9 @@ export interface AgentToolDef {
   requiresPlaying?: boolean;
   /** Runs in the renderer with the game's own imports in scope. Return a JSON-serializable
    *  answer. Convention (`docs/mcp-tool-conventions.md` §5): on a refusal return
-   *  `{ ok:false, reason, ...options }` — naming what would have worked — rather than throwing. */
+   *  `{ ok:false, code?, reason, options? }` — naming what would have worked — rather than throwing.
+   *  `code` is one of §5's closed set (NOT_FOUND, AMBIGUOUS, …); omit it for a state refusal. One
+   *  outside the set is sent as REFUSED_BY_OP with a note (`docs/agent-tools.md` § Handler conventions). */
   handler: (args: Record<string, unknown>) => unknown | Promise<unknown>;
 }
 

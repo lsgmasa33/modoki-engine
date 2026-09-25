@@ -16,10 +16,10 @@
  *  shows one extra line of text.
  *
  *  The tail is the LAST line on purpose: the backend's synthetic-input banner is a PREFIX, so the
- *  tail survives it. Dependency-free, like `mcpResult.ts`, so the page, the backend and the MCP all
+ *  tail survives it. Dependency-free, like `errorCodes.ts`, so the page, the backend and the MCP all
  *  import this one copy (§9). */
 
-import { ERROR_CODES, type ErrorCode } from './mcpResult.js';
+import { ERROR_CODES, type ErrorCode } from './errorCodes.js';
 
 /** The structured half of a refusal. `error` is the whole `Error: …` message. */
 export interface DeviceRefusal {

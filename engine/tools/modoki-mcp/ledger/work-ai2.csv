@@ -188,3 +188,5 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-25,work-ai2,modoki_watch,10,4220,166332,c0eb13947
 2026-09-25,work-ai2,modoki_write_asset,22,2579,166332,c0eb13947
 2026-09-25,work-ai2,modoki_scroll,43,3154,166600,645912adf
+2026-09-25,work-ai2,modoki_editor_journal,45,4976,167770,15d97e6d7
+2026-09-25,work-ai2,modoki_journal,233,2307,167770,15d97e6d7

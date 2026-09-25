@@ -23,7 +23,7 @@ const OPEN_CODED = /ERROR_CODES[\s\S]{0,40}\.includes\s*\(/;
 /** The two files allowed to run it, each because it OWNS a decode rather than consuming one.
  *  Anything else asks `codeFromBody` / `codeFromStatus`. */
 const OWNERS = [
-  'engine/tools/shared/mcpResult.ts',    // codeFromBody / codeFromStatus themselves
+  'engine/tools/shared/errorCodes.ts',   // codeFromBody itself (split from mcpResult.ts, #1561)
   'engine/tools/shared/deviceRefusal.ts', // decodes the device wire's trailing line, not a body
 ];
 

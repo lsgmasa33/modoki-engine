@@ -107,8 +107,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'clip/track ops) are label-only (no detail). Each event has a ' +
       '`source`: "human" (the person) or "agent" (YOUR own edits via these MCP ops) — filter to see ' +
       'only what the human did, so you don\'t attribute your own edits to them. Captured at COMMIT ' +
-      'points (not per drag frame); wall-clock + monotonic `seq` stamped — pass the last `seq` as ' +
-      '`since` to poll only new EDITOR events. `merged:true` also returns the game journal under ' +
+      'points (not per drag frame); wall-clock + monotonic `seq` stamped — pass the returned `nextSeq` as ' +
+      '`since` to poll only new EDITOR events (a `limit:0` read is a baseline; nothing is ever deleted). `merged:true` also returns the game journal under ' +
       '`game` (raw, tick-stamped) AND a `timeline`: a SINGLE-AXIS interleave of editor + game events ' +
       'ordered by a shared `cap` capture counter, each tagged `stream:"editor"|"game"` — the one ' +
       'ordered story ("pressed Play → set timeScale 0.3 → @match on tick 84 → paused"). `type`/`source`/' +
@@ -122,14 +122,13 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     {
       type: z.string().optional().describe('Only editor events of this type, e.g. !edit | !select | !create | !transform | !save — every type starts with `!`; an unknown one is refused, listing them all. (Filters the `editor` array only.)'),
       source: z.enum(['human', 'agent']).optional().describe('Only events by the human at the keyboard, or by the agent (your MCP ops). Omit for both. (Filters the `editor` array only.)'),
-      since: z.number().optional().describe(`${SINCE_CURSOR_BASE}, for the \`editor\` array: returns the OLDEST events with seq greater than this (contiguous, oldest-first) + a \`nextSeq\` when truncated.` + ' Advance with `nextSeq` each poll — a cursored poll NEVER skips events (unlike the bare newest-last call). Does NOT window the merged timeline (use sinceCap).'),
-      epoch: z.string().optional().describe(`${EPOCH_BASE}.`),
+      since: z.number().optional().describe(`${SINCE_CURSOR_BASE}, for the \`editor\` array: returns the OLDEST events with seq greater than this (contiguous, oldest-first).` + ' Every reply carries `nextSeq`; advance with it each poll — a cursored poll NEVER skips events (unlike the bare newest-last call). Does NOT window the merged timeline (use sinceCap).'),
+      epoch: z.string().optional().describe(`${EPOCH_BASE}. It covers since and sinceCap alike.`),
       sinceCap: z.number().optional().describe('Forward cursor for the merged `timeline`: returns the OLDEST interleaved events with cap greater than this (contiguous, oldest-first) + a `nextCap` when truncated. Advance with `nextCap` each poll to fetch newer events with no gap.'),
       merged: z.boolean().optional().describe('Also include the game journal under `game` (raw) AND the interleaved `timeline`. Both are tailed too — cursor with sinceCap for a precise incremental slice.'),
       limit: z.number().optional().describe('Return the last N events per stream (default 100). An explicit limit always wins.'),
-      clear: z.boolean().optional().describe('Clear the editor-activity buffer after reading.'),
     },
-    async ({ type, source, since, epoch, sinceCap, merged, limit, clear }) => {
+    async ({ type, source, since, epoch, sinceCap, merged, limit }) => {
       const q = new URLSearchParams();
       if (type) q.set('type', type);
       if (source) q.set('source', source);
@@ -138,11 +137,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       if (sinceCap != null) q.set('sinceCap', String(sinceCap));
       if (merged) q.set('merged', '1');
       if (limit != null) q.set('limit', String(limit));
-      if (clear) q.set('clear', '1');
       const qs = q.toString();
-      // `clear=1` makes this a "do this", so its `ok` is a success flag and gets checked — a plain
-      // read's `ok` is not (see getJson's docblock, and the journal twin). (Phase 6)
-      return getJson(`/api/editor-journal${qs ? `?${qs}` : ''}`, undefined, !!clear);
+      // A pure read since #1561 retired `clear`: its `ok` is not a success flag (getJson's docblock).
+      return getJson(`/api/editor-journal${qs ? `?${qs}` : ''}`);
     },
   );
 

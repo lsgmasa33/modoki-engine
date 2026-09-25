@@ -34,6 +34,7 @@
     "./testing/authoredTextBudget": "./tests/helpers/authoredTextBudget.ts",
     "./testing/fontMetrics": "./tests/helpers/fontMetrics.ts",
     "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts",
+    "./testing/replyVocabulary": "./tests/helpers/replyVocabulary.ts",
     "./testing/exemptionLedger": "./tests/helpers/exemptionLedger.ts",
     "./testing/sourceAst": "./tests/helpers/sourceAst.ts",
     "./testing/importClosure": "./tests/helpers/importClosure.ts",

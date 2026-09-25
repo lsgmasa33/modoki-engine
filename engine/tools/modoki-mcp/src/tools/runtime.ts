@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { foldEntityRef, guidOnlyEntityAlias, precisionParam } from '../shapes.js';
+import { EPOCH_BASE } from '../../../shared/sinceCursor.js';
 import { PROFILER_ACTIONS, PROFILER_READ_ACTIONS } from '../../../shared/profilerActions.js';
 
 export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
@@ -28,6 +29,9 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'LAST 100 events by default plus `byType` counts over the whole 10,000-event ring and ' +
       '`captures` (Tier-2 diagnostic state). Narrow with type= and/or level=, raise limit=N, pair ' +
       'with modoki_dispatch_action to drive the game.\n' +
+      'BASELINE: read once (limit:0 is enough), then pass the returned `nextCap` (+ `epoch`) as ' +
+      '`sinceCap` — that read covers only the events after it, and `ringTotal`/`byType` count only ' +
+      'those. Nothing is ever deleted.\n' +
       'LEVEL: every event carries a triage severity, `info` (default) / `warn` / `error` — set via ' +
       'the `gameJournal.ts` helpers (`journalWarn`/`journalError`) or emit()\'s 4th arg. ' +
       'level:"warn" returns warn AND error, skipping the normal-gameplay noise — the fastest way to ' +
@@ -42,21 +46,23 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       level: z.enum(['info', 'warn', 'error']).optional().describe('Read: only events at this severity OR ABOVE (e.g. "warn" returns warn + error).'),
       action: z.enum(['start', 'stop']).optional().describe('Open ("start") or close ("stop") a Tier-2 capture window for type=. Omit to just read.'),
       limit: z.number().optional().describe('Return the last N events (default 100). An explicit limit always wins.'),
-      clear: z.boolean().optional().describe('Clear the journal after reading. REFUSED when combined with type=/level= — the ring has no selective clear, so clearing a FILTERED read would destroy every other event too. Read with the filter, then clear deliberately with a bare clear:true (which means ALL).'),
+      sinceCap: z.number().int().min(0).optional().describe('Forward cursor: only events after this — the `nextCap` of an earlier read. A cursored read returns the OLDEST events after it (contiguous, oldest-first).'),
+      epoch: z.string().optional().describe(`${EPOCH_BASE}.`),
     },
-    async ({ type, level, action, limit, clear }) => {
+    async ({ type, level, action, limit, sinceCap, epoch }) => {
       const q = new URLSearchParams();
       if (type) q.set('type', type);
       if (level) q.set('level', level);
       if (action) q.set('action', action);
       if (limit != null) q.set('limit', String(limit));
-      if (clear) q.set('clear', '1');
+      if (sinceCap != null) q.set('sinceCap', String(sinceCap));
+      if (epoch) q.set('epoch', epoch);
       const qs = q.toString();
-      // A MUTATING read (`action=start|stop`, `clear=1`) is a "do this", so its `ok` is a success
+      // A MUTATING read (`action=start|stop`) is a "do this", so its `ok` is a success
       // flag and must be checked — a plain read's `ok` is not (see getJson's docblock). Measured
       // live: `{action:'start'}` with no `type` answers 200 {ok:false, reason:…} and was reported
       // as a successful call. (Phase 6)
-      return getJson(`/api/journal${qs ? `?${qs}` : ''}`, undefined, !!action || !!clear);
+      return getJson(`/api/journal${qs ? `?${qs}` : ''}`, undefined, !!action);
     },
   );
   tool(

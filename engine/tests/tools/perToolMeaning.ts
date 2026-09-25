@@ -3,7 +3,7 @@
  *  (`mcpRegistry.test.ts`, which also keeps the list honest through its exemption ledger) and the
  *  device surface's (`deviceToolSurface.test.ts`) — see mcpRegistry.test.ts for each entry's history. */
 export const PER_TOOL_MEANING: readonly string[] = [
-  'path', 'name', 'kind', 'id', 'ids', 'key', 'limit', 'all', 'from', 'to', 'clear',
+  'path', 'name', 'kind', 'id', 'ids', 'key', 'limit', 'all', 'from', 'to',
   'guid', 'guids', 'quality', 'selector', 'button', 'steps', 'entity', 'parentId',
   'parentGuid', 'action', 'type',
   // #1152/#1153: an AIM on the input tools ("press the element labelled X") and a FILTER on

@@ -46,6 +46,18 @@ export function tailWithCounts<T>(
   return { items: tail, total: items.length, truncated, byType };
 }
 
+/** The FORWARD-cursor twin of `tailWithCounts`: the OLDEST `limit` items (see `takeHead` for why a
+ *  cursored poll must not take the tail), with the same histogram over the full set. */
+export function headWithCounts<T>(
+  items: readonly T[],
+  typeOf: (item: T) => string,
+  opts: { limit?: number; defaultLimit: number },
+): TailResult<T> {
+  const counted = tailWithCounts(items, typeOf, { limit: 0, defaultLimit: 0 });
+  const { items: head, truncated } = takeHead(items, opts.limit, opts.defaultLimit);
+  return { items: head, total: counted.total, truncated, byType: counted.byType };
+}
+
 /** Take the last N — the ONLY place the tail arithmetic lives.
  *
  *  Two traps, both of which have shipped here at least once:

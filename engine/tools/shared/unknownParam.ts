@@ -124,6 +124,18 @@ function homeSentence(key: string, homes: NestedHome[], quoted: Set<string>): st
   return `'${key}' is not a top-level parameter; ${who} a field of that name${brief}.`;
 }
 
+/** Params a tool USED to accept, and what replaced them — so a caller working from an old habit or
+ *  an old transcript is told what to do instead, not just that the key is unknown. Only for a
+ *  removal whose replacement is a different MOVE; a plain rename needs no entry, since the accepted
+ *  list already names the new key. Keyed by tool, because the same word is live elsewhere
+ *  (`watch`'s `clear` still means something). */
+export const RETIRED_PARAMS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  // #1561: a journal READ used to delete the ring it read (§7). Its one real use was a baseline.
+  modoki_journal: { clear: "'clear' was removed — a journal read no longer deletes anything. For a clean baseline, read once (limit:0 is enough) and pass the returned nextCap as sinceCap, with its epoch." },
+  device_journal: { clear: "'clear' was removed — a journal read no longer deletes anything. For a clean baseline, read once (limit:0 is enough) and pass the returned nextCap as sinceCap, with its epoch." },
+  modoki_editor_journal: { clear: "'clear' was removed — a journal read no longer deletes anything. For a clean baseline, read once (limit:0 is enough) and pass the returned nextSeq as since, with its epoch." },
+};
+
 /** The refusal for `keys` (the unknown ones) on `tool`, whose top-level params are `shape`. */
 export function unknownParamMessage(tool: string, shape: Record<string, unknown>, keys: readonly string[]): string {
   const params = Object.keys(shape);
@@ -131,7 +143,9 @@ export function unknownParamMessage(tool: string, shape: Record<string, unknown>
   if (!keys.length) return `${tool} received an unrecognized parameter. ${accepts}`;
   const named = keys.map((k) => `'${k}'`).join(', ');
   const quoted = new Set<string>();
+  const retired = RETIRED_PARAMS[tool];
   const homes = keys.flatMap((k) => {
+    if (retired && Object.prototype.hasOwnProperty.call(retired, k)) return [retired[k]];
     const found = nestedHomesOf(shape, k);
     return found.length ? [homeSentence(k, found, quoted)] : [];
   });

@@ -530,3 +530,23 @@ describe('sync', () => {
     expect((await h.sync.refresh()).reachable).toBe(false);
   });
 });
+
+describe('a game tool\'s §5 code reaches the envelope (#1561)', () => {
+  /** The route sends a coded refusal as a 400 (`relayJson`), an uncoded one as a 200 — both must
+   *  leave the MCP server carrying the code the GAME chose, not the generic REFUSED_BY_OP. The device
+   *  twin is `deviceRefusalCodeRelay.test.ts`'s `device_game_tool_call` row. */
+  for (const status of [400, 200]) {
+    it(`a ${status} {ok:false, code:'NOT_FOUND'} arrives as NOT_FOUND with its options`, async () => {
+      const h = harness(() => ({ body: { version: 1, tools: [decl()] } }));
+      await h.sync.refresh();
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(
+        JSON.stringify({ ok: false, code: 'NOT_FOUND', reason: "no level with id 'x'", options: ['lvl-a'] }),
+        { status, headers: { 'Content-Type': 'application/json' } })));
+      const r = await getTool('court_load_level')!.handler({ levelId: 'x' }) as { isError?: boolean; content: { text: string }[] };
+      expect(r.isError).toBe(true);
+      const env = JSON.parse(r.content[0].text) as { error: { code: string; options?: string[] } };
+      expect(env.error.code).toBe('NOT_FOUND');
+      expect(env.error.options).toEqual(['lvl-a']);
+    });
+  }
+});

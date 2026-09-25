@@ -60,7 +60,7 @@ import {
   upsertKey, findTrack, encodeValue,
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
   getCreatableAssets, createRegisteredAsset,
-  readEditorJournal, clearEditorJournal, editorJournalEpoch, editorJournalEpochChanged, resolveEditorJournalCursor, withEditorActor, openActorLease, closeActorLease,
+  readEditorJournal, editorJournalSeq, editorJournalDroppedThrough, editorJournalEpoch, resolveEditorJournalCursor, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal, EDITOR_JOURNAL_SOURCES, isEditorJournalSource, EDITOR_JOURNAL_TYPES, isEditorJournalType,
   readMetaPreferringPark, peekPendingMeta, discardPendingMeta, getPendingMetaPaths,
   getResolvedRender3d,
@@ -75,7 +75,7 @@ import {
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
   getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, deleteEntity, findUnrenderable2D,
-  getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
+  getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, currentCaptureSeq, resolveCapCursor, journalDroppedThroughCap, journalGapNote, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid,
@@ -1263,16 +1263,25 @@ export function registerEditorAgentOps(): void {
   // the shared `cap` capture counter — so Claude reads one ordered story ("pressed Play
   // → set timeScale 0.3 → @match on tick 84 → paused").
   registerAgentOp('editor-journal', (params) => {
-    const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; epoch?: string; sinceCap?: number; clear?: boolean; merged?: boolean; limit?: number };
+    const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; epoch?: string; sinceCap?: number; clear?: unknown; merged?: boolean; limit?: number };
+    // `clear` is RETIRED (#1561): it made this read delete the buffer it read (§7). Refused, never
+    // ignored — a caller that meant "start clean" would otherwise read a full buffer believing it empty.
+    if (p.clear !== undefined) {
+      throw new OpRefusal('UNKNOWN_PARAM',
+        'editor-journal: clear was removed — a journal read no longer deletes anything. For a clean baseline, '
+        + 'read once (limit:0 is enough) and pass the returned nextSeq as since (with its epoch): that read '
+        + 'returns only the events after it. Nothing was read and nothing was cleared.',
+        { options: ['since', 'epoch'] });
+    }
     // An unknown `source` matched nothing, so the read came back EMPTY under a filtered framing —
     // "the agent did nothing" for a typo. Refused with the options instead (#1072); the route used to
     // drop the value before it got here, and forwards it raw now so this can fire.
     if (p.source !== undefined && !isEditorJournalSource(p.source)) {
       throw new OpRefusal('REFUSED_BY_OP',
-        `editor-journal: unknown source ${JSON.stringify(p.source)} — nothing was read and nothing was cleared. Valid: ${EDITOR_JOURNAL_SOURCES.join(', ')}.`,
+        `editor-journal: unknown source ${JSON.stringify(p.source)} — nothing was read. Valid: ${EDITOR_JOURNAL_SOURCES.join(', ')}.`,
         { options: [...EDITOR_JOURNAL_SOURCES] });
     }
-    refuseUnknownJournalType('editor-journal', p.type, 'nothing was read and nothing was cleared');
+    refuseUnknownJournalType('editor-journal', p.type, 'nothing was read');
     // `editor` is the editor-only view: filtered by type/source and cursored by the
     // editor-local `since` (a `seq`). `timeline` is the single-axis merged view.
     //
@@ -1301,19 +1310,28 @@ export function registerEditorAgentOps(): void {
       editor: unknown[]; editorTotal: number; ringTotal: number; byType: Record<string, number>; epoch: string; cursorReset?: string;
       truncated?: boolean; hint?: string; nextSeq?: number;
       game?: unknown[]; gameTotal?: number; gameByType?: Record<string, number>;
-      timeline?: unknown[]; timelineTotal?: number; nextCap?: number;
+      timeline?: unknown[]; timelineTotal?: number; nextCap?: number; droppedThroughCap?: number; timelineGapNote?: string; droppedThroughSeq?: number; gapNote?: string;
     } = {
       editor: ed.items, editorTotal: editorAll.length,
       ringTotal: editorRing.length, byType: histogram(editorRing, (e) => String(e.type ?? '?')),
       epoch: editorJournalEpoch(),
       ...(cursor.cursorReset ? { cursorReset: cursor.cursorReset } : {}),
     };
+    // The editor ring keeps the newest 2,000: a `since` below what it has lost has a gap the returned
+    // seqs cannot show — say so rather than promise "no gap" (#1561 re-review).
+    const edDropped = editorJournalDroppedThrough();
+    const seqGap = since != null && since < edDropped.seq;
+    if (seqGap) {
+      result.droppedThroughSeq = edDropped.seq;
+      result.gapNote = `editor events after since=${since} up to seq ${edDropped.seq} were lost from the editor ring before this read (it keeps the newest 2,000, or it was cleared). Poll more often.`;
+    }
     if (ed.truncated) {
       result.truncated = true;
       if (edCursored) {
         const lastSeq = (ed.items[ed.items.length - 1] as { seq?: number } | undefined)?.seq;
-        if (lastSeq != null) result.nextSeq = lastSeq;
-        result.hint = `Showing the OLDEST ${ed.items.length} of ${editorAll.length} editor events after since=${since} (oldest first). Poll again with since=${result.nextSeq} to continue contiguously with no gap; raise limit=N to fetch more per poll.`;
+        // A cut-short read that returned nothing (limit:0) read nothing, so the cursor stays put.
+        result.nextSeq = lastSeq ?? since;
+        result.hint = `Showing the OLDEST ${ed.items.length} of ${editorAll.length} editor events after since=${since} (oldest first). Poll again with since=${result.nextSeq} to continue contiguously${seqGap ? ' from here (see gapNote: earlier editor events were already lost)' : ' with no gap'}; raise limit=N to fetch more per poll.`;
       } else {
         result.hint = tailHint('editor events', ed.items.length, editorAll.length, ', or narrow with type=/source=/since=');
       }
@@ -1334,13 +1352,21 @@ export function registerEditorAgentOps(): void {
       // `source`/`since` filters shape only the `editor` array, NOT the timeline (which
       // is the full correlated story). cap is unique ⇒ no ties ⇒ a total order.
       // The `cap` counter restarts on a reload too (#1214 close-out review): a pre-reload `sinceCap`
-      // sent with its epoch replays this life's timeline instead of filtering all of it out.
-      const capReset = p.sinceCap != null && editorJournalEpochChanged(p.epoch);
-      if (capReset) {
-        result.cursorReset = `sinceCap=${p.sinceCap} was issued under epoch ${p.epoch}; the journal has restarted since (epoch ${editorJournalEpoch()}), so the timeline replays everything from the restart.`
-          + (result.cursorReset ? ` ${result.cursorReset}` : '');
+      // sent with its epoch replays this life's timeline instead of filtering all of it out. It is
+      // checked by the SAME resolver as `modoki_journal`'s cursor, against the capture part of the
+      // epoch, so a baseline taken there is valid here (#1561 review: two epochs for one counter
+      // reported a reload that never happened).
+      const capCursor = resolveCapCursor(p.sinceCap, p.epoch);
+      if (capCursor.cursorReset) {
+        result.cursorReset = capCursor.cursorReset + (result.cursorReset ? ` ${result.cursorReset}` : '');
       }
-      const capFloor = capReset ? -Infinity : (p.sinceCap ?? -Infinity);
+      const capFloor = capCursor.sinceCap ?? -Infinity;
+      // The timeline reads the same game ring as `modoki_journal` with the same cursor, so it owes the
+      // same disclosure when that ring lost events after the cursor (#1561 re-review).
+      // The timeline interleaves BOTH rings, so the gap is the later of what either has lost.
+      const dropped = Math.max(journalDroppedThroughCap(), editorJournalDroppedThrough().cap);
+      const capGap = capCursor.sinceCap != null && capCursor.sinceCap < dropped;
+      if (capGap) { result.droppedThroughCap = dropped; result.timelineGapNote = journalGapNote(capCursor.sinceCap!, dropped); }
       const edAll = readEditorJournal(); // unfiltered — the timeline shows everything
       const timeline = [
         ...edAll.filter((e) => e.cap > capFloor).map((e) => ({ stream: 'editor' as const, ...e })),
@@ -1358,14 +1384,20 @@ export function registerEditorAgentOps(): void {
         result.truncated = true;
         if (tlCursored) {
           const lastCap = (tl.items[tl.items.length - 1] as { cap?: number } | undefined)?.cap;
-          if (lastCap != null) result.nextCap = lastCap;
-          result.hint = `Showing the OLDEST ${tl.items.length} of ${timeline.length} timeline events after sinceCap=${p.sinceCap} (oldest first). Poll again with sinceCap=${result.nextCap} to continue contiguously with no gap; raise limit=N for more per poll.`;
+          // A cut-short read that returned nothing (limit:0) read nothing, so the cursor stays put.
+          result.nextCap = lastCap ?? capCursor.sinceCap;
+          result.hint = `Showing the OLDEST ${tl.items.length} of ${timeline.length} timeline events after sinceCap=${p.sinceCap} (oldest first). Poll again with sinceCap=${result.nextCap} to continue contiguously${capGap ? ' from here (see timelineGapNote: earlier events were already lost)' : ' with no gap'}; raise limit=N for more per poll.`;
         } else {
           result.hint = tailHint('timeline events', tl.items.length, timeline.length, ', or cursor with sinceCap=<last cap>');
         }
       }
+      // Every merged reply says where the next timeline read starts (#1561), so a `limit:0` merged
+      // read is a baseline for `sinceCap` just as it is on `modoki_journal`.
+      if (result.nextCap == null) result.nextCap = currentCaptureSeq();
     }
-    if (p.clear) clearEditorJournal();
+    // Every reply says where the next read starts, so a bare `limit:0` read is a baseline (#1561).
+    // A cursored read cut short set it above, to its last returned event; otherwise it is the tip.
+    if (result.nextSeq == null) result.nextSeq = editorJournalSeq();
     return result;
   });
 

@@ -1514,7 +1514,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_asset_schema` | GET `/api/asset-schema` | read-only | editor | — | `{"type":"particle"}` |
 | `modoki_capture_viewport` | POST `/api/capture-viewport` | read-only | editor + electron | — | *(no args)* |
 | `modoki_diagnose` | GET `/api/diagnose` | read-only | editor + scene | — | *(no args)* |
-| `modoki_editor_journal` | GET `/api/editor-journal` | session · **IMPURE READ** (an optional arg destroys state) | editor | — | *(no args)* |
+| `modoki_editor_journal` | GET `/api/editor-journal` | read-only | editor | — | *(no args)* |
 | `modoki_eval_api` | GET `/api/eval-api` | read-only | editor + renderer | — | *(no args)* |
 | `modoki_find_references` | GET `/api/find-references` | read-only | project | asset | `{"target":"/assets/scenes/main.scene.json"}` |
 | `modoki_game_view_devices` | GET `/api/game-view-devices` | read-only | editor | — | *(no args)* |
@@ -1525,7 +1525,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_get_scene_state` | GET `/api/scene-state` | read-only | editor + scene | — | *(no args)* |
 | `modoki_handles` | GET `/api/enact-handles` | read-only | editor | — | *(no args)* |
 | `modoki_identity` | — | read-only | editor | — | *(no args)* |
-| `modoki_journal` | GET `/api/journal` | session · **IMPURE READ** (an optional arg destroys state) | editor + renderer | — | *(no args)* |
+| `modoki_journal` | GET `/api/journal` | session · **IMPURE READ** (an optional arg changes state) | editor + renderer | — | *(no args)* |
 | `modoki_list_actions` | GET `/api/game-introspect` | read-only | editor + renderer | — | *(no args)* |
 | `modoki_list_assets` | GET `/api/scan-assets` | read-only | project | — | *(no args)* |
 | `modoki_list_creatable_assets` | GET `/api/creatable-assets` | read-only | editor | — | *(no args)* |
@@ -1842,7 +1842,21 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `modoki_dispatch_action` fires a game intent by name (needs Play); `modoki_list_actions` discovers
   dispatchable actions + read-values. Assert on events, not screenshots. Returns the **last 100 events
   + `byType` counts over the whole 10,000-event ring** (a `@contact`-heavy physics session is ~582k
-  tokens entire) — narrow with `type=`, raise `limit=N`. (Journal is **off in shipped game builds** —
+  tokens entire) — narrow with `type=`, raise `limit=N`. **A read never deletes anything** (#1561
+  retired `clear`): for a clean baseline, read once with `limit:0` and pass the returned `nextCap`
+  (+ `epoch`) as `sinceCap` — that read covers only the events after it, and its `ringTotal`/`byType`
+  count only those. A cursored read returns the OLDEST events after the cursor, so paging with each
+  reply's `nextCap` never skips; a cursor from before a reload comes back with `cursorReset`. What
+  paging cannot recover is an event the RING already lost — past its 10,000-event cap, or to an
+  explicit `clear-journal` — and a reply says so with `gapNote`/`droppedThroughCap`. The editor
+  journal does the same for its own 2,000-event ring (`gapNote`/`droppedThroughSeq` on `since`) and
+  for the merged timeline, which interleaves both rings (`timelineGapNote`/`droppedThroughCap`). (A
+  jump in the returned `cap`s proves nothing: the counter is shared
+  with the editor stream and other worlds). ⚠️ The ring is PER WORLD: a scene load or Play starts a
+  new world whose ring never held the previous world's events, and that is not reported as a gap. One
+  capture counter has one epoch: `modoki_editor_journal`'s epoch is `<capture life>~<seq life>`, a
+  `sinceCap` is checked against the capture part only, so a `modoki_journal` baseline works as a
+  merged-timeline `sinceCap` and a merged read's `nextCap` works here. (Journal is **off in shipped game builds** —
   gated `__MODOKI_EDITOR__ || build.debugBuild`; always on in the editor. **Off means not
   RECORDING, not removed** — unlike the debug menu and the bridge (dynamic imports that
   tree-shake out entirely), `core/journal.ts` is statically imported by ~14 runtime modules
@@ -1944,7 +1958,7 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `registerHitRegionProvider()`, from the code that OWNS it — never a second copy, which would agree
   today and drift on the first retune. (`runtime/rendering/hitRegions.ts`; Court is the worked
   example, `games/court/runtime/systems.ts`.)
-- **Editor session (perceive the human):** `modoki_editor_journal {type,source,since,sinceCap,merged,limit,clear}`
+- **Editor session (perceive the human):** `modoki_editor_journal {type,source,since,epoch,sinceCap,merged,limit}`
   — the human-authoring stream (`!` sigil: `!select`/`!edit`/`!mutate`/`!transform`/`!create`/`!duplicate`/
   `!delete`/`!reparent`/`!play`/`!pause`/`!stop`/`!gizmo`/`!scene-load`/`!save`/`!undo`/`!redo`), GUID-addressed with
   old→new values on edits. ⚠️ `!edit` is the human Inspector-field path; **your own
