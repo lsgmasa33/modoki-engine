@@ -63,6 +63,18 @@ export interface EntityScreenBounds {
    *  editor's GameView and a preview), so bounds alone don't say which rect they
    *  describe without this. Omitted for 3D/UI. */
   canvasId?: number;
+  /** The rect this surface DRAWS INTO (viewport CSS px) — the `vp` the rect was projected
+   *  through. `screen` is the whole projected AABB and routinely spills past it (`onScreen` only
+   *  means the two overlap); nothing of the entity is drawn outside this rect, so nothing there
+   *  can be clicked. In the SceneView's `ui` mode it is the game-aspect LETTERBOX, not the canvas,
+   *  and a press in the bars picks nothing (#1489).
+   *
+   *  Load-bearing for aiming: `entityResolve.ts` samples its aim points inside
+   *  `screen ∩ drawRect`. Sampling the whole of `screen` spent 13 of 25 samples in the letterbox
+   *  bars of a cube that spilled past them, so whether the aim found the visible part came down
+   *  to the panel's aspect (#1563). Every engine provider (3D via `computeEntityScreenBounds`, 2D via
+   *  `Scene2D`) reports it; a provider that omits it gets the whole-`screen` search. */
+  drawRect?: ScreenRect;
   /** WHICH on-screen surface this rect was measured in. See `BoundsSurface`.
    *
    *  Load-bearing, not decorative: the SAME entity is routinely measured by two providers at

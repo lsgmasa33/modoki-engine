@@ -44,6 +44,9 @@ export const COVERED_BY_SMOKE: readonly string[] = [
   'modoki_tap', 'modoki_focus', 'modoki_dispatch_action', 'modoki_set_timescale', 'modoki_journal',
   'modoki_hit_regions', 'modoki_profiler',
   'modoki_set_game_view_device', 'modoki_set_animation_view_mode',
+  // UC3 (#1489): runs its tap in BOTH SceneView modes and restores the one it found, and in 'ui'
+  // drags a translate-gizmo axis (mode AND space pinned, both restored) and undoes it.
+  'modoki_set_scene_view_mode', 'modoki_set_gizmo', 'modoki_drag_handle',
   // UC14 (#872): read the sidecar, write it back unchanged, verify it survived — and assert the
   // reply does NOT say `editorConnected:false`, which is the live proof that the park gate's
   // renderer probe is actually wired. Its REFUSAL side is not smoke-coverable (parking an
@@ -77,8 +80,6 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_timeline_set: 'replaces a live timeline',
   modoki_timeline_add_clip: 'edits a live timeline',
   modoki_set_collider_edit: 'enters a viewport sub-mode the human is not in',
-  modoki_set_gizmo: "changes the human's gizmo mode mid-session",
-  modoki_set_scene_view_mode: "switches the human's viewport mode",
   modoki_open_particle_editor: "opens a panel over the human's layout",
   modoki_open_sprite_editor: "opens a panel over the human's layout",
   modoki_open_nine_slice_editor: "opens a panel over the human's layout",
@@ -93,7 +94,6 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_play_clip: 'plays a clip on a live entity',
   modoki_persistence: "changes the editor's persistence mode",
   modoki_project_settings: "action:'set' rewrites project.config.json in the human's open project (identity, signing, build flags). The action:'get' half IS swept — see minimalArgsMutates",
-  modoki_editor_journal: "clear:true would destroy the human's activity buffer (the read form is safe, but the tool is declared mutating because of it)",
   modoki_drag: "a real drag on the human's viewport",
   modoki_pointer: 'leaves a pointer HELD across calls',
   modoki_hover: 'harmless, but there is nothing to assert without a target',
@@ -102,7 +102,6 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_type_text: 'types into whatever holds focus',
   modoki_dnd: "a real drag-and-drop on the human's hierarchy",
   modoki_tap_handle: 'needs an open canvas editor with handles',
-  modoki_drag_handle: 'needs an open canvas editor with handles',
   modoki_capture_gesture: 'a real drag, and requires the game Playing',
   modoki_menu: 'opens a native menu — modal, and only a human can dismiss one',
   modoki_eval: 'arbitrary code in the renderer',

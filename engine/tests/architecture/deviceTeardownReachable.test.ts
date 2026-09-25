@@ -9,7 +9,8 @@
  *    and every reader of that file, human or agent, would have concluded otherwise. It is now
  *    called from Electron's awaited `before-quit` teardown.
  *  - **`reclaimStaleDeviceStateAtStartup` is the backstop for the endings that hook cannot cover**
- *    — a SIGTERM from `stop-editor.sh`, a crash, `kill -9`. It has to run in BOTH backend hosts
+ *    — a crash, `kill -9`, and the SIGKILL `stop-editor.sh` falls back to. (A single SIGTERM from
+ *    `stop-editor.sh` DOES reach `before-quit` since #1580, which stopped it double-signalling.) It has to run in BOTH backend hosts
  *    (Electron's `startBackendServer` and the Vite plugin's `configureServer`); a host that drops
  *    it leaves that lane un-swept, and nothing about the running editor would look wrong.
  *

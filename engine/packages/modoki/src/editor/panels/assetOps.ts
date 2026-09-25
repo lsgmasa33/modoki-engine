@@ -12,8 +12,9 @@
  *  `${targetFolder}/…`). They now live here so a fix lands in ONE place, and
  *  the logic is unit-testable without rendering a React panel. */
 
+import { whyWorldNotAuthored } from '../scene/authoredWorld';
 import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
-import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, type PrefabFile } from '../scene/prefab';
+import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
 import { reportUndoFailure } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
@@ -507,7 +508,11 @@ export async function createPrefabFromEntity(
    *  the path, taking the original prefab with it. A yes replaces the content and KEEPS the prefab's
    *  guid (owner 2026-09-15), so placed instances stay linked; undo restores the replaced bytes. */
   confirmReplace: (path: string) => Promise<boolean>,
-): Promise<CreatePrefabResult | 'declined' | null> {
+): Promise<CreatePrefabResult | 'declined' | { refused: string } | null> {
+  // The live subtree is what gets written, so it must be authored (#1548) — a posed or played
+  // entity saved as a prefab carries the pose into every future instance.
+  const notAuthored = whyWorldNotAuthored();
+  if (notAuthored) return { refused: `Create Prefab refused — ${notAuthored}. Exit the preview / stop Play first.` };
   // serializePrefab reads nested children from the editor prefab cache SYNCHRONOUSLY, and
   // nothing else on this path warms it — after an ordinary scene load it is empty, so a held
   // nested instance was flattened into copies with only a console.warn (#1284).
@@ -553,17 +558,27 @@ export async function createPrefabFromEntity(
   // strip was never needed here — and it was actively wrong: a held nested instance's members
   // are deliberately NOT retagged (a reload leaves them linked to their own prefab), so
   // stripping first left them plain until the next scene load.
+  // ⚠️ Resolve the ref FIRST: `entityRef` mints the root a guid if it has none, and that guid is the
+  // ANCHOR every member's derived guid is computed from (#1461). Minted after the tag, the stamp below
+  // would have nothing to derive from and would silently leave the window open. Its other job is
+  // unchanged — resolving the tagged subtree after a world rebuild (Play→Stop).
+  const ref = entityRef(entityId);
   let priorLinks = detachPrefabInstance(entityId, { strip: false });
-  tagEntityTreeAsInstance(entityId, savePath, prefab);
+  // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
+  let guidRemap = tagEntityTreeAsInstance(entityId, savePath, prefab);
   // Whether the tree currently carries THIS prefab's tags. A failed undo returns without untagging, and
   // the undo manager still moves it to the redo stack — so redo must not re-snapshot a tree that is
   // still tagged, or `priorLinks` becomes this prefab's own links and the next undo re-links the tree
   // to the file it just trashed (#1264 close-out review).
   let tagged = true;
 
-  // Resolve the tagged subtree root by guid so tag/untag hit the right entity
-  // after a world rebuild (Play→Stop).
-  const ref = entityRef(entityId);
+  /** Put the members' ORIGINAL guids back, and every ref with them (#1461). Runs ahead of the links:
+   *  the `priorLinks` snapshot was taken one line before the tag and addresses each member by the guid it
+   *  held then. The order is asserted in `tests/editor/createPrefabUndo.test.ts` (the `calls` sequence),
+   *  so moving this line is a test failure, not a silent change. Only on a path that actually undoes —
+   *  a refused file write leaves the tree
+   *  tagged, and must leave the stamp with it. */
+  const unstamp = () => unstampMemberGuids(guidRemap);
   const action: UndoAction = {
     label,
     // Both directions are ALL-OR-NOTHING: the file write/delete is gated, and the
@@ -596,6 +611,7 @@ export async function createPrefabFromEntity(
           for (const entry of restored.entities ?? []) migrateUIAnchorZIndexStructured(entry);
           setPrefabCache(cacheKey, restored);
         } catch { setPrefabCache(cacheKey, null); }
+        unstamp();
         const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath);
         reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
         tagged = false;
@@ -609,6 +625,7 @@ export async function createPrefabFromEntity(
         return;
       }
       setPrefabCache(cacheKey, null);
+      unstamp();
       const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath);
       reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
       tagged = false;
@@ -641,7 +658,7 @@ export async function createPrefabFromEntity(
         // file precisely because a raw id goes stale across a world rebuild (Play->Stop, a
         // watcher reload). Tagging the pre-await id could hit a different entity, or none.
         const tagId = ref.resolve(); if (tagId == null) return;
-        tagEntityTreeAsInstance(tagId, savePath, prefab);
+        guidRemap = tagEntityTreeAsInstance(tagId, savePath, prefab); // re-stamped, so undo reverses THIS run's rename
         tagged = true;
       }
     },

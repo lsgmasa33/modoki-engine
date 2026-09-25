@@ -1117,8 +1117,9 @@ Panels live in `editor/panels/`:
   view (`ScriptTree.tsx`) — a lightweight collapsible tree of the project's source
   (`game.ts`, `runtime/**`, writable) plus a read-only **Engine** source root, fed by
   `GET /api/scripts/tree`. Scripts deliberately bypass the asset pipeline (no
-  GUID/`.meta.json`). Modoki has **no in-app code editor** — clicking a script *reveals*
-  it in the OS file manager (`/api/reveal-in-finder`) so you edit it in your own editor
+  GUID/`.meta.json`). Modoki has **no in-app code editor** — clicking a script *opens*
+  it in whatever app owns the file type (`/api/open-file`), and **Alt-click** *reveals* it
+  in the OS file manager (`/api/reveal-in-finder`) instead, so you edit it in your own editor
   (VS Code, …) and drive it with your own Claude Code (see
   [connect-claude-code](./connect-claude-code.md)).
 - **Console** (`Console.tsx`) — captured log output with a per-level filter (persisted in
@@ -1251,6 +1252,40 @@ derives basic hints from a koota schema's default values; it has no internal cal
 
 The gizmo mode (`translate | rotate | scale`) and space (`world | local`) live in
 `editorStore` and are shared by both modes via a toolbar.
+
+**The two modes draw the 3D layer through DIFFERENT cameras, and exactly one place picks which.**
+3D mode renders through the editor orbit camera over the whole canvas; UI mode renders the 3D
+layer through the **game** camera into a letterbox sized to the game aspect. `viewCamera()` /
+`viewProjection()` in `SceneView.tsx` return that camera and draw rect, and everything that maps
+between a client point and the scene reads them: the render loop, the click pick, the aim-rect
+bounds provider (`modoki_tap`, `get_scene_state bounds`), the gizmo's published handles and its
+pointer hit-test, and the marquee. The pure mapping is `viewportDrawRect` in
+`scene/sceneViewMath.ts`, which `computeUIModeNDC` is defined through. Two consequences are easy
+to miss:
+- **three's `TransformControls` listens to the canvas itself.** It maps its own hover and press
+  over the full canvas unless `gizmo.viewport` is set. The render loop sets it every frame from the
+  same draw rect (`transformControlsViewport`: lower-left origin, `null` in 3D mode). Without that, a
+  press in an empty letterbox bar grabbed a handle drawn elsewhere.
+- **Outside the draw rect is "nothing here".** A ray at NDC beyond ±1 still hits geometry, so a
+  click in a bar selected an entity the view does not show. The pick now returns nothing there.
+
+The UI-mode letterbox aspect comes from the store's `gameRect`, and GameView is its only writer.
+Its deferred ResizeObserver update is cancelled with the effect. Before that, a device → Free
+switch inside one frame let the old device's frame land after Free's zero rect, and the SceneView
+stayed letterboxed to a device no longer selected until the editor relaunched.
+
+Scar (#1489): the render, the pick and the gizmo camera switched on the mode, but the bounds
+provider kept the editor camera over the full canvas, and the gizmo pointer kept full-canvas NDC.
+In UI mode `modoki_tap` aimed where the editor camera would draw an entity and asked a pick that
+looks through the game camera. It was refused as OCCLUDED by whatever was behind, and passed or
+failed by coincidence. It looked like state building up on one editor, and two things did build
+up. The MODE is persisted, so an editor stays in `ui`. The stale `gameRect` above survived every
+smoke run's device-preset case, which shifted what the coincidence landed on. Two more things worth
+knowing:
+- In UI mode `modoki_focus_entity` moves the editor camera, which the view does not draw through.
+  It frames nothing you can see there, and the aim does not depend on it.
+- The smoke's UC3 taps in both modes. Its UI pass frames something ELSE on purpose, because an
+  aim that wrongly used the editor camera still passes while that camera happens to frame the target.
 
 ### ⚠️ The UI-mode measurement seam — THREE stacked coordinate spaces, and FOUR wrong fixes
 
@@ -1615,6 +1650,10 @@ show a notch bug at all. Always on, with the bands drawn over the frame. Mechani
 per-orientation data, and what is measured vs published:
 [UI system](./ui-system.md) § "The editor simulates the safe area".
 
+The toolbar's **● Record** plays a take for the gameplay recorder. Stopping it opens a render dialog,
+and a non-modal progress card follows the render. The flow, and why the render is a backend job the
+page polls: [Gameplay recorder](./gameplay-recorder.md) § "Rendering from the editor".
+
 ### Driving the preview screen from an agent (#367)
 
 The selected device and orientation live in the **editor store** (`gameViewDevice` /
@@ -1717,14 +1756,25 @@ edits reflect immediately.
 The Play/Stop controller (`editor/scene/playMode.ts`) implements Unity-style
 enter-play / revert-on-stop:
 
-- **Play** (`enterPlay`) snapshots the live world **in memory** with the same
-  `serializeScene()` the save path uses — deliberately **without** `assignGuids`, so Play
-  never writes authored data — records the scene path and the current undo depth (the
-  "barrier"), then flips to `'playing'`. Resuming from Pause does **not** re-snapshot.
+- **Play** (`enterPlay`) snapshots the live world **in memory** — the primary AND every base in
+  the chain, through `editor/scene/authoredSnapshot.ts`, the same capture the preview session uses —
+  deliberately **without** `assignGuids`, so Play never writes authored data. It records the scene
+  key and the current undo depth (the "barrier"), then flips to `'playing'`. Resuming from Pause
+  does **not** re-snapshot.
 - **Pause** (`pausePlay`) freezes the sim but keeps the mutated play world.
 - **Stop** (`stopPlay`) reverts by reloading that snapshot through `SceneManager`
   (`preloaded:` — no disk fetch; resources reused via the scene refcount), discarding every
-  play-mode mutation, then `truncateUndoTo(barrier)` drops the during-play edits.
+  play-mode mutation, then `truncateUndoTo(barrier)` drops the during-play edits. The reload
+  **carries** kept bases and the primary's `Persistent` roots instead of rebuilding them, so
+  `restoreAuthoredSnapshot` replays their authored fields afterwards (#1547). ⚠️ A snapshot is
+  SPARSE — the serializer omits every field at its trait default — so the replay fills schema
+  defaults back in (skipping `runtimeOnly` and `entityId` fields); replaying only the keys present
+  silently skipped every posed field whose authored value was the default. `EntityAttributes` is
+  replayed too, minus its structural fields (`parentId`, `sortOrder`, `guid`, `sourceScene`,
+  `editorFolder`) — skipping it wholesale left an activation-hidden Persistent HUD hidden after Stop.
+  ⚠️ Only a PLAIN entity is schema-filled: what a prefab entry omits comes from its template, so it
+  is replayed only as far as it states — a prefab root with no root overrides writes a bare
+  `EntityAttributes {parentId}`, and filling that blanked the instance's name and forced it active.
   **Pre-play undo history survives** the world rebuild because undo actions resolve their
   targets by stable GUID. A guard skips the revert if the active scene changed since Play
   (the snapshot is for a different scene).
@@ -1748,9 +1798,10 @@ before it, TimelineEditor's `if (getRunMode() === 'preview')` cleanup clobbers t
 entered. But that ordering is **necessary, not sufficient**: it makes the guard decline only when the
 new mode is `'scrub'`; a `'preview'` displacer passes it and steals the ownership back. What makes it
 safe is that **no displacement callback re-enters a mode transition** — they only stop their own rAF.
-Second, **a displaced panel must stop its own rAF, never call `setPreviewPlaying(false)`** —
-`isPreviewPlaying` is one flag BOTH panels read, so that stops the global preview rather than the
-panel. Third, and the reason `previewOwner` exists: **both panels' preview effects fire on one ▶
+Second, **a displaced panel must never clear `isPreviewPlaying` UNCONDITIONALLY** — it is one flag
+BOTH panels read, so that stops the global preview rather than the panel. It drops the flag only
+when IT started the run (`stopPreviewIfOwnedBy`, owner-strict), which is the half #1546 added: a
+panel that stopped only its loop left its flag up, and the next re-render re-entered preview. Third, and the reason `previewOwner` exists: **both panels' preview effects fire on one ▶
 press**, so each would take the mode from the other — and the Timeline always lands second (its entry
 is behind an await), so it always won and always stopped the Animation panel's loop. Pressing ▶ in
 the Animation panel played nothing at all. A panel now drives the preview only when it owns it.
@@ -1775,7 +1826,14 @@ store action's clothes.
   would restore a pose. The owner chose **refuse** over **wait** (2026-09-13). Waiting would have
   kept a drag's last position, but the pose that followed would aim at entity ids resolved before
   the swap. Refusing matches #1148, which already refuses every undo/redo for the same window. A
-  scrub drag poses again on its next move once the restore has landed. One chain has its own
+  scrub drag poses again on its next move once the restore has landed. **"A restore" means ANY
+  authored restore, Stop's included (#1572)**: `authoredRestoreInFlight()`, next to the preview's
+  own counter. Stop sets `stopped` before its restore, and the session's `onWorldSwap` abandon
+  covers only a begin that seats before the swap. A scrub in the post-swap tail (managers disposing
+  and initialising) snapshotted Persistent roots and kept bases still at their Play values, and
+  that session's Exit or Cmd+S cycle wrote them back as authored. The same window refuses Play
+  (`aSceneSwapIsHappening`) and undo/redo (`registerUndoRestoreBarrier`): `canEdit()` reads true
+  there, so an undo wrote a Play-time value into the reloaded world with nothing left to revert it. One chain has its own
   restore: grabbing the playhead while ▶ plays reverts the forward run and then reopens a scrub
   session. That chain goes through `reopenPreviewAfterRestore`, which re-claims scrub, because a drag
   move refused during its restore handed the mode back and the reopen then posed under `stopped`. It
@@ -1784,8 +1842,9 @@ store action's clothes.
   used to be silently undone by the reopen.
 - **The restore window reaches the other authored writers too.** Exit clears the session and sets
   `stopped` before the swap lands, so anything that only checks those would act on the posed world.
-  Cmd+S waits for the restore (`whenPreviewRestoresLanded`) instead of writing the pose, and Play
-  treats a landing restore as a world swap (`aSceneSwapIsHappening`). A Stop pressed during that
+  Cmd+S waits for the restore (`whenPreviewRestoresLanded`) instead of writing the pose, every other
+  writer refuses through `isWorldAuthored` (below), and Play treats a landing restore as a world
+  swap (`aSceneSwapIsHappening`). A Stop pressed during that
   window waits for the restore and then returns to stopped. The exception is a Stop pressed while
   Play is starting up: it still goes to #470's queue, because Play's own preview restore produces
   the same state.
@@ -1822,6 +1881,128 @@ Stop that arrives while it's set is queued instead of dropped, and `enterPlay`'s
 is refused outright (returns without doing anything) rather than starting a concurrent snapshot —
 two independent in-flight Plays could otherwise race their `finally` clears and leave the editor
 `'playing'` with no snapshot left to revert.
+
+**Every decline is RETURNED, not only warned (#1574).** `enterPlay` resolves to a `PlayOutcome`
+(`started` · `resumed` · `already-playing` · `refused` with its `reason` · `stopped-during-startup`,
+carrying the queued Stop's own `reverted` — including a restore that threw, which the tail logs and
+folds in rather than rejecting the Play press)
+and `stopPlay` to a `StopOutcome` (`reverted` true/false + `reason`, `queued`, `already-stopped`,
+`preview-exited`). **Both surfaces read them, and print the same string.** The toolbar ▶/⏹, the
+`mod+p` chord and the take recorder's ⏺ (a Play press, then a Stop press — the recorder adds its own
+toast where it abandons a take, [gameplay-recorder.md](./gameplay-recorder.md)) go through `pressPlay`/`pressStop` (`editor/scene/playPressFeedback.ts`, #1577), which
+raise a warn toast carrying the outcome's `message`/`reason` for a refused Play (except a
+double-press, `already-starting`) and for any Play or Stop that ended without reverting — including a
+Stop whose restore THREW, which under the old `void stopPlay()` was an unhandled rejection. Until
+#1577 the toolbar discarded the outcome, so a correct refusal looked like a dead button. The agent
+`play`/`stop` ops build their reply from the same outcomes — the reply table is in
+[debug-tools-mcp.md](./debug-tools-mcp.md) § "Editor debugging — DEFAULT to Electron (modoki MCP)" (the Play/test bullet). A new early return in either
+function needs its own outcome, or the agent reads it as success again.
+
+
+### One envelope at a time, one exit, one owner, one "is it authored?" (#1546–#1550)
+
+Phase 3 of [plans/preview-mode-refactor.md](plans/preview-mode-refactor.md). A review found every
+remaining leak sat where two of the envelope's many pieces of state disagreed, so each rule below
+makes ONE place answer a question several used to answer separately.
+
+- **A preview session and Play never coexist.** `beginTimelinePreviewSession` refuses while Play runs,
+  is paused, or is starting (`holdPreviewSessionsClosed`). A pose during Play goes straight into the
+  Play world (`poseEnvelopeHeld`): Stop reverts it with everything else, and saving is refused until
+  then. It used to open a session anyway — `enterScrubMode` no-ops in Play, the begin did not — and
+  that session snapshotted the RUNNING world, outlived Stop, and later restored the Play world as
+  authored (on ⏹ Exit, the Cmd+S cycle, or the next Play press).
+- **Play, Stop and a scene load take the envelope down through one path.** `takeDownPreviewEnvelope`
+  restores, cancels pending begins and grab chains, and drops the mode; the mode OWNER is released by
+  a run-mode listener on every change out of scrub/preview, and the owner hears it as a displacement —
+  so the panel stands down fully (loop, ▶ flag, recording). A scene load reaches it through
+  `registerBeforeSceneLoad`, awaited inside the load's token BEFORE the load flips the mode — it used
+  to drop the mode and leave the session to the swap, so a REFUSED or failed load stranded an
+  owner-less session, and a successful one carried posed bases/Persistent roots across. A load that a
+  newer one superseded while it waited returns `'superseded'` without reaching SceneManager.
+  `openPrefabForEditing`, which swaps through SceneManager directly, runs the same takedown
+  (through `prepareWorldSwitch`, after the undo wait — § A user world switch waits for the undo in
+  flight) before its save and swap. Any OTHER world swap (a prefab undo's
+  reload, a new scene) abandons the session without restoring (its snapshot belongs to the world that
+  went away).
+- **A session is seated only under a live mode claim, and leaving the claim cancels its begin
+  (#1569).** Every teardown ends only a HELD session. A begin still serializing its snapshot therefore
+  survived a timeline switch, the panel's unmount, a world swap or the Animation ⏹, and seated a
+  session after the mode was back at `stopped`: a posed world, no owner, no ⏹ anywhere. The cancel
+  now lives in the same run-mode listener as the owner release: any change OUT of scrub/preview
+  calls `cancelPendingPreviewBegins()`, so no exit path has to remember it. A move within the
+  envelope (scrub ⇄ preview, a pause freezing it) cancels nothing. That makes one rule for callers:
+  **claim the mode before you begin.** Scrubs, `poseClipAtTime` and the Animation ▶ always did. The
+  Timeline ▶ used to begin first and claim `preview` after the snapshot landed, so a teardown in that
+  gap found the mode `stopped` and nothing to cancel. It now goes through `openPlaybackSession`,
+  which claims a frozen `preview` first. A refused begin hands its claim back through
+  `handBackPreviewClaim`, which skips the hand-back while a newer begin is live. Without that check, a
+  cancelled click's refusal would drop a later click's claim, and the cancel would then lose that
+  click's pose too.
+- **One capture, one restore** (`editor/scene/authoredSnapshot.ts`): see Stop above. The preview
+  restore had drifted from Play's — no base replay, and it keyed on the editor's file path, so ⏹ Exit
+  inside prefab-edit reloaded under `''` and Cmd+S then opened Save As.
+- **One "is the live world authored?"** (`editor/scene/authoredWorld.ts`). `saveScene` (and so Save
+  All, agent `save-all`, Create Scene, the save before prefab-edit), `savePrefabEdit`, Apply to Prefab
+  and Create Prefab all ask `whyWorldNotAuthored()`: the run mode, plus registered sources — a held
+  session, a preview restore in flight, any authored restore in flight (Stop reads `stopped` while the
+  Play world is still live). Apply to Prefab had no guard at all and wrote poses into shared
+  templates. ⚠️ It is deliberately NOT the world-replacement token: the Cmd+S preview cycle holds that
+  across its own save. A source that throws counts as posed — the write is refused, not waved through.
+  A restore that THROWS is a source of its own until the next world swap: the envelope has ended and
+  every counter has dropped, but the live world may still be the posed one. While it holds, a new
+  preview session AND Play are refused too — either would snapshot that world as authored, and its
+  own successful restore (a swap) would clear the guard and wave the pose through a save.
+- **One owner field decides "is this envelope mine?"** Both panels read `getModeOwner()` through
+  `onModeOwnerChange` (every write goes through one notifying setter — B taking scrub from A leaves
+  the MODE unchanged, so a run-mode subscriber never hears it). The Timeline's ⏹, status text and
+  Cmd+S handler key on `owner === 'timeline'` (it used to register for an Animation envelope, win the
+  save, and strand the Animation ⏹); the Animation panel's `inPreview` is derived, not a `useState`
+  that missed every exit it did not make. The decisions live in `openPreviewSession.ts`
+  (`panelOwnsEnvelope`, `mayEndSharedSession`, `undoMayRepose`).
+- **An asset undo does not open an envelope.** Clip/timeline undo+redo re-pose only into the panel's
+  own held session, through a ref (a pose OPENS the envelope, so Cmd+Z after ⏹ Exit — or with the
+  panel closed — used to re-enter scrub with no ⏹ anywhere).
+- **Recording lives inside the envelope.** Switching record ON opens it, so every recorded value is
+  preview-only and lives in the clip (Unity's record mode is a preview mode too). It used to open only
+  after the first recorded write had landed, so that one value — and only that one — was saved into
+  the scene. ⚠️ The guard is the INVARIANT, not a list of exits: the record hook runs AFTER the edit
+  is written, so it keys only when the Animation panel already holds a live session
+  (`ownsHeldSession`), and otherwise stops recording and says the edit stayed a normal scene edit. A
+  first cut turned recording off at ⏹ and on displacement and missed four other ways to leave (an
+  agent exit, a Timeline ⏹, Record pressed in Play or under a Timeline envelope). Record ON refuses at
+  once when the envelope it opens is not the Animation panel's.
+- **The Animation rebind finds the same entity by guid** before falling back to "the first Animator
+  whose bank lists the clip", which picked none for a "+ New Animation" bind and the wrong one when
+  two Animators share a clip.
+- **The agent's live-world edits refuse an envelope** (#1552). `create-entity`, `duplicate-entity`,
+  `delete-entities`, `reparent-entity` and `prefab` instantiate / detach / revert edited the
+  snapshotted world, replied `ok`, and vanished on Exit. They ask `whyWorldNotAuthored()` like the disk
+  writers. The exits follow which condition holds (`posedWorldExits`): inside an envelope, the exits
+  `/api/scene-mutate` offers — one copy, `editor/scene/envelopeExits.ts`; a session still held after
+  the mode left, Stop; a restore landing, retry; a FAILED restore, reload the scene. `prefab create`
+  shares the refusal and, since it writes a FILE, refuses Play as well. `player-prefs-write` (not
+  `flush`) refuses only while a session is HELD — that is the only thing that puts PlayerPrefs back
+  (#1551). Play is exempt on purpose: editing the play world is how an agent drives a running game,
+  and Stop discarding it is Play's contract, not a silent loss. Game agent tools are not gated.
+- **Pause says it is paused.** Both panels pause through `freezePreviewIfOwnedBy` (`preview` +
+  `advancing:false`, session still held). The Animation ▶ never froze the mode, so `get_editor_state`
+  reported an advancing preview while it sat still (#1552). The helper declines when a scrub, an
+  exit or another panel already changed the mode, which is what the Timeline's own inline guard did.
+
+Still open, and why:
+- signal/`OnSequence` actions fired by ▶ still run for real where the effect is not state the engine
+  knows (`iap.buy`, `system.openUrl`, `engine.reload`, a game's own stores). The known stores — bus
+  volumes, PlayerPrefs, the applied quality tier — are put back on every end (#1551,
+  [timeline.md](timeline.md) § ▶ Preview);
+- a takedown from OUTSIDE the panel (Play, Stop, a scene load) passes no rebind, so the Animation
+  root is re-taken by NUMBER by `editorRefLiveness` — right while load order is deterministic, which
+  it is for an unedited scene; only ⏹ Exit and Cmd+S rebind by guid;
+- Record ON can briefly show lit with no envelope when its session begin is refused (⏺ pressed while
+  a restore is still landing): the record hook's `ownsHeldSession` check stops it at the first edit —
+  safe, but the notice comes after the edit rather than at the press;
+- Cmd+S while recording saves the clip but refuses the scene half ("edited inside the preview"): the
+  recorded edits bump the edit version like any in-envelope edit. Nothing is lost — exiting reverts
+  exactly those preview-only values — but the message overstates it.
 
 ## Panel registrations in module-level slots — why the unguarded ones are safe (#811)
 
@@ -3793,6 +3974,86 @@ loss, worth interrupting for whatever caused it.
 resolves `false` rather than throwing. It was fixed anyway because "just throw so the entry stays
 on the stack" is the obvious-looking design the next change will reach for, and it did not work
 until this landed.
+
+### A step that awaits across a scene switch drops its entry too (#1575)
+
+`swapHistory` parks the outgoing world's stacks and refills the live `undoStack`/`redoStack` **in
+place** with the incoming world's. A step still awaiting when a scene load, an Exit from prefab edit
+or a Create Scene swaps the history would push its entry onto the new world's stack, where a later
+undo or redo runs it against a world it was never recorded on. It was latent until #1575. Apply's
+undo then started reloading its snapshot under the key live when it runs (see prefabs.md § Undoing
+an Apply). A skipped undo's redo then loaded the old world's snapshot under the new scene's key and
+saved it into that scene's file.
+
+So `runStep` captures a history liveness token (the shared `createTeardownToken`, docs/async-lifetime.md)
+before the await. Every effective `swapHistory` and `clearHistory` invalidates it. A step whose
+capture went stale is **dropped**, as a throwing one is, with a
+console warning, because the world it belongs to is gone. Its journal event carries `dropped: true`.
+It marks neither the incoming world edited nor its own `affectedScenes` dirty. Those are usually
+scenes of the world that left, and a dirty mark on a scene that is not loaded makes the incoming
+world read as unsaved: a load then refuses, and its next switch discards its history. ⚠️ A base the
+incoming scene KEEPS is the exception, since its edit is still live. Since #1579 no editor entry point
+swaps under a running step (next section), so this drop is reachable only through a route that swaps
+through `sceneManager` directly. An `_isFileDirect` entry is kept, because the asset file outlives the swap; `parkSurvivors`
+already keeps those across a discard. The step itself still ran, and whatever it did to disk stands.
+Tests: `packages/modoki/tests/editor/undoSpansSceneSwitch.test.ts`, and the scene-switch cases in
+`untitledApplyUndo.test.ts` / `prefabEditApplyUndo.test.ts`.
+
+### A user world switch waits for the undo in flight (#1579)
+
+The drop above, and the guards inside Apply's undo (prefabs.md § Undoing an Apply), are guards at the
+STEP. #1575's close-out added one per review round and each round found the next window, because
+nothing serialized a step against the user switching worlds during its awaits. Four windows were left:
+Play pressed during an Apply undo's file install, a kept base keeping the applied build, a load's tail
+discarding the history the step had just dirtied, and a pending load that then failed.
+
+The serialization now lives where a switch STARTS, not in the step:
+- **`beginWorldSwitch()`** (`undoManager.ts`) refuses every undo/redo from the call until `release`
+  ("A scene switch is in progress — undo again once it has landed."). The refusal is read when a step
+  runs, so a step queued behind the running one is refused too. It returns `idle`, the step already
+  running, or `null` when there is none, so a switch with nothing to wait for stays synchronous.
+- **`prepareWorldSwitch({ takeDownEnvelope })`** (`serialize.ts`) composes it with the preview-envelope
+  takedown. `serialize.loadScene`, `newScene` and `openPrefabForEditing` call it; `enterPlay` calls
+  `beginWorldSwitch` directly (its envelope goes down through `takeDownPreviewEnvelope`). Those four
+  cover the menu, the Assets panel, the agent ops, prefab Exit (`exitPrefabEditing` → `loadScene`),
+  boot and the toolbar. **Every one WAITS**; none refuses. Play starts late by the undo's length, and
+  the agent `play` op's reply table (#1574) is unchanged.
+- **Ordering, per #887:** a switch's own refusals and in-flight latches (`_newSceneInFlight`,
+  `_loadsInFlight`, the load epoch, `_entering`) stay synchronous and come FIRST, so a second gesture
+  is still refused while the first waits. Then the switch is raised, then awaited. `loadScene`
+  re-checks `stillLive()` after the wait. `newScene` writes the editor path only after it: the undo
+  restores under the CURRENT scene's key, and would skip if the path already named the new one.
+  `openPrefabForEditing` waits (`prepareWorldSwitch().idle`) before it even FETCHES the prefab: an
+  Apply undo installs that file, so a fetch during the write read the applied bytes and overwrote
+  the undo's restored copy in the editor cache, and the edit world came up applied (close-out
+  review). The envelope takedown stays where it was, after the fetch.
+- **Waiting is not swapping.** `isSceneLoadInFlight()` counts a load that is still waiting for the
+  undo, and Apply's undo skipped its reload on it, recreating the fourth window. So there is a second
+  count, `isSceneLoadSwapping()` (loads past their wait), and the undo reads that one. Play and the
+  Hierarchy keep `isSceneLoadInFlight`, the conservative answer for them.
+- **The unsaved-work gates wait too** — for a step already running when they are asked. A step's conservative dirty mark (#310) lands at its END. A gate
+  read during it answered "clean", the switch then waited for the step, and `adoptReplacedWorld`
+  discarded the history the step had just dirtied with no prompt. `confirmDiscardUnsaved` (world-swap
+  scope only; a page unload must not hang on a step) and the agent ops' `guardUnsavedAfterUndo`
+  (load-scene, new-scene, prefab edit-open and edit-exit) await `undoStepPending()` before they read.
+
+⚠️ **Never call a world switch from inside an undo/redo closure.** It would wait for the chain it is
+part of, forever. Closures that must replace the world call `sceneManager` directly, and
+`isExecutingUndoRedo()` cannot serve as an escape hatch, because it reads true for a concurrent user
+gesture too. `engine/tests/architecture/editorWorldSwitchWaitsForUndo.test.ts` keeps editor callers of
+`sceneManager.loadScene`/`replaceWorldContent` to a reviewed list, each with the reason it cannot race
+a step. Nothing guards the deadlock direction mechanically. The corollary: a step that never settles
+now holds every switch with it. So `beginWorldSwitch` warns once when a switch has waited
+`WORLD_SWITCH_STALL_WARN_MS` (10 s) for its step, so the hang names its cause.
+
+**Not covered:** the disk hot reload (`agentBridge`) and `NavigationManager` during Play, where undo is
+refused anyway. The hot reload's own deferral (`authoringSettle`) counts world-replacement tokens and
+the run mode, not undo steps, so it gives no protection against a running step. #1575's step guards stay, as defence
+in depth for those routes.
+
+Tests: the #1579 describe in `engine/tests/editor/untitledApplyUndo.test.ts` (one case per entry point,
+the failed load, the gate and the #887 latch, each mutation-checked), `beginWorldSwitch` in
+`packages/modoki/tests/editor/undoManager.test.ts`, and the agent gate in `prefabEditExitGuard.test.ts`.
 
 
 ## Quick reference

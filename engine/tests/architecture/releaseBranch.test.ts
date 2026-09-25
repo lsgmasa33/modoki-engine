@@ -305,17 +305,72 @@ describe('claimLabelFor — a release branch claims as the HUB', () => {
     expect(claimLabelFor(undefined as unknown as string)).toBeNull();
   });
 
-  it('the --claim-label CLI prints a well-formed label for whatever is checked out', () => {
-    // ⚠️ Deliberately NOT an enumeration of the six clone branches. This ran inside the OSS
-    // snapshot's own throwaway test repo, whose branch is `master`, and correctly printed
-    // `wip/master` — the earlier assertion listed the six and failed on a right answer. Which
-    // branches map to which label is `claimLabelFor`'s unit tests' job (above, all six plus
-    // release_*); what the CLI adds is that it reads the branch and emits ONE clean line.
-    const r = spawnSync(process.execPath, [CLI, '--claim-label'], { encoding: 'utf8', cwd: REPO });
-    expect(r.status).toBe(0);
-    expect(r.stdout.trim()).toMatch(/^wip\/[A-Za-z0-9._\-/]+$/);
-    // The one thing it must never emit, whatever branch it finds.
-    expect(r.stdout).not.toContain('wip/release_');
+  // ⚠️ BOTH states are BUILT here, in a throwaway repo, rather than read off whatever this checkout
+  // happens to be in (#1466). The old test ran the CLI in the real repo and asserted exit 0 — which
+  // cannot pass on a `pull_request` CI run, because `actions/checkout` leaves a DETACHED HEAD there
+  // and a detached HEAD is a legitimate state whose defined answer is the refusal (exit 2). It
+  // reddened every Dependabot PR on the public mirror while every push build stayed green. Choosing
+  // the expectation by the checkout's state would fix that and still test only ONE half per
+  // environment — locally the refusal would never run — so each half gets its own repo instead.
+  //
+  // ⚠️ Still deliberately NOT an enumeration of the six clone branches: the OSS snapshot's own test
+  // repo is on `master` and correctly printed `wip/master`, and an assertion that listed the six
+  // failed on that right answer. Which branch maps to which label is `claimLabelFor`'s unit tests'
+  // job (above); what the CLI adds is that it READS the branch and emits one clean line — or refuses.
+  describe('the --claim-label CLI reads the checked-out branch', () => {
+    // An inherited GIT_DIR/GIT_WORK_TREE (a test run under a git hook) outranks `cwd`, and would
+    // point both the fixture and the CLI back at the real repo.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { cwd, env, stdio: 'pipe' });
+    const claimLabelIn = (cwd: string) => spawnSync(process.execPath, [CLI, '--claim-label'], { encoding: 'utf8', cwd, env });
+    /** A repo with one commit on `feature-x`, so it can be left on the branch or detached from it. */
+    const repoOnBranch = (): string => {
+      const dir = makeScratchDir('modoki-claim-label-');
+      git(dir, 'init', '-q', '-b', 'feature-x');
+      git(dir, 'commit', '-q', '--allow-empty', '-m', 'x');
+      return dir;
+    };
+
+    it('on a branch: exit 0 and exactly one line, wip/<that branch>', () => {
+      const dir = repoOnBranch();
+      try {
+        const r = claimLabelIn(dir);
+        expect(r.status).toBe(0);
+        expect(r.stdout).toBe('wip/feature-x\n');
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('on a RELEASE branch: claims as the hub, wip/main — never wip/release_*', () => {
+      // The routing half the old in-checkout test covered only when it happened to run on a
+      // release branch (`not.toContain('wip/release_')`). `feature-x` maps to itself, so the two
+      // cases around this one cannot tell `claimLabelFor` from a CLI that bypasses it and prints
+      // `wip/<branch>` raw — which would bring back #39's double claim during every release.
+      const dir = makeScratchDir('modoki-claim-label-');
+      try {
+        git(dir, 'init', '-q', '-b', 'release_0_7_0');
+        git(dir, 'commit', '-q', '--allow-empty', '-m', 'x');
+        const r = claimLabelIn(dir);
+        expect(r.status).toBe(0);
+        expect(r.stdout).toBe('wip/main\n');
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('on a DETACHED HEAD (a pull_request checkout): exit 2 and the refusal, never a label', () => {
+      const dir = repoOnBranch();
+      try {
+        git(dir, 'checkout', '-q', '--detach');
+        const r = claimLabelIn(dir);
+        expect(r.status).toBe(2);
+        expect(r.stdout).toBe('');
+        expect(r.stderr).toContain('no branch checked out (detached HEAD?)');
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
 

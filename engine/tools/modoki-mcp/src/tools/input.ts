@@ -8,12 +8,12 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, TIMEOUT_MS_BASE, allowOccludedParam, makeEntitySpec, makeLabelAimParam, makeWithinParam, modifierEnum, makePointSpec } from '../shapes.js';
+import { unknownKeysErrorMap, ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, TIMEOUT_MS_BASE, allowOccludedParam, makeEntitySpec, makeLabelAimParam, makeWithinParam, modifierEnum, makePointSpec } from '../shapes.js';
 import { KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../shared/inputVocabulary.js';
 import { parseHandleIds } from '../../../shared/handlesReply.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
-  const { getJson, postJson, evalRenderer, editorAction } = ctx;
+  const { getJson, postJson, evalRenderer, editorAction, fail } = ctx;
 
   /** Built-in panel ids, shared by the two `panel` params so they cannot drift. Deliberately
    *  NOT a z.enum: a game can register custom panels, so the real vocabulary is only knowable
@@ -44,7 +44,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       // The example must name a selector that EXISTS: `inspector.header.kebab` did not (the
       // Inspector has no kebab menu at all), and being the docstring example is exactly how a
       // wrong selector propagates — it was copied into a QA case brief before anyone checked.
-      selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.delete\"]'. Overrides x/y."),
+      selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.delete\"]'. Not with x/y, label or entity."),
       label: makeLabelAimParam(),
       within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
@@ -71,7 +71,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       '(asset→slot, reparent) use modoki_dnd, NOT this. Requires the Electron editor.',
     {
       from: makePointSpec().describe('Drag origin: {entity} | {selector} | {label, within?} | {x,y}.'),
-      to: makePointSpec().describe('Drag destination: {entity} | {selector} | {label, within?} | {x,y}.'),
+      to: makePointSpec({ sameAs: 'from' }).describe('Drag destination: {entity} | {selector} | {label, within?} | {x,y}.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button (default 'left')."),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
@@ -96,14 +96,14 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'gesture cannot coexist with a held press). Both dispatch the real mouseup, and the next ' +
       'move/up then tells you it happened. This exists because a press left held latches the ' +
       "renderer's pointer input and kills dragging for the HUMAN too, with no error anywhere " +
-      '(#302) — so release with `action:"up"` when you are done, and keep a long gesture moving. ' +
+      '— so release with `action:"up"` when you are done, and keep a long gesture moving. ' +
       'modoki_get_editor_state reports `heldPointer` if you need to check. ' +
       'Requires the Electron editor.',
     {
       action: z.enum(POINTER_ACTIONS).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
-      selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Overrides x/y.'),
+      selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Not with x/y, label or entity.'),
       label: makeLabelAimParam(),
       within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
@@ -124,7 +124,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     {
       x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
-      selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
+      selector: z.string().optional().describe('CSS selector to aim at. Not with x/y, label or entity.'),
       label: makeLabelAimParam(),
       within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
@@ -149,17 +149,28 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     {
       x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
-      selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
+      selector: z.string().optional().describe('CSS selector to aim at. Not with x/y, label or entity.'),
       label: makeLabelAimParam(),
       within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
       deltaX: z.number().optional().describe('Horizontal wheel delta (default 0). At least ONE of deltaX/deltaY must be non-zero — a zero-delta scroll is REFUSED, not dispatched as a silent no-op.'),
       deltaY: z.number().optional().describe('Vertical wheel delta; positive = content down. Default 0, but a call with neither delta non-zero is REFUSED (~120 ≈ one wheel tick).'),
+      dx: z.number().optional().describe('Alias for deltaX — device_scroll\'s spelling. Not together with deltaX.'),
+      dy: z.number().optional().describe('Alias for deltaY — device_scroll\'s spelling. Not together with deltaY.'),
       modifiers: z.array(modifierEnum)
         .optional().describe(`${MODIFIERS_BASE}, set on the wheel event (e.g. ["control"] or ["meta"] for Ctrl/Cmd+wheel zoom).`),
       allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, label, within, entity, deltaX, deltaY, modifiers, allowOccluded }) => postJson('/api/input/scroll', { x, y, selector, label, within, entity, deltaX, deltaY, modifiers, allowOccluded }),
+    async ({ x, y, selector, label, within, entity, deltaX, deltaY, dx, dy, modifiers, allowOccluded }) => {
+      // `dx`/`dy`: the most-guessed missing keys on this tool (#1560), and its device twin's aliases —
+      // so the same two names work on both surfaces. Both spellings of one delta is AMBIGUOUS, as there.
+      const doubled = [deltaX != null && dx != null ? 'deltaX/dx' : null, deltaY != null && dy != null ? 'deltaY/dy' : null]
+        .filter((e): e is string => e !== null);
+      if (doubled.length) {
+        return fail({ code: 'AMBIGUOUS', what: 'scroll', why: `${doubled.join(' and ')} given together — one parameter under two names, so choosing one would ignore the other.`, expected: 'deltaX/deltaY (canonical) or dx/dy — not both' });
+      }
+      return postJson('/api/input/scroll', { x, y, selector, label, within, entity, deltaX: deltaX ?? dx, deltaY: deltaY ?? dy, modifiers, allowOccluded });
+    },
   );
 
   // ── eval — evaluate JS in the editor renderer (Electron editor only) ──
@@ -168,7 +179,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'Evaluate JavaScript in the editor RENDERER and return the value — the editor twin of ' +
       'device_eval; list the injected `modoki` ops with modoki_eval_api. Reads/pokes LIVE renderer state a static file read cannot (a global like ' +
       'window.__3d, window.innerWidth/devicePixelRatio, a React fiber value, WGSL validation, or ' +
-      'dispatching a bridge event), so you no longer need a raw CDP client for it. Runs as a ' +
+      'dispatching a bridge event). Runs as a ' +
       'function body: use `return` to yield a value. The result is safe-stringified in the renderer, ' +
       'so return a PROJECTION for anything large/circular (e.g. `return {w: innerWidth, h: innerHeight}` ' +
       '— a bare `window` or DOM node serializes poorly). A thrown error is reported as a tool error. ' +
@@ -229,8 +240,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_press_key',
     'Press a single trusted key chord into the focused element — keyDown+keyUp, plus a `char` ' +
       'event for Enter/Return so the press can actually INSERT: a bare keyDown/keyUp pair carries ' +
-      'no text for ANY spelling (measured, Electron 43.2.0), which is why pressing Enter in a ' +
-      'textarea used to do nothing at all. ⚠️ A MODIFIED Enter sends no char — Cmd/Ctrl+Enter is ' +
+      'no text for ANY spelling (measured, Electron 43.2.0). ⚠️ A MODIFIED Enter sends no char — Cmd/Ctrl+Enter is ' +
       '"commit, do not insert" — and Shift+Enter therefore does not soft-break either. The ' +
       'standalone keys typeText can only send as a terminal submitKey: Escape (close modal/' +
       'picker), Delete/Backspace, arrows (nudge), and editor hotkeys (W/E/R gizmo mode, F ' +
@@ -247,7 +257,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       + 'which modoki_focus with no selector clears, and (2) the KEYBOARD SCOPE — while any '
       + 'panel other than the Game panel owns it, the editor gate suppresses input to the '
       + 'running game entirely. A bare modoki_focus {} fixes only the first. Pass panel:"game" '
-      + 'to drive the game. The response now echoes `focusedPanel` on every press, and warns '
+      + 'to drive the game. The response echoes `focusedPanel` on every press, and warns '
       + 'when a press reached NOTHING (no editor binding claimed it and the gate blocked it). '
       + 'CAVEAT: this is renderer-level input — it does NOT trigger native Electron MENU ' +
       'accelerators, so a chord the OS menu claims (Cmd+R reload, Cmd+Alt+I devtools, and on ' +
@@ -320,7 +330,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     selector: z.string().optional(),
     x: z.number().optional(),
     y: z.number().optional(),
-  }).strict('a dnd endpoint accepts only: selector, x, y')
+  }, { errorMap: unknownKeysErrorMap('a dnd endpoint accepts only: selector, x, y') }).strict()
     .refine((e) => !!e.selector || (typeof e.x === 'number' && typeof e.y === 'number'),
       { message: 'a dnd endpoint needs {selector} or BOTH {x,y} — this tool cannot be aimed by entity (HTML5 DnD is a DOM-element protocol)' });
   tool(
@@ -328,7 +338,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'Synthesize an HTML5 drag-and-drop (dragstart→dragover→drop) — the DnD interactions a ' +
       'trusted pointer-drag CANNOT emit: Hierarchy reparent/reorder, Assets file-move & ' +
       'prefab-instantiate, Skin sprite-onto-part / part-reorder / bone-reparent (a canvas or gizmo drag is modoki_drag). Address ' +
-      'each endpoint by CSS `selector` (targets its center) OR viewport `{x,y}`. Lets the ' +
+      'each endpoint by CSS `selector` (targets its center) OR viewport `{x,y}` — both is AMBIGUOUS. Lets the ' +
       "app's own dragstart handler fill the DataTransfer (never fabricated). Returns the " +
       'MIME `types` written (empty ⇒ wrong source element) and `accepted` (target took the ' +
       'drop). AIM: this is the ONE input tool that cannot be aimed by `entity` — HTML5 DnD is a ' +
@@ -382,7 +392,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
         + 'clip with 2+ numeric tracks until one is selected — see modoki_get_editor_state '
         + '`animationView`). "collider2d" needs modoki_set_scene_view_mode \'ui\' + '
         + 'modoki_set_collider_edit, AND the SceneView 2D layer toggle left on — a human can turn it '
-        + 'off with no agent-readable state or route back on yet (#373 part 2; the toolbar button '
+        + 'off with no agent-readable state or route back on yet (the toolbar button '
         + 'is chrome-tappable at data-ui-id "sceneView.toolbar.layer.show2D" with data-ui-state '
         + '"on"/"off", but blindly tapping it can turn 2D OFF if that was never the problem — '
         + 'check the state first). "sprite" (open with action:open-sprite-editor) additionally '
@@ -418,13 +428,15 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'vertex/bone without eyeballing pixels. `button`/`clickCount`/`modifiers` as in ' +
       'modoki_tap (e.g. clickCount:2 to insert/rename, modifiers:["shift"] to add to a ' +
       'marquee selection). Reports `occluded` (BOOLEAN — same meaning as modoki_tap) plus ' +
-      '`occludedBy` naming the covering element. An off-screen, disabled, or OCCLUDED handle is ' +
-      'REFUSED rather than tapped: a press that provably lands on the covering element is a miss, ' +
-      'and reporting one as ok:true is how a covered handle reads as an inert one. Pass ' +
-      '`allowOccluded:true` to press anyway and see what happens. Requires the Electron editor.',
+      '`occludedBy` naming the covering element. A handle that is covered, or clipped by a ' +
+      'neighbouring panel, is REFUSED as OCCLUDED rather than tapped: a press that provably lands ' +
+      'on something else is a miss, and reporting one as ok:true is how a covered handle reads as ' +
+      'an inert one. Pass `allowOccluded:true` to press anyway and see what happens. An ' +
+      'off-window or disabled handle is refused outright, and allowOccluded does not open it. ' +
+      'Requires the Electron editor.',
     {
       id: z.string().describe('Handle id from modoki_handles.'),
-      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button to click with (default 'left'). This tool CLICKS — the 'held during the drag' wording here was copy-pasted from modoki_drag_handle."),
+      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button to click with (default 'left'). This tool CLICKS; no button is held across a gesture."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click — same meaning as modoki_tap.'),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, e.g. ["shift"] to add to a marquee selection — same meaning as modoki_tap.`),
       allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Here the target is a HANDLE, and a covered one reads as an inert one — which is how a working gizmo handle under the SceneView toolbar got filed as a high-severity bug.`),
@@ -444,9 +456,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'key for the whole drag (see modoki_drag). Occlusion is reported PER ' +
       'ENDPOINT — `fromTarget`/`toTarget` each carry `occluded` (boolean) + `occludedBy` — so a ' +
       'covered source and a covered destination are distinguishable (they need different fixes); ' +
-      '`toTarget` appears only for a `toId` destination. An off-screen, disabled, or OCCLUDED ' +
-      'endpoint is REFUSED rather than dragged (the press would land on the cover, which reads as ' +
-      '"this handle does nothing"); `allowOccluded:true` forces it. Requires the Electron editor.',
+      '`toTarget` appears only for a `toId` destination. An endpoint that is covered, or clipped ' +
+      'by a neighbouring panel, is REFUSED as OCCLUDED rather than dragged (the press would land on ' +
+      'the cover, which reads as "this handle does nothing"); `allowOccluded:true` forces it. An ' +
+      'off-window or disabled endpoint is refused outright. Requires the Electron editor.',
     {
       id: z.string().describe('Handle id to drag (from modoki_handles).'),
       to: z.object({ x: z.number(), y: z.number() }).optional().describe('Absolute destination in viewport CSS px.'),
@@ -474,9 +487,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'you the field rejected it. `typed` is MEASURED (the focused element\'s value delta), not the length of ' +
       'what you asked for, and `valueAfter` echoes the field — so a short insert is a FAILURE naming ' +
       'what landed. NON-ASCII (Japanese, emoji, accented) text DOES insert — measured on Electron ' +
-      '43. This used to say it could not, and steered agents to modoki_eval, which is a ' +
-      'NON-input write a controlled input never sees, so the advice was worse than the path it ' +
-      'replaced. When text really does not land, the live cause is a field that reformats or ' +
+      '43 — do not route it through modoki_eval, a NON-input write a controlled input never sees. When text really does not land, the live cause is a field that reformats or ' +
       'rejects input as you type — read `valueAfter`, it names what is actually there. ' +
       'Requires the Electron editor.',
     {

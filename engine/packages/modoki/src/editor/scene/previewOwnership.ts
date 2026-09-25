@@ -4,9 +4,10 @@
  *  their preview effects on it, so a single ▶ press starts both. Each then calls
  *  `enterPreviewMode` and takes the single-valued `RunMode` from the other — harmless ownership
  *  churn until #810 gave displacement real teeth, after which the loser's rAF is stopped. The
- *  Timeline ALWAYS lands second (its entry sits behind an awaited `beginTimelinePreviewSession()`),
- *  so it always won and always stopped the Animation panel's loop; with no timeline doc open its
- *  own tick then early-returns every frame, so pressing ▶ in the Animation panel played NOTHING.
+ *  Timeline then ALWAYS landed second (its entry sat behind an awaited session begin; since #1569 it
+ *  claims before the await, and which panel lands second is React's effect order instead), so it
+ *  always won and always stopped the Animation panel's loop; with no timeline doc open its own tick
+ *  then early-returns every frame, so pressing ▶ in the Animation panel played NOTHING.
  *
  *  The fix is to record WHICH panel's ▶ started the preview (`editorStore.previewOwner`) and let
  *  only that panel drive it. This lives in its own module, not inline in the two `.tsx` panels,
@@ -24,8 +25,8 @@ export type PreviewOwner = 'timeline' | 'animation';
  *  Strict: an unclaimed preview (`owner === null`) drives NOTHING. An earlier cut let either panel
  *  drive when unclaimed, to keep a programmatic `setPreviewPlaying(true)` working — but that is
  *  #810 verbatim on that path (both panels run, the Timeline lands second, wins the mode and stops
- *  the other's loop), and the e2e it was written for asserts `isSkeletalPreviewing() === false`,
- *  which passes either way. So the fallback protected nothing and re-armed the bug; every caller
+ *  the other's loop), and the e2e it was written for asserted a skeletal-preview flag that nothing
+ *  could set any more (#1552), so it passed either way. So the fallback protected nothing and re-armed the bug; every caller
  *  names its panel instead, and `setPreviewPlaying` warns in DEV if one does not. Nothing playing
  *  is the safe failure here; two panels fighting over a single-valued RunMode is not. */
 export function panelDrivesPreview(

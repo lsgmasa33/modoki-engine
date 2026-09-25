@@ -1146,6 +1146,7 @@ export default function Hierarchy() {
     // and a Replace keeps that prefab's guid (#1264).
     const result = await createPrefabFromEntity(entity.id, savePath, `Save prefab "${entity.name}"`, confirmReplaceAsset);
     if (result === 'declined') return;
+    if (result && 'refused' in result) { useEditorStore.getState().showToast(result.refused, 'warn'); return; }
     if (!result) { console.error(`[Hierarchy] Failed to create prefab ${savePath}`); return; }
     console.log(`[Hierarchy] Created prefab: ${savePath}`);
     if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');

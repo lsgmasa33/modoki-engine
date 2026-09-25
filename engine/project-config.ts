@@ -584,6 +584,17 @@ export interface ProjectConfig {
     /** Minutes in the background after which a resume triggers a full app reload (#574).
      *  0 or absent = disabled. */
     reloadAfterBackgroundMinutes?: number;
+    /** Reload the page when the engine declares its audio DEAD (#1455) — a context reporting
+     *  `running` with a frozen clock that nothing in the page can revive. Absent/false = off. */
+    reloadOnDeadAudio?: boolean;
+  };
+  /** The gameplay recorder's render defaults (#1488, docs/gameplay-recorder.md). Optional: absent
+   *  means the render dialog opens at its own fallbacks. */
+  recording?: {
+    /** Output video height in px that the render dialog pre-fills Scale from (scale = this ÷ the
+     *  take's layout height), e.g. 1920 for 1080×1920 ads. 0 or absent = not set. A value the owner
+     *  last chose in the dialog for this project wins over it. */
+    outputHeight?: number;
   };
 }
 
@@ -801,6 +812,11 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   // pruneProjectConfig above).
   runtime: {
     reloadAfterBackgroundMinutes: 0,
+    reloadOnDeadAudio: false,
+  },
+  // Present for the same reason as `runtime` above: a resolved 0 prunes against it.
+  recording: {
+    outputHeight: 0,
   },
 };
 
@@ -1069,6 +1085,7 @@ export function mergeProjectConfig(
         : stringListOf(p.ota?.subgames, d.ota.subgames, 'ota.subgames'),
     },
     runtime: { ...d.runtime, ...p.runtime },
+    recording: { ...d.recording, ...p.recording },
   };
 }
 

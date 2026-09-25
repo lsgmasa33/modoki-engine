@@ -1,4 +1,4 @@
-/** `PREFAB_FORMAT_VERSION` (engine/packages/modoki/src/editor/scene/prefab.ts) was bumped
+/** `PREFAB_FORMAT_VERSION` (engine/packages/modoki/src/runtime/core/version.ts) was bumped
  *  2 → 3 in #762's UIAnchor.zIndex follow-up (613dc5909), but the Playwright spec
  *  `editor-hierarchy.spec.ts` asserts the serialized bytes with a DELIBERATE numeric literal
  *  — `expect(prefab.version).toBe(3)` — rather than importing the constant, so a wrong
@@ -15,9 +15,13 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
+// ⚠️ `runtime/core/version.ts`, NOT `editor/scene/prefab.ts` — the constant MOVED there in #1468
+// so the dev server could reach it for the prefab format gate. This guard finds it by TEXT, so the
+// move would otherwise have made `readConstant` throw its own "could not find" assertion rather
+// than silently pass; that is the right failure, but it still has to be pointed at the new home.
 const PREFAB_TS = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
-  '../../packages/modoki/src/editor/scene/prefab.ts',
+  '../../packages/modoki/src/runtime/core/version.ts',
 );
 const E2E_SPEC = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -41,7 +45,7 @@ function readSpecLiteral(): number {
 }
 
 describe('prefab format version stays in sync with the e2e literal (#762 follow-up)', () => {
-  it('finds PREFAB_FORMAT_VERSION in prefab.ts', () => {
+  it('finds PREFAB_FORMAT_VERSION in version.ts', () => {
     expect(Number.isNaN(readConstant())).toBe(false);
   });
 

@@ -1,20 +1,19 @@
 /** Guard: a Pixi `Geometry` is torn down in exactly ONE place — `releaseGeometry` in
  *  `Scene2D.tsx`.
  *
- *  WHY. PixiJS 8.19.0's `Geometry.destroy()` calls `removeAllListeners()` BEFORE it calls
- *  `unload()`, tearing off the `"unload"` listener before it can fire. `gl.deleteVertexArray` is
- *  reachable ONLY through that listener — `GCManagedHash`'s `item.once("unload", this.remove,
- *  this)` registration, owned by `GlGeometrySystem`, is what reaches
- *  `GlGeometrySystem.onGeometryUnload`, the only `gl.deleteVertexArray` call site — so a bare
- *  `geo.destroy()`, even `destroy(true)`, permanently orphans a WebGL VAO. `destroy(true)`
- *  alone does not help: `buffers.forEach` still runs before `unload()` inside the same call.
- *  `Buffer`, `TextureSource`, `GraphicsContext` and `ViewContainer` all order `unload()` before
- *  `destroy()` correctly — `Geometry` is the one Pixi class that inverts it. The fix is
- *  `geo.unload()` BEFORE `geo.destroy(true)`, which is exactly what `releaseGeometry` does.
+ *  WHY. `releaseGeometry` destroys the geometry's buffers with it (`destroy(true)`; a bare
+ *  `destroy()` leaves them to the GC) and makes a second release a no-op, where a second bare
+ *  `destroy()` throws on the `buffers` the first one nulled. A teardown site that calls
+ *  `.destroy(` itself gets neither, and nothing fails until two dispose paths meet on one slot.
  *
- *  A new geometry-teardown site that calls `.destroy(` directly reintroduces the leak
- *  silently — nothing throws, the VAO just never frees — so this needs a static guard, not a
- *  runtime one.
+ *  ⚠️ This guard was written for a worse defect that is now FIXED UPSTREAM — read this before
+ *  deciding it is still load-bearing in the way its history suggests. Before pixi.js 8.21.0,
+ *  `Geometry.destroy()` called `removeAllListeners()` BEFORE `unload()`, tearing off the
+ *  `"unload"` listener that is the only route to `gl.deleteVertexArray`, so every bare destroy
+ *  orphaned a WebGL VAO and `releaseGeometry` called `unload()` first (pixijs#12212, fixed by
+ *  #12190 in 8.21.0). The floor is now `^8.21.0` and that call is gone; the fixed order is pinned
+ *  against the installed pixi by `packages/modoki/tests/runtime/geometryReleaseVao.test.ts`, not
+ *  here — a static scan of OUR code cannot see pixi's order.
  *
  *  THE RULE. No `.destroy(` call on a Pixi Geometry anywhere in `engine/packages/modoki/src/**`
  *  or `engine/app/**`, except inside `releaseGeometry`'s own body in Scene2D.tsx. Route the
@@ -61,8 +60,7 @@ const HELPER_NAME = 'releaseGeometry';
 // Name-based: catches `geo.destroy()`, `myGeometry.destroy()`, `mesh.geometry.destroy()` (the
 // receiver's last name is "geometry"). Deliberately NOT a bare `^g$` — this codebase names plenty
 // of unrelated `Graphics` locals `g` (e.g. `colliderOverlays`), and a Graphics.destroy() is a
-// legitimate bare call (ViewContainer orders unload-before-destroy correctly; it's Geometry alone
-// that inverts it). A short-named local actually holding a Geometry (the original bug used
+// legitimate bare call. A short-named local actually holding a Geometry (the original bug used
 // `const g = m.geometry`) is caught by rule (2) instead.
 const GEOMETRY_NAME = /geometry|geo$/i;
 const GEOMETRY_BUILDERS = new Set(['buildMaterialQuad', 'buildTextGeometryByPage']);
@@ -152,7 +150,7 @@ function parsed(abs: string, rel: string): ts.SourceFile {
   return parseSource(readScannedSource(abs).code, rel);
 }
 
-describe('a Pixi Geometry is destroyed only through releaseGeometry (unload-before-destroy)', () => {
+describe('a Pixi Geometry is destroyed only through releaseGeometry', () => {
   it('no other .destroy( call touches a geometry-shaped identifier', () => {
     const offenders: string[] = [];
     for (const { abs, rel } of sourceFiles()) {
@@ -165,27 +163,17 @@ describe('a Pixi Geometry is destroyed only through releaseGeometry (unload-befo
     }
     expect(
       offenders,
-      'A bare `.destroy(` on a Pixi Geometry orphans its WebGL VAO — PixiJS 8.19.0 Geometry.destroy()\n'
-      + 'tears off the "unload" listener before calling unload(), and gl.deleteVertexArray\n'
-      + '(GlGeometrySystem.onGeometryUnload, the only call site) is reachable ONLY through that\n'
-      + 'listener, via the item.once("unload", …) registration GCManagedHash owns.\n'
-      + 'Route this through releaseGeometry(geo) in Scene2D.tsx instead — it calls unload() before\n'
-      + 'destroy(true), which is the only correct order.\n\nOffending call sites:\n' + offenders.join('\n'),
+      'A bare `.destroy(` on a Pixi Geometry skips what releaseGeometry does: it leaves the\n'
+      + 'geometry\'s buffers to the GC, and a second destroy() of the same geometry THROWS on the\n'
+      + '`buffers` the first one nulled. Route this through releaseGeometry(geo) in Scene2D.tsx.\n'
+      + '(The VAO leak this guard was written for is fixed upstream since pixi.js 8.21.0 — #1540.)\n'
+      + '\nOffending call sites:\n' + offenders.join('\n'),
     ).toEqual([]);
   });
-
-  it(`${HELPER_NAME} itself still calls unload() before destroy(true)`, () => {
-    const helper = releaseGeometryIn(parsed(HELPER_FILE, path.relative(process.cwd(), HELPER_FILE)));
-    const unloads = callsTo(helper.body, 'unload').filter((c) => c.arguments.length === 0);
-    const destroys = destroyCalls(helper.body).map(({ call }) => call);
-    expect(unloads.length, `${HELPER_NAME} no longer calls unload()`).toBeGreaterThan(0);
-    expect(destroys.some((c) => c.arguments.length === 1 && c.arguments[0]!.kind === ts.SyntaxKind.TrueKeyword),
-      `${HELPER_NAME} no longer calls destroy(true)`).toBe(true);
-    // Ordered against ANY destroy, not only destroy(true): a bare destroy() ahead of unload() orphans
-    // the VAO just the same (#1181 close-out re-review, by mutation).
-    expect(unloads[0]!.getStart(), `${HELPER_NAME} must call unload() BEFORE destroy() — Pixi orphans the VAO otherwise`)
-      .toBeLessThan(destroys[0]!.getStart());
-  });
+  // What releaseGeometry itself does (destroy(true), the double-release guard, and that pixi's
+  // destroy fires "unload") is behaviour, pinned against the real pixi in
+  // packages/modoki/tests/runtime/geometryReleaseVao.test.ts. The static "unload() before
+  // destroy(true)" check that lived here retired with the unload() call itself (#1540).
 });
 
 // Unit cover for the classifier itself, against synthetic snippets rather than the real tree — a

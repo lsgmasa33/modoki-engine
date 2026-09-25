@@ -36,12 +36,16 @@ import fs from 'fs';
 //      — see docs/build.md, guarded by tests/electron/mainBundleExternals.test.ts.
 import { hasDocKey } from '../../packages/modoki/src/runtime/core/docKeys';
 import { PREFAB_EDIT_SCENE_PREFIX } from '../../packages/modoki/src/runtime/core/ecs/sceneLoaded';
+import { envelopeExitOptions } from '../../packages/modoki/src/editor/scene/envelopeExits';
 import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
+import { renderAvailability, renderJobs, renderScriptPath } from './recordRenderJob';
+import { fingerprintAssets } from '../takeAssets';
+import type { RenderOptions } from '../../packages/modoki/src/editor/recorder/renderOptions';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
 import { osascriptChooser, type NativeChooser } from './nativeChooser';
 import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
@@ -50,6 +54,8 @@ import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash, remintSceneEntityGuids, planMemberPathRepair, type RepairFile } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
+import { classifyPrefabWrite } from '../prefabWriteGuard';
+import { classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
 
 /** A validate route's file, parsed — or the parse failure as a WARNING (#1212 A-4).
  *  A file that does not parse is the most important thing a validator can report, and it used to
@@ -74,6 +80,15 @@ function parseForValidation(absPath: string, urlPath: string): { data: unknown }
 export function toFsUrl(abs: string): string {
   return path.posix.join('/@fs/', abs.replace(/\\/g, '/'));
 }
+
+/** `modoki_find_references`' ceilings. The MCP schema refuses above them (#1560) and hand-copies the
+ *  numbers (it bundles standalone); `numericRangeInSchema.test.ts` holds the copy to these. */
+export const FIND_REFERENCES_MAX_LIMIT = 1000;
+export const FIND_REFERENCES_MAX_DEPTH = 20;
+/** `modoki_render_sequence`'s ceilings — the same hand-copy arrangement as the two above. */
+export const RENDER_SEQUENCE_MAX_FRAMES = 120;
+export const RENDER_SEQUENCE_MAX_FPS = 60;
+
 /** The 403 for a path that resolves outside the project's asset roots — carrying its OWN options (#1254).
  *
  *  Without them the MCP's `httpFailure` fell back to its bare-403 option, "the backend belongs to a DIFFERENT
@@ -103,6 +118,50 @@ function toAssetRef(ctx: BackendContext, scenePath: string | undefined): string 
   if (scenePath.startsWith('/@fs/')) return ctx.absToAssetUrl(fromFsUrl(scenePath));
   // Not an /@fs URL: only claim it if the edit routes would actually accept it.
   return ctx.resolveAssetPath(scenePath) ? scenePath : null;
+}
+
+/** A `save-all` reply with every file path it names in the asset-root form (#1562).
+ *
+ *  The renderer builds this reply from its own paths, and the OPEN scene's is whatever spelling it
+ *  was opened under — Vite's `/@fs/<abs>` for a boot candidate or an explicit `/@fs/` load. So one
+ *  reply named two files in two address spaces: a Save As answered `scenePath: "/assets/…"` (the
+ *  backend's disk spelling of the copy) beside `savedAsCopyOf: "/@fs/…"` (the same scene the caller
+ *  addresses as `/assets/…`), and a caller comparing them read "a copy of some other file". A plain
+ *  save answered `scenePath: "/@fs/…"`, which `modoki_mutate_scene {path}` refuses with a 403.
+ *  Mapped HERE because this process owns the asset roots, with the same `toAssetRef` that gives
+ *  `editor-state` its `scenePathRef`. A path outside every root is left as the renderer spelled it,
+ *  never dropped. */
+function saveReplyAssetRefs(ctx: BackendContext, body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  // ⚠️ By VALUE, not by field name: a hand list named five of the reply's six path fields
+  // (`savedImportSettings` was missing — close-out review), and the next one added to the op would
+  // have been missed the same way. Only a `/@fs/` string is renderer-spelled, so only it is mapped —
+  // top-level, in a list, or as a list entry's `path`.
+  const ref = (v: unknown) => (typeof v === 'string' && v.startsWith('/@fs/') ? toAssetRef(ctx, v) ?? v : v);
+  const entry = (e: unknown) => (e && typeof e === 'object' && !Array.isArray(e) && 'path' in e
+    ? { ...e, path: ref((e as { path?: unknown }).path) } : ref(e));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(body as Record<string, unknown>)) out[k] = Array.isArray(v) ? v.map(entry) : ref(v);
+  return out;
+}
+
+/** An editor-action reply carrying the editor state (`...readEditorState()` — load-scene, play,
+ *  undo, prefab edit-open and a dozen more) gains the `scenePathRef` `/api/editor-state` gives, from
+ *  the same `toAssetRef` (#1562's sibling, close-out sweep). Its `scenePath` is the renderer's
+ *  spelling, `/@fs/<abs>` for a scene opened that way, which `modoki_mutate_scene {path}` refuses;
+ *  observed live on `load_scene`. Additive, exactly as on editor-state: `scenePath` keeps its value. */
+function withScenePathRef(ctx: BackendContext, body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const out: Record<string, unknown> = { ...(body as Record<string, unknown>) };
+  // `returnScene` is prefab edit-open's scene-to-return-to, captured in the same renderer spelling
+  // (second close-out review) — the same field shape, so the same additive ref.
+  for (const key of ['scenePath', 'returnScene'] as const) {
+    const v = out[key];
+    if (typeof v !== 'string' || `${key}Ref` in out) continue;
+    const ref = toAssetRef(ctx, v);
+    if (ref) out[`${key}Ref`] = ref;
+  }
+  return out;
 }
 
 /** A `setTrait` naming an unknown field on a KNOWN trait — a certain typo — or null.
@@ -224,6 +283,7 @@ import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, 
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
+import { DEVICE_REQUEST_HEADROOM_MS, WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS } from '../../tools/shared/waitForTiming';
 import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import { PROFILER_MUTATING_ACTIONS, PROFILER_READ_ACTIONS } from '../../tools/shared/profilerActions';
 import { decodeSceneOpsReply } from './sceneOpsReply';
@@ -498,6 +558,58 @@ function resolveWritableFilePath(ctx: BackendContext, filePath: string): string 
     return (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) ? abs : null;
   }
   return ctx.resolveAssetPath(filePath);
+}
+
+/** The url the SCANNER will index `absPath` under: the disk's spelling of every folder that exists.
+ *  A file that is there answers for itself (#1273). A new one lands in whatever folder the disk
+ *  already has under that name in another case (APFS/NTFS fold it), and the scan reads THAT folder's
+ *  spelling — so `/assets/Scenes/x.json` beside an on-disk `scenes/` is typed by `scenes`. Only the
+ *  part that does not exist yet keeps the caller's spelling, because that is what gets created.
+ *  Null outside every asset root (the root itself included, which has no url). */
+function scannerUrlOf(ctx: BackendContext, absPath: string): string | null {
+  if (fs.existsSync(absPath)) return ctx.absToAssetUrl(absPath, { onDisk: true });
+  const tail = [path.basename(absPath)];
+  let dir = path.dirname(absPath);
+  while (!fs.existsSync(dir)) {
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    tail.unshift(path.basename(dir));
+    dir = up;
+  }
+  const dirUrl = ctx.absToAssetUrl(dir, { onDisk: true });
+  return dirUrl === null ? ctx.absToAssetUrl(absPath) : `${dirUrl}/${tail.join('/')}`.replace(/\/+/g, '/');
+}
+
+/** The asset kind of the JSON document at `absPath`, or null when nothing says. An existing file is
+ *  what the MANIFEST types it, looked up by the disk's own spelling so a case variant still finds
+ *  it (#1273); a file the manifest does not list (not scanned yet, or scanned before a rename) and a
+ *  file that does not exist yet get `classifyJsonAssetPath` on `scannerUrlOf` — the rule and the
+ *  spelling the scanner itself types by, so the answer is the type the next scan WILL give the file,
+ *  legacy `/scenes/` folder and case-folded folders included. With no url (outside every asset root)
+ *  only the name's suffix can say anything. */
+function assetKindAt(ctx: BackendContext, absPath: string): { kind: string | null; exists: boolean; url: string | null } {
+  const exists = fs.existsSync(absPath);
+  const url = scannerUrlOf(ctx, absPath);
+  const registered = exists && url ? ctx.getManifest().assets.find((a) => a.path === url) : undefined;
+  return { kind: registered?.type ?? (url ? classifyJsonAssetPath(url) : classifyJsonAssetSuffix(absPath)), exists, url };
+}
+
+/** Never cross kinds (#1264, #1472): a route that writes a document of kind `expected` to a path the
+ *  CALLER names refuses a path whose file is — or, when new, whose name makes it — another kind.
+ *  Every such route calls this rather than carrying its own copy: #1264 wrote the check inline in
+ *  `/api/scene-save-as`, and `/api/scene-mutate`, `/api/asset-write` and `/api/create-asset` got
+ *  nothing, so an agent could rewrite a prefab through the scene path.
+ *
+ *  A kind nothing can name (a plain `.json` outside the legacy `/scenes/`/`/materials/` folders) is
+ *  NOT refused: an unknown kind is not a wrong one, and refusing it would break a write this never
+ *  had grounds to judge. */
+function wrongKindRefusal(ctx: BackendContext, absPath: string, expected: string): BackendResult | null {
+  const { kind, exists, url } = assetKindAt(ctx, absPath);
+  if (kind === null || kind === expected) return null;
+  const shown = url ?? absPath;
+  return exists
+    ? json({ error: `${shown} is not a ${expected} (it is typed '${kind}'). Nothing was written.`, wrongKind: true, existingType: kind }, 409)
+    : json({ error: `${shown} would be typed '${kind}' by its name, not '${expected}'. Nothing was written.`, wrongKind: true, nameType: kind }, 409);
 }
 
 function rebuildManifestInline(ctx: BackendContext): boolean {
@@ -1423,10 +1535,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // browser. Lets tooling read editor errors (failed scene/mesh loads, etc.)
   // without a devtools/MCP attach — the curl-able sibling of /api/scene-state.
   if (urlPath === '/api/console-logs' && method === 'GET') {
-    const params: { level?: string; limit?: number; since?: number } = {};
+    const params: { level?: string; limit?: number; since?: number; sinceMs?: number; epoch?: string } = {};
     const level = query.get('level');
     const limit = query.get('limit');
     const since = query.get('since');
+    const sinceMs = query.get('sinceMs');
     if (level) params.level = level;
     // NaN-guard, like the /api/journal and /api/editor-journal siblings. `?limit=abc` would
     // otherwise pass NaN through to the op's tail: `NaN ?? 50` is NaN (nullish coalescing does
@@ -1435,13 +1548,16 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // `ts > NaN` is false, so it returns zero logs and hides real errors.
     if (limit != null && limit !== '' && !Number.isNaN(Number(limit))) params.limit = Number(limit);
     if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
+    if (sinceMs != null && sinceMs !== '' && !Number.isNaN(Number(sinceMs))) params.sinceMs = Number(sinceMs);
+    const epoch = query.get('epoch');
+    if (epoch) params.epoch = epoch;
     return relayJson(ctx, 'console-logs', params);
   }
 
-  // ── GET /api/journal[?type=&clear=1] (M→R) ── the tick-stamped game-event trace
+  // ── GET /api/journal[?type=&level=&sinceCap=&epoch=] (M→R) ── the tick-stamped game-event trace
   // (emit/journalEvents) — verify game LOGIC (match/score/win) without screenshots.
   if (urlPath === '/api/journal' && method === 'GET') {
-    const params: { type?: string; level?: string; clear?: boolean; limit?: number; action?: string } = {};
+    const params: { type?: string; level?: string; clear?: string; limit?: number; action?: string; sinceCap?: number | string; epoch?: string } = {};
     const type = query.get('type');
     if (type) params.type = type;
     // ⚠️ `level` and `action` are forwarded RAW — never narrowed to the values this route knows
@@ -1454,9 +1570,18 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     if (level) params.level = level;
     const action = query.get('action');
     if (action) params.action = action;
-    if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;
+    // `clear` is RETIRED (#1561) and forwarded RAW, whatever its value, so the op refuses it — dropped
+    // here, a caller that meant "start clean" would get a full ring it believed empty.
+    const clear = query.get('clear');
+    if (clear != null) params.clear = clear;
     const jLimit = query.get('limit');
     if (jLimit != null && jLimit !== '' && !Number.isNaN(Number(jLimit))) params.limit = Number(jLimit);
+    // `sinceCap` goes through as a number when it is one and RAW otherwise, so `?sinceCap=abc` is
+    // refused by the op instead of silently becoming an uncursored read of the whole ring.
+    const jSinceCap = query.get('sinceCap');
+    if (jSinceCap != null && jSinceCap !== '') params.sinceCap = Number.isNaN(Number(jSinceCap)) ? jSinceCap : Number(jSinceCap);
+    const jEpoch = query.get('epoch'); // the capture counter's life the cursor belongs to
+    if (jEpoch) params.epoch = jEpoch;
     return relayJson(ctx, 'journal-events', params);
   }
 
@@ -1471,7 +1596,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // ── GET /api/game-introspect (M→R) ── discoverable dispatchable actions (+ param
   // schemas) and live named read-values, so an agent knows what it can trigger/read.
   if (urlPath === '/api/game-introspect' && method === 'GET') {
-    return relayJson(ctx, 'game-introspect', {});
+    const name = query.get('name');
+    return relayJson(ctx, 'game-introspect', name ? { name } : {});
   }
 
   // ── GET /api/game-tools (M→R) ── the GAME's own MCP tool declarations (#270). The MCP server
@@ -1705,7 +1831,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       const opTimeout = Number((b.params as { timeoutMs?: unknown } | undefined)?.timeoutMs);
       // Headroom for the round trip in BOTH directions. Deliberately smaller than /api/eval's
       // 10s — that one crosses an HMR websocket relay; this is one LAN/USB hop.
-      const deadline = Number.isFinite(opTimeout) && opTimeout > 0 ? opTimeout + 5_000 : undefined;
+      const deadline = Number.isFinite(opTimeout) && opTimeout > 0 ? opTimeout + DEVICE_REQUEST_HEADROOM_MS : undefined;
       const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p, deadline);
       // SYSTEM logs come from the HOST, not the app (see deviceSyslog.ts). Handled before every
       // lease-dependent path below, and deliberately NOT gated on the lease: the questions this
@@ -2334,8 +2460,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // frames). Body adds {frames?, fps?} to render-scene's. Returns frame paths.
   if (urlPath === '/api/render-sequence' && method === 'POST') {
     const b = (body ?? {}) as { frames?: number; fps?: number; width?: number; height?: number; quality?: number; camera?: unknown };
-    const frames = Math.max(1, Math.min(Math.round(b.frames ?? 8), 120));
-    const fps = Math.max(1, Math.min(b.fps ?? 10, 60));
+    const frames = Math.max(1, Math.min(Math.round(b.frames ?? 8), RENDER_SEQUENCE_MAX_FRAMES));
+    const fps = Math.max(1, Math.min(b.fps ?? 10, RENDER_SEQUENCE_MAX_FPS));
     const frameOpts = { width: b.width, height: b.height, quality: b.quality, camera: b.camera };
     const paths: string[] = [];
     // Hoisted alongside `paths` (#994 close-out F5) so the catch below can report the timings of
@@ -2558,8 +2684,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
  * Probes each ref with a TARGETED query, one at a time. A BARE `scene-state` would be wrong
  * in two ways that both manufacture a NEW lie ("really is absent") in the function written to
  * stop lying: the untargeted index DROPS resource entities (`all.filter(e => !e.isResource)`)
- * and is CAPPED at DEFAULT_INDEX_LIMIT. Targeting opts back into the uncapped,
- * resource-inclusive path — which is exactly why those params exist.
+ * and is CAPPED at DEFAULT_INDEX_LIMIT. Targeting opts back into the
+ * resource-inclusive path (and `isLive` lifts the targeted cap with an explicit limit, #1557).
  *
  * Best-effort by construction: no editor connected (headless curl / pure runtime) → no hint,
  * and the plain error stands. It must never turn a mutate into a 500.
@@ -2568,7 +2694,9 @@ async function describeUnresolvedAgainstLiveWorld(
   ctx: BackendContext,
   unresolved: EntityRef[],
 ): Promise<string | null> {
-  /** Is THIS ref live? Targeted probe ⇒ uncapped + includes resource entities. */
+  /** Is THIS ref live? Targeted probe ⇒ includes resource entities. Uncapped by an explicit `limit`:
+   *  a targeted read defaults to 20 rows (#1557), and a `name` probe re-checks the EXACT name among
+   *  every CONTAINS match, so the exact one sitting past row 20 would read as "not live". */
   const isLive = async (ref: EntityRef): Promise<boolean | null> => {
     // `guid`, not a `where EntityAttributes.guid=` string compare: the filter resolves through
     // `findEntityByGuid`, which follows a runtime guid a save re-minted (#1223).
@@ -2576,7 +2704,7 @@ async function describeUnresolvedAgainstLiveWorld(
       ? { guid: ref.guid }
       : ref.id != null
         ? { id: ref.id }
-        : { name: ref.name };
+        : { name: ref.name, limit: 100_000 };
     const r = (await ctx.requestBrowser('scene-state', params, 2000)) as
       | { entities?: Array<{ name?: string }> }
       | null;
@@ -2630,6 +2758,9 @@ async function describeUnresolvedAgainstLiveWorld(
         const resolved = ctx.resolveAssetPath(scenePath);
         if (!resolved) return outsideAssetRoots('path outside allowed directories');
         if (!fs.existsSync(resolved)) return json({ error: `scene not found: ${scenePath}` }, 404);
+        // The file branch below parses whatever is here as a scene and writes it back (#1472).
+        const kindRefusal = wrongKindRefusal(ctx, resolved, 'scene');
+        if (kindRefusal) return kindRefusal;
         absPath = resolved;
       }
       if (!Array.isArray(ops)) return json({ error: 'ops must be an array' }, 400);
@@ -2802,47 +2933,9 @@ async function describeUnresolvedAgainstLiveWorld(
             + 'back successfully, and then silently discarded. Nothing was written.',
           runMode: st.runMode,
           ...(owner ? { modeOwner: owner } : {}),
-          // §5: name REAL exits only. `modoki_exit_pose_envelope` is a real exit for an
-          // ANIMATION-owned envelope and a guaranteed refusal for a timeline-owned one (it will
-          // not end another panel's session), so which one is listed depends on the owner.
-          //
-          // ⚠️ `options` holds only things the agent can DO. The reason NOT to reach for the pose
-          // op goes in `hint` instead: an entry that names a tool in order to warn against it is
-          // still an entry with a tool name in it, and an agent scanning the list for something to
-          // call will call it.
-          // ⚠️ THREE arms, and the generic one is not padding. A previous draft collapsed it into
-          // the timeline arm, which then answered "Stop also ends a TIMELINE preview" to a
-          // renderer reporting no `modeOwner` at all (the field is omit-when-null) or a future
-          // third panel — the same "nobody remembers the next one" failure the mode allowlist
-          // above exists to prevent, one expression over.
-          options: owner === 'animation'
-            ? [
-              'modoki_exit_pose_envelope — closes the ANIMATION preview, restores the authored world and returns the run-mode to stopped; then retry this call',
-            ]
-            : owner === 'timeline'
-              ? [
-                // ⚠️ A timeline envelope DOES have an agent exit, and an earlier draft denied it,
-                // sending the agent to find a human over a one-call fix. `stopPlay()` ends a
-                // scrub/preview holding a preview session; the `stop` agent op is unguarded.
-                // ⚠️ …but it is DESTRUCTIVE, and saying so is the difference between an exit and a
-                // trap: it runs `endTimelinePreviewSession({restore:true})`, a full scene reload
-                // from the snapshot taken when the envelope opened, so anything the human did
-                // inside it is discarded. The old text asked the HUMAN to press ⏹; handing an
-                // unattended agent the same button without the caution is not an improvement.
-                "modoki_play_control {action:'stop'} — ends the Timeline preview session and returns the run-mode to stopped, then retry. ⚠️ DESTRUCTIVE: it restores the snapshot taken when the envelope opened, discarding anything the human authored inside it. Prefer asking them if they are at the screen",
-                // ⚠️ NOT "a plain drag-scrub holds no session" — that was true before Phase 3 and
-                // is copied from a `stopPlay` comment that is now stale. Every `enterScrubMode`
-                // call site pairs with `beginTimelinePreviewSession()`, so the only no-session
-                // window left is the async gap before `serializeScene()` resolves — and the right
-                // advice there is to retry, not to go looking for a human.
-                'if the run-mode is STILL not stopped, the session had not finished seating yet (the snapshot is async) — retry stop once before escalating to the human’s ⏹ Exit Preview',
-              ]
-              : [
-                'exit the scrub/preview envelope — ⏹ Exit Preview in whichever panel is driving it — then retry',
-              ],
-          ...(owner === 'timeline'
-            ? { hint: 'Do not reach for modoki_exit_pose_envelope here — it deliberately refuses a timeline-owned envelope, because ending that session would revert its world mid-run. Use modoki_play_control stop instead, minding the caution above.' }
-            : {}),
+          // The exits, by owner — one copy shared with the live-world agent ops (#1552); the §5
+          // reasoning for each arm lives with it.
+          ...envelopeExitOptions(owner),
         }, 409);
       }
       // ── Live-world path (mcp-persistence.md Phase 2) ──
@@ -3491,8 +3584,8 @@ async function describeUnresolvedAgainstLiveWorld(
       }
 
       const result = findReferences(graph, node, {
-        limit: clampInt(query.get('limit'), 50, 1, 1000),
-        maxDepth: clampInt(query.get('maxDepth'), 6, 1, 20),
+        limit: clampInt(query.get('limit'), 50, 1, FIND_REFERENCES_MAX_LIMIT),
+        maxDepth: clampInt(query.get('maxDepth'), 6, 1, FIND_REFERENCES_MAX_DEPTH),
         reachableOnly: query.get('reachableOnly') === '1',
       });
       const body: FindReferencesResponse = {
@@ -4202,6 +4295,9 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
       if (!abs) return outsideAssetRoots('path outside allowed directories');
+      // `type` only picks the schema `data` is validated against; the FILE decides what it is (#1472).
+      const kindRefusal = wrongKindRefusal(ctx, abs, type);
+      if (kindRefusal) return kindRefusal;
       // ── #889 phase 3: the dirty-asset gate. ──
       //
       // ⚠️ **`selfWrite` is the whole reason this route could not simply be gated**, and it is why
@@ -4457,6 +4553,9 @@ async function describeUnresolvedAgainstLiveWorld(
       const abs = ctx.resolveAssetPath(assetPath);
       if (!abs) return outsideAssetRoots('path outside allowed directories');
       if (fs.existsSync(abs)) return json({ error: `destination exists: ${assetPath}` }, 409);
+      // A name the manifest would type as another kind (#1472) — `x.scene.json` from `type:'material'`.
+      const kindRefusal = wrongKindRefusal(ctx, abs, type);
+      if (kindRefusal) return kindRefusal;
       const id = crypto.randomUUID();
       const data = defaultAssetData(type) as Record<string, unknown>;
       data.id = id;
@@ -4494,6 +4593,22 @@ async function describeUnresolvedAgainstLiveWorld(
       // of doing its own read-then-write with a gap a second write can land in between. Absent
       // `ifMatch` ⇒ unconditional write, exactly as before. See `ifMatchRefusal` for why NOTHING
       // may `await` between here and the write below.
+      // ── The PREFAB FORMAT GATE (#1468 D4, owner ruling: refuse to SAVE, never to load). ──
+      // ⚠️ BEFORE `ifMatchRefusal`, never between it and the write: this READS the file, and the
+      // CAS window below must stay free of anything else. Same placement, and the same reason, as
+      // the sidecar gate at `/api/write-meta`.
+      // Keyed on the path suffix because this route is byte-opaque by design. That is not a wart
+      // here: a census of every path a `.prefab.json` can reach disk found 17 writers, 8 of which
+      // reach this route and only 4 of which go through the editor's own `writePrefabFile` — so
+      // this is where the client half stops being bypassable. See `prefabWriteGuard.ts`.
+      const prefabRefusal = classifyPrefabWrite(absPath);
+      if (prefabRefusal) {
+        console.error(`[Prefab] ${prefabRefusal.message}`);
+        return json({
+          ok: false, conflict: true, reason: 'prefab-format-too-new',
+          stored: prefabRefusal.stored, current: prefabRefusal.current, error: prefabRefusal.message,
+        }, 409);
+      }
       const refusal = ifMatchRefusal(absPath, ifMatch);
       if (refusal) return json(refusal, 409);
       // `ifNoneMatch: '*'` is the CREATE-only twin of `ifMatch` (#1215 A-1): refuse when anything
@@ -4579,14 +4694,10 @@ async function describeUnresolvedAgainstLiveWorld(
       let scene: Record<string, unknown>;
       try { scene = JSON.parse(String(content).replace(/^\uFEFF/, '')); } catch { return json({ error: 'content is not valid JSON' }, 400); }
       // Never cross kinds (#1264): the client only sends a `.scene.json` name or a file the manifest
-      // already types `scene`, so this is the backstop for a manifest that disagrees.
-      if (fs.existsSync(absPath)) {
-        const onDisk = ctx.absToAssetUrl(absPath, { onDisk: true });
-        const existing = ctx.getManifest().assets.find((a) => a.path === onDisk);
-        if (existing && existing.type !== 'scene') {
-          return json({ error: `${onDisk} is not a scene (it is typed '${existing.type}')`, wrongKind: true, existingType: existing.type }, 409);
-        }
-      }
+      // already types `scene`, so this is the backstop for a manifest that disagrees — or that does
+      // not list the file at all, which the manifest-only check this replaced let through (#1472).
+      const kindRefusal = wrongKindRefusal(ctx, absPath, 'scene');
+      if (kindRefusal) return kindRefusal;
       const guid = crypto.randomUUID();
       const copy = remintSceneEntityGuids({ ...scene, id: guid }, () => crypto.randomUUID(), makePrefabResolver(ctx));
       const bytes = assetJsonBytes(copy);
@@ -4839,6 +4950,57 @@ async function describeUnresolvedAgainstLiveWorld(
     }
   }
 
+  // ── POST /api/record/fingerprint ── the open project's asset fingerprint, which a take stores at
+  // the Play press so its render can name the assets that changed since (#1509, takeAssets.ts).
+  if (urlPath === '/api/record/fingerprint' && method === 'POST') {
+    try {
+      return json(await fingerprintAssets(ctx.projectRoot));
+    } catch (e) {
+      return json({ error: String(e) }, 500);
+    }
+  }
+
+  // ── GET/POST /api/record/render, POST /api/record/render/cancel ── the gameplay recorder's render
+  // job (#1488): the editor's Stop → render dialog → progress card. A JOB the page polls rather than
+  // an SSE stream, so a game-code reload of the editor page does not cancel a render (recordRenderJob.ts
+  // says why, and why cancel is the CLI's stdin closing).
+  if (urlPath === '/api/record/render' && method === 'GET') {
+    return json({ ...renderAvailability(ctx.editorRoot), job: renderJobs.current(), now: Date.now() });
+  }
+  if (urlPath === '/api/record/render' && method === 'POST') {
+    const availability = renderAvailability(ctx.editorRoot);
+    if (!availability.available || !ctx.editorRoot) return json({ error: availability.reason }, 503);
+    const { take, options } = (body ?? {}) as { take?: unknown; options?: unknown };
+    // The take must be one of THIS project's: the CLI reads it, and by default writes beside it.
+    if (typeof take !== 'string' || !path.isAbsolute(take) || !take.endsWith('.take.json')) {
+      return json({ error: 'take must be the absolute path of a .take.json' }, 400);
+    }
+    if (!isUnderOrSame(ctx.projectRoot, take)) return json({ error: 'take must be inside the open project' }, 403);
+    if (!fs.existsSync(take)) return json({ error: `no take at ${take}` }, 404);
+    const started = renderJobs.start({ repoRoot: ctx.editorRoot, scriptPath: renderScriptPath(ctx.editorRoot), take, options: options as RenderOptions });
+    if (!started.ok) return json({ error: started.error }, started.status);
+    return json({ job: started.job, now: Date.now() });
+  }
+  if (urlPath === '/api/record/render/cancel' && method === 'POST') {
+    const job = renderJobs.cancel();
+    if (!job) return json({ error: 'no render is running' }, 409);
+    return json({ job, now: Date.now() });
+  }
+  // Reveal the video a finished job wrote, named by the job — not by a path the caller sends. The
+  // dialog's "Choose…" folder is usually outside the project, where /api/reveal-in-finder refuses.
+  if (urlPath === '/api/record/render/reveal' && method === 'POST') {
+    const { id } = (body ?? {}) as { id?: unknown };
+    const job = renderJobs.current();
+    if (!job || job.id !== id || !job.result?.video) return json({ error: 'that render has no video to show' }, 404);
+    if (!fs.existsSync(job.result.video)) return json({ error: `the video is gone: ${job.result.video}` }, 404);
+    try {
+      await revealInOS(job.result.video);
+      return json({ ok: true });
+    } catch (e) {
+      return json({ error: String(e) }, 500);
+    }
+  }
+
   // ── POST /api/reveal-in-finder {path} (M, exec) ── open in OS file manager.
   if (urlPath === '/api/reveal-in-finder' && method === 'POST') {
     try {
@@ -4848,6 +5010,12 @@ async function describeUnresolvedAgainstLiveWorld(
       // the same project/engine-root guard the code-editor endpoints use.
       const absPath = ctx.resolveAssetPath(assetPath) ?? resolveSourcePath(ctx, assetPath)?.abs ?? null;
       if (!absPath) return json({ error: 'path outside project/engine roots' }, 403);
+      // Answer a gone file HERE rather than handing it to the OS (#1515): the win32
+      // opener raises a modal dialog for a path the shell cannot open, and since
+      // `launchDetached` no longer waits for that dialog, an unchecked path would
+      // 200 while nothing opened. A row can outlive its file (deleted between the
+      // listing and the click), so this is reachable, not defensive.
+      if (!fs.existsSync(absPath)) return json({ error: `no such file: ${absPath}` }, 404);
       await revealInOS(absPath);
       return json({ ok: true });
     } catch (e) {
@@ -4862,6 +5030,9 @@ async function describeUnresolvedAgainstLiveWorld(
       const { path: assetPath } = (body ?? {}) as { path: string };
       const absPath = ctx.resolveAssetPath(assetPath) ?? resolveSourcePath(ctx, assetPath)?.abs ?? null;
       if (!absPath) return json({ error: 'path outside project/engine roots' }, 403);
+      // Same reason as /api/reveal-in-finder above (#1515) — a gone file is a 404
+      // here, not a modal dialog on the owner's desktop and a 200 that lied.
+      if (!fs.existsSync(absPath)) return json({ error: `no such file: ${absPath}` }, 404);
       await openInOS(absPath);
       return json({ ok: true });
     } catch (e) {
@@ -5299,7 +5470,7 @@ async function describeUnresolvedAgainstLiveWorld(
   // Percept: the human-activity stream (!-prefixed). merged also returns the game journal
   // + a single-axis `timeline` windowed by `sinceCap` (a shared `cap` cursor).
   if (urlPath === '/api/editor-journal' && method === 'GET') {
-    const params: { type?: string; source?: string; since?: number; epoch?: string; sinceCap?: number; merged?: boolean; clear?: boolean; limit?: number } = {};
+    const params: { type?: string; source?: string; since?: number; epoch?: string; sinceCap?: number; merged?: boolean; clear?: string; limit?: number } = {};
     const type = query.get('type');
     const source = query.get('source');
     const since = query.get('since');
@@ -5314,7 +5485,9 @@ async function describeUnresolvedAgainstLiveWorld(
     if (ejLimit != null && ejLimit !== '' && !Number.isNaN(Number(ejLimit))) params.limit = Number(ejLimit);
     if (sinceCap != null && sinceCap !== '' && !Number.isNaN(Number(sinceCap))) params.sinceCap = Number(sinceCap);
     if (query.get('merged') === '1' || query.get('merged') === 'true') params.merged = true;
-    if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;
+    // RETIRED (#1561), forwarded raw so the op refuses it — see /api/journal.
+    const ejClear = query.get('clear');
+    if (ejClear != null) params.clear = ejClear;
     return relayJson(ctx, 'editor-journal', params);
   }
 
@@ -5324,13 +5497,13 @@ async function describeUnresolvedAgainstLiveWorld(
   // unevaluable condition is the op's refusal, before it parks. The body is forwarded whole so the
   // op — not this relay — owns validation, and a field added there cannot be dropped here.
   //
-  // The relay deadline must clear the op's own, exactly as /api/wait-for-edit below: the clamp
-  // (WAIT_FOR_DEFAULT_MS 5000, [50, 120000] in waitFor.ts) is restated, not imported — plugins/
-  // cannot import app/.
+  // The relay deadline must clear the op's own, exactly as /api/wait-for-edit below: the clamp is the
+  // op's, from `tools/shared/waitForTiming.ts` (#1559 — it was restated here while plugins/ could not
+  // import app/, and the shared module is what ended that).
   if (urlPath === '/api/wait-for' && method === 'POST') {
     const b = (body ?? {}) as Record<string, unknown>;
-    const t = typeof b.timeoutMs === 'number' && Number.isFinite(b.timeoutMs) ? b.timeoutMs : 5000;
-    const opTimeout = Math.max(50, Math.min(120_000, Math.floor(t)));
+    const t = typeof b.timeoutMs === 'number' && Number.isFinite(b.timeoutMs) ? b.timeoutMs : WAIT_FOR_DEFAULT_MS;
+    const opTimeout = Math.max(WAIT_FOR_MIN_MS, Math.min(WAIT_FOR_MAX_MS, Math.floor(t)));
     return relayJson(ctx, 'wait-for', b, opTimeout + 10_000);
   }
 
@@ -5554,7 +5727,14 @@ async function describeUnresolvedAgainstLiveWorld(
     // them generous headroom over the default relay timeout. Through `relayJson` because this route
     // carries most of the ops that NAME a §5 code: a bare `json(raw)` sent their refusal as a 200
     // (#1012), which only `postJson`'s `isFailureBody` rescued.
-    return relayJson(ctx, action, relayParams, 60_000);
+    const relayed = await relayJson(ctx, action, relayParams, 60_000);
+    // A success only: a refusal's `error` names paths in prose, and its status must pass untouched.
+    if (relayed.kind === 'json' && relayed.status === undefined) {
+      // save-all's `scenePath` is MAPPED (it names the file written), and it still gets the ref, so
+      // `scenePathRef` means one thing on every reply of this route (second close-out review).
+      return json(withScenePathRef(ctx, action === 'save-all' ? saveReplyAssetRefs(ctx, relayed.body) : relayed.body));
+    }
+    return relayed;
   }
 
   // ── GET /api/scenes (M) ── list the project's scene assets (guid/path/name)

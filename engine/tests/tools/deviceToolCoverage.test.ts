@@ -86,12 +86,13 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_layout_bounds: {},
   device_resolve_refs: { refs: ['g-1'] },
   device_introspect: {},
+  device_wait_for: { entity: { name: 'P' }, timeoutMs: 50 },
   // #288 Phase 6 — the device half of PlayerPrefs + scene queries. Both ops live in
   // `agentBridge.ts` (runtime), so the device runtime already had them and shipping only the
   // editor tools would have been the §9 asymmetry that rule calls a finding.
   device_player_prefs: {},
   device_write_player_prefs: { action: 'flush' },
-  device_scene_query: { kind: 'point', dim: '3d', point: [0, 0, 0] },
+  device_physics_query: { kind: 'point', dim: '3d', point: [0, 0, 0] },
   device_game_tools: {},
   // The ergonomic form is a name and nothing else: `args` is optional, and a game tool with no
   // required params is called bare — which is also the shape the device VALIDATES against the
@@ -118,7 +119,7 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_eval_api: {},   // discovery for device_eval's injected `modoki` object (#83) — no params
   device_screenshot: {},
   device_tap: { selector: '#play' },
-  device_drag: { fromSelector: '#a', toSelector: '#b' },
+  device_drag: { from: { selector: '#a' }, to: { selector: '#b' } },
   device_pointer: { action: 'down', selector: '#play' },
   device_hover: { selector: '#play' },
   device_scroll: { selector: '#list', deltaY: 120 },   // canonical name — see the twin-parity note in mcp-tools.ts

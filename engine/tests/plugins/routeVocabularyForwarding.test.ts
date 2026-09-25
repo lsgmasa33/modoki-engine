@@ -266,3 +266,37 @@ describe('the journal routes forward the cursor epoch (#1214)', () => {
     expect(calls[0].params).toMatchObject({ since: 5, epoch: 'abc-123' });
   });
 });
+
+describe('the retired `clear` and the new cursor reach the journal op, never dropped (#1561)', () => {
+  let game: TestWorld | undefined;
+  afterEach(() => { game?.dispose(); game = undefined; });
+
+  it.each(['clear=1', 'clear=true', 'clear=0', 'clear='])('/api/journal ?%s is a 400 naming the cursor — not a full read the caller believes empty', async (qs) => {
+    game = createTestWorld();
+    emit('match', { n: 1 });
+    const { ctx } = makeCtx((op, params) => runAgentOp(op, params));
+    const r = await get(ctx, '/api/journal', qs);
+    expect(r.status).toBe(400);
+    expect(r.body.code).toBe('UNKNOWN_PARAM');
+    expect(r.body.options).toEqual(['sinceCap', 'epoch']);
+    expect(r.body.events).toBeUndefined();
+  });
+
+  it('/api/editor-journal ?clear=1 reaches the op, which owns the refusal', async () => {
+    const { ctx, calls } = makeCtx(() => ({ ok: true }));
+    await get(ctx, '/api/editor-journal', 'clear=1');
+    expect(calls[0].params).toMatchObject({ clear: '1' });
+  });
+
+  it('/api/journal ?sinceCap&epoch reach the op, and a non-number sinceCap is refused rather than read uncursored', async () => {
+    const { ctx, calls } = makeCtx(() => ({ ok: true }));
+    await get(ctx, '/api/journal', 'sinceCap=5&epoch=abc-1');
+    expect(calls[0].params).toMatchObject({ sinceCap: 5, epoch: 'abc-1' });
+
+    game = createTestWorld();
+    const real = makeCtx((op, params) => runAgentOp(op, params));
+    const r = await get(real.ctx, '/api/journal', 'sinceCap=abc');
+    expect(r.status).toBe(400);
+    expect(r.body.events).toBeUndefined();
+  });
+});

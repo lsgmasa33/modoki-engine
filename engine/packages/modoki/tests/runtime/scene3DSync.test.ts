@@ -1159,44 +1159,31 @@ describe('scene3DSync', () => {
     });
   });
 
-  // The skeletal mixer advance: frozen out of Play mode EXCEPT while the Animation
-  // editor previews (skeletalPreview). This is the decision that fixes "Animator
-  // doesn't play in the scene unless in Play mode".
+  // The skeletal mixer advance: frozen out of Play mode, with no editor-preview exception
+  // (the `skeletalPreview` flag that was one is gone — #1552).
   describe('mixerAdvanceDelta', () => {
     async function load(playState: string, visual: number) {
       mockSceneSyncDeps();
       vi.doMock('../../src/runtime/core/playState', () => ({ getPlayState: () => playState }));
       vi.doMock('../../src/runtime/core/getTime', () => ({ getVisualDelta: () => visual }));
-      const sync = await import('../../src/runtime/rendering/scene3DSync');
-      const preview = await import('../../src/runtime/core/skeletalPreview');
-      return { ...sync, ...preview };
+      return import('../../src/runtime/rendering/scene3DSync');
     }
 
     it('uses the engine visual delta while playing', async () => {
-      const { mixerAdvanceDelta, setSkeletalPreview } = await load('playing', 0.02);
-      setSkeletalPreview(false, 0); // even if preview is off, playing wins
+      const { mixerAdvanceDelta } = await load('playing', 0.02);
       expect(mixerAdvanceDelta({} as any)).toBeCloseTo(0.02);
     });
 
-    it('freezes (0) while stopped and NOT previewing', async () => {
-      const { mixerAdvanceDelta, setSkeletalPreview } = await load('stopped', 0.02);
-      setSkeletalPreview(false, 0);
+    it('freezes (0) while stopped', async () => {
+      const { mixerAdvanceDelta } = await load('stopped', 0.02);
       expect(mixerAdvanceDelta({} as any)).toBe(0);
-    });
-
-    it('advances by the editor preview delta while stopped + previewing', async () => {
-      const { mixerAdvanceDelta, setSkeletalPreview } = await load('stopped', 0.02);
-      setSkeletalPreview(true, 0.016);
-      expect(mixerAdvanceDelta({} as any)).toBeCloseTo(0.016);
-      setSkeletalPreview(false, 0); // don't leak the flag into other tests
     });
 
     // Missing Test #1 (animation F1): a PAUSED world must freeze the skeletal mixer
     // (dt 0) — Pause is not Stop, but both are "not playing" so the mixer must not
-    // advance. Without an active editor preview, advance is 0.
-    it('freezes (0) while paused and NOT previewing', async () => {
-      const { mixerAdvanceDelta, setSkeletalPreview } = await load('paused', 0.02);
-      setSkeletalPreview(false, 0);
+    // advance.
+    it('freezes (0) while paused', async () => {
+      const { mixerAdvanceDelta } = await load('paused', 0.02);
       expect(mixerAdvanceDelta({} as any)).toBe(0);
     });
 

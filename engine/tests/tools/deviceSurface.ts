@@ -84,13 +84,22 @@ export async function loadDeviceSurface(responder?: Responder): Promise<DeviceSu
     await import('../../tools/game-debug-mcp/src/registry');
   clearDeviceRegistry();
 
+  // The schema each tool was registered WITH, so `validate`/`call` can go through the SDK's
+  // validation seam exactly as the wire does — `installArgCoercion` wraps it (#1560), and a harness
+  // that skipped it could not tell whether `registerTools` still installs the decoding.
+  const registeredSchemas = new Map<string, unknown>();
   const server = {
-    registerTool: vi.fn(),
+    // SYNCHRONOUS on purpose (the SDK's is async): the wrapper returns whatever this returns, and a
+    // sync harness keeps `validate` callable without an await at its ~40 call sites.
+    validateToolInput: (_tool: unknown, args: unknown) => args,
+    registerTool: vi.fn((name: string, config: { inputSchema?: unknown }) => { registeredSchemas.set(name, config?.inputSchema); }),
     tool: vi.fn(() => { throw new Error('device tools must register through createDeviceToolDef (registry.ts), not server.tool'); }),
   } as unknown as Parameters<typeof registerTools>[0];
   registerTools(server);
 
   const text = (r: { content: Array<{ type: string; text?: string }> }) => r.content.map((c) => c.text ?? '').join('\n');
+  const decode = (name: string, args: unknown) => (server as unknown as { validateToolInput: (t: unknown, a: unknown, n: string) => unknown })
+    .validateToolInput({ inputSchema: registeredSchemas.get(name) }, args, name);
   return {
     requests,
     names: deviceToolNames(),
@@ -108,13 +117,13 @@ export async function loadDeviceSurface(responder?: Responder): Promise<DeviceSu
     real: () => requests.filter((r) => r.path !== '/api/identity'),
     last: () => requests[requests.length - 1],
     validate: (name, args = {}) => {
-      const r = parseDeviceArgs(name, args);
+      const r = parseDeviceArgs(name, decode(name, args));
       return r.ok ? { ok: true } : { ok: false, error: r.error };
     },
     call: async (name, args = {}) => {
       const entry = getDeviceTool(name);
       if (!entry) throw new Error(`device tool '${name}' is not registered — have: ${deviceToolNames().join(', ')}`);
-      const parsed = parseDeviceArgs(name, args);
+      const parsed = parseDeviceArgs(name, decode(name, args));
       if (!parsed.ok) throw new Error(`invalid args for ${name}: ${parsed.error}`);
       return (entry.handler as (a: unknown) => Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }>)(parsed.data);
     },

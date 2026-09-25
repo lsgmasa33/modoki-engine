@@ -33,8 +33,8 @@
  *    is an ordinary anchor, and `keyed` leaves it out so the caller drops the key.
  *  See docs/scene-loading.md § "Guid uniqueness is a PER-FILE rule, not a repo-wide one" (the subtree duplicate bullet). */
 
-import { addedKeyStep, deriveMemberGuid, memberStepId } from './assetRefRules';
-import { homeStepsOf } from './ecs/memberHome';
+import { deriveMemberGuid, entityStep, isStoredRoot } from './assetRefRules';
+import { resolveIdentityParents, type IdentityNode, type IdentityPi, type TemplateDocReader } from './ecs/identityParents';
 
 export interface CopyGuidPlan<N> {
   /** The new guid for each node of the tree. */
@@ -45,11 +45,13 @@ export interface CopyGuidPlan<N> {
   keyed: Set<N>;
 }
 
-type Pi = { localId?: number; parentLocalId?: number; rootInstanceId?: number; homeSteps?: string } | null;
+type Pi = { localId?: number; parentLocalId?: number; rootInstanceId?: number } | null;
 
 /** Plan the copy's guids. `dataOf(node, 'EntityAttributes' | 'PrefabInstance')` returns that trait's
  *  data on the node, or null when it has none; `keyOf(node)` its template key (`TemplateAddedKey`),
- *  or `''`. */
+ *  or `''`. `readDoc` reads the prefab documents the copied members' frames were expanded from, which is
+ *  where a moved member's template parent comes from (`identityParents.ts`); without it every member is
+ *  walked from where it hangs. */
 export function planCopyGuids<N>(
   root: N,
   childrenOf: (node: N) => readonly N[],
@@ -57,12 +59,13 @@ export function planCopyGuids<N>(
   idOf: (node: N) => number,
   mint: () => string,
   keyOf: (node: N) => string,
+  readDoc?: TemplateDocReader,
 ): CopyGuidPlan<N> {
   const guidOf = new Map<N, string>();
   const remap = new Map<string, string>();
   const keyed = new Set<N>();
-  // Walk the copy in IDENTITY order: a member moved inside its instance hangs under its HOME parent
-  // (`PrefabInstance.homeParent`), which is where a reload derives it from (#1437 — `identityParentId`).
+  // Walk the copy in IDENTITY order: a member moved inside its instance hangs under its TEMPLATE parent,
+  // which is where a reload derives it from (#1437; read from the document since #1468 Phase 6).
   const liveOrder: N[] = [];
   const liveParent = new Map<N, N>();
   const collect = (node: N): void => {
@@ -70,17 +73,20 @@ export function planCopyGuids<N>(
     for (const child of childrenOf(node)) { liveParent.set(child, node); collect(child); }
   };
   collect(root);
-  const byGuid = new Map<string, N>();
+  const byId = new Map<number, N>();
+  const nodes: IdentityNode[] = [];
   for (const node of liveOrder) {
     const guid = dataOf(node, 'EntityAttributes')?.guid;
-    if (typeof guid === 'string' && guid) byGuid.set(guid, node);
+    const lp = liveParent.get(node);
+    byId.set(idOf(node), node);
+    nodes.push({ id: idOf(node), parentId: lp === undefined ? 0 : idOf(lp), guid: typeof guid === 'string' ? guid : '', pi: dataOf(node, 'PrefabInstance') as IdentityPi });
   }
+  const parents = resolveIdentityParents(nodes, readDoc ?? (() => undefined));
   const identityChildren = new Map<N, N[]>();
   for (const node of liveOrder) {
     if (node === root) continue;
-    const home = dataOf(node, 'PrefabInstance')?.homeParent;
-    const homeNode = typeof home === 'string' && home ? byGuid.get(home) : undefined;
-    const parent = homeNode && homeNode !== node ? homeNode : liveParent.get(node)!;
+    const at = byId.get(parents.parentOf(idOf(node)));
+    const parent = at && at !== node ? at : liveParent.get(node)!;
     const list = identityChildren.get(parent);
     if (list) list.push(node);
     else identityChildren.set(parent, [node]);
@@ -97,9 +103,9 @@ export function planCopyGuids<N>(
     const pi = dataOf(node, 'PrefabInstance') as Pi;
     const oldGuid = typeof ea?.guid === 'string' ? ea.guid : '';
     const key = ctx?.inInstance ? keyOf(node) : '';
-    const storedRoot = !!pi && pi.rootInstanceId === idOf(node) && !pi.parentLocalId;
+    const storedRoot = isStoredRoot(pi, idOf(node));
     const inInstance = (storedRoot && !keyOf(node)) || !!ctx?.inInstance;
-    const path = ctx && [...ctx.path, ...homeStepsOf(pi), key ? addedKeyStep(key) : memberStepId(pi)];
+    const path = ctx && [...ctx.path, ...parents.of(idOf(node)).extra, entityStep(pi, key)];
     const derived = !!ctx && (!!key || (!!pi && !storedRoot));
     const guid = derived ? deriveMemberGuid(ctx!.anchor, path!) : mint();
     guidOf.set(node, guid);
@@ -109,7 +115,7 @@ export function planCopyGuids<N>(
     for (const child of identityChildren.get(node) ?? []) visit(child, next);
   };
   visit(root, null);
-  // A node whose home chain loops never hangs off the root; it keeps its live place.
+  // A node whose identity chain loops never hangs off the root; it keeps its live place.
   for (const node of liveOrder) if (!visited.has(node)) visit(node, null);
   return { guidOf, remap, keyed };
 }

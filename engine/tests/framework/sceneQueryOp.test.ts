@@ -1,5 +1,5 @@
 /** The `scene-query` agent op (#288 gap 1) — raycast / shapecast / point-pick over the live
- *  physics world, behind `modoki_scene_query`.
+ *  physics world, behind `modoki_physics_query`.
  *
  *  What is actually worth pinning here is the REFUSAL TAXONOMY, not the casting. Rapier does the
  *  casting and `physics3DSystem.test.ts` already proves it; what this op adds is the ability to

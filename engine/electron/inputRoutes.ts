@@ -26,6 +26,7 @@ import type { MouseButton, InputModifier } from './rendererOps';
 // than re-declared because both sides speak this shape over the bridge, and a second copy
 // of a wire contract silently drifts.
 import type { AimGesture } from '../app/debug/domPointContract';
+import { aimAddresses, ambiguousAimMessage } from '../tools/shared/aimAddresses';
 import type { DomPointResolution } from '../app/debug/domPointContract';
 import type { EntityPointSpec, EntityPointResolution, OcclusionScope, AimedAt } from '../app/debug/entityPointContract';
 // A VALUE, DOM-free for the same reason: the entity-aim refuse/accept decision the device page shares.
@@ -103,18 +104,16 @@ export type InputRoutesHandler =
  *  auto-release would describe a mouseup that never happened. */
 export type HeldLossReason = 'idle' | 'superseded' | 'reload';
 
-/** A point the agent wants to act on: an ENTITY, a CSS selector, or explicit coordinates.
- *
- *  Precedence is `entity` → `selector` → `{x,y}`, extending the existing
- *  selector-overrides-coordinates rule rather than replacing it (the tool descriptions have
- *  documented that ordering since selectors landed, so re-litigating it here would break
- *  callers for no gain). */
+/** A point the agent wants to act on: an ENTITY, a CSS selector, a chrome LABEL, or explicit
+ *  coordinates — exactly ONE of them. Two are refused `AMBIGUOUS` (#1556, owner-approved as a
+ *  breaking change); the rule and what counts as "given" live in `aimAddresses`
+ *  (`tools/shared/aimAddresses.ts`), shared with the renderer and the device MCP. It used to be
+ *  precedence (`entity` → `selector` → `{x,y}`), which pressed one target and answered ok while the
+ *  caller's other address named something else. */
 export interface PointSpec {
   x?: number; y?: number; selector?: string; entity?: EntityPointSpec;
   /** Editor chrome by its LABEL (#1153) — resolved in the renderer over the same set
-   *  `modoki_handles {editor:'chrome'}` lists. Ranks with `selector` (both name a DOM thing), so
-   *  combining it with `selector` or `entity` is REFUSED rather than settled by precedence:
-   *  unlike `selector`-over-`{x,y}` there is no legacy call shape that sends both incidentally. */
+   *  `modoki_handles {editor:'chrome'}` lists. Rides the selector path below (both name a DOM thing). */
   label?: string;
   /** CSS selector scoping a `label` aim to one panel or dialog. */
   within?: string;
@@ -218,20 +217,14 @@ export async function resolvePoint(
   // have re-introduced the permissive path this parameter exists to remove.
   gesture?: AimGesture,
 ): Promise<{ point: ResolvedPoint } | AimRefusal> {
-  const hasEntity = !!spec?.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0;
-  if (spec && spec.label !== undefined && (spec.selector || hasEntity)) {
-    return {
-      error: `${which}: give ONE of label, selector or entity — ${spec.selector ? 'label and selector' : 'label and entity'} `
-        + 'are two addresses for one target, and picking one by precedence would silently ignore the other.',
-      code: 'AMBIGUOUS',
-    };
-  }
+  // One address, before anything resolves (#1556): the chain below reads them in order, and with two
+  // present that order WOULD be precedence — the first to resolve wins and the other is dropped.
+  const twoAddresses = ambiguousAimMessage(aimAddresses(spec));
+  if (twoAddresses) return { error: `${which}: ${twoAddresses}`, code: 'AMBIGUOUS' };
   if (spec && spec.within !== undefined && spec.label === undefined) {
     return { error: `${which}: \`within\` scopes a \`label\` aim and has no meaning without one — pass label, or drop within.`, code: 'REFUSED_BY_OP' };
   }
   // ── entity: resolve {guid}/{name}/{id} to the entity's LIVE screen rect in the renderer. ──
-  // Highest precedence: it is the most specific thing the caller can say, and (unlike a
-  // selector) there is no legacy call shape that passes it incidentally.
   if (spec && spec.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0) {
     let res: EntityPointResolution | null;
     // A top-level `allowOccluded` means the same thing whichever aim is used, so forward it —
@@ -797,7 +790,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const r = await resolvePoint(
         {
           x, y, selector, label, within,
-          entity: held && entity ? { ...entity, allowOccluded: true } : entity,
+          // Only a REAL entity aim gets the flag: `{}` + allowOccluded would have a key, and
+          // `aimAddresses` would count it — refusing `{entity:{}, x, y}` on move/up but not on down.
+          entity: held && entity && Object.keys(entity).length > 0 ? { ...entity, allowOccluded: true } : entity,
           allowOccluded: held ? true : allowOccluded,
         },
         `pointer ${action}`, requestRenderer,
@@ -1068,6 +1063,15 @@ export function createInputRoutes(deps: InputRouteDeps) {
         refuseUnknownValues(`${verb} modifiers`, h.modifiers, EDITOR_INPUT_MODIFIERS),
       );
       if (unknownVocab) return unknownVocab;
+      // drag-handle's destination is ONE of to{}, toId or delta — checked HERE, before any handle
+      // resolves, so a bad `id` cannot hide it. Two used to be settled by precedence (to → toId →
+      // delta) while the tool said "ONE of": the same mechanism #1556 removed from the point aims.
+      const destinations = [h.to ? 'to' : null, h.toId ? 'toId' : null, h.delta ? 'delta' : null]
+        .filter((d): d is string => d !== null);
+      if (verb === 'drag-handle' && destinations.length > 1) {
+        return bad(`drag-handle: give ONE of to{x,y}, toId or delta{dx,dy} — this call gave ${destinations.join(' AND ')}, `
+          + 'which are two destinations for one drag, and picking one by precedence would silently ignore the other.', 'AMBIGUOUS');
+      }
       // Carry the aimability annotations computeHandles already produces — the old closure narrowed
       // the result to {id,x,y} and DROPPED them, so tap/drag fired unconditionally: an off-screen
       // handle taps nothing, an occluded one hits the covering element, a disabled one is inert, and
@@ -1089,20 +1093,49 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // the entity out from under the toolbar moved it correctly on the first try). A press that
       // provably lands on something else is a miss, and a miss reported as a success is how a tool
       // manufactures a phantom product bug. `allowOccluded:true` still forces it through.
-      const blockedReason = (hd: ResolvedHandle, allowOccluded?: boolean): string | null =>
-        hd.onScreen === false
-          // `clipped` = inside the window but outside its OWN panel's visible box. Same refusal,
-          // different remedy: scrolling is what fixes a panel taller than its dock row, and is
-          // useless for a gizmo handle projected past the edge of its viewport (there the panel
-          // or the camera has to move). Saying "scroll it into view" for both sent a QA session
-          // scrolling a canvas that does not scroll.
-          ? (hd.clipped
-            ? 'off-screen — its coordinates are inside the window but OUTSIDE its own panel\'s visible box, so a press there lands on whatever panel occupies those pixels. Scroll that panel (modoki_scroll over it), enlarge it, or move the target back into view, then retry'
-            : 'off-screen — scroll it into view (modoki_scroll over the panel), then retry')
-          : hd.meta?.disabled === true ? 'disabled (inert / greyed-out)'
-            : hd.occludedBy !== undefined && !allowOccluded
-              ? `covered by ${hd.occludedBy} — the press would land on THAT, not on the handle. Move the covering panel/menu (or the target) out of the way, or pass allowOccluded:true to press anyway and see what happens`
-              : null;
+      // Returns the refusal's text and its code, in the contract every other aimed route keeps
+      // (`resolvePoint`, #1555 review → #1565): what `allowOccluded` can override is `OCCLUDED`,
+      // and it is the ONLY thing that is.
+      //  - COVERED, or CLIPPED by a neighbouring panel (inside the window, outside its own panel's
+      //    visible box): OCCLUDED, overridable. Both mean "a press here lands on something else";
+      //    the selector path already treats a clipped aim as a cover, and a clipped handle used to
+      //    take the off-screen branch instead — no code, unforceable — so a gizmo handle drawn past
+      //    its viewport's edge was refused as invalid while the QA case expected OCCLUDED (owner:
+      //    overridable, 2026-09-25).
+      //  - OFF-WINDOW or DISABLED: a hard refusal, `REFUSED_BY_OP` stated rather than left for the
+      //    MCP layer to infer. A press outside the window reaches nothing, and a disabled handle is
+      //    inert — neither is a cover, so `allowOccluded` does not open them.
+      const blockedReason = (hd: ResolvedHandle, allowOccluded?: boolean): { reason: string; code: 'OCCLUDED' | 'REFUSED_BY_OP' } | null => {
+        if (hd.onScreen === false && !hd.clipped) {
+          return { reason: 'off-screen — scroll it into view (modoki_scroll over the panel), then retry', code: 'REFUSED_BY_OP' };
+        }
+        if (hd.meta?.disabled === true) return { reason: 'disabled (inert / greyed-out)', code: 'REFUSED_BY_OP' };
+        if (allowOccluded) return null;
+        // `clipped` = inside the window but outside its OWN panel's visible box. Same code as a
+        // cover, different remedy: scrolling fixes a panel taller than its dock row, and is useless
+        // for a gizmo handle projected past the edge of its viewport (there the panel or the camera
+        // has to move). Saying "scroll it into view" for both sent a QA session scrolling a canvas
+        // that does not scroll.
+        if (hd.clipped) {
+          return {
+            reason: `clipped — its coordinates are inside the window but OUTSIDE its own panel's visible box, so a press there lands on ${hd.occludedBy ?? 'whatever panel occupies those pixels'}. `
+              + 'Scroll that panel (modoki_scroll over it), enlarge it, or move the target back into view and retry — or pass allowOccluded:true to press anyway and see what happens',
+            code: 'OCCLUDED',
+          };
+        }
+        if (hd.occludedBy !== undefined) {
+          return {
+            reason: `covered by ${hd.occludedBy} — the press would land on THAT, not on the handle. Move the covering panel/menu (or the target) out of the way, or pass allowOccluded:true to press anyway and see what happens`,
+            code: 'OCCLUDED',
+          };
+        }
+        return null;
+      };
+      // A refusal is a 400 with its code, as on every other aimed route (`badAim`). These answered
+      // 200 {ok:false}: the MCP relay re-derives a code from that body, so the agent saw the same
+      // envelope — but a curl caller or a `status >= 400` client read a refusal as success (#1565).
+      const refuseHandle = (which: string, hd: ResolvedHandle, blocked: { reason: string; code: string }, hint: string) =>
+        json({ ok: false, error: `${which} is ${blocked.reason}${hint}`, code: blocked.code, handle: { id: hd.id, x: hd.x, y: hd.y, onScreen: hd.onScreen ?? true } }, 400);
 
       const from = await resolve(h.id);
       if (!from) return json({ error: `no live handle with id '${h.id}' (query /api/enact-handles to list current handles)` }, 404);
@@ -1111,9 +1144,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // to reach it too or the rule diverges again — a handle sitting under a panel that has not
       // finished moving reads exactly as "this handle is inert", which is how a working 2D gizmo
       // handle got filed at severity high.
-      if (fromBlocked) {
-        return json({ ok: false, error: `handle '${h.id}' is ${fromBlocked}${await settlingHint(requestRenderer)}`, handle: { id: h.id, x: from.x, y: from.y, onScreen: from.onScreen ?? true } });
-      }
+      if (fromBlocked) return refuseHandle(`handle '${h.id}'`, from, fromBlocked, await settlingHint(requestRenderer));
       // S3.17 — `occluded` means the SAME thing here as on every other aimed route: a BOOLEAN,
       // always present, with the covering element's identity in `occludedBy`. The handle routes
       // used to emit `occluded` as a STRING naming the cover and omit it when clean, so a caller
@@ -1134,23 +1165,24 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // guarantee see" question is answered rather than implied.
       const occlusion = (hd: ResolvedHandle): Record<string, unknown> => (
         hd.occlusionChecked
-          ? { occluded: hd.occludedBy !== undefined, occludedBy: hd.occludedBy ?? null, occlusionChecked: true }
+          // A CLIPPED handle is occluded by definition — its own panel does not own those pixels —
+          // even when the hit-test named no cover, so a forced press never reports a clean one.
+          ? { occluded: hd.occludedBy !== undefined || hd.clipped === true, occludedBy: hd.occludedBy ?? null, occlusionChecked: true, ...(hd.clipped ? { clipped: true } : {}) }
           : { occluded: null, occludedBy: null, occlusionChecked: false }
       );
       if (urlPath === '/api/input/tap-handle') {
         await ops.tap(from.x, from.y, { button: h.button, clickCount: h.clickCount, modifiers: h.modifiers });
         return json({ ok: true, tappedHandle: { id: h.id, x: from.x, y: from.y }, ...occlusion(from) });
       }
-      // drag-handle: destination is an explicit to{}, another handle (toId), or from+delta.
+      // drag-handle: destination is an explicit to{}, another handle (toId), or from+delta — the
+      // one-of check ran before any resolve, above.
       let to: { x: number; y: number } | null = h.to ?? null;
       let toHandle: ResolvedHandle | null = null;
       if (!to && h.toId) {
         const t = await resolve(h.toId);
         if (!t) return json({ error: `no live handle with toId '${h.toId}'` }, 404);
         const tBlocked = blockedReason(t, h.allowOccluded);
-        if (tBlocked) {
-          return json({ ok: false, error: `toId handle '${h.toId}' is ${tBlocked}${await settlingHint(requestRenderer)}`, handle: { id: h.toId, x: t.x, y: t.y, onScreen: t.onScreen ?? true } });
-        }
+        if (tBlocked) return refuseHandle(`toId handle '${h.toId}'`, t, tBlocked, await settlingHint(requestRenderer));
         to = { x: t.x, y: t.y };
         toHandle = t;
       }
@@ -1164,8 +1196,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
         return json({
           ok: false,
           error: `drag-handle is a no-op: the destination resolved to the same point as handle '${h.id}' (${from.x}, ${from.y}) — a press+release at one pixel is a CLICK, not a drag. Use /api/input/tap-handle, or pass a non-zero delta{dx,dy}.`,
+          code: 'REFUSED_BY_OP',
           handle: { id: h.id, x: from.x, y: from.y },
-        });
+        }, 400);
       }
       await ops.drag({ x: from.x, y: from.y }, to, { steps: h.steps, button: h.button, modifiers: h.modifiers });
       // PER ENDPOINT, mirroring /api/input/drag's fromTarget/toTarget: collapsing the two into one
@@ -1178,7 +1211,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
         fromTarget: { id: h.id, ...occlusion(from) },
         ...(toHandle ? { toTarget: { id: h.toId, ...occlusion(toHandle) } } : {}),
         // Kept for callers written against the old shape: true when EITHER end is covered.
-        occluded: from.occludedBy !== undefined || toHandle?.occludedBy !== undefined,
+        occluded: from.occludedBy !== undefined || from.clipped === true || toHandle?.occludedBy !== undefined || toHandle?.clipped === true,
         occludedBy: from.occludedBy ?? toHandle?.occludedBy ?? null,
       });
     }

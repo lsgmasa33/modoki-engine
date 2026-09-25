@@ -25,12 +25,12 @@ import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
 import {
-  beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
-  capturePreviewGesture, cancelPreviewGestures,
+  endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
+  capturePreviewGesture, cancelPreviewGestures, poseEnvelopeHeld,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
-import { openPreviewSessionThen, reopenPreviewAfterRestore } from '../scene/openPreviewSession';
+import { enterScrubMode, enterPreviewMode, exitPreviewMode, freezePreviewIfOwnedBy, registerModeOwnerDisplaced, getModeOwner, onModeOwnerChange } from '../scene/playMode';
+import { openPreviewSessionThen, openPlaybackSession, reopenPreviewAfterRestore, mayEndSharedSession, undoMayRepose } from '../scene/openPreviewSession';
 import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
 import { panelDrivesPreview, panelMayStopPreview } from '../scene/previewOwnership';
 import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/core/playState';
@@ -130,7 +130,10 @@ export default function TimelineEditor() {
   // preview are the two states of the preview-session envelope; stopped = editing.
   const runMode = useSyncExternalStore(onRunModeChange, getRunMode);
   const advancing = useSyncExternalStore(onRunModeChange, isAdvancing);
-  const inPreview = runMode === 'scrub' || runMode === 'preview';
+  // OURS, not merely "some panel is previewing" (#1549): the ⏹, the status text and the Cmd+S handler
+  // below all key on this, and reading the run mode alone made them act for an ANIMATION envelope.
+  const modeOwner = useSyncExternalStore(onModeOwnerChange, getModeOwner);
+  const inPreview = (runMode === 'scrub' || runMode === 'preview') && modeOwner === 'timeline';
 
   const [viewport, setViewport] = useState<Viewport>(DEFAULT_VIEWPORT);
   const [selectedTrack, setSelectedTrack] = useState<number | null>(null);
@@ -192,7 +195,7 @@ export default function TimelineEditor() {
     // The invariant, asserted where the damage would happen — the twin of AnimationEditor's. A pose
     // with no session held is unrevertible AND unguarded (run-mode reads 'stopped', so a save bakes
     // it), and this one is the worse of the two: `previewControlAt` SPAWNS control-track prefabs.
-    if (!hasTimelinePreviewSession()) {
+    if (!poseEnvelopeHeld()) {
       console.error(
         '[TimelineEditor] refused to pose with no preview session held — the pose would be ' +
         'unrevertible and a scene save would bake it. Every pose must go through `pose`.',
@@ -217,11 +220,15 @@ export default function TimelineEditor() {
    *  Animation-panel instance, which cost the owner real data first. */
   const pose = useCallback((d: TimelineDef | null, t: number) => {
     if (!d || rootId == null) return;
-    if (hasTimelinePreviewSession()) { applyPose(d, t); return; }
+    if (poseEnvelopeHeld()) { applyPose(d, t); return; } // a held session, or Play (#1546)
     enterScrubMode('timeline');
     void openPreviewSessionThen('timeline', () => applyPose(d, t));
   }, [rootId, applyPose]);
   const poseLatest = useCallback((d: TimelineDef) => pose(d, useEditorStore.getState().playheadTime), [pose]);
+  // The undo/redo closures outlive the render that made them; through the ref they pose with the
+  // CURRENT root, not one a restore has since replaced (#1550).
+  const poseLatestRef = useRef(poseLatest);
+  poseLatestRef.current = poseLatest;
 
   // ── Load the doc when the open target changes ──
   useEffect(() => {
@@ -231,7 +238,8 @@ export default function TimelineEditor() {
     // is held, so this is a no-op.
     clearPreviewControls(); // drop any control-prefab a scrub of the PREVIOUS timeline left spawned
     cancelPreviewGestures(); // a grab chain of the PREVIOUS target must not reopen on this one
-    if (hasTimelinePreviewSession()) void endTimelinePreviewSession({ restore: true });
+    // Only OUR envelope, or an orphan (#1549) — an Animation preview's world must not be restored under it.
+    if (hasTimelinePreviewSession() && mayEndSharedSession('timeline')) void endTimelinePreviewSession({ restore: true });
     exitPreviewMode('timeline'); // opening/switching a timeline returns to stopped (any prior scrub/preview ended above)
     lastAction.current = null;
     lastGroup.current = undefined;
@@ -347,8 +355,9 @@ export default function TimelineEditor() {
         // interrupt a preview and rewrite the scene file on every save while authoring. The agent
         // twins have set this since S2.27; the panels never did.
         _isFileDirect: true,
-        undo: () => { useEditorStore.getState().applyTimelineDoc(path, before); poseLatest(before); },
-        redo: () => { useEditorStore.getState().applyTimelineDoc(path, a._after); poseLatest(a._after); },
+        // Re-pose only into our own held session — a pose OPENS the envelope (#1550; `undoMayRepose`).
+        undo: () => { useEditorStore.getState().applyTimelineDoc(path, before); if (undoMayRepose('timeline')) poseLatestRef.current(before); },
+        redo: () => { useEditorStore.getState().applyTimelineDoc(path, a._after); if (undoMayRepose('timeline')) poseLatestRef.current(a._after); },
       };
       pushAction(a);
       lastAction.current = a;
@@ -473,12 +482,16 @@ export default function TimelineEditor() {
         .then((newRoot) => { if (newRoot != null) useEditorStore.getState().setDirectorRoot(newRoot); });
       void reopenPreviewAfterRestore('timeline', restored, capturePreviewGesture(),
         () => poseAt(useEditorStore.getState().playheadTime));
-    } else if (!hasTimelinePreviewSession()) {
+    } else if (!poseEnvelopeHeld()) {
       // First scrub of the envelope (from stopped): snapshot the AUTHORED world BEFORE posing, so
       // Exit / asset-switch / unmount can revert the pose. (Mandatory scrub session — Phase 3.)
       void openPreviewSessionThen('timeline', () => poseAt(clamped));
     } else {
-      poseAt(clamped); // continuing a scrub within the envelope — just repose
+      // Continuing a scrub within the envelope — or scrubbing during PLAY, whose own snapshot Stop
+      // reverts (#1546). Asking `hasTimelinePreviewSession()` here sent a Play scrub to the opener,
+      // whose begin refuses in Play, so a Timeline scrub during Play posed nothing while the
+      // Animation panel's did — the same question `pose` above already asks.
+      poseAt(clamped);
     }
   }, [poseAt, stopPreviewLoop]);
 
@@ -551,29 +564,38 @@ export default function TimelineEditor() {
     // the flat refusal ("exit scrub to save") on a clean scene: exactly the non-event warning the
     // assets-only branch exists to remove. The Animation panel worked only because its own dep
     // happens to be a `useState` that the scrub sets.
-    if (!playing && runMode === 'stopped') return;
+    //
+    // ⚠️ And on OWNERSHIP, not the run mode (#1549): registering for any scrub/preview put this
+    // handler on top during an ANIMATION envelope, so Cmd+S ran our suspend (a restore that could not
+    // release the Animation panel's mode), refused the save, then resumed by claiming scrub for
+    // 'timeline' — leaving the Animation panel's ⏹ inert.
+    if (!inPreview) return;
     const mine = saveHandlerRef.current!;
     setPreviewSaveHandler(mine);
     return () => clearPreviewSaveHandler(mine);
-  }, [playing, runMode]);
+  }, [inPreview]);
 
   // ── Displacement (#810): the Animation panel taking the mode (a clip scrub/preview) ends OUR
   // preview GLOBALLY — `RunMode` is single-valued — but nothing else tells this panel's rAF loop
   // to stop, and its tick body never consults `getRunMode()`.
   //
-  // ⚠️ Must NOT call `setPreviewPlaying(false)` — that flag is SHARED with the Animation panel
+  // ⚠️ Must NOT call `setPreviewPlaying(false)` UNCONDITIONALLY — that flag is SHARED with the Animation panel
   // (both read `useEditorStore((s) => s.isPreviewPlaying)`), so flipping it off here does not stop
   // "our" preview, it stops BOTH panels' preview effects. With both docked, one ▶ press could stop
-  // itself: Animation enters first (no notify yet), Timeline's async session-open resolves a
-  // microtask later and takes the mode, displacing Animation — whose callback (the first #810
+  // itself: Animation entered first (no notify yet), Timeline's async session-open resolved a
+  // microtask later and took the mode (it claims before the await since #1569, same effect),
+  // displacing Animation — whose callback (the first #810
   // pass) then killed the flag Timeline's own just-started preview was keyed on. Confirmed live in
   // `previewDisplacementSharedFlag.test.ts` before this fix. Stopping only THIS run's guard is
   // what avoids it — see `previewLoopGuard.ts`. Registered for the panel's whole lifetime, not
   // gated on `playing` — a displacement can arrive between preview sessions just as easily as
   // during one, and the callback is a no-op when no guard is live.
+  // Stand down fully, not just the loop (#1546) — see the AnimationEditor twin: a still-true ▶ flag
+  // re-ran the preview effect on the next root change and reopened the envelope. Owner-strict.
   useEffect(() => registerModeOwnerDisplaced('timeline', () => {
     previewLoopGuardRef.current?.stop();
     previewRafRef.current = 0;
+    useEditorStore.getState().stopPreviewIfOwnedBy('timeline');
   }), []);
 
   // ── Preview playback loop ──
@@ -593,13 +615,10 @@ export default function TimelineEditor() {
     let last = performance.now();
     let cancelled = false;
     void (async () => {
-      let opened = false;
-      try {
-        opened = await beginTimelinePreviewSession(); // snapshot authored world (idempotent across pause/resume)
-      } catch (e) {
-        console.error('[TimelineEditor] could not open the preview session — ▶ not started', e);
-      }
-      if (cancelled || guard.stopped) return; // displaced before we ever took the mode ourselves
+      // Claims a frozen 'preview' BEFORE the snapshot, so a teardown in the gap cancels it (#1569);
+      // idempotent across pause/resume. A refusal or a throw has already handed the claim back.
+      const opened = await openPlaybackSession('timeline');
+      if (cancelled || guard.stopped) return; // displaced, or torn down, while the snapshot serialized
       if (!opened) {
         // No session (#1167: ▶ pressed while an Exit's restore is still landing, or the snapshot
         // threw). The loop below poses AND fires signals with nothing to revert them, so it must not
@@ -644,9 +663,8 @@ export default function TimelineEditor() {
     // clobber the just-set scrub back to 'preview'. Also: a DISPLACEMENT (not a scrub/exit of our
     // own) already stopped the guard and cleared `previewRafRef` above, and does NOT flip `playing`
     // (see the registration comment) — so this cleanup only runs here for OUR OWN teardown, never
-    // as a side effect of losing the mode to another panel. If it ever ran on displacement too, the
-    // `getRunMode() === 'preview'` check below would already read the NEW owner's mode and decline
-    // — same guard `enterPreviewMode`'s ordering relies on (see playMode.ts).
+    // as a side effect of losing the mode to another panel. If it ever ran on displacement too,
+    // `freezePreviewIfOwnedBy` would read the NEW owner and decline.
     return () => {
       cancelled = true;
       guard.stop();
@@ -657,7 +675,7 @@ export default function TimelineEditor() {
       if (previewLoopGuardRef.current === guard) previewLoopGuardRef.current = null;
       previewRafRef.current = 0;
       setTimelinePreviewActive(false);
-      if (getRunMode() === 'preview') enterPreviewMode(false, 'timeline');
+      freezePreviewIfOwnedBy('timeline');
     };
   }, [playing, previewOwner, rootId]);
 

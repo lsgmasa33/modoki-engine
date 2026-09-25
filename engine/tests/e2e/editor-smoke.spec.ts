@@ -10,34 +10,19 @@
  *  viewport center — a deterministic click target independent of projection. */
 
 import { test, expect, type Page } from '@playwright/test';
+import { SCENE, selectedName, gotoEditorWithScene as gotoEditorWithSceneShared } from './helpers';
 
-const SCENE = '/tests/e2e/fixtures/e2e-smoke.scene.json';
-
-const selectedName = (page: Page) =>
-  page.evaluate(() => (window as { __modokiEditorTest?: any }).__modokiEditorTest?.selectedEntityName() ?? null);
+// ⚠️ The shared goto, never a local copy (#1544 close-out). This spec was the one e2e file that did
+// not import `helpers.ts`: its own hand copy predated `blockLayoutAutosave`, so it booted whatever
+// dock layout this clone had autosaved. With a saved layout that selects another tab over Scene (a
+// `2D Skin` tab, Sep 17), `[data-scene-viewport] canvas` never mounted and all five tests timed out
+// at boot, locally only, since CI has no autosave. The copy also passed `{timeout}` as
+// `waitForFunction`'s ARG (so its 30s timeouts never applied) and truth-tested `loadScene`'s outcome
+// string (so a failed load read as ok). The helper already fixes all three.
+const gotoEditorWithScene = (page: Page) => gotoEditorWithSceneShared(page, SCENE, 'CenterCube');
 
 const selectedId = (page: Page) =>
   page.evaluate(() => (window as { __modokiEditorTest?: any }).__modokiEditorTest?.store.getState().selectedEntityId ?? null);
-
-async function gotoEditorWithScene(page: Page) {
-  // Force the WebGL2 renderer path: the detection does requestAdapter/Device, so
-  // removing navigator.gpu makes it report "no WebGPU" → WebGL2 (SwiftShader).
-  await page.addInitScript(() => { try { delete (navigator as any).gpu; } catch { /* ignore */ } });
-
-  await page.goto('/#/editor');
-  await page.waitForSelector('[data-scene-viewport] canvas', { timeout: 30_000 });
-  // Load the fixture through the bridge rather than seeding localStorage: the editor
-  // scopes its last-scene key per project (`modoki-last-scene:<project>`), so a plain
-  // `modoki-last-scene` write is silently ignored and the fixture never loads.
-  await page.waitForFunction(() => !!(window as any).__modokiEditorTest, { timeout: 30_000 });
-  const ok = await page.evaluate((scene) => (window as any).__modokiEditorTest.loadScene(scene), SCENE);
-  if (!ok) throw new Error(`gotoEditorWithScene: loadScene('${SCENE}') returned false`);
-  // Wait for the fixture entities to populate.
-  await page.waitForFunction(() => {
-    const b = (window as any).__modokiEditorTest;
-    return !!b && b.getAllEntities().some((e: any) => e.name === 'CenterCube');
-  }, { timeout: 30_000 });
-}
 
 /** Center of the 3D viewport canvas, in page coordinates. */
 async function viewportCenter(page: Page) {

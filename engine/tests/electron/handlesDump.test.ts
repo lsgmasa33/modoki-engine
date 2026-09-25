@@ -102,6 +102,18 @@ describe('computeHandles', () => {
       expect(r).toMatchObject({ occludedCount: 1, occlusionUnchecked: 0 });
     });
 
+    it('a handle under a GAME UI node names the entity, not the dock (#1570)', () => {
+      // The live shape: a 3D gizmo handle drawn under the scene's own HUD bar in SceneView 'ui'.
+      const canvas = el('canvas');
+      const dock = el('div', 'flexlayout__tab_moveable');
+      const host = document.createElement('div');
+      host.setAttribute('data-entity-id', '13');
+      dock.appendChild(host);
+      document.elementFromPoint = () => host;
+      provide(h({ id: 'gizmo3d:translate:x', editor: 'gizmo3d', owner: canvas }));
+      expect(computeHandles().handles[0].occludedBy).toBe('entity 13');
+    });
+
     it('a descendant on top is not occlusion (the click still bubbles)', () => {
       const btn = el('button');
       const label = document.createElement('span');

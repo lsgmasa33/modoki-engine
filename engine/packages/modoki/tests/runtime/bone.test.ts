@@ -9,7 +9,6 @@ import * as THREE from 'three';
 import { Transform, EntityAttributes, Bone, Animator } from '../../src/runtime/traits';
 import { deactivatedEntities, transformPropagationSystem, worldTransforms } from '../../src/runtime/core/ecs/transformPropagationSystem';
 import { setPlayState } from '../../src/runtime/core/playState';
-import { setSkeletalPreview } from '../../src/runtime/core/skeletalPreview';
 import { registerLateUpdate, clearLateUpdates } from '../../src/runtime/core/lateUpdate';
 import { registerTrait, getAllTraits } from '../../src/runtime/core/ecs/traitRegistry';
 import { setAnimationClip, clearAnimationClipCache } from '../../src/runtime/loaders/animationClipCache';
@@ -62,9 +61,8 @@ beforeEach(() => {
   clearAnimationClipCache();
   ensureTraitsRegistered();
   setPlayState('playing');
-  setSkeletalPreview(false, 0);
 });
-afterEach(() => { world.destroy(); setPlayState('stopped'); setSkeletalPreview(false, 0); clearLateUpdates(); clearAnimationClipCache(); });
+afterEach(() => { world.destroy(); setPlayState('stopped'); clearLateUpdates(); clearAnimationClipCache(); });
 
 describe('syncBones (P7b bridge)', () => {
   it('reads the posed bone back into the Bone entity Transform (local)', () => {
@@ -292,16 +290,17 @@ describe('syncBones (P7b bridge)', () => {
 /** Regression — Animation-editor preview of a KEYFRAME Animator clip in the Scene
  *  window (the Cone in the Skinned Test scene).
  *
- *  The bug: previewing globally flipped the `skeletalPreview` flag, which made
- *  `syncBones` treat the stopped editor as "playing" and run the bone-Animator
+ *  The bug: previewing globally flipped a `skeletalPreview` flag (deleted in #1552), which
+ *  made `syncBones` treat the stopped editor as "playing" and run the bone-Animator
  *  LAYER pass. That pass re-poses the rig from the ECS `Animator.time` — which the
  *  preview never advances (only the editor's store playhead moves) — so it stamped
  *  the keyframe pose the editor just wrote BACK to frame 0 every render. Net: the
  *  Cone looked frozen even though its bone Transform briefly held the right value.
  *
- *  The fix keeps the preview flag OFF for a keyframe clip, so the editor's pose is
- *  the sole writer and write-back carries it to the skeleton — like a scrub. These
- *  two tests pin both halves: the off path must NOT clobber; the on path WOULD. */
+ *  Now nothing but the play state makes `syncBones` "playing", so a Stopped preview leaves the
+ *  editor's pose the sole writer and write-back carries it to the skeleton — like a scrub. These
+ *  two tests pin both halves: Stopped must NOT clobber; any non-stopped state WOULD, which is
+ *  why no preview may derive one. */
 describe('keyframe Animator preview on a stopped rig (scene-window preview)', () => {
   /** A clip whose bone1 track is 0 at every time (so the layer pass, sampling at
    *  Animator.time = 0, would reset a non-zero editor pose to 0). */
@@ -324,9 +323,8 @@ describe('keyframe Animator preview on a stopped rig (scene-window preview)', ()
     return { bone, be };
   }
 
-  it('preview OFF: the editor pose survives and deforms the mesh (no clobber)', () => {
+  it('Stopped (what a preview runs under): the editor pose survives and deforms the mesh (no clobber)', () => {
     setPlayState('stopped');
-    setSkeletalPreview(false, 0);          // keyframe preview no longer flips this
     const { bone, be } = setupConeRig(-0.5);
 
     syncBones(world, scene, state);
@@ -335,9 +333,8 @@ describe('keyframe Animator preview on a stopped rig (scene-window preview)', ()
     expect(new THREE.Euler().setFromQuaternion(bone.quaternion).x).toBeCloseTo(-0.5); // reached the skeleton → deforms
   });
 
-  it('preview ON (the old hazard): the layer pass clobbers the pose back to Animator.time=0', () => {
-    setPlayState('stopped');
-    setSkeletalPreview(true, 0.016);       // what SceneView used to do during preview
+  it('not Stopped (the old hazard): the layer pass clobbers the pose back to Animator.time=0', () => {
+    setPlayState('paused');                // what the old flag made a Stopped preview look like
     const { bone, be } = setupConeRig(-0.5);
 
     syncBones(world, scene, state);

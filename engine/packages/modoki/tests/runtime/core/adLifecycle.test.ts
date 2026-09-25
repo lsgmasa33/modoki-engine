@@ -4,8 +4,11 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { getActiveReloadBlockers } from '../../../src/runtime/core/resumeReload';
+import { getBootTimeline, resetBootTimeline } from '../../../src/runtime/core/bootTimeline';
 import {
-  createAdLifecycle, type AdEventSink, type AdLifecycle, type AdLifecycleHooks, type AdSdk, type FullscreenKind,
+  createAdLifecycle, onFullscreenAdChange, type AdEventSink, type AdLifecycle, type AdLifecycleHooks,
+  type AdLifecycleOptions, type AdSdk,
+  type FullscreenKind,
 } from '../../../src/runtime/core/adLifecycle';
 
 const BLOCKER = 'test.fullscreenAd';
@@ -52,8 +55,8 @@ function fakeSdk(over: Partial<AdSdk> = {}) {
 const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
 
 let life: AdLifecycle | null = null;
-function make(sdk: AdSdk, hooks: AdLifecycleHooks = {}, now = () => 0) {
-  life = createAdLifecycle(sdk, hooks, { blockerId: BLOCKER, tag: 'test', now, presentTimeoutMs: 1000, retryMs: 5000 });
+function make(sdk: AdSdk, hooks: AdLifecycleHooks = {}, now = () => 0, over: Partial<AdLifecycleOptions> = {}) {
+  life = createAdLifecycle(sdk, hooks, { blockerId: BLOCKER, tag: 'test', now, presentTimeoutMs: 1000, retryMs: 5000, ...over });
   return life;
 }
 
@@ -76,6 +79,23 @@ describe('init', () => {
     await Promise.all([l.init(), l.init()]);
     expect(sdk.start).toHaveBeenCalledTimes(1);
     expect(l.isInitialized()).toBe(true);
+  });
+
+  it('start() is an `ads-start` boot span, open exactly while it runs (#1475)', async () => {
+    // start() can put a native consent form in front of the game; the timeline has to show when.
+    resetBootTimeline();
+    const gate = deferred();
+    const { sdk } = fakeSdk({ start: vi.fn(() => gate.promise) });
+    const l = make(sdk);
+    const done = l.init();
+    const open = getBootTimeline().spans.filter((s) => s.name === 'ads-start');
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({ endMs: -1, detail: 'test' });
+    gate.resolve();
+    await done;
+    // Closed — `-1` is the open sentinel. Not `>= 0`: this suite fakes timers, which moves the clock
+    // under the timeline's real-time origin, so a closed span's timestamps can read negative here.
+    expect(getBootTimeline().spans.find((s) => s.name === 'ads-start')!.endMs).not.toBe(-1);
   });
 
   it('a disabled SDK is never called — not by init, a show, or the banner (the crash guard)', async () => {
@@ -353,6 +373,46 @@ describe('fullscreen shows', () => {
     expect(sdk.preload).toHaveBeenCalledTimes(2);
     expect(l.isReady('interstitial')).toBe(true);
   });
+
+  // #1507: MAX drops a load issued while it reloads an expired ad, and reports that reload only to a listener
+  // the load never sees — so the adapter's promise never settles. Unbounded, `loading` latched that kind.
+  it('a load the SDK never settles counts as failed after the bound, and takes the retry (#1507)', async () => {
+    const { sdk } = fakeSdk();
+    sdk.preload = vi.fn()
+      .mockReturnValueOnce(new Promise<void>(() => {}))
+      .mockResolvedValue(undefined);
+    sdk.has = vi.fn((k: FullscreenKind | 'banner') => k === 'rewarded');
+    const l = make(sdk, {}, () => 0, { preloadTimeoutMs: 60_000 });
+    await ready(l);
+    vi.advanceTimersByTime(59_999);
+    await flush();
+    expect(sdk.preload).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);   // the bound: a failed load
+    await flush();
+    vi.advanceTimersByTime(5000);   // the retry back-off
+    await flush();
+    expect(sdk.preload).toHaveBeenCalledTimes(2);
+    expect(l.isReady('rewarded')).toBe(true);
+  });
+
+  it('a timed-out load that settles late marks nothing ready — the retry owns the kind now (#1507)', async () => {
+    const first = deferred<void>();
+    const { sdk } = fakeSdk();
+    sdk.preload = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValue(new Promise<void>(() => {}));
+    sdk.has = vi.fn((k: FullscreenKind | 'banner') => k === 'rewarded');
+    const l = make(sdk, {}, () => 0, { preloadTimeoutMs: 60_000 });
+    await ready(l);
+    vi.advanceTimersByTime(60_000);
+    await flush();
+    first.resolve();
+    await flush();
+    expect(l.isReady('rewarded')).toBe(false);
+    vi.advanceTimersByTime(5000);
+    await flush();
+    expect(sdk.preload).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('the reward slot across a realm-survived recovery (Court #631)', () => {
@@ -369,6 +429,33 @@ describe('the reward slot across a realm-survived recovery (Court #631)', () => 
     l.cleanup();
     await l.restoreAfterRealmSurvived();
     sink().rewardEarned({ kind: 'rewarded', type: 'c', amount: 1 });
+    expect(pay).toHaveBeenCalledTimes(1);
+  });
+
+  it('a reward the SDK RETAINED is paid when it is handed over during listener registration — restore only (#1496)', async () => {
+    // The MAX plugin retains `adRewardEarned` until a listener subscribes and hands it to the first one, so
+    // a reward earned while cleanup() had removed the listeners arrives INSIDE init()'s registration loop.
+    const retained: Array<{ kind: 'rewarded'; type: string; amount: number }> = [];
+    const base = fakeSdk();
+    const sdk = {
+      ...base.sdk,
+      listeners: vi.fn((s: AdEventSink) => base.sdk.listeners(s).map((register, i) => async () => {
+        const handle = await register();
+        if (i === 0) for (const r of retained.splice(0)) s.rewardEarned(r);
+        return handle;
+      })),
+    };
+    const pay = vi.fn();
+    const l = make(sdk);
+    l.onRewardEarned(pay);
+    await l.init();
+    l.cleanup();
+    retained.push({ kind: 'rewarded', type: 'c', amount: 1 });
+    await l.init();   // a plain init (a boot, a game swap) never inherits a payout
+    expect(pay).not.toHaveBeenCalled();
+    l.cleanup();
+    retained.push({ kind: 'rewarded', type: 'c', amount: 1 });
+    await l.restoreAfterRealmSurvived();
     expect(pay).toHaveBeenCalledTimes(1);
   });
 });
@@ -472,6 +559,41 @@ describe('review findings (#1309 close-out)', () => {
     l.setBannerVisible(true);
     await flush();
     expect(sdk.showBanner).toHaveBeenCalledTimes(2);
+  });
+
+  it('bannerFailures counts every way a banner fails to come up, and nothing else (#1477)', async () => {
+    // A caller compares against its own baseline, so the count must move on a real failure and ONLY there:
+    // a stray increment donates a strip the banner was about to fill.
+    let t = 0;
+    const { sdk, sink } = fakeSdk({ showBanner: vi.fn().mockRejectedValueOnce(new Error('not ready')).mockResolvedValue(undefined) });
+    const l = make(sdk, {}, () => t);
+    await l.init();
+    expect(l.bannerFailures()).toBe(0);
+    l.setBannerVisible(true);
+    await flush();
+    expect(l.bannerFailures(), 'a refused show').toBe(1);
+    t = 5000;
+    l.setBannerVisible(true);
+    await flush();
+    expect(sdk.showBanner).toHaveBeenCalledTimes(2);
+    expect(l.bannerFailures(), 'a show that resolves is not a failure').toBe(1);
+    sink().bannerLoaded();
+    expect(l.bannerFailures(), 'nor a load').toBe(1);
+    // Before the load failure below: that marks the banner down, and a hide of a banner already down is never called.
+    (sdk.hideBanner as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('gone'));
+    l.setBannerVisible(false);
+    await flush();
+    expect(sdk.hideBanner, 'setup: the hide really ran, and failed').toHaveBeenCalled();
+    expect(l.bannerFailures(), 'a failed HIDE is not a banner failing to come up').toBe(1);
+    sink().bannerFailed();
+    expect(l.bannerFailures(), 'a load failure — a no-fill, or a refresh').toBe(2);
+  });
+
+  it('an init that fails counts as a banner failure: no banner can come up until one succeeds (#1477)', async () => {
+    const { sdk } = fakeSdk({ start: vi.fn().mockRejectedValue(new Error('consent does not allow ad requests')) });
+    const l = make(sdk);
+    await l.init();
+    expect(l.bannerFailures()).toBe(1);
   });
 
   it('a banner that finishes loading after the game hid it is removed again (iOS adds the view late)', async () => {
@@ -628,3 +750,60 @@ describe('review findings (#1309 close-out)', () => {
   });
 });
 
+
+describe('the fullscreen-ad edge the audio hold listens to (#1455)', () => {
+  async function ready(l: AdLifecycle) {
+    await l.init();
+    await flush();
+  }
+  let unhook: (() => void) | null = null;
+  afterEach(() => { unhook?.(); unhook = null; });
+
+  it('goes UP before the SDK call (our audio is down before the ad\'s player starts) and DOWN on dismissal, once each', async () => {
+    const edges: boolean[] = [];
+    unhook = onFullscreenAdChange((showing) => edges.push(showing));
+    const { sdk, sink } = fakeSdk();
+    sdk.present = vi.fn(() => {
+      expect(edges, 'already announced while the native call is in flight').toEqual([true]);
+      return new Promise<unknown>(() => {});
+    });
+    const l = make(sdk);
+    await ready(l);
+    const result = l.showFullscreen('interstitial', 'p');
+    expect(sdk.present).toHaveBeenCalled();
+    sink().presented('interstitial');   // already up: no second edge
+    await result;
+    sink().dismissed('interstitial');
+    expect(edges).toEqual([true, false]);
+  });
+
+  it('comes down on a failure to present, and on a cleanup with an ad up — never left held', async () => {
+    const edges: boolean[] = [];
+    unhook = onFullscreenAdChange((showing) => edges.push(showing));
+    const { sdk, sink } = fakeSdk();
+    const l = make(sdk);
+    await ready(l);
+    const first = l.showFullscreen('interstitial', 'p');
+    sink().failedToPresent('interstitial');
+    expect(await first).toBe(false);
+    expect(edges).toEqual([true, false]);
+    await flush();
+    const second = l.showFullscreen('rewarded', 'p');
+    sink().presented('rewarded');
+    await second;
+    l.cleanup();
+    expect(edges).toEqual([true, false, true, false]);
+  });
+
+  it('an unsubscribed listener hears nothing more', async () => {
+    const fn = vi.fn();
+    const off = onFullscreenAdChange(fn);
+    off();
+    const { sdk, sink } = fakeSdk();
+    const l = make(sdk);
+    await ready(l);
+    void l.showFullscreen('interstitial', 'p');
+    sink().dismissed('interstitial');
+    expect(fn).not.toHaveBeenCalled();
+  });
+});

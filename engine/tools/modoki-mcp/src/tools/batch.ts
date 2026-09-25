@@ -11,6 +11,7 @@ import type { ToolContext } from '../context.js';
 import { runBatch, DENIED, XY_AIMED_TOOLS, MAX_STEPS, MAX_WAIT_MS } from '../batch.js';
 import { reportBatch } from '../batchReport.js';
 import { MAX_PAYLOAD_CHARS } from '../result.js';
+import { unknownKeysErrorMap } from '../shapes.js';
 
 export function registerBatchTool(tool: ToolDef, ctx: ToolContext): void {
   const { ok, fail, ensureIdentity, getIdentityWarning } = ctx;
@@ -40,7 +41,7 @@ export function registerBatchTool(tool: ToolDef, ctx: ToolContext): void {
       'changes, use a modoki_wait_for step instead of guessing ms.\n\n' +
       'REFUSED at pre-flight (nothing runs): raw {x,y} aiming on ' + XY_AIMED_TOOLS.join('/') + ' — ' +
       'aim by `entity` ({guid|name|id}), `selector`, a handle id, or (drag_handle) toId/delta, which ' +
-      'resolve inside their own call and cannot go stale mid-batch; and ' +
+      'resolve inside their own call and cannot go stale mid-batch; an aim giving TWO addresses (AMBIGUOUS); and ' +
       [...DENIED].filter((t) => t !== 'modoki_batch').sort().join(' / ') +
       ', and a nested modoki_batch — all of which belong in their own call. Max ' + MAX_STEPS + ' steps.\n\n' +
       'UNDO: each step is a separate undoable action, so a human\'s Cmd-Z unwinds a batch one ' +
@@ -56,7 +57,7 @@ export function registerBatchTool(tool: ToolDef, ctx: ToolContext): void {
         tool: z.string().describe('Tool name, e.g. "modoki_set_transform" or just "set_transform" (the modoki_ prefix is optional) — or "wait".'),
         args: z.record(z.any()).optional().describe("That tool's own arguments, validated against its real schema before ANY step runs."),
         result: z.enum(['none', 'ack', 'full']).optional().describe('How much of this step to return. Default: "ack", or "full" for the last step.'),
-      }).strict('a batch step accepts only: tool, args, result (note `args` is PLURAL).')).describe('Steps, executed in array order.'),
+      }, { errorMap: unknownKeysErrorMap('a batch step accepts only: tool, args, result (note `args` is PLURAL).') }).strict()).describe('Steps, executed in array order.'),
       stopOnError: z.boolean().optional().describe('Stop at the first failing step (default true). false runs them all and reports every failure.'),
       resultDefault: z.enum(['none', 'ack', 'full']).optional().describe('Default `result` for non-terminal steps (default "ack").'),
     },

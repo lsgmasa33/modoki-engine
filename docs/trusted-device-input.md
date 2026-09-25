@@ -584,6 +584,42 @@ Every one of these looked like success:
   hung `device_tap` outright rather than merely slowing it. Both channels' probes are bounded now
   (`CDP_DISCOVERY_TIMEOUT_MS` 4s, `WDA_PROBE_TIMEOUT_MS` 1.5s); found by sweeping #99's WDA fix for
   siblings, which is the only reason it surfaced at all.
+- **One devtools socket is one PROCESS, not one page (#1530).** Every WebView in the app's process
+  shares `webview_devtools_remote_<pid>`, so once a game embeds an ad SDK its `/json/list` holds the
+  game AND the SDK's WebViews. Discovery took the FIRST `page`. The aim is resolved in the game
+  (through the bridge), so the reply said `ok (cdp touch) … [input:trusted-cdp]` while the touch
+  went into an ad's WebView. The game never saw it: Court's win-overlay **Next** on the S22.
+  Measured on the A23 with Court + AppLovin MAX: with an interstitial up, the list was
+  `about:blank` (the ad, attached) → `http://localhost/` → `about:blank` (idle, never attached).
+  After a cold relaunch with the game in the foreground it was still `about:blank` FIRST, then the
+  game. **Position is not identity**, and the order changes as SDK WebViews come and go. So
+  `pickAppPage` takes a lone page as-is. With several, it asks each one over `Runtime.evaluate`
+  whether it carries Capacitor's bridge. The Modoki bridge answers `resolve-aim` through a
+  Capacitor plugin, so that is the page the aim was computed in, on every build ever shipped.
+  Exactly one must answer. None or two refuses to the synthetic fallback with its own reason
+  (`ambiguousPageReason`), never "the first one". A revert run on the A23 sent the same touch into
+  the old rule's pick: no CDP error, and nothing reached the game's input watch.
+  The pages are probed **in parallel**, and each probe is bounded by `CDP_DISCOVERY_TIMEOUT_MS` at
+  the connect and at the evaluate. A probe that yields no verdict (a timeout, a refused connection,
+  or a CDP error reply, which is how a page mid-navigation answers) is `no-answer`, not "not the app
+  page", and the reason says so: a reloading or stalled game page is not a foreign one. Measured on the A23 with Court + MAX, ad page first, three runs: the whole discovery took
+  126–142 ms, and each verdict was a real answer (ad `other` 30–75 ms, game `app` 49–60 ms).
+  A refusal is not cached, so an ambiguous device pays that cost again on each input call.
+- **A reset cannot cancel a discovery that is already running.** `resetDeviceCdpSession` (a lease
+  disconnect) only drops `inFlight`. A discovery that started before it used to finish afterwards
+  and cache a session, and latch a forward, for a lease nobody held. It also let the next call start
+  a SECOND discovery on the same per-clone forward port. Now the shared #573 teardown generation
+  (`createTeardownToken`), invalidated by the reset, makes a stale run stop at its next check
+  (queued, before its connect, after its connect) and keep nothing, and each discovery waits for the one before it (`discoveryTail`). This was
+  pre-existing; #1530's probes widened the window from two HTTP calls to a probe budget.
+- **A unit test reached REAL adb, and deleted another clone's tunnel.** Discovery's teardown calls
+  `removeForward` from places a test does not obviously reach: a `finally` inside discovery, a
+  reset after a test restored its spies, or a router test that leased an Android mock and never
+  stubbed the seam. Under vitest `MODOKI_BACKEND_PORT` is unset, so the port was 9333 (the hub's),
+  and with no serial the #158 owner check is skipped. Every teardown swallows adb errors, so
+  nothing showed. Now `deviceCdpAdb` refuses every real call under `process.env.VITEST`, before
+  `adbBinary()`, and records it. The three test files on this seam fail any test that tripped it
+  (`_drainRefusedAdbForTests`). A census of 627 test files found no other caller.
 - **WDA silently CLAMPS out-of-viewport coordinates** rather than erroring (a drag aimed off-screen
   landed at 86,795).
 - **`devicectl --json-output /dev/stdout` never parses** — devicectl writes its human-readable table

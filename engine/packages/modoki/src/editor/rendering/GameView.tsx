@@ -7,7 +7,8 @@ import { stepOneFrame } from '../../runtime/rendering/frameDriver';
 import { getPlayState, setPlayState, onPlayStateChange } from '../../runtime/core/playState';
 import { setShowColliders2D, isShowColliders2D } from '../../runtime/rendering';
 import { setAudioMuted, isAudioMuted } from '../../runtime/audio/audioService';
-import { enterPlay, stopPlay, pausePlay } from '../scene/playMode';
+import { pausePlay } from '../scene/playMode';
+import { pressPlay, pressStop } from '../scene/playPressFeedback';
 import { useEditorStore } from '../store/editorStore';
 import { computeDeviceLetterbox } from '../scene/sceneViewMath';
 import { resolveLogicalSize, resolveSafeArea, safeAreaCssVars, type DevicePreset } from '../scene/devicePresets';
@@ -16,6 +17,7 @@ import SafeAreaOverlay from './SafeAreaOverlay';
 import { DebugMenu } from '../../runtime/debug';
 import { VideoOverlay } from '../../runtime/video/VideoOverlay';
 import { saveGameViewMuted, loadGameViewShowColliders, saveGameViewShowColliders, resolveInitialGameViewMute } from './gameViewPrefs';
+import { startTakeRecording, finishTakeRecording, isRecordingTake, onTakeRecordingChange } from '../recorder/takeRecorder';
 
 // ── Main GameView ───────────────────────────────────────
 
@@ -120,7 +122,12 @@ export default function GameView({ uiLayer }: GameViewProps) {
     // Defer the store write to the next frame: a synchronous setState inside the
     // RO callback can re-lay-out within the same RO cycle ("ResizeObserver loop
     // completed with undelivered notifications").
+    // The deferred write dies with this effect — the same trap as the gameRect effect below: a
+    // Free → device switch inside one frame would otherwise let Free's panel size land after the
+    // device's size and stay (the device branch has no observer to correct it).
     let pending = false;
+    let raf = 0;
+    let disposed = false;
     let lastW = 0, lastH = 0;
     const ro = new ResizeObserver(([entry]) => {
       const { width, height } = entry.contentRect;
@@ -128,16 +135,16 @@ export default function GameView({ uiLayer }: GameViewProps) {
       lastW = width; lastH = height;
       if (pending) return;
       pending = true;
-      requestAnimationFrame(() => { pending = false; setGameViewSize(lastW, lastH); });
+      raf = requestAnimationFrame(() => { pending = false; if (!disposed) setGameViewSize(lastW, lastH); });
     });
     ro.observe(gameAreaRef.current);
-    return () => ro.disconnect();
+    return () => { disposed = true; cancelAnimationFrame(raf); ro.disconnect(); };
   }, [setGameViewSize, isFree, deviceW, deviceH]);
 
   // Play snapshots the authored world; Stop reverts to it (discarding play-mode
   // mutations); Pause freezes the sim in place. See editor/scene/playMode.ts.
-  const onPlay = useCallback(() => { void enterPlay(); }, []);
-  const onStop = useCallback(() => { void stopPlay(); }, []);
+  const onPlay = useCallback(() => { void pressPlay(); }, []);
+  const onStop = useCallback(() => { void pressStop(); }, []);
   const onPause = useCallback(() => { pausePlay(); }, []);
 
   // Step one frame while Paused: briefly run the sim for a single frame, then
@@ -153,6 +160,16 @@ export default function GameView({ uiLayer }: GameViewProps) {
   const isStopped = playState === 'stopped';
   const isPaused = playState === 'paused';
 
+  // Record a take (#1479): snapshots the save + seed, presses Play, and records the pointer until
+  // the owner presses it again or Stop. `npm run record` renders the saved take to video.
+  const recordingTake = useSyncExternalStore(onTakeRecordingChange, isRecordingTake);
+  const toggleRecord = useCallback(() => {
+    if (isRecordingTake()) { void finishTakeRecording(); return; }
+    void startTakeRecording(safeArea)
+      .then((err) => { if (err) console.warn(`[takeRecorder] not recording: ${err}`); })
+      .catch((err: unknown) => console.error('[takeRecorder] could not start recording:', err));
+  }, [safeArea]);
+
   // Letterbox calculation — sole writer to the store's gameRect.
   useEffect(() => {
     if (isFree || !gameAreaRef.current) {
@@ -166,14 +183,23 @@ export default function GameView({ uiLayer }: GameViewProps) {
     update();
     // Defer to next frame — synchronous setStoreGameRect inside the RO callback
     // can re-lay-out within the same RO cycle (RO-loop warning).
+    // ⚠️ The deferred update must die with this effect. Disconnecting the observer does not cancel a
+    // frame it already scheduled, and that frame's `update` closes over THIS effect's device size:
+    // switching device → Free inside one frame (the smoke does iPhone-landscape → Custom → Free in
+    // ~25 ms) let it land AFTER Free's zero rect and pin a landscape letterbox in gameRect until the
+    // next relaunch. SceneView's UI mode letterboxes both its 3D render and its DOM preview to that
+    // aspect, so the stale rect squashed the scene under the HUD — the state that "built up across
+    // runs on one editor" in #1489.
     let pending = false;
+    let raf = 0;
+    let disposed = false;
     const ro = new ResizeObserver(() => {
       if (pending) return;
       pending = true;
-      requestAnimationFrame(() => { pending = false; update(); });
+      raf = requestAnimationFrame(() => { pending = false; if (!disposed) update(); });
     });
     ro.observe(gameAreaRef.current);
-    return () => ro.disconnect();
+    return () => { disposed = true; cancelAnimationFrame(raf); ro.disconnect(); };
   }, [isFree, deviceW, deviceH, setStoreGameRect]);
 
   const toggleOrientation = useCallback(
@@ -202,6 +228,12 @@ export default function GameView({ uiLayer }: GameViewProps) {
         <button data-ui-id="gameView.toolbar.step" onClick={stepOnce} style={{ ...iconBtnStyle, opacity: isPaused ? 1 : 0.4 }} title="Step Frame" disabled={!isPaused}>
           ⏭
         </button>
+        <button data-ui-id="gameView.toolbar.record" onClick={toggleRecord}
+          style={{ ...iconBtnStyle, color: recordingTake ? '#e74c3c' : '#c0392b', opacity: recordingTake || isStopped ? 1 : 0.4 }}
+          disabled={!recordingTake && !isStopped}
+          title={recordingTake ? 'Stop recording and save the take' : 'Record a take — plays from the start; press again or Stop to save'}>
+          {recordingTake ? '■' : '●'}
+        </button>
         <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
         <button data-ui-id="gameView.toolbar.colliders" onClick={toggleColliders} style={{ ...iconBtnStyle, color: showColliders ? '#2effa6' : '#888' }}
           title="Toggle 2D collider overlay">⬡</button>
@@ -209,7 +241,7 @@ export default function GameView({ uiLayer }: GameViewProps) {
           title={muted ? 'Unmute audio' : 'Mute audio'}>{muted ? '🔇' : '🔊'}</button>
         <span style={{ flex: 1 }} />
         <span data-ui-id="gameView.status" style={{ color: isStopped ? '#888' : isPaused ? '#f1c40f' : '#2ecc71', fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 }}>
-          {isStopped ? 'STOPPED' : isPaused ? 'PAUSED' : 'PLAYING'}
+          {(recordingTake ? 'REC · ' : '') + (isStopped ? 'STOPPED' : isPaused ? 'PAUSED' : 'PLAYING')}
         </span>
         <span style={{ color: '#555', fontSize: '11px', flexShrink: 0 }}>|</span>
         {/* The device readout is the least important thing here: in a narrow Game panel
@@ -235,7 +267,10 @@ export default function GameView({ uiLayer }: GameViewProps) {
             width: deviceW, height: deviceH,
             transform: `scale(${deviceW > 0 ? gameRect.width / deviceW : 1})`,
             transformOrigin: 'top left',
-            border: '1px solid #333',
+            // An OUTLINE, not a border: the app sets `box-sizing: border-box` globally, so a border
+            // ate 2px of the device size and the game laid out at (deviceW-2)×(deviceH-2) — a
+            // "540×960" preview was really 538×958, and a recorded take (#1479) inherited that size.
+            outline: '1px solid #333',
           }),
           // Simulate the device's safe area for everything inside this preview.
           // `anchorCss` emits `var(--ui-sa-top, env(safe-area-inset-top))`, so setting

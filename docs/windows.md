@@ -44,21 +44,24 @@ from an empty `command -v` is a **false blocker** — the editor bundles it.
 name whose real file is `npm.cmd` / `toktx.exe` throws `ENOENT`, which reads as "not found" —
 this is exactly how Build Support reported "Node / npm — not found" on a machine that had both.
 
-Use `whichSync()` (resolves a bare name over PATH × PATHEXT to an absolute path *before*
-probing) and `spawnable()` (decides `{shell}` and quotes accordingly), both in
-[engine/toolchain/index.ts](../engine/toolchain/index.ts). Never hand a bare name to `execFile`.
+Spawn through `toSpawn(command, args, { env })` in
+[engine/scripts/winSpawn.mjs](../engine/scripts/winSpawn.mjs) (re-exported by `engine/toolchain`):
+it resolves a bare name over PATH × PATHEXT with `whichSync()` (on the CHILD's `env` when you pass
+one) and runs a resulting `.cmd`/`.bat` through cmd.exe itself — see the next section for why that
+is not `shell:true`. Never hand a bare name to `execFile`.
 
-⚠️ Node throws `EINVAL` on spawning a `.cmd`/`.bat` without `shell:true` (the CVE-2024-27980
-fix), so "just add a `.cmd` shim" is not a workaround for an unexecutable stub either.
+⚠️ Node throws `EINVAL` on spawning a `.cmd`/`.bat` without a shell (the CVE-2024-27980 fix), so
+"just add a `.cmd` shim" is not a workaround for an unexecutable stub either.
 
 **gcloud is the same case (#1444).** On Windows the Cloud SDK's CLI is `gcloud.cmd` (beside an
-extensionless bash shim), so the two `execFileSync('gcloud', …)` calls (`/api/ota/status`, the
-OTA publish's CORS update) could never run there; they go through `execGcloudSync`
-(`engine/plugins/backend/gcloud.ts`), which is `whichSync` + `spawnable`. The same issue found the
+extensionless bash shim). Every gcloud call — `/api/ota/status`, the OTA publish, the version prune —
+goes through ONE helper, `gcloudSync` ([engine/scripts/ota/gcloud.mjs](../engine/scripts/ota/gcloud.mjs);
+`execGcloudSync` in `engine/plugins/backend/gcloud.ts` delegates to it). The same issue found the
 gcloud dir prepended to `PATH` with a literal `:` — on win32 that glues the dir onto the first
 entry, so the dir is never searched and the old first entry is lost. What still does NOT work on
-Windows: the built-in web GCS deploy (its steps are bash `find`/`for`), and gcloud auto-detection
-— a Windows user sets the gcloud path in Project Settings.
+Windows: the built-in web GCS deploy is gated off (`resolveGcloudDir`; its steps no longer need bash
+since #1537, but enabling it is a separate decision), and gcloud auto-detection — a Windows user sets
+the gcloud path in Project Settings.
 
 ### A COPY of `process.env` has no `PATH` key on Windows — it has `Path`
 
@@ -821,6 +824,16 @@ conversion never engaged".
 - Vite `/@fs/` URLs, `:`-joined PATH assumptions, and `chmod 0600` are the other members of this
   family. The repo has had a steady trickle of these; they are readable from any machine once you
   know to look, unlike the process-behaviour class below.
+  ⚠️ **`chmod` bites hardest in a TEST FIXTURE, where it fails by staging nothing.** Node's
+  `fs.chmodSync(p, 0o000)` on win32 only toggles the read-only attribute — it **cannot withdraw read
+  permission** — so a test that locks a file and asserts the code reports it unreadable instead
+  compares a real hash to `'unreadable'`. #1509's three "never fails the render" cases did exactly
+  that: green on a Mac, red here the day they landed. The fixture is the broken half, not the
+  product — `fingerprintAssets` marks unreadable from a plain `catch` around `readFile`, so a
+  genuinely unreadable file (an ACL deny, a handle held by another process) is still handled on
+  Windows. **Guard such a case by PLATFORM, like the `root` guard beside it** — root reads anything
+  for the same reason — rather than restaging it with `icacls`, which needs privileges a gate should
+  not assume. Nothing caught it automatically because those files have no Windows leg (#1054).
 - **A guard keyed by a hand-authored POSIX path will not match `node:path` output.** `relative()`
   and `join()` return `\`-separated on Windows, so an allowlist entry like
   `runtime/loaders/textureResolver.ts` — or a `split('/')` over a relative path — silently stops
@@ -1187,6 +1200,56 @@ normalise again — `path.resolve` is platform-specific, so on POSIX a Windows-s
 `E:\Projects\x` is not absolute and gets anchored under the cwd, after which the drive letter is
 no longer leading and cannot be folded.
 
+## Never hand a shell a command line (#1537)
+
+**The rule: variable data never appears in shell text.** Every spawn is a program + argv through
+`toSpawn`; a build step is an `execStep`; the few genuinely compound build steps (the Mac-only iOS
+device install) are `shell` steps whose text only the `sh` tagged template can build, with every
+value a `ref()` carried in the child's env (`buildStepShell.ts`). `engine/tests/architecture/noShellSpawn.test.ts`
+fails on any `shell:` option but `false` and on any `child_process` `exec`/`execSync` of a
+non-constant string.
+
+**Why quoting could never close it.** cmd.exe expands `%VAR%` even INSIDE double quotes, and an
+unquoted `&` starts a second command. Observed on the win clone before the fix: the old
+`spawnable()` quoted a path for `shell:true`, and `C:\proj\%OS%\a.glb` still reached gltf-transform
+as `C:\proj\Windows_NT\a.glb`; a build step's `"…%OS%…"` expanded the same way. There is no escape
+for `%` inside quotes. (bash's twin is `$(…)` inside double quotes — #649.)
+
+**How `toSpawn` runs a batch file.** It spawns `%ComSpec% /d /v:off /s /c "<line>"` with
+`windowsVerbatimArguments`, where the line is every arg MSVCRT-quoted and then `^`-escaped OUTSIDE
+quotes for every cmd metacharacter (`%` included) — the args TWICE, because the batch re-parses them
+when it expands `%*`. Measured on the win clone: `%OS%`, `&`, `^`, `!`, `()`, `"`, a trailing `\`,
+a space, an empty arg and `a\"b` all arrive byte-exact through the real npm cmd-shim and a
+gradlew-style `.bat` (`winSpawn.test.ts` pins it, each arg alone AND together — together, one arg's
+odd quote count re-quoted the next arg's `&` and hid a single-escape mutation).
+
+**`cross-spawn` was probed and rejected**: it merges an arg ending in `\` into the next one, its `^%`
+trick fails when a variable named `OS^` exists, and it double-escapes only shims under
+`node_modules/.bin` — not `gcloud.cmd`, `gradlew.bat` or `sdkmanager.bat`.
+
+**Residuals — what `toSpawn` cannot carry, each observed:**
+- **`!` into a batch that forwards `%*` WHILE delayed expansion is on.** Measured with a synthetic
+  batch: `a!OS!b` arrives as `aWindows_NTb` and a lone `!` vanishes (`&`, `%`, `^`, `"` still exact).
+  Escaping `!` for it would leave a stray `^` in every arg of an ordinary `%*` batch. No batch the
+  engine runs does this. ⚠️ A first draft of #1537 claimed gcloud.cmd did and refused `!` for every
+  gcloud call; the review read the installed SDK (581): gcloud.cmd enables delayed expansion only to
+  probe for python and runs `SETLOCAL DisableDelayedExpansion` BEFORE its `%*` lines, and a copy of
+  the real script carried `a!OS!b` exact. The refusal was removed. Read the real script, not a
+  grep of it — the probe that missed this filtered the lines it searched.
+- **A batch that reads `%1` itself** instead of forwarding `%*` sees the caret-escaped token. Every
+  batch the engine runs forwards `%*` (npm cmd-shim, gradlew.bat, gcloud.cmd, sdkmanager.bat).
+- **A `"` inside a `shell` step's ref, on win32.** `"%X%"` expands to the value between those quotes,
+  so a `"` in it closes them and frees the rest (observed: `x"&echo INJ&"y` ran `echo INJ`).
+  `planBuildStep` refuses it; a Windows path cannot contain `"`, and no ref-bearing step runs there.
+- **An `&` in the npm cmd-shim's OWN install directory** breaks the shim before our line is involved:
+  it runs `SET dp0=%~dp0` unquoted ("\ was unexpected at this time"). npm's defect, not ours.
+- **The custom web deploy command** stays the project author's own shell text (`authoredShell`), with
+  `{dist}`/`{base}` substituted raw — an owner ruling on #1537. A project folder holding shell
+  metacharacters is the author's to quote there. ⚠️ One behaviour change on Windows: every `shell` step
+  now runs `cmd /d /v:off`, so on a machine whose registry sets `DelayedExpansion=1` the author's own
+  `!VAR!` no longer expands (before, `shell:true` passed no `/v` switch). The default Windows setting
+  is unaffected; an author who needs it writes `cmd /v:on /c …` inside the command.
+
 ## Never shell out to a platform binary whose shape you assumed
 
 `extractArchive()` used to call `tar`, which made one subprocess the single OS dependency of the
@@ -1204,6 +1267,116 @@ degrades to system npm, so a dev machine boots fine and `smoke:packaged` reporte
 its own log said `Node provisioning failed`. When testing an extractor, do not build the fixture
 with the same tool — GNU tar's `-a -cf x.zip` writes a *tar* named `.zip` that extracts happily
 and proves nothing. Assert the `PK` magic bytes instead.
+
+### A GUI launcher's exit status is not the operation's outcome
+
+The same assumption, one level up: not *which* binary answers, but whether its **exit code means
+anything**. `osOpen.ts` awaited the OS file-manager/default-app launcher and mapped a non-zero exit
+to a 500. On Windows neither launcher it uses reports that way, and both were measured on real
+hardware (#1508, #1515 — a Mac can see neither):
+
+| invocation | exit | what actually happened |
+|---|---|---|
+| `explorer /select,<file that exists>` | **1** | window opened, file selected |
+| `explorer /select,<file that is missing>` | **1** | window opened at the parent |
+| `explorer <a directory>` | **1** | window opened |
+| `cmd /c start "" <file that exists>` | 0 | opened |
+| `cmd /c start "" <file that is missing>` | **never exits** | blocks on a modal "Windows cannot find…" dialog |
+
+So `explorer` has no success code *and no failure code* — every reveal in the editor answered 500
+with the window already open, for months. ⚠️ **Ignoring exit code 1 specifically is not the fix** —
+`1` is also what a genuine failure returns, so that is false precision. The exit status has to be
+dropped entirely: `spawn` detached, resolve on the `'spawn'` event, and keep only the one signal
+Windows still gives honestly — whether the opener could be **started** (`'error'`/`ENOENT`).
+
+`start`'s half is worse than a wrong answer: `cmd` waits for a human to dismiss a dialog the owner
+may never see, so the route never answered at all and held its socket open. Detaching stops the
+hang, and checking the path **before** handing it to the shell keeps the *common* case off the
+screen — which is why `/api/reveal-in-finder` and `/api/open-file` now 404 a file that is gone.
+
+⚠️ **That check covers the missing-file cause only.** A file that exists behind a **dangling
+association** — a `.ts` whose handler points at an uninstalled editor — still raises the modal, and
+the launcher behind it is detached, `unref`'d and orphaned while the route has already answered
+`ok`. Accepted deliberately: the alternative is blocking the request forever, and a watchdog that
+killed the child would also kill a legitimately slow launcher. (Measured with `cmd /c start`; the
+opener is `explorer` now — below — and this case has not been re-measured with it.)
+
+⚠️ **`openInOS` never hands a path to `cmd`.** `cmd /c start "" <path>` parses its command line as
+shell text, and Node only quotes an argument holding a space: a file or folder name containing `&`
+ran the rest of the path as a **second command**, `%OS%` expanded and `^` vanished — command
+injection from a file name, with the route still answering `ok` (found in review with a harmless
+`echo`, 2026-09-24). `explorer <file>` opens a file with its default app just as `start` does, and
+no shell reads the path: from a folder named `R&D %OS% ^x o'b`, `explorer` delivered the exact path
+to the app while `start` opened nothing. The real-binary open test now opens from a folder with
+every one of those characters and requires the path to arrive byte-for-byte.
+
+⚠️ **But explorer parses its OWN command line — pass the path quoted and verbatim, always.** `,` is
+its switch separator (`/select,`, `/root,`), and Node quotes an argument only when it holds a space,
+so `…\Game,v2\a.ts` reached explorer bare and opened **nothing** (measured; review finding). The
+first version of this fix passed every hostile test because each test folder had a space, which
+made Node quote it. `openInOS` now sends `"<path>"` with `windowsVerbatimArguments`, like reveal,
+and the open test's folder has a comma and deliberately NO space.
+
+⚠️ **`explorer /select,` needs the quotes around the PATH, not around the switch.** Node's
+default quoting wraps any argument containing a space whole — `"/select,C:\My Game\x.png"` — and
+explorer does not read that as `/select`: it opens the user's **Documents** folder instead, with
+the same meaningless exit code, so the reveal "succeeds" in the wrong place. So `revealInOS`
+passes `/select,"<path>"` with `windowsVerbatimArguments` (a Windows path cannot contain `"`).
+Measured: a space went to Documents, an apostrophe alone was fine, and the verbatim form reached
+the right folder for both. It hid because every fixture lived under a `%TEMP%` with no space —
+the real-binary reveal tests now use a folder named with a space AND an apostrophe, the shapes
+real project paths have.
+
+**darwin and linux deliberately still await the exit code** — there `open`/`xdg-open` return
+non-zero for a path they cannot open, and flattening the platforms would trade a real 500 for a
+silent 200 on the primary dev machine. The asymmetry is the correct shape; the module says so, so
+nobody tidies it away.
+
+**How it hid** is the part that generalises, and it is this repo's dominant test defect ([falsifiable-tests.md](falsifiable-tests.md)): the only test touching the module mocked the whole
+module away, so the stand-in always succeeded and a branch failing **100% of the time** on Windows
+stayed green. A mock cannot catch this class, because the defect *is* the gap between the stand-in
+and the real binary. The test that catches it spawns the real `explorer.exe`
+(`engine/tests/plugins/osOpenWin32.test.ts`) and runs in `verify` on win32 by the owner's call
+(2026-09-24), at the cost of an Explorer window opening during the gate — weighed against #968 and
+#1054, where this bug class is guarded by discipline rather than by a gate.
+
+**Whether a window can be observed is decided by opening one, not by asking whether `explorer.exe`
+runs** (#1528). The first guard asked the latter; the public CI's `windows-latest` runner answered yes
+(explorer IS running there), yet no window the test opened ever appeared in `Shell.Application`, and
+every public CI run went red until the runner was excluded by name. The guard now opens its own
+probe window — `explorer /select,` for the reveal, a bare WinForms window with a stamped title for
+the open, never through `osOpen.ts`, so a broken `revealInOS`/`openInOS` still fails rather than
+skips — polls the same observable its test asserts on, and closes the window before returning.
+A skip writes session id, `UserInteractive`, explorer's session ids and the
+`Shell.Application` window count to stderr (not `console.warn`, which the default reporter hides for
+a passing file), so the runner's first skipped run records WHY its windows are invisible — still
+unknown when this was written.
+
+**A gate must never open a fixture in the owner's real default app** (#1534). The `openInOS` test
+first opened a `.txt`, which on Windows 11 means Notepad, and Notepad saves its tabs and restores
+them on the next launch. **The tab survives everything a test can do from outside:** killing the
+process, closing it normally (closing is what SAVES the session), and deleting the file. Measured
+on the win clone: 29 leftover gate/probe tabs in Notepad's session store
+(`%LOCALAPPDATA%\Packages\Microsoft.WindowsNotepad_8wekyb3d8bbwe\LocalState\TabState`), 27 of them
+for files the scratch-dir cleanup had already removed. Cleaning up would have meant driving the owner's own
+Notepad, where a stray keystroke closes one of THEIR tabs. So the test registers a throwaway
+per-user association instead: a unique `HKCU\Software\Classes\.<stamp>` whose `open` verb shows a
+window titled from `%1`. It still exercises the real launcher → shell association → app launch, the
+title proves the path arrived, and the window is always a new process the test can kill. What it
+gives up — ".txt opens in Notepad" — is machine configuration, not the code under test (owner's
+call, 2026-09-24).
+
+⚠️ **Registering an association is not its whole footprint.** The first time the shell RESOLVES
+one it writes two per-user traces of its own — `HKCU\…\CurrentVersion\Explorer\FileExts\.<ext>`
+and a `<ProgID>_<ext>` value under `…\CurrentVersion\ApplicationAssociationToasts` — and both
+outlive deleting the `Classes` keys. The first version of this test deleted only what it had
+written and left one of each per `verify` (found in review, measured). Anything that registers a
+throwaway association has to delete all four.
+
+**Pass `%1` quoted, as an argument — never splice it into script source.** A `'%1'` inside a
+PowerShell literal breaks on an apostrophe in the path (a user name like `O'Brien` puts one in
+`%TEMP%`), and an unquoted `%1` can arrive as an 8.3 short name. The same splice in the test's
+own Explorer-window matcher failed the whole file under such a `%TEMP%`.
 
 ### `powershell -Command "<script>" a b` does NOT pass `a b` as arguments
 
@@ -1521,6 +1694,20 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
     sweeps **twice**, and it did not time out — which fits "the first sweep in a process is the
     expensive one" and rules out "every sweep costs ~20 s". One failure sample, so treat that as the
     best-supported reading rather than a settled fact.
+- **A real Vite dev server inside a vitest fork killed the Windows CI worker, and only there** (#1529).
+  `projectLockfileHash.test.ts`'s dep-cache-key test boots `createServer` with rolldown's NATIVE
+  dep optimizer, the only test in the suite that does. On `windows-latest` (Server 2025, Node
+  24.20) every run while it was enabled ended with one `Worker exited unexpectedly`, with every file
+  green: 4 reds out of 4. With it `skipIf(win32)`: 5 greens out of 5. In vitest 4 that error means
+  the fork died on its own after reporting and before the pool asked it to stop, which fits a
+  native crash during teardown.
+  **Not reproduced on this Windows 11 / Node 24.18 box** (2026-09-25): 3 isolated runs, one full
+  app-suite run (1192 files, exit 0), 10 vitest runs under 12 busy-loop processes, and 30 plain Node
+  runs of the same create → `init()` → close sequence (natural exit and `process.exit`, with and
+  without load) all exited 0. So the mechanism is unconfirmed, and it depends on the environment.
+  **The skip stays.** The property it checks is Vite's own JS config hashing, identical on every
+  platform, and macOS and Linux run it. The editor is not affected: it runs the same optimizer in a
+  long-lived process on Windows every day. Un-skipping it is a CI experiment, not a local one.
 - **Size time budgets from the slowest machine.** A budget tuned on a Mac is not a budget. An
   isolated timing is worth roughly a quarter of the real under-load cost. Worked example
   (2026-08-20): `rampProbeRunner.test.ts`'s `expect(performance.now() - started).toBeLessThan(5)`
@@ -1594,7 +1781,7 @@ blamed for a defect a **function parameter** would have caught.
 
 | | what it is | how it gets covered |
 |---|---|---|
-| **platform RULE** | pure logic that merely BRANCHES on the platform — `appSupportRoot`, path-shape derivation, `needsWinShell`, `spawnable`, a reap pattern's construction | make it **injectable** (`platform`, `env`, `home`) and every leg pins EVERY branch. No runner, no minutes, no decision. |
+| **platform RULE** | pure logic that merely BRANCHES on the platform — `appSupportRoot`, path-shape derivation, `needsWinShell`, `toSpawn`/`winBatchCommandLine`, a reap pattern's construction | make it **injectable** (`platform`, `env`, `home`) and every leg pins EVERY branch. No runner, no minutes, no decision. |
 | **platform BEHAVIOUR** | what the OS actually DOES — `/var` → `/private/var` aliasing, `rmSync` unlinking a dir symlink and sparing the payload, a mount point traversed, junction semantics, whether `os.homedir()` honours `HOME` | only the platform can answer. No amount of injection reaches it. |
 
 ⚠️ **A rule wearing behaviour's clothing is the trap.** `cleanPackagedCacheLinkGuard`'s exemption case

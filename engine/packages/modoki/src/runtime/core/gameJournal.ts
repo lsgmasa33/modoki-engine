@@ -15,26 +15,26 @@
  *  report (#1056). See its own doc comment before choosing it over `journalWarn`. */
 
 import { type World } from 'koota';
-import { emit } from './journal';
+import { emit, type EmitOptions } from './journal';
 import { captureToCrashlytics } from './globalErrors';
 import { jsonSafeReplacer } from './jsonSafe';
 
 /** A state-machine/phase transition — `resetPhase`, a wave start/end, a boss phase
  *  change. `level: 'info'`. */
-export function journalState(name: string, payload?: unknown, world?: World): void {
-  emit(name, payload, world, 'info');
+export function journalState(name: string, payload?: unknown, world?: World, options?: EmitOptions): void {
+  emit(name, payload, world, 'info', options);
 }
 
 /** A branch the game took and why — an AI target pick, a spawn roll, a
  *  difficulty-scaling decision. `level: 'info'`. */
-export function journalDecision(name: string, payload?: unknown, world?: World): void {
-  emit(name, payload, world, 'info');
+export function journalDecision(name: string, payload?: unknown, world?: World, options?: EmitOptions): void {
+  emit(name, payload, world, 'info', options);
 }
 
 /** Something unexpected but non-fatal to that system — "no spawn point found," "asset
  *  ref missing at runtime." `level: 'warn'`. Journal-only: it reports nothing to Crashlytics. */
-export function journalWarn(name: string, payload?: unknown, world?: World): void {
-  emit(name, payload, world, 'warn');
+export function journalWarn(name: string, payload?: unknown, world?: World, options?: EmitOptions): void {
+  emit(name, payload, world, 'warn', options);
 }
 
 /** Something unexpected and fatal to that system. `level: 'error'`.
@@ -59,11 +59,11 @@ export function journalWarn(name: string, payload?: unknown, world?: World): voi
  *  ⚠️ **PRIVACY: the payload is sent to Crashlytics as text.** Guids, keys, product and transaction
  *  ids, counts and error text only. Never player content (a typed word, a name) and never an
  *  account identifier (a uid, an email). */
-export function journalError(name: string, payload?: unknown, world?: World): void {
+export function journalError(name: string, payload?: unknown, world?: World, options?: EmitOptions): void {
   // Reported FIRST: the journal write resolves a default world, and a throw there must not also
   // cost the report.
   captureToCrashlytics('caught', caughtFailureText(name, payload));
-  emit(name, payload, world, 'error');
+  emit(name, payload, world, 'error', options);
 }
 
 /** `[journalError] <name> <payload>`. A string payload is used verbatim; anything else is JSON through

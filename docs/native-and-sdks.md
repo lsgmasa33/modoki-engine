@@ -6,7 +6,7 @@ See also [Architecture](./architecture.md).
 
 ## Standalone Capacitor Plugin Pattern (iOS SPM)
 
-Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 a plugin lives in one of two places. **Shared** plugins live under `engine/packages/` (`capacitor-game-debug`, `capacitor-modoki-ota`, `capacitor-modoki-iap`, `capacitor-appsflyer`, `capacitor-applovin-max`, `capacitor-modoki-system`) and reach each consuming game as a vendored tarball ([cross-game-infrastructure.md](./cross-game-infrastructure.md) § "The vendoring pipeline, and why it is tarballs"). **Per-game** plugins live under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-adjust`). ⚠️ `games/3d-test/packages/capacitor-applovin-max` is a per-game **fork** of the engine plugin: identical when Court's copy was promoted in #931, and deliberately not switched over, because vendoring it would put MAX into 3d-test's native build, where blank unit ids crash at init (#510). A package contains:
+Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 a plugin lives in one of two places. **Shared** plugins live under `engine/packages/` (`capacitor-game-debug`, `capacitor-modoki-ota`, `capacitor-modoki-iap`, `capacitor-appsflyer`, `capacitor-applovin-max`, `capacitor-modoki-system`) and reach each consuming game as a vendored tarball ([cross-game-infrastructure.md](./cross-game-infrastructure.md) § "The vendoring pipeline, and why it is tarballs"). **Per-game** plugins live under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-adjust`). ⚠️ `games/3d-test/packages/capacitor-applovin-max` is a per-game **fork** of the engine plugin: identical when Court's copy was promoted in #931, and deliberately not switched over, because vendoring it would put MAX into 3d-test's native build, where blank unit ids crash at init (#510). **It is frozen at the pre-#1494 API on purpose:** 3d-test never builds it natively, and its own `ads.ts`/`ads.test.ts` are written against the old surface, so syncing it would mean rewriting a non-shipping adapter for nobody. ⚠️ **Frozen means it still carries the defects #1494 fixed** — on iOS it never sets `revenueDelegate`, so `didPayRevenue` cannot fire; its load calls resolve before the ad loads; and it reloads natively on dismissal. Never ship it: move 3d-test onto the engine plugin instead. A package contains:
 
 - `Package.swift` — declares the native SDK as a **Swift Package Manager (SPM)** dependency (e.g. `AppLovin-MAX-Swift-Package`, `adjust/ios_sdk`).
 - `*.podspec` — CocoaPods fallback manifest (SPM is the primary path).
@@ -35,7 +35,7 @@ Mixing CocoaPods and SPM produces duplicate-framework conflicts. Any SDK that ha
 
 SPM static linking **stripped `GameDebugPlugin` and `ModokiOtaPlugin`**: the class compiled and linked, then was simply absent at runtime, so Capacitor reported `"GameDebug" plugin is not implemented on ios`. The explanation once given — plugin classes with no external framework dependency get stripped — is contradicted on hardware (below), so treat the cause as unknown. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
 
-⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment on `healNativeConfig.ts`'s `healIosGameDebugRegistration`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
+⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the fenced registration block for `GameDebugPlugin` in every project, and the pbxproj reference that compiles `GameDebugPlugin.swift` only while `build.debugBuild` is on (#1521). It contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment on `healNativeConfig.ts`'s `healIosGameDebugRegistration`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
 
 **`MyViewController.swift` carries a SECOND fenced block**, `modoki:text-interaction-{begin,end}`, which disables the web view's text interaction to kill the iOS double-tap selection magnifier over the game (#1360). Unlike the game-debug fence it is **not** gated on `build.debugBuild` or on `usesGameDebug` — the magnifier is equally wrong in a release build of a project with no debug bridge — and it sits at class-body scope rather than inside `viewDidLoad`, because it is a method override. Guarded by `engine/tests/architecture/iosTextInteraction.test.ts`; the measurement, and the `<input>` constraint it carries, are in [input.md](./input.md) § "The iOS text-selection magnifier".
 
@@ -249,36 +249,125 @@ Current plugins and minimal usage:
 
 ### `capacitor-applovin-max` — AppLovin MAX
 
-Banner, MREC, interstitial, and rewarded ads + the mediation debugger. The core SDK is provided via SPM (iOS) / Gradle (Android).
+Banner, MREC, interstitial and rewarded ads, Google UMP consent, and the mediation debugger. The SDK
+comes from SPM (iOS) and Gradle (Android), pinned EXACTLY to one version on all three manifests
+(`Package.swift`, the podspec, `android/build.gradle`) — 13.6.4 as of #1494. The call-by-call contract
+is `src/definitions.ts`; what follows is what it cannot say. Shaped in #1494 to be driven by the engine's
+`runtime/core/adLifecycle.ts` through a game's `AdSdk` adapter: Weaveling's `maxSdk` since #1495 (the first
+consumer), Court's in #1496.
 
 ```typescript
 import { ApplovinMax } from 'capacitor-applovin-max';
 
-await ApplovinMax.showBanner({ adUnitId, position: 'bottom' });
-await ApplovinMax.loadInterstitial({ adUnitId });
-const { shown } = await ApplovinMax.showInterstitial();
-await ApplovinMax.showMediationDebugger();
+// Consent FIRST — after AppsFlyer's ATT prompt has settled, so the two launch-time asks never race.
+let consent = await ApplovinMax.requestConsentInfo();
+if (consent.status === 'REQUIRED' && consent.isConsentFormAvailable) consent = await ApplovinMax.showConsentForm();
+if (consent.canRequestAds) await ApplovinMax.initialize({ sdkKey, testDeviceAdvertisingIds });
+
+await ApplovinMax.loadInterstitial({ adUnitId });      // resolves when LOADED, rejects when it failed
+await ApplovinMax.showInterstitial({ placement });      // started — adDisplayed / adDisplayFailed / adHidden say the rest
+const { heightPx } = await ApplovinMax.showBanner({ adUnitId });
 ```
 
-⚠️ **A blank `adUnitId` is a CRASH, not a no-op** (#510). Loading or showing an ad with an
-empty id throws on the native **main thread** — outside any JS `try/catch` — and terminates the app.
-So a game's ad wrapper must gate on **the unit id it is about to pass**, per entry point; gating on
-the SDK key alone is not enough, because a configured key with unfilled unit ids is exactly the
-half-configured state that reaches the SDK.
+- **Consent is Google UMP, run by this plugin — not MAX's own Terms and Privacy Policy flow.** MAX's
+  flow can drive UMP itself, but AppLovin says that integration *"is opt-in and AppLovin will provide
+  you instructions on how you can enable this Google UMP integration"*, and the MAX dashboard has no
+  switch for it (checked 2026-09-24). So the plugin links `GoogleUserMessagingPlatform` (SPM) /
+  `com.google.android.ump:user-messaging-platform` directly, and exposes
+  `requestConsentInfo` / `showConsentForm` / `showPrivacyOptionsForm` — the same three steps as
+  `@capacitor-community/admob`, but NOT the same types: `debugGeography` is a string (`'eea'`), and the
+  result carries `privacyOptionsRequired: boolean` where AdMob's has a `privacyOptionsRequirementStatus`
+  string, so an adapter's `start()` ports step for step, not line for line. **MAX learns the answer from the IAB TCF string UMP writes on the
+  device** — there is no `setHasUserConsent` call to make. ⚠️ Two things outside the plugin make it
+  work: **UMP reads the AdMob app id** (`GADApplicationIdentifier` in Info.plist, the
+  `com.google.android.gms.ads.APPLICATION_ID` meta-data on Android), so a game dropping AdMob must KEEP
+  that key; and **the consent message published in the AdMob console must list AppLovin among its ad
+  partners**, or AppLovin gets no consent in the EEA.
+- **Loads settle on the AD, not on the call.** `loadInterstitial` / `loadRewardedAd` resolve on
+  `didLoad` and reject on `didFailToLoadAd` (code = MAX's error code); a second load while one is
+  pending rejects the first with code `superseded`. ⚠️ **A load while that ad is ON SCREEN rejects at
+  once with code `showing`**, because MAX ignores it without any callback ("Can not load another ad while
+  the ad is showing") and the call would hang — reachable when the lifecycle's show timeout schedules a
+  preload while a late-presenting ad is still up, which would leave that kind loading forever. **Nothing reloads by itself after a dismissal** —
+  the caller owns preloading (the lifecycle does it on `dismissed`, with its own back-off), because two
+  owners would double every load. A load while the ad is already LOADED resolves at once. The MAX SDK
+  refreshes an EXPIRED loaded ad on its own, so an adapter need not age ads out the way AdMob's one-hour
+  expiry forces: both games pass the lifecycle `maxAdAgeMs: Infinity`, because the age rule would only
+  refuse a show for an ad MAX still holds.
+  ⚠️ **That reload is why the plugin sets the expiration listener/delegate (#1507).** Read from the Android
+  SDK 13.6.4 bytecode (`MaxFullscreenAdImpl`). On iOS, `MAAdExpirationDelegate.h` confirms only the second
+  bullet; the rest is assumed to match:
+  - During the reload the ad stays READY, not LOADING. A show in that window gets `{ shown: false }`, and
+    the lifecycle's preload is dropped by MAX with no callback ("An ad is already loaded").
+  - A SUCCESSFUL reload is reported ONLY to `onExpiredAdReloaded` / `didReloadExpiredAd`, never as
+    `didLoad`. So that callback settles the parked load; without it, the kind stays `loading` for the rest
+    of the session.
+  - A FAILED reload arrives as the ordinary `didFailToLoadAd`.
+  - Not killed: a READY ad that its network reports not-ready BEFORE MAX's expiry timer fires would drop
+    the load the same way, with no reload to settle it. The lifecycle's preload bound (2 min, then its
+    back-off) retries until the reload comes. That window is inferred, not seen.
+  ⚠️ **`initialize` is once per app PROCESS, and every call settles (#1507).** On Android, MAX drops the
+  listener of a second initialise issued while the first is still running ("already initialized …
+  Ignoring") and posts it after completion; iOS is assumed to match. The plugin therefore keeps the state
+  itself, in STATIC fields: the first call starts the init, and every call that arrives while it runs
+  waits for the one completion. Static, because MAX's state is per process while a plugin instance is not:
+  a webview reload keeps the instance, but a recreated Android Activity builds a new Bridge. This covers a
+  realm that reloads during the first realm's init, which no JS-side memo can see. Only the first call's
+  options count. ⚠️ Not killed: if MAX ever skipped its init callback, every `initialize` would wait for
+  the rest of the PROCESS, not just one Activity's life. No such case is known; a failed init still
+  calls back.
+- **A failed show is `adDisplayFailed`, not `adLoadFailed`** — the ad HAD loaded; conflating the two
+  made a failed presentation look like a no-fill. Every `AdInfo` carries `format` (`banner` covers the
+  LEADER MAX serves through a banner unit on a tablet) and `currency: 'USD'`: **MAX's `revenue` is
+  already US dollars in major units**, the unit `AdRevenue.value` uses, so an adapter passes it straight
+  through — AdMob's micros are the ones that need dividing.
+- **The banner is anchored adaptive and sizes itself from the width it is actually given.** iOS pins a
+  host view to the view's SAFE AREA with Auto Layout (not a frame from `UIScreen` bounds, which is how
+  #1316's iPad-landscape overlap happened); Android puts a host at the bottom of the content view,
+  padded by the system-bar insets it is dispatched (edge-to-edge on Android 15+). Its height is
+  `adaptiveSize(forWidth:)` — 50–90 pt, never over 15% of the screen height — and every change of the
+  laid-out size arrives as **`bannerLayout { heightPx, widthPx }`** (CSS px: iOS points, Android dp;
+  the ad's own height, not the inset under it). `showBanner` resolves with the height too, and is
+  idempotent: create-and-load once, then un-hide + resume refresh (re-load if the last load failed).
+  `hideBanner` hides and stops the refresh. The banner is created with MAX's
+  `allow_pause_auto_refresh_immediately`, without which `stopAutoRefresh` is ignored until the first ad
+  has loaded and a manual `loadAd` after a stop is refused (read from the 13.6.4 Android bytecode,
+  `MaxAdViewImpl`). It does NOT abort a refresh already in flight: that one completes, and its failure
+  still arrives as `adLoadFailed` for a banner the game has hidden. **A banner load failure hides the view and stops
+  its refresh — the plugin does it, because MAX's SDK does not** (AdMob's removes its view). The
+  lifecycle's `bannerFailed` assumes the view is gone: left up, it could never be hidden again (the
+  game's later "no banner" diffs against a banner it believes is down), and an empty host over the
+  webview swallows every tap in the strip Weaveling gives back to the board (#1477). The next
+  `showBanner` re-loads and resumes the refresh.
+- **Unverified on a device (#1495/#1496 carry the checks):** the ad is requested for the WINDOW width
+  (`adaptiveWidth` is left at -1) while the view spans the safe-area width — equal in portrait, which is
+  all both games ship; under Weaveling's immersive Android mode, transient system bars may re-dispatch
+  insets and move the banner by the nav-bar height until they hide; after a FIRST-load failure on
+  Android, MAX schedules its own retry before the plugin's `stopAutoRefresh` runs, so a hidden banner
+  may retry and report a second failure (and a `showBanner` inside that window has its `loadAd`
+  refused until the retry fires); and `loadAd` + `startAutoRefresh` after a refresh failure may load
+  twice. None hangs anything — nothing awaits a banner load. Also a cost, not a defect: a
+  network-refresh failure hides a banner that was still showing a good ad, for the lifecycle's retry
+  wait (30 s), exactly as AdMob does.
+- ⚠️ **iOS revenue needs `revenueDelegate`, a separate property from `delegate`** — until #1494 the
+  plugin never set it, so `didPayRevenue` could not fire on iOS at all.
+- **Test devices are an `initialize` option** (IDFA / GAID). SDK 13 removed the setter after init, so
+  the old `setTestDeviceAdvertisingIds` (and `setIsAgeRestrictedUser`, also removed from the SDK) were
+  silent no-ops and are gone.
+- The reward event is emitted `retainUntilConsumed` on both platforms (#587), so a reward that lands
+  during a webview reload drains into the next realm instead of being dropped.
 
-⚠️ **Check the plugin signature — not every ad call takes an id, and the rule only bites on the
-ones that do.** **Read the plugin's `definitions.ts` for the call you are adding** rather than trusting a list
-here — this one has already been wrong once, and a hand-maintained enumeration in a doc whose
-thesis is "check the signature" is precisely what goes stale. As of writing, `loadInterstitial`,
-`loadRewardedAd`, `showBanner` and `showMRec` take an `adUnitId`, and those guards are crash
-guards; `showInterstitial`/`showRewardedAd` take only `{ placement }` and
-`hideBanner`/`showMediationDebugger` take nothing at all, so no blank id can reach the SDK through
-them — guarding those on the unit id is still right, but it is a *behavioural* "we never loaded
-one, so there is nothing to show", not a crash guard. Stating it as one (this doc did, briefly)
-teaches the next wrapper author to look for the wrong thing. `games/court/packages/app-services/src/ads.ts` is the
-reference shape (a `unit(kind)` accessor + a guard on every call that takes an id);
-`games/3d-test`'s had the warning in its banner and the check on the key only, which is how #510
-was filed. `hideBanner`/`showMediationDebugger` take no id and need no such guard.
+⚠️ **A blank `adUnitId` is a CRASH, not a no-op** (#510). Loading or showing an ad with an empty id
+throws on the native **main thread** — outside any JS `try/catch` — and terminates the app. So an
+adapter gates **per entry point on the unit id it is about to pass** (the `AdSdk.enabled()` +
+`has(kind)` pair in `adLifecycle.ts`); gating on the SDK key alone is not enough, because a configured
+key with unfilled unit ids is exactly the half-configured state that reaches the SDK. **Read
+`definitions.ts` for which calls take an id** rather than trusting a list here: `showInterstitial` /
+`showRewardedAd` / `hideBanner` take none, so a guard there is behavioural ("nothing was loaded"), not
+a crash guard.
+
+⚠️ `games/3d-test/packages/capacitor-applovin-max` is a fork frozen at the PRE-#1494 API on purpose —
+see the note at the top of this doc.
 
 ### `capacitor-adjust` — Adjust (SDK v5)
 
@@ -309,6 +398,66 @@ import { GameDebug } from 'capacitor-game-debug';
 await GameDebug.startServer({ port: 9095 });
 const { running, connected } = await GameDebug.getStatus();
 ```
+
+## Every parked call must settle — on EVERY path (#1507, #1514)
+
+A plugin method that settles its `PluginCall` only from an async callback — an SDK completion, a
+listener, a state handler — hangs its JS promise for the life of the process if some path never
+reaches that callback. Nothing errors; whatever awaits the promise simply latches: the debug bridge's
+`busy` flag, Court's `storeInFlight`, the IAP boot reconcile. #1507 found it in
+`capacitor-applovin-max`; #1514's sweep of every other engine plugin found it in three more. **The
+rule: before a method parks a call, enumerate every way the callback can fail to arrive, and settle
+the call on each one in NATIVE code.** The three ways it happened:
+
+- **An unhandled state.** `GameDebugPlugin.swift`'s `NWListener` handler settled on `.ready` and
+  `.failed` only; `.waiting` and `.cancelled` fell to `default: break`, and a released listener hit
+  a silent `guard … else { return }`. Now one lock-protected `StartSettle` per `startServer` call is
+  threaded through every EADDRINUSE retry and the port-0 fallback (it used to be a per-attempt,
+  unsynchronised bool); `.cancelled` rejects unless the handler cancelled that listener itself for a
+  retry; a 10s start deadline bounds `.waiting` and `@unknown` states; `stopAll` bumps a start
+  generation so a retry pending in `asyncAfter` cannot re-bind after the stop. Device-observed on
+  the iPad (2026-09-24, `games/sling`): a `stopServer` landing while a start was still in `setup`
+  rejected with "TCP server was stopped before it became ready (last listener state: setup)", and
+  the next start bound 9095 with no fallback. ⚠️ **Not observed: the `.waiting` → 10s-deadline
+  path** — nothing drove a listener into `.waiting`; it is pinned by shape only.
+- **A throw the SDK swallows.** ⚠️ **Play Billing runs its query/consume/acknowledge listeners
+  inside `ExecutorService.submit`** (javap on Billing 9.0.0, `BillingClientImpl.zzN`), so a throw
+  from one is captured in the `Future` and never surfaces — no crash, no logcat line — and Billing's
+  own 30s timeout is skipped, because it checks `!future.isDone()` and a throw has made the future
+  done. Its setup and disconnect listeners are called inside a catch that only logs — louder, and
+  the call still never settles. The same goes for `startConnection` itself on our RECONNECT path:
+  `bindService` can throw out of it, and inside a disconnect listener that throw is swallowed, so
+  `connect()` catches it and rejects the queue. That settles, it does not recover: Billing leaves
+  the client CONNECTING, so later calls are rejected at once until relaunch — a reject, not a hang. Every Billing listener in `ModokiIapPlugin.java` therefore runs through `guarded(call, …)` or
+  `IapCore.Join.branch(…)`. Contrast `requestReview`'s gms Tasks listener, which runs on MAIN: a
+  throw there is a CRASH, not a hang — same fix, worse symptom.
+- **A lifecycle event that clears state without settling what is queued.** `withBilling`'s
+  `onBillingServiceDisconnected` only cleared `connecting`, and nothing guarantees a setup callback
+  for an attempt that disconnects mid-setup — so the boot calls waited for some later call to reconnect.
+  See [docs/iap.md](iap.md) § 7 for the reconnect-once policy.
+
+**Fix it natively, not with a JS timeout — with one exception.** A JS bound settles the promise but
+leaves the native state parked (the #583 lesson: the next `purchase()` still hits the hard reject),
+and a JS bound on top of a native fix is a second guard hiding the first. The exception is #1507's
+`adLifecycle` preload bound: the unsettled path there lives inside MAX, which the plugin cannot
+enumerate, and a preload is idempotent and retryable. A purchase is neither — see the
+`PARKED_PURCHASE_TIMEOUT_MS` doc for the measured double-charge risk of bounding one.
+
+**The JS side has a half too.** A native deadline turns a hang into a reject, and a reject is only
+better if something retries: `initNativeBridge` (`engine/app/debug/bridge.ts`) used to rethrow a
+failed boot `startServer` before registering its `appStateChange` and `request` listeners, so a
+bounded start would have become a permanent failure. It now registers both and rethrows at the end.
+
+Guarded by `engine/tests/architecture/nativeSettleEveryPark.test.ts` (shape, 13 mutations), the
+`android/iap-core` leg of `npm run test:native` (the `Join` / `ConnectionQueue` / `drainEach`
+behaviour, on a JVM) and `engine/tests/framework/bridgeBootStartFailure.test.ts`.
+
+⚠️ **Read and deliberately NOT fixed by #1514:** `games/3d-test/packages/capacitor-adjust`'s
+`getAdid` / `getAttribution` settle only from Adjust v5 callbacks that wait for the SDK to have an
+answer (never, if it is uninitialised, disabled or offline) — no runtime code awaits either today;
+`games/3d-test/packages/capacitor-applovin-max` is a diverged fork still in the pre-#1507 shape. Both
+are 3d-test testbed code. Read and ruled out: AppsFlyer, iOS ATT, IAP iOS (StoreKit 2), OTA on both
+platforms, game-debug Android (its bind is synchronous), modoki-system iOS.
 
 ## Removing a plugin listener — `remove()` is NOT idempotent
 
@@ -477,16 +626,10 @@ four are fixed on `work-ai2`; check `git log`/the issues for whether that has re
 | #588 | Crashlytics rate-limit budgets are module state, so a cap named "per session" was really per realm while native counted one session | The three session budgets seed from `sessionStorage`; a `[reload]` breadcrumb now explains the discontinuity in a post-reload report |
 | #585 | litert-lm re-loads an already-ready model — Android never closes the old `Engine`, iOS peaks at 2× resident | **Closed, not planned** — the plugin was deleted in #1191. The JS guard that would have prevented it was a realm-scoped `let`, exactly the class above |
 
-⚠️ **#587's Court-side wiring is DORMANT in every build today, and the fix's stated motivation is
-therefore fixed for nobody yet.** `maxEnabled()` requires `APP_CONFIG.applovin.sdkKey !== ''` and the
-shipped config has `sdkKey: ''`, so `initAds()` returns before it can
-`registerReloadBlocker('court.fullscreenAd', …)` or attach the `adHidden`/`adLoadFailed` listeners,
-and `cleanupAds()`'s three `destroy*` calls sit behind the same gate. Every test that exercises this
-forces the gate open with `vi.mock('./config', …)`. So the banner/MREC surviving a reload and
-under-counting `ad_revenue` — the defect #587 describes — cannot happen right now, and the first
-real exercise of the mechanism will be the day a key is added, with no device evidence behind it.
-The engine-side registry (`realmShutdown.ts`) IS live; it is the Court consumer that is gated off.
-Worth knowing before anyone reads #587 as "ads teardown is proven".
+**#587's Court-side MAX wiring no longer exists** — Court moved to AdMob (#1312) and dropped the plugin
+(#342); ads teardown is now `adLifecycle.ts`'s `cleanup()`, reached from the same realm-shutdown task.
+MAX came back to Court through that lifecycle (#1496, 2026-09-24: `maxSdk` in Court's `ads.ts`, whose
+`teardown` destroys the banner), not through the wiring #587 described.
 
 ⚠️ **The `pagehide` backstop's `event.persisted === false` gate (`engine/app/useBackgroundFlush.ts`) is an ANDROID
 measurement shipping on iOS too, and the iOS behaviour is still UNOBSERVED (#611).** `pagehide`
@@ -736,7 +879,7 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 
 ⚠️ **`<project>/packages/app-services/` is a REQUIRED path, not a naming convention.** `projectNativeSdkDeps` in `engine/vite.config.ts` reads `<project>/packages/app-services/package.json` to force-prebundle the wrapped native-SDK deps, and returns `[]` when the path is missing — an app-service package placed anywhere else makes the editor's project-open flow silently skip the pre-bundle and visibly re-optimize/reload mid-session instead.
 
-⚠️ **Declare a native plugin dep in BOTH the game-root `package.json` and the app-services one** (as `games/court` and `games/3d-test` do for their real plugins). The root copy is not redundant: `healNativeConfig.ts`'s `usesCrashlytics()` reads only the project **root** `package.json` to gate the iOS dSYM upload phase, and **`cap sync` scans only the app's own root `package.json`**, never the nested one. A dep declared solely on the nested `app-services` package is exactly why `games/3d-test`'s `capacitor-applovin-max` — declared only in `packages/app-services/package.json` — is absent from both its generated `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` today. Only a JS-only SDK peer dep (e.g. `firebase` itself) legitimately stays app-services-only. ⚠️ **A vendored ENGINE plugin is the opposite exception: game root ONLY.** Court's `capacitor-appsflyer` (#632) and `capacitor-applovin-max` (#931) are declared in `games/court/package.json` alone. The root spec is a hashed tarball name that `vendor-plugins.mjs` rewrites on every re-vendor, and nothing rewrites a nested workspace's `package.json`, so an app-services copy would go stale on the first re-vendor. Node resolves the root copy by walking up from `packages/app-services/src`. The comment in Court's `app-services/package.json` carries the same argument. ⚠️ **In THIS repo a missing game-root declaration does not fail where you would look for it.** Every engine plugin is also a repo-root workspace, so `node_modules/<plugin>` at the repo root answers a bare import from ANY game by walking up: `require.resolve('capacitor-applovin-max')` from `games/wordweave`, which does not declare it, resolves to `engine/packages/capacitor-applovin-max`. Typecheck and the editor both pass; only `cap sync` (which reads the game root's `package.json`) leaves the plugin out, so the failure lands on a device. A game copied out of the repo would fail at import instead. Nothing guards this for any engine plugin today.
+⚠️ **Declare a native plugin dep in BOTH the game-root `package.json` and the app-services one** (as `games/court` and `games/3d-test` do for their real plugins). The root copy is not redundant: `healNativeConfig.ts`'s `usesCrashlytics()` reads only the project **root** `package.json` to gate the iOS dSYM upload phase, and **`cap sync` scans only the app's own root `package.json`**, never the nested one. A dep declared solely on the nested `app-services` package is exactly why `games/3d-test`'s `capacitor-applovin-max` — declared only in `packages/app-services/package.json` — is absent from both its generated `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` today. Only a JS-only SDK peer dep (e.g. `firebase` itself) legitimately stays app-services-only. ⚠️ **A vendored ENGINE plugin is the opposite exception: game root ONLY.** Court's `capacitor-appsflyer` (#632) and `capacitor-applovin-max` (#931) are declared in `games/court/package.json` alone. The root spec is a hashed tarball name that `vendor-plugins.mjs` rewrites on every re-vendor, and nothing rewrites a nested workspace's `package.json`, so an app-services copy would go stale on the first re-vendor. Node resolves the root copy by walking up from `packages/app-services/src`. The comment in Court's `app-services/package.json` carries the same argument. ⚠️ **In THIS repo a missing game-root declaration does not fail where you would look for it.** Every engine plugin is also a repo-root workspace, so `node_modules/<plugin>` at the repo root answers a bare import from ANY game by walking up: `require.resolve('capacitor-appsflyer')` from a game that does not declare it resolves to `engine/packages/capacitor-appsflyer`. Typecheck and the editor both pass; only `cap sync` (which reads the game root's `package.json`) leaves the plugin out, so the failure lands on a device. A game copied out of the repo would fail at import instead. Nothing guards this for any engine plugin today.
 
 ⚠️ **`cap sync` is a STEP in promoting a plugin, and its generated files are part of the commit** — not a follow-up. Wordweave's Firebase JS wiring once landed without regenerating `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` + `android/app/capacitor.build.gradle`, and nothing caught it: the files self-heal on whoever next runs a native build, so the tree only churns silently, and `npm run verify` is vitest — it compiles no native project. Both platforms shipped with no Firebase Capacitor plugin actually linked while every test stayed green. `npx cap update android` alone is not enough to regenerate them — it exits `ENOENT` on `assets/capacitor.plugins.json`, which only `cap copy` writes, so it needs a real `--target native` build first.
 
@@ -937,8 +1080,10 @@ the three ways a run can report nothing while working correctly are in
 
 Two facts belong here rather than there, because they are about the native plugin:
 
-- **iOS had no native gate before this.** Android refuses every `GameDebugPlugin` method unless the
-  manifest meta-data is on; the Swift half checked nothing, and stayed out of shipped games only
+- **iOS had no native gate before this.** Android's `startServer` and `triggerFault` refuse unless
+  the manifest meta-data is on. Its other methods (`getDeviceIp`, `captureScreen`, `getNativeLogs`
+  and the rest) check nothing, and since #1521 a flag-off build does not contain the plugin at all.
+  The Swift half checked nothing, and stayed out of shipped games only
   because JS never called `startServer`. Harmless for a server nobody starts, not harmless for a
   method that kills the app — hence the `ModokiDebugBuild` Info.plist key, written both ways by
   `healNativeConfig` and read by `isDebugBuildEnabled()`.
@@ -1034,7 +1179,7 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
 
 | Ships its own manifest | Does not |
 |---|---|
-| Capacitor and CapacitorCordova (both empty) · **GoogleMobileAds** and **UserMessagingPlatform** (Weaveling, #1309 — collected data and required-reason APIs declared, checked in the resolved artifacts 2026-09-17) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · ~~Facebook (tracking)~~ stripped from the graph by #1062 | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
+| Capacitor and CapacitorCordova (both empty) · **GoogleMobileAds** and **UserMessagingPlatform** (Weaveling, #1309 — collected data and required-reason APIs declared, checked in the resolved artifacts 2026-09-17) · **AppLovinSDK 13.6.4** and UserMessagingPlatform 3.1.0 (Court since #1496, through `capacitor-applovin-max` — AppLovin's manifest declares UserDefaults `CA92.1` and **no collected data**, read from the xcframework 2026-09-24) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · ~~Facebook (tracking)~~ stripped from the graph by #1062 | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
 
 - **Required-reason APIs: UserDefaults `CA92.1` only**, for `@capacitor/preferences`. The app
   target's own Swift uses none. The guard derives this from each game's `package.json`.
@@ -1045,7 +1190,11 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
   App Functionality, not tracking. Weaveling's were added by #1389 once sign-in (#927), purchases (#925)
   and cloud save (#679) landed, each confirmed against a sender in its own code: the save keyed by the account uid,
   the progress/settings sync groups, and the `wordweave.purchases` group's receipts. Ads (#932)
-  added no row — AdMob and UMP declare their own.
+  added no row — AdMob and UMP declare their own. ⚠️ **Court's MAX (#1496) added no row either, but for a
+  different reason:** AppLovin's manifest declares NO collected data, so nothing in Court's privacy report
+  covers the ad SDK's collection. By the first-party rule above that is App Store label work (#933), like
+  GoogleAppMeasurement's gap below — not something to add to the app's manifest. The
+  `capacitor-applovin-max` Swift calls no required-reason API.
 - ⚠️ **GoogleAppMeasurement ships no manifest, so Firebase Analytics' own collection is declared by
   nothing in the graph.** That is App Store privacy-label work (#933), not something to paper over
   in the app's manifest. Confirmed in a built Court `App.app`, whose bundle carries ~45 SDK
@@ -1130,12 +1279,14 @@ just never arrives.
 | Tap/Drag | PixiJS EventSystem calls | PixiJS EventSystem calls |
 | Native logs | OSLogStore (iOS 15+) | logcat |
 | Debug gate | `modoki:game-debug-*` fenced registration in `MyViewController.swift` | `com.modokiengine.gamedebug.DEBUG_BUILD` manifest `<meta-data>` |
+| Plugin in the build at all (#1521) | the pbxproj entries that compile `GameDebugPlugin.swift` into the App target | the `capacitor-game-debug` entry in `capacitor.config.json` `includePlugins`, which `cap sync` turns into the gradle graph |
 
-**Both gates are written from the ONE project flag `build.debugBuild`** (Project Settings →
+**Every row is written from the ONE project flag `build.debugBuild`** (Project Settings →
 Developer) by `healNativeConfig`, not from the Xcode/Gradle configuration (#112) — so
 `debugBuild: true` + a Release configuration is a *working* debug build, which is what a TestFlight
-QA build is. Reopen the project after flipping the flag so the heal runs. Absent Android meta-data
-reads as false. Detail:
+QA build is. The heal runs on project open and at the start of every native build, before
+`cap sync`. Absent Android meta-data reads as false. A flag-OFF build carries no native debug
+bridge at all: the plugin is out of both native graphs, not just unregistered. Detail:
 [debug-tools-mcp.md](./debug-tools-mcp.md) § "Native Debug Bridge" (the "Debug vs Release — ONE flag decides" note).
 
 ### MCP tools
@@ -1210,7 +1361,7 @@ Opening a project in the Electron editor runs two idempotent "make it just work"
   has no inset to tell CSS about — which is how "Android has no safe-area insets" briefly got
   recorded as a platform fact instead of a symptom. With the flag: frame `[0,0][720,1560]`, no
   band, and `env()` reports the real cutout (28dp on an A23, 27dp on an S22).
-- **game-debug wiring** (only when the project depends on `capacitor-game-debug`): adds the `NSLocalNetworkUsageDescription` + `NSBonjourServices` Info.plist keys (iOS 14+ gates the device's inbound-LAN TCP listener behind the **Local Network permission**, prompted via these keys). *(`NSBonjourServices` predates the Bonjour removal and is likely now vestigial — the lease connects by direct IP, no mDNS — but it hasn't been re-verified on-device, so it's left in for now.)* Also writes `MyViewController.swift` + points the storyboard's bridge VC at it + adds the pbxproj file-refs that compile `MyViewController.swift` and the engine's `GameDebugPlugin.swift` into the App target (the SPM static-linking workaround — see the [iOS SPM static-linking gotcha](#ios-spm-static-linking-gotcha)). The Local Network keys and the plugin registration both track `build.debugBuild` **in both directions** — flip it off and the next heal removes them, so an App Store build ships without a Local Network prompt. (Pre-#112 the keys were added unconditionally and stripped from the BUILT plist by a `CONFIGURATION == Release` build phase; that phase is retired, and the heal deletes it from any project that still carries it.)
+- **game-debug wiring** (only when the project depends on `capacitor-game-debug`): adds the `NSLocalNetworkUsageDescription` + `NSBonjourServices` Info.plist keys (iOS 14+ gates the device's inbound-LAN TCP listener behind the **Local Network permission**, prompted via these keys). *(`NSBonjourServices` predates the Bonjour removal and is likely now vestigial — the lease connects by direct IP, no mDNS — but it hasn't been re-verified on-device, so it's left in for now.)* Also writes `MyViewController.swift` + points the storyboard's bridge VC at it + adds the pbxproj file-refs that compile `MyViewController.swift` and the engine's `GameDebugPlugin.swift` into the App target (the SPM static-linking workaround — see the [iOS SPM static-linking gotcha](#ios-spm-static-linking-gotcha)). The Local Network keys, the plugin registration, the `GameDebugPlugin.swift` pbxproj entries and the plugin's `includePlugins` entry all track `build.debugBuild` **in both directions** (the last two since #1521; a project with no `includePlugins` at all links every dependency, so the heal reports that case instead of writing an allowlist for it). The iOS strip refuses while App-target Swift still uses the class, and the ON registration is written only when the class is compiled in; the detail is in [debug-tools-mcp.md](./debug-tools-mcp.md) § "Native Debug Bridge" — flip it off and the next heal removes them, so an App Store build ships without a Local Network prompt. (Pre-#112 the keys were added unconditionally and stripped from the BUILT plist by a `CONFIGURATION == Release` build phase; that phase is retired, and the heal deletes it from any project that still carries it.)
 
 It is called explicitly on open — **not** buried inside `ensureProjectDeps` — so it runs even for a flat game with native folders but no `package.json`, can't be silently skipped by a dep-install refactor, and always logs (a "already up to date" line included).
 
@@ -1331,9 +1482,11 @@ depends on it carries a `patch-package` patch (owner ruling, 2026-09-17). Forkin
   install. Each patch therefore needs an engine guard that reads the INSTALLED copy. It also only
   runs on a bare `npm install`: `npm install <pkg>` skips the project's own `postinstall`.
 
-The one live case is `@capacitor-community/admob` in Court and Weaveling, which fixes iOS paid-event
-revenue units ([Court ads.md](../games/court/ads.md) § "Ad revenue stops at Firebase"). Its guard is
-`engine/tests/architecture/admobRevenueUnitPatched.test.ts`.
+There is no live case since #1495 and #1496 moved both games to AppLovin MAX. The last was
+`@capacitor-community/admob`, whose patch fixed iOS paid-event
+revenue units ([Court ads.md](../games/court/ads.md) § "Ad revenue stops at Firebase"). Its guard,
+the `admobRevenueUnitPatched` architecture test, retired with it — git history keeps it as
+the template for the next patched plugin's installed-copy guard.
 
 ## App Identity & Build
 

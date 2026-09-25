@@ -168,7 +168,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
     mutating: true, undoable: true, persists: 'live', requires: ['editor', 'scene'], aim: 'entity',
     minimalArgs: { ops: [{ op: 'addEntity', name: 'ContractProbe', parentId: 0 }] },
-    notes: "Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first) — or, in prefab-edit mode, to the prefab-edit world (`prefabEditWorld`, /__prefab-edit__/<guid>), which is LIVE-ONLY: no file-direct fallback, 409 unless that world is loaded with its edit session open (#1254). ⚠️ The FILE-DIRECT path (a scene that is not the live one, or a setBaseScene op) refuses REQUIRES_SAVE while the editor holds ANY unsaved work, because the write hot-reloads the scene and that DISCARDS it — `holds` names each path and registry. There is no force/discardUnsaved hatch here on purpose: modoki_save_all is the only remedy. It also refuses NO_RENDERER (503) when a renderer may be attached and did not answer the probe — retry, it is usually mid-parse (#889 §8). With NO renderer at all it writes as before and says so in `warnings`.",
+    notes: "Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first) — or, in prefab-edit mode, to the prefab-edit world (`prefabEditWorld`, /__prefab-edit__/<guid>), which is LIVE-ONLY: no file-direct fallback, 409 unless that world is loaded with its edit session open (#1254). ⚠️ The FILE-DIRECT path (a scene that is not the live one, or a setBaseScene op) refuses REQUIRES_SAVE while the editor holds ANY unsaved work, because the write hot-reloads the scene and that DISCARDS it — `holds` names each path and registry. There is no force/discardUnsaved hatch here on purpose: modoki_save_all is the only remedy. It also refuses NO_RENDERER (503) when a renderer may be attached and did not answer the probe — retry, it is usually mid-parse (#889 §8). With NO renderer at all it writes as before and says so in `warnings`. Refuses 409 `wrongKind` (with `existingType`) for a path that is not a scene — a `.prefab.json` used to be parsed and rewritten as one (#1472).",
   },
   modoki_set_transform: {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
@@ -327,6 +327,10 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_menu: {
     kind: 'control', method: 'POST', route: '/api/menu', mutating: true, persists: 'session', requires: ['editor', 'electron'],
+    // A read half and a fire half on ONE route (§7 offender, 2026-09-25 audit C-11): `{}`/`list:true`
+    // returns the menu tree, `path`/`id` clicks an item. Not split — the bare call is the safe one.
+    // NOT `minimalArgsMutates:false`: that guard proves a read by its GET, and both halves are POST.
+    notes: 'Two jobs on one POST route (§7): {} or list:true reads the menu tree; path/id fires the item.',
   },
   modoki_eval: {
     kind: 'control', method: 'POST', route: '/api/eval', mutating: true, requires: ['editor', 'renderer'],
@@ -351,9 +355,8 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_editor_journal: {
     kind: 'read', method: 'GET', route: '/api/editor-journal',
-    mutating: true, persists: 'session',
     filters: ['type', 'source', 'since', 'limit'],
-    notes: 'IMPURE READ, and a mutating GET: clear:true empties the editor-activity buffer via GET.',
+    notes: 'A pure read since #1561 retired clear:true (§7): a baseline is a limit:0 read, then since=nextSeq.',
   },
   modoki_wait_for: {
     kind: 'read', method: 'POST', route: '/api/wait-for', requires: ['editor', 'renderer'],
@@ -447,8 +450,11 @@ const DECLS: Record<string, Decl> = {
       + "'overrides' is READ-only discovery — it walks the SAME override-key enumeration "
       + "'apply'/'revert' consume (collectInstanceOverrideKeys) and hands back the exact key "
       + "strings, so an agent can pick `keys` without guessing the "
-      + '`"localId.trait.field"` / `"+added.<guid>"` / `"-removed.<localId>"` / '
-      + '`"-trait.<localId>.<name>"` shapes. `apply`/`revert` act on ALL current overrides when '
+      + '`"<member>.trait.field"` / `"+added.<guid>"` / `"-removed.<member>"` / '
+      + '`"-trait.<member>.<name>"` / `"+trait.<member>.<tag>"` (an added tag) / `"~moved.<member>"` shapes, where `<member>` is the prefab '
+      + "member's minted nodeGuid (its localId only when the prefab predates format 5), so a key "
+      + 'listed before a template re-save still names the same member after it; a localId-spelled '
+      + 'key is still accepted. `apply`/`revert` act on ALL current overrides when '
       + '`keys` is omitted, and throw (never a silent ok:true) if ANY given key matches no '
       + 'override — a partial apply/revert would read as a success. An EXPLICIT empty `keys` '
       + 'array is refused rather than treated as omitted: a caller-side filter that matched '
@@ -537,7 +543,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_get_console_logs: {
     kind: 'read', method: 'GET', route: '/api/console-logs', filters: ['level', 'limit', 'since'],
-    notes: 'The clean comparison for the two journals: same job, purely a read, no clear mode. ' +
+    notes: 'Same job as the two journals, and like them (since #1561) purely a read. ' +
       'A non-zero `dropped` in the response means entries between the pinned boot prefix and the ' +
       'recent tail were evicted from the ring — the log is NOT contiguous, so do not read a gap in ' +
       'it as "nothing happened there".',
@@ -587,10 +593,11 @@ const DECLS: Record<string, Decl> = {
   modoki_journal: {
     kind: 'read', method: 'GET', route: '/api/journal',
     mutating: true, persists: 'session', requires: ['editor', 'renderer'],
-    filters: ['type', 'level', 'limit'],
+    filters: ['type', 'level', 'limit', 'sinceCap'],
     notes: "IMPURE READ, and a mutating GET: action:'start'/'stop' opens/closes a Tier-2 capture " +
-      'window and clear:true empties the 10,000-event ring — both via GET, so isFailureBody never ' +
-      'checks them. No `since` filter, unlike modoki_editor_journal.',
+      'window via GET, which the tool runs through the failure check at its call site (conventions §4), ' +
+      'so a refusal cannot arrive as success. clear:true is retired (#1561): nothing a read does deletes ' +
+      'events, and a baseline is a limit:0 read, then sinceCap=nextCap.',
   },
   modoki_resolve_refs: {
     kind: 'read', method: 'GET', route: '/api/resolve-refs', requires: ['project'],
@@ -598,6 +605,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_list_actions: {
     kind: 'read', method: 'GET', route: '/api/game-introspect', requires: ['editor', 'renderer'],
+    filters: ['name'],
   },
   modoki_dispatch_action: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'dispatch-action',
@@ -616,7 +624,7 @@ const DECLS: Record<string, Decl> = {
     requires: ['editor', 'renderer'], filters: ['guids', 'name', 'ids', 'layer', 'limit', 'precision'],
     notes: 'One row PER PROVIDER: an entity on screen in both Scene and Game panels reports twice.',
   },
-  modoki_scene_query: {
+  modoki_physics_query: {
     kind: 'read', method: 'POST', route: '/api/scene-query', requires: ['editor', 'scene'], aim: 'point',
     minimalArgs: { kind: 'point', dim: '3d', point: [0, 0, 0] },
     notes: "All six engine scene queries (#288 gap 1) behind one tool — §7-legal because no argument changes the method, the route, or whether anything is written; every kind is a pure read. POST despite being a read for the same reason capture_viewport/render_scene are: the input is nested vectors. Its substance is the REFUSAL taxonomy — the engine functions collapse 'no physics world', 'zero-length direction' and a genuine miss onto one null, so the first two are ruled out BEFORE casting and only what is left is reported as hit:null. The raw coordinates are a MEASUREMENT, not an aim (the capture_gesture carve-out), so this must never be added to batch.ts's XY_AIMED map.",
@@ -710,12 +718,13 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/create-asset',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { type: 'particle', path: '/assets/particles/probe.particle.json' },
+    notes: 'Refuses 409 `wrongKind` (with `nameType`) for a name the manifest would type as another kind — `type:\'material\'` at `x.scene.json` (#1472). A name no kind claims is not refused.',
   },
   modoki_write_asset: {
     kind: 'asset', method: 'POST', route: '/api/asset-write',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/particles/probe.particle.json', type: 'particle', data: {} },
-    notes: 'F1: `path` and `type` — its two primary args — are undocumented. Can RE-MINT the asset id. Refuses NOT_FOUND for a path that is not on disk rather than creating an id-less, unmanifested file (#1215); the editor\'s own flush (`selfWrite`) is exempt. ⚠️ REFUSES with REQUIRES_SAVE while the human has a PARKED edit to this same document, because this is a wholesale replace and the file-change event it raises makes the editor drop their copy (#889). The hatch is `discardUnsaved`, and the reply then names what was dropped in `discardedParked` — or carries `discardWarning` if the discard could not be confirmed, which means their older copy may still flush back over this write. The editor own save is exempt via selfWrite; an agent must not send that.',
+    notes: 'F1: `path` and `type` — its two primary args — are undocumented. Can RE-MINT the asset id. Refuses NOT_FOUND for a path that is not on disk rather than creating an id-less, unmanifested file (#1215); the editor\'s own flush (`selfWrite`) is exempt. ⚠️ REFUSES with REQUIRES_SAVE while the human has a PARKED edit to this same document, because this is a wholesale replace and the file-change event it raises makes the editor drop their copy (#889). The hatch is `discardUnsaved`, and the reply then names what was dropped in `discardedParked` — or carries `discardWarning` if the discard could not be confirmed, which means their older copy may still flush back over this write. The editor own save is exempt via selfWrite; an agent must not send that. Refuses 409 `wrongKind` when `type` is not the kind the FILE is (manifest type, else its suffix) — `type` picks the schema, it does not retype the file (#1472).',
   },
   modoki_delete_asset: {
     kind: 'mutate', method: 'POST', route: '/api/delete-asset',
@@ -730,7 +739,7 @@ const DECLS: Record<string, Decl> = {
   modoki_create_registered_asset: {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'create-registered-asset',
     mutating: true, persists: 'file', requires: ['editor', 'project'], aim: 'asset',
-    minimalArgs: { kind: 'material', path: '/assets/materials/probe.mat.json' },
+    minimalArgs: { type: 'material', path: '/assets/materials/probe.mat.json' },
     notes: "Routes around the panel's native save dialog (a modal panel only a human can answer) by taking an explicit path, which is what made the whole 'New X' surface agent-unreachable (#288 gap 5). Separate from modoki_create_asset, whose `type` is a fixed enum while this registry is dynamic and game-extensible. REFUSES create-override kinds: `scene`'s override discards the live world, and the dialog it normally goes through IS the guard an explicit path removes — modoki_new_scene has the REQUIRES_SAVE check instead. REFUSES an existing path (409 from `/api/write-file` `ifNoneMatch`) rather than replacing that asset under a new guid (#1215); only the Assets panel replaces, and it keeps the replaced guid.",
   },
   modoki_open_animation_editor: {
@@ -779,22 +788,22 @@ const DECLS: Record<string, Decl> = {
   modoki_anim_set_clip: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'anim-set-clip',
     mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
-    minimalArgs: { clipPath: '/assets/anim/probe.anim.json', clip: {} },
+    minimalArgs: { path: '/assets/anim/probe.anim.json', clip: {} },
   },
   modoki_anim_add_key: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'anim-add-key',
     mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
-    minimalArgs: { clipPath: '/assets/anim/probe.anim.json', trait: 'Transform', field: 'x', time: 0, value: 1 },
+    minimalArgs: { path: '/assets/anim/probe.anim.json', trait: 'Transform', field: 'x', t: 0, value: 1 },
   },
   modoki_timeline_set: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'timeline-set',
     mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
-    minimalArgs: { timelinePath: '/assets/timelines/probe.timeline.json', timeline: {} },
+    minimalArgs: { path: '/assets/timelines/probe.timeline.json', timeline: {} },
   },
   modoki_timeline_add_clip: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'timeline-add-clip',
     mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
-    minimalArgs: { timelinePath: '/assets/timelines/probe.timeline.json', trackType: 'animation', item: {} },
+    minimalArgs: { path: '/assets/timelines/probe.timeline.json', trackType: 'animation', item: {} },
   },
   // ── the six routes that had no tool (2026-08-21 audit F6, owner: expose all six) ──
   // Each was reachable only through modoki_eval + modoki.api(). Two of them were DOCUMENTED as

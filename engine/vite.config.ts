@@ -15,6 +15,8 @@ import { msdfWorkerAssetStripPlugin } from './plugins/msdfWorkerAssetStrip'
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
 import { bootSplashPlugin } from './plugins/bootSplash'
 import { earlyConsoleShimPlugin } from './plugins/earlyConsoleShim'
+import { projectLockfilesHash } from './plugins/projectLockfileHash'
+import { projectScanEntries } from './plugins/projectScanEntries'
 import { perfCoreWorkers } from './testWorkers'
 
 // C3: engine/ is the vite root (this config + index.html + app/ live here). The
@@ -500,7 +502,19 @@ export default defineConfig(({ command }) => {
   // into a chunk where those sibling files no longer sit. Excluding it keeps the lib served
   // from node_modules as-is.
   optimizeDeps: {
+    // #1520 — the cold scan crawls the open project's game.ts too, so the game's own packages are
+    // pre-bundled before the first page load instead of found mid-boot (a full reload). Dev AND
+    // packaged; the helper's docblock has the observation.
+    entries: projectScanEntries(engineDir, buildProjectRoot),
     exclude: ['@zappar/msdf-generator'],
+    // #1502 — Vite keys this cache on the REPO ROOT lockfile only, so a game dropping a dep it had
+    // pre-bundled left the cache "valid" and the next re-optimize failed on the missing source (the
+    // game booted DEGRADED). The define is inert — no dependency names that identifier — but
+    // `getConfigHash` serialises `rolldownOptions`, so every project lockfile now keys the cache.
+    // The helper's docblock has the mechanism.
+    rolldownOptions: {
+      transform: { define: { __MODOKI_PROJECT_LOCKFILES__: JSON.stringify(projectLockfilesHash(repoRoot, buildProjectRoot)) } },
+    },
     // PACKAGED-ONLY: pre-bundle the @modoki/engine subpaths the DYNAMICALLY-loaded game
     // module imports but the editor's own startup graph does NOT (notably
     // `runtime/rendering`). In a packaged app electron-builder dereferences the
@@ -529,10 +543,15 @@ export default defineConfig(({ command }) => {
         '@modoki/engine/runtime/core/dailyCalendar',
         // #926 — Court's and wordweave's login bonus wheels import its pure decisions the same way.
         '@modoki/engine/runtime/core/loginBonus',
-        // #1312 — both games' AdMob adapters import the promoted ad lifecycle, and their pacing
+        // #1312 — both games' ad adapters (AppLovin MAX since #1495 Weaveling / #1496 Court) import the promoted ad lifecycle, and their pacing
         // modules the interstitial rules, by narrow subpath.
         '@modoki/engine/runtime/core/adLifecycle',
         '@modoki/engine/runtime/core/adPacing',
+        // #1501 — both games' ads.ts wrap that lifecycle in the promoted debug overrides.
+        // NOT `runtime/debug/adsTab` (#1526): it resolves to a `.tsx`, which Vite never pre-bundles, so
+        // listing it only printed "Cannot optimize dependency" on every boot. It is served as source,
+        // so it cannot trigger a re-optimize either. Guarded in viteConfigEngineOptimizeDeps.test.ts.
+        '@modoki/engine/runtime/core/adDebug',
         // #1332 — both games' AppsFlyer wiring imports the promoted attribution lifecycle.
         '@modoki/engine/runtime/core/attribution',
         // #1274 — both games' auth wrappers hash login keys with the account-continuity module.

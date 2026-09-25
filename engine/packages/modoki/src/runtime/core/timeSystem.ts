@@ -19,6 +19,16 @@ import { isTimeHeldForLoading } from './loadingTimeHold';
 
 let lastTime = rawNow();
 let smoothedCadence = 0; // internal EMA of the raw (unscaled) frame cadence
+/** The most recent frame's clamped delta BEFORE `timeScale` — real seconds, as the frame saw them. */
+let lastUnscaledDelta = 0;
+
+/** The last `timeSystem` run's clamped delta before `timeScale` and the loading hold were applied —
+ *  what a VIDEO frame is measured in: real seconds, so a slow-mo stretch plays slowly in the video
+ *  instead of shortening the take's timeline. Read it through `takeClockDelta`, which zeroes it
+ *  for the frames that did not advance. */
+export function getUnscaledFrameDelta(): number {
+  return lastUnscaledDelta;
+}
 const MAX_DELTA = 1 / 30; // 33ms cap — prevents teleporting on GC pauses or tab throttle
 const SMOOTH_WEIGHT = 0.15; // Unity-style EMA weight for smoothDeltaTime
 
@@ -28,6 +38,7 @@ const SMOOTH_WEIGHT = 0.15; // Unity-style EMA weight for smoothDeltaTime
 export function resetTimeBaseline(): void {
   lastTime = rawNow();
   smoothedCadence = 0;
+  lastUnscaledDelta = 0;
 }
 
 export function timeSystem(world: World) {
@@ -36,6 +47,7 @@ export function timeSystem(world: World) {
   lastTime = now; // always track real time, only clamp what systems see
 
   const delta = Math.min(rawDelta, MAX_DELTA);
+  lastUnscaledDelta = delta;
 
   world.query(Time).updateEach(([time]) => {
     // Pausing is NOT done here: the editor Pause button calls setPlayState('paused'),

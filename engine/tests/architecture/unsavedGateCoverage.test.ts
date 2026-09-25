@@ -431,6 +431,7 @@ describe('the sidecar park gate covers every Node route that could clobber a par
     const ALLOWED: ReadonlyArray<{ item: string; reason: string }> = [
       { item: 'engine/plugins/meta-sidecar.ts', reason: 'the sidecar helper module itself' },
       { item: 'engine/plugins/asset-fs-ops.ts', reason: 'the sidecar helper module itself' },
+      { item: 'engine/plugins/takeAssets.ts', reason: '#1509: READS .meta.json bytes (hashing + GUID index), writes nothing, so it cannot clobber a parked edit. Behind POST /api/record/fingerprint, which the recorder calls only after refusing to record on hasUnsavedChanges() — every cause, parked asset docs and import settings included — so disk IS what the take plays' },
       { item: 'engine/plugins/reimport-registry.ts', reason: 'declares getReimportHandler; dispatches, never writes' },
       { item: 'engine/plugins/asset-tree-shaker.ts', reason: 'a build-time / static path with no editor attached' },
       { item: 'engine/plugins/vite-asset-scanner.ts', reason: 'a build-time / static path with no editor attached' },
@@ -463,12 +464,18 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       { item: 'engine/plugins/inlinePlayable.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/load-project-config.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/model-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/prefabWriteGuard.ts', reason: "#1468: READS ONLY — one readFileSync of the "
+        + 'prefab already on disk, to classify its format version and refuse a write that would overwrite a '
+        + 'newer one. It never writes, so it cannot clobber a parked edit; the route it guards '
+        + '(/api/write-file) is byte-opaque and deliberately ungated, which is why the refusal lives here '
+        + 'rather than in that route body' },
       { item: 'engine/plugins/rigged-model-optimize.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/texture-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/vendorPlugins.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/video-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/stripFirebaseAuthFacebook.ts', reason: '#1062: build heal step 6 (reached from /api/build via healNativeProject, under the build claim) — reads capacitor.config.json and reads/writes node_modules/@capacitor-firebase/authentication/Package.swift only; no asset, sidecar or document a panel can hold unsaved' },
       { item: 'engine/plugins/backend/loginShellProbe.ts', reason: '#1449: reads back only the one-line answer file its own login-shell probe wrote into a fresh mkdtemp dir; no asset, sidecar or document a panel can hold unsaved' },
+      { item: 'engine/plugins/projectLockfileHash.ts', reason: '#1502: READS ONLY each project\'s package-lock.json, at vite.config evaluation, to key the dep-optimizer cache; behind no editor route, writes nothing, touches no sidecar' },
       { item: 'engine/plugins/backend/iosUsbForward.ts', reason: '#1065: reads/writes only this clone\'s .modoki/ios-forward.json pid record for the go-ios forward' },
     ];
     assertExemptionLedger({

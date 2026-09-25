@@ -37,6 +37,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   getCurrentScenePath: () => 'scenes/test.json',
   setCurrentScenePath: vi.fn(),
   setCurrentBaseScene: (...a: any[]) => setCurrentBaseScene(...a),
+  isSceneLoadSwapping: () => false,
 }));
 
 vi.mock('../../src/editor/scene/prefab', () => ({
@@ -47,11 +48,14 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   // #1431: undo/redo re-derive carried BASE instances; this suite's instance is primary, and its
   // subject is the prefab + primary scene pair — pinned in engine/tests/editor/applyPrefabDirtiesBase.test.ts.
   refreshBaseInstances: vi.fn(),
+  // #1483: the restore rebases carried roots; nothing here is carried.
+  rebaseStaleInstances: vi.fn(async () => 0),
 }));
 
 let currentBaseScene: string | undefined;
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
-  sceneManager: { loadScene: (...a: any[]) => loadScene(...a), getCurrentBaseScene: () => currentBaseScene },
+  // `getCurrent`: a real scene, so the Apply is not the prefab-edit world's (#1573).
+  sceneManager: { loadScene: (...a: any[]) => loadScene(...a), getCurrentBaseScene: () => currentBaseScene, getCurrent: () => ({ path: '/scenes/main.json' }), getNext: () => null },
 }));
 
 vi.mock('../../src/editor/store/editorStore', () => ({
@@ -60,6 +64,8 @@ vi.mock('../../src/editor/store/editorStore', () => ({
 
 vi.mock('../../src/editor/undo/undoManager', () => ({
   pushAction: (a: UndoAction) => { pushed = a; },
+  // The restore reads its target from `currentSceneKey` (#1575), whose module registers a barrier on import.
+  registerUndoRestoreBarrier: () => {},
 }));
 
 async function getModule() { return import('../../src/editor/undo/applyPrefabUndo'); }

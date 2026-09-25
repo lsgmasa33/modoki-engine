@@ -62,7 +62,7 @@ function harness(reply: () => { status?: number; body?: unknown }) {
 
 /** The static surface needs a server too, and it must share nothing with the harness's fake beyond
  *  being a valid sink — the assertions here are about the REGISTRY, which both write into. */
-const server2 = (_h: ReturnType<typeof harness>) => ({ registerTool: () => ({ remove: () => {} }) }) as never;
+const server2 = (_h: ReturnType<typeof harness>) => ({ registerTool: () => ({ remove: () => {} }), validateToolInput: async (_t: unknown, a: unknown) => a }) as never;
 
 afterEach(() => { vi.unstubAllGlobals(); clearRegistry(); });
 
@@ -222,7 +222,7 @@ describe('sync', () => {
     // and "unreachable" is not a guarantee. The engine tool must win, and the game must be told.
     // Registering the static surface first is what makes the collision real rather than theoretical.
     const h = harness(() => ({ body: { version: 1, tools: [decl({ name: 'modoki_tap' })] } }));
-    registerAllTools({ registerTool: () => ({ remove: () => {} }) } as never, createToolContext({ backend: STUB }));
+    registerAllTools({ registerTool: () => ({ remove: () => {} }), validateToolInput: async (_t: unknown, a: unknown) => a } as never, createToolContext({ backend: STUB }));
     const r = await h.sync.refresh();
     expect(r.registered).toEqual([]);
     expect(r.refused.modoki_tap).toMatch(/already registered|duplicate/i);
@@ -529,4 +529,24 @@ describe('sync', () => {
     const h = harness(() => ({ status: 504, body: { error: 'no renderer' } }));
     expect((await h.sync.refresh()).reachable).toBe(false);
   });
+});
+
+describe('a game tool\'s §5 code reaches the envelope (#1561)', () => {
+  /** The route sends a coded refusal as a 400 (`relayJson`), an uncoded one as a 200 — both must
+   *  leave the MCP server carrying the code the GAME chose, not the generic REFUSED_BY_OP. The device
+   *  twin is `deviceRefusalCodeRelay.test.ts`'s `device_game_tool_call` row. */
+  for (const status of [400, 200]) {
+    it(`a ${status} {ok:false, code:'NOT_FOUND'} arrives as NOT_FOUND with its options`, async () => {
+      const h = harness(() => ({ body: { version: 1, tools: [decl()] } }));
+      await h.sync.refresh();
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(
+        JSON.stringify({ ok: false, code: 'NOT_FOUND', reason: "no level with id 'x'", options: ['lvl-a'] }),
+        { status, headers: { 'Content-Type': 'application/json' } })));
+      const r = await getTool('court_load_level')!.handler({ levelId: 'x' }) as { isError?: boolean; content: { text: string }[] };
+      expect(r.isError).toBe(true);
+      const env = JSON.parse(r.content[0].text) as { error: { code: string; options?: string[] } };
+      expect(env.error.code).toBe('NOT_FOUND');
+      expect(env.error.options).toEqual(['lvl-a']);
+    });
+  }
 });

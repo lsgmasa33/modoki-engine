@@ -289,7 +289,7 @@ describe('ota-publish.mjs takes the cross-process build claim (#650)', () => {
   it('acquires BEFORE hashing/reading distDir (buildManifestFiles) and before any upload', () => {
     const acquireIdx = found(src.indexOf('acquireBuildClaim('), 'acquireBuildClaim(');
     const hashIdx = found(src.indexOf('await buildManifestFiles(distDir)'), 'await buildManifestFiles(distDir)');
-    const uploadIdx = found(src.indexOf("gcloud storage rsync"), 'gcloud storage rsync');
+    const uploadIdx = found(src.indexOf("'storage', 'rsync'"), "'storage', 'rsync'");
     expect(acquireIdx).toBeLessThan(hashIdx);
     expect(acquireIdx).toBeLessThan(uploadIdx);
   });
@@ -408,7 +408,7 @@ describe('build-subgame.mjs takes the cross-process build claim (#650, #837)', (
   it('acquires BEFORE its first write (the scoped tsconfig) and before the vite build', () => {
     const acquireIdx = found(src.indexOf('acquireBuildClaim('), 'acquireBuildClaim(');
     const writeIdx = found(src.indexOf('writeFileSync(scopedPath'), 'writeFileSync(scopedPath');
-    const viteIdx = found(src.indexOf('build --config'), 'build --config');
+    const viteIdx = found(src.indexOf("'build', '--config'"), "'build', '--config'");
     expect(acquireIdx).toBeLessThan(writeIdx);
     expect(acquireIdx).toBeLessThan(viteIdx);
   });

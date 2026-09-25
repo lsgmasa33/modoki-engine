@@ -2,6 +2,7 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { openIdentityScope, closeIdentityScope } from '../../runtime/core/ecs/identityParents';
 import { collectTransientSubtreeIds } from './authoringScope';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
@@ -20,14 +21,15 @@ import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegist
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
-import { setPlayState, getRunMode } from '../../runtime/core/playState';
+import { setPlayState } from '../../runtime/core/playState';
+import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
-import { swapHistory, forgetHistory, getEditVersion } from '../undo/undoManager';
+import { swapHistory, forgetHistory, getEditVersion, beginWorldSwitch } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, preloadNestedPrefabs } from './prefab';
+import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefab';
-import type { AddedEntity, NestedOverridePaths, NestedStructurePaths } from '../../runtime/loaders/loadSceneFile';
+import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
@@ -74,7 +76,8 @@ export interface SerializedEntity {
   removed?: number[];
   /** Per-localId component (trait) names the instance deleted from prefab members. */
   removedTraits?: Record<number, string[]>;
-  /** Members moved to another parent inside the instance (#1437): row localId → live parent guid. */
+  /** LEGACY (#1437): row localId → live parent guid, for the moves NO member row carries — a member of
+   *  a pre-v5 template, which has no row. A member with a row states its move as `parent` there. */
   moved?: Record<number, string>;
   /** Scene-level overrides on this instance's NESTED prefab instances (a prefab's
    *  own internal nested instances, e.g. a ship's engine flames). Path-keyed so the
@@ -83,6 +86,11 @@ export interface SerializedEntity {
   /** Scene-level STRUCTURAL edits inside this instance's nested instances, path-keyed exactly like
    *  `nestedOverrides` (#1358). */
   nestedStructure?: NestedStructurePaths;
+  /** v16+: this instance's members, keyed by minted identity (#1468). One thin row per member,
+   *  carrying the guid that used to be re-derived from the member's position on every load. The
+   *  runtime shape and every rule about the key live on `SceneMemberRow` (`runtime/loaders/loadSceneFile.ts`) — this is the same type, re-exported, not a
+   *  second declaration of it. */
+  members?: Record<string, SceneMemberRow>;
 }
 
 /** A single resource the scene needs at load time. SceneManager acquires these
@@ -161,6 +169,16 @@ export function isSkippedByPrimarySave(entityId: number): boolean {
 }
 
 export async function serializeScene(opts?: {
+  assignGuids?: boolean;
+  scene?: { path: string; guid: string };
+}): Promise<SceneFile> {
+  // One identity resolver for the whole save, rebuilt only if the world's structure moves under an await
+  // (`identityParents.ts`).
+  openIdentityScope();
+  try { return await serializeSceneScoped(opts); } finally { closeIdentityScope(); }
+}
+
+async function serializeSceneScoped(opts?: {
   assignGuids?: boolean;
   scene?: { path: string; guid: string };
 }): Promise<SceneFile> {
@@ -318,20 +336,24 @@ export async function serializeScene(opts?: {
   // The nested channels, per top-level root — one top-down walk each (#1369; see captureNestedChannels).
   const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
   const nestedStructureByTop = new Map<number, NestedStructurePaths>();
+  const nestedFramesByTop = new Map<number, Map<string, { root: number; path: number[] }>>();
   for (const [rootId, { source }] of prefabRootInfo) {
     const prefab = await getPrefabSource(source);
     if (!prefab) continue;
     // A nested row whose instance is gone is recorded as removed only when its prefab is cached
     // (#1355), and a deleted instance's source is not among the live ones preloaded above.
     await preloadNestedPrefabs(prefab);
-    const s = captureInstanceStructure(rootId, prefab);
+    // Scene FILE form (#1468 Phase 4): a reference node inside writes its edits on its own rows.
+    const s = captureInstanceStructure(rootId, prefab, { rows: true });
     for (const ecsId of s.consumedEcsIds) prefabChildIds.add(ecsId);
-    const channels = captureNestedChannels(source, s.ownedNested);
+    const channels = captureNestedChannels(source, s.ownedNested, { rows: true });
     for (const ecsId of channels.consumedEcsIds) prefabChildIds.add(ecsId);
     if (channels.nestedOverrides) nestedOverridesByTop.set(rootId, channels.nestedOverrides);
     if (channels.nestedStructure) nestedStructureByTop.set(rootId, channels.nestedStructure);
-    if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length || Object.keys(s.moved).length) {
-      rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits, moved: s.moved });
+    nestedFramesByTop.set(rootId, channels.frames);
+    const unrowed = s.unrowed ?? {};
+    if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length || Object.keys(unrowed).length) {
+      rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits, moved: unrowed });
     }
   }
 
@@ -382,19 +404,30 @@ export async function serializeScene(opts?: {
       entry.prefab = rootInfo.source;
       const prefab = await getPrefabSource(rootInfo.source);
       if (prefab) {
-        const overrides = captureInstanceOverrides(info.id, prefab);
-        if (Object.keys(overrides).length > 0) entry.overrides = overrides;
         const struct = rootStructure.get(info.id);
-        if (struct) {
-          if (struct.added.length) entry.added = struct.added;
-          if (struct.removed.length) entry.removed = struct.removed;
-          if (Object.keys(struct.removedTraits).length) entry.removedTraits = struct.removedTraits;
-          if (Object.keys(struct.moved).length) entry.moved = struct.moved;
-        }
-        const nested = nestedOverridesByTop.get(info.id);
-        if (nested && Object.keys(nested).length) entry.nestedOverrides = nested;
-        const nestedStruct = nestedStructureByTop.get(info.id);
-        if (nestedStruct && Object.keys(nestedStruct).length) entry.nestedStructure = nestedStruct;
+        // v16 (#1468): each member's guid, STORED under its minted identity instead of re-derived
+        // from its position on the next load — plus, since Phase 3, `parent` for a member that has
+        // been moved inside the instance. Absent when the template predates prefab v5; see
+        // `memberRowKeysIn` for the full exclusion list.
+        // ⚠️ The template is passed, and it is what makes `parent` writable at all: the move is a
+        // DIFF against where this document puts the member, so a capture with no document can only
+        // carry the rows it is handed (`memberRowParents`).
+        // Since Phase 4 the rows also carry every EDIT they can key (`moveChannelsOntoRows`): what is
+        // left in the localId channels below is the root's own edits and what no row can address.
+        const moved = moveChannelsOntoRows(info.id, prefab, rootInfo.source, {
+          overrides: captureInstanceOverrides(info.id, prefab),
+          added: struct?.added, removed: struct?.removed, removedTraits: struct?.removedTraits,
+          nestedOverrides: nestedOverridesByTop.get(info.id), nestedStructure: nestedStructureByTop.get(info.id),
+        }, captureInstanceMembers(info.id, prefab), nestedFramesByTop.get(info.id));
+        const ch = moved.channels;
+        if (ch.overrides && Object.keys(ch.overrides).length) entry.overrides = ch.overrides;
+        if (ch.added?.length) entry.added = ch.added;
+        if (ch.removed?.length) entry.removed = ch.removed;
+        if (ch.removedTraits && Object.keys(ch.removedTraits).length) entry.removedTraits = ch.removedTraits;
+        if (struct && Object.keys(struct.moved).length) entry.moved = struct.moved;
+        if (ch.nestedOverrides && Object.keys(ch.nestedOverrides).length) entry.nestedOverrides = ch.nestedOverrides;
+        if (ch.nestedStructure && Object.keys(ch.nestedStructure).length) entry.nestedStructure = ch.nestedStructure;
+        if (Object.keys(moved.members).length) entry.members = moved.members;
         // Persist the root's stable guid on the node. The trait loop below writes
         // ONLY PrefabInstance for a captured root (EntityAttributes never gets
         // written, and guid is never an override), so this is the only place the
@@ -672,6 +705,16 @@ export function assertNoPathRefs(entry: SerializedEntity): void {
     flagNestedStructure(node.nestedStructure, `${ctx}.nestedStructure`); // a reference node's own slot (#1369)
     for (let i = 0; i < (node.children?.length ?? 0); i++) flagAdded(node.children[i], `${ctx}.child[${i}]`);
     for (let i = 0; i < (node.added?.length ?? 0); i++) flagAdded(node.added![i], `${ctx}.added[${i}]`);
+    flagRows(node.members, `${ctx}.members`);
+  };
+  // members: Record<key, SceneMemberRow> — since Phase 4 (#1468) a row carries a trait bag and added
+  // nodes, the two channels it took over, so it is walked for the same reason they are.
+  const flagRows = (members: Record<string, SceneMemberRow> | undefined, ctx: string) => {
+    for (const [key, r] of Object.entries(members ?? {})) {
+      if (r?.traits) flagTraits(r.traits, `${ctx}{${key}}.`);
+      for (let i = 0; i < (r?.added?.length ?? 0); i++) flagAdded(r.added![i], `${ctx}{${key}}.added[${i}]`);
+      for (let i = 0; i < (r?.own?.length ?? 0); i++) flagAdded(r.own![i], `${ctx}{${key}}.own[${i}]`); // v17 (#1516)
+    }
   };
 
   flagTraits(entry.traits, '');
@@ -680,6 +723,7 @@ export function assertNoPathRefs(entry: SerializedEntity): void {
   flagNested(entry.nestedOverrides, 'nestedOverrides');
   flagNestedStructure(entry.nestedStructure, 'nestedStructure');
   for (let i = 0; i < (entry.added?.length ?? 0); i++) flagAdded(entry.added![i], `added[${i}]`);
+  flagRows(entry.members, 'members');
 }
 
 /** Walk serialized entities and extract every resource ref they reference.
@@ -844,9 +888,18 @@ function adoptReplacedWorld(scenePath: string, keptBaseGuids: ReadonlySet<string
  *  `adoptReplacedWorld` holds. Before #1409, `unsavedChanges` stayed true after the reload over a
  *  world that matched disk, and the stack still offered to undo a reparent the file never had.
  *  A changed BASE reloads through `forceReloadBases`, so it is not in `keptBaseGuids` and its
- *  edits are discarded with its flag. Installed via `setWorldReloadedFromDiskHook`. */
-export function adoptWorldReloadedFromDisk(scenePath: string, keptBaseGuids: ReadonlySet<string>): void {
+ *  edits are discarded with its flag. Installed via `setWorldReloadedFromDiskHook`.
+ *
+ *  A kept base (and any `Persistent` root) is CARRIED flat, so when the reload was a PREFAB change its
+ *  instances are still the old document's expansion while the editor's copy is already the new one — rebuilt
+ *  here from the document each was expanded from (#1483), or every capture would match its members with
+ *  another member's rows. */
+export async function adoptWorldReloadedFromDisk(scenePath: string, keptBaseGuids: ReadonlySet<string>): Promise<void> {
   adoptReplacedWorld(scenePath, keptBaseGuids);
+  // Not only kept bases: a `Persistent` root is carried too, whatever scene owns it (review of 4f0b839d0).
+  // Everything the reload re-expanded from disk compares equal and is left alone.
+  const rebuilt = await rebaseStaleInstances();
+  if (rebuilt) console.log(`[Prefab] rebuilt ${rebuilt} carried instance(s) from the prefab that changed`);
 }
 
 /** WHICH kinds of unsaved work exist, told apart. The causes themselves — what each one is, what
@@ -1223,16 +1276,20 @@ export async function saveScene(opts: {
   // TRANSIENCE guard (preview-mode-refactor, Phase 2): only ever WRITE authored data. While
   // scrub/preview/play is live the world holds preview mutations (a signal action moved the
   // camera, `isActive` toggled, a control prefab spawned) — the Transient skip drops spawns, but
-  // authored-trait mutations would still leak. Refuse the save until stopped. (Phase 3 replaces
-  // this with a mandatory snapshot session so the authored data is always recoverable to save.)
+  // authored-trait mutations would still leak. Refuse the save until the world is authored again.
   //
-  // This subsumes the earlier Play/Pause-only refusal (C7): run-mode 'playing' ⇒ a live/paused
-  // Play, so this also blocks baking the RUNTIME world (physics-settled positions, spawned
-  // entities) over the authored scene — and additionally blocks 'scrub'/'preview', where
-  // playState is still 'stopped'. modoki_save_all's doc CLAIMED "Blocked during Play" and
-  // nothing enforced it; /api/scene-mutate already refuses for the mirror-image reason.
-  if (getRunMode() !== 'stopped') {
-    console.warn(`[Editor] Save refused — run-mode is '${getRunMode()}', not 'stopped'. Stop preview/play before saving so preview mutations don't reach disk.`);
+  // This subsumes the earlier Play/Pause-only refusal (C7): a live/paused Play is refused, so this
+  // also blocks baking the RUNTIME world (physics-settled positions, spawned entities) over the
+  // authored scene — and additionally 'scrub'/'preview', where playState is still 'stopped'.
+  // modoki_save_all's doc CLAIMED "Blocked during Play" and nothing enforced it; /api/scene-mutate
+  // already refuses for the mirror-image reason.
+  //
+  // ⚠️ `isWorldAuthored`, not the run mode (#1548): an envelope's exit reads 'stopped' before its
+  // restore has swapped the posed world out, and the agent `save-all` in that window wrote the pose
+  // and replied ok:true. Only the human Cmd+S waited for the restore; every caller inherits this.
+  const notAuthored = whyWorldNotAuthored();
+  if (notAuthored) {
+    console.warn(`[Editor] Save refused — ${notAuthored}. Stop preview/play (and let it finish reverting) before saving so preview mutations don't reach disk.`);
     return { saved: false, path: explicitPath || _currentScenePath, reason: 'playing' };
   }
   // Saving is the authored write that persists identity — commit minted guids
@@ -1341,6 +1398,13 @@ export function sceneLoadGeneration(): number { return loadEpoch.current; }
 let _loadsInFlight = 0;
 export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
 
+/** How many of those loads are past their wait for the undo in flight (#1579) — the ones that may be swapping the
+ *  world now. `isSceneLoadInFlight` also counts a load still WAITING for an undo to finish, and an undo that skipped
+ *  on it would skip against the very load that is waiting for it: the prefab file restored, the world not, and the
+ *  step dropped (the window #1579 closes, recreated by its own fix). `applyPrefabUndo.restoreSnapshot` reads this. */
+let _loadsSwapping = 0;
+export function isSceneLoadSwapping(): boolean { return _loadsSwapping > 0; }
+
 /** `loadScene`'s outcome. `'superseded'` covers BOTH ways a load can lose to a newer one:
  *  cancelled early (SceneManager aborts the in-flight load — rejects with AbortError) and
  *  superseded in the winner's TAIL (`SceneManager.loadScene`'s step-11 tail guard — nothing left to cancel, so the
@@ -1348,6 +1412,59 @@ export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
  *  is `'failed'`: this op's own load did not fail, and it says nothing about whether the path
  *  exists. See the doc comment on `loadScene` for why this can't just be a boolean. */
 export type SceneLoadOutcome = 'loaded' | 'superseded' | 'failed' | 'refused';
+
+/** Work that must finish before `loadScene` touches the world — registered by a module this one
+ *  cannot import without a cycle: `playMode.ts`'s preview-envelope takedown, the only one. A single
+ *  slot, not a listener set: there is one owner of the envelope, and a second registrant would need
+ *  an ordering decision nobody has made. Returns a promise ONLY when there is work to wait for, so a
+ *  load with no envelope still flips to 'stopped' in the same synchronous run it always did. */
+let _beforeSceneLoad: (() => Promise<unknown> | null) | null = null;
+
+export function registerBeforeSceneLoad(fn: () => Promise<unknown> | null): void {
+  _beforeSceneLoad = fn;
+}
+
+/** Take a preview envelope down before replacing the world by any route. Null when there is nothing
+ *  to wait for. Wraps a failure so it is not mistaken for the load's own. Called through
+ *  `prepareWorldSwitch`, which waits for the undo in flight first. */
+function takeDownEnvelopeBeforeWorldSwap(): Promise<void> | null {
+  const takedown = _beforeSceneLoad?.() ?? null;
+  if (!takedown) return null;
+  return takedown.then(() => undefined, (e: unknown) => {
+    throw new Error(`could not revert the preview before replacing the scene: ${(e as Error)?.message ?? String(e)}`);
+  });
+}
+
+/** Everything a user-initiated world switch must do before it touches the world or the editor's scene
+ *  path (#1579): refuse new undo/redo steps from the call on, then — when `ready()` is called — wait for
+ *  the step in flight and, with `takeDownEnvelope`, take a preview envelope down. The one entry for
+ *  `loadScene`, `newScene` and `openPrefabForEditing` (`enterPlay` takes the undo half from
+ *  `beginWorldSwitch` directly, and its envelope through `takeDownPreviewEnvelope`).
+ *
+ *  Call it synchronously AFTER the switch's own refusals and in-flight latches (#887), so a second
+ *  gesture is still refused while this one waits. Call `ready()` where the switch used to take the
+ *  envelope down, and await it when non-null — null keeps a switch with nothing to wait for
+ *  synchronous. Call `release` in a `finally` once the switch is done. `ready` is lazy so nothing
+ *  starts before the caller reaches it (`openPrefabForEditing` fetches first, and a takedown started
+ *  before a failed fetch would reject with nobody awaiting it).
+ *
+ *  Why the undo wait: an undo step awaits across a prefab file write and a world reload, and a switch
+ *  landing in that window resumed it over a changed world or history — see `beginWorldSwitch`. */
+export function prepareWorldSwitch(opts: { takeDownEnvelope: boolean }): {
+  /** The undo step in flight alone, for a switch that must READ something the step writes before it reaches `ready`
+   *  (`openPrefabForEditing` fetches the prefab the undo is installing). */
+  idle: Promise<void> | null;
+  ready: () => Promise<void> | null;
+  release: () => void;
+} {
+  const { idle, release } = beginWorldSwitch();
+  const takedown = () => (opts.takeDownEnvelope ? takeDownEnvelopeBeforeWorldSwap() : null);
+  return {
+    idle,
+    release,
+    ready: () => (idle ? idle.then(() => takedown() ?? undefined) : takedown()),
+  };
+}
 
 /** Set alongside a `'failed'` or `'refused'` outcome PRODUCED BY THIS MODULE'S OWN `loadScene`
  *  below — the message from the throw that caused it, since `SceneLoadOutcome` stays a bare
@@ -1415,7 +1532,30 @@ export async function loadScene(
   // #1164: `setPlayState('stopped')` below is a settle edge, and a hot reload deferred during Play
   // must not replay into the middle of this load — see `authoringSettle.ts`. Released in `finally`.
   const releaseReplacement = beginWorldReplacement();
+  // Refuses new undo steps from here, and names the one in flight (#1579) — released in `finally`.
+  const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: true });
+  let swapping = false;
   try {
+    // A preview envelope is taken down FIRST — restored, not abandoned (#1548 close-out review).
+    // Loading out of one used to drop the mode at the line below and leave the session to be
+    // abandoned at the swap: a load that was then REFUSED or FAILED never swapped, stranding a held
+    // session with no owner (⏹ gone from both panels, saves refused "a preview session is open",
+    // `exit-pose-envelope` answering "nothing to exit"), and one that succeeded carried kept bases
+    // and Persistent roots across with the pose still on them. Awaited inside this load's token and
+    // in-flight count, so neither a hot-reload settle nor a Play press can start in the gap.
+    // NOT isolated: a takedown that throws has left the world in an unknown state, and loading over
+    // it is not the recovery — the load fails with that error instead.
+    // The undo in flight finishes FIRST (#1579): it reloads the world under this scene's key, and a load
+    // swapping over it left the step to resume over the incoming world.
+    const ready = worldSwitch.ready();
+    if (ready) {
+      await ready;
+      // A newer load started while this one waited: it owns the world now, and continuing would call
+      // SceneManager AFTER it — superseding the winner with the loser.
+      if (!stillLive()) return 'superseded';
+    }
+    _loadsSwapping += 1;
+    swapping = true;
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
     // Read on BOTH sides of the await (#1409): the outgoing world stays live and editable while the
@@ -1474,6 +1614,9 @@ export async function loadScene(
     // the epoch guard above); it's expected, not a failure worth a red console error, and it's
     // the same outcome as the tail-supersede case above: this op's own load did not fail.
     if ((e as Error)?.name === 'AbortError') return 'superseded';
+    // A newer load took over while this one was still reverting the preview (#1548 re-review): the
+    // world is the winner's now, so "failed — the previous scene is still loaded" would be false.
+    if (!stillLive()) return 'superseded';
     // A format-version refusal (docs/format-versioning.md § 2b-bis — Scene is REFUSE, #784
     // phase C3): distinct from 'failed' because "Failed to load — check the path" is a WRONG
     // diagnosis for a right symptom — the path exists and the bytes are fine, this build just
@@ -1509,6 +1652,8 @@ export async function loadScene(
     // Load-bearing: if anything above throws, this must still return to zero, or every later
     // reader of `isSceneLoadInFlight()` would believe a load is running forever.
     _loadsInFlight -= 1;
+    if (swapping) _loadsSwapping -= 1;
+    worldSwitch.release();
     // Beside the count it mirrors, and above the store call, so a throw there cannot leak the token
     // (a leaked token means no deferred reload ever replays again).
     releaseReplacement();
@@ -1587,7 +1732,14 @@ export async function newScene(path: string | null = null): Promise<void> {
   // resource release or a world destroy in its tail), and a latch left stuck true would brick
   // Create Scene for the rest of the session.
   _newSceneInFlight = true;
+  // After the latch, so a second Create Scene is still refused while this one waits (#887, #1579).
+  // No envelope takedown: Create Scene never took one (unchanged here).
+  const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: false });
   try {
+    // The undo in flight finishes before the path is written (#1579): it restores under the CURRENT scene's key,
+    // and reading this scene's path there would skip it — the prefab file restored, the world not.
+    const ready = worldSwitch.ready();
+    if (ready) await ready;
     // Set the editor path BEFORE the swap, not after. `setCurrentWorld` fires `onWorldSwap`
     // synchronously and the Hierarchy's restore reads `getCurrentScenePath()` one frame later;
     // `aSceneSwapIsHappening()` is false on this path, so there is no settle-wait to save us
@@ -1636,6 +1788,7 @@ export async function newScene(path: string | null = null): Promise<void> {
     clearAllSceneDirty();
     console.log('[Editor] New scene created');
   } finally {
+    worldSwitch.release();
     _newSceneInFlight = false;
   }
 }

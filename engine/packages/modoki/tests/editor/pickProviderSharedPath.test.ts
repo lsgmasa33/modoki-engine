@@ -13,7 +13,7 @@ import { describe, it, expect } from 'vitest';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { readScannedSource } from '../helpers/sourceScanner';
-import { callsTo, declarationOf, enclosingNamedFunction, functionBodyOf, functionsNamed, parseSource, printedText, siteText, stringValueOf, ts } from '../helpers/sourceAst';
+import { callsTo, calleeName, declarationOf, enclosingNamedFunction, functionBodyOf, functionsNamed, isBlock, parseSource, printedText, siteText, stringValueOf, ts } from '../helpers/sourceAst';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const sceneView = parseSource(readScannedSource(join(here, '../../src/editor/panels/SceneView.tsx')).code, 'SceneView.tsx');
@@ -69,6 +69,41 @@ function pickWiring(sf: ts.SourceFile): PickWiring[] {
   });
 }
 
+/** #1576 — where, in a pick function's top-level statements, the reach gate sits:
+ *  `if (!pressReachesCanvas(renderer.domElement, …)) return null;`, exactly — a condition that is
+ *  anything more than that negated call (`false && !…`) is not the gate. `answeredBefore` is true
+ *  when a statement ahead of it could already answer: anything other than a `const`, or an `if`
+ *  whose only outcome is `return null`. -1 when there is no gate at all. */
+function reachGate(fn: ts.Node): { at: number; answeredBefore: boolean } {
+  const body = functionBodyOf(fn);
+  if (!body || !isBlock(body)) return { at: -1, answeredBefore: false };
+  const returnsNull = (st: ts.Statement): boolean => {
+    const inner = ts.isBlock(st) && st.statements.length === 1 ? st.statements[0] : st;
+    return ts.isReturnStatement(inner) && inner.expression?.kind === ts.SyntaxKind.NullKeyword;
+  };
+  // The gate must ask about THIS press: exactly (renderer.domElement, <x param>, <y param>) — an
+  // extra argument (an injected `elementAt`) or constant coordinates make it answer for some other
+  // point, and each was green under the first version of this reader (close-out §2d review).
+  const params = ts.isFunctionLike(fn) ? (fn as ts.SignatureDeclaration).parameters.map((p) => p.name.getText()) : [];
+  const isGate = (st: ts.Statement): boolean => {
+    if (!ts.isIfStatement(st) || st.elseStatement || !returnsNull(st.thenStatement)) return false;
+    const c = st.expression;
+    if (!ts.isPrefixUnaryExpression(c) || c.operator !== ts.SyntaxKind.ExclamationToken) return false;
+    const call = c.operand;
+    return ts.isCallExpression(call) && calleeName(call) === 'pressReachesCanvas' && call.arguments.length === 3
+      && printedText(call.arguments[0]) === 'renderer.domElement'
+      && printedText(call.arguments[1]) === params[0] && printedText(call.arguments[2]) === params[1];
+  };
+  const at = body.statements.findIndex(isGate);
+  // A `const pressReachesCanvas = () => true` ahead of the gate is a variable statement like any
+  // other, so a name the gate calls must not be (re)declared there.
+  const shadows = (st: ts.Statement) => ts.isVariableStatement(st)
+    && st.declarationList.declarations.some((d) => d.name.getText() === 'pressReachesCanvas');
+  const answeredBefore = body.statements.slice(0, Math.max(at, 0)).some((st) => shadows(st)
+    || (!ts.isVariableStatement(st) && !(ts.isIfStatement(st) && !st.elseStatement && returnsNull(st.thenStatement))));
+  return { at, answeredBefore };
+}
+
 describe('SceneView pick providers share the pointer handler\'s own code path', () => {
   // Read inside each test, so a registration it refuses fails the test that names it, not the file's collection.
   const wiring = (): PickWiring[] => pickWiring(sceneView);
@@ -96,6 +131,31 @@ describe('SceneView pick providers share the pointer handler\'s own code path', 
       provider: 'pickEntityAtViewportPoint', priority: '10', registeredIn: 'installScene2DInteraction',
       calledFrom: ['installScene2DInteraction > onPointerDown(e.clientX, e.clientY)'],
     });
+  });
+
+  it('#1576 — the 3D pick withholds a press another canvas takes, before anything can answer', () => {
+    // The Canvas2D pick overlay absorbs a press it misses; the 3D viewport never sees it, so its
+    // pick must not predict one — and a real press on the 3D canvas always passes (pickReach.ts).
+    // Pinned in SOURCE because the function lives in a mount effect no headless test can drive:
+    // weakening it (`false && !…`) left every behavioural test green (close-out review).
+    const threeD = functionsNamed(sceneView, 'pickEntityAtViewportPoint').find((f) => namedPath(f) === 'ThreeJSViewport > install');
+    expect(reachGate(threeD!)).toEqual({ at: expect.any(Number), answeredBefore: false });
+    expect(reachGate(threeD!).at).toBeGreaterThanOrEqual(0);
+  });
+
+  it('the reach-gate reader accepts only the real gate, ahead of every answer', () => {
+    const gateOf = (body: string) => reachGate(functionsNamed(parseSource(`function pick(x, y) { ${body} }`, 'probe.tsx'), 'pick')[0]);
+    const gate = 'if (!pressReachesCanvas(renderer.domElement, x, y)) return null;';
+    expect(gateOf(`const r = 1; if (x < 0) return null; ${gate} return 7;`)).toEqual({ at: 2, answeredBefore: false });
+    expect(gateOf(`if (false && !pressReachesCanvas(renderer.domElement, x, y)) return null; return 7;`).at).toBe(-1);
+    expect(gateOf(`if (!pressReachesCanvas(other, x, y)) return null; return 7;`).at).toBe(-1);
+    expect(gateOf(`if (!pressReachesCanvas(renderer.domElement, x, y)) return 3; return 7;`).at).toBe(-1);
+    expect(gateOf(`if (hit) return 5; ${gate} return 7;`)).toEqual({ at: 1, answeredBefore: true });
+    expect(gateOf('return 7;').at).toBe(-1);
+    // Sabotage the first reader let through: an injected hit-test, fixed coordinates, a shadow.
+    expect(gateOf('if (!pressReachesCanvas(renderer.domElement, x, y, () => null)) return null; return 7;').at).toBe(-1);
+    expect(gateOf('if (!pressReachesCanvas(renderer.domElement, -1, -1)) return null; return 7;').at).toBe(-1);
+    expect(gateOf(`const pressReachesCanvas = () => true; ${gate} return 7;`).answeredBefore).toBe(true);
   });
 
   it('there is exactly ONE definition of `pickEntityAtViewportPoint` per scope (2D and 3D) — no drifted duplicate', () => {

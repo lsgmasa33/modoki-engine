@@ -1,11 +1,36 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import type { UserConfig } from 'vite'
 import path from 'node:path'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { repoFiles } from '../../scripts/repoCorpus.mjs'
 import { hasInternalGames } from '../helpers/repoLayout'
 import { readScannedSource } from '@modoki/engine/testing'
 import { importsIn, parseSource } from '@modoki/engine/testing/sourceAst'
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
+
+/** #1526 — Vite 8.2's own rule (`OPTIMIZABLE_ENTRY_RE` + `isOptimizable` in
+ *  `vite/dist/node/chunks/node.js`): a dep entry is pre-bundled only if it ends in `.js`/`.ts` (and
+ *  their `c`/`m` forms), or in one of `optimizeDeps.extensions`. Any other entry is dropped from
+ *  `include` with "Cannot optimize dependency" and served as plain source. */
+const VITE_OPTIMIZABLE_ENTRY = /\.[cm]?[jt]s$/
+const engineExports = JSON.parse(
+  readFileSync(path.join(repoRoot, 'engine/packages/modoki/package.json'), 'utf8'),
+).exports as Record<string, string>
+
+/** The file an `@modoki/engine` specifier resolves to through the package's `exports`. */
+function engineEntryFile(spec: string): string | undefined {
+  return engineExports[spec === '@modoki/engine' ? '.' : `./${spec.slice('@modoki/engine/'.length)}`]
+}
+
+/** True when the specifier's entry EXISTS and Vite would refuse to pre-bundle it. */
+function engineEntryUnoptimizable(spec: string, config: UserConfig): boolean {
+  const file = engineEntryFile(spec)
+  if (file === undefined) return false
+  const extensions = config.optimizeDeps?.extensions ?? []
+  return !VITE_OPTIMIZABLE_ENTRY.test(file) && !extensions.some((ext) => file.endsWith(ext))
+}
 
 /**
  * Regression guard for the packaged-editor dep-optimize stabilization fix.
@@ -86,9 +111,9 @@ describe('vite.config @modoki/engine optimizeDeps.include (packaged dep-optimize
   // must keep running on the mirror, which is why the guard is not on the describe.
   it.skipIf(!hasInternalGames())('#813 — every @modoki/engine specifier a GAME\'s runtime imports is in the packaged list', async () => {
     process.env[ENV_KEY] = '/tmp/fake-userdata/vite-cache'
-    const include = (await buildConfig()).optimizeDeps?.include ?? []
+    const config = await buildConfig()
+    const include = config.optimizeDeps?.include ?? []
 
-    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
     const sources = repoFiles({
       under: [path.join(repoRoot, 'games'), path.join(repoRoot, 'demos')],
       match: /\.(ts|tsx)$/,
@@ -109,10 +134,45 @@ describe('vite.config @modoki/engine optimizeDeps.include (packaged dep-optimize
     }
 
     expect(found.size).toBeGreaterThan(0)
-    const missing = [...found].filter(([spec]) => !include.includes(spec))
+    // #1526 — a subpath whose entry Vite cannot pre-bundle (a `.tsx`, today `runtime/debug/adsTab`) is
+    // served as source, so it cannot trigger the mid-session re-optimize either. Listing it would only
+    // warn; the guard below keeps it out of the list.
+    const missing = [...found].filter(([spec]) => !include.includes(spec) && !engineEntryUnoptimizable(spec, config))
       .map(([spec, rel]) => `${spec}  (first seen in ${rel})`)
     expect(missing, 'a game imports an @modoki/engine subpath the packaged optimize list does not '
       + 'pre-bundle — add it to vite.config.ts optimizeDeps.include').toEqual([])
+  })
+
+  /**
+   * #1526 — the other direction. #1501 added `runtime/debug/adsTab`, whose entry is a `.tsx`, so Vite
+   * dropped it from the pre-bundle and printed "Cannot optimize dependency" on every packaged boot:
+   * a line that looked protective and did nothing, and a warning that taught readers to skip that
+   * log line. Every `@modoki/engine` entry in the list must be one Vite will actually pre-bundle.
+   */
+  it('#1526 — every @modoki/engine subpath in the packaged list is one Vite can pre-bundle', async () => {
+    process.env[ENV_KEY] = '/tmp/fake-userdata/vite-cache'
+    const config = await buildConfig()
+    const engineSpecs = (config.optimizeDeps?.include ?? [])
+      .filter((spec) => spec === '@modoki/engine' || spec.startsWith('@modoki/engine/'))
+
+    expect(engineSpecs.length).toBeGreaterThan(0)
+    const inert = engineSpecs
+      .filter((spec) => engineEntryFile(spec) === undefined || engineEntryUnoptimizable(spec, config))
+      .map((spec) => `${spec} → ${engineEntryFile(spec) ?? '(no such export)'}`)
+    expect(inert, 'these entries are not pre-bundled (Vite warns "Cannot optimize dependency") — '
+      + 'drop them from vite.config.ts optimizeDeps.include').toEqual([])
+  })
+
+  it('#1526 — the pre-bundle predicate accepts a .ts entry and refuses the .tsx one', async () => {
+    process.env[ENV_KEY] = '/tmp/fake-userdata/vite-cache'
+    const config = await buildConfig()
+    expect(engineEntryFile('@modoki/engine/runtime/core/adDebug')).toMatch(/\.ts$/)
+    expect(engineEntryUnoptimizable('@modoki/engine/runtime/core/adDebug', config)).toBe(false)
+    expect(engineEntryFile('@modoki/engine/runtime/debug/adsTab')).toMatch(/\.tsx$/)
+    expect(engineEntryUnoptimizable('@modoki/engine/runtime/debug/adsTab', config)).toBe(true)
+    // An extension the config opts in is optimizable, as it is to Vite.
+    expect(engineEntryUnoptimizable('@modoki/engine/runtime/debug/adsTab',
+      { optimizeDeps: { extensions: ['.tsx'] } })).toBe(false)
   })
 
   it('still excludes @zappar/msdf-generator regardless of packaged state', async () => {

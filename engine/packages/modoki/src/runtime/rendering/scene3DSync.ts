@@ -72,7 +72,6 @@ import { EntityTable } from '../core/ecs/entityTable';
 import { emit, entityRef } from '../core/journal';
 import { getVisualDelta, getTime } from '../core/getTime';
 import { getPlayState } from '../core/playState';
-import { isSkeletalPreviewing, skeletalPreviewDelta } from '../core/skeletalPreview';
 import { getSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../core/skeletalSeek';
 import { createPrimitiveMesh, isPrimitive, PRIMITIVE_NAMES } from '../loaders/primitives';
 import {
@@ -2342,12 +2341,11 @@ export function mergeAnimationLibrary(
 /** Per-frame skeletal mixer advance (seconds).
  *  - PLAYING → engine visual delta (smoothed cadence × timeScale, so skeletal
  *    respects pause / slow-mo / time-stop).
- *  - STOPPED / PAUSED → frozen (0), EXCEPT while the Animation editor previews
- *    skeletal animation (`skeletalPreviewDelta` > 0): advance by the editor's
- *    wall-clock delta so baked clips animate live out of Play mode. Shipped runtime
- *    never sets the preview, so this collapses to 0-when-not-playing there. */
+ *  - STOPPED / PAUSED → frozen (0). No editor preview advances the mixers: the Animation and
+ *    Timeline previews pose rigs explicitly (a keyframe write, or a `skeletalSeek`), and a
+ *    global "advance while stopped" flag animated every rig's baked clip out of Play (#1552). */
 export function mixerAdvanceDelta(world: World): number {
-  return getPlayState() === 'playing' ? getVisualDelta(world) : skeletalPreviewDelta();
+  return getPlayState() === 'playing' ? getVisualDelta(world) : 0;
 }
 
 /** Normalized playhead (0..1) of an action, for @anim-* event payloads. */
@@ -2807,15 +2805,13 @@ function applyBoneAnimators(world: World, skinned: EntityTable<SkinnedEntry>): b
 export function syncBones(world: World, _scene: THREE.Scene, state: RenderState) {
   const { skinned } = state;
   if (skinned.size === 0) return;
-  // Treat Animation-editor preview like Playing: the mixer just posed the bones
-  // (syncSkinnedModels advanced it with the preview delta), so read-back must copy
-  // that pose into the bone Transforms — otherwise step-3 write-back sees the
-  // entity Transforms diverge from the freshly-animated baseline and clobbers the
-  // mixer pose back to the static/bind values, freezing the preview.
-  const playing = getPlayState() !== 'stopped' || isSkeletalPreviewing();
+  // Playing (or paused mid-Play): the mixer posed the bones, so read-back must copy that pose into
+  // the bone Transforms — otherwise step-3 write-back sees the entity Transforms diverge from the
+  // freshly-animated baseline and clobbers the mixer pose back to the static/bind values.
+  const playing = getPlayState() !== 'stopped';
   // A timeline scrub-seek (Phase 5) poses the mixer while STOPPED (seekSkeletal → mixer.update(0)).
   // Read-back must copy that seeked pose into the bone Transforms too, else write-back would
-  // clobber it back to bind — same reasoning as preview above. But it is NOT "playing": the layer
+  // clobber it back to bind — same reasoning as Playing above. But it is NOT "playing": the layer
   // pass (bone Animators + LateUpdates, step 2) must stay off during a scrub, so keep that gated on
   // `playing` and use `readback` only for step 1.
   const readback = playing || hasSkeletalSeeks();

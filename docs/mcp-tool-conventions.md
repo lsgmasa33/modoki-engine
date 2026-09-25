@@ -39,6 +39,20 @@ not outrank #1.
 **Every tool validates its arguments strictly, on every path a call can arrive by.** An unknown or
 misspelled key is a **refusal** naming the tool's real parameter names — never silently dropped.
 
+**The refusal names the offending key too, and which nested param has a field of that name** (#1545):
+``modoki_tap received an unrecognized parameter: 'surface'. 'surface' is not a top-level parameter;
+`entity` has a field of that name (entity: …). It accepts: …``; a nested object says `unrecognized key 'values' — setTrait
+accepts: …`. The MCP SDK delivers only each zod issue's `message` (plus `at <path>` when nested) —
+never zod's `keys` — so a refusal that merely listed the options left the caller diffing its own
+call against the list; measured, 5 of 8 retries after a misplaced `surface` failed again. One
+wording for every surface in `engine/tools/shared/unknownParam.ts` (the editor's zod-3 `errorMap`,
+the device's zod-4 `error` fn, `modoki_batch`'s pre-flight, and the nested objects via
+`unknownKeysErrorMap`/`unknownKeysError`). ⚠️ A fixed `.strict('message')` string cannot see the
+key — a new strict object uses the helper, not a literal. ⚠️ **The nested match is a FACT, never an
+instruction** ("goes inside X"): a name match is not a meaning match — `set_selection
+{name:'Capsule'}` meant an entity, and its only nested `name` is `asset.name`, an asset selection —
+so the refusal states which param has the field and quotes that param's own description.
+
 Why: zod strips unknown keys by default, and the MCP SDK builds a plain `z.object` (no `.strict()`)
 — verified in `@modelcontextprotocol/sdk`'s `objectFromShape` (`.../zod-compat.js`). For a tool
 whose params are all optional, that turns a typo into **a different operation**:
@@ -46,6 +60,29 @@ whose params are all optional, that turns a typo into **a different operation**:
 "no refs = clear", so it **clears the human's selection and reports success**. That was measured,
 fixed for `modoki_batch`'s pre-flight — and left in place for every direct call, which is where
 most calls happen (V2).
+
+**A string-encoded value is DECODED, not refused — lossless cases only** (#1560; owner decision
+2026-09-25). `"12"` → 12, `"true"`/`"false"` → boolean, and a string that `JSON.parse`s to the
+object or array the schema wants → that value. Only where the schema at that path REJECTS the string:
+a plain `z.string()`, an enum or a `string | array` union is never rewritten. The decoded args then
+go through the same strict parse, so `"12abc"` still refuses, and so does a decoded object with a
+typo'd key, naming the key. Why: agents send `"limit":"12"`, `"bounds":"1"` and
+`"entity":"{\"name\":…}"`, and Claude Code itself sometimes packs a nested object into a string
+(the `$ref` corollary below). Each of these used to cost a raw `Expected number, received string`
+and a re-send of the same value.
+One helper, `engine/tools/shared/coerceArgs.ts`, keyed on the schema's own type-mismatch issues, so
+it works on both zod dialects. It reaches every path:
+- **Direct calls, both servers:** `installArgCoercion` wraps `McpServer.validateToolInput`. It is
+  installed by `registerAllTools`/`registerTools`, so no server can register tools without it.
+- **`modoki_batch`:** decodes in its pre-flight and writes the result back onto the step.
+- **Game tools:** `coerceAgentToolArgs` in the op-side validator decodes numbers and booleans
+  against the declaration.
+
+⚠️ **Not `z.preprocess` on the schema:** that makes it an effects/pipe schema, the SDK's
+`normalizeObjectSchema` stops recognising an object, and `tools/list` would advertise an EMPTY
+input schema for every tool. ⚠️ `installArgCoercion` **fails loud** if the SDK drops
+`validateToolInput` — a skip-if-absent would quietly return this to "refused".
+Tests: `engine/tests/tools/coerceStringEncoded.test.ts`, including a real-SDK round trip per server.
 
 Corollaries:
 - `modoki_batch`'s envelope itself is strict too, including **inside** each step object: `arg` for
@@ -351,8 +388,9 @@ legitimate exception: it *measures* a path).
 - **A ROLE prefix is not a second spelling.** `parentGuid`/`entityGuid` (`modoki_prefab`) and
   `sampleGuid` (`modoki_capture_gesture`) name WHICH entity, because those tools address two, and a
   bare `guid` could not say which. A tool that addresses one entity uses bare `id`/`guid`.
-  `set_selection`'s `entityId`/`entityIds` beside `guid`/`guids` is the one mixed spelling left
-  (#1208 P1-5).
+  `set_selection`'s `entityId`/`entityIds` beside `guid`/`guids` was the last mixed spelling
+  (#1208 P1-5); #1560 renamed them `id`/`ids`. Its reply's `selection` object still reports
+  `entityId`/`entityIds`, because that is `get_editor_state`'s shape and is read, not sent.
 - **A `guid` and an `id` given together are REFUSED (`AMBIGUOUS`)**, flat or nested, and so are
   `parentGuid` beside ANY `parentId` (0 included: "the root" and "under this entity" are two answers)
   and `entityGuid` beside `entityId` (#1223 D1, which
@@ -366,7 +404,12 @@ legitimate exception: it *measures* a path).
   2026-08-22 the singular-aim tools accept **either**, so one shape works across the surface.
   Sending BOTH is refused (`AMBIGUOUS`) rather than resolved by precedence: a caller who gave two
   addresses does not know which one the tool used, and picking for them is the §0 rank-1 class.
-  The SET-shaped params (`guids`, `entityIds`, `get_scene_state`'s filters) are deliberately
+  ⚠️ **The same rule covers the aim MODES, not just the entity's two shapes** (#1556, owner-approved
+  breaking change): any two of `entity` / `selector` / `label` / `{x,y}` are refused `AMBIGUOUS`, on
+  every aimed tool on both surfaces. They used to be settled by precedence (`entity` → `selector` →
+  `{x,y}`) while `label` beside either was refused, which is two answers to one question. One
+  predicate, `engine/tools/shared/aimAddresses.ts`, is read by every layer that sees a caller's aim.
+  The SET-shaped params (`guids`, `ids`, `get_scene_state`'s filters) are deliberately
   untouched — they take a set, not an aim, and a singular `entity` there would be a third shape
   rather than one fewer.
   ⚠️ **The flat-side alias takes `{guid|id}` only — no `name` — and is `.strict()`.** Both halves
@@ -396,9 +439,9 @@ Therefore:
 
 Because such an operation's failure is structurally unchecked. Six tools reach a mutating op by GET:
 `modoki_build`, `add_native_target`, `ota_publish`, and (found only by reading query params, not
-routes) `modoki_journal`, `editor_journal` — which mutate via `?action=start` and `?clear=1` (F3) —
-and **`modoki_hit_regions`**, whose `action:'show'|'hide'` flips the overlay through a GET-only
-route. All six now run their `ok:false` through the failure check at the call site, so a refusal
+routes) `modoki_journal`, `editor_journal` — which mutated via `?action=start` and `?clear=1` (F3);
+`editor_journal` left the list when #1561 retired `clear` — and **`modoki_hit_regions`**, whose
+`action:'show'|'hide'` flips the overlay through a GET-only route. All of them now run their `ok:false` through the failure check at the call site, so a refusal
 cannot arrive as a success; the remaining violation is the METHOD, and the fix pattern below.
 
 ⚠️ **The re-runnable query is only as trustworthy as the field it filters on — this sentence used
@@ -457,6 +500,12 @@ Closed code set (extend deliberately, never ad hoc): `UNKNOWN_PARAM` · `AMBIGUO
 `AMBIGUOUS_SURFACE` · `OCCLUDED` · `REFUSED_BY_OP` · `NO_RENDERER` · `TIMEOUT` · `TOO_LARGE` ·
 `REQUIRES_SAVE` · `NOT_AVAILABLE_HERE` · `PARTIAL`.
 
+**Game tools are inside this rule, not beside it** (#1561). A `registerAgentTool` handler refuses
+with `{ok:false, code?, reason, options?}` and its code reaches the agent unchanged on both
+servers; a code outside the set is sent as `REFUSED_BY_OP` with a note naming it, never dropped
+silently. The handler contract and the §2 count names for game replies:
+[agent-tools.md](./agent-tools.md) § Handler conventions.
+
 Rules:
 - **A refusal is not a transport failure.** A deliberate op refusal is a 400 that says so, never a
   504 — `load_scene`'s correct "you have unsaved live-world changes" once arrived as a gateway
@@ -503,7 +552,8 @@ Rules:
   making the device channel carry THROWN §5 codes is a protocol change to that MCP, not an extra
   call to `opReplyFor`. A RETURNED code needs no protocol: it crosses the wire intact, and since
   #1211 the game-debug MCP relays it (`codeFromBody`/`optionsFromBody`, shared in
-  `tools/shared/mcpResult.ts`) where `perceptCall`/`writeCall` used to stamp `REFUSED_BY_OP` over it.
+  `tools/shared/mcpResult.ts`; `codeFromBody` and `ERROR_CODES` themselves live in the import-free
+  `tools/shared/errorCodes.ts` since #1561, re-exported there) where `perceptCall`/`writeCall` used to stamp `REFUSED_BY_OP` over it.
   ⚠️ **The rule every hop follows: relay the classification you were handed; never invent one.**
   This class has been re-entered at five hops — op → route (#1012, #1070), `/api/eval`'s bare 504
   (#1013), the device wire's string protocol (#1223 P3), device wire → device MCP (#1211), and op →
@@ -667,7 +717,14 @@ Rules:
       nobody asked for. Two exceptions, both documented on the tool: a clamp the reply REPORTS
       (`set-playhead`'s `clampedFrom`), and a TIMEOUT budget (`timeoutMs`), which is clamped to its
       stated range like `modoki_eval`'s, because it bounds the wait rather than choosing the work.
-      A non-finite timeout is still refused (`sim-step`).
+      A non-finite timeout is still refused (`sim-step`). **The refusal lives in the SCHEMA** — a
+      param whose description states "max N" publishes `maximum: N` (#1560). The 2026-09-25 usage
+      audit (C-16) found `find_references`, `profiler`, `watch`, `input_watch` and
+      `device_duplicate_entity` advertising a max that the schema let through, to be clamped later
+      (`court_list_levels` also turned `limit:0` into 20). Guarded on both surfaces by
+      `engine/tests/tools/numericRangeInSchema.test.ts`. A max the schema cannot hold, because it
+      depends on another param, is refused by the op and listed in that test's `EXEMPT` with the
+      reason: `profiler` capture-read's 20 beside boot's 200, and the iOS system-capture window.
     - **An explicit argument that CONTRADICTS what the op can infer is refused** (`read-asset-def`'s
       `type` vs the path's suffix), rather than winning and producing a confident wrong negative.
   - **An op that acts ON an editor refuses when that editor is not showing anything** (#1213). The
@@ -754,10 +811,17 @@ that says what was elided and which filter to reach for — never a severed blob
 > **A `read` tool never mutates.**
 
 `read` is the promise Percept makes, and it is the one thing an agent must be able to do freely — a
-read that mutates makes **verification itself destructive**. Today `modoki_journal` and
-`modoki_editor_journal` are declared and documented as reads and can destroy the buffer they read
-(`clear:true`), while `modoki_get_console_logs` does the same job and stays pure — so this is a
-choice, not a necessity (F9).
+read that mutates makes **verification itself destructive**. `modoki_journal`, `device_journal` and
+`modoki_editor_journal` used to destroy the buffer they read (`clear:true`) while
+`modoki_get_console_logs` did the same job and stayed pure (F9). **#1561 removed `clear` from all
+three, with no alias** (owner, 2026-09-25). Its one real use was a clean baseline before an action,
+and a CURSOR does that without deleting anything: read once with `limit:0`, then pass the returned
+`nextCap` as `sinceCap` (`nextSeq` as `since` on the editor journal), each with its `epoch`. With a
+cursor the window IS the ring — `ringTotal`/`byType` count only what came after it — so every
+count a clear used to zero still starts at zero. **That is the pattern for any future "reset so the
+next read is clean" request: a cursor, never a delete on the read.** A retired param keeps a
+`RETIRED_PARAMS` row (`tools/shared/unknownParam.ts`), so the strict-schema refusal names the
+replacement move rather than only listing the accepted keys.
 
 Splitting rule: **if one argument value changes the tool's method, its route, or whether it writes to
 disk, it is more than one tool.** Current offenders (F10): `project_settings` (get/set),
@@ -765,6 +829,8 @@ disk, it is more than one tool.** Current offenders (F10): `project_settings` (g
 and, added since that list was written, `profiler` and `input_watch` (read actions GET, capture
 control POST) and `hit_regions` (`action:'show'|'hide'` flips an overlay on a read route). A game
 tool counts too: `wordweave_crossword_view` reads with no params and writes with any (#1208 B-20).
+`modoki_menu` too (2026-09-25 audit C-11): `{}`/`list:true` returns the menu tree and `path`/`id`
+fires the item, both as `POST /api/menu` — low harm, because the bare call is the safe one.
 `play_control`/`history` are acceptable — the op varies but the job does not.
 
 `varies` / `opVaries` in the contract table is a **smell marker**, not a blessing. It exists so the
@@ -825,6 +891,23 @@ variance is machine-readable while it lasts.
   from the same place the write landed (`read_asset_def` reads the LIVE cache, because an unsaved
   edit exists only there). A write whose effect cannot be read back cannot be verified without
   judging pixels, which this surface tells agents not to do.
+- **An action replies with what it CHANGED, read back — not with the whole editor state** (#1553).
+  `modoki_play_control` answers `{ok, playState, runMode, advancing}`, `modoki_history`
+  `{did, undo, unsavedChanges}`, a view setter the one field it set; the full state is
+  `modoki_get_editor_state`. The fields come from `editorStateFields(...)` in
+  `agentEditorOps.ts`, which re-reads the stores AFTER the action, so the reply is still evidence
+  of the post-state (§11) rather than an echo of the arguments. Scar: seventeen action ops spread
+  `readEditorState()` into their reply — ~1.7k chars a call, and `play_control` alone was 10.1% of
+  all MCP result tax (usage audit 2026-09-25 T-1). The size also pushed every such reply over
+  `modoki_batch`'s 1,500-char verbatim cap, so a batch elided the one field its step was run to
+  see. Guarded by `engine/tests/editor/actionReplyShape.test.ts`, which scans the source for any
+  new `readEditorState(` caller and pins each op's reply keys. ⚠️ **The HEALTH fields still ride on
+  every action reply** (`ACTION_HEALTH_KEYS`: `staleGameCode`, `frameLoop`, `rendererGate`, `gpu`,
+  `gameBootFaults`, `discardedUnsavedEdits`), each only while FAULTED: `frameLoop` only when
+  `stalled` and `rendererGate` only when `failed`. A hidden window and a `pending` renderer are
+  expected states, still reported by `get_editor_state`. The first cut dropped the faults with the
+  rest, so Play on a stale editor stopped saying `staleGameCode:true` in the one reply the agent
+  was reading (#1553 review). Pinned per key by `engine/tests/editor/actionReplyHealth.test.ts`.
 - **A file write invalidates the cache the runtime reads.** A `.particle.json` write currently
   leaves the renderer's particle cache stale, so a read-back returns the pre-write def as live truth
   and a read→modify→write round-trip silently reverts the file (S1) — the bug already fixed for
@@ -847,8 +930,9 @@ variance is machine-readable while it lasts.
 found the predictable result of treating them as separate: the device server had **no
 `isFailureBody` equivalent**, so a 200-with-`{ok:false}` was reported to the agent as success across
 all six device Percept tools — the exact class fixed on the editor side and silently unfixed there.
-(Closed since: `perceptCall` runs the shared `isFailureBody`. Its sibling `writeCall` and two inline
-checks still carry hand-copied predicates, #1208 C-16.)
+(Closed since: `perceptCall`, `writeCall` and the inline relay check all run the shared
+`isFailureBody` (#1211 C-16). `device_type_text` deliberately does not — it always answers `ok`, so
+it reads its own verification field instead; the reason is at the call site.)
 
 - **A rule implemented twice diverges.** `result.ts` and `summarize.ts` exist in both MCP servers,
   diverged (136 vs 64 lines). Shared behaviour lives in ONE module both import (F5).
@@ -871,6 +955,17 @@ substituted for the missing tools — eval adds composition and zero capability.
 runtime-only op in the editor file is therefore not a stylistic slip; it is how the write gap
 opened one op at a time, each new capability landing wherever its first caller happened to live.
 An op registered in `agentEditorOps.ts` whose handler reaches nothing from `editor/` is a finding.
+`wait-for` was one (#1559 C-12): two of its four conditions read only the runtime, so it now registers
+in `agentBridge.ts` and the editor REPLACES that registration with the editor-only readers added —
+the same shape `player-prefs-write` uses.
+
+**Twin PARAMETERS are compared too, and the param rules run on both surfaces (#1559).** Each server
+declares its own zod shapes, so a param added on one twin is silently absent from the other.
+`twinParamParity.test.ts` fails on any unrecorded difference (a param, a stated default, a device tool
+with no twin); `deviceToolSurface.test.ts` runs §11's documented-param check and §2's one-meaning
+check over the device surface, with the editor's pardon list (`perToolMeaning.ts`). Wordings both
+servers need live in `tools/shared/` (`paramBases.ts`, `sinceCursor.ts`, `consoleLevels.ts`), not in
+modoki-mcp's `shapes.ts`, which the device server cannot import.
 
 ## 9-bis. A cross-runtime reply is DECODED, never cast (#644 → #647/#648)
 
@@ -896,8 +991,9 @@ FALSE rather than failing:
    ship separately.
 3. An unrecognised shape is described **BY KEYS ONLY** — `describeShape` in
    `engine/tools/shared/mcpResult.ts` (the §9 shared home; `engine/app/debug/bridgeHelpers.ts`
-   keeps a deliberate copy, because `engine/app` reaches `tools/shared` only with `import type` and
-   a value import would put MCP formatting code in the bundle that ships to devices). A log line or
+   keeps a deliberate copy, because `engine/app` value-imports `tools/shared` only for small,
+   dependency-free modules — `errorCodes.ts` is one (#1561) — and a value import of `mcpResult.ts`
+   would put MCP formatting code in the bundle that ships to devices). A log line or
    a scene op can carry secrets and authored strings; a refusal must never echo the value.
 4. The refusal says **what it is NOT**: "this is not 'the project has no assets', it is a reply this
    build cannot read."
@@ -1183,6 +1279,24 @@ The description is the tool's contract with the agent — it is read far more of
   scanner can go quiet: a description shape it cannot parse is recorded as unreadable rather than
   excused, and an independent count of `registerAgentTool` call sites catches a registration it
   never saw at all (a call made through a variable yields no row, so nothing else could).
+- **A description says what is true NOW** (#1555). "Used to be called…", "this description used to
+  claim…" and a bare `(#32)` are history, which a maintainer needs and an agent choosing arguments
+  does not — put them in a code comment or the feature doc. The exception is history that IS the
+  reason for current behaviour (`set_transform`'s `space` has no default because it was once
+  documented wrong); `mcpDescriptionProse.test.ts` holds the rule over both servers, with those
+  exceptions as named ledger rows.
+- **Repeat the structure, not the prose** (#1555). §1's no-`$ref` rule makes every aimed input tool
+  carry its own copy of the aim schema, and before #1555 the prose rode along — 26.8 KB of
+  description strings over 80 B repeated ≥3× across both servers (measured 2026-09-25), re-read on
+  every turn after a schema loads. So: one base wording per concept in
+  `engine/tools/shared/aimVocabulary.ts` (plain strings — the servers are on different zod
+  dialects), which a tool EXTENDS rather than rewords; and a nested restatement of a rule the same
+  tool already states POINTS at it (`ALLOW_OCCLUDED_NESTED`; drag's `to` is `As \`from.entity\`.`).
+  ⚠️ **Point within the tool, never at another tool** — under deferral a pointer at a different tool
+  costs that tool's whole schema load, which is the cost being cut. Guarded by the same test: a
+  ceiling on repeated prose, every aim field extending the shared wording, at most ONE full aim
+  statement per tool (a ceiling alone missed the device drag's `to`), and every pointer resolving
+  to a field in its own tool that is not itself a pointer.
 
 ## Decisions taken (the surface changes these rules implied)
 
@@ -1203,6 +1317,11 @@ These needed owner sign-off because each changes the advertised surface. All are
    the component), and the mutating GETs (`?action=`/`?clear=`) now run their `ok:false` through the
    failure check so a refusal cannot arrive as a success. `project_settings` keeps one name because
    its `action:'set'` is already a different method on the wire and is declared as `varies`.
+   **AMENDED for the journals' `clear` (#1561, owner, 2026-09-25):** the tool names still were not
+   split, but `clear` was REMOVED rather than moved to a new tool — a delete on a read was the one
+   hazard that destroyed evidence, and nothing but baselining used it, which a cursor does
+   non-destructively (§7). The journal's `action:'start'|'stop'` capture control stays on the read:
+   it changes what is recorded from now on, and deletes nothing.
 
 4. **§3 occlusion refusal on the SELECTOR path — LANDED (2026-08-19).** `entity` aims had refused
    since 2026-08-02 (`609663e75`; 2026-07-29 added entity ADDRESSING, not the refusal) and the
@@ -1248,6 +1367,27 @@ These needed owner sign-off because each changes the advertised surface. All are
    the Skin editor's "Make Prefab" writes it as a root entity name into a `.prefab.json`). A
    constant that satisfies the containment check states its claim N times — check it on every
    member, not on the one you wrote it for.
+
+7. **One word per concept — second pass, and when an alias is allowed (#1560, 2026-09-25).** Hard
+   renames, the same way as item 5:
+   - Whole-asset writers take **`path`**: `anim_set_clip`'s `clipPath` and
+     `timeline_set`/`timeline_add_clip`'s `timelinePath`, beside `particle_set`/`write_asset`.
+   - Asset kind is **`type`** on `create_registered_asset`, as on `create_asset`.
+   - Clip time is **`t`** on `anim_add_key`, as on `set_playhead`/`pose_clip` and in the clip
+     file's own `Keyframe.t`. That tool's name-path became **`target`**, the timeline's word for
+     it, which freed `path` for the clip.
+   - `set_selection`'s `entityId(s)` became **`id`/`ids`** (§3).
+   - `device_drag` lost its six flat endpoint aliases.
+
+   The op wire names are unchanged; the MCP layer maps them, and
+   `engine/tests/tools/paramVocabulary.test.ts` pins each mapping.
+   **An alias is kept only where the guessed word is ALREADY another tool's vocabulary** for the
+   same thing: `modoki_scroll` took `device_scroll`'s `dx`/`dy`, and `delete_asset` took `path` for
+   one file beside `paths`. Both-at-once is `AMBIGUOUS`. The transcript guesses that fail that test
+   stay refused by name: `batch.calls`, `prefab.op`, `type_text.clear` and `create_entity.parent`,
+   because each of those words means something else elsewhere. `history.limit` has no list to
+   limit, and `handles.limit` is covered by the reply's own summary budget. A guess that named a
+   real missing capability became one: `create_entity {name}`, on both ops.
 
 The remaining known asymmetries are recorded rather than churned: the device↔editor NAMING
 differences (`device_console_logs` vs `modoki_get_console_logs`, …) are tabulated in

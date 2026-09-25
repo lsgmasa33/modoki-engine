@@ -27,6 +27,7 @@ import { getCurrentWorld, peekCurrentWorld } from './ecs/worldRegistry';
 import { EntityAttributes } from './traits/EntityAttributes';
 import { hasDocKey } from './docKeys';
 import { warnVocabOnce } from './warnVocab';
+import { rawEpochNow } from './clock';
 
 /** Triage severity for a journal event — the axis Claude filters on first when hunting
  *  a bug ("show me warn+ in the last N ticks") rather than reading the full trace.
@@ -60,6 +61,17 @@ export interface GameEvent {
   /** Triage severity, defaulting to `'info'`. Set via `gameJournal.ts`'s `journalWarn`/
    *  `journalError` helpers, or the raw `emit()` 4th arg. */
   level: JournalLevel;
+  /** This one emission came from an app-level service's boot, not from the scene (#1527,
+   *  `EmitOptions.appLifetime`). Absent otherwise. */
+  appLifetime?: true;
+}
+
+/** Per-emission options for `emit()` and the `gameJournal.ts` helpers. */
+export interface EmitOptions {
+  /** Mark THIS emission as the app boot's (#1527). The gameplay recorder's replay check skips it and
+   *  still counts the same type's other emissions. For a type that only the boot ever emits,
+   *  declaring the type with `appLifetimeEvent` says the same thing once. */
+  appLifetime?: boolean;
 }
 
 // ── Shared capture sequence (Percept V3) ─────────────────────────────────────
@@ -74,8 +86,62 @@ export interface GameEvent {
 let _captureSeq = 0;
 /** Next value of the shared game+editor capture counter. */
 export function nextCaptureSeq(): number { return ++_captureSeq; }
-/** Test-only: reset the shared capture counter (harness teardown). */
-export function _resetCaptureSeq(): void { _captureSeq = 0; }
+/** The newest capture value issued so far — every later event's `cap` is greater. */
+export function currentCaptureSeq(): number { return _captureSeq; }
+
+// ── The counter's LIFE, so a `cap` can be a read cursor (#1561) ──────────────
+// `cap` is module state: a renderer reload (every game-code edit force-reloads) restarts it at 0,
+// and so does the harness reset below. A cursor from an earlier life is then either AHEAD of every
+// new event (a forward read returns nothing, forever) or, once the new counter passes it, silently
+// in the middle of events it never saw. The epoch names the life, so a stale cursor is DETECTED
+// rather than guessed at — the same contract as the editor journal's `epoch` (#1214 B-3). A wall
+// timestamp through the sanctioned clock wrapper is enough: it only has to differ between loads,
+// and it is never read back into the simulation.
+const _loadStamp = rawEpochNow().toString(36);
+let _captureLife = 0;
+/** Which life of the capture counter a `cap` belongs to. Replies carry it; callers send it back. */
+export function captureEpoch(): string { return `${_loadStamp}-${_captureLife}`; }
+
+/** The capture-counter part of an epoch. The editor journal's epoch is `<capture life>~<its own seq
+ *  life>` because its cursors live on BOTH counters, while the game journal's names only the
+ *  capture life — and a `cap` cursor is legitimately carried from one tool to the other (a
+ *  `modoki_journal` baseline, then `modoki_editor_journal {merged, sinceCap}`). So a cap cursor is
+ *  checked against this part alone; two epochs for one counter reported a reload that never
+ *  happened (#1561 review). */
+export function capturePartOf(epoch: string): string {
+  const i = epoch.indexOf('~');
+  return i < 0 ? epoch : epoch.slice(0, i);
+}
+
+/** Test-only: reset the shared capture counter (harness teardown). Starts a new life too, so a
+ *  cursor taken before the reset is recognised as stale. */
+export function _resetCaptureSeq(): void { _captureSeq = 0; _captureLife++; }
+
+export interface ResolvedCapCursor {
+  sinceCap: number | undefined;
+  /** Set when the caller's cursor belonged to an earlier life and was replaced with 0. */
+  cursorReset?: string;
+}
+
+/** Turn a caller's `sinceCap` (+ the `epoch` it was read under) into a cursor valid for THIS life.
+ *  - `epoch` given and different → from before a restart: replay this life from 0.
+ *  - no `epoch`, but `sinceCap` past the newest cap ever issued → it cannot be from this life
+ *    either (a cursor never runs ahead of the counter): same reset.
+ *  An old cursor sent WITHOUT its epoch and still below the new counter cannot be told apart from a
+ *  current one — which is why replies carry `epoch` and the tools say to send it back. */
+export function resolveCapCursor(sinceCap: number | undefined, callerEpoch: string | undefined): ResolvedCapCursor {
+  if (sinceCap == null) return { sinceCap };
+  const epoch = captureEpoch();
+  // A blank epoch is ABSENT, not a different life: `device_journal` forwards `""` where the editor
+  // route drops it, and reading it as a mismatch replayed the whole ring on one surface only.
+  if (callerEpoch && capturePartOf(callerEpoch) !== epoch) {
+    return { sinceCap: 0, cursorReset: `sinceCap=${sinceCap} was issued under epoch ${callerEpoch}; the journal has restarted since (epoch ${epoch} — a renderer reload, e.g. a game-code edit), so this read replays everything from the restart. Use the returned nextCap from now on.` };
+  }
+  if (sinceCap > _captureSeq) {
+    return { sinceCap: 0, cursorReset: `sinceCap=${sinceCap} is past the newest event this journal has issued (${_captureSeq}), so it is from before a restart (a renderer reload, e.g. a game-code edit); this read replays everything from the restart. Send \`epoch\` back with \`sinceCap\` so a restart is always detected.` };
+  }
+  return { sinceCap };
+}
 
 const MAX_EVENTS = 10_000; // ring cap — drop oldest beyond this
 
@@ -98,6 +164,10 @@ interface JournalState {
   // by ref (a re-seen ref just refreshes its name + recency) and ring-capped LRU, so a
   // long session spawning thousands of transient entities stays bounded.
   names: Map<string | number, string>;
+  /** The newest `cap` this ring has LOST — evicted past the cap, or removed by a clear. A cursor at
+   *  or below it has a gap it cannot see: caps are shared with the editor stream and other worlds,
+   *  so a jump in the returned caps is normal and proves nothing (#1561 review). 0 = nothing lost. */
+  droppedThroughCap: number;
 }
 
 // Per-world trace. WeakMap so old worlds GC cleanly.
@@ -141,10 +211,39 @@ export function verboseCaptureState(): { types: string[]; active: string[] } {
   return { types: [...VERBOSE_TYPES], active: [...activeVerbose] };
 }
 
+// ── App-lifetime events (#1524, #1527) ───────────────────────────────────────
+// Some events are emitted once per PAGE LOAD by an app-level service's boot (an IAP catalogue,
+// a server-clock fetch), not by anything a scene does. The gameplay recorder has to know which. A
+// game's boot system runs on the first frame the sim runs, so in the editor that is the page's FIRST
+// Play: a take recorded then has them, and a take from any later Play does not. Every replay boots
+// a fresh page and always has them. Compared by count, a later-Play take read as a replay that
+// `diverged` when it did exactly what was played (`compareTakeEvents` skips them instead).
+//
+// Two ways to say it, both at the emit site so neither can drift from the code that emits:
+// - **Per emission** (`emit(..., { appLifetime: true })`), for a type the boot AND the scene emit.
+//   Court's price fetch is one: the boot asks once, and every board build past the ad unlock asks
+//   again. Declaring that type would stop the check counting the board builds' fetches (#1527).
+// - **Per type** (`appLifetimeEvent`), for a type only the boot emits, or one whose boot emissions
+//   the emit site cannot tell apart (`iap.not-configured`: any call made before the boot configured
+//   the store).
+const APP_LIFETIME_TYPES = new Set<string>();
+
+/** Declare `type` as emitted once per page load rather than by the scene, and return it, so the
+ *  declaration sits where the event is emitted: `const PRODUCTS = appLifetimeEvent('court.iap.products')`.
+ *  ⚠️ The whole TYPE is declared, so the replay check also skips any later, scene-driven emission
+ *  of it. For a type the scene emits too, mark the boot's emissions instead
+ *  (`EmitOptions.appLifetime`, #1527). */
+export function appLifetimeEvent<T extends string>(type: T): T {
+  APP_LIFETIME_TYPES.add(type);
+  return type;
+}
+/** Every type declared by `appLifetimeEvent` in this page. */
+export function appLifetimeEventTypes(): string[] { return [...APP_LIFETIME_TYPES]; }
+
 function journalStateFor(world: World): JournalState {
   let s = journalStates.get(world);
   if (!s) {
-    s = { events: [], head: 0, tick: 0, names: new Map() };
+    s = { events: [], head: 0, tick: 0, names: new Map(), droppedThroughCap: 0 };
     journalStates.set(world, s);
   }
   return s;
@@ -177,6 +276,26 @@ export function resolveRefName(ref: string | number, world: World = getCurrentWo
  *  can't mutate the backing store. */
 function liveEvents(s: JournalState): GameEvent[] {
   return s.events.slice(s.head);
+}
+
+/** Record that every live event is about to be removed (a clear or a drain), so a cursor reader
+ *  learns it has a gap rather than reading a quiet ring as "nothing happened". */
+function markDropped(s: JournalState): void {
+  const last = s.events[s.events.length - 1];
+  if (last && s.events.length > s.head) s.droppedThroughCap = Math.max(s.droppedThroughCap, last.cap);
+}
+
+/** The one sentence both journal readers attach when a cursor has a gap (#1561). Scoped to THIS
+ *  world's ring on purpose: a scene load or Play starts a new world with a ring of its own, and the
+ *  previous world's events are simply not in it — that is not tracked as a loss here. */
+export function journalGapNote(sinceCap: number, droppedThroughCap: number): string {
+  return `events after sinceCap=${sinceCap} up to cap ${droppedThroughCap} were lost before this read (the game ring keeps the newest 10,000 per world, the editor ring 2,000, or one was cleared), so the counts cover only what survived. Read more often, or narrow the capture. (A scene load or Play starts a new world whose ring never held the previous world's events; that is not reported here.)`;
+}
+
+/** The newest `cap` this world's ring has lost — to eviction past the 10,000-event cap, or to a
+ *  clear. A `sinceCap` below it means events after the cursor are gone. 0 when nothing was lost. */
+export function journalDroppedThroughCap(world: World = getCurrentWorld()): number {
+  return journalStateFor(world).droppedThroughCap;
 }
 
 /** Set the current tick used to stamp subsequent emits. Wired from `timeSystem`
@@ -263,13 +382,16 @@ export function entityRef(entity: EntityLike): string | number | null {
  *  to `'info'`; prefer `gameJournal.ts`'s `journalWarn`/`journalError` over passing it
  *  here directly — this 4th positional arg exists mainly so those helpers stay thin
  *  wrappers over `emit()` instead of a parallel recording path. */
-export function emit(type: string, payload?: unknown, world: World = getCurrentWorld(), level: JournalLevel = 'info'): void {
+export function emit(
+  type: string, payload?: unknown, world: World = getCurrentWorld(), level: JournalLevel = 'info', options?: EmitOptions,
+): void {
   if (!_enabled) return;
   // Tier-2 (watch-gated) diagnostic events are dropped unless their capture window is open.
   if (VERBOSE_TYPES.has(type) && !activeVerbose.has(type)) return;
   const s = journalStateFor(world);
-  s.events.push({ tick: s.tick, type, payload, cap: nextCaptureSeq(), level });
+  s.events.push({ tick: s.tick, type, payload, cap: nextCaptureSeq(), level, ...(options?.appLifetime ? { appLifetime: true } : {}) });
   if (s.events.length - s.head > MAX_EVENTS) {
+    s.droppedThroughCap = s.events[s.head].cap;
     s.head++; // drop the oldest (logically) — no array re-index
     if (s.head > MAX_EVENTS) { s.events = s.events.slice(s.head); s.head = 0; } // periodic compaction
   }
@@ -305,6 +427,7 @@ export function journalEvents(filter?: { type?: string; level?: JournalLevel }, 
 export function drainJournal(world: World = getCurrentWorld()): GameEvent[] {
   const s = journalStateFor(world);
   const out = liveEvents(s);
+  markDropped(s);
   s.events = [];
   s.head = 0;
   return out;
@@ -313,6 +436,7 @@ export function drainJournal(world: World = getCurrentWorld()): GameEvent[] {
 /** Clear the journal (call at the start of a playtest scenario for a clean run). */
 export function clearJournal(world: World = getCurrentWorld()): void {
   const s = journalStateFor(world);
+  markDropped(s);
   s.events = [];
   s.head = 0;
 }

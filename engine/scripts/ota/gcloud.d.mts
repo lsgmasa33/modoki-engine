@@ -10,5 +10,5 @@ export function isGcloudObjectNotFoundError(stderr: string): boolean;
 /** "That URL or glob matched nothing" from `gcloud storage ls`/`rm` (#836). */
 export function isGcloudNoMatchError(stderr: string): boolean;
 
-/** Quotes one value for a real shell (`/bin/sh`, or `cmd.exe` on Windows). */
-export function shellQuote(value: unknown): string;
+/** Runs `gcloud <args>` as argv with no shell (#1537); returns stdout, throws on a non-zero exit. */
+export function gcloudSync(args: string[], opts?: import('node:child_process').ExecFileSyncOptions): Buffer | string;

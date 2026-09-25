@@ -1561,6 +1561,84 @@ describe('asset-tree-shaker', () => {
     expect(result.unreachableRefs).toEqual([]);
   });
 
+  it('keeps refs held only in a MEMBER ROW — its traits and its added nodes (#1468 Phase 4)', () => {
+    // Since Phase 4 a member's overrides and the subtrees added under it live on its row, not in
+    // `overrides`/`added`. A ref there that this walker misses is dropped from the build, and — the
+    // guard below — fails it.
+    const rowGuid = 'abab1111-2222-4333-8444-555555555501';
+    const rowAddedGuid = 'abab1111-2222-4333-8444-555555555502';
+    fx.writeJson('/games/test/assets/mats/row.mat.json', { id: rowGuid, version: 1 });
+    fx.writeJson('/games/test/assets/mats/rowadded.mat.json', { id: rowAddedGuid, version: 1 });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 16,
+      entities: [{
+        id: 1, traits: {},
+        members: { '/abab1111-2222-4333-8444-5555555555ff': {
+          guid: 'abab1111-2222-4333-8444-5555555555fe',
+          traits: { Renderable3DPrimitive: { material: rowGuid } },
+          added: [{ parentLocalId: 0, guid: '', name: 'X', traits: { Renderable3DPrimitive: { material: rowAddedGuid } }, children: [] }],
+        } },
+      }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/mats/row.mat.json');
+    expect(result.kept).toContain('/games/test/assets/mats/rowadded.mat.json');
+    expect(result.unreachableRefs).toEqual([]);
+  });
+
+  it('keeps refs held only in a v17 row channel — `own`, a node row`s traits, a node row`s `own` (#1516)', () => {
+    // Mutation: read `r.added` only for `fromRows` — own.mat and nodeown.mat are shaken out, and the guard fails.
+    const guids = ['abab1111-2222-4333-8444-555555555511', 'abab1111-2222-4333-8444-555555555512', 'abab1111-2222-4333-8444-555555555513'];
+    const [ownG, nodeG, nodeOwnG] = guids;
+    fx.writeJson('/games/test/assets/mats/own.mat.json', { id: ownG, version: 1 });
+    fx.writeJson('/games/test/assets/mats/node.mat.json', { id: nodeG, version: 1 });
+    fx.writeJson('/games/test/assets/mats/nodeown.mat.json', { id: nodeOwnG, version: 1 });
+    const plain = (mat: string) => ({ parentLocalId: 0, guid: '', name: 'X', traits: { Renderable3DPrimitive: { material: mat } }, children: [] });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 17,
+      entities: [{
+        id: 1, traits: {},
+        members: {
+          '/abab1111-2222-4333-8444-5555555555ff': { guid: 'abab1111-2222-4333-8444-5555555555fe', own: [plain(ownG!)] },
+          '/abab1111-2222-4333-8444-5555555555ff/a+k-node': { traits: { Renderable3DPrimitive: { material: nodeG } }, own: [plain(nodeOwnG!)] },
+        },
+      }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    for (const f of ['own', 'node', 'nodeown']) expect(result.kept).toContain(`/games/test/assets/mats/${f}.mat.json`);
+    expect(result.unreachableRefs).toEqual([]);
+  });
+
+  it('keeps refs held only in a PREFAB nested row`s member rows (prefab v6, #1533)', () => {
+    // A prefab row states its nested frames' structure on `members` now, so a node an outer prefab added inside a
+    // nested frame lives only there. Mutation: skip `node.members` in `walkCarrier` — row.mat is shaken out.
+    const matG = 'abab1111-2222-4333-8444-555555555521';
+    const prefabG = 'abab1111-2222-4333-8444-555555555522';
+    fx.writeJson('/games/test/assets/mats/row.mat.json', { id: matG, version: 1 });
+    fx.writeJson('/games/test/assets/prefabs/outer.prefab.json', {
+      id: prefabG, version: 6, name: 'Outer', rootLocalId: 1,
+      entities: [
+        { localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } },
+        { localId: 2, name: 'Row', prefab: 'abab1111-2222-4333-8444-555555555523', traits: { EntityAttributes: { name: 'Row', parentId: 1 } },
+          members: { '/abab1111-2222-4333-8444-5555555555f1/abab1111-2222-4333-8444-5555555555f2': {
+            own: [{ parentLocalId: 0, guid: '', key: 'k-1533', name: 'X', traits: { Renderable3DPrimitive: { material: matG } }, children: [] }],
+          } } },
+      ],
+    });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 17,
+      entities: [{ id: 1, prefab: prefabG, traits: {} }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/mats/row.mat.json');
+  });
+
   it('does NOT flag a video the module toggle dropped on purpose (ordering, not luck)', () => {
     // The guard runs BEFORE the excludeVideo prune for exactly this case. `build.modules.video:false`
     // removes clips from the keep-set AFTER the walk, so a scene that legitimately references one

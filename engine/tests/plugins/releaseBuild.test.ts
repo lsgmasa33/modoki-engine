@@ -12,6 +12,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import type { BuildStep, ExecStep } from '../../plugins/buildStepShell';
 import {
   parseBuildVariant, keystoreRefusal, renderKeystoreProperties, renderExportOptionsPlist,
   androidReleaseSteps, iosReleaseSteps, debugBuildReleaseWarning,
@@ -21,6 +22,12 @@ import {
   ANDROID_AAB_PATH, ANDROID_RELEASE_APK_PATH, IOS_ARCHIVE_PATH, IOS_EXPORT_DIR, IOS_EXPORT_OPTIONS_PATH,
 } from '../../plugins/releaseBuild';
 import { DEFAULT_PROJECT_USER_CONFIG, DEFAULT_PROJECT_CONFIG } from '../../project-config';
+
+/** The value following `flag` in an argv list. */
+const argAfter = (args: string[], flag: string): string | undefined => {
+  const i = args.indexOf(flag);
+  return i < 0 ? undefined : args[i + 1];
+};
 
 const KS = {
   storeFile: '/keys/com.example.app-upload.jks',
@@ -204,102 +211,123 @@ describe('renderExportOptionsPlist', () => {
   });
 });
 
+/** A step's program + argv as one list (#1537: steps carry argv, not command strings). An
+ *  in-process step has none. `line` joins it only to read an assertion — nothing ever runs it. */
+const argv = (s: BuildStep): string[] => (s.kind === 'exec' ? [s.command, ...s.args] : []);
+const line = (s: BuildStep): string => argv(s).join(' ');
+
 describe('androidReleaseSteps', () => {
   const steps = androidReleaseSteps({ androidCwd: '/p', buildCwd: '/r', env: { JAVA_HOME: '/jdk' }, ota: false, buildNumber: undefined });
+  const gradle = steps[0] as ExecStep;
 
   it('builds the AAB *and* a release-signed APK in one gradle run', () => {
     // The APK is not redundant: it is the only way to `adb install` and actually TEST the release
     // signing certificate, which #360's Google Sign-In matches on. A debug build cannot.
-    expect(steps[0].cmd).toContain('bundleRelease');
-    expect(steps[0].cmd).toContain('assembleRelease');
-    expect(steps[0].cmd?.match(/gradlew/g)?.length).toBe(1);
+    expect(gradle.args).toContain('bundleRelease');
+    expect(gradle.args).toContain('assembleRelease');
+    expect(steps.filter((s) => s.kind === 'exec' && /gradlew/.test(s.command))).toHaveLength(1);
   });
 
   it('never runs a debug task', () => {
-    for (const s of steps) expect(s.cmd).not.toMatch(/assembleDebug|installDebug/);
+    for (const s of steps) expect(line(s)).not.toMatch(/assembleDebug|installDebug/);
   });
 
   it('installs nothing and touches no device', () => {
     // The whole point of the variant. An `adb` here would resurrect the device coupling the
     // release path exists to shed — and would fail on a machine with no phone attached.
-    for (const s of steps) expect(s.cmd).not.toMatch(/\badb\b|devicectl|go-ios/);
+    for (const s of steps) expect(line(s)).not.toMatch(/\badb\b|devicectl|go-ios/);
   });
 
   it('carries JAVA_HOME through and stays --no-daemon (Windows file locks)', () => {
-    expect(steps[0].env).toEqual({ JAVA_HOME: '/jdk' });
-    expect(steps[0].cmd).toContain('--no-daemon');
-    expect(steps[0].winCmd).toContain('--no-daemon');
+    expect(gradle.env).toEqual({ JAVA_HOME: '/jdk' });
+    expect(gradle.args).toContain('--no-daemon');
   });
 
-  it('has a Windows command for every step that has a POSIX one', () => {
-    // `gradlew` vs `gradlew.bat` and `open` vs `start` — a missing winCmd is a step that runs the
-    // POSIX string on cmd.exe and fails with a shell error that names nothing useful.
-    for (const s of steps) expect(s.winCmd, `${s.label} needs a winCmd`).toBeTruthy();
+  it('runs gradlew.bat on Windows, and reveals the outputs in-process rather than with a shell verb', () => {
+    // `gradlew` vs `gradlew.bat`; `open` vs `start` is gone — the reveal is osOpen.ts in this process.
+    expect(gradle.winCommand).toBe('android\\gradlew.bat');
+    expect(steps[1]).toMatchObject({ kind: 'inproc', label: 'Revealing release artifacts...' });
   });
 
   it('cleans first only for an OTA project (the asset-merge staleness gotcha)', () => {
-    expect(steps[0].cmd).not.toContain('clean');
+    expect(gradle.args).not.toContain('clean');
     const ota = androidReleaseSteps({ androidCwd: '/p', buildCwd: '/r', env: {}, ota: true, buildNumber: undefined });
-    expect(ota[0].cmd).toContain('clean');
+    expect((ota[0] as ExecStep).args.slice(2, 3)).toEqual(['clean']);
   });
 });
 
 describe('iosReleaseSteps', () => {
-  const steps = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-project ios/App/App.xcodeproj', buildNumber: undefined });
+  const PROJECT = ['-project', 'ios/App/App.xcodeproj'];
+  const steps = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: PROJECT, buildNumber: undefined });
+  const archive = steps[1] as ExecStep;
+  const exportStep = steps[2] as ExecStep;
 
-  it('CLEARS the previous archive + export before archiving', () => {
+  it('CLEARS the previous archive + export before archiving', async () => {
     // Nothing else does. `-exportArchive` refuses a non-empty exportPath, and a failed export after
     // a successful archive would otherwise leave the PREVIOUS run's .ipa in place — looking exactly
     // like the artifact of the run that just finished. Both paths are inside the gitignored
-    // ios/App/build/, so the rm cannot reach anything tracked.
-    expect(steps[0].cmd).toMatch(/^rm -rf /);
-    expect(steps[0].cmd).toContain(JSON.stringify(IOS_ARCHIVE_PATH));
-    expect(steps[0].cmd).toContain(JSON.stringify(IOS_EXPORT_DIR));
+    // ios/App/build/, so the clear cannot reach anything tracked.
     for (const p of [IOS_ARCHIVE_PATH, IOS_EXPORT_DIR]) expect(p.startsWith('ios/App/build/')).toBe(true);
+    const root = makeScratchDir('modoki-ios-clear-');
+    try {
+      for (const p of [IOS_ARCHIVE_PATH, IOS_EXPORT_DIR]) {
+        fs.mkdirSync(path.join(root, p), { recursive: true });
+        fs.writeFileSync(path.join(root, p, 'stale.ipa'), 'x');
+      }
+      fs.writeFileSync(path.join(root, 'ios/App/build/keep.txt'), 'x');
+      const clear = iosReleaseSteps({ iosCwd: root, iosXcodeTarget: PROJECT, buildNumber: undefined })[0];
+      expect(clear.kind).toBe('inproc');
+      if (clear.kind === 'inproc') await clear.run(() => {});
+      for (const p of [IOS_ARCHIVE_PATH, IOS_EXPORT_DIR]) expect(fs.existsSync(path.join(root, p)), p).toBe(false);
+      expect(fs.existsSync(path.join(root, 'ios/App/build/keep.txt')), 'only the two outputs go').toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('archives Release for a generic device, then exports', () => {
-    expect(steps[1].cmd).toContain('-configuration Release');
-    expect(steps[1].cmd).toContain("-destination 'generic/platform=iOS'");
-    expect(steps[1].cmd).toMatch(/\barchive\b/);
-    expect(steps[2].cmd).toContain('-exportArchive');
+    expect(argAfter(archive.args, '-configuration')).toBe('Release');
+    expect(argAfter(archive.args, '-destination')).toBe('generic/platform=iOS');
+    expect(archive.args).toContain('archive');
+    expect(exportStep.args).toContain('-exportArchive');
   });
 
   it('never builds Debug, and never targets a specific device id', () => {
-    // `-destination 'id=…'` is the debug path. A release archive that pinned a UDID would refuse
+    // `-destination id=…` is the debug path. A release archive that pinned a UDID would refuse
     // to run without that exact phone plugged in.
     for (const s of steps) {
-      expect(s.cmd).not.toContain('-configuration Debug');
-      expect(s.cmd).not.toMatch(/-destination 'id=/);
+      expect(line(s)).not.toContain('-configuration Debug');
+      expect(line(s)).not.toMatch(/-destination id=/);
     }
   });
 
   it('passes -allowProvisioningUpdates to BOTH commands', () => {
     // The export re-signs, so it needs the distribution profile as much as the archive does —
     // without the flag it fails with a profile error that reads like a code problem.
-    expect(steps[1].cmd).toContain('-allowProvisioningUpdates');
-    expect(steps[2].cmd).toContain('-allowProvisioningUpdates');
+    expect(archive.args).toContain('-allowProvisioningUpdates');
+    expect(exportStep.args).toContain('-allowProvisioningUpdates');
   });
 
   it('the export reads the archive the archive step WROTE, and the options file we generate', () => {
     // Two paths that must agree across two commands — the exact thing named constants exist for.
-    expect(steps[1].cmd).toContain(JSON.stringify(IOS_ARCHIVE_PATH));
-    expect(steps[2].cmd).toContain(JSON.stringify(IOS_ARCHIVE_PATH));
-    expect(steps[2].cmd).toContain(JSON.stringify(IOS_EXPORT_OPTIONS_PATH));
-    expect(steps[2].cmd).toContain(JSON.stringify(IOS_EXPORT_DIR));
+    expect(argAfter(archive.args, '-archivePath')).toBe(IOS_ARCHIVE_PATH);
+    expect(argAfter(exportStep.args, '-archivePath')).toBe(IOS_ARCHIVE_PATH);
+    expect(argAfter(exportStep.args, '-exportOptionsPlist')).toBe(IOS_EXPORT_OPTIONS_PATH);
+    expect(argAfter(exportStep.args, '-exportPath')).toBe(IOS_EXPORT_DIR);
   });
 
   it('honours an xcworkspace target (a CocoaPods project) unchanged', () => {
-    const ws = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-workspace ios/App/App.xcworkspace', buildNumber: undefined });
-    expect(ws[1].cmd).toContain('-workspace ios/App/App.xcworkspace');
+    const ws = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: ['-workspace', 'ios/App/App.xcworkspace'], buildNumber: undefined });
+    expect(argAfter((ws[1] as ExecStep).args, '-workspace')).toBe('ios/App/App.xcworkspace');
   });
 });
 
 /** #1226: the build number reaches every native compile on the command line, so no build writes it
- *  into a committed file. Four compiles — debug and release on each platform — and a gradle `winCmd`
- *  beside each POSIX one; the variant nobody checks is the one that would ship the committed number. */
+ *  into a committed file. Four compiles — debug and release on each platform; the variant nobody
+ *  checks is the one that would ship the committed number. */
 describe('build number injection (#1226)', () => {
   const GRADLE_ARG = ' -PmodokiVersionCode=42 --init-script .gradle/modoki-version-code.init.gradle';
+  const PROJECT = ['-project', 'ios/App/App.xcodeproj'];
 
   it('an injectable number becomes the argument; anything else passes none, so the committed value is used', () => {
     expect(xcodeBuildNumberArg(42)).toBe(' CURRENT_PROJECT_VERSION=42');
@@ -310,24 +338,22 @@ describe('build number injection (#1226)', () => {
     }
   });
 
-  it('every compile carries it: both platforms, debug and release, POSIX and Windows', () => {
-    const iosDebug = iosDebugBuildStep({ iosCwd: '/p', iosXcodeTarget: '-project ios/App/App.xcodeproj', deviceId: 'D', buildNumber: 42 });
-    const iosRelease = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-project ios/App/App.xcodeproj', buildNumber: 42 });
+  it('every compile carries it: both platforms, debug and release', () => {
+    const iosDebug = iosDebugBuildStep({ iosCwd: '/p', iosXcodeTarget: PROJECT, deviceId: 'D', buildNumber: 42 });
+    const iosRelease = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: PROJECT, buildNumber: 42 });
     const androidDebug = androidDebugBuildStep({ androidCwd: '/p', env: {}, ota: true, buildNumber: 42 });
     const androidRelease = androidReleaseSteps({ androidCwd: '/p', buildCwd: '/r', env: {}, ota: false, buildNumber: 42 });
-    expect(iosDebug.cmd).toMatch(/ build CURRENT_PROJECT_VERSION=42$/);
-    expect(iosRelease[1].cmd).toMatch(/ archive CURRENT_PROJECT_VERSION=42$/);
-    for (const s of [androidDebug, androidRelease[0]]) {
-      expect(s.cmd?.endsWith(GRADLE_ARG), s.label).toBe(true);
-      expect(s.winCmd?.endsWith(GRADLE_ARG), s.label).toBe(true);
-    }
-    expect(androidDebug.cmd).toContain('clean assembleDebug');
+    expect(line(iosDebug)).toMatch(/ build CURRENT_PROJECT_VERSION=42$/);
+    expect(line(iosRelease[1])).toMatch(/ archive CURRENT_PROJECT_VERSION=42$/);
+    // One argv serves both platforms now (only the program differs), so there is no Windows copy to drift.
+    for (const s of [androidDebug, androidRelease[0]]) expect(line(s).endsWith(GRADLE_ARG), s.label).toBe(true);
+    expect(line(androidDebug)).toContain('clean assembleDebug');
   });
 
   it('the export takes no number — it does not compile, and ships the archive\'s own value', () => {
-    const steps = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-project ios/App/App.xcodeproj', buildNumber: 42 });
-    expect(steps[2].cmd).toContain('-exportArchive');
-    expect(steps[2].cmd).not.toContain('CURRENT_PROJECT_VERSION');
+    const steps = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: PROJECT, buildNumber: 42 });
+    expect(line(steps[2])).toContain('-exportArchive');
+    expect(line(steps[2])).not.toContain('CURRENT_PROJECT_VERSION');
     // Which is only true while Xcode is told not to manage the number at export.
     expect(renderExportOptionsPlist({ teamId: 'X', method: 'app-store-connect' })).toContain('<key>manageAppVersionAndBuildNumber</key>\n\t<false/>');
   });

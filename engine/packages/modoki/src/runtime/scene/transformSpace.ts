@@ -246,6 +246,41 @@ export function persistedTrsKeys(fields: Record<string, unknown>): (keyof TRS)[]
   return out;
 }
 
+const _qa = new THREE.Quaternion();
+const _qb = new THREE.Quaternion();
+/** Whether two Euler triples (XYZ) are the SAME orientation. Euler components are coupled, so a pose that
+ *  went through a matrix decomposition comes back in another spelling of one rotation — `ry: π` returns as
+ *  `(-π, ~0, -π)` — and a per-component compare reads two equal orientations as three different fields. */
+export function sameOrientation(a: Pick<TRS, 'rx' | 'ry' | 'rz'>, b: Pick<TRS, 'rx' | 'ry' | 'rz'>): boolean {
+  _qa.setFromEuler(_euler.set(a.rx, a.ry, a.rz));
+  _qb.setFromEuler(_euler.set(b.rx, b.ry, b.rz));
+  return 1 - Math.abs(_qa.dot(_qb)) <= 1e-9;
+}
+
+const _ma = new THREE.Matrix4();
+const _mb = new THREE.Matrix4();
+const _sa = new THREE.Vector3();
+const _sb = new THREE.Vector3();
+const _zero = new THREE.Vector3();
+/** Whether two poses have the SAME rotation-and-scale — the linear part of the transform, compared as one matrix.
+ *  Rotation and a NEGATIVE scale are coupled as well: a decomposition puts a mirror's sign on whichever axis it
+ *  likes, so `sz: -1` comes back as `sx: -1` turned π about y. Per field, or rotation apart from scale, those read
+ *  as different poses. */
+export function sameRotationScale(
+  a: Pick<TRS, 'rx' | 'ry' | 'rz' | 'sx' | 'sy' | 'sz'>, b: Pick<TRS, 'rx' | 'ry' | 'rz' | 'sx' | 'sy' | 'sz'>,
+): boolean {
+  _ma.compose(_zero, _qa.setFromEuler(_euler.set(a.rx, a.ry, a.rz)), _sa.set(a.sx, a.sy, a.sz));
+  _mb.compose(_zero, _qb.setFromEuler(_euler.set(b.rx, b.ry, b.rz)), _sb.set(b.sx, b.sy, b.sz));
+  // Each COLUMN at its own scale: one tolerance sized by the largest axis hid a real change on the others
+  // (`sx: 10000` swallowed an `rx: 0.005` tilt).
+  const sa = [a.sx, a.sy, a.sz], sb = [b.sx, b.sy, b.sz];
+  return _ma.elements.every((v, i) => {
+    const col = Math.floor(i / 4);
+    if (col > 2) return true;
+    return Math.abs(v - _mb.elements[i]!) <= 1e-6 * Math.max(1, Math.abs(sa[col]!), Math.abs(sb[col]!));
+  });
+}
+
 /** Merge only the fields the caller actually supplied over a base TRS.
  *
  *  A partial write must convert as a WHOLE POSE, not field-by-field: with a rotated parent, a

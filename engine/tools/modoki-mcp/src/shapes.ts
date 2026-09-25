@@ -9,6 +9,16 @@
 
 import { z } from 'zod';
 import { EDITOR_INPUT_MODIFIERS } from '../../shared/inputVocabulary.js';
+import { ALLOW_OCCLUDED_BASE, ALLOW_OCCLUDED_NESTED, ENTITY_AIM_BASE, SURFACE_AIM_BASE, sameAs } from '../../shared/aimVocabulary.js';
+import { nestedUnknownKeyMessage } from '../../shared/unknownParam.js';
+
+/** The refusal for a NESTED strict object: its fixed "X accepts only: …" sentence, prefixed with
+ *  the key(s) the caller actually sent (`shared/unknownParam.ts`). An `errorMap` rather than
+ *  `.strict(message)`, because a fixed string cannot see `issue.keys` — and the SDK reports only
+ *  the message plus the path. Any other issue on the object keeps zod's own text. */
+export const unknownKeysErrorMap = (accepts: string): z.ZodErrorMap => (issue, ctx) => ({
+  message: issue.code === 'unrecognized_keys' ? nestedUnknownKeyMessage(accepts, issue.keys) : ctx.defaultError,
+});
 
 /* `SAVE_PARAM` was here. REMOVED 2026-08-22 (owner decision).
  *
@@ -36,58 +46,35 @@ export const modifierEnum = z.enum(EDITOR_INPUT_MODIFIERS);
  *  `{"$ref": "#/properties/from/properties/entity"}`, no `type` at that node). A client that does
  *  not resolve JSON Schema `$ref` sees an untyped field and can mis-encode it — the exact failure
  *  mode that broke `modoki_dnd` (see `makeDndEndpoint` in `tools/input.ts`). Every call site making
- *  its own instance keeps each one a plain inline object in the schema, no `$ref` involved. */
-export const makeEntitySpec = () => z.object({
+ *  its own instance keeps each one a plain inline object in the schema, no `$ref` involved.
+ *
+ *  `brief` builds the SECOND copy inside one tool (drag's `to`): the structure still has to be a
+ *  fresh inline object, but every description becomes a pointer at the same field under `sameAs`
+ *  (#1555) — the prose was 2.5 KB per copy and said nothing the first copy did not. */
+export const makeEntitySpec = (brief?: { sameAs: string }) => z.object({
   guid: z.string().optional(),
   name: z.string().optional(),
   id: z.number().int().optional(),
   surface: z.enum(['game-3d', 'game-2d', 'scene-view', 'game-ui']).optional()
-    .describe('Which on-screen surface to aim in. REQUIRED for a 2D/3D entity, even when only one ' +
-      'viewport shows it. For a UI entity it is optional until the entity resolves to more than ' +
-      'one DOM node — the editor mounts a UI host in BOTH the Scene panel preview and the Game ' +
-      "panel — and then required. 'scene-view' = the editor authoring viewport, including its UI " +
-      "preview frame; 'game-3d'/'game-2d' = the running game's canvases; 'game-ui' = its DOM UI " +
-      'layer. Why it must be stated rather than guessed: docs/debug-tools-mcp.md § Aiming.'),
-  allowOccluded: z.boolean().optional()
-    .describe('Aim at the entity even when the surface\'s own hit-test says something else is in ' +
-      'front of it, and report what was actually hit. Default false — a covered aim is a REFUSAL ' +
-      'on EVERY scope, whether the cover is another entity or a DOM element over the viewport (a ' +
-      'modal, a menu, a panel), because the press lands on it either way. `occlusionScope` in the ' +
-      'response says how far the check could SEE.'),
-}).strict('an entity aim accepts only: guid, name, id, surface, allowOccluded').describe(
-  'Aim at a SCENE ENTITY by exactly one of {guid} | {name} | {id}, resolved to its live screen rect ' +
-  'INSIDE this call, so there is no read-then-tap race. {id} only for an entity with no guid: ' +
-  'runtime ids are reassigned on every reload. A name matching several entities is REFUSED, never first-match. A 2D/3D entity ' +
-  'additionally REQUIRES `surface`, and a UI entity requires it whenever it is mounted in more ' +
-  'than one panel. Overrides `selector` and x/y. The response reports `entity`, `surface` (WHICH ' +
-  'on-screen copy was aimed at), `aimedAt` ("centre" | "sampled"), `occluded`, ' +
-  '`occludedByEntity` and `occlusionScope` — "element" (UI: a real DOM comparison, trustworthy), ' +
-  '"entity" (the surface\'s own hit-test ran, so a mesh in front IS detected and REFUSES the aim ' +
-  'by default — see `allowOccluded`), or "canvas" (no pick provider: DOM covering only, a mesh ' +
-  'in front is NOT detected, so a clear result proves less). Detail: docs/debug-tools-mcp.md ' +
-  '§ Aiming.');
+    .describe(brief ? sameAs(`${brief.sameAs}.surface`) : `${SURFACE_AIM_BASE}. 'scene-view' = the editor ` +
+      'authoring viewport, incl. its UI preview frame (the editor mounts a UI host in BOTH the Scene and ' +
+      "Game panels); 'game-3d'/'game-2d' = the running game's canvases; 'game-ui' = its DOM UI layer."),
+  allowOccluded: z.boolean().optional().describe(ALLOW_OCCLUDED_NESTED),
+}, { errorMap: unknownKeysErrorMap('an entity aim accepts only: guid, name, id, surface, allowOccluded') }).strict().describe(
+  brief ? sameAs(brief.sameAs) : `${ENTITY_AIM_BASE}. The reply's \`occlusionScope\` says how far the cover ` +
+  'check could see: "element" (UI, a real DOM comparison), "entity" (the surface\'s hit-test ran, so a ' +
+  'mesh in front is detected and refused), or "canvas" (DOM covering only — a mesh in front is NOT ' +
+  'detected, so a clear result proves less). Detail: docs/debug-tools-mcp.md § Aiming.');
 
-/** The one description of the occlusion escape hatch, shared by every aimed input tool — a rule
- *  worded differently per tool is a rule an agent reads as two rules (mcp-tool-conventions.md §2).
- *
- *  ⚠️ The scope sentence named only `entity` and `selector` until #1218's close-out, and it was
- *  wrong in both directions: a `label` aim rides the selector path and IS refused, while
- *  `tap_handle`/`drag_handle` have NEITHER of the two modes it named — their only aim is a handle
- *  id, so an agent reading it literally would conclude the flag is inert there. That is exactly the
- *  "a covered gizmo handle reads as an inert one" bug the per-tool text on those two was written to
- *  prevent. Stated by what the flag ACTUALLY governs — any aim the surface RESOLVES — so it stays
- *  true as aim modes are added. */
-export const ALLOW_OCCLUDED_BASE =
-  'Aim there even though something covers the target (default false = REFUSED, naming the cover). '
-  + 'A covered press lands on the covering element, so reporting ok would be a false success — the '
-  + 'worst outcome on this surface. Applies to every aim this surface RESOLVES — `entity`, '
-  + '`selector`, `label`, a handle id; only a raw {x,y} is never refused, because a coordinate is '
-  + 'exactly what you asked for';
+/** The one description of the occlusion escape hatch now lives in `tools/shared/aimVocabulary.ts`,
+ *  shared with the device server; re-exported so the input tools keep one import site. */
+export { ALLOW_OCCLUDED_BASE };
 export const allowOccludedParam = z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`);
 
-/** The shared half of every `timeoutMs` description (#1154 made it three tools). Each tool
- *  CONCATENATES its own default and ceiling, which really do differ. */
-export const TIMEOUT_MS_BASE = 'How long to wait before giving up, in ms';
+/** `timeoutMs`'s and `precision`'s shared wordings live in `tools/shared/paramBases.ts` (#1559) —
+ *  the device server uses them too. Re-exported so the tools keep one import site. */
+import { TIMEOUT_MS_BASE, PRECISION_BASE } from '../../shared/paramBases.js';
+export { TIMEOUT_MS_BASE, PRECISION_BASE };
 
 /** The shared half of every `modifiers` description. A tool that needs to say more CONCATENATES —
  *  `${MODIFIERS_BASE}, e.g. …` — rather than replacing, so the rule reads identically everywhere
@@ -115,7 +102,7 @@ export const MODIFIERS_BASE = 'Held modifier keys';
 export const flatEntityAlias = z.object({
   guid: z.string().optional(),
   id: z.number().optional(),
-}).strict('an entity ref here accepts only: guid, id')
+}, { errorMap: unknownKeysErrorMap('an entity ref here accepts only: guid, id') }).strict()
   .optional().describe(
     'Alternative to this tool\'s flat `guid`/`id`: the same nested ref shape the aimed-input tools '
     + 'take, accepted here so one addressing form works across the surface. {id} only for an entity '
@@ -127,47 +114,22 @@ export const flatEntityAlias = z.object({
     + 'one.',
   );
 
-/** Fold a nested `entity` ref into the flat `{guid, id}` a tool's handler already passes on.
- *
- *  Refuses BOTH-at-once rather than picking: a caller who sent two addresses does not know which
- *  one this tool uses, and choosing for them is exactly the silent-wrong-target class §0 ranks
- *  first. Returns the flat pair, or a message for the caller to refuse with.
- *
- *  ⚠️ `flatEntityAlias` is `.strict()` and carries no `name` ON PURPOSE — both halves matter.
- *  Without `name` but not strict, zod STRIPS the key (a nested `z.object` is not strict just
- *  because its parent is), so `entity:{name:'Crate'}` would arrive here as `{}`, fold to the empty
- *  flat ref, and surface as "entity ref matched no live entity — it may be stale": a §0 rank-4
- *  unclear failure pointing at the wrong cause. That is the §1 silent-key-strip bug one level down,
- *  and it is why `mutateOpSchema`'s entity ref is strict too. */
-export function foldEntityRef(
-  flat: { guid?: string; id?: number },
-  entity: { guid?: string; id?: number } | undefined,
-): { guid?: string; id?: number } | { conflict: string } {
-  if (!entity || Object.keys(entity).length === 0) return flat;
-  // `!== undefined`, not truthiness: `id: 0` is the ROOT entity, and a truthiness test would read
-  // it as "no address given" and silently fall through to the other branch.
-  // An empty string is ABSENT, as in the live resolver (`app/debug/entityRef.ts`, #1223).
-  const flatKeys = Object.entries(flat).filter(([, v]) => v !== undefined && v !== '').map(([k]) => k);
-  if (flatKeys.length) {
-    return { conflict: `both \`entity\` and the flat ${flatKeys.join('/')} were given — they are two ways to say the same thing, and sending both leaves it ambiguous which target you meant. Pass exactly one.` };
-  }
-  return entity;
-}
+/** `flatEntityAlias` for a tool whose op addresses by GUID ONLY (`modoki_play_clip`). Sharing the
+ *  guid/id alias advertised an `id` the op refuses — and #1545's refusals quote a param's
+ *  description, so `play_clip {id:3}` was told "`entity` has a field of that name (entity:
+ *  Alternative to this tool's flat `guid`/`id`…)" and sent to a shape that is refused too. */
+export const guidOnlyEntityAlias = z.object({
+  guid: z.string().optional(),
+}, { errorMap: unknownKeysErrorMap('an entity ref here accepts only: guid') }).strict()
+  .optional().describe(
+    'Alternative to this tool\'s flat `guid`, in the nested shape the aimed-input tools take. GUID '
+    + 'only — this op has no id or name resolver; look the guid up with modoki_get_scene_state {name}.',
+  );
+
+/** `foldEntityRef` lives in `tools/shared` since #1559 — `device_duplicate_entity` takes the same alias. */
+export { foldEntityRef } from '../../shared/foldEntityRef.js';
 
 
-/** `precision`, in ONE wording (§2).
- *
- *  It said the same thing four ways across seven tools — the long form, a terse "(read)" form, a
- *  per-tool field list, and a scene-query variant. Nothing was wrong with any of them, which is the
- *  point: a param an agent has to re-read per tool to check it still means what it meant is the
- *  cost §2 is about, and every one of these drifted by being restated rather than shared.
- *
- *  `fields` keeps the one genuinely per-tool part — WHICH floats get rounded — without forking the
- *  rule that governs them. */
-export const PRECISION_BASE =
-  'Significant digits for the returned floats. Default 9 — trims float64 mantissa noise '
-  + '(247.13061935179246 -> 247.130619), saving ~17-29% of the response with a max error of '
-  + '3.5e-7. Verify a value with a TOLERANCE, never string/=== equality. Pass 0 for exact float64';
 export const precisionParam = (fields?: string) => z.number().int().nonnegative().optional()
   .describe(`${PRECISION_BASE}.${fields ? ` Rounded fields: ${fields}.` : ''}`);
 
@@ -208,6 +170,11 @@ export const DISPLAY_NAME_BASE =
 export const displayNameParam = (extra?: string) => z.string().optional()
   .describe(`${DISPLAY_NAME_BASE}.${extra ? ` ${extra}` : ''}`);
 
+/** `t` — a time along the open animation clip, in seconds: ONE word and one wording on every tool
+ *  that takes it (#1560), matching the clip file's own keyframe field (`Keyframe.t`). */
+export const CLIP_TIME_BASE = 'Clip time in seconds (`t`, the clip file\'s own keyframe field)';
+export const clipTimeParam = (extra?: string) => z.number().describe(`${CLIP_TIME_BASE}.${extra ? ` ${extra}` : ''}`);
+
 /** `force` — "proceed even though the editor has unsaved work", in ONE wording.
  *
  *  Shared by the five tools that work FROM THE FILES while the editor holds edits the files do not
@@ -232,11 +199,9 @@ export const displayNameParam = (extra?: string) => z.string().optional()
  *  With the destructive half renamed to `discardUnsaved`, `force` now means exactly one thing
  *  everywhere it appears, and the guard polices it instead of an exemption list. */
 export const unsavedForceParam = z.boolean().optional().describe(
-  'Proceed even though the editor has unsaved work this operation cannot see. It works from what '
-  + 'is on DISK, so your unsaved changes will NOT be included — this proceeds anyway rather than '
-  + 'refusing. Prefer modoki_save_all first; use this only when you mean to work from the last '
-  + 'saved state. NON-DESTRUCTIVE: your unsaved work is left alone, merely not used — which is why '
-  + 'THIS one keeps the name `force`. The tools that DESTROY it call theirs `discardUnsaved`.',
+  'Proceed even though the editor has unsaved work this operation cannot see. It works from DISK, '
+  + 'so your unsaved changes are NOT included. NON-DESTRUCTIVE: that work is left alone, merely not '
+  + 'used — prefer modoki_save_all first. The tools that DESTROY it take `discardUnsaved` instead.',
 );
 
 /** `discardUnsaved` — shared by the three tools that SWAP THE WORLD and destroy live work.
@@ -283,16 +248,15 @@ export const DISCARD_UNSAVED_BASE =
   + 'only what THIS operation overwrites or replaces, NOT everything the editor is holding: a '
   + 'world swap leaves a parked .meta.json import-settings edit untouched, and a sidecar write '
   + 'leaves the live world untouched — so this is never a way to clear an unrelated '
-  + 'REQUIRES_SAVE. Prefer modoki_save_all first. This is the param that used to be called '
-  + '`force`; it was renamed because `force` on modoki_build / modoki_add_native_target / '
-  + 'modoki_ota_publish destroys NOTHING, and one word cannot mean both';
+  + 'REQUIRES_SAVE. Prefer modoki_save_all first. Not `force`: that is the NON-destructive flag '
+  + 'on modoki_build / modoki_add_native_target / modoki_ota_publish, which destroys nothing';
 export const discardUnsavedParam = z.boolean().optional().describe(`${DISCARD_UNSAVED_BASE}.`);
 
 /** The `label` aim (#1153): editor chrome by its visible label. Factories, not shared consts, for
  *  the `$ref`-dedup reason `makePointSpec` documents below — drag's `from`/`to` both carry them. */
 export const makeLabelAimParam = () => z.string().optional().describe(
   'Editor chrome (data-ui-id control or dock tab) by its WHOLE label, e.g. "Console"; case-insensitive. '
-  + 'Refused unless exactly one on-screen match. Not with selector/entity.',
+  + 'Refused unless exactly one on-screen match. Not with selector, entity or x/y.',
 );
 export const makeWithinParam = () => z.string().optional().describe(
   'CSS selector scoping `label`, e.g. \'[data-panel-scope="assets"]\'.',
@@ -309,14 +273,16 @@ export const makeWithinParam = () => z.string().optional().describe(
  *  level deeper, into the one field this factory forgot to freshen). A client that doesn't
  *  resolve `$ref` reads that field as untyped and can encode `true`/`false` as a string — the
  *  exact `modoki_dnd` failure this factory exists to prevent, one field short of covering it. */
-export const makePointSpec = () => z.object({
+export const makePointSpec = (brief?: { sameAs: string }) => z.object({
   x: z.number().optional(),
   y: z.number().optional(),
   selector: z.string().optional(),
-  label: makeLabelAimParam(),
-  within: makeWithinParam(),
-  entity: makeEntitySpec().optional(),
-  allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
+  // The SAME factories either way — `brief` swaps only the prose, so a constraint added to the label
+  // param later reaches both endpoints instead of silently skipping `to` (#1555 review).
+  label: brief ? makeLabelAimParam().describe(sameAs(`${brief.sameAs}.label`)) : makeLabelAimParam(),
+  within: brief ? makeWithinParam().describe(sameAs(`${brief.sameAs}.within`)) : makeWithinParam(),
+  entity: makeEntitySpec(brief && { sameAs: `${brief.sameAs}.entity` }).optional(),
+  allowOccluded: z.boolean().optional().describe(ALLOW_OCCLUDED_NESTED),
 });
 
 /** The `mutate_scene` op vocabulary as a REAL schema, not `z.record(z.any())`.
@@ -341,7 +307,7 @@ const makeEntityRef = () => z.object({
   id: z.number().int().optional(),
   name: z.string().optional(),
   guid: z.string().optional(),
-}).strict('an entity ref accepts only: id, name, guid');
+}, { errorMap: unknownKeysErrorMap('an entity ref accepts only: id, name, guid') }).strict();
 
 export const mutateOpSchema = z.discriminatedUnion('op', [
   z.object({
@@ -350,24 +316,24 @@ export const mutateOpSchema = z.discriminatedUnion('op', [
     trait: z.string(),
     fields: z.record(z.any()).optional(),
     space: z.enum(['local', 'world']).optional(),
-  }).strict("setTrait accepts: op, entity, trait, fields, space (note `fields`, not `feilds`)"),
+  }, { errorMap: unknownKeysErrorMap("setTrait accepts: op, entity, trait, fields, space (note `fields`, not `feilds`)") }).strict(),
   z.object({
     op: z.literal('removeTrait'),
     entity: makeEntityRef(),
     trait: z.string(),
-  }).strict('removeTrait accepts: op, entity, trait'),
+  }, { errorMap: unknownKeysErrorMap('removeTrait accepts: op, entity, trait') }).strict(),
   z.object({
     op: z.literal('addEntity'),
     name: z.string().optional(),
     parentId: z.union([z.number(), z.string()]).optional(),
     traits: z.record(z.union([z.record(z.any()), z.boolean()])).optional(),
-  }).strict('addEntity accepts: op, name, parentId, traits'),
+  }, { errorMap: unknownKeysErrorMap('addEntity accepts: op, name, parentId, traits') }).strict(),
   z.object({
     op: z.literal('removeEntity'),
     entity: makeEntityRef(),
-  }).strict('removeEntity accepts: op, entity'),
+  }, { errorMap: unknownKeysErrorMap('removeEntity accepts: op, entity') }).strict(),
   z.object({
     op: z.literal('setBaseScene'),
     baseScene: z.string().nullable(),
-  }).strict('setBaseScene accepts: op, baseScene'),
+  }, { errorMap: unknownKeysErrorMap('setBaseScene accepts: op, baseScene') }).strict(),
 ]);

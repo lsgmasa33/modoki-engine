@@ -97,6 +97,9 @@ export function loadSurface(responder?: Responder): Surface {
   // the schema each tool was registered WITH so a test can assert the surface is strict
   // (`docs/mcp-tool-conventions.md` §1).
   const server = {
+    // The SDK's validation seam, which `installArgCoercion` wraps (#1560). `call` below goes THROUGH
+    // it, so the decoding a direct call gets on the wire is the decoding a test gets here.
+    validateToolInput: async (_tool: unknown, args: unknown) => args,
     registerTool: vi.fn((name: string, config: { inputSchema?: unknown }) => {
       registeredSchemas.set(name, config?.inputSchema);
     }),
@@ -144,7 +147,9 @@ export function loadSurface(responder?: Responder): Surface {
       // `strictSchema()` — which is the shape to copy.
       const registered = registeredSchemas.get(name) as z.ZodType | undefined;
       const schema = registered ?? z.object(entry.shape).strict();
-      const parsed = schema.safeParse(args);
+      const decoded = await (server as unknown as { validateToolInput: (t: unknown, a: unknown, n: string) => Promise<unknown> })
+        .validateToolInput({ inputSchema: schema }, args, name);
+      const parsed = schema.safeParse(decoded);
       if (!parsed.success) {
         throw new Error(`invalid args for ${name}: ${parsed.error.issues.map((i) => `${i.path.join('.')} ${i.message}`).join('; ')}`);
       }

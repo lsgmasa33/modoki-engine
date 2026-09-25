@@ -731,6 +731,80 @@ reads exactly like the vacuous shape. Spell absence as `expect(s.indexOf(x)).toB
 
 Its `IN_FLIGHT_1179` rows pardon four files that #1179 was rewriting on another branch at the time.
 
+### Shape (I): the SETUP waits a CONSTANT, so the mechanism may never be exercised (#527)
+
+A fixed `setTimeout` before an assertion is the well-known flake — it bets that a deferred effect
+lands inside a hardcoded window, which is true on an idle machine and false under load. The half
+that belongs in THIS doc is the other one: **the same constant in the SETUP fails green.**
+
+`deviceConnectionReentrancy.test.ts` builds a 3-step interleaving — two teardowns suspended inside
+one `client.disconnect()` — by racing two connects with `await new Promise(r => setTimeout(r, 20))`
+between them. Nothing asserted that both had arrived. Under load the second never suspends, the
+race does not form, and the #527 regression guard **passes without exercising #527 at all**. The
+assertion is still there and still correct; it is just being evaluated against a world where the
+hazard was never set up. That is the same "cannot fail" family as the rest of this doc, hiding one
+level earlier than usual — the mutation check still goes red, because a mutation check runs on an
+idle machine where the sleep is long enough.
+
+Both halves have the same repair, and it is the ruling already recorded in `deviceConnection.test.ts`'s
+"auto-reconnects over real TCP after an unexpected socket drop" — **poll, never sleep**, via
+`vi.waitFor`:
+
+- **In the setup**, poll on an observable of the step itself and then ASSERT it. Where the test has
+  no such observable, a **pass-through spy** (one that counts and calls through, changing no
+  behaviour) is a legitimate way to mint one. Record the count AT the moment it matters — a
+  post-hoc read of a counter that keeps incrementing answers a different question.
+- **In the assertion**, poll to a deadline and fail there. This is not a softened assertion: the
+  effect that never happens still fails.
+
+⚠️ **A poll's timeout is bounded from BOTH ends, and the upper bound is the one that gets
+forgotten.** It must clear event-loop slop, and stay **below the product's own late-acting timers**
+— otherwise the poll waits out a real defect and reports it as healthy. `deviceConnection`'s socket
+closes late on three paths (`reconnectDelayMs` 1000ms, `pingIntervalMs` 2000ms,
+`REQUEST_TIMEOUT_MS` 5000ms), so its leak assertions poll for **500ms**: a deadline at 5000ms would
+have tolerated a socket that only closed via the RPC timeout. Name the ceiling in a comment, so the
+next person raising the timeout to quiet a flake sees what they are spending.
+
+⚠️ **Polling is not a free substitute everywhere — check which direction the wait serves.** The
+same file's positive control reads a socket count that must be `> 0`. Polling for that returns on
+the first sample, which can catch sockets already destroyed but not yet reaped; the sleep it
+replaced was buying SETTLING time, and swapping it for a poll weakened the control it was meant to
+strengthen. A wait that exists so a reading STOPS changing is not the same as one that exists so an
+event ARRIVES.
+
+**The corpus sweep (#1478) sorted 13 sites three ways, and the sorting was the work.** Nine waited
+for an EVENT and now rest on an observable of it. Two waited on a PRODUCT TIMER or for SETTLING and
+were kept, each with its reason written beside it: `buildStepShell`'s mid-grace survival check sits
+*inside* the 400ms grace window (a poll would pass on its first sample and say nothing about the
+window), and `deviceSyslog`'s snapshot check waits for a reading to stop growing. Two were not
+sleeps at all, only matches for the query: `bridge.test`'s `setTimeout` is inside the body being
+EVAL'd (product input), and `connectClaudeProbeTimeout` is already a bounded hand-written poll. A
+fourteenth, unlisted site turned up in a file the sweep touched (`deviceConnectUsb`'s #1082 case: a
+30ms setup sleep inside a 300ms reply delay), because the query only matched sleeps within two
+lines of an `expect(` — **a setup sleep is exactly the one that is NOT next to an assertion.**
+
+When no observable exists, one can usually be minted without touching product code:
+- **the continuation's own promise** — a pass-through `vi.spyOn(mgr, 'disconnect')`, then `await`
+  its `mock.results[0].value`. The product chained its `.then` first, so resuming there means the
+  continuation has run (`deviceConnectUsb`, the stale-teardown case);
+- **a held reply** instead of a delayed one — the mock device queues the reply until the test calls
+  `releaseDisconnects()`, and the test polls `heldDisconnects()` to know the hang-up is in flight;
+- **a pass-through wrapper on a decision** — `releasePolicy`'s `onPipelineStart` answers recorded,
+  so the test waits until the route has ASKED and been refused (`sseRouteRejection`). A route that
+  never asks times out red, which a sleep could not tell apart from a route that asked late;
+- **a count the product already exposes** — `pendingCompileTurns(renderer) === 2` proves the
+  compile was REGISTERED behind the held turn (`postfxStack`). ⚠️ It does not prove the turn WAITS:
+  a chain that ran `fn` off `Promise.resolve()` still counts two. So the negative that follows is
+  taken after a `setTimeout(r, 0)` yield — which drains every microtask whatever the load, so it is a
+  yield and not a timing bet. Without it, the 10ms sleep's removal left `not.toHaveBeenCalled()`
+  unable to fail (close-out review, confirmed by that exact mutation);
+- **the terminal status** of a fire-and-forget load (`setFontStatus('error')`, `ecs/init`).
+
+Each conversion was mutation-checked against the mechanism it guards and went red — `postfxStack`
+only after the yield above was added, which is the point of running the check. That proves
+the tests still discriminate. It does NOT prove the old sleeps were ever too short on an idle
+machine; they were not, which is why none of these showed up as a flake.
+
 ## Gotchas
 
 ⚠️ **`onWorldSwap` is a re-export, and that is what makes this invisible.** It is defined in

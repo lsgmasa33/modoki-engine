@@ -975,10 +975,11 @@ export function registerAllTraits() {
     fields: {
       source: { type: 'string', readOnly: true },
       localId: { type: 'number', readOnly: true },
+      nodeGuid: { type: 'string', readOnly: true },
       rootInstanceId: { type: 'number', readOnly: true, entityId: { onMissing: 'stripTrait' } },
       parentLocalId: { type: 'number', readOnly: true },
-      homeParent: { type: 'string', readOnly: true },
-      homeSteps: { type: 'string', readOnly: true },
+      parentNodeGuid: { type: 'string', readOnly: true },
+      ownerGuid: { type: 'string', readOnly: true },
     },
   });
 

@@ -29,7 +29,7 @@ import os from 'os';
 import path from 'path';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
-import { detect as detectTool, forgetDetection, withToolOnPath, resetToolchainCache, gltfTransformInvocation, spawnable } from '../toolchain';
+import { detect as detectTool, forgetDetection, withToolOnPath, resetToolchainCache, gltfTransformInvocation, toSpawn } from '../toolchain';
 import { resolveUastcLevel, resolveUastcRdoLambda, type TextureImportSettings } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import {
   getModelCacheDir, processedCachePath, cacheDirFor, cacheHit, MODEL_PIPELINE_VERSION,
@@ -70,8 +70,8 @@ function ensureGltfTransformCli(): void {
   if (gltfTransformOk === null) {
     try {
       const inv = gltfTransformInvocation();
-      const s = spawnable(inv.command, [...inv.prefixArgs, '--version']);
-      const out = execFileSync(s.command, s.args, { stdio: ['ignore', 'pipe', 'pipe'], shell: s.shell });
+      const s = toSpawn(inv.command, [...inv.prefixArgs, '--version']);
+      const out = execFileSync(s.command, s.args, { stdio: ['ignore', 'pipe', 'pipe'], ...s.options });
       gltfTransformVersion = out.toString().trim();
       gltfTransformOk = true;
     } catch {
@@ -126,11 +126,11 @@ function runGltfTransform(args: string[], label: string): void {
     // (uastc/etc1s) spawn KTX-Software's `ktx` by bare name (gltf-transform 4.4), so inject the
     // resolved toktx dir into PATH — the pinned/bundled `ktx` sits beside toktx (#1351).
     const inv = gltfTransformInvocation();
-    const s = spawnable(inv.command, [...inv.prefixArgs, ...args]);
+    const s = toSpawn(inv.command, [...inv.prefixArgs, ...args]);
     execFileSync(s.command, s.args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: withToolOnPath('toktx'),
-      shell: s.shell,
+      ...s.options,
     });
   } catch (e) {
     const stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);

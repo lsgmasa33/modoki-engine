@@ -10,6 +10,7 @@ import {
   type AttributionConfig,
   type AttributionSdk,
 } from '../../../src/runtime/core/attribution';
+import { getBootTimeline, resetBootTimeline } from '../../../src/runtime/core/bootTimeline';
 
 type SdkMock = { [K in keyof AttributionSdk]: ReturnType<typeof vi.fn> };
 
@@ -92,6 +93,25 @@ describe('attribution — configured', () => {
     const startAt = sdk.start.mock.invocationCallOrder[0];
     expect(initAt, 'initialize must precede the consent prompt').toBeLessThan(attAt);
     expect(attAt, 'consent must resolve BEFORE start()').toBeLessThan(startAt);
+  });
+
+  it('the ATT prompt is an `att-prompt` boot span, open exactly while the prompt is up (#1475)', async () => {
+    // On a fresh iOS install this is the system alert that takes the screen; a first-launch stall is
+    // only readable against the timeline if the span brackets the prompt, not merely exists.
+    resetBootTimeline();
+    let answer!: () => void;
+    sdk.requestTrackingAuthorization.mockImplementationOnce(
+      () => new Promise((resolve) => { answer = () => resolve({ status: 'authorized' }); }),
+    );
+    const a = make(CONFIGURED, { os: 'ios' });
+    const done = a.initAppsFlyer();
+    await vi.waitFor(() => expect(sdk.requestTrackingAuthorization).toHaveBeenCalled());
+    const open = getBootTimeline().spans.filter((s) => s.name === 'att-prompt');
+    expect(open).toHaveLength(1);
+    expect(open[0].endMs).toBe(-1);
+    answer();
+    await done;
+    expect(getBootTimeline().spans.find((s) => s.name === 'att-prompt')!.endMs).toBeGreaterThanOrEqual(0);
   });
 
   it('start() waits for the consent call to RESOLVE, not merely to be made', async () => {
@@ -311,5 +331,34 @@ describe('attribution — getAdvertisingId', () => {
     const first = await a.getAdvertisingId();
     first.id = 'mutated';
     await expect(a.getAdvertisingId()).resolves.toEqual(NONE);
+  });
+});
+
+/**
+ * #1510: iOS answers `notDetermined` at once, with no prompt drawn, when the app is not active. The
+ * plugin now holds the request until it is (`capacitor-appsflyer/att-core`). If the answer still comes
+ * back, the log has to say the player was never asked rather than pass it off as an answer.
+ */
+describe('attribution — an ATT answer that means no prompt was shown (#1510)', () => {
+  const warned = () =>
+    (console.warn as unknown as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[0]).includes('did not show the tracking prompt'));
+
+  it('warns on iOS when the answer is notDetermined, and still starts the SDK', async () => {
+    sdk.requestTrackingAuthorization.mockResolvedValueOnce({ status: 'notDetermined' });
+    await make(CONFIGURED, { os: 'ios' }).initAppsFlyer();
+    expect(warned()).toBe(true);
+    expect(sdk.start).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['authorized', 'denied', 'restricted'])('stays quiet for a real answer (%s)', async (status) => {
+    sdk.requestTrackingAuthorization.mockResolvedValueOnce({ status });
+    await make(CONFIGURED, { os: 'ios' }).initAppsFlyer();
+    expect(warned()).toBe(false);
+  });
+
+  it('stays quiet off iOS, where there is no prompt to miss', async () => {
+    sdk.requestTrackingAuthorization.mockResolvedValueOnce({ status: 'notDetermined' });
+    await make(CONFIGURED, { os: 'android' }).initAppsFlyer();
+    expect(warned()).toBe(false);
   });
 });

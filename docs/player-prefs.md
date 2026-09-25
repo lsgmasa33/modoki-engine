@@ -390,6 +390,18 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   | `SIGKILL` 8 s after `flush()` | **lost** |
 
   Not a timing race at the time — waiting did not help, because nothing committed until shutdown.
+  ⚠️ For a RAW `localStorage.setItem` that never goes through `flush()` (the editor's own
+  layout/prefs keys, a QA case's eval), the "survives" row does NOT hold when the write is seconds
+  old. In 2026-09-25's #1578 runs, such writes were lost after a graceful stop 5 times out of 7,
+  and calling `modoki:flush-storage-data` saved them 3 of 3. PlayerPrefs' own `flush()` already
+  makes that call (#335), so this is not a measured PlayerPrefs loss. **Mechanism, fixed in
+  #1580:** that stop was not graceful. `pkill -f main.cjs` also hit the npm `electron` wrapper,
+  which forwards SIGTERM, so Electron got two signals, and the second killed it before
+  `before-quit` ran. `stop-editor.sh` and the launcher now send one
+  (`reap_repo_signal_editor_once`). The same write then survived `editor:stop` 7 of 7 and a
+  relaunch over the running editor 3 of 3. It also survived 5 of 5 with no quit-time
+  `flushStorageData()`: a clean quit commits by itself. ⚠️ **posix only** — on Windows the stop is
+  still a forced `Stop-Process`, so the loss remains there. Measurements: `qa/knowledge.md` § 5.
 
   **RE-MEASURED against the #335 fix** (2026-08-26, `games/anim-bug`, backend 5182, this clone's
   dev editor): wrote a key, called `flush()` (confirmed the IPC round-trip returns `{ok:true}`),

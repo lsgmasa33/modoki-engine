@@ -3,7 +3,7 @@
  *  mock TCP device, proving the request→router→manager→transport→device round-trip and the route
  *  error mapping (the whole data plane was previously untested — code-review T1/T2). */
 
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import net from 'net';
 import os from 'os';
@@ -11,7 +11,7 @@ import { handleBackendRequest, type BackendContext, type Manifest } from '../../
 import { deviceConnection } from '../../plugins/backend/deviceConnection';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 import { WDA_NOT_IOS_REASON, WDA_NEEDS_WIFI_REASON, WDA_SHOT_NO_SESSION_REASON, WDA_LEASE_ENDED_REASON, endDeviceWdaLease, resolveWdaPort, _resetDeviceWdaStateForTests } from '../../plugins/backend/deviceWda';
-import { _resetDeviceCdpStateForTests, _setDeviceCdpSessionProbeForTests } from '../../plugins/backend/deviceCdp';
+import { _resetDeviceCdpStateForTests, _setDeviceCdpSessionProbeForTests, _drainRefusedAdbForTests } from '../../plugins/backend/deviceCdp';
 import { _resetWdaLauncherForTests, ensureWdaRunning, isWdaProcessRunning } from '../../plugins/backend/wdaLauncher';
 import type { FrameLoopStatus } from '../../packages/modoki/src/runtime/rendering/frameLoopStatus';
 
@@ -303,7 +303,13 @@ describe('/api/device/request screenshot while the lease is RECONNECTING (#102)'
 // gating both WDA entry points (input + all three screenshot sites in editorBackendRouter.ts) on
 // the answer being `'ios'`.
 describe('/api/device/request WDA gated on device platform (#99)', () => {
+  // These lease an ANDROID mock, so the router hands the tap to the REAL CDP getter — whose
+  // discovery shells to adb. No trusted route is what these tests assume; say so, rather than
+  // letting a real `adb shell` + `adb forward` on port 9333 decide it (#1530 close-out).
+  beforeEach(() => { _setDeviceCdpSessionProbeForTests(async () => null); });
   afterEach(async () => {
+    _setDeviceCdpSessionProbeForTests(null);
+    expect(_drainRefusedAdbForTests(), 'a test reached real adb through deviceCdp').toEqual([]);
     await deviceConnection.disconnect();
     // wdaLauncher/deviceWda hold MODULE-LEVEL state (a latched lastFailure, a cached session) that
     // otherwise leaks into the NEXT test and makes these order-dependent — the same trap #102's

@@ -3,8 +3,8 @@
  * in it. Written for Weaveling (#1309), promoted here when Court became the second consumer (#1312).
  *
  * ⚠️ **Imports nothing SDK-specific and nothing game-specific, and must stay that way.** The SDK arrives
- * as an `AdSdk` adapter (each game's `packages/app-services/src/ads.ts` is its AdMob one — the plugin is a
- * per-game dependency, so the adapter cannot live here), and everything a game decides — placements, the
+ * as an `AdSdk` adapter (each game's `packages/app-services/src/ads.ts` holds its own — AppLovin MAX in both
+ * since #1495 Weaveling / #1496 Court; the plugin is a per-game dependency, so the adapter cannot live here), and everything a game decides — placements, the
  * analytics taxonomy, pacing numbers — arrives through `AdLifecycleHooks` or stays in the caller. When to
  * show an interstitial is `./adPacing.ts`.
  *
@@ -40,8 +40,25 @@ import { registerReloadBlocker } from './resumeReload';
 import { createSupersessionToken, createTeardownToken } from './liveness';
 import { withTimeout } from './abandonment';
 import { rawEpochNow } from './clock';
+import { notifyListeners } from './notifyListeners';
+import { bootSpanAsync } from './bootTimeline';
 
 export type FullscreenKind = 'interstitial' | 'rewarded';
+
+type FullscreenAdListener = (showing: boolean) => void;
+const fullscreenAdListeners = new Set<FullscreenAdListener>();
+
+/**
+ * Hear every edge of "a fullscreen ad is on screen", from any lifecycle (#1455). The app shell wires
+ * the audio hold to it (`engine/app/useAudioResumeRearm.ts`), so every game's ads pause the game's
+ * audio without the game doing anything. Fires on CHANGE only, from the show's first native call
+ * (before the ad draws, so our audio is already down when its player starts) to its dismissal,
+ * failure or the lifecycle's cleanup. Returns the unsubscribe.
+ */
+export function onFullscreenAdChange(fn: FullscreenAdListener): () => void {
+  fullscreenAdListeners.add(fn);
+  return () => { fullscreenAdListeners.delete(fn); };
+}
 
 /** A registered native listener. */
 export interface AdListenerHandle {
@@ -72,11 +89,13 @@ export interface AdEventSink {
   dismissed(kind: FullscreenKind): void;
   rewardEarned(reward: AdReward): void;
   revenue(revenue: AdRevenue): void;
-  /** The banner's ad arrived, AFTER `showBanner` resolved. iOS adds the view only now (Android added it
-   *  before the load), so a remove issued in between removed nothing there. */
+  /** The banner's ad arrived, AFTER `showBanner` resolved. Under AdMob, iOS adds the view only now (Android
+   *  added it before the load), so a remove issued in between removed nothing there; the MAX plugin adds
+   *  its view at `showBanner`. Either way a hide asked for while the ad loaded is re-applied here. */
   bannerLoaded(): void;
-  /** The banner's load failed — including a refresh. Both native SDKs REMOVE the view on this, without
-   *  rejecting anything, so the lifecycle must stop believing a banner is up. */
+  /** The banner's load failed — including a refresh. The native side takes the banner off screen without
+   *  rejecting anything (AdMob removes the view; the MAX plugin hides it and stops its refresh), so the
+   *  lifecycle must stop believing a banner is up. */
   bannerFailed(): void;
 }
 
@@ -118,13 +137,18 @@ export interface AdLifecycleOptions {
   now?: () => number;
   /** How long a show waits for `presented`/`failedToPresent` before calling it not shown. */
   presentTimeoutMs?: number;
+  /** How long a preload may take before it counts as a failed load and takes the retry back-off. Default 2 min
+   *  — far past a real waterfall, so it only fires on an SDK that never answers (#1507: MAX drops a load
+   *  issued while it reloads an expired ad, and reports that reload to a listener the load never sees). */
+  preloadTimeoutMs?: number;
   /** Wait before re-trying a failed preload, and before re-trying a failed banner call. Also the first
    *  wait before re-trying a failed init, which then doubles up to `maxInitRetryMs`. */
   retryMs?: number;
   /** Ceiling of the init retry back-off. Default 10 min. */
   maxInitRetryMs?: number;
   /** A loaded fullscreen ad older than this is discarded and reloaded. AdMob's expire after an hour, and
-   *  an expired one fails to show or does not count. Default 55 min. */
+   *  an expired one fails to show or does not count. Default 55 min. An SDK that reloads its own expired
+   *  ads (AppLovin MAX) passes `Infinity`: the age rule would only refuse a show for an ad it still holds. */
   maxAdAgeMs?: number;
 }
 
@@ -146,6 +170,12 @@ export interface AdLifecycle {
    *  the video is still up, so anything it raises plays out underneath the ad (#1379). */
   isFullscreenShowing(): boolean;
   isInitialized(): boolean;
+  /** How many times a banner could not be put up: a load that failed (a no-fill included, and a refresh's),
+   *  a show call that was refused, or an init that failed. MONOTONIC and never reset — a caller keeps its
+   *  own baseline and asks "has it failed since?" (#1477: Weaveling gives an unfillable strip to the
+   *  crossword). A count rather than a "failed now" flag because a flag set by the PREVIOUS attempt would
+   *  still read true before the next attempt had even started. */
+  bannerFailures(): number;
 }
 
 interface PendingShow {
@@ -160,6 +190,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
   // the app is backgrounded. `rawEpochNow` is the sanctioned wrapper (the determinism guard).
   const now = opts.now ?? rawEpochNow;
   const presentTimeoutMs = opts.presentTimeoutMs ?? 10_000;
+  const preloadTimeoutMs = opts.preloadTimeoutMs ?? 120_000;
   const retryMs = opts.retryMs ?? 30_000;
   const maxInitRetryMs = opts.maxInitRetryMs ?? 600_000;
   const maxAdAgeMs = opts.maxAdAgeMs ?? 55 * 60_000;
@@ -199,6 +230,12 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
   // mutated away with the suite green, 2026-09-17). Court's `fullscreenAdGen` carries the same note. They
   // stay because one added post-await write would make them load-bearing silently.
   let fullscreenShowing = false;
+  /** Every write to `fullscreenShowing` goes through here, so a listener sees each edge exactly once. */
+  function setFullscreenShowing(showing: boolean): void {
+    if (showing === fullscreenShowing) return;
+    fullscreenShowing = showing;
+    notifyListeners([...fullscreenAdListeners], 'adLifecycle:fullscreenAd', [showing]);
+  }
   const showOwnership = createSupersessionToken();
   let pending: PendingShow | null = null;
   let unregisterBlocker: (() => void) | null = null;
@@ -207,6 +244,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
   let bannerShown = false;
   let bannerBusy = false;
   let bannerRetryAt = 0;
+  let bannerFailures = 0;
 
   function settlePending(shown: boolean): void {
     const p = pending;
@@ -237,7 +275,10 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     if (!initialized || !sdk.enabled() || !sdk.has(kind) || ready[kind] || loading[kind]) return;
     loading[kind] = true;
     const live = lifetime.capture();
-    sdk.preload(kind).then(
+    // Bounded, or a load the SDK never settles holds `loading` — and so that kind — for the session.
+    withTimeout(sdk.preload(kind), preloadTimeoutMs, `${kind} preload`, {
+      discard: 'a late load result is superseded by the retry this timeout schedules; the SDK then re-reports readiness',
+    }).then(
       () => {
         if (!live()) return;
         loading[kind] = false;
@@ -256,20 +297,20 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
   const sink: AdEventSink = {
     presented(kind) {
       // Authoritative: an ad IS up, whoever's show it was.
-      fullscreenShowing = true;
+      setFullscreenShowing(true);
       if (pending?.kind === kind) settlePending(true);
       // Whatever was loaded for this kind is what went up — even for a show that already timed out.
       else ready[kind] = false;
     },
     failedToPresent(kind) {
       showOwnership.begin();
-      fullscreenShowing = false;
+      setFullscreenShowing(false);
       if (pending?.kind === kind) settlePending(false);
       preload(kind);
     },
     dismissed(kind) {
       showOwnership.begin();
-      fullscreenShowing = false;
+      setFullscreenShowing(false);
       // A dismissal with the show still pending means `presented` never arrived, yet the ad was up.
       if (pending?.kind === kind) settlePending(true);
       preload(kind);
@@ -289,6 +330,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     },
     bannerFailed() {
       if (!initialized) return;
+      bannerFailures++;
       bannerShown = false;
       bannerRetryAt = now() + retryMs;
       const live = lifetime.capture();
@@ -320,6 +362,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     } catch (e) {
       console.warn(`[${opts.tag}] ${target ? 'showBanner' : 'hideBanner'} failed:`, e);
       if (live()) {
+        if (target) bannerFailures++;
         bannerRetryAt = now() + retryMs;
         // A failed or timed-out SHOW may still put a view up later, and the game may have asked for none
         // meanwhile — `bannerShown` is still false, so the diff below would do nothing. Remove defensively.
@@ -347,7 +390,14 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     // Declared OUTSIDE the try so the catch can unwind it; `splice(0)` keeps both unwinds idempotent.
     const handles: AdListenerHandle[] = [];
     try {
-      await sdk.start();
+      // A boot-timeline span (#1475): `start()` can put a native consent form in front of the game.
+      await bootSpanAsync('ads-start', () => sdk.start(), opts.tag);
+      // A realm-survived recovery puts the payout back BEFORE the listeners register, not after: an SDK
+      // that RETAINS a reward earned while no listener was attached (the MAX plugin's `adRewardEarned`,
+      // `retainUntilConsumed`) hands it to the first listener that subscribes — inside the loop below, where
+      // a handler restored only on success would not be there to pay it. Harmless if the loop then fails:
+      // with no listener registered nothing can reach the handler, and the retry sets it again.
+      if (restorePayoutOnInit && lastRewardHandler && live()) rewardHandler = lastRewardHandler;
       // Sequential and STOPS on the first failure — the `registration` kind in `notifyIsShared.test.ts`'s
       // EXEMPT: isolating each call would publish a half-registered set that reports success.
       for (const register of sdk.listeners(sink)) {
@@ -367,7 +417,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
         restorePayoutOnInit = false;
         if (lastRewardHandler) rewardHandler = lastRewardHandler;
       }
-      fullscreenShowing = false;
+      setFullscreenShowing(false);
       unregisterBlocker = registerReloadBlocker(opts.blockerId, () => fullscreenShowing);
       preload('interstitial');
       preload('rewarded');
@@ -383,6 +433,8 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
       console.warn(`[${opts.tag}] Init failed:`, e);
       // Only this run's own latch: clearing a newer run's would let two inits race again.
       if (live()) {
+        // No banner can come up until an init succeeds, whatever the reason (offline, consent refused).
+        bannerFailures++;
         starting = false;
         // Nothing else calls `init()` again before the next cold start (the engine calls it at boot and on
         // a realm-survived recovery), so a transient failure — offline at launch — would mean no ads for
@@ -405,7 +457,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     unregisterBlocker?.();
     unregisterBlocker = null;
     showOwnership.begin();
-    fullscreenShowing = false;
+    setFullscreenShowing(false);
     settlePending(false);
     for (const t of retryTimers) clearTimeout(t);
     retryTimers.clear();
@@ -444,7 +496,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     const owns = showOwnership.begin();
     // Set BEFORE the native call: the ad's activity is up while the call is in flight, and
     // `useResumeReload` samples the blockers at background time (Court #587).
-    fullscreenShowing = true;
+    setFullscreenShowing(true);
     let timedOut = false;
     const shown = await new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
@@ -464,7 +516,7 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     if (!shown) {
       // Clear only what this show set: a dismissal or cleanup already moved the generation on. When in
       // doubt, don't block — a flag stuck true blocks every reload for the rest of the realm.
-      if (owns()) fullscreenShowing = false;
+      if (owns()) setFullscreenShowing(false);
       // A refusal or a failure to present leaves nothing on screen, so reload now. A TIMEOUT may still
       // present late, and a replacement loaded under the same unit id meanwhile would be deleted on its
       // dismissal — so wait; a late `presented` + `dismissed` reloads first if it comes.
@@ -493,5 +545,6 @@ export function createAdLifecycle(sdk: AdSdk, hooks: AdLifecycleHooks, opts: AdL
     },
     isFullscreenShowing: () => fullscreenShowing,
     isInitialized: () => initialized,
+    bannerFailures: () => bannerFailures,
   };
 }

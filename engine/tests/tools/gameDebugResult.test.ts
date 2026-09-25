@@ -164,6 +164,18 @@ describe('§5 error envelope — the device server', () => {
     expect(e.options?.join(' ')).not.toContain('Connect a Device');
   });
 
+  // #1558: device_list's question (what is attached, who claims it) is answerable host-side, so its
+  // refusal leads with the claim-aware CLI — raw adb was the observed fallback, and it hides claims.
+  it('device_list with no editor names the claim-aware CLI first; other tools do not', () => {
+    const unreachable = () => new Error("Can't reach the Modoki backend at http://127.0.0.1:5183 — is the editor running for this clone?");
+    const list = env(caughtFailure('device_list', 'enumerate attached devices and their claims', unreachable()));
+    expect(list.code).toBe('NOT_AVAILABLE_HERE');
+    expect(list.options?.[0]).toContain('npm run device:list');
+    expect(list.options?.join(' ')).toContain('launch-editor.sh');
+    const status = env(caughtFailure('device_status', 'read the lease', unreachable()));
+    expect(status.options?.join(' ')).not.toContain('device:list');
+  });
+
   it('an unclassified transport error still names the tool and offers a next move', () => {
     const e = env(caughtFailure('device_eval', 'evaluate JS', new Error('socket hang up')));
     expect(e.code).toBe('NOT_AVAILABLE_HERE');

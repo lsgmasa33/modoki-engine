@@ -215,12 +215,6 @@ const POST_ONLY_ELSEWHERE: ReadonlyArray<{ item: string; count?: number; reason:
     reason: 'dispatchInput is called only by inputRoutes() below `if (!urlPath.startsWith(\'/api/input/\') || '
       + 'method !== \'POST\') return null` — only a POST reaches it, and postJson\'s isFailureBody reads the ok:false.',
   },
-  {
-    item: 'engine/electron/inputRoutes.ts::/api/input/tap-handle',
-    count: 3,
-    reason: 'dispatchInput is called only by inputRoutes() below `if (!urlPath.startsWith(\'/api/input/\') || '
-      + 'method !== \'POST\') return null` — only a POST reaches it, and postJson\'s isFailureBody reads the ok:false.',
-  },
 ];
 
 const scanned = ROUTE_FILES.map((rel) => {

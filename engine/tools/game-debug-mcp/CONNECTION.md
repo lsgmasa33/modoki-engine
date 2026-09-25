@@ -105,7 +105,7 @@ WebGPU screenshot is black:
 | Tool | Description |
 |---|---|
 | `device_tap` | Tap by CSS `selector` (resolved on-device, occlusion-checked, **no screenshot**) or screenshot pixel `x`/`y` |
-| `device_drag` | Drag between two points, each aimed by selector (`fromSelector`/`toSelector`) or screenshot coords. `dom:true` (auto on a non-canvas grab) drags DOM chrome (widgets/sliders) by dispatching on the element itself |
+| `device_drag` | Drag between two points, each a nested `from`/`to`: `{entity}`, `{selector}` or screenshot `{x,y}`. `dom:true` (auto on a non-canvas grab) drags DOM chrome (widgets/sliders) by dispatching on the element itself |
 | `device_dispatch_action` | Trigger a game intent directly by name (no pixel-hunting); a no-op is reported as an error, not a phantom success |
 | `device_press_key` | Press a key chord (keydown/hold/keyup) — open the debug menu (`F12`), Escape a modal, drive gameplay keys; `key` + `modifiers[]` |
 | `device_hover` | Hover a target (pointerover/enter/move) so :hover styles / tooltips / hover-gated UI activate |

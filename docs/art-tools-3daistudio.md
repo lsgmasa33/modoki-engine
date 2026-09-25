@@ -110,6 +110,44 @@ repo has actually produced through the service, so §2a's table stops being vend
   lands in the ACTIVE dir, then authenticate with `/mcp`. The stored entry is only `{type, url}` —
   the OAuth credential is not in the file, so nothing sensitive moves between config dirs.
 
+## 2a-ter. Findings from the Court video-ad run (measured 2026-09-23, `work-qa`, #1395)
+
+Four 9:16 video ads for Court: opening stills over MCP, image-to-video in the web app, cut in ffmpeg.
+
+- 🔴 **`edit_image_gpt` does NOT keep the input's aspect ratio**, despite its description ("The
+  output auto-sizes to match the input image"). A 768×1376 (9:16) input came back **1024×1024**.
+  `edit_image_nano` takes an explicit `aspect_ratio` and returned 768×1376 for the same edit — use it
+  whenever the frame shape matters, which is every video or ad still.
+- **Repair a near-miss by EDITING it, not by re-rolling.** Each fresh generation of an almost-right
+  frame fixed the flaw and broke something that had been right (blender base gained → the book's grid
+  lost; knight resized → the blender came apart). `edit_image_nano` edits kept what they were told to
+  keep — but **keep the edit small and local**: one edit asked to seat a detached glass jug back on
+  its base did not do it at all, and a large pose change came back from a visibly different camera
+  angle. The same mechanism as §2a consequence 1, applied to repair.
+- **2K is still rejected** — reproduced with §2a-bis's isolation (identical call, only `resolution`
+  changed; `1K` succeeded).
+- **Video is web-only (§2a), and the web app's video models differ a lot:**
+  - The first model refused a photoreal person destroying objects ("flagged by a content checker",
+    credits refunded), and refused again on a retry. A different model in the same web app accepted
+    the original image and prompt. **Switch models before rewording.** Which model passed was not
+    recorded.
+  - **Output differs by model.** The first gave 720×1280 at 8.0 s; the one that worked gave
+    **1076×1924** (not 1080×1920 — scale, then crop to the master) at 5.04 s or 8.04 s. Both ran at
+    24 fps with a **generated AAC audio track** whose content varies — kitchen sound peaking around
+    −3 dBFS in one scene, near-silent room tone (about −60 dB mean) in another. Measure it before
+    mixing.
+  - **Image-to-video "tidies up" any frame that contradicts the motion it is asked for.** A smashed
+    chess board reassembled itself; a violent clap became a prayer pose; a puzzle book was read and
+    set down instead of blended; props vanished between the palms; a phone whose dark back faced the
+    camera lit up as a screen when the prompt asked for a thumb scrolling on it; and a phone flipped
+    round mid-clip to show its cameras. Two fixes worked: **put the implausible state in the still**
+    (the book already crammed into the jug), or **stop asking for motion the frame cannot physically
+    show** (asking for the screen's light to flicker on her face instead of a thumb scrolling fixed
+    the lit-up back). When a clip still goes wrong late, cut before it: the phone flip began at
+    2.55 s and the clip was used up to 2.45 s.
+  - **One action per clip.** A four-beat prompt (drop in → lid → press → blend) lost a beat. The same
+    beats as three single-action clips all worked, and cut together better.
+
 ## 2a. What the MCP surface ACTUALLY exposes (measured 2026-08-05, 22 tools)
 
 ⚠️ **The MCP surface is a SUBSET of the web app — plan against this list, not against §3/§4.**
@@ -129,7 +167,7 @@ of those, it happens in the browser.
 |---|---|
 | `generate_image_nano_lite` | Nano Banana 2 Lite. **Recommended default for generation. TEXT INPUT ONLY** — no image reference. 5 credits flat, any resolution; up to 4 images/call; `png` available for transparency. |
 | `generate_image_gpt` | GPT Image 2. Takes text only for generation. Pick it over Nano when **instruction-following or text-in-image** matters. Cost varies with quality × pixel area (low 3/5/8, medium 6/14/25 at 1K/2K/4K, high 30). |
-| `edit_image_gpt` | **Recommended default for EDITS** (use `low` quality). Accepts **up to 10 input images**. |
+| `edit_image_gpt` | **Recommended default for EDITS** (use `low` quality). Accepts **up to 10 input images**. ⚠️ Returns SQUARE output for a non-square input — use `edit_image_nano` with `aspect_ratio` when the shape matters (§2a-ter). |
 | `edit_image_nano` | Alternative editor, accepts **up to 14 input images**. 7/10/14/20 credits at 0.5K/1K/2K/4K. |
 | `remove_background` | birefnet (1 credit, default) · birefnet-v2 (2) · pixelcut (3, product photos). Outputs PNG/RGBA. |
 | `upload_image` | Shows an inline card so the user hands over a local file, returning an `upload:<id>` ref. **Chat attachments are NOT reachable by the other tools**, and images must never be re-encoded from vision — this is the only way in. |

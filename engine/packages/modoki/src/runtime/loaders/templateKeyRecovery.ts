@@ -15,16 +15,18 @@
  *  nothing matches — so the result depends only on the world and the prefab documents. */
 
 import type { World } from 'koota';
-import { deriveMemberGuid, memberStepId, addedKeyStep } from '../core/assetRefRules';
+import { deriveMemberGuid, addedKeyStep, entityStep, memberRowNodes, type MemberStep } from '../core/assetRefRules';
 import type { PackedEntity } from '../core/ecs/entityTable';
 
 /** The slice of a prefab document the key walk reads (a `PrefabFile` / loader doc fits structurally). */
-type KeyedNode = { key?: string; children?: KeyedNode[]; added?: KeyedNode[]; nestedStructure?: StructurePaths };
+type KeyedNode = { key?: string; children?: KeyedNode[]; added?: KeyedNode[]; nestedStructure?: StructurePaths; members?: MemberRows };
 type StructurePaths = Record<string, { added?: KeyedNode[] } | undefined>;
-export type TemplateKeyDoc = { entities: Array<{ added?: KeyedNode[]; nestedStructure?: StructurePaths }> };
+type MemberRows = Record<string, { added?: unknown; own?: unknown } | null | undefined>;
+export type TemplateKeyDoc = { entities: Array<{ added?: KeyedNode[]; nestedStructure?: StructurePaths; members?: MemberRows }> };
 
-/** Every template key a prefab document declares — its rows' `added`, their `nestedStructure[*].added`,
- *  and a reference node's own `added`/`nestedStructure`, recursively. Memoised per document object. */
+/** Every template key a prefab document declares — its rows' `added`, their `nestedStructure[*].added`
+ *  and `members` rows' nodes (prefab v6, #1533), and a reference node's own `added`/`nestedStructure`/`members`
+ *  (a template reference node carries rows too since #1538), recursively. Memoised per document object. */
 const keysByDoc = new WeakMap<object, string[]>();
 export function templateKeysOf(doc: TemplateKeyDoc): string[] {
   const memo = keysByDoc.get(doc);
@@ -36,12 +38,20 @@ export function templateKeysOf(doc: TemplateKeyDoc): string[] {
       nodes(n.children);
       nodes(n.added);
       structure(n.nestedStructure);
+      rows(n.members);
     }
+  };
+  const rows = (members: MemberRows | undefined): void => {
+    for (const row of Object.values(members ?? {})) nodes(memberRowNodes(row) as KeyedNode[]);
   };
   const structure = (paths: StructurePaths | undefined): void => {
     for (const delta of Object.values(paths ?? {})) nodes(delta?.added);
   };
-  for (const pe of doc.entities ?? []) { nodes(pe.added); structure(pe.nestedStructure); }
+  for (const pe of doc.entities ?? []) {
+    nodes(pe.added);
+    structure(pe.nestedStructure);
+    rows(pe.members);
+  }
   keysByDoc.set(doc, keys);
   return keys;
 }
@@ -79,10 +89,10 @@ export interface KeyRecoveryNode {
   /** Its template key if it still carries the marker, else ''. */
   key: string;
   pi: { localId?: number; parentLocalId?: number } | null;
-  /** The steps between its identity parent and its own step, when its home was deleted or unpacked (#1437 —
-   *  `PrefabInstance.homeSteps`). `parentId` is its IDENTITY parent: its home, for a member moved inside its
-   *  instance — the chain its guid was derived along. */
-  extra?: number[];
+  /** The steps between its identity parent and its own step: the template rows between that are gone —
+   *  deleted or unpacked (#1437). `parentId` is its IDENTITY parent: its template parent, for a member moved
+   *  inside its instance (`core/ecs/identityParents.ts`) — the chain its guid was derived along. */
+  extra?: MemberStep[];
 }
 
 /** The template key the node `ecsId` was spawned with, recovered from its guid. `''` when nothing
@@ -108,7 +118,7 @@ export function recoverTemplateKey(
   if (!keys.size) return '';
   const self = nodeOf(ecsId);
   if (!self?.guid) return '';
-  const steps: (number | string)[] = [];
+  const steps: MemberStep[] = [];
   let cur = self.parentId;
   const seen = new Set<number>([ecsId]);
   while (cur && !seen.has(cur)) {
@@ -124,8 +134,7 @@ export function recoverTemplateKey(
     // This ancestor is on the path, not the anchor: prepend its step, as the derive pass does. A
     // prefab member steps by its localId. A keyed REFERENCE root that lost its marker (#1438) never
     // reaches this line in the loader: it is a stored root, so `isTop` already tried it as the anchor.
-    const step = node.key ? addedKeyStep(node.key)
-      : node.pi ? memberStepId(node.pi)
+    const step = node.key || node.pi ? entityStep(node.pi, node.key)
       : (() => { const k = recoverTemplateKey(cur, nodeOf, keys, memo, isTop); return k ? addedKeyStep(k) : 0; })();
     steps.unshift(...(node.extra ?? []), step);
     cur = node.parentId;

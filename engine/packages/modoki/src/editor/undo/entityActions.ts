@@ -17,8 +17,9 @@ import { planCopyGuids } from '../../runtime/core/copyIdentity';
 import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
-import { endFrames, relinkDetachedMembers, homeStepsOf, identityParentId, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
-import { memberStepId } from '../../runtime/core/assetRefRules';
+import { endFrames, relinkDetachedMembers, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
+import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader, frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../../runtime/core/ecs/identityParents';
+import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
@@ -385,6 +386,11 @@ export interface EntitySnapshot {
    *  sees (#1427). Restored by an undo's respawn; a copy drops them (`regenerateSnapshotGuids`), all
    *  but the template key of a node inside a copied whole instance (#1430). */
   markers?: CarriedMarkers;
+  /** The document its frame was expanded from, when it is a prefab-instance root with a record of its own
+   *  (#1483). A respawn is a new entity, so the record keyed by the old one does not reach it; without this a
+   *  duplicated, pasted or undo-restored instance read as expanded from whatever the cache holds, and the
+   *  stale-frame guards could not see it. A copy keeps it too: it was built from the same document. */
+  frameDoc?: { source: string; doc: TemplateDoc };
 }
 
 export function snapshotEntity(entityId: number): EntitySnapshot | null {
@@ -407,10 +413,12 @@ export function snapshotEntity(entityId: number): EntitySnapshot | null {
   const children = childEntities.map(c => snapshotEntity(c.id)).filter((s): s is EntitySnapshot => s !== null);
   const marks = getOverrideMarkSet(entity);
   const markers = captureMarkers(entity);
+  const frameDoc = frameRootDoc(getCurrentWorld(), entity);
   return {
     id: entityId, traits, children,
     ...(marks && marks.size > 0 ? { marks: [...marks] } : {}),
     ...(markers ? { markers } : {}),
+    ...(frameDoc ? { frameDoc } : {}),
   };
 }
 
@@ -435,7 +443,7 @@ export function regenerateSnapshotGuids(snapshot: EntitySnapshot): EntitySnapsho
     const tk = s.markers?.TemplateAddedKey;
     return tk && tk !== true && typeof tk.key === 'string' ? tk.key : '';
   };
-  const { guidOf, remap, keyed } = planCopyGuids(snapshot, (s) => s.children, dataOf, (s) => s.id, newGuid, keyOf);
+  const { guidOf, remap, keyed } = planCopyGuids(snapshot, (s) => s.children, dataOf, (s) => s.id, newGuid, keyOf, frameDocReader(getCurrentWorld()));
   // Once every new guid is known: a parent's ref can name a child and vice versa.
   // A copy is a new identity, so it carries no unregistered markers (`carriedMarkers.ts`) — except
   // the template key of a node the plan derived through it, inside a copy of a whole instance (#1430).
@@ -511,7 +519,7 @@ export function clearOwnedNestedStampFromSnapshot(snapshot: EntitySnapshot): Ent
       if (!((data.parentLocalId as number) || 0)) return t;
       // New object rather than a mutation: the snapshot is retained by the undo entry and replayed
       // on redo, so mutating it in place would edit the recorded action too.
-      return { ...t, data: { ...data, parentLocalId: 0, homeParent: '', homeSteps: '' } }; // a stored root has no row parent to go home to (#1437)
+      return { ...t, data: { ...data, parentLocalId: 0, parentNodeGuid: '', ownerGuid: '' } }; // a stored root has no row, so no owner (#1437/#1468)
     }),
   };
 }
@@ -539,6 +547,7 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
     clearOverrideMarks(entity);
     if (snap.marks) restoreOverrideMarks(entity, snap.marks);
     restoreMarkers(entity, snap.markers);
+    if (snap.frameDoc) noteFrameRootDoc(getCurrentWorld(), entity, snap.frameDoc);
     const id = entity.id();
     idMap.set(snap.id, id);
     spawned.push([snap, id]);
@@ -880,34 +889,6 @@ function decomposeMatrix(mat: THREE.Matrix4): { x: number; y: number; z: number;
   return { x: pos.x, y: pos.y, z: pos.z, rx: euler.x, ry: euler.y, rz: euler.z, sx: scale.x, sy: scale.y, sz: scale.z };
 }
 
-/** Is `parentId` the position a member with this home (`homeParent` + `homeSteps`) started at — its row
- *  parent? With no steps, that is the home itself. With steps, it is the entity the steps lead to: the
- *  parent's own identity path, climbed until it reaches the home, must spell exactly those steps (#1437). */
-function isHomePosition(parentId: number, homeParent: string, steps: number[]): boolean {
-  const piMeta = getTraitByName('PrefabInstance');
-  const eaMeta = getTraitByName('EntityAttributes');
-  if (!eaMeta) return false;
-  const guidOf = (id: number) => (readTraitData(id, eaMeta)?.guid as string) || '';
-  if (!steps.length) return !!parentId && guidOf(parentId) === homeParent;
-  const idOfGuid = (g: string) => findEntityByGuid(g)?.id();
-  let acc: number[] = [];
-  for (let cur = parentId, n = 0; cur && n < 10_000; n++) {
-    const pi = piMeta ? findEntity(cur)?.get(piMeta.trait) as { homeParent?: string; homeSteps?: string; localId?: number; parentLocalId?: number } | undefined : undefined;
-    if (!pi) return false;
-    acc = [...homeStepsOf(pi), memberStepId(pi), ...acc];
-    if (acc.length > steps.length) return false;
-    const up = identityParentId((readTraitData(cur, eaMeta)?.parentId as number) || 0, pi.homeParent, idOfGuid);
-    if (acc.length === steps.length) return guidOf(up) === homeParent && acc.every((s, i) => s === steps[i]);
-    cur = up;
-  }
-  return false;
-}
-function writeHome(id: number, home: { homeParent: string; homeSteps: string }): void {
-  const piMeta = getTraitByName('PrefabInstance');
-  const e = piMeta ? findEntity(id) : undefined;
-  if (e?.has(piMeta!.trait)) e.set(piMeta!.trait, { ...(e.get(piMeta!.trait) as Record<string, unknown>), ...home });
-}
-
 /** The root of the OUTERMOST prefab instance `nodeId` sits in: the instance root of its topmost ancestor
  *  (itself included) that carries `PrefabInstance`, or 0 when none does. A member moved anywhere under the
  *  same outermost instance stays linked, across nested instances and scene-added nodes alike (#1437). */
@@ -939,19 +920,19 @@ function planMoveUnlinks(entityId: number, newParentId: number): { strip: number
   const leaving = outermostInstanceRoot(newParentId) !== top;
   const all = getAllEntities();
   const inSub = new Set(collectSubtreeIds(all.map((e) => [e.id, e.parentId] as const), [entityId]));
-  const byGuid = new Map(all.filter((e) => e.guid).map((e) => [e.guid!, e.id]));
+  // Where each entity's template puts it, and which instance owns each owned root — before the move.
+  const identity = worldIdentityParents(getCurrentWorld());
   const parentOf = new Map(all.map((e) => [e.id, e.parentId]));
   const strip: number[] = [];
   const promote: number[] = [];
   if (leaving) for (const e of all) {
-    const pi = findEntity(e.id)?.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number; homeParent?: string } | undefined;
+    const pi = findEntity(e.id)?.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number } | undefined;
     if (!pi) continue;
     const root = pi.rootInstanceId || 0;
-    if (root === e.id && !pi.parentLocalId) continue; // a stored root
-    if (root === e.id) {
-      // An owned nested root belongs to the instance of the member its row hangs under — its identity parent.
-      const rowParent = identityParentId(parentOf.get(e.id) ?? 0, pi.homeParent, (g) => byGuid.get(g));
-      const owner = (findEntity(rowParent)?.get(piMeta.trait) as { rootInstanceId?: number } | undefined)?.rootInstanceId || 0;
+    if (isStoredRoot(pi, e.id)) continue; // a stored root
+    if (isOwnedRoot(pi, e.id)) {
+      // An owned nested root belongs to the instance whose row expanded it — its owner.
+      const owner = identity.ownerOf(e.id);
       if (owner && inSub.has(owner) !== inSub.has(e.id)) promote.push(e.id);
     } else if (root && inSub.has(root) !== inSub.has(e.id)) {
       strip.push(e.id);
@@ -968,7 +949,7 @@ function planMoveUnlinks(entityId: number, newParentId: number): { strip: number
   const stripped = new Set(strip);
   const after = new Map(parentOf);
   after.set(entityId, newParentId);
-  const piOf = (id: number) => findEntity(id)?.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number; homeParent?: string } | undefined;
+  const piOf = (id: number) => findEntity(id)?.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number } | undefined;
   /** The outermost instance `id` sits INSIDE after the move: the root of its topmost linked ancestor, not counting
    *  its own link or one this plan strips; 0 when none. */
   const topAbove = (id: number): number => {
@@ -989,18 +970,18 @@ function planMoveUnlinks(entityId: number, newParentId: number): { strip: number
       if (promoted.has(root)) return root;
       const rp = piOf(root);
       if (!rp?.parentLocalId) return root; // a stored root
-      const rowParent = identityParentId(parentOf.get(root) ?? 0, rp.homeParent, (g) => byGuid.get(g));
-      root = piOf(rowParent)?.rootInstanceId || 0;
+      root = identity.ownerOf(root);
     }
     return 0;
   };
   /** Whether the save cannot write `id` as linked where the move leaves it: its identity parent is unpacked, or it
    *  sits above its frame, or outside its outermost. The first is close-out review 3: a live child of an unpacked
-   *  member has no identity walk left — `rehomeDependents` re-points only a recorded home — so an owned root there
-   *  reloaded as a stored one under new guids, and a member reloaded plain while the editor still showed it linked. */
+   *  member that never moved (so it sits at its row) — an owned root there reloaded as a stored one under new
+   *  guids, and a member reloaded plain while the editor still showed it linked. (It read "no recorded home"
+   *  before #1468 Phase 6; "not moved" is the same set, now read from the document.) */
   const unwritable = (id: number): boolean => {
     const pi = piOf(id);
-    if (pi && !pi.homeParent && stripped.has(parentOf.get(id) ?? 0)) return true;
+    if (pi && !identity.moved(id) && stripped.has(parentOf.get(id) ?? 0)) return true;
     const frame = frameOf(id);
     if (!frame || frame === id) return false;
     const seen = new Set<number>();
@@ -1019,7 +1000,7 @@ function planMoveUnlinks(entityId: number, newParentId: number): { strip: number
       const rp = piOf(root);
       if (!rp?.parentLocalId) break; // a stored root
       out.push(root);
-      root = piOf(identityParentId(parentOf.get(root) ?? 0, rp.homeParent, (g) => byGuid.get(g)))?.rootInstanceId || 0;
+      root = identity.ownerOf(root);
     }
     return out;
   };
@@ -1034,7 +1015,7 @@ function planMoveUnlinks(entityId: number, newParentId: number): { strip: number
   // only grow, so it ends.
   const linkedMember = (id: number): boolean => {
     const pi = piOf(id);
-    return !!pi?.rootInstanceId && !(pi.rootInstanceId === id && !pi.parentLocalId) && !promoted.has(id) && !stripped.has(id);
+    return !!pi?.rootInstanceId && !isStoredRoot(pi, id) && !promoted.has(id) && !stripped.has(id);
   };
   const ancestorsAfter = (id: number): number[] => {
     const out: number[] = [];
@@ -1062,15 +1043,16 @@ function planMoveUnlinks(entityId: number, newParentId: number): { strip: number
  *  (`captureInstanceOverrides`), so an unmarked compensated field reloaded at the prefab's value and the
  *  entity jumped (#1436 review: a root dropped under a moved parent reloaded at that parent's origin).
  *  Marks each field the compensation changed — on a STORED instance root only (top-level or user-added).
- *  A member moved inside its own instance needs no mark: while it carries `PrefabInstance.homeParent` the
+ *  A member moved inside its own instance needs no mark: while it sits away from its template parent the
  *  save writes every Transform field that differs from the base (`captureInstanceOverrides`, #1437), and
- *  once it is moved back home nothing is left pinned. A mark would outlive the move and pin the pose. */
+ *  once it is moved back nothing is left pinned. A mark would outlive the move and pin the pose. The same
+ *  holds for an OWNED nested root, whose "away from its template parent" is asked of its owner's frame
+ *  (`ownedRootMoved`, #1481). */
 function markCompensatedTransform(id: number, oldLocal: Record<string, unknown>, newLocal: Record<string, number>): void {
   const piMeta = getTraitByName('PrefabInstance');
   const entity = findEntity(id);
   if (!piMeta || !entity?.has(piMeta.trait)) return;
-  const pi = entity.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number };
-  if (pi.rootInstanceId !== id || (pi.parentLocalId || 0) > 0) return;
+  if (!isStoredRoot(entity.get(piMeta.trait) as MemberPi, id)) return;
   for (const f of Object.keys(newLocal)) {
     if (Math.abs(newLocal[f]! - Number(oldLocal[f] ?? 0)) > 1e-6) markOverride(entity, 'Transform', f);
   }
@@ -1158,6 +1140,10 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // drop into ANOTHER instance read as staying inside the one it had left.
   const detachPlan = parentChanged ? planMoveUnlinks(entityId, newParentId) : null;
 
+  // An OWNED nested root records which instance's row it is BEFORE it leaves: after the write its live parent
+  // no longer says (`identityParents.ts`). Kept across the undo — back at its row, the link and the live parent
+  // agree. (A plain member records nothing: its template parent is read from the document.)
+  if (parentChanged) linkOwnerBeforeMove(getCurrentWorld(), entityId);
   if (parentChanged) writeTraitField(entityId, attrMeta, 'parentId', newParentId);
   if (newSortOrder !== undefined) writeTraitField(entityId, attrMeta, 'sortOrder', newSortOrder);
   if (clearFolder) writeTraitField(entityId, attrMeta, 'editorFolder', '');
@@ -1231,20 +1217,8 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   const oldParentRef = oldParentId ? entityRef(oldParentId) : null;
   const newParentRef = newParentId ? entityRef(newParentId) : null;
   if (detaching) applyDetach();
-  // A member that STAYS linked remembers the row parent it left (`PrefabInstance.homeParent`, #1437), so
-  // every identity walk still derives it — and everything below it — from there. Moving it back clears it.
-  // Both fields move together — `homeSteps` qualifies `homeParent`, and an undo that restored one without the
-  // other would leave the member walking a path it never had.
-  let oldHome = { homeParent: '', homeSteps: '' };
-  let newHome = oldHome;
-  const movedPiNow = parentChanged && piMeta ? findEntity(entityId)?.get(piMeta.trait) as Record<string, unknown> | undefined : undefined;
-  const tracksHome = !!movedPiNow && !(movedPiNow.rootInstanceId === entityId && !((movedPiNow.parentLocalId as number) || 0));
-  if (tracksHome) {
-    oldHome = { homeParent: (movedPiNow!.homeParent as string) || '', homeSteps: (movedPiNow!.homeSteps as string) || '' };
-    const home = oldHome.homeParent ? oldHome : { homeParent: (readTraitData(oldParentId, attrMeta)?.guid as string) || '', homeSteps: '' };
-    newHome = home.homeParent && !isHomePosition(newParentId, home.homeParent, homeStepsOf(home)) ? home : { homeParent: '', homeSteps: '' };
-    if (newHome.homeParent !== oldHome.homeParent || newHome.homeSteps !== oldHome.homeSteps) writeHome(entityId, newHome);
-  }
+  // A member that STAYS linked keeps deriving from the row parent it left (#1437) with nothing recorded on it:
+  // every identity walk reads its template parent from the document (`identityParents.ts`, #1468 Phase 6).
   if (oldLocal && newLocal) markCompensatedTransform(entityId, oldLocal, newLocal);
   markStructureDirty();
 
@@ -1271,7 +1245,6 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       writeTraitField(id, attrMeta!, 'sortOrder', oldSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', oldFolder);
       if (savedOldLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedOldLocal[f]); }
-      if (tracksHome) writeHome(id, oldHome);
       putBackMarks(id, oldMarks);
       markStructureDirty();
     },
@@ -1282,7 +1255,6 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', '');
       if (savedNewLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedNewLocal[f]); }
       if (detaching) applyDetach(); // re-strip after the move
-      if (tracksHome) writeHome(id, newHome);
       if (savedOldLocal && savedNewLocal) markCompensatedTransform(id, savedOldLocal, savedNewLocal);
       markStructureDirty();
     },
@@ -1644,7 +1616,7 @@ function sceneMovePrefabRefusal(entityId: number, piMeta: TraitMeta): 'instance-
     const owner = pd.rootInstanceId as number;
     if (!moving.has(owner)) return 'instance-member';
     // An owned nested root is owned by the instance its PARENT belongs to; that one has to move too.
-    const ownedNested = owner === id && (pd.parentLocalId || 0) > 0;
+    const ownedNested = isOwnedRoot(pd, id);
     if (ownedNested && !moving.has(byId.get(id)?.parentId ?? 0)) return 'instance-member';
   }
   return null;

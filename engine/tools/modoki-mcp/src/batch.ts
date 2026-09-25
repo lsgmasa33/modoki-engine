@@ -29,6 +29,9 @@ import { z, type ZodRawShape } from 'zod';
 import type { ToolResult } from './result.js';
 import { getTool as defaultGetTool, toolNames } from './registry.js';
 import { CONTRACTS } from './contracts.js';
+import { unknownParamMessage } from '../../shared/unknownParam.js';
+import { coerceStringEncoded, decodeStringEncoded, NOT_DECODED } from '../../shared/coerceArgs.js';
+import { aimAddresses, ambiguousAimMessage } from '../../shared/aimAddresses.js';
 
 /** How much of a step's payload comes back. See the module header for why `'none'` is safe. */
 export type ResultMode = 'none' | 'ack' | 'full';
@@ -186,9 +189,9 @@ function usesRawXY(tool: string, args: Record<string, unknown>): string | null {
   const hasXY = (o: unknown): boolean =>
     !!o && typeof o === 'object' && typeof (o as { x?: unknown }).x === 'number'
       && typeof (o as { y?: unknown }).y === 'number';
-  // An entity/selector/label aim WINS over stray coordinates in `resolvePoint`, so coordinates
-  // sitting beside one are inert and must not trip this. Only a call that would actually BE
-  // coordinate-aimed is refused.
+  // Coordinates beside an entity/selector/label are not a RAW-coordinate aim, which is all this
+  // guard is about: `resolvePoint` refuses that pair itself as AMBIGUOUS (#1556 — it used to let the
+  // aim win and drop the coordinates). Only a call that would actually BE coordinate-aimed is refused.
   const aimed = (o: unknown): boolean =>
     !!o && typeof o === 'object'
       && (!!(o as { selector?: string }).selector
@@ -201,6 +204,30 @@ function usesRawXY(tool: string, args: Record<string, unknown>): string | null {
   for (const end of ['from', 'to'] as const) {
     const spec = args[end];
     if (hasXY(spec) && !aimed(spec)) return `${end}.x/y`;
+  }
+  return null;
+}
+
+/** A step whose aim gives two addresses (#1556) — the route refuses it `AMBIGUOUS`, so refuse it HERE,
+ *  before step 1 runs: a batch is not a transaction, and failing at step N leaves 1..N-1 applied. Same
+ *  predicate as the routes (`shared/aimAddresses.ts`); `drag_handle` checks its destination. */
+function twoAddressAim(tool: string, args: Record<string, unknown>): string | null {
+  // `modoki_focus` aims by label OR selector and has its OWN rule on the route (`/api/input/focus`:
+  // both present, by `!== undefined`) — mirrored here rather than `aimAddresses`, so the pre-flight
+  // and the route cannot disagree (second close-out review: it slipped through to step N).
+  if (tool === 'modoki_focus') {
+    return args.label !== undefined && args.selector !== undefined ? 'give a label OR a selector, not both' : null;
+  }
+  const where = XY_AIMED[tool];
+  if (!where) return null;
+  if (where === 'to') {
+    const dest = (['to', 'toId', 'delta'] as const).filter((k) => !!args[k]);
+    return dest.length > 1 ? `give ONE destination of to, toId or delta — this step gave ${dest.join(' AND ')}` : null;
+  }
+  const specs: Array<[string, unknown]> = where === 'top' ? [['', args]] : [['from', args.from], ['to', args.to]];
+  for (const [end, spec] of specs) {
+    const msg = ambiguousAimMessage(aimAddresses(spec && typeof spec === 'object' ? spec as Record<string, unknown> : null));
+    if (msg) return `${end ? `${end}: ` : ''}${msg}`;
   }
   return null;
 }
@@ -235,7 +262,9 @@ type PreflightResult = { rejected: string } | { tools: string[] };
 function preflight(input: BatchInput, getTool: typeof defaultGetTool): PreflightResult {
   const { steps } = input;
   if (!Array.isArray(steps) || steps.length === 0) return { rejected: 'batch: `steps` must be a non-empty array.' };
-  if (steps.length > MAX_STEPS) return { rejected: `batch: ${steps.length} steps exceeds the cap of ${MAX_STEPS}.` };
+  // Each cap refusal names the next move, not just the limit (#1558): measured, every cap refusal
+  // was followed by a re-sent batch, so the one line that says HOW to get under it is the fix.
+  if (steps.length > MAX_STEPS) return { rejected: `batch: ${steps.length} steps exceeds the cap of ${MAX_STEPS} — split it into ${Math.ceil(steps.length / MAX_STEPS)} batches; nothing ran.` };
 
   /** The resolved name PER STEP, handed to the executor — see PreflightResult. */
   const resolved: string[] = [];
@@ -265,9 +294,13 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
     const args = (step.args ?? {}) as Record<string, unknown>;
 
     if (tool === WAIT) {
-      const ms = args.ms;
+      // A string-encoded `ms` is decoded like any other tool's number (#1560) — and written back,
+      // because the executor sleeps on `step.args.ms`.
+      const decodedMs = typeof args.ms === 'string' ? decodeStringEncoded(args.ms, 'number') : args.ms;
+      if (decodedMs !== args.ms && decodedMs !== NOT_DECODED) step.args = { ...args, ms: decodedMs };
+      const ms = decodedMs;
       if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return { rejected: `batch: ${at}: wait needs {ms: <number ≥ 0>}.` };
-      if (ms > MAX_WAIT_MS) return { rejected: `batch: ${at}: wait ms ${ms} exceeds the cap of ${MAX_WAIT_MS}.` };
+      if (ms > MAX_WAIT_MS) return { rejected: `batch: ${at}: wait ms ${ms} exceeds the cap of ${MAX_WAIT_MS} — to wait UNTIL something appears or changes, use a modoki_wait_for step instead of a longer sleep; nothing ran.` };
       continue;
     }
     if (DENIED.has(tool)) {
@@ -279,8 +312,6 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
       return { rejected: `batch: ${at}: unknown tool — ${known} tools are registered, and nothing ran. `
         + `Check the name; the \`modoki_\` prefix is optional, so this is not a prefix problem.` };
     }
-    const rawXY = usesRawXY(tool, args);
-    if (rawXY) return { rejected: `batch: ${at}: raw ${rawXY} aiming is not allowed inside a batch — ${AIM_HINT}` };
 
     // STRICT: an unknown key is an error here, not something to strip.
     //
@@ -292,16 +323,35 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
     // batch, because there is no intermediate response to notice it in. (The
     // `timeScale`-instead-of-`scale` typo WAS caught the same day — but only because `scale` is
     // required; an all-optional schema catches nothing.)
-    const parsed = z.object(entry.shape as ZodRawShape).strict().safeParse(args);
+    // String-encoded values are decoded first (#1560), as a direct call's are by
+    // `installArgCoercion` — and written BACK onto the step, because the step runs on `step.args`.
+    const schema = z.object(entry.shape as ZodRawShape).strict();
+    const decoded = coerceStringEncoded(schema, args);
+    if (decoded !== args) step.args = decoded;
+    // ⚠️ AFTER decoding, on what the step will actually RUN with (#1560 review): checked on the raw
+    // args, `{x:'100', y:'200'}` was not "a number" to `usesRawXY`, passed, and then decoded into the
+    // raw-coordinate tap this rule exists to refuse.
+    const rawXY = usesRawXY(tool, decoded);
+    if (rawXY) return { rejected: `batch: ${at}: raw ${rawXY} aiming is not allowed inside a batch — ${AIM_HINT}` };
+    const parsed = schema.safeParse(decoded);
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
       const where = issue.path.join('.') || '(root)';
-      const known = Object.keys(entry.shape).join(', ');
-      // Name the accepted keys on an unrecognized-key error: the whole failure is "you used a name
-      // this tool doesn't have", so the answer is the list of names it does.
-      const extra = issue.code === 'unrecognized_keys' ? ` — accepted params: ${known}` : '';
-      return { rejected: `batch: ${at}: invalid args — ${where}: ${issue.message}${extra}` };
+      // A TOP-LEVEL unknown key gets the same refusal a direct call does (`shared/unknownParam.ts`):
+      // the key, where it belongs when a nested param declares it, and the accepted params. A
+      // nested one keeps zod's text, which already names the key beside its path.
+      if (issue.code === 'unrecognized_keys' && issue.path.length === 0) {
+        return { rejected: `batch: ${at}: invalid args — ${unknownParamMessage(entry.name, entry.shape as Record<string, unknown>, issue.keys)}` };
+      }
+      return { rejected: `batch: ${at}: invalid args — ${where}: ${issue.message}` };
     }
+    // AFTER the strict parse (second close-out review): a key the tool does not take — a `label` on a
+    // dnd endpoint, a `label:null` — must be named as THAT, not as two addresses whose advice ("keep
+    // one") leads straight into the schema refusal. Still before any step runs.
+    // On the DECODED args, like `usesRawXY` above: a JSON-string endpoint holding two addresses must
+    // not slip past as a non-object and then decode into one (#1560 merge follow-up).
+    const twoAddresses = twoAddressAim(tool, decoded);
+    if (twoAddresses) return { rejected: `batch: ${at}: AMBIGUOUS — ${twoAddresses} Nothing ran.` };
   }
   return { tools: resolved };
 }

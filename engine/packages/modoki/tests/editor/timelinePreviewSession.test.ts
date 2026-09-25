@@ -11,10 +11,11 @@
  *  The session now backs BOTH preview panels (Timeline + Animation), so the rebind is a callback
  *  supplied by the caller rather than a timeline path. */
 
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
   scenePath: 'A.json' as string | null,
+  livePath: null as string | null,   // SceneManager's live path, when it differs from the editor's file path
   snapshots: [] as unknown[],
   loadCalls: [] as { path: string; preloaded: unknown }[],
   resolvedRoot: 42 as number | null,
@@ -22,13 +23,15 @@ const h = vi.hoisted(() => ({
   loadGate: null as Promise<void> | null,
   loadGates: [] as Promise<void>[],
   serializeGate: null as Promise<void> | null,
+  beforeLoad: null as (() => Promise<unknown> | null) | null,   // what playMode registers with serialize.loadScene
 }));
 
 vi.mock('../../src/editor/scene/serialize', () => ({
+  registerBeforeSceneLoad: (fn: () => Promise<unknown> | null) => { h.beforeLoad = fn; },
   serializeScene: async () => {
     if (h.serializeGate) await h.serializeGate;
     if (h.failSerialize) throw new Error('serialize failed');
-    const s = { snap: h.snapshots.length }; h.snapshots.push(s); return s;
+    const s = { snap: h.snapshots.length, entities: [] }; h.snapshots.push(s); return s;
   },
   getCurrentScenePath: () => h.scenePath,
   sceneLoadGeneration: () => 0,
@@ -45,7 +48,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
     },
     getNext: () => null,
     getLoadedScenes: () => new Map(),
-    getCurrent: () => ({ path: h.scenePath }),
+    getCurrent: () => ({ path: h.livePath ?? h.scenePath }),
   },
 }));
 // NOTE: no openAssetInEditor mock — the controller no longer resolves a root itself; each panel
@@ -64,20 +67,35 @@ import {
 } from '../../src/editor/undo/undoManager';
 import { setRunMode } from '../../src/runtime/core/playState';
 import { onAuthoringSettled } from '../../src/editor/scene/authoringSettle';
-import { openPreviewSessionThen, reopenPreviewAfterRestore } from '../../src/editor/scene/openPreviewSession';
-import { capturePreviewGesture, whenPreviewRestoresLanded } from '../../src/editor/scene/timelinePreview';
+import { openPreviewSessionThen, openPlaybackSession, reopenPreviewAfterRestore } from '../../src/editor/scene/openPreviewSession';
+import { capturePreviewGesture, whenPreviewRestoresLanded, poseEnvelopeHeld } from '../../src/editor/scene/timelinePreview';
 import { createTeardownToken } from '../../src/runtime/core/liveness';
-import { enterScrubMode, exitPreviewMode, aSceneSwapIsHappening, stopPlay, enterPlay } from '../../src/editor/scene/playMode';
+import { enterScrubMode, exitPreviewMode, aSceneSwapIsHappening, stopPlay, enterPlay, enterPreviewMode, getModeOwner, registerModeOwnerDisplaced, freezePreviewIfOwnedBy } from '../../src/editor/scene/playMode';
 import { getPlayState } from '../../src/runtime/core/playState';
 import { getRunMode } from '../../src/runtime/core/playState';
+import { getBusVolumes, setBusVolume } from '../../src/runtime/audio/audioService';
+
+// The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing),
+// and a begin during Play is refused (#1546) — so the premise is set, not inherited from test order.
+beforeEach(() => { setRunMode('stopped'); });
 
 afterEach(async () => {
   // End any dangling session so the module-level snapshot doesn't leak to the next test.
   if (hasTimelinePreviewSession()) await endTimelinePreviewSession({ restore: false });
+  // A case whose restore THREW leaves the world flagged "not authored" (#1548) until a world swap —
+  // which the stubbed SceneManager never makes. Make one, as a real reload from disk would.
+  const { lastRestoreFailed } = await import('../../src/editor/scene/authoredSnapshot');
+  if (lastRestoreFailed()) {
+    const { createWorld } = await import('koota');
+    const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/worldRegistry');
+    const before = getCurrentWorld();
+    const scratch = createWorld();
+    setCurrentWorld(scratch); setCurrentWorld(before); scratch.destroy();
+  }
   setTimelinePreviewActive(false);
   clearSkeletalSeeks();
   clearControlSpawns();
-  h.scenePath = 'A.json'; h.snapshots = []; h.loadCalls = []; h.resolvedRoot = 42;
+  h.scenePath = 'A.json'; h.livePath = null; h.snapshots = []; h.loadCalls = []; h.resolvedRoot = 42;
   h.failSerialize = false; h.loadGate = null; h.loadGates = []; h.serializeGate = null;
   setRunMode('stopped');
 });
@@ -445,10 +463,24 @@ describe('a begin during a restore is refused (#1167)', () => {
     expect(h.snapshots).toHaveLength(2);
   });
 
-  it('ACCEPT SIDE: a restore whose load THROWS still releases the refusal', async () => {
+  it('ACCEPT SIDE: a restore whose load THROWS still releases the in-flight refusal — and the failure refuses on its own until a swap', async () => {
+    const { isPreviewRestoreInFlight } = await import('../../src/editor/scene/timelinePreview');
     await beginTimelinePreviewSession();
     h.loadGates = [Promise.reject(new Error('load failed'))];
     await expect(endTimelinePreviewSession({ restore: true })).rejects.toThrow('load failed');
+    // #1167's point: the in-flight counter is released on a throw, or every later begin is refused for good.
+    expect(isPreviewRestoreInFlight()).toBe(false);
+    // ⚠️ This case used to expect the begin to OPEN here. Since #1548's re-review it must not: the failed
+    // restore may have left the posed world live, and a session opened now would snapshot that pose as
+    // "authored" — then its own successful restore (a world swap) would clear the guard and let a save
+    // write it. MUTATION TARGET: drop `lastRestoreFailed()` from beginTimelinePreviewSession.
+    expect(await beginTimelinePreviewSession()).toBe(false);
+    // …until a world swap (a reload from disk) replaces the possibly-posed world.
+    const { createWorld } = await import('koota');
+    const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/worldRegistry');
+    const before = getCurrentWorld();
+    const scratch = createWorld();
+    setCurrentWorld(scratch); setCurrentWorld(before); scratch.destroy();
     expect(await beginTimelinePreviewSession()).toBe(true);
   });
 
@@ -640,5 +672,631 @@ describe('reopenPreviewAfterRestore — the grab-while-playing chain (#1167 revi
     open(); await ending; await waiting;
     // MUTATION TARGET: never flush `_restoreWaiters` and this never resolves (the test times out).
     expect(landed).toBe(true);
+  });
+});
+
+describe('a preview session and Play never coexist (#1546)', () => {
+  it('a begin is refused while Play runs OR is paused — no snapshot of the running world is taken', async () => {
+    setRunMode('playing');
+    // MUTATION TARGET: drop the `getPlayState() !== 'stopped'` refusal from beginTimelinePreviewSession
+    // and this opens a session whose snapshot is the Play world — the one Exit later restored as authored.
+    expect(await beginTimelinePreviewSession()).toBe(false);
+    setRunMode('playing', { advancing: false }); // paused: Play's snapshot is still what Stop reverts to
+    expect(await beginTimelinePreviewSession()).toBe(false);
+    expect(h.snapshots).toHaveLength(0);
+    expect(hasTimelinePreviewSession()).toBe(false);
+    // ACCEPT SIDE: the same begin from 'stopped' opens.
+    setRunMode('stopped');
+    expect(await beginTimelinePreviewSession()).toBe(true);
+  });
+
+  it('a pose during Play goes into the Play envelope — no session, no mode claim', async () => {
+    const { poseClipAtTime } = await import('../../src/editor/animation/poseClip');
+    setRunMode('playing');
+    expect(poseEnvelopeHeld()).toBe(true);
+    const clip = { duration: 1, loop: false, frameRate: 30, tracks: [] } as never;
+    const r = await poseClipAtTime(clip, 1, 0.5, 'animation');
+    // MUTATION TARGET: drop the `poseEnvelopeHeld()` fast path in poseClipAtTime and this pose is
+    // REFUSED (the begin declines in Play) — scrubbing during Play would silently stop working.
+    expect(r.refused).toBeUndefined();
+    expect(r.openedSession).toBe(false);
+    expect(hasTimelinePreviewSession()).toBe(false);
+    expect(getRunMode()).toBe('playing');
+    // ACCEPT SIDE of the guard: back in 'stopped' with no session, nothing is held.
+    setRunMode('stopped');
+    expect(poseEnvelopeHeld()).toBe(false);
+  });
+
+  it('Play press over an Animation scrub: session restored, owner released AND told, and no session outlives Stop', async () => {
+    const displaced = vi.fn();
+    const unregister = registerModeOwnerDisplaced('animation', displaced);
+    try {
+      enterScrubMode('animation');
+      expect(await beginTimelinePreviewSession()).toBe(true);
+      await enterPlay();
+      expect(getPlayState()).toBe('playing');
+      expect(h.loadCalls).toHaveLength(1);                 // the scrub pose was reverted before Play's snapshot
+      expect(hasTimelinePreviewSession()).toBe(false);
+      // MUTATION TARGET: drop the run-mode listener's owner release and this stays 'animation' — the
+      // reviewers' repro, where the owner outlived Play and Stop.
+      expect(getModeOwner()).toBe(null);
+      // MUTATION TARGET: drop `notifyDisplaced` from the listener and the panel is never told — its
+      // ▶ loop keeps posing into the Play world.
+      expect(displaced).toHaveBeenCalledTimes(1);
+      // The panel's next tick during Play cannot open a session.
+      expect(await beginTimelinePreviewSession()).toBe(false);
+      await stopPlay();
+      expect(getPlayState()).toBe('stopped');
+      expect(hasTimelinePreviewSession()).toBe(false);
+    } finally { unregister(); }
+  });
+
+  it('a begin still serializing when Play is pressed is cancelled — it seats nothing', async () => {
+    let open!: () => void;
+    h.serializeGate = new Promise<void>((r) => { open = r; });
+    enterScrubMode('timeline');
+    const begin = beginTimelinePreviewSession();            // the first scrub move, mid-snapshot
+    await new Promise((r) => setTimeout(r, 0));
+    h.serializeGate = null;                                 // Play's own snapshot must not stall
+    const playing = enterPlay();
+    open();
+    // MUTATION TARGET: drop `cancelPendingPreviewBegins()` from takeDownPreviewEnvelope and this
+    // resolves true — a session seated under a running Play.
+    expect(await begin).toBe(false);
+    await playing;
+    expect(hasTimelinePreviewSession()).toBe(false);
+    await stopPlay();
+  });
+
+  it('a begin made DURING Play startup is refused — Play owns the world from the press', async () => {
+    let open!: () => void;
+    h.serializeGate = new Promise<void>((r) => { open = r; });   // Play's own snapshot, parked
+    const playing = enterPlay();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(getPlayState()).toBe('stopped');                      // still starting — the window
+    // MUTATION TARGET: drop `_closedHolds > 0` from beginTimelinePreviewSession and this opens a
+    // session that nothing will ever end (Stop ends Play's envelope only).
+    const begin = beginTimelinePreviewSession();
+    open(); h.serializeGate = null;
+    expect(await begin).toBe(false);
+    await playing;
+    expect(getPlayState()).toBe('playing');
+    expect(hasTimelinePreviewSession()).toBe(false);
+    await stopPlay();
+    // ACCEPT SIDE: the hold is released with Play started — a begin after Stop opens.
+    expect(await beginTimelinePreviewSession()).toBe(true);
+  });
+
+  it('toolbar Stop pressed while the first scrub is still snapshotting cancels that begin', async () => {
+    let open!: () => void;
+    h.serializeGate = new Promise<void>((r) => { open = r; });
+    enterScrubMode('animation');
+    const begin = beginTimelinePreviewSession();
+    await new Promise((r) => setTimeout(r, 0));
+    const stopping = stopPlay();
+    open();
+    await stopping;
+    // MUTATION TARGET: drop `cancelPendingPreviewBegins()` from takeDownPreviewEnvelope and this seats a
+    // session under 'stopped' — the pose chained onto it then runs where a save bakes it.
+    expect(await begin).toBe(false);
+    expect(hasTimelinePreviewSession()).toBe(false);
+    expect(getRunMode()).toBe('stopped');
+  });
+
+  it('toolbar Stop over an Animation ▶ tells the owner and drops its ▶ flag, not just the session', async () => {
+    const { useEditorStore } = await import('../../src/editor/store/editorStore');
+    const displaced = vi.fn(() => useEditorStore.getState().stopPreviewIfOwnedBy('animation'));
+    const unregister = registerModeOwnerDisplaced('animation', displaced);
+    try {
+      useEditorStore.getState().setPreviewPlaying(true, 'animation');
+      enterPreviewMode(true, 'animation');
+      expect(await beginTimelinePreviewSession()).toBe(true);
+      await stopPlay();
+      expect(h.loadCalls).toHaveLength(1);
+      expect(getRunMode()).toBe('stopped');
+      expect(displaced).toHaveBeenCalledTimes(1);
+      expect(useEditorStore.getState().isPreviewPlaying).toBe(false);
+    } finally { unregister(); useEditorStore.getState().setPreviewPlaying(false); }
+  });
+
+  it('a scene load out of a scrub releases the owner and abandons the session without restoring', async () => {
+    const { createWorld } = await import('koota');
+    const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/worldRegistry');
+    const displaced = vi.fn();
+    const unregister = registerModeOwnerDisplaced('animation', displaced);
+    const before = getCurrentWorld();
+    const next = createWorld();
+    try {
+      enterScrubMode('animation');
+      expect(await beginTimelinePreviewSession()).toBe(true);
+      // `serialize.loadScene`'s two effects, in its order: the mode drops, then the world swaps.
+      setRunMode('stopped');
+      expect(getModeOwner()).toBe(null);
+      expect(displaced).toHaveBeenCalledTimes(1);
+      setCurrentWorld(next);
+      // MUTATION TARGET: drop the session module's onWorldSwap abandon and the session stays held for
+      // the old world — every pose-guard reads "held" and poses the new world under 'stopped'.
+      expect(hasTimelinePreviewSession()).toBe(false);
+      expect(h.loadCalls).toHaveLength(0);                 // abandoned, NOT restored over the new scene
+    } finally { unregister(); setCurrentWorld(before); next.destroy(); }
+  });
+});
+
+/** #1569 — a begin still serializing when its envelope ends must seat nothing. Every teardown ends
+ *  only a HELD session, so the cancel lives on the mode transition out of scrub/preview instead. */
+describe('leaving the envelope cancels a begin still serializing (#1569)', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  function gate(): () => void {
+    let open!: () => void;
+    h.serializeGate = new Promise<void>((r) => { open = r; });
+    return () => { h.serializeGate = null; open(); };
+  }
+
+  it('a timeline switch mid-snapshot: the scrub seats nothing and its pose never runs', async () => {
+    const open = gate();
+    enterScrubMode('timeline');
+    const pose = vi.fn();
+    const scrub = openPreviewSessionThen('timeline', pose);
+    await tick();
+    exitPreviewMode('timeline');                          // TimelineEditor's open/switch effect, no session held yet
+    open();
+    // MUTATION TARGET: drop `cancelPendingPreviewBegins()` from playMode's run-mode listener and this
+    // resolves true — the reviewer's repro: a session held under 'stopped', owner null, pose applied.
+    expect(await scrub).toBe(false);
+    expect(pose).not.toHaveBeenCalled();
+    expect(hasTimelinePreviewSession()).toBe(false);
+    expect(getRunMode()).toBe('stopped');
+    expect(getModeOwner()).toBe(null);
+  });
+
+  it('a mode drop that bypasses exitPreviewMode (a scene load setting stopped) cancels it too', async () => {
+    const open = gate();
+    enterScrubMode('timeline');
+    const begin = beginTimelinePreviewSession();
+    await tick();
+    setRunMode('stopped');                                // what `serialize.loadScene` does to the mode
+    open();
+    expect(await begin).toBe(false);
+    expect(hasTimelinePreviewSession()).toBe(false);
+  });
+
+  it('the Animation ⏹ over a pose still snapshotting: refused, nothing applied, no session', async () => {
+    const { poseClipAtTime, exitPoseEnvelope } = await import('../../src/editor/animation/poseClip');
+    const open = gate();
+    const clip = { duration: 1, loop: false, frameRate: 30, tracks: [] } as never;
+    const posing = poseClipAtTime(clip, 1, 0.5, 'animation');   // enterScrubMode('animation') + begin
+    await tick();
+    expect((await exitPoseEnvelope(true)).exited).toBe(true);  // no session held → used to end nothing
+    open();
+    const r = await posing;
+    expect(r.refused).toBe(true);
+    expect(r.openedSession).toBe(false);
+    expect(hasTimelinePreviewSession()).toBe(false);
+    expect(getRunMode()).toBe('stopped');
+  });
+
+  it('Timeline ▶ claims the mode BEFORE its begin, so closing the panel in the gap cancels it', async () => {
+    const open = gate();
+    const playing = openPlaybackSession('timeline');
+    // MUTATION TARGET: drop `enterPreviewMode(false, owner)` from openPlaybackSession and the mode is
+    // still 'stopped' here — the unmount's exitPreviewMode below is a no-op and the begin seats.
+    expect(getRunMode()).toBe('preview');
+    expect(getModeOwner()).toBe('timeline');
+    expect(getPlayState()).toBe('stopped');                // frozen: a claim, not an advancing preview
+    await tick();
+    exitPreviewMode('timeline');                          // TimelineEditor's unmount cleanup
+    open();
+    expect(await playing).toBe(false);
+    expect(hasTimelinePreviewSession()).toBe(false);
+  });
+
+  it('ACCEPT SIDE: a Pause in the gap keeps the claim, so ▶ seats a paused preview', async () => {
+    const open = gate();
+    const playing = openPlaybackSession('timeline');
+    await tick();
+    freezePreviewIfOwnedBy('timeline');                   // the ▶ effect's cleanup on Pause
+    open();
+    expect(await playing).toBe(true);
+    expect(hasTimelinePreviewSession()).toBe(true);
+    expect(getRunMode()).toBe('preview');
+    exitPreviewMode('timeline');
+  });
+
+  it('a refused ▶ hands its claim back', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    h.failSerialize = true;
+    // MUTATION TARGET: drop the `handBackPreviewClaim` from openPlaybackSession and the mode stays
+    // pinned at 'preview' with no session — Cmd+S refused and no ⏹ to press.
+    expect(await openPlaybackSession('timeline')).toBe(false);
+    expect(getRunMode()).toBe('stopped');
+    expect(getModeOwner()).toBe(null);
+    expect(err).toHaveBeenCalled();
+    err.mockRestore();
+    h.failSerialize = false;
+  });
+
+  it('ACCEPT SIDE: scrub → preview with a begin pending cancels nothing — both are inside the envelope', async () => {
+    const open = gate();
+    enterScrubMode('timeline');
+    const begin = beginTimelinePreviewSession();
+    await tick();
+    enterPreviewMode(false, 'timeline');                  // ▶ pressed while the first scrub still snapshots
+    open();
+    // MUTATION TARGET: cancel on ANY run-mode change instead of on leaving the envelope and this is false.
+    expect(await begin).toBe(true);
+    exitPreviewMode('timeline');
+  });
+
+  it('a stale refusal does not take a LATER click\'s claim — the later click still poses', async () => {
+    const openFirst = gate();
+    enterScrubMode('timeline');
+    const pose1 = vi.fn();
+    const first = openPreviewSessionThen('timeline', pose1);
+    await tick();
+    exitPreviewMode('timeline');                          // a timeline switch cancels the first click
+    const openSecond = gate();                            // the second click's own snapshot
+    enterScrubMode('timeline');
+    const pose2 = vi.fn();
+    const second = openPreviewSessionThen('timeline', pose2);
+    await tick();
+    openFirst();
+    expect(await first).toBe(false);                      // cancelled, and resolves before the second seats
+    // MUTATION TARGET: hand the claim back unconditionally (plain `exitPreviewMode`) and the stale
+    // refusal drops the second click's scrub — which now cancels its begin, so its pose is lost.
+    expect(getRunMode()).toBe('scrub');
+    openSecond();
+    expect(await second).toBe(true);
+    expect(pose1).not.toHaveBeenCalled();
+    expect(pose2).toHaveBeenCalledTimes(1);
+    exitPreviewMode('timeline');
+  });
+
+  /** The same stale-refusal ordering for every OTHER hand-back site (close-out review: only the one
+   *  above was pinned, and plain `exitPreviewMode` at the other four stayed green). The stale caller
+   *  starts, its envelope ends, a later scrub claims and begins, then the stale begin lands — refused
+   *  or thrown — while the later one is still serializing. The later claim must survive it. */
+  async function laterClaimSurvives(
+    owner: 'timeline' | 'animation', startStale: () => Promise<unknown>, opts: { staleThrows: boolean },
+  ): Promise<void> {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const openStale = gate();
+      const stale = startStale().catch(() => 'threw');
+      await tick();
+      exitPreviewMode(owner);                             // a switch / unmount / ⏹ cancels it
+      const openLater = gate();
+      enterScrubMode(owner);
+      const pose = vi.fn();
+      const later = openPreviewSessionThen(owner, pose);
+      await tick();
+      h.failSerialize = opts.staleThrows;                 // read after the gate: only the stale one throws
+      openStale();
+      await stale;
+      h.failSerialize = false;
+      expect(getRunMode(), 'the stale refusal took the later claim').toBe('scrub');
+      openLater();
+      expect(await later).toBe(true);
+      expect(pose).toHaveBeenCalledTimes(1);
+      exitPreviewMode(owner);
+    } finally { err.mockRestore(); }
+  }
+
+  it('…a stale ▶ refusal (openPlaybackSession) — a same-Director timeline switch, then a scrub', async () => {
+    // MUTATION TARGET: plain `exitPreviewMode` in openPlaybackSession.
+    await laterClaimSurvives('timeline', () => openPlaybackSession('timeline'), { staleThrows: false });
+  });
+
+  it('…a stale scrub whose snapshot THROWS (openPreviewSessionThen reject branch)', async () => {
+    // MUTATION TARGET: plain `exitPreviewMode` in openPreviewSessionThen's reject handler.
+    await laterClaimSurvives('timeline', () => { enterScrubMode('timeline'); return openPreviewSessionThen('timeline', vi.fn()); }, { staleThrows: true });
+  });
+
+  it('…a stale Animation pose refused (poseClipAtTime !opened)', async () => {
+    const { poseClipAtTime } = await import('../../src/editor/animation/poseClip');
+    const clip = { duration: 1, loop: false, frameRate: 30, tracks: [] } as never;
+    // MUTATION TARGET: plain `exitPreviewMode` in poseClipAtTime's `!opened` branch.
+    await laterClaimSurvives('animation', () => poseClipAtTime(clip, 1, 0.5, 'animation'), { staleThrows: false });
+  });
+
+  it('…a stale Animation pose whose snapshot THROWS (poseClipAtTime catch)', async () => {
+    const { poseClipAtTime } = await import('../../src/editor/animation/poseClip');
+    const clip = { duration: 1, loop: false, frameRate: 30, tracks: [] } as never;
+    // MUTATION TARGET: plain `exitPreviewMode` in poseClipAtTime's catch.
+    await laterClaimSurvives('animation', () => poseClipAtTime(clip, 1, 0.5, 'animation'), { staleThrows: true });
+  });
+});
+
+/** #1572 — Stop sets 'stopped' BEFORE its restore lands, so a scrub in that window used to open a
+ *  session over a world the editor itself reports as not-authored. The mocked SceneManager never
+ *  swaps worlds, so a parked load here models the post-swap tail the session's own `onWorldSwap`
+ *  cannot cover: Persistent roots still at their Play values until the restore's replay. */
+describe('a begin during Stop\'s restore is refused (#1572)', () => {
+  // Drained after EVERY case, pass or fail: a red assertion otherwise leaves Stop's load parked on a
+  // promise nothing resolves, `authoredRestoreInFlight()` stays true, and every later case in the file
+  // fails with it (close-out review — a mutation run reported 5 failures where 2 were the target).
+  let parked: { open: () => void; stopping: Promise<unknown> } | null = null;
+  afterEach(async () => {
+    if (parked) { parked.open(); await parked.stopping; parked = null; }
+    if (getPlayState() !== 'stopped') await stopPlay();
+  });
+
+  async function stopWithRestoreParked(beforeStop?: () => void): Promise<{ open: () => void; stopping: Promise<unknown> }> {
+    await enterPlay();
+    expect(getPlayState()).toBe('playing');
+    beforeStop?.();
+    let open!: () => void;
+    h.loadGate = new Promise<void>((r) => { open = r; });
+    const stopping = stopPlay();
+    parked = { open, stopping };
+    await new Promise((r) => setTimeout(r, 0));
+    expect(getRunMode()).toBe('stopped');                 // the premise: the mode already reads stopped
+    return { open, stopping };
+  }
+
+  it('undo is refused while the restore lands — a during-Play entry must not write into the reloaded world', async () => {
+    clearHistory();
+    const prePlay = vi.fn();
+    pushAction({ label: 'authored before Play', undo: prePlay, redo: () => {} });
+    const duringPlay = vi.fn();
+    const { open, stopping } = await stopWithRestoreParked(
+      () => pushAction({ label: 'edit during Play', undo: duringPlay, redo: () => {} }),
+    );
+    // MUTATION TARGET: drop the `_restoreBarriers` check from undoRefusedReason and this is null —
+    // canEdit() reads true, and the during-Play entry's undo runs into the world being reloaded.
+    expect(undoRefusedReason('undo')).toMatch(/being restored after Stop/);
+    expect(await undo()).toBe(false);
+    expect(duringPlay).not.toHaveBeenCalled();
+    open(); await stopping;
+    // ACCEPT SIDE: Stop truncated the during-Play entry, and the authored history undoes normally.
+    expect(undoRefusedReason('undo')).toBe(null);
+    expect(await undo()).toBe(true);
+    expect(prePlay).toHaveBeenCalledTimes(1);
+    expect(duringPlay).not.toHaveBeenCalled();
+    clearHistory();
+  });
+
+  it('a scrub in the window opens no session and snapshots nothing', async () => {
+    const { open, stopping } = await stopWithRestoreParked();
+    const before = h.snapshots.length;
+    enterScrubMode('timeline');
+    const pose = vi.fn();
+    // MUTATION TARGET: drop `authoredRestoreInFlight()` from the begin's refusal and this is true —
+    // a session holding a snapshot of the not-yet-restored world, still held after Stop lands.
+    expect(await openPreviewSessionThen('timeline', pose)).toBe(false);
+    expect(pose).not.toHaveBeenCalled();
+    expect(h.snapshots.length, 'the begin must not serialize the world').toBe(before);
+    expect(getRunMode()).toBe('stopped');                 // the scrub's claim was handed back
+    open(); await stopping;
+    expect(hasTimelinePreviewSession()).toBe(false);
+  });
+
+  it('an agent pose_clip in the window is refused, not applied', async () => {
+    const { poseClipAtTime } = await import('../../src/editor/animation/poseClip');
+    const { open, stopping } = await stopWithRestoreParked();
+    const clip = { duration: 1, loop: false, frameRate: 30, tracks: [] } as never;
+    const r = await poseClipAtTime(clip, 1, 0.5, 'animation');
+    expect(r.refused).toBe(true);
+    expect(r.openedSession).toBe(false);
+    expect(getModeOwner()).toBe(null);
+    open(); await stopping;
+    expect(hasTimelinePreviewSession()).toBe(false);
+  });
+
+  it('Play pressed in the same window is refused — it would snapshot the not-yet-restored world', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { open, stopping } = await stopWithRestoreParked();
+    try {
+      const before = h.snapshots.length;
+      // MUTATION TARGET: drop `authoredRestoreInFlight()` from aSceneSwapIsHappening and Play arms
+      // with a snapshot whose Persistent roots still hold the previous run's values.
+      await enterPlay();
+      expect(getPlayState()).toBe('stopped');
+      expect(h.snapshots.length, 'Play must not snapshot the world mid-restore').toBe(before);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/Play refused/));
+      open(); await stopping;
+      // ACCEPT SIDE: once the restore has landed, Play starts.
+      await enterPlay();
+      expect(getPlayState()).toBe('playing');
+    } finally {
+      // A failed assertion above must not leave Play running or the restore parked for later tests.
+      open(); await stopping;
+      if (getPlayState() !== 'stopped') await stopPlay();
+      warn.mockRestore();
+    }
+  });
+
+  it('ACCEPT SIDE: once Stop\'s restore has landed, a scrub opens normally', async () => {
+    const { open, stopping } = await stopWithRestoreParked();
+    open(); await stopping;
+    enterScrubMode('timeline');
+    const pose = vi.fn();
+    expect(await openPreviewSessionThen('timeline', pose)).toBe(true);
+    expect(pose).toHaveBeenCalledTimes(1);
+    exitPreviewMode('timeline');
+  });
+});
+
+describe('stopPreviewIfOwnedBy — a displaced panel drops only ITS OWN ▶ (#1546)', () => {
+  it('clears the flag for its owner and leaves the other panel\'s ▶ running', async () => {
+    const { useEditorStore } = await import('../../src/editor/store/editorStore');
+    const st = () => useEditorStore.getState();
+    st().setPreviewPlaying(true, 'timeline');
+    st().stopPreviewIfOwnedBy('animation');                // the Timeline ▶ displaced the Animation panel
+    // MUTATION TARGET: make it unconditional and the Timeline's just-started ▶ is killed — #810's
+    // shared-flag defect, re-armed through the new stand-down.
+    expect(st().isPreviewPlaying).toBe(true);
+    st().stopPreviewIfOwnedBy('timeline');
+    expect(st().isPreviewPlaying).toBe(false);
+    expect(st().previewOwner).toBe(null);
+    // An UNCLAIMED ▶ is not a displaced panel's to stop.
+    useEditorStore.setState({ isPreviewPlaying: true, previewOwner: null });
+    st().stopPreviewIfOwnedBy('animation');
+    expect(st().isPreviewPlaying).toBe(true);
+    useEditorStore.setState({ isPreviewPlaying: false, previewOwner: null });
+  });
+});
+
+describe('the preview restore keys on the live scene, not the editor file path (#1547)', () => {
+  it('⏹ Exit inside prefab-edit reloads under the SYNTHETIC path, not an empty string', async () => {
+    const { PREFAB_EDIT_SCENE_PREFIX } = await import('../../src/editor/scene/prefabEditWorld');
+    h.livePath = `${PREFAB_EDIT_SCENE_PREFIX}/assets/prefabs/Hero.prefab.json`;
+    h.scenePath = null;                                  // prefab-edit nulls the file path on purpose
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    await endTimelinePreviewSession({ restore: true });
+    // MUTATION TARGET: key the snapshot on `getCurrentScenePath()` again and this is '' — the editor
+    // leaves prefab-edit and the next Cmd+S opens Save As.
+    expect(h.loadCalls.map((c) => c.path)).toEqual([h.livePath]);
+  });
+});
+
+describe('one owner field decides "is this envelope mine?" for both panels (#1549, #1550)', () => {
+  it('onModeOwnerChange fires when the OTHER panel takes scrub — a change the run mode never signals', async () => {
+    const { onModeOwnerChange } = await import('../../src/editor/scene/playMode');
+    const { onRunModeChange } = await import('../../src/runtime/core/playState');
+    enterScrubMode('timeline');
+    const owner = vi.fn();
+    const mode = vi.fn();
+    const offOwner = onModeOwnerChange(owner);
+    const offMode = onRunModeChange(mode);
+    try {
+      enterScrubMode('animation');                 // Animation takes scrub from the Timeline
+      expect(mode).not.toHaveBeenCalled();         // 'scrub' → 'scrub': the run mode is silent
+      // MUTATION TARGET: write `_modeOwner` directly in enterScrubMode (bypass setModeOwner) and the
+      // Animation panel's derived ⏹ never appears — the same drift the hand-kept useState had.
+      expect(owner).toHaveBeenCalledTimes(1);
+      enterScrubMode('animation');                 // re-entry by the same owner is not a change
+      expect(owner).toHaveBeenCalledTimes(1);
+      exitPreviewMode('animation');
+      expect(owner).toHaveBeenCalledTimes(2);
+    } finally { offOwner(); offMode(); }
+  });
+
+  it('the three ownership decisions, across owner states', async () => {
+    const { panelOwnsEnvelope, mayEndSharedSession, undoMayRepose } = await import('../../src/editor/scene/openPreviewSession');
+    // Nobody owns it: an orphan session may be ended by either panel; nobody re-poses on undo.
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    expect(panelOwnsEnvelope('timeline')).toBe(false);
+    expect(mayEndSharedSession('timeline')).toBe(true);
+    expect(undoMayRepose('animation')).toBe(false);
+    enterScrubMode('animation');
+    expect(panelOwnsEnvelope('animation')).toBe(true);
+    // MUTATION TARGET: make the Timeline's open/switch end the session unconditionally and the Animation
+    // panel's world is restored under it — `mayEndSharedSession` is what refuses that.
+    expect(panelOwnsEnvelope('timeline')).toBe(false);
+    expect(mayEndSharedSession('timeline')).toBe(false);
+    expect(mayEndSharedSession('animation')).toBe(true);
+    // MUTATION TARGET: drop the owner half of undoMayRepose and the Timeline's Cmd+Z poses into the
+    // Animation panel's session; drop the session half and an undo after ⏹ Exit reopens the envelope.
+    expect(undoMayRepose('animation')).toBe(true);
+    expect(undoMayRepose('timeline')).toBe(false);
+    await endTimelinePreviewSession({ restore: false });
+    expect(undoMayRepose('animation')).toBe(false);     // owner still claimed, but no session: do not reopen
+    exitPreviewMode('animation');
+  });
+});
+
+describe('a scene load restores the envelope first — the hook playMode registers (#1548 close-out review)', () => {
+  it('restores, releases and notifies the owner; returns nothing to wait for when there is no envelope or during Play', async () => {
+    expect(h.beforeLoad).toBeTypeOf('function');
+    expect(h.beforeLoad!()).toBeNull();                  // no envelope: the load stays synchronous
+    setRunMode('playing');
+    expect(h.beforeLoad!()).toBeNull();                  // Play is not an envelope here
+    setRunMode('stopped');
+    const displaced = vi.fn();
+    const unregister = registerModeOwnerDisplaced('animation', displaced);
+    try {
+      enterScrubMode('animation');
+      expect(await beginTimelinePreviewSession()).toBe(true);
+      const down = h.beforeLoad!();
+      // MUTATION TARGET: register a hook that returns null and the load drops the mode and leaves the
+      // session to the swap — a refused load then strands it with no owner.
+      expect(down).not.toBeNull();
+      await down;
+      expect(h.loadCalls).toHaveLength(1);               // RESTORED, not abandoned
+      expect(hasTimelinePreviewSession()).toBe(false);
+      expect(getRunMode()).toBe('stopped');
+      expect(getModeOwner()).toBe(null);
+      expect(displaced).toHaveBeenCalledTimes(1);
+    } finally { unregister(); }
+  });
+
+  it('ownsHeldSession — the record hook keys only inside ITS OWN held session', async () => {
+    const { ownsHeldSession } = await import('../../src/editor/scene/openPreviewSession');
+    enterScrubMode('animation');
+    expect(ownsHeldSession('animation')).toBe(false);    // owner claimed, snapshot not seated yet
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    expect(ownsHeldSession('animation')).toBe(true);
+    enterScrubMode('timeline');                          // the Timeline takes the envelope
+    // MUTATION TARGET: drop the owner half and a recorded edit is "keyed" into the Timeline's session.
+    expect(ownsHeldSession('animation')).toBe(false);
+    exitPreviewMode('timeline');
+  });
+});
+
+describe('a failed restore refuses Play as well as a new session (#1548 re-review)', () => {
+  it('enterPlay is refused while the last restore is marked failed', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await beginTimelinePreviewSession();
+    h.loadGates = [Promise.reject(new Error('load failed'))];
+    await expect(endTimelinePreviewSession({ restore: true })).rejects.toThrow('load failed');
+    // MUTATION TARGET: drop the `lastRestoreFailed()` refusal from enterPlay and this is 'playing' — Play's
+    // snapshot takes the possibly-posed world as authored, and Stop's restore then clears the guard.
+    await enterPlay();
+    expect(getPlayState()).toBe('stopped');
+    expect(warn.mock.calls.some((c) => /restore FAILED/.test(String(c[0])))).toBe(true);
+    warn.mockRestore();
+  });
+});
+
+describe('the session puts back the non-world state its actions changed, on every end (#1551)', () => {
+  // The music bus is the probe: `audio.setBusVolume` is the engine action a cutscene fires to duck it.
+  // The store list itself is pinned in previewSideState.test.ts; these pin the SESSION seams.
+  afterEach(() => { setBusVolume('music', 1); });
+
+  it('⏹ Exit (restore:true) puts the bus back alongside the world', async () => {
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    setBusVolume('music', 0.2);
+    await endTimelinePreviewSession({ restore: true });
+    // MUTATION TARGET: drop `releaseSideState()` from endSessionHoldingReplacement.
+    expect(getBusVolumes().music).toBe(1);
+  });
+
+  it('an end that leaves the world alone (restore:false, or a scene changed since) still puts it back', async () => {
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    setBusVolume('music', 0.2);
+    await endTimelinePreviewSession({ restore: false });
+    // MUTATION TARGET: move `releaseSideState()` below the restore:false early return.
+    expect(getBusVolumes().music).toBe(1);
+
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    setBusVolume('music', 0.3);
+    h.scenePath = 'B.json';                                 // the path guard's no-op branch
+    await endTimelinePreviewSession({ restore: true });
+    expect(h.loadCalls).toHaveLength(0);
+    expect(getBusVolumes().music).toBe(1);
+  });
+
+  it('a world swap that abandons the session (an engine.loadScene fired by ▶) still puts it back', async () => {
+    const { createWorld } = await import('koota');
+    const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/worldRegistry');
+    const before = getCurrentWorld();
+    const next = createWorld();
+    try {
+      expect(await beginTimelinePreviewSession()).toBe(true);
+      setBusVolume('music', 0.2);
+      setCurrentWorld(next);
+      expect(hasTimelinePreviewSession()).toBe(false);
+      // MUTATION TARGET: drop `releaseSideState()` from the onWorldSwap abandon.
+      expect(getBusVolumes().music).toBe(1);
+    } finally { setCurrentWorld(before); next.destroy(); }
+  });
+
+  it('ACCEPT SIDE: a change made AFTER the session ended is the human\'s, and stays', async () => {
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    await endTimelinePreviewSession({ restore: true });
+    setBusVolume('music', 0.4);
+    // A second end with no session held must not replay a stale snapshot over it.
+    await endTimelinePreviewSession({ restore: true });
+    expect(getBusVolumes().music).toBe(0.4);
   });
 });

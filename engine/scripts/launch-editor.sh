@@ -191,7 +191,23 @@ kill_repo_process() { reap_repo_process "$1"; }
 # either spelling — so they must cover the SET. `cd "$REPO"` above is the other half and stays
 # physical: that governs what this launcher's own children carry, which is the point of #961.
 if [ -z "$MULTI" ]; then
-  kill_repo_process "$REPO_LOGICAL/engine/electron/dist/main.cjs"
+  # The editor gets ONE SIGTERM and time to quit cleanly, like `npm run editor:stop` (#1580). A
+  # `pkill` double-signalled it through the npm wrapper, and the instant death that caused
+  # discarded the old editor's uncommitted localStorage (saved layout, panel state, `@editor`
+  # PlayerPrefs) on every relaunch over a running one.
+  reap_repo_signal_editor_once "$REPO_LOGICAL/engine/electron/dist/main.cjs"
+  for _ in $(seq 1 60); do   # × 0.25s = 15s, stop-editor.sh's graceful window
+    reap_repo_alive "$REPO_LOGICAL/engine/electron/dist/main.cjs" || break
+    sleep 0.25
+  done
+  if reap_repo_alive "$REPO_LOGICAL/engine/electron/dist/main.cjs"; then
+    # Most often the editor is waiting on its unsaved-work question (a SIGTERM reaches before-quit,
+    # which asks it). Forcing past that discards what the question was protecting, so say so.
+    echo "[launch-editor] the running editor did not quit within 15s — forcing." >&2
+    echo "[launch-editor]   ⚠️  Discards its unsaved scene edits (an unanswered quit question" >&2
+    echo "[launch-editor]       is the usual cause) and its uncommitted localStorage." >&2
+    reap_repo_force "$REPO_LOGICAL/engine/electron/dist/main.cjs"
+  fi
   kill_repo_process "$REPO_LOGICAL/node_modules/vite/bin/vite.js"
   # Windows releases a listening socket a beat after the owning process dies;
   # too short a wait and the relaunch races the port it just freed.

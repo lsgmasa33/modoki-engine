@@ -749,6 +749,30 @@ describe('frameDriver — stall watchdog escalation (#590)', () => {
     expect(texts[0]).not.toContain('attempt 2');
   });
 
+  it('names an INACTIVE app in the stall report, and only while it is inactive (#1475)', async () => {
+    // A system alert or a native sheet resigns the app with the page still "visible", and the OS
+    // may withhold frames the whole time — the report has to say so, or it reads as a wedge.
+    vi.resetModules();
+    const { setManualNow, advanceManual } = await import('../../src/runtime/core/clock');
+    const { noteAppActive } = await import('../../src/runtime/core/appActivity');
+    setManualNow(0);
+    vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation(() => 1); // NEVER delivers
+    vi.spyOn(globalThis, 'cancelAnimationFrame').mockImplementation(() => {});
+
+    const { startFrameDriver, setTargetFPS } = await getDriver();
+    setTargetFPS(0);
+    startFrameDriver();
+
+    for (let i = 0; i < 3; i++) { advanceManual(1000); vi.advanceTimersByTime(1000); }
+    expect(stallTexts()).toHaveLength(1);
+    expect(stallTexts()[0]).not.toContain('INACTIVE');
+
+    noteAppActive(false);
+    for (let i = 0; i < 3; i++) { advanceManual(1000); vi.advanceTimersByTime(1000); }
+    expect(stallTexts()).toHaveLength(2);
+    expect(stallTexts()[1]).toContain('INACTIVE');
+  });
+
   it('declareUnrecoverable fires exactly once no matter how long the outage runs', async () => {
     vi.resetModules();
     const { setManualNow, advanceManual } = await import('../../src/runtime/core/clock');

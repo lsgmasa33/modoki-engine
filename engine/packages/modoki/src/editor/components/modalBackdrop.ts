@@ -94,6 +94,10 @@ export function openDomModalShell(kind: string, opts: { onDismiss?: () => void; 
     inset: '0', zIndex: String(opts.zIndex ?? MODAL_Z_INDEX), background: opts.scrim ?? MODAL_SCRIM, outline: 'none',
   });
   root.tabIndex = -1;
+  // The same marker the React form puts on its root, so "which modals are open" is one DOM query
+  // whichever form drew them — `modoki_dnd` reads it to tell a drop that raised a confirm from one
+  // that did nothing (#1471), and `within:'[data-modal-shell="<kind>"]'` scopes an aim to it.
+  root.dataset.modalShell = kind;
   if (opts.onDismiss) {
     const h = scrimDismissHandlers(opts.onDismiss);
     root.addEventListener('mousedown', h.onMouseDown);

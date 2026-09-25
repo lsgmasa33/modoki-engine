@@ -125,14 +125,15 @@ function formatWarning(w: Error & { code?: string; detail?: unknown }): string {
  * **The defect (#955).** Node's default `'warning'` listener — an internal function literally named
  * `onWarning` — routes through `console.error`. By the time it fires, `console.error` is the tee
  * above, so EVERY process warning lands in `main.log` tagged `[error]`. On packaged Windows that is
- * one guaranteed `[error]` per launch (DEP0190, from the `shell: true` that `toolchain/index.ts`'s `needsWinShell` doc
- * documents as load-bearing against `spawn EINVAL`), and `QA-PKG-0001` step 8 tells its runner to
+ * one guaranteed `[error]` per launch (DEP0190, from the `shell: true` the old `spawnable()` passed args
+ * with — gone since #1537, whose `toSpawn` runs cmd.exe itself), and `QA-PKG-0001` step 8 tells its runner to
  * read that log for failures. The honest failure mode is a runner filing a bug against a healthy
  * build — or learning to ignore `[error]` there, which is the assertion going quiet.
  *
  * ⚠️ **The mechanism is ALL warnings, not DEP0190.** Filtering that one id at the logger would leave
- * the class open and the next deprecation Node adds re-files the ticket. `shell: true` itself is not
- * touched — removing it is the fix that keeps being re-litigated and it breaks Windows.
+ * the class open and the next deprecation Node adds re-files the ticket. (#1537 later removed that
+ * `shell: true` for its own reason — cmd expanded `%VAR%` in paths — without breaking `spawn EINVAL`;
+ * this handler stays, because the mechanism is every warning.)
  *
  * **The RENDERER channel already gets this right, which is the sharpest statement of the scope.**
  * A tag census of a real 1.3 MB packaged macOS `main.log`: 1322 `[renderer:info]`, 59 `[info]`,
@@ -148,7 +149,7 @@ function formatWarning(w: Error & { code?: string; detail?: unknown }): string {
  * GPU / NetworkService / AudioService plus their paired forensic snapshots) and 4
  * `[renderer:error]` (a `registerSystems()` failure, unrelated to this). So on macOS the change is
  * all cost and no benefit, and it is still unconditional: the mechanism is platform-independent and
- * only the `shell: true` that triggers it is Windows-only.
+ * only the `shell: true` that triggered it was Windows-only.
  *
  * ⚠️ That count was FIRST REPORTED AS 6, from a plain `grep '\[error\]'` — which does not match
  * `[renderer:error]`. Recorded because it is the same instrument-not-the-log mistake that the QA

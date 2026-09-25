@@ -109,6 +109,77 @@ describe('mergeRiggedPrefab', () => {
     expect(parentOf(gem)).toBe(1);         // re-anchored to the model root
   });
 
+  // ── Top-level fields the merge does not itself compute (#1468) ───────────────────────────
+  //
+  // The merge used to return a five-field object literal — `id`, `version`, `name`,
+  // `rootLocalId`, `entities` — so EVERY other top-level field of the on-disk document was
+  // discarded on a rigged re-import. `moved` is what v4 added, so this was live data loss at the
+  // version the repo already ships. It is also Phase 2A's own mechanism: a writer that drops a
+  // top-level field it does not recognise is the writer that would drop node identity.
+
+  it('carries the existing prefab\'s `moved` map through a re-import', () => {
+    const existing = existingPrefab();
+    existing.moved = { '4.7': '@member:7' };
+    const merged = mergeRiggedPrefab(freshPrefab(), existing);
+    expect(merged.moved).toEqual({ '4.7': '@member:7' });
+  });
+
+  it('does not invent a `moved` map when the existing prefab has none', () => {
+    // The accept side: carrying the field must not turn an absent one into `{}`, which would
+    // change every ordinary rigged prefab's bytes and make the field meaningless as a signal.
+    const merged = mergeRiggedPrefab(freshPrefab(), existingPrefab());
+    expect('moved' in merged).toBe(false);
+  });
+
+  it('carries a top-level field this build does not know about', () => {
+    // The additive rule (runtime/core/formatVersion.ts): an older build meeting a document a
+    // newer one wrote reads the fields it understands and leaves the rest alone. `existing` is
+    // the on-disk document and is the only side that can carry one — `fresh` is this importer's
+    // own output.
+    const existing = existingPrefab() as PrefabFile & { futureField?: unknown };
+    existing.futureField = { some: 'v6 thing' };
+    const merged = mergeRiggedPrefab(freshPrefab(), existing) as PrefabFile & { futureField?: unknown };
+    expect(merged.futureField).toEqual({ some: 'v6 thing' });
+  });
+
+  // ── Node identity across a regeneration (#1468 design record: the node guid, part 2) ─────────────────────────────
+  //
+  // A minted id cannot survive a document rebuilt from a GLB that has never heard of it, so the
+  // merge's CONTENT match — already here to keep a bone's localId — is what carries it.
+
+  it('carries a matched bone\'s node identity across the re-import, not the fresh one', () => {
+    const existing = existingPrefab();
+    byName(existing, 'bone1').nodeGuid = 'NODE-BONE1';
+    byName(existing, 'Cylinder').nodeGuid = 'NODE-ROOT';
+    const fresh = freshPrefab();
+    byName(fresh, 'bone1').nodeGuid = 'FRESHLY-MINTED';
+    const merged = mergeRiggedPrefab(fresh, existing);
+    expect(byName(merged, 'bone1').nodeGuid).toBe('NODE-BONE1');
+    expect(byName(merged, 'Cylinder').nodeGuid).toBe('NODE-ROOT');
+  });
+
+  it('keeps the freshly minted identity for a bone the re-import ADDED', () => {
+    // bone3 is in `fresh` and not in `existing` — there is no prior identity to carry, and the
+    // guid `serializePrefab` minted for it when the importer built the fresh document stands.
+    const fresh = freshPrefab();
+    byName(fresh, 'bone3').nodeGuid = 'FRESH-BONE3';
+    const merged = mergeRiggedPrefab(fresh, existingPrefab());
+    expect(byName(merged, 'bone3').nodeGuid).toBe('FRESH-BONE3');
+  });
+
+  it('preserves a user-added entity\'s identity untouched', () => {
+    const existing = existingPrefab();
+    byName(existing, 'Sword').nodeGuid = 'NODE-SWORD';
+    expect(byName(mergeRiggedPrefab(freshPrefab(), existing), 'Sword').nodeGuid).toBe('NODE-SWORD');
+  });
+
+  it('does not add a node guid where neither side has one', () => {
+    // The accept side. A pre-v5 document merged by a pre-v5 fresh import stays without identity
+    // until something SAVES it; the merge is not a writer and must not mint.
+    const merged = mergeRiggedPrefab(freshPrefab(), existingPrefab());
+    for (const e of merged.entities) expect('nodeGuid' in e).toBe(false);
+  });
+
   it('does not mutate the input prefab objects', () => {
     const existing = existingPrefab();
     const fresh = freshPrefab();

@@ -53,7 +53,7 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
-import { loadEnginePluginModule } from './loadVendorPlugins.mjs';
+import { toSpawn } from './winSpawn.mjs';
 import { buildZip } from './ota/zip.mjs';
 import { PLUGIN_CLASS_LEGS, schemeFor, legLabel, networkFailureCause, joinCapturedStreams } from './nativePluginLegs.mjs';
 
@@ -90,32 +90,11 @@ function has(cmd) {
   return spawnSync(process.platform === 'win32' ? 'where' : 'which', [cmd], { stdio: 'ignore' }).status === 0;
 }
 
-/** `spawnable()` from engine/toolchain — the repo's ONE answer to "how do I spawn a resolved tool
- *  path on Windows": since CVE-2024-27980 (Node ≥18.20) spawning a `.cmd`/`.bat` WITHOUT
- *  `shell:true` throws `spawn EINVAL`, and with `shell:true` an unquoted path containing a space
- *  is split by the shell. Both apply here — the Android leg's command is `gradlew.bat` on Windows.
- *  Loaded through the same esbuild seam build-web.mjs uses, rather than re-implemented: a private
- *  copy of that rule is how it drifts. If the seam is unavailable (no esbuild), fall back to the
- *  bare spawn and SAY so, rather than silently spawning something Windows will reject. */
-let spawnable = null;
-try {
-  ({ spawnable = null } = (await loadEnginePluginModule(repoRoot, path.join('toolchain', 'index.ts'))) ?? {});
-} catch (e) {
-  // NOT fatal. This is a top-level await, so an unhandled rejection here would kill the whole
-  // gate before a single leg ran or a summary printed — turning "the shell helper is
-  // unavailable" into "the native tests appear not to exist". loadEnginePluginModule catches a
-  // missing esbuild but not a bundle failure, and its /tmp bundle marks packages external, so
-  // the day anything under engine/toolchain imports a bare package this path is what runs.
-  console.warn(`[test:native] could not load engine/toolchain (${e.message}) — falling back to a bare spawn`);
-}
-if (!spawnable && process.platform === 'win32') {
-  console.warn('[test:native] no spawnable() — a .cmd/.bat command will likely fail with spawn EINVAL (CVE-2024-27980)');
-}
 
 function run(name, cmd, args, opts = {}) {
-  const sp = spawnable ? spawnable(cmd, args) : { command: cmd, args, shell: false };
+  const sp = toSpawn(cmd, args);
   console.log(`\n── ${name}: ${cmd} ${args.join(' ')}\n`);
-  const r = spawnSync(sp.command, sp.args, { cwd: repoRoot, stdio: 'inherit', shell: sp.shell, ...opts });
+  const r = spawnSync(sp.command, sp.args, { ...sp.options, cwd: repoRoot, stdio: 'inherit', ...opts });
   // spawnSync sets .error (not a code) when the binary itself could not be launched.
   record(name, r.error ? 1 : r.status ?? 1);
   if (r.error) console.error(`[test:native] ${name}: ${r.error.message}`);
@@ -126,6 +105,7 @@ function run(name, cmd, args, opts = {}) {
 // summary can name every leg that exists, including the ones this machine could not run.
 const otaDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-modoki-ota');
 const iapDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-modoki-iap');
+const appsflyerDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-appsflyer');
 
 // The ios/ota-core leg's OtaZipTests.swift cross-checks OtaZip against a REAL zip built by the
 // Node writer (engine/scripts/ota/zip.mjs) — that fixture used to be a hand-typed /tmp file
@@ -176,6 +156,9 @@ const SWIFT_LEGS = [
   // living in the test — see IapClassification.swift's header for why importing StoreKit is fine
   // here while importing Capacitor is not.
   { name: 'ios/iap-core', packagePath: path.join(iapDir, 'iap-core') },
+  // #1510. The SHIPPING ATT active-state gate. The plugin's UIKit half (reading applicationState,
+  // forwarding didBecomeActive) is not reachable from here; games/court/attribution.md records the device check.
+  { name: 'ios/att-core', packagePath: path.join(appsflyerDir, 'att-core') },
 ];
 
 for (const leg of SWIFT_LEGS) {
@@ -422,10 +405,10 @@ function removeTempDir(dir) {
 
 /** Run gradle CAPTURING its output — the SKIP/FAIL classification reads it — while still showing it. */
 function gradleCapture(args) {
-  const sp = spawnable ? spawnable(gradle.cmd, args) : { command: gradle.cmd, args, shell: false };
+  const sp = toSpawn(gradle.cmd, args);
   console.log(`\n── ${gradle.cmd} ${args.join(' ')}\n`);
   const r = spawnSync(sp.command, sp.args, {
-    cwd: repoRoot, encoding: 'utf8', shell: sp.shell, env: javaEnv, maxBuffer: 256 * 1024 * 1024,
+    ...sp.options, cwd: repoRoot, encoding: 'utf8', env: javaEnv, maxBuffer: 256 * 1024 * 1024,
   });
   // Joined on a line boundary, not glued — see joinCapturedStreams in nativePluginLegs.mjs for
   // why the `^`-anchored patterns depend on it (#1079 close-out review).
@@ -570,8 +553,8 @@ for (const leg of JAVA_LEGS) {
     // against code that no longer exists.
     const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-java-selftest-'));
     try {
-      const cc = spawnable ? spawnable(javaBin('javac'), ['-d', outDir, ...sources]) : { command: javaBin('javac'), args: ['-d', outDir, ...sources], shell: false };
-      const c = spawnSync(cc.command, cc.args, { cwd: leg.dir, stdio: 'inherit', shell: cc.shell, env: javaEnv });
+      const cc = toSpawn(javaBin('javac'), ['-d', outDir, ...sources]);
+      const c = spawnSync(cc.command, cc.args, { ...cc.options, cwd: leg.dir, stdio: 'inherit', env: javaEnv });
       if (c.error || c.status !== 0) { record(leg.name, 1); }
       // The self-tests resolve their vectors from the PACKAGE ROOT, so cwd matters.
       else run(leg.name, javaBin('java'), ['-cp', outDir, leg.mainClass], { cwd: leg.dir, env: javaEnv });

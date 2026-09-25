@@ -8,7 +8,8 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { flatEntityAlias, foldEntityRef, precisionParam } from '../shapes.js';
+import { foldEntityRef, guidOnlyEntityAlias, precisionParam } from '../shapes.js';
+import { EPOCH_BASE } from '../../../shared/sinceCursor.js';
 import { PROFILER_ACTIONS, PROFILER_READ_ACTIONS } from '../../../shared/profilerActions.js';
 
 export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
@@ -28,6 +29,9 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'LAST 100 events by default plus `byType` counts over the whole 10,000-event ring and ' +
       '`captures` (Tier-2 diagnostic state). Narrow with type= and/or level=, raise limit=N, pair ' +
       'with modoki_dispatch_action to drive the game.\n' +
+      'BASELINE: read once (limit:0 is enough), then pass the returned `nextCap` (+ `epoch`) as ' +
+      '`sinceCap` — that read covers only the events after it, and `ringTotal`/`byType` count only ' +
+      'those. Nothing is ever deleted.\n' +
       'LEVEL: every event carries a triage severity, `info` (default) / `warn` / `error` — set via ' +
       'the `gameJournal.ts` helpers (`journalWarn`/`journalError`) or emit()\'s 4th arg. ' +
       'level:"warn" returns warn AND error, skipping the normal-gameplay noise — the fastest way to ' +
@@ -42,21 +46,23 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       level: z.enum(['info', 'warn', 'error']).optional().describe('Read: only events at this severity OR ABOVE (e.g. "warn" returns warn + error).'),
       action: z.enum(['start', 'stop']).optional().describe('Open ("start") or close ("stop") a Tier-2 capture window for type=. Omit to just read.'),
       limit: z.number().optional().describe('Return the last N events (default 100). An explicit limit always wins.'),
-      clear: z.boolean().optional().describe('Clear the journal after reading. REFUSED when combined with type=/level= — the ring has no selective clear, so clearing a FILTERED read would destroy every other event too. Read with the filter, then clear deliberately with a bare clear:true (which means ALL).'),
+      sinceCap: z.number().int().min(0).optional().describe('Forward cursor: only events after this — the `nextCap` of an earlier read. A cursored read returns the OLDEST events after it (contiguous, oldest-first).'),
+      epoch: z.string().optional().describe(`${EPOCH_BASE}.`),
     },
-    async ({ type, level, action, limit, clear }) => {
+    async ({ type, level, action, limit, sinceCap, epoch }) => {
       const q = new URLSearchParams();
       if (type) q.set('type', type);
       if (level) q.set('level', level);
       if (action) q.set('action', action);
       if (limit != null) q.set('limit', String(limit));
-      if (clear) q.set('clear', '1');
+      if (sinceCap != null) q.set('sinceCap', String(sinceCap));
+      if (epoch) q.set('epoch', epoch);
       const qs = q.toString();
-      // A MUTATING read (`action=start|stop`, `clear=1`) is a "do this", so its `ok` is a success
+      // A MUTATING read (`action=start|stop`) is a "do this", so its `ok` is a success
       // flag and must be checked — a plain read's `ok` is not (see getJson's docblock). Measured
       // live: `{action:'start'}` with no `type` answers 200 {ok:false, reason:…} and was reported
       // as a successful call. (Phase 6)
-      return getJson(`/api/journal${qs ? `?${qs}` : ''}`, undefined, !!action || !!clear);
+      return getJson(`/api/journal${qs ? `?${qs}` : ''}`, undefined, !!action);
     },
   );
   tool(
@@ -78,10 +84,13 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_list_actions',
-    'Discover what the game exposes: dispatchable UI/game action names (+ their param schemas) ' +
-      'and live named read-values (e.g. canGoBack, timeSinceGameStart). Use before modoki_dispatch_action.',
-    {},
-    async () => getJson('/api/game-introspect'),
+    'Discover what the game exposes: dispatchable UI/game action NAMES and live named read-values ' +
+      '(e.g. canGoBack, timeSinceGameStart). Use before modoki_dispatch_action. Bare = names only; ' +
+      'name=<substr> returns the matching actions with their param schemas.',
+    {
+      name: z.string().optional().describe('Case-insensitive substring of an action name; the matches come back as {name, params}.'),
+    },
+    async ({ name }) => getJson(`/api/game-introspect${name ? `?name=${encodeURIComponent(name)}` : ''}`),
   );
   tool(
     'modoki_dispatch_action',
@@ -102,28 +111,27 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_play_clip',
     'Switch an entity\'s active animation clip BY NAME — the unified engine.playClip action, which ' +
       'drives whichever animator the entity carries (keyframe Animator, 2D SpriteAnimator, or GLB ' +
-      'SkeletalAnimator). Only while Playing (modoki_play_control play first). This switches WHICH ' +
+      'SkeletalAnimator). Only while Playing (modoki_play_control play first; to scrub a clip in the ' +
+      'editor instead, modoki_pose_clip). This switches WHICH ' +
       'clip plays; it does NOT edit clip data — that is modoki_anim_set_clip. Discover the valid ' +
       'names from the `clipNames` field on the animator trait in modoki_get_scene_state; verify the ' +
       'switch with get_scene_state (the trait\'s activeClip / clip).',
     {
       guid: z.string().optional().describe('GUID of the animator entity. Required unless `entity` is given.'),
-      entity: flatEntityAlias,
+      entity: guidOnlyEntityAlias,
       clip: z.string().describe('Clip NAME to play (one of the target\'s clipNames).'),
     },
     async ({ guid, entity, clip }) => {
       const ref = foldEntityRef({ guid }, entity);
-      if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'play a clip on an entity', why: ref.conflict, expected: 'either `guid`, or `entity:{guid|name|id}` — not both' });
-      // This op addresses the animator by GUID specifically — unlike duplicate/focus, an `id` does
-      // not work either, so both the missing case and the id-only case are refused HERE rather than
-      // sent on to fail less clearly downstream.
+      if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'play a clip on an entity', why: ref.conflict, expected: 'either `guid`, or `entity:{guid}` — not both' });
+      // This op addresses the animator by GUID only — unlike duplicate/focus, an `id` does not work,
+      // which is why `entity` is `guidOnlyEntityAlias` and an `{id}` is refused by the schema. What
+      // is left to refuse here is the call that addressed nothing.
       if (!ref.guid) {
         return fail({
           code: 'NOT_FOUND',
-          what: ref.id != null ? `play a clip on entity id ${ref.id}` : 'play a clip',
-          why: ref.id != null
-            ? 'engine.playClip addresses the animator by GUID, and only an id was given.'
-            : 'no entity was addressed.',
+          what: 'play a clip',
+          why: 'no entity was addressed.',
           expected: 'guid:"…", or entity:{guid}',
           options: ['look the guid up with modoki_get_scene_state (name= or id=), then pass it here'],
         });
@@ -179,10 +187,11 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
 
   // ── scene queries (#288 gap 1) ──
   tool(
-    'modoki_scene_query',
+    'modoki_physics_query',
     'Cast a ray, sweep a sphere/circle, or pick a point against the LIVE PHYSICS world — the ' +
       '"what is over there / would this fit / what is under this point" question, answered as ' +
-      'DATA instead of from a screenshot. All six engine queries (raycast/shapecast/point, in 2D ' +
+      'DATA instead of from a screenshot. NOT an entity search — find entities by name/trait with ' +
+      'modoki_get_scene_state. All six engine queries (raycast/shapecast/point, in 2D ' +
       'and 3D) behind one tool; every one is a pure read that writes nothing.\n\n' +
       'REQUIRES A RUNNING SIM. A Rapier world is built by the physics system on its first tick and ' +
       'freed on Stop, so a STOPPED editor has none and every query REFUSES with ' +
@@ -225,8 +234,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_player_prefs',
     'READ the engine\'s PlayerPrefs store — the durable per-key JSON save data a game writes ' +
-      '(progress, settings, unlocks). Until now this was reachable only through modoki_eval + a ' +
-      'dynamic import.\n\n' +
+      '(progress, settings, unlocks).\n\n' +
       'NOT modoki_persistence, which is the EDITOR\'s scene/asset save mode and is unrelated — ' +
       'that name collision is the confusion this description exists to stop.\n\n' +
       'CALLED BARE it returns the KEY INDEX (`keys`, `totalCount`) plus `pendingWrites`. ' +
@@ -327,7 +335,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'deliberately opt-in because enabling costs real time (two timestamps per pass) and the ' +
       'profiler must not change what it measures; where the backend cannot support them the status ' +
       'comes back "unsupported" with a reason and NO number is invented. reset clears markers and ' +
-      'captures. boot reads the BOOT-PHASE timeline (#238) — always-on spans across scene load, ' +
+      'captures. boot reads the BOOT-PHASE timeline — always-on spans across scene load, ' +
       'asset acquire, shader prewarm and renderer init — and intersects them with the worst dropped ' +
       'frame, so a cold-boot freeze is attributed by measurement instead of guessed from the frame ' +
       'aggregate (which cannot see it: a stall is DROPPED from the percentiles by design). ' +
@@ -339,7 +347,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       action: z.enum(PROFILER_ACTIONS)
         .optional().describe('Default "read" (the live aggregate). capture-* record/read frames; gpu-* toggle GPU timestamps; reset clears markers + captures; boot reads the boot-phase timeline; boot-reset re-arms it.'),
       markers: z.number().optional().describe('action:read only — how many marker rows to return (default 12).'),
-      limit: z.number().optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200).'),
+      limit: z.number().int().positive().max(200).optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200). Over the max is refused.'),
       all: z.boolean().optional().describe('action:boot only — return EVERY recorded span, not just the stall overlap and the costliest. Large.'),
     },
     async ({ action, markers, limit, all }) => {
@@ -405,12 +413,12 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       fields: z.array(z.string()).optional().describe('(start) Restrict to these numeric fields; omit for all numeric fields of the component.'),
       epsilon: z.number().optional().describe('(start) Change threshold — record only when a value moves more than this. Default 1e-4.'),
       everyNFrames: z.number().int().positive().optional().describe('(start) Sample every Nth frame (decimation). Default 1.'),
-      maxSamples: z.number().int().positive().optional().describe('(start) Ring cap per series. Default 600.'),
-      maxSeries: z.number().int().positive().optional().describe('(start) Cap on MOVING series — max distinct (entity,field) series that record movement. Default 512, max 4096. A static/never-moved entity does NOT consume this budget (its baseline is kept cheaply), so a screen of static tiles can\'t crowd out a late-joining mover (e.g. a projectile spawned mid-scene). A DESPAWNED entity gives its slot back, and at the 4096 memory ceiling the oldest despawned series are evicted first (read reports evictedDespawned), so a per-shot spawner cannot fill the watch with dead shots.'),
+      maxSamples: z.number().int().positive().max(5000).optional().describe('(start) Ring cap per series. Default 600, max 5000.'),
+      maxSeries: z.number().int().positive().max(4096).optional().describe('(start) Cap on MOVING series — max distinct (entity,field) series that record movement. Default 512, max 4096. A static/never-moved entity does NOT consume this budget (its baseline is kept cheaply), so a screen of static tiles can\'t crowd out a late-joining mover (e.g. a projectile spawned mid-scene). A DESPAWNED entity gives its slot back, and at the 4096 memory ceiling the oldest despawned series are evicted first (read reports evictedDespawned), so a per-shot spawner cannot fill the watch with dead shots.'),
       expireFrames: z.number().int().nonnegative().optional().describe('(start) Auto-remove the watch after N observed frames (0 = never). Default 0.'),
       id: z.string().optional().describe('(read/clear) Watch id from start/list. Omit on clear to clear ALL.'),
       name: z.string().optional().describe('(read) Filter the returned series to entities whose name contains this (case-insensitive) — isolate one entity in a broad watch. `seriesTotal` still reports the full match count.'),
-      limit: z.number().int().nonnegative().optional().describe('(read) Cap the number of series returned (sets seriesTruncated when it drops some). Pair with name=/guids= on a broad watch so the response does not blow the cap.'),
+      limit: z.number().int().nonnegative().optional().describe('(read) Cap the number of series returned (default 100; sets seriesTruncated when it drops some). Pair with name=/guids= on a broad watch so the response does not blow the cap.'),
       clear: z.boolean().optional().describe('(read) Clear the series THIS CALL RETURNED (not the whole watch — a read is capped/filterable, so the ones you did not see keep their samples). The reply echoes `cleared` + `clearedScope`.'),
       samples: z.boolean().optional().describe('(read) Include the RAW time-series per field. Default false — read returns stats only. A full read is ~40 chars/sample and the caps allow 512 series x 5000 samples, so ask for samples only when the stats are not enough (e.g. plotting the curve shape).'),
       precision: precisionParam(),
@@ -503,7 +511,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'REFUSED naming the right action rather than silently dropped.',
     {
       action: z.enum(['start', 'read', 'stop', 'clear']).describe('open the window | read presses | close (keeps presses) | drop recorded presses (window stays open if it was)'),
-      maxPresses: z.number().int().positive().optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not modoki_watch\'s `maxSamples`, which caps each series separately.'),
+      maxPresses: z.number().int().positive().max(500).optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not modoki_watch\'s `maxSamples`, which caps each series separately.'),
       limit: z.number().int().positive().optional().describe('(read) Most-recent N presses to return (default 20).'),
       unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter: this is the one question this tool exists to answer, so start here when a reported gesture apparently did nothing."),
       precision: precisionParam('x/y/upX/upY/maxD/heldMs'),

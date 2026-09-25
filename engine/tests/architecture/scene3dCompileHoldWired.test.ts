@@ -35,7 +35,7 @@ function between(startNeedle: string, endNeedle: string): string {
 
 const BORROW_GUARD = 'if (isRendererTargetBorrowed(renderer)) { heldFrames.held(); return; } heldFrames.released();';
 const STAGE_GUARD = 'if (isPrecompileActive(renderer, rawNow())) return;';
-const IDLE_GATE = 'if (idleGrace.shouldIdle(isSimRunning() || isSkeletalPreviewing())) return;';
+const IDLE_GATE = 'if (idleGrace.shouldIdle(isSimRunning())) return;';
 
 describe('Scene3D consults the #1246 compile holds', () => {
   it('holds every frame while a scene-pass compile has the target bound — before EITHER submit', () => {

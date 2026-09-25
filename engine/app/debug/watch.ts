@@ -61,9 +61,9 @@ const watches = new Map<string, Watch>();
 let hookInstalled = false;
 let watchSeq = 0;
 
-const MAX_SAMPLES_CEIL = 5000;
+export const MAX_SAMPLES_CEIL = 5000;
 const DEFAULT_MAX_SERIES = 512;
-const MAX_SERIES_CEIL = 4096; // hard ceiling for the caller-tunable maxSeries (Batch 3 C)
+export const MAX_SERIES_CEIL = 4096; // hard ceiling for the caller-tunable maxSeries (Batch 3 C)
 const DEFAULT_IDLE_EXPIRE = 18_000; // ~5 min of frames — a watch not read by then is "forgotten"
 
 const SEP = ' ';

@@ -127,6 +127,7 @@ export function computeEntityScreenBounds(
 ): EntityScreenBounds[] {
   const out: EntityScreenBounds[] = [];
   const seen = new Set<number>();
+  const drawRect = { x: vp.left, y: vp.top, w: vp.width, h: vp.height };
 
   const project = ([id, obj, owner]: OwnedBoundsEntry, geometric: boolean): void => {
     if (ids && !ids.has(id)) return;
@@ -142,7 +143,7 @@ export function computeEntityScreenBounds(
       _box.getSize(_size); _box.getCenter(_center);
       worldAABB = { size: [_size.x, _size.y, _size.z], center: [_center.x, _center.y, _center.z] };
     }
-    out.push({ id, layer: '3d', surface, screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
+    out.push({ id, layer: '3d', surface, screen, onScreen, drawRect, ...(worldAABB ? { worldAABB } : {}) });
   };
 
   for (const e of sources.ecsObjects) project(e, true);

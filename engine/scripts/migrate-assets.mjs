@@ -31,6 +31,11 @@ const versionSrc = readFileSync(
 const m = versionSrc.match(/SCENE_FORMAT_VERSION\s*=\s*(\d+)/);
 if (!m) { console.error('could not read SCENE_FORMAT_VERSION from runtime/core/version.ts'); process.exit(1); }
 const SCENE_FORMAT_VERSION = Number(m[1]);
+// Read the same way and for the same reason (#1468): this script REWRITES prefab files too, and a
+// prefab a newer build wrote must be left alone rather than run through this build's transforms.
+const mp = versionSrc.match(/PREFAB_FORMAT_VERSION\s*=\s*(\d+)/);
+if (!mp) { console.error('could not read PREFAB_FORMAT_VERSION from runtime/core/version.ts'); process.exit(1); }
+const PREFAB_FORMAT_VERSION = Number(mp[1]);
 
 // ── Field transforms (mirror loadSceneFile.ts migrations) ──────────────────────────
 const RENDERABLE_TRAITS = new Set([
@@ -93,7 +98,7 @@ const prefabs = repoFiles({
 });
 const files = new Set([...scenes, ...prefabs].map(({ rel }) => rel));
 
-let rewritten = 0, bumped = 0;
+let rewritten = 0, bumped = 0, skippedTooNew = 0;
 for (const rel of [...files].sort()) {
   const abs = path.join(REPO_ROOT, rel);
   let json;
@@ -106,7 +111,30 @@ for (const rel of [...files].sort()) {
   // current scene format version. Prefab files (rootLocalId present) keep their own
   // independent schema `version`.
   const isScene = Array.isArray(json.entities) && json.rootLocalId === undefined;
+
+  // ⚠️ REFUSE a document a NEWER build wrote (#1468) — found by the close-out sweep of the same
+  // defect in `migrate-anchor-zindex.mjs`. Two halves, and this file had both:
+  //
+  //   - the scene stamp was `!==`, so a v16 scene written by a newer build was stamped back DOWN to
+  //     this build's number — claiming a shape this build cannot produce;
+  //   - prefabs are rewritten here (the TRANSFORMS below run on them) with no version check at all,
+  //     so a newer prefab was run through this build's understanding of its fields.
+  //
+  // One-sided, like every other gate in this family: the entire point of this script is to migrate
+  // documents BELOW the current number, so an exact-match check would refuse all of them.
+  const target = isScene ? SCENE_FORMAT_VERSION : PREFAB_FORMAT_VERSION;
+  if (typeof json.version === 'number' && json.version > target) {
+    skippedTooNew++;
+    console.log(`SKIP ${rel}: format ${json.version} is newer than ${target} — written by a newer build`);
+    continue;
+  }
+
   let didBump = false;
+  // `!==` is safe HERE and only here: the refusal above has already returned for anything stamped
+  // above the target, so by this line `json.version` is at or below it and this can only ever stamp
+  // FORWARD. It was the whole downgrade before that guard existed. Left as one mechanism rather than
+  // two — a `<` here as well would be unfalsifiable (mutating it back to `!==` leaves every test
+  // green, which is exactly what a redundant guard looks like from the outside).
   if (isScene && json.version !== SCENE_FORMAT_VERSION) { json.version = SCENE_FORMAT_VERSION; didBump = true; }
 
   if (changed || didBump) {
@@ -124,3 +152,6 @@ for (const rel of [...files].sort()) {
   }
 }
 console.log(`\n✓ ${rewritten} file(s) ${DRY ? 'would be ' : ''}rewritten (${bumped} scene version stamps) → format v${SCENE_FORMAT_VERSION}.`);
+// Counted and reported, never silent: a skipped file still holds whatever this script exists to
+// migrate, so a run that rewrites nothing and says nothing else would read as a clean corpus.
+if (skippedTooNew > 0) console.log(`${skippedTooNew} file(s) SKIPPED — written by a newer build; update this checkout and re-run.`);

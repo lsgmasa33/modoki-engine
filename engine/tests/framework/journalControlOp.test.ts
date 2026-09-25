@@ -64,35 +64,141 @@ describe('journal-events: read-path capture reporting', () => {
   });
 });
 
-describe('journal-events: a FILTERED read must not destroy the rest of the ring', () => {
-  /** `clear:true` used to call clearJournal() unconditionally — so a filtered read returned its
-   *  slice and wiped every OTHER event too, including the human's. The ring is flat and has no
-   *  selective clear, so the honest move is to refuse rather than over-delete: destroying data the
-   *  caller did not ask about, and never saw, is not something to do on a best guess. */
-  const emitSome = () => {
+describe('journal-events: a read never deletes — `clear` is retired, `sinceCap` is the baseline (#1561)', () => {
+  /** `clear:true` made a READ destroy the ring it read — the evidence the next verification read
+   *  depends on (mcp-tool-conventions.md §7). Its one real use was a clean baseline before an action,
+   *  which the capture-counter cursor now gives without deleting anything. */
+  type Read = {
+    ok?: boolean; code?: string; error?: string; options?: string[];
+    events: { type: string; cap: number }[]; returnedCount: number; totalCount: number; ringTotal: number;
+    byType: Record<string, number>; nextCap: number; epoch: string; cursorReset?: string; truncated?: boolean; hint?: string;
+  };
+  const read = (args: Record<string, unknown>) => journal(args) as unknown as Promise<Read>;
+
+  it('REFUSES clear — any value, filtered or not — with the replacement, and deletes nothing', async () => {
+    game = createTestWorld();
     emit('match', { n: 1 });
     emit('score', { n: 2 });
-    emit('match', { n: 3 });
-  };
-
-  it('REFUSES clear:true when a filter is present, and clears NOTHING', async () => {
-    game = createTestWorld();
-    emitSome();
-    const r = await journal({ type: 'match', clear: true }) as unknown as { ok?: boolean; error?: string; hint?: string };
-    expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/REFUSED/);
-    expect(r.error).toMatch(/type=match/);
-    // The load-bearing half: the score event the caller never asked about is still there.
-    const after = await journal({}) as unknown as { events: { type: string }[] };
-    expect(after.events.map((e) => e.type).sort()).toEqual(['match', 'match', 'score']);
+    for (const args of [{ clear: true }, { clear: false }, { type: 'match', clear: true }]) {
+      const r = await read(args);
+      expect(r.ok, JSON.stringify(args)).toBe(false);
+      expect(r.code).toBe('UNKNOWN_PARAM');
+      expect(r.options).toEqual(['sinceCap', 'epoch']);
+      expect(r.error).toMatch(/sinceCap/);
+      expect(r.events).toBeUndefined();
+    }
+    expect((await read({})).events.map((e) => e.type)).toEqual(['match', 'score']);
   });
 
-  it('an UNFILTERED clear:true still clears everything — that one really does mean ALL', async () => {
+  it('a limit:0 read is a baseline: sinceCap=nextCap returns only what came after, counted as the ring', async () => {
     game = createTestWorld();
-    emitSome();
-    await journal({ clear: true });
-    const after = await journal({}) as unknown as { events: unknown[] };
-    expect(after.events).toHaveLength(0);
+    emit('match', { n: 1 });
+    emit('score', { n: 2 });
+    const base = await read({ limit: 0 });
+    expect(base.events).toEqual([]);
+    emit('match', { n: 3 });
+    emit('win', {});
+    const after = await read({ sinceCap: base.nextCap, epoch: base.epoch });
+    expect(after.events.map((e) => e.type)).toEqual(['match', 'win']);
+    // The window IS the ring for this read — exactly what a clear used to make it.
+    expect(after.ringTotal).toBe(2);
+    expect(after.byType).toEqual({ match: 1, win: 1 });
+    expect(after.cursorReset).toBeUndefined();
+    // ...and nothing was deleted to get there.
+    expect((await read({})).ringTotal).toBe(4);
+  });
+
+  it('a filter narrows the rows INSIDE the window; the window still counts every type', async () => {
+    game = createTestWorld();
+    emit('match', { n: 1 });
+    const base = await read({ limit: 0 });
+    emit('match', { n: 2 });
+    emit('score', { n: 3 });
+    const r = await read({ sinceCap: base.nextCap, epoch: base.epoch, type: 'match' });
+    expect(r.events.map((e) => e.type)).toEqual(['match']);
+    expect(r.totalCount).toBe(1);
+    expect(r.ringTotal).toBe(2);
+    expect(r.byType).toEqual({ match: 1, score: 1 });
+  });
+
+  it('a cursored read cut short returns the OLDEST after the cursor and continues with no gap', async () => {
+    game = createTestWorld();
+    const base = await read({ limit: 0 });
+    for (let i = 0; i < 5; i++) emit('tick', { i });
+    const seen: number[] = [];
+    let cap = base.nextCap;
+    for (let page = 0; page < 4; page++) {
+      const r = await read({ sinceCap: cap, epoch: base.epoch, limit: 2 });
+      seen.push(...r.events.map((e) => (e as unknown as { payload: { i: number } }).payload.i));
+      cap = r.nextCap;
+    }
+    expect(seen).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it('a cursored limit:0 read that is cut short read nothing, so its cursor does not move', async () => {
+    game = createTestWorld();
+    const base = await read({ limit: 0 });
+    emit('match', { n: 1 });
+    const r = await read({ sinceCap: base.nextCap, epoch: base.epoch, limit: 0 });
+    expect(r.truncated).toBe(true);
+    expect(r.nextCap).toBe(base.nextCap);
+  });
+
+  it('a cursor from an earlier life of the counter is reset and says so, not trusted', async () => {
+    game = createTestWorld();
+    for (let i = 0; i < 20; i++) emit('old', { i });
+    const stale = await read({ limit: 0 });
+    game.dispose(); // the harness teardown restarts the capture counter: a new life, as a reload does
+    game = createTestWorld();
+    emit('fresh', {});
+    // With its epoch: detected even though nothing about the number looks wrong.
+    const withEpoch = await read({ sinceCap: 0, epoch: stale.epoch });
+    expect(withEpoch.cursorReset).toMatch(/restarted/);
+    expect(withEpoch.events.map((e) => e.type)).toEqual(['fresh']);
+    // Without it: a cursor past the newest cap cannot be from this life either.
+    const noEpoch = await read({ sinceCap: stale.nextCap });
+    expect(noEpoch.cursorReset).toMatch(/past the newest/);
+    expect(noEpoch.events.map((e) => e.type)).toEqual(['fresh']);
+    // And a current epoch is trusted as-is.
+    expect((await read({ sinceCap: 0, epoch: noEpoch.epoch })).cursorReset).toBeUndefined();
+    // A BLANK epoch is absent, not a different life — device_journal forwards "" (#1561 review).
+    const blank = await read({ sinceCap: noEpoch.nextCap, epoch: '' });
+    expect(blank.cursorReset).toBeUndefined();
+    expect(blank.events).toEqual([]);
+  });
+
+  it('events LOST after the cursor are said out loud — eviction past the ring cap, or a clear (#1561 review)', async () => {
+    game = createTestWorld();
+    const base = await read({ limit: 0 });
+    emit('match', { n: 1 });
+    const quiet = await read({ sinceCap: base.nextCap, epoch: base.epoch }) as Read & { gapNote?: string };
+    expect(quiet.gapNote).toBeUndefined();          // accept side: nothing lost, nothing claimed
+    expect(quiet.hint ?? '').not.toMatch(/lost/);
+
+    for (let i = 0; i < 10_050; i++) emit('tick', { i });   // 51 events past the 10,000 cap
+    const r = await read({ sinceCap: base.nextCap, epoch: base.epoch, limit: 2 }) as Read & { gapNote?: string; droppedThroughCap?: number };
+    expect(r.gapNote).toMatch(/were lost/);
+    expect(r.droppedThroughCap).toBeGreaterThan(base.nextCap);
+    expect(r.hint).not.toMatch(/with no gap/);
+    // A cursor taken AFTER the loss has no gap.
+    const fresh = await read({ limit: 0 });
+    emit('match', { n: 2 });
+    expect((await read({ sinceCap: fresh.nextCap, epoch: fresh.epoch }) as Read & { gapNote?: string }).gapNote).toBeUndefined();
+
+    // A clear through the explicit clear-journal op is a loss too.
+    const beforeClear = await read({ limit: 0 });
+    emit('score', {});
+    await runAgentOp('clear-journal', {});
+    expect((await read({ sinceCap: beforeClear.nextCap, epoch: beforeClear.epoch }) as Read & { gapNote?: string }).gapNote).toMatch(/were lost/);
+  });
+
+  it('a non-numeric or negative sinceCap is refused, not read as "no cursor"', async () => {
+    game = createTestWorld();
+    for (const sinceCap of ['abc', -1, Number.NaN]) {
+      const r = await read({ sinceCap });
+      expect(r.code, String(sinceCap)).toBe('REFUSED_BY_OP');
+      expect(r.events).toBeUndefined();
+    }
   });
 });
 
@@ -103,10 +209,10 @@ describe('journal-events: an unknown vocabulary value is REFUSED with a code and
    *  route; these pin what the op itself decides. */
   type Refusal = { ok?: boolean; code?: string; error?: string; options?: string[]; events?: unknown; captures?: CaptureState };
 
-  it('an unknown level: code + the levels, nothing read, nothing cleared', async () => {
+  it('an unknown level: code + the levels, nothing read', async () => {
     game = createTestWorld();
     emit('match', { n: 1 });
-    const r = await journal({ level: 'wran', clear: true }) as unknown as Refusal;
+    const r = await journal({ level: 'wran' }) as unknown as Refusal;
     expect(r.ok).toBe(false);
     expect(r.code).toBe('REFUSED_BY_OP');
     expect(r.options).toEqual(['info', 'warn', 'error']);

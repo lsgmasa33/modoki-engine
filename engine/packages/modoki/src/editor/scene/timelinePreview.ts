@@ -20,21 +20,26 @@
  *   - the ACTIVE flag (`setTimelinePreviewActive`) is true only while the forward loop advances,
  *     so Pause silences audio + blocks dispatch without losing the paused frame. */
 
-import type { SceneData } from '../../runtime/loaders/loadSceneFile';
-import { sceneManager } from '../../runtime/scene/SceneManager';
 import { setTimelinePreviewActive } from '../../runtime/core/timelinePreview';
+import { getRunMode } from '../../runtime/core/playState';
+import { onWorldSwap } from '../../runtime/core/ecs/world';
+import { registerPosedWorldSource } from './authoredWorld';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { clearControlSpawns } from '../../runtime/timeline/controlSpawnRegistry';
-import { serializeScene, getCurrentScenePath, type SceneFile } from './serialize';
+import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
+import { capturePreviewSideState, restorePreviewSideState, type PreviewSideState } from './previewSideState';
 import { beginWorldReplacement } from './authoringSettle';
 import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 
-/** Authored-world snapshot captured at the first ▶ of a preview session, plus the scene path it
- *  belongs to (so a scene swap mid-preview can't revert the wrong scene). */
-let _snap: SceneFile | null = null;
-let _snapPath: string | null = null;
+/** Authored-world snapshot captured at the first pose of a session — primary, bases, and the scene
+ *  key it belongs to (so a scene swap mid-preview can't revert the wrong scene). Captured and
+ *  restored by `authoredSnapshot.ts`, the same code Play/Stop uses (#1547). */
+let _snap: AuthoredSnapshot | null = null;
+/** The non-world stores ▶ actions can change (#1551), seated and released WITH `_snap` — see
+ *  `previewSideState.ts`. Restored on every end, including the ones that leave the world alone. */
+let _side: PreviewSideState | null = null;
 /** The scene edit-version when the snapshot was taken, so `previewHasAuthoredEdits` can tell an
  *  authored change made INSIDE the envelope from one that predates it. */
 let _snapEditVersion = 0;
@@ -61,6 +66,9 @@ const gestureLiveness = createTeardownToken();
 /** Invalidated by every session END, so a `begin` that was already awaiting cannot seat its
  *  snapshot after the envelope it belonged to was exited. */
 const beginLiveness = createTeardownToken();
+/** Open holds from {@link holdPreviewSessionsClosed} — Play starting up. While non-zero every begin
+ *  is refused (#1546). A count, for the same reason as `_restoresInFlight`. */
+let _closedHolds = 0;
 
 export { setTimelinePreviewActive };
 
@@ -248,6 +256,45 @@ export function hasTimelinePreviewSession(): boolean {
   return _snap !== null;
 }
 
+/** Is a live `begin` still serializing its snapshot? Distinct from a held session: nothing has
+ *  been posed yet, but a pose is chained onto it. */
+export function isPreviewSessionPending(): boolean {
+  return _pending !== null && _pendingLive();
+}
+
+/** Is the live world inside SOME envelope a pose may be written into — a held preview session, or
+ *  full Play (#1546)?
+ *
+ *  A pose writes authored trait values, so it needs something that will put them back. In Play that
+ *  is Play's own snapshot: Stop reverts every write made while playing, a pose included, and saving
+ *  is refused for the whole of Play. So a pose during Play goes STRAIGHT into the Play world and
+ *  opens no preview session. It used to open one — `enterScrubMode` no-ops in Play but the begin did
+ *  not — and that session snapshotted the RUNNING world, outlived Stop (which ends only Play's
+ *  envelope), and later restored the Play world as if it were authored: on ⏹ Exit, on the Cmd+S
+ *  cycle, or on the next Play press. Every pose-guard asks this, so the two envelopes can never nest.
+ *
+ *  A PAUSED Play counts (run mode `'playing'`, not advancing): Play's snapshot is still held. Play STARTING UP does not — it reads `'stopped'`
+ *  until the snapshot is taken, and `holdPreviewSessionsClosed` refuses a begin for that window. */
+export function poseEnvelopeHeld(): boolean {
+  return _snap !== null || getRunMode() === 'playing';
+}
+
+/** Refuse every begin until the returned release is called. `enterPlay` holds this across its
+ *  startup: a session opened after its hand-off restore and before `'playing'` would snapshot a
+ *  world Play is about to own, and nothing would ever end it (#1546). It refuses NEW begins only —
+ *  one already serializing is cancelled by the takedown that follows (`cancelPendingPreviewBegins`). */
+export function holdPreviewSessionsClosed(): () => void {
+  _closedHolds++;
+  let released = false;
+  return () => { if (!released) { released = true; _closedHolds--; } };
+}
+
+/** Cancel a `begin` still serializing, so it seats nothing and the pose chained onto it never runs.
+ *  For a teardown that finds NO held session to end — an end already does this itself. */
+export function cancelPendingPreviewBegins(): void {
+  beginLiveness.invalidateAll();
+}
+
 /** Begin a preview session: snapshot the authored world ONCE (idempotent, so Pause→resume keeps
  *  the original authored snapshot to revert to — never re-snapshots the preview-mutated world).
  *
@@ -259,19 +306,29 @@ export function hasTimelinePreviewSession(): boolean {
  *
  *  **Resolves `true` only when a session is held**, and every caller must honour `false` by posing
  *  nothing and handing back the run mode it claimed. `false` means one of:
- *   - **a restore is in progress** (#1167, owner-settled: refuse, not wait). The ending session has
+ *   - **a restore is in progress** — a preview Exit's or Play's Stop (#1572) — (#1167, owner-settled:
+ *     refuse, not wait). The ending session has
  *     already cleared `_snap`, so a begin here would serialize the still-POSED world as the new
  *     "authored" snapshot, and the next Exit would restore a pose. Waiting instead was declined: the
  *     pose that follows would aim at entity ids resolved before the swap. The same window already
  *     refuses every undo/redo (`beginPreviewRestore`, #1148); a drag simply poses again on its next
  *     move once the restore has landed.
  *   - **an end intervened** while the snapshot was serializing (see `endTimelinePreviewSession`).
+ *   - **Play is running or starting** (#1546) — see `poseEnvelopeHeld` for where that pose goes.
  *  A pose after `false` is unrevertible and unguarded, since the run mode is (or is about to be)
  *  back at 'stopped'. A thrown `serializeScene` still rejects. */
 export async function beginTimelinePreviewSession(): Promise<boolean> {
+  // FIRST, ahead of the held-session answer: a preview session and Play never coexist (#1546). In
+  // Play the pose goes into Play's own envelope — see `poseEnvelopeHeld`.
+  if (getRunMode() === 'playing' || _closedHolds > 0) return false;
+  // A failed restore left the world possibly posed: snapshotting it would launder the pose (#1548).
+  if (lastRestoreFailed()) return false;
   if (_snap) return true;
   if (_pending && _pendingLive()) { await _pending; return _snap !== null; }
-  if (_restoresInFlight > 0) return false;
+  // #1167's refusal covers ANY authored restore, not only a preview one (#1572). Stop sets 'stopped'
+  // before its restore, so a scrub in that window saw a world the editor itself calls not-authored
+  // (Persistent roots still at their Play values until the post-swap replay) and snapshotted it.
+  if (_restoresInFlight > 0 || authoredRestoreInFlight()) return false;
   const stillLive = beginLiveness.capture();
   // ⚠️ Sample the edit-version BEFORE the await, not after. `serializeScene()` is async, and an
   // authored edit landing during it may or may not be in `snap` — but folding its bump into the
@@ -286,10 +343,9 @@ export async function beginTimelinePreviewSession(): Promise<boolean> {
   const session = ++_undoSessionSeq;
   setPreviewUndoSession(session);
   const mine: Promise<void> = (async () => {
-    const snap = await serializeScene();
-    const path = getCurrentScenePath();
+    const snap = await captureAuthoredSnapshot();
     // Only seat it if no session end intervened (see endTimelinePreviewSession).
-    if (!_snap && stillLive()) { _snap = snap; _snapPath = path; _snapEditVersion = version; }
+    if (!_snap && stillLive()) { _snap = snap; _side = capturePreviewSideState(); _snapEditVersion = version; }
   })().finally(() => {
     // Only its OWN slot: a begin made after an Exit cancelled this one may already hold `_pending`.
     if (_pending === mine) _pending = null;
@@ -310,6 +366,13 @@ export async function beginTimelinePreviewSession(): Promise<boolean> {
  *  because BOTH preview panels end sessions here and each resolves its own root. No-op restore
  *  when the scene changed since the snapshot. */
 export async function endTimelinePreviewSession(opts: { restore: boolean; rebind?: () => number | null }): Promise<number | null> {
+  return (await endTimelinePreviewSessionReporting(opts)).root;
+}
+
+/** `endTimelinePreviewSession`, also saying whether the snapshot was actually restored — false when
+ *  the scene changed since the begin (the guard below refuses to load it over the new scene). For
+ *  toolbar Stop's agent reply (#1574), which otherwise cannot tell a revert from a skip. */
+export async function endTimelinePreviewSessionReporting(opts: { restore: boolean; rebind?: () => number | null }): Promise<{ root: number | null; reverted: boolean }> {
   // #1164: taken synchronously, before anything else. Panels call this WITHOUT awaiting and flip the
   // run mode to 'stopped' on the next line, so without the token that flip would count as settled
   // and a deferred hot reload would start a load under the restore below — see `authoringSettle.ts`.
@@ -321,7 +384,7 @@ export async function endTimelinePreviewSession(opts: { restore: boolean; rebind
   }
 }
 
-async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: () => number | null }): Promise<number | null> {
+async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: () => number | null }): Promise<{ root: number | null; reverted: boolean }> {
   // ⚠️ Invalidate any in-flight `begin` FIRST. `beginTimelinePreviewSession` seats its snapshot on
   // `if (!_snap)` alone, so a begin still awaiting `serializeScene()` when the envelope is exited
   // used to seat a session AFTERWARDS — and the pose chained onto it then ran with run-mode back at
@@ -333,16 +396,18 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
   clearSkeletalSeeks();
   clearControlSpawns(); // preview-spawned prefabs are discarded by the snapshot reload below
   const snap = _snap;
-  const snapPath = _snapPath;
   const session = _undoSessionSeq;
   _snap = null;
-  _snapPath = null;
-  const path = getCurrentScenePath();
-  if (!opts.restore || !snap || snapPath !== path) {
+  // Before the world branch below, and whichever way it goes (#1551): a restore:false end, or one
+  // for a scene that has since changed, still ends the session whose actions changed these stores.
+  releaseSideState();
+  // `currentSceneKey`, NOT the editor's file path: prefab-edit nulls that path on purpose, and the
+  // restore used to reload under `''` — dropping the editor out of prefab-edit (#1547).
+  if (!opts.restore || !snap || snap.key !== currentSceneKey()) {
     // No restore (or a snapshot for a different scene — don't clobber): the world keeps the session's
     // edits, so their entries stay valid, and pushes from here on are authored.
     clearPreviewUndoSession(session);
-    return null;
+    return { root: null, reverted: false };
   }
   // From here until the drop, every undo/redo is refused and the session's mark stays on (#1148
   // review): an edit pushed while the restore is awaiting lands in the posed world the swap throws
@@ -357,8 +422,8 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
     await whenUndoIdle();
     // ⚠️ Re-check the path AFTER that wait: a scene opened meanwhile must not have this snapshot
     // loaded over it (the check above ran before the yield).
-    if (getCurrentScenePath() !== snapPath) return null;
-    await sceneManager.loadScene(path ?? '', { preloaded: snap as unknown as SceneData });
+    if (currentSceneKey() !== snap.key) return { root: null, reverted: false };
+    await restoreAuthoredSnapshot(snap);
     reverted = true;
   } finally {
     // Released first: a throw from the drop must not leave every later begin refused for good.
@@ -372,5 +437,40 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
     // them, or an undo after Exit writes a posed value into the authored scene (#1148).
     finishPreviewRestore(session, { drop: reverted });
   }
-  return opts.rebind?.() ?? null;
+  return { root: opts.rebind?.() ?? null, reverted: true };
 }
+
+function releaseSideState(): void {
+  const side = _side;
+  _side = null;
+  if (side) restorePreviewSideState(side);
+}
+
+/** A world swap this module did not make ends the session WITHOUT a restore (#1546).
+ *
+ *  The snapshot belongs to the world that just went away: its restore would either no-op (a
+ *  different scene — the path guard) or put the OLD scene back over the new one (a same-path reload).
+ *  Leaving it held was worse than useless — every pose-guard read "session held", so both panels'
+ *  fast paths went on posing the NEW world with the run mode already back at 'stopped' (a scene load
+ *  sets it), where a save bakes the pose. The Timeline panel dropped it from its own swap handler,
+ *  but only while mounted and only for its own previews; this is the one place that sees every swap.
+ *
+ *  Our OWN restore swaps the world too, and needs no exclusion: by then `_snap` is already null and
+ *  the end invalidated every pending begin, so the early return below takes it. */
+onWorldSwap(() => {
+  if (!_snap && !isPreviewSessionPending()) return;
+  beginLiveness.invalidateAll();
+  _snap = null;
+  // The world is not put back, but the audio/prefs/tier the session's actions changed are (#1551):
+  // an `engine.loadScene` fired by ▶ is exactly the swap that lands here.
+  releaseSideState();
+  // Nothing will restore: the scene edits made during the session live on in no world at all, and
+  // edits from here on are authored.
+  clearPreviewUndoSession(_undoSessionSeq);
+});
+
+// A held session means the live world may carry a pose; a restore in flight means it still does until
+// the swap lands — including the gap BEFORE the load starts, where the mode already reads 'stopped'
+// (a panel's ⏹ Exit flips it without awaiting the restore). Every disk writer asks (#1548).
+registerPosedWorldSource('a preview session is open', () => _snap !== null);
+registerPosedWorldSource('a preview restore is still landing', () => _restoresInFlight > 0);

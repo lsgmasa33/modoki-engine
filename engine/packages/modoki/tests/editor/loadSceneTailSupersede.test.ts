@@ -46,6 +46,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 vi.mock('../../src/editor/undo/undoManager', () => ({
   swapHistory: (path: string) => { h.swapHistoryCalls.push(path); },
   getEditVersion: () => 0,
+  beginWorldSwitch: () => ({ idle: null, release: () => {} }),
 }));
 
 vi.mock('../../src/editor/editorJournal', () => ({

@@ -248,7 +248,7 @@ if (adoptedLegacyState.length) {
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { createAssetBackend, type ElectronAssetBackend } from './assetBackend';
-import { npmSpawnSpec, ensureNode, PINNED_NODE } from '../toolchain';
+import { npmSpawnSpec, spawnSpecCall, ensureNode, PINNED_NODE } from '../toolchain';
 import { startBackendServer, type BackendServerHandle, type HostRoutes } from './backendServer';
 import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
 import { captureViewport, CaptureUnavailableError, captureRefusalBody, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
@@ -383,10 +383,11 @@ async function ensureNodeProvisioned(): Promise<void> {
 function runNpm(cwd: string, args: string[]): Promise<number> {
   const spec = npmSpawnSpec();
   return new Promise((resolve, reject) => {
-    const child = spawn(spec.command, [...spec.prefixArgs, ...args], {
+    const s = spawnSpecCall(spec, args);
+    const child = spawn(s.command, s.args, {
+      ...s.options,
       cwd,
       stdio: ['ignore', 'inherit', 'inherit'],
-      shell: spec.shell,
       env: spec.env,
     });
     child.on('error', reject);
@@ -2491,8 +2492,10 @@ app.on('before-quit', (e) => {
       // MACHINE-WIDE state that outlives this process, and until #225 nothing in production called
       // this at all — the only caller was `/api/device/disconnect`, i.e. the case where a human had
       // already tidied up. All of it is sync, so it completes even if a step below wedges and the
-      // 5s race times the teardown out. It does NOT cover a SIGTERM (`stop-editor.sh`) or a crash:
-      // Chromium takes the signal and this listener never runs — that is what the startup sweep in
+      // 5s race times the teardown out. A single SIGTERM (`stop-editor.sh`) DOES reach it: Chromium
+      // takes the signal and quits through this listener (measured, #1580). A SECOND signal during
+      // the quit kills the process outright, which is why `stop-editor.sh` sends exactly one. A
+      // crash or `kill -9` never reaches it; that is what the startup sweep in
       // `reclaimStaleDeviceStateAtStartup` is for.
       try { releaseDeviceResourcesOnExit(); } catch { /* never let cleanup block the quit */ }
       await backendHandle?.close().catch(() => {});

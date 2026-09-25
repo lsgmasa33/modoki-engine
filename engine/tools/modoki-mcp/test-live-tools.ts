@@ -124,7 +124,7 @@ type Row = {
    *
    *  It used to be re-derived — `detail.startsWith('REFUSED_BY_OP (expected')` — which quietly
    *  assumed every expected refusal carries that one code. The first entry that did not
-   *  (`modoki_scene_query`, NOT_AVAILABLE_HERE) was reported as STALE in the same run whose own
+   *  (`modoki_physics_query`, NOT_AVAILABLE_HERE) was reported as STALE in the same run whose own
    *  output line said `(expected: …)` two lines above. A staleness guard that reads a rendered
    *  string instead of the fact it is about will keep finding new ways to be wrong; this cannot. */
   expectationFired?: boolean;
@@ -202,7 +202,7 @@ const EXPECTED_REFUSALS: Record<string, { match: RegExp; why: string; when?: () 
     match: /could not derive a gs:\/\/ bucket|gcloud not found/i,
     why: 'the swept project has no OTA bucket configured; the route refuses rather than answering "nothing is published", which is the §5 could-not-look-vs-nothing-there rule working.',
   },
-  modoki_scene_query: {
+  modoki_physics_query: {
     match: /no (2D|3D) physics world exists on this surface/i,
     why: 'the swept scene has no physics colliders, so no Rapier world is ever built — measured on tropical-island, which has ZERO Collider3D entities whether playing or stopped. The op refuses rather than answering hit:null, which is §5 working: a query that could not run is not a query that found nothing. The MATCH here is the discriminator that keeps this honest — a genuinely dead route also answers NOT_AVAILABLE_HERE, but with the route-is-absent text, not this one. Smoke UC12 builds a real world and casts against it, because this entry proves the route is alive and nothing about the casting.',
   },

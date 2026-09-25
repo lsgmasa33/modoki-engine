@@ -31,8 +31,10 @@ afterEach(() => { vi.unstubAllGlobals(); unregisterAsset(OLD); idAtSave = undefi
 describe("Create Scene's override", () => {
   it('registers an unindexed scene\'s ON-DISK id before the save that overwrites it', async () => {
     vi.stubGlobal('fetch', vi.fn(async (url: string) => (String(url).endsWith(PATH)
-      ? ({ ok: true, json: async () => ({ id: OLD, entities: [] }) } as unknown as Response)
-      : ({ ok: false, json: async () => ({}) } as unknown as Response))));
+      // `text` as well as `json` (#1468): the on-disk id is read through `parseAssetJson`, which
+      // reads the BODY so it can tell an absent file apart from an unreadable one.
+      ? ({ ok: true, status: 200, text: async () => JSON.stringify({ id: OLD, entities: [] }), json: async () => ({ id: OLD, entities: [] }) } as unknown as Response)
+      : ({ ok: false, status: 404, text: async () => '', json: async () => ({}) } as unknown as Response))));
     expect(getGuidForPath(PATH), 'precondition: the manifest does not know the file').toBeUndefined();
     registerBuiltinCreatableAssets();
     await getCreatableAssets().find((d) => d.id === 'scene')!.create!(PATH);
@@ -40,7 +42,7 @@ describe("Create Scene's override", () => {
   });
 
   it('a fresh path registers nothing, so the save mints as before', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, json: async () => ({}) } as unknown as Response)));
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 404, text: async () => '', json: async () => ({}) } as unknown as Response)));
     registerBuiltinCreatableAssets();
     await getCreatableAssets().find((d) => d.id === 'scene')!.create!(PATH);
     expect(idAtSave).toBeUndefined();

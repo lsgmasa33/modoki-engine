@@ -9,7 +9,7 @@
 export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl, jsonFileBody, writeAssetFile } from './backend/editorBackend';
 export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {
-  pushAction, undo, redo, undoStep, type UndoStepResult, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
+  pushAction, undo, redo, undoStep, undoStepPending, type UndoStepResult, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
   beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
 } from './undo/undoManager';
 export { runAsCompositeAction, composeUndoActions, type CompositeActionOptions } from './undo/compositeAction';
@@ -25,7 +25,12 @@ export {
   buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type LightKind,
 } from '../runtime/scene/entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
-export { enterPlay, stopPlay, pausePlay, resetPlayMode, getModeOwner } from './scene/playMode';
+export { enterPlay, stopPlay, pausePlay, resetPlayMode, getModeOwner, onModeOwnerChange } from './scene/playMode';
+export type { PlayOutcome, StopOutcome } from './scene/playMode';
+export { isWorldAuthored, whyWorldNotAuthored } from './scene/authoredWorld';
+export { envelopeExitOptions } from './scene/envelopeExits';
+export { lastRestoreFailed } from './scene/authoredSnapshot';
+export { hasTimelinePreviewSession } from './scene/timelinePreview';
 export { onAuthoringSettled, isWorldReplacementInFlight } from './scene/authoringSettle';
 // GameView device simulation. Exported for the agent ops behind `modoki_set_game_view_device` /
 // `modoki_game_view_devices` (#367) — the catalog is the single source of truth for what screens
@@ -42,7 +47,7 @@ export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
   withEditorActor, AGENT_SCOPE_MAX_MS, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
   waitForEditorJournal, type EditorEvent, type WaitForEditResult,
-  editorJournalEpoch, editorJournalEpochChanged, resolveEditorJournalCursor, type ResolvedEditorJournalCursor,
+  editorJournalEpoch, editorJournalSeq, editorJournalDroppedThrough, editorJournalEpochChanged, resolveEditorJournalCursor, type ResolvedEditorJournalCursor,
   EDITOR_JOURNAL_SOURCES, isEditorJournalSource, type EditorJournalSource,
   EDITOR_JOURNAL_TYPES, isEditorJournalType, type EditorJournalType,
 } from './editorJournal';
@@ -69,10 +74,10 @@ export {
   getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, getOverrides, getOverrideValues,
   preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
   captureInstanceOverrides, applyOverridesByRootInstance,
-  applyToPrefab, applyToPrefabSelective,
+  applyToPrefab, applyToPrefabSelective, staleInstanceRefusal,
   revertOverridesSelective, rebuildInstance,
-  writePrefabFile, warnInertPrefabSizes, resolveExistingPrefabId,
-  tagEntityTreeAsInstance, untagEntityTreeAsInstance,
+  writePrefabFile, warnInertPrefabSizes, classifyExistingPrefabId,
+  tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance,
   captureInstanceStructure, resolveInstanceContext,
   type PrefabFile, type RevertResult,
@@ -82,7 +87,7 @@ export {
 // agent op both build their checkbox/discovery list from this ONE walk, so they cannot
 // silently drift from each other (see prefabOverrideKeys.ts's header comment).
 export {
-  fieldKey, addedKey, removedEntityKey, removedTraitKey,
+  fieldKey, addedKey, removedEntityKey, removedTraitKey, canonicalOverrideKey,
   collectInstanceOverrideFields, collectInstanceOverrideKeys,
   type FieldNode, type TraitNode, type EntityOverrideNode, type InstanceOverrideKeys,
 } from './scene/prefabOverrideKeys';

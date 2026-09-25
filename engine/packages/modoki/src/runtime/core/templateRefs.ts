@@ -26,12 +26,14 @@
  *  readable path is what makes rebasing a prefix join and not a hash lookup. See docs/scene-loading.md
  *  § "Guid uniqueness is a PER-FILE rule", "Template identity". */
 
-import { mapStringValues } from './assetRefRules';
+import { mapStringValues, parseStep, formatStep, type MemberStep } from './assetRefRules';
 
 export const MEMBER_TOKEN_PREFIX = '@member:';
 
-/** A step: a numeric localId step, or `'+key'` for a template-keyed added node. */
-export type MemberStep = number | string;
+/** A step: a numeric localId step, or `'+key'` for a template-keyed added node. Declared in
+ *  `assetRefRules` beside the two functions that produce one (`memberStepId`, `addedKeyStep`) and
+ *  re-exported here, because a member token IS a step path and every token caller wants the type. */
+export type { MemberStep };
 
 const UP = '^';
 
@@ -55,30 +57,36 @@ export function parseMemberToken(token: string): { up: number; path: MemberStep[
     if (part === UP) {
       if (path.length) return null;
       up++;
-    } else if (part.startsWith('+') && part.length > 1) {
-      path.push(part);
-    } else if (/^\d+$/.test(part)) {
-      path.push(Number(part));
-    } else {
-      return null;
+      continue;
     }
+    // The step grammar is `parseStep`'s, not this function's (#1468 Phase 1). A token comes from a
+    // file, so it is the one reader that REJECTS a part fitting neither shape rather than letting it
+    // through as a step that names nothing.
+    const step = parseStep(part);
+    if (step === null) return null;
+    path.push(step);
   }
   return { up, path };
 }
 
-/** The key a step path is indexed under: the same text a token carries. */
+/** The key a step path is indexed under: the same text a token carries. `memberPathSteps` is its
+ *  inverse. */
 export function memberPathKey(path: readonly MemberStep[]): string {
-  return path.join('.');
+  return path.map(formatStep).join('.');
 }
 
 /** `value` with every member token rebased onto `segments`: the path from the top call's root to
  *  the instance the value is applied to, one segment per nesting level. A `^` climbs one segment. A
- *  token that climbs past the top stays as it is. Copy-on-write, like `remapGuidValues`. */
+ *  token that climbs past the top keeps the climbs left over, counted from the top call's root: a
+ *  template reference node's top call resolves those in the frame around it (#1541,
+ *  `templateFrameClimber`), and anywhere else they name nothing, as before. Copy-on-write, like
+ *  `remapGuidValues`. */
 export function rebaseMemberTokens(value: unknown, segments: readonly (readonly MemberStep[])[]): unknown {
   if (!segments.length) return value;
   return mapStringValues(value, (s) => {
     const t = isMemberToken(s) ? parseMemberToken(s) : null;
-    if (!t || t.up > segments.length) return s;
+    if (!t) return s;
+    if (t.up > segments.length) return memberToken(t.up - segments.length, t.path);
     return memberToken(0, [...segments.slice(0, segments.length - t.up).flat(), ...t.path]);
   });
 }

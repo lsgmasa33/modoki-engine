@@ -1,3 +1,6 @@
+/// <reference types="node" />
+// This file imports `node:path`/`node:url`, and a game's tsconfig loads only `vite/client` types —
+// without this line a freshly scaffolded project failed its first build (#1544).
 /**
  * Every tappable control meets the 44 pt tap-target floor (#1024).
  *

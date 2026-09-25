@@ -10,6 +10,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resolveDomPoint, resolveDomPointReport, describeElement, describeOccluder } from '../../app/debug/domResolve';
+import { opReplyFor } from '../../app/debug/opRefusal';
 
 /** Give `el` a real-looking rect. jsdom reports all zeroes otherwise. */
 function stubRect(el: Element, r: { left: number; top: number; width: number; height: number }) {
@@ -372,6 +373,16 @@ describe('describeOccluder', () => {
     expect(describeOccluder(anon)).toBe('div in the "scene" panel');
   });
 
+  it('names a game UI node by its entity before walking to the chrome around it (#1570)', () => {
+    // No world behind this DOM, so the entity is named by its id — the fallback for a node whose
+    // entity is gone. The named form is covered in entityResolve.test.ts, which mocks the lookup.
+    document.body.innerHTML = '<div class="flexlayout__tab_moveable"><div data-entity-id="13"><div></div></div></div>';
+    expect(describeOccluder(document.querySelector('[data-entity-id] div')!)).toBe('entity 13');
+    // Tagged editor chrome still names itself, wherever it sits.
+    document.body.innerHTML = '<div data-entity-id="13"><button data-ui-id="x.y"></button></div>';
+    expect(describeOccluder(document.querySelector('button')!)).toBe('button[data-ui-id="x.y"]');
+  });
+
   it('falls back to the nearest NAMED ancestor when no panel is in the chain', () => {
     document.body.innerHTML = '<section class="overlay"><div><span></span></div></section>';
     // The intermediate div names nothing either, so the walk keeps going.
@@ -494,9 +505,23 @@ describe('label aim (#1153)', () => {
     expect(resolveDomPointReport({ label: 'Delete', gesture: 'tap' })).toMatchObject({ ok: true, occluded: true, hitTarget: 'div.modal' });
   });
 
+  it('the THROWING resolver keeps the code through the relay — modoki_dnd answers AMBIGUOUS (#1556)', async () => {
+    // Close-out review: `resolveDomPoint` threw a plain Error, `opReplyFor` keeps a code only for an
+    // OpRefusal, so dnd's two addresses reached the agent as REFUSED_BY_OP. Through the real relay wrapper.
+    const two = await opReplyFor(() => resolveDomPoint({ selector: '#x', x: 1, y: 1 }, 'from'));
+    expect(two).toMatchObject({ result: { ok: false, code: 'AMBIGUOUS' } });
+    expect((two as { result: { error: string } }).result.error).toMatch(/^from: give ONE of/);
+    // An uncoded miss stays an uncoded error — the coded branch must not invent a code.
+    const miss = await opReplyFor(() => resolveDomPoint({ selector: '#absent-1556' }, 'from'));
+    expect(miss).toEqual({ error: expect.stringContaining('from: no element matches') });
+  });
+
   it('label + selector is AMBIGUOUS, `within` alone is an error, an empty label matches nothing', () => {
     control('a.b.c', 'Go', { left: 10, top: 10, width: 80, height: 20 });
     expect(resolveDomPointReport({ label: 'Go', selector: '#x' })).toMatchObject({ ok: false, code: 'AMBIGUOUS' });
+    // #1556: selector + {x,y} too — `modoki_dnd`'s endpoint reaches here, and the selector used to win.
+    expect(resolveDomPointReport({ selector: '[data-ui-id="a.b.c"]', x: 1, y: 1 })).toMatchObject({ ok: false, code: 'AMBIGUOUS' });
+    expect(resolveDomPointReport({ label: 'Go', x: 1, y: 1 })).toMatchObject({ ok: false, code: 'AMBIGUOUS' });
     expect(resolveDomPointReport({ selector: '[data-ui-id="a.b.c"]', within: '.x' }).ok).toBe(false);
     // The empty-label guard, not the filter: without it '' "matches" nothing yet suggests EVERY label
     // (a substring of all of them) under a NOT_FOUND code. Asserting only ok:false could not tell.

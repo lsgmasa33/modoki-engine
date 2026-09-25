@@ -137,12 +137,14 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // `matBuildSig` gates a full Mesh+Shader+Geometry rebuild (the resolved sprite-texture url and
   // the extra-sampler set — see `matBuildSig` at its use site). `matQuadSig` gates a cheaper
   // in-place resize of just the quad's 8 position floats (size/pivot only, #692) — split from
-  // `matBuildSig` because a Shader rebuild adds two permanent entries to WebGPU's
-  // `BindGroupSystem._hash` (#699, filed upstream as pixijs/pixijs#12214 with the measurement), so
-  // an animated size must never force one. ⚠️ This used to also cite "a never-deleted key to pixi's
-  // `GCManagedHash` (#707)" — that half was WRONG (the null is a tombstone, compacted at 10k by
-  // `GCSystem.runOnHash`); see docs/rendering.md § the two-tier gate. The rule is unchanged: the
-  // `_hash` half alone is unbounded. `textureUrl` holds the retained sprite url (shared
+  // `matBuildSig` because a Shader rebuild adds two entries to WebGPU's `BindGroupSystem._hash`
+  // (#699, pixijs/pixijs#12214), so an animated size must never force one. Before pixi.js 8.21.0
+  // those entries were permanent; 8.21.0 sweeps one on the first RENDERED frame at least
+  // `gc.maxUnusedTime` (60s) after its last use — so a per-frame rebuild still piles up a minute or
+  // more of them, and an idle canvas keeps them until it next draws (docs/rendering.md, #1540).
+  // ⚠️ This used to also cite "a never-deleted key to pixi's `GCManagedHash` (#707)" — that half
+  // was WRONG (the null is a tombstone, compacted at 10k by `GCSystem.runOnHash`); see
+  // docs/rendering.md § the two-tier gate. `textureUrl` holds the retained sprite url (shared
   // spriteTextureRefs — released in disposeSlot). The shader is also registered in
   // Scene2DRenderer.entityShaders for MaterialInstance driving.
   // `materialTexUrls` holds the resolved urls of the shader's extra `texture` params
@@ -511,8 +513,9 @@ export function buildMaterialQuad(w: number, h: number, px: number, py: number):
 /** Resize an EXISTING material quad in place (#692). Only the 8 position floats move: the uvs,
  *  the indices, the texture bindings and the shader are all independent of the quad's size, so a
  *  size/pivot edit never needs a new Mesh — and never needs a new Shader, which is the part that
- *  matters, because every Shader rebuild adds two permanent entries to WebGPU's
- *  `BindGroupSystem._hash` (#699, filed upstream as pixijs/pixijs#12214). It is NOT also a
+ *  matters, because every Shader rebuild adds two entries to WebGPU's `BindGroupSystem._hash`
+ *  (#699, pixijs/pixijs#12214) — permanent before pixi.js 8.21.0, and since then held for at least
+ *  `gc.maxUnusedTime` (60s) before the GC sweeps them (#1540). It is NOT also a
  *  `GCManagedHash` key as this comment once claimed — that cache tombstones and compacts.
  *  Same in-place shape the skinned-mesh deform and the text animation passes already use. */
 export function resizeMaterialQuad(geo: MeshGeometry, w: number, h: number, px: number, py: number): void {
@@ -593,25 +596,22 @@ function sameGrouping(a: ReadonlyMap<number, number>, b: ReadonlyMap<number, num
   return true;
 }
 
-/** The ONLY place a Pixi `Geometry` is destroyed. PixiJS 8.19.0's `Geometry.destroy()` calls
- *  `removeAllListeners()` BEFORE it calls `unload()`, so the GC hook that actually frees the GL
- *  VAO — `GlGeometrySystem.onGeometryUnload`, the only `gl.deleteVertexArray` call site, reached
- *  only via `GCManagedHash`'s `item.once("unload", …)` registration — is torn off before
- *  `unload()` ever fires, permanently orphaning the VAO. `destroy(true)` alone does not fix it:
- *  `buffers.forEach` still runs before `unload()` inside the same call. `Buffer`, `TextureSource`,
- *  `GraphicsContext` and `ViewContainer` all order `unload()` before `destroy()` correctly —
- *  `Geometry` is the one Pixi class that inverts it, so this is a workaround for an upstream
- *  quirk, not a local convention.
+/** The ONLY place a Pixi `Geometry` is destroyed, for two reasons that both still hold:
+ *  it destroys the geometry's BUFFERS too (`destroy(true)` — a bare `destroy()` leaves them to
+ *  the GC), and it makes a second release safe. `destroy()` nulls `buffers`, and its own
+ *  `for (const buffer of this.buffers)` then throws on the next call, so the `!g.buffers` check
+ *  below is load-bearing, not defensive noise — a caller that releases the same geometry twice
+ *  (e.g. two dispose paths racing on the same slot) must still land here safely.
  *
- *  Guards against a second call on the same Geometry: `destroy(true)` nulls `buffers` (so
- *  `Geometry.destroy`'s own `this.buffers.forEach(...)` would run on a null next time), so a
- *  double release now THROWS where the old bare `geo.destroy()` was a silent no-op. The
- *  `!g.buffers` check below is load-bearing, not defensive noise — a caller that releases the
- *  same geometry twice (e.g. two dispose paths racing on the same slot) must still land here
- *  safely. */
+ *  It used to exist for a third reason, now fixed upstream: before pixi.js 8.21.0,
+ *  `Geometry.destroy()` called `removeAllListeners()` BEFORE `unload()`, tearing off the
+ *  `"unload"` listener that is the only route to `gl.deleteVertexArray` and orphaning the WebGL
+ *  VAO, so this called `unload()` itself first (pixijs#12212, fixed by #12190). 8.21.0 unloads
+ *  inside `destroy()` ahead of `removeAllListeners()`, and `package.json`'s floor is `^8.21.0`,
+ *  so that call is gone. `tests/runtime/geometryReleaseVao.test.ts` pins the fixed order against
+ *  the installed pixi. */
 export function releaseGeometry(g: Geometry | undefined | null): void {
   if (!g || !g.buffers) return;
-  g.unload();
   g.destroy(true);
 }
 
@@ -2114,11 +2114,13 @@ export class Scene2DRenderer {
         // ⚠️ RESET, not rebuild — the one place in this file where this diverges from the
         // `physics2DSystem` shape. `docs/engine-concepts.md` requires ACTING on a generation
         // mismatch; rebuilding is one way to obey that and resetting is the other, and here the
-        // rebuild is itself the leak: every `new Shader` mints two `UniformGroup`s with fresh
-        // `_resourceId`s, so Pixi's `BindGroupSystem._hash` gains two permanent entries per respawn
-        // and is cleared only at renderer teardown (#699 — still live upstream, carried as #694
-        // defect 5). Recycled ids ARE the pooled-VFX path, the last place to put unbounded growth;
-        // see the #692 note above on `matBuildSig`. The in-place write is the shape
+        // rebuild is itself the cost: every `new Shader` mints two `UniformGroup`s with fresh
+        // `_resourceId`s, so Pixi's `BindGroupSystem._hash` gains two entries per respawn (#699).
+        // Before pixi.js 8.21.0 they were cleared only at renderer teardown; since then the GC
+        // sweeps each on a rendered frame at least `gc.maxUnusedTime` (60s) after its last use
+        // (pixijs#12214, fixed by #12193 — #1540), so a pooled-VFX burst still holds its dead entries
+        // for a minute or more, and until the canvas next draws if it goes idle. Recycled ids ARE
+        // that path; see the #692 note above on `matBuildSig`. The in-place write is the shape
         // `updateMtsdfPixiMetrics` (#690) and the frame swap (#698) already use — bare into the
         // group's `uniforms`, no dirty bump, which reaches the GPU on BOTH backends only because
         // these groups are built with Pixi's default `isStatic: false` (`UboSystem` and
@@ -2859,7 +2861,9 @@ export class Scene2DRenderer {
         const p1 = canvasPxToClient(b.maxX, b.maxY, rect, backingW, backingH);
         const x = p0.x, y = p0.y, w = p1.x - p0.x, h = p1.y - p0.y;
         const onScreen = x < rect.right && x + w > rect.left && y < rect.bottom && y + h > rect.top;
-        out.push({ id, layer: '2d', surface, screen: { x, y, w, h }, onScreen, canvasId });
+        // `drawRect` = the canvas this was projected into: the aim samples inside screen ∩ drawRect,
+        // since a press outside the host canvas cannot pick what it drew (#1563, `screenBounds.ts`).
+        out.push({ id, layer: '2d', surface, screen: { x, y, w, h }, onScreen, canvasId, drawRect: { x: rect.left, y: rect.top, w: rect.width, h: rect.height } });
       } catch { out.push({ id, layer: '2d', surface, screen: null, onScreen: false, canvasId }); }
     }
     return out;

@@ -202,6 +202,9 @@ is the worse failure — but the loss is always announced, and named for what it
   reported.
 - **Cancel** → `staleGameCode: true` and a persistent "Running STALE game code" banner. This is the
   one state where measurements silently lie, so it stays loud.
+- **Every banner button is named** — `hmr.banner.reload-now`, `.cancel`, `.reload`, `.dismiss` on a
+  box `hmr.banner` — so an agent that sees the countdown can press Cancel by name inside the 5 s
+  (`modoki_tap {selector:'[data-ui-id="hmr.banner.cancel"]'}`) rather than hunting it by text.
 
 **The cause set is ENUMERATED, not hand-listed (#850).** `app/debug/hmrStaleness.ts`'s `DirtyProbe`
 returns whatever `unsavedChangeCauses()` (`editor/scene/serialize.ts`) reports — a `Record<string,
@@ -274,7 +277,7 @@ that module is re-evaluated while the subscriber survives. Touching each one:
 | `runtime/core/playState.ts` (`onPlayStateChange`) | **page reload** | `SceneView.tsx` :2471 |
 | `runtime/rendering/text/textDirty.ts` (`onTextDirty`) | **page reload** | `SceneView.tsx` :2472 |
 | `runtime/rendering/materialDirty.ts` (`onMaterial3DDirty`) | **page reload** | `SceneView.tsx` :2478 |
-| `editor/animation/poseClip.ts` (`onPoseEnvelopeExited`) | **page reload** | `AnimationEditor.tsx` :439 — see below |
+| `editor/animation/poseClip.ts` (`onPoseEnvelopeExited`) | **page reload** | no panel subscribes since #1549 (the ⏹ follows the mode owner) |
 | *control:* `editor/panels/Console.tsx` | `hmr update` | — |
 
 A full reload rebuilds the registry **and** its subscribers together, so the stale-`Set` fork cannot
@@ -306,7 +309,9 @@ class unreachable in practice**, and it is why the keymap registries needed an e
 
 So #312's premise that the hazard "just bit for real" is **wrong**: the `useHmrEpoch()` key added to
 `AnimationEditor` in `9c6215f35` is harmless and costs nothing in a shipped build, but it was never
-load-bearing. Do not read it as evidence the hazard fired.
+load-bearing. Do not read it as evidence the hazard fired. (That subscription is gone since #1549 — the panel's ⏹
+follows the mode owner instead — but the reasoning is the general one and still applies to the rows
+above.)
 
 ⚠️ **This verdict is a property of the import graph, not of the effects.** It would stop holding if
 a registry module's only importers became components — so re-measure with the query above after a

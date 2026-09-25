@@ -41,6 +41,7 @@ Grouped:
   native logs" below) · `device_crash_reports` (iOS crash + jetsam reports — the only surface that
   explains a death that already happened).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
+  `device_wait_for` (the runtime half of `modoki_wait_for`: `entity`/`console` conditions only) ·
   `device_resolve_refs` · `device_introspect` · `device_game_tools` (what TOOLS the connected
   game registers — [agent-tools.md](agent-tools.md); invoke one with `device_game_tool_call`) ·
   `device_layout_bounds` · `device_watch` ·
@@ -523,6 +524,35 @@ logs it already has. The response says which read you got (`logcat dump, backwar
 forward for Ns`), because an empty result means *"nothing was logged"* in one case and *"nothing
 happened while I watched"* in the other, and those lead to opposite next moves.
 
+⚠️ **On the `app` path, `seconds` was ignored on BOTH platforms until #1558** — the window is only
+real if the code bounds it, and neither did. **iOS:** a position alone does not bound
+`OSLogStore.getEntries` — measured on macOS, a boot-relative and a date position both returned all
+20,000 of the process's entries (4.8 s), and only a `date >= since` **predicate** returned the window
+(1.4 s). So every read walked the app's whole log since launch, grew with uptime, and ended as
+`device request timed out after 5000ms`, however small `seconds` was. **Android:** `logcat -t N` is a
+LINE count, not seconds — `-t 60` on the S22 covered 11 s, so a filter for anything older answered
+"No logs". It now passes `-T <epoch seconds>`, which has no timezone or year to get wrong. The MCP
+also sends a `timeoutMs` sized from `seconds` (15 s + 5 ms/s, capped at 25 s; the base covers the
+worst iPhone 8 read below with margin, and the slope is still a guess), because the relay's deadline
+is otherwise the lease transport's fixed 5000 ms
+(#153). **Observed through the plugin on 2026-09-25 (QA-TOOL-0013):** on the S22, a 20 s read held
+only the newest marker and a 120 s read held all 202 older lines (0.3–0.6 s). On the iPad (iOS 26.6.2),
+with the app up 11 minutes, a 30 s read returned 49 lines, the oldest 34 s old, and none of the
+~3,700-line launch burst. The first read after idle costs ~4–5 s whatever the window (opening
+OSLogStore), and repeat reads ~2 s. On the **iPhone 8** (over WiFi), where every read used to time
+out, the window now holds: a 30 s read
+returned 54 lines, the oldest 29 s old. But **every read cost 6.2–10.6 s whatever the window**, over
+two runs (a 600 s read of 917 lines took no longer than a 30 s one). That fixed cost is opening the
+log store, and it is why the budget's base is 15 s. On the second run the 120 s read took 10.59 s,
+and the original 5 s base gave that read a relay deadline of exactly 10.6 s. ⚠️ **Unmeasured:**
+whether that cost grows with uptime past the ~10 minutes both runs had. They differed by 40% at the
+same uptime, so a long-running app on the iPhone 8 is the case to watch. A
+failed read now arrives in `error` on both platforms (iOS used to send it as a log line, and a
+logcat that rejects its arguments used to read as "No logs"). `seconds` is a whole number from 1
+to 30 days, and `limit` is at least 1 (`limit:0` crashed the iOS reader). An app binary built before
+#1558 still has both bugs, so keep that in mind when an old build gives an empty or timed-out `app`
+read.
+
 ⚠️ **On the iOS forward path, `seconds` is a window of SYSLOG and starts when `ios syslog` is UP** —
 not when the route asked for it. Host fork/exec latency used to be billed against the caller's window,
 which is invisible on an idle Mac and load-dependent everywhere else: a 1 s capture could return an
@@ -657,6 +687,11 @@ roughly 7x the 60,000-char budget, and nothing else on this path truncates.
 
 Two questions, one mechanism each. `device_list` answers both in one call — attached Androids
 (`adb devices -l`), paired iPhones (`devicectl` + the legacy `xctrace` listing), and who holds each.
+
+⚠️ **`device_list` goes through the editor (`/api/device/list`), so it refuses when no editor runs** —
+but its question needs none. **`npm run device:list` answers the same thing host-side**, claims
+included, and the refusal names it first (#1558). Don't fall back to raw `adb devices`/`devicectl`:
+they list phones with no claims, which is #285's bypass — measured, 20 of 120 refused agents did.
 
 **Which one — the serial is resolved ONCE, at connect, and carried on the lease.** Every adb call on
 this surface used to be un-targeted, which is fine with one phone and fails outright with two: adb
@@ -1009,6 +1044,17 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
   - `editor {playState|runMode|advancing|scenePath}` — every given field must equal
     `get_editor_state`'s.
 
+  **Where it is registered (#1559 C-12).** The op registers in the RUNTIME (`agentBridge.ts`) with the
+  `entity` and `console` readers, so the device has it as `device_wait_for`; the editor replaces
+  that registration with the same readers plus `chrome` and `editor`, the two only it can answer. The
+  runtime registration carries an `accepts` predicate, so on the HMR relay a page with no editor (a
+  `#/game/<id>` tab) DECLINES a `chrome`/`editor` wait rather than refusing it — the relay settles on
+  the first answer that is not a decline (#1030), and the instant refusal used to beat the editor's
+  park. On a device a `chrome`/`editor` condition is refused by name, and `device_wait_for` caps its park at
+  55 s: `/api/device/request` sizes the transport deadline as the op's `timeoutMs` + 5 s, capped at
+  60 s, so a longer park would outlive its own transport. The console `level` is a threshold there
+  too (below).
+
   It checks at once, then polls every 50 ms, which keeps working while `advancing:false` freezes
   frames. Satisfied → `{satisfied:true, elapsedMs, observation}`; a timeout is a NORMAL result
   `{satisfied:false, timedOut:true, lastObservation}` — read `lastObservation` for why. A condition
@@ -1044,7 +1090,9 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
     capture (`"modoki_wait"` is accepted for it too).
   - **Refused at pre-flight, so nothing runs:** unknown tool, args that fail the tool's real schema,
     raw `{x,y}` aiming on `tap`/`hover`/`scroll`/`pointer`/`drag`/`dnd`/`drag_handle` (aim by
-    `entity`/`selector`/handle id, or `drag_handle`'s `toId`/`delta`), and
+    `entity`/`selector`/handle id, or `drag_handle`'s `toId`/`delta`), an aim giving TWO addresses
+    (`AMBIGUOUS`, #1556 — refused up front, since the route would refuse it only after the steps
+    before it had run), and
     `modoki_build`/`modoki_add_native_target`/`modoki_ota_publish`/`modoki_capture_gesture`/a nested
     batch (run those alone — `capture_gesture`'s `from`/`to` are REQUIRED raw coordinates, so it has
     no stale-proof aim to offer).
@@ -1133,6 +1181,23 @@ same actions + state a person has in the editor. They relay to the renderer over
   queued; from PAUSED (where `enterPlay` awaits nothing) the op waits itself, like `resume`.
   `device_step` waits inside its own `timeoutMs` budget and refuses with `physicsLoading: [...]` only
   when that runs out (retry), or names a permanent failure.
+  **The reply is built from what the controller DID, never from the state re-read after it** (#1574):
+  `enterPlay`/`stopPlay` return a `PlayOutcome`/`StopOutcome` (`editor/scene/playMode.ts`), because a
+  refused Play reads `'stopped'` exactly like a Play nobody asked for, and the op used to answer
+  `ok:true` over every refusal.
+
+  | Outcome | `play` / `stop` reply |
+  |---|---|
+  | Play refused: `scene-swap` (a load or an authored restore in flight), `restore-failed`, `already-starting`, `load-landed` (mid-snapshot) | `ok:false, code:'REFUSED_BY_OP', reason, error` — `error` is the same string the toolbar's console warn prints |
+  | Play started, then a Stop queued during startup ended it | `ok:false, code:'REFUSED_BY_OP', reason:'stopped-during-startup', reverted` — `reverted` is that Stop's answer; its restore THROWING lands here too, as `reverted:false` |
+  | Stop ran its restore | `ok:true, reverted:true` |
+  | Stop skipped it (scene changed during Play or preview; no snapshot) | `ok:true, reverted:false, reason` — the snapshot was not restored, so after a Play the live world keeps what Play did (after a preview it is the scene that replaced it) |
+  | Stop only waited for a restore a panel had already started | `ok:true`, no `reverted` — that restore's outcome is the panel's |
+  | Stop while a Play is still starting | `ok:true, queued:true` — the startup performs the revert; the PLAY reply says how it went |
+  | Stop's restore THREW | `ok:false, code:'REFUSED_BY_OP'` — no longer an escaped throw, which the relay called `NOT_AVAILABLE_HERE` ("relaunch") |
+
+  `play` while playing and `stop` while stopped stay `ok:true`: the state the reply reports IS the
+  one asked for, and the live sweep's `{"action":"stop"}` relies on it.
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/canvas2d/ui/camera/light/
   environment/particle — identical to the Hierarchy menu), `modoki_duplicate_entity`, `modoki_delete_entities`,
   `modoki_reparent_entity`, `modoki_set_selection`, `modoki_set_gizmo`, `modoki_focus_entity`,
@@ -1355,8 +1420,9 @@ so existing callers don't break; don't pass it.
   a cheerful `ok:true` with the bad news buried in a field. `unsavedChanges` on
   `get_editor_state` tells you where you stand. The re-audit swept this across the whole surface:
   `tap_handle`/`drag_handle` refuse an off-screen, disabled, or OCCLUDED handle and report
-  `occluded` (a BOOLEAN, always present) + `occludedBy`, per endpoint for `drag_handle` (S3.17) —
-  `allowOccluded:true` presses anyway. Occluded was a *warning that still dispatched* until
+  `occluded` (a BOOLEAN, always present) + `occludedBy`, per endpoint for `drag_handle` (S3.17).
+  A covered handle, or one clipped by a neighbouring panel, is `OCCLUDED` and `allowOccluded:true`
+  presses anyway; an off-window or disabled one is `REFUSED_BY_OP` and it does not (#1565). Occluded was a *warning that still dispatched* until
   2026-08-19: a 2D gizmo handle under the SceneView's own toolbar pressed the TOOLBAR and answered
   `ok:true`, and the covered press was filed as "the handle is completely inert" (testboard
   5jE5Tip6Qwp7s7YVAYoH — it was not; the same handle moved the entity on the first try once it was
@@ -1476,7 +1542,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_asset_schema` | GET `/api/asset-schema` | read-only | editor | — | `{"type":"particle"}` |
 | `modoki_capture_viewport` | POST `/api/capture-viewport` | read-only | editor + electron | — | *(no args)* |
 | `modoki_diagnose` | GET `/api/diagnose` | read-only | editor + scene | — | *(no args)* |
-| `modoki_editor_journal` | GET `/api/editor-journal` | session · **IMPURE READ** (an optional arg destroys state) | editor | — | *(no args)* |
+| `modoki_editor_journal` | GET `/api/editor-journal` | read-only | editor | — | *(no args)* |
 | `modoki_eval_api` | GET `/api/eval-api` | read-only | editor + renderer | — | *(no args)* |
 | `modoki_find_references` | GET `/api/find-references` | read-only | project | asset | `{"target":"/assets/scenes/main.scene.json"}` |
 | `modoki_game_view_devices` | GET `/api/game-view-devices` | read-only | editor | — | *(no args)* |
@@ -1487,19 +1553,19 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_get_scene_state` | GET `/api/scene-state` | read-only | editor + scene | — | *(no args)* |
 | `modoki_handles` | GET `/api/enact-handles` | read-only | editor | — | *(no args)* |
 | `modoki_identity` | — | read-only | editor | — | *(no args)* |
-| `modoki_journal` | GET `/api/journal` | session · **IMPURE READ** (an optional arg destroys state) | editor + renderer | — | *(no args)* |
+| `modoki_journal` | GET `/api/journal` | session · **IMPURE READ** (an optional arg changes state) | editor + renderer | — | *(no args)* |
 | `modoki_list_actions` | GET `/api/game-introspect` | read-only | editor + renderer | — | *(no args)* |
 | `modoki_list_assets` | GET `/api/scan-assets` | read-only | project | — | *(no args)* |
 | `modoki_list_creatable_assets` | GET `/api/creatable-assets` | read-only | editor | — | *(no args)* |
 | `modoki_list_scenes` | GET `/api/scenes` | read-only | project | — | *(no args)* |
 | `modoki_list_traits` | GET `/api/trait-schema` | read-only | editor | — | *(no args)* |
 | `modoki_ota_status` | GET `/api/ota/status` | read-only | project | — | *(no args)* |
+| `modoki_physics_query` | POST `/api/scene-query` | read-only | editor + scene | point | `{"kind":"point","dim":"3d","point":[0,0,0]}` |
 | `modoki_player_prefs` | GET `/api/player-prefs` | read-only | editor | — | *(no args)* |
 | `modoki_read_asset_def` | GET `/api/asset-def` | read-only | editor | asset | `{"path":"/assets/particles/probe.particle.json"}` |
 | `modoki_render_scene` | POST `/api/render-scene` | read-only | editor + renderer + scene | — | *(no args)* |
 | `modoki_render_sequence` | POST `/api/render-sequence` | read-only | editor + renderer + scene | — | *(no args)* |
 | `modoki_resolve_refs` | GET `/api/resolve-refs` | read-only | project | — | `{"refs":["00000000-0000-0000-0000-000000000000"]}` |
-| `modoki_scene_query` | POST `/api/scene-query` | read-only | editor + scene | point | `{"kind":"point","dim":"3d","point":[0,0,0]}` |
 | `modoki_unused_assets` | GET `/api/unused-assets` | read-only | project | — | *(no args)* |
 | `modoki_validate_prefab` | GET `/api/validate-prefab` | read-only | project | asset | `{"path":"/assets/prefabs/probe.prefab.json"}` |
 | `modoki_validate_scene` | GET `/api/validate-scene` | read-only | project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
@@ -1511,7 +1577,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
 | `modoki_create_entity` | POST `/api/editor-action` `create-entity` | live · undoable | editor + scene | — | `{"kind":"empty"}` |
-| `modoki_create_registered_asset` | POST `/api/editor-action` `create-registered-asset` | file | editor + project | asset | `{"kind":"material","path":"/assets/materials/probe.mat.json"}` |
+| `modoki_create_registered_asset` | POST `/api/editor-action` `create-registered-asset` | file | editor + project | asset | `{"type":"material","path":"/assets/materials/probe.mat.json"}` |
 | `modoki_delete_asset` | POST `/api/delete-asset` | file | project | asset | `{"paths":["/assets/particles/probe.particle.json"]}` |
 | `modoki_delete_entities` | POST `/api/editor-action` `delete-entities` | live · undoable | editor + scene | entity | *(no args)* |
 | `modoki_discard_asset_edits` | POST `/api/editor-action` `discard-asset-edits` | session | editor | — | `{"all":true}` |
@@ -1527,8 +1593,8 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
-| `modoki_anim_add_key` | POST `/api/editor-action` `anim-add-key` | live · undoable | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","trait":"Transform","field":"x","time":0,"value":1}` |
-| `modoki_anim_set_clip` | POST `/api/editor-action` `anim-set-clip` | live · undoable | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","clip":{}}` |
+| `modoki_anim_add_key` | POST `/api/editor-action` `anim-add-key` | live · undoable | editor | asset | `{"path":"/assets/anim/probe.anim.json","trait":"Transform","field":"x","t":0,"value":1}` |
+| `modoki_anim_set_clip` | POST `/api/editor-action` `anim-set-clip` | live · undoable | editor | asset | `{"path":"/assets/anim/probe.anim.json","clip":{}}` |
 | `modoki_create_asset` | POST `/api/create-asset` | file | project | asset | `{"type":"particle","path":"/assets/particles/probe.particle.json"}` |
 | `modoki_create_folder` | POST `/api/create-folder` | file | project | asset | `{"path":"/assets/probe-folder"}` |
 | `modoki_duplicate_asset` | POST `/api/duplicate-asset` | file | project | asset | `{"from":"/assets/particles/probe.particle.json","to":"/assets/particles/probe-copy.particle.json"}` |
@@ -1536,8 +1602,8 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_move_asset` | POST `/api/move-file` | file | project | asset | `{"from":"/assets/particles/probe.particle.json","to":"/assets/particles/moved.particle.json"}` |
 | `modoki_particle_set` | POST `/api/editor-action` `particle-set` | live · undoable | editor | asset | `{"path":"/assets/particles/probe.particle.json","def":{}}` |
 | `modoki_reimport_asset` | POST `/api/reimport` | file | project | asset | `{"path":"/assets/textures/probe.png"}` |
-| `modoki_timeline_add_clip` | POST `/api/editor-action` `timeline-add-clip` | live · undoable | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","trackType":"animation","item":{}}` |
-| `modoki_timeline_set` | POST `/api/editor-action` `timeline-set` | live · undoable | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","timeline":{}}` |
+| `modoki_timeline_add_clip` | POST `/api/editor-action` `timeline-add-clip` | live · undoable | editor | asset | `{"path":"/assets/timelines/probe.timeline.json","trackType":"animation","item":{}}` |
+| `modoki_timeline_set` | POST `/api/editor-action` `timeline-set` | live · undoable | editor | asset | `{"path":"/assets/timelines/probe.timeline.json","timeline":{}}` |
 | `modoki_write_asset` | POST `/api/asset-write` | file | project | asset | `{"path":"/assets/particles/probe.particle.json","type":"particle","data":{}}` |
 | `modoki_write_asset_meta` | POST `/api/write-meta` | file | project | asset | `{"path":"/assets/textures/probe.png","meta":{}}` |
 
@@ -1623,10 +1689,20 @@ existing agent call for a cosmetic win. Read across:
 | screen-space rects | `modoki_get_layout_bounds` | `device_layout_bounds` |
 | a picture of it | `modoki_capture_viewport` | `device_screenshot` |
 | what can I dispatch? | `modoki_list_actions` | `device_introspect` |
+| wait for a condition | `modoki_wait_for` | `device_wait_for` (entity/console only) |
 | the GAME's own tools | they appear as tools (`court_load_level`) | `device_game_tools` + `device_game_tool_call` — deliberately NOT a dynamic tail; see [agent-tools.md](agent-tools.md) |
 
 **Editor-only BY NATURE, recorded rather than filed as a gap — the §9 ledger.** A capability on one
 surface and not the other is a *finding*: either closed, or written down here with the reason.
+
+**PARAMETER-level differences between twins are enforced, not tabulated here (#1559).**
+`engine/tests/tools/twinParamParity.test.ts` walks both live registries and fails on a param one twin
+takes and the other lacks, a differing stated default, or a device tool with no editor twin — unless
+its `RECORDED` / `RECORDED_DEFAULTS` / `DEVICE_ONLY` table gives the reason, and a record that no longer
+holds fails too. That is where `label`/`within`/`modifiers` (editor chrome and mouse, not the device),
+`duplicate_entity.count` (a device load-test knob), `drag.steps` 5 vs 10 (different pacing models) and
+the `wait_for` `chrome`/`editor` conditions are written down. The 2026-09-25 audit found four such
+gaps nobody had recorded; nothing compared the twins before.
 
 | Editor-only tool | Why there is nothing for a device counterpart to do |
 |---|---|
@@ -1639,7 +1715,7 @@ surface and not the other is a *finding*: either closed, or written down here wi
 | `modoki_pose_clip` · `modoki_open_animation_editor` · `modoki_exit_pose_envelope` | all three turn on the editor's **preview envelope** — a snapshot of the authored world that ⏹ Exit reverts to, plus a run-mode that blocks a scene save. A device build has no Animation panel, no envelope, and nothing to revert a pose *to*. |
 
 **Closed rather than recorded (#288 Phase 6):** `device_player_prefs`,
-`device_write_player_prefs` and `device_scene_query` ship alongside their `modoki_*` twins, because
+`device_write_player_prefs` and `device_physics_query` ship alongside their `modoki_*` twins, because
 both ops register in `agentBridge.ts` (runtime) and the device runtime therefore already had them.
 Prefs in particular matter *more* here: on a device the store is a real player's save data,
 namespaced by appId, which is why `action:'clear'` requires `confirm:true` on **both** surfaces —
@@ -1794,7 +1870,21 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `modoki_dispatch_action` fires a game intent by name (needs Play); `modoki_list_actions` discovers
   dispatchable actions + read-values. Assert on events, not screenshots. Returns the **last 100 events
   + `byType` counts over the whole 10,000-event ring** (a `@contact`-heavy physics session is ~582k
-  tokens entire) — narrow with `type=`, raise `limit=N`. (Journal is **off in shipped game builds** —
+  tokens entire) — narrow with `type=`, raise `limit=N`. **A read never deletes anything** (#1561
+  retired `clear`): for a clean baseline, read once with `limit:0` and pass the returned `nextCap`
+  (+ `epoch`) as `sinceCap` — that read covers only the events after it, and its `ringTotal`/`byType`
+  count only those. A cursored read returns the OLDEST events after the cursor, so paging with each
+  reply's `nextCap` never skips; a cursor from before a reload comes back with `cursorReset`. What
+  paging cannot recover is an event the RING already lost — past its 10,000-event cap, or to an
+  explicit `clear-journal` — and a reply says so with `gapNote`/`droppedThroughCap`. The editor
+  journal does the same for its own 2,000-event ring (`gapNote`/`droppedThroughSeq` on `since`) and
+  for the merged timeline, which interleaves both rings (`timelineGapNote`/`droppedThroughCap`). (A
+  jump in the returned `cap`s proves nothing: the counter is shared
+  with the editor stream and other worlds). ⚠️ The ring is PER WORLD: a scene load or Play starts a
+  new world whose ring never held the previous world's events, and that is not reported as a gap. One
+  capture counter has one epoch: `modoki_editor_journal`'s epoch is `<capture life>~<seq life>`, a
+  `sinceCap` is checked against the capture part only, so a `modoki_journal` baseline works as a
+  merged-timeline `sinceCap` and a merged read's `nextCap` works here. (Journal is **off in shipped game builds** —
   gated `__MODOKI_EDITOR__ || build.debugBuild`; always on in the editor. **Off means not
   RECORDING, not removed** — unlike the debug menu and the bridge (dynamic imports that
   tree-shake out entirely), `core/journal.ts` is statically imported by ~14 runtime modules
@@ -1896,7 +1986,7 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `registerHitRegionProvider()`, from the code that OWNS it — never a second copy, which would agree
   today and drift on the first retune. (`runtime/rendering/hitRegions.ts`; Court is the worked
   example, `games/court/runtime/systems.ts`.)
-- **Editor session (perceive the human):** `modoki_editor_journal {type,source,since,sinceCap,merged,limit,clear}`
+- **Editor session (perceive the human):** `modoki_editor_journal {type,source,since,epoch,sinceCap,merged,limit}`
   — the human-authoring stream (`!` sigil: `!select`/`!edit`/`!mutate`/`!transform`/`!create`/`!duplicate`/
   `!delete`/`!reparent`/`!play`/`!pause`/`!stop`/`!gizmo`/`!scene-load`/`!save`/`!undo`/`!redo`), GUID-addressed with
   old→new values on edits. ⚠️ `!edit` is the human Inspector-field path; **your own
@@ -2021,7 +2111,7 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
     it and its own review caught it.
 
   Frame-fed READS
-  (`world`/`bounds`, `layout_bounds`, `hit_regions`, `scene_query`, profiler, watch, and the
+  (`world`/`bounds`, `layout_bounds`, `hit_regions`, `physics_query`, profiler, watch, and the
   enact/resolve-point ops the trusted routes aim from) carry a staleness note on the existing
   `warnings` array rather than a new payload shape.
 
@@ -2129,7 +2219,31 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   evicted; the rest rolls. No cap survives an error loop, and an error loop is precisely when the
   boot lines are wanted, so size alone cannot deliver the guarantee. 1000 entries in the editor, 512
   on a debug device build (matching the 200+300 it replaced).
-- **Console:** `modoki_get_console_logs` returns the **last 50** plus three numbers that do NOT mean the
+- **Console:** `modoki_get_console_logs` and `device_console_logs` are ONE op (`console-logs`) since
+  #1559 — the device kept its own bridge command before, with a prose reply, no counts, no `since` and
+  an exact-match `level` that disagreed with the editor's about `info`. Its filters, owner decisions
+  2026-09-25:
+  - **`level` is a threshold** — that level or worse, as on the journals (`warn` → warn + error);
+    `log` and `info` rank together. It used to be an exact match, so `level:'warn'` hid the errors.
+    `wait_for`'s console condition reads it the same way.
+  - **`since` is the ring's seq cursor**, with editor_journal's contract: entries carry `seq`, the
+    reply hands back `nextSeq` and `epoch`, and a `since` read pages **oldest-first** — a truncated
+    page's `nextSeq` is its last row, so polling never skips a line. (A tail here handed back the
+    newest 50 of an error storm and a cursor past the rest, so the first error — the cause — was
+    unreachable; the close-out review observed it.) An untruncated read moves `nextSeq` to the newest
+    seq in the WHOLE ring, so a `level:'error'` poll does not re-read what it filtered out. A bare
+    read is still the newest 50.
+  - **`epoch` is the ring's identity for this page load.** Send it back with `since`: a mismatch
+    means the ring restarted (a reload — a game-code edit forces one) and the read starts over with
+    `cursorReset` (a sentence, as on the journal). Without it only a cursor ABOVE the new ring's
+    newest seq can be recognised, and once the reloaded page has logged past the old cursor its boot
+    lines — where the error the edit caused sits — were skipped silently (observed in review).
+  - **`sinceMs` is the clock form** (epoch ms). Both together are refused `AMBIGUOUS`; a timestamp
+    passed as `since` (≥ 1e11, which no seq reaches) is refused with a pointer to `sinceMs`, because
+    `since` WAS epoch ms before and an old caller would otherwise silently match nothing — and a seq
+    passed as `sinceMs` (< 1e11, an instant in 1970) is refused with a pointer to `since`.
+
+  A bare read returns the **last 50** (a `since` read, the oldest 50 after the cursor) plus three numbers that do NOT mean the
   same thing: `returnedCount` (what came back), `totalCount` (what matched `level=`/`since=`), and
   `ringTotal`+`byLevel` (the WHOLE ring — 1000 entries in the editor, 512 on a debug device build
   since #596/#597 — regardless of the filter). That last part is the
@@ -2156,8 +2270,8 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `SkeletalAnimator.activeClip`/`normalizedTime` and RigidBody `isSleeping`), `world` (resolved world TRS
   + `activeInHierarchy`), `bounds` (per-entity `screen` rect + `onScreen` + 3D `worldAABB {size,center}`),
   `contacts` (live solid `contacts` + sensor `overlaps`, GUIDs — a code-spawned partner has a runtime guid (#1210); `id:<n>` only for one with no guid — since #1248 only an entity whose EntityAttributes was removed after spawn), `resources` (include resource entities,
-  excluded by default), `limit` (`truncated` when it bites; `returnedCount`/`totalCount` are always present; an explicit `limit` always wins, and a
-  targeted query is never silently capped). **Floats are rounded to 9 significant digits**
+  excluded by default), `limit` (`truncated` when it bites; `returnedCount`/`totalCount` are always present; an explicit `limit` always wins; defaults are
+  200 for the untargeted index and 20 for a targeted read, and a capped reply puts `truncated` and a hint naming the hidden count BEFORE its rows — #1557). **Floats are rounded to 9 significant digits**
   (`247.13061935179246` → `247.130619`; max error 3.5e-7) — ~18–21% of the tokens on a Transform
   drill-down. **Verify an edit with a TOLERANCE, not `===`.** `precision=0` returns exact float64;
   the same param exists on `get_layout_bounds` and `watch`.
@@ -2176,9 +2290,10 @@ agent can do anything a mouse+keyboard can, in dev AND the DMG. Reach for it whe
 Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor trusted input except
 `dnd`/`handles`, which ride the editor-action relay and work in dev too. (Design:
 [enact.md](./enact.md).)
-- **Never aim by pixels. There are three aim modes, and `{x,y}` is the last resort.** Precedence is
-  `entity` → `selector` → `{x,y}`; the first two resolve **server-side in the same call**, so nothing
-  can move between reading a coordinate and acting on it.
+- **Never aim by pixels. There are three aim modes, and `{x,y}` is the last resort.** Give exactly
+  ONE — two are refused `AMBIGUOUS` on both surfaces, never settled by precedence (#1556). `entity`
+  and `selector` resolve **server-side in the same call**, so nothing can move between reading a
+  coordinate and acting on it.
   - **`selector`** (a CSS selector) for **editor chrome** — resolved to the element's centre. Drag
     takes one point spec per endpoint.
   - **`entity: {guid|name|id}`** for a **scene entity** in a viewport — resolved to the entity's live
@@ -2218,8 +2333,9 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
     caught, but **a mesh directly in front of the target reports `occluded:false`**, because
     nothing asked the scene what is actually there. Treat `'canvas'` + `occluded:false` as "the
     click reaches the canvas", not "the click hits the entity". A successful `'entity'`-scope
-    response also carries `aimedAt` (`'centre'` | `'sampled'` — whether the entity's projected-rect
-    centre picked it, or a concave/hollow shape needed a searched point instead) and, on a refusal
+    response also carries `aimedAt` (`'centre'` | `'sampled'` — whether the centre of the VISIBLE
+    part of the entity's projected rect picked it, or a concave/hollow/partly-covered shape needed
+    a searched point instead; the search stays inside the rect the surface draws, #1563) and, on a refusal
     or an `allowOccluded` dispatch, `occludedByEntity` naming who is actually there. Design +
     tests: [docs/enact.md](enact.md).
 - **Raw input modalities** (beyond `tap`/`drag`): `modoki_hover` (bare mouse-move → tooltips/hover-
@@ -2299,8 +2415,11 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
     not** — since #1270 every full-screen dialog is portalled to `<body>`, so the Sprite/9-slice
     editors and the animation pickers are NOT under the panel that opened them. Narrow those with
     `within:'[data-modal-shell="<kind>"]'` (`sprite-editor`, `nine-slice-editor`, `project-settings`,
-    …), which is the attribute the shell puts on every backdrop. Label together with
-    `selector` or `entity` also refuses `AMBIGUOUS`.
+    `save-dialog`, …), which is the attribute the shell puts on every backdrop — the plain-DOM form
+    too, since #1471. The plain-DOM prompt/confirm (`save-dialog`) names its controls
+    `save-dialog.confirm` / `save-dialog.cancel` / `save-dialog.input`, and a choice modal names
+    each button `<kind>.<value>` (#1470). Label beside any other address also refuses
+    `AMBIGUOUS`.
   - **Limits.**
     - An untagged element has no label to aim at — tag it.
     - A field is labelled only by its `data-ui-label` (many Inspector fields pass one) or its
@@ -2534,6 +2653,22 @@ holding onto — "Debug" is an overloaded word and this is exactly where a reade
 - **Android native plugin** — the `com.modokiengine.gamedebug.DEBUG_BUILD` AndroidManifest
   `<meta-data>`, healed from the flag and read by `GameDebugPlugin.startServer`. Absent reads as
   false (fail closed).
+- **The plugin itself** (#1521). Flag off takes `GameDebugPlugin.swift` out of the iOS App target
+  (its four pbxproj entries) and `capacitor-game-debug` out of `capacitor.config.json`
+  `includePlugins`. `cap sync` builds the Android gradle graph from that list. A flag-off build
+  therefore carries no native debug bridge at all, which is the owner's store-build ruling on #938.
+  The iOS removal runs after the registration heal, because the fence only stops naming the type
+  once it is in its OFF form. It **refuses**, with a loud note, while any App-target Swift still
+  uses `GameDebugPlugin` in code (a hand-written, unfenced registration): stripping the class
+  under it would break the compile. "In code" means outside comments and string literals, found by
+  a small Swift scanner (`swiftCodeOnly`), because nested block comments and interpolation defeat a
+  regex. A `.swift` that cannot be read counts as a use. The mirror rule holds for flag ON: the
+  fence is written ON only when the pbxproj compiles the class (its `in Sources` entry). A class
+  whose source was not found, or whose Target Membership was removed by hand, keeps the fence
+  OFF, with a note. One side effect: code that reads the plugin opportunistically
+  gets nothing in a flag-off build. `readDeviceModel` in `runtime/rendering/deviceCaps.ts` returns
+  `undefined` there, as it already did on iOS. `rampProbe`'s fingerprint includes that model, so an
+  Android install upgrading from a pre-#1521 flag-off build re-runs the probe once.
 
 Each of those used to key on something *else* — `#if DEBUG`, `CONFIGURATION == Release`,
 `FLAG_DEBUGGABLE` — and they could disagree. The combination that broke was one you would normally
@@ -2563,13 +2698,16 @@ holds it for the JS bundle by building a project twice and grepping `dist/` (mea
 `games/sling`: `app-identity` 1 → 0, `GameDebug` 9 → 0). Both carry a flag-ON control, so a green
 run cannot mean "the grep found nothing".
 
-The one honest limit on "stripped": `GameDebugPlugin.swift` is compiled into the iOS App target
-**unconditionally** — its pbxproj file-ref is not flag-gated — so the class is in the binary either
-way. What the flag removes is the *registration*, and since JS is the only caller, an unregistered
-plugin has no way in: Capacitor never exposes it, so `startServer` can never be called and no
-socket is ever bound. That is why the guard asserts registration rather than symbol absence
-(asserting absence would fail for a correct build). Gating the file-ref too is possible but is a
-larger, riskier pbxproj edit than #112 needed.
+Until #1521 "stripped" had a limit: `GameDebugPlugin.swift` was compiled into the iOS App target
+unconditionally, and `capacitor-game-debug` sat in every Android build's plugin list. The flag
+removed only the *registration*. Unreachable is not the same as absent, and the owner's ruling is
+that a store build ships no native debug bridge, so both now follow the flag.
+`debugBuildGates.test.ts` holds the pbxproj entries and the `includePlugins` entry with the other
+markers, and checks the committed gradle graph separately, because only a real `cap sync` produces
+it. One case stays open by design: a project with **no** `includePlugins` list. Capacitor then
+links every dependency and has no exclude list. Writing an allowlist for the project would freeze
+its plugin set, so the heal reports that case rather than rewriting it. For a project in this repo,
+`debugBuildGates.test.ts` turns that report into a red gate.
 
 **Known issues:**
 - iOS SPM static linking strips the plugin class — requires manual registration in MyViewController + Xcode file reference from App target to `engine/packages/capacitor-game-debug/ios/Sources/GameDebugPlugin/GameDebugPlugin.swift` (project-relative path in pbxproj, no copy). Edit the package source only.
@@ -2603,7 +2741,7 @@ larger, riskier pbxproj edit than #112 needed.
 Dev-only endpoints + scene hot-reload so an AI agent (or any tooling) can edit scenes via plain `curl` and verify the result **without driving a browser/screenshot**. All dev-only (the asset-scanner middleware only runs under `vite` dev). Server: `engine/plugins/vite-asset-scanner.ts`. Browser client: `engine/app/debug/agentBridge.ts` (gated on `import.meta.hot`, stripped from prod). Pure logic (shared Node + browser): `packages/modoki/src/runtime/scene/{sceneValidation,sceneMutate,sceneSchema}.ts`; ref predicates in import-free `runtime/core/assetRefRules.ts`.
 
 - **Scene/prefab hot-reload** — editing a scene file on disk (the `Edit` tool, `git checkout`, `/api/scene-mutate`) auto-reloads the **active** scene in the browser; editor camera + selection are preserved (selection via the existing GUID-keyed `selectionRestore`). A prefab edit reloads the current scene (instances re-expand). The watcher classifies files with the scanner's own `detectType()` — **scene files are positively identified by the `.scene.json` suffix** (or, as a legacy fallback, a plain `.json` under a `scenes/` dir — issue #54). The editor's own Cmd+S saves (`/api/write-file`) are suppressed (1.5s self-write guard) so they don't bounce the live scene; external edits still reload.
-- **`curl localhost:5173/api/scene-state[?trait=Transform][&id=N]`** — returns the **live ECS world** as JSON. **Bare it is an INDEX** (`{scenePath, returnedCount, totalCount, resourcesExcluded?, entities:[{id,guid,name,parentId,layer,traits:[names]}], hint}`), capped at a default `limit` of 200 entities — past that it clips and gains `truncated`. `returnedCount` is the rows returned and `totalCount` every entity the query matched before the limit; both are always present. Pass a target (`trait`/`id`/`name`/`where`) or an enricher (`full`/`world`/`bounds`/`contacts`) to get trait **values** (`traits` becomes an object); a targeted query is never capped unless you pass `limit`. Relays to the open tab over the HMR socket (504 if no app is open). Because it reads the live world (not the file), a changed value here proves a hot-reload actually took effect. **Prefer this over screenshots to verify scene edits.**
+- **`curl localhost:5173/api/scene-state[?trait=Transform][&id=N]`** — returns the **live ECS world** as JSON. **Bare it is an INDEX** (`{scenePath, returnedCount, totalCount, resourcesExcluded?, entities:[{id,guid,name,parentId,layer,traits:[names]}], hint}`), capped at a default `limit` of 200 entities — past that it clips and gains `truncated`. `returnedCount` is the rows returned and `totalCount` every entity the query matched before the limit; both are always present. Pass a target (`trait`/`id`/`name`/`where`) or an enricher (`full`/`world`/`bounds`/`contacts`) to get trait **values** (`traits` becomes an object); `trait=` also SELECTS — only the entities carrying it come back. A targeted query is capped at 20 by default, disclosed (`truncated` + a hint with the hidden count, before the rows); pass `limit` for more. Relays to the open tab over the HMR socket (504 if no app is open). Because it reads the live world (not the file), a changed value here proves a hot-reload actually took effect. **Prefer this over screenshots to verify scene edits.**
 - **`curl .../api/validate-scene?path=/games/.../x.json`** — warn-but-load validation: unknown trait/field, type mismatch, and the literal-asset-path-instead-of-GUID mistake (see "Asset References" in `CLAUDE.md`). Needs a tab open to push the trait schema (`schemaAvailable:false` ⇒ ref checks still run, type checks skipped).
 - **`POST .../api/scene-mutate {path, ops}`** — validated `setTrait`/`removeTrait`/`addEntity`/`removeEntity` (entity ref by `id`/`name`/`guid`; mints GUIDs); writes atomically; returns `{ok, changed, errors, warnings}`. Hot-reload then reflects it. It does **NOT** echo the scene back (that fired on every edit and cost ~10k tokens of context for data nobody read — and it was the pre-expansion *file*, not the live world). Pass `returnScene:true` if you actually want the written file; **to verify an edit, read `/api/scene-state`.**
 - **`GET .../api/editor-state`** + **`POST .../api/editor-action {action, …}`** (allowlisted) + **`GET .../api/scenes`** + **`POST .../api/import-file {srcPath, destFolder}`** — the editor-parity surface (live UI state read; selection/play/undo/scene/prefab/entity actions; scene list; Finder-style import). `editor-state`/`editor-action` relay to the renderer, so they need a tab/editor open. See the modoki MCP section above for the tool wrappers.

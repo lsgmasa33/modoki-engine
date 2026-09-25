@@ -73,8 +73,10 @@ beforeEach(() => {
       return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response;
     }
     const served = [...onDisk.entries()].find(([p]) => u.endsWith(p));
-    if (served) return { ok: true, status: 200, json: async () => JSON.parse(served[1]) } as unknown as Response;
-    return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+    // `text` as well as `json` (#1468): the kept id is read through `parseAssetJson`, which reads the
+    // BODY so it can tell the dev server's SPA fallback apart from a real document.
+    if (served) return { ok: true, status: 200, text: async () => served[1], json: async () => JSON.parse(served[1]) } as unknown as Response;
+    return { ok: false, status: 404, text: async () => '', json: async () => ({}) } as unknown as Response;
   }));
 });
 // The manifest is a module global: a guid one test registered for TARGET would otherwise be "the replaced

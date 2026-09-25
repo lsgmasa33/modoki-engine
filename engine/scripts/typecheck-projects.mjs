@@ -37,7 +37,8 @@
  *  hold there. Owner's call, taken deliberately 2026-09-08 ("keep sweeping all"): a fresh clone
  *  checking nothing and reporting green is the failure this gate exists to prevent. The
  *  compensating case is the hub's normal one — right after `git merge origin/<branch>` the
- *  `--first-parent --no-merges` walk sees nothing, so the leg selects 0 projects and costs ~0.
+ *  `--first-parent --no-merges` walk sees nothing, so the leg selects 0 projects and pays only for
+ *  the scaffolder template, which runs every time (~6.5s standalone — see discoverTemplates(), #1544).
  *
  *  So the default is now the projects this branch actually TOUCHED, which lets it
  *  live in `verify` (see verify.mjs lane 2). That is not merely a cost dodge — the
@@ -87,10 +88,13 @@
  *    node engine/scripts/typecheck-projects.mjs wordweave court  # named projects
  *    node engine/scripts/typecheck-projects.mjs games/wordweave  # ...or root-qualified
  *    node engine/scripts/typecheck-projects.mjs --list           # print the selection, check nothing
+ *    node engine/scripts/typecheck-projects.mjs engine/templates/starter  # just the scaffolder template
+ *
+ *  Every run except a NAMED one also checks the scaffolder templates — see discoverTemplates().
  */
 
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
+import { writeFileSync, unlinkSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects, PROJECT_ROOT_DIRS } from './projectRoots.mjs';
@@ -229,6 +233,25 @@ function selectTouched(all) {
 }
 
 
+/** The scaffolder templates (`engine/templates/<name>`), shaped like projects so the loop below
+ *  checks them exactly as it checks a game (#1544). ⚠️ **Checked on EVERY run, never "if touched".**
+ *  A template sits in no wide program — `tsconfig.app.json` includes `app`, `../games`, `../demos`,
+ *  not `templates/` — so an engine or package change that breaks it reddens nothing else, and a
+ *  touched-only rule would never see it. It is also the one program with no sibling to borrow
+ *  ambient types from: a fresh scaffold IS this tree, and it failed its first build on a helper's
+ *  `node:fs` import while every existing project passed. Checking it in place is faithful because
+ *  the scaffolder's `__TOKEN__`s sit inside string literals. Derived from the directory, so a new
+ *  template is covered without an edit here. Empty in a checkout with no `engine/templates`. */
+function discoverTemplates() {
+  const root = 'engine/templates';
+  const abs = path.join(repoRoot, root);
+  if (!existsSync(abs)) return [];
+  return readdirSync(abs, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => ({ root, name: d.name, dir: path.join(abs, d.name) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
 /** The scoped program's `include`: the app shell plus exactly one project. ⚠️ Changing this
  *  changes the shape for EVERY project, which is why this file is in MACHINERY_PATHS. */
 function buildInclude(proj) {
@@ -273,17 +296,22 @@ function main() {
   //  neither root ("the public OSS repo ships neither"). So the floor keys on the ROOTS being on
   //  disk, not on the project count, which is the actual question: did discovery miss?
   const all = discoverProjects(repoRoot);
+  const templates = discoverTemplates();
   if (all.length === 0) {
     const rootsOnDisk = PROJECT_ROOT_DIRS.filter((r) => existsSync(path.join(repoRoot, r)));
-    if (rootsOnDisk.length === 0) {
+    // A project-less checkout (the public OSS snapshot) still ships the scaffolder template, and
+    // the template is the one thing there to check — so fall through to it rather than exit.
+    if (rootsOnDisk.length === 0 && templates.length === 0) {
       console.log(`[typecheck-projects] no ${PROJECT_ROOT_DIRS.map((r) => `${r}/`).join(' or ')} `
         + `directory in ${repoRoot} — nothing to typecheck.`);
       process.exit(0);
     }
-    console.error(`[typecheck-projects] ${rootsOnDisk.map((r) => `${r}/`).join(' and ')} present `
-      + `under ${repoRoot}, but discovery returned ZERO projects. That is a discovery miss, not an `
-      + 'empty checkout — a pass here would have typechecked nothing.');
-    process.exit(1);
+    if (rootsOnDisk.length > 0) {
+      console.error(`[typecheck-projects] ${rootsOnDisk.map((r) => `${r}/`).join(' and ')} present `
+        + `under ${repoRoot}, but discovery returned ZERO projects. That is a discovery miss, not an `
+        + 'empty checkout — a pass here would have typechecked nothing.');
+      process.exit(1);
+    }
   }
 
   let projects;
@@ -294,14 +322,21 @@ function main() {
   } else if (selectors.length > 0) {
     // An unknown selector is a hard error, never an empty run: a typo'd project name
     // must not read as "checked, and clean".
+    // A template is nameable only root-qualified (`engine/templates/starter`): its bare name is
+    // not a project's, and `starter` must not read as a typo'd game that silently matched.
+    const known = [...all, ...templates];
     const unknown = selectors.filter((sel) =>
-      !all.some((p) => p.name === sel || `${p.root}/${p.name}` === sel));
+      !all.some((p) => p.name === sel || `${p.root}/${p.name}` === sel)
+      && !templates.some((t) => `${t.root}/${t.name}` === sel));
     if (unknown.length > 0) {
       console.error(`[typecheck-projects] unknown project(s): ${unknown.join(', ')}`);
-      console.error(`[typecheck-projects] known: ${all.map((p) => `${p.root}/${p.name}`).join(', ')}`);
+      console.error(`[typecheck-projects] known: ${known.map((p) => `${p.root}/${p.name}`).join(', ')}`);
       process.exit(1);
     }
-    projects = all.filter((p) => selectors.includes(p.name) || selectors.includes(`${p.root}/${p.name}`));
+    projects = [
+      ...all.filter((p) => selectors.includes(p.name) || selectors.includes(`${p.root}/${p.name}`)),
+      ...templates.filter((t) => selectors.includes(`${t.root}/${t.name}`)),
+    ];
     reason = `named on the command line (${selectors.join(', ')})`;
   } else {
     const sel = selectTouched(all);
@@ -310,6 +345,14 @@ function main() {
   }
 
   console.log(`[typecheck-projects] selection: ${reason}`);
+  // The templates ride along on every run but a NAMED one — see discoverTemplates() for why a
+  // touched-only rule cannot cover them. Appended AFTER the reason line so that line stays a true
+  // statement about the PROJECT selection, which is what its readers (and its tests) key on.
+  if (!(selectors.length > 0 && !wantAll) && templates.length > 0) {
+    projects = [...projects, ...templates];
+    console.log(`[typecheck-projects] + ${templates.length} scaffolder template(s), checked on every run (#1544): `
+      + templates.map((t) => `${t.root}/${t.name}`).join(', '));
+  }
   if (projects.length === 0) {
     console.log('[typecheck-projects] no project touched on this branch — nothing to check.');
     process.exit(0);
@@ -336,8 +379,10 @@ function main() {
     // finishes first unlinks the shared path in its `finally` and the other's tsc — if it has not
     // read its config yet — dies with TS5083, a false RED nobody can reproduce. `.gitignore`'s
     // `engine/tsconfig.app.scoped*.json` glob already covers this name.
+    // ⚠️ The root is flattened: a template's root is `engine/templates`, and a raw `/` here would
+    // name a directory that does not exist.
     const configPath = path.join(engineDir,
-      `tsconfig.app.scoped.${proj.root}-${proj.name}.${process.pid}.json`);
+      `tsconfig.app.scoped.${proj.root.replaceAll('/', '-')}-${proj.name}.${process.pid}.json`);
     writeFileSync(configPath, JSON.stringify(scopedTsconfigContent(include), null, 2) + '\n');
 
     const start = Date.now();

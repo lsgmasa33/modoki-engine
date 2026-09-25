@@ -34,8 +34,31 @@
  *   none is under way). Each game's `ads.ts` waits on it before Google's UMP consent form (#1309/#1312):
  *   the engine starts attribution and ads in the same tick (`engine/app/App.tsx`), so the two launch-time
  *   full-screen asks would race. It is armed synchronously, before the first await.
+ * - **An iOS `notDetermined` answer means NO PROMPT WAS SHOWN** (#1510). iOS draws the ATT prompt only
+ *   while the app is active and otherwise answers `notDetermined` at once. The plugin now holds an
+ *   UNANSWERED request until the app is active (`capacitor-appsflyer/att-core`; an answered status runs
+ *   at once, #1532), so this answer should not come back. If it does, iOS did not show the prompt for that request and AppsFlyer starts unanswered anyway,
+ *   so `warnIfPromptNotShown` says so in the log instead of passing it off as an answer.
  * - **No method rejects into a caller.** Every failure is a `console.warn` and a resolved sentinel.
  */
+
+import { beginBootSpan, endBootSpan } from './bootTimeline';
+
+/**
+ * Warns when iOS answered the ATT request without showing the prompt (#1510). A player's answer is
+ * always `authorized`, `denied` or `restricted`. `notDetermined` means the system declined to draw the
+ * prompt for THIS request. Whether something else (UMP's IDFA explainer, say) asks later in the run is
+ * not known here, so the message does not claim the player is never asked.
+ */
+function warnIfPromptNotShown(att: unknown, os: string): void {
+  if (os !== 'ios') return;
+  const status = (att as { status?: unknown } | null | undefined)?.status;
+  if (status !== 'notDetermined') return;
+  console.warn(
+    '[AppsFlyer] ATT answered notDetermined: iOS did not show the tracking prompt for this request, ' +
+      'so AppsFlyer starts without the player having answered (#1510).',
+  );
+}
 
 /** iOS IDFA / Android GAID, with `kind` naming which — see the plugin's own doc comment. */
 export type AdvertisingId = {
@@ -144,11 +167,17 @@ export function createAttribution({ config, sdk, platform, bundleId }: Attributi
       });
       // Retrying this call is safe: iOS shows the system dialog ONCE EVER, and a second request returns
       // the cached answer without UI. Not retrying would leave attribution off for the whole run.
+      // A boot-timeline span (#1475): on a fresh iOS install this is the system ATT alert, which takes
+      // the screen and withholds frames — the read has to be able to see that it was up.
+      const attSpan = beginBootSpan('att-prompt');
+      let att: unknown;
       try {
-        await sdk.requestTrackingAuthorization();
+        att = await sdk.requestTrackingAuthorization();
       } finally {
+        endBootSpan(attSpan);
         settleAtt();
       }
+      warnIfPromptNotShown(att, platform.getPlatform());
       attPrompted = true;
       await sdk.start();
       initialized = true;

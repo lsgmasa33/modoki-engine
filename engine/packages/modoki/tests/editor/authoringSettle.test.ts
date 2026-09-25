@@ -29,6 +29,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 }));
 const SCENE = { version: 1, entities: [], resources: [] };
 vi.mock('../../src/editor/scene/serialize', () => ({
+  registerBeforeSceneLoad: () => {},
   serializeScene: async () => SCENE,
   getCurrentScenePath: () => '/assets/scenes/main.scene.json',
   sceneLoadGeneration: () => 0,
@@ -40,12 +41,14 @@ vi.mock('../../src/editor/scene/timelinePreview', () => ({
   cancelPreviewGestures: () => {},
   whenPreviewRestoresLanded: async () => {},
   endTimelinePreviewSession: async () => null,
+  holdPreviewSessionsClosed: () => () => {},
+  cancelPendingPreviewBegins: () => {},
 }));
 vi.mock('../../src/editor/panels/aiSettingsModel', () => ({
   fetchAiSettings: async () => ({}),
   getCachedAiSettings: () => ({}),
 }));
-vi.mock('../../src/editor/undo/undoManager', () => ({ undoDepth: () => 0, truncateUndoTo: vi.fn() }));
+vi.mock('../../src/editor/undo/undoManager', () => ({ undoDepth: () => 0, truncateUndoTo: vi.fn(), registerUndoRestoreBarrier: () => {}, beginWorldSwitch: () => ({ idle: null, release: () => {} }) }));
 vi.mock('../../src/editor/editorJournal', () => ({ editorEmit: vi.fn() }));
 
 const { enterPlay, stopPlay } = await import('../../src/editor/scene/playMode');

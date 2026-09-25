@@ -37,6 +37,11 @@ vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) 
   const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefab')>();
   return {
     ...real,
+    // The restore rebases carried stale roots (#1483). In production the world restore re-expands the primary
+    // from the restored prefab, so the rebase finds nothing there; here `loadScene` is a no-op that leaves the
+    // primary built from the prefab being undone, and a real rebase would rebuild it — masking the
+    // `refreshBaseInstances` filter this file pins. No root here is carried, so the stub loses nothing.
+    rebaseStaleInstances: async () => 0,
     installPrefabSnapshot: async (_src: string, doc: { id?: string }) => { install(doc); },
     // The real apply promotes `Mine` into the prefab (here: member `Promoted`), deletes the live node,
     // installs the new prefab and REFRESHES every instance of it from the old one. Modelled so.

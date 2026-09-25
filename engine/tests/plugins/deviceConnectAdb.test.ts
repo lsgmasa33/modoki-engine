@@ -17,8 +17,11 @@ import { DeviceConnectionManager, adbRunner, releaseDeviceResourcesOnExit, recla
 import { androidDevicesExec, _clearFriendlyNameCache } from '../../plugins/backend/androidDevices';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 import { claimsDir, listClaims } from '../../plugins/backend/deviceClaims';
-import { deviceCdpAdb, discoverDeviceCdpTarget, resetDeviceCdpSession } from '../../plugins/backend/deviceCdp';
+import { deviceCdpAdb, discoverDeviceCdpTarget, resetDeviceCdpSession, _drainRefusedAdbForTests } from '../../plugins/backend/deviceCdp';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+
+// No test here may reach real adb through deviceCdp — see `refuseRealAdbUnderTest` (#1530 close-out).
+afterEach(() => { expect(_drainRefusedAdbForTests(), 'a test reached real adb through deviceCdp').toEqual([]); });
 
 const realForward = adbRunner.forward;
 const realRemove = adbRunner.removeForward;
@@ -276,8 +279,9 @@ describe('DeviceConnectionManager — useAdb branch', () => {
         expect(cdpRemove).toHaveBeenCalledWith(9335, 'TESTSERIAL1');
       } finally {
         globalThis.fetch = realFetch;
-        listSockets.mockRestore(); cdpForward.mockRestore(); cdpRemove.mockRestore();
+        // Reset BEFORE restoring: a latch still standing would otherwise be removed through REAL adb.
         resetDeviceCdpSession();
+        listSockets.mockRestore(); cdpForward.mockRestore(); cdpRemove.mockRestore();
       }
     });
 
@@ -317,8 +321,9 @@ describe('DeviceConnectionManager — useAdb branch', () => {
         expect(adbRunner.removeForward).toHaveBeenCalled();            // the lease's own forward
       } finally {
         globalThis.fetch = realFetch;
-        listSockets.mockRestore(); cdpForward.mockRestore(); cdpRemove.mockRestore();
+        // Reset BEFORE restoring: a latch still standing would otherwise be removed through REAL adb.
         resetDeviceCdpSession();
+        listSockets.mockRestore(); cdpForward.mockRestore(); cdpRemove.mockRestore();
       }
     });
 

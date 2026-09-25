@@ -2,6 +2,7 @@
  *  land in the new prefab file; unselected fields keep their old base values. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { setRunMode as setRunModeForAuthoring } from '../../packages/modoki/src/runtime/core/playState';
 import { getCurrentWorld, Transient, findEntity, getAllEntities } from '@modoki/engine/runtime';
 import { collectTransientSubtreeIds } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -44,6 +45,10 @@ function findChildEcsId(rootId: number, localId: number): number {
   });
   return id;
 }
+
+// The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing), and
+// every writer of the live world refuses outside an authored world (#1548) — so the premise is stated.
+beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('applyToPrefabSelective', () => {
   beforeEach(() => {
@@ -121,6 +126,60 @@ describe('applyToPrefabSelective', () => {
     // because the sweep grepped for the token `version`, which a writer that never mentions it
     // cannot match.
     expect(writtenJson!.version).toBe(PREFAB_FORMAT_VERSION);
+  });
+
+  /** #1468 — Apply REWRITES the whole document and re-stamps it with this serializer's version, so
+   *  on a document a NEWER build wrote that stamp is a DOWNGRADE: the file would claim a shape this
+   *  build cannot produce, and whatever the newer format added would be attributed to a serializer
+   *  that never wrote it. `plugins/prefabWriteGuard.ts` refuses the write, but a 409 lands after the
+   *  promotion pass has already mutated the live world, leaving the editor holding changes the file
+   *  rejected. This refuses first.
+   *
+   *  ⚠️ One-sided on purpose. Every authored prefab in the corpus is BELOW the constant, so an
+   *  exact-match gate would refuse all of them — the measurement that decided `>` over `!==` for the
+   *  write gate decides it here too. The accept side below is what pins that. */
+  describe('a document a newer build wrote (#1468)', () => {
+    const at = (version: number): PrefabFile => ({ ...makePrefab(), version });
+    const setup = async (version: number) => {
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === '/api/write-file' && init?.method === 'POST') { wrote = true; return { ok: true, json: async () => ({}) } as unknown as Response; }
+        return { ok: true, json: async () => at(version) } as unknown as Response;
+      });
+      const editorMod = await import('@modoki/engine/editor');
+      const source = `pkg/too-new-${version}.prefab.json`;
+      await editorMod.getPrefabSource(source);
+      const rootId = instantiatePrefab(at(version));
+      editorMod.setPrefabSource(rootId, source);
+      return rootId;
+    };
+    let wrote = false;
+    beforeEach(() => { wrote = false; });
+
+    it('is refused, and nothing is written', async () => {
+      const rootId = await setup(PREFAB_FORMAT_VERSION + 1);
+      const result = await applyToPrefabSelective(rootId, new Set(['2.Transform.x']));
+      expect(result.applied).toBe(false);
+      expect(wrote).toBe(false);
+      // ⚠️ `refused`, NOT `skipped` (#1468 close-out review F4). `skipped` means "everything else
+      // landed, these keys did not", and every reporter words it as a MOVE that was not applied —
+      // so a refusal riding that channel toasted "1 move was not applied: prefab format 6 is newer
+      // than 5" at a human, which is wrong twice over.
+      expect(result.skipped).toBeUndefined();
+      expect(result.refused).toContain(String(PREFAB_FORMAT_VERSION + 1));
+    });
+
+    it('accepts a document at the CURRENT version — the refusal is strictly one-sided', async () => {
+      const rootId = await setup(PREFAB_FORMAT_VERSION);
+      expect((await applyToPrefabSelective(rootId, new Set(['2.Transform.x']))).applied).toBe(true);
+      expect(wrote).toBe(true);
+    });
+
+    it('accepts an OLDER document and stamps it forward, which is the whole corpus today', async () => {
+      const rootId = await setup(1);
+      expect((await applyToPrefabSelective(rootId, new Set(['2.Transform.x']))).applied).toBe(true);
+      expect(wrote).toBe(true);
+    });
   });
 
   /** #1301 — Apply-to-Prefab must not fan out to a RUNTIME instance of the same prefab.

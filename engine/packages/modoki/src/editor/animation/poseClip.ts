@@ -26,16 +26,17 @@
  */
 
 import { notifyListeners } from '../../runtime/core/notifyListeners';
-import { getCurrentWorld } from '../../runtime/core/ecs/world';
-import { fireDirtyListeners } from '../../runtime/core/ecs/entityUtils';
+import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
+import { fireDirtyListeners, guidOfEntityId } from '../../runtime/core/ecs/entityUtils';
 import { applyClipAtTime } from '../../runtime/animation/sampleClip';
 import { applyClipDeform } from '../../runtime/animation/deform2DSystem';
 import { beginDeform2DFrame } from '../../runtime/animation/deform2DBuffers';
 import type { AnimationClipDef } from '../../runtime/animation/types';
 import { useEditorStore } from '../store/editorStore';
 import { enterScrubMode, exitPreviewMode, getModeOwner } from '../scene/playMode';
-import { beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession } from '../scene/timelinePreview';
+import { beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, poseEnvelopeHeld } from '../scene/timelinePreview';
 import { resolveAnimatorRootForClip } from '../panels/openAssetInEditor';
+import { handBackPreviewClaim } from '../scene/openPreviewSession';
 
 /** Write the clip's sampled values into the bound entities. Returns how many channels applied.
  *
@@ -47,7 +48,7 @@ import { resolveAnimatorRootForClip } from '../panels/openAssetInEditor';
  *  what actually cost the owner data. */
 export function applyPoseAtTime(clip: AnimationClipDef | null, rootId: number | null, t: number): number {
   if (!clip || rootId == null) return 0;
-  if (!hasTimelinePreviewSession()) {
+  if (!poseEnvelopeHeld()) {
     console.error(
       '[poseClip] refused to pose with no preview session held — the pose would be unrevertible ' +
       'and a scene save would bake it. Every pose must go through poseClipAtTime.',
@@ -95,7 +96,10 @@ export async function poseClipAtTime(
   clip: AnimationClipDef | null, rootId: number | null, t: number, owner: 'animation' | 'timeline' = 'animation',
 ): Promise<{ applied: number; openedSession: boolean; refused?: true }> {
   if (!clip || rootId == null) return { applied: 0, openedSession: false };
-  if (hasTimelinePreviewSession()) {
+  // Already inside an envelope — a held session, or Play, whose own snapshot Stop reverts (#1546).
+  // No mode claim and no session in Play: a session opened there snapshotted the running world and
+  // outlived Stop.
+  if (poseEnvelopeHeld()) {
     return { applied: applyPoseAtTime(clip, rootId, t), openedSession: false };
   }
   enterScrubMode(owner);
@@ -108,14 +112,15 @@ export async function poseClipAtTime(
     // error) an unguarded throw leaves the editor pinned at `scrub` with NO session — Cmd+S
     // blocked, and nothing to revert, which is the wedge this whole module exists to avoid. Hand
     // the mode back before rethrowing so the failure costs the caller a retry, not their editor.
-    exitPreviewMode(owner);
+    handBackPreviewClaim(owner);
     throw e;
   }
   if (!opened) {
     // No session: a restore was in progress, or an Exit landed while the snapshot serialized (#1167).
     // Pose nothing — it would be unrevertible — and hand the mode back, for the same reason as the
     // throw above. `rootId` was also resolved before that swap, so it may name a dead entity.
-    exitPreviewMode(owner);
+    // Not over a newer begin's claim, though — see `handBackPreviewClaim`.
+    handBackPreviewClaim(owner);
     return { applied: 0, openedSession: false, refused: true };
   }
   return { applied: applyPoseAtTime(clip, rootId, t), openedSession: true };
@@ -130,12 +135,11 @@ export async function poseClipAtTime(
 
 /** Notified whenever the envelope is closed through `exitPoseEnvelope`.
  *
- *  This exists for one concrete failure. `AnimationEditor` keeps an `inPreview` `useState` that
- *  gates its ⏹ button AND the registration of its Cmd+S save handler, whose `resume()` RE-POSES at
- *  the current playhead. Without this notification an agent-driven exit would leave that handler
- *  registered against a closed envelope — so the human's next save would suspend (a no-op),
- *  serialize, and then resume by re-posing a world the agent had just reverted. A surprise pose
- *  after a save is the same class of bug the envelope itself exists to prevent. */
+ *  It was written for `AnimationEditor`'s hand-kept `inPreview` `useState` (an agent-driven exit left
+ *  the panel's Cmd+S handler registered against a closed envelope, so the next save re-posed a world
+ *  the agent had just reverted). The panel no longer subscribes: `inPreview` is now DERIVED from the
+ *  mode owner (#1549), which every exit — this one and the ones that never came through here —
+ *  clears. Kept as the observable "an exit happened" signal an agent-side caller can wait on. */
 const exitListeners = new Set<() => void>();
 
 /** Subscribe to envelope exits. Returns the unsubscribe closure. */
@@ -156,6 +160,19 @@ export function onPoseEnvelopeExited(cb: () => void): () => void {
  *  Resolves once the world has ACTUALLY been restored. Cmd+S awaits it and serializes immediately
  *  afterwards, so a fire-and-forget restore would let the save write the POSED world — the whole
  *  thing the envelope exists to prevent. */
+/** Which entity the Animation panel is bound to after a world swap: the SAME entity, found by its
+ *  guid, and only when that fails the first Animator whose clip bank lists the clip.
+ *
+ *  The clip lookup alone was the rebind (#1549), and it is right only when exactly one Animator lists
+ *  the clip: "+ New Animation" binds the selected Animator WITHOUT adding the clip to its bank (so
+ *  the lookup returned null and the panel kept a dead id), and two Animators sharing a clip rebound
+ *  to whichever came first — so ⏹ Exit could silently move the panel to a different entity. */
+export function rebindAnimatorRoot(rootGuid: string | null, clipPath: string | undefined): number | null {
+  const same = rootGuid ? findEntityByGuid(rootGuid) : undefined;
+  if (same) return same.id();
+  return clipPath ? resolveAnimatorRootForClip(clipPath, { fallbackToSelection: false }) : null;
+}
+
 export async function exitPoseEnvelope(restore: boolean): Promise<{ exited: boolean; rebound: number | null }> {
   if (getModeOwner() !== 'animation') return { exited: false, rebound: null };
   const store = useEditorStore.getState();
@@ -165,11 +182,9 @@ export async function exitPoseEnvelope(restore: boolean): Promise<{ exited: bool
     if (hasTimelinePreviewSession()) {
       const path = store.editingAnimationAsset?.path;
       // The restore rebuilds entities, so the bound root id can change underneath us — rebind by
-      // resolving the clip again rather than trusting the id we came in with.
-      rebound = await endTimelinePreviewSession({
-        restore,
-        rebind: () => (path ? resolveAnimatorRootForClip(path, { fallbackToSelection: false }) : null),
-      });
+      // the root's own GUID first, captured before the swap (#1549; see `rebindAnimatorRoot`).
+      const rootGuid = store.animatorRootEntityId != null ? guidOfEntityId(store.animatorRootEntityId) : null;
+      rebound = await endTimelinePreviewSession({ restore, rebind: () => rebindAnimatorRoot(rootGuid, path) });
       if (rebound != null) useEditorStore.getState().setAnimatorRoot(rebound);
     }
   } finally {

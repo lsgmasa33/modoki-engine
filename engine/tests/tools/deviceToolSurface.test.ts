@@ -10,6 +10,8 @@ import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import { join } from 'node:path';
 import { loadDeviceSurface, deviceReply, DEVICE_STUB_BACKEND, type DeviceSurface } from './deviceSurface';
 import { readScannedSource } from '@modoki/engine/testing';
+import { nativeLogsAppTimeoutMs } from '../../tools/game-debug-mcp/src/mcp-tools';
+import { PER_TOOL_MEANING } from './perToolMeaning';
 
 let surface: DeviceSurface | undefined;
 afterEach(() => { surface?.restore(); surface = undefined; });
@@ -42,6 +44,51 @@ describe('S2.7 — an unknown argument key is REFUSED, not silently stripped', (
       const v = s.validate(name, { definitelyNotAParam__: 1 });
       expect(v.ok, `${name} accepted an unknown key`).toBe(false);
     }
+  });
+});
+
+/** §11 and §2 on the DEVICE surface (#1559). Both checks lived in `mcpRegistry.test.ts`, which loads
+ *  the modoki registry only — so `device_console_logs.level` went undocumented and `precision` was worded
+ *  three ways across six device tools with nothing to notice. Same rules, same pardon list. */
+describe('the device surface keeps the editor surface\'s param rules (#1559)', () => {
+  type Field = { description?: string };
+
+  it('every parameter is documented — in its own .describe() or the tool description', async () => {
+    const s = (surface = await loadDeviceSurface());
+    const missing: string[] = [];
+    for (const name of s.names) {
+      const desc = s.descriptionOf(name);
+      for (const [param, field] of Object.entries(s.shapeFor(name) as Record<string, Field>)) {
+        if (!field.description && !new RegExp(`\\b${param}\\b`).test(desc)) missing.push(`${name}.${param}`);
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  it('a param used by 3+ tools means ONE thing, or is declared per-tool', async () => {
+    // The editor check's rule exactly: the shortest wording is the shared base, and every longer
+    // one must contain it verbatim (a tool adds its nuance AFTER the shared rule, never instead).
+    const s = (surface = await loadDeviceSurface());
+    const byParam = new Map<string, Map<string, string[]>>();
+    for (const name of s.names) {
+      for (const [param, field] of Object.entries(s.shapeFor(name) as Record<string, Field>)) {
+        const forParam = byParam.get(param) ?? new Map<string, string[]>();
+        const d = field.description ?? '';
+        forParam.set(d, [...(forParam.get(d) ?? []), name]);
+        byParam.set(param, forParam);
+      }
+    }
+    const drifted: string[] = [];
+    for (const [param, byDesc] of byParam) {
+      if (PER_TOOL_MEANING.includes(param)) continue;
+      const described = [...byDesc].filter(([d]) => d !== '');
+      const users = described.flatMap(([, tools]) => tools);
+      if (users.length < 3 || described.length === 1) continue;
+      const descs = described.map(([d]) => d);
+      const base = descs.reduce((a, b) => (a.length <= b.length ? a : b));
+      if (descs.some((d) => !d.includes(base.replace(/\.$/, '')))) drifted.push(`${param} (${users.join(', ')})`);
+    }
+    expect(drifted, 'put the shared wording in tools/shared/paramBases.ts and concatenate onto it').toEqual([]);
   });
 });
 
@@ -291,5 +338,57 @@ describe('device_status reports the app identity the SOCKET actually holds (#88)
     }));
     await s.call('device_status');
     expect(s.real().some((q) => q.path === '/api/device/request')).toBe(false);
+  });
+});
+
+describe('#1558 — device_native_logs gives the in-process read a budget sized from its window', () => {
+  const nativeLogsParams = (s: DeviceSurface) =>
+    (s.real().find((q) => q.path === '/api/device/request')?.body as { params?: Record<string, unknown> } | undefined)?.params;
+
+  it('source:app forwards timeoutMs, so a long lookback is not cut off at the relay\'s fixed 5000ms', async () => {
+    // Without it the router's deadline is the lease transport's default, and the transcripts show
+    // every long `seconds` read ending "device request timed out after 5000ms".
+    const s = (surface = await loadDeviceSurface((q) => (q.path === '/api/device/request' ? deviceReply(['line']) : undefined)));
+    await s.call('device_native_logs', { seconds: 600 });
+    expect(nativeLogsParams(s)?.timeoutMs).toBe(nativeLogsAppTimeoutMs(600));
+    // Pinned exactly: a looser bound held for any base and any slope, so it could not fail.
+    expect(nativeLogsAppTimeoutMs(600)).toBe(18_000);
+  });
+
+  it('source:system sends none — the router answers it host-side, before the device relay', async () => {
+    const s = (surface = await loadDeviceSurface((q) => (q.path === '/api/device/request' ? deviceReply(['line']) : undefined)));
+    await s.call('device_native_logs', { source: 'system', seconds: 10 });
+    expect(nativeLogsParams(s)).toBeDefined();
+    expect(nativeLogsParams(s)?.timeoutMs).toBeUndefined();
+  });
+
+  it('refuses a window or limit the native readers would turn into a silent "No logs." or a crash', async () => {
+    // #1558 review: limit 0 crashed the iOS ring (removeFirst on empty); seconds < 1 is a start in
+    // the FUTURE (empty on both platforms); a non-integer made Capacitor's getInt return nil, so
+    // the window silently became 60 s; a huge one overflowed Android's -T into a malformed time.
+    const s = (surface = await loadDeviceSurface());
+    for (const bad of [{ limit: 0 }, { limit: 2.5 }, { seconds: 0 }, { seconds: -5 }, { seconds: 1.5 }, { seconds: 2_000_000_000 }]) {
+      expect(s.validate('device_native_logs', bad).ok, JSON.stringify(bad)).toBe(false);
+    }
+    expect(s.validate('device_native_logs', { limit: 1, seconds: 1 }).ok).toBe(true);
+    expect(s.validate('device_native_logs', { seconds: 2_592_000 }).ok).toBe(true);
+  });
+
+  it('a logcat that rejected its arguments is refused as that, not as a missing permission', async () => {
+    const reply = (error: string) => (q: { path: string }) => (q.path === '/api/device/request' ? deviceReply({ logs: [], error }) : undefined);
+    const s = (surface = await loadDeviceSurface(reply('logcat exited 1 (-T -1234.-567)')));
+    const r = await s.call('device_native_logs', {});
+    expect(s.text(r)).toContain('NOT_AVAILABLE_HERE');
+    expect(s.text(r)).toContain('logcat rejected the read itself');
+    surface.restore();
+    const denied = (surface = await loadDeviceSurface(reply('OSLogStore error: denied')));
+    expect(denied.text(await denied.call('device_native_logs', {}))).not.toContain('logcat rejected');
+  });
+
+  it('the budget is bounded at both ends', () => {
+    // The base covers the worst measured iPhone 8 read (10.6 s, whatever the window) with margin (#1558).
+    expect(nativeLogsAppTimeoutMs(0)).toBe(15_000);
+    expect(nativeLogsAppTimeoutMs(-5)).toBe(15_000);
+    expect(nativeLogsAppTimeoutMs(1_000_000)).toBe(25_000);
   });
 });

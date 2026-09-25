@@ -144,6 +144,10 @@ the occlusion check could see, because `occluded:false` does not mean the same t
   engine has no business deciding what a game considers clickable. A game registers its own
   provider to opt in; only the editor's `scene-view` surface ships one today (its SceneView
   pointer-handler picking, hoisted into a shared function both the handler and the provider call).
+  The AIM must be computed in the same frame as that pick, or a clear aim is refused as covered:
+  SceneView's bounds provider projects through the same camera and draw rect the pick uses —
+  in "ui" mode the GAME camera into the letterbox, not the editor orbit camera (#1489;
+  [editor.md](editor.md) § SceneView modes).
   `scene-view` registers **two in general, three while the SceneView's "ui" preview mode is
   mounted** — the 2D canvas overlay (priority 10) and the 3D viewport, which overlap on screen —
   so `registerPickProvider` takes an explicit `priority` (higher consulted first, registration
@@ -156,15 +160,55 @@ the occlusion check could see, because `occluded:false` does not mean the same t
   canvas in the combined DOM+canvas paint stack, then additionally reconciles that against real UI
   elements sharing the same preview, so it must be asked first or its reconciliation would never
   run.
+  ⚠️ **`pickAt` takes the first NON-NULL answer, so a provider's `null` means "ask the next one"
+  — and an overlay that ABSORBS a press answers `null` too** (#1576). A Canvas2D host's pick
+  overlay that misses deselects, and the press never reaches the Three.js canvas below it. The
+  3D viewport, asked next, named the mesh under the point anyway, so on `2D Animation.scene` (a
+  full-screen Canvas2D host) `modoki_tap` reported ok on a cube that no click could select. The
+  3D viewport's pick function therefore asks `pressReachesCanvas` (`editor/scene/pickReach.ts`)
+  first, and answers only when no OTHER canvas is on top at the point. The check goes INSIDE the one
+  function that both the pointer handler and the registration call, because
+  `pickProviderSharedPath.test.ts` forbids a wrapper. For a real press it is always true. A non-canvas cover (a toolbar, a dialog)
+  still gets an answer, because that cover is the DOM check's flag (`occluded` + `hitTarget`),
+  and withholding the pick would turn the flag into a refusal that misnames what covers it.
+  **The same mechanism existed one layer up**, in the 'ui' arbiter: `resolvePreviewPick` went on
+  down the stack past a topmost Canvas2D that missed, and could predict a LOWER canvas's sprite.
+  When the press lands ON a pick overlay (a canvas tops the stack), that overlay takes it, and on a
+  miss it resolves UI nodes only. So in that case only its own hit-test counts. ⚠️ **Not when a
+  UI node tops the stack.** Then `UIEditorOverlay`'s capture handler owns the press and runs the
+  same arbiter for the REAL selection, and #337's "a genuine 2D hit beats decorative UI above it"
+  still descends the whole stack. A first cut skipped lower canvases in both cases, which changed
+  real clicks, not just the prediction. This was found by reading (no fixture has overlapping
+  hosts) and both sides are pinned in `uiPreviewPick.test.ts`.
 
 Reporting the scope is what stops the weaker check from being read as the stronger one; a bare
 `occluded:false` on `'canvas'` would be a false clean bill of health. The `'entity'` scope also
-reports **`aimedAt`** (`'centre'` | `'sampled'`): the aim point starts at the centre of the
-entity's projected rect, which for a torus, an L-shape, a crescent — any concave or hollow mesh —
-is not on the entity at all. When the picker confirms the centre misses, the rect is searched (a
-small grid, closest-to-centre first, capped and reported as `samplesTried`) for a point that DOES
-pick the target; `aimedAt:'sampled'` marks that this happened, so a sampled aim is never mistaken
-for a clean centre hit.
+reports **`aimedAt`** (`'centre'` | `'sampled'`): the aim point starts at the centre of the part
+of the entity's projected rect that can be pressed (below), which for a torus, an L-shape, a
+crescent — any concave or hollow mesh — is not on the entity at all. When the picker confirms the
+centre misses, that rect is searched (a small grid, closest-to-centre first, capped and reported as
+`samplesTried`) for a point that DOES pick the target; `aimedAt:'sampled'` marks that this
+happened, so a sampled aim is never mistaken for a clean centre hit.
+
+**The rect that is searched is the part the surface DRAWS, inside the window** (#1563). Every
+engine provider reports `drawRect` — the rect it projected into: the canvas, or in the SceneView's
+`ui` mode the game-aspect letterbox (the 2D provider reports its host canvas). The aim's first point
+and its grid come from `screen ∩ drawRect ∩ window`. The projected AABB routinely spills past the
+draw rect, and a press outside it picks nothing (the letterbox bars, #1489), so a grid over the
+whole projection spends its samples where no click can land. Measured on `games/3d-test`: the
+cube's rect spilled above and right of the letterbox, 13 of 25 samples fell outside it, and one grid
+row reached the visible cube — so UC3 `[ui]` passed or refused as OCCLUDED ("selects Top UI") by the
+panel's aspect, on the same editor state. A revert-run at iPhone 16 Pro landscape reproduced that
+refusal; the clipped grid found the cube on its third sample. A provider that reports no `drawRect`
+keeps the whole-rect search.
+
+**The refusals do NOT move with the aim.** "Only partly visible" and "straddles its surface's
+edge" are still judged on the PROJECTED centre, exactly as before #1563: the searched rect's centre
+is inside the draw rect by construction, so judging them there retired both, and on a picker-less
+surface (game-3d, device) a 95%-off-canvas AABB was then aimed at a sliver nothing checks holds the
+mesh (#1563 review). One refusal is new: a rect whose drawn part lies wholly outside the window.
+The window is in the intersection rather than a second centre check, because such a check refused a
+draw rect merely overhanging the window edge (#1563 re-review).
 
 **Everything ambiguous is refused, never approximated** — an ambiguous `name`, an off-screen entity,
 a zero-size projection, a UI entity with no mounted node, and the subtle one: a rect that *overlaps*
@@ -365,9 +409,18 @@ Three compounding papercuts motivated the fix, all now addressed by the pieces b
 
 ## Selector-aware raw input
 
-`modoki_tap` / `drag` / `hover` / `scroll` / `pointer` accept an optional `selector` (and an
-`entity`, above) alongside `{x,y}`, resolved **server-side** so there's no race between reading a
-position and acting on it. Precedence is `entity` → `selector` → `{x,y}`.
+`modoki_tap` / `drag` / `hover` / `scroll` / `pointer` accept a `selector` (or an `entity`, above,
+or a chrome `label`) in place of `{x,y}`, resolved **server-side** so there's no race between
+reading a position and acting on it. **Exactly ONE address per aim — two are refused `AMBIGUOUS`**
+(#1556, owner-approved as a breaking change, both surfaces). It used to be precedence, `entity` →
+`selector` → `{x,y}`, which pressed one target and answered ok while the caller's other address
+named something else; the conventions doc's §3 rule ("sending both is refused rather than resolved
+by precedence") had always said otherwise. The rule, and what counts as given (`entity:{}` and
+`selector:''` do not; a lone stray `x` does), is `aimAddresses` in
+`engine/tools/shared/aimAddresses.ts`. Three layers read it: the editor host's `resolvePoint`, the
+renderer's `resolveCore` (what `modoki_dnd`'s `{selector, x, y}` endpoint reaches), and the device
+MCP. `modoki_drag_handle`'s destination (`to` / `toId` / `delta`) was the same precedence under
+another name and refuses the same way.
 
 - `resolveDomPointReport` lives in `engine/app/debug/domResolve.ts` (extracted from the DnD path in
   `engine/app/debug/domDnd.ts`).
@@ -403,9 +456,8 @@ Transcripts showed 213 `modoki_eval` calls finding a button by its visible text 
   "Save All" and turn every short label into an ambiguity. A miss *suggests* labels that contain
   the text; it never aims at them.
 - **It rides `resolvePoint`'s selector branch.** Occlusion, scrolled-out and layout-settling
-  diagnoses are the same code for both aims. `label` together with `selector` or `entity` is
-  refused `AMBIGUOUS`. The older `entity` → `selector` → `{x,y}` order is precedence only because
-  legacy calls sent both; nothing ever sent a label alongside another aim. `modoki_focus` resolves
+  diagnoses are the same code for both aims. `label` beside any other address is refused
+  `AMBIGUOUS`, and since #1556 so is every other pair. `modoki_focus` resolves
   a label through the same op and focuses the returned `uiId`.
 
 A label is the element's `data-ui-label`, else its text, else `title`/`aria-label`. A `<select>`
@@ -521,6 +573,26 @@ The handle shape carries three fields that make chrome addressing robust:
   walks up for the nearest ancestor that names anything (a bare `"div"` identifies nothing), and
   the SceneView toolbar — chrome that structurally overlaps the top of the viewport — carries
   `data-ui-id="sceneView.toolbar"` so it names itself.
+  ⚠️ **A GAME UI node is named as its entity BEFORE that walk** (#1570): `entity "Top UI" [<guid>]`,
+  or `entity 13` when no live entity has the id. A UINode host is a bare `div` whose only identity
+  is `data-entity-id`, so the walk used to skip it and reach the dock. A 3D gizmo handle under a
+  scene's own HUD bar in SceneView 'ui' was reported as covered by `div inside
+  div.flexlayout__tab_moveable`, and filed as "under the dock tab chrome". In 'ui' the HUD
+  **wins the press** over a gizmo drawn beneath it (owner ruling, 2026-09-25), so that refusal is
+  correct. It only needed to say whose it was. The canvas-cover check (`canvasOcclusionAt`) uses
+  the same describer.
+
+  **A handle CLIPPED by a neighbouring panel is a cover too, and every handle refusal is a coded
+  400** (#1565). `computeHandles` marks a handle inside the window but outside its own panel's
+  visible box `clipped` (the exposed population is gizmo handles drawn past their viewport's edge).
+  The handle routes sent that down the off-screen branch — no code, and `allowOccluded` could not
+  reach it — while the selector path calls the same geometry `OCCLUDED` and lets `allowOccluded`
+  press it. The handle contract now matches (owner: overridable, 2026-09-25): covered or clipped →
+  `OCCLUDED`, forceable, and a forced press reports `occluded:true` (+ `clipped:true`) even when
+  the hit-test named no cover; off-WINDOW or disabled → `REFUSED_BY_OP`, which `allowOccluded`
+  does not open, since a press outside the window reaches nothing and a disabled handle is inert.
+  The refusals were HTTP 200 `{ok:false}` — the MCP relay re-derived the same envelope from the
+  body, but a direct caller read success — and are now 400 like every other aimed route's.
 
   **A 3D gizmo aim point is now geometry, not a pixel guess — for EVERY handle.** The old constants
   (52px for an arrow, 66px for a ring) could not work, and not because of camera distance: the gizmo
@@ -554,6 +626,17 @@ The handle shape carries three fields that make chrome addressing robust:
   plates in the gizmo's positive octant, and a ray can cross one before reaching the uniform box —
   measured on a two-entity selection, whose proxy has no rotation so the plates lie in the world
   planes, the drag came back with `sy` UNCHANGED and x/z grown, i.e. a silent two-axis scale.
+  (d) **A translate/scale AXIS verifies its picker too** (#1570, `picksAxis`). three's axis pickers
+  are fat two-ended cones (`CylinderGeometry(0.2, 0, 0.6)` at ±0.3), and under an oblique camera a
+  ray at one axis's cone can cross a neighbour's first. Measured 2026-09-25 on tropical-island's cube
+  in SceneView 'ui': the published `translate:x` point dragged the cube along **z** only. The aim now
+  samples three points along each half of the cone and ranks them: selects THIS axis, then reachable,
+  then the cone centre, then separation. An axis where every point is known to select something
+  else is not published, because a handle that drags the wrong axis and reports ok is worse than no
+  handle. `pickerNameAt` takes the first VISIBLE hit, as three's `intersectObjectWithRay` does: a
+  flipped or collapsed axis hides its pickers, and those are not what a press selects. A rotate
+  RING gets the same check (`picksRing`). Its 45° diagonals avoid the rings' 3D intersections, but
+  not the points where their projected ellipses cross on screen.
 
   The rule is enforced by `engine/tests/architecture/handleProviderOwner.test.ts` — a SOURCE guard,
   because these providers live inside panel mount effects that cannot be invoked without a real
@@ -872,8 +955,31 @@ paragraph said it was: `createPrefabFromEntity` → `tagEntityTreeAsInstance` wr
 because the wrong version would have told an agent its entities were untouched when a trait had
 just been written to each of them.
 
-⚠️ **What still reaches the no-commit warning**, now that an asset-document drop does not. Both are
-real and neither is a defect in the probe:
+#### A drop that opened a modal is `pendingModal`, not a no-op (#1471)
+
+A handler that **asks first** records nothing until a person answers — the cross-scene reparent
+confirm (#1429, `Hierarchy.tsx` awaits `confirmInEditor`) is the one that bit. `committed:false` is
+correct there, and the warning used to call it "probably did nothing" from a list that read
+"TWO legitimate drops also land here" — so a QA session watching the gate work would have recorded
+it as a refusal. The fix is a checkable FACT, not a third bullet (the #1214 shape):
+`performDomDnd` snapshots every `[data-modal-shell]` element before the drop and again after the
+settle, and a shell that was not there before comes back as
+`pendingModal: { kind, controls, controlCount }` — `controls` being the `data-ui-id`s of the
+buttons inside it (capped), i.e. what to aim at next. The warning then says the drop opened a modal
+and names them.
+
+- **Read from the DOM, which is why it covers every modal.** Both forms of the one modal shell
+  stamp `data-modal-shell=<kind>` on their root (`ModalShell.tsx`, and `openDomModalShell` since
+  #1471), and `modalShellCoverage.test.ts` fails on a backdrop drawn anywhere else. No editor
+  dependency is added to `domDnd.ts`.
+- **Compared by element, not kind** — a drop that opens a second `save-dialog` over one already
+  showing still opened a modal.
+- **Not seen:** a modal that opens after the 400 ms settle. That is the "handler still running"
+  case below, and the no-op warning names it.
+
+⚠️ **What still reaches the no-commit warning**, now that an asset-document drop does not. The
+warning says these are EXAMPLES, not the full set — the complete-looking list is what made the modal
+case read as a refusal. Both are real and neither is a defect in the probe:
 - a handler still running after `COMMIT_SETTLE_MS` (400 ms) — a prefab fetch with nested-prefab
   preloading, or a Skin sprite drop's alpha-mask readback. ⚠️ **Not an OS-file import**: it is
   gated on `dataTransfer.files.length`, and `performDomDnd` builds a bare `new DataTransfer()` that
@@ -985,8 +1091,8 @@ cannot see those would be a false positive on legitimate flows. The warning comp
 RUNTIME op that has always run on a device, so nothing about a scene entity needs an editor to
 resolve it. `bridge.ts`'s `resolveAim` simply never called it.
 - **`entity`** on `device_tap`/`hover`/`scroll`/`pointer`, and on each end of `device_drag` (nested
-  `from`/`to`, the `modoki_drag` shape; the flat `fromSelector`/`fromX`… still work, and one endpoint
-  given both ways is refused `AMBIGUOUS`). The page resolves it through the same op, and accepts or
+  `from`/`to`, the `modoki_drag` shape — the only shape since #1560 removed the six flat
+  `fromSelector`/`fromX`… aliases, so a stale one refuses by name). The page resolves it through the same op, and accepts or
   refuses the answer through the same function the editor's `resolvePoint` uses
   (`app/debug/entityAimRefusal.ts`), so one resolution is refused identically on both surfaces.
   The trusted CDP/WDA routes resolve through `handleResolveAim`, which reads the endpoint's keys from
@@ -1007,9 +1113,11 @@ resolve it. `bridge.ts`'s `resolveAim` simply never called it.
 - ⚠️ **Version skew is made loud, not handled.** An app built before this change has no entity branch
   and fell through to its pixel or viewport-centre default: `device_scroll {entity}` scrolled the
   centre and answered ok (review finding). So the MCP sends a selector that matches nothing
-  (`ENTITY_AIM_SKEW_SELECTOR`) beside any entity aim without one. The new page resolves the entity
-  first and never reads it; the old one resolves it, misses, and refuses naming
-  `[data-modoki-app-predates-entity-aim]`. Rebuild the app.
+  (`ENTITY_AIM_SKEW_SELECTOR`) beside every entity aim. The new page resolves the entity first and
+  never reads it; the old one resolves it, misses, and refuses naming
+  `[data-modoki-app-predates-entity-aim]`. Rebuild the app. ⚠️ This is the ONE deliberate second
+  address on the wire, which is why the device MCP checks the CALLER's spec for two addresses
+  (#1556) before it adds this selector. The page keeps its entity-first order only to arbitrate it.
 - **Found on the way:** the backend fronts a synthetic-fallback reply with a banner, a refusal
   included, and the device MCP judged failure by `startsWith('Error:')`. So every refused synthetic tap
   (the iPhone 8, an Android without adb) came back as `Tapped — ⚠️ SYNTHETIC INPUT … Error: …`, ok.

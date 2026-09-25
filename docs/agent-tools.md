@@ -147,10 +147,26 @@ description: 'Place a piece from the tray onto a cell. The ONE thing an agent co
 
 Return a JSON-serializable answer; it is passed through to the caller **untouched**, so your tool
 answers its own question rather than having it buried in an envelope. On a refusal follow
-[mcp-tool-conventions.md](./mcp-tool-conventions.md) §5 — `{ ok:false, reason, …options }`, naming
-what *would* have worked — instead of throwing. A throw is caught and reported as
+[mcp-tool-conventions.md](./mcp-tool-conventions.md) §5 — `{ ok:false, code?, reason, options? }`,
+naming what *would* have worked — instead of throwing. A throw is caught and reported as
 `ok:false`, so it never presents as a transport failure (a 504 reads as "the editor is gone" and
 sends the agent diagnosing the wrong layer).
+
+**`code` is how a caller branches on WHY** (#1561). Both MCP servers take it off your reply, so
+`NOT_FOUND` (the level/cell you named does not exist), `AMBIGUOUS` (two addresses given, which wins?)
+and the rest of §5's closed set reach the agent as that code. Leave it off for a state refusal ("no
+level loaded yet") — every surface stamps `REFUSED_BY_OP` on an uncoded one, which is the right
+answer there. A code OUTSIDE the set is not dropped silently: the relay sends it as `REFUSED_BY_OP`
+and appends a note naming your code to `reason`, so the mistake shows in your own tool's output.
+`options` must be a `string[]` to be relayed. The relay's own refusals are coded the same way — an
+unknown tool is `NOT_FOUND` with the registered names as `options`, an undeclared key
+`UNKNOWN_PARAM`.
+
+**Count fields use the engine's names** (§2): `returnedCount`/`totalCount` for rows here vs. rows
+matched, never a bare top-level `count`/`total`, and a qualified name (`manifestLength`,
+`trackLength`) for a size that is neither. Walk your replies with `retiredCountKeys` from
+`@modoki/engine/testing/replyVocabulary` in the game's own tool tests —
+`games/court/tests/agentTools.test.ts` walks every registered Court tool that way.
 
 ## Release builds
 

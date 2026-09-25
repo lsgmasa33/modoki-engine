@@ -800,6 +800,11 @@ questions, recorded so they are not re-opened by accident.
   (CVE-2024-27980). And the win32 quoting branch is **unvalidated against a real Windows shell**
   from a Mac — the same caveat `engine/plugins/buildStepShell.ts` already carries for its `winCmd`
   forms.
+  ⚠️ **Superseded by #1537.** Both "not done" items above were resolved: every gcloud call is argv
+  through `gcloudSync` (`engine/scripts/ota/gcloud.mjs`) — no shell, so `shellQuote` is gone — and a
+  `.cmd` is spawned by `toSpawn`, which runs cmd.exe itself with an escaped line rather than needing
+  `shell:true`. The win32 double-quote branch was then MEASURED wrong: cmd expands `%VAR%` inside
+  double quotes — see [windows.md](windows.md) § "Never hand a shell a command line".
 - **`ota-embed-manifest.mjs` did not read `ota.enabled`** (#649) — its own sibling
   `ota-publish.mjs` did, and so did the route (`vite-asset-scanner.ts` makes the embed step
   conditional on it), so a hand run wrote `ota-embedded-manifest.json` into the dist of a project

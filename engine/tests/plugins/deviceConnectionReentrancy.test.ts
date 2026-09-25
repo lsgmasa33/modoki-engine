@@ -181,6 +181,36 @@ function startGatedMockDevice(authority: DeviceLeaseAuthority, gateConnNumber = 
   });
 }
 
+/** Wait for the mock device to have observed exactly `expected` live sockets, or throw.
+ *
+ *  `client.disconnect()` destroys its socket SYNCHRONOUSLY, but the mock server learns of the
+ *  close through its own `'close'` event — an I/O callback on this same process's event loop. A
+ *  fixed `setTimeout` before counting therefore races the loop rather than the product: normally
+ *  the close lands in microseconds, but on a loaded CI box (six vitest workers, a 516s app suite)
+ *  it can slip past any constant, which is exactly how this went red on macOS while ubuntu and
+ *  windows passed (ci/main 35730635110).
+ *
+ *  This is NOT a softened assertion. It polls to the DEADLINE and then throws with the observed
+ *  count, so a genuinely leaked socket — one that never closes, the #527 hazard these tests
+ *  exist to catch — still fails the test; only the arbitrary wait is gone. */
+/** Poll, never sleep — shape (I) in docs/falsifiable-tests.md.
+ *
+ *  ⚠️ The 500ms ceiling is load-bearing in BOTH directions, and is not slack to be raised.
+ *
+ *  FLOOR: the observed close lands in microseconds — the CI red was one scheduling slip past a
+ *  hardcoded 80ms — so 500ms is ~6x the constant it replaces and costs nothing when healthy,
+ *  because `vi.waitFor` returns the moment the count actually reaches zero.
+ *
+ *  CEILING: the product closes a lease socket LATE on three paths — `reconnectDelayMs` (1000ms),
+ *  `pingIntervalMs` (2000ms) and `REQUEST_TIMEOUT_MS` (5000ms). A socket that only closes via one
+ *  of THOSE is a leaked lease client and must fail here, so this timeout has to stay comfortably
+ *  BELOW 1000ms. None of the three is reachable from this harness today (one guid, so no
+ *  `'not-owner'`; the mock listens throughout and always answers `'disconnect'`) — but a future
+ *  test in this file that withholds a `'disconnect'` reply, the way `startGatedMockDevice` already
+ *  withholds `'connect'`, would close at ~5000ms and a 5000ms deadline would make it a coin flip. */
+const expectNoOpenSockets = (device: { openSocketCount: () => number }) =>
+  vi.waitFor(() => expect(device.openSocketCount()).toBe(0), { timeout: 500 });
+
 describe('DeviceConnectionManager — a disconnect() landing inside the #283 rediscovery window (#506)', () => {
   it('does not leave a live client installed on the manager', async () => {
     const authority = new DeviceLeaseAuthority();
@@ -361,6 +391,15 @@ describe('DeviceConnectionManager — two racing connect() calls (#527)', () => 
     const device = await startGatedMockDevice(authority, 1);
     process.env.MODOKI_DEVICE_HOST_PORT = String(device.port);
     const mgr = new DeviceConnectionManager('g-527-repro', stateDir);
+    // A PASS-THROUGH spy, purely as an observable: it changes no behaviour, it just makes "B's
+    // head teardown has run against A's published client" something the test can WAIT FOR instead
+    // of bet 30ms on. A's own head `disconnect()` finds `this.client` null and never reaches here,
+    // so the first entry is B's — the exact step this setup depends on.
+    let hangups = 0;
+    const realClientDisconnect = DeviceLeaseClient.prototype.disconnect;
+    const hangupSpy = vi.spyOn(DeviceLeaseClient.prototype, 'disconnect').mockImplementation(
+      async function (this: DeviceLeaseClient) { hangups += 1; return realClientDisconnect.call(this); },
+    );
     try {
       const connectA = mgr.connect({ useAdb: true });
       // A has published its client and is suspended inside the gated handshake.
@@ -369,25 +408,36 @@ describe('DeviceConnectionManager — two racing connect() calls (#527)', () => 
       // the Change-2 join does not collapse it into A's promise — this test wants two genuinely
       // separate `connectInner` calls racing, not one deduplicated into the other.
       const connectB = mgr.connect({ useAdb: true, ip: 'unused-so-B-has-a-different-key' });
-      // Give B's head `await this.disconnect()` a turn to run against A's published client.
-      await new Promise((r) => setTimeout(r, 30));
+      // B's head `await this.disconnect()` has now run against A's published client. Polled, not
+      // slept at: if this has NOT happened before the gate releases, the interleaving under test
+      // never forms and the guard would pass without exercising anything.
+      await vi.waitFor(() => expect(hangups).toBe(1), { timeout: 2000 });
       // Let A's handshake complete. This is the moment A's socket goes live, after B's teardown.
       device.releaseGate();
       await connectA;
       await connectB;
+      // This SETTLING wait stays a sleep on purpose, and must not become a poll for `> 0`. Both
+      // connects have resolved, so the accept callbacks have already run and the count cannot be
+      // starved to zero; what the wait buys is the opposite — time for sockets destroyed
+      // client-side to be REAPED, so the control below counts the live set rather than zombies. A
+      // poll returning on its first sample would accept that residue and let a run where every
+      // connect failed still satisfy `beforeTeardown > 0`, which is the vacuity it exists to catch.
       await new Promise((r) => setTimeout(r, 50));
       const beforeTeardown = device.openSocketCount();
       // Tear the manager down the only way anything can: the public disconnect().
       await mgr.disconnect();
       expect(mgr.status().state).toBe('disconnected');
-      // Give any in-flight socket close a turn to land before counting.
-      await new Promise((r) => setTimeout(r, 50));
       // POSITIVE CONTROL: the counter must have been reading a real live socket a moment ago,
       // otherwise the assertion below is vacuous and would pass against any code at all.
       expect(beforeTeardown).toBeGreaterThan(0);
       // THE ASSERTION. A fully-disconnected manager must leave no lease socket open.
-      expect(device.openSocketCount()).toBe(0);
+      await expectNoOpenSockets(device);
+      // ...and must not be holding the hardware. The socket count alone cannot see an orphan that
+      // closed its socket and then RE-GRABBED the lease on its reconnect timer, which is the
+      // user-visible half of the #527 harm.
+      expect(authority.status(Date.now()).leased).toBe(false);
     } finally {
+      hangupSpy.mockRestore();
       await mgr.disconnect();
       await device.close();
     }
@@ -434,19 +484,32 @@ describe('DeviceConnectionManager — two racing connect() calls (#527)', () => 
 
       // Different request keys (Change 2 would otherwise join two IDENTICAL requests into one
       // `connectInner` call, defeating the two-genuinely-separate-connects setup this test needs).
+      // ⚠️ These waits are what makes the 3-step race FORM, so they are polls on the interleaving
+      // itself, not sleeps at it. They were `setTimeout(r, 20)` — a bet that each connect's head
+      // `disconnect()` reaches the gate inside 20ms. On the loaded runner that slipped a 50ms
+      // socket close past the old assertion, that bet loses with only ONE teardown suspended: the
+      // race never forms and this regression guard passes GREEN without exercising #527 at all.
+      // `seen` is the spy's own entry count, so it observes exactly the step being waited for.
       const connectA = mgr.connect({ useAdb: true });
-      await new Promise((r) => setTimeout(r, 20));
+      await vi.waitFor(() => expect(seen).toBe(1), { timeout: 2000 });
       const connectB = mgr.connect({ useAdb: true, ip: 'unused-so-B-has-a-different-key' });
-      await new Promise((r) => setTimeout(r, 20));
+      await vi.waitFor(() => expect(seen).toBe(2), { timeout: 2000 });
+      // Recorded AT the release, not read back afterwards: `seen` goes on counting once the gate
+      // opens (A and B each run their own later teardowns, reaching 4), so a post-hoc read cannot
+      // say what was suspended at the only moment that matters.
+      const seenAtRelease = seen;
       releaseTeardown!();
       await connectA;
       await connectB;
       spy.mockRestore();
+      // The setup held: BOTH teardowns were suspended inside client0.disconnect() together. Without
+      // this the test can only fail loudly, never report that it verified nothing.
+      expect(seenAtRelease).toBe(2);
 
       await mgr.disconnect();
       expect(mgr.status().state).toBe('disconnected');
-      await new Promise((r) => setTimeout(r, 80));
-      expect(device.openSocketCount()).toBe(0);
+      await expectNoOpenSockets(device);
+      expect(authority.status(Date.now()).leased).toBe(false);
     } finally {
       vi.restoreAllMocks();
       await mgr.disconnect();
@@ -539,7 +602,9 @@ describe('DeviceConnectionManager — disconnect() holds the machine-wide claim 
     // Slow the hangup itself — the same gating idiom the reentrancy tests above use on
     // `client.connect()` — so `disconnect()`'s `await client.disconnect()` stays suspended for as
     // long as the test wants, with the claim's fate observable on either side of it.
+    let hangupsSuspended = 0;
     const spy = vi.spyOn(DeviceLeaseClient.prototype, 'disconnect').mockImplementation(async function (this: DeviceLeaseClient) {
+      hangupsSuspended += 1;
       await hangupGate;
       return realDisconnect.call(this);
     });
@@ -550,8 +615,10 @@ describe('DeviceConnectionManager — disconnect() holds the machine-wide claim 
       expect(listClaims().length).toBeGreaterThan(0); // sanity: the connect actually claimed hardware
 
       const disconnectDone = mgr.disconnect();
-      // Give disconnect()'s synchronous head a turn to run and reach the gated client.disconnect().
-      await new Promise((r) => setTimeout(r, 20));
+      // Wait until disconnect() is actually SUSPENDED in the gated client.disconnect() (#1478). It
+      // was a 20ms sleep: under load the head had not arrived yet, the claim below was still held
+      // because nothing had reached the release, and the case passed without testing the window.
+      await vi.waitFor(() => expect(hangupsSuspended).toBe(1), { timeout: 2000 });
 
       // THE ASSERTION. Mid-teardown — `client.disconnect()` still suspended on the gate — the claim
       // must STILL be held: releasing it earlier would empty the claims file while
@@ -614,7 +681,9 @@ describe('DeviceConnectionManager — a stale disconnect() continuation cannot r
       // Session A's disconnect — suspends inside the gated `client.disconnect()`, after its
       // synchronous field-nulling has already run.
       const disconnectA = mgr.disconnect();
-      await new Promise((r) => setTimeout(r, 20)); // give the synchronous head + gate a turn to land
+      // A is SUSPENDED in its hangup before B starts — polled, not a 20ms bet on it (#1478). If B
+      // ran first, A's continuation would never be stale and the case would pass on nothing.
+      await vi.waitFor(() => expect(disconnectCalls).toBe(1), { timeout: 2000 });
 
       // Session B: a fresh connect() on the SAME manager instance, same target — re-claims the
       // SAME device id and completes fully while A's disconnect is still suspended.

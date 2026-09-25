@@ -7,7 +7,9 @@ import {
   computeLetterbox, computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, frameCameraToBox,
   frameCameraToBoxFixed, computeDeviceLetterbox, resolveDeviceSize, gameAspectFromRect,
   createSelectGesture, DESELECT_DRAG_PX, outlineSourceGeometry, syncEdgeOutline, syncOutlineFor, disposeEdgeOutline,
-  resolveFocusTarget, FOCUS_DEFAULT_RADIUS, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../../src/editor/scene/sceneViewMath';
+  resolveFocusTarget, FOCUS_DEFAULT_RADIUS, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast,
+  viewportDrawRect, transformControlsViewport } from '../../src/editor/scene/sceneViewMath';
+import { projectAABBToScreen } from '../../src/runtime/core/screenBounds';
 
 describe('frameCameraToBox (Missing Test #1 — camera framing)', () => {
   it('frames a box preserving the current view direction; sets near/far from radius', () => {
@@ -105,6 +107,52 @@ describe('computeLetterbox + NDC (Missing Test #4 — UI-mode letterbox remap)',
     expect(computeFullNDC(0, 0, rect)).toEqual({ x: -1, y: 1 });   // top-left
     expect(computeFullNDC(100, 100, rect)).toEqual({ x: 1, y: -1 }); // bottom-right
     expect(computeFullNDC(50, 50, rect)).toEqual({ x: 0, y: 0 });    // center
+  });
+});
+
+describe('viewportDrawRect — an aim and its pick share one frame (#1489)', () => {
+  // A canvas that is NOT at the page origin, so a helper that forgot the canvas offset (or the
+  // letterbox offset inside it) is caught too. 600×300 against a portrait game aspect → pillarbox.
+  const canvas = { left: 300, top: 40, width: 600, height: 300 };
+  const gameAspect = 0.5;
+
+  it('is the whole canvas in 3D mode, and the offset letterbox in UI mode', () => {
+    expect(viewportDrawRect(canvas, false, gameAspect)).toEqual(canvas);
+    // letterbox inside 600×300 at aspect 0.5 → 150×300, centred: vpX = 225
+    expect(viewportDrawRect(canvas, true, gameAspect)).toEqual({ left: 525, top: 40, width: 150, height: 300 });
+  });
+
+  it('UI-mode NDC is full-canvas NDC over the draw rect (one mapping, not two)', () => {
+    const draw = viewportDrawRect(canvas, true, gameAspect);
+    for (const [x, y] of [[525, 40], [600, 190], [675, 340], [310, 100]]) {
+      expect(computeUIModeNDC(x, y, canvas, gameAspect)).toEqual(computeFullNDC(x, y, draw));
+    }
+  });
+
+  // The #1489 round trip itself: the bounds provider projects an entity's box to a client rect,
+  // `modoki_tap` aims at that rect's centre, and the pick maps the point back through the UI-mode
+  // NDC and raycasts. Projected through the draw rect, the ray finds the box; projected through
+  // the full canvas (what the provider did), the same pick misses it — which also proves this
+  // fixture can tell the two apart.
+  it('an aim projected through the draw rect is picked by the UI-mode pick; one through the canvas is not', () => {
+    const cam = new THREE.PerspectiveCamera(50, gameAspect, 0.1, 100);
+    cam.position.set(0, 0, 10);
+    cam.lookAt(0, 0, 0);
+    cam.updateMatrixWorld(true);
+    const box = new THREE.Box3(new THREE.Vector3(1.5, 1.5, -0.5), new THREE.Vector3(2.5, 2.5, 0.5));
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1));
+    mesh.position.set(2, 2, 0);
+    mesh.updateMatrixWorld(true);
+    const hits = (screen: { x: number; y: number; w: number; h: number }) => {
+      const ndc = computeUIModeNDC(screen.x + screen.w / 2, screen.y + screen.h / 2, canvas, gameAspect);
+      const ray = new THREE.Raycaster();
+      ray.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), cam);
+      return ray.intersectObject(mesh).length > 0;
+    };
+    const viaDraw = projectAABBToScreen(box, cam, viewportDrawRect(canvas, true, gameAspect)).screen!;
+    const viaCanvas = projectAABBToScreen(box, cam, canvas).screen!;
+    expect(hits(viaDraw)).toBe(true);
+    expect(hits(viaCanvas)).toBe(false);
   });
 });
 
@@ -529,5 +577,76 @@ describe('colliderModeToast (#1003)', () => {
 
   it('tells the user how to get back, since the viewport it leaves is empty', () => {
     expect(colliderModeToast(true, 0)).toContain('C again');
+  });
+});
+
+describe('transformControlsViewport — the gizmo maps its OWN pointer events through the draw rect (#1489 review)', () => {
+  it('is null for the full canvas (3D mode) and lower-left-origin CSS px for a sub-rect', () => {
+    const canvas = { left: 100, top: 50, width: 400, height: 600 };
+    expect(transformControlsViewport(canvas, { ...canvas })).toBeNull();
+    // Asymmetric on purpose: 50px from the canvas top, 250px from its bottom, so a flipped origin
+    // cannot pass by symmetry.
+    const v = transformControlsViewport(canvas, { left: 150, top: 100, width: 200, height: 300 })!;
+    expect(v.toArray()).toEqual([50, 250, 200, 300]);
+  });
+
+  // Drives three's REAL TransformControls through its own canvas pointerdown listener — the path
+  // SceneView's capture handler lets through when its own hit-test misses. In a letterboxed view,
+  // a press in the empty bar where the FULL-canvas mapping would put the handle must not grab it,
+  // and a press on the handle where it is DRAWN must.
+  it('with the viewport set, a press where the handle is DRAWN grabs it and one in the bar does not', async () => {
+    const { TransformControls } = await import('three/examples/jsm/controls/TransformControls.js');
+    vi.stubGlobal('document', { pointerLockElement: null });
+    try {
+      const W = 1600, H = 900, gameAspect = 9 / 16;
+      const canvas = { left: 0, top: 0, width: W, height: H };
+      const draw = viewportDrawRect(canvas, true, gameAspect);
+      const listeners: Record<string, ((e: unknown) => void)[]> = {};
+      const el = {
+        style: {}, ownerDocument: { pointerLockElement: null }, setPointerCapture() {}, releasePointerCapture() {},
+        addEventListener: (t: string, f: (e: unknown) => void) => { (listeners[t] ??= []).push(f); },
+        removeEventListener: (t: string, f: (e: unknown) => void) => { listeners[t] = (listeners[t] ?? []).filter((g) => g !== f); },
+        getBoundingClientRect: () => ({ ...canvas, right: W, bottom: H }),
+      };
+      const cam = new THREE.PerspectiveCamera(30, gameAspect, 0.1, 500);
+      cam.position.set(0, 0, 10);
+      cam.updateMatrixWorld();
+      const scene = new THREE.Scene();
+      const obj = new THREE.Object3D();
+      scene.add(obj);
+      // Off-centre (NDC x 0.6), so the drawn handle and its full-canvas "phantom" are far apart.
+      const p = new THREE.Vector3(0.6, 0, 0.5).unproject(cam);
+      const dir = p.sub(cam.position).normalize();
+      obj.position.copy(cam.position).addScaledVector(dir, 10 / -dir.z);
+      obj.updateMatrixWorld();
+      const make = () => {
+        const tc = new TransformControls(cam, el as unknown as HTMLElement);
+        tc.attach(obj);
+        scene.add(tc.getHelper());
+        tc.getHelper().updateMatrixWorld(true);
+        tc.viewport = transformControlsViewport(canvas, draw);
+        return tc;
+      };
+      const n = obj.position.clone().project(cam);
+      const cy = (-n.y * 0.5 + 0.5) * H;
+      const press = (x: number) => { for (const f of listeners.pointerdown ?? []) f({ clientX: x, clientY: cy, button: 0, pointerId: 1, pointerType: 'mouse' }); };
+      const drawnX = draw.left + (n.x * 0.5 + 0.5) * draw.width;
+      const phantomX = (n.x * 0.5 + 0.5) * W;
+      // The fixture must separate the two, or neither assertion below means anything.
+      expect(phantomX).toBeGreaterThan(draw.left + draw.width);
+
+      const inBar = make();
+      press(phantomX);
+      expect(inBar.dragging).toBe(false);
+      inBar.dispose();
+      for (const k of Object.keys(listeners)) delete listeners[k];
+
+      const onHandle = make();
+      press(drawnX);
+      expect(onHandle.dragging).toBe(true);
+      onHandle.dispose();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

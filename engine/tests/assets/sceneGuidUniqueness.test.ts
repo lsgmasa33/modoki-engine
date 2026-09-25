@@ -34,6 +34,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { REPO_ROOT, hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 
@@ -55,14 +56,53 @@ function sceneFiles(): string[] {
  *  Reads the guid the way the loader does — `EntityAttributes.guid` first, falling back to
  *  a top-level `guid` — so a scene on either shape is covered. Top-level `entities[]` only:
  *  a prefab instance's `added[]` subtree carries its own guids under a different ownership
- *  rule and is not what this invariant is about. */
-function duplicatesIn(file: string): { dups: string[]; guids: number; attrGuids: number; missing: string[] } {
+ *  rule and is not what this invariant is about.
+ *
+ *  ⚠️ **`members[*].guid` IS in scope, and it is a second channel of the same invariant** (scene
+ *  v16, #1468). A member row states the guid its member answers to, so a guid appearing in a row
+ *  AND on an entity — or in two rows — is two entities in one scene sharing one address, exactly
+ *  what this file exists to stop. Added on the Phase 2B close-out review's finding, while the answer
+ *  is provably zero: no authored prefab is v5 yet, so no committed scene has rows. The moment Phase
+ *  4's precondition lands (migrate the corpus to v5) this stops being vacuous — and the only other
+ *  detector is `dropCollidingPins`, which runs at LOAD, in the editor's console, not in the gate. */
+function duplicatesIn(file: string): { dups: string[]; guids: number; attrGuids: number; missing: string[]; rows: number } {
   const data = JSON.parse(fs.readFileSync(file, 'utf8'));
   const entities: Array<Record<string, unknown>> = data.entities ?? [];
   const byGuid = new Map<string, string[]>();
   const missing: string[] = [];
   let guids = 0;
   let attrGuids = 0;
+  let rows = 0;
+  /** Member rows wherever they sit: on an instance entry, and on a reference node at any depth. */
+  const walkRows = (node: Record<string, unknown> | undefined, where: string): void => {
+    if (!node || typeof node !== 'object') return;
+    const members = node.members as Record<string, { guid?: string; name?: string }> | undefined;
+    if (members && typeof members === 'object') {
+      for (const [key, row] of Object.entries(members)) {
+        const g = row?.guid;
+        if (typeof g !== 'string' || !g) continue;
+        // ⚠️ Counted in `rows`, NOT in `guids`. The two existing read paths are floored SEPARATELY on
+        // purpose (see the floor below), so one channel cannot hold the combined total above zero
+        // while the other reads nothing — and feeding rows into `guids` would give the ROW channel
+        // that power the moment the corpus has rows. It also stops `guids + missing` being an entity
+        // count, which the second test's population floor relies on.
+        rows++;
+        const arr = byGuid.get(g);
+        const label = `${where} member ${row.name || key}`;
+        if (arr) arr.push(label); else byGuid.set(g, [label]);
+      }
+    }
+    // ⚠️ `children` too, not just `added`: `snapshotSubtree` puts a `captureChild` result there, and
+    // `captureChild` returns a reference NODE for a dragged-in instance — which carries `members`.
+    // The first cut of this walk missed it, and `toTemplateNodes` (touched in the same change) does
+    // recurse `children`, so the two walks disagreed about where a reference node can live.
+    for (const child of (node.added as Record<string, unknown>[] | undefined) ?? []) walkRows(child, where);
+    for (const child of (node.children as Record<string, unknown>[] | undefined) ?? []) walkRows(child, where);
+    const slots = node.nestedStructure as Record<string, { added?: Record<string, unknown>[] }> | undefined;
+    if (slots && typeof slots === 'object') {
+      for (const delta of Object.values(slots)) for (const child of delta?.added ?? []) walkRows(child, where);
+    }
+  };
   for (const e of entities) {
     const ea = (e.traits as Record<string, unknown> | undefined)?.['EntityAttributes'] as
       Record<string, unknown> | undefined;
@@ -74,10 +114,11 @@ function duplicatesIn(file: string): { dups: string[]; guids: number; attrGuids:
     const arr = byGuid.get(guid);
     if (arr) arr.push(name); else byGuid.set(guid, [name]);
   }
+  for (const e of entities) walkRows(e, (((e.traits as Record<string, unknown> | undefined)?.['EntityAttributes'] as Record<string, unknown> | undefined)?.name as string) || (e.name as string) || '(unnamed)');
   const dups = [...byGuid.entries()]
     .filter(([, names]) => names.length > 1)
     .map(([guid, names]) => `${guid} → ${names.join(' + ')}`);
-  return { dups, guids, attrGuids, missing };
+  return { dups, guids, attrGuids, missing, rows };
 }
 
 describe.skipIf(!hasAnyProject())('entity guids are unique within a scene file', () => {
@@ -148,5 +189,62 @@ describe.skipIf(!hasAnyProject())('entity guids are unique within a scene file',
         + 'the loader derives a stable guid, and the save stores it. Do not hand-write a v4 guid: '
         + 'another clone would derive a different value for the same entry.',
     ).toEqual([]);
+  });
+
+  /** ⚠️ The member-row channel is VACUOUS on today's corpus — no authored prefab is v5, so no
+   *  committed scene has rows and the scan above finds none to compare. A scan that can see nothing
+   *  reports "no duplicates" for the same reason a broken one does, so the detector is proved on a
+   *  synthetic document instead. This is the positive case; the corpus run is the negative one.
+   *
+   *  Delete this only when the corpus genuinely has rows AND the floor above counts them. */
+  it('the member-row scan detects a duplicate (the channel is vacuous on today`s corpus)', () => {
+    const file = path.join(makeScratchDir('row-uniqueness'), 'probe.scene.json');
+    const SHARED = 'aaaaaaaa-0000-4000-8000-00000000beef';
+    {
+      fs.writeFileSync(file, JSON.stringify({
+        version: 16,
+        entities: [
+          // A row and a top-level entity claiming one guid — two entities, one address.
+          { traits: { EntityAttributes: { name: 'Plain', guid: SHARED } } },
+          {
+            prefab: 'aaaaaaaa-0000-4000-8000-0000000000p1', guid: 'aaaaaaaa-0000-4000-8000-0000000000r1',
+            traits: { EntityAttributes: { name: 'Inst' } },
+            members: { '/aaaaaaaa-0000-4000-8000-0000000000n1': { guid: SHARED, name: 'Member' } },
+          },
+        ],
+      }));
+      const r = duplicatesIn(file);
+      expect(r.rows, 'the walk must have SEEN the row, or the duplicate below proves nothing').toBe(1);
+      expect(r.dups.join(' ')).toContain(SHARED);
+      expect(r.dups.join(' ')).toContain('Member');
+    }
+  });
+
+  it('the member-row scan reaches a REFERENCE node`s rows too, at depth', () => {
+    // The other half of the walk: a reference node is an instance and carries its own rows, inside
+    // `added` and inside a `nestedStructure` slot. A scan that stopped at the entry would miss them.
+    const file = path.join(makeScratchDir('row-uniqueness-nested'), 'probe.scene.json');
+    const SHARED = 'aaaaaaaa-0000-4000-8000-00000000cafe';
+    {
+      fs.writeFileSync(file, JSON.stringify({
+        version: 16,
+        entities: [{
+          prefab: 'aaaaaaaa-0000-4000-8000-0000000000p2', guid: 'aaaaaaaa-0000-4000-8000-0000000000r2',
+          traits: { EntityAttributes: { name: 'Inst' } },
+          added: [{ prefab: 'aaaaaaaa-0000-4000-8000-0000000000p3', guid: 'aaaaaaaa-0000-4000-8000-0000000000r3',
+            members: { '/aaaaaaaa-0000-4000-8000-0000000000n2': { guid: SHARED, name: 'Deep' } } }],
+          nestedStructure: { '2': { added: [{ prefab: 'aaaaaaaa-0000-4000-8000-0000000000p4', guid: 'aaaaaaaa-0000-4000-8000-0000000000r4',
+            members: { '/aaaaaaaa-0000-4000-8000-0000000000n3': { guid: SHARED, name: 'Deeper' } } }] } },
+          // A plain added node whose CHILD is a reference node — `snapshotSubtree`'s shape.
+          children: [{ children: [{ prefab: 'aaaaaaaa-0000-4000-8000-0000000000p5', guid: 'aaaaaaaa-0000-4000-8000-0000000000r5',
+            members: { '/aaaaaaaa-0000-4000-8000-0000000000n4': { guid: SHARED, name: 'Child' } } }] }],
+        }],
+      }));
+      const r = duplicatesIn(file);
+      expect(r.rows).toBe(3);
+      expect(r.dups.join(' ')).toContain('Deep');
+      expect(r.dups.join(' ')).toContain('Deeper');
+      expect(r.dups.join(' '), 'a reference node inside `children` is reached too').toContain('Child');
+    }
   });
 });

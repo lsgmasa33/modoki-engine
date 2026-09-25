@@ -35,7 +35,7 @@ const codeOf = (text: string) => envelope(text).error.code;
 const TOOLS: ReadonlyArray<{ name: string; args?: Record<string, unknown> }> = [
   // perceptCall
   { name: 'device_get_scene_state' },
-  { name: 'device_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, 0, 0], direction: [0, 0, -1] } },
+  { name: 'device_physics_query', args: { kind: 'raycast', dim: '3d', origin: [0, 0, 0], direction: [0, 0, -1] } },
   { name: 'device_journal' },
   { name: 'device_watch', args: { action: 'list' } },
   { name: 'device_input_watch', args: { action: 'read' } },
@@ -49,6 +49,8 @@ const TOOLS: ReadonlyArray<{ name: string; args?: Record<string, unknown> }> = [
   { name: 'device_write_player_prefs', args: { action: 'set', key: 'k', value: 'v' } },  // its description promises PARTIAL
   { name: 'device_game_tools' },
   { name: 'device_game_tool_call', args: { name: 'court_load_level' } },
+  { name: 'device_console_logs' },  // #1559: the shared console-logs op now, not a bridge command
+  { name: 'device_wait_for', args: { entity: { name: 'P' } } },
   // NOT device_diagnose: `ok:false` is its ANSWER ("this scene is unhealthy"), not a failure —
   // `OK_IS_A_VERDICT` exempts it, and running the failure check over it turned the one tool built
   // to report problems into an error envelope exactly when it had something to report. A row here

@@ -27,6 +27,7 @@ import {
   cloneTraitValues,
   remapGuidValues,
   planCopyGuids,
+  frameDocReader,
   templateKeyOf,
   setTemplateKey,
   carryEntityIdFields,
@@ -91,8 +92,12 @@ function spawnFromSpecs(specs: Array<{ name: string; data?: Record<string, unkno
   return entity.id();
 }
 
+/** `device_duplicate_entity`'s ceiling. The device schema hand-copies it (#1560);
+ *  `numericRangeInSchema.test.ts` holds the copy to this. */
+export const DUPLICATE_MAX_COUNT = 1000;
+
 export function createEntityLive(params: unknown): unknown {
-  const p = (params ?? {}) as { spec?: CreateEntitySpec; parentGuid?: string; parentId?: number };
+  const p = (params ?? {}) as { spec?: CreateEntitySpec; parentGuid?: string; parentId?: number; name?: unknown };
   if (!p.spec) return { ok: false, error: 'create-entity requires { spec } — nothing was created.' };
 
   // The ONE vocabulary check both create-entity ops share (#1070): the per-kind defaults, then the
@@ -116,7 +121,10 @@ export function createEntityLive(params: unknown): unknown {
     return { ok: false, error: `parent ${parentId} is a resource (Time, Input, a config singleton) and holds no children — a child under the Transient Time/Input singleton is dropped from every save. Nothing was created; parent it elsewhere, or omit the parent for the scene root (#1248).` };
   }
 
-  const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId);
+  if (p.name !== undefined && (typeof p.name !== 'string' || !p.name.trim())) {
+    return { ok: false, error: `name must be a non-empty string (got ${JSON.stringify(p.name)}) — nothing was created.` };
+  }
+  const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId, p.name as string | undefined);
   const id = spawnFromSpecs(specs);
   if (id == null) return { ok: false, error: `nothing was created for spec ${JSON.stringify(resolved.spec)} — a referenced trait is not registered in this build.` };
   return { ok: true, id, guid: mintGuid(id), name, saved: false, savedNote: LIVE_ONLY };
@@ -152,8 +160,8 @@ export function duplicateEntityLive(params: unknown): unknown {
     return { ok: false, error: `duplicate-entity: entity ${rootId} is a resource (Time, Input, a config singleton) — a world holds one, so nothing was duplicated.` };
   }
   const count = p.count === undefined ? 1 : p.count;
-  if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > 1000) {
-    return { ok: false, error: `count must be an integer between 1 and 1000 — got ${JSON.stringify(p.count)}. Nothing was duplicated.` };
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > DUPLICATE_MAX_COUNT) {
+    return { ok: false, error: `count must be an integer between 1 and ${DUPLICATE_MAX_COUNT} — got ${JSON.stringify(p.count)}. Nothing was duplicated.` };
   }
 
   const all = getAllTraits();
@@ -198,7 +206,7 @@ export function duplicateEntityLive(params: unknown): unknown {
     // A copy must NOT inherit the original's guid — two entities answering to one address is the
     // addressing failure every Percept tool would then inherit — and a ref INSIDE the copy must
     // follow it, or the copy drives the source (#1338). One plan per copy: each gets its own guids.
-    const { guidOf, remap, keyed } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid, (node) => node.key);
+    const { guidOf, remap, keyed } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid, (node) => node.key, frameDocReader(getCurrentWorld()));
     for (const src of snapshot) {
       const specs = src.traits.map((t) => {
         if (!t.data) return t;

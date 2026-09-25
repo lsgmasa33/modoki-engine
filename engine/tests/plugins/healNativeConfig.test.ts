@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { healNativeConfig, androidSdkDirValue, injectedBuildNumbers, writeBuildNumberArgFiles } from '../../plugins/healNativeConfig';
+import { healNativeConfig, androidSdkDirValue, injectedBuildNumbers, writeBuildNumberArgFiles, swiftCodeOnly } from '../../plugins/healNativeConfig';
 import {
   ANDROID_BUILD_NUMBER_ARGS_PATH, IOS_BUILD_NUMBER_ARGS_PATH, ANDROID_VERSION_CODE_INIT_SCRIPT_PATH,
   renderAndroidVersionCodeInitScript, gradleBuildNumberArg,
@@ -18,6 +18,7 @@ import { loadProjectConfig } from '../../plugins/load-project-config';
 // their rationale, in tests/architecture/buildTargetFloor.test.ts — duplicating them here
 // would mean a reviewed floor change had to be edited in two places.
 import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
+import { canMakeFileLink } from '../helpers/linkFixture';
 
 /** Strip the #370 release-signing fence from an `app/build.gradle` before comparing it.
  *
@@ -1113,6 +1114,236 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     healNativeConfig(root);
     expect(readPbx()).toBe(pbx);
   });
+
+  // #1521 — a store build carries no native debug bridge, so flag-OFF takes GameDebugPlugin.swift
+  // out of the App target, not just its registration. MyViewController stays in both forms: it
+  // hosts the registration fence and the text-interaction heal (#1360).
+  const linesNaming = (file: string) => readPbx().split('\n').filter((l) => l.includes(file)).length;
+
+  it('flag OFF compiles MyViewController in but NOT GameDebugPlugin.swift (#1521)', () => {
+    scaffoldIos(); writeConfig('', false); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    expect(linesNaming('MyViewController.swift')).toBe(4);
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(0);
+  });
+
+  it('flipping the flag moves GameDebugPlugin.swift out of the App target and back, idempotently (#1521)', () => {
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(4);
+    const on = readPbx();
+    // The layout every committed project carries: the plugin's entries directly after
+    // MyViewController's, in all four places. A round-trip alone cannot pin this, because the ON
+    // state it compares against comes from the same insert.
+    for (const tail of [' in Sources */ = {', ' */ = {isa = PBXFileReference', ' */,', ' in Sources */,']) {
+      const lines = on.split('\n');
+      const mvc = lines.findIndex((l) => l.includes(`/* MyViewController.swift${tail}`));
+      expect(lines[mvc + 1], `the GameDebugPlugin entry after MyViewController's "${tail}" line`).toContain(`/* GameDebugPlugin.swift${tail}`);
+    }
+
+    writeConfig('', false);
+    expect(healNativeConfig(root).notes.join('\n')).toContain('removed GameDebugPlugin.swift from the iOS App target');
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(0);
+    expect(linesNaming('MyViewController.swift')).toBe(4);
+    const off = readPbx();
+    healNativeConfig(root);
+    expect(readPbx()).toBe(off);
+
+    // Back ON restores the file byte-for-byte: the owner flips this for a debug session, and a
+    // round-trip must not leave four moved lines in a committed pbxproj.
+    writeConfig('');
+    healNativeConfig(root);
+    expect(readPbx()).toBe(on);
+  });
+
+  it('flag OFF strips a hand-wired GameDebugPlugin.swift with Xcode-minted UUIDs, and nothing else (#1521)', () => {
+    // A project wired by hand before the heal existed does not carry GD_UUID, so the strip has to
+    // match the file, not the synthetic UUIDs.
+    scaffoldIos(); writeConfig('', false); writeGameDebugDep(); writeEngineGameDebugSwift();
+    const ref = 'A1B2C3D4E5F60718293A4B5C';
+    const bf = 'A1B2C3D4E5F60718293A4B5D';
+    const seeded = pristinePbxproj()
+      .replace(/(\t\t504EC3081 \/\* AppDelegate\.swift in Sources \*\/ = .*\n)/,
+        `$1\t\t${bf} /* GameDebugPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = ${ref} /* GameDebugPlugin.swift */; };\n`)
+      .replace(/(\t\t504EC3071 \/\* AppDelegate\.swift \*\/ = .*\n)/,
+        `$1\t\t${ref} /* GameDebugPlugin.swift */ = {isa = PBXFileReference; name = GameDebugPlugin.swift; path = "x/GameDebugPlugin.swift"; sourceTree = SOURCE_ROOT; };\n`)
+      .replace(/(\t\t\t\t504EC3071 \/\* AppDelegate\.swift \*\/,\n)/, `$1\t\t\t\t${ref} /* GameDebugPlugin.swift */,\n`)
+      .replace(/(\t\t\t\t504EC3081 \/\* AppDelegate\.swift in Sources \*\/,\n)/, `$1\t\t\t\t${bf} /* GameDebugPlugin.swift in Sources */,\n`);
+    fs.writeFileSync(path.join(root, ...PBX), seeded);
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(4);
+
+    healNativeConfig(root);
+    const pbx = readPbx();
+    expect(pbx).not.toContain(ref);
+    expect(pbx).not.toContain(bf);
+    // Every line the project had that did not name the plugin is still there.
+    const survivors = seeded.split('\n').filter((l) => !l.includes('GameDebugPlugin.swift'));
+    expect(survivors.filter((l) => !pbx.split('\n').includes(l))).toEqual([]);
+  });
+
+  it('flag OFF REFUSES to strip while hand-written Swift still uses GameDebugPlugin, and says so (#1521 review)', () => {
+    // A registration with no fence markers is left alone by the registration heal, so stripping the
+    // class under it would turn a working build into `cannot find 'GameDebugPlugin' in scope`.
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    fs.writeFileSync(path.join(root, ...MVC), [
+      'import UIKit', 'import Capacitor', '',
+      '// GameDebugPlugin is registered by hand here — this comment alone must not block the strip.',
+      'class MyViewController: CAPBridgeViewController {',
+      '    override func viewDidLoad() {', '        super.viewDidLoad()',
+      '        bridge?.registerPluginInstance(GameDebugPlugin())', '    }', '}', '',
+    ].join('\n'));
+
+    writeConfig('', false);
+    const notes = healNativeConfig(root).notes.join('\n');
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(4);
+    expect(notes).toContain('was LEFT in the iOS App target');
+    expect(notes).toContain('ios/App/App/MyViewController.swift');
+
+    // Once the code no longer uses it, the next heal takes it out; a comment naming it is fine.
+    fs.writeFileSync(path.join(root, ...MVC), fs.readFileSync(path.join(root, ...MVC), 'utf8')
+      .replace('        bridge?.registerPluginInstance(GameDebugPlugin())\n', ''));
+    healNativeConfig(root);
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(0);
+  });
+
+  it('the refusal also sees a use in a Swift file in a SUBFOLDER of the App target (#1521)', () => {
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    const sub = path.join(root, 'ios', 'App', 'App', 'Debug');
+    fs.mkdirSync(sub, { recursive: true });
+    fs.writeFileSync(path.join(sub, 'Boot.swift'), 'func boot(_ b: Any) { _ = GameDebugPlugin() }\n');
+
+    writeConfig('', false);
+    const notes = healNativeConfig(root).notes.join('\n');
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(4);
+    expect(notes).toContain('ios/App/App/Debug/Boot.swift');
+  });
+
+  // A FILE symlink needs a privilege Windows grants only to admins or Developer Mode (#949).
+  it.skipIf(!canMakeFileLink())('an unreadable Swift file makes the strip refuse, and does NOT abort the heals after it (#1521 review)', () => {
+    // A throw here would skip every later heal, including the Android flag-off ones.
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    fs.symlinkSync(path.join(root, 'nowhere.swift'), path.join(root, 'ios', 'App', 'App', 'Dangling.swift'));
+    fs.writeFileSync(path.join(root, 'capacitor.config.json'),
+      JSON.stringify({ includePlugins: ['@capacitor/app', 'capacitor-game-debug'] }, null, 2) + '\n');
+
+    writeConfig('', false);
+    const notes = healNativeConfig(root).notes.join('\n');
+    expect(notes).not.toContain('heal skipped');
+    expect(notes).toContain('was LEFT in the iOS App target');
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(4);
+    expect(JSON.parse(fs.readFileSync(path.join(root, 'capacitor.config.json'), 'utf8')).includePlugins).toEqual(['@capacitor/app']);
+  });
+
+  it('flag back ON with no plugin source keeps the registration OFF and says why (#1521 review)', () => {
+    // The mirror of the refusal above: registering a class the target no longer compiles is the
+    // same compile break. The standalone game whose node_modules is gone hits this.
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    writeConfig('', false);
+    healNativeConfig(root);
+    fs.rmSync(path.join(root, 'engine'), { recursive: true, force: true });
+
+    writeConfig('');
+    const notes = healNativeConfig(root).notes.join('\n');
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(0);
+    expect(fs.readFileSync(path.join(root, ...MVC), 'utf8')).not.toContain('GameDebugPlugin()');
+    expect(notes).toContain('GameDebugPlugin.swift is not compiled into the iOS App target');
+  });
+
+  it('flag ON keeps the registration OFF when Target Membership was removed by hand (#1521 review 3)', () => {
+    // Xcode keeps the file reference and group child, and drops only the two "in Sources" lines, so
+    // "the pbxproj mentions the file" is not "the class is compiled".
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    fs.writeFileSync(path.join(root, ...PBX), readPbx().split('\n')
+      .filter((l) => !l.includes('/* GameDebugPlugin.swift in Sources */')).join('\n'));
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(2);
+
+    const notes = healNativeConfig(root).notes.join('\n');
+    expect(fs.readFileSync(path.join(root, ...MVC), 'utf8')).not.toContain('GameDebugPlugin()');
+    expect(notes).toContain('Target Membership');
+  });
+
+  it('flag OFF strips GameDebugPlugin.swift even when the plugin source cannot be found (#1521)', () => {
+    // Wiring needs the source; taking the file out does not. A standalone game whose node_modules
+    // is gone must still build clean for the store.
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    healNativeConfig(root);
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(4);
+    fs.rmSync(path.join(root, 'engine'), { recursive: true, force: true });
+
+    writeConfig('', false);
+    healNativeConfig(root);
+    expect(linesNaming('GameDebugPlugin.swift')).toBe(0);
+  });
+});
+
+describe('healNativeConfig — capacitor-game-debug in includePlugins follows build.debugBuild (#1521)', () => {
+  // `cap sync` builds the Android plugin graph from this list, so the committed config is where
+  // "a store build carries no native debug bridge" is decided for Android.
+  const CAP = () => path.join(root, 'capacitor.config.json');
+  const writeCap = (json: unknown) => fs.writeFileSync(CAP(), JSON.stringify(json, null, 2) + '\n');
+  const readCap = () => JSON.parse(fs.readFileSync(CAP(), 'utf8'));
+
+  it('flag OFF removes it from the top-level list AND from a per-platform override', () => {
+    writeGameDebugDep(); writeConfig('', false);
+    writeCap({
+      includePlugins: ['@capacitor/app', 'capacitor-game-debug', 'capacitor-modoki-iap'],
+      // A platform list REPLACES the top-level one for that platform, so leaving the plugin here
+      // would keep it in the Android build.
+      android: { includePlugins: ['@capacitor/app', 'capacitor-game-debug'] },
+    });
+    const notes = healNativeConfig(root).notes.join('\n');
+    expect(readCap().includePlugins).toEqual(['@capacitor/app', 'capacitor-modoki-iap']);
+    expect(readCap().android.includePlugins).toEqual(['@capacitor/app']);
+    expect(notes).toContain('removed capacitor-game-debug from capacitor.config.json includePlugins');
+  });
+
+  it('flag OFF removes EVERY occurrence, so a duplicate from a bad merge does not keep it in (#1521 review)', () => {
+    writeGameDebugDep(); writeConfig('', false);
+    writeCap({ includePlugins: ['@capacitor/app', 'capacitor-game-debug', 'capacitor-game-debug'] });
+    healNativeConfig(root);
+    expect(readCap().includePlugins).toEqual(['@capacitor/app']);
+  });
+
+  it('flag ON puts it back in sorted position, and a second pass changes nothing', () => {
+    writeGameDebugDep(); writeConfig('');
+    writeCap({ includePlugins: ['@capacitor/app', 'capacitor-appsflyer', 'capacitor-modoki-iap'] });
+    healNativeConfig(root);
+    expect(readCap().includePlugins)
+      .toEqual(['@capacitor/app', 'capacitor-appsflyer', 'capacitor-game-debug', 'capacitor-modoki-iap']);
+    const once = fs.readFileSync(CAP(), 'utf8');
+    const notes = healNativeConfig(root).notes.join('\n');
+    expect(fs.readFileSync(CAP(), 'utf8')).toBe(once);
+    expect(notes).not.toContain('includePlugins');
+  });
+
+  it('flag OFF with NO includePlugins says so, and does not write an allowlist on the project\'s behalf', () => {
+    // Without a list Capacitor links every dependency, so the plugin stays in. Writing a list here
+    // would freeze the project's plugin set and silently drop the next plugin it adds.
+    writeGameDebugDep(); writeConfig('', false);
+    writeCap({ appName: 'x' });
+    const notes = healNativeConfig(root).notes.join('\n');
+    expect(notes).toContain('has no includePlugins');
+    expect(readCap().includePlugins).toBeUndefined();
+    expect(readCap().android).toBeUndefined();
+  });
+
+  it('flag ON with no includePlugins has nothing to report', () => {
+    writeGameDebugDep(); writeConfig('');
+    writeCap({ appName: 'x' });
+    expect(healNativeConfig(root).notes.join('\n')).not.toContain('includePlugins');
+  });
+
+  it('leaves a project that does not depend on the bridge alone', () => {
+    writeConfig('', false);
+    writeCap({ includePlugins: ['capacitor-game-debug'] });
+    healNativeConfig(root);
+    expect(readCap().includePlugins).toEqual(['capacitor-game-debug']);
+  });
 });
 
 describe('healNativeConfig — iOS GameDebugPlugin registration follows build.debugBuild (#112)', () => {
@@ -1148,8 +1379,16 @@ class MyViewController: CAPBridgeViewController {
   it('a freshly scaffolded file registers the plugin when the flag is on', () => {
     fs.mkdirSync(path.join(root, 'ios', 'App', 'App.xcodeproj'), { recursive: true });
     fs.mkdirSync(path.join(root, 'ios', 'App', 'App'), { recursive: true });
-    fs.writeFileSync(path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'),
-      '// !$*UTF8*$!\n{ objects = { }; }\n');
+    // The AppDelegate anchors, so the wiring can compile GameDebugPlugin.swift in. Since #1521 the
+    // registration is ON only when the class is in the target; an anchorless stub keeps it OFF.
+    fs.writeFileSync(path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'), [
+      '// !$*UTF8*$!', '{ objects = {',
+      '\t\t504EC3081 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 504EC3071 /* AppDelegate.swift */; };',
+      '\t\t504EC3071 /* AppDelegate.swift */ = {isa = PBXFileReference; path = AppDelegate.swift; sourceTree = "<group>"; };',
+      '\t\t\t\t504EC3071 /* AppDelegate.swift */,',
+      '\t\t\t\t504EC3081 /* AppDelegate.swift in Sources */,',
+      '}; }', '',
+    ].join('\n'));
     writeConfig('', true); writeGameDebugDep(); writeEngineGameDebugSwift();
     healNativeConfig(root);
     const mvc = readMvc();
@@ -3110,3 +3349,31 @@ class MyViewController: CAPBridgeViewController {
 });
 
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+
+describe('swiftCodeOnly — what the #1521 strip treats as a use of GameDebugPlugin', () => {
+  // Swift block comments nest, and a string can look like a comment opener, so a regex gets this
+  // wrong both ways (the #1521 review probes). A miss strips a class still in use (compile break);
+  // a false hit refuses the strip (the store build ships the bridge).
+  const uses = (src: string) => /\bGameDebugPlugin\b/.test(swiftCodeOnly(src));
+  it.each([
+    ['a plain call', 'bridge?.registerPluginInstance(GameDebugPlugin())'],
+    ['after a string holding //', 'let u = "http://x"; bridge?.registerPluginInstance(GameDebugPlugin())'],
+    ['after a string holding /*, with a later block comment', 'let a = "image/*"\nbridge?.registerPluginInstance(GameDebugPlugin())\n/** doc */'],
+    ['after a closed nested comment', '/* a /* b */ c */ GameDebugPlugin()'],
+    // A string inside an interpolation must not end the outer string (#1521 review 3).
+    ['on the line after an interpolation holding "/*"', 'print("glob: \\(dir.appending("/*"))")\nbridge?.registerPluginInstance(GameDebugPlugin())'],
+    ['after an interpolation holding "//"', 'print("\\(f("//")) x"); GameDebugPlugin()'],
+    ['after an interpolation with a nested call before a "//" string', 'print("\\(f(g(), "//")) x"); GameDebugPlugin()'],
+    ['inside an interpolation, which is code', 'print("\\(GameDebugPlugin())")'],
+  ])('sees a use: %s', (_label, src) => { expect(uses(src)).toBe(true); });
+  it.each([
+    ['a line comment', '// GameDebugPlugin is not registered'],
+    ['a nested block comment', '/* old: /* inner */ bridge?.registerPluginInstance(GameDebugPlugin()) */'],
+    ['a string literal', 'print("GameDebugPlugin is off")'],
+    // Without escape handling the string would end at \" and the name would read as code.
+    ['a string with an escaped quote before the name', 'print("say \\" GameDebugPlugin")'],
+    ['a multi-line string', 'let s = """\nGameDebugPlugin\n"""'],
+    ['a string inside an interpolation', 'print("\\(f("GameDebugPlugin"))")'],
+    ['a doc comment', '/// `GameDebugPlugin` is compiled in while build.debugBuild is on'],
+  ])('sees no use: %s', (_label, src) => { expect(uses(src)).toBe(false); });
+});

@@ -77,6 +77,11 @@ APPDIR="$(node "$PATHS" "$OUT" appDir)"
 # ordinary run. Two `${VAR:?}`-led literals keep the pattern the guard can actually see. Migrating
 # to the helper would delete the one line that guard watches and move the safety inside a function
 # it cannot resolve — a coverage loss disguised as a refactor (#959).
+# This clone's DEV editor is stopped the sanctioned way FIRST: one SIGTERM and a graceful window
+# (#1580). The `pkill` lines below then match nothing and stay as the fallback the guard watches;
+# alone they double-signal the editor through its npm wrapper and discard its uncommitted
+# localStorage (saved layout, panel state, `@editor` PlayerPrefs).
+bash "$REPO/engine/scripts/stop-editor.sh" >/dev/null 2>&1 || true
 node "$PATHS" kill "${APPDIR:?refusing to reap with an empty APPDIR — that pattern would match every clone}" 2>/dev/null || true
 pkill -f "${REPO:?refusing to reap with an empty REPO — that pattern would match every clone}/engine/electron/dist/main.cjs" 2>/dev/null || true
 if [ "$REPO_PHYS" != "$REPO" ]; then

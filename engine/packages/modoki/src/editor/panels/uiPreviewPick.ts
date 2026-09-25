@@ -49,8 +49,17 @@ export function resolvePreviewPick(
   // predictor/real-click divergence this bound exists to close (opus-reviewer, close-out §2d).
   // A 2D HIT returns immediately, so the first `2d` entry the loop survives is the topmost.
   let topMissedCanvas: number | null = null;
+  const pressOnCanvas = stack[0]?.kind === '2d';
   for (const entry of stack) {
     if (entry.kind === '2d') {
+      // ⚠️ #1576 (close-out review) — when the press lands ON a pick overlay (a `2d` entry tops the
+      // stack), only that canvas's hit-test can answer: its handler takes the press and, on a miss,
+      // resolves UI nodes only (`pickUnderlyingUIEntity`), never another canvas's sprites — so a
+      // LOWER canvas's hit is a click that cannot happen. NOT when a UI node tops the stack: then
+      // `UIEditorOverlay`'s capture handler owns the press and runs THIS function for the real
+      // selection, and descending the whole stack is the real behaviour (#337: a genuine 2D hit
+      // beats decorative UI above it). A first cut skipped in both cases and changed real clicks.
+      if (pressOnCanvas && topMissedCanvas !== null) continue;
       const id = pick2DAt(entry.canvasEntityId);
       if (id != null) return { kind: '2d', id };
       if (topMissedCanvas === null) topMissedCanvas = entry.canvasEntityId;

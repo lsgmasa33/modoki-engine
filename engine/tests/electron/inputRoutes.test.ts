@@ -181,7 +181,8 @@ function makeRenderer(overrides?: Record<string, unknown>) {
         { id: 'bone.covered', x: 40, y: 40, onScreen: true, occludedBy: 'div.modal', occlusionChecked: true },
         { id: 'bone.canvas', x: 60, y: 60, onScreen: true },
         // Inside the window, outside its own panel's clip box (testboard AceYUBoBXbcGtIIFmzGb).
-        { id: 'grad.clipped', x: 200, y: 863, onScreen: false, clipped: true, occlusionChecked: true },
+        { id: 'grad.clipped', x: 200, y: 863, onScreen: false, clipped: true, occludedBy: 'div.flexlayout__tab', occlusionChecked: true },
+        { id: 'grad.clipped-bare', x: 210, y: 870, onScreen: false, clipped: true, occlusionChecked: true },
       ];
       return { handles: known.filter((h) => wanted.includes(h.id)) };
     }
@@ -348,9 +349,22 @@ describe('tap', () => {
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('a selector wins over stale coordinates passed alongside it', async () => {
-    await post('/api/input/tap', { selector: '#kebab', x: 1, y: 2 });
-    expect(ops.tap).toHaveBeenCalledWith(210, 110, expect.anything());
+  // #1556 (owner-approved breaking): this used to be "a selector WINS over stale coordinates". Two
+  // addresses are now refused on EVERY aimed route, before the renderer is asked anything.
+  it.each([
+    ['/api/input/tap', { selector: '#kebab', x: 1, y: 2 }],
+    ['/api/input/tap', { selector: '#kebab', x: 1 }],
+    ['/api/input/pointer', { action: 'down', selector: '#kebab', x: 1, y: 2 }],
+    ['/api/input/hover', { selector: '#kebab', x: 1, y: 2 }],
+    ['/api/input/scroll', { selector: '#kebab', x: 1, y: 2, deltaY: 10 }],
+    ['/api/input/drag', { from: { selector: '#kebab', x: 1, y: 2 }, to: { x: 9, y: 9 } }],
+    ['/api/input/drag', { from: { x: 1, y: 1 }, to: { selector: '#kebab', x: 9, y: 9 } }],
+  ])('%s with a selector AND coordinates is REFUSED AMBIGUOUS, nothing dispatched (#1556)', async (url, body) => {
+    const res = await post(url, body) as { status: number; body: { code?: string; error?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(res.body.error).toContain('selector AND {x,y}');
+    for (const op of [ops.tap, ops.drag, ops.pointerDown, ops.hover, ops.scroll]) expect(op).not.toHaveBeenCalled();
   });
 
   it('forwards button, clickCount and modifiers', async () => {
@@ -683,7 +697,8 @@ describe('sustained pointer: the backend releases a stranded press (#302)', () =
     'a mid-gesture %s leaves the hold ALONE — those are legitimate during a drag',
     async (route) => {
       await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
-      await post(`/api/input/${route}`, { key: 'Shift', text: 'x', deltaY: 10, x: 1, y: 1, selector: '#kebab' });
+      // One address — a selector AND x/y here would now be refused (#1556) and pass this vacuously.
+      await post(`/api/input/${route}`, { key: 'Shift', text: 'x', deltaY: 10, selector: '#kebab' });
       // Constraining a drag with Shift, cancelling with Escape, or scrolling a list while dragging
       // over it are real interactions; stealing the press would break the thing under test.
       expect(ops.pointerUp).not.toHaveBeenCalled();
@@ -886,13 +901,35 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.drag).toHaveBeenCalledWith({ x: 11, y: 22 }, { x: 16, y: 20 }, expect.anything());
   });
 
+  it.each([
+    [{ to: { x: 50, y: 60 }, delta: { dx: 5, dy: 5 } }, 'to AND delta'],
+    [{ toId: 'bone.1', delta: { dx: 5, dy: 5 } }, 'toId AND delta'],
+    [{ to: { x: 50, y: 60 }, toId: 'bone.1' }, 'to AND toId'],
+  ])('drag-handle refuses two destinations as AMBIGUOUS — they were settled by precedence (#1556) %j', async (dest, named) => {
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', ...dest }) as { status: number; body: { code?: string; error?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(res.body.error).toContain(named);
+    expect(ops.drag).not.toHaveBeenCalled();
+  });
+
+  it('drag-handle refuses two destinations BEFORE resolving the handle — a bad id cannot hide it', async () => {
+    // Observed live: with the check after the resolve, `{id:'nope', to, delta}` answered 404 "no live
+    // handle", so the caller fixed the id and only then learned the destination was ambiguous.
+    const res = await post('/api/input/drag-handle', { id: 'nope', to: { x: 1, y: 1 }, delta: { dx: 1, dy: 1 } }) as { body: { code?: string } };
+    expect(res.body.code).toBe('AMBIGUOUS');
+    // The route's own lease/focus probes still run; the HANDLE lookup must not.
+    expect(requestRenderer.mock.calls.map((c) => c[0])).not.toContain('enact-handles');
+  });
+
   it('drag-handle refuses a zero delta — the easiest way to reach the degenerate drag', async () => {
     // `delta:{dx:0,dy:0}` is a TRUTHY object, so it sails past the `if (!to && h.delta)` guard
     // and produces to === from. This route already refuses off-screen and disabled handles;
     // a click wearing a drag's name is the same class of false success.
     const res = await post('/api/input/drag-handle', { id: 'bone.0', delta: { dx: 0, dy: 0 } });
     expect(ops.drag).not.toHaveBeenCalled();
-    expect(res).toMatchObject({ body: { ok: false } });
+    // A 400 like /api/input/drag's own zero-length refusal (#1565 — it was a bare 200).
+    expect(res).toMatchObject({ status: 400, body: { ok: false, code: 'REFUSED_BY_OP' } });
     expect((res as { body: { error?: string } }).body.error).toMatch(/tap-handle/);
   });
 
@@ -921,9 +958,12 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.drag).not.toHaveBeenCalled();
   });
 
-  it('an explicit `to` wins over toId and delta', async () => {
-    await post('/api/input/drag-handle', { id: 'bone.0', to: { x: 1, y: 1 }, toId: 'bone.1', delta: { dx: 9, dy: 9 } });
-    expect(ops.drag).toHaveBeenCalledWith({ x: 11, y: 22 }, { x: 1, y: 1 }, expect.anything());
+  it('all three destinations at once are refused, not "an explicit `to` wins" (#1556)', async () => {
+    // This test used to pin the precedence; the tool description said "ONE of" the whole time.
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', to: { x: 1, y: 1 }, toId: 'bone.1', delta: { dx: 9, dy: 9 } }) as { body: { code?: string; error?: string } };
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(res.body.error).toContain('to AND toId AND delta');
+    expect(ops.drag).not.toHaveBeenCalled();
   });
 
   it('drag-handle forwards steps/button/modifiers', async () => {
@@ -948,32 +988,62 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('tap-handle REFUSES an off-screen handle (ok:false) and dispatches nothing', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.off' }) as { body: { ok: boolean; error: string } };
-    expect(res.body.ok).toBe(false);
-    expect(res.body.error).toMatch(/off-screen/);
+  // #1565 — every handle refusal is a 400 with its code, as on every other aimed route. They were
+  // 200 {ok:false}; the MCP relay re-derived the same envelope, but a direct caller read success.
+  it('tap-handle REFUSES an off-WINDOW handle as a hard 400 REFUSED_BY_OP — allowOccluded cannot force it', async () => {
+    for (const allowOccluded of [false, true]) {
+      const res = await post('/api/input/tap-handle', { id: 'bone.off', allowOccluded }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+      // A press outside the window reaches nothing: not a cover, so not OCCLUDED and not forceable.
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+      expect(res.body.error).toMatch(/off-screen/);
+    }
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('a CLIPPED handle is refused with the remedy that actually applies, not "scroll it"', async () => {
+  it('a CLIPPED handle is OCCLUDED like a clipped selector, with the remedy that applies (#1565)', async () => {
     // Off the PANEL, not off the window: the press would land on whichever panel owns those
-    // pixels, and telling the caller to scroll is wrong for a handle drawn past a viewport edge.
-    const res = await post('/api/input/tap-handle', { id: 'grad.clipped' }) as { body: { ok: boolean; error: string } };
-    expect(res.body.ok).toBe(false);
+    // pixels. That is a cover, and the selector path calls it one — the handle path used to send
+    // it down the off-screen branch, uncoded and unforceable (owner: overridable, 2026-09-25).
+    const res = await post('/api/input/tap-handle', { id: 'grad.clipped' }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ ok: false, code: 'OCCLUDED' });
     expect(res.body.error).toMatch(/OUTSIDE its own panel/);
+    expect(res.body.error).toMatch(/lands on div\.flexlayout__tab/); // names the neighbour that would get the press
+    expect(res.body.error).toMatch(/allowOccluded:true/);
+    expect(res.body.error).not.toMatch(/scroll it into view/); // not the off-window remedy
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('tap-handle REFUSES a disabled handle (ok:false) and dispatches nothing', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.disabled' }) as { body: { ok: boolean; error: string } };
-    expect(res.body.ok).toBe(false);
-    expect(res.body.error).toMatch(/disabled/);
+  it('…and allowOccluded:true presses the clipped handle, reporting it occluded and clipped', async () => {
+    const res = await post('/api/input/tap-handle', { id: 'grad.clipped', allowOccluded: true }) as { status: number; body: Record<string, unknown> };
+    expect(ops.tap).toHaveBeenCalledWith(200, 863, expect.anything());
+    expect(res.body).toMatchObject({ ok: true, occluded: true, clipped: true, occludedBy: 'div.flexlayout__tab' });
+  });
+
+  it('a forced clipped press whose hit-test named NO cover still reports occluded:true', async () => {
+    // Clipped means its own panel does not own those pixels, whatever the hit-test answered.
+    const res = await post('/api/input/tap-handle', { id: 'grad.clipped-bare', allowOccluded: true }) as { body: Record<string, unknown> };
+    expect(res.body).toMatchObject({ ok: true, occluded: true, clipped: true, occludedBy: null });
+  });
+
+  it('tap-handle REFUSES a disabled handle as a hard 400 REFUSED_BY_OP — allowOccluded cannot force it', async () => {
+    for (const allowOccluded of [false, true]) {
+      const res = await post('/api/input/tap-handle', { id: 'bone.disabled', allowOccluded }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+      expect(res.status).toBe(400);
+      // Not a cover, so not OCCLUDED — the code is reserved for what allowOccluded can override.
+      expect(res.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+      expect(res.body.error).toMatch(/disabled/);
+    }
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
   it('tap-handle REFUSES an occluded handle, naming the cover and the escape hatch', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { body: { ok: boolean; error: string } };
+    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+    expect(res.status).toBe(400);
     expect(res.body.ok).toBe(false);
+    // The code every aimed route sends for a cover, and the one `allowOccluded` promises (#1555).
+    expect(res.body.code).toBe('OCCLUDED');
     expect(res.body.error).toMatch(/covered by div\.modal/);
     expect(res.body.error).toMatch(/allowOccluded/);
     expect(ops.tap).not.toHaveBeenCalled();
@@ -995,22 +1065,44 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   });
 
   it('drag-handle refuses an off-screen FROM, and a blocked toId, dispatching nothing', async () => {
-    const r1 = await post('/api/input/drag-handle', { id: 'bone.off', to: { x: 1, y: 1 } }) as { body: { ok: boolean } };
-    expect(r1.body.ok).toBe(false);
-    const r2 = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.disabled' }) as { body: { ok: boolean; error: string } };
-    expect(r2.body).toMatchObject({ ok: false });
+    const r1 = await post('/api/input/drag-handle', { id: 'bone.off', to: { x: 1, y: 1 } }) as { status: number; body: { ok: boolean } };
+    expect(r1.status).toBe(400);
+    expect(r1.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+    const r2 = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.disabled' }) as { status: number; body: { ok: boolean; error: string } };
+    expect(r2.status).toBe(400);
+    expect(r2.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
     expect(r2.body.error).toMatch(/disabled/);
     expect(ops.drag).not.toHaveBeenCalled();
   });
 
   it('drag-handle REFUSES a covered source, and drags it under allowOccluded', async () => {
-    const refused = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { body: { ok: boolean; error: string } };
+    const refused = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+    expect(refused.status).toBe(400);
     expect(refused.body.ok).toBe(false);
+    expect(refused.body.code).toBe('OCCLUDED');
     expect(refused.body.error).toMatch(/covered by div\.modal/);
     expect(ops.drag).not.toHaveBeenCalled();
     const forced = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 }, allowOccluded: true }) as { body: Record<string, unknown> };
     expect(ops.drag).toHaveBeenCalledWith({ x: 40, y: 40 }, { x: 5, y: 5 }, expect.anything());
     expect(forced.body).toMatchObject({ ok: true, occluded: true, occludedBy: 'div.modal' });
+  });
+
+  it('drag-handle REFUSES a covered toId destination with OCCLUDED (#1555 review)', async () => {
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.covered' }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ ok: false, code: 'OCCLUDED' });
+    expect(res.body.error).toMatch(/toId handle 'bone\.covered' is covered by div\.modal/);
+    expect(ops.drag).not.toHaveBeenCalled();
+  });
+
+  it('drag-handle forced onto a CLIPPED toId reports it occluded, per endpoint and in the aggregate (#1565)', async () => {
+    // `grad.clipped-bare`: clipped, but the hit-test named no cover — so only `clipped` can make
+    // either `occluded` true, and a forced press must never read as a clean one.
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'grad.clipped-bare', allowOccluded: true }) as
+      { body: { ok: boolean; occluded?: boolean; toTarget?: Record<string, unknown> } };
+    expect(ops.drag).toHaveBeenCalledWith({ x: 11, y: 22 }, { x: 210, y: 870 }, expect.anything());
+    expect(res.body).toMatchObject({ ok: true, occluded: true });
+    expect(res.body.toTarget).toMatchObject({ id: 'grad.clipped-bare', occluded: true, clipped: true });
   });
 
   it('drag-handle says WHICH endpoint was covered (S3.17)', async () => {
@@ -1160,6 +1252,15 @@ describe('entity-aimed input (the third target surface)', () => {
     expect(ops.pointerMove).toHaveBeenCalled();
   });
 
+  it('…and a held move with an EMPTY entity beside x/y is a coordinate move, as on down (close-out review)', async () => {
+    // The carve-out used to spread `allowOccluded:true` into `{}`, giving it a key — so `aimAddresses`
+    // counted an entity and refused "entity AND {x,y}" on move while down accepted the same args.
+    await post('/api/input/pointer', { action: 'down', entity: {}, x: 40, y: 50 });
+    const moved = await post('/api/input/pointer', { action: 'move', entity: {}, x: 60, y: 70 }) as { status: number; body: { code?: string } };
+    expect(moved.body.code).not.toBe('AMBIGUOUS');
+    expect(ops.pointerMove).toHaveBeenCalled();
+  });
+
   it('…and an explicit entity.allowOccluded:false does NOT re-impose a refusal on that move', async () => {
     // The carve-out is about DELIVERY — the press already captured the target — so it overrides
     // the caller's flag instead of losing to it via `??`. Before this, the top-level force reached
@@ -1187,9 +1288,17 @@ describe('entity-aimed input (the third target surface)', () => {
     expect(calls.filter((c) => !c.startsWith('renderer:')), 'no INPUT was dispatched').toEqual([]);
   });
 
-  it('takes precedence over selector and {x,y}', async () => {
-    await post('/api/input/tap', { entity: { guid: 'g-puck' }, selector: '#kebab', x: 1, y: 2 });
-    expect(calls).toEqual(['renderer:resolve-entity-point', 'tap(400,300)']);
+  // #1556: this used to "take precedence over selector and {x,y}" — the entity was pressed and the
+  // other two addresses silently dropped. Refused before ANY resolve, so no renderer round trip either.
+  it.each([
+    [{ entity: { guid: 'g-puck' }, selector: '#kebab' }, 'entity AND selector'],
+    [{ entity: { guid: 'g-puck' }, x: 1, y: 2 }, 'entity AND {x,y}'],
+    [{ entity: { guid: 'g-puck' }, selector: '#kebab', x: 1, y: 2 }, 'entity AND selector AND {x,y}'],
+  ])('an entity beside another address is REFUSED AMBIGUOUS (%j)', async (body, named) => {
+    const res = await post('/api/input/tap', body) as { status: number; body: { code?: string; error?: string } };
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(res.body.error).toContain(named);
+    expect(calls).toEqual([]);
   });
 
   it('an EMPTY entity object falls through to the other aim modes', async () => {
@@ -2044,9 +2153,10 @@ describe('label aim (#1153)', () => {
     expect(calls.filter((c) => c.startsWith('renderer:'))).toEqual([]); // refused before any resolve
   });
 
-  it('…but stray x/y beside a label are inert, exactly as beside a selector', async () => {
-    await post('/api/input/tap', { label: 'Console', x: 1, y: 1 });
-    expect(calls[calls.length - 1]).toBe('tap(360,546)');
+  it('…and so is x/y beside a label — no longer "inert" (#1556)', async () => {
+    const res = await post('/api/input/tap', { label: 'Console', x: 1, y: 1 }) as { body: { code?: string } };
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(calls).toEqual([]);
   });
 
   it('`within` without a label is refused rather than silently ignored', async () => {

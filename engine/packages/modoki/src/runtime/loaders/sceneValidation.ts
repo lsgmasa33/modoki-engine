@@ -927,7 +927,8 @@ export function validateSceneData(
     // (a conservative false negative, never a wrong claim).
     if (pi && typeof pi === 'object') {
       const overrides = e.overrides;
-      if (overrides && typeof overrides === 'object') {
+      const members = (e as { members?: unknown }).members;
+      if ((overrides && typeof overrides === 'object') || (members && typeof members === 'object')) {
         const src = (pi as { source?: unknown }).source;
         let prefab: unknown;
         if (typeof src === 'string' && src && getPrefab) {
@@ -955,16 +956,38 @@ export function validateSceneData(
           return memberTraits.get(localId);
         };
 
-        for (const [localIdKey, traitOverridesRaw] of Object.entries(overrides as Record<string, unknown>)) {
+        // Every override group, whichever channel holds it: the legacy `overrides[localId]`, and since
+        // Phase 4 (#1468) a member ROW's `traits`, keyed by identity. A direct row (`/<nodeGuid>`) is
+        // resolved to its localId through the prefab so the size checks below can compose the member;
+        // a deeper one (a nested member) gets the ref check only — its member is not in THIS prefab.
+        const groups: { where: string; localId: number; raw: unknown }[] = [];
+        for (const [k, raw] of Object.entries((overrides ?? {}) as Record<string, unknown>)) {
+          groups.push({ where: `overrides[${k}]`, localId: Number(k), raw });
+        }
+        const byNode = new Map<string, number>();
+        const rows = (prefab as { entities?: unknown } | undefined)?.entities;
+        if (Array.isArray(rows)) {
+          for (const r of rows as { nodeGuid?: unknown; localId?: unknown }[]) {
+            if (r && typeof r.nodeGuid === 'string' && typeof r.localId === 'number') byNode.set(r.nodeGuid, r.localId);
+          }
+        }
+        for (const [key, row] of Object.entries((members ?? {}) as Record<string, { traits?: unknown } | null>)) {
+          if (!row?.traits) continue;
+          const direct = key.length > 1 && key[0] === '/' && key.indexOf('/', 1) < 0;
+          groups.push({ where: `members[${key}].traits`, localId: direct ? byNode.get(key.slice(1)) ?? NaN : NaN, raw: row.traits });
+        }
+
+        for (const { where, localId: groupLocalId, raw: traitOverridesRaw } of groups) {
           if (!traitOverridesRaw || typeof traitOverridesRaw !== 'object') continue;
           const traitOverrides = traitOverridesRaw as Record<string, unknown>;
+          const localIdKey = String(groupLocalId);
 
           // #292 — an override group has the same `{trait: {field: value}}` shape as
           // `traits`, and 56 ref fields across `games/` + `demos/` are authored in one, so
           // the ref rule belongs here too. Runs BEFORE the UIElement early-continue below:
           // most override groups touch no UIElement at all, and the ref check must not be
           // hostage to a size check it has nothing to do with.
-          warnings.push(...refFieldWarnings(traitOverrides, `${label}.overrides[${localIdKey}]`, assetExists));
+          warnings.push(...refFieldWarnings(traitOverrides, `${label}.${where}`, assetExists));
 
           const ovUel = traitOverrides.UIElement;
           const ovUelObj = ovUel && typeof ovUel === 'object' ? (ovUel as Record<string, unknown>) : undefined;
@@ -972,7 +995,7 @@ export function validateSceneData(
           const ovUan = traitOverrides.UIAnchor;
           const ovUanObj = ovUan && typeof ovUan === 'object' ? (ovUan as Record<string, unknown>) : undefined;
 
-          const prefabTraits = prefabTraitsOf(Number(localIdKey));
+          const prefabTraits = Number.isFinite(groupLocalId) ? prefabTraitsOf(groupLocalId) : undefined;
           const prefabUel = prefabTraits?.UIElement as Record<string, unknown> | undefined;
           const prefabUan = prefabTraits?.UIAnchor as Record<string, unknown> | undefined;
 
@@ -999,7 +1022,7 @@ export function validateSceneData(
               if (typeof v === 'number' && !isNeutralSize(v, unit, axis) && isSizeInert(anchor, axis)) {
                 const authored = `${v}${unitOf(axis, unit)}`;
                 warnings.push(
-                  `${label}.overrides[${localIdKey}].UIElement.${axis} is inert: the '${anchor}' anchor `
+                  `${label}.${where}.UIElement.${axis} is inert: the '${anchor}' anchor `
                   + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
                   + `sizes that axis from its ${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, `
                   + `which overwrite the overridden ${authored}`,
@@ -1029,7 +1052,7 @@ export function validateSceneData(
               const unit = unitField in ovUelObj ? ovUelObj[unitField] : prefabUel?.[unitField];
               const authored = `${v}${unitOf(key as UIElementLengthField, unit)}`;
               warnings.push(
-                `${label}.overrides[${localIdKey}].UIElement.${key} is inert: the '${marginAnchorMode}' anchor `
+                `${label}.${where}.UIElement.${key} is inert: the '${marginAnchorMode}' anchor `
                 + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
                 + `positions this element from its own offsets, which overwrite all four margins — `
                 + `the overridden ${authored} is discarded`,

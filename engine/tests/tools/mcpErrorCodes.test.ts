@@ -2,7 +2,7 @@
  *  somewhere real — not merely declared.
  *
  *  Why this exists (QA-TOOL-0003): `docs/mcp-tool-conventions.md` §5 documents a CLOSED set of
- *  failure codes, and `ERROR_CODES` (`engine/tools/shared/mcpResult.ts`) is its single source of
+ *  failure codes, and `ERROR_CODES` (`engine/tools/shared/errorCodes.ts`) is its single source of
  *  truth. Three codes — `AMBIGUOUS`, `AMBIGUOUS_SURFACE`, `OCCLUDED` — sat in that set for months
  *  with no call site that ever produced them: every refusal they were meant to name (an ambiguous
  *  `name`, a missing `surface`, a click a surface's own hit-test would refuse) arrived as the
@@ -19,7 +19,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ERROR_CODES } from '../../tools/shared/mcpResult';
+import { ERROR_CODES } from '../../tools/shared/errorCodes';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
 
@@ -62,16 +62,16 @@ function allSourceFiles(dirs: string[]): Array<{ rel: string; abs: string }> {
 /** The DECLARATION — not the whole file — is excluded from the reachability scan. Matching
  *  `ERROR_CODES`'s own array (and its per-entry explanatory comments) against itself would make
  *  every code trivially "reachable" without a single call site ever producing it, which is the
- *  exact defect this guard exists to catch. But `mcpResult.ts` is also a legitimate PRODUCER —
- *  `encode()` stamps `code:'TOO_LARGE'` into the over-cap envelope — so excluding the file
- *  wholesale would make that real emission invisible and demand a fake one elsewhere. Cut the
- *  declaration block out and scan what is left. Matched on `rel` (#849) — git's own repo-relative
+ *  exact defect this guard exists to catch. The declaration lives in `errorCodes.ts` (#1561), beside
+ *  `codeFromBody` — cut the declaration block out and scan what is left, so a real emission in the
+ *  same file would still count. (`mcpResult.ts`'s `encode()` stamping `code:'TOO_LARGE'` is scanned
+ *  as an ordinary file now.) Matched on `rel` (#849) — git's own repo-relative
  *  POSIX string — not on an independently `path.join`-built absolute. */
-const MCP_RESULT_REL = 'engine/tools/shared/mcpResult.ts';
+const MCP_RESULT_REL = 'engine/tools/shared/errorCodes.ts'; // the declaration's home since #1561 (split from mcpResult.ts)
 
 function withoutDeclaration(src: string): string {
   const start = src.indexOf('export const ERROR_CODES');
-  if (start === -1) throw new Error('ERROR_CODES declaration not found in mcpResult.ts — has it moved?');
+  if (start === -1) throw new Error(`ERROR_CODES declaration not found in ${MCP_RESULT_REL} — has it moved?`);
   const end = src.indexOf('] as const;', start);
   if (end === -1) throw new Error('ERROR_CODES declaration is not the expected `[…] as const;` array');
   return src.slice(0, start) + src.slice(end);

@@ -9,30 +9,27 @@
 
 import type { Entity } from 'koota';
 import type { PrefabFile } from './prefab';
-import { PREFAB_EDIT_LOCAL_GUID_PREFIX } from './prefabEditGuids';
-import { serializePrefab, warnInertPrefabSizes, writePrefabFile, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
+import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
+import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs, refreshPrefabSourceForPath, rebaseStaleInstances } from './prefab';
 import { runtimeExcludedMessage } from './authoringScope';
-import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
+import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
 import { clearAllSceneDirty } from './sceneDirty';
-import type { SceneData, SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
+import type { SceneData, SceneEntityEntry, AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
-import { getRunMode } from '../../runtime/core/playState';
+import { linkOwnerBeforeMove } from '../../runtime/core/ecs/identityParents';
+import { whyWorldNotAuthored } from './authoredWorld';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
-import { deriveMemberGuid, mapStringValues } from '../../runtime/core/assetRefRules';
+import { deriveMemberGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
 import { isMemberToken, parseMemberToken, type MemberStep } from '../../runtime/core/templateRefs';
 
-/** Sentinel guid stamped on the prefab root in the synthetic edit scene so the
- *  save path can locate it after the loader reassigns ECS ids. Lives only in the
- *  throwaway edit world; serializePrefab clears guids in the written file. */
-export const PREFAB_EDIT_ROOT_GUID = '__prefab_edit_root__';
 /** Guid prefix stamped on EVERY member of the synthetic edit scene, carrying that member's
  *  ORIGINAL localId (`__prefab_edit_local__7`).
  *
@@ -43,7 +40,7 @@ export const PREFAB_EDIT_ROOT_GUID = '__prefab_edit_root__';
  *  them silently drops those overrides. Riding on `guid` is safe because serializePrefab
  *  CLEARS EntityAttributes.guid on every row it writes — a template carries no per-instance
  *  identity — so the sentinel can never reach the file. */
-export { PREFAB_EDIT_LOCAL_GUID_PREFIX };
+export { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID };
 /** Default HDR for the edit-mode environment (wooden_motel_2k — already in the
  *  asset manifest). Purely scaffolding; never written into the prefab. */
 export const PREFAB_EDIT_HDR_GUID = '984275f1-3ebd-4848-927f-012595c76500';
@@ -177,7 +174,22 @@ function scaffold2DEntities(prefab: PrefabFile): SceneEntityEntry[] {
 
 /** The guid the edit world gives the member at `path` below the prefab's root (#1352). A flat row is its
  *  own sentinel. Past a nested row, the rest derives from that row's sentinel, because the row is a
- *  top-level scene instance here. `null` when the path names no row. */
+ *  top-level scene instance here. `null` when the path names no row.
+ *
+ *  ⚠️ **In the prefab EDIT world, derivation stays the SOLE rule — never a fallback behind stored
+ *  member rows** (#1468 Phase 2B). Scene v16 stores a member's guid and derives only what no row
+ *  names; this world does the opposite on purpose, and the reason is that it has no scene:
+ *
+ *  - There is no `SceneEntityEntry` to hold rows. The edit world is scaffolding plus the prefab's own
+ *    rows, assembled by `buildPrefabEditScene` and never written to disk as a scene.
+ *  - Its guids are SENTINELS, not identities — `__prefab-edit-local-<localId>` — whose entire job is
+ *    to smuggle localIds through a round trip so `collectPreservedLocalIds` can read them back. A row
+ *    pinning one would pin a value that is meaningless outside this session.
+ *  - The document being edited is the one the rows would be ABOUT. Storing identity for a template's
+ *    own nodes inside that template is the circularity `nodeGuid` already answers, on the row itself.
+ *
+ *  So a reader looking for the v16 fallback here should stop looking: it is deliberately absent, and
+ *  the sentinel was deliberately NOT retired (#1468 design record). */
 function editGuidAt(prefab: PrefabFile, path: readonly MemberStep[]): string | null {
   const sentinel = (localId: number) => localId === prefab.rootLocalId ? PREFAB_EDIT_ROOT_GUID : `${PREFAB_EDIT_LOCAL_GUID_PREFIX}${localId}`;
   if (!path.length) return sentinel(prefab.rootLocalId);
@@ -194,13 +206,63 @@ function editGuidAt(prefab: PrefabFile, path: readonly MemberStep[]): string | n
 /** A payload `depth` frames below the prefab's root, with every member token that climbs back to the
  *  root replaced by the edit world's guid for it. The edit world flattens the root's own rows into
  *  plain scene entities, so no instantiate call there has the root as a frame. A token relative to an
- *  inner frame is left for the loader, which expands that row as a scene instance. */
+ *  inner frame is left for the loader, which expands that row as a scene instance.
+ *
+ *  A REFERENCE node (an `added` node carrying `prefab`) is not in this payload's frame: its payload is in its
+ *  own instance's, applied by a top call of its own, as the loader's `rebaseAddedTokens` leaves it. So it is
+ *  mapped at ITS depth, one below this (`editReferenceNodeRefs`) — counted from this depth, a `^` that only
+ *  reaches the node's root would read as one reaching the prefab's (#1538). A `^` that does climb out of the node
+ *  to the prefab's root is rewritten like any other (#1541); one reaching only a frame between is the loader's. */
 function editWorldRefs(prefab: PrefabFile, value: unknown, depth: number): unknown {
-  return mapStringValues(value, (s) => {
+  const mapped = mapStringValues(value, (s) => {
     const t = isMemberToken(s) ? parseMemberToken(s) : null;
     if (!t || t.up !== depth) return s;
     return editGuidAt(prefab, t.path) ?? s;
-  });
+  }, isReferenceNode);
+  return swapReferenceNodes(mapped, (n) => editReferenceNodeRefs(prefab, n, depth + 1));
+}
+
+/** A reference node's own payload, its root `depth` frames below the prefab's root: each channel at the depth of the
+ *  frame it applies in, as a row's are (`buildPrefabEditScene`). */
+function editReferenceNodeRefs(prefab: PrefabFile, n: AddedEntity, depth: number): AddedEntity {
+  const at = <T,>(v: T, d: number): T => editWorldRefs(prefab, v, d) as T;
+  const byPath = <T,>(paths: Record<string, T> | undefined) =>
+    paths && Object.fromEntries(Object.entries(paths).map(([k, v]) => [k, at(v, depth + k.split('.').length)]));
+  return {
+    ...n,
+    traits: at(n.traits, depth),
+    children: at(n.children, depth),
+    ...(n.overrides ? { overrides: at(n.overrides, depth) } : {}),
+    ...(n.added ? { added: at(n.added, depth) } : {}),
+    ...(n.nestedOverrides ? { nestedOverrides: byPath(n.nestedOverrides) } : {}),
+    ...(n.nestedStructure ? { nestedStructure: byPath(n.nestedStructure) } : {}),
+    ...(n.members ? { members: byRowDepth(n.members, n.prefab, (v, d) => at(v, depth - 1 + d)) } : {}),
+  };
+}
+
+/** `value` with every reference node in it (they sit in node lists: `added`, `children`, a row's `own`) replaced by
+ *  `fn(node)`. Copy-on-write, like `mapStringValues`. */
+function swapReferenceNodes(value: unknown, fn: (n: AddedEntity) => AddedEntity): unknown {
+  if (Array.isArray(value)) {
+    const out = value.map((v) => (v && typeof v === 'object' && isReferenceNode(v) ? fn(v as AddedEntity) : swapReferenceNodes(v, fn)));
+    return out.some((v, i) => v !== value[i]) ? out : value;
+  }
+  if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) return value;
+  let out: Record<string, unknown> | undefined;
+  for (const [k, v] of Object.entries(value)) {
+    const w = swapReferenceNodes(v, fn);
+    if (w === v) continue;
+    out ??= { ...(value as Record<string, unknown>) };
+    Object.defineProperty(out, k, { value: w, enumerable: true, writable: true, configurable: true });
+  }
+  return out ?? value;
+}
+
+/** An `added` node carrying `prefab` — told apart by the node's own shape, since a trait's field bag may hold a
+ *  `prefab` string too (a spawner's), and that bag's tokens must still be rewritten. */
+function isReferenceNode(v: object): boolean {
+  const n = v as { prefab?: unknown; parentLocalId?: unknown; children?: unknown };
+  return !Array.isArray(v) && typeof n.prefab === 'string' && typeof n.parentLocalId === 'number' && Array.isArray(n.children);
 }
 
 /** `paths` with each entry mapped at its depth below the prefab's root: 1 for the row, plus one per path step. */
@@ -209,10 +271,32 @@ function byPathDepth<T>(paths: Record<string, T> | undefined, fn: (v: T, depth: 
   return Object.fromEntries(Object.entries(paths).map(([k, v]) => [k, fn(v, 1 + k.split('.').length) as T]));
 }
 
+/** A prefab row's `members` (#1533) with each row mapped at the depth of the frame it applies in — {@link byPathDepth}
+ *  for the identity-keyed channel. A row applies in the frame its key names a member of (the key less its last
+ *  component), except a nested ROOT's row, which lands at that root and so applies in the root's own frame; only the
+ *  documents on the way tell the two apart, so they are walked from the row's prefab. */
+function byRowDepth<T>(rows: Record<string, T> | undefined, rowPrefab: string | undefined, fn: (v: T, depth: number) => unknown): Record<string, T> | undefined {
+  if (!rows) return rows;
+  const depthOf = (key: string): number => {
+    let doc = rowPrefab ? getCachedPrefabSync(rowPrefab) : null;
+    let depth = 1;
+    const parts = key.split('/').slice(1);
+    for (let i = 0; i < parts.length && doc; i++) {
+      const nested = doc.entities.find((e) => e.nodeGuid === parts[i] && e.prefab && e.localId !== (doc!.rootLocalId ?? 1));
+      if (!nested) break;
+      depth++;
+      doc = getCachedPrefabSync(nested.prefab!);
+    }
+    return depth;
+  };
+  return Object.fromEntries(Object.entries(rows).map(([k, v]) => [k, fn(v, depthOf(k)) as T]));
+}
+
 /** Show the prefab's own moves (#1437) in the loaded edit world: each member goes under its target, found by
- *  the guids the edit world gives both. A linked member (inside a nested row's instance) remembers the parent
- *  it left, as a loaded move does; a flat row is plain here, and the save puts it back under its original
- *  row parent (`serializePrefab`'s `rowParents`). A move naming nothing is reported and left out. */
+ *  the guids the edit world gives both. A linked member (inside a nested row's instance) keeps deriving from
+ *  the row parent it left, as a loaded move does — read from its document (`identityParents.ts`), with an
+ *  owned nested root's owner linked first; a flat row is plain here, and the save puts it back under its
+ *  original row parent (`serializePrefab`'s `rowParents`). A move naming nothing is reported and left out. */
 export function applyEditWorldMoves(prefab: PrefabFile): void {
   if (!prefab.moved) return;
   const eaMeta = getTraitByName('EntityAttributes');
@@ -223,22 +307,15 @@ export function applyEditWorldMoves(prefab: PrefabFile): void {
     const g = e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid : '';
     if (g) byGuid.set(g, e);
   }
-  const steps = (key: string): MemberStep[] => (key ? key.split('.').map((x) => (x.startsWith('+') ? x : Number(x))) : []);
   for (const [key, token] of Object.entries(prefab.moved)) {
     const t = parseMemberToken(token);
-    const memberGuid = editGuidAt(prefab, steps(key));
+    const memberGuid = editGuidAt(prefab, memberPathSteps(key));
     const targetGuid = t && !t.up ? editGuidAt(prefab, t.path) : null;
     const member = memberGuid ? byGuid.get(memberGuid) : undefined;
     const target = targetGuid ? byGuid.get(targetGuid) : undefined;
     if (!member || !target) { console.warn(`[PrefabEdit] the prefab's move of ${key} names nothing here; not shown`); continue; }
-    const ea = member.get(eaMeta.trait) as { parentId?: number };
-    if (piMeta && member.has(piMeta.trait)) {
-      const pi = member.get(piMeta.trait) as { homeParent?: string };
-      const from = [...getCurrentWorld().entities].find((x) => x.id() === ea.parentId);
-      const fromGuid = from?.has(eaMeta.trait) ? (from.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '';
-      if (!pi.homeParent && fromGuid) member.set(piMeta.trait, { ...pi, homeParent: fromGuid, homeSteps: '' });
-    }
-    member.set(eaMeta.trait, { ...ea, parentId: target.id() });
+    if (piMeta && member.has(piMeta.trait)) linkOwnerBeforeMove(getCurrentWorld(), member.id());
+    member.set(eaMeta.trait, { ...(member.get(eaMeta.trait) as { parentId?: number }), parentId: target.id() });
   }
 }
 
@@ -273,6 +350,8 @@ export function buildPrefabEditScene(prefab: PrefabFile): SceneData {
       // save re-captures them from this live expansion (`planPrefabRows`).
       nestedOverrides: byPathDepth(pe.nestedOverrides, (v, d) => editWorldRefs(prefab, v, d)),
       nestedStructure: byPathDepth(pe.nestedStructure, (v, d) => editWorldRefs(prefab, v, d)),
+      // …and its member rows (prefab v6, #1533), the outermost layer here as a scene entry's are.
+      ...(pe.members ? { members: byRowDepth(pe.members, pe.prefab, (v, d) => editWorldRefs(prefab, v, d)) } : {}),
     };
   });
   entities.push(...scaffoldEntities());
@@ -327,6 +406,24 @@ export async function openPrefabForEditing(
     confirmDiscard?: (action: string) => Promise<boolean>;
   } = {},
 ): Promise<void> {
+  // Refuses new undo steps for the whole switch, fetch included, and names the one in flight (#1579).
+  const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: true });
+  try {
+    // The undo in flight finishes BEFORE the fetch below (#1579 close-out review): an Apply undo installs the prefab
+    // file, so a fetch during its write read the applied file and `setPrefabCache` overwrote the undo's restored copy —
+    // the edit world was built from the applied document, and saving it put the Apply back on disk.
+    if (worldSwitch.idle) await worldSwitch.idle;
+    await openPrefabForEditingSwitching(asset, opts, worldSwitch.ready);
+  } finally {
+    worldSwitch.release();
+  }
+}
+
+async function openPrefabForEditingSwitching(
+  asset: { path: string; name: string },
+  opts: { confirmDiscard?: (action: string) => Promise<boolean> },
+  switchReady: () => Promise<void> | null,
+): Promise<void> {
   let prefab: PrefabFile;
   try {
     const res = await fetch(asset.path);
@@ -357,6 +454,14 @@ export async function openPrefabForEditing(
   // first so the round trip is non-destructive. Skip when there's no real scene file
   // to write to — an unsaved new scene, or already inside prefab-edit opening a
   // NESTED prefab (both have a null current path) — which would pop a Save-As picker.
+  // The undo in flight finishes first (#1579), and then a preview envelope comes down, restored
+  // (#1548 re-review): the swap below goes straight through SceneManager, so `loadScene`'s own takedown
+  // never runs — the session was abandoned at the swap, a posed Persistent root rode the carry into
+  // prefab-edit and back, and the save just below was silently refused ("a preview session is open")
+  // instead of persisting the round trip. The undo goes first because it reloads the world this save
+  // writes and this swap replaces.
+  const ready = switchReady();
+  if (ready) await ready;
   if (getCurrentScenePath()) await saveScene();
   if (opts.confirmDiscard && worldHasUnsavedEdits() && !(await opts.confirmDiscard(`edit prefab ${asset.name}`))) return;
 
@@ -369,8 +474,7 @@ export async function openPrefabForEditing(
   // discarded by this swap, and so is its undo stack (#1409). Read on both sides of the await.
   const dirtyBeforeSwap = worldHasUnsavedEdits();
   try {
-    await sceneManager.loadScene(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { preloaded: sceneData });
-    applyEditWorldMoves(prefab);
+    await loadPrefabEditWorld(guid, prefab, sceneData);
   } catch (e) {
     console.error('[PrefabEdit] failed to load edit scene:', e);
     return;
@@ -387,6 +491,13 @@ export async function openPrefabForEditing(
   clearAllSceneDirty();
   useEditorStore.getState().openPrefabEditor({ path: asset.path, guid, name: prefab.name }, returnScene);
   console.log(`[PrefabEdit] editing "${prefab.name}"`);
+}
+
+/** Build the prefab-edit world for `prefab` (the document of the prefab `guid`) in place of the live world — the
+ *  world half of `openPrefabForEditing`, which owns entering the session (history, dirty baseline, the store). */
+export async function loadPrefabEditWorld(guid: string, prefab: PrefabFile, sceneData: SceneData = buildPrefabEditScene(prefab)): Promise<void> {
+  await sceneManager.loadScene(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { preloaded: sceneData });
+  applyEditWorldMoves(prefab);
 }
 
 /** Locate the live ECS id of the prefab root in the edit world (by sentinel guid). */
@@ -426,6 +537,9 @@ export function collectPreservedLocalIds(rootLocalId: number, rootEcsId: number)
  *  `warnInertPrefabSizes` reported for it (empty unless `saved`). */
 export interface PrefabEditSaveReport {
   saved: boolean;
+  /** The prefab validation warnings the write reported — and, when `saved` is FALSE, the reason the
+   *  backend refused (#1468). It used to be documented as "empty unless `saved`"; the format gate
+   *  made a failed save something a human can act on, so the failure now has somewhere to say why. */
   warnings: string[];
 }
 
@@ -456,45 +570,20 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   // every caller inherits it and none can forget. It was in exactly one caller — the Cmd+S
   // handler's `!canEdit()` early return — which meant the AGENT path (`prefab edit-save`) never
   // had it at all, and deleting that early return in #259 (so parked asset docs could still flush
-  // during preview) removed the human's too. One guard, both paths.
-  if (getRunMode() !== 'stopped') {
+  // during preview) removed the human's too. One guard, both paths. `isWorldAuthored`, not the run
+  // mode, for the same reason as `saveScene` (#1548): an exit reads 'stopped' before its restore lands.
+  const notAuthored = whyWorldNotAuthored();
+  if (notAuthored) {
     console.error(
-      `[PrefabEdit] cannot save "${editingPrefab.name}" — run-mode is '${getRunMode()}', not 'stopped'. ` +
+      `[PrefabEdit] cannot save "${editingPrefab.name}" — ${notAuthored}. ` +
       'Saving now would bake preview/play mutations (a posed rig, a spawned prefab) into the prefab ' +
       'file, and every scene that instantiates it would inherit them. Exit preview / stop first.',
     );
     return NOT_SAVED;
   }
-  const rootId = findPrefabEditRoot();
-  if (!rootId) { console.error('[PrefabEdit] cannot save — prefab root not found'); return NOT_SAVED; }
-
-  // The file as it was when we opened it (openPrefabForEditing seeds this cache). It supplies
-  // the two things a re-save must NOT re-derive from the live world: the existing localId
-  // numbering, and the asset's own name. Refuse rather than fall back to renumbering — a
-  // silent renumber drops every localId-keyed override in every scene that instantiates this
-  // prefab, which is precisely the damage this path exists to avoid.
-  const previous = getCachedPrefabSync(editingPrefab.guid);
-  if (!previous) {
-    console.error(
-      `[PrefabEdit] cannot save "${editingPrefab.name}" — the opened prefab is no longer in the ` +
-      'editor cache, so its localId numbering cannot be preserved. Saving now would renumber ' +
-      "members and break every scene override keyed to them. Re-open the prefab and try again.",
-    );
-    return NOT_SAVED;
-  }
-
-  // A prefab containing a UIScrollView spawns pooled rows INSIDE the prefab-edit world (the pool
-  // runs while stopped), so this save legitimately drops them — and says so, because this path
-  // already has a `warnings` array the agent op surfaces and a console nobody reads (review F4).
-  let runtimeExcluded = 0;
-  const prefab = serializePrefab(rootId, editingPrefab.guid, {
-    preserveLocalIds: collectPreservedLocalIds(previous.rootLocalId, rootId),
-    name: previous.name,
-    // A row the prefab's own move placed under a nested member keeps its original row parent (#1437).
-    rowParents: new Map(previous.entities.map((e) => [e.localId, ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0])),
-    onRuntimeExcluded: (n) => { runtimeExcluded = n; },
-  });
-  if (!prefab) { console.error('[PrefabEdit] serialize produced no prefab'); return NOT_SAVED; }
+  const serialized = serializePrefabEditWorld(editingPrefab.guid);
+  if ('error' in serialized) { console.error(`[PrefabEdit] cannot save "${editingPrefab.name}" — ${serialized.error}`); return NOT_SAVED; }
+  const { prefab, runtimeExcluded } = serialized;
   // The version `prefab` represents, captured BEFORE the write. `writePrefabFile` is a real fetch
   // to the dev server, and the human keeps working during it — a bone drag or an agent op lands as
   // an ordinary `pushAction`. Re-reading the version after the await would fold that edit into the
@@ -505,8 +594,13 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   // the call sits here and not in writePrefabFile.
   const warnings = warnInertPrefabSizes(prefab, editingPrefab.guid);
   if (runtimeExcluded > 0) warnings.push(runtimeExcludedMessage(runtimeExcluded));
-  const ok = await writePrefabFile(editingPrefab.guid, prefab);
-  if (!ok) return NOT_SAVED;
+  const wrote = await writePrefabFileReport(editingPrefab.guid, prefab);
+  // ⚠️ Carry the backend's REASON out (#1468). The owner's ruling is refuse-to-SAVE-never-to-LOAD,
+  // so a build will open a prefab a newer build wrote, edit it and press Cmd+S — the gate answers
+  // 409 and, until this, the human got a `{saved:false}` with nothing on it: the server's own error
+  // goes to the dev-server terminal, not the editor console. Reported through `warnings`, which the
+  // agent `edit-save` op already surfaces and the human paths already read.
+  if (!wrote.ok) return { saved: false, warnings: wrote.error ? [wrote.error] : [] };
   // Refresh the editor's prefab cache to the just-saved version AND invalidate the
   // runtime refcount cache, so reopening the return scene re-expands from the new file.
   setPrefabCache(editingPrefab.guid, prefab);
@@ -524,6 +618,55 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   markSceneSaved(savedAtEditVersion);
   console.log(`[PrefabEdit] saved "${prefab.name}" (${prefab.entities.length} entities)`);
   return { saved: true, warnings };
+}
+
+/** The live prefab-edit world as the document of the prefab `guid` — what Save writes. `runtimeExcluded` counts
+ *  the runtime-spawned entities it left out. An `error` says why there is no document, phrased to follow
+ *  "cannot save …". Pure: it writes nothing. */
+export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; runtimeExcluded: number } | { error: string } {
+  const rootId = findPrefabEditRoot();
+  if (!rootId) return { error: 'prefab root not found' };
+
+  // The file as it was when we opened it (openPrefabForEditing seeds this cache). It supplies
+  // the two things a re-save must NOT re-derive from the live world: the existing localId
+  // numbering, and the asset's own name. Refuse rather than fall back to renumbering — a
+  // silent renumber drops every localId-keyed override in every scene that instantiates this
+  // prefab, which is precisely the damage this path exists to avoid.
+  const previous = getCachedPrefabSync(guid);
+  if (!previous) {
+    return {
+      error: 'the opened prefab is no longer in the ' +
+        'editor cache, so its localId numbering cannot be preserved. Saving now would renumber ' +
+        'members and break every scene override keyed to them. Re-open the prefab and try again.',
+    };
+  }
+
+  // A prefab containing a UIScrollView spawns pooled rows INSIDE the prefab-edit world (the pool
+  // runs while stopped), so this save legitimately drops them — and says so, because this path
+  // already has a `warnings` array the agent op surfaces and a console nobody reads (review F4).
+  let runtimeExcluded = 0;
+  const preservedLocalIds = collectPreservedLocalIds(previous.rootLocalId, rootId);
+  // …and the node identity each of those rows already had (#1468). The edit world holds the document
+  // as PLAIN entities with no prefab link, so the baseline file is the only thing that still knows
+  // which row a given live entity is; without this every node would be re-minted on every Cmd+S, and
+  // an identity that changes on each save is worse than none. A row of a pre-v5 document has no guid
+  // to keep and is simply absent here, so the save mints it one — which is how a file migrates
+  // (#1468 design record: on next save, never on load).
+  const nodeGuidByLocalId = new Map(previous.entities.map((e) => [e.localId, e.nodeGuid ?? '']));
+  const preserveNodeGuids = new Map<number, string>();
+  for (const [ecsId, localId] of preservedLocalIds) {
+    const g = nodeGuidByLocalId.get(localId);
+    if (g) preserveNodeGuids.set(ecsId, g);
+  }
+  const prefab = serializePrefab(rootId, guid, {
+    preserveLocalIds: preservedLocalIds,
+    preserveNodeGuids,
+    name: previous.name,
+    // A row the prefab's own move placed under a nested member keeps its original row parent (#1437).
+    rowParents: new Map(previous.entities.map((e) => [e.localId, ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0])),
+    onRuntimeExcluded: (n) => { runtimeExcluded = n; },
+  });
+  return prefab ? { prefab, runtimeExcluded } : { error: 'serialize produced no prefab' };
 }
 
 /** Leave prefab-edit mode: reload the scene the prefab was opened from — that
@@ -549,8 +692,17 @@ export async function exitPrefabEditing(): Promise<string | null> {
   // candidate carries it, so the fallback can never reintroduce the same dead end.
   const target = [prefabReturnScenePath, stored]
     .find((p): p is string => !!p && !p.startsWith(PREFAB_EDIT_SCENE_PREFIX)) ?? null;
+  const edited = useEditorStore.getState().editingPrefab;
   if (target) await loadScene(target);
   closePrefabEditor();
+  // The editor's copy of the prefab that was OPEN skipped every external-write refresh while it was open
+  // (`refreshPrefabSourceForPath`), so after an exit without saving it can be older than the file — which the
+  // scene just loaded from. Left so, Apply/Revert refused every instance of it and a later hot reload rebuilt
+  // carried ones back to the old template (#1483 review). Re-read now that nothing is editing it.
+  if (edited) await refreshPrefabSourceForPath(edited.path);
+  // A `Persistent` root is carried into the prefab-edit world and back, so a SAVED edit reaches it only here
+  // — the scene load re-expands everything else (close-out review 2). Rebuilds nothing that is current.
+  await rebaseStaleInstances();
   return target;
 }
 

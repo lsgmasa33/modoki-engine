@@ -19,10 +19,12 @@
 
 import type { DomPointSpec, DomPointResolution, DomRect, AimGesture } from './domPointContract';
 import { isClickShaped } from './domPointContract';
+import { aimAddresses, ambiguousAimMessage } from '../../tools/shared/aimAddresses';
+import { OpRefusal } from './opRefusal';
 // ⚠️ The RUNTIME's own veto, not a copy of the rule (#1016). `resolveTapZoneVeto` is what
 // `pressOrigin.ts` uses to route a real press, so the aim surface and the router cannot disagree
 // about who gets the click — §9: a rule implemented twice diverges, and this pair already had.
-import { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, collectHandles, normalizeHandleLabel } from '@modoki/engine/runtime';
+import { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, collectHandles, normalizeHandleLabel, findEntity, entityDisplayName, guidOfEntityId } from '@modoki/engine/runtime';
 
 // Re-exported so existing importers (domDnd, agentBridge) keep one import site.
 export type { DomPointSpec, DomPointResolution, DomRect, AimGesture } from './domPointContract';
@@ -272,8 +274,7 @@ export function describeOccluder(el: Element | null | undefined): string | null 
   const zone = el?.closest?.(`[${UI_TAP_ZONE_ATTR}]`);
   if (zone) {
     const host = zone.parentElement;
-    const entityId = host?.getAttribute('data-entity-id');
-    const named = entityId ? `entity ${entityId}` : (host ? describeElement(host) : null);
+    const named = host ? (describeEntityHost(host) ?? describeElement(host)) : null;
     // Falls through to the ancestor walk when the host names nothing at all, rather than
     // announcing an anonymous owner — "of div" tells the caller strictly less than the panel does.
     // ⚠️ `/[.#[]/` — "did `describeElement` find a real name, or fall back to a bare tag?" — NOT
@@ -286,8 +287,40 @@ export function describeOccluder(el: Element | null | undefined): string | null 
     return anon ? `the minTapSize tap zone in ${describeOccluderContext(el!) ?? anon}` : null;
   }
   const own = describeElement(el);
-  if (!own || /[.#[]/.test(own)) return own; // already identifiable
+  if (!own) return own;
+  // ⚠️ A GAME UI node is named as its entity before the ancestor walk (#1570). A UINode host is a
+  // bare `div` whose one identity is `data-entity-id`, so the walk skipped past it to the dock: a
+  // gizmo handle under a scene's own HUD bar was reported as covered by `div inside
+  // div.flexlayout__tab_moveable`, and filed as "under the dock tab chrome". The entity is what an
+  // agent can act on, and it says the cover is the SCENE's, not the editor's.
+  // But only AFTER an element that names itself (`data-ui-id` chrome, an `id`, a class, a `title`):
+  // that name is the more specific one, and the entity above it may be the very carrier the cover
+  // sits inside (`carrierCover.ts`'s "shared ancestor's own drawing" must read as `span#hud-frame`).
+  if (/[.#[]/.test(own)) return own; // already identifiable
+  const host = el!.closest('[data-entity-id]');
+  const entity = host ? describeEntityHost(host) : null;
+  if (entity) return entity;
   return describeOccluderContext(el!) ?? own;
+}
+
+/** Name a game UI node's host by the entity it renders: `entity "Top UI" [<guid>]`, or `entity 13`
+ *  when the id resolves to no live entity (the DOM can outlive its entity by a frame, and a unit
+ *  test's DOM has no world behind it). `null` when the attribute is not an id at all.
+ *
+ *  The guid is what makes the name addressable: runtime ids are reassigned on every scene
+ *  hot-reload, and a display name need not be unique. Looked up by id (`findEntity`, O(1)) rather
+ *  than by scanning every entity, because a handle list can describe many covers in one call. */
+function describeEntityHost(host: Element): string | null {
+  const raw = host.getAttribute('data-entity-id');
+  const id = raw ? Number(raw) : NaN;
+  if (!Number.isFinite(id) || id <= 0) return null;
+  try {
+    if (findEntity(id)) {
+      const guid = guidOfEntityId(id);
+      return `entity "${entityDisplayName(id)}"${guid ? ` [${guid}]` : ` (id:${id})`}`;
+    }
+  } catch { /* no current world to ask — name it by id */ }
+  return `entity ${id}`;
 }
 
 /** Walk up for the nearest ancestor that names something, and say where the element sits. Split out
@@ -418,12 +451,11 @@ function resolveLabel(label: string, within: string | undefined): CoreResolution
  *  the DnD path and the trusted-input path. Returns an error as data; the wrappers decide
  *  whether to throw. */
 function resolveCore(spec: DomPointSpec): CoreResolution {
-  if (spec.label !== undefined) {
-    if (spec.selector) {
-      return { error: 'give a label OR a selector, not both — two addresses for one target', code: 'AMBIGUOUS' };
-    }
-    return resolveLabel(spec.label, spec.within);
-  }
+  // One address (#1556) — the chain below is otherwise precedence: `modoki_dnd`'s endpoint schema
+  // accepts {selector, x, y} together, and the selector silently won.
+  const twoAddresses = ambiguousAimMessage(aimAddresses(spec));
+  if (twoAddresses) return { error: twoAddresses, code: 'AMBIGUOUS' };
+  if (spec.label !== undefined) return resolveLabel(spec.label, spec.within);
   if (spec.within !== undefined) return { error: '`within` scopes a `label` aim; it has no meaning without one' };
   if (spec.selector) {
     let el: Element | null;
@@ -450,7 +482,9 @@ function resolveCore(spec: DomPointSpec): CoreResolution {
  *  Element itself (DnD dispatch). */
 export function resolveDomPoint(spec: DomPointSpec, which = 'target'): DomPointHit {
   const r = resolveCore(spec);
-  if ('error' in r) throw new Error(`${which}: ${r.error}`);
+  // A CODED miss throws coded: a plain Error loses it at `opReplyFor`, and `modoki_dnd` answered two
+  // addresses as REFUSED_BY_OP while its description (and #1556) say AMBIGUOUS (close-out review).
+  if ('error' in r) throw r.code ? new OpRefusal(r.code, `${which}: ${r.error}`) : new Error(`${which}: ${r.error}`);
   return r;
 }
 

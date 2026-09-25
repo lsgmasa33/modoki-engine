@@ -1,36 +1,165 @@
 /**
- * Cross-platform build-step execution (W-6). The `/api/build` pipeline authors each
- * step as a POSIX/bash one-liner; on macOS/Linux we run it through `bash -c`
- * (byte-identical to the original pipeline, so `$(…)`, `~`, gcloud/xcode bash steps
- * keep working). Windows has no `bash` by default, so there we run through the
- * platform shell (cmd.exe via ComSpec) — steps whose bash form isn't portable carry a
- * `winCmd` override, and env vars come via the spawn `env` (never an inline bash
- * `export …;` / `FOO=bar cmd` prefix, which is bash-only).
+ * Cross-platform build-step execution (W-6, #1537). A step is one of three kinds:
  *
- * ⚠️ The Windows command forms (`winCmd`) are UNVALIDATED against a real Windows shell —
- *    verify them on an actual Windows box (see the plan's Phase W checklist).
+ * - **`exec`** — a program and its argv, spawned with NO shell. Almost every step is this. Paths,
+ *   project names and config strings travel as argv, so no shell ever parses them: on Windows a
+ *   `.cmd`/`.bat` (gradlew.bat, npx.cmd, gcloud.cmd) goes through `toSpawn`'s escaped cmd.exe line.
+ * - **`shell`** — the few steps that are genuinely compound (`$(…)`, `&&`, `||`). The script text is
+ *   built ONLY by the `sh` tagged template, whose slots accept a `ShellRef`, never a raw string: the
+ *   ref's value rides in the child's ENV and the text holds a quoted `"$NAME"` / `"%NAME%"`
+ *   reference. Posix runs it through `bash -c`, Windows through cmd.exe.
+ * - **`inproc`** — work done in this process (a reveal in Explorer/Finder, a directory clear).
+ *
+ * Why (#1537): steps used to be one command STRING with paths interpolated, run through `bash -c`
+ * or `shell:true`. cmd expands `%VAR%` even inside quotes and bash evaluates `$(…)` inside double
+ * quotes, so a folder named `My%OS%Game` or `a$(x)b` changed the command that ran. Variable data
+ * never appears in shell text now — the `sh` slot type makes the old shape a TYPE error.
+ *
+ * The one exception is `authoredShell` — a project author's own custom deploy command, which is
+ * shell text by definition and runs as written (owner ruling on #1537).
  *
  * This module is also the ONLY place that knows how a build child is torn down (#176).
  * Aborting a build means killing the whole process TREE, not the shell we spawned — see
  * `killBuildProcess` for why a plain `proc.kill()` silently orphans the real work.
  */
 import { spawn, execFile, execFileSync } from 'child_process';
+import { toSpawn } from '../scripts/winSpawn.mjs';
 
-/** One build/scaffold step: a shell command run from `cwd`. `env` is merged over the
- *  shared build env (replaces bash `export`/`FOO=bar` prefixes). `winCmd` is a
- *  Windows-shell equivalent used when the bash `cmd` isn't portable (posix file-op
- *  builtins, the `android/gradlew` path, `open`). */
-export interface BuildStep {
-  label: string;
-  cmd: string;
-  cwd: string;
-  env?: Record<string, string>;
-  winCmd?: string;
+/** A value a `shell` step's script refers to. Only `ref()` makes one, so a raw string cannot be
+ *  interpolated into `sh` — the brand is what the type check keys on. */
+declare const shellRefBrand: unique symbol;
+export interface ShellRef { readonly [shellRefBrand]: true; readonly envName: string; readonly value: string }
+
+/** Shell text plus the env its refs read from. Built by `sh` (or `authoredShell`), never by hand. */
+export interface ShellScript { readonly posix: string; readonly win: string; readonly env: Readonly<Record<string, string>> }
+
+/** `name` becomes the env var `MODOKI_ARG_<name>`; the script refers to it, quoted, wherever the
+ *  ref is interpolated. `name` is an identifier because it is spliced into the script text. */
+export function ref(name: string, value: string): ShellRef {
+  if (!/^[A-Z][A-Z0-9_]*$/.test(name)) throw new Error(`shell ref name must be UPPER_SNAKE: ${JSON.stringify(name)}`);
+  return { envName: `MODOKI_ARG_${name}`, value } as ShellRef;
 }
 
-/** Spawn one build/scaffold command, cross-platform: `bash -c` on posix, the default
- *  shell (cmd.exe) on Windows. `platform` defaults to the running process; override it
- *  only in tests.
+function isShellScript(x: ShellRef | ShellScript): x is ShellScript {
+  return typeof (x as ShellScript).posix === 'string';
+}
+
+/** The ONLY way to write a `shell` step's script. Each slot is a `ShellRef` (rendered as a quoted
+ *  env reference) or a nested `ShellScript` fragment (its text spliced, its env merged). A raw
+ *  string in a slot does not typecheck — that is the whole guard. */
+export function sh(parts: TemplateStringsArray, ...slots: (ShellRef | ShellScript)[]): ShellScript {
+  let posix = parts[0];
+  let win = parts[0];
+  const env: Record<string, string> = {};
+  const bind = (name: string, value: string) => {
+    if (name in env && env[name] !== value) throw new Error(`shell ref ${name} bound to two different values`);
+    env[name] = value;
+  };
+  slots.forEach((slot, i) => {
+    if (isShellScript(slot)) {
+      posix += slot.posix;
+      win += slot.win;
+      for (const [k, v] of Object.entries(slot.env)) bind(k, v);
+    } else {
+      // Quoted: bash word-splits and globs an unquoted "$X"; cmd runs an unquoted %X% holding `&`.
+      // Neither re-scans the expanded value, so a `$(…)` or `%OS%` inside it stays literal.
+      posix += `"$${slot.envName}"`;
+      win += `"%${slot.envName}%"`;
+      bind(slot.envName, slot.value);
+    }
+    posix += parts[i + 1];
+    win += parts[i + 1];
+  });
+  return { posix, win, env };
+}
+
+/** A project author's own shell text (the custom web deploy command), run exactly as written on
+ *  both platforms. The ONE sanctioned way to put non-`sh` text in a shell step — do not reach for
+ *  it for engine-authored steps. */
+export function authoredShell(text: string): ShellScript {
+  return { posix: text, win: text, env: {} };
+}
+
+interface StepCommon {
+  label: string;
+  /** Evaluated when the step is reached, not when the plan is made — e.g. "does dist/ hold a .glb"
+   *  after the build that produces dist/ has run. False skips the step. */
+  when?: () => boolean;
+}
+
+/** A program + argv, spawned with no shell. `winCommand` replaces `command` on win32 (gradlew →
+ *  gradlew.bat); a BARE name there is resolved on the step env's PATH by toSpawn, since no shell will. */
+export interface ExecStep extends StepCommon {
+  kind: 'exec';
+  command: string;
+  args: string[];
+  winCommand?: string;
+  cwd: string;
+  env?: Record<string, string>;
+}
+
+/** A compound command. See the module header — build `script` with `sh`. */
+export interface ShellStep extends StepCommon {
+  kind: 'shell';
+  script: ShellScript;
+  cwd: string;
+  env?: Record<string, string>;
+}
+
+/** Work done in this process. `log` streams to the same place a child's output would. */
+export interface InprocStep extends StepCommon {
+  kind: 'inproc';
+  run: (log: (line: string) => void) => void | Promise<void>;
+}
+
+export type BuildStep = ExecStep | ShellStep | InprocStep;
+export type SpawnedStep = ExecStep | ShellStep;
+
+/** Shorthand for the common case. */
+export function execStep(label: string, cwd: string, command: string, args: string[], extra: Pick<ExecStep, 'env' | 'winCommand' | 'when'> = {}): ExecStep {
+  return { kind: 'exec', label, cwd, command, args, ...extra };
+}
+
+/** What `spawnBuildStep` will actually spawn — pure, so the platform branching is unit-testable from
+ *  any host. `env` is the full child env (the shared build env, the step's own, and a script's refs). */
+export function planBuildStep(
+  step: SpawnedStep,
+  buildEnv: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[]; options: { shell: false; windowsVerbatimArguments?: true }; env: NodeJS.ProcessEnv } {
+  if (step.kind === 'exec') {
+    const env = step.env ? { ...buildEnv, ...step.env } : buildEnv;
+    const command = platform === 'win32' && step.winCommand ? step.winCommand : step.command;
+    // No shell does the PATHEXT lookup any more: toSpawn resolves a bare `npx` to `npx.cmd` on the
+    // CHILD's PATH (the step may prepend a tool dir), not this process's.
+    return { ...toSpawn(command, step.args, { platform, env }), env };
+  }
+  const env = { ...buildEnv, ...step.env, ...step.script.env };
+  if (platform === 'win32') {
+    // ⚠️ A ref is safe in cmd ONLY without a `"`: `"%X%"` expands to the value between those
+    // quotes, and a `"` inside it closes them, making the rest of the value — `&` included — live
+    // command text (observed on the win clone: `x"&echo INJ&"y` ran `echo INJ`). Refused loudly
+    // rather than quoted around, because cmd has no escape for a quote inside a quoted string.
+    // A Windows path cannot contain `"`, and no engine-authored shell step runs on win32 today.
+    for (const [name, value] of Object.entries(step.script.env)) {
+      if (value.includes('"')) throw new Error(`build step "${step.label}": ${name} holds a double quote, which cmd.exe cannot carry safely`);
+    }
+    // cmd.exe run directly (the same thing `shell:true` does, minus Node's concatenation): /d skips
+    // AutoRun, /v:off pins delayed expansion OFF (a registry `DelayedExpansion=1` would otherwise
+    // re-expand `!X!` inside a ref's value), /s /c strips exactly the outer quotes. `%X%` refs expand
+    // once, quoted; the expanded value is not re-scanned for `%`.
+    return {
+      command: process.env.ComSpec || 'cmd.exe',
+      args: ['/d', '/v:off', '/s', '/c', `"${step.script.win}"`],
+      options: { shell: false, windowsVerbatimArguments: true },
+      env,
+    };
+  }
+  return { command: 'bash', args: ['-c', step.script.posix], options: { shell: false }, env };
+}
+
+/** Spawn one build/scaffold step. `platform` defaults to the running process; override it only in
+ *  tests.
  *
  *  `detached: true` on posix puts the child in its OWN process group, so `killBuildProcess`
  *  can signal the group and reach the grandchildren a compound `bash -c` forks (#176). It is
@@ -40,14 +169,15 @@ export interface BuildStep {
  *
  *  We never `unref()` the child: stdio stays piped (the SSE log depends on it) and the step
  *  loop still awaits its `close`. Detaching changes WHO gets a signal, not the lifetime. */
-export function spawnBuildCommand(
-  cmd: string,
-  opts: { cwd: string; env: NodeJS.ProcessEnv },
+export function spawnBuildStep(
+  step: SpawnedStep,
+  buildEnv: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = process.platform,
 ): ReturnType<typeof spawn> {
-  const proc = platform === 'win32'
-    ? spawn(cmd, { cwd: opts.cwd, env: opts.env, shell: true })
-    : spawn('bash', ['-c', cmd], { cwd: opts.cwd, env: opts.env, detached: true });
+  const plan = planBuildStep(step, buildEnv, platform);
+  const proc = spawn(plan.command, plan.args, {
+    ...plan.options, cwd: step.cwd, env: plan.env, ...(platform === 'win32' ? {} : { detached: true }),
+  });
   track(proc, platform);
   return proc;
 }
@@ -72,11 +202,11 @@ export function winKillTreeArgs(pid: number): string[] {
  * spawned pid and do get the signal) but FORKS for a compound one — and several real steps
  * are compound: the iOS `Installing on device...` (`APP_PATH=$(…) && { xcrun devicectl … }`),
  * icon generation (`mkdir && cp && … && printf`), and the web deploy's `for ext in …; do
- * gcloud storage objects update …; done`. Signalling the shell there kills the shell and
- * leaves `devicectl`/`gcloud` running, orphaned, holding no build slot — free to race the
+ * gcloud storage objects update …; done` (the last two are exec steps since #1537; a `shell` step
+ * still forks). Signalling the shell there kills the shell and leaves `devicectl`/`gcloud` running, orphaned, holding no build slot — free to race the
  * retry that the freed slot immediately admits.
  *
- * posix: signal the process GROUP (`-pid`), which `spawnBuildCommand`'s `detached` created.
+ * posix: signal the process GROUP (`-pid`), which `spawnBuildStep`'s `detached` created.
  * A group signal also reaches a tool's own workers (xcodebuild's clang/swift-frontend,
  * gradle's `--no-daemon` single-use JVM) without depending on that tool to forward it.
  * win32: `taskkill /T`, which walks the tree by parent pid instead.
@@ -204,17 +334,4 @@ function track(proc: ReturnType<typeof spawn>, platform: NodeJS.Platform): void 
   };
   process.once('SIGINT', onSignal(130));
   process.once('SIGTERM', onSignal(143));
-}
-
-/** The command + env to actually run for a step on `platform` (picks `winCmd` on
- *  Windows when present; merges the step's `env` over the shared build env). Pure, so
- *  the platform branching is unit-testable from any host. */
-export function resolveBuildStep(
-  step: BuildStep,
-  buildEnv: NodeJS.ProcessEnv,
-  platform: NodeJS.Platform = process.platform,
-): { cmd: string; env: NodeJS.ProcessEnv } {
-  const cmd = platform === 'win32' && step.winCmd ? step.winCmd : step.cmd;
-  const env = step.env ? { ...buildEnv, ...step.env } : buildEnv;
-  return { cmd, env };
 }

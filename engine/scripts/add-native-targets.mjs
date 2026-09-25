@@ -37,7 +37,6 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
 import { loadRequiredEngineModules } from './loadVendorPlugins.mjs';
@@ -109,15 +108,15 @@ function discoverMissing() {
  *  `JSON.parse(project.config.json)` instead and every scaffold died on
  *  `Cannot read properties of undefined (reading 'webDir')` — a raw config is not a ProjectConfig,
  *  it is the SPARSE OVERRIDE of one. */
-const [addNativeTargetModule, projectConfigModule] = await loadRequiredEngineModules(
+const [addNativeTargetModule, projectConfigModule, buildStepShellModule] = await loadRequiredEngineModules(
   repoRoot,
-  [path.join('plugins', 'addNativeTarget.ts'), path.join('plugins', 'load-project-config.ts')],
+  [path.join('plugins', 'addNativeTarget.ts'), path.join('plugins', 'load-project-config.ts'), path.join('plugins', 'buildStepShell.ts')],
   'add-native-targets.mjs',
 );
 const {
   scaffoldNativeTarget, loadProjectConfig, isNativeTargetScaffolded,
-  projectBuildConfigErrors,
-} = { ...addNativeTargetModule, ...projectConfigModule };
+  projectBuildConfigErrors, spawnBuildStep, execStep,
+} = { ...addNativeTargetModule, ...projectConfigModule, ...buildStepShellModule };
 const specs = ALL ? discoverMissing() : argv.filter((a) => !a.startsWith('--') && a !== platArg);
 if (!specs.length) {
   console.error('usage: add-native-targets.mjs [--platform ios|android] [--dry-run] [--force] <project…> | --all-missing');
@@ -131,12 +130,13 @@ if (!specs.length) {
  *  the per-game teardown (#29) a repo-root build with no `MODOKI_PROJECT` fails fast by design
  *  ("the repo root is not a buildable game"). The editor's own wrapper sets it via
  *  `buildStepEnv({ MODOKI_PROJECT: projectRoot })`; omitting it here failed all 18 scaffolds. */
-const makeRunShell = (projectRoot) => (label, cmd, cwd) => new Promise((resolve) => {
+const makeRunShell = (projectRoot) => (label, command, args, cwd) => new Promise((resolve) => {
   console.log(`\n── ${label} ──  (${cwd})`);
-  const proc = spawn(cmd, {
-    cwd, shell: true, stdio: 'inherit',
-    env: { ...process.env, MODOKI_PROJECT: projectRoot },
-  });
+  // The editor's own step runner (argv, no shell — #1537), so the two transports cannot disagree
+  // about how `npm`/`npx` are found or how an argument reaches them. Output is relayed live.
+  const proc = spawnBuildStep(execStep(label, cwd, command, args), { ...process.env, MODOKI_PROJECT: projectRoot });
+  proc.stdout?.on('data', (d) => process.stdout.write(d));
+  proc.stderr?.on('data', (d) => process.stderr.write(d));
   proc.on('close', (code) => resolve(code === 0));
   proc.on('error', (e) => { console.error(`ERROR: ${e.message}`); resolve(false); });
 });

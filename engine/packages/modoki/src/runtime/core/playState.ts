@@ -93,8 +93,9 @@ export function isPoseOnly(): boolean {
   return _mode === 'scrub';
 }
 
-/** The viewport should render continuously (Play + forward-preview). FX-preview / skeletal-preview
- *  side-channels are ORed in at the call sites — they compose with any mode. */
+/** The viewport should render continuously (Play + forward-preview). Editor side-channels (the
+ *  particle FX preview, the Animation panel's ▶) are ORed in at the call sites — they compose with
+ *  any mode. */
 export function isLiveRender(): boolean {
   return _mode === 'playing' || _mode === 'preview';
 }

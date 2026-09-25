@@ -101,7 +101,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     // The reader must SEE the authoring writes, or an empty census would pass everything below.
     expect(census).toEqual(expect.arrayContaining([
       { file: 'packages/modoki/src/editor/scene/prefab.ts', in: 'applyToPrefabSelective', warned: true },
-      { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true },
+      { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true }, // via writePrefabFileReport
       { file: 'app/editor/agentEditorOps.ts', in: 'registerEditorAgentOps', warned: true }, // prefabAction:'create'
     ]));
     // An unwarned write is an offender unless it is a restore. Keyed `file::function` and SPENT per call, so a second
@@ -161,7 +161,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     assertExemptionLedger({
       label: 'prefab serializers that never call warnInertPrefabSizes (#1251)',
       population: producers.filter((p) => !p.warns).map((p) => ({ item: `${p.file}::${p.in}`, site: p.file })),
-      exempt: GENERATED_PREFAB_WRITERS,
+      exempt: [...GENERATED_PREFAB_WRITERS, ...SERIALIZE_FOR_A_CALLER],
       scanned: producers.length,
       floor: 6,
       fix: 'an AUTHORING write calls warnInertPrefabSizes(<the prefab>, <its source>) before writing; a prefab generated from a model or rig gets an exempt row saying so',
@@ -361,6 +361,12 @@ const GENERATED_PREFAB_WRITERS = [
   { item: 'packages/modoki/src/editor/scene/skinPrefab.ts::makeRigPrefabAsset', reason: 'a 2D skin rig prefab built from bone definitions — Bone/skin entities, no UIElement' },
 ];
 
+/** Functions that serialize a prefab for a CALLER and write nothing themselves: whether it is written, and so warned,
+ *  is the caller's, which the write census above holds to it. */
+const SERIALIZE_FOR_A_CALLER = [
+  { item: 'packages/modoki/src/editor/scene/prefabEdit.ts::serializePrefabEditWorld', reason: 'the prefab-edit world as a document: savePrefabEditReport warns what it writes (the write census row for it), and the tests read it as what a Save would write' },
+];
+
 /** Whether `e` calls THE engine `warnInertPrefabSizes` — by its bare name, resolving to an import or to its own
  *  top-level declaration in `prefab.ts`. A method that shares the name (`logger.warnInertPrefabSizes(…)`) or a local
  *  function shadowing it is not the warning (#1251 review of d6c713d53). */
@@ -456,11 +462,20 @@ function prefabWriteCensus(): Array<{ file: string; in: string | undefined; warn
   return files.sort().flatMap((abs) => {
     const code = readScannedSource(abs).code;
     if (!code.includes('writePrefabFile')) return [];
-    return callsTo(parseSource(code, path.basename(abs)), 'writePrefabFile').map((call) => ({
-      file: path.relative(ENGINE, abs).split(path.sep).join('/'),
-      in: enclosingNamedFunction(call)?.name,
-      warned: warnedFirst(call),
-    }));
+    const sf = parseSource(code, path.basename(abs));
+    // ⚠️ BOTH names (#1468). The save choke point gained a report-returning sibling —
+    // `writePrefabFileReport` carries the backend's refusal reason out, which a boolean cannot — and
+    // `writePrefabFile` is now a thin wrapper over it. A census that knows only the old name stops
+    // seeing every caller that moves to the new one, which is this guard going quiet rather than
+    // green: `savePrefabEditReport` dropped straight out of it.
+    return [...callsTo(sf, 'writePrefabFile'), ...callsTo(sf, 'writePrefabFileReport')]
+      .map((call) => ({
+        file: path.relative(ENGINE, abs).split(path.sep).join('/'),
+        in: enclosingNamedFunction(call)?.name,
+        warned: warnedFirst(call),
+      }))
+      // The wrapper's own delegation is not a write SITE — it is the same write, named twice.
+      .filter((w) => w.in !== 'writePrefabFile');
   });
 }
 

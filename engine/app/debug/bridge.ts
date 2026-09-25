@@ -15,8 +15,7 @@ import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
 import { setJournalEnabled, getFrameLoopHealth, hasDocKey } from '@modoki/engine/runtime';
 import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
-import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
-import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
+import { installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
 import { domCodeForKey, normalizeKeyName, refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import {
   safeStringify,
@@ -33,7 +32,6 @@ import { deviceAimKeys, type AimGesture } from './domPointContract';
 import type { EntityPointResolution, EntityPointSpec } from './entityPointContract';
 import { entityAimOutcome, type AimRefusal } from './entityAimRefusal';
 import { encodeDeviceRefusal } from '../../tools/shared/deviceRefusal';
-import { histogram } from '../../tools/shared/filterDisclosure';
 
 interface Request {
   id: string;
@@ -274,7 +272,9 @@ async function resolveSelectorPoint(selector: string, gesture: AimGesture | unde
 
 /** Resolve an aim point from an ENTITY (`{guid|name|id, surface}`, #1223 P3), a CSS `selector`
  *  (resolved + occlusion-checked on-device), or screenshot pixel coords (converted via the last
- *  capture) — in that precedence, the editor routes' order (`resolvePoint`). `selKey`/`xKey`/`yKey`
+ *  capture), read in that order. The order is NOT a caller-facing precedence: the device MCP refuses
+ *  a caller's two addresses (#1556), so it only ever arbitrates the entity against the MCP's own
+ *  `ENTITY_AIM_SKEW_SELECTOR`. `selKey`/`xKey`/`yKey`
  *  name the params (tap uses selector/x/y; drag uses fromSelector/fromX/fromY and
  *  toSelector/toX/toY); the entity and `allowOccluded` keys follow from `selKey` (`deviceAimKeys`).
  *  A miss or a covered target returns a refusal (surfaced as isError by the MCP client). */
@@ -673,24 +673,6 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   canvas.dispatchEvent(new PointerEvent('pointerup', ptrInit(to.x, to.y)));
   _log(`[debug-bridge] DRAG → canvas:${how}`);
   return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})${driftAtFrom}${superseded}`);
-}
-
-/** ⚠️ SHAPE CHANGE, coordinated with `engine/tools/game-debug-mcp/src/mcp-tools.ts`'s
- *  `device_console_logs` (the only consumer of this bridge method — do not change one without the
- *  other). Used to return the bare array `consoleRing.query()` produces; now wraps it with
- *  `dropped`, for the same reason the editor's `console-logs` agent op does (see its own comment,
- *  `agentBridge.ts`) — the ring is `[pinned] ++ [tail]`, discontiguous once it wraps, and on device
- *  there is no devtools console to notice the gap any other way. */
-export function handleConsoleLogs(params: Record<string, unknown>): { logs: ReturnType<typeof consoleRing.query>; dropped: number; ringTotal: number; byLevel: Record<string, number> } {
-  const ring = consoleRing.entries;
-  return {
-    logs: consoleRing.query((params.limit as number) || 50, params.level as string | undefined),
-    dropped: getConsoleRingDropped(),
-    // #1214: the WHOLE ring, level filter ignored — the editor `console-logs` op's contract. Without it
-    // `level:'error'` on a ring of 800 warnings printed "No console logs.", i.e. "the game logged nothing".
-    ringTotal: ring.length,
-    byLevel: histogram(ring, (l) => l.level),
-  };
 }
 
 // --- App identity (#88) ---
@@ -1325,7 +1307,6 @@ async function handleMessage(req: Request): Promise<unknown> {
     case 'hover': return await handleHover(p);
     case 'scroll': return await handleScroll(p);
     case 'type-text': return await handleType(p);
-    case 'consoleLogs': return handleConsoleLogs(p);
     case 'app-identity': return await handleAppIdentity();
     // Percept / Enact on device (device_get_scene_state, device_diagnose, device_journal, …).
     // Delegate any other method to the SHARED runtime op registry (engine/app/debug/agentBridge)
@@ -1367,6 +1348,12 @@ async function initNativeBridge() {
   const { GameDebug } = await import('capacitor-game-debug');
   _log('[debug-bridge] Plugin loaded, starting server...');
 
+  // A failed boot start must NOT skip the listener registration below (#1514). It used to rethrow
+  // right here, so neither `appStateChange` nor `request` was ever registered and the bridge stayed
+  // dead until relaunch — no later foreground could retry, and nothing could have answered a request
+  // if one had. The failure is still reported loudly: it is rethrown at the END, into
+  // `initDebugBridge`'s catch, once the lifecycle handler that can recover from it is in place.
+  let bootStartError: unknown = null;
   try {
     const result = await GameDebug.startServer();
     _log('[debug-bridge] Native TCP server listening on port', result.port);
@@ -1385,7 +1372,7 @@ async function initNativeBridge() {
     }
   } catch (e) {
     _err('[debug-bridge] GameDebug.startServer failed:', (e as Error).message);
-    throw e;
+    bootStartError = e;
   }
 
   // THE FOREGROUND APP OWNS THE PORT (#95). Port 9095 is a fixed default shared by every Modoki
@@ -1525,6 +1512,9 @@ async function initNativeBridge() {
   } catch (e) {
     _log('[debug-bridge] getStatus failed:', (e as Error).message);
   }
+
+  // Reported only now, with the lifecycle handler registered: the next foreground retries the bind.
+  if (bootStartError !== null) throw bootStartError;
 }
 
 // --- Public API ---
@@ -1557,7 +1547,8 @@ export function initDebugBridge() {
       // and not the second, and every symptom points at the first.
       _err(
         '[debug-bridge] FAILED to start — the GameDebug TCP server is NOT listening, so every '
-        + 'device_* tool is unreachable for this app. Reason:', (e as Error).message,
+        + 'device_* tool is unreachable for this app until a later foreground re-binds it (#1514: '
+        + 'background and reopen the app to retry). Reason:', (e as Error).message,
         '\n  If that says the debug bridge is disabled, or the plugin is not implemented: the JS '
         + 'side is on (this ran) but the NATIVE gate is off. Reopen the project in the editor, or '
         + 'run healNativeConfig(projectRoot), to sync build.debugBuild into the native project — '

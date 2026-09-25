@@ -94,6 +94,81 @@ died on a package none of them import. **Check `dist/plugin.cjs.js` exists, not 
 if a plugin build fails, run it directly (`npm --prefix <pkg> run build`) — the root install hides
 the real error. Guarded now by `engine/tests/architecture/ambientTypesOptOut.test.ts`.
 
+### A game's lockfile keys the editor's Vite dep cache (#1502)
+
+Vite keys its dep-optimizer cache (`node_modules/.vite/deps/_metadata.json`, or `vite-cache` under
+userData when packaged) on its config plus ONE lockfile: the first one found walking up from its
+root, `engine/`, which is the repo root's. A `games/<id>/package-lock.json` is never that lockfile. So when a game **dropped** a dependency the cache had pre-bundled, the cache stayed
+"valid". The next re-optimize, which fires the first time a new dependency is discovered, rebuilt the
+cached list, hit `ENOENT` on the removed package's source, and wrote nothing. The game then booted
+**DEGRADED**, with 504s on the new dependency's chunk. Seen when #1495/#1496 swapped AdMob for
+AppLovin MAX in Weaveling and Court.
+
+`engine/plugins/projectLockfileHash.ts` now hashes every project's lockfile, plus the open project's
+when it lives outside the repo. `vite.config.ts` puts that hash in
+`optimizeDeps.rolldownOptions.transform.define`. The identifier is inert, since no dependency names
+it. But Vite's `getConfigHash` serialises `rolldownOptions`, so any project's lockfile change now
+logs `Re-optimizing dependencies because vite config has changed`, and `browserHash` moves with it.
+Measured 2026-09-24 with a headless dev server over Weaveling's graph:
+- the pre-fix config reproduces the `ENOENT`;
+- the fixed config re-optimizes clean;
+- an unchanged tree reuses the cache.
+
+⚠️ **This rests on Vite's PRIVATE hashing**: `getConfigHash` is not API, and the manifest's `"vite": "^8.0.5"` lets a
+lockfile refresh change what it serialises. `engine/tests/plugins/projectLockfileHash.test.ts` asks
+the INSTALLED Vite, through a real dev server, whether a changed define moves its cache key. If a
+bump stops hashing it, that test goes red, instead of #1502 quietly coming back. It is skipped on
+win32 because it crashed the Windows CI worker. The hashing is platform-independent, so macOS and
+Linux cover it ([windows.md](windows.md) § Tests, gates and timings, #1529).
+
+**Not covered:** a package deleted from a game's `node_modules` WITHOUT a lockfile change, i.e.
+`npm install` never ran. That is RULE 1, and no cache key catches it. A cache written before this
+fix needs no manual wipe: adding the define changed the config hash, so the first boot re-optimizes.
+
+### Cold dependency scan: the open project's `game.ts` is a scan entry (#1520)
+
+On a cold cache, Vite's dep scan crawls its entries and pre-bundles every package it finds before the
+first page load. The editor loads the game at runtime by URL from the project registry, so with the
+default entries (the HTML only), the scan never saw a game's own packages. Vite found them while the
+game booted, re-optimised, and **reloaded the page**. Observed on Court with `node_modules/.vite`
+moved aside:
+
+```
+[vite] (client) dependencies optimized: @capacitor-firebase/analytics, … capacitor-applovin-max, capacitor-appsflyer, capacitor-modoki-system
+[vite] (client) optimized dependencies changed. reloading
+```
+
+A cold cache follows every lockfile change (see #1502 above), so this hit the first boot after most
+pulls:
+- the dev editor opened the project twice;
+- the gameplay recorder's first render died at boot (#1518; the recorder now also survives such a
+  reload, `docs/gameplay-recorder.md`).
+
+`engine/plugins/projectScanEntries.ts` adds the open project's `game.ts` to `optimizeDeps.entries`,
+in dev and packaged. Measured on the same cold boot: all nine packages are optimised at startup, and
+the recorder reports `bootReloads: 0`. The scan resolves each import from the importing file, as the
+live import does. That is why this needs none of the hand-resolving and aliasing the packaged-only
+`projectNativeSdkDeps` include list in `vite.config.ts` needed (its GOTCHA #2). The list is kept for
+now: the packaged editor has not been re-measured with the scan entry in place.
+
+The explicit list restates Vite's default crawl (`**/*.html` minus `__tests__/` and `coverage/`),
+because setting `entries` replaces it. Project paths are glob-escaped, so a folder named
+`My Game (copy)` matches itself. ⚠️ **Windows, not run:** a project on a different drive from the
+engine gives an absolute pattern. If it fails to match, the fallback is the old one-reload
+behaviour, not a crash.
+
+### The packaged `@modoki/engine` include list takes only `.ts` entries (#1526)
+
+Vite pre-bundles a dependency entry only if it ends in `.js`/`.ts` (or a `c`/`m` form of either), or
+in an extension that `optimizeDeps.extensions` adds. It drops any other entry from `include` and
+prints `Cannot optimize dependency: …` on every boot. #1501 listed `runtime/debug/adsTab`, which
+resolves to `adsDebugTab.tsx`, so the entry did nothing except print that warning. Such a subpath is
+served as source, so a game importing it cannot trigger the mid-session re-optimize the list exists
+to prevent. It stays off the list, and `.tsx` stays off `extensions`, which would widen the optimizer
+for every dependency. `viteConfigEngineOptimizeDeps.test.ts` checks both directions: every listed
+engine subpath is one Vite can pre-bundle, and every one a game imports is listed unless its entry
+cannot be pre-bundled.
+
 ## Native scaffolding: auto on first build
 
 A game with no `ios/`/`android/` yet is **auto-scaffolded on the first native build** —
@@ -689,12 +764,14 @@ Three things that bite:
   merely not included. This is why the build family kept the name `force` while the world-swapping
   tools (`load_scene`, `prefab`, `new_scene`) renamed theirs to `discardUnsaved` — they DESTROY
   that work. Prefer `modoki_save_all` first and pass nothing.
-- **The project must be OPEN in the editor**, and for a device build that open is load-bearing
-  beyond convenience: `healNativeConfig` runs on open and is what actually registers
-  `GameDebugPlugin` and the local-network keys after a `build.debugBuild` change. Set the flag →
-  reopen → *then* build. Build before the reopen and you get an app with no debug bridge, which
-  presents as a lease handshake failure and reads like a network fault. See
-  [qa/README.md](../qa/README.md) § "Device cases".
+- **The project must be OPEN in the editor.** After a `build.debugBuild` change, `healNativeConfig`
+  is what registers `GameDebugPlugin`, puts it in (or takes it out of) the iOS App target and
+  `includePlugins` (#1521), and sets the local-network keys. It runs on open and again at the start
+  of every native build, before `cap sync`, so a build right after flipping the flag picks the
+  change up. A hand-run `gradle`/`xcodebuild` with no heal and no sync in between does not. After
+  flipping ON, the result is an app with no debug bridge, which presents as a lease handshake
+  failure and reads like a network fault. After flipping OFF, it is worse: the store build still
+  carries the bridge, compiled in and registered. See [qa/README.md](../qa/README.md) § "Device cases".
 
 ⚠️ **Several phones of the same platform attached? The install target is whichever device this
 clone has CLAIMED**, and a raw `adb`/`devicectl` command against an unclaimed one is refused by the
@@ -898,6 +975,15 @@ storage objects update …; done`. `kill('SIGTERM')` on that one pid killed the 
 immediately admits. The `(D6)` comments claimed a disconnect left nothing that "can't conflict with
 a retry"; that was never true, and #173's slot only narrowed the window.
 
+**What a step IS (#1537).** A `BuildStep` is one of three kinds — `exec` (program + argv, no
+shell; `winCommand` swaps in `gradlew.bat`), `shell` (only the compound Mac iOS-install steps; text
+built by the `sh` template, every value a `ref()` carried in env), or `inproc` (reveal in
+Finder/Explorer, favicon copy, the release archive clear). A step no longer has a command STRING, so
+no path or config value is ever parsed by bash or cmd.exe; `when` gates one at run time (the CDN
+step runs per extension dist/ actually holds). The custom web deploy command is the one shell text
+the project author writes (`authoredShell`). Why: [windows.md](windows.md) § "Never hand a shell a
+command line".
+
 The fix lives entirely in `engine/plugins/buildStepShell.ts`: posix steps spawn `detached` (their
 own process group) and every abort path calls `killBuildProcess`, which signals `-pid` — SIGTERM,
 then SIGKILL to the group after a 5s grace. Two things fall out for free: a group signal reaches a
@@ -917,7 +1003,8 @@ Windows takes the other road: no `detached` (there it allocates a new **console*
 editor would flash per step) and `taskkill /T /F /PID <pid>`, which walks the tree by parent pid.
 **Validated on a real Windows box (#182)**, and the premise turned out to be worse there than on
 posix: `spawn(cmd, {shell:true})` is `cmd.exe /d /s /c "<command>"`, and Windows has no
-exec-replace, so **every** step carries the extra `cmd.exe` layer — where on posix only the three
+exec-replace, so **every** step carried the extra `cmd.exe` layer (since #1537 only a `shell` step or
+an exec of a `.cmd`/`.bat` — gradlew.bat, npx.cmd — does; an `.exe` like node is spawned directly) — where on posix only the three
 compound steps did. Measured: aborting a real build killed a 5-process, 4-level tree
 (`cmd.exe` → `node build-web.mjs` → `cmd.exe` → `tsc`) in **350ms**, against an **11175ms**
 uninterrupted lifetime in the control run. No console window ever appeared (`MainWindowHandle` 0
@@ -2628,6 +2715,12 @@ No sudo, no tunnel, no manual Developer Disk Image mount is needed on 16.x — m
 8 (16.7.16): kill the running app, `ios install` + `ios launch`, whole cycle ~4s, verified by a new
 pid that outlives the tool.
 
+⚠️ **`ios launch` can fail too** (#1510, 2026-09-24, same iPhone 8, go-ios 1.3.2): it failed twice a
+minute apart with `failed starting process … write unix ->/var/run/usbmuxd: write: broken pipe`,
+and the phone stayed on the home screen. `idevicedebug -u <UDID> run <appId>` launched it fine
+right after. That is a DEBUGGER launch, though, so it is not a stand-in for a home-screen tap when the
+launch mode matters (the ATT prompt, for one; see `games/court/attribution.md` § Phase 3).
+
 ⚠️ **`ios install` is INTERMITTENT, and `ideviceinstaller` is the fallback that has never failed
 here** (2026-08-20, QA-BUILD-0004). The ~4s success above is real and reproducible at other times —
 but the same command also fails outright, and when it does the message points at the wrong thing:
@@ -2874,6 +2967,15 @@ but equally indirect message. Before #199 nothing in the engine managed either n
 project shipped the scaffolder's hardcoded `1` — which only mattered once a project published, and
 then cost a diagnosis cycle.
 
+⚠️ **Change the marketing version in `app.version`, never by hand in `build.gradle` / `project.pbxproj`.**
+The marketing version syncs in BOTH directions from the RESOLVED config, and an absent `app.version`
+resolves to the default `1.0` — so a hand-edited native value is overwritten by the next build, while
+an Xcode archive (which skips the heal) ships the hand-edited one: two build paths, two versions. A
+game's store listing hit exactly this (native files `0.1.0`, config defaulted to `1.0`, and the
+uploaded build did not match the store's version page). `engine/tests/architecture/nativeVersionMatchesConfig.test.ts`
+fails on any project whose committed native value differs from its resolved `app.version` (it skips
+in a checkout with no committed native projects, such as the public engine snapshot).
+
 **The heal never LOWERS a build number.** Lowering is the one direction that is always a mistake,
 and it is exactly what a stale config, a fresh clone, or a forgotten bump would produce on a project
 that has already uploaded. A would-be lowering is reported instead — naming the current value and
@@ -3119,6 +3221,20 @@ Both variants share everything up to the compile — the web bundle, the OTA man
 `cap sync`, the dep heal, the version heal. Only the compile step and the device requirement
 differ, which is why `variant` is a separate parameter rather than two more `BUILD_PLATFORMS`
 values: a release build must never miss a check the debug build gets.
+
+### iOS export compliance: `ITSAppUsesNonExemptEncryption`, per game
+
+A shipping game declares `<key>ITSAppUsesNonExemptEncryption</key><false/>` in its own
+`ios/App/App/Info.plist` if it uses only OS-provided HTTPS/TLS, which is exempt. Without the key,
+App Store Connect asks the encryption question on **every** uploaded build, and a build nobody
+answers sits in "Missing Compliance" (#1531).
+- **It is per game, not a heal default.** `healNativeConfig` patches `Info.plist` key by key and
+  never writes this one, because an engine default would assert an encryption fact about every
+  project.
+- **`npx cap add ios` regenerates `Info.plist` without it.** Court and Weaveling each guard the key
+  with `tests/exportCompliance.test.ts`: present, `false`, and present exactly once, since `plutil`
+  reads the last of any duplicates.
+- A new shipping game copies that test along with the key.
 
 ### The Android upload key
 

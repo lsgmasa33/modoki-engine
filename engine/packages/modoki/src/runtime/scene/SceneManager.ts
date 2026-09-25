@@ -99,11 +99,13 @@ import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline'
 import { ensurePhysicsReady } from '../physics/physicsReady';
 import { clearAllOverrideMarks, getOverrideMarkSet, restoreOverrideMarks } from '../loaders/overrideMarks';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../core/carriedMarkers';
+import { frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../core/ecs/identityParents';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 
 import { Persistent } from '../traits/Persistent';
 import { Time } from '../core/traits/Time';
+import { sceneLoadInFlight } from '../core/takeClock';
 import { Transient } from '../core/traits/Transient';
 import { Input } from '../traits/Input';
 import {
@@ -757,12 +759,20 @@ class SceneManagerImpl implements SceneManager {
       // never sees them, so `Transient` and `TemplateAddedKey` were silently dropped — a runtime pool
       // was saved into the next scene, and a template-added node showed false overrides.
       const carriedMarkers = new Map<number, CarriedMarkers>();
+      // …and the document each carried prefab-instance ROOT was expanded from (#1483). The flat snapshot keeps
+      // every member's `PrefabInstance.localId`, whose meaning is that document; without the record the editor
+      // read the frame as expanded from whatever its cache holds, which a prefab change that caused this very
+      // reload has already replaced — so a kept base's members were diffed against another member's row.
+      const carriedFrameDocs = new Map<number, { source: string; doc: TemplateDoc }>();
+      const carryWorld = getCurrentWorld();
       for (const entry of carriedSnapshots) {
         const old = findEntityById(entry.id);
         const set = old ? getOverrideMarkSet(old) : undefined;
         if (set && set.size > 0) carriedMarks.set(entry.id, [...set]);
         const markers = captureMarkers(old as Parameters<typeof captureMarkers>[0]);
         if (markers) carriedMarkers.set(entry.id, markers);
+        const frameDoc = old ? frameRootDoc(carryWorld, old) : undefined;
+        if (frameDoc) carriedFrameDocs.set(entry.id, frameDoc);
       }
       const persistentOnlySnapshots = carriedSnapshots.filter((e) => e.traits['Persistent'] === true);
       const persistentResources = collectResourceRefsFromEntities(persistentOnlySnapshots);
@@ -977,6 +987,8 @@ class SceneManagerImpl implements SceneManager {
               const keys = carriedMarks.get(oldId);
               if (keys) restoreOverrideMarks(entity as unknown as Entity, keys);
               restoreMarkers(entity as unknown as Parameters<typeof restoreMarkers>[0], carriedMarkers.get(oldId));
+              const frameDoc = carriedFrameDocs.get(oldId);
+              if (frameDoc && nextWorld) noteFrameRootDoc(nextWorld, entity as unknown as Entity, frameDoc);
             },
           },
         );
@@ -2160,6 +2172,11 @@ function reportStartupErrors(scenePath: string, errors: readonly ManagerStartupE
 
 /** The singleton SceneManager. Importers should generally just call sceneManager.loadScene(). */
 export const sceneManager: SceneManager = new SceneManagerImpl();
+
+// The take clock stops while a load is in flight (#1486) — answered from `getNext()`, the state the
+// replay's settle gate waits on, so the recorder and the replay read one thing. Looked up per call,
+// not bound, so a test that stubs `getNext` stubs this too.
+sceneLoadInFlight.provide({ inFlight: () => Boolean(sceneManager.getNext()) });
 
 /** The id of the currently-loaded scene (for scene-scoped resource ownership from
  *  the renderers — e.g. the Text sync acquiring a font not yet in the manifest).

@@ -13,7 +13,6 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
 import { getCurrentWorld, peekCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
 import { isSimRunning, onPlayStateChange, inPreviewSession } from '../../runtime/core/playState';
-import { setSkeletalPreview } from '../../runtime/core/skeletalPreview';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
@@ -70,6 +69,7 @@ import {
   type MarqueeCandidate,
 } from '../scene/marqueeSelect';
 import { resolvePickSelection, pickRequestsReveal, type PickModifiers } from '../scene/pickSelection';
+import { pressReachesCanvas } from '../scene/pickReach';
 import { getCanvas2DRouting, getPaintOrder } from './sceneView2DGraph';
 import { UIRenderer } from '../../runtime/ui/UIRenderer';
 import { useEditorStore } from '../store/editorStore';
@@ -81,7 +81,7 @@ import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBo
 import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
 import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys';
-import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, syncOutlineFor, disposeEdgeOutline, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
+import { computeUIModeNDC, computeFullNDC, viewportDrawRect, transformControlsViewport, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, syncOutlineFor, disposeEdgeOutline, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID, exitPrefabEditing } from '../scene/prefabEdit';
 import { confirmDiscardUnsaved } from '../scene/unsavedGate';
@@ -2935,11 +2935,18 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     const unregGizmo3DHandles = registerHandleProvider((): InteractionHandle[] => {
       const obj = gizmo.object;
       if (!obj || !gizmo.enabled || !(gizmo as { visible?: boolean }).visible) return [];
-      const r = renderer.domElement.getBoundingClientRect();
+      // The camera and rect the gizmo is DRAWN with (UI mode: game camera, letterbox) — #1489.
+      const { camera: viewCam, rect: r } = viewProjection();
       if (!r.width || !r.height) return [];
-      const { gizmoMode, gizmoSpace } = useEditorStore.getState();
+      // The gizmo AS THREE HAS IT, not as the store wants it: the render loop copies the store's
+      // mode/space into TransformControls once per DRAWN frame, so for the frame after a
+      // set_gizmo the store is ahead of the pickers a press would hit. Publishing the store's
+      // space there aimed at a world axis that three still had in local space, and a drag moved
+      // the wrong axis (#1489 close-out, observed once in four smoke runs).
+      const gizmoMode = gizmo.getMode();
+      const gizmoSpace = gizmo.space;
       const project = (p: THREE.Vector3) => {
-        const n = p.clone().project(activeEditorCam);
+        const n = p.clone().project(viewCam);
         return { x: r.left + (n.x * 0.5 + 0.5) * r.width, y: r.top + (-n.y * 0.5 + 0.5) * r.height, z: n.z };
       };
       const origin = obj.getWorldPosition(new THREE.Vector3());
@@ -2955,7 +2962,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         return localBasis ? base.applyQuaternion(q) : base;
       };
       const out: InteractionHandle[] = [];
-      const gizmoCam = (gizmo.camera ?? activeEditorCam) as THREE.PerspectiveCamera | THREE.OrthographicCamera;
+      const gizmoCam = viewCam;
       const camPos = gizmoCam.getWorldPosition(new THREE.Vector3());
       const worldScale = gizmoWorldScale(gizmoCam, camPos, origin, gizmo.size);
       // `project` wants a real Vector3 (it clones + projects); the aim module speaks plain {x,y,z}.
@@ -2976,17 +2983,23 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         : camPos.clone().sub(origin).normalize();
       // Which of three's internal pickers a press would select. Same defensive read as the pick
       // provider below: a rename on upgrade degrades to "cannot tell" rather than throwing.
-      const pickerNameAt = (px: number, py: number): string | null => {
+      // `undefined` = cannot tell (no readable picker); `null` = a press here selects no handle.
+      const pickerNameAt = (px: number, py: number): string | null | undefined => {
         const picker = (gizmo as unknown as { _gizmo?: { picker?: Record<string, THREE.Object3D> } })._gizmo?.picker?.[gizmo.getMode()];
-        if (!picker || !picker.children.length) return null;
+        if (!picker || !picker.children.length) return undefined;
         const n = { x: ((px - r.left) / r.width) * 2 - 1, y: -((py - r.top) / r.height) * 2 + 1 };
         raycaster.setFromCamera(new THREE.Vector2(n.x, n.y), gizmoCam);
-        const hit = raycaster.intersectObjects(picker.children, true)[0];
+        // The first VISIBLE hit, as three's own `intersectObjectWithRay` takes it: the gizmo hides
+        // the pickers of an axis it has flipped or collapsed, and those are not what a press selects.
+        const hit = raycaster.intersectObjects(picker.children, true).find((h) => h.object.visible);
         return hit ? (hit.object.parent?.name || hit.object.name || null) : null;
       };
       if (gizmoMode === 'translate' || gizmoMode === 'scale') {
         for (const ax of ['x', 'y', 'z'] as const) {
-          const aim = axisPickAim({ origin, dir: axisDir(ax), offsetWorld: AXIS_PICKER_CENTER * worldScale, eye, project: projectPlain, reachable });
+          const aim = axisPickAim({
+            origin, dir: axisDir(ax), offsetWorld: AXIS_PICKER_CENTER * worldScale, eye, project: projectPlain, reachable,
+            picksAxis: (p) => { const name = pickerNameAt(p.x, p.y); return name === undefined ? null : name === ax.toUpperCase(); },
+          });
           if (!aim) continue;
           out.push({ id: `gizmo3d:${gizmoMode}:${ax}`, kind: 'gizmo-axis', editor: 'gizmo3d', x: aim.x, y: aim.y, label: `${gizmoMode} ${ax}`, meta: { axis: ax, mode: gizmoMode, space: gizmoSpace, approximate: true, world: [aim.world.x, aim.world.y, aim.world.z] }, owner: renderer.domElement });
         }
@@ -3010,7 +3023,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         const planeAxes: Record<'x' | 'y' | 'z', ['x' | 'y' | 'z', 'x' | 'y' | 'z']> = { x: ['y', 'z'], y: ['z', 'x'], z: ['x', 'y'] };
         for (const ax of ['x', 'y', 'z'] as const) {
           const [ua, va] = planeAxes[ax];
-          const aim = rotateRingAim({ origin, u: axisDir(ua), vAxis: axisDir(va), radius, project: projectPlain, reachable });
+          const aim = rotateRingAim({
+            origin, u: axisDir(ua), vAxis: axisDir(va), radius, project: projectPlain, reachable,
+            picksRing: (p) => { const name = pickerNameAt(p.x, p.y); return name === undefined ? null : name === ax.toUpperCase(); },
+          });
           if (!aim) continue;
           out.push({ id: `gizmo3d:rotate:${ax}`, kind: 'gizmo-axis', editor: 'gizmo3d', x: aim.x, y: aim.y, label: `rotate ${ax}`, meta: { axis: ax, mode: gizmoMode, space: gizmoSpace, approximate: true, world: [aim.world.x, aim.world.y, aim.world.z] }, owner: renderer.domElement });
         }
@@ -3347,17 +3363,15 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       }
       if (!(gizmo as any).enabled || !(gizmo as any).visible) return;
 
-      const r = renderer.domElement.getBoundingClientRect();
-      const ptr = {
-        x: ((event.clientX - r.left) / r.width) * 2 - 1,
-        y: -((event.clientY - r.top) / r.height) * 2 + 1,
-        button: event.button,
-      };
+      // Hit-test with the SAME camera the gizmo renders under AND the rect it is drawn into: the
+      // editor orbit cam over the canvas in 3D view, the game cam inside the letterbox in 2D (`ui`)
+      // view. The camera alone was not enough — NDC over the full canvas while the view is
+      // letterboxed misses the handle by the bar width (#1489, the same split as the aim bug).
+      const view = viewProjection();
+      const ndc = computeFullNDC(event.clientX, event.clientY, view.rect);
+      const ptr = { x: ndc.x, y: ndc.y, button: event.button };
       gizmoMouse.set(ptr.x, ptr.y);
-      // Hit-test with the SAME camera the gizmo renders under (`gizmo.camera`): the editor
-      // orbit cam in 3D view, the game cam in 2D (`ui`) view — else the handle raycast in
-      // 2D view uses the wrong camera and the gizmo (e.g. a billboard bone) can't be grabbed.
-      gizmoRaycaster.setFromCamera(gizmoMouse, modeRef.current === 'ui' ? gameActiveCam : activeEditorCam);
+      gizmoRaycaster.setFromCamera(gizmoMouse, view.camera);
       const mode = useEditorStore.getState().gizmoMode;
       const picker = (gizmo as any)._gizmo?.picker?.[mode];
       const hit = picker && gizmoRaycaster.intersectObject(picker, true).length > 0;
@@ -3373,12 +3387,9 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     function onPointerMoveCapture(event: PointerEvent) {
       if ((gizmo as any).dragging) {
-        const r = renderer.domElement.getBoundingClientRect();
-        const ptr = {
-          x: ((event.clientX - r.left) / r.width) * 2 - 1,
-          y: -((event.clientY - r.top) / r.height) * 2 + 1,
-          button: event.button,
-        };
+        // Same draw rect as the press (below) — see viewProjection() (#1489).
+        const ndc = computeFullNDC(event.clientX, event.clientY, viewProjection().rect);
+        const ptr = { x: ndc.x, y: ndc.y, button: event.button };
         (gizmo as any).pointerMove(ptr);
         event.stopImmediatePropagation();
       }
@@ -3450,10 +3461,11 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       marqueeEl.style.display = 'none';
       controls.enabled = m.prevEnabled; // restore orbit
       if (!m.moved) return; // a shift-click (no drag) → handled by the additive pick in onSelectUp
-      const rect = renderer.domElement.getBoundingClientRect();
+      // 3D view only (the press is gated on mode !== 'ui'), where this is the editor camera over
+      // the canvas — read through viewProjection() anyway, so no site picks its own frame (#1489).
+      const { camera: cam, rect } = viewProjection();
       const minX = Math.min(m.x0, ev.clientX), maxX = Math.max(m.x0, ev.clientX);
       const minY = Math.min(m.y0, ev.clientY), maxY = Math.max(m.y0, ev.clientY);
-      const cam = activeEditorCam;
       const inside: number[] = [];
       const consider = (id: number, obj: THREE.Object3D | undefined) => {
         if (!obj || deactivatedEntities.has(id)) return; // matches click-pick (Three's raycaster skips invisible/deactivated meshes)
@@ -3497,18 +3509,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // including a point outside this viewport's own rect (do not clamp — an out-of-rect point
     // belongs to whichever surface actually covers it, if any).
     function pickEntityAtViewportPoint(clientX: number, clientY: number): number | null {
-      const r = renderer.domElement.getBoundingClientRect();
+      const { camera: activeCam, canvas: r, rect: drawRect } = viewProjection();
       if (clientX < r.left || clientX > r.right || clientY < r.top || clientY > r.bottom) return null;
-      const isUI = modeRef.current === 'ui';
-      // In UI mode the 3D render is letterboxed to the game aspect ratio, so NDC is
-      // computed relative to the letterboxed viewport, not the full canvas. The aspect
-      // comes from the SAME source as the render-side scissor + gameCam projection
-      // (gameRect, F11) so picking can't drift from what's drawn.
-      const { x: mx, y: my } = isUI
-        ? computeUIModeNDC(clientX, clientY, r,
-            gameAspectFromRect(useEditorStore.getState().gameRect, getGameAspect()))
-        : computeFullNDC(clientX, clientY, r);
-      const activeCam = isUI ? gameActiveCam : activeEditorCam;
+      // #1576 — a canvas on top (the Canvas2D pick overlay) absorbs a press it misses and deselects;
+      // this viewport never sees it, so it must not predict one. Always true for `onPointerDown`'s
+      // own press, which this canvas received — see `pickReach.ts`.
+      if (!pressReachesCanvas(renderer.domElement, clientX, clientY)) return null;
+      // In UI mode the 3D render is letterboxed to the game aspect ratio, so NDC is computed
+      // relative to the letterboxed draw rect, not the full canvas — the SAME rect and camera the
+      // bounds provider projects the aim through, so an aim and its pick can't disagree (#1489).
+      const { x: mx, y: my } = computeFullNDC(clientX, clientY, drawRect);
       // A press that lands on the TRANSFORM GIZMO never reaches the selection at all:
       // TransformControls handles it first and starts a drag, and `onPointerDown` below bails
       // while it is dragging. So the honest answer for such a point is "the selection stays as it
@@ -3532,6 +3542,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           if (raycaster.intersectObjects(picker.children, true).length) return gizmoOwner;
         }
       }
+      // Past the gizmo, outside the DRAW rect is "nothing here". In UI mode that is the letterbox
+      // bars: nothing is drawn there, but a ray at NDC beyond ±1 still hits geometry off the game
+      // camera's frame, so a click selected an entity the user could not see (#1489 review). The
+      // gizmo is answered FIRST on purpose: its pickers are larger than the arrows and overhang into
+      // the bar, and a press there really does grab it (both press paths map through the same
+      // rect without clamping) — refusing it here would predict a deselect for a press that drags.
+      if (clientX < drawRect.left || clientX > drawRect.left + drawRect.width
+        || clientY < drawRect.top || clientY > drawRect.top + drawRect.height) return null;
       const { show3D } = layersRef.current;
       // Meshes listed before gizmos so a mesh wins the tie at a shared ancestor. Every map is keyed by
       // entity id and swept on the next pass, so an entry whose owner is dead is left out: its id may
@@ -3626,6 +3644,24 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     const gameOrthoCam = new THREE.OrthographicCamera(-8, 8, 4.5, -4.5, 0.1, 500);
     gameOrthoCam.layers.enable(PARTICLE_LAYER);
     let gameActiveCam: THREE.PerspectiveCamera | THREE.OrthographicCamera = gameCam;
+
+    // The camera this viewport DRAWS with, and the client rect it draws into — the ONE place that
+    // decides either (#1489). UI mode renders through the game camera into a letterbox; 3D mode
+    // through the editor orbit camera over the whole canvas. Everything that maps between a client
+    // point and the scene (the click pick, the aim-rect bounds provider, the gizmo's handles and
+    // its pointer hit-test) reads these, because a site that chose its own camera or rect is how
+    // `modoki_tap` came to aim through the editor camera at a view drawn through the game camera.
+    // Function declarations, so the closures defined above this line can call them.
+    function viewCamera(): THREE.PerspectiveCamera | THREE.OrthographicCamera {
+      return modeRef.current === 'ui' ? gameActiveCam : activeEditorCam;
+    }
+    function viewProjection() {
+      const canvas = renderer.domElement.getBoundingClientRect();
+      const rect = viewportDrawRect(canvas, modeRef.current === 'ui',
+        gameAspectFromRect(useEditorStore.getState().gameRect, getGameAspect()));
+      return { camera: viewCamera(), canvas, rect };
+    }
+    const gizmoViewport = new THREE.Vector4(); // reused by the render loop's gizmo.viewport write
 
     // Publish the game-camera billboard raycast for the 2D overlay's pointer handler. Uses the
     // SAME letterboxed NDC + gameCam as the in-viewport pick3D (`pickEntityAtViewportPoint`'s UI-mode path) so 2D-mode picking
@@ -3830,14 +3866,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     const gizmos = new SceneViewGizmoTable({ scene, shared: new Set([camGizmoPivot]) });
 
     const unregBounds = registerBoundsProvider((ids) => {
-      const r = renderer.domElement.getBoundingClientRect();
       // WHAT is measured (and why an icon gizmo is measured differently from a mesh) lives in
-      // `editor/scene/sceneViewBounds.ts`, where it is unit-tested. Only the live inputs —
-      // this renderer's viewport rect and the active editor camera — belong here.
+      // `editor/scene/sceneViewBounds.ts`, where it is unit-tested. Only the live inputs — the
+      // camera this viewport draws with and the rect it draws into — belong here. Both come from
+      // `viewProjection()`: this used to hard-code the editor camera over the full canvas, so in
+      // UI mode (game camera, letterboxed) every aim landed where the entity was NOT drawn (#1489).
+      const { camera, rect } = viewProjection();
       return computeEntityScreenBounds(
         boundsSourcesOf(renderState, gizmos.owned()),
-        activeEditorCam,
-        { left: r.left, top: r.top, width: r.width, height: r.height },
+        camera,
+        rect,
         'scene-view',
         ids,
       );
@@ -4794,8 +4832,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       const { show3D } = layersRef.current;
 
       // Switch gizmo camera to match the active viewport camera
-      const activeGizmoCam = isUI ? gameActiveCam : activeEditorCam;
+      // …and the rect it is drawn into, for TransformControls' OWN canvas listeners (hover, and the
+      // press SceneView's capture handler lets through): null = full canvas (3D), the letterbox in
+      // UI mode. Without it three maps those over the whole canvas while everything else maps
+      // through the letterbox (#1489 review).
+      const gizmoView = viewProjection();
+      const activeGizmoCam = gizmoView.camera;
       if (gizmo.camera !== activeGizmoCam) gizmo.camera = activeGizmoCam;
+      gizmo.viewport = transformControlsViewport(gizmoView.canvas, gizmoView.rect, gizmoViewport);
 
       // Editor helpers: visible in 3D mode only
       grid.visible = !isUI && showGridRef.current;
@@ -4883,11 +4927,11 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
       // Face any 2.5D billboards toward the camera actually being rendered
       // (UI-mode uses the game cam, otherwise the editor orbit cam).
-      orientBillboards(renderState, isUI ? gameActiveCam : activeEditorCam);
+      orientBillboards(renderState, viewCamera());
 
       // Scoped suppression of Three.js's spurious 'Light node not found' warning
       // (F9) — patched only for this synchronous render call, then restored.
-      withWarnFilter(() => renderer.render(scene, isUI ? gameActiveCam : activeEditorCam));
+      withWarnFilter(() => renderer.render(scene, viewCamera()));
     }
     // Renderer is already inited by makeWebGPURenderer — start the frame loop.
     if (!disposed) {
@@ -4925,7 +4969,6 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       renderer.domElement.removeEventListener('pointermove', onPointerMoveCapture, true);
       renderer.domElement.removeEventListener('pointerup', onPointerUpCapture, true);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
-      setSkeletalPreview(false, 0); // don't leave the runtime preview flag stuck on
       clearSkeletalSeeks(); // drop any timeline scrub-preview seek so a rig isn't pinned to a scrubbed frame
       controls.dispose();
       gizmo.removeEventListener('dragging-changed', onGizmoDraggingChanged);

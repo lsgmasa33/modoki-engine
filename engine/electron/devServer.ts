@@ -110,8 +110,10 @@ function installExitHook(): void {
   exitHookInstalled = true;
   const kill = () => { try { killTree(child); } catch { /* already gone */ } };
   process.on('exit', kill);
-  process.once('SIGINT', () => { kill(); process.exit(130); });
-  process.once('SIGTERM', () => { kill(); process.exit(143); });
+  // No SIGINT/SIGTERM listener: in Electron's main process Chromium owns those signals and quits
+  // through `before-quit` (whose teardown stops Vite, then `app.exit()` fires the hook above). The
+  // listeners that used to sit here never ran — probed live for #1580 with a log line in each, and
+  // a single SIGTERM or SIGINT quit the editor cleanly without either firing.
 }
 
 /**

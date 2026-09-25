@@ -49,7 +49,9 @@ if ! reap_repo_alive "$MAIN" && ! reap_repo_alive "$VITE"; then
 fi
 
 echo "[stop-editor] stopping this clone's editor: $REPO"
-reap_repo_process "$MAIN"
+
+# ONE SIGTERM, to the Electron main process only — see the helper for why a `pkill` loses data (#1580).
+reap_repo_signal_editor_once "$MAIN"
 
 # Give Electron a graceful window to run its exit hooks — that is what takes its OWN Vite
 # down with it, and what makes the launch log's EXIT line appear. Poll rather than sleeping
@@ -60,8 +62,11 @@ reap_repo_process "$MAIN"
 # the last commit — the saved panel layout, panel/expansion state, and the game's
 # `@editor`-namespace PlayerPrefs. Measured 2026-08-19 (docs/player-prefs.md § Gotchas): a
 # value confirmed present in localStorage survives a graceful stop and is GONE after a
-# SIGKILL, at 0s and at 8s after the write, so waiting for the flush is not an option — only
-# letting the process exit on its own is.
+# SIGKILL, at 0s and at 8s after the write. A raw write made seconds before a stop was lost
+# 5 of 7 until #1580. That stop was double-signalled; it now sends one SIGTERM (above) and the
+# write survives (7 of 7; posix only, Windows still force-stops). The force path below still
+# loses it, unless the write was committed first with #335's `modoki:flush-storage-data`
+# (session.flushStorageData).
 #
 # 5s turned out to be short enough that a healthy-but-slow exit hit the force path twice in
 # one session. The trade is deliberately one-sided: a genuinely wedged editor now costs 10
@@ -77,6 +82,8 @@ if reap_repo_alive "$MAIN"; then
   # Say what forcing COSTS. A layout that silently reverts reads as the editor losing your
   # work at random; naming it here is the difference between a known trade and a mystery.
   echo "[stop-editor] editor did not exit gracefully after ${GRACEFUL_POLLS}×0.25s — forcing."
+  echo "[stop-editor]   ⚠️  If it was asking about UNSAVED SCENE EDITS (a stop reaches the same"
+  echo "[stop-editor]       quit question as Cmd+Q), those are discarded too, even after a Cancel."
   echo "[stop-editor]   ⚠️  A forced stop discards this editor's UNCOMMITTED localStorage:"
   echo "[stop-editor]       saved layout, panel state, and the game's @editor PlayerPrefs."
   echo "[stop-editor]       Chromium only commits those on a clean exit. Not a crash — see"
@@ -84,8 +91,8 @@ if reap_repo_alive "$MAIN"; then
   reap_repo_force "$MAIN"
 fi
 
-# Let the Vite the editor owns finish dying before calling it orphaned. Electron's SIGTERM hook
-# SIGKILLs its child (devServer.ts installExitHook), but the child is not reaped the instant the
+# Let the Vite the editor owns finish dying before calling it orphaned. Electron's quit stops it and
+# its process-exit hook SIGKILLs it (devServer.ts installExitHook), but the child is not reaped the instant the
 # parent is — measured, the main process is gone within one 0.25s poll while its Vite lags. Both
 # outcomes have been observed on this machine: sometimes the Vite is gone by the second poll,
 # sometimes it outlives the whole 3s window and really is left behind. So this wait is not a

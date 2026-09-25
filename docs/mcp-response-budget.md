@@ -183,10 +183,36 @@ returns the elision envelope + hint — correct, but it means "give me literally
 longer one call; use `trait=`/`id=`/`limit=`.
 
 The default `limit` applies only when the caller passed none, so an explicit `limit:100000` still
-wins. Implemented at the **route/tool boundary**, not in `dumpSceneState()`:
-`engine/electron/main.ts`'s `/api/capture-gesture` route (`captureGesture`'s Watch sampler)
-calls the `scene-state` op with `trait:'Transform'` — targeted, so it keeps values regardless,
-and the producer is untouched.
+wins. Both defaults live in `dumpSceneState()` (`DEFAULT_INDEX_LIMIT`, `DEFAULT_TARGETED_LIMIT`), so
+the editor and device twins share them.
+
+### Targeted reads: `trait=` selects, and a cap of 20 that says so (#1557)
+
+Two months of transcripts (2026-07-26 → 09-25), grouped by ARGUMENTS, put the tail of this tool on
+**targeted** reads, not on `full`:
+
+| Call | Chars | Why |
+|---|---|---|
+| `trait=CourtConfig` | 35–44k | 274 rows, **273 of them `traits:{}`** — `trait=` projected fields but did not select rows |
+| `name=Account` | 36k | a substring matching 17+ UI entities at ~2k per row, and targeted reads were uncapped |
+| `name=…` (all) | 546k over 101 calls, p90 17k | the heaviest argument group |
+
+So `trait=X` now **selects** the entities that carry X (an unregistered name selects nothing and its
+warning says the name is wrong), and a targeted read defaults to **20** rows. It used to be uncapped
+on purpose — losing rows *silently* would be worse than a large answer — so the cap is never silent
+(owner, 2026-09-25): a capped reply puts `truncated:true` and a hint ("Showing 20 of 37 matches — 17
+MORE are not shown … Pass limit=37 for all of them") **before** `entities`, where a reader skimming the
+rows meets it first. Internal callers that need every match pass an explicit `limit`
+(`editorBackendRouter.ts`'s `isLive` name probe); `wait_for` asks for `limit:1` and reads
+`totalCount`, and `capture_gesture` samples one guid.
+
+### `list_actions` / `device_introspect` — names first (#1557)
+
+Both twins read one op, `game-introspect`. Every row used to carry its param schema — `null` for
+nearly all of them — so "what can I dispatch?" cost a median **5.7k chars** per call (38 calls, 194k in
+the 2026-09-25 transcripts). A bare call now answers `actionCount` + `actions: string[]` + the live
+`readValues`; `name=<substr>` (case-insensitive, as `get_scene_state`'s `name`) returns the matches as
+`{name, params}`, and a miss carries the empty-filter hint naming the closest live action.
 
 ### `get_layout_bounds` — counts-first, `overlaps` opt-in
 
@@ -301,7 +327,7 @@ never in the producer. The ceilings below are **measured** (bytes/entry × ring 
 
 | Tool | Producer (untouched) | Seam | Boundary default | Measured ceiling |
 |---|---|---|---|---|
-| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 + `returnedCount`/`totalCount`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
+| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 bare, oldest 50 after a `since` cursor (#1559) + `returnedCount`/`totalCount`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
 | `watch` (`read`) | `readWatch()` — `WatchTab.tsx`'s `WatchCard` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
 | `journal` | `journalEvents()` — cap `journal.ts`'s `MAX_EVENTS` — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
 | `editor_journal` | `readEditorJournal()` — cap `editorJournal.ts`'s `MAX_EVENTS` | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |
@@ -462,12 +488,14 @@ client that does not resolve JSON-Schema `$ref` saw an untyped field and mis-enc
 nobody should "optimize" the factory into a shared const, independent of what it would or would not
 save in bytes.
 
-**Declined: a briefer `entity` description for `modoki_drag`'s `to` endpoint.** Only `modoki_drag`
-pays the entity-spec blob TWICE — once for `from`, once for `to` — via `makePointSpec`. Giving `to`
-a shorter description than `from` would save ~1,800 chars. Declined: it would add a second
-entity-spec shape to `shapes.ts` that a future tool could reach for wrongly — the same class of
-cleverness the `$ref`-avoidance comment above already warns against. One entity-spec shape, always
-the same wording, is worth more than 1,800 chars.
+**Taken in #1555, after being declined: a briefer `entity` description for drag's `to` endpoint.**
+Drag pays the aim schema TWICE (`from` and `to`) on both servers. The earlier decline argued that a
+second entity-spec SHAPE in `shapes.ts` was cleverness a future tool could reach for wrongly. What
+landed is not a second shape: it is the same factory with `sameAs`, which keeps the structure and
+the `$ref`-free inline object and swaps only the prose for `As \`from.entity\`.`-style pointers. The
+risk the decline named — a pointer used where there is nothing to point at — is now a test failure:
+`mcpDescriptionProse.test.ts` requires every pointer to resolve to a described field in the same
+tool.
 
 ## Definition surface under tool deferral (measured 2026-08-31)
 
@@ -577,9 +605,14 @@ concrete consequences:
   generic `open_editor` whose mode enum costs a round-trip to discover. The view-mode group is also
   incoherent on its own terms — three different `mode` enums, and `set_game_view_device` isn't a
   view mode at all.
-- **Trimming descriptions for size.** Under deferral a description is paid only when its schema is
-  fetched, so shrinking it saves near-nothing — and conventions §11 already says a description "is
-  read far more often than this file."
+- ~~**Trimming descriptions for size.**~~ **REVERSED by measurement (#1555, owner-approved
+  2026-09-25).** The decline rested on "under deferral a description is paid only when its schema is
+  fetched, so shrinking it saves near-nothing." That premise misprices both halves: a loaded schema
+  costs ~958 tokens (median), there were 5,295 loads over two months, and a loaded schema then sits
+  in the prefix and is re-read on EVERY later turn. What was cut is prose that said nothing new:
+  26.8 KB of description strings over 80 B repeated three or more times (15.5 KB after), plus
+  history narrative. That took `DEFINITION_BYTES` from 175,582 to 165,715. The rules that came out of it
+  are conventions §11's last two bullets; a description's CONTENT still outranks its size.
 
 See [mcp-tool-conventions.md](./mcp-tool-conventions.md) § 2a for the tool-name audit this same work
 produced.

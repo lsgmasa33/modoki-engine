@@ -105,7 +105,8 @@ describe('the op enforces it', () => {
   it('still refuses an unknown tool by name, listing what is registered', async () => {
     const r = await runAgentOp('game-tool-call', { name: 'court_nope', args: {} }) as Record<string, unknown>;
     expect(r.ok).toBe(false);
-    expect(r.known).toEqual(['court_load_level']);
+    expect(r.code).toBe('NOT_FOUND');
+    expect(r.options).toEqual(['court_load_level']);
   });
 
   it('reports a throwing handler as a refusal, not a transport failure', async () => {
@@ -124,5 +125,50 @@ describe('game-tools declaration feed', () => {
     // The handler must NOT be serialized — it cannot cross the bridge, and shipping it would make
     // the payload unserializable rather than merely large.
     expect(r.tools[0]).not.toHaveProperty('handler');
+  });
+});
+
+describe('game-tool-call refusals carry a §5 code (#1561)', () => {
+  /** Both MCP servers take the code off the body (`codeFromBody`), so a coded refusal reaches the
+   *  agent as THAT code; an uncoded one arrives as the generic REFUSED_BY_OP. */
+  it('the op\'s own refusals: missing name, unknown key, bad value, a throw', async () => {
+    const missing = await runAgentOp('game-tool-call', { args: {} }) as Record<string, unknown>;
+    expect(missing).toMatchObject({ ok: false, code: 'REFUSED_BY_OP', options: ['court_load_level'] });
+    expect(await call({ levelid: 'g-1' })).toMatchObject({ ok: false, code: 'UNKNOWN_PARAM', options: ['levelId', 'track', 'index', 'settle'] });
+    expect(await call({ track: 'brutal' })).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+    handler.mockImplementationOnce(async () => { throw new Error('boom'); });
+    expect(await call({})).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+  });
+
+  it('a handler\'s §5 code passes through untouched', async () => {
+    handler.mockImplementationOnce(async () => ({ ok: false, code: 'NOT_FOUND', reason: 'no such level', options: ['a'] }) as never);
+    expect(await call({})).toEqual({ ok: false, code: 'NOT_FOUND', reason: 'no such level', options: ['a'] });
+  });
+
+  it('a refusal by `error` alone (no ok:false) is a refusal too — the servers fail it (#1561 re-review)', async () => {
+    handler.mockImplementationOnce(async () => ({ error: 'no level', code: 'INVALID' }) as never);
+    const r = await call({});
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(String(r.reason)).toMatch(/returned code "INVALID"/);
+  });
+
+  it('a code OUTSIDE §5 is not dropped silently: sent as REFUSED_BY_OP, and the reply says why', async () => {
+    handler.mockImplementationOnce(async () => ({ ok: false, code: 'INVALID', reason: 'bad level' }) as never);
+    const r = await call({});
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(String(r.reason)).toMatch(/^bad level \(game tool 'court_load_level' returned code "INVALID", which is not a §5 error code/);
+  });
+
+  it('a successful reply, or one with no code, is not touched', async () => {
+    handler.mockImplementationOnce(async () => ({ ok: true, levels: [] }) as never);
+    expect(await call({})).toEqual({ ok: true, levels: [] });
+    handler.mockImplementationOnce(async () => ({ ok: false, reason: 'not loaded' }) as never);
+    expect(await call({})).toEqual({ ok: false, reason: 'not loaded' });
+    // A SUCCESS may carry a `code` of its own — a key code, a locale — and it is the game's answer,
+    // not a §5 refusal code (#1561 review).
+    for (const reply of [{ pressed: true, code: 'KeyA' }, { ok: true, code: 'en-US' }]) {
+      handler.mockImplementationOnce(async () => reply as never);
+      expect(await call({})).toEqual(reply);
+    }
   });
 });

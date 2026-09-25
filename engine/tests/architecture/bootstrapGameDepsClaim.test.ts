@@ -19,7 +19,7 @@ import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../scripts');
 const SCRIPTS = [
   'bootstrap-game-deps.mjs', 'projectRoots.mjs', 'projectNeedsInstall.mjs', 'loadVendorPlugins.mjs',
-  'buildClaimsStore.mjs', 'deviceClaimsStore.mjs', 'pathIdentity.mjs',
+  'buildClaimsStore.mjs', 'deviceClaimsStore.mjs', 'pathIdentity.mjs', 'winSpawn.mjs',
 ];
 
 let repo: string;

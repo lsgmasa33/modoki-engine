@@ -182,6 +182,13 @@ export function preservedVersion(verdict: FormatVerdict, current: number): numbe
  * read the fields it understands and carry the rest through untouched. #735 and #763 each
  * hand-rolled this bag, **in the same game**, and review still caught a real defect in the second
  * one — which is why it is shared now rather than transcribed a third time.
+ *
+ * ⚠️ **Prefer DERIVING `known` from the literal you are about to write** — `Object.keys(known)` —
+ * over a hand-kept constant beside it (#1468). A transcribed list is a claim that goes wrong in
+ * BOTH directions: it drops a field added to the writer above it, and it silently claims one that
+ * was removed. The two IAP callers keep a constant because their known object is assembled across
+ * two functions; where the writer is one literal, derive it. Neither list is stale today — this is
+ * the shape to reach for next time, not a defect report.
  */
 export function collectUnknownFields(
   raw: unknown,

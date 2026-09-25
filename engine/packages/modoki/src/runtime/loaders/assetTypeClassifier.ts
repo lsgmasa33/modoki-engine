@@ -52,6 +52,30 @@ export function classifyJsonAssetSuffix(pathOrName: string): string | null {
   return null;
 }
 
+/** Classify a JSON asset by its asset URL the way the MANIFEST does — the suffix table, plus the
+ *  three rules only a path can answer: `.layout.json`, and the LEGACY folder conventions (issue #54)
+ *  that type a plain `.json` under `/scenes/` as a scene and one under `/materials/` as a material.
+ *  The scanner's `detectType` and every "never cross kinds" check (#1472) call THIS, so a kind check
+ *  cannot disagree with the type the next scan will give the file.
+ *
+ *  ⚠️ Takes an asset URL (`/assets/scenes/x.json`, forward slashes), never an absolute disk path:
+ *  the folder rules are substring tests, and a disk path's own `/scenes/` or `/materials/` component
+ *  (or a Windows backslash) would answer for the wrong reason. A caller with no URL passes the name
+ *  to `classifyJsonAssetSuffix` instead. */
+export function classifyJsonAssetPath(url: string): string | null {
+  // The two exclusions `detectType` makes before it gets here, carried in so a kind check calling
+  // this directly cannot type what the scan never indexes (close-out review): only `.json` is a JSON
+  // asset, and a sidecar — `.meta.json`, `.meta.local.json` — is metadata ABOUT an asset. (The
+  // quarantined `.meta.json.corrupt` already fails the first test.)
+  if (!url.endsWith('.json') || url.endsWith('.meta.json') || url.endsWith('.meta.local.json')) return null;
+  if (url.endsWith('.layout.json')) return 'layout';
+  const bySuffix = classifyJsonAssetSuffix(url);
+  if (bySuffix) return bySuffix;
+  if (url.includes('/scenes/') || url.endsWith('/scene.json')) return 'scene';
+  if (url.includes('/materials/')) return 'material';
+  return null;
+}
+
 /** Shippable BINARY asset kinds keyed by extension — the GUID-referenced runtime
  *  assets whose type BOTH the scanner and the tree-shaker must agree on (drift here
  *  is the exact `.anim.json` failure via the binary path: a kind the scanner ships

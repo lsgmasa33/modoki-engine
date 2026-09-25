@@ -98,7 +98,7 @@ export const review = {
  */
 export const ads = {
   async initAds(): Promise<void> {},
-  // The AdMob surface both games export (#1309, #1312): the banner as per-frame desired state, a synchronous readiness
+  // The ad surface both games export (#1309, #1312; AppLovin MAX in both since #1495/#1496): the banner as per-frame desired state, a synchronous readiness
   // read for the "watch a video" button, and UMP's privacy-options row — all "nothing here".
   setBannerVisible(_visible: boolean): void {},
   rewardedReady(): boolean { return false; },
@@ -106,7 +106,27 @@ export const ads = {
   interstitialReady(): boolean { return false; },
   // #1379 — the purchase card waits while an ad is up; a playable never shows one.
   fullscreenAdShowing(): boolean { return false; },
+  // #1474/#1501 — both games' debug-menu Ads tab is built over `ads.adsDebug` (the engine's `createAdDebug`).
+  // A playable has no debug menu and no SDK, so the tab is never rendered; this keeps the value both
+  // games hand to `createAdsDebugTab` at module load complete and inert.
+  adsDebug: {
+    setBannerVisible(_visible: boolean): void {},
+    async showFullscreen(_kind: string, _placement: string): Promise<boolean> { return false; },
+    isReady(_kind: string): boolean { return false; },
+    setOverride(_patch: Record<string, unknown>): void {},
+    async showNow(_kind: string): Promise<boolean> { return false; },
+    status() {
+      return {
+        initialized: false, interstitialLoaded: false, rewardedLoaded: false, fullscreenShowing: false,
+        gameWantsBanner: false, override: { banner: 'auto' as const, interstitial: true, rewarded: true },
+      };
+    },
+    hasMediationDebugger: false,
+    async openMediationDebugger() { return { opened: false, message: 'no ad SDK in a playable' }; },
+  },
   bannerHeightPx(): number { return 0; },
+  // #1477 — a playable never requests a banner (its strip is always donated), so nothing ever fails.
+  bannerFailures(): number { return 0; },
   privacyOptionsRequired(): boolean { return false; },
   async showPrivacyOptions(): Promise<void> {},
   cleanupAds(): void {},

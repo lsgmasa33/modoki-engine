@@ -800,3 +800,74 @@ describe('the load heal re-keys an edited template-keyed reference node (#1438)'
     expect(keyAt('KyRoot/InnerRoot/LeafyRoot/Tip')).toBe('');
   });
 });
+
+describe('remintSceneEntityGuids — a member ROW is rebuilt unconditionally (#1468 D3/R6)', () => {
+  const NODE_A = 'eeeeeeee-0000-4000-8000-0000000000a1';
+  const NODE_B = 'eeeeeeee-0000-4000-8000-0000000000a2';
+  const PINNED = 'eeeeeeee-0000-4000-8000-0000000000b1';
+  const DIVERGED = 'eeeeeeee-0000-4000-8000-0000000000b2';
+
+  /** A scene holding one instance whose entry carries member rows, plus a ref at each row's guid. */
+  const sceneWithRows = (): Record<string, unknown> => ({
+    version: 16, entities: [
+      {
+        id: 1, prefab: OUTER, guid: ROOT,
+        traits: { EntityAttributes: { name: 'Root', parentId: 0 } },
+        members: { [`/${NODE_A}`]: { guid: PINNED, name: 'A' }, [`/${NODE_B}`]: { guid: DIVERGED, name: 'B' } },
+      },
+      {
+        id: 2, traits: {
+          EntityAttributes: { name: 'Ref', parentId: 0, guid: 'eeeeeeee-0000-4000-8000-0000000000c1' },
+          UIAction: { bindings: [{ target: PINNED }, { target: DIVERGED }] },
+        },
+      },
+    ],
+  });
+  const rowsOf = (copy: Record<string, unknown>) =>
+    ((copy.entities as { members?: Record<string, { guid: string }> }[])[0].members)!;
+  const targetsOf = (copy: Record<string, unknown>) =>
+    ((copy.entities as { traits: { UIAction?: { bindings: { target: string }[] } } }[])[1].traits.UIAction!.bindings).map((b) => b.target);
+
+  it('gives every row a guid the original does not have, whether or not it was derivable', () => {
+    // Neither of these guids is anything this file's prefabs derive — they stand for a row whose
+    // stored value diverged from derivation, which is the case rows exist FOR. Before #1468 the copy
+    // kept both verbatim, so two scene files named one entity (#1293).
+    const copy = remintSceneEntityGuids(sceneWithRows() as never, gen, (g) => prefabs.get(g)) as Record<string, unknown>;
+    const rows = rowsOf(copy);
+    expect(rows[`/${NODE_A}`].guid).not.toBe(PINNED);
+    expect(rows[`/${NODE_B}`].guid).not.toBe(DIVERGED);
+    expect(rows[`/${NODE_A}`].guid).not.toBe(rows[`/${NODE_B}`].guid);
+  });
+
+  it('re-points every reference to a row at the row`s new guid', () => {
+    const copy = remintSceneEntityGuids(sceneWithRows() as never, gen, (g) => prefabs.get(g)) as Record<string, unknown>;
+    // Both halves, because consistency ALONE is true before the fix as well — with nothing reminted,
+    // the refs and the rows agree on the old value and this passed vacuously (found by mutation).
+    expect(targetsOf(copy)).not.toEqual([PINNED, DIVERGED]);
+    expect(targetsOf(copy)).toEqual([rowsOf(copy)[`/${NODE_A}`].guid, rowsOf(copy)[`/${NODE_B}`].guid]);
+  });
+
+  it('moves each row`s GUID while leaving its KEY alone', () => {
+    // A copy instantiates the same template, so its members ARE the same template nodes: the key is
+    // the template's identity and remapping it would orphan every row against a template that never
+    // changed. The guid is the SCENE's identity and must move.
+    //
+    // ⚠️ Asserted as a pair, because the key half alone cannot fail. It is protected twice over and
+    // independently — `remapGuidValues` rewrites string VALUES only, and a node guid is never in the
+    // remap to begin with — so no mutation of this module can move it. Measured, after a first
+    // version of this test claimed otherwise: making `remapGuidValues` rewrite object keys left it
+    // green, and so did making this walk `define()` every key component. Pairing it with the guid
+    // gives the test a way to fail (the rows-not-reminted mutation) and still records the invariant
+    // where a future author would be tempted to break it.
+    const copy = remintSceneEntityGuids(sceneWithRows() as never, gen, (g) => prefabs.get(g)) as Record<string, unknown>;
+    expect(Object.keys(rowsOf(copy)).sort()).toEqual([`/${NODE_A}`, `/${NODE_B}`].sort());
+    expect(rowsOf(copy)[`/${NODE_A}`].guid).not.toBe(PINNED);
+  });
+
+  it('rebuilds rows even with no prefab reader, where member REFS cannot follow', () => {
+    // The two halves are independent: refs follow only when the prefabs can be read (#1324), but a
+    // shared row guid is a collision whether or not anything can be read, so it must not depend on it.
+    const copy = remintSceneEntityGuids(sceneWithRows() as never, gen) as Record<string, unknown>;
+    expect(rowsOf(copy)[`/${NODE_A}`].guid).not.toBe(PINNED);
+  });
+});

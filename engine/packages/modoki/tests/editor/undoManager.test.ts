@@ -553,3 +553,110 @@ describe('getEditVersion (C7)', () => {
     expect(getEditVersion()).toBe(afterRealEdit); // unchanged — still reads as dirty
   });
 });
+
+/** #1579 — a user world switch refuses undo/redo for its whole length, and hands back the step already running so it
+ *  can wait for it. Mutations: drop `undoRefusedReason`'s world-switch clause — the refusal case goes red; return a
+ *  null `idle` unconditionally — the idle case goes red; skip the release's decrement — the release case goes red. */
+describe('beginWorldSwitch (#1579)', () => {
+  it('refuses an undo and a redo while a switch is open, moving neither stack', async () => {
+    const { pushAction, undo, undoStep, beginWorldSwitch, canUndo, canRedo } = await getUndoManager();
+    pushAction({ label: 'A', undo: () => {}, redo: () => {} });
+    pushAction({ label: 'B', undo: () => {}, redo: () => {} });
+    await undo(); // B → redo, so both directions have something to refuse
+
+    const sw = beginWorldSwitch();
+    expect((await undoStep('undo')).refused).toMatch(/scene switch is in progress/);
+    expect((await undoStep('redo')).refused).toMatch(/scene switch is in progress/);
+    expect(canUndo()).toBe(true);
+    expect(canRedo()).toBe(true);
+    sw.release();
+    sw.release(); // a second release must not open a second switch's refusal
+    expect((await undoStep('undo')).did).toBe(true);
+  });
+
+  it('a step queued before the switch but not yet running is refused when its turn comes', async () => {
+    const { pushAction, undoStep, beginWorldSwitch } = await getUndoManager();
+    let open!: () => void;
+    const gate = new Promise<void>((r) => { open = r; });
+    pushAction({ label: 'A', undo: () => {}, redo: () => {} });
+    pushAction({ label: 'B', undo: () => gate, redo: () => {} });
+    const running = undoStep('undo'); // B, parked on its gate
+    const queued = undoStep('undo'); // A, behind it
+    for (let i = 0; i < 5; i++) await Promise.resolve(); // B starts running (a step is decided when it runs)
+
+    const sw = beginWorldSwitch();
+    open();
+    expect((await running).did).toBe(true); // already running: it finishes
+    expect((await queued).refused).toMatch(/scene switch/); // its turn came inside the switch
+    sw.release();
+  });
+
+  it('idle is the step in flight, and null when there is none', async () => {
+    const { pushAction, undo, beginWorldSwitch } = await getUndoManager();
+    const none = beginWorldSwitch();
+    expect(none.idle).toBeNull();
+    none.release();
+
+    let open!: () => void;
+    const gate = new Promise<void>((r) => { open = r; });
+    let finished = false;
+    pushAction({ label: 'A', undo: async () => { await gate; finished = true; }, redo: () => {} });
+    const step = undo();
+    for (let i = 0; i < 5; i++) await Promise.resolve(); // it starts running
+    const sw = beginWorldSwitch();
+    expect(sw.idle).not.toBeNull();
+    let idleResolved = false;
+    void sw.idle!.then(() => { idleResolved = true; });
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(idleResolved).toBe(false); // still waiting on the step
+    open();
+    await sw.idle;
+    expect(finished).toBe(true);
+    await step;
+    sw.release();
+  });
+});
+
+/** #1579 close-out review — a step that never settles would hold every world switch silently. Mutation: drop the
+ *  timer — the first case goes red; drop the clear on settle — the second goes red. */
+describe('beginWorldSwitch stall warning (#1579)', () => {
+  it('warns once when a switch has waited past the threshold for the step in flight', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { pushAction, undo, beginWorldSwitch, WORLD_SWITCH_STALL_WARN_MS } = await getUndoManager();
+      pushAction({ label: 'Hangs', undo: () => new Promise<void>(() => {}), redo: () => {} });
+      void undo();
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      const sw = beginWorldSwitch();
+      vi.advanceTimersByTime(WORLD_SWITCH_STALL_WARN_MS + 1);
+      expect(warn.mock.calls.filter((c) => /scene switch has waited/.test(String(c[0])))).toHaveLength(1);
+      sw.release();
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not warn when the step settles in time', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { pushAction, undo, beginWorldSwitch, WORLD_SWITCH_STALL_WARN_MS } = await getUndoManager();
+      let open!: () => void;
+      pushAction({ label: 'Quick', undo: () => new Promise<void>((r) => { open = r; }), redo: () => {} });
+      const step = undo();
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      const sw = beginWorldSwitch();
+      open();
+      await step;
+      await sw.idle;
+      vi.advanceTimersByTime(WORLD_SWITCH_STALL_WARN_MS + 1);
+      expect(warn.mock.calls.filter((c) => /scene switch has waited/.test(String(c[0])))).toHaveLength(0);
+      sw.release();
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});

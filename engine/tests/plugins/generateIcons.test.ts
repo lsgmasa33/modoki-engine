@@ -621,8 +621,8 @@ describe('generate-icons reads project.config.json (#1011, at the seam)', () => 
   beforeEach(() => {
     binDir = makeScratchDir('modoki-fakebin-');
     fs.writeFileSync(path.join(binDir, 'npx'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
-    // ⚠️ The `.cmd` sibling is not belt-and-braces. `generate-icons.mjs` spawns with
-    // `shell: process.platform === 'win32'`, so cmd.exe resolves by PATHEXT and skips an
+    // ⚠️ The `.cmd` sibling is not belt-and-braces. `generate-icons.mjs` spawns through `toSpawn`,
+    // which resolves a bare name by PATHEXT on Windows and skips an
     // EXTENSIONLESS `npx` entirely — falling through to the REAL one. These tests would then
     // download `@capacitor/assets@3.0.5` from inside the gate, on every run. Their assertions would
     // still pass (the staging and the facet-B delete both happen before the spawn), so it would
@@ -1006,9 +1006,9 @@ describe('the editor tells the generator what only it knows (#1011, producer sid
     // — the last of which matters most, because the build then shifts the flag-carrying step away.
     // `(?:, …)?` — the prefix steps also name their platform (MODOKI_NATIVE_PLATFORM, #1062); what this
     // pins is only that the icons flag rides along.
-    const planSteps = scanner.match(/build-web\.mjs --target native', env: \{ MODOKI_ICONS_HANDLED: '1'(?:, [^}]*)? \}/g) ?? [];
+    const planSteps = scanner.match(/'engine\/scripts\/build-web\.mjs', '--target', 'native'\], \{ env: \{ MODOKI_ICONS_HANDLED: '1'(?:, [^}]*)? \} \}/g) ?? [];
     expect(planSteps.length, 'both the iOS and Android prefix steps must carry it').toBe(2);
-    const runners = scanner.match(/env: \{ \.\.\.buildEnv, MODOKI_ICONS_HANDLED: '1'(?:, [^}]*)? \}/g) ?? [];
+    const runners = scanner.match(/spawnBuildStep\(execStep\(label, cwd, command, args\), \{ \.\.\.buildEnv, MODOKI_ICONS_HANDLED: '1'(?:, [^}]*)? \}/g) ?? [];
     expect(runners.length, 'both scaffold runners must carry it').toBe(2);
   });
 
@@ -1030,7 +1030,8 @@ describe('the editor tells the generator what only it knows (#1011, producer sid
 
   it('does not leave a bare build-web native step behind — that step would generate twice', () => {
     // The failure this guards: someone adds a third native entry point and copies the OLD line.
-    const bare = scanner.match(/'node engine\/scripts\/build-web\.mjs --target native', cwd:/g) ?? [];
+    // The plan's shape (#1537): an execStep with the build-web argv and NO options object after it.
+    const bare = scanner.match(/execStep\('Building web assets\.\.\.', buildCwd, 'node', \['engine\/scripts\/build-web\.mjs', '--target', 'native'\]\)/g) ?? [];
     expect(bare, 'a --target native build-web step with no MODOKI_ICONS_HANDLED').toHaveLength(0);
   });
 });

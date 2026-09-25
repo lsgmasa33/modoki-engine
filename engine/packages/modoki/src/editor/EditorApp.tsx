@@ -34,11 +34,13 @@ import BuildSupportDialog from './panels/BuildSupportDialog';
 import CleanupAssetsDialog from './panels/CleanupAssetsDialog';
 import FindReferencesDialog from './panels/FindReferencesDialog';
 import PublishOtaDialog from './panels/PublishOtaDialog';
+import RenderTakeUI from './panels/RenderTakeDialog';
 import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
 import { runSaveAll, toastForSave } from './scene/saveCommand';
 import { confirmDiscardUnsaved, answerUnsavedGateRequest } from './scene/unsavedGate';
-import { enterPlay, pausePlay } from './scene/playMode';
+import { pausePlay } from './scene/playMode';
+import { pressPlay } from './scene/playPressFeedback';
 import { getPlayState, setPlayState, getRunMode, onRunModeChange } from '../runtime/core/playState';
 import { useEditorStore } from './store/editorStore';
 import { setActionCallback } from './undo/entityActions';
@@ -325,9 +327,10 @@ export default function EditorApp() {
           // which panel has focus AND while the game is running (the game samples plain keys,
           // so it ignores a meta-chord — no conflict, no double-handling). Reads the LIVE play
           // state: Stopped → enter Play (snapshots the authored world), Playing → Pause,
-          // Paused → resume — via the same enterPlay/pausePlay the toolbar buttons use.
+          // Paused → resume — via the same pressPlay/pausePlay the toolbar buttons use (a refused
+          // Play raises a toast, #1577).
           if (getPlayState() === 'playing') pausePlay();
-          else void enterPlay();
+          else void pressPlay();
         },
       }),
       // Undo/redo edit the AUTHORED scene; during Play/Pause, and for a scene edit inside a
@@ -805,6 +808,7 @@ export default function EditorApp() {
       <FindReferencesDialog />
       <BuildSupportDialog />
       <PublishOtaDialog />
+      <RenderTakeUI />
       <OtaKeysDialog />
       {showLoad && <LoadLayoutModal onClose={() => setShowLoad(false)} />}
       {showSaveAs && <SaveLayoutAsModal initial={currentLayoutName() || 'default'} onSave={saveLayoutAs} onExport={(name) => { const m = modelRef.current; if (m) downloadLayoutJson(name, m.toJson()); }} onClose={() => setShowSaveAs(false)} />}

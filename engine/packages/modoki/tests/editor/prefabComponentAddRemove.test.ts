@@ -9,6 +9,7 @@
  *     instance gains it on refresh (no clobbering of unrelated state). */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { setRunMode as setRunModeForAuthoring } from '../../src/runtime/core/playState';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -132,6 +133,10 @@ const rootMember = (root: number, localId: number): any => {
 const shipRoots = (): number[] => {
   const out: number[] = []; testWorld.query(PrefabInstance).updateEach(([pi], e) => { const p = pi as any; if (p.source === SHIP && p.rootInstanceId === e.id()) out.push(e.id()); }); return out;
 };
+
+// The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing), and
+// every writer of the live world refuses outside an authored world (#1548) — so the premise is stated.
+beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('remove a prefab component from an instance', () => {
   it('captures it as removedTraits', async () => {

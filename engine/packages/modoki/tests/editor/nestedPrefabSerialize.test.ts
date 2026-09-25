@@ -41,6 +41,9 @@ function readTraitDataImpl(id: number, meta: any) {
 }
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  // #1461: tagEntityTreeAsInstance now stamps member guids, and applyGuidRemap re-indexes each
+  // renamed entity. This mock is an explicit list, so a new reachable export must be named here.
+  indexEntityGuid: () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
@@ -106,7 +109,7 @@ const outerPrefab = {
 
 describe('serializePrefab — nested prefabs', () => {
   it('writes a nested instance as ONE reference row; inner members do not leak', async () => {
-    const { instantiatePrefab, setPrefabCache, setPrefabSource, serializePrefab } = await getModule();
+    const { instantiatePrefab, setPrefabCache, setPrefabSource, serializePrefab, PREFAB_FORMAT_VERSION } = await getModule();
     setPrefabCache(INNER, innerPrefab as any);
     setPrefabCache(OUTER, outerPrefab as any);
 
@@ -115,7 +118,13 @@ describe('serializePrefab — nested prefabs', () => {
 
     const out = serializePrefab(outerRoot, OUTER)!;
     expect(out).not.toBeNull();
-    expect(out.version).toBe(4);
+    // Read from the constant, not a literal (#1468's 4 → 5 bump found both of these). What this
+    // asserts is that the serializer stamps the CURRENT version even though the prefab nests one —
+    // the rule #379 replaced was `nestedRefs.size > 0 ? 2 : 1`, which derived the field from content
+    // and could go backwards. Which NUMBER the constant holds is pinned once, deliberately, by the
+    // literal in `tests/e2e/editor-hierarchy.spec.ts`; a second literal here would only be another
+    // place to forget on the next bump.
+    expect(out.version).toBe(PREFAB_FORMAT_VERSION);
     // O1 + O2 + one nested-ref row (named after the inner root 'Hull') = 3.
     // The inner CHILD 'Bolt' must be gone (it expands from the child file).
     expect(out.entities).toHaveLength(3);
@@ -165,7 +174,7 @@ describe('Create-Prefab-on-a-child then save outer → nested reference (regress
   // is GUID-only), so saving the OUTER prefab references it instead of flattening.
   it('serializes the just-created child prefab as a reference row, not flattened', async () => {
     const mani = await import('../../src/runtime/loaders/assetManifest');
-    const { serializePrefab, setPrefabCache, tagEntityTreeAsInstance } = await getModule();
+    const { serializePrefab, setPrefabCache, tagEntityTreeAsInstance, PREFAB_FORMAT_VERSION } = await getModule();
 
     // Live edit world: a plain "Ship" root with a plain "Flame" child.
     const ship = testWorld.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Ship', parentId: 0, guid: 'g-ship' }));
@@ -183,7 +192,7 @@ describe('Create-Prefab-on-a-child then save outer → nested reference (regress
 
     // --- Now save the OUTER prefab (the Ship) ---
     const out = serializePrefab(ship.id(), 'g-ship-prefab')!;
-    expect(out.version).toBe(4);
+    expect(out.version).toBe(PREFAB_FORMAT_VERSION);
     const ref = out.entities.find((e) => e.prefab);
     expect(ref, 'Flame should be a nested reference row, not flattened').toBeTruthy();
     expect(ref!.prefab).toBe(childPrefab.id);

@@ -17,7 +17,7 @@
  * node_modules already exists — see the comment on the loop for why that skip was wrong.
  *
  * Mirrors bootstrap-game-deps.mjs mechanically (execFileSync as a completed child process →
- * sidesteps npm #4828, shell:true on Windows for npm.cmd).
+ * sidesteps npm #4828; npm.cmd on Windows through winSpawn's toSpawn, never shell:true — #1537).
  */
 
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
@@ -25,12 +25,15 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { projectNeedsInstall } from './projectNeedsInstall.mjs';
+import { toSpawn } from './winSpawn.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const toolsDir = path.join(repoRoot, 'engine', 'tools');
 
-const isWindows = process.platform === 'win32';
-const npmRun = (args, cwd) => execFileSync('npm', args, { cwd, stdio: 'inherit', shell: isWindows });
+const npmRun = (args, cwd) => {
+  const s = toSpawn('npm', args);
+  execFileSync(s.command, s.args, { ...s.options, cwd, stdio: 'inherit' });
+};
 
 if (!existsSync(toolsDir)) process.exit(0);
 

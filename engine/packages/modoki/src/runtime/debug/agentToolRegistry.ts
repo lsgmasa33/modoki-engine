@@ -51,8 +51,9 @@ export interface AgentToolDef {
   /** The tool's FULL name, exactly as it will appear over MCP (e.g. `court_load_level`).
    *
    *  The game supplies the whole name rather than a bare verb the engine namespaces, so there is
-   *  no synthesized prefix that can drift from what the agent actually calls. The convention —
-   *  and the bridge enforces it — is `<gameId>_<verb>`. */
+   *  no synthesized prefix that can drift from what the agent actually calls. The convention is
+   *  `<gameId>_<verb>`, checked STATICALLY by `tests/architecture/gameAgentToolNames.test.ts` —
+   *  not at runtime, since this registry cannot tell which game is calling (docs/agent-tools.md). */
   name: string;
   /** What the tool does, in the CALLER's terms. This is the only thing an agent sees before
    *  choosing it, so say what question it answers and what it returns. */
@@ -76,7 +77,9 @@ export interface AgentToolDef {
   requiresPlaying?: boolean;
   /** Runs in the renderer with the game's own imports in scope. Return a JSON-serializable
    *  answer. Convention (`docs/mcp-tool-conventions.md` §5): on a refusal return
-   *  `{ ok:false, reason, ...options }` — naming what would have worked — rather than throwing. */
+   *  `{ ok:false, code?, reason, options? }` — naming what would have worked — rather than throwing.
+   *  `code` is one of §5's closed set (NOT_FOUND, AMBIGUOUS, …); omit it for a state refusal. One
+   *  outside the set is sent as REFUSED_BY_OP with a note (`docs/agent-tools.md` § Handler conventions). */
   handler: (args: Record<string, unknown>) => unknown | Promise<unknown>;
 }
 
@@ -157,6 +160,41 @@ export function listAgentTools(): readonly AgentToolDef[] {
 export function getAgentTool(name: string): AgentToolDef | undefined {
   if (!isDebugMenuEnabled()) return undefined;
   return tools.get(name);
+}
+
+/** A full-match finite decimal — the same rule as `engine/tools/shared/coerceArgs.ts`'s
+ *  `decodeStringEncoded`. A COPY, because the MCP packages bundle standalone and import nothing
+ *  from the engine; the parity table at the end of `engine/tests/tools/coerceStringEncoded.test.ts` holds the two to one rule. */
+const DECIMAL = /^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+/** Finite, and an integer-looking string stays exact — `"12345678901234567890"` would round. */
+const isLosslessDecimal = (s: string): boolean => {
+  if (!DECIMAL.test(s)) return false;
+  const n = Number(s);
+  return Number.isFinite(n) && !(/^-?\d+$/.test(s) && !Number.isSafeInteger(n));
+};
+
+/**
+ * Decode string-encoded NUMBER and BOOLEAN args against the declaration (#1560): `"12"` → 12,
+ * `"true"` → true. A game tool declares only string/number/boolean params, so these are the only
+ * two cases. The editor MCP already decodes before its own schema; this reaches every other
+ * caller of `game-tool-call` — `device_game_tool_call` above all, whose `args` is an open record.
+ * Returns `args` itself when nothing changed; {@link validateAgentToolArgs} still refuses whatever
+ * is left (`"12abc"`, `"yes"`).
+ */
+export function coerceAgentToolArgs(def: AgentToolDef, args: Record<string, unknown>): Record<string, unknown> {
+  let out: Record<string, unknown> | null = null;
+  for (const [key, spec] of Object.entries(def.params ?? {})) {
+    const value = hasDocKey(args, key) ? args[key] : undefined;
+    if (typeof value !== 'string') continue;
+    const s = value.trim();
+    let decoded: unknown;
+    if (spec.type === 'number' && isLosslessDecimal(s)) decoded = Number(s);
+    else if (spec.type === 'boolean' && (s === 'true' || s === 'false')) decoded = s === 'true';
+    else continue;
+    out ??= { ...args };
+    out[key] = decoded;
+  }
+  return out ?? args;
 }
 
 /** Check `args` against a tool's DECLARED params. Returns a caller-facing reason, or null when

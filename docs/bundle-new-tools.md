@@ -83,6 +83,11 @@ Runtime resolution is shared: `engine/electron/main.ts` `resolveBundled(envVar, 
    - **other platforms** → return.
    - Be **graceful** on every branch: missing binary → `console.warn` + `return`, never throw (a build
      machine without `foo` must still build; the app degrades to a manual-install hint).
+   - **A skip CLEARS what an earlier pack staged** (macOS) — remove your own files from `build/bin/`
+     before the `return`. Nothing else empties that dir and electron-builder ships all of it, so a skip
+     that leaves last run's copy behind ships a binary this pack could not provision, under a log line
+     saying it was skipped. `stage-msdf`'s skip lacked this until #1571; both existing stagers are
+     pinned by `engine/tests/electron/stagerSkipClearsItsSet.test.ts` — add yours to it.
    - Register it in `engine/scripts/before-pack.cjs` (`await stageFoo(context)`).
 
 5. **Add the CI download step** — a `Stage foo` step in `oss/.github/workflows/release-windows.yml`

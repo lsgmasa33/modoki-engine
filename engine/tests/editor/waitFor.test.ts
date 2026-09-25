@@ -179,6 +179,14 @@ describe('console', () => {
     h.setOnSleep(() => { h.state.console.push({ seq: h.sleeps.length, level: h.sleeps.length === 1 ? 'log' : 'error', args: ['boom'] }); });
     expect(await h.run({ console: { match: 'boom', level: 'error' } })).toMatchObject({ satisfied: true, observation: { seq: 2, level: 'error' } });
   });
+
+  // #1559: `level` is a threshold on every console reader — waiting for `warn` is satisfied by an
+  // error, and a `log` line does not satisfy it.
+  it('level is a threshold — warn is satisfied by an error, not by a log', async () => {
+    const h = harness();
+    h.setOnSleep(() => { h.state.console.push({ seq: h.sleeps.length, level: h.sleeps.length === 1 ? 'log' : 'error', args: ['boom'] }); });
+    expect(await h.run({ console: { match: 'boom', level: 'warn' } })).toMatchObject({ satisfied: true, observation: { seq: 2, level: 'error' } });
+  });
 });
 
 describe('editor', () => {

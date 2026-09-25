@@ -3,7 +3,8 @@
  *  The seam no unit test reaches. `isPreviewPlaying` is ONE editor-store flag and BOTH preview
  *  panels key their preview effect on it, so a single ▶ press ran both. Each then called
  *  `enterPreviewMode`, taking the single-valued `RunMode` from the other — and the Timeline ALWAYS
- *  lands second, because its entry sits behind an awaited `beginTimelinePreviewSession()`. It
+ *  landed second, because its entry sat behind an awaited session begin (since #1569 it claims
+ *  before the await, and React's effect order decides who lands second). It
  *  therefore always won `_modeOwner`, and once #810 gave displacement real teeth it stopped the
  *  Animation panel's rAF every time. Both panels auto-dock into the SAME tabset
  *  (`EditorApp.tsx`'s two auto-dock effects) and FlexLayout keeps a tab mounted once shown, so
@@ -119,8 +120,8 @@ test('▶ in the Animation panel drives the ANIMATION panel, with the Timeline p
   // ▶ in the ANIMATION panel — exactly what its transport button does, owner tag and all.
   await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(true, 'animation'));
 
-  // Let both panels' effects run. The Timeline's entry lands a microtask (plus a session open)
-  // after the Animation panel's, so this window has to be long enough for it to have competed —
+  // Let both panels' effects run. The Timeline's entry used to land a microtask (plus a session
+  // open) after the Animation panel's, so this window has to be long enough for it to have competed —
   // sampling too early would pass even with the bug present.
   await page.waitForTimeout(1000);
 
@@ -169,4 +170,31 @@ test('closing the idle Timeline panel does not stop an Animation-owned preview',
   expect(after.playhead).toBeGreaterThan(before); // and it is still advancing
 
   await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(false));
+});
+
+test('an Animation ▶ never advances the skeletal mixers, and pausing it reports a frozen preview (#1552)', async ({ page }) => {
+  // Moved here from editor-animation-preview.spec.ts, which pressed ▶ with no clip open: no panel
+  // drove the preview, so the run mode never left 'stopped' and its "mixers stay frozen" assertion
+  // held whatever the mixers did. This file opens a real clip, so the precondition below can hold.
+  await gotoEditorWithScene(page);
+  await openBothPanels(page);
+  const read = () => page.evaluate(() => {
+    const t = (window as any).__modokiEditorTest;
+    return { advance: t.skeletalMixerAdvance() as number, owner: t.previewModeOwner(), ...t.runModeState() };
+  });
+  expect((await read()).advance).toBe(0);
+
+  await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(true, 'animation'));
+  await page.waitForTimeout(600);
+  const live = await read();
+  // PRECONDITION: the Animation panel is really previewing — without it the next line proves nothing.
+  expect(live).toMatchObject({ owner: 'animation', mode: 'preview', advancing: true });
+  // A preview poses rigs itself; advancing every rig's mixer animates baked clips out of Play and
+  // clobbers the keyframe pose it just wrote.
+  expect(live.advance).toBe(0);
+
+  // ⏸: the loop stops, the session stays held, and the run mode must SAY it is frozen.
+  await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(false));
+  await page.waitForTimeout(300);
+  expect(await read()).toMatchObject({ owner: 'animation', mode: 'preview', advancing: false, advance: 0 });
 });

@@ -12,7 +12,7 @@
  * Every one of them failed against the version that shipped.
  */
 import { describe, expect, it } from 'vitest';
-import { SECTION_CITE, headingIds } from '../helpers/docSections';
+import { SECTION_CITE, citedDoc, headingIds } from '../helpers/docSections';
 
 /** All (doc, section) pairs in a string — `SECTION_CITE` is /g, so it must be reset per use. */
 function cites(text: string): Array<[string, string]> {
@@ -72,5 +72,40 @@ describe('headingIds', () => {
 
   it('ignores an UNNUMBERED heading and body text that looks like one', () => {
     expect([...headingIds(['## Where things live', 'A line: 5. not a heading'].join('\n'))]).toEqual([]);
+  });
+});
+
+describe('citedDoc — a linked citation names its TARGET, not its text (#1519)', () => {
+  /** The doc each `SECTION_CITE` match in `text` points at. */
+  function docs(text: string): string[] {
+    SECTION_CITE.lastIndex = 0;
+    return [...text.matchAll(SECTION_CITE)].map((m) => citedDoc(text, m));
+  }
+
+  // The accept side the issue asked for: text and target name DIFFERENT files, and only the target
+  // has the section. Reading the text went red on a correct citation (games/wordweave's store listing).
+  it('a link whose text names another file resolves to the target', () => {
+    expect(docs("see [Court's legal-drafts/README.md](../court/legal-drafts/README.md) § 3 for it"))
+      .toEqual(['../court/legal-drafts/README.md']);
+  });
+
+  it('an abbreviated or backticked link text resolves to the target', () => {
+    expect(docs('[rendering.md](../rendering.md) § 4')).toEqual(['../rendering.md']);
+    expect(docs('[`qa/knowledge.md`](../../knowledge.md) §13b.')).toEqual(['../../knowledge.md']);
+  });
+
+  it('drops an anchor and decodes an escaped target', () => {
+    expect(docs('[a.md](../My%20Docs/b.md#part-two) § 2')).toEqual(['../My Docs/b.md']);
+  });
+
+  it('a bare path, or one after a CLOSED link, is its own doc', () => {
+    expect(docs('`docs/editor.md` § 5')).toEqual(['docs/editor.md']);
+    expect(docs('[see here](https://x.test) then docs/build.md § 7')).toEqual(['docs/build.md']);
+    // A link LATER on the line is not this path's link: `](…)` follows it, but no `[` opened before it.
+    expect(docs('docs/build.md § 7, and [more](other.md)')).toEqual(['docs/build.md']);
+  });
+
+  it('an in-page anchor link keeps the text, since there is no doc to resolve', () => {
+    expect(docs('[docs/build.md](#build) § 7')).toEqual(['docs/build.md']);
   });
 });

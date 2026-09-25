@@ -3,8 +3,8 @@
  *  engine/plugins/asset-fs-ops.ts so the editor can run the same walk on a live scene's serialized form
  *  (#1437: an applied move changes member paths, and every stored ref to a moved member follows). */
 
-import { durableGuid, deriveMemberGuid, addedKeyStep, mapStringValues } from '../core/assetRefRules';
-import { isMemberToken, parseMemberToken, memberToken, MEMBER_TOKEN_PREFIX } from '../core/templateRefs';
+import { durableGuid, memberRowNodes, deriveMemberGuid, addedKeyStep, mapStringValues, parseSteps, memberPathSteps, FRAME_STEP, type MemberStep } from '../core/assetRefRules';
+import { isMemberToken, parseMemberToken, memberToken, memberPathKey, MEMBER_TOKEN_PREFIX } from '../core/templateRefs';
 import { descendPathKeyed, mergeNestedStructurePaths } from './prefabOverrides';
 
 /** Reads a prefab document by its asset guid; `null`/`undefined` when it cannot. */
@@ -21,8 +21,36 @@ const MAX_MEMBER_PATHS = 100_000;
 class MemberWalkTooLarge extends Error {}
 
 /** The fields of a scene row or an `added[]` node that decide which members derive under it. */
-export type AddedNode = { guid?: unknown; key?: unknown; prefab?: unknown; added?: unknown; children?: unknown; nestedStructure?: unknown };
-type PrefabRow = { localId?: number; prefab?: string; added?: unknown; nestedStructure?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
+export type AddedNode = { guid?: unknown; key?: unknown; prefab?: unknown; added?: unknown; children?: unknown; nestedStructure?: unknown; members?: unknown };
+type PrefabRow = { localId?: number; nodeGuid?: string; prefab?: string; added?: unknown; nestedStructure?: unknown; members?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
+/** Scene member rows (v16), relative to one frame: `/<nodeGuid>[/…]` → a row whose `added` (#1468
+ *  Phase 4) holds nodes added under that member. Only `added` matters to this walk. */
+type MemberRows = Record<string, { added?: unknown } | null>;
+const rowsOf = (v: unknown): MemberRows | undefined => (v && typeof v === 'object' && !Array.isArray(v) ? v as MemberRows : undefined);
+/** A frame's DIRECT rows' added nodes, by the nodeGuid they hang under, and the rows one frame down
+ *  (`/<g>/…` → `/…`) for the nested row whose identity is `g` — the loader's `foldMemberRowChannels`
+ *  and `descendMemberRows`, as far as this walk needs them. */
+const directRowAdded = (rows: MemberRows | undefined, nodeGuid: string): unknown[] => {
+  return nodeGuid ? memberRowNodes(rows?.[`/${nodeGuid}`]) : [];
+};
+const descendRows = (rows: MemberRows | undefined, nodeGuid: string | undefined): MemberRows | undefined => {
+  if (!rows || !nodeGuid) return undefined;
+  const prefix = `/${nodeGuid}/`;
+  let out: MemberRows | undefined;
+  for (const [k, v] of Object.entries(rows)) if (k.startsWith(prefix)) (out ??= {})[k.slice(prefix.length - 1)] = v;
+  return out;
+};
+/** Two frames' worth of rows as one, for this walk only (#1533): a prefab ROW's own `members` and the rows
+ *  an outer layer handed down, key by key, a shared key keeping both rows' nodes. The loader folds the two
+ *  layers one after another; this walk only needs every node either could spawn, and over-generating is
+ *  harmless (see {@link derivedMemberPathsByAnchor}). */
+const unionRows = (inner: MemberRows | undefined, outer: MemberRows | undefined): MemberRows | undefined => {
+  if (!inner) return outer;
+  if (!outer) return inner;
+  const out: MemberRows = { ...inner };
+  for (const [k, v] of Object.entries(outer)) out[k] = out[k] ? { added: [...memberRowNodes(out[k]), ...memberRowNodes(v)] } : v;
+  return out;
+};
 /** A path-keyed structural slot (`nestedStructure`): '<localId>[.<localId>…]' → that expansion's delta. */
 type NestedSlots = Record<string, { added?: unknown }>;
 const slotsOf = (v: unknown): NestedSlots | undefined => (v && typeof v === 'object' ? v as NestedSlots : undefined);
@@ -37,8 +65,9 @@ type AnchorTag = 'self' | 'parent' | 'skip';
  *  guid-less stored root on the way down, each of which derives its own guid and anchors the next
  *  segment (#1349). */
 type Base = { tag: AnchorTag; done: Step[][]; path: Step[]; id: string };
-/** A numeric localId step, or a template-keyed added node's `'+key'` (`addedKeyStep`, #1387). */
-type Step = number | string;
+/** A numeric localId step, or a template-keyed added node's `'+key'` (`addedKeyStep`, #1387).
+ *  Aliased rather than re-declared: the type is `MemberStep` and lives in `assetRefRules` (#1468). */
+type Step = MemberStep;
 
 /** Every `path` (`deriveInstanceMemberGuids`'s step chain, dot-joined; `|` between segments, see
  *  {@link deriveMemberChain}) a member can derive at below
@@ -84,7 +113,7 @@ export function memberPathRecords(
   const emit = (b: Base): void => {
     if (b.tag === 'skip' || !b.path.length) return;
     const set = out[b.tag];
-    const key = [...b.done, b.path].map((seg) => seg.join('.')).join('|');
+    const key = [...b.done, b.path].map(memberPathKey).join('|');
     if (set.has(key)) return;
     set.set(key, b.id);
     if (++size > MAX_MEMBER_PATHS) throw new MemberWalkTooLarge();
@@ -106,7 +135,7 @@ export function memberPathRecords(
    *  structure an outer layer addressed INTO this expansion, split at each nested row exactly as the loader
    *  splits it (`descendPathKeyed`, the row's own slots under what was forwarded) — a template-keyed node a
    *  row writes into a deeper expansion lives only there (#1430). */
-  const expand = (doc: PrefabDoc, root: Base, orphan: Base, added: unknown, stack: string[], depth: number, frame: string, nested?: NestedSlots): void => {
+  const expand = (doc: PrefabDoc, root: Base, orphan: Base, added: unknown, stack: string[], depth: number, frame: string, nested?: NestedSlots, memberRows?: MemberRows): void => {
     if (depth > MAX_INSTANCE_DEPTH) throw new MemberWalkTooLarge();
     const rootLocalId = doc.rootLocalId ?? 1;
     // The rows the loader actually spawns and maps: a nested row only when its prefab resolves.
@@ -122,7 +151,7 @@ export function memberPathRecords(
     // that is not a row is the root — the re-anchoring an `added` node gets.
     const baseOf = (localId: number): Base | null => {
       if (localId === rootLocalId || !rows.has(localId)) return root;
-      const chain: number[] = [];
+      const chain: Step[] = [];
       const seen = new Set<number>();
       let cur = localId;
       for (;;) {
@@ -132,6 +161,9 @@ export function memberPathRecords(
         const p = parentOf(rows.get(cur)!);
         if (p === rootLocalId) return under(root, idOf(localId), ...chain);
         if (!p || !rows.has(p)) return under(orphan, idOf(localId), ...chain);
+        // A row under a NESTED row steps across that frame, as the live derive does (`FRAME_STEP`, #1484): its
+        // identity parent is the nested root, and its localId is this document's, not the nested one's.
+        if (rows.get(p)!.prefab) chain.unshift(FRAME_STEP);
         cur = p;
       }
     };
@@ -144,14 +176,28 @@ export function memberPathRecords(
         // The loader REPLACES the row's `added` with an outer layer's direct list. Both are walked:
         // over-generating is harmless, and a node the scene saved in scene form (its derived guid,
         // no key) is still named by the template path that derives it (#1430).
-        const rowAdded = [...(Array.isArray(row.added) ? row.added : []), ...(Array.isArray(direct?.added) ? direct.added : [])];
+        // …and so does a member ROW for this nested root (Phase 4, #1468), whose added nodes hang at the
+        // child's ROOT (no `parentLocalId`, which the child's walk reads as its root).
+        const fromRow = directRowAdded(memberRows, row.nodeGuid ?? '').map((n) => (n && typeof n === 'object' ? { ...n as object, parentLocalId: undefined } : n));
+        const rowAdded = [...(Array.isArray(row.added) ? row.added : []), ...(Array.isArray(direct?.added) ? direct.added : []), ...fromRow];
         // A nested row expands under parent 0, so ITS orphans are unaddressable.
         expand(docOf(row.prefab)!, here, SKIP, rowAdded, [...stack, row.prefab], depth + 1, here.id,
-          mergeNestedStructurePaths(slotsOf(row.nestedStructure), forward));
+          mergeNestedStructurePaths(slotsOf(row.nestedStructure), forward), unionRows(rowsOf(row.members), descendRows(memberRows, row.nodeGuid)));
       }
     }
-    if (Array.isArray(added)) {
-      for (const n of added as (AddedNode & { parentLocalId?: number })[]) {
+    // A member row's added nodes (Phase 4, #1468) hang under the member the row names — the same
+    // anchoring `parentLocalId` gives a legacy node, reached by identity instead.
+    const fromRows: unknown[] = [];
+    for (const [localId, row] of rows) {
+      // A nested root's row was walked by its expansion above — the route the loader takes. Walking it
+      // here as well would name the same paths again (`emit` dedups them), so this is one route, not a
+      // correctness guard: mutation confirms dropping it changes no output.
+      if (row.prefab && localId !== rootLocalId) continue;
+      for (const n of directRowAdded(memberRows, row.nodeGuid ?? '')) if (n && typeof n === 'object') fromRows.push({ ...n as object, parentLocalId: localId });
+    }
+    const allAdded = [...(Array.isArray(added) ? added : []), ...fromRows];
+    if (allAdded.length) {
+      for (const n of allAdded as (AddedNode & { parentLocalId?: number })[]) {
         if (!n || typeof n !== 'object') continue;
         const at = n.parentLocalId ?? rootLocalId;
         const b = baseOf(at);
@@ -175,7 +221,7 @@ export function memberPathRecords(
       emit(here);
       // A FRESH row chain, as `spawnNestedInstance` gives it (#1324 review). Guid-less, the root
       // still anchors its members on the guid it derives (#1349).
-      expand(child, ownGuid ? SKIP : anchoredAt(here), base, n.added, [n.prefab as string], depth + 1, id, slotsOf(n.nestedStructure));
+      expand(child, ownGuid ? SKIP : anchoredAt(here), base, n.added, [n.prefab as string], depth + 1, id, slotsOf(n.nestedStructure), rowsOf(n.members));
       return;
     }
     // A plain node with its own guid anchors everything below it (its own walk).
@@ -192,7 +238,7 @@ export function memberPathRecords(
         const orphan: Base = { tag: opts.orphans ?? 'skip', done: [], path: [], id: '' };
         const root: Base = opts.guidLess ? under(orphan, '', doc.rootLocalId ?? 1) : { tag: 'self', done: [], path: [], id: '' };
         emit(root);
-        expand(doc, opts.guidLess ? anchoredAt(root) : root, orphan, node.added, [node.prefab as string], 0, '', slotsOf(node.nestedStructure));
+        expand(doc, opts.guidLess ? anchoredAt(root) : root, orphan, node.added, [node.prefab as string], 0, '', slotsOf(node.nestedStructure), rowsOf(node.members));
       }
     } else if (Array.isArray(node.children)) {
       // A plain added node anchors any guid-less nested instance added beneath it.
@@ -208,7 +254,9 @@ export function memberPathRecords(
 /** The guid a member at `key` (a {@link derivedMemberPathsByAnchor} path) derives from `anchor`:
  *  one `deriveMemberGuid` per `|`-separated segment, each result anchoring the next. */
 export function deriveMemberChain(anchor: string, key: string): string {
-  return key.split('|').reduce((a, seg) => deriveMemberGuid(a, seg.split('.').map((s) => (s.startsWith('+') ? s : Number(s)))), anchor);
+  // `parseSteps`, not `memberPathSteps`: an empty SEGMENT has always seeded `deriveMemberGuid` with
+  // `'0'` rather than with nothing, and that output is persisted and frozen (#1468 Phase 1).
+  return key.split('|').reduce((a, seg) => deriveMemberGuid(a, parseSteps(seg)), anchor);
 }
 
 /** The member paths that derive from `node`'s own guid — {@link derivedMemberPathsByAnchor}'s `self`. */
@@ -266,6 +314,8 @@ export function sceneMemberAnchors(scene: Record<string, unknown>): SceneMemberA
       if (anchor && !topLevel) out.push({ node: row, opts: {}, self: anchor, parent: null });
       visit(row.children, false);
       visit(row.added, false);
+      // A member row's added nodes (Phase 4, #1468) define anchors exactly as `added` does.
+      for (const r of Object.values(rowsOf(row.members) ?? {})) visit(memberRowNodes(r), false);
       const slot = (row as { nestedStructure?: unknown }).nestedStructure;
       if (slot && typeof slot === 'object') {
         for (const delta of Object.values(slot as Record<string, { added?: unknown } | null>)) visit(delta?.added, false);
@@ -319,11 +369,15 @@ export function memberGuidRemap(scene: Record<string, unknown>, readOld: PrefabR
  *  asked for `docGuid` too, so a caller rewriting the changed prefab itself answers with its two versions.
  *
  *  A token is read in the frame its value is applied in (templateRefs.ts § Frame): a row's own traits, and
- *  the document's own `moved` targets, in the document's; a nested row's `overrides` and `added` in that row's instance; a `nestedOverrides` or
- *  `nestedStructure` entry in the instance its key addresses. It climbs `^` frames, names a path below
- *  that one, is followed by identity, and is written back relative to the same frame. A value inside a
- *  user-added REFERENCE node is left as it is — its frame is not a row chain — and so is a token that
- *  resolves to nothing, as the loader leaves it. */
+ *  the document's own `moved`, in the document's; a nested row's `overrides` and `added` in that row's instance; a
+ *  `nestedOverrides` or `nestedStructure` entry in the instance its key addresses; a `members` row in the frame its
+ *  key less its last component addresses. A template REFERENCE node in an `added` list is a frame of its own, on top
+ *  of the ones holding it (#1564): its root's `traits` are read where the node hangs, and everything else it carries
+ *  — `overrides`, `added`, both nested channels, `members` and `templateMoved` — in its own frame, where a token names
+ *  a member past the node's anchor (`|`) and climbs `^` out of it as the loaders climb (`templateFrameClimber`). It
+ *  climbs `^` frames, names a path below that one, is followed by identity, and is written back relative to the same
+ *  frame. A reference node that stores its own guid is its own anchor: only its root's `traits` are re-pointed, and
+ *  its payload is left as it is. So is a token that resolves to nothing, as the loader leaves it. */
 export function rewritePrefabMemberTokens(
   doc: Record<string, unknown>, docGuid: string, readOld: PrefabReader, readNew: PrefabReader,
 ): Record<string, unknown> | null {
@@ -332,7 +386,6 @@ export function rewritePrefabMemberTokens(
     const idOf = new Map<string, string>();
     const pathOf = new Map<string, string>([['', '']]);
     for (const [path, id] of r.self) {
-      if (path.includes('|')) continue; // past a guid-less stored root: another anchor, not a token path
       idOf.set(path, id);
       if (!pathOf.has(id)) pathOf.set(id, path);
     }
@@ -341,7 +394,9 @@ export function rewritePrefabMemberTokens(
   };
   const before = index(readOld);
   const after = index(readNew);
-  const join = (a: string, b: string): string => (a && b ? `${a}.${b}` : a || b);
+  /** A template reference node's frame is an anchor: the paths of its members start a new segment (`anchoredAt`). */
+  const sepBelow = (frame: string): string => (/\/a[^/]*$/.test(frame) ? '|' : '.');
+  const join = (frame: string, a: string, b: string): string => (a && b ? `${a}${sepBelow(frame)}${b}` : a || b);
   let changed = false;
   /** `value` with its tokens re-pointed, read in the frame whose identities are `frames` (outermost first). */
   const rewrite = (value: unknown, frames: string[]): unknown => mapStringValues(value, (s) => {
@@ -351,65 +406,144 @@ export function rewritePrefabMemberTokens(
     const oldBase = before.pathOf.get(frame);
     const newBase = after.pathOf.get(frame);
     if (oldBase === undefined || newBase === undefined) return s;
-    const id = before.idOf.get(join(oldBase, t.path.join('.')));
+    const id = before.idOf.get(join(frame, oldBase, memberPathKey(t.path)));
     const target = id === undefined ? undefined : after.pathOf.get(id);
     if (target === undefined) return s;
-    if (newBase && target !== newBase && !target.startsWith(newBase + '.')) return s;
+    if (newBase && target !== newBase && !target.startsWith(newBase + sepBelow(frame))) return s;
     const rel = newBase ? target.slice(newBase.length + 1) : target;
-    const next = memberToken(t.up, rel ? rel.split('.').map((x) => (x.startsWith('+') ? x : Number(x))) : []);
+    if (rel.includes('|')) return s; // past another anchor: no token names it from here
+    const next = memberToken(t.up, memberPathSteps(rel));
     if (next !== s) changed = true;
     return next;
   });
-  type Row = Record<string, unknown> & { localId?: number; prefab?: string; traits?: unknown };
-  const rows = Array.isArray(doc.entities) ? (doc.entities as Row[]) : [];
-  /** An `added` subtree applied in `frames`: plain nodes' traits, recursively; a reference node is skipped. */
-  const addedIn = (nodes: unknown, frames: string[]): unknown => (!Array.isArray(nodes) ? nodes : nodes.map((n) => {
-    if (!n || typeof n !== 'object' || (n as { prefab?: unknown }).prefab) return n;
-    const node = n as Record<string, unknown>;
-    const out = { ...node };
-    if (node.traits !== undefined) out.traits = rewrite(node.traits, frames);
-    if (node.children !== undefined) out.children = addedIn(node.children, frames);
-    return out;
-  }));
-  /** A path-keyed slot of a nested row at `row`: each key's frames run through the chain it names. */
-  const slot = (paths: unknown, row: string, each: (v: unknown, frames: string[]) => unknown): unknown => {
-    if (!paths || typeof paths !== 'object') return paths;
+  /** A moves map (member path → member token, both in the frame `frames` ends in): its keys and values followed. */
+  const movesIn = (moved: unknown, frames: string[]): unknown => {
+    if (!moved || typeof moved !== 'object' || Array.isArray(moved)) return moved;
     const out: Record<string, unknown> = {};
-    for (const [key, v] of Object.entries(paths as Record<string, unknown>)) {
-      const frames = ['', row];
-      for (const lid of key.split('.')) frames.push(`${frames[frames.length - 1]}/${lid}`);
-      Object.defineProperty(out, key, { value: each(v, frames), enumerable: true, writable: true, configurable: true });
+    for (const [key, value] of Object.entries(moved as Record<string, unknown>)) {
+      const next = rewrite(memberToken(0, memberPathSteps(key)), frames) as string;
+      const nextKey = next.slice(MEMBER_TOKEN_PREFIX.length);
+      Object.defineProperty(out, nextKey, { value: rewrite(value, frames), enumerable: true, writable: true, configurable: true });
     }
     return out;
   };
+  const docOf = (guid: unknown): PrefabDoc | null => {
+    if (typeof guid !== 'string' || !guid) return null;
+    const d = readOld(guid) ?? readNew(guid);
+    return d && typeof d === 'object' && Array.isArray((d as PrefabDoc).entities) ? d as PrefabDoc : null;
+  };
+  /** The identity of the entity a top-level `added` node of the frame `frame` (document `fdoc`) hangs under. */
+  const ownerIn = (frame: string, fdoc: PrefabDoc | null) => (parentLocalId: unknown): string => {
+    const root = fdoc?.rootLocalId ?? 1;
+    const lid = typeof parentLocalId === 'number' ? parentLocalId : root;
+    return lid !== root && fdoc?.entities?.some((e) => e?.localId === lid) ? `${frame}/${lid}` : frame;
+  };
+  /** An `added` subtree applied in `frames`: plain nodes' traits, recursively, and a template reference node's whole
+   *  payload in its own frame. `owner` names the entity a node hangs under (`memberPathRecords`' `addedNode`). */
+  const addedIn = (nodes: unknown, frames: string[], owner: (parentLocalId: unknown) => string): unknown => (!Array.isArray(nodes) ? nodes : nodes.map((n) => {
+    if (!n || typeof n !== 'object') return n;
+    const node = n as Record<string, unknown>;
+    const out = { ...node };
+    if (node.traits !== undefined) out.traits = rewrite(node.traits, frames);
+    const ownGuid = durableGuid(typeof node.guid === 'string' ? node.guid : '');
+    const key = !ownGuid && typeof node.key === 'string' && node.key ? addedKeyStep(node.key) : '';
+    const id = `${owner(node.parentLocalId)}/a${key || (node.prefab ? 'r' : '0')}`;
+    if (node.prefab) {
+      if (ownGuid) return out; // its own anchor: its payload belongs to no frame of this document
+      Object.assign(out, framePayload(node, [...frames, id], docOf(node.prefab)));
+      return out;
+    }
+    if (node.children !== undefined) out.children = addedIn(node.children, frames, () => id);
+    return out;
+  }));
+  /** A path-keyed slot of the instance `frames` ends in (document `fdoc`): each key's frames run through the chain it
+   *  names, and `each` is handed the document of the instance the key addresses. */
+  const slot = (paths: unknown, frames: string[], fdoc: PrefabDoc | null, each: (v: unknown, frames: string[], doc: PrefabDoc | null) => unknown): unknown => {
+    if (!paths || typeof paths !== 'object') return paths;
+    const out: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(paths as Record<string, unknown>)) {
+      const f = [...frames];
+      let d = fdoc;
+      for (const lid of key.split('.')) {
+        f.push(`${f[f.length - 1]}/${lid}`);
+        d = docOf(d?.entities?.find((e) => String(e?.localId) === lid)?.prefab);
+      }
+      Object.defineProperty(out, key, { value: each(v, f, d), enumerable: true, writable: true, configurable: true });
+    }
+    return out;
+  };
+  /** Member rows (prefab v6, #1533) of the instance `frames` ends in (document `fdoc`): each row in the frame its key
+   *  less its last component addresses, `/<nodeGuid>` by nested row. A key naming nothing is left as it is. */
+  const membersIn = (rows: unknown, frames: string[], fdoc: PrefabDoc | null): unknown => {
+    if (!rows || typeof rows !== 'object' || Array.isArray(rows)) return rows;
+    const out: Record<string, unknown> = {};
+    for (const [key, row] of Object.entries(rows as Record<string, unknown>)) {
+      const steps = key.split('/').slice(1);
+      const f = [...frames];
+      let d = fdoc;
+      for (const g of steps.slice(0, -1)) {
+        const r = d?.entities?.find((e) => e?.nodeGuid === g && e.prefab);
+        if (!r) { d = null; break; }
+        f.push(`${f[f.length - 1]}/${r.localId}`);
+        d = docOf(r.prefab);
+      }
+      let value = row;
+      if (d && row && typeof row === 'object') {
+        const frame = f[f.length - 1]!;
+        const last = d.entities?.find((e) => e?.nodeGuid === steps[steps.length - 1]);
+        // Nodes a member row adds hang under that member; a NODE row's (`a+<key>`) under the template node it names.
+        // The frame's root is the frame itself (`memberPathRecords`' `idOf`).
+        const at = last?.localId === (d.rootLocalId ?? 1) ? frame
+          : last?.localId !== undefined ? `${frame}/${last.localId}` : [...before.pathOf.keys()].find((id) => id.startsWith(`${frame}/`) && id.endsWith(`/${steps[steps.length - 1]}`));
+        const r = row as Record<string, unknown>;
+        const next: Record<string, unknown> = { ...r };
+        if (r.traits !== undefined) next.traits = rewrite(r.traits, f);
+        if (r.parent !== undefined) next.parent = rewrite(r.parent, f);
+        if (at) for (const ch of ['added', 'own'] as const) if (r[ch] !== undefined) next[ch] = addedIn(r[ch], f, () => at);
+        value = next;
+      }
+      Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true });
+    }
+    return out;
+  };
+  /** What an instance carries in its own frame (`frames` ends in it; its document is `fdoc`): a nested ROW's channels,
+   *  and a template reference node's. */
+  const framePayload = (carrier: Record<string, unknown>, frames: string[], fdoc: PrefabDoc | null): Record<string, unknown> => {
+    const next: Record<string, unknown> = {};
+    const frame = frames[frames.length - 1]!;
+    if (carrier.overrides !== undefined) next.overrides = rewrite(carrier.overrides, frames);
+    if (carrier.added !== undefined) next.added = addedIn(carrier.added, frames, ownerIn(frame, fdoc));
+    if (carrier.nestedOverrides !== undefined) next.nestedOverrides = slot(carrier.nestedOverrides, frames, fdoc, (v, f) => rewrite(v, f));
+    if (carrier.nestedStructure !== undefined) {
+      next.nestedStructure = slot(carrier.nestedStructure, frames, fdoc, (v, f, d) => (v && typeof v === 'object'
+        ? { ...(v as Record<string, unknown>), added: addedIn((v as { added?: unknown }).added, f, ownerIn(f[f.length - 1]!, d)) }
+        : v));
+    }
+    if (carrier.members !== undefined) next.members = membersIn(carrier.members, frames, fdoc);
+    if (carrier.templateMoved !== undefined) next.templateMoved = movesIn(carrier.templateMoved, frames);
+    return next;
+  };
+  type Row = Record<string, unknown> & { localId?: number; prefab?: string; traits?: unknown };
+  const rows = Array.isArray(doc.entities) ? (doc.entities as Row[]) : [];
   const entities = rows.map((row) => {
     if (!row || typeof row !== 'object') return row;
     const next: Row = { ...row };
     if (row.traits !== undefined) next.traits = rewrite(row.traits, ['']);
-    if (row.prefab && typeof row.localId === 'number') {
-      const frames = ['', `/${row.localId}`];
-      if (row.overrides !== undefined) next.overrides = rewrite(row.overrides, frames);
-      if (row.added !== undefined) next.added = addedIn(row.added, frames);
-      if (row.nestedOverrides !== undefined) next.nestedOverrides = slot(row.nestedOverrides, frames[1]!, (v, f) => rewrite(v, f));
-      if (row.nestedStructure !== undefined) {
-        next.nestedStructure = slot(row.nestedStructure, frames[1]!, (v, f) => (v && typeof v === 'object'
-          ? { ...(v as Record<string, unknown>), added: addedIn((v as { added?: unknown }).added, f) }
-          : v));
-      }
-    }
+    if (row.prefab && typeof row.localId === 'number') Object.assign(next, framePayload(row, ['', `/${row.localId}`], docOf(row.prefab)));
     return next;
   });
   // The prefab's own moves name their members AND their targets by path in its own frame (#1437 P3-b).
-  let moved: Record<string, unknown> | undefined;
-  if (doc.moved && typeof doc.moved === 'object') {
-    moved = {};
-    for (const [key, value] of Object.entries(doc.moved as Record<string, unknown>)) {
-      const token = memberToken(0, key ? key.split('.').map((x) => (x.startsWith('+') ? x : Number(x))) : []);
-      const next = rewrite(token, ['']) as string;
-      const nextKey = next.slice(MEMBER_TOKEN_PREFIX.length);
-      if (nextKey !== key) changed = true;
-      Object.defineProperty(moved, nextKey, { value: rewrite(value, ['']), enumerable: true, writable: true, configurable: true });
-    }
-  }
+  const moved = doc.moved && typeof doc.moved === 'object' ? movesIn(doc.moved, ['']) : undefined;
   return changed ? { ...doc, entities, ...(moved !== undefined ? { moved } : {}) } : null;
+}
+
+/** A moves map stated in the frame of an instance of `docGuid` — a template reference node's `templateMoved`, or the
+ *  live record of it (`FrameRootRecord.nodeMoved`) — re-pointed from `readOld`'s member paths to `readNew`'s, as
+ *  {@link rewritePrefabMemberTokens} re-points a document's own `moved`. `null` when nothing changed. Read in that frame
+ *  alone: a node's move never targets outside its own subtree (docs/prefab-structural-overrides.md § #1543). */
+export function rewriteFrameMoves(
+  moved: Record<string, string>, docGuid: string, readOld: PrefabReader, readNew: PrefabReader,
+): Record<string, string> | null {
+  const out = rewritePrefabMemberTokens({ entities: [], moved }, docGuid, readOld, readNew);
+  return out ? out.moved as Record<string, string> : null;
 }

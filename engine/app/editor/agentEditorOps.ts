@@ -25,9 +25,8 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, dumpSceneState, whereError } from '../debug/agentBridge';
-import { conditionError, waitForCondition, clampWaitTimeout, type WaitCondition, type WaitReaders } from '../debug/waitFor';
-import { getConsoleRingEntries } from '@modoki/engine/runtime/core/consoleRing';
+import { registerAgentOp as _registerAgentOp, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
 import { getGameBootFaults } from './gameBootFaults';
@@ -36,8 +35,8 @@ import { makeEvalApi } from './evalApi';
 import {
   useEditorStore, type SelectedAsset, GIZMO_MODES, GIZMO_SPACES, SCENE_VIEW_MODES,
   type AssetEditorKind, type AssetEditorMount, colliderEditBlocker,
-  enterPlay, stopPlay, pausePlay,
-  undoStep, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
+  enterPlay, stopPlay, pausePlay, type PlayOutcome, type StopOutcome,
+  undoStep, undoStepPending, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk,
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
@@ -52,16 +51,16 @@ import {
   getPrefabSource, instantiatePrefabInstance, serializePrefab, writePrefabFile, warnInertPrefabSizes,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
-  resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
+  classifyExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance,
-  applyToPrefabWithUndo, revertOverridesSelective, rebuildInstance, resolveInstanceContext,
-  collectInstanceOverrideFields, collectInstanceOverrideKeys,
+  applyToPrefabWithUndo, revertOverridesSelective, staleInstanceRefusal, rebuildInstance, resolveInstanceContext,
+  collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey,
   pushAction, makePrefabInstantiateAction, entityRef,
   getEditorViewportCamera, focusEntityInSceneView,
   upsertKey, findTrack, encodeValue,
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
   getCreatableAssets, createRegisteredAsset,
-  readEditorJournal, clearEditorJournal, editorJournalEpoch, editorJournalEpochChanged, resolveEditorJournalCursor, withEditorActor, openActorLease, closeActorLease,
+  readEditorJournal, editorJournalSeq, editorJournalDroppedThrough, editorJournalEpoch, resolveEditorJournalCursor, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal, EDITOR_JOURNAL_SOURCES, isEditorJournalSource, EDITOR_JOURNAL_TYPES, isEditorJournalType,
   readMetaPreferringPark, peekPendingMeta, discardPendingMeta, getPendingMetaPaths,
   getResolvedRender3d,
@@ -70,20 +69,20 @@ import {
   describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
   type DevicePreset, type Orientation,
   type PrefabFile,
-  causeSpecs, flushParked, getModeOwner, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath,
+  causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath, whyWorldNotAuthored,
   dirtyAssetEditorHolds,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
   getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, deleteEntity, findUnrenderable2D,
-  getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
+  getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, currentCaptureSeq, resolveCapCursor, journalDroppedThroughCap, journalGapNote, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid,
   getAllTraits, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
-  sceneManager, assetUrl, type AssetSchemaType, collectHandles, rawNow, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
+  sceneManager, assetUrl, type AssetSchemaType, collectHandles, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -425,6 +424,48 @@ function readEditorState() {
   };
 }
 
+type EditorState = ReturnType<typeof readEditorState>;
+
+/**
+ * An ACTION op's reply: the editor-state fields that action changed, READ BACK from the stores
+ * after it ran (#1553). The whole `readEditorState()` used to be spread into 17 action replies —
+ * ~1.7k chars a call, 10% of all MCP result tax on `play_control` alone, and over batch's
+ * verbatim cap so a batch elided the one field the step was run to see. The full state stays one
+ * `modoki_get_editor_state` away. Read back rather than echoed from the args, so the reply is
+ * still evidence of the post-state (§11), not a restatement of the request.
+ * A key the state omits (the optional-when-healthy/empty ones) stays omitted here.
+ */
+function editorStateFields<K extends keyof EditorState>(...keys: K[]): Pick<EditorState, K> {
+  const s = readEditorState();
+  const out = {} as Pick<EditorState, K>;
+  for (const k of keys) if (k in s) out[k] = s[k];
+  for (const k of ACTION_HEALTH_KEYS) if (k in s && isActionFault(k, s)) (out as Record<string, unknown>)[k] = s[k];
+  return out;
+}
+
+/** A health field is a FAULT on an action reply only in its failing states. `get_editor_state`
+ *  reports `frameLoop` for a hidden window or after a recovered re-arm and `rendererGate` while
+ *  `pending` — useful there, expected here: a hidden window is "not a fault" by frameDriver's own
+ *  word, and a 2D/UI-only project sits in `pending` for its whole session, so reporting them would
+ *  hang a false alarm (and the bytes #1553 removed) on every action (#1553 second review). */
+function isActionFault(k: typeof ACTION_HEALTH_KEYS[number], s: EditorState): boolean {
+  if (k === 'frameLoop') return s.frameLoop?.status === 'stalled';
+  if (k === 'rendererGate') return s.rendererGate?.status === 'failed';
+  return true;
+}
+
+/** The HEALTH fields every action reply still carries — each only while FAULTED ({@link isActionFault}),
+ *  so a healthy editor pays nothing for them. An agent that presses Play on a stale editor must still hear
+ *  `staleGameCode:true` in that reply (CLAUDE.md § Hot reload: measurements from it are suspect);
+ *  #1553 dropped these with the rest of the state until review caught it. `hmrUpdates` is NOT here:
+ *  it is present on any editor that ever hot-reloaded, i.e. a count, not a fault. */
+export const ACTION_HEALTH_KEYS = [
+  'staleGameCode', 'discardedUnsavedEdits', 'frameLoop', 'rendererGate', 'gpu', 'gameBootFaults',
+] as const satisfies ReadonlyArray<keyof EditorState>;
+
+/** The play-state trio every play_control transition reports (+ the health fields, when unhealthy). */
+const playStateFields = () => editorStateFields('playState', 'runMode', 'advancing');
+
 /** CSS viewport size + zoom, read live from the renderer window. Guarded for the
  *  headless/SSR case (no `window`) so this stays safe if ever called off the renderer. */
 function readViewport() {
@@ -440,7 +481,7 @@ function readViewport() {
 // ── Param shapes ───────────────────────────────────────────────────────────
 
 interface SetSelectionParams { entityId?: number | null; entityIds?: number[]; guid?: string; guids?: string[]; asset?: SelectedAsset | null }
-interface CreateEntityParams { spec: CreateEntitySpec; parentId?: number; parentGuid?: string }
+interface CreateEntityParams { spec: CreateEntitySpec; parentId?: number; parentGuid?: string; name?: unknown }
 /** The prefab operations. The three `edit-*` actions drive PREFAB-EDIT MODE — opening a
  *  `.prefab.json` in isolation, saving the edited template back, and returning to the scene
  *  it was opened from. They are the only route that re-serializes a prefab file, which is why
@@ -480,8 +521,9 @@ interface PrefabParams {
   /** create/detach/overrides/apply/revert: the entity guid. Given together with `entityId`, the call is refused (#1223 D1). */
   entityGuid?: string;
   /** apply/revert: the override keys to act on (see `overrides`'s `keys.all` for the exact
-   *  strings — `"localId.trait.field"` / `"+added.<guid>"` / `"-removed.<localId>"` /
-   *  `"-trait.<localId>.<name>"`). Omitted ⇒ ALL current overrides on the instance. */
+   *  strings — `"<member>.trait.field"` / `"+added.<guid>"` / `"-removed.<member>"` /
+   *  `"-trait.<member>.<name>"` / `"+trait.<member>.<tag>"` / `"~moved.<member>"`, `<member>` a nodeGuid or, for a pre-v5
+   *  template, a localId; `prefabOverrideKeys.ts`). Omitted ⇒ ALL current overrides on the instance. */
   keys?: string[];
 }
 
@@ -1070,6 +1112,64 @@ export function countTimelineItems(t: Partial<TimelineDef> | undefined): number 
   return n;
 }
 
+/** The exits for a world that is not authored, picked by WHICH condition holds (§5: name real exits
+ *  only). An envelope in scrub/preview has its owner's exits. A session held with the mode already
+ *  'stopped' has no ⏹ to press, but Stop takes a held session down. The known way into that state (a
+ *  begin that seated after its panel left the mode) was closed by #1569, so this branch is a backstop
+ *  for one nobody has found yet. A failed restore clears on the next world swap; a restore still landing clears
+ *  on its own. */
+function posedWorldExits(): { options: string[]; hint?: string; owner: string | null } {
+  const mode = getRunMode();
+  const owner = getModeOwner();
+  if (mode === 'scrub' || mode === 'preview') return { ...envelopeExitOptions(owner), owner };
+  if (hasTimelinePreviewSession()) {
+    return { owner, options: ["modoki_play_control {action:'stop'} — ends the held preview session (restoring the snapshot it took), then retry"] };
+  }
+  if (lastRestoreFailed()) {
+    return { owner, options: ['modoki_load_scene — reload the scene from disk (the failed-restore guard clears on the next world swap), then retry'] };
+  }
+  return { owner, options: ['retry in a moment — the restore is still landing and clears on its own'] };
+}
+
+/** Refuse a live-world edit the world will not keep (#1552): inside a scrub/preview envelope the world
+ *  is snapshotted and reverts on Exit, and while a restore is still landing (or after one FAILED) the
+ *  world is about to be replaced. These ops replied `ok` and the edit then vanished — the same hole
+ *  `/api/scene-mutate` closed for the file-shaped path in #1122, and the same exits.
+ *
+ *  Asks `whyWorldNotAuthored()`, the one question every disk writer asks (#1548), not the run mode:
+ *  an Exit reads 'stopped' before its restore has swapped the posed world out.
+ *  ⚠️ Play is exempt ON PURPOSE. Editing the play world is how an agent exercises a running game, and
+ *  Stop discarding it is Play's documented contract, not a silent loss.
+ *  `consequence` replaces the default "why this edit would be lost" for a caller whose risk differs. */
+function refuseEditOfPosedWorld(op: string, consequence?: string): void {
+  if (getRunMode() === 'playing') return;
+  const why = whyWorldNotAuthored();
+  if (!why) return;
+  const { options, hint, owner } = posedWorldExits();
+  const envelope = getRunMode() === 'scrub' || getRunMode() === 'preview';
+  const lost = consequence ?? (envelope
+    ? 'the live world reverts when the envelope ends, so this edit would reply ok and then be silently discarded'
+    : 'the live world may still hold a pose and is about to be replaced, so this edit could be lost');
+  throw new OpRefusal('REFUSED_BY_OP',
+    `${op} refused: ${why}${owner ? ` (owned by the ${owner} panel)` : ''} — ${lost}. Nothing was changed.`
+    + (hint ? ` ${hint}` : ''),
+    { options });
+}
+
+/** PlayerPrefs is put back only by a held preview SESSION (#1551, `previewSideState.ts`), so only a held
+ *  session refuses — not every "world not authored" reason. A Stop restore landing, or a failed one,
+ *  leaves PlayerPrefs alone, and refusing there sent the agent to reload the scene for a write that
+ *  was never at risk (#1551 re-review). */
+function refusePrefsWriteInSession(): void {
+  if (!hasTimelinePreviewSession()) return;
+  const { options, hint, owner } = posedWorldExits();
+  throw new OpRefusal('REFUSED_BY_OP',
+    `player-prefs-write refused: a preview session is open${owner ? ` (owned by the ${owner} panel)` : ''} — `
+    + 'ending it puts PlayerPrefs back to its state when the session opened, whoever wrote it, so this '
+    + 'write would reply ok and then be undone. Nothing was changed.' + (hint ? ` ${hint}` : ''),
+    { options });
+}
+
 export function registerEditorAgentOps(): void {
   // Every op registered here is the AGENT acting (human actions come through the UI,
   // not these ops). Shadow registerAgentOp so any editor-activity events an op emits
@@ -1163,16 +1263,25 @@ export function registerEditorAgentOps(): void {
   // the shared `cap` capture counter — so Claude reads one ordered story ("pressed Play
   // → set timeScale 0.3 → @match on tick 84 → paused").
   registerAgentOp('editor-journal', (params) => {
-    const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; epoch?: string; sinceCap?: number; clear?: boolean; merged?: boolean; limit?: number };
+    const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; epoch?: string; sinceCap?: number; clear?: unknown; merged?: boolean; limit?: number };
+    // `clear` is RETIRED (#1561): it made this read delete the buffer it read (§7). Refused, never
+    // ignored — a caller that meant "start clean" would otherwise read a full buffer believing it empty.
+    if (p.clear !== undefined) {
+      throw new OpRefusal('UNKNOWN_PARAM',
+        'editor-journal: clear was removed — a journal read no longer deletes anything. For a clean baseline, '
+        + 'read once (limit:0 is enough) and pass the returned nextSeq as since (with its epoch): that read '
+        + 'returns only the events after it. Nothing was read and nothing was cleared.',
+        { options: ['since', 'epoch'] });
+    }
     // An unknown `source` matched nothing, so the read came back EMPTY under a filtered framing —
     // "the agent did nothing" for a typo. Refused with the options instead (#1072); the route used to
     // drop the value before it got here, and forwards it raw now so this can fire.
     if (p.source !== undefined && !isEditorJournalSource(p.source)) {
       throw new OpRefusal('REFUSED_BY_OP',
-        `editor-journal: unknown source ${JSON.stringify(p.source)} — nothing was read and nothing was cleared. Valid: ${EDITOR_JOURNAL_SOURCES.join(', ')}.`,
+        `editor-journal: unknown source ${JSON.stringify(p.source)} — nothing was read. Valid: ${EDITOR_JOURNAL_SOURCES.join(', ')}.`,
         { options: [...EDITOR_JOURNAL_SOURCES] });
     }
-    refuseUnknownJournalType('editor-journal', p.type, 'nothing was read and nothing was cleared');
+    refuseUnknownJournalType('editor-journal', p.type, 'nothing was read');
     // `editor` is the editor-only view: filtered by type/source and cursored by the
     // editor-local `since` (a `seq`). `timeline` is the single-axis merged view.
     //
@@ -1201,19 +1310,28 @@ export function registerEditorAgentOps(): void {
       editor: unknown[]; editorTotal: number; ringTotal: number; byType: Record<string, number>; epoch: string; cursorReset?: string;
       truncated?: boolean; hint?: string; nextSeq?: number;
       game?: unknown[]; gameTotal?: number; gameByType?: Record<string, number>;
-      timeline?: unknown[]; timelineTotal?: number; nextCap?: number;
+      timeline?: unknown[]; timelineTotal?: number; nextCap?: number; droppedThroughCap?: number; timelineGapNote?: string; droppedThroughSeq?: number; gapNote?: string;
     } = {
       editor: ed.items, editorTotal: editorAll.length,
       ringTotal: editorRing.length, byType: histogram(editorRing, (e) => String(e.type ?? '?')),
       epoch: editorJournalEpoch(),
       ...(cursor.cursorReset ? { cursorReset: cursor.cursorReset } : {}),
     };
+    // The editor ring keeps the newest 2,000: a `since` below what it has lost has a gap the returned
+    // seqs cannot show — say so rather than promise "no gap" (#1561 re-review).
+    const edDropped = editorJournalDroppedThrough();
+    const seqGap = since != null && since < edDropped.seq;
+    if (seqGap) {
+      result.droppedThroughSeq = edDropped.seq;
+      result.gapNote = `editor events after since=${since} up to seq ${edDropped.seq} were lost from the editor ring before this read (it keeps the newest 2,000, or it was cleared). Poll more often.`;
+    }
     if (ed.truncated) {
       result.truncated = true;
       if (edCursored) {
         const lastSeq = (ed.items[ed.items.length - 1] as { seq?: number } | undefined)?.seq;
-        if (lastSeq != null) result.nextSeq = lastSeq;
-        result.hint = `Showing the OLDEST ${ed.items.length} of ${editorAll.length} editor events after since=${since} (oldest first). Poll again with since=${result.nextSeq} to continue contiguously with no gap; raise limit=N to fetch more per poll.`;
+        // A cut-short read that returned nothing (limit:0) read nothing, so the cursor stays put.
+        result.nextSeq = lastSeq ?? since;
+        result.hint = `Showing the OLDEST ${ed.items.length} of ${editorAll.length} editor events after since=${since} (oldest first). Poll again with since=${result.nextSeq} to continue contiguously${seqGap ? ' from here (see gapNote: earlier editor events were already lost)' : ' with no gap'}; raise limit=N to fetch more per poll.`;
       } else {
         result.hint = tailHint('editor events', ed.items.length, editorAll.length, ', or narrow with type=/source=/since=');
       }
@@ -1234,13 +1352,21 @@ export function registerEditorAgentOps(): void {
       // `source`/`since` filters shape only the `editor` array, NOT the timeline (which
       // is the full correlated story). cap is unique ⇒ no ties ⇒ a total order.
       // The `cap` counter restarts on a reload too (#1214 close-out review): a pre-reload `sinceCap`
-      // sent with its epoch replays this life's timeline instead of filtering all of it out.
-      const capReset = p.sinceCap != null && editorJournalEpochChanged(p.epoch);
-      if (capReset) {
-        result.cursorReset = `sinceCap=${p.sinceCap} was issued under epoch ${p.epoch}; the journal has restarted since (epoch ${editorJournalEpoch()}), so the timeline replays everything from the restart.`
-          + (result.cursorReset ? ` ${result.cursorReset}` : '');
+      // sent with its epoch replays this life's timeline instead of filtering all of it out. It is
+      // checked by the SAME resolver as `modoki_journal`'s cursor, against the capture part of the
+      // epoch, so a baseline taken there is valid here (#1561 review: two epochs for one counter
+      // reported a reload that never happened).
+      const capCursor = resolveCapCursor(p.sinceCap, p.epoch);
+      if (capCursor.cursorReset) {
+        result.cursorReset = capCursor.cursorReset + (result.cursorReset ? ` ${result.cursorReset}` : '');
       }
-      const capFloor = capReset ? -Infinity : (p.sinceCap ?? -Infinity);
+      const capFloor = capCursor.sinceCap ?? -Infinity;
+      // The timeline reads the same game ring as `modoki_journal` with the same cursor, so it owes the
+      // same disclosure when that ring lost events after the cursor (#1561 re-review).
+      // The timeline interleaves BOTH rings, so the gap is the later of what either has lost.
+      const dropped = Math.max(journalDroppedThroughCap(), editorJournalDroppedThrough().cap);
+      const capGap = capCursor.sinceCap != null && capCursor.sinceCap < dropped;
+      if (capGap) { result.droppedThroughCap = dropped; result.timelineGapNote = journalGapNote(capCursor.sinceCap!, dropped); }
       const edAll = readEditorJournal(); // unfiltered — the timeline shows everything
       const timeline = [
         ...edAll.filter((e) => e.cap > capFloor).map((e) => ({ stream: 'editor' as const, ...e })),
@@ -1258,14 +1384,20 @@ export function registerEditorAgentOps(): void {
         result.truncated = true;
         if (tlCursored) {
           const lastCap = (tl.items[tl.items.length - 1] as { cap?: number } | undefined)?.cap;
-          if (lastCap != null) result.nextCap = lastCap;
-          result.hint = `Showing the OLDEST ${tl.items.length} of ${timeline.length} timeline events after sinceCap=${p.sinceCap} (oldest first). Poll again with sinceCap=${result.nextCap} to continue contiguously with no gap; raise limit=N for more per poll.`;
+          // A cut-short read that returned nothing (limit:0) read nothing, so the cursor stays put.
+          result.nextCap = lastCap ?? capCursor.sinceCap;
+          result.hint = `Showing the OLDEST ${tl.items.length} of ${timeline.length} timeline events after sinceCap=${p.sinceCap} (oldest first). Poll again with sinceCap=${result.nextCap} to continue contiguously${capGap ? ' from here (see timelineGapNote: earlier events were already lost)' : ' with no gap'}; raise limit=N for more per poll.`;
         } else {
           result.hint = tailHint('timeline events', tl.items.length, timeline.length, ', or cursor with sinceCap=<last cap>');
         }
       }
+      // Every merged reply says where the next timeline read starts (#1561), so a `limit:0` merged
+      // read is a baseline for `sinceCap` just as it is on `modoki_journal`.
+      if (result.nextCap == null) result.nextCap = currentCaptureSeq();
     }
-    if (p.clear) clearEditorJournal();
+    // Every reply says where the next read starts, so a bare `limit:0` read is a baseline (#1561).
+    // A cursored read cut short set it above, to its last returned event; otherwise it is the tip.
+    if (result.nextSeq == null) result.nextSeq = editorJournalSeq();
     return result;
   });
 
@@ -1288,39 +1420,19 @@ export function registerEditorAgentOps(): void {
   // `debug/waitFor.ts`; this binds its readers to the resolvers the matching READ tools use.
   // Unwrapped for wait-for-edit's reason below: it parks, and the agent wrapper would attribute
   // every human edit made during the park to 'agent'. Listed in evalApi.ts's ATTRIBUTION_OPS too.
+  //
+  // #1559 C-12: the runtime registers `wait-for` itself with the `entity`/`console` readers, so a device
+  // has it too (§9); the editor REPLACES that registration with the same readers plus the two only it
+  // can answer, `chrome` and `editor`.
   const waitReaders: WaitReaders = {
+    ...runtimeWaitReaders,
     chrome: ({ label, id }) => collectHandles({ editor: 'chrome', ...(label ? { label } : {}), ...(id ? { ids: [id] } : {}) })
       .map((h) => ({ id: h.id, label: h.label, meta: h.meta as Record<string, unknown> | undefined })),
-    whereError,
-    entities: ({ guid, name, where }) => {
-      // `trait` narrows the one returned row to the trait the predicate reads, keeping the
-      // observation small; `limit:1` because the wait needs a count and one example, not a dump.
-      const trait = where ? /^\s*(\w+)\./.exec(where)?.[1] : undefined;
-      const r = dumpSceneState({ guid, name, where, ...(trait ? { trait } : {}), limit: 1 }) as { entities: unknown[]; totalCount: number };
-      return { count: r.totalCount, first: r.entities[0] };
-    },
-    consoleSince: (seq) => getConsoleRingEntries(seq),
-    consoleWatermark: (lookbackMs) => {
-      const all = getConsoleRingEntries();
-      if (!lookbackMs) return all.at(-1)?.seq ?? 0;
-      // `mono` is the ring's own `rawNow()` stamp, so the cutoff is on the same clock.
-      const cutoff = rawNow() - lookbackMs;
-      let mark = 0;
-      for (const e of all) { if (e.mono < cutoff) mark = e.seq; else break; }
-      return mark;
-    },
     editorState: () => readEditorState() as unknown as Record<string, unknown>,
     chromeLabels: () => collectHandles({ editor: 'chrome' }).map((h) => h.label ?? '').filter(Boolean),
     chromeIds: () => collectHandles({ editor: 'chrome' }).map((h) => h.id),
-    entityNames: () => getAllEntities().map((e) => e.name ?? '').filter(Boolean),
   };
-  _registerAgentOp('wait-for', (params) => {
-    const p = (params ?? {}) as WaitCondition & { timeoutMs?: unknown };
-    const { timeoutMs, ...cond } = p;
-    const why = conditionError(cond, waitReaders);
-    if (why) throw new OpRefusal('REFUSED_BY_OP', `wait-for: ${why} — nothing was waited for.`);
-    return waitForCondition(cond, { readers: waitReaders, timeoutMs: clampWaitTimeout(timeoutMs) });
-  });
+  _registerAgentOp('wait-for', (params) => runWaitFor(params, waitReaders));
 
   // ── wait-for-edit (#28) ── long-poll twin of editor-journal: park until the human does
   // something instead of the agent polling in a loop. Registered as a plain renderer op
@@ -1381,7 +1493,7 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as SetSelectionParams;
     if (p.asset !== undefined) {
       useEditorStore.setState({ selectedAsset: p.asset, selectedEntityId: null, selectedEntityIds: [] });
-      return readEditorState();
+      return { ok: true, ...editorStateFields('selection') };
     }
     // Resolve every requested ref to a LIVE id through the shared resolver, keeping only ids that resolve.
     // Selecting a nonexistent/stale id used to "succeed" and echo it back as selected, so a
@@ -1408,7 +1520,7 @@ export function registerEditorAgentOps(): void {
     // An explicit request to select IS a request to see it: re-selecting the entity already
     // selected changes no value, so without this a row collapsed since stays hidden (#1156).
     if (resolved.length) useEditorStore.getState().requestEntityReveal();
-    const state = readEditorState();
+    const state = { ok: true, ...editorStateFields('selection') };
     return missing.length
       ? { ...state, skipped: missing, warning: `${missing.length} requested entity ref(s) matched no live entity and were skipped` }
       : state;
@@ -1430,7 +1542,7 @@ export function registerEditorAgentOps(): void {
     const store = useEditorStore.getState();
     if (p.mode !== undefined) store.setGizmoMode(p.mode);
     if (p.space !== undefined) store.setGizmoSpace(p.space);
-    return readEditorState();
+    return { ok: true, ...editorStateFields('gizmoMode', 'gizmoSpace') };
   });
 
   // ── SceneView mode + collider-edit ── the toolbar's native <select> ('3d'|'ui')
@@ -1443,7 +1555,7 @@ export function registerEditorAgentOps(): void {
     // success (#1213 B-7) — the precedent `set-animation-view-mode` below was written against.
     refuseUnknownValue('set-scene-view-mode', 'mode', p.mode ?? null, SCENE_VIEW_MODES, 'the view was not changed');
     useEditorStore.getState().setSceneViewMode(p.mode as typeof SCENE_VIEW_MODES[number]);
-    return readEditorState();
+    return { ok: true, ...editorStateFields('sceneViewMode') };
   });
 
   // ── Animation editor: Dopesheet vs Curves (#369) ──
@@ -1476,7 +1588,7 @@ export function registerEditorAgentOps(): void {
       };
     }
     useEditorStore.getState().setAnimationViewMode(p.mode);
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('animationViewMode', 'animationView') };
   });
 
   // ── GameView device simulation (#367) ──
@@ -1682,7 +1794,7 @@ export function registerEditorAgentOps(): void {
       }
     }
     useEditorStore.getState().setColliderEditMode(p.on);
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('colliderEditMode') };
   });
   // Open the Particle Editor dock panel on a .particle.json (normally a double-click in
   // Assets). Mounts CurveEditor/GradientEditor, whose interaction-handle providers then
@@ -1699,7 +1811,7 @@ export function registerEditorAgentOps(): void {
     const path = p.path!;
     await awaitEditorMount('particle', path, 'open-particle-editor',
       'The store now names this asset, but the Particle editor tab did not mount to show it.');
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('openEditors') };
   });
   // Open the Sprite slicer / 9-slice modal on a texture (normally the Texture-Inspector
   // buttons). Selects the texture + requests the modal → its handle providers mount.
@@ -1730,7 +1842,7 @@ export function registerEditorAgentOps(): void {
     useEditorStore.getState().requestTextureEditor(p.path!, 'sprite', p.displayName);
     const path = p.path!;
     await awaitTextureModal('sprite', path, 'open-sprite-editor');
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('openEditors', 'spriteEditorSelection') };
   });
   registerAgentOp('open-nine-slice-editor', async (params) => {
     const p = (params ?? {}) as { path?: string; displayName?: string };
@@ -1738,7 +1850,7 @@ export function registerEditorAgentOps(): void {
     useEditorStore.getState().requestTextureEditor(p.path!, 'nineslice', p.displayName);
     const path = p.path!;
     await awaitTextureModal('nineslice', path, 'open-nine-slice-editor');
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('openEditors') };
   });
   // Select a slice in the currently-open Sprite Editor, so its 8 resize handles + pivot
   // register (`spriteEditorSelection` — #373: the modal opens with nothing selected, and
@@ -1748,7 +1860,7 @@ export function registerEditorAgentOps(): void {
     // Deselecting needs no open editor — there is nothing it could select wrongly.
     if (p.guid === undefined || p.guid === null) {
       useEditorStore.getState().setSpriteEditorSelection(null);
-      return { ...readEditorState(), ok: true };
+      return { ok: true, ...editorStateFields('spriteEditorSelection') };
     }
     // #1213 B-1: any string used to be stored as the selection, with or without a Sprite Editor on
     // screen — then `modoki_handles editor=sprite` came back empty, which reads as "no slices".
@@ -1761,7 +1873,7 @@ export function registerEditorAgentOps(): void {
         { options: [...slices] });
     }
     useEditorStore.getState().setSpriteEditorSelection(p.guid);
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('spriteEditorSelection') };
   });
   // Open the Skin (2D rig) editor on a .rig2d.json — normally reached from the Assets panel
   // double-click or the Texture Inspector's "Auto Rig". Neither `editingSkinAsset` (which
@@ -1776,7 +1888,7 @@ export function registerEditorAgentOps(): void {
     const path = p.path!;
     await awaitEditorMount('skin', path, 'open-skin-editor',
       'The store now names this rig, but the Skin editor tab did not mount to show it.');
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('openEditors', 'editingSkinAsset', 'skinMode') };
   });
   registerAgentOp('set-skin-mode', (params) => {
     const p = (params ?? {}) as { mode?: unknown };
@@ -1796,7 +1908,7 @@ export function registerEditorAgentOps(): void {
     // answered ok and the caller read the empty `bone-joint` handle list as "no rig".
     requireEditorOpen('skin', 'set-skin-mode');
     useEditorStore.getState().setSkinMode(p.mode);
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('skinMode') };
   });
 
   // Open a .anim.json in the Animation editor and BIND it to an entity, exactly as a
@@ -1884,8 +1996,8 @@ export function registerEditorAgentOps(): void {
     // perfectly and bind to nothing (no entity in the scene carries a matching Animator), and a
     // caller told only "opened" would then get a NOT_FOUND from pose_clip with no idea why.
     return {
-      ...readEditorState(),
       ok: true,
+      ...editorStateFields('openEditors', 'animationViewMode', 'animationView'),
       openedClip: clip.name ?? name,
       animatorRootEntityId: st.animatorRootEntityId,
       animatorRootGuid: st.animatorRootEntityId != null ? liveGuidOf(st.animatorRootEntityId) : null,
@@ -1927,6 +2039,13 @@ export function registerEditorAgentOps(): void {
     error: `${op} refused — physics failed to initialize, so the world would advance with NO physics: ${error}`,
     playState: getPlayState(),
   });
+  // `enterPlay` DECLINES without throwing, so the reply is built from what it says it did — never from
+  // the state re-read afterwards, which reads 'stopped' for a refused Play and a Play nobody asked for
+  // alike (#1574). A refusal is coded (§5) and carries the same message the toolbar's console warn does.
+  const playOutcomeRefusal = (o: PlayOutcome) =>
+    o.kind === 'refused' || o.kind === 'stopped-during-startup'
+      ? { ok: false, code: 'REFUSED_BY_OP', error: o.message, ...(o.kind === 'refused' ? { reason: o.reason } : { reason: o.kind, reverted: o.reverted }), ...playStateFields() }
+      : null;
   registerAgentOp('play', async () => {
     let physicsError: string | null = null;
     if (getPlayState() === 'paused') {
@@ -1937,16 +2056,18 @@ export function registerEditorAgentOps(): void {
       const pausedError = await physicsFailure();
       if (pausedError) return physicsRefused('play', pausedError);
       if (getPlayState() !== 'paused') return { ok: false, error: 'play from PAUSED — the play state changed while physics was loading', playState: getPlayState() };
-      await enterPlay();
+      const refused = playOutcomeRefusal(await enterPlay());
+      if (refused) return refused;
     } else {
-      await enterPlay();
+      const refused = playOutcomeRefusal(await enterPlay());
+      if (refused) return refused;
       // From stopped, enterPlay awaited readiness inside `_entering`, so anything still pending here
       // is a permanent failure (the loader memoises the rejection) — this await settles immediately.
       physicsError = getPlayState() === 'playing' ? await physicsFailure() : null;
     }
     return physicsError
-      ? { ...readEditorState(), physicsError: `Play started, but physics failed to initialize — bodies will not simulate: ${physicsError}` }
-      : readEditorState();
+      ? { ok: true, ...playStateFields(), physicsError: `Play started, but physics failed to initialize — bodies will not simulate: ${physicsError}` }
+      : { ok: true, ...playStateFields() };
   });
   // `resume` and `pause` are TRANSITIONS, and both used to accept any state and report the editor
   // state back as a success. From STOPPED, `resume` ran a full `enterPlay()` — a snapshot + run,
@@ -1969,10 +2090,32 @@ export function registerEditorAgentOps(): void {
     // Re-read after the await: from anything but paused, enterPlay would run a full Play — the very
     // outcome this op exists to refuse.
     if (getPlayState() !== 'paused') return { ok: false, error: 'resume requires the PAUSED state — the play state changed while physics was loading', playState: getPlayState() };
-    await enterPlay();
-    return readEditorState();
+    const refused = playOutcomeRefusal(await enterPlay());
+    if (refused) return refused;
+    return { ok: true, ...playStateFields() };
   });
-  registerAgentOp('stop', async () => { await stopPlay(); return readEditorState(); });
+  // Stop's reply says whether the revert happened (#1574): `reverted:false` + `reason` when Stop
+  // deliberately skipped it, `queued` while a Play is still starting. A restore that THROWS is a coded
+  // refusal rather than an escaped throw, which the relay turns into NOT_AVAILABLE_HERE ("relaunch") —
+  // the mode already reads 'stopped' then, and the live world may still be the Play world.
+  registerAgentOp('stop', async () => {
+    let o: StopOutcome;
+    try {
+      o = await stopPlay();
+    } catch (e) {
+      return {
+        ok: false,
+        code: 'REFUSED_BY_OP',
+        error: `Stopped, but restoring the authored world FAILED (${e instanceof Error ? e.message : String(e)}) — the live world may still be the Play or posed world. Reload the scene before saving or pressing Play.`,
+        ...playStateFields(),
+      };
+    }
+    if (o.kind === 'queued') return { ok: true, queued: true, ...playStateFields(), note: 'A Play startup is still in flight — this Stop is queued behind it, and that startup performs the revert (read the play reply, or playState, for how it ended).' };
+    if (o.kind === 'stopped' || o.kind === 'preview-exited') {
+      return { ok: true, ...playStateFields(), ...('reverted' in o ? { reverted: o.reverted } : {}), ...('reason' in o && o.reason ? { reason: o.reason } : {}) };
+    }
+    return { ok: true, ...playStateFields() };
+  });
   registerAgentOp('pause', () => {
     const st = getPlayState();
     if (st !== 'playing') {
@@ -1984,7 +2127,7 @@ export function registerEditorAgentOps(): void {
       };
     }
     pausePlay();
-    return readEditorState();
+    return { ok: true, ...playStateFields() };
   });
   // Step one frame while Paused: flip to 'playing' around a single synchronous
   // frame, then freeze again (exactly GameView's stepOnce).
@@ -1998,7 +2141,7 @@ export function registerEditorAgentOps(): void {
     setPlayState('playing');
     stepOneFrame();
     setPlayState('paused');
-    return readEditorState();
+    return { ok: true, ...playStateFields() };
   });
 
   // ── Undo / redo ── (async — undo/redo may run async undo closures).
@@ -2015,7 +2158,7 @@ export function registerEditorAgentOps(): void {
   const undoOrRefuse = async (op: 'undo' | 'redo') => {
     const { did, refused } = await undoStep(op);
     if (refused !== null) throw new OpRefusal('REFUSED_BY_OP', `${op}: ${refused} Nothing was undone or redone, and the stack is untouched.`);
-    return { did, ...readEditorState() };
+    return { did, ...editorStateFields('undo', 'unsavedChanges') };
   };
   registerAgentOp('undo', () => undoOrRefuse('undo'));
   registerAgentOp('redo', () => undoOrRefuse('redo'));
@@ -2149,11 +2292,19 @@ export function registerEditorAgentOps(): void {
       + `${consequence}${survives}${remedy}`,
     );
   };
+  /** `guardUnsaved`, read once the undo in flight has landed (#1579). Its dirty mark (#310) comes at its END, and the
+   *  swap waits for the step anyway — read during it, the gate passed a world the step then dirtied, and the swap
+   *  discarded that scene's history with no refusal. */
+  const guardUnsavedAfterUndo = async (op: string, discardUnsaved: boolean | undefined) => {
+    const pending = undoStepPending();
+    if (pending) await pending;
+    guardUnsaved(op, discardUnsaved);
+  };
   registerAgentOp('load-scene', async (params) => {
     const p = (params ?? {}) as { path: string; discardUnsaved?: boolean; force?: boolean };
     const { path } = p;
     if (!path) throw new Error('load-scene requires { path }');
-    guardUnsaved('load-scene', p.discardUnsaved ?? p.force);
+    await guardUnsavedAfterUndo('load-scene', p.discardUnsaved ?? p.force);
     // Read BEFORE the load — `loadScene()` never gets far enough to change this on a
     // refusal/failure, but capturing it up front (mirrors `agentBridge.ts`'s runtime twin,
     // #486 finding A) lets the message say whether the PREVIOUS scene is still what's loaded,
@@ -2191,7 +2342,11 @@ export function registerEditorAgentOps(): void {
         error: `load-scene for "${path}" was superseded — a LATER scene load won the swap, and `
           + `"${sceneManager.getCurrent()?.path ?? 'null'}" is now the active scene. This op's own `
           + `load did not fail; this says nothing about whether "${path}" exists.`,
-        ...readEditorState(),
+        // The health faults, then the WINNER's path from the scene manager, for the reason above — not
+        // `editorStateFields('scenePath')`, which reads the tracked path this comment says may still be
+        // pre-swap (#1553 review).
+        ...editorStateFields(),
+        scenePath: sceneManager.getCurrent()?.path ?? null,
       };
     }
     // #1425: the scene loaded, but a manager failed to start. Say so rather than a bare ok.
@@ -2199,21 +2354,21 @@ export function registerEditorAgentOps(): void {
     return {
       ok: true,
       ...(startupErrors.length ? { warnings: startupErrors.map((e) => `manager failed to start (the scene is still loaded): ${e}`) } : {}),
-      ...readEditorState(),
+      ...editorStateFields('scenePath', 'worldEntityTotal', 'unsavedChanges'),
     };
   });
   registerAgentOp('new-scene', async (params) => {
     const p = (params ?? {}) as { discardUnsaved?: boolean; force?: boolean };
     // In prefab-edit, `newScene` refuses whatever is dirty (below), so the unsaved-work refusal would
     // only send the caller to save and then hit that one anyway (#1424 review). Let it speak first.
-    if (!isEditingPrefab()) guardUnsaved('new-scene', p.discardUnsaved ?? p.force);
+    if (!isEditingPrefab()) await guardUnsavedAfterUndo('new-scene', p.discardUnsaved ?? p.force);
     // Async since #853 — `newScene` now swaps the world through SceneManager instead of
     // respawning in place, so `onWorldSwap` fires and every id-keyed cache clears. It also
     // REFUSES during prefab edit; that throw carries its own message and propagates as this
     // op's error, the same shape `guardUnsaved` above uses.
     await newScene();
     setSelectionRaw(null, []);
-    return readEditorState();
+    return { ok: true, ...editorStateFields('scenePath', 'worldEntityTotal', 'unsavedChanges') };
   });
   // save_all is the tool the whole "create live, then edit the file" story depends on, so it
   // must never claim a write that didn't happen. It used to hardcode {ok:true} over a
@@ -2383,7 +2538,10 @@ export function registerEditorAgentOps(): void {
       const note = landed.length
         ? ` The ${landed.length} parked item(s) WERE written (${landed.join(', ')}) — those are authored documents and are not affected by run mode.`
         : '';
-      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing, because saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene, and Stop would revert the live world anyway. Stop the editor first (modoki_play_control {action:"stop"}).${note}`);
+      // The REASON, not a fixed "stop the editor" (#1548 close-out review): a preview restore still
+      // landing is cleared by retrying, not by Stop, which is a no-op there.
+      const why = whyWorldNotAuthored() ?? 'the live world is not authored';
+      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing (${why}). Saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene. Stop Play (modoki_play_control {action:"stop"}), exit a preview (modoki_exit_pose_envelope), or — if a restore is landing — retry in a moment.${note}`);
     }
     // ⚠️ "NOTHING was written" was a claim about the WHOLE save, and a failed scene write does not
     // undo the parked flushes — so with anything in `landed` it was a real write reported as a
@@ -2506,8 +2664,26 @@ export function registerEditorAgentOps(): void {
     };
   });
 
+  // ── PlayerPrefs writes refuse an envelope too (#1551 review) ──
+  // Ending a preview puts PlayerPrefs back to its state when the envelope opened, whoever wrote it — it
+  // cannot tell a ▶ action's write from an agent's. So an agent write made inside one replied ok and
+  // was deleted at ⏹/Stop/Play. The op itself lives in the shared bridge (the device runs it too, and
+  // has no envelope), so the editor wraps it here instead of copying it. `flush` changes no value.
+  const bridgePrefsWrite = agentOpHandler('player-prefs-write');
+  if (bridgePrefsWrite) {
+    registerAgentOp('player-prefs-write', (params) => {
+      if ((params as { action?: string } | null)?.action !== 'flush') {
+        refusePrefsWriteInSession();
+      }
+      return bridgePrefsWrite(params);
+    });
+  }
+
   // ── Entity create / duplicate / delete / reparent ── (undoable, like the menus).
+  // Each refuses inside a scrub/preview envelope, or while its restore is landing (#1552) — see
+  // `refuseEditOfPosedWorld`.
   registerAgentOp('create-entity', (params) => {
+    refuseEditOfPosedWorld('create-entity');
     const p = (params ?? {}) as CreateEntityParams;
     if (!p.spec) throw new Error('create-entity requires { spec }');
     // The ONE vocabulary check both create-entity ops share (#1070) — `resolveCreateEntitySpec`
@@ -2523,7 +2699,10 @@ export function registerEditorAgentOps(): void {
     }
     // parentGuid and parentId are ONE address (both given → refused, #1223); 0 alone = root stays literal.
     const parentId = resolveParentId(p, 'create-entity parent');
-    const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId);
+    if (p.name !== undefined && (typeof p.name !== 'string' || !p.name.trim())) {
+      throw new OpRefusal('REFUSED_BY_OP', `create-entity: name must be a non-empty string (got ${JSON.stringify(p.name)}) — nothing was created.`);
+    }
+    const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId, p.name as string | undefined);
     const id = createEntityWithUndo(`Create ${name}`, parentId, specs as TraitSpec[], (i) => setSelectionRaw(i, i != null ? [i] : []));
     // null = nothing was created. Reporting {id:null} as a success let an agent proceed as
     // if the entity existed — say so instead. (C7)
@@ -2540,6 +2719,7 @@ export function registerEditorAgentOps(): void {
     return { id, name, guid: ensureGuid(id), saved: false };
   });
   registerAgentOp('duplicate-entity', (params) => {
+    refuseEditOfPosedWorld('duplicate-entity');
     const p = (params ?? {}) as { id?: number; guid?: string };
     const id = requireLiveId(p, 'duplicate-entity'); // throws on a stale, ambiguous or id-for-a-guid ref (#1223)
     if (isResourceEntity(id)) {
@@ -2552,6 +2732,7 @@ export function registerEditorAgentOps(): void {
     return { id: newId, guid: ensureGuid(newId), saved: false }; // stable handle — see create-entity (C7)
   });
   registerAgentOp('delete-entities', (params) => {
+    refuseEditOfPosedWorld('delete-entities');
     // Accept guids (stable) and/or ids, resolving each to a LIVE id. This closes the C7 residual:
     // a numeric id recycled by a hot-reload passed the old findEntity() guard and deleted a
     // DIFFERENT valid entity (data loss reported as success). A guid resolves to the RIGHT entity
@@ -2593,6 +2774,7 @@ export function registerEditorAgentOps(): void {
     return { ok: true, ...named, ...also, saved: false, ...(missing.length ? { skipped: missing, warning: `${missing.length} ref(s) matched no live entity and were skipped (ids are reassigned on scene reload — prefer guid)` } : {}) };
   });
   registerAgentOp('reparent-entity', async (params) => {
+    refuseEditOfPosedWorld('reparent-entity');
     // Both the moved entity and the new parent resolve through the shared resolver (#1223): one address
     // each, `{id}` only for a guid-less entity — a recycled id would silently move the wrong node.
     const p = (params ?? {}) as { id?: number; guid?: string; parentId?: number; parentGuid?: string; sortOrder?: number; moveToScene?: boolean };
@@ -2652,6 +2834,7 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as PrefabParams;
     const which = p.prefabAction ?? p.action;
     if (which === 'instantiate') {
+      refuseEditOfPosedWorld('prefab instantiate');
       if (!p.path) throw new Error('prefab instantiate requires { path }');
       const path = p.path;
       const prefab = await getPrefabSource(path);
@@ -2696,8 +2879,23 @@ export function registerEditorAgentOps(): void {
       if ((p.entityId == null && !p.entityGuid) || !p.path) throw new Error('prefab create requires { entityId | entityGuid, path }');
       const path = p.path;
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // both given → refused (#1223 D1)
-      const existingId = await resolveExistingPrefabId(path);
-      // Same cold-cache flatten as the human path (#1284) — resolveExistingPrefabId fetches
+      // The live subtree is what gets written — refuse a posed/played one (#1548), as the human path does.
+      // Unlike the live-world edits, Play is NOT exempt here: this writes a FILE, and a played subtree
+      // would be baked into the template.
+      if (getRunMode() === 'playing') {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${whyWorldNotAuthored()} — stop Play first, or the played pose is written into the prefab.`,
+          { options: ["modoki_play_control {action:'stop'} — returns to the authored world, then retry"] });
+      }
+      refuseEditOfPosedWorld('prefab create', 'the subtree may carry a pose, which would be written into the prefab file');
+      const existing = await classifyExistingPrefabId(path);
+      // ⚠️ Refuse rather than mint a fresh file guid over a prefab that is THERE and unreadable — a
+      // 500, corrupt bytes, or one a newer build wrote (#1468, #896's class). The agent asked to
+      // create a prefab at a path, not to re-identify the asset already sitting on it, and every
+      // scene referencing the old id would dangle with the old bytes still on disk. Thrown, because
+      // this op's contract is that a refusal reaches the caller rather than the renderer console.
+      if (existing.kind === 'refuse') throw new Error(`prefab create refused: ${existing.reason}`);
+      const existingId = existing.kind === 'known' ? existing.id : undefined;
+      // Same cold-cache flatten as the human path (#1284) — classifyExistingPrefabId fetches
       // raw and never touches the editor prefab cache, so nothing here warms it.
       await preloadNestedPrefabsForSubtree(entityId);
       let runtimeExcluded = 0;
@@ -2717,18 +2915,27 @@ export function registerEditorAgentOps(): void {
         // deliberately leaves a held nested instance linked to its OWN prefab, but the untag
         // below strips the WHOLE tree — without this the agent path's undo left that instance
         // permanently unlinked, with nothing recorded to restore it. Mirrors the human flow.
+        // ⚠️ Mint the root's guid BEFORE the tag: it is the ANCHOR every member's derived guid comes
+        // from (#1461), and `entityRef` is what mints it. Taken after, the stamp has nothing to derive
+        // from and leaves the create window open. (Its other job — resolving the subtree across a world
+        // rebuild — is unchanged.)
+        const ref = entityRef(entityId);
         const priorLinks = detachPrefabInstance(entityId, { strip: false });
-        tagEntityTreeAsInstance(entityId, path, prefab);
+        // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
+        let guidRemap = tagEntityTreeAsInstance(entityId, path, prefab);
         // Undo reverts the LIVE tagging only — deliberately NOT the file write. Deleting the
         // .prefab.json on undo (as the human path does for a brand-new prefab) is wrong here:
         // this op also OVERWRITES an existing prefab (`existingId` preserves its GUID), and
         // undoing an overwrite by deleting the file would destroy an asset the agent never
         // created. File-direct writes are not undoable anywhere else in the MCP surface either.
-        const ref = entityRef(entityId);
         pushAction({
           label: `Create prefab "${prefab.name ?? path}" (link only)`,
           undo: () => {
             const id = ref.resolve(); if (id == null) return;
+            // Put the members' ORIGINAL guids back FIRST, and every ref with them: `priorLinks` was
+            // snapshotted one line before the tag and addresses each member by the guid it held then,
+            // so reattaching ahead of this would resolve nothing (#1461).
+            unstampMemberGuids(guidRemap);
             // Scoped to THIS prefab (#1272): a held nested instance keeps its own link rather
             // than being stripped and restored from a guid that a Play→Stop may have re-minted.
             untagEntityTreeAsInstance(id, path);
@@ -2742,7 +2949,8 @@ export function registerEditorAgentOps(): void {
             // the file written warm, and the redo tags nothing at all.
             await preloadNestedPrefabsForSubtree(id);
             const after = ref.resolve(); if (after == null) return;
-            tagEntityTreeAsInstance(after, path, prefab);
+            guidRemap = tagEntityTreeAsInstance(after, path, prefab); // undo reverses THIS run's rename
+
           },
         });
       }
@@ -2752,6 +2960,7 @@ export function registerEditorAgentOps(): void {
       return { ok, source: path, saved: ok, sceneLinkageSaved: false, ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'detach') {
+      refuseEditOfPosedWorld('prefab detach');
       if (p.entityId == null && !p.entityGuid) throw new Error('prefab detach requires { entityId | entityGuid }');
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab detach'); // both given → refused (#1223 D1)
       const snapshot = detachPrefabInstance(entityId);
@@ -2820,6 +3029,9 @@ export function registerEditorAgentOps(): void {
     }
     if (which === 'apply' || which === 'revert') {
       const verb = which; // 'apply' | 'revert'
+      // Revert edits THIS instance in the live world (#1552 review); apply writes the template and is
+      // refused further down by `applyToPrefabSelective`'s own gate.
+      if (verb === 'revert') refuseEditOfPosedWorld('prefab revert');
       if (p.entityId == null && !p.entityGuid) throw new Error(`prefab ${verb} requires { entityId | entityGuid }`);
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, `prefab ${verb}`);
       const ctx = resolveInstanceContext(entityId);
@@ -2858,7 +3070,10 @@ export function registerEditorAgentOps(): void {
         // most of what was asked, so the caller has no reason to look. One typo in a list of
         // five would then leave a field un-applied, and the next reader would conclude the
         // apply is flaky rather than that they mistyped a key.
-        const unknown = new Set(p.keys.filter((k) => !available.all.includes(k)));
+        // Compared in ONE spelling (#1468 Phase 4): a key names its member by `nodeGuid` where it can, and
+        // a caller holding the localId spelling of the same key is asking for the same thing.
+        const listed = new Set(available.all.map((k) => canonicalOverrideKey(k, prefab)));
+        const unknown = new Set(p.keys.filter((k) => !listed.has(canonicalOverrideKey(k, prefab))));
         if (unknown.size > 0) {
           const sample = available.all.slice(0, 5).join(', ');
           throw new OpRefusal(
@@ -2882,7 +3097,9 @@ export function registerEditorAgentOps(): void {
         // is `continue`d past by applyToPrefabSelective WITHOUT being counted, so the overall
         // `applied` flag can be true while a specific requested key was never written.
         // Echoing the request back as `appliedKeys` would report that key as applied.
-        const excluded = available.applyExcluded.filter((k) => keySet.has(k));
+        // In the CALLER's spelling, so the refusal and `skippedKeys` name what they passed.
+        const excludedCanon = new Set(available.applyExcluded.map((k) => canonicalOverrideKey(k, prefab)));
+        const excluded = [...keySet].filter((k) => excludedCanon.has(canonicalOverrideKey(k, prefab)));
         if (p.keys && excluded.length > 0) {
           // Explicitly asked for by name → refuse, rather than do less than was asked.
           throw new Error(
@@ -2899,6 +3116,10 @@ export function registerEditorAgentOps(): void {
         // A move the prefab cannot express (#1437) is named with its reason, not echoed back as applied.
         const notWritten = result.skipped ?? [];
         if (!result.applied) {
+          // A REFUSAL states its own cause; leading with the "may have stopped being a prefab
+          // instance" guess before appending the real reason sends the reader down the wrong path
+          // (#1468 close-out review F4). That guess is right only when nothing else explains it.
+          if (result.refused) throw new Error(`prefab apply refused: ${result.refused}`);
           const why = notWritten.length ? ` Not applied: ${notWritten.map((x) => `${x.key} (${x.reason})`).join('; ')}.` : '';
           throw new Error(`prefab apply: nothing was written — the apply produced no change for entity ${entityId} (it may have stopped being a prefab instance mid-call).${why}`);
         }
@@ -2910,10 +3131,11 @@ export function registerEditorAgentOps(): void {
         const applied = [...keySet].filter((k) => !skippedKeys.includes(k));
         return {
           ok: true, source: result.source, appliedKeys: applied,
-          // skippedReason speaks for the excluded FIELDS only; each skipped move carries its own in skippedMoves.
+          // skippedReason speaks for the excluded FIELDS only; every other key Apply did not write (a move it
+          // cannot express, a tag it cannot add — #1491) carries its own reason in notWritten.
           ...(skippedKeys.length > 0 ? { skippedKeys } : {}),
           ...(excluded.length > 0 ? { skippedReason: `fields ${excluded.join(', ')}: not representable in a prefab template (scene-only / runtime-only field)` } : {}),
-          ...(notWritten.length > 0 ? { skippedMoves: notWritten } : {}),
+          ...(notWritten.length > 0 ? { notWritten } : {}),
           promotedAdditions: result.promotedAdditions, saved: true,
           // An applied move changed member paths (#1437): which other files had their refs repaired, and which not.
           ...(result.memberPathsChanged ? { fileRepair: result.fileRepair ?? { failed: true } } : {}),
@@ -2924,6 +3146,9 @@ export function registerEditorAgentOps(): void {
       // which === 'revert' — mirrors ApplyPrefabDialog.handleRevert EXACTLY: revert itself
       // pushes NO undo entry (rebuildInstance is a raw teardown+rebuild), so the caller must,
       // with the same before/after rebuild-from-snapshot undo/redo the dialog wires.
+      // A refusal states its own cause (#1483) — Revert's bare null would be reported below as a lost instance.
+      const refusal = staleInstanceRefusal(ctx.rootInstanceId);
+      if (refusal) throw new Error(`prefab revert refused: ${refusal}`);
       const result = await revertOverridesSelective(ctx.rootInstanceId, keySet);
       if (!result) {
         throw new Error(`prefab revert: revertOverridesSelective returned nothing for entity ${entityId} — it stopped being a prefab instance, or the prefab source could not be re-loaded for the rebuild (see the editor console for the [Prefab] warning).`);
@@ -2966,7 +3191,7 @@ export function registerEditorAgentOps(): void {
       // same way and must refuse for the same reason. It additionally SAVES the current scene on
       // the way in (prefabEdit.ts does this deliberately, so the return trip's reload-from-disk
       // is non-destructive) — which is a write the caller should not discover afterwards.
-      guardUnsaved('prefab edit-open', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
+      await guardUnsavedAfterUndo('prefab edit-open', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
       const scenePathBefore = getCurrentScenePath();
       const name = p.path.split('/').pop()?.replace(/\.prefab\.json$/, '') ?? p.path;
       await openPrefabForEditing({ path: p.path, name });
@@ -2988,7 +3213,7 @@ export function registerEditorAgentOps(): void {
         /** The scene saved + remembered on the way in; 'edit-exit' reloads it. */
         returnScene: scenePathBefore,
         savedReturnScene: scenePathBefore != null,
-        ...readEditorState(),
+        ...editorStateFields('scenePath', 'prefabEditWorld', 'worldEntityTotal'),
       };
     }
     if (which === 'edit-save') {
@@ -3001,10 +3226,15 @@ export function registerEditorAgentOps(): void {
       const editing = useEditorStore.getState().editingPrefab!;
       const { saved, warnings } = await savePrefabEditReport();
       if (!saved) {
+        // ⚠️ `warnings` carries the backend's own REASON on a failure now (#1468) — the format gate
+        // answers 409 with why, and without this the agent got three guesses and a pointer to a
+        // console it cannot read. A produced reason nobody reads is this repo's #1 defect class, and
+        // it shipped here once already (close-out review R2).
+        const why = warnings.length ? ` Reason: ${warnings.join('; ')}` : '';
         throw new Error(
           `prefab edit-save FAILED for ${editing.path} — NOTHING was written. Either the prefab root ` +
           'was not found in the edit world, serialization produced no prefab, or the file write was ' +
-          'rejected. See the editor console for the [PrefabEdit] error.',
+          `rejected.${why || ' See the editor console for the [PrefabEdit] error.'}`,
         );
       }
       // `warnings`: the prefab validation warnings for the written template, as `create` answers them (#1258).
@@ -3012,15 +3242,15 @@ export function registerEditorAgentOps(): void {
     }
     if (which === 'edit-exit') {
       // Report not-editing rather than throwing: leaving a mode you are not in is a legitimate no-op.
-      if (!isEditingPrefab()) return { ok: true, wasEditing: false, ...readEditorState() };
+      if (!isEditingPrefab()) return { ok: true, wasEditing: false, ...editorStateFields('scenePath') };
       // Exiting reloads the return scene, which DISCARDS the prefab world — so it refuses on unsaved
       // work exactly as edit-open and load-scene do (#1424: it answered ok:true over an unsaved
       // delete, with the undo stack gone). This deliberately ends "call it blindly after a failed
       // edit-save": after a failed save the edits ARE unsaved, and dropping them must be a choice
       // the caller makes with discardUnsaved:true, not a side effect of tidying up.
-      guardUnsaved('prefab edit-exit', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
+      await guardUnsavedAfterUndo('prefab edit-exit', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
       const returned = await exitPrefabEditing();
-      return { ok: true, wasEditing: true, returnedTo: returned, ...readEditorState() };
+      return { ok: true, wasEditing: true, returnedTo: returned, ...editorStateFields('scenePath', 'worldEntityTotal', 'unsavedChanges') };
     }
     throw new Error(
       `unknown prefab action '${which}' — pass prefabAction: 'instantiate' | 'create' | 'detach' ` +
@@ -3120,8 +3350,8 @@ export function registerEditorAgentOps(): void {
       return {
         ok: false, code: 'REFUSED_BY_OP', playhead: clamped, boundClip: clip.name ?? null,
         ...(clamped !== t ? { clampedFrom: t, duration } : {}),
-        error: 'the preview is closing — the scene was being restored (or the envelope was exited) when '
-          + 'this pose tried to open its session, so nothing was posed.',
+        error: 'the scene was being restored (a preview closing, or Play stopping) or the envelope was '
+          + 'exited when this pose tried to open its session, so nothing was posed.',
         options: ['pose again once the restore has landed (it takes one scene reload)'],
       };
     }
@@ -3147,8 +3377,13 @@ export function registerEditorAgentOps(): void {
       boundClip: clip.name ?? null,
       ...(clamped !== t ? { clampedFrom: t, duration } : {}),
       saved: false,
-      note: 'The rig is posed INSIDE the preview envelope, so this is revertible (⏹ Exit Preview) '
-        + 'and a scene save cannot bake it. It is NOT an undo-stack entry — Cmd-Z does not reach it.',
+      // Two envelopes, two ways out (#1546): during Play the pose goes into the PLAY world and opens
+      // no preview session, so ⏹ Exit Preview / exit-pose-envelope have nothing to revert — Stop does.
+      note: getRunMode() === 'playing'
+        ? 'The rig is posed inside PLAY (no preview session opens while playing): Stop reverts it with '
+          + 'the rest of the play session, and a scene save is refused until then. It is NOT an undo-stack entry.'
+        : 'The rig is posed INSIDE the preview envelope, so this is revertible (⏹ Exit Preview) '
+          + 'and a scene save cannot bake it. It is NOT an undo-stack entry — Cmd-Z does not reach it.',
     };
   });
 

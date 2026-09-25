@@ -8,6 +8,7 @@
  *  before the heavy refresh — we only need to assert what would be written. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { setRunMode as setRunModeForAuthoring } from '../../src/runtime/core/playState';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -115,6 +116,10 @@ beforeEach(() => {
   entityInfos = [];
   writtenContent = null;
 });
+
+// The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing), and
+// every writer of the live world refuses outside an authored world (#1548) — so the premise is stated.
+beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('applyToPrefabSelective — added component persists to the prefab', () => {
 

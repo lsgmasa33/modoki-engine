@@ -72,6 +72,40 @@ export function gameAspectFromRect(
   return rect.width > 0 && rect.height > 0 ? rect.width / rect.height : fallbackAspect;
 }
 
+/** The client-px rect the SceneView's 3D pass is actually DRAWN into: in UI mode the render is
+ *  letterboxed to `gameAspect` inside the canvas; in 3D mode it fills the canvas. Every mapping
+ *  between a client point and NDC — picking a click, projecting an aim rect, hit-testing the
+ *  gizmo — must go through this rect (and the camera the pass draws with), or one side of a
+ *  round trip is in a different frame from the other: #1489, where `modoki_tap` aimed at the
+ *  full-canvas projection while the pick looked through the letterbox, and hit the Water. */
+export function viewportDrawRect(
+  canvas: { left: number; top: number; width: number; height: number },
+  isUI: boolean,
+  gameAspect: number,
+): { left: number; top: number; width: number; height: number } {
+  if (!isUI) return { left: canvas.left, top: canvas.top, width: canvas.width, height: canvas.height };
+  const { vpX, vpY, vpW, vpH } = computeLetterbox(canvas.width, canvas.height, gameAspect);
+  return { left: canvas.left + vpX, top: canvas.top + vpY, width: vpW, height: vpH };
+}
+
+/** The same draw rect in the form three's `TransformControls#viewport` takes — CSS px, origin at
+ *  the canvas's LOWER-left, `(x, y, width, height)` — or `null` when the draw rect IS the canvas
+ *  (3D mode), which is three's "use the full canvas". TransformControls listens to the canvas
+ *  itself and maps every press/hover/move through this, so leaving it `null` while the view is
+ *  letterboxed maps its OWN pointer handling to the full canvas: a press in the empty bar grabs a
+ *  handle drawn elsewhere, and the drag then jumps once SceneView's capture handler (which maps
+ *  through the letterbox) takes over the moves (#1489 review). Writes into `out` when given. */
+export function transformControlsViewport(
+  canvas: { left: number; top: number; width: number; height: number },
+  draw: { left: number; top: number; width: number; height: number },
+  out: THREE.Vector4 = new THREE.Vector4(),
+): THREE.Vector4 | null {
+  if (draw.left === canvas.left && draw.top === canvas.top && draw.width === canvas.width && draw.height === canvas.height) return null;
+  const x = draw.left - canvas.left;
+  const yFromTop = draw.top - canvas.top;
+  return out.set(x, canvas.height - yFromTop - draw.height, draw.width, draw.height);
+}
+
 /** Map a pointer event to normalized device coords (-1..1) inside the UI-mode letterboxed
  *  viewport (the 3D render is letterboxed to `gameAspect`, not the full canvas). */
 export function computeUIModeNDC(
@@ -80,11 +114,7 @@ export function computeUIModeNDC(
   rect: { left: number; top: number; width: number; height: number },
   gameAspect: number,
 ): { x: number; y: number } {
-  const { vpX, vpY, vpW, vpH } = computeLetterbox(rect.width, rect.height, gameAspect);
-  return {
-    x: ((clientX - rect.left - vpX) / vpW) * 2 - 1,
-    y: -((clientY - rect.top - vpY) / vpH) * 2 + 1,
-  };
+  return computeFullNDC(clientX, clientY, viewportDrawRect(rect, true, gameAspect));
 }
 
 /** Default press→release travel (CSS px) under which a press counts as a click (a selection

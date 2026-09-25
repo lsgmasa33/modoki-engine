@@ -335,9 +335,9 @@ describe('scaffoldNativeTarget repair (#581)', () => {
     expect(isNativeTargetScaffolded(root, 'ios')).toBe(false);
 
     const sent: string[] = [];
-    const runShell = async (label: string, cmd: string) => {
+    const runShell = async (label: string, command: string, args: string[]) => {
       sent.push(label);
-      if (cmd.startsWith('npx cap add')) {
+      if ([command, ...args].join(' ').startsWith('npx cap add')) {
         // The real `cap add` would fatal here if the stale folder were still present —
         // assert the repair step already cleared it before this runs.
         expect(fs.existsSync(pbxproj)).toBe(false);
@@ -440,8 +440,8 @@ describe('scaffoldNativeTarget repair (#581)', () => {
       fs.mkdirSync(path.join(root, 'ios', 'inner'), { recursive: true });
       makeDirLink(path.join(root, 'ios', 'inner'), path.join(root, 'ios', 'shim'));
 
-      const runShell = async (_l: string, cmd: string) => {
-        if (cmd.startsWith('npx cap add')) {
+      const runShell = async (_l: string, command: string, args: string[]) => {
+        if ([command, ...args].join(' ').startsWith('npx cap add')) {
           expect(fs.existsSync(pbxproj)).toBe(false);        // the repair really did run
           fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
           fs.writeFileSync(pbxproj, '// stub');
@@ -482,8 +482,8 @@ describe('scaffoldNativeTarget repair (#581)', () => {
     fs.writeFileSync(buildGradle, 'stale — from an interrupted extraction');
     expect(isNativeTargetScaffolded(root, 'android')).toBe(false);
 
-    const runShell = async (_label: string, cmd: string) => {
-      if (cmd.startsWith('npx cap add')) {
+    const runShell = async (_label: string, command: string, args: string[]) => {
+      if ([command, ...args].join(' ').startsWith('npx cap add')) {
         expect(fs.existsSync(buildGradle)).toBe(false);
         fs.mkdirSync(path.dirname(buildGradle), { recursive: true });
         fs.writeFileSync(buildGradle, '// stub');
@@ -525,9 +525,9 @@ describe('scaffoldNativeTarget repair (#581)', () => {
     expect(isNativeTargetScaffolded(root, 'ios')).toBe(true); // genuinely complete before this run
 
     const sent: string[] = [];
-    const runShell = async (label: string, cmd: string) => {
+    const runShell = async (label: string, command: string, args: string[]) => {
       sent.push(label);
-      if (cmd.startsWith('npx cap add')) {
+      if ([command, ...args].join(' ').startsWith('npx cap add')) {
         expect(fs.existsSync(pbxproj)).toBe(false); // removed before cap add, even though it was complete
         fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
         fs.writeFileSync(pbxproj, 'REGENERATED');

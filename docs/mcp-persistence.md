@@ -64,7 +64,12 @@ three were rare under `auto` and are routine now:
   is the predicate, and its docblock names `mutate` by name; it just had no caller on this route.
   The refusal names the exit that actually works, which depends on `modeOwner`: an ANIMATION-owned
   envelope is ended by `modoki_exit_pose_envelope`, and a TIMELINE-owned one is not — that op
-  deliberately refuses it, so there the reply asks for the human's ⏹ Exit Preview instead.
+  deliberately refuses it, so there the reply offers `modoki_play_control {action:'stop'}`, marked
+  DESTRUCTIVE because it restores the envelope's snapshot over anything the human did inside it.
+  The live-world entity ops (`create_entity`, `duplicate_entity`, `delete_entities`,
+  `reparent_entity`, `prefab` instantiate) refuse the same way with the same exits since #1552 —
+  they used to reply `ok` and be reverted on Exit. The exits live in one place,
+  `editor/scene/envelopeExits.ts`.
 - **A game-code (`.ts`) edit force-reloads the editor and DISCARDS unsaved scene edits** after a 5s
   countdown (CLAUDE.md). This is the sharpest one: accumulated unsaved work is more exposed than it
   was under `auto`.
@@ -899,13 +904,59 @@ referenced a scene replaced by Save As no longer resolves. It is not drift from 
   close-out reviews). A
   scene with no path yet (`new_scene`) already has a fresh id. A base loaded under the open scene is
   refused as a target. The human Save As is unaffected: it is offered only for an untitled scene.
+- **The reply names every file in the asset-root form (#1562).** The renderer builds the reply from
+  its own paths, and the open scene's path is whatever spelling it was opened under. That is Vite's
+  `/@fs/<abs>` for a boot candidate or an explicit `/@fs/` load. So a Save As answered
+  `scenePath: "/assets/…"` (the backend's disk spelling of the copy) beside
+  `savedAsCopyOf: "/@fs/…"` for the scene the caller addresses as `/assets/…`, and the live smoke read
+  that as "a copy of some other file". A plain save answered `scenePath: "/@fs/…"`, which
+  `modoki_mutate_scene {path}` refuses. The `/api/editor-action` relay now maps every `/@fs/` string
+  in the reply (top-level, in a list, or a list entry's `path`) through `toAssetRef`, the same
+  canonicalizer that gives `editor-state` its `scenePathRef`. ⚠️ It maps by VALUE, not by field name:
+  the first cut named five fields and missed a sixth (`savedImportSettings`), and the next field
+  added to the op would have been missed the same way. A path outside every asset root keeps the
+  renderer's spelling. The raw open path still drives the same-file compare and the plain-save
+  write, because those have to match what the editor holds.
+  **Every OTHER editor-action reply** that carries the editor state (`load_scene`, play, undo,
+  prefab edit-open and about a dozen more spread `readEditorState()`) gains the same additive
+  `scenePathRef` that `modoki_get_editor_state` has. `load_scene` was observed answering
+  `scenePath: "/@fs/…"` with no ref at all. Save All carries `scenePathRef` too, so the field means
+  one thing on every reply of the route, and prefab edit-open's `returnScene` gains a
+  `returnSceneRef` the same way.
 
 **A Replace never crosses KINDS.** The scene flows write plain `.json`, so their destination can be
 `Enemy.prefab.json`. Kept, that guid would be re-registered as a scene, and every `PrefabInstance.source`
 would resolve to a scene document. A destination the manifest types as another kind is refused
 before any question (`otherAssetKindAt`). Only the scene flows pass `kind`: every other create
-enforces a compound extension. A file the manifest has not indexed yet cannot be classified and is
-not refused.
+enforces a compound extension.
+
+**The same rule fronts every backend route that writes a caller-named JSON asset** (#1472), through
+ONE predicate, `wrongKindRefusal` in `editorBackendRouter.ts`: `/api/scene-mutate` (expects `scene`),
+`/api/scene-save-as` (`scene`), `/api/asset-write` and `/api/create-asset` (the body's `type`). Each
+answers `409 {wrongKind:true}` with `existingType` for a file that is there, or `nameType` for a new
+name, and writes nothing. Before it, #1264's check lived inline in save-as alone, so the other three
+decided the kind from the CALLER — the route, or the body's `type` — and never asked the file:
+`setTrait` posted to `/api/scene-mutate` at a `.prefab.json` answered `saved:true` and rewrote the
+prefab through the scene path (observed), and `write_asset {type:'material'}` would have done the
+same to any asset.
+
+A file's kind is asked in the same order on both sides — the client's `otherAssetKindAt` and the
+backend predicate: **the manifest's type** (looked up by the disk's spelling, #1273), **else
+`classifyJsonAssetPath`** on that same on-disk url — the function the scanner's `detectType` itself
+types JSON by, so a file the manifest has not indexed yet is judged by the type it is about to get.
+Both used to read an unindexed file as no conflict. ⚠️ **The SUFFIX table alone is not that rule**:
+the scan also types `.layout.json`, and a plain `.json` under a legacy `/scenes/` or `/materials/`
+folder (issue #54). The first version of this check used only the suffixes, and `create_asset
+{type:'particle', path:'/scenes/burst.json'}` answered `saved:true` for a file the next scan typed
+`scene` (close-out review). The url it classifies is the one the scan WILL index the file under
+(`scannerUrlOf`): the disk's spelling of every folder that already exists, because on APFS/NTFS a new
+`/assets/Scenes/x.json` lands in the on-disk `scenes/` and is typed by it (second close-out review).
+A path no kind claims — a plain `.json` outside those folders, or a `.meta.json` sidecar — is NOT
+refused: an unknown kind is not a wrong one. Deliberately outside the rule: `/api/write-file` (byte-
+opaque by design; its only kind-aware guard is the prefab format gate), and `duplicate-asset`,
+`move-file` and `adopt-file`, which never overwrite an existing file. Guarded by
+`tests/plugins/wrongKindRefusal.test.ts`, `tests/plugins/sceneSaveAsRoute.test.ts` and
+`tests/editor/otherAssetKindAt.test.ts`.
 
 **A case-variant name resolves to the file that is really there** (#1273). On APFS/NTFS the create-only
 check folds case, so `enemy.prefab.json` 409s over `Enemy.prefab.json` — while the manifest keys the

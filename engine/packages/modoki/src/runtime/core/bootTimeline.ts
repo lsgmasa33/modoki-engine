@@ -57,6 +57,10 @@ const starts = new Float64Array(MAX_BOOT_SPANS);
 const ends = new Float64Array(MAX_BOOT_SPANS);
 let count = 0;
 let dropped = 0;
+/** Bumped by `resetBootTimeline`, and folded into every handle. A span left open across a reset (#1477
+ *  close-out: `appActivity`'s can stay open for minutes) otherwise holds a bare slot index, and closing it
+ *  would stamp an end onto whatever unrelated span has since been written into that slot. */
+let generation = 0;
 const origin = rawNow();
 
 /** The `rawNow()` reading this module was first evaluated at. Every `startMs`/`endMs` is
@@ -77,16 +81,17 @@ export function beginBootSpan(name: string, detail?: string): number {
   details[i] = detail;
   starts[i] = rawNow() - origin;
   ends[i] = -1;
-  return i;
+  return generation * MAX_BOOT_SPANS + i;
 }
 
-/** Close a span. Idempotent and bounds-checked: closing twice, or closing a refused span, is a
- *  no-op rather than a corrupted timeline. */
+/** Close a span. Idempotent and bounds-checked: closing twice, closing a refused span, or closing one
+ *  opened before a `resetBootTimeline()`, is a no-op rather than a corrupted timeline. */
 export function endBootSpan(handle: number, detail?: string): void {
-  if (handle < 0 || handle >= count) return;
-  if (ends[handle] >= 0) return;
-  ends[handle] = rawNow() - origin;
-  if (detail !== undefined) details[handle] = detail;
+  if (handle < 0 || Math.floor(handle / MAX_BOOT_SPANS) !== generation) return; // refused, or from before a reset
+  const i = handle % MAX_BOOT_SPANS;
+  if (i >= count || ends[i] >= 0) return;
+  ends[i] = rawNow() - origin;
+  if (detail !== undefined) details[i] = detail;
 }
 
 /** Time a synchronous span. Exception-safe — a throwing boot step still closes its span, so one
@@ -182,4 +187,5 @@ export function bootSpansOverlapping(fromMs: number, toMs: number): Array<BootSp
 export function resetBootTimeline(): void {
   count = 0;
   dropped = 0;
+  generation++;
 }

@@ -290,6 +290,13 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
       + 'for equality-checking around the generator\'s product dir — not a source corpus.',
   },
   {
+    file: 'engine/plugins/takeAssets.ts', rule: 'walker', walker: 'walk',
+    reason: 'Walks ONE project\'s runtime/assets folder to hash every file in it for a take\'s '
+      + 'fingerprint (#1509). The editor opens projects from outside this repo (a game is portable, '
+      + '#29), where repoFiles() — git-tracked-or-untracked files of THIS repo — cannot reach, and '
+      + 'the population must include whatever the render will load, tracked or not.',
+  },
+  {
     file: 'engine/scripts/ota/buildManifest.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks a built dist/ directory (build output) to hash files for the OTA manifest — '
       + 'not repo/tracked content.',
@@ -430,6 +437,12 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
     file: 'engine/plugins/inlinePlayable.ts', rule: 'walker', walker: 'pruneEmpty',
     reason: 'Deletes the directories left EMPTY under dist/assets after inlining — the same build '
       + 'output as walk() above, and a deletion rather than a read, so there is no corpus at all.',
+  },
+  {
+    file: 'engine/plugins/vite-asset-scanner.ts', rule: 'walker', walker: 'walk',
+    reason: 'distHasExtension()\'s walk() over the web BUILD OUTPUT (dist/), asking whether any .glb/.ktx2/.webp '
+      + 'was produced so the CDN step for it runs (#1537) — build output, never tracked, same class as '
+      + 'inlinePlayable\'s walk().',
   },
   {
     file: 'engine/plugins/vite-asset-scanner.ts', rule: 'walker', walker: 'scanDir',

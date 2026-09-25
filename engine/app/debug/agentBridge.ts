@@ -31,11 +31,14 @@
  *  ops to the runtime ones. Nobody designed it as a safety mechanism: removing or `@vite-ignore`-ing
  *  the `main.tsx` import, or adding an accept boundary here, would quietly break it. */
 
-import { opReplyFor } from './opRefusal';
+import { opReplyFor, OpRefusal } from './opRefusal';
+import { CONSOLE_LEVELS, atConsoleLevel, isConsoleLevel, type ConsoleLevel } from '../../tools/shared/consoleLevels';
+import { conditionError, surfaceError, waitForCondition, clampWaitTimeout, type WaitCondition, type WaitReaders } from './waitFor';
 import {
   hasDocKey,
   sceneManager,
   getAllEntities,
+  rawNow,
   getAllTraits,
   readTraitData,
   readTraitDataFull,
@@ -46,6 +49,11 @@ import {
   hasSceneRenderer,
   journalEvents,
   clearJournal,
+  captureEpoch,
+  currentCaptureSeq,
+  resolveCapCursor,
+  journalDroppedThroughCap,
+  journalGapNote,
   setJournalEnabled,
   JOURNAL_LEVELS,
   isJournalLevel,
@@ -122,11 +130,11 @@ import { classifyWorldAbsence } from './sceneQueryAbsence';
 import { applyLiveMutate } from './liveMutate';
 import { createEntityLive, duplicateEntityLive, deleteEntitiesLive, liveGuidOf } from './liveLifecycle';
 import { resolveEntityAddress, type EntityAddress } from './entityRef';
-import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { ERROR_CODES, codeFromBody, isFailureBody, type ErrorCode } from '../../tools/shared/errorCodes';
 import { INVALIDATABLE_ASSET_TYPES, type InvalidatableAssetType } from '../../tools/shared/invalidateAssets';
 import { describeFilter, emptyFilterHint, histogram } from '../../tools/shared/filterDisclosure';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
-import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
+import { tailWithCounts, headWithCounts, takeHead, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
 import { computeHandles, type HandlesDumpParams } from './handlesDump';
 import { resolveDomPointReport, type DomPointSpec } from './domResolve';
@@ -134,7 +142,7 @@ import { layoutSettleReport } from './layoutSettle';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
 import { coveredCarriers } from './carrierCover';
 import { readConsoleSource } from './consoleSource';
-import { getConsoleRingEntries, getConsoleRingDropped, installConsoleRing } from '@modoki/engine/runtime/core/consoleRing';
+import { getConsoleRingEntries, getConsoleRingDropped, getConsoleRingEpoch, installConsoleRing } from '@modoki/engine/runtime/core/consoleRing';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
 import { makeSchemaPusher } from './schemaPusher';
@@ -155,7 +163,7 @@ import {
   getFrameLoopHealth,
 } from '@modoki/engine/runtime';
 import {
-  listAgentTools, getAgentTool, agentToolsVersion, validateAgentToolArgs, type AgentToolDef,
+  listAgentTools, getAgentTool, agentToolsVersion, validateAgentToolArgs, coerceAgentToolArgs, type AgentToolDef,
 } from '@modoki/engine/runtime';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
@@ -177,7 +185,7 @@ interface ElectronBridge {
 }
 
 interface SceneStateParams {
-  /** Only include this trait's data (still lists all entities). */
+  /** Only the entities that CARRY this trait, and only this trait's data on each (#1557). */
   trait?: string;
   /** Only include this single entity id. */
   id?: number;
@@ -196,8 +204,9 @@ interface SceneStateParams {
    *  listing only — any id/trait/name/where filter already includes them. */
   resources?: boolean;
   /** Cap the number of entities returned; sets `truncated` when hit (`returnedCount`/`totalCount` are always present).
-   *  In INDEX mode (the untargeted default) this defaults to `DEFAULT_INDEX_LIMIT`;
-   *  a targeted/enriched query stays uncapped unless you pass one. */
+   *  In INDEX mode (the untargeted default) this defaults to `DEFAULT_INDEX_LIMIT`, and a
+   *  TARGETED query (id/guid/trait/name/where) to `DEFAULT_TARGETED_LIMIT`; an untargeted
+   *  enriched query (full/world/bounds/contacts alone) stays uncapped unless you pass one. */
   limit?: number;
   /** Add the resolved WORLD transform (after parent-chain propagation) + an
    *  `activeInHierarchy` flag (false if the entity or an ancestor is inactive) to
@@ -267,8 +276,15 @@ function parseWhere(
 // ── Console capture ── the ONE shared engine console ring (#596/#597 Stage 3a), read here for
 // an agent/tooling to reach via the curl-able /api/console-logs (backed by the 'console-logs' op
 // below) — no devtools or MCP attach needed.
-interface ConsoleEntry { level: 'log' | 'warn' | 'error'; ts: number; text: string }
-interface ConsoleLogsParams { level?: 'log' | 'warn' | 'error'; limit?: number; since?: number }
+interface ConsoleEntry { seq: number; level: 'log' | 'warn' | 'error'; ts: number; text: string }
+/** `level` is a threshold and `since` a ring SEQ cursor, with `sinceMs` the clock form (#1559). */
+interface ConsoleLogsParams { level?: ConsoleLevel; limit?: number; since?: number; sinceMs?: number; epoch?: unknown }
+
+/** A `since` at or above this is an epoch-ms timestamp, not a ring seq: a seq counts log lines from
+ *  one page load and cannot reach 1e11, and every epoch-ms instant since 1973 is above it. Before
+ *  #1559 `since` WAS epoch ms on this tool, so an old caller's number lands here and is refused with
+ *  a pointer to `sinceMs` instead of silently matching nothing. */
+const CONSOLE_SEQ_CEILING = 1e11;
 
 /** UNTIL STAGE 3a this wrapped `console.log/warn/error` into a private `consoleBuffer` and
  *  registered its OWN `window` `error`/`unhandledrejection` listeners — a SECOND capture,
@@ -300,6 +316,7 @@ export function installConsoleCapture(): void {
  *  non-empty in exactly that build. */
 function ringEntriesAsConsoleEntries(): ConsoleEntry[] {
   return getConsoleRingEntries().map((e) => ({
+    seq: e.seq,
     // The ring carries 'info' as a distinct level; this reader's vocabulary has three ('log' /
     // 'warn' / 'error') and 'info' must never leak into /api/console-logs, diagnose, or the MCP
     // contract — fold it into 'log' rather than dropping the entry.
@@ -319,8 +336,9 @@ function dumpConsoleLogs(p: ConsoleLogsParams = {}): { logs: ConsoleEntry[]; tot
   // `ringEntriesAsConsoleEntries`'s own doc comment for why `readConsoleSource()` is still tried
   // first.
   let logs: ConsoleEntry[] = readConsoleSource() ?? ringEntriesAsConsoleEntries();
-  if (p.level) logs = logs.filter((e) => e.level === p.level);
-  if (p.since != null) logs = logs.filter((e) => e.ts > p.since!);
+  if (p.level) logs = logs.filter((e) => atConsoleLevel(e.level, p.level!));
+  if (p.since != null) logs = logs.filter((e) => e.seq > p.since!);
+  if (p.sinceMs != null) logs = logs.filter((e) => e.ts > p.sinceMs!);
   const total = logs.length;
   if (p.limit != null) logs = logs.slice(-p.limit);
   return { logs, total };
@@ -396,6 +414,14 @@ function frameStalenessWarning(what: string): string | null {
  *  enough that a generated one can't flood a context window before the agent narrows. */
 export const DEFAULT_INDEX_LIMIT = 200;
 
+/** Default cap on a TARGETED read (#1557). Targeted rows carry trait VALUES — ~1.6-2.2k chars per UI
+ *  row — so a substring like `name=Account` matching 17+ entities answered 36k chars, and `name` was
+ *  the heaviest argument group in two months of transcripts (101 calls, 546k chars). This used to be
+ *  uncapped on purpose, because losing rows SILENTLY would be worse than a large answer. The cap is
+ *  therefore never silent: a capped reply leads with `truncated`, `totalCount` and a hint that names
+ *  how many more there are and the exact `limit` that returns them all (owner, 2026-09-25). */
+export const DEFAULT_TARGETED_LIMIT = 20;
+
 /** Why `where` cannot be evaluated (the same parse `dumpSceneState` applies), or null. Lets a caller
  *  refuse a typo'd predicate up front instead of reading it as "nothing matches" (#1154). */
 export function whereError(where: string): string | null {
@@ -404,6 +430,9 @@ export function whereError(where: string): string | null {
 }
 
 export function dumpSceneState(params: SceneStateParams = {}) {
+  // An empty `trait` filters nothing — as before #1557, when it could only project. Selecting on it
+  // would answer "trait '' is not registered" to an eval body that passed a blank field through.
+  if (params.trait === '') params = { ...params, trait: undefined };
   const metaByName = new Map(getAllTraits().map((m) => [m.name, m] as const));
   const readTrait = params.full ? readTraitDataFull : readTraitData;
   const warnings: string[] = [];
@@ -460,11 +489,16 @@ export function dumpSceneState(params: SceneStateParams = {}) {
     wanted = wanted.filter((e) => (e.name ?? '').toLowerCase().includes(q));
   }
   if (whereResult && !('error' in whereResult)) wanted = wanted.filter((e) => whereResult.pred(e));
+  // `trait=` SELECTS the entities that carry it (#1557). It used to only project the fields, so every
+  // other entity came back as a `traits:{}` row — `trait=CourtConfig` answered 274 rows for one config
+  // entity. An unregistered trait selects nothing; its own warning below says why.
+  const traitKnown = params.trait != null && metaByName.has(params.trait);
+  if (params.trait != null) wanted = traitKnown ? wanted.filter((e) => e.traits.includes(params.trait!)) : [];
   const totalCount = wanted.length;
   let truncated = false;
-  // A targeted query stays uncapped unless the caller asks — narrowing to `trait=Transform`
-  // and then silently losing entities off the end would be worse than a large answer.
-  const limit = params.limit ?? (indexMode ? DEFAULT_INDEX_LIMIT : undefined);
+  // Both defaults are DISCLOSED caps, never silent ones: a capped reply carries `truncated`, the
+  // `totalCount` before the cap, and a hint naming the `limit` that returns every match.
+  const limit = params.limit ?? (indexMode ? DEFAULT_INDEX_LIMIT : targeted ? DEFAULT_TARGETED_LIMIT : undefined);
   if (limit != null && wanted.length > limit) {
     wanted = wanted.slice(0, limit);
     truncated = true;
@@ -522,12 +556,12 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   // the spelling — so the answer must distinguish them. `where=` already warns on an unknown
   // trait/field (line above); this is the same rule for the simpler filter. (§6: never silently
   // ignore a parameter.)
-  if (params.trait && !metaByName.has(params.trait)) {
+  if (params.trait != null && !traitKnown) {
     const near = [...metaByName.keys()].filter((t) => t.toLowerCase() === params.trait!.toLowerCase()
       || t.toLowerCase().includes(params.trait!.toLowerCase())).slice(0, 6);
     warnings.push(
-      `trait "${params.trait}" is not a REGISTERED trait, so every entity below shows traits:{} — ` +
-      `that means the FILTER matched nothing, NOT that the scene lacks the component.` +
+      `trait "${params.trait}" is not a REGISTERED trait, so it selected no entities — ` +
+      `that means the FILTER name is wrong, NOT that the scene lacks the component.` +
       (near.length ? ` Did you mean: ${near.join(', ')}? (names are case-sensitive)` : ' List them with modoki_list_traits.'),
     );
   }
@@ -596,13 +630,15 @@ export function dumpSceneState(params: SceneStateParams = {}) {
       `id=<n>, name=<substr>, where="Transform.y > 3". Enrichers: world=1, bounds=1, contacts=1, resources=1.` +
       (truncated ? ` Showing ${entities.length} of ${totalCount}; raise limit=N.` : '')
     : truncated
-      ? `Showing ${entities.length} of ${totalCount}; raise limit=N or narrow the filter.`
+      ? `Showing ${entities.length} of ${totalCount} matches — ${totalCount - entities.length} MORE are not shown` +
+        `${params.limit == null ? ` (a targeted read is capped at ${DEFAULT_TARGETED_LIMIT} by default)` : ''}. ` +
+        `Pass limit=${totalCount} for all of them, or narrow with trait=/name=/where=.`
       // #1214: a targeted query that matched nothing answered `totalCount:0` with nothing beside it, so
       // a typo'd `name=Plyer` read exactly like "that entity is gone". Say which one it was.
-      : targeted && totalCount === 0 && !guidMissed
+      : targeted && totalCount === 0 && !guidMissed && (params.trait == null || traitKnown)
         ? emptyFilterHint({
           what: 'entity',
-          filter: describeFilter({ id: params.id, guid: params.guid, name: params.name, where: params.where }),
+          filter: describeFilter({ id: params.id, guid: params.guid, trait: params.trait, name: params.name, where: params.where }),
           unfilteredCount: all.length,
           // A targeted query searches every entity, resources included — which a BARE read hides.
           unfilteredLabel: 'exist in the world, resources included',
@@ -617,11 +653,14 @@ export function dumpSceneState(params: SceneStateParams = {}) {
     // Never `entityCount`: it meant these rows here and the whole world in the editor state.
     returnedCount: entities.length,
     totalCount,
+    // A capped reply says so BEFORE the rows (#1557): a reader skimming 20 rows meets `truncated` and
+    // the hint naming the missing count first, not after the payload it would otherwise stop at.
+    ...(truncated ? { truncated } : {}),
+    ...(truncated && hint ? { hint } : {}),
     ...(resourcesExcluded ? { resourcesExcluded } : {}),
     entities,
-    ...(truncated ? { truncated } : {}),
     ...(warnings.length ? { warnings } : {}),
-    ...(hint ? { hint } : {}),
+    ...(hint && !truncated ? { hint } : {}),
   };
 }
 
@@ -666,7 +705,7 @@ export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>
  *  bases it kept (#1417), so the editor can drop discarded work's undo entries and rebaseline —
  *  `adoptWorldReloadedFromDisk`.
  *  Installed the way the suppressor is; unset in the game runtime, which has no undo. */
-type WorldReloadedFromDisk = (scenePath: string, keptBaseGuids: ReadonlySet<string>) => void;
+type WorldReloadedFromDisk = (scenePath: string, keptBaseGuids: ReadonlySet<string>) => void | Promise<void>;
 let _worldReloadedFromDisk: WorldReloadedFromDisk | null = null;
 
 /** Editor-only: install the after-reload hook. Called from `agentEditorOps.ts`. */
@@ -682,8 +721,30 @@ export function sceneReloadSuppressedReason(): string | null {
 
 /** Register (or replace) an agent op handler. Editor-only ops call this from
  *  `engine/app/editor/agentEditorOps.ts` during editor startup. */
-export function registerAgentOp(name: string, handler: AgentOpHandler): void {
+export function registerAgentOp(name: string, handler: AgentOpHandler, opts: { accepts?: (params: unknown) => boolean } = {}): void {
   agentOps.set(name, handler);
+  // A re-registration without `accepts` (the editor replacing a runtime op) takes EVERY call again.
+  if (opts.accepts) agentOpAccepts.set(name, opts.accepts); else agentOpAccepts.delete(name);
+}
+
+/** Per-op "is this call MINE?" predicates (#1559 review). The HMR relay broadcasts a request to every
+ *  client and settles on the first answer that is not a decline (#1030), so a client that holds an op
+ *  but cannot serve THIS call must decline it, not refuse it: the runtime `wait-for` on a
+ *  `#/game/<id>` tab has no editor, and its instant refusal of a `chrome` wait beat the editor's park. */
+const agentOpAccepts = new Map<string, (params: unknown) => boolean>();
+
+/** Would this client serve `op` with `params`? What the relay asks before running anything. */
+export function servesAgentOp(op: string, params: unknown): boolean {
+  if (!agentOps.has(op)) return false;
+  const accepts = agentOpAccepts.get(op);
+  return !accepts || accepts(params);
+}
+
+/** The handler registered under `name` right now, or undefined. For a client that REPLACES a shared op
+ *  and must still run the original — the editor's `player-prefs-write` adds its envelope refusal in
+ *  front of this module's handler (#1551 review) rather than copying it. */
+export function agentOpHandler(name: string): AgentOpHandler | undefined {
+  return agentOps.get(name);
 }
 
 /** The currently-registered op names (testing / diagnostics). */
@@ -691,9 +752,10 @@ export function listAgentOps(): string[] {
   return [...agentOps.keys()];
 }
 
-/** Is `name` registered in THIS client right now?
+/** Is `name` registered in THIS client right now? The membership half of `servesAgentOp`, which is
+ *  what the relay asks since #1559 (it adds the op's `accepts` predicate).
  *
- *  The relay's decline test (#1030) — see the `modoki:request` handler. Deliberately a membership
+ *  Why the relay's decline test (#1030) is membership at all: deliberately a membership
  *  question rather than "did `runAgentOp` throw something that reads like `unknown agent op`":
  *  the string test would miscount an op that legitimately throws those words, and would have RUN
  *  the op before deciding. Exported (like `listAgentOps`) so the transport asks the registry
@@ -722,10 +784,10 @@ export function hasAgentOp(name: string): boolean {
  *  RUN the op before deciding whether it existed. */
 export async function relayResponseFor(
   msg: { id: number; op: string; params?: unknown },
-  has: (op: string) => boolean = hasAgentOp,
+  has: (op: string, params: unknown) => boolean = servesAgentOp,
   run: (op: string, params: unknown) => Promise<unknown> = (op, params) => runAgentOp(op, params),
 ): Promise<{ id: number; result?: unknown; error?: string; declined?: boolean }> {
-  if (!has(msg.op)) return { id: msg.id, declined: true };
+  if (!has(msg.op, msg.params)) return { id: msg.id, declined: true };
   // An `OpRefusal` comes back as a coded RESULT, not an `error` — through `opReplyFor`, which the
   // Electron IPC handler shares so the two transports cannot disagree about it (#1012).
   return { id: msg.id, ...(await opReplyFor(() => run(msg.op, msg.params))) };
@@ -805,24 +867,79 @@ registerAgentOp('render-scene', (params) => {
 // a bare read returns the last 50 plus a per-level histogram of the whole window.
 registerAgentOp('console-logs', (params) => {
   const p = (params ?? {}) as ConsoleLogsParams;
-  // Filter here, tail here: pass no `limit` to the producer so the histogram sees everything.
-  const { logs } = dumpConsoleLogs({ level: p.level, since: p.since });
-  const r = tailWithCounts(logs, (e) => e.level, { limit: p.limit, defaultLimit: CONSOLE_TAIL_DEFAULT });
+  // One reading per argument (#1559). The MCP schemas already bound these; the curl route and a
+  // device op call do not, and a value this op cannot honour must refuse rather than filter wrongly.
+  // RETURNED, not thrown: the device relay carries a returned `{ok:false, code}` through with its
+  // code, and would flatten a thrown OpRefusal to REFUSED_BY_OP (opRefusal.ts's docblock).
+  if (p.level !== undefined && !isConsoleLevel(p.level)) {
+    return { ok: false as const, code: 'REFUSED_BY_OP' as const, error: `console-logs: level must be one of ${CONSOLE_LEVELS.join(', ')} (a threshold: that level or worse), got ${JSON.stringify(p.level)}.`, options: [...CONSOLE_LEVELS] };
+  }
+  if (p.since != null && p.sinceMs != null) {
+    return { ok: false as const, code: 'AMBIGUOUS' as const, error: 'console-logs: pass since (a ring seq cursor, from nextSeq) OR sinceMs (an epoch-ms timestamp), not both — they select by different clocks.', options: ['since', 'sinceMs'] };
+  }
+  if (p.since != null && (!Number.isInteger(p.since) || p.since < 0)) {
+    return { ok: false as const, code: 'REFUSED_BY_OP' as const, error: `console-logs: since is a ring seq cursor (a non-negative integer — pass back a reply's nextSeq), got ${p.since}.` };
+  }
+  if (p.since != null && p.since >= CONSOLE_SEQ_CEILING) {
+    return { ok: false as const, code: 'REFUSED_BY_OP' as const, error: `console-logs: since=${p.since} is a timestamp, but since is a ring SEQ cursor — pass back a reply's nextSeq. For "logged after this instant", use sinceMs=${p.since}.`, options: ['sinceMs'] };
+  }
+  // The mirror image: a seq passed as `sinceMs` reads as an instant in 1970, so it would match the whole ring.
+  if (p.sinceMs != null && p.sinceMs < CONSOLE_SEQ_CEILING) {
+    return { ok: false as const, code: 'REFUSED_BY_OP' as const, error: `console-logs: sinceMs=${p.sinceMs} is a ring seq, not an epoch-ms timestamp — for a cursor use since=${p.sinceMs}.`, options: ['since'] };
+  }
+  // An empty epoch is ABSENT: the editor's route and tool drop `''`, and the device tool must not turn
+  // it into a reset on every call.
+  const callerEpoch = p.epoch === '' ? undefined : p.epoch;
+  if (callerEpoch !== undefined && typeof callerEpoch !== 'string') {
+    return { ok: false as const, code: 'REFUSED_BY_OP' as const, error: `console-logs: epoch is the string a previous reply returned, got ${JSON.stringify(callerEpoch)}.` };
+  }
+  // The ring's IDENTITY for this page load (#1559 review). `seq` restarts at 1 on a reload, so a
+  // cursor's VALUE cannot tell "the ring restarted" from "nothing new" once the new ring has logged
+  // past it — which is exactly the case that matters: a game-code edit reloads the page, its boot
+  // logs past the old cursor, and a value check drops the boot error it caused. `timeOrigin` differs
+  // per page load; the ring's generation covers a reset within one (tests). Same contract as
+  // editor_journal's `epoch`: send it back with `since`, and a mismatch replays from the start.
+  const epoch = `${Math.round(performance.timeOrigin).toString(36)}-${getConsoleRingEpoch()}`;
+  const whole = dumpConsoleLogs({}).logs;
+  const newestSeq = whole.reduce((m, e) => Math.max(m, e.seq), 0);
+  const cursorReset = p.since == null ? undefined
+    : callerEpoch !== undefined && callerEpoch !== epoch
+      ? `since=${p.since} was issued under epoch ${callerEpoch}; the console ring has restarted since (epoch ${epoch} — a reload, e.g. a game-code edit), so this read starts from the beginning. Use the returned cursor from now on.`
+      // Without `epoch`, a cursor past the newest seq is the only restart that can still be seen.
+      : p.since > newestSeq
+        ? `since=${p.since} is past the newest seq this ring has issued (${newestSeq}), so it is from before a restart (a reload); this read starts from the beginning.` +
+          (callerEpoch === undefined ? ' Send `epoch` back with `since` so a restart is always detected.' : '')
+        : undefined;
+  const since = cursorReset ? 0 : p.since;
+  const { logs } = dumpConsoleLogs({ level: p.level, since, sinceMs: p.sinceMs });
+  // A CURSORED read pages OLDEST-first (#1559 review), as editor_journal's `since` does: a tail would
+  // hand back the newest 50 of an error storm and a `nextSeq` past the rest, so the first error — the
+  // cause — could never be reached again. An uncursored read stays a tail: "what happened lately".
+  const cursored = since != null;
+  const page = cursored
+    ? { ...takeHead(logs, p.limit, CONSOLE_TAIL_DEFAULT), total: logs.length }
+    : tailWithCounts(logs, (e) => e.level, { limit: p.limit, defaultLimit: CONSOLE_TAIL_DEFAULT });
   // S3.8 — `byLevel`/`ringTotal` describe the WHOLE ring, `total` describes what MATCHED the
   // filter. The histogram used to be built over the already-filtered array, so `level:'warn'`
   // answered `byLevel:{warn:N}` — an agent using it to decide "are there errors?" concluded no
   // from a filtered read. Same three-number contract as modoki_journal (count/total/ringTotal),
   // because two tools answering the same question must answer it the same way (§8).
-  const ring = p.level || p.since ? dumpConsoleLogs({}).logs : logs;
-  const byLevel = histogram(ring, (e) => e.level);
+  const byLevel = histogram(whole, (e) => e.level);
+  // The cursor for the NEXT read. A truncated cursored page continues right after its last row. Any
+  // other read has seen everything that matched, so it moves to the newest seq in the WHOLE ring — a
+  // `level:'error'` poll then does not re-read the warnings it filtered out.
+  const nextSeq = cursored && page.truncated ? (page.items.at(-1)?.seq ?? since) : newestSeq;
   return {
-    logs: r.items,
+    logs: page.items,
+    nextSeq,
+    epoch,
+    ...(cursorReset ? { cursorReset } : {}),
     // §2 (#1217, #1223 D3, #1266): `returnedCount` is the rows here, `totalCount` everything the
     // filter matched before the tail. `ringTotal` is a THIRD population — the whole ring, filter
     // ignored — so it keeps its own name rather than being folded into either.
-    returnedCount: r.items.length,
-    totalCount: r.total,
-    ringTotal: ring.length,
+    returnedCount: page.items.length,
+    totalCount: page.total,
+    ringTotal: whole.length,
     byLevel,
     // The ring is `[pinned boot prefix] ++ [rolling tail]` — once it wraps, that is DISCONTIGUOUS,
     // and `logs`/`ring` above concatenate the two halves with nothing marking the seam. `dropped`
@@ -830,7 +947,12 @@ registerAgentOp('console-logs', (params) => {
     // is looking at boot plus a recent window with a real gap in between, not a continuous log. See
     // `getConsoleRingDropped`'s own doc comment (consoleRing.ts).
     dropped: getConsoleRingDropped(),
-    ...(r.truncated ? { truncated: true, hint: tailHint('console entries', r.items.length, r.total, ', or narrow with level=/since=') } : {}),
+    ...(page.truncated ? {
+      truncated: true,
+      hint: cursored
+        ? `Showing the OLDEST ${page.items.length} of ${page.total} entries after since=${since} (oldest first). Continue with since=${nextSeq} and this epoch, or raise limit=N.`
+        : tailHint('console entries', page.items.length, page.total, ', or narrow with level=/since='),
+    } : {}),
   };
 });
 
@@ -845,8 +967,29 @@ const isJournalCaptureAction = (a: unknown): a is typeof JOURNAL_CAPTURE_ACTIONS
   (JOURNAL_CAPTURE_ACTIONS as readonly unknown[]).includes(a);
 
 registerAgentOp('journal-events', (params) => {
-  const p = (params ?? {}) as { type?: string; level?: unknown; clear?: boolean; limit?: number; action?: unknown };
+  const p = (params ?? {}) as { type?: string; level?: unknown; clear?: unknown; limit?: number; action?: unknown; sinceCap?: unknown; epoch?: unknown };
   setJournalEnabled(true);
+  // ⚠️ `clear` is RETIRED, and refused rather than ignored (#1561). It made a READ destroy the ring
+  // it read — the evidence the next verification read depends on (mcp-tool-conventions.md §7) — and
+  // its one real use was a clean baseline, which `sinceCap` now gives without deleting anything.
+  // Ignoring it would be worse than the old behaviour: a caller that meant "start clean" would read
+  // a full ring believing it empty. The MCP tools' strict schemas refuse it first; this catches the
+  // dev-server curl API and in-process callers.
+  if (p.clear !== undefined) {
+    return {
+      ok: false, code: 'UNKNOWN_PARAM',
+      error: 'clear was removed — a journal read no longer deletes anything. For a clean baseline, '
+        + 'read once (limit:0 is enough) and pass the returned nextCap as sinceCap (with its epoch): '
+        + 'that read returns only the events after it. Nothing was read and nothing was cleared.',
+      options: ['sinceCap', 'epoch'],
+    };
+  }
+  if (p.sinceCap !== undefined && (typeof p.sinceCap !== 'number' || !Number.isFinite(p.sinceCap) || p.sinceCap < 0)) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `sinceCap must be a non-negative number (a nextCap from an earlier read), got ${JSON.stringify(p.sinceCap)} — nothing was read.`,
+    };
+  }
   // ⚠️ These two vocabulary refusals carry a §5 CODE and `options`, and that is load-bearing, not
   // decoration (#1072). This op answers a GET relay: `relayJson` sends a coded envelope as a 400, and
   // the MCP client fails any status ≥400 — but a plain read's 200 body is NOT checked for `ok:false`
@@ -856,7 +999,7 @@ registerAgentOp('journal-events', (params) => {
   if (p.action !== undefined && !isJournalCaptureAction(p.action)) {
     return {
       ok: false, code: 'REFUSED_BY_OP',
-      error: `unknown action ${JSON.stringify(p.action)} — nothing was started, stopped, read or cleared. Omit action to just read.`,
+      error: `unknown action ${JSON.stringify(p.action)} — nothing was started, stopped or read. Omit action to just read.`,
       options: [...JOURNAL_CAPTURE_ACTIONS], captures: verboseCaptureState(),
     };
   }
@@ -878,37 +1021,30 @@ registerAgentOp('journal-events', (params) => {
   if (p.level !== undefined && (typeof p.level !== 'string' || !isJournalLevel(p.level))) {
     return {
       ok: false, code: 'REFUSED_BY_OP',
-      error: `unknown level ${JSON.stringify(p.level)} — nothing was read and nothing was cleared. `
+      error: `unknown level ${JSON.stringify(p.level)} — nothing was read. `
         + 'A level filter means that severity AND ABOVE.',
       options: [...JOURNAL_LEVELS],
     };
   }
   const level = p.level as JournalLevel | undefined;
   const filtered = !!(p.type || level);
-  const all = journalEvents();
-  const events = filtered ? journalEvents({ type: p.type, level }) : all;
-  // `clear` used to wipe the ENTIRE 10,000-event ring even when the read was FILTERED — so
-  // `journal {type:'match', clear:true}` returned 100 match events and silently destroyed every
-  // @contact / score / win event alongside them, including the human's. There is no selective
-  // clear (the journal is a flat ring), so the honest move is to refuse rather than to
-  // over-delete: destroying data the caller did not ask about, and did not see, is not something
-  // to do on a best guess. An UNFILTERED clear is unchanged — that one really does mean "all".
-  if (p.clear && filtered) {
-    return {
-      ok: false,
-      error:
-        `REFUSED: clear:true with a filter (${[p.type && `type=${p.type}`, p.level && `level=${p.level}`].filter(Boolean).join(', ')}) ` +
-        'would clear the WHOLE journal, not just the events returned — the ring has no selective ' +
-        'clear. Nothing was cleared and the events were NOT returned.',
-      hint: 'Read with the filter and no clear, then clear deliberately with a bare clear:true (which means ALL events); or clear first and re-read from a known-empty ring.',
-    };
-  }
-  if (p.clear) clearJournal();
+  // The cursor WINDOWS the ring: with `sinceCap`, "the ring" is every event after it, exactly as if
+  // the caller had cleared at that point — which is the job `clear` used to do, destructively (#1561).
+  // The filters then narrow the returned rows inside that window. A cursor from an earlier life of the
+  // capture counter (a reload) is reset and said so, rather than filtering every new event out.
+  const cursor = resolveCapCursor(p.sinceCap as number | undefined, typeof p.epoch === 'string' ? p.epoch : undefined);
+  const sinceCap = cursor.sinceCap;
+  const cursored = sinceCap != null;
+  const inWindow = (e: { cap: number }) => !cursored || e.cap > sinceCap;
+  const all = journalEvents().filter(inWindow);
+  const events = filtered ? journalEvents({ type: p.type, level }).filter(inWindow) : all;
   // Tail at the op. `journalEvents()` stays whole for JournalTab, which slices its own view.
   // A busy physics Play session fills the 10,000-event ring with ~226-byte `@contact` events
   // — ~582k tokens if returned entire.
-  const r = tailWithCounts(events, (e) => String((e as { type?: string }).type ?? '?'), { limit: p.limit, defaultLimit: JOURNAL_TAIL_DEFAULT });
-  // `byType`/`ringTotal` describe the WHOLE RING, which is what the tool description and
+  // A CURSORED read takes the OLDEST events after the cursor (C7: a tail would drop the block
+  // between the cursor and the tail for good); a bare read keeps the newest tail.
+  const r = (cursored ? headWithCounts : tailWithCounts)(events, (e) => String((e as { type?: string }).type ?? '?'), { limit: p.limit, defaultLimit: JOURNAL_TAIL_DEFAULT });
+  // `byType`/`ringTotal` describe the WHOLE RING (after `sinceCap`, when cursored), which is what the tool description and
   // docs/debug-tools-mcp.md both promise. They used to be computed over the FILTERED slice, so
   // `journal {type:'match'}` answered `byType:{match:N}` — indistinguishable from "this ring
   // contains nothing but match events", which is the opposite of a histogram's purpose (§2: one
@@ -920,6 +1056,18 @@ registerAgentOp('journal-events', (params) => {
   // opened a watch — otherwise an empty @contact result reads as "no contacts" not "not capturing".
   const captures = verboseCaptureState();
   const idle = captures.types.filter((t) => !captures.active.includes(t));
+  // Where the NEXT read should start. A cursored read cut short continues from its last returned
+  // event (contiguous, no gap); anything else has seen everything up to the counter's tip, so the
+  // next read starts there — which is what makes a bare `limit:0` read a baseline.
+  const lastCap = (r.items[r.items.length - 1] as { cap?: number } | undefined)?.cap;
+  // (A cut-short read that returned nothing — limit:0 — read nothing, so it stays where it was.)
+  const nextCap = cursored && r.truncated ? (lastCap ?? sinceCap) : currentCaptureSeq();
+  // Events after the cursor that the ring has LOST (evicted past its cap, or cleared) — said out loud,
+  // because nothing in the returned caps can show it (#1561 review).
+  const dropped = journalDroppedThroughCap();
+  const gap = cursored && sinceCap! < dropped
+    ? { droppedThroughCap: dropped, gapNote: journalGapNote(sinceCap!, dropped) }
+    : undefined;
   return {
     // §2 (#1217, #1223 D3, #1266): `returnedCount`/`totalCount` everywhere; `ringTotal` below is a
     // THIRD population (the whole ring, filter ignored) and keeps its own name.
@@ -930,11 +1078,20 @@ registerAgentOp('journal-events', (params) => {
      *  a filtered read still shows what else is in there. */
     ringTotal: ring.total,
     byType: ring.byType,
+    nextCap,
+    epoch: captureEpoch(),
+    ...(gap ?? {}),
+    ...(cursor.cursorReset ? { cursorReset: cursor.cursorReset } : {}),
     ...(filtered ? { filter: { ...(p.type ? { type: p.type } : {}), ...(p.level ? { level: p.level } : {}) } } : {}),
     events: r.items,
     captures,
     ...(idle.length ? { captureHint: `${idle.join(', ')} ${idle.length > 1 ? 'are' : 'is'} watch-gated and NOT capturing — start with action:'start', type:'${idle[0]}' before the moment you want to trace.` } : {}),
-    ...(r.truncated ? { truncated: true, hint: tailHint('events', r.items.length, r.total, ', or narrow with type=') } : {}),
+    ...(r.truncated ? {
+      truncated: true,
+      hint: cursored
+        ? `Showing the OLDEST ${r.items.length} of ${r.total} events after sinceCap=${sinceCap} (oldest first). Read again with sinceCap=${nextCap} to continue ${gap ? 'from here (see gapNote: earlier events were already lost)' : 'with no gap'}; raise limit=N for more per read.`
+        : tailHint('events', r.items.length, r.total, ', or narrow with type='),
+    } : {}),
   };
 });
 // Resolve journal/contact refs (GUIDs and/or numeric ids) to entity display names —
@@ -986,12 +1143,79 @@ registerAgentOp('resolve-refs', (params) => {
   }
   return { resolved, ...(unresolved.length ? { unresolved } : {}) };
 });
+// ── wait-for (#1154, #1559 C-12) ── park until a CONDITION holds instead of sleeping a guessed number
+// of ms. The decisions live in `waitFor.ts`; these are its RUNTIME readers — `entity` (the scene-state
+// resolver) and `console` (the shared ring) — registered here so the device has the op too (§9: an op
+// that needs only `runtime/` registers where both surfaces get it). The editor re-registers `wait-for`
+// with these plus `chrome`/`editor`; on a device those two kinds are refused by name.
+export const runtimeWaitReaders: WaitReaders = {
+  whereError,
+  entities: ({ guid, name, where }) => {
+    // `trait` narrows the one returned row to the trait the predicate reads, keeping the
+    // observation small; `limit:1` because the wait needs a count and one example, not a dump.
+    const trait = where ? /^\s*(\w+)\./.exec(where)?.[1] : undefined;
+    const r = dumpSceneState({ guid, name, where, ...(trait ? { trait } : {}), limit: 1 }) as { entities: unknown[]; totalCount: number };
+    return { count: r.totalCount, first: r.entities[0] };
+  },
+  consoleSince: (seq) => getConsoleRingEntries(seq),
+  consoleWatermark: (lookbackMs) => {
+    const all = getConsoleRingEntries();
+    if (!lookbackMs) return all.at(-1)?.seq ?? 0;
+    // `mono` is the ring's own `rawNow()` stamp, so the cutoff is on the same clock.
+    const cutoff = rawNow() - lookbackMs;
+    let mark = 0;
+    for (const e of all) { if (e.mono < cutoff) mark = e.seq; else break; }
+    return mark;
+  },
+  entityNames: () => getAllEntities().map((e) => e.name ?? '').filter(Boolean),
+};
+
+/** Run one `wait-for` call against `readers`. An unevaluable condition is RETURNED as a coded refusal,
+ *  not thrown: the device relay keeps a returned `{ok:false, code}`'s code (opRefusal.ts's docblock). */
+export function runWaitFor(params: unknown, readers: WaitReaders) {
+  const { timeoutMs, ...cond } = (params ?? {}) as WaitCondition & { timeoutMs?: unknown };
+  const why = surfaceError(cond, readers) ?? conditionError(cond, readers);
+  if (why) return { ok: false as const, code: 'REFUSED_BY_OP' as const, error: `wait-for: ${why} — nothing was waited for.` };
+  return waitForCondition(cond, { readers, timeoutMs: clampWaitTimeout(timeoutMs) });
+}
+// It ACCEPTS only what it can answer: on the HMR relay a `chrome`/`editor` wait from a page with no editor
+// is DECLINED, so the editor's own registration (which accepts everything) takes it. The device relay
+// runs the op directly, so there the refusal above is what the agent sees.
+registerAgentOp('wait-for', (params) => runWaitFor(params, runtimeWaitReaders), {
+  accepts: (params) => surfaceError(params, runtimeWaitReaders) === null,
+});
+
 // Discover what an agent can dispatch/read: action names + their param schemas,
 // and the live named read-values (e.g. canGoBack, timeSinceGameStart).
-registerAgentOp('game-introspect', () => ({
-  actions: getUIActionNames().map((name) => ({ name, params: getUIActionParams(name) ?? null })),
-  readValues: getReadSourceNames().map((name) => ({ name, value: getReadValue(name) })),
-}));
+//
+// Summary-first (§6, #1557): a BARE call answers the action NAMES only. Every row used to carry its
+// param schema, `null` for nearly all of them, so the list cost a median 5.7k chars per call to answer
+// "what can I dispatch?". `name=<substr>` (case-insensitive CONTAINS, as scene-state's `name`) buys
+// the detail rows, `{name, params}`, for the matches.
+registerAgentOp('game-introspect', (params) => {
+  const { name } = (params ?? {}) as { name?: unknown };
+  const all = getUIActionNames();
+  const readValues = getReadSourceNames().map((n) => ({ name: n, value: getReadValue(n) }));
+  if (typeof name !== 'string' || name === '') {
+    return {
+      actionCount: all.length,
+      actions: all,
+      readValues,
+      hint: 'Action NAMES only. name=<substr> returns the matching actions with their param schemas.',
+    };
+  }
+  const q = name.toLowerCase();
+  const hits = all.filter((n) => n.toLowerCase().includes(q));
+  return {
+    returnedCount: hits.length,
+    totalCount: hits.length,
+    actions: hits.map((n) => ({ name: n, params: getUIActionParams(n) ?? null })),
+    readValues,
+    ...(hits.length === 0 ? {
+      hint: emptyFilterHint({ what: 'action', filter: describeFilter({ name }), unfilteredCount: all.length, live: { name: all }, near: { name } }),
+    } : {}),
+  };
+});
 
 // ── Game-registered agent tools (#270) ── the game side of the MCP extension seam.
 //
@@ -1022,39 +1246,66 @@ registerAgentOp('game-tools', () => ({
 // Invoke one. The handler's return value is passed through UNTOUCHED: a game tool answers its
 // own question, and wrapping it in an envelope here would bury that answer one level deeper for
 // every caller. A refusal follows the same convention as the rest of the surface (§5) —
-// `ok:false` + a `reason` + the options — so the MCP client's isFailureBody surfaces it as a
-// failed call rather than a cheerful 200.
+// `ok:false` + a `code` + a `reason` + the `options` — so both MCP servers surface it as a failed
+// call carrying THAT code (`codeFromBody`), not a blanket REFUSED_BY_OP (#1561).
 registerAgentOp('game-tool-call', async (params) => {
   const p = (params ?? {}) as { name?: string; args?: Record<string, unknown> };
-  if (!p.name) return { ok: false, reason: 'missing tool name' };
+  const known = () => listAgentTools().map((t: AgentToolDef) => t.name);
+  if (!p.name) return { ok: false, code: 'REFUSED_BY_OP', reason: 'missing tool name', options: known() };
   const tool = getAgentTool(p.name);
   if (!tool) {
     // Name the alternatives. An unknown name is nearly always a stale tool list (the project was
     // switched, or the game unregistered on a hot-reload), and the recovery is to look at what IS
     // registered — so answer that question in the same call instead of making the agent ask it.
-    const known = listAgentTools().map((t: AgentToolDef) => t.name);
+    const options = known();
     return {
-      ok: false,
-      reason: known.length
+      ok: false, code: 'NOT_FOUND',
+      reason: options.length
         ? `unknown game tool '${p.name}'`
         : `unknown game tool '${p.name}' — this project registers no agent tools (or the debug menu is disabled, which suppresses them)`,
-      known,
+      options,
     };
   }
-  const args = p.args ?? {};
+  // String-encoded numbers/booleans are decoded against the declaration first (#1560).
+  const args = coerceAgentToolArgs(tool, p.args ?? {});
   // Enforce the DECLARATION here, so every caller inherits it — the curl API, device_eval's
   // modoki.call, and the device relays all land on this op, and only the editor MCP rebuilds a
   // zod schema of its own. A declaration honoured by one caller in four is not a contract.
   const invalid = validateAgentToolArgs(tool, args);
-  if (invalid) return { ok: false, reason: invalid, params: Object.keys(tool.params ?? {}) };
+  if (invalid) {
+    const declared = Object.keys(tool.params ?? {});
+    // An undeclared key is §1's UNKNOWN_PARAM, as it is for every engine tool; a declared key with a
+    // bad value is the op declining the call. Own-key check, never `in` (the #986 prototype trap).
+    const undeclared = Object.keys(args).some((k) => !Object.prototype.hasOwnProperty.call(tool.params ?? {}, k));
+    return { ok: false, code: undeclared ? 'UNKNOWN_PARAM' : 'REFUSED_BY_OP', reason: invalid, params: declared, options: declared };
+  }
+  let result: unknown;
   try {
-    return await tool.handler(args);
+    result = await tool.handler(args);
   } catch (e) {
     // A throwing handler is the game's bug, but it must not present as a transport failure: a 504
     // reads as "the editor is gone" and sends the agent diagnosing the wrong layer entirely.
-    return { ok: false, reason: `game tool '${p.name}' threw: ${e instanceof Error ? e.message : String(e)}` };
+    return { ok: false, code: 'REFUSED_BY_OP', reason: `game tool '${p.name}' threw: ${e instanceof Error ? e.message : String(e)}` };
   }
+  return checkGameToolCode(p.name, result);
 });
+
+/** A game handler's refusal `code` must be one of §5's closed set. One outside it used to be
+ *  dropped SILENTLY — `codeFromBody` falls back to REFUSED_BY_OP on both servers — so a game that
+ *  wrote `code:'INVALID'` believed its callers could branch on it while every caller saw the
+ *  generic code. Say so in the reply instead, where the game's own author reads it (#1561). */
+function checkGameToolCode(name: string, result: unknown): unknown {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const r = result as { ok?: unknown; code?: unknown; reason?: unknown };
+  // Only a REFUSAL's code is §5's: a successful reply may carry a `code` of its own (a key code, a
+  // locale, a promo code) and is passed through untouched like every other answer. "A refusal" is
+  // whatever the SERVERS will fail the call for — `isFailureBody`, the one predicate, so a body
+  // failing on `error`/`errors` without `ok:false` is covered too (#1561 re-review). Then
+  // `codeFromBody` hands back the body's code only when it is in the set — the one membership test.
+  if (r.code === undefined || isFailureBody(r) === null || codeFromBody(r, 'REFUSED_BY_OP') === r.code) return result;
+  const note = `game tool '${name}' returned code ${JSON.stringify(r.code)}, which is not a §5 error code (${ERROR_CODES.join(', ')}) — sent as REFUSED_BY_OP.`;
+  return { ...r, code: 'REFUSED_BY_OP', reason: typeof r.reason === 'string' ? `${r.reason} (${note})` : note };
+}
 // Trigger a game intent directly (no pixel-hunting a button). Dispatch is inert
 // unless the sim is playing, and throws in dev on an unknown name — so guard both.
 registerAgentOp('dispatch-action', (params) => {
@@ -1347,6 +1598,11 @@ registerAgentOp('diagnose', (params) => {
 // frame time, not every frame. A 300-frame capture with a full marker tree each is far past any
 // response budget, and "which frames were slow, and what did they spend it on" is the question —
 // the whole capture is still exportable as JSON for the cases that genuinely need it.
+/** The profiler's two `limit` ceilings — capture-read's worst frames and boot's rows per section.
+ *  The MCP schemas publish the larger and the op refuses capture-read above the smaller (#1560);
+ *  `numericRangeInSchema.test.ts` holds both servers' copies to these. */
+export const PROFILER_CAPTURE_READ_MAX = 20;
+export const PROFILER_BOOT_MAX = 200;
 registerAgentOp('profiler', (raw: unknown) => {
   const params = (raw ?? {}) as Record<string, unknown>;
   const action = params.action ?? 'read';
@@ -1381,7 +1637,12 @@ registerAgentOp('profiler', (raw: unknown) => {
       return { cleared: true };
     case 'capture-read': {
       const cap = getCapture();
-      const limit = Math.max(1, Math.min(20, Number(params.limit ?? 5)));
+      // The schema caps `limit` at boot's 200; a capture-read over ITS 20 is refused here rather than
+      // clamped (§5, #1560) — a silent 20-of-50 reads as "only 20 frames were captured".
+      if (params.limit != null && Number(params.limit) > PROFILER_CAPTURE_READ_MAX) {
+        throw new OpRefusal('REFUSED_BY_OP', `profiler capture-read: limit ${params.limit} is over the max of ${PROFILER_CAPTURE_READ_MAX} worst frames. Nothing was read.`, { options: [`limit:${PROFILER_CAPTURE_READ_MAX}`] });
+      }
+      const limit = Math.max(1, Math.min(PROFILER_CAPTURE_READ_MAX, Number(params.limit ?? 5)));
       // Sorted by cost, so the interesting frames come first regardless of when they happened.
       const worst = [...cap.frames].sort((a, b) => b.frameMs - a.frameMs).slice(0, limit);
       // #682: `captureFrame` is called from inside `runFrame` (a frame callback) — a dead loop
@@ -1435,7 +1696,7 @@ registerAgentOp('profiler', (raw: unknown) => {
       // Relative to the boot origin, so every number in this response is on one axis.
       const stallRel = stall ? { startMs: round(stall.startMs - origin), endMs: round(stall.endMs - origin) } : null;
       const closed = tl.spans.filter((sp) => sp.endMs >= 0);
-      const limit = Math.max(1, Math.min(200, Number(params.limit ?? 15)));
+      const limit = Math.max(1, Math.min(PROFILER_BOOT_MAX, Number(params.limit ?? 15)));
       const out: Record<string, unknown> = {
         spanCount: tl.spans.length,
         dropped: tl.dropped,
@@ -1502,7 +1763,7 @@ registerAgentOp('watch-start', (params) => startWatch((params ?? {}) as StartWat
 // ~160KB–1MB), unlike sibling reads (journal, get_scene_state) which default-cap. Cap HERE at the op —
 // NOT in readWatch, which WatchTab.tsx calls directly and needs every series for its chart. seriesTotal/
 // seriesTruncated (already emitted by readWatch when limit < matched) announce the truncation.
-const DEFAULT_WATCH_SERIES_LIMIT = 100;
+export const DEFAULT_WATCH_SERIES_LIMIT = 100;
 registerAgentOp('watch-read', (params) => {
   const p = (params ?? {}) as { id?: string; clear?: boolean; samples?: boolean; precision?: number; name?: string; guids?: string[]; limit?: number };
   const sig = resolvePrecision(p.precision);
@@ -2432,7 +2693,7 @@ registerAgentOp('read-asset-def', (params) => {
 
 // ── Scene swap (#166 P5) — load another scene on the device with NO rebuild.
 //
-// The editor's `load-scene` guards unsaved editor work and returns editor state; neither exists
+// The editor's `load-scene` guards unsaved editor work and returns the editor's scene fields; neither exists
 // here. What DOES carry over is the failure discipline: a load that did not happen must never be
 // reported as one, which is why the current path is read back after the swap rather than echoed.
 registerAgentOp('load-scene', async (params) => {
@@ -2944,7 +3205,7 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
     });
-    _worldReloadedFromDisk?.(current, keptBaseGuids);
+    await _worldReloadedFromDisk?.(current, keptBaseGuids);
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
     // A newer load superseding this one aborts the in-flight load
@@ -3012,7 +3273,7 @@ export function registerRelayResponder(hot: RelayHot): void {
   // one client that owns the op and must settle immediately. Collapsing them is the whole defect.
   //
   // The decision is `relayResponseFor`, called with NO overrides on purpose: its defaults already
-  // are `hasAgentOp` and `runAgentOp`, so passing them again adds a line that can be mis-wired —
+  // are `servesAgentOp` and `runAgentOp`, so passing them again adds a line that can be mis-wired —
   // swapping `hasAgentOp` for `() => true` there left 228 tests green while making every client
   // claim every op. Nothing to pass is nothing to get wrong.
   hot.on('modoki:request', async (msg: { id: number; op: string; params?: unknown }) => {

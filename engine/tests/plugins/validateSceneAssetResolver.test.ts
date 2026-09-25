@@ -34,6 +34,8 @@ function makeCtx(manifestAssets: Manifest['assets']): BackendContext {
   return {
     projectRoot: tmp,
     resolveAssetPath: (p: string) => (p.startsWith('/assets/') ? path.join(tmp, 'runtime', p) : null),
+    // The inverse of resolveAssetPath: scene-mutate asks it for the target's on-disk url (#1472).
+    absToAssetUrl: (abs: string) => '/' + path.relative(path.join(tmp, 'runtime'), abs).split(path.sep).join('/'),
     getManifest: () => ({ version: 2, assets: manifestAssets }) as Manifest,
     getSchema: () => undefined,
     firstRootDir: () => null,

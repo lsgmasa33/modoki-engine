@@ -7,13 +7,15 @@
  *  `ModokiIapPlugin.java` parks the `purchase()` call in `awaitingPurchase` (+
  *  `awaitingProductId`) because Google Play reports the outcome through
  *  `purchasesUpdatedListener`, not through `purchase()` itself, and calls `call.setKeepAlive(true)`
- *  at the parking site. There are SIX places that can settle that call — `USER_CANCELED`, a
+ *  at the parking site. There are SEVEN places that can settle that call — `USER_CANCELED`, a
  *  non-OK/null delivery, a matched delivery, a `launchBillingFlow` launch failure, (since
  *  #586) a webview reload, which releases the slot from a `WebViewListener.onPageStarted`
  *  registered by `ensureWebViewListener()` at PARK time — NOT from `load()`, where the listener is
  *  silently discarded by `Bridge.Builder.create()`'s `setWebViewListeners` (device-proven on an
  *  S22, 2026-09-03; see docs/native-and-sdks.md) — and (since #583) a bounded timeout for a call
- *  left parked with no delivery ever matching it. The original four each used to clear `awaitingPurchase` by hand, with
+ *  left parked with no delivery ever matching it — and (since #1514) `settleOnThrow`, reached when
+ *  the purchase body throws inside Play Billing's executor, which would otherwise swallow the throw
+ *  and leave the call parked forever. The original four each used to clear `awaitingPurchase` by hand, with
  *  three of them leaving `awaitingProductId` stale and NONE of them clearing `setKeepAlive`. A future settle path copy-pasted from one of
  *  those sites inherits the same gap silently: nothing here throws, nothing here fails a runtime
  *  test, because the bug is a flag that is never read on the paths this repo currently exercises.
@@ -106,7 +108,7 @@ function countOccurrences(haystack: string, needle: string): number {
  * physical line at a time (a wrapped `unpark(\n call);` is not counted, a statement sharing a line is
  * judged with it). The #1179 census moved every JS/TS and shell scanner onto a parser or onto logical
  * commands; this repo's test helpers have no Java parser, and one file does not justify adding one.
- * A reflow fails LOUD here rather than green: the `unpark` count is pinned at exactly 6, and every
+ * A reflow fails LOUD here rather than green: the `unpark` count is pinned at exactly 7, and every
  * `statementLines` lookup below must find its statement. */
 
 /** Count real `unpark(...)` STATEMENTS — a line whose trimmed form starts with `unpark(` and ends
@@ -222,7 +224,7 @@ describe('ModokiIapPlugin: every purchase-call settle path clears the parked slo
     ).toBe(1);
   });
 
-  it('unpark() is called from exactly 6 real settle sites (comments/declaration excluded)', () => {
+  it('unpark() is called from exactly 7 real settle sites (comments/declaration excluded)', () => {
     // Counting the bare substring `unpark(` over the whole file is fooled by a prose comment
     // mentioning `unpark(call)` (inflates the count, masking a REMOVED call site) just as easily
     // as it is by the declaration — so only count lines that are themselves a statement calling
@@ -230,16 +232,17 @@ describe('ModokiIapPlugin: every purchase-call settle path clears the parked slo
     const callSites = countUnparkCallSites(source);
     expect(
       callSites,
-      `found ${callSites} real unpark() call sites in ModokiIapPlugin.java — expected exactly 6, `
+      `found ${callSites} real unpark() call sites in ModokiIapPlugin.java — expected exactly 7, `
         + 'the enumerated settle paths: USER_CANCELED, a non-OK/null delivery, a matched delivery, '
         + 'a launchBillingFlow failure, the webview-reload release in the '
-        + 'ensureWebViewListener() WebViewListener (#586), and the parked-purchase timeout (#583). '
+        + 'ensureWebViewListener() WebViewListener (#586), the parked-purchase timeout (#583), and '
+        + 'settleOnThrow() for a purchase body that threw inside Billing\'s executor (#1514). '
         + 'A different count means either a settle path is '
         + 'clearing the parked call by hand instead of calling unpark(call) (fewer), or a genuine '
         + 'new settle path has appeared that this guard doesn\'t know about yet (more) — in the '
         + 'latter case, update this expectation and the enumeration above once you\'ve confirmed '
         + 'the new site really does route through unpark().',
-    ).toBe(6);
+    ).toBe(7);
   });
 });
 

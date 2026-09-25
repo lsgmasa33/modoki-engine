@@ -175,7 +175,7 @@ describe('the envelope is closable from the agent surface', () => {
     const r = await pose({ t: 0.5 });
     expect(r.ok).toBe(false);
     expect(r.code).toBe('REFUSED_BY_OP');
-    expect(String(r.error)).toMatch(/preview is closing/);
+    expect(String(r.error)).toMatch(/Play stopping|preview closing/);
     expect(getRunMode()).toBe('stopped');
     spy.mockRestore();
   });

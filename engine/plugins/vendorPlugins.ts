@@ -27,7 +27,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
-import { npmSpawnSpec } from '../toolchain';
+import { npmSpawnSpec, spawnSpecCall } from '../toolchain';
 
 export interface VendorOptions {
   /** May this process BUILD a plugin whose dist/ is missing or stale? True in a
@@ -914,7 +914,8 @@ function ensurePluginBuilt(plugin: EnginePlugin, canBuild: boolean): void {
   try {
     console.log(`[vendor] building ${plugin.name} dist…`);
     const npm = npmSpawnSpec();
-    execFileSync(npm.command, [...npm.prefixArgs, 'run', 'build'], { cwd: plugin.dir, stdio: 'inherit', shell: npm.shell, env: npm.env });
+    const s = spawnSpecCall(npm, ['run', 'build']);
+    execFileSync(s.command, s.args, { ...s.options, cwd: plugin.dir, stdio: 'inherit', env: npm.env });
     // Stamp AFTER a successful build only: if the build throws we leave the old
     // (or absent) stamp so the next pass retries instead of trusting bad output.
     if (srcHash !== null) writeBuildStamp(plugin.dir, srcHash);
@@ -1028,7 +1029,8 @@ function packInto(plugin: EnginePlugin, projectRoot: string, hash: string, canBu
     fs.writeFileSync(pkgJsonPath, JSON.stringify(pkg, null, 2) + '\n');
 
     const npm = npmSpawnSpec();
-    execFileSync(npm.command, [...npm.prefixArgs, 'pack', '--pack-destination', tmp], { cwd: plugin.dir, stdio: ['ignore', 'pipe', 'pipe'], shell: npm.shell, env: npm.env });
+    const s = spawnSpecCall(npm, ['pack', '--pack-destination', tmp]);
+    execFileSync(s.command, s.args, { ...s.options, cwd: plugin.dir, stdio: ['ignore', 'pipe', 'pipe'], env: npm.env });
     const produced = fs.readdirSync(tmp).find((f) => f.endsWith('.tgz'));
     if (!produced) throw new Error(`npm pack produced no tarball for ${plugin.name}`);
 

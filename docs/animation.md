@@ -206,7 +206,9 @@ below).
    formula collapses to "trait field always wins" in the legacy case).
 3. **Advance** — every live mixer advances by `mixerAdvanceDelta`: playing → engine *visual* delta
    (smoothed cadence × `timeScale`, so skeletal respects pause/slow-mo/time-stop); stopped/paused →
-   frozen (dt 0), **except** while the Animation editor previews (`skeletalPreviewDelta`). No
+   frozen (dt 0), with no editor-preview exception: the Animation and Timeline previews pose a rig
+   explicitly (a keyframe write, or a `skeletalSeek`), and the old "advance every mixer while
+   previewing" flag (`skeletalPreview`) was deleted as dead in #1552. No
    wall-clock read — "not playing → no animation" — which is why `scene3DSync` left the determinism
    wall-clock allowlist.
 
@@ -392,10 +394,11 @@ silently rewrote a scene file to the clip's t=0 values.
 
 **Exiting is not optional scope.** The envelope pins the run-mode at `scrub`, which is exactly what
 blocks the human's Cmd+S — an agent that posed and never un-posed would wedge the editor.
-`poseClip.ts` publishes `onPoseEnvelopeExited` and `AnimationEditor` subscribes, so an agent-driven
-exit cannot leave the panel's Cmd+S save handler pointed at a closed envelope; that handler's
-`resume()` re-poses, so the human's next save would serialize and then re-pose the world the agent
-had just reverted.
+The panel's ⏹ and its Cmd+S save handler follow the mode OWNER (#1549), which every exit clears —
+the agent's `exit-pose-envelope` included — so an agent-driven exit cannot leave that handler pointed
+at a closed envelope (its `resume()` re-poses, so the human's next save would serialize and then
+re-pose the world the agent had just reverted). This used to depend on `onPoseEnvelopeExited`, which
+covered only exits that went through `exitPoseEnvelope`.
 
 A real limit: POSING needs no Animation panel mounted, but OPENING a clip does — the clip document
 is fetched by the panel's own effect, and a panel never opened this session is not mounted

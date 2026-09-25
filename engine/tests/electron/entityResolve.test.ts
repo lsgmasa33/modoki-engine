@@ -48,6 +48,11 @@ vi.mock('@modoki/engine/runtime', () => ({
     return e ? { guid: e.guid ?? '', name: e.name } : null;
   },
   classifyRuntimeGuidMiss: () => null,
+  // `describeOccluder` names a covering game UI node by its entity (#1570) — answered from the same
+  // mocked list, so a cover's name and guid agree with every other lookup here.
+  findEntity: (id: number) => (getAllEntities() as Ent[]).find((e) => e.id === id) ?? null,
+  entityDisplayName: (id: number) => (getAllEntities() as Ent[]).find((e) => e.id === id)?.name ?? `Entity ${id}`,
+  guidOfEntityId: (id: number) => (getAllEntities() as Ent[]).find((e) => e.id === id)?.guid || null,
   resolveTapZoneVeto: (...a: unknown[]) => (resolveTapZoneVeto as (...x: unknown[]) => unknown)(...a),
   // The REAL constants, not string copies: this file already has them in scope from the
   // `importActual` above, and a hand-synced duplicate of a value you are holding is the
@@ -205,6 +210,29 @@ describe('2D/3D entities (canvas scope)', () => {
     overlay.id = 'modal';
     stubTopmost(overlay);
     expect(aimPuck()).toMatchObject({ occluded: true, hitTarget: 'div#modal' });
+  });
+
+  it('names a game UI node covering the canvas as its ENTITY, not the dock it sits in (#1570)', () => {
+    // Shipping shape: a UINode host is a bare `div` whose one identity is `data-entity-id`, inside
+    // the dock's anonymous chrome. Named by the old walk, this read `div inside
+    // div.flexlayout__tab_moveable` — and #1570 was filed against the dock when the cover was the
+    // scene's own HUD bar.
+    getAllEntities.mockReturnValue([PUCK, { id: 13, name: 'Top UI', guid: 'g-top', layer: 'ui' }]);
+    const dock = document.createElement('div');
+    dock.className = 'flexlayout__tab_moveable';
+    const host = document.createElement('div');
+    host.setAttribute('data-entity-id', '13');
+    const text = document.createElement('div');
+    dock.appendChild(host); host.appendChild(text);
+    stubTopmost(text);
+    expect(aimPuck()).toMatchObject({ occluded: true, hitTarget: 'entity "Top UI" [g-top]' });
+  });
+
+  it('names a covering UI node by its bare id when no live entity has it (the DOM outlived it)', () => {
+    const host = document.createElement('div');
+    host.setAttribute('data-entity-id', '99');
+    stubTopmost(host);
+    expect(aimPuck()).toMatchObject({ occluded: true, hitTarget: 'entity 99' });
   });
 
   it('treats a child of the canvas as reaching it', () => {
@@ -704,6 +732,101 @@ describe('2D/3D entities with a pick provider (entity scope)', () => {
     stubTopmost(document.createElement('canvas'));
     pickAt.mockReturnValue(8);
     expect(aimPuck()).toMatchObject({ ok: true, occluded: false, occlusionScope: 'entity' });
+  });
+
+  // #1563 — the shape measured on games/3d-test: the projected rect spills past the rect the
+  // surface draws into (the `ui` letterbox), and the entity is pickable only in a band of it.
+  // The whole-rect grid's rows sit at y=50/150/250/350/450 and its centre at 250 — every one
+  // outside the band 260-300 — so a sampler that ignores `drawRect` finds nothing and REFUSES.
+  // Sampled inside screen ∩ drawRect (y 250-500) its first row is y=275, inside the band.
+  describe('samples only the part of the rect its surface draws (#1563)', () => {
+    const DRAW = { x: 0, y: 250, w: 500, h: 250 };
+    const spill = () => collectScreenBounds.mockReturnValue(bounds({ screen: { x: 0, y: 0, w: 500, h: 500 }, drawRect: DRAW } as never));
+    const insideDraw = (x: number, y: number) => x >= DRAW.x && x <= DRAW.x + DRAW.w && y >= DRAW.y && y <= DRAW.y + DRAW.h;
+    // The bars pick nothing, as the SceneView's letterbox does (#1489); the cover wins elsewhere.
+    const pickBand = (_s: unknown, x: number, y: number) => (!insideDraw(x, y) ? null : y >= 260 && y <= 300 ? 7 : 99);
+
+    it('finds a target visible only in a band the whole-rect grid never reaches', () => {
+      getAllEntities.mockReturnValue([PUCK, BUTTON, { id: 99, name: 'Top UI', guid: 'g-top', layer: 'ui' }]);
+      stubTopmost(document.createElement('canvas'));
+      spill();
+      pickAt.mockImplementation(pickBand);
+      const r = aimPuck();
+      expect(r).toMatchObject({ ok: true, occluded: false, occlusionScope: 'entity' });
+      expect(r.y).toBeGreaterThanOrEqual(260);
+      expect(r.y).toBeLessThanOrEqual(300);
+    });
+
+    it('never spends a sample outside the draw rect, even on a failed search', () => {
+      stubTopmost(document.createElement('canvas'));
+      spill();
+      pickAt.mockReturnValue(99);
+      const r = aimPuck();
+      expect(r).toMatchObject({ ok: false, code: 'OCCLUDED' });
+      expect(pickAt.mock.calls.length).toBe(25);
+      for (const [, x, y] of pickAt.mock.calls as [unknown, number, number][]) expect(insideDraw(x, y)).toBe(true);
+    });
+
+    it('aims a picker-less surface at the centre of the VISIBLE part, not of the projection', () => {
+      stubTopmost(document.createElement('canvas'));
+      spill();
+      expect(aimPuck()).toMatchObject({ ok: true, x: 250, y: 375, occlusionScope: 'canvas' });
+    });
+
+    // The #1563 review: moving the refusals onto the visible part's centre retired them, because
+    // that centre is inside the draw rect by construction. They stay on the PROJECTED centre.
+    it('still REFUSES a rect whose projected centre is off the window, drawRect or not', () => {
+      stubTopmost(document.createElement('canvas'));
+      // 95% off the left of the canvas — the sliver left over may not hold the mesh at all, and
+      // game-3d has no picker to check. Before #1563 this was refused; it still is.
+      collectScreenBounds.mockReturnValue(bounds({ screen: { x: -1900, y: 100, w: 2000, h: 100 }, drawRect: { x: 0, y: 0, w: 800, h: 600 } } as never));
+      const r = aimPuck();
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain('only partly visible');
+    });
+
+    it('still REFUSES a rect whose projected centre lands on a NEIGHBOURING panel\'s canvas', () => {
+      // Game canvas x 0-366, Scene canvas beyond it (the side-by-side dock). The rect straddles the
+      // edge: its projected centre (400) is on the Scene panel, its visible part (200-366) on the
+      // Game canvas. The straddle is the refusal, whichever centre the aim would then use.
+      const hosted = (marker: string) => { const h = document.createElement('div'); h.setAttribute(marker, ''); const c = document.createElement('canvas'); h.appendChild(c); document.body.appendChild(h); return c; };
+      const game = hosted('data-game-view-area');
+      const scene = hosted('data-scene-viewport');
+      document.elementFromPoint = ((x: number) => (x < 366 ? game : scene)) as typeof document.elementFromPoint;
+      collectScreenBounds.mockReturnValue(bounds({ screen: { x: 200, y: 100, w: 400, h: 50 }, drawRect: { x: 0, y: 0, w: 366, h: 600 } } as never));
+      const r = aimPuck();
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain('the Scene panel');
+    });
+
+    it('a draw rect overhanging the WINDOW edge still aims at the part inside the window (#1563 re-review)', () => {
+      // Canvas x -300..100, entity x -200..300: pickable only on-window at x 0..100. The projected
+      // centre (50) is in the window, so neither refusal applies — and the aim must start at the
+      // centre of screen ∩ drawRect ∩ window (x 50), not of screen ∩ drawRect (x -50, off-window).
+      stubTopmost(document.createElement('canvas'));
+      collectScreenBounds.mockReturnValue(bounds({ screen: { x: -200, y: 100, w: 500, h: 100 }, drawRect: { x: -300, y: 0, w: 400, h: 600 } } as never));
+      pickAt.mockImplementation((_s: unknown, x: number) => (x >= 0 && x <= 100 ? 7 : null));
+      const r = aimPuck();
+      expect(r).toMatchObject({ ok: true, occluded: false, aimedAt: 'centre' });
+      expect(r.x).toBe(50);
+    });
+
+    it('REFUSES when the part its surface draws lies wholly outside the window', () => {
+      // Projected centre (100) in the window, but the canvas (x -500..-10) is entirely off it: the
+      // entity is drawn, nowhere a press can reach. Without this refusal a picker-less surface
+      // answered ok:true at an off-window point, since the first point skips the loop's check.
+      stubTopmost(document.createElement('canvas'));
+      collectScreenBounds.mockReturnValue(bounds({ screen: { x: -100, y: 100, w: 400, h: 100 }, drawRect: { x: -500, y: 0, w: 490, h: 600 } } as never));
+      const r = aimPuck();
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain('the part its surface draws is outside the window');
+    });
+
+    it('a provider that reports no drawRect keeps the whole-rect aim', () => {
+      stubTopmost(document.createElement('canvas'));
+      collectScreenBounds.mockReturnValue(bounds({ screen: { x: 0, y: 0, w: 500, h: 500 } }));
+      expect(aimPuck()).toMatchObject({ ok: true, x: 250, y: 250 });
+    });
   });
 
   it('a surface with NO registered picker keeps the "canvas" fallback — the call still succeeds', () => {

@@ -21,9 +21,10 @@
  *  the next Cmd+S flushes the old edited document back over the replacement. */
 
 import { newGuid, getAssetEntry } from '../../runtime/loaders/assetManifest';
+import { classifyJsonAssetPath } from '../../runtime/loaders/assetTypeClassifier';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { backendFetch, postWriteFile } from '../backend/editorBackend';
-import { resolveExistingDocumentId } from './prefab';
+import { classifyExistingDocumentId } from './prefab';
 import { assetWrittenToDisk } from './dirtyAssets';
 
 export type NewAssetDocumentResult =
@@ -81,7 +82,17 @@ export async function writeNewAssetDocument(
   if (!(await opts.confirmReplace(at))) return { outcome: 'declined', path: at };
 
   // Both read BEFORE the replacing write, which is what destroys them.
-  const keptId = await resolveExistingDocumentId(at);
+  const existing = await classifyExistingDocumentId(at);
+  // ⚠️ REFUSE rather than mint over a document that is THERE and unreadable (#1468, #896's class).
+  // A 500, corrupt bytes or a file a newer build wrote used to arrive here as `undefined`, which
+  // this line read as "first-time import" and answered with a FRESH guid — orphaning everything
+  // that referenced the old one, with the old bytes still on disk. The human already confirmed
+  // replacing the file; they did not confirm re-identifying it.
+  if (existing.kind === 'refuse') {
+    console.error(`[Asset] not replacing ${at} — ${existing.reason}`);
+    return { outcome: 'failed', path: at };
+  }
+  const keptId = existing.kind === 'known' ? existing.id : undefined;
   const previousContent = opts.keepPrevious ? await readText(at) : null;
   const guid = keptId ?? fresh;
   const body = build(guid, keptId != null);
@@ -117,9 +128,12 @@ export async function mayCreateOver(
  *  kind. The scene flows write plain `.json`, so their destination can be `Enemy.prefab.json`: kept,
  *  that prefab's guid would be re-registered as a scene and every `PrefabInstance.source` pointing at it
  *  would resolve to a scene document. Every other create enforces a compound extension that cannot
- *  land on another kind. A file the manifest has not indexed yet reads as no conflict. */
+ *  land on another kind. A file the manifest has not indexed yet is classified by its url with
+ *  `classifyJsonAssetPath`, the rule the scanner types by — the answer the manifest WILL give once it
+ *  indexes the file (#1472; the backend's `wrongKindRefusal` asks the same two questions in the same
+ *  order). A path no kind claims reads as no conflict. */
 export function otherAssetKindAt(path: string, kind: string): string | undefined {
-  const type = getAssetEntry(path)?.type;
+  const type = getAssetEntry(path)?.type ?? classifyJsonAssetPath(path);
   return type && type !== kind ? type : undefined;
 }
 

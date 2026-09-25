@@ -31,18 +31,17 @@
  *  Delete order within a version: `files/`, then `bundle.zip`, then the rest — `manifest.json` last. A
  *  prune that dies partway then leaves a version that still HAS its manifest, which the next prune
  *  sees and finishes; manifest-first would leave a manifest-less folder the rule above never deletes. */
-import { execSync } from 'node:child_process';
-import { isGcloudNoMatchError, isGcloudObjectNotFoundError, shellQuote } from './gcloud.mjs';
+import { isGcloudNoMatchError, isGcloudObjectNotFoundError, gcloudSync } from './gcloud.mjs';
 import { OTA_SAFE_TOKEN } from './otaSafeTokens.mjs';
 
 /** A folder name that can be a version at all: a publish token, and not `.`/`..`. Anything else is
  *  ignored rather than deleted — a name is interpolated into a delete GLOB, where `*` would widen it. */
 const isVersionName = (s) => OTA_SAFE_TOKEN.test(s) && s !== '.' && s !== '..';
 
-/** Runs `gcloud <args>` through a shell (Windows resolves `gcloud.cmd`). Never throws. */
+/** Runs `gcloud <args>` with no shell (`gcloudSync`; Windows resolves `gcloud.cmd`). Never throws. */
 export function runGcloud(args) {
   try {
-    const stdout = execSync(`gcloud ${args.map(shellQuote).join(' ')}`, { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }).toString('utf8');
+    const stdout = gcloudSync(args, { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }).toString('utf8');
     return { ok: true, stdout, stderr: '' };
   } catch (e) {
     return { ok: false, stdout: e?.stdout?.toString() ?? '', stderr: e?.stderr?.toString() || String(e?.message ?? e) };

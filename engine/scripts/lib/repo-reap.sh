@@ -121,6 +121,39 @@ _reap_repo_process_one() { # $1 = one exact spelling
   esac
 }
 
+# Ask this clone's Electron editor to quit with exactly ONE SIGTERM, to the Electron main process
+# only (#1580). `$1` is the `.../engine/electron/dist/main.cjs` fragment.
+#
+# `reap_repo_process` is wrong for this, on posix. The fragment also matches the npm `electron`
+# wrapper (`node_modules/.bin/electron` → `electron/cli.js`) that launch-editor.sh starts, and the
+# wrapper FORWARDS a SIGTERM to its child, so a `pkill -f` delivered two, microseconds apart.
+# Chromium handles the first by starting a clean quit (before-quit runs) and restoring the default
+# action, so the second killed the editor before the quit ran and before its localStorage was
+# committed: a raw write seconds old was lost 5 times out of 7. The wrapper exits by itself when its
+# child does. `sort -u` because a process can match BOTH root spellings (a logical root that is a
+# substring of the physical one, like `/tmp` → `/private/tmp`), and a pid listed twice is signalled
+# twice. Those two sends from one `kill` merged into one delivery in 12 of 12 trials, so this is a
+# timing hazard closed, not a failure reproduced. Windows keeps the shared reap: its pass is a
+# forced stop, so the uncommitted-write loss #1580 fixed on posix is still there.
+reap_repo_signal_editor_once() { # $1 = absolute main.cjs fragment, from the LOGICAL root
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) reap_repo_process "$1"; return 0 ;;
+  esac
+  local alt pids
+  alt="$(reap_alt_pattern "$1")"
+  pids=$(
+    { pgrep -f "$1"; [ -n "$alt" ] && pgrep -f "$alt"; } 2>/dev/null \
+      | sort -u \
+      | while read -r pid; do
+          ps -o command= -p "$pid" 2>/dev/null | grep -qE '/\.bin/electron |/electron/cli\.js ' || echo "$pid"
+        done
+  ) || true   # no editor running: `pgrep` exits 1, and under a caller's `set -e` + `pipefail` the
+              # failed assignment would end the CALLER right here, silently (launch-editor.sh did)
+  # shellcheck disable=SC2086 # one pid per word, on purpose
+  [ -n "$pids" ] && kill -TERM $pids 2>/dev/null
+  return 0
+}
+
 # True while any process matching the fragment is still alive.
 #
 # WINDOWS: this used to `return 1` unconditionally, on the reasoning that the CIM reap above is

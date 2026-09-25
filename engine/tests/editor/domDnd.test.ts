@@ -2,8 +2,11 @@
 /** Enact Phase 1 — HTML5 drag-and-drop synthesis (engine/app/debug/domDnd.ts).
  *  Verifies the synthesized sequence lets the app's OWN dragstart handler fill the
  *  DataTransfer and the drop handler read it back — the human-drag contract. */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { performDomDnd, type EditWitness } from '../../app/debug/domDnd';
+import { confirmInEditor } from '../../packages/modoki/src/editor/utils/saveDialog';
+import { openChoiceModal } from '../../packages/modoki/src/editor/components/choiceModal';
+import { clearOverlays } from '../../packages/modoki/src/editor/input/focusScope';
 
 /** A witness over three independently-movable counters, so a fixture can model the editor's real
  *  shape: an undo-stack push, a parked asset write, and a scene-world edit are three DIFFERENT
@@ -243,6 +246,90 @@ describe('performDomDnd', () => {
   // editor, all of which are `_isFileDirect`, came back `committed:false` plus "the drop probably
   // did nothing" on edits that demonstrably landed and were undoable. Both symptoms in #1142 are
   // below, and each one is a case the old single-counter probe got backwards.
+  // #1471. A drop whose handler ASKS FIRST — the cross-scene reparent confirm (#1429) — records
+  // nothing until a person answers, so `committed:false` is right and "probably did nothing" was
+  // wrong. These drive the REAL plain-DOM confirm (`confirmInEditor`), after an await like
+  // Hierarchy's `preflightSceneMove`, so they cover both halves of the contract: the shell stamps
+  // `data-modal-shell`, and the synthesizer reads it.
+  describe('a drop that raises a modal', () => {
+    afterEach(() => { clearOverlays(); });
+
+    /** `ask` is what the drop handler does: open a confirm (after an await), or nothing. */
+    function scene(id: string, ask: boolean) {
+      const src = place(document.createElement('div'), 0, 0); src.id = `${id}s`;
+      const dst = place(document.createElement('div'), 100, 0); dst.id = `${id}d`;
+      src.addEventListener('dragstart', (e) => (e as DragEvent).dataTransfer!.setData('application/editor-entity', '7'));
+      dst.addEventListener('dragover', (e) => e.preventDefault());
+      const c = counters();
+      dst.addEventListener('drop', () => {
+        if (!ask) return;
+        void (async () => {
+          await Promise.resolve();
+          if (await confirmInEditor('Move into another scene?', 'body', 'Move')) c.bump('stack', 'world');
+        })();
+      });
+      return { witness: c.witness, from: { selector: `#${id}s` }, to: { selector: `#${id}d` } };
+    }
+
+    it('reports the modal it opened, and does NOT call the drop a no-op', async () => {
+      const s = scene('m1', true);
+      const res = await performDomDnd({ from: s.from, to: s.to }, { witness: s.witness });
+      expect(res.committed).toBe(false); // correct: nobody has answered yet
+      expect(res.pendingModal).toEqual({ kind: 'save-dialog', controls: ['save-dialog.cancel', 'save-dialog.confirm'], controlCount: 2 });
+      expect(res.warning).toMatch(/OPENED A MODAL \(data-modal-shell="save-dialog"\)/);
+      expect(res.warning).toMatch(/save-dialog\.confirm/); // names what to aim at next
+      expect(res.warning).not.toMatch(/probably did nothing/);
+      expect(res.ok).toBe(true);
+    });
+
+    it('accept side: no modal, no `pendingModal`, and the no-op warning says its cases are examples', async () => {
+      const s = scene('m2', false);
+      const res = await performDomDnd({ from: s.from, to: s.to }, { witness: s.witness });
+      expect(res.committed).toBe(false);
+      expect(res.pendingModal).toBeUndefined();
+      expect(res.warning).toMatch(/probably did nothing/);
+      // The old text said "TWO legitimate drops also land here" — a list that read as complete,
+      // which is what made the modal case look like a refusal.
+      expect(res.warning).toMatch(/EXAMPLES, not the full set/);
+      expect(res.warning).not.toMatch(/TWO legitimate/);
+    });
+
+    it('a modal already open BEFORE the drop is not reported as raised by it', async () => {
+      void confirmInEditor('already here', 'body', 'OK');
+      const s = scene('m3', false);
+      const res = await performDomDnd({ from: s.from, to: s.to }, { witness: s.witness });
+      expect(res.pendingModal).toBeUndefined();
+      expect(res.warning).toMatch(/probably did nothing/);
+    });
+
+    it('a modal naming more buttons than the cap lists the first ones and says how many it left out', async () => {
+      const src = place(document.createElement('div'), 0, 0); src.id = 'm5s';
+      const dst = place(document.createElement('div'), 100, 0); dst.id = 'm5d';
+      src.addEventListener('dragstart', (e) => (e as DragEvent).dataTransfer!.setData('application/editor-entity', '7'));
+      dst.addEventListener('dragover', (e) => e.preventDefault());
+      const c = counters();
+      dst.addEventListener('drop', () => {
+        void openChoiceModal({
+          kind: 'many', title: 't', message: 'm', cancelValue: 'c0', focus: 'c0',
+          choices: Array.from({ length: 11 }, (_, i) => ({ value: `c${i}`, label: `C${i}` })),
+        });
+      });
+      const res = await performDomDnd({ from: { selector: '#m5s' }, to: { selector: '#m5d' } }, { witness: c.witness });
+      expect(res.pendingModal?.kind).toBe('many');
+      expect(res.pendingModal?.controlCount).toBe(11);
+      expect(res.pendingModal?.controls).toEqual(Array.from({ length: 8 }, (_, i) => `many.c${i}`));
+      expect(res.warning).toContain('(+3 more)');
+    });
+
+    it('a SECOND modal of a kind already showing still counts — compared by element, not kind', async () => {
+      void confirmInEditor('already here', 'body', 'OK');
+      const s = scene('m4', true);
+      const res = await performDomDnd({ from: s.from, to: s.to }, { witness: s.witness });
+      expect(res.pendingModal?.kind).toBe('save-dialog');
+      expect(res.warning).not.toMatch(/probably did nothing/);
+    });
+  });
+
   describe('asset-document drops', () => {
     /** `bump` names exactly which counters this drop moves — that is the whole axis under test. */
     function scene(bump: (keyof EditWitness)[]) {

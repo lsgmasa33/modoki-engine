@@ -564,7 +564,7 @@ priority (< PHYSICS) so an impulse this frame is integrated by this frame's step
 
 ## Agent surface (scene queries)
 
-`modoki_scene_query` / `device_scene_query` expose all six scene-query exports behind one tool
+`modoki_physics_query` / `device_physics_query` expose all six scene-query exports behind one tool
 (`kind: 'raycast'|'shapecast'|'point'` × `dim: '2d'|'3d'`). The durable fact: the raw functions
 collapse three distinguishable outcomes onto the same `null` — no physics world, a zero-length
 direction, and a genuine miss. That's harmless in game code (the next line is `if (hit)`), but

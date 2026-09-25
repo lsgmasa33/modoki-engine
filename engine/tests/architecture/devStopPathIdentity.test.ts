@@ -11,8 +11,8 @@
  *  The script's whole job is to kill processes, and pointing it at the real repo would reap the
  *  developer's own running dev server (or another clone's, mid-`verify`) as a side effect of
  *  testing it. The markers are built from `argv[2]`, so a tmpdir root is a complete substitute. */
-import { describe, it, expect, afterEach } from 'vitest';
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { spawn, spawnSync, execFileSync, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { makeDirLink } from '../helpers/linkFixture';
@@ -59,6 +59,23 @@ function stop(repoRootArg: string): { out: string; status: number | null } {
   return { out: `${r.stdout}${r.stderr}`, status: r.status };
 }
 
+/** The command line the OS reports for `pid`, as the reap reads it — '' when it cannot be seen. */
+function argsOf(pid: number): string {
+  try {
+    return process.platform === 'win32'
+      ? execFileSync('powershell', ['-NoProfile', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`], { encoding: 'utf8' })
+      : execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8' });
+  } catch { return ''; }
+}
+
+/** Until the process table shows the child's vite argument — the thing the reap matches on (#1478).
+ *  A 300ms sleep stood here: under load the reap could run before the child's args were visible,
+ *  and then the "leaves a sibling alone" cases passed because there was nothing to see at all. */
+const visible = (kid: ChildProcess) => vi.waitFor(() => expect(argsOf(kid.pid!)).toMatch(/vite\.js/), { timeout: 5000, interval: 25 });
+/** Until the reaped child is gone — an event, so polled (#1478). */
+const gone = (kid: ChildProcess, why: string) => vi.waitFor(() => expect(alive(kid.pid!), why).toBe(false), { timeout: 5000, interval: 25 });
+/** A wait for a death that must NOT happen. Settling, not an event, so it stays a fixed sleep; each
+ *  such case also asserts the reap's own words, which is the deterministic half. */
 const settle = async () => { await new Promise((r) => setTimeout(r, 300)); };
 
 describe('dev:stop matches the repo through any spelling of its root (#908)', () => {
@@ -71,13 +88,12 @@ describe('dev:stop matches the repo through any spelling of its root (#908)', ()
 
     // Launched with the REAL spelling…
     const kid = fakeDevServer(real);
-    await settle();
+    await visible(kid);
     // …stopped through the LINK. Before the fix the marker was the link spelling, `includes()`
     // missed, and this printed `Done.` with the process still running.
     const { out } = stop(link);
 
-    await settle();
-    expect(alive(kid.pid!), `nothing was stopped, and the script said:\n${out}`).toBe(false);
+    await gone(kid, `nothing was stopped, and the script said:\n${out}`);
   });
 
   it('CONTROL: still stops it when reached through the real path', async () => {
@@ -88,11 +104,10 @@ describe('dev:stop matches the repo through any spelling of its root (#908)', ()
     fs.mkdirSync(real);
 
     const kid = fakeDevServer(real);
-    await settle();
+    await visible(kid);
     const { out } = stop(real);
 
-    await settle();
-    expect(alive(kid.pid!), `the control failed, so the harness is suspect:\n${out}`).toBe(false);
+    await gone(kid, `the control failed, so the harness is suspect:\n${out}`);
   });
 
   it('leaves a DIFFERENT repo root alone — the scoping the marker exists for', async () => {
@@ -104,7 +119,7 @@ describe('dev:stop matches the repo through any spelling of its root (#908)', ()
     fs.mkdirSync(mine); fs.mkdirSync(theirs);
 
     const kid = fakeDevServer(theirs);
-    await settle();
+    await visible(kid);
     const { out } = stop(mine);
 
     await settle();
@@ -133,7 +148,7 @@ describe('dev:stop says when it stopped NOTHING (#908)', () => {
     const real = path.join(base, 'repo');
     fs.mkdirSync(real);
     const kid = fakeDevServer(real);
-    await settle();
+    await visible(kid);
 
     const { out } = stop(real);
     expect(out).toMatch(new RegExp(`Stopping this repo's dev server: ${kid.pid}`));
@@ -147,7 +162,7 @@ describe('dev:stop says when it stopped NOTHING (#908)', () => {
     const real = path.join(base, 'repo');
     fs.mkdirSync(real);
     const kid = fakeDevServer(real, ['--configLoader', 'runner']);
-    await settle();
+    await visible(kid);
 
     const { out } = stop(real);
 

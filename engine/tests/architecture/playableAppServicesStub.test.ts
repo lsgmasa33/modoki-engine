@@ -414,6 +414,17 @@ const HANDED_ON_REVIEWED = [
     reason: 'the same default. `makeTransport(services.cloudSave)` calls it through a parameter spelled `cloudSave`, '
       + 'which the name fallback happens to read; a renamed parameter would not be.',
   },
+  {
+    item: "games/court/runtime/debugTab.tsx::ads in <module> > `export const CourtAdsTab = createAdsDebugTab(ads.adsDebug);`",
+    reason: 'the Ads debug tab (#1501). `ads.adsDebug` is handed to the ENGINE\'s `createAdsDebugTab`, which calls it '
+      + 'through the `AdDebug` interface (`debug.status()` …) — outside every game file, so no scan here can follow it. '
+      + 'The stub carries `ads.adsDebug` with every `AdDebug` member; they run only when a debug menu renders the tab, '
+      + 'which a playable never has.',
+  },
+  {
+    item: "games/wordweave/runtime/debugTab.tsx::ads in <module> > `export const WordweaveAdsTab = createAdsDebugTab(ads.adsDebug);`",
+    reason: 'Weaveling\'s copy of the same tab (#1474, shared since #1501) — the same handoff into the engine, safe for the same reason.',
+  },
 ] as const;
 
 describe('dynamicMembers — what an import() of app-services is read as (#1193)', () => {
@@ -613,7 +624,7 @@ describe.skipIf(!hasInternalGames())('the playable app-services stub keeps up wi
       label: 'HANDED_ON_REVIEWED in playableAppServicesStub',
       population: handedOn,
       exempt: HANDED_ON_REVIEWED,
-      // 2 measured (cloudSyncWiring), both pardoned; wiring either through a followable shape trips this floor.
+      // 6 measured (4 cloudSyncWiring, 2 Ads debug tabs), all pardoned; wiring either through a followable shape trips this floor.
       floor: 1,
       fix: 'an app-services binding is used as a VALUE here, so its member calls happen through a receiver this guard '
         + 'cannot follow by symbol. Read the file: if its calls are spelled `<import name>.<member>(` the name fallback '

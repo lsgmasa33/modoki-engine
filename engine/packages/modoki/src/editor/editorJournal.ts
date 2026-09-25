@@ -13,7 +13,7 @@
  *  (an undo-stack push, a play toggle) — not per-drag-frame — so the stream stays
  *  naturally sparse. */
 
-import { nextCaptureSeq } from '../runtime/core/journal';
+import { captureEpoch, capturePartOf, nextCaptureSeq } from '../runtime/core/journal';
 import { notifyListeners } from '../runtime/core/notifyListeners';
 
 /** Who an editor event is attributed to — the vocabulary of `EditorEvent.source` and of the
@@ -65,22 +65,35 @@ export interface EditorEvent {
 const MAX_EVENTS = 2000; // ring-drop oldest
 const buffer: EditorEvent[] = [];
 let seq = 0;
+const droppedThrough = { seq: 0, cap: 0 };
 /** Which LIFE of this module a `seq` belongs to (#1214 B-3). `seq` is module state, so a renderer
  *  reload — and every game-code edit force-reloads — restarts it at 0. A cursor from before the reload
  *  is then AHEAD of every new event, and a forward read with it filters out all of them: the agent saw
  *  `{events:[], timedOut:true}` on every poll while the human kept editing. Replies carry this, and a
  *  caller that sends it back gets its cursor reset when the life has changed (`resolveEditorJournalCursor`).
  *  Editor code is not determinism-guarded; this only has to differ between two loads. */
-const epoch = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const seqLife = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
-/** The current life's id — see `epoch`. */
-export function editorJournalEpoch(): string { return epoch; }
+/** The newest `seq` issued in this life — every later event's `seq` is greater. */
+export function editorJournalSeq(): number { return seq; }
 
-/** True when a caller's `epoch` names an EARLIER life. The shared capture counter (`cap`, the
- *  merged timeline's cursor) is module state too and restarts on the same reload, so a `sinceCap`
- *  needs this check as much as `since` does. */
+/** The current life's id: `<capture-counter life>~<this module's seq life>` (#1561). This journal's
+ *  cursors live on BOTH counters — `since` is a `seq`, the merged timeline's `sinceCap` is a `cap` —
+ *  so its epoch names both, and a `cap` cursor is checked against the capture part alone
+ *  (`capturePartOf`), which is what lets a `modoki_journal` baseline feed a merged read. */
+export function editorJournalEpoch(): string { return `${captureEpoch()}~${seqLife}`; }
+
+/** True when a caller's `epoch` names an EARLIER life of this journal's `seq`. A `sinceCap` is NOT
+ *  checked here: it is a capture-counter cursor, resolved by `resolveCapCursor` against the capture
+ *  part of the epoch alone, so a `modoki_journal` baseline stays valid on a merged read (#1561). */
 export function editorJournalEpochChanged(callerEpoch: string | undefined): boolean {
-  return callerEpoch !== undefined && callerEpoch !== epoch;
+  if (!callerEpoch) return false;
+  // A CAPTURE-ONLY epoch (a `modoki_journal` reply's, no `~`) names no seq life: compare the part it
+  // does name, and leave the seq cursor to the past-the-counter check below. One `epoch` param
+  // serves `since` and `sinceCap` alike, so a caller sending the game journal's epoch for a merged
+  // read must not have its valid `since` reset (#1561 re-review).
+  if (!callerEpoch.includes('~')) return capturePartOf(callerEpoch) !== captureEpoch();
+  return callerEpoch !== editorJournalEpoch();
 }
 
 export interface ResolvedEditorJournalCursor {
@@ -98,7 +111,7 @@ export interface ResolvedEditorJournalCursor {
 export function resolveEditorJournalCursor(since: number | undefined, callerEpoch: string | undefined): ResolvedEditorJournalCursor {
   if (since == null) return { since };
   if (editorJournalEpochChanged(callerEpoch)) {
-    return { since: 0, cursorReset: `since=${since} was issued under epoch ${callerEpoch}; the editor journal has restarted since (epoch ${epoch} — a renderer reload, e.g. a game-code edit), so this read replays everything from the restart. Use the returned cursor from now on.` };
+    return { since: 0, cursorReset: `since=${since} was issued under epoch ${callerEpoch}; the editor journal has restarted since (epoch ${editorJournalEpoch()} — a renderer reload, e.g. a game-code edit), so this read replays everything from the restart. Use the returned cursor from now on.` };
   }
   if (since > seq) {
     return { since: 0, cursorReset: `since=${since} is past the newest event this journal has issued (${seq}), so it is from before a restart (a renderer reload, e.g. a game-code edit); this read replays everything from the restart. Send \`epoch\` back with \`since\` so a restart is always detected.` };
@@ -276,7 +289,10 @@ export function editorEmit(type: EditorJournalType, payload?: unknown): void {
   if (!enabled) return;
   const event: EditorEvent = { seq: ++seq, cap: nextCaptureSeq(), ts: Date.now(), type, source: currentActor(), payload };
   buffer.push(event);
-  if (buffer.length > MAX_EVENTS) buffer.shift();
+  if (buffer.length > MAX_EVENTS) {
+    const gone = buffer.shift();
+    if (gone) { droppedThrough.seq = gone.seq; droppedThrough.cap = gone.cap; }
+  }
   notifyListeners(listeners, 'editorJournal', [event]);
 }
 
@@ -291,7 +307,16 @@ export function readEditorJournal(filter?: { type?: string; source?: 'human' | '
 }
 
 /** Clear the buffer. */
-export function clearEditorJournal(): void { buffer.length = 0; }
+export function clearEditorJournal(): void {
+  const last = buffer[buffer.length - 1];
+  if (last) { droppedThrough.seq = Math.max(droppedThrough.seq, last.seq); droppedThrough.cap = Math.max(droppedThrough.cap, last.cap); }
+  buffer.length = 0;
+}
+
+/** The newest event this ring has LOST — shifted out past its 2,000-event cap, or cleared — on both
+ *  of its axes: `seq` (the `since` cursor) and `cap` (the merged timeline's `sinceCap`). A cursor
+ *  below it has a gap the returned events cannot show (#1561 re-review). 0 = nothing lost. */
+export function editorJournalDroppedThrough(): { seq: number; cap: number } { return { ...droppedThrough }; }
 
 /** Enable/disable capture (e.g. to mute during a bulk programmatic operation). */
 export function setEditorJournalEnabled(on: boolean): void { enabled = on; }
@@ -333,7 +358,7 @@ export function waitForEditorJournal(
   const baseline = filter.since ?? seq; // "now" when no cursor was given
   const already = readEditorJournal({ type: filter.type, source: filter.source, since: baseline });
   if (already.length > 0) {
-    return Promise.resolve({ events: already, timedOut: false, nextSeq: already[already.length - 1].seq, epoch });
+    return Promise.resolve({ events: already, timedOut: false, nextSeq: already[already.length - 1].seq, epoch: editorJournalEpoch() });
   }
   const timedOut = (): WaitForEditResult => {
     const others = readEditorJournal({ since: baseline });
@@ -343,7 +368,7 @@ export function waitForEditorJournal(
       return out;
     };
     return {
-      events: [], timedOut: true, nextSeq: baseline, epoch,
+      events: [], timedOut: true, nextSeq: baseline, epoch: editorJournalEpoch(),
       ...(others.length ? { skipped: { total: others.length, byType: count((e) => e.type), bySource: count((e) => e.source) } } : {}),
     };
   };
@@ -361,7 +386,7 @@ export function waitForEditorJournal(
       if (filter.source && e.source !== filter.source) return;
       if (e.seq <= baseline) return; // pre-existing event replaying through some other path
       const events = readEditorJournal({ type: filter.type, source: filter.source, since: baseline });
-      finish({ events, timedOut: false, nextSeq: events.length ? events[events.length - 1].seq : baseline, epoch });
+      finish({ events, timedOut: false, nextSeq: events.length ? events[events.length - 1].seq : baseline, epoch: editorJournalEpoch() });
     });
     const timer = setTimeout(() => finish(timedOut()), timeoutMs);
   });

@@ -46,6 +46,18 @@ export function tailWithCounts<T>(
   return { items: tail, total: items.length, truncated, byType };
 }
 
+/** The FORWARD-cursor twin of `tailWithCounts`: the OLDEST `limit` items (see `takeHead` for why a
+ *  cursored poll must not take the tail), with the same histogram over the full set. */
+export function headWithCounts<T>(
+  items: readonly T[],
+  typeOf: (item: T) => string,
+  opts: { limit?: number; defaultLimit: number },
+): TailResult<T> {
+  const counted = tailWithCounts(items, typeOf, { limit: 0, defaultLimit: 0 });
+  const { items: head, truncated } = takeHead(items, opts.limit, opts.defaultLimit);
+  return { items: head, total: counted.total, truncated, byType: counted.byType };
+}
+
 /** Take the last N — the ONLY place the tail arithmetic lives.
  *
  *  Two traps, both of which have shipped here at least once:
@@ -58,7 +70,8 @@ export function tailWithCounts<T>(
  *  Exported so no caller is tempted to re-derive it. `agentEditorOps`' merged `timeline` did,
  *  and re-created the `slice(-0)` bug this comment describes. */
 export function takeTail<T>(items: readonly T[], limit: number | undefined, defaultLimit: number): { items: T[]; truncated: boolean } {
-  const n = typeof limit === 'number' && Number.isFinite(limit) ? limit : defaultLimit;
+  // A negative limit is 0 — else `0 > -3` reports an EMPTY list as truncated (#1559 review).
+  const n = Math.max(0, typeof limit === 'number' && Number.isFinite(limit) ? limit : defaultLimit);
   const truncated = items.length > n;
   return { items: n <= 0 ? [] : truncated ? items.slice(-n) : [...items], truncated };
 }
@@ -70,7 +83,7 @@ export function takeTail<T>(items: readonly T[], limit: number | undefined, defa
  *  window instead; pair it with a nextCursor = the last returned item's seq/cap so the next poll
  *  continues contiguously with no gap. Same NaN/`slice(0,0)` guards as takeTail. */
 export function takeHead<T>(items: readonly T[], limit: number | undefined, defaultLimit: number): { items: T[]; truncated: boolean } {
-  const n = typeof limit === 'number' && Number.isFinite(limit) ? limit : defaultLimit;
+  const n = Math.max(0, typeof limit === 'number' && Number.isFinite(limit) ? limit : defaultLimit);
   const truncated = items.length > n;
   return { items: n <= 0 ? [] : truncated ? items.slice(0, n) : [...items], truncated };
 }

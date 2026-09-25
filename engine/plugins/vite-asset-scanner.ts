@@ -50,7 +50,8 @@ import {
   CORRUPT_SIDECAR_SUFFIX,
   SIDECAR_FORMAT_VERSION,
 } from './meta-sidecar';
-import { classifyJsonAssetSuffix, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
+import { classifyPrefabWrite } from './prefabWriteGuard';
+import { classifyJsonAssetPath, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
 import { getCacheDir, cachePathFor } from './texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from './audio-cache';
 import { convertAudio } from './audio-convert';
@@ -83,7 +84,7 @@ import { handleBackendRequest, assetJsonBytes, type BackendContext, type Backend
 import { reclaimStaleDeviceStateAtStartup, shouldReclaimDeviceStateHere } from './backend/deviceConnection';
 import { healNativeProject } from './healNativeProject';
 import { injectedBuildNumbers, writeBuildNumberArgFiles } from './healNativeConfig';
-import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
+import { spawnBuildStep, killBuildProcess, execStep, sh, ref, authoredShell, type BuildStep, type ExecStep, type SpawnedStep } from './buildStepShell';
 import { catchMiddlewareRejection, runSsePipeline } from './ssePipeline';
 import {
   parseBuildVariant, keystoreRefusal, renderKeystoreProperties, renderExportOptionsPlist,
@@ -97,6 +98,7 @@ import { scaffoldNativeTarget, isNativeTargetScaffolded, type NativePlatform } f
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
 import { writeBackendResult } from './backend/writeResult';
+import { openInOS } from './backend/osOpen';
 
 
 
@@ -331,6 +333,17 @@ function shipPixiKtxTranscoder(projectRoot: string, distDir: string, ...fallback
 export function writeAssetGuid(absPath: string, type: string, guid: string): boolean {
   try {
     if (ID_BEARING_TYPES.has(type)) {
+      // ⚠️ Same reasoning as the sidecar refusal below, applied to the DOCUMENT (#1468 D4): this
+      // branch writes the JSON file directly, so it inherits neither `/api/write-file`'s prefab
+      // gate nor any other, and has to carry it itself. `prefab` IS in `ID_BEARING_TYPES`.
+      // What makes it the sharpest of the server-side writers: the GUID heal fires from the
+      // WATCHER, roughly 150ms after a file appears — so without this, dropping a newer-format
+      // prefab into the project re-serializes it before anyone has opened anything.
+      const prefabRefusal = classifyPrefabWrite(absPath);
+      if (prefabRefusal) {
+        console.warn(`[assets] not stamping a GUID into ${absPath}: ${prefabRefusal.message}`);
+        return false;
+      }
       const json = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
       if (isStampableObject(json)) {
         json.id = guid;
@@ -456,20 +469,12 @@ export function detectType(relPath: string, ext: string): string | null {
   if (ext === '.css') return null;
 
   if (ext === '.json') {
-    if (relPath.endsWith('.layout.json')) return 'layout';
-    // Shared JSON asset-kind classifier (see plugins/assetTypes.ts) — the single
-    // list the tree-shaker's classify() also uses, so the two can't drift. Scenes
-    // are matched here too, by the `.scene.json` suffix (issue #54).
-    const jsonAssetType = classifyJsonAssetSuffix(relPath);
-    if (jsonAssetType) return jsonAssetType;
-    // LEGACY fallback (issue #54): before the `.scene.json` suffix existed, a scene
-    // was any plain `.json` under a `/scenes/` directory (or a top-level `scene.json`).
-    // Keep honoring that convention so an externally-authored OSS project, or an
-    // already-published demo snapshot, whose scenes are still plain `.json` under
-    // `/scenes/` keeps working. New scenes are always `.scene.json`.
-    if (relPath.includes('/scenes/') || relPath.endsWith('/scene.json')) return 'scene';
-    if (relPath.includes('/materials/')) return 'material';
-    return null;
+    // Shared with every "never cross kinds" check (#1472), so a kind refusal cannot disagree with the
+    // type this scan gives the file. It keeps the LEGACY fallback (issue #54): before the `.scene.json`
+    // suffix existed, a scene was any plain `.json` under a `/scenes/` directory (or a top-level
+    // `scene.json`), and an externally-authored OSS project or a published demo snapshot may still
+    // use it. The suffix list inside it is the one the tree-shaker's classify() also uses.
+    return classifyJsonAssetPath(relPath);
   }
   return EXT_TYPE[ext] || null;
 }
@@ -736,28 +741,35 @@ export function otaPublishSteps(o: {
   keyName: string;
   shellEngineApi: number;
   mandatory: boolean | undefined;
-}): { buildLabel: string; buildCmd: string; buildEnv: NodeJS.ProcessEnv; distDir: string; publishCmd: string } {
-  const mandatoryFlag = o.mandatory === true ? ' --mandatory' : o.mandatory === false ? ' --no-mandatory' : '';
-  const tail = `--bucket ${JSON.stringify(o.bucket)} --name ${JSON.stringify(o.bundleName)} --version ${JSON.stringify(o.version)} ` +
-    `--key ${JSON.stringify(o.keyName)} --repo-root ${JSON.stringify(o.buildCwd)} --project ${JSON.stringify(o.projectRoot)}${mandatoryFlag}`;
+}): { buildLabel: string; build: ExecStep; buildEnv: NodeJS.ProcessEnv; distDir: string; publish: ExecStep } {
+  // argv, never a command string (#1537): every value here is a name, a path or a config string.
+  const tail = [
+    '--bucket', o.bucket, '--name', o.bundleName, '--version', o.version,
+    '--key', o.keyName, '--repo-root', o.buildCwd, '--project', o.projectRoot,
+    ...(o.mandatory === true ? ['--mandatory'] : o.mandatory === false ? ['--no-mandatory'] : []),
+  ];
+  const publish = (dist: string, engineApi: string[]) =>
+    execStep('Publishing OTA bundle...', o.buildCwd, 'node', ['engine/scripts/ota-publish.mjs', '--dist', dist, ...engineApi, ...tail]);
   if (o.target.kind === 'subgame') {
     if (!o.subgameDir) throw new Error('otaPublishSteps: a sub-game target needs its resolved project dir');
     const distDir = subgameOutDir(o.subgameDir);
+    const buildLabel = `Building sub-game ${o.target.id}...`;
     return {
-      buildLabel: `Building sub-game ${o.target.id}...`,
-      buildCmd: 'node engine/scripts/build-subgame.mjs',
+      buildLabel,
+      build: execStep(buildLabel, o.buildCwd, 'node', ['engine/scripts/build-subgame.mjs']),
       buildEnv: { ...o.gcloudEnv, MODOKI_PROJECT: o.subgameDir },
       distDir,
-      publishCmd: `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} ${tail}`,
+      publish: publish(distDir, []),
     };
   }
   const distDir = path.join(o.projectRoot, 'dist');
+  const buildLabel = 'Building web assets...';
   return {
-    buildLabel: 'Building web assets...',
-    buildCmd: 'node engine/scripts/build-web.mjs --target native',
+    buildLabel,
+    build: execStep(buildLabel, o.buildCwd, 'node', ['engine/scripts/build-web.mjs', '--target', 'native']),
     buildEnv: otaPublishBuildStepEnv(o.gcloudEnv, o.projectRoot),
     distDir,
-    publishCmd: `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --engine-api ${o.shellEngineApi} ${tail}`,
+    publish: publish(distDir, ['--engine-api', String(o.shellEngineApi)]),
   };
 }
 
@@ -767,14 +779,50 @@ export function otaPublishSteps(o: {
 export { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
 import { readGitProvenance } from '../scripts/ota/buildStamp.mjs';
 
+/** Run an `inproc` build step; a throw is a failed step, reported like a child's non-zero exit. */
+async function runInprocStep(step: Extract<BuildStep, { kind: 'inproc' }>, log: (line: string) => void): Promise<boolean> {
+  try {
+    await step.run(log);
+    return true;
+  } catch (e) {
+    log(`ERROR: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+}
+
+/** The web deploy's "cache the content-hashed binaries forever" steps — one per extension, each gated
+ *  by a run-time `when` on the dist/ the build just produced. Only the extensions actually present
+ *  run: a game with no models/compressed textures has no .glb/.ktx2/.webp, and
+ *  `gcloud storage objects update` FAILS the whole deploy when a glob matches zero objects. (This was a
+ *  bash `for ext … find … | head -1` loop until #1537 made steps argv.) Pure — the plan, not the run. */
+export function cdnBinaryCacheSteps(bucket: string, distDir: string, buildCwd: string): ExecStep[] {
+  return (['glb', 'ktx2', 'webp'] as const).map((ext) => execStep(
+    `Caching content-hashed binaries (immutable, .${ext})...`, buildCwd, 'gcloud',
+    ['storage', 'objects', 'update', `${bucket}/**.${ext}`, '--cache-control=public, max-age=31536000, immutable'],
+    { when: () => distHasExtension(distDir, ext) },
+  ));
+}
+
+/** Does `dir` (recursively) hold a file ending `.<ext>`? The run-time check behind the CDN step's
+ *  per-extension `when` — it replaced a bash `find … | head -1` loop (#1537). A missing dir is "no". */
+export function distHasExtension(dir: string, ext: string): boolean {
+  const suffix = `.${ext}`;
+  const walk = (d: string): boolean => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return false; }
+    return entries.some((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : e.isFile() && e.name.endsWith(suffix)));
+  };
+  return walk(dir);
+}
+
 /** The build steps for a `playable` target: the single-file inliner build (VITE_PLAYABLE=1 →
  *  games/<id>/ads/index.html) then reveal the ads/ dir. No favicon/deploy/native — the one HTML IS
  *  the artifact. Pure — extracted from the /api/build handler so the routing is unit-testable. */
 export function playableBuildSteps(buildCwd: string, webCwd: string): BuildStep[] {
   const adsDir = path.join(webCwd, 'ads');
   return [
-    { label: 'Building playable ad (single HTML)...', cmd: 'node engine/scripts/build-web.mjs --target playable', env: { VITE_PLAYABLE: '1' }, cwd: buildCwd },
-    { label: 'Revealing ads/...', cmd: `open ${JSON.stringify(adsDir)}`, winCmd: `start "" "${adsDir}"`, cwd: webCwd },
+    execStep('Building playable ad (single HTML)...', buildCwd, 'node', ['engine/scripts/build-web.mjs', '--target', 'playable'], { env: { VITE_PLAYABLE: '1' } }),
+    { kind: 'inproc', label: 'Revealing ads/...', run: () => openInOS(adsDir) },
   ];
 }
 
@@ -2287,11 +2335,11 @@ export function assetScannerPlugin(): Plugin {
 
           // Provision Node ONCE so the scaffold's npm install / cap add run on it (no system npm).
           const buildEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
-          const runShell = (label: string, cmd: string, cwd: string) => new Promise<boolean>((resolve) => {
+          const runShell = (label: string, command: string, args: string[], cwd: string) => new Promise<boolean>((resolve) => {
             if (aborted) return resolve(false);
             send(`\n── ${label} ──`);
-            // Scaffold steps (npm install / npm run build / npx cap add) are pure
-            // program+args, so they run on the Windows shell unchanged (no winCmd needed).
+            // Scaffold steps (npm install / node build-web / npx cap add) are program + argv, spawned
+            // with no shell on either platform (#1537).
             // ⚠️ MODOKI_ICONS_HANDLED: step 3 of the scaffold runs `build-web.mjs --target native`
             // for its `dist/` — and the platform being scaffolded DOES NOT EXIST YET at that point.
             // So `generateNativeIcons` would filter to whatever OTHER platform dir happens to be on
@@ -2301,7 +2349,7 @@ export function assetScannerPlugin(): Plugin {
             // OTHER platform's folder, and an Android scaffold ran the iOS-only #1062 strip — which can
             // refuse ("web build failed"). The folder being added does not exist yet, so this heals
             // nothing platform-specific there; the scaffold ran `ensureCapacitorDeps` itself.
-            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' } });
+            const proc = spawnBuildStep(execStep(label, cwd, command, args), { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' });
             activeProc = proc;
             proc.stdout?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
             proc.stderr?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
@@ -2523,9 +2571,9 @@ export function assetScannerPlugin(): Plugin {
           const IOS_DEST = user.device.iosDeviceId;
           const IOS_DEVICECTL = user.device.iosDevicectlId;
           // go-ios: the hands-free install path for a device `devicectl` cannot reach (iOS ≤16).
-          // Resolved to an ABSOLUTE path where possible, and QUOTED at every use — the provisioned
-          // one lives under "…/Application Support/Modoki Editor/toolchain/…" (spaces), and these
-          // commands are interpolated into a bash string, the same trap `adb` documents below.
+          // Resolved to an ABSOLUTE path where possible. The provisioned one lives under
+          // "…/Application Support/Modoki Editor/toolchain/…" (spaces), so the install `shell` step
+          // reads it as a `ref()` ("$MODOKI_ARG_GO_IOS"), never as text spliced into the script (#1537).
           //
           // `goIosUsable` is "present, or we can get it": the toolchain dir is where install() puts
           // it, so being able to provision counts. The async phase before the steps run does the
@@ -2547,7 +2595,7 @@ export function assetScannerPlugin(): Plugin {
           // interpolated into a bash command string (`${adb} install …`), so an unquoted path
           // word-splits → `bash: /Users/…/Library/Application: No such file or directory`. The
           // `-s <serial>` flag stays outside the quotes (serials are [A-Za-z0-9._:-], no spaces).
-          const adbBin = JSON.stringify(detectAdb().path ?? 'adb');
+          const adbBin = detectAdb().path ?? 'adb';
           // WHICH phone, when several are attached (#149). The project pin still wins — it is
           // explicit config the human typed in Project Settings — but an UNPINNED project no longer
           // falls through to a bare `adb`: with two handsets on USB that install failed with adb's
@@ -2594,7 +2642,7 @@ export function assetScannerPlugin(): Plugin {
               }
             }
           }
-          const adb = androidSerial ? `${adbBin} -s ${androidSerial}` : adbBin;
+          const adbSerialArgs = androidSerial ? ['-s', androidSerial] : [];
           // JAVA_HOME / ANDROID_HOME come from the SHARED toolchain (an explicit user.sdk override,
           // else `detect()`), resolved in JS and injected into the gradle step's spawn `env` (NOT a
           // bash `export` prefix — that's bash-only, and would SHADOW the shared detection with a
@@ -2648,8 +2696,8 @@ export function assetScannerPlugin(): Plugin {
           // App.xcodeproj → build with -project. Auto-detect so the editor build
           // works for both (the hardcoded -workspace previously failed SPM games).
           const iosXcodeTarget = fs.existsSync(path.join(iosCwd, 'ios/App/App.xcworkspace'))
-            ? '-workspace ios/App/App.xcworkspace'
-            : '-project ios/App/App.xcodeproj';
+            ? ['-workspace', 'ios/App/App.xcworkspace']
+            : ['-project', 'ios/App/App.xcodeproj'];
           // App-icon + splash generation. Every INPUT is resolved by `resolveIconInputs`
           // (`engine/scripts/iconInputs.mjs`) — the same function `generate-icons.mjs` calls on its
           // own config read when `build-web.mjs --target native` runs it (#827). This plan used to
@@ -2680,18 +2728,13 @@ export function assetScannerPlugin(): Plugin {
           // match, so an input the hash cannot see changes nothing until someone deletes
           // `.cache/icon-stamp-*` by hand — the silent no-op #396/#397 called out.
           const stampExtras = stampExtrasFrom(iconInputs, buildCwd);
-          const iconArgs = iconInputsToArgs(iconInputs)
-            .map(([flag, value]) => ` --${flag} ${JSON.stringify(value)}`)
-            .join('');
+          const iconArgs = iconInputsToArgs(iconInputs).flatMap(([flag, value]) => [`--${flag}`, String(value)]);
           const iconStep = (plat: 'ios' | 'android'): BuildStep | null => {
             if (iconIsUpToDate(projectRoot, iconSrcAbs, plat, stampExtras)) return null;
             const stamp = iconStampValue(iconSrcAbs, plat, stampExtras);
             const script = path.join(buildCwd, 'engine/scripts/generate-icons.mjs');
-            return {
-              label: 'Generating app icons...',
-              cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --stamp ${stamp}${iconArgs}`,
-              cwd: plat === 'ios' ? iosCwd : androidCwd,
-            };
+            return execStep('Generating app icons...', plat === 'ios' ? iosCwd : androidCwd, 'node',
+              [script, '--project', projectRoot, '--platform', plat, '--stamp', String(stamp), ...iconArgs]);
           };
           // OTA Phase 5a: embed this build's own manifest into dist so the very FIRST
           // OTA check on a fresh install has something local to diff against (see
@@ -2702,11 +2745,12 @@ export function assetScannerPlugin(): Plugin {
           // doesn't otherwise need buildCwd-relative resolution. Gated on `ota.enabled`
           // so a project that hasn't opted in pays zero extra build cost.
           const projectDist = path.join(projectRoot, 'dist');
-          const otaEmbedStep: BuildStep | null = cfg.ota.enabled ? {
-            label: 'Embedding OTA manifest...',
-            cmd: `node engine/scripts/ota-embed-manifest.mjs --dist ${JSON.stringify(projectDist)} --name ${JSON.stringify(cfg.ota.bundleName)} --engine-api ${cfg.ota.engineApi} --project ${JSON.stringify(projectRoot)}`,
-            cwd: buildCwd,
-          } : null;
+          const otaEmbedStep: BuildStep | null = cfg.ota.enabled
+            ? execStep('Embedding OTA manifest...', buildCwd, 'node', [
+              'engine/scripts/ota-embed-manifest.mjs', '--dist', projectDist, '--name', cfg.ota.bundleName,
+              '--engine-api', String(cfg.ota.engineApi), '--project', projectRoot,
+            ])
+            : null;
           // Resolved once: `null` means the icons are already current for that platform,
           // and the step is dropped from the plan entirely rather than run as a no-op.
           const iosIconStep = iconStep('ios');
@@ -2714,13 +2758,21 @@ export function assetScannerPlugin(): Plugin {
           // ── How the built .app reaches the phone (see planIosInstall for the 3 modes) ──
           // The freshly-built bundle: newest matching DerivedData product. Shared by both
           // hands-free modes so they can never disagree about WHICH .app was just built.
-          const iosAppPath = 'APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1)';
-          const iosProjPath = iosXcodeTarget.replace(/^-(workspace|project) /, '');
+          //
+          // These steps are genuinely compound (`$(…)`, `&&`, `||`), so they stay `shell` steps — but
+          // every value in them (the device ids, the app id, the go-ios path, the project path) is a
+          // `ref`, carried in the child's env and referenced quoted, never spliced into the text (#1537).
+          const iosAppPath = sh`APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1)`;
+          const iosProjPath = ref('IOS_PROJECT', iosXcodeTarget[1]);
+          const appIdRef = ref('APP_ID', APP_ID);
+          const devicectlRef = ref('IOS_DEVICECTL_ID', IOS_DEVICECTL);
+          const udidRef = ref('IOS_UDID', IOS_DEST);
+          const goIosRef = ref('GO_IOS', GO_IOS);
           // The shared bail-out: the app BUILT, only the push failed, so say that and hand the
           // project to Xcode rather than reporting a raw tool error that reads as a broken build.
           const iosHandoff = (why: string) =>
-            `echo ""; echo "${why}"; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosProjPath}" 2>/dev/null || true`;
-          const GO_IOS_Q = JSON.stringify(GO_IOS);
+            sh`echo ""; echo ${ref('HANDOFF_WHY', why)}; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open ${iosProjPath} 2>/dev/null || true`;
+          const shellStep = (label: string, script: ReturnType<typeof sh>): BuildStep => ({ kind: 'shell', label, script, cwd: iosCwd });
           const iosDeploySteps: BuildStep[] =
             // ⚠️ The failure message names CANDIDATES, not a verdict — the same correction the
             // go-ios launch step below carries. It used to assert "it requires iOS 17+", which is
@@ -2739,8 +2791,8 @@ export function assetScannerPlugin(): Plugin {
             // Run does. iOS 17+ deliberately STAYS here rather than moving to go-ios: go-ios
             // needs a sudo `ios tunnel start` on 17+, and Apple's own tool needs nothing.
             iosInstall.ok && iosInstall.mode === 'devicectl' ? [
-              { label: 'Installing on device...', cmd: `${iosAppPath} && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { ${iosHandoff('⚠️  devicectl could not install to this device. Check it is unlocked, awake and trusted; devicectl also cannot reach anything below iOS 17.')}; exit 1; }; }`, cwd: iosCwd },
-              { label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd },
+              shellStep('Installing on device...', sh`${iosAppPath} && { xcrun devicectl device install app --device ${devicectlRef} "$APP_PATH" || { ${iosHandoff('⚠️  devicectl could not install to this device. Check it is unlocked, awake and trusted; devicectl also cannot reach anything below iOS 17.')}; exit 1; }; }`),
+              execStep('Launching app...', iosCwd, 'xcrun', ['devicectl', 'device', 'process', 'launch', '--device', IOS_DEVICECTL, APP_ID]),
             ]
             // go-ios: the iOS ≤16 device that has no devicectl id in EXISTENCE (it isn't a
             // CoreDevice, so `devicectl list devices` reports it `unavailable`). This used to be
@@ -2750,7 +2802,7 @@ export function assetScannerPlugin(): Plugin {
             // an iPhone 8 / iOS 16.7.16: kill → install → launch → a new pid that outlives the
             // tool, 4s for the whole cycle.
             : iosInstall.ok && iosInstall.mode === 'go-ios' ? [
-              { label: 'Installing on device (go-ios)...', cmd: `${iosAppPath} && { ${GO_IOS_Q} install --path="$APP_PATH" --udid=${IOS_DEST} || { ${iosHandoff('⚠️  go-ios could not install to this device.')}; exit 1; }; }`, cwd: iosCwd },
+              shellStep('Installing on device (go-ios)...', sh`${iosAppPath} && { ${goIosRef} install --path="$APP_PATH" --udid=${udidRef} || { ${iosHandoff('⚠️  go-ios could not install to this device.')}; exit 1; }; }`),
               // A launch failure is NOT worth failing the build over: the new build is already on
               // the phone, which is the part that can't be redone by tapping an icon. Say what
               // happened and exit 0.
@@ -2771,13 +2823,13 @@ export function assetScannerPlugin(): Plugin {
               // on the phone, freshly installed. The one thing the reader needs is that the INSTALL
               // landed; the cause is second, and go-ios's own error is already on the build stream
               // above this line for the detail.
-              { label: 'Launching app...', cmd: `${GO_IOS_Q} launch ${APP_ID} --udid=${IOS_DEST} || { echo ""; echo "✅ Installed — the new build IS on the device."; echo "⚠️  Auto-launch failed, so it did not come to the foreground. Tap the app icon to run it."; echo "   Launching goes through Apple's instruments service, which some older devices do not"; echo "   provide (iOS ≤16 on a recent Xcode) — there the install is hands-free but the launch"; echo "   never will be. A locked or asleep device causes this too, so check that first."; }`, cwd: iosCwd },
+              shellStep('Launching app...', sh`${goIosRef} launch ${appIdRef} --udid=${udidRef} || { echo ""; echo "✅ Installed — the new build IS on the device."; echo "⚠️  Auto-launch failed, so it did not come to the foreground. Tap the app icon to run it."; echo "   Launching goes through Apple's instruments service, which some older devices do not"; echo "   provide (iOS ≤16 on a recent Xcode) — there the install is hands-free but the launch"; echo "   never will be. A locked or asleep device causes this too, so check that first."; }`),
             ]
             // Neither tool can reach it: an iOS ≤16 device on an editor with no go-ios and no way
             // to provision one. The build DID succeed, so report success and hand off — exiting
             // non-zero here would label a healthy legacy-device build "failed".
             : [
-              { label: 'Handing off to Xcode (no CLI install available)...', cmd: `echo "ℹ️  No devicectl id set (that needs iOS 17+), and go-ios is not available to install to an older device."; echo "   Install go-ios from Build Support to make this hands-free."; ${iosHandoff('ℹ️  Deploying from Xcode instead.')}`, cwd: iosCwd },
+              shellStep('Handing off to Xcode (no CLI install available)...', sh`echo "ℹ️  No devicectl id set (that needs iOS 17+), and go-ios is not available to install to an older device."; echo "   Install go-ios from Build Support to make this hands-free."; ${iosHandoff('ℹ️  Deploying from Xcode instead.')}`),
             ];
           // Everything a native build does BEFORE it compiles: the web bundle, the OTA manifest, the
           // icons, `cap sync`. Identical for debug and release (#370) and named once so the release
@@ -2792,16 +2844,16 @@ export function assetScannerPlugin(): Plugin {
             // MODOKI_NATIVE_PLATFORM: build-web's own heal would otherwise cover every platform folder
             // on disk, so an ANDROID build of a project with `ios/` ran the iOS-only #1062 strip —
             // which can refuse, failing the Android build (`nativeHealPlatforms`, buildTarget.mjs).
-            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'ios' }, cwd: buildCwd },
+            execStep('Building web assets...', buildCwd, 'node', ['engine/scripts/build-web.mjs', '--target', 'native'], { env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'ios' } }),
             ...(otaEmbedStep ? [otaEmbedStep] : []),
             ...(iosIconStep ? [iosIconStep] : []),
-            { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
+            execStep('Syncing Capacitor iOS...', iosCwd, 'npx', ['cap', 'sync', 'ios']),
           ];
           const androidPrefixSteps: BuildStep[] = [
-            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'android' }, cwd: buildCwd },
+            execStep('Building web assets...', buildCwd, 'node', ['engine/scripts/build-web.mjs', '--target', 'native'], { env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'android' } }),
             ...(otaEmbedStep ? [otaEmbedStep] : []),
             ...(androidIconStep ? [androidIconStep] : []),
-            { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
+            execStep('Syncing Capacitor Android...', androidCwd, 'npx', ['cap', 'sync', 'android']),
           ];
           // The build number goes to xcodebuild/gradle on the command line, never into a committed
           // file (#1226) — see injectedBuildNumbers. Resolved per platform because each store's
@@ -2810,8 +2862,8 @@ export function assetScannerPlugin(): Plugin {
             ? injectedBuildNumbers(projectRoot, cfg)
             : { notes: [], platformNotes: { android: [], ios: [] } };
           const stepsByPlatform: Record<string, BuildStep[]> = {
-            // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
-            // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
+            // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only `shell` steps
+            // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows.
             ios: isRelease ? [
               ...iosPrefixSteps,
               ...iosReleaseSteps({ iosCwd, iosXcodeTarget, buildNumber: buildNumbers.ios }),
@@ -2827,18 +2879,18 @@ export function assetScannerPlugin(): Plugin {
               ...androidPrefixSteps,
               // The flags and why each is there: androidDebugBuildStep (releaseBuild.ts).
               androidDebugBuildStep({ androidCwd, env: androidBuildEnv, ota: cfg.ota.enabled, buildNumber: buildNumbers.android }),
-              // adb path + apk-relative path use forward slashes, which adb accepts on
-              // Windows too; adb is an absolute exe path, so these run on both shells.
-              { label: 'Installing on device...', cmd: `${adb} install -r android/app/build/outputs/apk/debug/app-debug.apk`, cwd: androidCwd },
-              { label: 'Launching app...', cmd: `${adb} shell am start -n ${APP_ID}/.MainActivity`, cwd: androidCwd },
+              // The apk-relative path uses forward slashes, which adb accepts on Windows too; adb is an
+              // absolute exe path, spawned with no shell on either platform.
+              execStep('Installing on device...', androidCwd, adbBin, [...adbSerialArgs, 'install', '-r', 'android/app/build/outputs/apk/debug/app-debug.apk']),
+              execStep('Launching app...', androidCwd, adbBin, [...adbSerialArgs, 'shell', 'am', 'start', '-n', `${APP_ID}/.MainActivity`]),
             ],
             // Web build ALWAYS compiles to <project>/dist + favicon. Deploy is
             // appended below per precedence: custom command > built-in gcloud (if a
             // bucket is set) > none (stop at dist). "Not everyone has a GCS bucket."
             web: [
               // env-var prefixes → spawn env (cross-platform; bash-only `FOO=bar cmd` fails on cmd).
-              { label: 'Building web assets (game-only)...', cmd: 'node engine/scripts/build-web.mjs --target web', env: { BASE_PATH: cfg.build.webBasePath, VITE_GAME_ONLY: 'true' }, cwd: buildCwd },
-              { label: 'Adding favicon...', cmd: `cp ${JSON.stringify(faviconSrc)} dist/favicon.png`, winCmd: `copy /y "${faviconSrc}" dist\\favicon.png`, cwd: webCwd },
+              execStep('Building web assets (game-only)...', buildCwd, 'node', ['engine/scripts/build-web.mjs', '--target', 'web'], { env: { BASE_PATH: cfg.build.webBasePath, VITE_GAME_ONLY: 'true' } }),
+              { kind: 'inproc', label: 'Adding favicon...', run: () => fs.copyFileSync(faviconSrc, path.join(webCwd, 'dist', 'favicon.png')) },
             ],
             // Playable ad: a single self-contained HTML (VITE_PLAYABLE=1 → the asset
             // profile inlines every reachable asset + the single-file inliner emits
@@ -2857,36 +2909,39 @@ export function assetScannerPlugin(): Plugin {
             // Custom deploy command the project author wrote — trusted, run as-is
             // with placeholders substituted. Bypasses the built-in gcloud steps so
             // non-GCS targets (rsync, Netlify, scp, …) work.
+            // ⚠️ The ONE step whose text is not built by `sh` (#1537): the command IS the author's
+            // shell text, and {dist}/{base} stay a raw substitution into it — an owner ruling on
+            // #1537, which weighed making them quoted env refs and kept the author's contract.
+            // A project folder holding shell metacharacters is the author's to quote here.
             const deployCmd = cfg.build.webDeployCommand
               .replaceAll('{dist}', distDir)
               .replaceAll('{base}', cfg.build.webBasePath);
-            stepsByPlatform.web.push({ label: 'Deploying (custom command)...', cmd: deployCmd, cwd: webCwd });
+            stepsByPlatform.web.push({ kind: 'shell', label: 'Deploying (custom command)...', script: authoredShell(deployCmd), cwd: webCwd });
           } else if (deployMode === 'gcs' && WEB_BUCKET) {
             // Built-in gcloud deploy. gcloud storage is used instead of `gsutil -m`
             // (which hangs via Python multiprocessing on macOS). Entry points get
             // no-cache so redeploys are picked up immediately.
             stepsByPlatform.web.push(
-              { label: `Uploading to ${WEB_BUCKET}...`, cmd: `gcloud storage rsync --recursive --delete-unmatched-destination-objects dist ${WEB_BUCKET}`, cwd: webCwd },
+              execStep(`Uploading to ${WEB_BUCKET}...`, webCwd, 'gcloud', ['storage', 'rsync', '--recursive', '--delete-unmatched-destination-objects', 'dist', WEB_BUCKET]),
               // No-cache the entry point AND every data JSON (scene/particle/mesh/
               // mat/prefab/shader + assets.manifest.json). These keep stable
               // filenames across redeploys, so without no-cache an authoring tweak
               // (e.g. a particle color) stays stale for up to max-age. Big binaries
               // (glb/ktx2/webp) keep the default long cache — they rarely change and
               // texture variants are content-hashed in their names.
-              { label: 'Setting cache headers...', cmd: `gcloud storage objects update ${WEB_BUCKET}/index.html "${WEB_BUCKET}/**.json" --cache-control="no-cache, max-age=0"`, cwd: buildCwd },
+              execStep('Setting cache headers...', buildCwd, 'gcloud', ['storage', 'objects', 'update', `${WEB_BUCKET}/index.html`, `${WEB_BUCKET}/**.json`, '--cache-control=no-cache, max-age=0']),
               // Hashed build outputs under /assets/ (JS/CSS + content-hashed JSON
               // chunks) have content-addressed filenames that change every build, so
               // they're safe to cache forever — repeat visitors skip re-fetching and
               // re-validating them entirely. Runs AFTER the no-cache step so the
               // **.json rule above doesn't downgrade the hashed JSON chunks here.
-              { label: 'Caching hashed bundles (immutable)...', cmd: `gcloud storage objects update "${WEB_BUCKET}/assets/**" --cache-control="public, max-age=31536000, immutable"`, cwd: buildCwd },
+              execStep('Caching hashed bundles (immutable)...', buildCwd, 'gcloud', ['storage', 'objects', 'update', `${WEB_BUCKET}/assets/**`, '--cache-control=public, max-age=31536000, immutable']),
             );
           } else {
-            // No bucket, no custom command → local build only. Reveal the dist dir
-            // (macOS `open`, Windows `start` → Explorer). The gcloud/CDN deploy steps
-            // below stay posix-only (bash `find`/`for` + gcloud) — a Windows user doing
-            // a GCS deploy is out of W-6 scope; local web + Android are covered.
-            stepsByPlatform.web.push({ label: 'Revealing dist/...', cmd: `open ${JSON.stringify(distDir)}`, winCmd: `start "" "${distDir}"`, cwd: webCwd });
+            // No bucket, no custom command → local build only. Reveal the dist dir in Finder /
+            // Explorer, in-process (osOpen.ts). A Windows GCS deploy is still gated off by
+            // resolveGcloudDir, but no step below depends on bash any more (#1537).
+            stepsByPlatform.web.push({ kind: 'inproc', label: 'Revealing dist/...', run: () => openInOS(distDir) });
           }
           // B1: the model/texture binaries (glb/ktx2/webp) keep STABLE filenames
           // across edits but are fetched with a content-hash `?v=<hash>` query in
@@ -2897,25 +2952,13 @@ export function assetScannerPlugin(): Plugin {
           // path (a custom deploy command owns its own caching).
           if (deployMode === 'gcs' && WEB_BUCKET && cfg.build.webCdnBackendBucket) {
             stepsByPlatform.web.push(
-              {
-                label: 'Enabling CDN query-string cache key (v only)...',
-                // Idempotent: re-running just re-asserts the policy. Whitelist ONLY
-                // the `v` cache-bust param (our sole query) so a distinct
-                // `?v=<hash>` keys a distinct edge object (B1) without fragmenting
-                // the cache on incidental/unknown query params.
-                cmd: `gcloud compute backend-buckets update ${cfg.build.webCdnBackendBucket} --cache-key-query-string-whitelist=v`,
-                cwd: buildCwd,
-              },
-              {
-                label: 'Caching content-hashed binaries (immutable)...',
-                // Only update the extensions the build actually produced — a game
-                // with no models/compressed textures (e.g. all-primitives) has no
-                // .glb/.ktx2/.webp, and `gcloud storage objects update` FAILS the
-                // whole deploy when a glob matches zero objects. Scan dist/ at run
-                // time (the same tree we just rsynced) and update per-present-type.
-                cmd: `for ext in glb ktx2 webp; do if [ -n "$(find ${JSON.stringify(distDir)} -type f -name "*.$ext" 2>/dev/null | head -1)" ]; then gcloud storage objects update "${WEB_BUCKET}/**.$ext" --cache-control="public, max-age=31536000, immutable"; fi; done`,
-                cwd: buildCwd,
-              },
+              // Idempotent: re-running just re-asserts the policy. Whitelist ONLY
+              // the `v` cache-bust param (our sole query) so a distinct
+              // `?v=<hash>` keys a distinct edge object (B1) without fragmenting
+              // the cache on incidental/unknown query params.
+              execStep('Enabling CDN query-string cache key (v only)...', buildCwd, 'gcloud',
+                ['compute', 'backend-buckets', 'update', cfg.build.webCdnBackendBucket, '--cache-key-query-string-whitelist=v']),
+              ...cdnBinaryCacheSteps(WEB_BUCKET, distDir, buildCwd),
             );
           }
           // Cloud CDN fronts the bucket: re-upload + no-cache headers don't help
@@ -2924,17 +2967,14 @@ export function assetScannerPlugin(): Plugin {
           // redeploy is visible immediately. Skipped when no url-map is configured
           // or a custom deploy command owns the deploy.
           if (deployMode === 'gcs' && WEB_BUCKET && cfg.build.webCdnUrlMap) {
-            stepsByPlatform.web.push({
-              // `--async`: submit the invalidation and return immediately instead of
-              // blocking on operation-polling. The synchronous form polls the op via
-              // extra gcloud API calls that can hang for minutes in the spawned build
-              // subprocess (observed: the dialog froze on this step while the op was
-              // never even created), even though the same command run interactively
-              // completes in ~3s. The edge flush still finishes server-side in seconds.
-              label: 'Invalidating CDN cache...',
-              cmd: `gcloud compute url-maps invalidate-cdn-cache ${cfg.build.webCdnUrlMap} --path "${cfg.build.webBasePath}*" --async`,
-              cwd: buildCwd,
-            });
+            // `--async`: submit the invalidation and return immediately instead of
+            // blocking on operation-polling. The synchronous form polls the op via
+            // extra gcloud API calls that can hang for minutes in the spawned build
+            // subprocess (observed: the dialog froze on this step while the op was
+            // never even created), even though the same command run interactively
+            // completes in ~3s. The edge flush still finishes server-side in seconds.
+            stepsByPlatform.web.push(execStep('Invalidating CDN cache...', buildCwd, 'gcloud',
+              ['compute', 'url-maps', 'invalidate-cdn-cache', cfg.build.webCdnUrlMap, '--path', `${cfg.build.webBasePath}*`, '--async']));
           }
           const steps = stepsByPlatform[platform];
 
@@ -3123,6 +3163,7 @@ export function assetScannerPlugin(): Plugin {
             if (podEnv) {
               const basePath = (buildEnv as Record<string, string>).PATH ?? process.env.PATH ?? '';
               for (const step of steps) {
+                if (step.kind === 'inproc') continue;
                 step.env = { ...step.env, GEM_HOME: podEnv.GEM_HOME, GEM_PATH: podEnv.GEM_PATH, PATH: prependPathEntry(podEnv.binPath, step.env?.PATH ?? basePath) };
               }
             }
@@ -3145,6 +3186,7 @@ export function assetScannerPlugin(): Plugin {
             }
             const basePath = (buildEnv as Record<string, string>).PATH ?? process.env.PATH ?? '';
             for (const step of steps) {
+              if (step.kind === 'inproc') continue;
               step.env = { ...step.env, PATH: prependPathEntry(gcloudDir, step.env?.PATH ?? basePath) };
             }
           }
@@ -3152,7 +3194,7 @@ export function assetScannerPlugin(): Plugin {
           // Spawn wrapper for the auto-scaffold phase — streams like a build step,
           // honors the same abort/disconnect handling, and steers vite at the open
           // project (MODOKI_PROJECT) so its `npm run build` emits the right dist.
-          const runScaffoldShell = (label: string, cmd: string, cwd: string) => new Promise<boolean>((resolve) => {
+          const runScaffoldShell = (label: string, command: string, args: string[], cwd: string) => new Promise<boolean>((resolve) => {
             if (aborted) return resolve(false);
             send(`\n── ${label} ──`);
             // ⚠️ MODOKI_ICONS_HANDLED — see the identical note on /api/add-native-target's runShell.
@@ -3162,7 +3204,7 @@ export function assetScannerPlugin(): Plugin {
             // the plan ever regenerates iOS.
             // MODOKI_NATIVE_PLATFORM rides along for the same `steps.shift()` reason — see the note on
             // /api/add-native-target's runShell (#1062).
-            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' } });
+            const proc = spawnBuildStep(execStep(label, cwd, command, args), { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' });
             activeProc = proc;
             proc.stdout?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
             proc.stderr?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
@@ -3213,7 +3255,8 @@ export function assetScannerPlugin(): Plugin {
               // The scaffold already ran `npm run build` against unchanged source,
               // so drop the build's leading web-build step — dist is current; cap
               // sync / xcodebuild / gradle still run on it.
-              if (steps[0]?.cmd?.startsWith('node engine/scripts/build-web.mjs')) steps.shift();
+              const first = steps[0];
+              if (first?.kind === 'exec' && first.command === 'node' && first.args[0] === 'engine/scripts/build-web.mjs') steps.shift();
               send(`\n✅ ${platform}/ scaffolded — continuing the build.`);
             }
             // Heal the native project on EVERY native build — `healNativeProject`, the ONE sequence
@@ -3235,7 +3278,7 @@ export function assetScannerPlugin(): Plugin {
               const heal = await healNativeProject(projectRoot, buildCwd, [platform], {
                 log: (line) => send(line),
                 warn: (line) => send(line),
-                install: (why) => runScaffoldShell(`npm install (${why})`, 'npm install', projectRoot),
+                install: (why) => runScaffoldShell(`npm install (${why})`, 'npm', ['install'], projectRoot),
               });
               if (aborted) return;
               if (!heal.ok) {
@@ -3335,14 +3378,14 @@ export function assetScannerPlugin(): Plugin {
               sendStep(i, total);
               sendStatus(step.label);
               send(`\n── ${step.label} ──`);
+              if (step.when && !step.when()) { send('(skipped — nothing to do)'); continue; }
               // Ring-buffer the tail of BOTH streams — many tools (notably `tsc`)
               // write their errors to stdout, not stderr, so an stderr-only summary
               // comes back empty and the editor can't show why a build failed.
               const recentOutput: string[] = [];
               const keep = (line: string) => { recentOutput.push(line); if (recentOutput.length > 25) recentOutput.shift(); };
-              const ok = await new Promise<boolean>((resolve) => {
-                const { cmd: stepCmd, env: stepEnv } = resolveBuildStep(step, buildEnv);
-                const proc = spawnBuildCommand(stepCmd, { cwd: step.cwd, env: stepEnv });
+              const ok = step.kind === 'inproc' ? await runInprocStep(step, (line) => { send(line); keep(line); }) : await new Promise<boolean>((resolve) => {
+                const proc = spawnBuildStep(step, buildEnv);
                 activeProc = proc;
                 proc.stdout?.on('data', (d: Buffer) => { const line = d.toString().trimEnd(); send(line); keep(line); });
                 proc.stderr?.on('data', (d: Buffer) => { const line = d.toString().trimEnd(); send(line); keep(line); });
@@ -3559,9 +3602,9 @@ export function assetScannerPlugin(): Plugin {
           let aborted = false;
           req.on('close', () => { aborted = true; killBuildProcess(activeProc); });
 
-          const runStep = (label: string, cmd: string, cwd: string, env: NodeJS.ProcessEnv) => new Promise<{ ok: boolean; output: string }>((resolve) => {
-            send(`\n── ${label} ──`);
-            const proc = spawnBuildCommand(cmd, { cwd, env });
+          const runStep = (step: SpawnedStep, env: NodeJS.ProcessEnv) => new Promise<{ ok: boolean; output: string }>((resolve) => {
+            send(`\n── ${step.label} ──`);
+            const proc = spawnBuildStep(step, env);
             activeProc = proc;
             let out = '';
             proc.stdout?.on('data', (d: Buffer) => { const l = d.toString(); send(l.trimEnd()); out += l; });
@@ -3584,7 +3627,7 @@ export function assetScannerPlugin(): Plugin {
             // `--target web`, which would bake in the project's sub-path webBasePath (#40).
             // A listed sub-game builds from ITS project with build-subgame.mjs instead (#837).
             sendStatus(steps.buildLabel);
-            const build = await runStep(steps.buildLabel, steps.buildCmd, buildCwd, steps.buildEnv);
+            const build = await runStep(steps.build, steps.buildEnv);
             if (aborted) return;
             if (!build.ok) { sendStatus(`FAILED:${steps.buildLabel.replace(/\.\.\.$/, '')}\n${build.output.slice(-1500)}`); res.end(); return; }
             // #837: show which engine API the sub-game build stamped, BEFORE the upload, rather than
@@ -3640,7 +3683,7 @@ export function assetScannerPlugin(): Plugin {
             // the manifest, canonicalize) to compare against — i.e. re-implement the script
             // — and the two implementations drifting is this bug. Don't re-add it.
             sendStatus('Publishing...');
-            const publish = await runStep('Publishing OTA bundle...', steps.publishCmd, buildCwd, gcloudEnv);
+            const publish = await runStep(steps.publish, gcloudEnv);
             if (aborted) return;
             if (!publish.ok) { sendStatus(`FAILED:Publishing\n${publish.output.slice(-1500)}`); res.end(); return; }
 

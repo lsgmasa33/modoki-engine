@@ -11,7 +11,7 @@ import {
   getRunMode, setRunMode, isAdvancing, getPlayState,
 } from '../../src/runtime/core/playState';
 import {
-  enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner, registerModeOwnerDisplaced,
+  enterScrubMode, enterPreviewMode, exitPreviewMode, freezePreviewIfOwnedBy, getModeOwner, registerModeOwnerDisplaced,
 } from '../../src/editor/scene/playMode';
 
 afterEach(() => { setRunMode('playing', { advancing: true }); }); // restore the runtime default
@@ -35,6 +35,33 @@ describe('editor preview/scrub run-mode transitions', () => {
     expect(getRunMode()).toBe('preview');
     expect(isAdvancing()).toBe(false);
     expect(getPlayState()).toBe('stopped');
+  });
+
+  it('#1552 freezePreviewIfOwnedBy: pause freezes the OWNER\'s live preview, and nothing else', () => {
+    setRunMode('stopped');
+    enterPreviewMode(true, 'animation');
+    // MUTATION TARGET: drop the owner check and the Timeline's pause freezes the Animation's preview.
+    freezePreviewIfOwnedBy('timeline');
+    expect(isAdvancing()).toBe(true);
+    // ACCEPT SIDE: the owner's own pause freezes it, keeping the mode and the owner.
+    freezePreviewIfOwnedBy('animation');
+    expect(getRunMode()).toBe('preview');
+    expect(isAdvancing()).toBe(false);
+    expect(getModeOwner()).toBe('animation');
+
+    // A scrub/⏮ set `scrub` before the loop's cleanup ran — freezing must not turn it back into preview.
+    enterScrubMode('animation');
+    freezePreviewIfOwnedBy('animation');
+    expect(getRunMode()).toBe('scrub');
+    // …nor revive a preview a teardown already stopped.
+    exitPreviewMode('animation');
+    freezePreviewIfOwnedBy('animation');
+    expect(getRunMode()).toBe('stopped');
+    // …nor downgrade Play.
+    setRunMode('playing', { advancing: true });
+    freezePreviewIfOwnedBy('animation');
+    expect(getRunMode()).toBe('playing');
+    expect(isAdvancing()).toBe(true);
   });
 
   it('exitPreviewMode (same owner) returns scrub/preview to stopped, and is a no-op from stopped', () => {

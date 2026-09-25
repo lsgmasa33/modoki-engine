@@ -4,8 +4,9 @@
  *
  * The two things a caller must know:
  *
- *  - **Call `reconcile()` once on every launch, before the player can buy anything.** That is the
- *    recovery pass; without it, a purchase interrupted by a force-close is never picked up.
+ *  - **Call `reconcile({ atBoot: true })` once on every launch, before the player can buy anything.**
+ *    That is the recovery pass; without it, a purchase interrupted by a force-close is never picked
+ *    up. `atBoot` marks its journal lines as the boot's, for the gameplay recorder (docs/iap.md).
  *  - **Entitlements are re-derived from the store, not remembered.** `isEntitled()` reflects the
  *    last `refreshEntitlements()`/`reconcile()`, which asks the platform — so expiry, refunds and
  *    revocation are handled without us tracking them.

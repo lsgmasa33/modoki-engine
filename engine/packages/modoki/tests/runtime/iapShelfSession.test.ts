@@ -62,7 +62,7 @@ describe('prices and the open question', () => {
     expect(session.state).toEqual({ kind: 'shelf' });
     expect([...session.prices]).toEqual([['a', '$1']]);
     expect(session.pricesAnswered(0)).toBe(true);
-    expect(answered).toHaveBeenCalledWith({ where: 'store', priced: 1, failed: false });
+    expect(answered).toHaveBeenCalledWith({ where: 'store', priced: 1, failed: false, atBoot: false });
   });
 
   it('a failed fetch is still an answer, and is reported', async () => {
@@ -74,6 +74,25 @@ describe('prices and the open question', () => {
     expect(session.pricesAnswered(1e9)).toBe(true);
     expect(session.prices.size).toBe(0);
     expect(failed).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshPrices hands the boot\'s origin back to both price hooks, and only for that fetch (#1527)', async () => {
+    const answered = vi.fn();
+    const failed = vi.fn();
+    const { session, priceCalls } = make({ onPricesAnswered: answered, onPricesFailed: failed });
+    session.refreshPrices('store', { atBoot: true });
+    priceCalls[0]!.reject(new Error('offline'));
+    await flush();
+    expect(failed).toHaveBeenLastCalledWith(expect.any(Error), 'store', true);
+    expect(answered).toHaveBeenLastCalledWith({ where: 'store', priced: 0, failed: true, atBoot: true });
+    session.refreshPrices('shortfall');
+    priceCalls[1]!.resolve([info('a', '$1')]);
+    await flush();
+    expect(answered).toHaveBeenLastCalledWith({ where: 'shortfall', priced: 1, failed: false, atBoot: false });
+    session.open('store');
+    priceCalls[2]!.reject(new Error('offline'));
+    await flush();
+    expect(failed).toHaveBeenLastCalledWith(expect.any(Error), 'store', false);
   });
 
   it('a SUPERSEDED fetch cannot answer for a newer open', async () => {

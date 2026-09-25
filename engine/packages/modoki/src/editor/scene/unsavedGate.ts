@@ -25,6 +25,7 @@
 import { unsavedChangeCauses, causeSpecs, type UnsavedCauses } from './serialize';
 import { openChoiceModal } from '../components/choiceModal';
 import { useEditorStore } from '../store/editorStore';
+import { undoStepPending } from '../undo/undoManager';
 
 /** What the gesture is about to destroy: the live world only, or everything in the page. */
 export type UnsavedScope = 'world-swap' | 'page-unload';
@@ -137,7 +138,12 @@ let _open: Promise<boolean> | null = null;
  *  one decision. */
 export function confirmDiscardUnsaved(action: string, scope: UnsavedScope, deps: UnsavedGateDeps = DEFAULT_DEPS): Promise<boolean> {
   if (_open) return Promise.resolve(false);
-  const p = decideUnsavedGate(action, scope, deps).finally(() => { if (_open === p) _open = null; });
+  // A world swap asks once the undo in flight has landed (#1579): its dirty mark comes at its end, and the swap waits
+  // for it anyway — asked before, "clean" let the swap discard that scene's history with no prompt. Not for a page
+  // unload, which must not hang on a step that never settles.
+  const pending = scope === 'world-swap' ? undoStepPending() : null;
+  const decided = pending ? pending.then(() => decideUnsavedGate(action, scope, deps)) : decideUnsavedGate(action, scope, deps);
+  const p = decided.finally(() => { if (_open === p) _open = null; });
   _open = p;
   return p;
 }

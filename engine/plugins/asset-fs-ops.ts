@@ -13,7 +13,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
-import { durableGuid, remapGuidValues } from '../packages/modoki/src/runtime/core/assetRefRules';
+import { durableGuid, memberRowNodes, remapGuidValues } from '../packages/modoki/src/runtime/core/assetRefRules';
 import {
   derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, sceneMemberAnchors, memberGuidRemap,
   rewritePrefabMemberTokens, MAX_INSTANCE_DEPTH, type PrefabReader,
@@ -380,8 +380,8 @@ export function moveToTrash(
  *  level's ref into its BASE scene keeps pointing at the base. Override keys are localIds, never
  *  guids.
  *
- *  **Prefab MEMBERS follow too (#1324), given `readPrefab`.** A member's guid is not stored —
- *  `deriveInstanceMemberGuids` derives it on load as `deriveMemberGuid(anchor, path)` — so the members
+ *  **Prefab MEMBERS follow too (#1324), given `readPrefab`.** Before scene v16 a member's guid was not
+ *  stored at all — `deriveInstanceMemberGuids` derives it on load as `deriveMemberGuid(anchor, path)` — so the members
  *  re-derive from the new anchor on their own, but a stored REFERENCE to one (a `UIAction` target,
  *  an `entityRef` into an instance) would keep the old anchor's value and dangle. So for every
  *  reminted anchor the member paths are enumerated from its prefab file(s) (`derivedMemberPaths`)
@@ -413,6 +413,30 @@ export function remintSceneEntityGuids(
       if (!row || typeof row !== 'object') continue;
       define(row.guid);
       define(row.traits?.EntityAttributes?.guid);
+      // Every MEMBER ROW's guid (scene v16, #1468) — UNCONDITIONALLY, which is D3/R6. A stored row
+      // makes a member's guid something the file states rather than something the copy re-derives,
+      // so without this the copy and the original name one entity (#1293).
+      //
+      // Minting here and letting the carry pass below OVERWRITE it is what makes "unconditionally"
+      // true without a classifier. A row whose guid still equals its derivation is re-pointed by the
+      // carry to the NEW anchor's derivation, so the row and the fallback agree. A row whose guid has
+      // DIVERGED — the template changed after the scene was saved, which is the whole reason rows
+      // exist — matches no carry and keeps this fresh mint. Both cases end up unshared and with every
+      // reference following; neither asks what the value IS, which is the live-value classifier
+      // `planCopyGuids`' docblock rejects (`runtime/core/copyIdentity.ts`).
+      //
+      // ⚠️ The row's KEY is NOT remapped, and must not be: it is the TEMPLATE's node identity, and
+      // both copies legitimately instantiate the same template. `remapGuidValues` rewrites string
+      // VALUES only, so this is by construction rather than by a rule someone has to remember.
+      const members = (row as { members?: unknown }).members;
+      if (members && typeof members === 'object' && !Array.isArray(members)) {
+        for (const m of Object.values(members as Record<string, { guid?: unknown; added?: unknown } | null>)) {
+          define(m?.guid);
+          // A row's `added` (Phase 4) and `own` (v17, #1516) hold scene-authored nodes with their own guids,
+          // like `added` below.
+          visit(memberRowNodes(m));
+        }
+      }
       visit(row.children);
       visit(row.added);
       // A `nestedStructure` slot — on an entry (#1358) or on a reference node (#1369) — holds added

@@ -618,6 +618,10 @@ interface EditorState {
   setPlayhead: (t: number) => void;
   setRecording: (on: boolean) => void;
   setPreviewPlaying: (on: boolean, owner?: 'timeline' | 'animation') => void;
+  /** Stop the shared ▶ ONLY if `owner` started it — for a panel standing down after its envelope
+   *  was taken from it (displacement, Play, Stop, a scene load). Strict: an unclaimed preview is not
+   *  the displaced panel's to stop, unlike `panelMayStopPreview`'s unmount case. (#1546) */
+  stopPreviewIfOwnedBy: (owner: 'timeline' | 'animation') => void;
   setAnimatorRoot: (id: number | null) => void;
 
   /** Open the Timeline Editor on a `.timeline.json` asset, bound to `rootEntityId` (the
@@ -1140,6 +1144,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
     }
     set({ isPreviewPlaying: on, previewOwner: on ? (owner ?? null) : null });
   },
+  stopPreviewIfOwnedBy: (owner) => set((s) => (s.previewOwner === owner ? { isPreviewPlaying: false, previewOwner: null } : {})),
   setAnimatorRoot: (id) => set({ animatorRootEntityId: id }),
 
   openTimelineEditor: (asset, rootEntityId) => set((s) => ({

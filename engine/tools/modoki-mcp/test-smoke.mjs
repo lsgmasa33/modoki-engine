@@ -197,6 +197,18 @@ if (inner?.code !== 'NOT_FOUND') throw new Error(`a missing scene must be NOT_FO
 if (!/does-not-exist/.test(inner.why)) throw new Error('the failing step must name WHICH scene was missing');
 console.log('batch failure → code:', fe.code, ' failedAt:', fj.failedAt, ' step2:', inner.code, '✓');
 
+/** The `set_game_view_device` args that put back a device read off `gameView`/`current` — shared by
+ *  every case that pins the device, so they cannot restore differently. A CUSTOM size is restored
+ *  by size, not as 'Free' (UC3 pins the device on every run, so a lossy restore would reset a
+ *  custom preview — one an agent set, the only way to make one — every time). Its `logical` reads back POST-rotation — 640x480 set with
+ *  `orientation:'landscape'` reads 480x640 — so a landscape one is swapped back before re-setting.
+ *  MEASURED 2026-09-25: portrait custom, landscape custom and a landscape preset all round-trip. */
+const gameViewRestoreArgs = (gv) => {
+  if (gv.device !== 'Custom') return { device: gv.device, orientation: gv.orientation };
+  const land = gv.orientation === 'landscape';
+  return { logicalWidth: land ? gv.logical.h : gv.logical.w, logicalHeight: land ? gv.logical.w : gv.logical.h, dpr: gv.dpr, orientation: gv.orientation };
+};
+
 // ── Case preconditions (Issue #41) ───────────────────────────────────────────
 // UC3/UC5/UC6/UC8 below depend on state that only games/3d-test provides — a scene, a prefab, a
 // particle def, an entity named 'cube'. Probed ONCE up front via the TOOL SURFACE (never the
@@ -215,12 +227,15 @@ console.log('batch failure → code:', fe.code, ' failedAt:', fj.failedAt, ' ste
 const FIXTURE_SCENE = '/assets/scenes/skinned-test.scene.json';
 const FIXTURE_PREFAB = '/assets/models/skinned-test/cone.prefab.json';
 const FIXTURE_PARTICLE = '/assets/particles/confetti.particle.json';
-const [scenesR, prefabsR, particlesR, cubeR, coneR, identityR] = await Promise.all([
+const UC3_SCENE = '/assets/scenes/tropical-island.scene.json';
+const [scenesR, prefabsR, particlesR, cubeR, coneR, awayR, identityR] = await Promise.all([
   client.callTool({ name: 'modoki_list_scenes', arguments: {} }),
   client.callTool({ name: 'modoki_list_assets', arguments: { type: 'prefab' } }),
   client.callTool({ name: 'modoki_list_assets', arguments: { type: 'particle' } }),
   client.callTool({ name: 'modoki_get_scene_state', arguments: { name: 'cube' } }),
   client.callTool({ name: 'modoki_get_scene_state', arguments: { name: 'Cone' } }),
+  // UC3's 'ui' pass frames this instead of the cube, to point the editor camera AWAY (see UC3).
+  client.callTool({ name: 'modoki_get_scene_state', arguments: { name: 'Sphere013' } }),
   // get_editor_state carries no project-identifying field (only the open SCENE path) — the open
   // PROJECT's root comes from modoki_identity instead.
   client.callTool({ name: 'modoki_identity', arguments: {} }),
@@ -232,6 +247,9 @@ const cubeState = JSON.parse(text(cubeR));
 const CUBE_GUID = (cubeState.entities ?? [])[0]?.guid;
 const OPEN_SCENE = cubeState.scenePath ?? '(unknown)';
 const conesAlready = (JSON.parse(text(coneR)).entities ?? []).length;
+// `name` is a substring filter and the island prefab has two nodes called Sphere013; either one
+// sits low under the cube, which is all UC3 needs of it.
+const AWAY_GUID = (JSON.parse(text(awayR)).entities ?? [])[0]?.guid;
 // Which viewports are actually mounted right now. Read once, here, because it gates a precondition
 // below AND is asserted on later — one read, one truth.
 const mountedSurfaces = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }))).surfaces;
@@ -244,6 +262,14 @@ const PRECOND = {
   prefab: { ok: (JSON.parse(text(prefabsR)).assets ?? []).some((a) => a.path === FIXTURE_PREFAB), need: `the prefab ${FIXTURE_PREFAB}` },
   particle: { ok: (JSON.parse(text(particlesR)).assets ?? []).some((a) => a.path === FIXTURE_PARTICLE), need: `the particle def ${FIXTURE_PARTICLE}` },
   cube: { ok: (cubeState.entities ?? []).length > 0, need: "an entity named 'cube' in the OPEN scene" },
+  awayTarget: { ok: !!AWAY_GUID, need: "an entity named 'Sphere013' in the OPEN scene (tropical-island's island prefab) — UC3's 'ui' pass frames it to point the editor camera away from the cube" },
+  // UC3's GEOMETRY is tropical-island's, not merely its entities (#1570/#1576). `cube` and
+  // `Sphere013` also exist in `2D Animation.scene.json` (the same island prefab), so the two probes
+  // above pass there — and in 'ui' mode that scene's full-screen Canvas2D host covers the whole
+  // preview, where a real press on the cube lands on the 2D layer and selects nothing. The tap is
+  // then correctly REFUSED, which reads as the tool breaking. The gizmo step below likewise needs
+  // the HUD this scene draws, at the device it pins. Name the scene rather than let a lookalike run.
+  uc3Scene: { ok: OPEN_SCENE === UC3_SCENE, need: `the scene ${UC3_SCENE} OPEN (launch with \`launch-editor.sh games/3d-test --scene tropical-island\`) — UC3's aim and gizmo geometry is measured on it` },
   // UC5 aims by NAME on purpose (the ergonomic form is what finds bugs), so it needs 'Cone' to be
   // unambiguous AFTER its instantiate adds one. Any pre-existing Cone makes the name ambiguous,
   // and an ambiguous name is REFUSED everywhere by design — so the case cannot run, and the
@@ -277,7 +303,7 @@ const PRECOND = {
     need: `the Game tab to be OPEN and SELECTED (open/select it in the editor) — mounted now: ${(mountedSurfaces ?? []).join(', ') || 'none'}`,
   },
 };
-const CASE_NEEDS = { UC3: ['cube', 'sceneView'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'], gameViewDevice: ['gameView'] };
+const CASE_NEEDS = { UC3: ['cube', 'sceneView', 'awayTarget', 'uc3Scene'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'], gameViewDevice: ['gameView'] };
 
 /** True when `uc`'s preconditions all hold. Otherwise pushes ONE skip reason — naming the open
  *  project AND scene, since either can be the cause — and logs it, so the F12 verdict at the end
@@ -301,6 +327,56 @@ const canUC3 = preconditionsFor('UC3'), canUC5 = preconditionsFor('UC5'),
 // and `set_transform`/`mutate_scene` both had a broken-or-absent default that only the explicit
 // form hid), and any mutation is undone before the next case runs.
 
+// The editor as this run FOUND it, read before any case touches it. `pre.unsavedChanges` is what
+// licenses the two reloads that discard the live world (UC8's swap-back and the failed-run restore
+// in the teardown): if it was clean on arrival, everything in the world later is this run's own.
+const pre = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+// Whatever scene is open RIGHT NOW, so the harness restores the human's editor rather than
+// assuming a particular project's default.
+const SCENE = pre.scenePathRef;
+
+// ── SMOKE_DIR — the ONE folder every probe FILE below is written into (#1415) ──────────────────
+// Every write route mkdirs its target's parent (`writeJsonAtomic`, /api/write-file, the save-as
+// route, /api/import-file), while each case's cleanup trashes only the FILES it made. So a probe
+// under a type folder the open project lacks (`/assets/particles/` on games/anim-bug) left that
+// folder behind, empty. Finder then dropped a `.DS_Store` into it, and qaCaseReferences.test.ts
+// went red on a path a QA case declares it `creates:`. The run still printed
+// `save_all trashed its 2 probe file(s) ✓`, because it was cleaning files and never folders.
+//
+// One run-owned folder instead of a per-case "did the parent exist?" record. Four cases wrote
+// into three type folders, and the next probe case would have had to remember that pattern.
+// A case that writes a probe FILE puts it under SMOKE_DIR, and this run creates the folder and
+// trashes it whole at the end. The per-case file cleanups stay. They are what make each case
+// self-contained, and the REQUIRES_SAVE gate refuses a folder delete over a parked edit anyway.
+//
+// ⚠️ A folder that is already there is REFUSED, not trashed. It is either a crashed run's leftover or
+// ANOTHER smoke run live against this editor right now. Trashing it would break the second case.
+const SMOKE_DIR = '/assets/mcp-smoke';
+{
+  const made = await client.callTool({ name: 'modoki_create_folder', arguments: { path: SMOKE_DIR } });
+  if (made.isError) {
+    // Only a 409 means "it is already there". A 403 or 500 means the folder does NOT exist, so
+    // advice to trash it would send the reader after nothing.
+    const exists = /Folder exists|409/.test(text(made));
+    throw new Error(`cannot create the run's probe folder ${SMOKE_DIR}: ${text(made).slice(0, 200)}`
+      + (exists
+        ? ` — it already exists: a previous run was killed before its teardown, or another smoke run is live on this editor.`
+          + ` Trash it with modoki_delete_asset {paths:['${SMOKE_DIR}'], discardUnsaved:true} and re-run.`
+        : ''));
+  }
+}
+// Everything from here to the teardown runs inside this `try`, and that is load-bearing. The file has
+// no top-level catch, and `withCleanup` RETHROWS. So without it, any failing case ends the process
+// before the teardown, and the empty SMOKE_DIR then makes the NEXT run refuse at the create above.
+// This harness exists to fail, so that would have been the common path, not a crash-only one.
+// Only a killed process (or a second live run) should ever reach that refusal. No re-indent: the
+// cases stay at column 0, so this diff does not touch every line below.
+// ⚠️ It opens BEFORE the first mutating case (UC8), not after the early ones (#1489). It used to sit
+// after UC8/UC2/UC3/UC4/UC5/UC6, so a UC3 failure skipped the teardown: the folder stayed, and the
+// live world was left with 65 agent edits the next session read as `unsavedChanges: true`.
+let runFailure = null;
+try {
+
 // UC8 — a SCENE SWAP mid-batch. The hypothesis going in was that a reload reassigns runtime ids,
 // so later steps would break; addressed by NAME/PATH they do not, and the swap-back works too.
 // What it actually found was worse and unrelated: an unknown arg KEY was silently dropped, so
@@ -311,10 +387,6 @@ const canUC3 = preconditionsFor('UC3'), canUC5 = preconditionsFor('UC5'),
 // leave the world dirty by design (manual persistence: they mutate live and never save). Forcing
 // past it is not an option for a harness pointed at a live editor: the unsaved work might be the
 // human's. So: check, and skip out loud rather than either failing or discarding.
-const pre = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
-// Whatever scene is open RIGHT NOW, so the harness restores the human's editor rather than
-// assuming a particular project's default.
-const SCENE = pre.scenePathRef;
 if (!canUC8 || pre.unsavedChanges || !SCENE) {
   // `canUC8` already pushed its own reason (missing fixture) above — only push the
   // unsaved-changes/no-scene reason here, so one case never contributes two skip entries.
@@ -405,45 +477,178 @@ await withCleanup(() => {
 // `surface` is REQUIRED for a 2D/3D aim — even when one viewport has it. Without it the call would
 // succeed without ever stating which viewport was meant, so a wrong assumption would be confirmed
 // rather than corrected. `get_editor_state.surfaces` is how you know what's mounted.
+//
+// Run in BOTH SceneView modes (#1489). The mode is persisted per editor (localStorage), so a run
+// inherits whichever one the human last picked, and the two draw through different cameras: '3d'
+// through the editor orbit camera over the whole canvas, 'ui' through the GAME camera into a
+// letterbox. The aim rect was once projected through the editor camera in both, so in 'ui' the tap
+// aimed where the cube was NOT drawn and hit the Water behind it. Pass or fail was coincidence, and
+// only the editors that happened to be in 'ui' ever failed. Each mode is now tested on purpose, and
+// the mode the run found is restored.
 if (canUC3) {
+const foundMode = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }))).sceneViewMode;
+// The 'ui' pass frames something ELSE — a small sphere low on the island, which puts the cube above
+// the editor camera's frustum. In 'ui' the view is drawn through the game camera, so the editor
+// camera must not matter; framing the cube there would let an aim that wrongly uses the editor
+// camera pass by coincidence. MEASURED: with the #1489 fix reverted, UC3 [ui] still PASSED on a
+// fresh editor while it framed the cube, and is refused ("centre … is outside the window") once
+// the editor camera looks away.
+const AWAY = AWAY_GUID; // probed with the other preconditions; a missing one SKIPS UC3 (F12)
+// The gizmo drag below needs the TRANSLATE gizmo; the mode is restored in the cleanup.
+// Mode AND space: the space is persisted too, and the fixture cube is rotated, so in 'local' space
+// its X handle moves world x AND z and the "along one axis only" check below would fail on a
+// setting, not on the code (#1489 review).
+const { gizmoMode: foundGizmoMode, gizmoSpace: foundGizmoSpace, gameView: foundGameView } = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+// The Game View DEVICE is pinned for the 'ui' pass too (#1570), and restored in the cleanup. 'ui'
+// draws through the game camera into a letterbox of that device's shape, with the scene's own HUD
+// laid over it — so the device decides whether the Top UI bar covers the cube's gizmo. It is
+// persisted editor state like the mode and space above: MEASURED at a 1217x736 window, 'Free' left
+// no translate axis clear of the HUD (every one under `Top UI`), 'iPhone 16 Pro' portrait left x
+// and z clear. A HUD over the gizmo wins the press — owner ruling 2026-09-25, so the refusal is
+// the tool being right, and the fixture is what has to control it.
+const UC3_UI_DEVICE = { device: 'iPhone 16 Pro', orientation: 'portrait' };
+// Set once the gizmo drag has landed and cleared by its undo, so the cleanup can undo a drag whose
+// check threw — otherwise the run leaves the cube moved.
+let gizmoDragPending = null;
+let framedOnCube = null;
+await withCleanup(async () => {
+for (const mode of ['3d', 'ui']) {
 const uc3 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'modoki_set_scene_view_mode', args: { mode }, result: 'none' },
+  ...(mode === 'ui' ? [{ tool: 'modoki_set_game_view_device', args: UC3_UI_DEVICE, result: 'none' }] : []),
+  // Clear the selection first. A selected entity carries a transform gizmo, and a press on the
+  // gizmo answers "the selection stays" — the selected entity's own id — whatever mesh is under it.
+  // After the '3d' pass selects the cube, the 'ui' pass would otherwise be "confirmed" by the
+  // gizmo, not by a pick of the cube.
+  { tool: 'modoki_set_selection', args: {}, result: 'none' },
   { tool: 'modoki_focus', args: { panel: 'scene' }, result: 'none' },
-  // Frame the target FIRST. Without this the tap aims through whatever camera pose the human
-  // last left in this project, and the SceneView camera is remembered per project per clone —
-  // so whether `cube` is clickable varied by clone, and the gate failed for a reason that had
-  // nothing to do with the tools. MEASURED on games/3d-test: at one remembered pose the pick
-  // legitimately returns "Boat Hull" for every one of the 25 sampled points, and #15's
-  // occlusion check correctly REFUSES. That is the tool being right and the fixture being
-  // unreproducible. focus_entity makes the precondition something this suite controls.
+  // Frame the target FIRST. Without this the tap aims through whatever pose the SceneView's orbit
+  // camera is in, which is in-memory state a long-lived editor accumulates (a human orbiting, an
+  // earlier focus): it is NOT persisted, and a relaunch resets it to the mount default. MEASURED
+  // on games/3d-test: at one pose the pick legitimately returns "Boat Hull" for every one of the
+  // 25 sampled points, and #15's occlusion check correctly REFUSES. That is the tool being right and
+  // the fixture being unreproducible. focus_entity makes the precondition something this suite
+  // controls. (In 'ui' the view is drawn through the game camera, so framing moves nothing the
+  // tap aims through. It stays in the batch so the two modes run the same steps.)
   //
-  // ⚠️ The SCENE is not controlled the same way, and a failed run poisons the next one. UC8 swaps
-  // scenes and restores at the end — so a run that DIES before that restore (UC3 itself throwing,
-  // say) leaves the editor remembering the swapped scene, and the next `launch-editor.sh` reopens
-  // it. UC3 then SKIPS ("no entity named 'cube' in the OPEN scene") and later cases fail on a
-  // fixture nobody chose. Measured 2026-08-19, three runs to work out. Launch the gate with the
-  // scene PINNED — `launch-editor.sh games/3d-test --scene tropical-island` — and it is
-  // reproducible.
-  { tool: 'modoki_focus_entity', args: { guid: CUBE_GUID }, result: 'none' },
+  // ⚠️ The SCENE is not controlled the same way. UC8 swaps scenes and restores at the end, and a
+  // run killed before that restore leaves the editor remembering the swapped scene, so the next
+  // `launch-editor.sh` reopens it. UC3 then SKIPS ("no entity named 'cube' in the OPEN scene").
+  // Measured 2026-08-19, three runs to work out. Launch the gate with the scene PINNED —
+  // `launch-editor.sh games/3d-test --scene tropical-island` — and it is reproducible.
+  { tool: 'modoki_focus_entity', args: { guid: mode === 'ui' ? AWAY : CUBE_GUID }, result: 'none' },
   { tool: 'wait', args: { ms: 200 }, result: 'none' },
   { tool: 'modoki_tap', args: { entity: { name: 'cube', surface: 'scene-view' } } },
   { tool: 'wait', args: { ms: 200 }, result: 'none' },
   { tool: 'modoki_capture_viewport', args: {} },
-  { tool: 'modoki_get_editor_state', args: {} },
+  // `full` pinned, so the state is never summarized into stringified leaves: the checks below read
+  // `camera` and `selection` objects off it.
+  { tool: 'modoki_get_editor_state', args: {}, result: 'full' },
 ] } })));
-if (!uc3.ok) throw new Error(`UC3 input macro failed: ${JSON.stringify(uc3)}`);
+if (!uc3.ok) throw new Error(`UC3 [${mode}] input macro failed: ${JSON.stringify(uc3)}`);
 const tapped = uc3.steps.find((s) => s.tool === 'modoki_tap')?.result;
-if (tapped?.surface !== 'scene-view') throw new Error(`UC3 tap did not report its surface: ${JSON.stringify(tapped)}`);
-if (tapped?.occluded !== false) throw new Error(`UC3 tap was occluded: ${JSON.stringify(tapped)}`);
+if (tapped?.surface !== 'scene-view') throw new Error(`UC3 [${mode}] tap did not report its surface: ${JSON.stringify(tapped)}`);
+if (tapped?.occluded !== false) throw new Error(`UC3 [${mode}] tap was occluded: ${JSON.stringify(tapped)}`);
 // The click must have LANDED, not merely been dispatched — the editor selecting the entity is
 // the only evidence of that, and it is what distinguishes this from a plausible no-op.
-const sel = uc3.steps.find((s) => s.tool === 'modoki_get_editor_state')?.result?.selection;
+const st = uc3.steps.find((s) => s.tool === 'modoki_get_editor_state')?.result;
+if (st?.elided) throw new Error(`UC3 [${mode}] the editor-state step came back summarized despite result:'full': ${JSON.stringify(st).slice(0, 300)}`);
+if (st?.sceneViewMode !== mode) throw new Error(`UC3 ran in '${st?.sceneViewMode}', not the '${mode}' it set`);
+// The 'ui' pass is only a test if the editor camera really did look away — check the premise.
+const camPos = st?.camera?.position;
+if (mode === '3d') framedOnCube = camPos;
+else if (!camPos || !framedOnCube || Math.hypot(...camPos.map((v, i) => v - framedOnCube[i])) < 0.5) {
+  throw new Error(`UC3 [ui] premise: the editor camera did not move off the cube (framed on cube ${JSON.stringify(framedOnCube)}, now ${JSON.stringify(camPos)})`);
+}
+const sel = st?.selection;
 if (sel?.entityId !== tapped.entity.id) {
-  throw new Error(`UC3 tap did not select the entity it aimed at: selection=${JSON.stringify(sel)}`);
+  throw new Error(`UC3 [${mode}] tap did not select the entity it aimed at: selection=${JSON.stringify(sel)}`);
 }
 if (!uc3.steps.find((s) => s.tool === 'modoki_capture_viewport')?.result?.path) {
-  throw new Error('UC3 capture returned no path');
+  throw new Error(`UC3 [${mode}] capture returned no path`);
 }
-console.log('UC3 focus → tap by entity → wait → capture, and the tap SELECTED the target ✓');
+console.log(`UC3 [${mode}] focus → tap by entity → wait → capture, and the tap SELECTED the target ✓`);
+
+// The GIZMO in 'ui': the tap left the cube selected, so its translate gizmo is up, drawn through
+// the game camera into the letterbox. Drag one axis handle along its own on-screen direction and
+// the cube must move along THAT axis only; then undo it. This drives the handle provider's
+// projection and the gizmo's pointer mapping through the draw rect, which no other case reaches
+// in 'ui' (#1489 review): with the provider projecting through the editor camera the press lands
+// where no handle is drawn and nothing moves. Recipe: QA case translate-gizmo-x-axis-only.
+if (mode === 'ui') {
+  await client.callTool({ name: 'modoki_set_gizmo', arguments: { mode: 'translate', space: 'world' } });
+  // The gizmo adopts a new mode/space on its next DRAWN frame, and the handles describe the gizmo
+  // as three has it, so wait until they say translate/world rather than dragging into the frame
+  // where the pickers are still in the old space (#1489 close-out: one run in four moved the wrong
+  // axis). Bounded: a gizmo that never adopts it is a failure, reported below with the handles.
+  let hs = [];
+  for (let tries = 0; tries < 20; tries++) {
+    hs = JSON.parse(text(await client.callTool({ name: 'modoki_handles', arguments: { editor: 'gizmo3d', kind: 'gizmo-axis' } }))).handles ?? [];
+    if (hs.some((h) => h.meta?.mode === 'translate') && hs.every((h) => h.meta?.space === 'world')) break;
+    await new Promise((res) => setTimeout(res, 100));
+  }
+  if (!hs.every((h) => h.meta?.mode === 'translate' && h.meta?.space === 'world')) {
+    throw new Error(`UC3 [ui] the gizmo never adopted translate/world: ${JSON.stringify(hs.map((h) => h.meta)).slice(0, 400)}`);
+  }
+  const centre = hs.find((h) => h.id === 'gizmo3d:translate:center');
+  // Any axis the panel chrome does not cover (the toolbar sits over the view's top edge), and
+  // not near edge-on (a short on-screen offset makes the drag direction noise).
+  const axis = hs.filter((h) => /^gizmo3d:translate:[xyz]$/.test(h.id) && !h.occludedBy && centre
+    && Math.hypot(h.x - centre.x, h.y - centre.y) > 15)[0];
+  if (!centre || !axis) {
+    // Say WHAT covers each axis, and at which device and panel size — the raw handle dump was cut
+    // at 600 chars mid-list, and its cover read as editor chrome, so #1570 was filed against the
+    // dock when the cover was the scene's own HUD.
+    const gv = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }))).gameView;
+    const axes = hs.filter((h) => /^gizmo3d:translate:[xyz]$/.test(h.id)).map((h) =>
+      `${h.meta?.axis}: ${h.occludedBy ? `covered by ${h.occludedBy}` : `${Math.hypot(h.x - (centre?.x ?? h.x), h.y - (centre?.y ?? h.y)).toFixed(1)} px from the centre handle`}`);
+    throw new Error(`UC3 [ui] no draggable translate axis on the selected cube (device ${gv?.device}/${gv?.orientation}, `
+      + `panel ${gv?.panelSize?.w}x${gv?.panelSize?.h}; an axis needs to be uncovered and > 15 px from the centre): ${axes.join('; ') || 'no translate axis handles'}`);
+  }
+  const ax = axis.meta.axis;
+  const readT = async () => JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { guid: CUBE_GUID, trait: 'Transform' } }))).entities[0].traits.Transform;
+  const t0 = await readT();
+  const drag = await client.callTool({ name: 'modoki_drag_handle', arguments: { id: axis.id, delta: { dx: (axis.x - centre.x) * 4, dy: (axis.y - centre.y) * 4 } } });
+  if (drag.isError) throw new Error(`UC3 [ui] gizmo drag was refused: ${text(drag).slice(0, 400)}`);
+  gizmoDragPending = t0;
+  const t1 = await readT();
+  const moved = (k) => Math.abs(t1[k] - t0[k]);
+  const others = ['x', 'y', 'z'].filter((k) => k !== ax);
+  if (moved(ax) < 0.01 || others.some((k) => moved(k) > 1e-6)) {
+    throw new Error(`UC3 [ui] dragging ${axis.id} should move the cube along ${ax} only: before ${JSON.stringify(t0)}, after ${JSON.stringify(t1)}`);
+  }
+  const undone = JSON.parse(text(await client.callTool({ name: 'modoki_history', arguments: { action: 'undo' } })));
+  gizmoDragPending = null;
+  const t2 = await readT();
+  if (!undone.did || ['x', 'y', 'z'].some((k) => t2[k] !== t0[k])) {
+    throw new Error(`UC3 [ui] undo did not put the cube back: before ${JSON.stringify(t0)}, after undo ${JSON.stringify(t2)} (did=${undone.did})`);
+  }
+  console.log(`UC3 [ui] gizmo ${axis.id} drag moved the cube ${moved(ax).toFixed(3)} along ${ax} only, and undo restored it ✓`);
+}
+}
+}, async () => {
+  // Compare against where the SceneView IS, not where the loop should have ended: a failure in
+  // the '3d' pass leaves it in '3d' whatever the run found.
+  const modeNow = () => client.callTool({ name: 'modoki_get_editor_state', arguments: {} }).then((r) => JSON.parse(text(r)).sceneViewMode);
+  if (foundMode && (await modeNow()) !== foundMode) await client.callTool({ name: 'modoki_set_scene_view_mode', arguments: { mode: foundMode } });
+  const now = await modeNow();
+  // Settings BEFORE the drag-undo check below, which can throw: a throw there must not also leave
+  // the human's device and gizmo pinned to UC3's (#1570 close-out review).
+  if (foundGameView?.device) {
+    await client.callTool({ name: 'modoki_set_game_view_device', arguments: gameViewRestoreArgs(foundGameView) });
+  }
+  if (foundGizmoMode || foundGizmoSpace) {
+    await client.callTool({ name: 'modoki_set_gizmo', arguments: { ...(foundGizmoMode ? { mode: foundGizmoMode } : {}), ...(foundGizmoSpace ? { space: foundGizmoSpace } : {}) } });
+  }
+  if (gizmoDragPending) {
+    // The drag landed and a check threw before its undo. Undo it by label, so a Select entry the
+    // tap pushed is never popped in its place.
+    const st = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (/^Transform /.test(st.undo?.undoLabel ?? '')) await client.callTool({ name: 'modoki_history', arguments: { action: 'undo' } });
+    else throw new Error(`UC3 could not undo its gizmo drag: the top undo entry is '${st.undo?.undoLabel}', not a Transform`);
+  }
+  if (foundMode && now !== foundMode) throw new Error(`UC3 left the SceneView in '${now}', not the '${foundMode}' it found`);
+});
 
 // …and the same aim WITHOUT `surface` must be refused, naming the mounted surfaces. This is the
 // half that matters: it is refused even when only one viewport has the entity.
@@ -484,14 +689,29 @@ console.log('UC4 drives play + timescale and reads the journal in one batch →'
 
 // …and a mid-batch read WITHOUT `result:'full'`: the envelope must volunteer why the payload is
 // missing. This is the self-fixing half — the trap is fine, silence about it is not.
-// `list_traits({all})` and not `journal`: the journal's size depends on what has happened this
-// session (measured 1579 chars mid-play, 620 after a stop), so asserting on it would pass or fail
-// by run order. Every trait SCHEMA is fixed by the project and comfortably over the ack ceiling
-// (the names-only form is ~1.4k — under it, which is how this assertion first failed).
+// The probe step must land in a BAND: over the ack ceiling (1,500) so the batch summarizes it,
+// and under the single-result cap (60,000) so the tool does not elide it as TOO_LARGE first —
+// a TOO_LARGE reply is ~200 chars, so the batch never sees anything to summarize. Summarizing is
+// tool-agnostic (`batchReport.ts` reads only the length and the mode), so the step is an eval
+// whose size is fixed BY CONSTRUCTION. Every read tried before sized itself by something else:
+// `journal` by run order (1579 chars mid-play, 620 after a stop), `list_traits` names-only by the
+// project (~1.4k, under the ceiling), and `list_traits({all})` by the project too — 66,889 chars
+// on games/wordweave, over the cap (#1485).
+const UC4B_PROBE_CHARS = 4000;
 const uc4b = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
-  { tool: 'modoki_list_traits', args: { all: true } },
+  { tool: 'modoki_eval', args: { code: `return 'x'.repeat(${UC4B_PROBE_CHARS});` } },
   { tool: 'modoki_get_editor_state', args: {}, result: 'none' },
 ] } })));
+// Check the probe sat in the band BEFORE judging the hint, so a moved ceiling or cap reads as
+// "the probe is the wrong size", not as the summarized hint having gone missing.
+// The batch's summary is `{elided, bytes, preview}` with no `code`; the tool's own TOO_LARGE reply is
+// ALSO `elided: true`, but carries `code: 'TOO_LARGE'` and passes through the batch verbatim. So
+// `elided` without a `code` is the band — and no copy of either cap lives here to go stale.
+const probeStep = uc4b.steps?.find((st) => st.i === 0);
+if (probeStep && probeStep.ok === false) throw new Error(`UC4b's probe step itself failed: ${JSON.stringify(probeStep.error).slice(0, 600)}`);
+if (probeStep?.result?.elided !== true || probeStep.result.code !== undefined) {
+  throw new Error(`UC4b's probe step must be summarized by the batch (over the ack ceiling, under the TOO_LARGE cap) — resize UC4B_PROBE_CHARS: ${JSON.stringify(uc4b).slice(0, 600)}`);
+}
 if (uc4b.summarized?.[0] !== 0 || !/result:'full'/.test(uc4b.summarizedHint ?? '')) {
   throw new Error(`a summarized mid-batch read must say how to get it: ${JSON.stringify(uc4b)}`);
 }
@@ -594,44 +814,6 @@ await withCleanup(async () => {
 });
 }
 
-// ── SMOKE_DIR — the ONE folder every probe FILE below is written into (#1415) ──────────────────
-// Every write route mkdirs its target's parent (`writeJsonAtomic`, /api/write-file, the save-as
-// route, /api/import-file), while each case's cleanup trashes only the FILES it made. So a probe
-// under a type folder the open project lacks (`/assets/particles/` on games/anim-bug) left that
-// folder behind, empty. Finder then dropped a `.DS_Store` into it, and qaCaseReferences.test.ts
-// went red on a path a QA case declares it `creates:`. The run still printed
-// `save_all trashed its 2 probe file(s) ✓`, because it was cleaning files and never folders.
-//
-// One run-owned folder instead of a per-case "did the parent exist?" record. Four cases wrote
-// into three type folders, and the next probe case would have had to remember that pattern.
-// A case that writes a probe FILE puts it under SMOKE_DIR, and this run creates the folder and
-// trashes it whole at the end. The per-case file cleanups stay. They are what make each case
-// self-contained, and the REQUIRES_SAVE gate refuses a folder delete over a parked edit anyway.
-//
-// ⚠️ A folder that is already there is REFUSED, not trashed. It is either a crashed run's leftover or
-// ANOTHER smoke run live against this editor right now. Trashing it would break the second case.
-const SMOKE_DIR = '/assets/mcp-smoke';
-{
-  const made = await client.callTool({ name: 'modoki_create_folder', arguments: { path: SMOKE_DIR } });
-  if (made.isError) {
-    // Only a 409 means "it is already there". A 403 or 500 means the folder does NOT exist, so
-    // advice to trash it would send the reader after nothing.
-    const exists = /Folder exists|409/.test(text(made));
-    throw new Error(`cannot create the run's probe folder ${SMOKE_DIR}: ${text(made).slice(0, 200)}`
-      + (exists
-        ? ` — it already exists: a previous run was killed before its teardown, or another smoke run is live on this editor.`
-          + ` Trash it with modoki_delete_asset {paths:['${SMOKE_DIR}'], discardUnsaved:true} and re-run.`
-        : ''));
-  }
-}
-// Everything from here to the teardown runs inside this `try`, and that is load-bearing. The file has
-// no top-level catch, and `withCleanup` RETHROWS. So without it, any failing case ends the process
-// before the teardown, and the empty SMOKE_DIR then makes the NEXT run refuse at the create above.
-// This harness exists to fail, so that would have been the common path, not a crash-only one.
-// Only a killed process (or a second live run) should ever reach that refusal. No re-indent: the
-// cases stay at column 0, so this diff does not touch every line below.
-let runFailure = null;
-try {
 
 // UC10 — the ASSET LIFECYCLE: scaffold a probe asset, prove it is REACHABLE, trash it, prove it is
 // GONE. This closes the gap that made #288 gap 3 a QA finding: an agent could create an asset and
@@ -765,7 +947,7 @@ await withCleanup(async () => {
 // Rapier world is built by the physics system on its first tick, so a scene with NO physics
 // colliders never has one — and `tropical-island`, the scene this whole gate pins itself to, has
 // exactly zero (measured: `scene-state?trait=Collider3D` returns 0 entities, playing or stopped).
-// So `modoki_scene_query`'s ergonomic form correctly refuses NOT_AVAILABLE_HERE there, forever,
+// So `modoki_physics_query`'s ergonomic form correctly refuses NOT_AVAILABLE_HERE there, forever,
 // and an EXPECTED_REFUSALS entry covers it. That entry proves the ROUTE is alive; it proves
 // nothing whatsoever about the casting path. This case builds a world so something does.
 //
@@ -798,7 +980,7 @@ await withCleanup(async () => {
   // The world is built on the physics system's first TICK after Play, which is a frame, not a fixed
   // time — a slow first frame on a cold or loaded editor outlasted the 400ms this used to wait
   // (#1260). So wait for the op to stop saying "not built yet", and fail with its own words if it never does.
-  const down0 = { tool: 'modoki_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, -1, 0], maxDistance: 200 } };
+  const down0 = { tool: 'modoki_physics_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, -1, 0], maxDistance: 200 } };
   for (const deadline = Date.now() + 5000; ;) {
     const r = await client.callTool({ name: down0.tool, arguments: down0.args });
     if (!r.isError) break;
@@ -813,10 +995,10 @@ await withCleanup(async () => {
     steps: [
       // Straight down from just above the floor's top surface (y = -499).
       { ...down0, result: 'full' },
-      { tool: 'modoki_scene_query', args: { kind: 'point', dim: '3d', point: [0, -500, 0] }, result: 'full' },
+      { tool: 'modoki_physics_query', args: { kind: 'point', dim: '3d', point: [0, -500, 0] }, result: 'full' },
       // A cast the same length in the OPPOSITE direction — the distinguishing observation. Without
       // it, a tool that reported a hit unconditionally would pass every assertion above.
-      { tool: 'modoki_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, 1, 0], maxDistance: 200 }, result: 'full' },
+      { tool: 'modoki_physics_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, 1, 0], maxDistance: 200 }, result: 'full' },
     ],
   } })));
   if (!built.ok) throw new Error(`UC12 query batch failed at: ${failedStep(built)}`);
@@ -891,7 +1073,7 @@ if (!kinds.kinds.some((k) => k.kind === 'material' && k.agentCreatable === true)
 //    flip unlikely. It still fires on the real failure: a scene created at
 //    `${SMOKE_DIR}/mcp-smoke-NEVER.json` yields a DIFFERENT ref.
 const beforeRefusal = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
-const refused = text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'scene', path: `${SMOKE_DIR}/mcp-smoke-NEVER.json` } }));
+const refused = text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { type: 'scene', path: `${SMOKE_DIR}/mcp-smoke-NEVER.json` } }));
 if (!/REFUSED_BY_OP/.test(refused) || !/modoki_new_scene/.test(refused)) {
   throw new Error(`UC13 a scene create must be refused and point at modoki_new_scene, got: ${refused.slice(0, 400)}`);
 }
@@ -903,7 +1085,7 @@ if (sceneAfter !== sceneBefore) {
 }
 await withCleanup(async () => {
   const made = JSON.parse(text(await client.callTool({
-    name: 'modoki_create_registered_asset', arguments: { kind: 'material', path: REG_PROBE },
+    name: 'modoki_create_registered_asset', arguments: { type: 'material', path: REG_PROBE },
   })));
   if (!made.ok || !made.guid) throw new Error(`UC13 create failed: ${JSON.stringify(made).slice(0, 300)}`);
   // The extension is appended server-side. Without it the file would be written as a plain .json
@@ -1063,10 +1245,13 @@ await withCleanup(async () => {
 const typo = await client.callTool({ name: 'modoki_batch', arguments: { steps: [
   { tool: 'modoki_set_selection', args: { name: 'Capsule' } },
 ] } });
-if (!typo.isError || !/Unrecognized key/.test(text(typo))) {
+if (!typo.isError || !/unrecognized parameter: 'name'/.test(text(typo))) {
   throw new Error(`an unknown arg key must be refused: ${text(typo)}`);
 }
-if (!/accepted params:/.test(text(typo))) throw new Error('the refusal must name the accepted params');
+if (!/It accepts: .*\bguid\b/.test(text(typo))) throw new Error('the refusal must name the accepted params');
+// `name` is a field of `asset` (an ASSET selection) — the refusal may say so as a fact, never as
+// "it goes inside asset": the caller here meant an entity (#1545 review).
+if (/goes inside/.test(text(typo))) throw new Error(`the refusal must not instruct a nested home: ${text(typo)}`);
 console.log('batch pre-flight refuses an unknown arg key and lists the real ones ✓');
 
 // ── modoki_hit_regions (#139) ────────────────────────────────────────────────
@@ -1190,10 +1375,7 @@ if (canGameViewDevice) {
 
     console.log(`set_game_view_device sets by name, by explicit size, and refuses an unknown one ✓ (${catalog.presets.length} presets)`);
   }, async () => {
-    await client.callTool({
-      name: 'modoki_set_game_view_device',
-      arguments: { device: before.device === 'Custom' ? 'Free' : before.device, orientation: before.orientation },
-    });
+    await client.callTool({ name: 'modoki_set_game_view_device', arguments: gameViewRestoreArgs(before) });
   });
 }
 
@@ -1339,9 +1521,9 @@ if (canUC3) {
       // and by id only for a guid-less member; the op takes both in one call.
       const guids = before.guids.filter(Boolean);
       const entityIds = before.entityIds.filter((_, i) => !before.guids[i]);
-      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { ...(guids.length ? { guids } : {}), ...(entityIds.length ? { entityIds } : {}) } });
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { ...(guids.length ? { guids } : {}), ...(entityIds.length ? { ids: entityIds } : {}) } });
     } else if (before?.entityIds?.length) {
-      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { entityIds: before.entityIds } });
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { ids: before.entityIds } });
     } else {
       restore = await client.callTool({ name: 'modoki_set_selection', arguments: {} });
     }
@@ -1372,16 +1554,26 @@ if (canUC3) {
   const actions = JSON.parse(text(await client.callTool({ name: 'modoki_list_actions', arguments: {} })));
   const missingActions = !Array.isArray(actions.actions) || actions.actions.length === 0;
   // ENGINE-level actions, present regardless of which project is open.
-  const missingHaptics = !missingActions && !actions.actions.some((a) => a.name === 'haptics.toggle');
+  const missingHaptics = !missingActions && !actions.actions.includes('haptics.toggle');
   if (missingActions || missingHaptics) {
     const reason = missingActions
       ? `list_actions returned no actions: ${JSON.stringify(actions)}`
-      : `list_actions is missing the engine-level 'haptics.toggle' action: ${JSON.stringify(actions.actions.map((a) => a.name))}`;
+      : `list_actions is missing the engine-level 'haptics.toggle' action: ${JSON.stringify(actions.actions)}`;
     skipped.push(`dispatch_action — ${reason}`);
     console.log(`dispatch_action SKIPPED — ${reason}`);
   } else {
     await withCleanup(async () => {
-      await client.callTool({ name: 'modoki_play_control', arguments: { action: 'play' } });
+      // #1553: an action replies with the fields it changed, not the whole editor state (~1.7k chars).
+      // Live, because the unit test cannot see what the MCP relay adds on the way out.
+      const played = JSON.parse(text(await client.callTool({ name: 'modoki_play_control', arguments: { action: 'play' } })));
+      // + the health fields (ACTION_HEALTH_KEYS, each present only when unhealthy) and physicsError.
+      const allowed = ['ok', 'playState', 'runMode', 'advancing', 'physicsError',
+        'staleGameCode', 'discardedUnsavedEdits', 'frameLoop', 'rendererGate', 'gpu', 'gameBootFaults'];
+      const extra = Object.keys(played).filter((k) => !allowed.includes(k));
+      if (played.playState !== 'playing' || extra.length) {
+        throw new Error(`play_control must reply {ok, playState, runMode, advancing} — got playState=${played.playState}, extra keys ${JSON.stringify(extra)}`);
+      }
+      console.log('play_control replies with the play state only ✓');
 
       // `haptics.toggle` REFUSES when the open scene authors no `HapticSettings` entity, which is the
       // common case — and since #1129 the op reports a handler's refusal as a failed call naming it,
@@ -1891,9 +2083,9 @@ const errCode = (r) => { try { return JSON.parse(text(r)).error?.code ?? ''; } c
 }
 await withCleanup(async () => {
   // A-1: the second create at the same path is refused, and the first asset keeps its guid.
-  const first = JSON.parse(text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'material', path: UC15_MAT } })));
+  const first = JSON.parse(text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { type: 'material', path: UC15_MAT } })));
   if (!first.ok || !first.guid) throw new Error(`UC15 first create failed: ${JSON.stringify(first).slice(0, 300)}`);
-  const again = await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'material', path: UC15_MAT } });
+  const again = await client.callTool({ name: 'modoki_create_registered_asset', arguments: { type: 'material', path: UC15_MAT } });
   if (!again.isError || errCode(again) !== 'REFUSED_BY_OP' || !/already exists/.test(text(again))) {
     throw new Error(`UC15 a create over an existing asset must be refused, got: ${text(again).slice(0, 300)}`);
   }
@@ -1954,7 +2146,44 @@ try {
   if (runFailure) console.log(`  (the ${SMOKE_DIR} teardown ALSO failed: ${e.message})`);
   else runFailure = e;
 }
-if (runFailure) throw runFailure;
+// Failed-run restore (#1489). A passing run leaves the editor clean, because its last cases reload
+// the scene. A failing one stops wherever it failed, with the live world carrying this run's edits,
+// so the next session to open this editor saw `unsavedChanges: true` and none of it was the
+// owner's. When the editor was clean on ARRIVAL (`pre`), everything in the world now is this run's,
+// so reloading the scene it found is safe; the same argument licenses UC8's swap-back and the
+// save_all cleanup. An editor that was already dirty is left alone, and says so. Like the folder
+// teardown above, a failure here never masks the case failure.
+if (runFailure) {
+  try {
+    if (pre.unsavedChanges || !SCENE) {
+      console.log(`  (left the live world as it is: ${pre.unsavedChanges ? 'it had unsaved changes before this run started, so reloading would discard work that is not the run\'s' : 'no scene to restore'})`);
+    } else {
+      const state = async () => JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+      let now = await state();
+      if (now.runMode !== 'stopped') {
+        // A pose/timeline envelope (runMode 'scrub'/'preview') is not ended by stop: either the stop
+        // or the load_scene below refuses, and whichever does is reported — the honest outcome.
+        const stopped = await client.callTool({ name: 'modoki_play_control', arguments: { action: 'stop' } });
+        if (stopped.isError) throw new Error(`could not stop the ${now.runMode} session: ${text(stopped).slice(0, 200)}`);
+        now = await state(); // decide on the post-stop world: stopping restores the pre-play one
+      }
+      if (now.unsavedChanges || now.scenePathRef !== SCENE) {
+        const back = await client.callTool({ name: 'modoki_load_scene', arguments: { path: SCENE, discardUnsaved: true } });
+        if (back.isError) throw new Error(text(back).slice(0, 300));
+        const after = await state();
+        if (after.unsavedChanges !== false || after.scenePathRef !== SCENE) {
+          throw new Error(`the reload reported ok, but the editor is at ${after.scenePathRef} with unsavedChanges=${JSON.stringify(after.unsavedChanges)}`);
+        }
+        console.log(`  (failed run: reloaded ${SCENE} from disk, so the editor is left clean as it was found)`);
+      } else {
+        console.log('  (failed run: the editor was already clean on the scene it was found on — nothing to restore)');
+      }
+    }
+  } catch (e) {
+    console.log(`  (the failed-run restore ALSO failed, so the editor still carries this run's edits: ${e.message})`);
+  }
+  throw runFailure;
+}
 
 await client.close();
 

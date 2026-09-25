@@ -9,6 +9,9 @@ import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { DISCARD_UNSAVED_BASE, TIMEOUT_MS_BASE, discardUnsavedParam, displayNameParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
+import { EPOCH_BASE, SINCE_CURSOR_BASE } from '../../../shared/sinceCursor.js';
+import { WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS } from '../../../shared/waitForTiming.js';
+import { CONSOLE_LEVELS, CONSOLE_LOGS_PARAM_DOCS } from '../../../shared/consoleLevels.js';
 import {
   CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, LIGHT_KINDS, PRIMITIVE_MESHES, SPRITE_SHAPES, UI_PRESETS, vocabularyProse,
 } from '../../../shared/createEntityVocabulary.js';
@@ -28,7 +31,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'and `persistenceMode` (always \'manual\' — see modoki_persistence). ' +
       'Also `heldPointer` — the sustained modoki_pointer press currently held ({button,x,y,heldMs}), ' +
       'or null. Check it when the Game panel has stopped responding to drags: a press left held ' +
-      'latches pointer input for the human as well as the agent, and nothing else reports it (#302). ' +
+      'latches pointer input for the human as well as the agent, and nothing else reports it. ' +
       'Also `gameView` — WHICH SCREEN the Game panel is previewing at (device name, orientation, '
       + 'logical + physical size, dpr, safe-area insets). Read it before quoting any layout '
       + 'measurement: the same HUD is correct on one device and broken on another, so a number '
@@ -104,8 +107,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'clip/track ops) are label-only (no detail). Each event has a ' +
       '`source`: "human" (the person) or "agent" (YOUR own edits via these MCP ops) — filter to see ' +
       'only what the human did, so you don\'t attribute your own edits to them. Captured at COMMIT ' +
-      'points (not per drag frame); wall-clock + monotonic `seq` stamped — pass the last `seq` as ' +
-      '`since` to poll only new EDITOR events. `merged:true` also returns the game journal under ' +
+      'points (not per drag frame); wall-clock + monotonic `seq` stamped — pass the returned `nextSeq` as ' +
+      '`since` to poll only new EDITOR events (a `limit:0` read is a baseline; nothing is ever deleted). `merged:true` also returns the game journal under ' +
       '`game` (raw, tick-stamped) AND a `timeline`: a SINGLE-AXIS interleave of editor + game events ' +
       'ordered by a shared `cap` capture counter, each tagged `stream:"editor"|"game"` — the one ' +
       'ordered story ("pressed Play → set timeScale 0.3 → @match on tick 84 → paused"). `type`/`source`/' +
@@ -119,14 +122,13 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     {
       type: z.string().optional().describe('Only editor events of this type, e.g. !edit | !select | !create | !transform | !save — every type starts with `!`; an unknown one is refused, listing them all. (Filters the `editor` array only.)'),
       source: z.enum(['human', 'agent']).optional().describe('Only events by the human at the keyboard, or by the agent (your MCP ops). Omit for both. (Filters the `editor` array only.)'),
-      since: z.number().optional().describe('Forward cursor for the `editor` array: returns the OLDEST events with seq greater than this (contiguous, oldest-first) + a `nextSeq` when truncated. Advance with `nextSeq` each poll — a cursored poll NEVER skips events (unlike the bare newest-last call). Does NOT window the merged timeline (use sinceCap).'),
-      epoch: z.string().optional().describe('The `epoch` returned with the cursor; send it back. A reload restarts the counters, and a stale epoch replays with `cursorReset`.'),
+      since: z.number().optional().describe(`${SINCE_CURSOR_BASE}, for the \`editor\` array: returns the OLDEST events with seq greater than this (contiguous, oldest-first).` + ' Every reply carries `nextSeq`; advance with it each poll — a cursored poll NEVER skips events (unlike the bare newest-last call). Does NOT window the merged timeline (use sinceCap).'),
+      epoch: z.string().optional().describe(`${EPOCH_BASE}. It covers since and sinceCap alike.`),
       sinceCap: z.number().optional().describe('Forward cursor for the merged `timeline`: returns the OLDEST interleaved events with cap greater than this (contiguous, oldest-first) + a `nextCap` when truncated. Advance with `nextCap` each poll to fetch newer events with no gap.'),
       merged: z.boolean().optional().describe('Also include the game journal under `game` (raw) AND the interleaved `timeline`. Both are tailed too — cursor with sinceCap for a precise incremental slice.'),
       limit: z.number().optional().describe('Return the last N events per stream (default 100). An explicit limit always wins.'),
-      clear: z.boolean().optional().describe('Clear the editor-activity buffer after reading.'),
     },
-    async ({ type, source, since, epoch, sinceCap, merged, limit, clear }) => {
+    async ({ type, source, since, epoch, sinceCap, merged, limit }) => {
       const q = new URLSearchParams();
       if (type) q.set('type', type);
       if (source) q.set('source', source);
@@ -135,11 +137,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       if (sinceCap != null) q.set('sinceCap', String(sinceCap));
       if (merged) q.set('merged', '1');
       if (limit != null) q.set('limit', String(limit));
-      if (clear) q.set('clear', '1');
       const qs = q.toString();
-      // `clear=1` makes this a "do this", so its `ok` is a success flag and gets checked — a plain
-      // read's `ok` is not (see getJson's docblock, and the journal twin). (Phase 6)
-      return getJson(`/api/editor-journal${qs ? `?${qs}` : ''}`, undefined, !!clear);
+      // A pure read since #1561 retired `clear`: its `ok` is not a success flag (getJson's docblock).
+      return getJson(`/api/editor-journal${qs ? `?${qs}` : ''}`);
     },
   );
 
@@ -168,8 +168,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'polls. Satisfied → `{satisfied:true, elapsedMs, observation}`. A timeout is a NORMAL result, not ' +
       'an error: `{satisfied:false, timedOut:true, lastObservation}` — read `lastObservation` to see ' +
       'why (`ambiguous`: a state test needs one control; `live`: what IS there). An `absent` wait true on the ' +
-      'FIRST check adds `alreadyAbsent` + a live-vocabulary `hint` (labels, ids or names — as you aimed) — a typo is always absent. `timeoutMs` defaults to 5000, ' +
-      'clamped to [50, 120000]. An unevaluable condition (no ' +
+      'FIRST check adds `alreadyAbsent` + a live-vocabulary `hint` (labels, ids or names — as you aimed) — a typo is always absent. ' +
+      `\`timeoutMs\` defaults to ${WAIT_FOR_DEFAULT_MS}, clamped to [${WAIT_FOR_MIN_MS}, ${WAIT_FOR_MAX_MS}]. An unevaluable condition (no ` +
       'label/id, unknown trait) is refused BEFORE parking. Works as a modoki_batch step and as ' +
       'modoki.waitFor() in eval (whose 25s cap bounds it there).',
     {
@@ -177,7 +177,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       entity: entityCond.optional().describe('A get_scene_state match by guid/name/where — present, or `absent`.'),
       console: z.object({
         match: z.string().describe('Case-sensitive substring of the logged text.'),
-        level: z.enum(['log', 'info', 'warn', 'error']).optional(),
+        level: z.enum(CONSOLE_LEVELS).optional().describe(CONSOLE_LOGS_PARAM_DOCS.level),
         lookbackMs: z.number().min(0).max(60_000).optional().describe('Also accept a line logged up to this many ms BEFORE the call — for the batch step that logged it just before this wait.'),
       }).strict().optional().describe('A renderer console line logged after the call starts (or within lookbackMs before it).'),
       editor: z.object({
@@ -189,7 +189,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async ({ chrome, entity, console: consoleCond, editor, timeoutMs }) => {
       // Transport must outlast the op's park AND the relay's headroom over it (+10s), or a
       // legitimate long wait reads as an unreachable backend.
-      const transportTimeoutMs = Math.max(50, Math.min(120_000, timeoutMs ?? 5_000)) + 15_000;
+      const transportTimeoutMs = Math.max(WAIT_FOR_MIN_MS, Math.min(WAIT_FOR_MAX_MS, timeoutMs ?? WAIT_FOR_DEFAULT_MS)) + 15_000;
       return postJson('/api/wait-for', { chrome, entity, console: consoleCond, editor, timeoutMs }, transportTimeoutMs, 'wait for a condition in the editor');
     },
   );
@@ -206,14 +206,14 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'to keep watching; `skipped` counts events that arrived but did not match `type`/`source`. `source` defaults to "human" (the whole point is noticing what the HUMAN ' +
       'did, not your own MCP-driven edits). Same event shape/types as modoki_editor_journal, same ' +
       'forward `since`/`nextSeq` cursor (advance with the returned `nextSeq`, never re-use a stale ' +
-      'one). `timeoutMs` defaults to 30s and is capped at 120s server-side — for a longer watch, ' +
+      'one); omit `since` to wait for the NEXT event from now, not to replay history. `timeoutMs` defaults to 30s and is capped at 120s server-side — for a longer watch, ' +
       'call again. This BLOCKS the tool call for up to that long; do not set a short client-side ' +
       'timeout expectation around it.',
     {
       type: z.string().optional().describe('Only wake for this editor event type, e.g. !edit, !select, !transform. Omit to wake on any type. An unknown type (e.g. `edit` without `!`) is refused up front rather than waited on.'),
       source: z.enum(['human', 'agent']).optional().describe('Who must have done it. Defaults to "human" — pass "agent" only if you specifically want to notice your own MCP-driven edits.'),
-      since: z.number().optional().describe('Forward cursor (a prior `seq`/`nextSeq`). Omit to wait for the NEXT event from now, not to replay history.'),
-      epoch: z.string().optional().describe('The `epoch` returned with `nextSeq`; send it back. A reload restarts `seq`, and a stale epoch replays with `cursorReset`.'),
+      since: z.number().optional().describe(`${SINCE_CURSOR_BASE}.`),
+      epoch: z.string().optional().describe(`${EPOCH_BASE}.`),
       timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}. Default 30000, clamped to [50, 120000].`),
     },
     async ({ type, source, since, epoch, timeoutMs }) => {
@@ -239,16 +239,20 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Set the editor selection (what the Inspector/gizmo act on). Select entities by guid ' +
       '(PREFER — stable) or id, OR select an asset. A ref that matches no live entity is skipped ' +
       '(reported in `skipped`); if NONE resolve the call fails, so selection is never silently ' +
-      'confirmed on a stale id. No refs at all = clear. Does NOT push an undo entry. Returns the new editor state.',
+      'confirmed on a stale id. No refs at all = clear. Does NOT push an undo entry. Returns {ok, selection} — the selection read back after the write.',
     {
-      entityId: z.number().nullable().optional().describe('Primary entity id to select (null clears). Only for an entity with no guid — use guid.'),
-      entityIds: z.array(z.number()).optional().describe('Multi-selection set by id. Only for entities with no guid — use guids.'),
+      id: z.number().nullable().optional().describe('Primary entity id to select (null clears). Only for an entity with no guid — use guid.'),
+      ids: z.array(z.number()).optional().describe('Multi-selection set by id. Only for entities with no guid — use guids.'),
       guid: z.string().optional().describe('Entity guid to select (preferred — stable across hot-reloads).'),
       guids: z.array(z.string()).optional().describe('Multi-selection set by guid (preferred).'),
       asset: z.object({ path: z.string(), type: z.string(), name: z.string() }).nullable().optional()
         .describe('Select an asset instead of entities.'),
     },
-    async (p) => editorAction('set-selection', p),
+    // `id`/`ids` beside `guid`/`guids` — the §3 flat spelling every other tool uses (#1560). The op's
+    // wire names stay `entityId`/`entityIds`, which is also what get_editor_state's `selection` reports.
+    async ({ id, ids, ...rest }) => editorAction('set-selection', {
+      ...rest, ...(id !== undefined ? { entityId: id } : {}), ...(ids !== undefined ? { entityIds: ids } : {}),
+    }),
   );
 
   // ── play_control — Play/Stop/Pause/Resume/Step the live game ──
@@ -263,7 +267,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'frame runs, so a stepped frame always simulates. A permanent physics init failure is refused ' +
       '(ok:false) by `resume`/`step` and by `play` from paused; `play` from stopped still starts and reports it as `physicsError`. ' +
       'This is how you TEST the game like a human pressing Play. After play, exercise it with ' +
-      'modoki_tap/drag, read modoki_get_scene_state, then stop to revert. Returns editor state.',
+      'modoki_tap/drag, read modoki_get_scene_state, then stop to revert. Returns {ok, playState, runMode, advancing} (+frameLoop when the frame loop is unhealthy); the rest of the editor state is modoki_get_editor_state. ' +
+      'A Play the editor declines (a scene load in flight, a failed restore, a Play already starting) is REFUSED_BY_OP with `reason`; ' +
+      '`stop` adds `reverted` (false + `reason` when it skipped the revert — the authored snapshot was not restored) or `queued` while a Play is still starting.',
     { action: z.enum(['play', 'stop', 'pause', 'resume', 'step'])
       .describe("Transport command. 'step' advances ONE fixed-dt frame while paused. This IS the editor-action op name on the wire.") },
     async ({ action }) => editorAction(action),
@@ -278,7 +284,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       '"Select ..." entry, so ONE undo can pop that instead of your edit. Steer by `undoLabel`, never ' +
       'by counting calls. (modoki_set_selection is the exception — it writes selection raw and pushes ' +
       'no entry.) ' +
-      'Returns {did, ...editorState}. `did=false` means the stack END was reached — there was ' +
+      'Returns {did, undo, unsavedChanges}. `did=false` means the stack END was reached — there was ' +
       'nothing to undo. `did=true` means an entry was POPPED and its closure ran; it is NOT a ' +
       'guarantee that the world now looks as it did before, because an entry captured against a ' +
       'PREVIOUS world (anything from before a scene hot-reload, which any file write triggers) ' +
@@ -303,8 +309,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_load_scene',
-    'Switch the editor to a scene (returns to Stopped first, like opening a scene). Verify ' +
-      'with modoki_get_editor_state / modoki_get_scene_state afterwards. REFUSES when the ' +
+    'Switch the editor to a scene (returns to Stopped first, like opening a scene). Returns ' +
+      '{ok, scenePath, worldEntityTotal, unsavedChanges}; read the world with modoki_get_scene_state. REFUSES when the ' +
       'editor has unsaved live-world changes (it swaps the world, destroying them) — save_all ' +
       'first, or pass discardUnsaved:true.',
     {
@@ -319,7 +325,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'it has no path yet, so save_all REQUIRES one. WARNING: this DISCARDS the live world; ' +
       'anything created and not saved is gone (it refuses if there are unsaved changes — pass ' +
       'discardUnsaved:true to discard them deliberately). ALSO refuses while a prefab is being ' +
-      'edited (#853) — exit prefab-edit first; discardUnsaved does NOT bypass that one, because ' +
+      'edited — exit prefab-edit first; discardUnsaved does NOT bypass that one, because ' +
       'it is not about unsaved work. The replacement is a real world swap, so every id-keyed ' +
       'cache clears and the outgoing scene\'s resources are released immediately — entity ids ' +
       'are reassigned, so re-read any id you were holding.',
@@ -349,8 +355,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_discard_asset_edits',
     'ABANDON parked asset writes — the counterpart to modoki_save_all for the dirty-asset registry '
       + '(the pending asset defs — any ASSET_SCHEMA_TYPES type, not just particle/anim/timeline — '
-      + 'listed as `dirtyAssetPaths` by modoki_get_editor_state). Persistence is manual, and until now a save was the ONLY exit: an '
-      + 'exploratory modoki_particle_set / anim_set_clip / timeline_set could not be backed out.\n\n'
+      + 'listed as `dirtyAssetPaths` by modoki_get_editor_state). Persistence is manual, so besides a save this is the ONLY '
+      + 'way out of an exploratory modoki_particle_set / anim_set_clip / timeline_set.\n\n'
       + 'DO NOT "undo" one by re-applying the old def — that is not equivalent and the difference '
       + 'bites: it re-parks a write (so the doc is still dirty and the next save_all commits it), and '
       + 'the def you can read back is the MIGRATED one, so a legacy `gravity: 6` is rewritten as '
@@ -385,6 +391,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     {
       kind: z.enum(CREATE_ENTITY_KINDS)
         .describe('What to create — which traits the new entity gets. Drives the default name and, for primitive/2d/ui/light, which one field applies.'),
+      name: z.string().min(1).optional().describe("The new entity's name (default: the kind's, e.g. \"Cube\"). Set here rather than renaming after."),
       parentId: z.number().optional().describe('Parent entity id (default 0 = root). Only for a parent with no guid — use parentGuid.'),
       parentGuid: z.string().optional().describe('Parent entity guid — PREFER over parentId (stable across hot-reloads). Not together with parentId.'),
       mesh: z.string().optional().describe(`For kind=primitive only. One of: ${vocabularyProse(PRIMITIVE_MESHES)} (default ${CREATE_ENTITY_FIELDS.primitive.fallback}). An unknown name is REFUSED — it would otherwise create an entity whose renderer resolves to nothing.`),
@@ -392,7 +399,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       preset: z.enum(UI_PRESETS).optional().describe(`For kind=ui only (default ${CREATE_ENTITY_FIELDS.ui.fallback}).`),
       light: z.enum(LIGHT_KINDS).optional().describe(`For kind=light only (default ${CREATE_ENTITY_FIELDS.light.fallback}).`),
     },
-    async ({ kind, parentId, parentGuid, mesh, shape, preset, light }) => {
+    async ({ kind, name, parentId, parentGuid, mesh, shape, preset, light }) => {
       // Build the discriminated CreateEntitySpec the renderer op expects. Every given field rides
       // along, WHATEVER the kind (#1216 C-3): this switch used to copy only the kind's own field, so
       // `{kind:'primitive', shape:'circle'}` dropped `shape` here and built a sphere, ok. The op refuses
@@ -404,7 +411,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
         ...(mesh !== undefined ? { mesh } : {}), ...(shape !== undefined ? { shape } : {}),
         ...(preset !== undefined ? { preset } : {}), ...(light !== undefined ? { light } : {}),
       };
-      return editorAction('create-entity', { spec, parentId, parentGuid });
+      return editorAction('create-entity', { spec, parentId, parentGuid, ...(name !== undefined ? { name } : {}) });
     },
   );
   tool(
@@ -514,7 +521,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   // ── gizmo / focus ──
   tool(
     'modoki_set_gizmo',
-    'Set the SceneView transform gizmo mode (translate/rotate/scale) and/or space (world/local) — at least one; a call with neither is refused. Returns editor state; gizmoMode/gizmoSpace in modoki_get_editor_state confirm it.',
+    'Set the SceneView transform gizmo mode (translate/rotate/scale) and/or space (world/local) — at least one; a call with neither is refused. Returns {ok, gizmoMode, gizmoSpace}, read back after the write.',
     {
       mode: z.enum(['translate', 'rotate', 'scale']).optional(),
       space: z.enum(['world', 'local']).optional(),
@@ -526,8 +533,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     "Set the SceneView viewport mode: '3d' (Three.js) or 'ui' (the 2D/UI overlay). The " +
       "toolbar selector is a native <select> that trusted input can't drive, so use this. " +
       "'ui' mode is REQUIRED to edit Collider2D vertices (with set-collider-edit) and to see " +
-      'their interaction handles (modoki_handles editor=collider2d). Returns editor state; '
-      + 'sceneViewMode in modoki_get_editor_state confirms it.',
+      'their interaction handles (modoki_handles editor=collider2d). Returns {ok, sceneViewMode}, read back after the write.',
     { mode: z.enum(['3d', 'ui']) },
     async ({ mode }) => editorAction('set-scene-view-mode', { mode }),
   );
@@ -548,8 +554,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'legitimately absent on the first key (no in) and last key (no out), on a stepped key, and '
       + 'on any non-numeric track, which is never drawn at all. Settable before a clip is open. '
       + 'Does NOT open or reload a clip (that is modoki_open_animation_editor, which also resets '
-      + 'the playhead) and touches no keyframe data. Returns editor state, which reports the '
-      + 'result as `animationViewMode` plus an `animationView` carrying panelMounted and these '
+      + 'the playhead) and touches no keyframe data. Returns {ok, animationViewMode, animationView} — the view carries panelMounted and these '
       + 'caveats.',
     {
       mode: z.enum(['dopesheet', 'curves']).describe(
@@ -619,8 +624,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       "entity. Pair with modoki_set_scene_view_mode 'ui' + a selected entity that has an editable " +
       'collider (polygon/polyline/concave); then modoki_handles editor=collider2d lists its ' +
       'draggable vertices. on:true with no such collider selected is REFUSED, naming why (the toolbar '
-      + 'would switch the mode straight back off). Returns editor state; colliderEditMode in '
-      + 'modoki_get_editor_state confirms it — modoki_handles is the NEXT step, not the read-back.',
+      + 'would switch the mode straight back off). Returns {ok, colliderEditMode}, read back '
+      + 'after the write — modoki_handles is the NEXT step, not the read-back.',
     { on: z.boolean().describe('true enters collider vertex-edit mode on the selected entity, false leaves it.') },
     async ({ on }) => editorAction('set-collider-edit', { on }),
   );
@@ -631,7 +636,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'so their interaction handles then appear (modoki_handles editor=particle — kinds ' +
       "'curve-point' / 'gradient-stop'). Pass the asset's served path (e.g. " +
       "'/assets/particles/fire.particle.json'). Waits (up to 3s) for the panel to show the asset, and " +
-      'refuses NOT_AVAILABLE_HERE if it does not. Returns editor state; openEditors confirms it.',
+      'refuses NOT_AVAILABLE_HERE if it does not. Returns {ok, openEditors}.',
     { path: z.string().describe("The asset's served path, e.g. '/assets/particles/fire.particle.json'.") },
     async ({ path }) => editorAction('open-particle-editor', { path }),
   );
@@ -641,10 +646,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'Selects the texture + opens the modal. ⚠️ It opens with NOTHING selected, and the 8 ' +
       "corner/edge handles + pivot only exist for the SELECTED slice — so modoki_handles " +
       "editor=sprite returns an empty list right after this call; that is the normal case, not " +
-      'a bug (#373). Call modoki_select_sprite_slice next. ' +
+      'a bug. Call modoki_select_sprite_slice next. ' +
       "Pass the texture's served path (e.g. '/assets/textures/sheet.png'). Waits (up to 3s) for the " +
       "modal to open — it opens from the texture's Inspector view — and refuses NOT_AVAILABLE_HERE " +
-      'if it does not. Returns editor state; openEditors.sprite confirms it.',
+      'if it does not. Returns {ok, openEditors, spriteEditorSelection}.',
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
       displayName: displayNameParam() },
     async ({ path, displayName }) => editorAction('open-sprite-editor', { path, displayName }),
@@ -654,9 +659,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Select (or deselect) a slice in the currently-open Sprite Editor — normally a click on a ' +
       "rect or its row in the Sprites list. This is what makes a slice's 8 resize handles + " +
       "pivot appear in modoki_handles editor=sprite: the modal opens with nothing selected and " +
-      'had no other route to change that (#373). A guid is REFUSED unless a Sprite Editor is open ' +
+      'had no other route to change that. A guid is REFUSED unless a Sprite Editor is open ' +
       '(NOT_FOUND) and holds that slice (REFUSED_BY_OP, the slice guids as options); a deselect ' +
-      'always works. Returns editor state, which reports the result as `spriteEditorSelection`.',
+      'always works. Returns {ok, spriteEditorSelection}.',
     { guid: z.string().nullable().optional().describe('The slice guid to select (a slice of the open texture\'s sidecar), or omit/null to deselect.') },
     async ({ guid }) => editorAction('select-sprite-slice', { guid: guid ?? null }),
   );
@@ -665,7 +670,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Open the 9-slice border editor modal on a UI texture (the Texture Inspector "Edit ' +
       'visually…" button — only for type=ui textures). Its 4 guide knobs then appear ' +
       '(modoki_handles editor=nineslice). Pass the texture\'s served path. Waits (up to 3s) for the ' +
-      'modal to open and refuses NOT_AVAILABLE_HERE if it does not. Returns editor state.',
+      'modal to open and refuses NOT_AVAILABLE_HERE if it does not. Returns {ok, openEditors}.',
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
       displayName: displayNameParam() },
     async ({ path, displayName }) => editorAction('open-nine-slice-editor', { path, displayName }),
@@ -673,10 +678,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_open_skin_editor',
     'Open the Skin (2D rig) editor panel on a .rig2d.json asset — normally an Assets-panel ' +
-      'double-click or the Texture Inspector "Auto Rig" button. There was previously NO agent ' +
-      "route to open this panel at all (#373). Once open, modoki_handles editor=skin lists its " +
+      'double-click or the Texture Inspector "Auto Rig" button. Once open, ' +
+      "modoki_handles editor=skin lists its " +
       "bone-joint handles in skinMode 'rig' or 'weights' — NOT 'parts' (modoki_set_skin_mode). " +
-      "Pass the rig's served path (e.g. '/assets/characters/hero.rig2d.json'). Waits (up to 3s) for the panel to show the rig and refuses NOT_AVAILABLE_HERE if it does not. Returns editor state; openEditors.skin confirms it.",
+      "Pass the rig's served path (e.g. '/assets/characters/hero.rig2d.json'). Waits (up to 3s) for the panel to show the rig and refuses NOT_AVAILABLE_HERE if it does not. Returns {ok, openEditors, editingSkinAsset, skinMode}.",
     { path: z.string().describe("The rig's served path, e.g. '/assets/characters/hero.rig2d.json'."),
       displayName: displayNameParam('Here: the Skin panel header. ⚠️ ALSO used as DATA: "Make Prefab" writes it as the root entity name into the generated .prefab.json, so a throwaway label here persists to disk.') },
     async ({ path, displayName }) => editorAction('open-skin-editor', { path, displayName }),
@@ -688,8 +693,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       "selected bone's per-vertex influence). modoki_handles editor=skin reports bone-joint " +
       "handles in 'rig' AND 'weights' — only 'parts' hides them. The toolbar buttons carry " +
       '`data-ui-id="skin.mode.*"` and are chrome-tappable too; this is the direct route. Refused '
-      + '(NOT_FOUND) when no Skin editor is showing — open one first. Returns editor state; skinMode '
-      + 'in modoki_get_editor_state confirms it.',
+      + '(NOT_FOUND) when no Skin editor is showing — open one first. Returns {ok, skinMode}, '
+      + 'read back after the write.',
     { mode: z.enum(['parts', 'rig', 'weights']) },
     async ({ mode }) => editorAction('set-skin-mode', { mode }),
   );

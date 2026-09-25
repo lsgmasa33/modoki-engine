@@ -1,114 +1,58 @@
 # capacitor-applovin-max
 
-Capacitor 8 plugin for **AppLovin MAX** ad mediation. Supports banner, MREC, interstitial, and rewarded ads with 12 mediation networks.
+Capacitor 8 plugin for **AppLovin MAX**: banner (anchored adaptive), MREC, interstitial and rewarded ads,
+plus Google UMP consent. Built to be driven by the Modoki engine's SDK-neutral ad lifecycle
+(`runtime/core/adLifecycle.ts`) through a game's `AdSdk` adapter.
+
+The call-by-call contract is **`src/definitions.ts`** — read it rather than a list here. The reasoning
+behind it (consent, load settling, banner layout, revenue units) is in the engine's
+`docs/native-and-sdks.md` § `capacitor-applovin-max`.
 
 ## Installation
 
-```bash
-npm install capacitor-applovin-max
-npx cap sync
-```
+The AppLovin SDK and Google UMP come from **SPM** (iOS) and **Gradle** (Android). iOS pins them exactly
+(`Package.swift`, `CapacitorApplovinMax.podspec`); `android/build.gradle` declares the same version as a
+DEFAULT, which an app's `ext.appLovinSdkVersion` — or Gradle picking the highest version any dependency
+asks for — can override. In the Modoki repo the
+plugin reaches a game as a vendored tarball, declared in the game ROOT `package.json` only.
 
-The core AppLovin SDK is provided via **SPM** (iOS) and **Gradle** (Android). No CocoaPods needed for the SDK itself.
+## Initialise from JS, after consent — never natively
 
-## Mediation Networks
-
-12 networks supported: Amazon, BidMachine, DT Exchange, Facebook, Google AdMob, Google Ad Manager, InMobi, Liftoff/Vungle, Moloco, Smaato, Unity Ads, Verve.
-
-**iOS**: Adapters installed via CocoaPods. A local **stub podspec** (`ios/App/local_pods/AppLovinSDK/`) satisfies adapter dependency on `AppLovinSDK` without duplicating the SPM-provided framework. Requires `s.static_framework = true` on the stub.
-
-**Android**: Adapters installed via Gradle dependencies in `app/build.gradle`. Additional Maven repos required for BidMachine, Smaato, Verve, and Amazon.
-
-## Native Initialization
-
-The SDK must be initialized natively before the WebView loads:
-
-**iOS** — `AppDelegate.swift`:
-```swift
-import AppLovinSDK
-
-let config = ALSdkInitializationConfiguration(sdkKey: "YOUR_SDK_KEY") { builder in
-    builder.mediationProvider = ALMediationProviderMAX
-}
-ALSdk.shared().initialize(with: config) { _ in }
-```
-
-**Android** — `MainActivity.java`:
-```java
-AppLovinSdk.getInstance(this).initialize(config -> { });
-```
-
-## API
+Do **not** initialise MAX in `AppDelegate` / `MainActivity`: that requests ads before the player has
+answered the consent form. The order is:
 
 ```typescript
 import { ApplovinMax } from 'capacitor-applovin-max';
+
+// 1. After the ATT prompt has settled (the game's attribution SDK owns it).
+let consent = await ApplovinMax.requestConsentInfo();
+if (consent.status === 'REQUIRED' && consent.isConsentFormAvailable) consent = await ApplovinMax.showConsentForm();
+// 2. Only when UMP allows it.
+if (consent.canRequestAds) await ApplovinMax.initialize({ sdkKey, testDeviceAdvertisingIds: [] });
+// 3. Offer Settings → Privacy choices only when UMP says the player needs one:
+if (consent.privacyOptionsRequired) await ApplovinMax.showPrivacyOptionsForm();
 ```
 
-### SDK Lifecycle
+UMP needs the AdMob app id in the app (`GADApplicationIdentifier` in Info.plist; the
+`com.google.android.gms.ads.APPLICATION_ID` meta-data on Android) and a consent message published in the
+AdMob console that lists AppLovin among its ad partners.
 
-| Method | Description |
-|---|---|
-| `initialize({ sdkKey })` | Initialize the SDK (usually done natively instead) |
-| `isReady()` | Check SDK + ad unit readiness |
-| `setUserId({ userId })` | Set user ID for analytics |
-| `showMediationDebugger()` | Open the mediation debugger UI |
-
-### Banner Ads
-
-| Method | Description |
-|---|---|
-| `showBanner({ adUnitId, position? })` | Show banner (`'top'` or `'bottom'`) |
-| `hideBanner()` | Hide banner |
-| `destroyBanner()` | Destroy banner instance |
-| `setBannerBackgroundColor({ color })` | Set background color (hex) |
-| `setBannerPlacement({ placement })` | Set placement name for reporting |
-
-### MREC Ads
-
-| Method | Description |
-|---|---|
-| `showMRec({ adUnitId, position? })` | Show MREC (`'top'`, `'bottom'`, `'center'`) |
-| `hideMRec()` | Hide MREC |
-| `destroyMRec()` | Destroy MREC instance |
-
-### Interstitial Ads
-
-| Method | Description |
-|---|---|
-| `loadInterstitial({ adUnitId })` | Pre-load interstitial |
-| `showInterstitial({ placement? })` | Show interstitial (returns `{ shown, reason? }`) |
-| `setInterstitialExtraParameter({ key, value })` | Set extra parameter |
-
-### Rewarded Ads
-
-| Method | Description |
-|---|---|
-| `loadRewardedAd({ adUnitId })` | Pre-load rewarded ad |
-| `showRewardedAd({ placement? })` | Show rewarded ad (returns `{ shown, reason? }`) |
-| `setRewardedExtraParameter({ key, value })` | Set extra parameter |
-
-### Privacy & Consent
-
-| Method | Description |
-|---|---|
-| `setHasUserConsent({ consent })` | Set GDPR consent |
-| `setDoNotSell({ doNotSell })` | Set CCPA do-not-sell |
-| `setIsAgeRestrictedUser({ ageRestricted })` | Set COPPA age restriction |
-
-### Events
+## Ads
 
 ```typescript
-ApplovinMax.addListener('adLoaded', (info) => { });
-ApplovinMax.addListener('adLoadFailed', (info) => { });
-ApplovinMax.addListener('adDisplayed', (info) => { });
-ApplovinMax.addListener('adHidden', (info) => { });
-ApplovinMax.addListener('adClicked', (info) => { });
-ApplovinMax.addListener('adRevenuePaid', (info) => { });
-ApplovinMax.addListener('adRewardEarned', (info) => { });
+await ApplovinMax.loadInterstitial({ adUnitId });   // resolves when LOADED, rejects when it failed
+await ApplovinMax.showInterstitial({ placement });   // { shown: false } when nothing is ready; else adDisplayed / adDisplayFailed / adHidden follow
+const { heightPx } = await ApplovinMax.showBanner({ adUnitId });   // more sizes arrive as `bannerLayout`
 ```
 
-## Platform Requirements
+⚠️ **A blank `adUnitId` crashes the app** on the native main thread. Gate every call that takes one.
 
-- iOS 15.0+, Xcode 15+
-- Android API 21+, JDK 21
-- Capacitor 8
+Events: `adLoaded`, `adLoadFailed`, `adDisplayed`, `adDisplayFailed`, `adHidden`, `adClicked`,
+`adRevenuePaid` (revenue in USD, major units), `adRewardEarned` (retained across a webview reload),
+`bannerLayout`. Every ad event carries `format`.
+
+## Mediation
+
+This plugin is single-network MAX today. Adding mediated networks (adapters via CocoaPods with a local
+`AppLovinSDK` stub podspec on iOS, Gradle on Android) is documented in the engine's
+`docs/native-and-sdks.md` § "AppLovin MAX Mediation".

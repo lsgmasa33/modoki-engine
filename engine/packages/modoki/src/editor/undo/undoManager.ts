@@ -5,6 +5,7 @@ import { markSceneDirty } from '../scene/sceneDirty';
 import { reportUndoThrew } from './undoFailure';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 import { canEdit, getRunMode } from '../../runtime/core/playState';
+import { createTeardownToken } from '../../runtime/core/liveness';
 
 /** Structured diff for a trait-field edit — the machine-readable companion to an
  *  action's human `label`, forwarded into the editor journal's `!edit` event so
@@ -188,6 +189,63 @@ export function finishPreviewRestore(session: number, opts: { drop: boolean }): 
 export function whenUndoIdle(): Promise<void> {
   return _inFlight.then(() => undefined);
 }
+
+/** `whenUndoIdle()` when an undo/redo step is queued or running, else null — so a caller with nothing to wait for
+ *  stays synchronous. The unsaved-work gates await it before they read the dirty state (#1579): an undo's
+ *  conservative dirty mark (#310) lands at its END, so a gate read during the step answered "clean", and the switch
+ *  that then waited for the step discarded the history it had just dirtied without asking. */
+export function undoStepPending(): Promise<void> | null {
+  return _stepsPending > 0 ? whenUndoIdle() : null;
+}
+
+/** How long a world switch waits for an undo step before `beginWorldSwitch` warns. An Apply undo is one prefab file
+ *  write and a scene reload; ten seconds is far past either. */
+export const WORLD_SWITCH_STALL_WARN_MS = 10_000;
+
+/** World switches in progress — a scene load, Create Scene, entering prefab edit, a Play startup (#1579). While any
+ *  is, every undo/redo step is refused (`undoRefusedReason`), read when the step RUNS, so a step queued behind the
+ *  one the switch is waiting for is refused rather than started over the incoming world. A COUNT, since two switches
+ *  can overlap (a load superseding another). */
+let _worldSwitches = 0;
+
+/** Begin a world switch (#1579): refuse every undo/redo step from now until `release`, and report the step that is
+ *  already queued or running as `idle` — resolved once it has finished, or null when there is none, so a caller with
+ *  nothing to wait for stays synchronous (a load with no envelope and no undo still flips to 'stopped' in the same
+ *  run). Call it synchronously at the top of the switch, AFTER the switch's own refusals and in-flight latches
+ *  (#887), and await `idle` before the switch touches the world or the editor's scene path.
+ *
+ *  Why: an undo step awaits across a prefab file write and a world reload (`applyPrefabUndo.restoreSnapshot`), and
+ *  a switch landing in that window resumed the step over a world or history that had changed under it. #1575's
+ *  close-out guarded the step itself four times and each round found the next window; waiting HERE, where the switch
+ *  starts, closes all of them at once. `timelinePreview`'s restore has always done the same with `whenUndoIdle`.
+ *
+ *  ⚠️ Never call a world switch from inside an undo/redo closure: it would wait for the chain it is part of, forever.
+ *  Closures that must replace the world call `sceneManager` directly (`applyPrefabUndo`, `authoredSnapshot`).
+ *  `isExecutingUndoRedo()` cannot tell the two apart — it reads true for a concurrent user gesture too. */
+export function beginWorldSwitch(): { idle: Promise<void> | null; release: () => void } {
+  _worldSwitches += 1;
+  notifyUndoChanged(); // the Edit menu's enabled state reads the refusal
+  let released = false;
+  const idle = undoStepPending();
+  // A step that never settles now holds every switch with it — scene opens hang, Play refuses, every undo is refused —
+  // and nothing else says why. Warn once, so the hang names its cause (#1579 close-out review).
+  const stall = idle ? setTimeout(() => {
+    console.warn(`[undo] a scene switch has waited ${WORLD_SWITCH_STALL_WARN_MS / 1000}s for the undo/redo step in flight — `
+      + 'until that step settles, no scene can be opened or created and Play cannot start');
+  }, WORLD_SWITCH_STALL_WARN_MS) : null;
+  const clearStall = () => { if (stall !== null) clearTimeout(stall); };
+  void idle?.then(clearStall);
+  return {
+    idle,
+    release: () => {
+      clearStall();
+      if (released) return;
+      released = true;
+      _worldSwitches -= 1;
+      notifyUndoChanged();
+    },
+  };
+}
 let _truncationWarned = false;
 
 // ── Change subscription ───────────────────────────────────
@@ -259,10 +317,16 @@ export function isExecutingUndoRedo(): boolean { return _executing; }
 // strictly one-at-a-time, in call order, and each pops the stack only when it is
 // actually its turn (editor-prefab-system.md F6).
 let _inFlight: Promise<unknown> = Promise.resolve();
+/** Steps queued or running on `_inFlight` — lets `beginWorldSwitch` tell "nothing to wait for" apart without an await. */
+let _stepsPending = 0;
 /** Serialize `op` after any in-flight undo/redo. The chain never rejects (each
  *  op is isolated) so one failing undo can't wedge the queue. */
 function serialize<T>(op: () => Promise<T>): Promise<T> {
+  _stepsPending += 1;
   const run = _inFlight.then(op, op);
+  // A side branch, not a `.finally` on `run`: that would delay every caller and the chain by a tick.
+  const settled = () => { _stepsPending -= 1; };
+  run.then(settled, settled);
   _inFlight = run.catch(() => {});
   return run;
 }
@@ -434,17 +498,31 @@ async function runStep(
   _executing = true;
   let ok = false;
   let error: unknown;
+  const sameHistory = _historyLiveness.capture();
   // Not `catch { }` + a sentinel: a closure may legitimately throw `undefined`, and testing the
   // caught value for one would read that as success.
   try { await run(); ok = true; } catch (e) { error = e; } finally { _executing = false; }
 
-  if (ok) pushTo.push(action);
+  // A history swap during the await (a scene load, an Exit from prefab edit, a Create Scene) refilled `pushTo` IN
+  // PLACE with the incoming world's stack. Pushed there, the entry would be undone or redone later against a world it
+  // was never recorded on: a skipped Apply undo's redo loaded the old world's snapshot under the new scene's key and
+  // saved it into that scene's file (#1575 close-out review). So it is DROPPED, as a throwing step's is, since the
+  // world it belongs to is gone. An `_isFileDirect` entry edits an asset file, which outlives any world swap
+  // (`parkSurvivors` keeps them too), so it stays.
+  const worldGone = !sameHistory() && !action._isFileDirect;
+  if (ok && !worldGone) pushTo.push(action);
+  if (worldGone) console.warn(`[undo] ${direction} of "${action.label}" spanned a scene switch; it is dropped from the history`);
 
-  if (!action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
-  markAffectedScenesDirty(action);
+  // The world it moved is no longer the live one, so it dirties neither the incoming world nor the scenes it names:
+  // those belong to the world that left, and a dirty mark on a scene that is not loaded makes the incoming world read
+  // as unsaved (a load then refuses, and its next switch discards its history) and points Save All at a scene it
+  // cannot write.
+  if (!worldGone && !action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
+  if (!worldGone) markAffectedScenesDirty(action);
   notifyUndoChanged();
   const payload = buildEditorPayload(action);
   if (!ok) payload.failed = true;
+  if (worldGone) payload.dropped = true; // it ran, and it is on neither stack
   editorEmit(event, payload);
 
   // Reported LAST, and guarded. `reportUndoThrew` reaches into the editor store to toast, and
@@ -488,10 +566,22 @@ async function runStep(
  *  ⚠️ Read `canEdit()`, NOT `getPlayState()`: the 3-value shim calls a preview `'stopped'`, which is
  *  how every Undo gate — and the panel buttons and agent ops, which were never gated at all — said
  *  "safe" inside an envelope. The gate lives HERE so every caller shares it. */
+/** Authored restores still landing — Stop's included — registered by `authoredSnapshot.ts` rather than
+ *  imported, so this module stays free of the scene-loading graph (#1572). Stop sets 'stopped' before
+ *  its restore, so `canEdit()` reads true while the world is mid-reload: an undo there wrote a
+ *  Play-time value into the reloaded world (the during-Play entries are truncated right after, so
+ *  nothing reverted it), or undid a Persistent root that the restore's replay then overwrote. */
+const _restoreBarriers: Array<() => boolean> = [];
+export function registerUndoRestoreBarrier(isRestoring: () => boolean): void {
+  _restoreBarriers.push(isRestoring);
+}
+
 export function undoRefusedReason(direction: 'undo' | 'redo' = 'undo'): string | null {
   const top = direction === 'undo' ? undoStack[undoStack.length - 1] : redoStack[redoStack.length - 1];
   if (!top) return null; // nothing to undo is never a refusal, whatever the mode
+  if (_worldSwitches > 0) return `A scene switch is in progress — ${direction} again once it has landed.`;
   if (_restoringSessions.size > 0) return `The preview is closing — ${direction} again once the scene has been restored.`;
+  if (_restoreBarriers.some((isRestoring) => isRestoring())) return `The scene is being restored after Stop — ${direction} again once it has landed.`;
   if (canEdit()) return null;
   const mode = getRunMode();
   if (mode === 'playing') return `Stop the game to ${direction} — disabled during Play.`;
@@ -590,6 +680,7 @@ export function redoLabel(): string {
 
 /** Clear all history. */
 export function clearHistory() {
+  _historyLiveness.invalidateAll();
   undoStack.length = 0;
   redoStack.length = 0;
   _coalesce = null;
@@ -622,6 +713,10 @@ export function truncateUndoTo(depth: number) {
 // is preserved + barrier-truncated. Keyed by scene path.
 
 let _activeKey = '';
+/** Invalidated each time the live stacks are refilled or emptied for another world — every effective
+ *  `swapHistory`, and `clearHistory`. `runStep` captures it across its await: the stacks are the SAME arrays before
+ *  and after a swap, so it is the only way a step can tell its entry's world has gone (#1575 close-out review). */
+const _historyLiveness = createTeardownToken();
 const _histories = new Map<string, { undo: UndoAction[]; redo: UndoAction[] }>();
 
 /** Save the active stacks under the current key and load `key`'s stacks (empty
@@ -643,6 +738,7 @@ export function swapHistory(
   { discardOutgoing = false, freshIncoming = false }: { discardOutgoing?: boolean; freshIncoming?: boolean } = {},
 ) {
   if (key === _activeKey && !discardOutgoing && !freshIncoming) return;
+  _historyLiveness.invalidateAll();
   _coalesce = null; // a context switch ends any in-flight edit chain
   if (discardOutgoing) parkSurvivors(_activeKey, undoStack, redoStack);
   else _histories.set(_activeKey, { undo: [...undoStack], redo: [...redoStack] });
@@ -681,6 +777,7 @@ export function forgetHistory(key: string): void {
 
 /** Test-only: reset the context map + active key. */
 export function _resetHistoryContexts() {
+  _historyLiveness.invalidateAll();
   _histories.clear();
   _activeKey = '';
   _captureStack.length = 0; // a test that threw mid-batch must not leak a capture frame

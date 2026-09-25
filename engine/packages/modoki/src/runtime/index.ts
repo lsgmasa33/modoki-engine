@@ -380,6 +380,9 @@ export {
   bootSpansOverlapping, resetBootTimeline, MAX_BOOT_SPANS,
   type BootSpan, type BootTimeline,
 } from './core/bootTimeline';
+// App activity (#1475) — `app-inactive` / `page-hidden` / `window-blur` spans on the same timeline,
+// so a stall can be read against what the OS was doing. The app shell feeds the native edge.
+export { noteAppActive, installPageActivityTimeline } from './core/appActivity';
 export { readPerfProfile } from './debug/perfSources';
 // Profiler markers — the data model the Profiler panel and the MCP surface are both views of.
 // `profileScope` is public API: game code can name its own spans and they rank alongside the
@@ -524,6 +527,7 @@ export { measureText2D, type MeasureText2DOptions } from './loaders/measureText2
 // Runtime guids (#1210): tell an entity's live-only address from its durable identity.
 export { isRuntimeGuid, durableGuid, remapGuidValues } from './core/assetRefRules';
 export { planCopyGuids, type CopyGuidPlan } from './core/copyIdentity';
+export { frameDocReader, type TemplateDocReader } from './core/ecs/identityParents';
 export { templateKeyOf, setTemplateKey } from './core/templateIdentity';
 export {
   isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
@@ -585,6 +589,7 @@ export {
   subscribeAgentTools,
   agentToolsVersion,
   validateAgentToolArgs,
+  coerceAgentToolArgs,
   clearAgentTools,
 } from './debug/agentToolRegistry';
 export {
@@ -606,7 +611,7 @@ export type { AgentToolDef, AgentToolParam } from './debug/agentToolRegistry';
 // ── Frame Driver (no heavy deps — safe for all importers) ──
 export {
   registerFrameCallback, unregisterFrameCallback,
-  startFrameDriver, stopFrameDriver, stepOneFrame,
+  startFrameDriver, stopFrameDriver, stepOneFrame, setFrameLoopHeld, isFrameLoopHeld,
   setTargetFPS, targetFPS, getCurrentFPS, getFrameLoopHealth,
   onFrameLoopUnrecoverable,
   PRIORITY_ECS, PRIORITY_RENDER_3D, PRIORITY_RENDER_2D,
@@ -749,7 +754,7 @@ export {
   type LoginBonusSegmentId, type LoginBonusSubstitution, type LoginBonusVerdict,
 } from './core/loginBonus';
 export {
-  createAdLifecycle,
+  createAdLifecycle, onFullscreenAdChange,
   type AdEventSink, type AdLifecycle, type AdLifecycleHooks, type AdLifecycleOptions, type AdListenerHandle,
   type AdRevenue, type AdReward, type AdSdk, type FullscreenKind, type RewardHandler,
 } from './core/adLifecycle';
@@ -764,13 +769,17 @@ export {
   type NoAdsOfferPolicy, type NoAdsOfferVerdict, type NoAdsOfferWithheld,
 } from './core/adBreak';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
-export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
+export { isCaptureMode, getCaptureMode, setCaptureMode, type CaptureMode } from './core/captureMode';
+export { takeClockDelta, isNextSceneLoading } from './core/takeClock';
+export { TakeJournalTap, type TappedEvent } from './core/takeJournal';
+export { seedRng, pinFreshWorldSeed, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
   emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, journalTick, setJournalEnabled,
   JOURNAL_LEVELS, isJournalLevel,
   resolveRefName, setVerboseCapture, verboseCaptureState, isVerboseType,
-  isJournalEnabled,
-  type GameEvent, type JournalLevel,
+  isJournalEnabled, appLifetimeEvent, appLifetimeEventTypes,
+  captureEpoch, capturePartOf, currentCaptureSeq, resolveCapCursor, journalDroppedThroughCap, journalGapNote,
+  type GameEvent, type JournalLevel, type EmitOptions,
 } from './core/journal';
 export { journalState, journalDecision, journalWarn, journalError } from './core/gameJournal';
 export {
@@ -834,8 +843,19 @@ export {
   setAudioMuted, isAudioMuted,
   crossfade as crossfadeAudio,
   getAudioLog, clearAudioLog, setAudioRecordMode,
+  noteForeground as noteAudioForeground,
+  holdForFullscreenAd as holdAudioForFullscreenAd,
+  noteBackground as noteAudioBackground, onAudioDead, isAudioStillDead, type AudioClockCheckAfter,
   type BusName, type AudioPlaySpec, type AudioHandle, type AudioLogEntry,
 } from './audio/audioService';
+// Audio-health trace — why a music bed went silent, kept in memory for the life of the realm.
+// Exported so an agent can read it over the device bridge (#1455): the failure it serves leaves
+// the app ALIVE and silent, so the realm holding the trace is still there to be asked.
+export {
+  getAudioHealthTrace, clearAudioHealthTrace,
+  type AudioHealthEntry, type AudioStreamHealth, type AudioHealthKind, type AudioResumeOutcome,
+  type AudioKickReason,
+} from './audio/audioHealth';
 // Video subsystem — playback core (HTMLVideoElement lifetime, timeScale coupling,
 // autoplay-block recovery). Its SOUND routes onto the audio bus above.
 export {
@@ -911,6 +931,11 @@ export {
   type ResumeReloadDeps,
   type ResumeReloadHandler,
 } from './core/resumeReload';
+// Reload on DEAD audio (#1455) — the decision; the wiring is `engine/app/useDeadAudioReload.ts`.
+export {
+  createDeadAudioReloadHandler,
+  type DeadAudioReloadDeps, type DeadAudioReloadHandler, type DeadAudioReloadOutcome,
+} from './core/deadAudioReload';
 // Realm shutdown tasks (#587) — the seam that lets a reload destroy native SDK state (an AppLovin
 // banner/MREC/interstitial) before the reload destroys the JS realm. `runtime/**` cannot reach
 // `appServices()` (layering), so the app registers the task here and the reload sites

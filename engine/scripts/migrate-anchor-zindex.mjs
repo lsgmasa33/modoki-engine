@@ -10,8 +10,10 @@
  *  `uiAnchorZIndexMigration.ts`) — this script is the one-time on-disk rewrite for the
  *  committed corpus; the runtime migration is what future old scenes go through.
  *
- *  Also bumps each rewritten scene's `version` to 13, and each rewritten prefab's
- *  `version` to `PREFAB_FORMAT_VERSION` (3).
+ *  Also bumps each rewritten scene's `version` to `SCENE_FORMAT_VERSION` and each rewritten
+ *  prefab's to `PREFAB_FORMAT_VERSION`, both read from `runtime/core/version.ts` as TEXT rather
+ *  than hardcoded — and never DOWNWARDS: a document stamped higher than the target is skipped
+ *  untouched, because a newer build wrote it and this one cannot claim to understand it (#1468).
  *
  *  Only touches scene/prefab JSON under `games/<id>/runtime/assets` and
  *  `demos/<id>/runtime/assets`, and never the e2e fixtures (see the note at the push site
@@ -51,11 +53,14 @@ const SCENE_FORMAT_VERSION = Number(sceneVersionMatch[1]);
 // ⚠️ READ, for the same reason as the scene version one line up — this script STAMPS both, so a
 // stale literal here downgrades every PREFAB it rewrites. The scene half was unpinned and this was
 // left behind in the same function; version.ts says in as many words to check BOTH.
+// #1468 moved PREFAB_FORMAT_VERSION out of editor/scene/prefab.ts into runtime/core/version.ts so
+// the dev server could reach it. Read it from its new home; the hard exit below is what makes a
+// wrong path loud instead of a silent downgrade.
 const prefabSrc = readFileSync(
-  resolve(ROOT, 'engine/packages/modoki/src/editor/scene/prefab.ts'), 'utf8');
+  resolve(ROOT, 'engine/packages/modoki/src/runtime/core/version.ts'), 'utf8');
 const prefabVersionMatch = prefabSrc.match(/PREFAB_FORMAT_VERSION\s*=\s*(\d+)/);
 if (!prefabVersionMatch) {
-  console.error('could not read PREFAB_FORMAT_VERSION from editor/scene/prefab.ts');
+  console.error('could not read PREFAB_FORMAT_VERSION from runtime/core/version.ts');
   process.exit(1);
 }
 const PREFAB_FORMAT_VERSION = Number(prefabVersionMatch[1]);
@@ -125,7 +130,7 @@ function filesMatching(re) {
   return repoSceneAndPrefabFiles().filter((f) => re.test(f.rel)).map((f) => f.abs);
 }
 
-let changedFiles = 0, changedKeys = 0;
+let changedFiles = 0, changedKeys = 0, skippedTooNew = 0;
 const unmatchable = [];
 
 /** Migrate one `UIAnchor`/`UIElement` bag in place. Returns true if it changed anything.
@@ -214,7 +219,23 @@ async function migrateFile(file) {
   if (!dirtyRef.dirty) return;
 
   const isPrefab = /\.prefab\.json$/i.test(file);
-  json.version = isPrefab ? PREFAB_FORMAT_VERSION : SCENE_FORMAT_VERSION;
+  const target = isPrefab ? PREFAB_FORMAT_VERSION : SCENE_FORMAT_VERSION;
+
+  // ⚠️ REFUSE a document a NEWER build wrote (#1468) — never rewrite it, and never lower its stamp.
+  // This script has no server and no client wrapper between it and the bytes, so the write gate
+  // (`engine/plugins/prefabWriteGuard.ts`) cannot see it; the refusal has to live here. The stamp
+  // was UNCONDITIONAL, so running an older checkout of this script over a newer corpus rewrote the
+  // file with this build's understanding of it and then claimed the older number — losing whatever
+  // the newer format added and mislabelling what remained.
+  //
+  // One-sided, like every other prefab gate in this repo: the whole point of this script is to
+  // migrate documents BELOW the target, and an exact-match check would refuse all of them.
+  if (typeof json.version === 'number' && json.version > target) {
+    skippedTooNew++;
+    console.log(`SKIP ${file.slice(ROOT.length + 1)}: format ${json.version} is newer than ${target} — written by a newer build`);
+    return;
+  }
+  json.version = target;
 
   changedFiles++;
   console.log(`${WRITE ? 'rewrote' : 'would rewrite'} ${file.slice(ROOT.length + 1)}`);
@@ -263,6 +284,9 @@ if (targets.length === 0) {
 for (const file of targets) await migrateFile(file);
 
 console.log(`\n${changedKeys} UIAnchor.zIndex key(s) in ${changedFiles} file(s)${WRITE ? ' rewritten' : ' would be rewritten (dry run — pass --write)'}.`);
+// Counted and reported, never silent: a skipped file still HAS the key this script exists to
+// migrate, so a run that reports 0 rewrites and says nothing else would read as a clean corpus.
+if (skippedTooNew > 0) console.log(`${skippedTooNew} file(s) SKIPPED — written by a newer build; update this checkout and re-run.`);
 if (unmatchable.length > 0) {
   console.log('\nCould not migrate (no sibling UIElement trait to carry the value onto):');
   for (const m of unmatchable) console.log(`  ${m}`);

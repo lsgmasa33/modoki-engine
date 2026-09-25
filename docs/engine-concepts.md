@@ -157,10 +157,12 @@ two, and the choice is a real one:
   an argument the rebuild does not.
 
 #873 is the case that earns the second, and the reason is worth carrying: on that path *the rebuild
-is itself the leak*. Every `new Shader` mints two `UniformGroup`s with fresh `_resourceId`s, so
-Pixi's `BindGroupSystem._hash` gains two permanent entries per respawn and is cleared only at
-renderer teardown (#699, live upstream, carried as #694 defect 5) — and recycled ids ARE the pooled
-respawn path, the last place to put unbounded growth. So `Scene2D.tsx`'s material pass re-seeds
+is itself the cost*. Every `new Shader` mints two `UniformGroup`s with fresh `_resourceId`s, so
+Pixi's `BindGroupSystem._hash` gains two entries per respawn (#699). Before pixi.js 8.21.0 they
+were cleared only at renderer teardown; since then the GC sweeps each on a rendered frame at least
+`gc.maxUnusedTime` (60s) after its last use (pixijs#12214, #1540). No longer permanent, but a pooled
+burst still holds them for a minute or more (longer on a canvas that stops drawing), and recycled ids
+ARE the pooled respawn path. So `Scene2D.tsx`'s material pass re-seeds
 `matUniforms` from the program defaults instead, which is the shape #690 (`updateMtsdfPixiMetrics`)
 and #698 (the frame swap) already use in that file. The enumeration that licenses it is in
 `docs/rendering.md` § 2D custom materials.

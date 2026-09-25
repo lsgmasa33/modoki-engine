@@ -148,10 +148,9 @@ function mockDeps() {
     }
     // `buffers` mirrors real Pixi Geometry: a truthy array until `destroy(true)` nulls it, which
     // is what `releaseGeometry`'s `!g.buffers` idempotency guard checks (a second call must not
-    // re-run unload/destroy, exactly like the real Geometry.destroy() nulling `buffers`).
+    // re-run destroy, exactly like the real Geometry.destroy() nulling `buffers`).
     class MeshGeometry {
       buffers: unknown[] | null = [];
-      unload = vi.fn();
       destroy = vi.fn(() => { this.buffers = null; });
       constructor(public opts?: any) {}
     }

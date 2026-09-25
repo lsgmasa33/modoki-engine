@@ -795,9 +795,9 @@ describe('/api/scene-mutate (play-mode guard)', () => {
       // the envelope opened, discarding whatever the human authored inside it. An exit handed to
       // an unattended agent without that caution is a trap, not a fix.
       expect(options).toMatch(/DESTRUCTIVE/);
-      // The residual case is a session that has not finished seating (the snapshot is async), so
-      // the advice is RETRY — not the pre-Phase-3 "a plain drag-scrub holds no session".
-      expect(options).toMatch(/retry stop/);
+      // No "retry stop, the session had not finished seating" either: since #1569 a Stop in the
+      // snapshot gap cancels the begin, so one stop is the whole exit and a retry is dead advice.
+      expect(options).not.toMatch(/retry stop/);
       expect(options, 'the stale pre-Phase-3 caveat must not come back').not.toMatch(/drag-scrub/);
       expect(options).toMatch(/Exit Preview/);
       // …but the agent is still TOLD why, so it does not go looking for the op itself. Warning and

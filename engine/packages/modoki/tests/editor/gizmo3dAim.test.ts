@@ -114,6 +114,29 @@ describe('rotateRingAim', () => {
     expect(rotateRingAim({ origin, u: X, vAxis: Y, radius, project: clipped })).toBeNull();
   });
 
+  // #1570 close-out sweep — the ring twin of `axisPickAim`'s picker check.
+  const at = (a: { x: number; y: number }, b: { x: number; y: number }) => Math.abs(a.x - b.x) < 0.5 && Math.abs(a.y - b.y) < 0.5;
+
+  it('moves off a diagonal whose press selects ANOTHER ring, even over reachability', () => {
+    const plain = rotateRingAim({ origin, u: Y, vAxis: Z, radius, project })!;
+    const steered = rotateRingAim({
+      origin, u: Y, vAxis: Z, radius, project,
+      reachable: (p) => at(p, plain),     // only the wrong-ring diagonal is clickable…
+      picksRing: (p) => !at(p, plain),    // …and every other one selects this ring
+    })!;
+    expect(at(steered, plain)).toBe(false);
+  });
+
+  it('publishes NO point when every diagonal is known to select another ring', () => {
+    expect(rotateRingAim({ origin, u: Y, vAxis: Z, radius, project, picksRing: () => false })).toBeNull();
+  });
+
+  it('accept side: "cannot tell" and "agrees everywhere" both keep the plain answer', () => {
+    const plain = rotateRingAim({ origin, u: Y, vAxis: Z, radius, project })!;
+    expect(rotateRingAim({ origin, u: Y, vAxis: Z, radius, project, picksRing: () => null })).toEqual(plain);
+    expect(rotateRingAim({ origin, u: Y, vAxis: Z, radius, project, picksRing: () => true })).toEqual(plain);
+  });
+
   it('follows a rotated (local-space) basis', () => {
     // A ring whose plane is spanned by two axes rotated 90° about X: Y→Z, Z→-Y.
     const aim = rotateRingAim({ origin, u: Z, vAxis: { x: 0, y: -1, z: 0 }, radius, project })!;
@@ -251,5 +274,39 @@ describe('axisPickAim', () => {
 
   it('still answers when BOTH ends are covered, rather than dropping the handle', () => {
     expect(axisPickAim({ origin, dir: X, offsetWorld, eye, project, reachable: () => false })).not.toBeNull();
+  });
+
+  // #1570 — the cones are fat and overlap under an oblique camera, so the point the plain rule picks
+  // can select a NEIGHBOUR's picker: live, `translate:x`'s published point dragged the cube along z.
+  const near = (a: { x: number; y: number }, b: { x: number; y: number }) => Math.abs(a.x - b.x) < 0.5 && Math.abs(a.y - b.y) < 0.5;
+
+  it('moves off a point that selects ANOTHER axis, onto one that selects this one', () => {
+    const plain = axisPickAim({ origin, dir: X, offsetWorld, eye, project })!;
+    const steered = axisPickAim({ origin, dir: X, offsetWorld, eye, project, picksAxis: (p) => !near(p, plain) })!;
+    expect(near(steered, plain)).toBe(false);
+    // Still ON the axis, inside three's cone (0 → 0.6 gizmo units = 0 → 2x the centre offset).
+    expect(steered.world.y).toBeCloseTo(0, 9);
+    expect(Math.abs(steered.world.x)).toBeLessThan(2 * offsetWorld);
+  });
+
+  it('outranks reachability with its own picker — a covered right axis refuses; a free wrong one edits', () => {
+    const plain = axisPickAim({ origin, dir: X, offsetWorld, eye, project })!;
+    const steered = axisPickAim({
+      origin, dir: X, offsetWorld, eye, project,
+      reachable: (p) => near(p, plain),      // only the wrong-axis point is clickable…
+      picksAxis: (p) => !near(p, plain),     // …and every other point selects this axis
+    })!;
+    expect(near(steered, plain)).toBe(false);
+  });
+
+  it('publishes NO point when every grab point is known to select another axis', () => {
+    expect(axisPickAim({ origin, dir: X, offsetWorld, eye, project, picksAxis: () => false })).toBeNull();
+  });
+
+  it('accept side: "cannot tell" (an unreadable picker) keeps the plain centre, as before', () => {
+    const plain = axisPickAim({ origin, dir: X, offsetWorld, eye, project })!;
+    expect(axisPickAim({ origin, dir: X, offsetWorld, eye, project, picksAxis: () => null })).toEqual(plain);
+    // …and so does a picker that agrees everywhere: the extra samples never move a point that was fine.
+    expect(axisPickAim({ origin, dir: X, offsetWorld, eye, project, picksAxis: () => true })).toEqual(plain);
   });
 });

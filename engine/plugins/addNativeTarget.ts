@@ -330,7 +330,7 @@ export function detectMissingFirebaseResult(
 /** Scaffold one native target end-to-end: deps + capacitor.config.json + vendored engine
  *  plugins (in-process), then install → web build → `npx cap add` → heal native config.
  *
- *  `runShell(label, cmd, cwd)` is the CALLER's spawn wrapper — each transport owns its own,
+ *  `runShell(label, command, args, cwd)` is the CALLER's spawn wrapper (argv, never a shell string — #1537) — each transport owns its own,
  *  wired to its own abort/disconnect handling and output streaming (the editor streams over
  *  SSE; the CLI inherits stdio). A false return throws. Returns the missing-Firebase warnings
  *  the caller should surface; the editor's build path PAUSES on a non-empty list so the user
@@ -345,7 +345,7 @@ export async function scaffoldNativeTarget(opts: {
   buildCwd: string;
   cfg: ProjectConfig;
   send: (msg: string) => void;
-  runShell: (label: string, cmd: string, cwd: string) => Promise<boolean>;
+  runShell: (label: string, command: string, args: string[], cwd: string) => Promise<boolean>;
   /** Remove and regenerate an already-COMPLETE target too, not just an incomplete leftover left
    *  by an interrupted run. Only the CLI's explicit `--force` flag ever sets this — a human typed
    *  it, so the destructive intent is unambiguous; the editor never passes it. Still refused by
@@ -448,10 +448,10 @@ export async function scaffoldNativeTarget(opts: {
   const v = vendorEnginePlugins(projectRoot, buildCwd);
   if (v.vendored.length) send(`vendored engine plugin(s): ${v.vendored.join(', ')}`);
   // 2. Install (project) — needs the cap CLI + plugin copies present.
-  if (!(await runShell('npm install', 'npm install', projectRoot))) throw new Error('npm install failed');
+  if (!(await runShell('npm install', 'npm', ['install'], projectRoot))) throw new Error('npm install failed');
   writeVendorMarker(projectRoot, v.expectedVendor); // record installed tarballs (D3)
   // 3. Web build → <project>/dist (cap add needs webDir to exist).
-  if (!(await runShell('Building web assets', 'node engine/scripts/build-web.mjs --target native', buildCwd))) throw new Error('web build failed');
+  if (!(await runShell('Building web assets', 'node', ['engine/scripts/build-web.mjs', '--target', 'native'], buildCwd))) throw new Error('web build failed');
   // The actual removal — deferred to HERE (right before cap add, after steps 1-3 already
   // succeeded) rather than at entry, so a failure in npm install / the web build never costs a
   // `force`-targeted project its native folder for nothing.
@@ -462,7 +462,7 @@ export async function scaffoldNativeTarget(opts: {
     fs.rmSync(platformDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 400 });
   }
   // 4. cap add (project) — generates the native project with the capacitor.config identity baked in.
-  if (!(await runShell(`cap add ${platform}`, `npx cap add ${platform}`, projectRoot))) throw new Error(`cap add ${platform} failed`);
+  if (!(await runShell(`cap add ${platform}`, 'npx', ['cap', 'add', platform], projectRoot))) throw new Error(`cap add ${platform} failed`);
   // 5. Heal native config (local.properties / DEVELOPMENT_TEAM) + flag missing Firebase.
   for (const n of healNativeConfig(projectRoot).notes) send(n);
   // #1096: the caller PAUSES the build on a non-empty list, so an unreadable manifest must not

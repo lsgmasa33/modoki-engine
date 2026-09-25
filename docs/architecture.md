@@ -258,6 +258,51 @@ Callbacks register/unregister by key (`registerFrameCallback`,
 any callback that throws 10 times in a row. `stepOneFrame()` runs all callbacks once
 for the editor's step button.
 
+### When frames stop: the stall watchdog, and what the OS was doing
+
+A 1 s watchdog declares the chain **stalled** after `STALL_MS` (3 s) with no frame while the
+document is visible, re-arms it where that is safe, and logs `[frameDriver] FRAME LOOP STALLED`. A
+hidden document is not a stall, since the browser legitimately withholds rAF there. **"Visible" is
+not "in front of the player", though.** A system alert or a native sheet makes iOS resign the app
+active with the page still `visible`, and the alert takes every tap until it is answered. #1475
+started this way: a first launch where "no input works" and 6.9 s passed with no rAF, with nothing
+on record to say whether a prompt was up.
+
+⚠️ **An alert that owns the screen does not by itself stop frames.** Measured on the iPad mini 5
+(iOS 26.6.2, fresh install of Weaveling, 2026-09-24): the ATT alert stayed up for 190 s, and
+`app-inactive` covered the whole of it. rAF kept firing at ~58 fps (frame 27 → frame 10,892), and
+the watchdog never fired. So "taps ignored" and "no frames" are two different observations. A
+prompt explains the first; do not assume it explains the second.
+
+**#1475 closed as cannot-reproduce (owner, 2026-09-24).** On the Air it failed to reproduce in
+three fresh installs: the ATT alert held for 159 s, the alert answered from iOS's cache, and a
+control run. The longest frame in any of them was the first cold compile (0.75 s). Every run here
+was launched by `devicectl` with **no debugger attached**. **The untested lead, if it comes back:**
+the original launch may have been Xcode's Run over wireless debugging. LLDB suspends the app
+process while it loads each new image's symbols, and ad-SDK init loads many. WKWebView's rAF and
+tap delivery go through that app process, while the page's timers run in the WebContent process.
+That matches the original trace: timers alive (the watchdog logged), no frames, taps ignored, and
+several separate multi-second gaps. Ask how the build was launched before debugging such a stall.
+
+So `runtime/core/appActivity.ts` puts that on the **boot timeline** as spans, next to the
+`frame-interval` span that records the stall itself:
+
+| Span | Opened by |
+|---|---|
+| `app-inactive` | the native app-active edge: `@capacitor/app`'s `appStateChange` (iOS `willResignActive`). The runtime does not import plugins, so `engine/app/useAppActivityTimeline.ts` feeds it in |
+| `page-hidden` / `window-blur` | the page's own `visibilitychange` / `blur`→`focus` edges. Focus counts from a real `blur` only: a webview can report `hasFocus() === false` at launch with nothing covering it |
+| `att-prompt` | the ATT request in `attribution.ts`, which is the system alert on a fresh iOS install |
+| `ads-start` | the ad lifecycle's `sdk.start()`: the consent form (EEA/UK) and SDK init |
+| `sign-in-sheet` | the native sign-in sheet in Court and Weaveling, including the one each opens unasked on a first launch |
+
+**To read a stall, intersect them:** `bootSpansOverlapping(frameIntervalStart, frameIntervalEnd)`.
+A `frame-slow` inside the gap means our own callbacks took the time (the first cold compile does
+this: 1.7 s on that iPad's fresh install, against 0.33 s warm). A gap with no `frame-slow` in it
+happened outside engine code. A prompt span over such a gap is a lead, not a verdict, given the
+measurement above. The stall log also adds a fixed
+clause while the app is inactive or unfocused. The clause is **never interpolated**, because the
+log is deduped by its text.
+
 The ECS pipeline itself runs at `PRIORITY_ECS`. Its systems are ordered by
 `SYSTEM_PRIORITY` tiers (`runtime/core/pipeline.ts`):
 `TIME (0) → INPUT (50) → GAME (100) → ANIMATION (150) → TRANSFORM_PREPASS (170) →

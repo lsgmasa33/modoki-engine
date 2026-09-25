@@ -1,3 +1,7 @@
+/// <reference types="node" />
+// Declared HERE, not borrowed from the importer (#1544): a game's tsconfig loads `vite/client` types
+// only, so this `node:*` import compiled only in a project that happened to carry this line in some
+// OTHER file. A fresh scaffold carries none, and its first build failed on this helper.
 /**
  * ⚠️ **A scratch dir a test creates with a bare `mkdtempSync` is never removed unless that test
  * remembers to (#1117).** Nothing else removes it. Measured on 2026-09-14: the `modoki-qa` Mac held

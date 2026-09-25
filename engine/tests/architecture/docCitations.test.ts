@@ -47,7 +47,7 @@ import { repoFiles as repoCorpusFiles } from '../../scripts/repoCorpus.mjs';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { readScannedSource } from '@modoki/engine/testing';
 import { hasInternalGames, hasPrivateDocs } from '../helpers/repoLayout';
-import { SECTION_CITE, headingIds } from '../helpers/docSections';
+import { SECTION_CITE, citedDoc, headingIds } from '../helpers/docSections';
 import {
   citesALine,
   citesALineByMarker,
@@ -1883,6 +1883,10 @@ describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #
  *  `§ "BOARD space is Pixi…"` -> `## The split, now that the migration is done: BOARD space is
  *  Pixi…`. Prefix matching was tried first and produced false offenders on the second shape.
  *  Markup and leading sigils are stripped before comparing (`## ⚠️ Foo` is cited as `§ "Foo"`).
+ *
+ *  The doc is the LINK TARGET when the matched path is a markdown link's text (`citedDoc`, #1519);
+ *  rule 3 resolves the same way. Reading the text went red on a correct citation, and it had been
+ *  skipping `docs/plans/profiler.md`'s stale one, whose text did not resolve from its folder.
  */
 const TITLE_CITE = /([A-Za-z0-9_./-]+\.md)\)?[^\n§]{0,60}§\s*[""]([^""\n]{4,80})[""]/g;
 
@@ -1929,7 +1933,8 @@ describe('cited doc SECTION TITLES resolve (#328)', () => {
       const text = fs.readFileSync(abs, 'utf8');
 
       for (const m of text.matchAll(TITLE_CITE)) {
-        const [, citedPath, rawTitle] = m;
+        const rawTitle = m[2];
+        const citedPath = citedDoc(text, m); // a link's TARGET, not its text (#1519)
         const candidates = [
           path.resolve(path.dirname(abs), citedPath),
           path.join(repoRoot, citedPath),
@@ -1969,7 +1974,8 @@ describe('cited doc SECTIONS resolve', () => {
       const text = fs.readFileSync(abs, 'utf8');
 
       for (const m of text.matchAll(SECTION_CITE)) {
-        const [, citedPath, section] = m;
+        const section = m[2];
+        const citedPath = citedDoc(text, m); // a link's TARGET, not its text (#1519)
         // Resolve the cited doc relative to the citing file first (most citations are relative),
         // then from the repo root (bare `docs/…` form).
         const candidates = [

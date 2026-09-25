@@ -89,6 +89,7 @@ export function perToolBytes(): Map<string, number> {
   const ctx = createToolContext({ backend: 'http://127.0.0.1:1' });
   const server = {
     registerTool: () => {},
+    validateToolInput: async (_tool: unknown, args: unknown) => args, // wrapped by installArgCoercion (#1560)
     tool: () => {
       throw new Error('registered via the legacy server.tool() overload — conventions §1');
     },

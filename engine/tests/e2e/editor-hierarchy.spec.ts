@@ -129,7 +129,7 @@ test('Create Prefab serializes the subtree and POSTs a .prefab.json (write inter
   // reading 2, two public runs red before the hub noticed. `tests/architecture/
   // prefabFormatVersionLiteral.test.ts` now compares the two as TEXT inside `verify`, so the
   // mismatch is caught locally; keep that guard's regex in mind if you reword this assertion.
-  expect(prefab.version).toBe(4);
+  expect(prefab.version).toBe(7);
   expect(prefab.name).toBe('CenterCube');
 });
 

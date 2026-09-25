@@ -219,6 +219,7 @@ describe('execGcloudSync', () => {
   beforeEach(() => { dir = makeScratchDir('modoki-gcloud-exec-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
+
   // The env is shaped like production's: a COPY of process.env, keyed `Path` on win32 as it is in an
   // editor launched from Explorer/PowerShell (a Git Bash parent says `PATH`, which hides the bug).
   // The fake prints each argv slot separately, so an unquoted `with space.json` split in two by
@@ -226,8 +227,12 @@ describe('execGcloudSync', () => {
   it('runs the gcloud found on env.PATH with argv intact and the system PATH kept', () => {
     const win = process.platform === 'win32';
     if (win) {
+      // The real gcloud.cmd's shape: `%*` forwarded once to the program (python there, node here),
+      // after it switches delayed expansion back OFF. A fake that echoed `%1` would print the batch-level token, not the argv the
+      // program receives — toSpawn quotes and caret-escapes every argument for the `%*` hop (#1537).
+      fs.writeFileSync(path.join(dir, 'gcloud.js'), "process.stdout.write(process.argv.slice(2).map((a) => `[${a}]`).join('') + '\\n')\n");
       fs.writeFileSync(path.join(dir, 'gcloud.cmd'),
-        '@echo off\r\necho [%1][%2][%~3]\r\nwhere /q where.exe && echo SYSTEM-PATH-KEPT\r\n');
+        '@echo off\r\nSETLOCAL EnableDelayedExpansion\r\nSETLOCAL DisableDelayedExpansion\r\nnode "%~dp0gcloud.js" %*\r\nwhere /q where.exe && echo SYSTEM-PATH-KEPT\r\n');
     } else {
       fs.writeFileSync(path.join(dir, 'gcloud'),
         '#!/bin/sh\nprintf \'[%s]\' "$@"; echo\ncommand -v ls >/dev/null && echo SYSTEM-PATH-KEPT\n', { mode: 0o755 });
@@ -235,8 +240,11 @@ describe('execGcloudSync', () => {
     const copy: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => k.toUpperCase() !== 'PATH'));
     copy[win ? 'Path' : 'PATH'] = process.env.PATH;
     const env = withGcloudOnPath(copy, dir);
-    const out = String(execGcloudSync(['storage', 'cat', 'gs://b/with space.json'], { env, encoding: 'utf8' }));
-    expect(out).toContain('[storage][cat][gs://b/with space.json]');
+    // `a!OS!b`: the real gcloud.cmd turns delayed expansion back OFF before forwarding `%*`, so a `!`
+    // arrives intact (#1537 retracted a refusal built on the opposite premise). Remove the fixture's
+    // DisableDelayedExpansion line and this arg arrives as `aWindows_NTb`.
+    const out = String(execGcloudSync(['storage', 'cat', 'gs://b/with space.json', 'gs://b/a!OS!b.json'], { env, encoding: 'utf8' }));
+    expect(out).toContain('[storage][cat][gs://b/with space.json][gs://b/a!OS!b.json]');
     expect(out).toContain('SYSTEM-PATH-KEPT');
   });
 });

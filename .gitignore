@@ -267,3 +267,8 @@ opencode.json
 # #921 Phase 1: CC0 audio candidates staged for the owner to listen to. Not committed, because
 # rejected clips must not land in history. Approved clips move to runtime/assets/audio/ in Phase 2.
 games/wordweave/audio-candidates/
+
+# Gameplay-recorder takes (#1479): each one embeds the save it was played from (progress, purchases,
+# an account if one is signed in), so none is committed by accident. Force-add a take on purpose.
+/games/*/recordings/
+/demos/*/recordings/

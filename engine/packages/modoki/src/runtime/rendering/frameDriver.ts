@@ -17,6 +17,8 @@ import { pollGpuTimings } from '../core/gpuTimings';
 // it used to leave. `activeRenderer` imports only `three` types + `./clock`, so this is L2→L0
 // (rendering → core) and adds no cycle.
 import { getGpuFaultState, onRendererLost, type GpuFaultState } from '../core/activeRenderer';
+// #1475 — names what the OS was doing (a native prompt, a lost focus) when the chain stalled.
+import { describeAppActivity } from '../core/appActivity';
 // Split out to a DOM-free leaf (this file is not) so a Node-side consumer with no "DOM" lib can
 // type against the union without pulling this whole file's `document`/`requestAnimationFrame`
 // usage into its program — see that file's header for the concrete failure (editorBackendRouter.ts
@@ -40,6 +42,17 @@ export let targetFPS = 60;
  *  `frameProfiler.frameCapIntervalMs`). Every source of the cap — project config and a quality
  *  tier — goes through this one setter, so a source added later cannot bypass it. */
 export function setTargetFPS(fps: number) { targetFPS = fps; setProfilerFrameCap(fps); }
+
+/** Set while an external driver (the gameplay recorder, #1479) owns the frame cadence. The rAF chain
+ *  keeps firing — so the watchdog still sees a live loop and nothing re-arms it — but runs no
+ *  callbacks; the driver advances the clock and calls `stepOneFrame()` itself, once per captured
+ *  frame. Without the hold, every real rAF between two captures would also run the pipeline, and
+ *  the frame counter (the journal tick) would depend on how long a screenshot took. */
+let heldForExternalDriver = false;
+/** Hand the frame cadence to an external driver (`true`) or give it back (`false`). */
+export function setFrameLoopHeld(held: boolean) { heldForExternalDriver = held; }
+/** True while an external driver owns the frame cadence — see `setFrameLoopHeld`. */
+export function isFrameLoopHeld(): boolean { return heldForExternalDriver; }
 
 const callbacks = new Map<string, { cb: FrameCallback; priority: number }>();
 let sorted: { key: string; cb: FrameCallback }[] = [];
@@ -161,6 +174,7 @@ function runFrame(now: DOMHighResTimeStamp, stillCurrent: LivenessCheck, self: F
   // manual clock (headless tests) the rAF stamp would drift from `rawNow()` and the watchdog
   // would judge liveness against a clock nothing else uses.
   lastFrameAt = rawNow();
+  if (heldForExternalDriver) return;
   if (targetFPS > 0) {
     const interval = 1000 / targetFPS;
     if (now - lastFrameTime < interval) return;
@@ -499,6 +513,7 @@ function checkStall() {
       `app is alive but not pumping frames: no ECS system ticks, nothing renders, and trusted ` +
       `input will silently no-op.` +
       (gpuFault?.deviceLost ? ` GPU fault: ${gpuFault.reason ?? 'unknown reason'}.` : '') +
+      describeAppActivity() +
       (frameSinceArm
         ? ' Re-arming the requestAnimationFrame chain.'
         : ' The outstanding requestAnimationFrame callback has never fired — re-arming would ' +
@@ -660,6 +675,7 @@ export function getFrameLoopHealth(): FrameLoopHealth {
 export function __resetFrameDriverForTests() {
   disarmLoop();
   callbacks.clear();
+  heldForExternalDriver = false;
   sorted = [];
   dirty = false;
   refCount = 0;

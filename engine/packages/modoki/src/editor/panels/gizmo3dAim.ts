@@ -112,24 +112,58 @@ export interface AxisPickAimOpts {
   eye: Vec3Like;
   project: (p: Vec3Like) => { x: number; y: number; z: number };
   reachable?: (p: { x: number; y: number }) => boolean;
+  /** Would a press here select THIS axis's picker? `true`/`false`, or `null` when the caller cannot
+   *  tell (three's internal picker unreadable). The axis cones are fat — `CylinderGeometry(0.2, 0,
+   *  0.6)`, both ends — so under an oblique camera a ray at one axis's cone can cross a NEIGHBOUR's
+   *  first, and the drag then moves the neighbour's axis. Measured 2026-09-25 (#1570, SceneView
+   *  'ui', tropical-island's cube, world space): the published `translate:x` point dragged the cube
+   *  along z only. The same class `picksUniform` guards on the scale centre. */
+  picksAxis?: (p: { x: number; y: number }) => boolean | null;
 }
+
+/** Where along the cone to try, as multiples of `offsetWorld` (the cone's middle, 0.3). The cone
+ *  WIDENS toward its far end (radius 0 at the origin, 0.2 at 0.6), so the outer samples are the
+ *  fatter, more forgiving ones; the inner one gives a steep view a point clear of the far end. */
+const AXIS_SAMPLE_FRACTIONS = [1, 1.5, 0.6] as const;
 
 /** Where to press for a translate/scale AXIS handle. Both directions of the axis carry a picker
  *  (three builds `+0.3` and `-0.3` cones), so this returns whichever projects better — preferring
  *  one the canvas actually owns, then the one further from the crowded centre. Null when three has
  *  hidden the axis, or when neither end projects on screen. */
 export function axisPickAim(opts: AxisPickAimOpts): { x: number; y: number; world: Vec3Like } | null {
-  const { origin, dir, offsetWorld, eye, project, reachable } = opts;
+  const { origin, dir, offsetWorld, eye, project, reachable, picksAxis } = opts;
   if (Math.abs(dir.x * eye.x + dir.y * eye.y + dir.z * eye.z) > AXIS_HIDE_DOT) return null;
   const oC = project(origin);
-  let best: { x: number; y: number; world: Vec3Like; free: boolean; sep: number } | null = null;
-  for (const sign of [1, -1]) {
-    const world = add(origin, dir, offsetWorld * sign);
-    const p = project(world);
-    if (p.z > 1 || p.z < -1) continue;
-    const cand = { x: p.x, y: p.y, world, free: reachable ? reachable(p) : true, sep: Math.hypot(p.x - oC.x, p.y - oC.y) };
-    if (!best || (cand.free !== best.free ? cand.free : cand.sep > best.sep)) best = cand;
+  // Ranked, most important first: a press that selects THIS axis (2), cannot tell (1), selects
+  // another (0) — a covered point on the right axis is a loud refusal, a free one on the wrong
+  // axis is a silent wrong edit, so this outranks reachability exactly as `picksUniform` does. Then
+  // reachable, then the cone centre (the extra samples exist only to find the axis, not to move a
+  // point that was already fine), then the further from the crowded centre.
+  type Cand = { x: number; y: number; world: Vec3Like; own: number; free: boolean; centre: boolean; sep: number };
+  const better = (a: Cand, b: Cand) => a.own !== b.own ? a.own > b.own
+    : a.free !== b.free ? a.free
+      : a.centre !== b.centre ? a.centre
+        : a.sep > b.sep;
+  let best: Cand | null = null;
+  for (const frac of AXIS_SAMPLE_FRACTIONS) {
+    for (const sign of [1, -1]) {
+      const world = add(origin, dir, offsetWorld * frac * sign);
+      const p = project(world);
+      if (p.z > 1 || p.z < -1) continue;
+      const picks = picksAxis ? picksAxis(p) : null;
+      const cand: Cand = {
+        x: p.x, y: p.y, world,
+        own: picks === true ? 2 : picks === null ? 1 : 0,
+        free: reachable ? reachable(p) : true,
+        centre: frac === 1,
+        sep: Math.hypot(p.x - oC.x, p.y - oC.y),
+      };
+      if (!best || better(cand, best)) best = cand;
+    }
   }
+  // Every grab point is KNOWN to select another axis (or nothing): there is no press that drags this
+  // one, and publishing a point anyway is a handle that edits the wrong axis and reports success.
+  if (best && best.own === 0) return null;
   return best ? { x: best.x, y: best.y, world: best.world } : null;
 }
 
@@ -231,6 +265,12 @@ export interface RotateRingAimOpts {
    *  correctly-reported-but-blocked aim into a usable one. Never a hard filter: when every
    *  candidate is covered, the nearest still comes back and the caller reports the occlusion. */
   reachable?: (p: { x: number; y: number }) => boolean;
+  /** Would a press here select THIS ring's picker — `true`/`false`, or `null` when the caller cannot
+   *  tell. The 45° diagonals avoid where two rings meet in 3D, but not where their projected
+   *  ellipses CROSS on screen, which under an oblique camera can be anywhere; a ray at one ring
+   *  there can reach a neighbour's torus first. The ring twin of `AxisPickAimOpts.picksAxis`
+   *  (#1570 close-out sweep: same mechanism, found by pattern rather than observed). */
+  picksRing?: (p: { x: number; y: number }) => boolean | null;
 }
 
 /** Pick the screen point to press for one rotation ring, or null when no candidate is on screen.
@@ -243,10 +283,10 @@ export interface RotateRingAimOpts {
  *  along the view direction and the camera's position is not a focal point. Ties (a face-on ring
  *  has two equally near diagonals) break on screen distance from the projected centre. */
 export function rotateRingAim(opts: RotateRingAimOpts): { x: number; y: number; world: Vec3Like } | null {
-  const { origin, u, vAxis, radius, project, reachable } = opts;
+  const { origin, u, vAxis, radius, project, reachable, picksRing } = opts;
   const oC = project(origin);
   const k = Math.SQRT1_2;
-  let best: { x: number; y: number; world: Vec3Like; free: boolean; depth: number; sep: number } | null = null;
+  let best: { x: number; y: number; world: Vec3Like; own: number; free: boolean; depth: number; sep: number } | null = null;
   for (const [su, sv] of [
     [1, 1],
     [-1, 1],
@@ -256,23 +296,29 @@ export function rotateRingAim(opts: RotateRingAimOpts): { x: number; y: number; 
     const world = add(add(origin, u, radius * k * su), vAxis, radius * k * sv);
     const p = project(world);
     if (p.z > 1 || p.z < -1) continue; // behind the camera / clipped
+    const picks = picksRing ? picksRing(p) : null;
     const cand = {
       x: p.x,
       y: p.y,
       world,
+      own: picks === true ? 2 : picks === null ? 1 : 0,
       free: reachable ? reachable(p) : true,
       depth: p.z,
       sep: Math.hypot(p.x - oC.x, p.y - oC.y),
     };
-    // Clickable beats blocked; then nearest (a near point cannot be shadowed by the ring's own far
-    // side); then a tie breaks on screen separation, so the press lands as far from the crowded
-    // centre as possible.
+    // Selects THIS ring first (a covered right ring is a loud refusal, a free wrong one a silent
+    // wrong rotation — as `axisPickAim` ranks it); then clickable beats blocked; then nearest (a
+    // near point cannot be shadowed by the ring's own far side); then a tie breaks on screen
+    // separation, so the press lands as far from the crowded centre as possible.
     const better =
       !best ||
-      (cand.free !== best.free ? cand.free
-        : Math.abs(cand.depth - best.depth) > 1e-9 ? cand.depth < best.depth
-          : cand.sep > best.sep);
+      (cand.own !== best.own ? cand.own > best.own
+        : cand.free !== best.free ? cand.free
+          : Math.abs(cand.depth - best.depth) > 1e-9 ? cand.depth < best.depth
+            : cand.sep > best.sep);
     if (better) best = cand;
   }
+  // Every diagonal is KNOWN to select something else: no press rotates about this ring.
+  if (best && best.own === 0) return null;
   return best ? { x: best.x, y: best.y, world: best.world } : null;
 }

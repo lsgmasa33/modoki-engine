@@ -22,6 +22,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { repoFiles } from './repoCorpus.mjs';
+import { toSpawn } from './winSpawn.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const dryRun = process.argv.includes('--dry-run');
@@ -29,23 +30,13 @@ const dryRun = process.argv.includes('--dry-run');
 // Bundle the TS module rather than reimplementing the split — the whole point is
 // that this script and the editor agree byte-for-byte.
 const outFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'meta-sidecar-')), 'meta-sidecar.mjs');
-// ⚠️ `shell: isWindows` is load-bearing, not defensive. `execFile`/`spawn` do NO PATHEXT
-// resolution on Windows, so a bare `npx` — whose real file is `npx.cmd` — throws ENOENT and this
-// script is simply unrunnable there (VERIFIED on the `win` clone: `execFileSync('npx',
-// ['--version'])` throws ENOENT in isolation). Same remedy and same spelling as
-// the `npmRun` of `bootstrap-mcp-deps.mjs` and `bootstrap-game-deps.mjs`; see docs/windows.md § PATHEXT.
-// Adding a `.cmd` shim is NOT an alternative — Node throws EINVAL on spawning `.cmd` without a
-// shell since the CVE-2024-27980 fix.
-//
-// ⚠️ Residual, shared with both bootstrap scripts: `shell: true` makes Node CONCATENATE argv
-// without escaping (DEP0190), so `outFile` would break if `os.tmpdir()` contained a space — a
-// real possibility on Windows (`C:\Users\Jane Doe\...`), though not on this clone. The
-// prescribed fix in docs/windows.md is `whichSync()`/`spawnable()` from engine/toolchain, which
-// a plain `.mjs` cannot import (the same `.ts`-barrier that forced pathPosix.mjs to exist). Left
-// matching the established `.mjs` precedent rather than diverging here.
-const isWindows = process.platform === 'win32';
-execFileSync('npx', ['esbuild', 'engine/plugins/meta-sidecar.ts', '--bundle', '--format=esm',
-  '--platform=node', `--outfile=${outFile}`], { cwd: repoRoot, stdio: 'inherit', shell: isWindows });
+// A bare `npx` is `npx.cmd` on Windows: `execFile` cannot find it (no PATHEXT lookup) or spawn it
+// (EINVAL without cmd.exe since CVE-2024-27980). `toSpawn` resolves it and runs it through an
+// escaped cmd.exe line, so `outFile` survives a profile path like `C:\Users\Jane Doe\…` or one
+// holding `%` — which the `shell: isWindows` this replaced did not (#1537; docs/windows.md § PATHEXT).
+const esbuild = toSpawn('npx', ['esbuild', 'engine/plugins/meta-sidecar.ts', '--bundle', '--format=esm',
+  '--platform=node', `--outfile=${outFile}`]);
+execFileSync(esbuild.command, esbuild.args, { ...esbuild.options, cwd: repoRoot, stdio: 'inherit' });
 const { readMetaSidecar, writeMetaSidecar } = await import(pathToFileURL(outFile).href);
 
 // repoFiles() is `-z`-safe internally (see repoCorpus.mjs) — a non-ASCII path (the

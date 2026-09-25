@@ -16,7 +16,7 @@ import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { getAnimSet } from '../../runtime/loaders/animSetCache';
 import { useEditorStore } from '../store/editorStore';
-import { getPrefabSource, getCachedPrefabSync, getOverrides, baseTokenResolver } from '../scene/prefab';
+import { getPrefabSource, getCachedPrefabSync, getOverrides, baseTokenResolver, instanceBase } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { isSkippedByPrimarySave } from '../scene/serialize';
 import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
@@ -1343,6 +1343,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
               border: '1px solid #3a4a5a', borderRadius: 3, fontSize: '11px', cursor: 'pointer',
             }}
             title="Pick which overrides to push back to the source .prefab.json"
+            data-ui-id="inspector.prefab.apply" data-ui-kind="button" data-ui-label="apply to prefab"
           >
             Apply to Prefab…
           </button>
@@ -1359,6 +1360,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
               border: '1px solid #4a3a3a', borderRadius: 3, fontSize: '11px', cursor: 'pointer',
             }}
             title="Pick which overrides to reset back to the prefab base on this instance"
+            data-ui-id="inspector.prefab.revert" data-ui-kind="button" data-ui-label="revert overrides"
           >
             Revert Overrides…
           </button>
@@ -1786,9 +1788,10 @@ export default function Inspector() {
         if (meta.category === 'tag' || !data) continue;
         currentTraits[meta.name] = data;
       }
-      // A base ref held as a member token compares against the guid it resolved to (#1352).
+      // A base ref held as a member token compares against the guid it resolved to (#1352). A NESTED instance's base
+      // is its template under the rows enclosing it (#1492): the outer row's value is not this instance's override.
       const root = (piNow?.['rootInstanceId'] as number) || 0;
-      setOverrides(getOverrides(lid, currentTraits, prefab, root ? baseTokenResolver(root) : undefined));
+      setOverrides(getOverrides(lid, currentTraits, root ? instanceBase(root, prefab) : prefab, root ? baseTokenResolver(root) : undefined));
     };
 
     // Capture selection at fetch time; on resolution, only apply the result if

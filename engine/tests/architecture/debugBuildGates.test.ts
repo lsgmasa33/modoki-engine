@@ -42,7 +42,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../
 /** The markers that must appear iff `build.debugBuild` is true. Each is `[label, file, needle]`
  *  relative to the project root — one per surface #112 unified, so a surface that silently stops
  *  following the flag names itself in the failure. */
-const NATIVE_MARKERS: Array<{ label: string; file: string; needle: string }> = [
+const NATIVE_MARKERS: Array<{ label: string; file: string; needle: string; appliesTo?: (text: string) => boolean }> = [
   { label: 'iOS plugin registration', file: 'ios/App/App/MyViewController.swift', needle: 'registerPluginInstance(gameDebugPlugin)' },
   { label: 'iOS Local Network plist key', file: 'ios/App/App/Info.plist', needle: 'NSLocalNetworkUsageDescription' },
   { label: 'iOS Bonjour plist key', file: 'ios/App/App/Info.plist', needle: 'NSBonjourServices' },
@@ -54,6 +54,13 @@ const NATIVE_MARKERS: Array<{ label: string; file: string; needle: string }> = [
   { label: 'iOS archive warning phase', file: 'ios/App/App.xcodeproj/project.pbxproj', needle: "Warn: Modoki 'Debug build' is ON" },
   { label: 'Android debug-build meta-data', file: 'android/app/src/main/AndroidManifest.xml', needle: 'com.modokiengine.gamedebug.DEBUG_BUILD" android:value="true"' },
   { label: 'Android release-build warning', file: 'android/app/build.gradle', needle: 'modoki:debug-build-warning-begin' },
+  // #1521 — the plugin itself, not just its registration: a store build carries no native debug
+  // bridge. The class leaves the iOS App target, and the package leaves the list `cap sync` builds
+  // the Android graph from.
+  { label: 'iOS GameDebugPlugin.swift compiled into the App target', file: 'ios/App/App.xcodeproj/project.pbxproj', needle: 'GameDebugPlugin.swift in Sources' },
+  // Only where the project HAS an allowlist. Without one Capacitor links every dependency and the
+  // heal reports rather than rewrites (it will not freeze a project's plugin set for it).
+  { label: 'Android plugin allowlist entry', file: 'capacitor.config.json', needle: '"capacitor-game-debug"', appliesTo: (t) => t.includes('"includePlugins"') },
 ];
 
 /** The retired `CONFIGURATION == Release` gate. It must not come back in ANY project — it is the
@@ -116,6 +123,7 @@ describe('build.debugBuild is the single gate — committed native projects (#11
       for (const m of NATIVE_MARKERS) {
         const text = readIf(p.dir, m.file);
         if (text === undefined) continue; // that platform isn't scaffolded for this project
+        if (m.appliesTo && !m.appliesTo(text)) continue;
         const present = text.includes(m.needle);
         if (present !== p.debugBuild) {
           wrong.push(`${p.id} (debugBuild: ${p.debugBuild}) — ${m.label} is ${present ? 'PRESENT' : 'ABSENT'} in ${m.file}`);
@@ -130,6 +138,34 @@ describe('build.debugBuild is the single gate — committed native projects (#11
         + 'healNativeConfig(projectRoot) directly.'
       : '',
     ).toEqual([]);
+  });
+
+  // #1521 — the GENERATED Android graph, which the synthetic sweep below cannot reach (it needs a
+  // real `cap sync`). The allowlist marker above is the intent; these files are what gradle builds.
+  // A flag flipped without a sync leaves them stale, and a release built from them would carry the
+  // plugin whatever the config says. (The Build menu syncs before compiling; a hand gradle run does not.)
+  it.skipIf(!hasNativeProjects())('the generated Android plugin graph matches the project\'s own flag (#1521)', () => {
+    const wrong: string[] = [];
+    for (const p of projects) {
+      // Flag OFF with no allowlist: Capacitor links every dependency and has no exclude list, so no
+      // sync can clear this. The heal only reports it; in this repo it is a red gate (#1521 review).
+      const cap = readIf(p.dir, 'capacitor.config.json');
+      if (!p.debugBuild && cap !== undefined && !cap.includes('"includePlugins"')) {
+        wrong.push(`${p.id} (debugBuild: false) — capacitor.config.json has no includePlugins, so cap sync links every `
+          + 'dependency and capacitor-game-debug ships. Add an includePlugins list.');
+        continue;
+      }
+      for (const file of ['android/capacitor.settings.gradle', 'android/app/capacitor.build.gradle']) {
+        const text = readIf(p.dir, file);
+        if (text === undefined) continue;
+        const present = text.includes('capacitor-game-debug');
+        if (present !== p.debugBuild) wrong.push(`${p.id} (debugBuild: ${p.debugBuild}) — capacitor-game-debug is ${present ? 'PRESENT' : 'ABSENT'} in ${file}`);
+      }
+    }
+    expect(wrong, wrong.length
+      ? 'The committed Android plugin graph disagrees with build.debugBuild:\n  ' + wrong.join('\n  ')
+        + '\n\nFix: `npx cap update android` in that project (after the heal has run).'
+      : '').toEqual([]);
   });
 
   it.skipIf(!hasNativeProjects())('no project has resurrected a build-configuration gate', () => {
@@ -193,6 +229,10 @@ describe('build.debugBuild OFF strips every native debug surface (#112)', () => 
       '/* End PBXSourcesBuildPhase section */',
       '\t};', '}', '',
     ].join('\n'));
+
+    // An allowlist WITHOUT the plugin: the flag-ON control proves the heal adds it.
+    fs.writeFileSync(path.join(dir, 'capacitor.config.json'),
+      JSON.stringify({ includePlugins: ['@capacitor/app'] }, null, 2) + '\n');
 
     fs.mkdirSync(path.join(dir, 'android', 'app', 'src', 'main'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'android', 'app', 'build.gradle'), "apply plugin: 'com.android.application'\n");

@@ -15,10 +15,14 @@
  *  dependency on the journal being enabled. */
 
 import { notifyListeners } from '../core/notifyListeners';
+import { createTeardownToken } from '../core/liveness';
 import { getAudioContext, hasAudioSupport } from './audioContext';
 import { audioAssetProvider } from './audioAssetProvider';
 import { hasDocKey } from '../core/docKeys';
 import { warnVocabOnce } from '../core/warnVocab';
+import {
+  recordAudioHealth, type AudioStreamHealth, type AudioResumeOutcome, type AudioKickReason,
+} from './audioHealth';
 function retryFailedAudioDecodes() { audioAssetProvider.get()?.retryFailedAudioDecodes(); }
 
 /** The mixer's buses — the ONE list. Enum pickers spread it rather than typing the four names out
@@ -188,6 +192,8 @@ interface Graph {
 let graph: Graph | null = null;
 const active = new Set<LiveHandle>();
 let muted = false; // persists across graph (re)creation
+/** A fullscreen ad is up and holds the audio (#1455) — see `holdForFullscreenAd`. */
+let adHold = false;
 const statechangeWired = new WeakSet<AudioContext>();
 
 function graphOrNull(): Graph | null {
@@ -220,6 +226,10 @@ function graphOrNull(): Graph | null {
       // Never while hidden: a context that comes back to `running` in the background must not
       // start a bed the OS paused there. The foreground re-arm covers the return.
       const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      // Traced on EVERY edge, including the ones this handler ignores. A context dropping to
+      // `interrupted` is half the story of a lost bed, and an entry only on the `running` edge
+      // would record the recoveries and none of the losses.
+      recordAudioHealth({ kind: 'statechange', state: ctx.state, ctxTime: ctx.currentTime, streams: snapshotStreams() });
       if (ctx.state === 'running' && !hidden) resumeActiveMedia();
     });
   }
@@ -348,24 +358,119 @@ export function resume(): void {
   notifyListeners(gestureUnlockListeners, 'audioService:gestureUnlock', []); // a subsystem's retry must not break the unlock
   if (recording()) { log.push({ op: 'resume' }); return; }
   const g = graphOrNull();
+  // Read BEFORE the attempt — `ctx.state` mutates under the resume, so a state read afterwards
+  // cannot say what the OS had left behind, which is the fact the trace exists to keep.
+  const before: string = g ? g.ctx.state : 'no-context';
+  // An ad holds the audio: a tap, or the foreground edge iOS fires as the ad's view comes and goes,
+  // must not bring our audio back up underneath it. The release resumes.
+  if (adHold) { traceResume(g?.ctx, before, 'skipped-held'); return; }
   // ⚠️ "Not running", NOT "=== 'suspended'" (#1428). WebKit has a fourth, non-standard state,
   // `'interrupted'` — what backgrounding, screen lock, a call or Siri leave the context in on
   // current iOS. The old equality skipped exactly that case, so every foreground re-arm and every
   // tap was a no-op for it, and music stayed dead whenever WebKit did not happen to auto-resume
   // the context itself (it does so inconsistently — WebKit bug 263627).
   if (g && needsResume(g.ctx)) {
+    const ctx = g.ctx;
     // Retry buffer decodes ONLY after the context is running — iOS rejects
     // decodeAudioData while suspended (the scene-load decodes failed there).
-    g.ctx.resume().then(() => {
+    ctx.resume().then(() => {
+      traceResume(ctx, before, 'resolved');
       retryFailedAudioDecodes();
       // A stream re-kicked below, while the context was still interrupted, MAY be refused or
       // re-paused by WebKit (modelled, not observed on a device); kick again once it is running.
       resumeActiveMedia();
-    }).catch(() => { /* ignore — a later gesture retries */ });
+    }).catch((err: unknown) => {
+      // ⚠️ Recorded AND logged, where it used to be swallowed entirely. A rejected resume is the
+      // one outcome that leaves the app silent with nothing of ours having noticed, and the bare
+      // `catch {}` here is why #1455 could not be diagnosed from a report. A later gesture still
+      // retries — this does not change the recovery, only whether it is visible.
+      // Warn only when the trace actually recorded — otherwise a context that refuses every
+      // attempt writes a console line on every tap, for the life of the session.
+      if (traceResume(ctx, before, 'rejected')) {
+        console.warn('[audio] resume() rejected — the context stays', ctx.state, err);
+      }
+    });
   } else {
+    traceResume(g?.ctx, before, !g ? 'no-graph' : before === 'closed' ? 'skipped-closed' : 'skipped-running');
     retryFailedAudioDecodes();
   }
   resumeActiveMedia();
+}
+
+/** Snapshot every live STREAM's liveness. Buffer voices report `null` and are dropped — they have
+ *  no playhead to read back, and a streamed bed is what these failures are about. */
+function snapshotStreams(): AudioStreamHealth[] {
+  const out: AudioStreamHealth[] = [];
+  for (const h of active) {
+    const s = h.streamHealth();
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+/** ⚠️ **`collapseRepeat`, and it is load-bearing.** `resume()` runs on EVERY `pointerdown`, so a
+ *  healthy app writes `skipped-running` on every tap — 32 taps would evict every `foreground` and
+ *  `statechange` entry from the ring, leaving a trace that records only that the player was
+ *  tapping. A stuck context refusing every attempt does the same with `rejected`, plus a console
+ *  line each time. Collapsing a run of identical outcomes keeps the TRANSITIONS, which is all this
+ *  is for, and costs nothing when outcomes alternate.
+ *
+ *  Returns whether an entry was actually written, so the caller's log line collapses with it. */
+function traceResume(ctx: AudioContext | undefined, before: string, outcome: AudioResumeOutcome): boolean {
+  return recordAudioHealth({
+    kind: 'resume', state: before, stateAfter: ctx?.state, outcome,
+    ctxTime: ctx?.currentTime, streams: snapshotStreams(),
+  }, { collapseRepeat: true });
+}
+
+/** Record that the app has come back to the foreground, after `backgroundedMs` away (`null` when
+ *  no preceding hide was seen — a boot-time or gesture-driven foreground).
+ *
+ *  ⚠️ Call this BEFORE `resume()`, not after: the whole value of the entry is `ctx.state` as the OS
+ *  left it. Called after the recovery it would read `running` every time and say nothing.
+ *
+ *  The duration is the app layer's to measure — `runtime/**` sees no foreground event — so it is a
+ *  parameter rather than something this module tracks. `engine/app/useAudioResumeRearm.ts` is the
+ *  caller; it is also what dedupes the two events iOS fires for one transition, and
+ *  `tests/app/audioResumeRearm.test.tsx` pins that. */
+export function noteForeground(backgroundedMs: number | null): void {
+  if (recording()) return;
+  const ctx = graphOrNull()?.ctx;
+  recordAudioHealth({
+    kind: 'foreground', state: ctx ? ctx.state : 'no-context',
+    backgroundedMs, ctxTime: ctx?.currentTime, streams: snapshotStreams(),
+  });
+  // The foreground half of the #1455 detection: the caller's `resume()` follows this call, and the
+  // check samples after it settles. Only for a context that was RUNNING when the app hid — a
+  // never-unlocked one would read as dead — and never under an ad, whose release owns its check.
+  const wasRunning = runningAtHide;
+  runningAtHide = false;
+  if (ctx && wasRunning && !adHold) {
+    cancelClockCheck();
+    scheduleClockCheck(ctx, false, 'foreground');
+  }
+}
+
+/** Record that the app is going to the background — the other half of `noteForeground`. Called by
+ *  the app shell on the FIRST hide of a transition. Traced, so a foreground that ran no check can be
+ *  told apart from one whose check found nothing (#1455 re-review 3). */
+export function noteBackground(): void {
+  if (recording()) return;
+  const ctx = graph?.ctx;
+  runningAtHide = !adHold && ctx?.state === 'running';
+  recordAudioHealth({ kind: 'background', state: ctx ? ctx.state : 'no-context', ctxTime: ctx?.currentTime, streams: snapshotStreams() });
+}
+
+/** Is the audio STILL dead — `running` with a clock that does not advance across `windowMs`? The
+ *  dead-audio reload asks this right before reloading: while it waited out a reload blocker the
+ *  audio may have recovered on its own (a lock/wake, WebKit's auto-resume). */
+export function isAudioStillDead(windowMs: number = CLOCK_WINDOW_MS): Promise<boolean> {
+  const ctx = graph?.ctx;
+  if (!ctx || ctx.state !== 'running') return Promise.resolve(false);
+  const t0 = ctx.currentTime;
+  return new Promise((resolve) => {
+    setTimeout(() => resolve(ctx.state === 'running' && ctx.currentTime - t0 < CLOCK_FROZEN_EPSILON_S), windowMs);
+  });
 }
 
 /** Whether the context needs a `resume()` — anything but running or closed. Typed as a string
@@ -376,7 +481,181 @@ function needsResume(ctx: AudioContext): boolean {
 }
 
 function resumeActiveMedia(): void {
+  if (adHold) return;
   for (const h of active) h.resumeMedia();
+}
+
+/** How long after a release to let the resume settle before the first clock sample, and how long
+ *  the sample window is. Mechanism, not feel: long enough that a running clock visibly moves. */
+const CLOCK_SETTLE_MS = 300;
+const CLOCK_WINDOW_MS = 700;
+/** Below this many seconds advanced across the window, the clock counts as frozen. */
+const CLOCK_FROZEN_EPSILON_S = 0.05;
+let clockCheckTimer: ReturnType<typeof setTimeout> | null = null;
+/** Invalidated by every cancel: a retry's promise chain settling later must not schedule into a
+ *  newer check, or after a dispose (#1455 review — its `finally` used to overwrite the live timer). */
+const clockCheckLife = createTeardownToken();
+/** The hold's own `suspend()`. ⚠️ `ctx.state` does not read `suspended` until it SETTLES, so a
+ *  release landing first (an SDK refusing the show within a bridge round-trip) saw `running`,
+ *  skipped the resume — and then the suspend landed, leaving the audio off with nothing traced
+ *  (#1455 review, reproduced against the fake). The release chains its resume after this. */
+let holdSuspend: Promise<void> | null = null;
+/** Was the context RUNNING when the ad took it? Only then is a non-advancing clock after the
+ *  release evidence of the #1455 freeze; a context that was never unlocked (an app-open ad before
+ *  the first tap) or already interrupted would read as the freeze and warn falsely (#1455 re-review). */
+let heldWhileRunning = false;
+/** A release's resume is still settling (set by the release, cleared at the check's first sample).
+ *  A back-to-back ad holding in that window reads `suspended` and would skip its check (#1455
+ *  re-review 2) — it counts as running. */
+let releaseResumeInFlight = false;
+/** Was the context running when the app went to the background? Only then is a frozen clock after
+ *  the foreground the #1455 death rather than a context that was never unlocked. */
+let runningAtHide = false;
+
+/** Is a fullscreen ad holding the audio right now? The cue bus drops one-shots while it is. */
+export function isAudioHeldForAd(): boolean { return adHold; }
+
+/** What the clock check was checking after. */
+export type AudioClockCheckAfter = 'ad' | 'foreground';
+
+const audioDeadListeners = new Set<(after: AudioClockCheckAfter) => void>();
+
+/**
+ * Hear the engine declare the page's audio DEAD (#1455): after an ad or a foreground, the context's
+ * clock did not advance, and still did not after one suspend→resume retry.
+ *
+ * Measured on the iPhone Air (2026-09-23, Apple Music took the session while the game was away):
+ * in that state NOTHING in the page recovers it — not a resume, not a fresh `AudioContext`, not
+ * either of those inside a real user gesture. A page RELOAD does, and so does a screen lock/wake.
+ * The app shell's `useDeadAudioReload` turns this into a reload for projects that opt in
+ * (`runtime.reloadOnDeadAudio`). Returns the unsubscribe.
+ */
+export function onAudioDead(fn: (after: AudioClockCheckAfter) => void): () => void {
+  audioDeadListeners.add(fn);
+  return () => { audioDeadListeners.delete(fn); };
+}
+
+function cancelClockCheck(): void {
+  if (clockCheckTimer !== null) clearTimeout(clockCheckTimer);
+  clockCheckTimer = null;
+  clockCheckLife.invalidateAll();
+}
+
+/**
+ * A fullscreen ad went up (`true`) or came down (`false`) — wired from the ad lifecycle by the app
+ * shell (`engine/app/useAudioResumeRearm.ts`, via `onFullscreenAdChange`).
+ *
+ * **Why (#1455):** the engine used to do nothing here, so our music played under every ad, and on
+ * the iPhone Air an interstitial left the context reporting `running` with its clock frozen — all
+ * audio gone for the rest of the realm. Google's guidance for an app with its own audio is to pause
+ * it for the ad and resume after. So:
+ *  - **hold:** pause every stream where it is (the bed resumes from the same place, not silently
+ *    running on under the ad) and suspend the context. While held, `resume()` and every media
+ *    re-kick stand down — the taps and foreground edges the ad's view causes must not undo it.
+ *  - **release:** `resume()` as usual, then CHECK THE CLOCK. A context can claim `running` and not
+ *    render, which no state check sees; a frozen clock gets one suspend→resume retry, and both
+ *    samples go in the health trace. ⚠️ Whether that retry revives a dead device is UNKNOWN
+ *    (on the Air a plain resume did not) — the check's job is first to make the failure visible.
+ */
+export function holdForFullscreenAd(held: boolean): void {
+  if (held === adHold) return;
+  adHold = held;
+  if (recording()) return;
+  cancelClockCheck();
+  const ctx = graph?.ctx;
+  recordAudioHealth({
+    kind: held ? 'ad-hold' : 'ad-release', state: ctx ? ctx.state : 'no-context',
+    ctxTime: ctx?.currentTime, streams: snapshotStreams(),
+  });
+  if (held) {
+    for (const h of active) h.holdMedia();
+    heldWhileRunning = (!!ctx && ctx.state === 'running') || releaseResumeInFlight;
+    releaseResumeInFlight = false;
+    // No graph yet = nothing playing; do not create a context just to suspend it.
+    // ⚠️ Suspend whenever the context is not CLOSED — not only when it reads `running`. A resume
+    // still in flight (a tap's, or the previous ad's release) reads `suspended`/`interrupted` until
+    // it settles, and skipping the suspend then let it land under THIS ad (#1455 re-review). A
+    // suspend queued behind a pending resume is ordered after it.
+    if (ctx && ctx.state !== 'closed') {
+      const p = ctx.suspend().catch((e: unknown) => console.warn('[audio] suspend for a fullscreen ad failed:', e));
+      holdSuspend = p;
+      // Once it has landed there is nothing to wait for: a release after that resumes at once, and
+      // a dispose in the same tick cannot swallow it (#1455 re-review 2).
+      void p.then(() => { if (holdSuspend === p) holdSuspend = null; });
+    }
+    return;
+  }
+  const pendingSuspend = holdSuspend;
+  holdSuspend = null;
+  const check = heldWhileRunning && ctx ? ctx : null;
+  const afterRelease = () => {
+    resume();
+    // Started AFTER the resume, so a slow hold-suspend cannot eat the sample window.
+    if (check) {
+      releaseResumeInFlight = true;
+      scheduleClockCheck(check, false, 'ad');
+    }
+  };
+  if (pendingSuspend) {
+    // Resume only once our own suspend has landed — see `holdSuspend`. A new hold, or a dispose,
+    // in between wins (both invalidate the token).
+    const live = clockCheckLife.capture();
+    void pendingSuspend.then(() => {
+      if (adHold || !live()) return;
+      afterRelease();
+    });
+  } else {
+    afterRelease();
+  }
+}
+
+function scheduleClockCheck(ctx: AudioContext, retried: boolean, after: AudioClockCheckAfter): void {
+  const alive = clockCheckLife.capture();
+  clockCheckTimer = setTimeout(() => {
+    releaseResumeInFlight = false;
+    const t0 = ctx.currentTime;
+    clockCheckTimer = setTimeout(() => {
+      clockCheckTimer = null;
+      // Hidden = the OS may have paused it legitimately; the foreground re-arm owns that case. A
+      // new hold cancelled this timer already.
+      const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      if (adHold || hidden) return;
+      const advanced = ctx.currentTime - t0;
+      // Recorded in EVERY visible state, not only `running`: a release whose resume was rejected
+      // ("Failed to start the audio device") leaves the context `suspended`, and that is the same
+      // dead-after-an-ad failure wearing another state.
+      recordAudioHealth({
+        kind: 'clock-check', state: ctx.state, ctxTime: ctx.currentTime, advanced, retried, after,
+        streams: snapshotStreams(),
+      });
+      if (ctx.state === 'running' && advanced >= CLOCK_FROZEN_EPSILON_S) return;
+      console.warn(`[audio] audio clock not advancing after ${after === 'ad' ? 'an ad' : 'a foreground'} (state ${ctx.state})${retried ? ', after a retry' : ''}`);
+      if (retried) {
+        // DEAD only in the MEASURED signature: `running` with a frozen clock. A context still
+        // `interrupted`/`suspended` after the retry may be held by a live call, Siri or an alarm —
+        // a reload cannot help that, and the next tap or WebKit's own auto-resume will (#1428) —
+        // so it stays a trace entry and nothing else (#1455 re-review 3).
+        if (ctx.state === 'running') {
+          recordAudioHealth({ kind: 'audio-dead', state: ctx.state, ctxTime: ctx.currentTime, after, streams: snapshotStreams() });
+          notifyListeners(audioDeadListeners, 'audioService:audioDead', [after]);
+        }
+        return;
+      }
+      const live = () => !adHold && alive();
+      (ctx.state === 'running' ? ctx.suspend() : Promise.resolve())
+        // Never bring the context up under a NEW ad that arrived mid-retry.
+        .then(() => (live() ? ctx.resume() : undefined))
+        .then(() => { if (live()) resumeActiveMedia(); })
+        .catch((e: unknown) => console.warn('[audio] resume retry after a frozen clock failed:', e))
+        .finally(() => { if (live()) scheduleClockCheck(ctx, true, after); });
+    }, CLOCK_WINDOW_MS);
+  }, CLOCK_SETTLE_MS);
+}
+
+/** A copy of every bus's last-set volume (0..1). Read by the editor's preview envelope, which puts
+ *  back what a ▶ preview's `audio.setBusVolume` changed (#1551). */
+export function getBusVolumes(): Record<BusName, number> {
+  return { ...busVolumes };
 }
 
 /** Set a bus's volume. Returns whether the bus was ACCEPTED — `false` means nothing was written,
@@ -484,12 +763,22 @@ export function stopAll(): void {
 /** Tear down the whole graph (app unmount / error recovery). */
 export function dispose(): void {
   stopAll();
+  cancelClockCheck();
+  // Per-graph detection state: a release + dispose in one tick (realm shutdown) must not leave a
+  // stale flag that makes the NEXT ad check a never-running context (#1455 re-review 3). `adHold`
+  // stays — it mirrors the ad lifecycle, not this graph.
+  releaseResumeInFlight = false;
+  runningAtHide = false;
+  heldWhileRunning = false;
   graph = null;
 }
 
 class LiveHandle implements AudioHandle {
   ended = false;
   private deliberatelyPaused = false;
+  /** Whether this source's last play attempt was refused — so a wedged bed records ONE trace entry
+   *  per episode rather than one per tap. Cleared by the first success. */
+  private playRefused = false;
   /** `ctx.currentTime` when a BUFFER source started — a buffer node exposes no playhead,
    *  so its remaining time is derived from the audio clock rather than read back. */
   private bufStartedAt = 0;
@@ -543,7 +832,14 @@ class LiveHandle implements AudioHandle {
       const src = ctx.createMediaElementSource(el);
       src.connect(this.gain);
       el.onended = () => { if (!spec.loop) this.cleanup(); };
-      el.play().catch(() => { /* gesture-gated; resume() will unlock */ });
+      // ⚠️ Deliberately NOT routed through `kick()` — this one refusal is ROUTINE, not a symptom.
+      // On iOS every bed start before the first gesture is refused by the autoplay policy, and a
+      // shuffle playlist mints a fresh handle per clip, so tracing it would write an entry every
+      // few minutes forever and evict the foreground entries the trace exists for. The re-kick
+      // that follows IS traced, and that is the one that means something.
+      // Under a fullscreen ad the element is left paused (not deliberately), and the release's
+      // re-kick starts it from the top — it must not run on under the ad (#1455 review).
+      if (!adHold) el.play().catch(() => { /* gesture-gated; resume() will unlock */ });
       this.mediaEl = el;
       this.mediaSrc = src;
     } else {
@@ -629,16 +925,70 @@ class LiveHandle implements AudioHandle {
     if (this.ended || !this.deliberatelyPaused) return;
     this.deliberatelyPaused = false;
     // Buffer gain is restored by the reconcile's setVolume on the same frame.
-    if (this.mediaEl) this.mediaEl.play().catch(() => { /* gesture-gated; resumeMedia retries */ });
+    if (this.mediaEl) this.kick('unpause');
+  }
+
+  /** Play the element, and RECORD a refusal instead of swallowing it (#1455 close-out sweep).
+   *
+   *  A refused `play()` is the other half of a lost bed: the context can come back `running` while
+   *  the element stays silent, and a context-only trace cannot tell that apart from a healthy
+   *  recovery. The rejection still does not propagate — a later gesture retries, exactly as before.
+   *
+   *  ⚠️ **At most one entry per stuck episode, not one per attempt.** `resumeActiveMedia()` runs on
+   *  every `resume()`, which fires on every pointerdown — so a bed that is wedged would otherwise
+   *  write an entry per tap and evict the foreground entries this trace exists for, from a ring
+   *  that only holds 32. The flag clears on the first success, so a NEW episode records again. */
+  private kick(reason: AudioKickReason): void {
+    const el = this.mediaEl;
+    // Held by an ad: stay paused, NOT deliberately — the release's re-kick picks it up.
+    if (!el || adHold) return;
+    el.play().then(
+      () => { this.playRefused = false; },
+      () => {
+        if (this.playRefused) return;
+        this.playRefused = true;
+        const s = this.streamHealth();
+        recordAudioHealth({
+          kind: 'play-refused', state: this.ctx.state, reason,
+          ctxTime: this.ctx.currentTime, streams: s ? [s] : [],
+        });
+      },
+    );
   }
 
   /** Re-kick a streaming element whose autoplay was gesture-blocked (called from
    *  resume() on the first user gesture). No-op for buffer sources / finished handles. */
+  /** A fullscreen ad took over (#1455): pause a playing stream WITHOUT marking it deliberately
+   *  paused, so the release's re-kick (`resumeMedia`) picks it up from the same place. */
+  holdMedia(): void {
+    if (this.ended || !this.mediaEl || this.mediaEl.paused) return;
+    this.mediaEl.pause();
+  }
+
   resumeMedia(): void {
     // Don't un-pause a source the game deliberately paused — only re-kick one whose
     // autoplay was gesture-blocked.
     if (this.ended || this.deliberatelyPaused || !this.mediaEl || !this.mediaEl.paused) return;
-    this.mediaEl.play().catch(() => { /* still gated — a later gesture retries */ });
+    this.kick('re-kick');
+  }
+
+  /** This voice's liveness for the audio-health trace, or `null` when it has nothing readable to
+   *  report — a buffer source (no playhead to read back) or a finished handle.
+   *
+   *  ⚠️ Reports `deliberatelyPaused` deliberately: without it a bed the GAME paused and a bed the
+   *  OS silently killed are the same two fields, and the whole point of the trace is telling those
+   *  apart after the fact. */
+  streamHealth(): AudioStreamHealth | null {
+    const el = this.mediaEl;
+    if (this.ended || !el) return null;
+    return {
+      paused: el.paused,
+      currentTime: el.currentTime,
+      duration: Number.isFinite(el.duration) ? el.duration : null,
+      readyState: el.readyState,
+      error: el.error ? el.error.code : null,
+      deliberatelyPaused: this.deliberatelyPaused,
+    };
   }
 
   setPosition(x: number, y: number, z: number): void {

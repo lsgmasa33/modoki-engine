@@ -426,81 +426,15 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
   },
 }
 
-/** A resolved tool command that Windows cannot spawn/execFile without a shell: a `.cmd`/`.bat`
- *  batch shim (npm's `.bin/<name>.cmd`, `sdkmanager.bat`, …). Since CVE-2024-27980 (Node ≥18.20)
- *  spawning one WITHOUT `shell:true` throws `spawn EINVAL` on Windows; probing it with a
- *  no-shell `execFileSync` fails the same way (which read as a just-installed tool being "not
- *  found"). Every spawn/execFile of a resolved tool path must pass `{ shell: needsWinShell(cmd) }`.
- *  (Pure/platform-injectable for host-agnostic tests.) */
-export function needsWinShell(command: string, platform: NodeJS.Platform = process.platform): boolean {
-  return platform === 'win32' && /\.(cmd|bat)$/i.test(command)
-}
-
-/** Make a resolved command + args safely spawnable: whether a shell is required (a Windows
- *  `.cmd`/`.bat` shim — see needsWinShell) and, when it is, the command/args QUOTED. Node
- *  concatenates argv into one command line for `shell:true`, so an unquoted path with a space
- *  (`C:\Users\Jane Doe\…\gltf-transform.cmd`, or a project under `My Games\`) is split by the
- *  shell and the spawn fails with a baffling "is not recognized as an internal or external
- *  command". Every spawn/execFile of a toolchain-resolved command should go through this. */
-export function spawnable(
-  command: string,
-  args: string[] = [],
-  platform: NodeJS.Platform = process.platform,
-): { command: string; args: string[]; shell: boolean } {
-  const shell = needsWinShell(command, platform)
-  if (!shell) return { command, args, shell }
-  const q = (s: string) => (/[\s&|<>^()]/.test(s) && !/^".*"$/.test(s) ? `"${s}"` : s)
-  return { command: q(command), args: args.map(q), shell }
-}
-
-/** Resolve a BARE binary name to an absolute path the way a shell would, or null if it isn't on PATH.
- *
- *  This exists because `execFile`/`spawn` WITHOUT a shell do no PATHEXT resolution on Windows: the OS
- *  looks for a file named exactly `npm`, and npm ships `npm.cmd` / `npm.ps1` / a `npm` bash script.
- *  So probing a PATH tool by bare name threw ENOENT and the Build-Support dialog reported a perfectly
- *  installed npm (and toktx, gltfpack, …) as "not found" even with "Use system-installed SDKs" ON.
- *  Resolving here also gives every PATH-found tool an absolute `path`/`dir`, which is what
- *  `withToolOnPath` and the spawn sites need.
- *
- *  Windows tries only the PATHEXT extensions (never the extension-less file — that's the bash shim,
- *  which Windows cannot run); POSIX requires the execute bit. Pure/injectable for host-agnostic tests. */
-export function whichSync(
-  bin: string,
-  opts: {
-    platform?: NodeJS.Platform
-    pathEnv?: string
-    pathExt?: string
-  } = {},
-): string | null {
-  const platform = opts.platform ?? process.platform
-  const win = platform === 'win32'
-  const pathEnv = opts.pathEnv ?? process.env.PATH ?? ''
-  // PATHEXT is conventionally UPPER-CASE (".COM;.EXE;…"); lower-case it so a resolved path reads
-  // `npm.cmd`, not `npm.CMD`, in the Build-Support UI and logs. Windows paths are case-insensitive,
-  // so this never changes what resolves.
-  const exts = win
-    ? (opts.pathExt ?? process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map((e) => e.toLowerCase())
-    : ['']
-  const runnable = (p: string): boolean => {
-    try {
-      if (!fs.statSync(p).isFile()) return false
-      if (!win) fs.accessSync(p, fs.constants.X_OK)
-      return true
-    } catch {
-      return false
-    }
-  }
-  for (const dir of pathEnv.split(win ? ';' : ':')) {
-    if (!dir) continue
-    // Strip the quotes Windows PATH entries sometimes carry ("C:\Program Files\x";…).
-    const base = path.join(dir.replace(/^"|"$/g, ''), bin)
-    for (const ext of exts) {
-      const cand = base + ext
-      if (runnable(cand)) return cand
-    }
-  }
-  return null
-}
+/** How every spawn/execFile of a toolchain-resolved command is made (#1537): `toSpawn(cmd, args)`
+ *  → `{command, args, options}`, spread `options` into the spawn call. A Windows `.cmd`/`.bat` shim
+ *  (npm's `.bin/<name>.cmd`, `sdkmanager.bat`, …) cannot spawn without a shell (`spawn EINVAL`
+ *  since CVE-2024-27980), and the old `spawnable()` answered that with `shell:true` + quoting —
+ *  which left `%VAR%` in a path live, because cmd expands it inside quotes. `toSpawn` runs cmd.exe
+ *  itself with an escaped, verbatim command line instead. Lives in a `.mjs` so the scripts share
+ *  the one copy. */
+export { needsWinShell, toSpawn, whichSync } from '../scripts/winSpawn.mjs'
+import { toSpawn, whichSync } from '../scripts/winSpawn.mjs'
 
 /** A candidate command → the absolute path to spawn, or null when it can't be found. A candidate that
  *  already carries a directory is taken as-is (the caller built it); a BARE name is resolved on PATH. */
@@ -691,7 +625,7 @@ const cache = new Map<ToolId, DetectResult>()
 function probeVersion(cmd: string, versionArgs: string[], env?: NodeJS.ProcessEnv): string | null {
   // A `.cmd`/`.bat` shim (npm .bin on Windows, sdkmanager.bat) needs a shell or execFile throws
   // EINVAL — which otherwise reads as a just-installed tool being "not found" in Build Support.
-  const { command, args, shell } = spawnable(cmd, versionArgs)
+  const s = toSpawn(cmd, versionArgs)
   // spawnSync (not execFileSync), reading BOTH streams: several CLIs print their version banner to
   // STDERR and exit 0 — `java -version` is the well-known one (see javaMajorMatches), and toktx does
   // the same (confirmed live: `toktx --version` writes "toktx v4.4.2" to stderr, empty stdout).
@@ -699,7 +633,7 @@ function probeVersion(cmd: string, versionArgs: string[], env?: NodeJS.ProcessEn
   // functionally fine (KTX2 encoding doesn't go through this probe), but Build Support could never
   // show its version. Concatenating both, stdout first, fixes toktx without changing any tool that
   // already prints to stdout (nothing here has meaningful content on BOTH streams at once).
-  const r = spawnSync(command, args, { stdio: ['ignore', 'pipe', 'pipe'], shell, encoding: 'utf8', ...(env ? { env } : {}) })
+  const r = spawnSync(s.command, s.args, { ...s.options, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', ...(env ? { env } : {}) })
   if (r.error || r.status !== 0) return null
   return `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()
 }
@@ -926,8 +860,6 @@ export interface SpawnSpec {
   command: string
   /** Args prepended before the caller's args (e.g. [npm-cli.js] when running npm on bundled node). */
   prefixArgs: string[]
-  /** Whether to spawn through a shell (npm is a `.cmd` on Windows). */
-  shell: boolean
   /** Environment for the child (base process.env in C1; gains the bundled-node dir on PATH later). */
   env: NodeJS.ProcessEnv
 }
@@ -947,19 +879,23 @@ export function npmSpawnSpec(): SpawnSpec {
     return {
       command: nodeBin,
       prefixArgs: [npmCli],
-      shell: false,
       env: { ...process.env, PATH: `${path.dirname(nodeBin)}${sep}${process.env.PATH ?? ''}` },
     }
   }
   const d = detect('npm')
-  // detect resolves a PATH npm to its absolute shim (npm.cmd on Windows) — `spawnable` decides
-  // whether that needs a shell and quotes it, so a Program Files path survives the shell.
-  if (d.command) {
-    const { command, shell } = spawnable(d.command)
-    return { command, prefixArgs: [], shell, env: process.env }
-  }
-  // Last resort: a bare `npm`, which on Windows needs a shell for PATHEXT to find npm.cmd.
-  return { command: 'npm', prefixArgs: [], shell: process.platform === 'win32', env: process.env }
+  // detect resolves a PATH npm to its absolute shim (npm.cmd on Windows). The spec stays RAW —
+  // callers run it through `spawnSpecCall`, which is where a `.cmd` gets its cmd.exe line.
+  if (d.command) return { command: d.command, prefixArgs: [], env: process.env }
+  // Last resort: a bare `npm`. There is deliberately no `shell:true` PATHEXT lookup any more
+  // (#1537): detect() already searched PATH the way that shell would, so a miss here fails as a
+  // plain ENOENT naming `npm` rather than a different, shell-parsed command succeeding.
+  return { command: 'npm', prefixArgs: [], env: process.env }
+}
+
+/** A `SpawnSpec` + the caller's args → the no-shell spawn to make (`toSpawn` over the spec's full
+ *  argv). Spread `options` and pass `env: spec.env` yourself. */
+export function spawnSpecCall(spec: SpawnSpec, args: string[]): ReturnType<typeof toSpawn> {
+  return toSpawn(spec.command, [...spec.prefixArgs, ...args])
 }
 
 /** How to invoke a model CLI as `{command, prefixArgs}` — callers append the tool's own args. Prefers
@@ -1373,7 +1309,8 @@ export function isInstallable(id: ToolId): boolean {
 const runStreaming: WdaCommandRunner = (command, args, o) =>
   new Promise<void>((resolve, reject) => {
     const log = o.onLog ?? (() => {})
-    const p = spawn(command, args, { cwd: o.cwd, env: o.env ?? process.env, shell: o.shell ?? false })
+    const s = toSpawn(command, args)
+    const p = spawn(s.command, s.args, { ...s.options, cwd: o.cwd, env: o.env ?? process.env })
     p.stdout?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
     p.stderr?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
     p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`${command} exited with code ${code}`))))
@@ -1710,7 +1647,8 @@ export async function uninstall(id: ToolId, opts: { toolchainDir: string; onLog?
       const spec = npmSpawnSpec()
       log(`Removing ${pkg}…`)
       await new Promise<void>((resolve) => {
-        const p = spawn(spec.command, [...spec.prefixArgs, 'uninstall', pkg, '--no-audit', '--no-fund'], { cwd: dir, shell: spec.shell, env: spec.env })
+        const s = spawnSpecCall(spec, ['uninstall', pkg, '--no-audit', '--no-fund'])
+        const p = spawn(s.command, s.args, { ...s.options, cwd: dir, env: spec.env })
         p.stdout?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
         p.stderr?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
         p.on('close', () => resolve())
@@ -1802,7 +1740,8 @@ async function npmToolsInstall(toolchainDir: string, specPkg: string, log: (line
   const spec = npmSpawnSpec()
   log(`Installing ${specPkg}…`)
   await new Promise<void>((resolve, reject) => {
-    const p = spawn(spec.command, [...spec.prefixArgs, 'install', specPkg, '--no-audit', '--no-fund'], { cwd: dir, shell: spec.shell, env: spec.env })
+    const s = spawnSpecCall(spec, ['install', specPkg, '--no-audit', '--no-fund'])
+    const p = spawn(s.command, s.args, { ...s.options, cwd: dir, env: spec.env })
     p.stdout?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
     p.stderr?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
     p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`npm install ${specPkg} exited with code ${code}`))))

@@ -15,7 +15,7 @@
 
 import { app, BrowserWindow, autoUpdater as nativeAutoUpdater } from 'electron';
 import { showMessageBox, resolveDialogParent } from './mainDialog';
-import { execSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 // electron-updater ships CJS with a default export carrying the singleton.
 import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
@@ -363,7 +363,7 @@ let adhocCache: boolean | undefined;
  *  requirement(s)"), so a check can only ever end in a dead-end "downloaded — restart
  *  to install" prompt that then fails to install. Detect the ad-hoc signature and skip
  *  auto-update entirely for such builds. codesign prints the signature info to stderr,
- *  so redirect it into the captured output. Any failure (codesign missing, unexpected
+ *  so both streams are read. argv, no shell (#1537): the app's own path can hold a `$`. Any failure (codesign missing, unexpected
  *  output) returns false → a real signed production build still updates normally.
  *  Skipped under the test harness (VITEST): the probe would run codesign on the
  *  ad-hoc-signed node binary — isAdhocSignature is unit-tested directly instead. */
@@ -371,7 +371,8 @@ function isUnsignedMacBuild(): boolean {
   if (process.platform !== 'darwin' || process.env.VITEST) return false;
   if (adhocCache !== undefined) return adhocCache;
   try {
-    adhocCache = isAdhocSignature(execSync(`codesign -dvv "${process.execPath}" 2>&1`, { encoding: 'utf8' }));
+    const r = spawnSync('codesign', ['-dvv', process.execPath], { encoding: 'utf8' });
+    adhocCache = !r.error && r.status === 0 && isAdhocSignature(`${r.stdout}${r.stderr}`);
   } catch {
     adhocCache = false; // can't tell → don't block production updates
   }

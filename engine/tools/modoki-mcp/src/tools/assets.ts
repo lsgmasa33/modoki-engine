@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { DISCARD_UNSAVED_BASE, displayNameParam, unsavedForceParam } from '../shapes.js';
+import { DISCARD_UNSAVED_BASE, clipTimeParam, displayNameParam, unsavedForceParam } from '../shapes.js';
 
 /** Every type the backend's `getAssetSchema` actually serves. ONE list, because three tools take
  *  it and they had drifted NARROWER than the backend: the enum was material|particle|animation
@@ -66,7 +66,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'NOT what modoki_discard_asset_edits does — that drops the parked disk WRITE and leaves the '
     + 'applied def live.';
 
-  const { getJson, postJson, editorAction } = ctx;
+  const { getJson, postJson, editorAction, fail } = ctx;
 
   // ── Phase C: asset schema introspection + validated authoring ──
   tool(
@@ -103,7 +103,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'need, write the WHOLE object back. ' +
       'Always writes the file directly, regardless of persistence mode (modoki_persistence) — this is ' +
       'an explicit "write this file" tool, not a live-state edit. For a LIVE particle/animation preview ' +
-      'while tuning, prefer modoki_particle_set / modoki_anim_set_clip.',
+      'while tuning, prefer modoki_particle_set / modoki_anim_set_clip / modoki_timeline_set.',
     {
       path: z.string().describe('Asset-root URL of the file to WRITE, e.g. /assets/particles/spark.particle.json. Must already exist — a path that is not on disk is refused NOT_FOUND; use modoki_create_asset for a new one.'),
       type: z.enum(ASSET_TYPES)
@@ -160,15 +160,26 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'not run and the manifest is still catching up via the file watcher; with `trashed:0` nothing was deleted ' +
       '(every path is in `missing`), so there was nothing to rebuild.',
     {
-      paths: z.array(z.string()).min(1)
+      path: z.string().optional().describe('One asset-root URL to trash — the single-file form of `paths`. Not together with `paths`.'),
+      paths: z.array(z.string()).min(1).optional()
         .describe('Asset-root URLs to trash, e.g. ["/games/x/assets/fx/probe.particle.json"]. Trashed in ONE OS call (one trash sound). Include the .meta.json sidecars yourself — nothing expands the list for you.'),
       discardUnsaved: z.boolean().optional().describe(
         `${DISCARD_UNSAVED_BASE}. Here that work is an unsaved asset document, import-settings or `
         + 'base-scene edit for a path being deleted: the editor drops it along with the file.',
       ),
     },
-    async ({ paths, discardUnsaved }) => postJson('/api/delete-asset', { paths, ...(discardUnsaved ? { discardUnsaved: true } : {}) },
-      undefined, `move ${paths.length} asset file(s) to the OS trash`),
+    async ({ path, paths, discardUnsaved }) => {
+      // `path` for one file (#1560: the most-guessed key here, and the word every other asset tool
+      // uses). Exactly one of the two — both, or neither, is refused rather than resolved by precedence.
+      if ((path === undefined) === (paths === undefined)) {
+        return fail({ code: path === undefined ? 'REFUSED_BY_OP' : 'AMBIGUOUS', what: 'delete assets',
+          why: path === undefined ? 'no path given — nothing to delete.' : '`path` and `paths` given together, so which set to trash would be a guess.',
+          expected: '`path` (one file) or `paths` (a list) — exactly one' });
+      }
+      const all = paths ?? [path!];
+      return postJson('/api/delete-asset', { paths: all, ...(discardUnsaved ? { discardUnsaved: true } : {}) },
+        undefined, `move ${all.length} asset file(s) to the OS trash`);
+    },
   );
 
   // ── Phase D: particle / animation first-pass editing (live + persisted) ──
@@ -185,7 +196,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'modoki_pose_clip is the tool that DOES pose the rig — it moves the playhead too, so reach ' +
       'for it whenever you want the world to change. Use this one only to set the keyframe ' +
       'INSERTION POINT without disturbing the live world.',
-    { t: z.number().describe('Playhead time in seconds.') },
+    { t: clipTimeParam() },
     async ({ t }) => editorAction('set-playhead', { t }),
   );
   tool(
@@ -206,7 +217,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_create_registered_asset',
     'Create one of the Assets panel\'s "New X" assets at a path you supply. The agent-reachable ' +
       'half of that surface: the panel\'s own flow opens the native save dialog FIRST — a modal ' +
-      'panel only a human can answer — so the whole "New X" surface was unreachable from here. ' +
+      'panel only a human can answer — so without `path` the whole "New X" surface is unreachable from here. ' +
       'Passing the path routes around it; the human\'s dialog is untouched.\n\n' +
       'DIFFERENT FROM modoki_create_asset, which takes a fixed enum of engine asset types. ' +
       'This drives the live, game-extensible registry — read modoki_list_creatable_assets for what ' +
@@ -229,10 +240,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'panel is not an error you can see here: check modoki_get_editor_state, or ' +
       'modoki_get_console_logs for the hook failure.',
     {
-      kind: z.string().describe('A `kind` id from modoki_list_creatable_assets (e.g. "material", "animation", "sling.level"). An unknown kind is refused with the live list.'),
+      type: z.string().describe('A `kind` id from modoki_list_creatable_assets (e.g. "material", "animation", "sling.level") — `type`, as on modoki_create_asset. An unknown one is refused with the live list.'),
       path: z.string().describe("Asset-root URL for the new file, e.g. /assets/materials/rock.mat.json. The kind's extension is appended if you leave it off, so the manifest cannot classify the file as something other than the kind you asked for."),
     },
-    async ({ kind, path }) => editorAction('create-registered-asset', { kind, path }),
+    async ({ type, path }) => editorAction('create-registered-asset', { kind: type, path }),
   );
   tool(
     'modoki_open_animation_editor',
@@ -257,7 +268,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_pose_clip',
     'Pose the bound rig at a time in the open animation clip — the thing modoki_set_playhead ' +
-      'deliberately does NOT do. This is the human scrub gesture, driven by the same code: it ' +
+      'deliberately does NOT do (to switch a PLAYING entity\'s clip, modoki_play_clip). This is the human scrub gesture, driven by the same code: it ' +
       'moves the playhead AND samples the clip into the live world, so a render or capture taken ' +
       'afterwards shows the posed rig.\n\n' +
       'It poses INSIDE the editor\'s preview envelope, opening one if needed. That matters: the ' +
@@ -276,7 +287,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'VERIFY BY PERTURBING: read a posed trait back (modoki_get_scene_state) at TWO different `t` ' +
       'values and assert they DIFFER. A single read can coincide with the authored value, and then ' +
       'it cannot tell "posed" from "ignored".',
-    { t: z.number().describe('Time in seconds to pose at. Clamped to the clip duration, like the panel does; the reply reports `clampedFrom` when that happened.') },
+    { t: clipTimeParam('The pose time. Clamped to the clip duration, like the panel does; the reply reports `clampedFrom` when that happened.') },
     async ({ t }) => editorAction('pose-clip', { t }),
   );
   tool(
@@ -351,28 +362,31 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       '.anim.json write is PARKED in the dirty-asset registry (see get_editor_state ' +
       '`dirtyAssetPaths`) until modoki_save_all.' + WRITE_VERIFY_AND_UNDO,
     {
-      clipPath: z.string().describe("Asset-root URL of the .anim.json clip, e.g. '/assets/anim/walk.anim.json'."),
+      path: z.string().describe("Asset-root URL of the .anim.json clip, e.g. '/assets/anim/walk.anim.json'."),
       clip: z.record(z.any()).describe('Full AnimationClipDef (see modoki_asset_schema animation).'),
     },
-    async ({ clipPath, clip }) => editorAction('anim-set-clip', { clipPath, clip }),
+    // `path`, like every whole-asset writer (#1560); the op's wire name stays `clipPath`.
+    async ({ path, clip }) => editorAction('anim-set-clip', { clipPath: path, clip }),
   );
   tool(
     'modoki_anim_add_key',
     'Add/update ONE keyframe on a clip track (creates the track if absent) — the granular way to ' +
       'rough-in timing. Applies live; the write is PARKED in the dirty-asset registry (persistence ' +
-      'is manual) until modoki_save_all. `path` is the relative entity name-path from ' +
+      'is manual) until modoki_save_all. `target` is the relative entity name-path from ' +
       'the Animator root ("" = root). `type` defaults to number (use color/boolean/enum for those fields).'
       + WRITE_VERIFY_AND_UNDO,
     {
-      clipPath: z.string().describe("Asset-root URL of the .anim.json clip, e.g. '/assets/anim/walk.anim.json'."),
+      path: z.string().describe("Asset-root URL of the .anim.json clip, e.g. '/assets/anim/walk.anim.json'."),
       trait: z.string().describe('e.g. "Transform"'),
       field: z.string().describe('e.g. "y" or "rz"'),
-      time: z.number().describe('Key time in seconds.'),
+      t: clipTimeParam('Where the key goes.'),
       value: z.union([z.number(), z.string(), z.boolean()]).describe('Value (encoded per track type).'),
-      path: z.string().optional().describe('Relative name-path from the Animator root (default "").'),
+      target: z.string().optional().describe('Relative name-path from the Animator root (default "") — `target`, as in modoki_timeline_add_clip.'),
       type: z.enum(['number', 'color', 'boolean', 'enum']).optional(),
     },
-    async (p) => editorAction('anim-add-key', p),
+    // One word per concept (#1560): `path` = the asset, `t` = clip time, `target` = the name-path.
+    // The op's wire names (clipPath/time/path) are unchanged.
+    async ({ path, t, target, ...rest }) => editorAction('anim-add-key', { ...rest, clipPath: path, time: t, ...(target !== undefined ? { path: target } : {}) }),
   );
   tool(
     'modoki_timeline_set',
@@ -381,10 +395,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'modoki_save_all. Tracks target descendants of the Director root by ' +
       'relative name-path.' + WRITE_VERIFY_AND_UNDO,
     {
-      timelinePath: z.string().describe("Asset-root URL of the .timeline.json, e.g. '/assets/timelines/intro.timeline.json'."),
+      path: z.string().describe("Asset-root URL of the .timeline.json, e.g. '/assets/timelines/intro.timeline.json'."),
       timeline: z.record(z.any()).describe('Full TimelineDef (see modoki_asset_schema timeline).'),
     },
-    async ({ timelinePath, timeline }) => editorAction('timeline-set', { timelinePath, timeline }),
+    async ({ path, timeline }) => editorAction('timeline-set', { timelinePath: path, timeline }),
   );
   tool(
     'modoki_timeline_add_clip',
@@ -398,12 +412,12 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'write is PARKED in the dirty-asset registry (persistence is manual) until ' +
       'modoki_save_all.' + WRITE_VERIFY_AND_UNDO,
     {
-      timelinePath: z.string().describe("Asset-root URL of the .timeline.json, e.g. '/assets/timelines/intro.timeline.json'."),
+      path: z.string().describe("Asset-root URL of the .timeline.json, e.g. '/assets/timelines/intro.timeline.json'."),
       trackType: z.enum(['animation', 'signal', 'audio', 'activation', 'control', 'video']),
       target: z.string().optional().describe('Relative name-path from the Director root (default "" = root).'),
       item: z.record(z.any()).describe('The per-kind item body (see description).'),
     },
-    async (p) => editorAction('timeline-add-clip', p),
+    async ({ path, ...rest }) => editorAction('timeline-add-clip', { ...rest, timelinePath: path }),
   );
 
   // ── validate_prefab (#261 audit F6) ── the prefab twin of modoki_validate_scene ──
@@ -465,7 +479,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + '⚠️ Texture settings are load-bearing on real hardware — block-compressed KTX2 needs '
     + 'multiple-of-4 dimensions, and a non-mult-4 texture with mipmaps renders SOLID BLACK on '
     + 'Adreno/mobile GPUs. That failure appears on a phone, not in the editor.\n\n'
-    + 'THIS WRITES DISK. Since #845 a human\'s Inspector import-settings change is PARKED in the '
+    + 'THIS WRITES DISK. A human\'s Inspector import-settings change is PARKED in the '
     + 'editor rather than written, and this replaces the file wholesale — so if one is pending for '
     + 'this path, writing DESTROYS it: your bytes land, the park survives, and their next Cmd+S '
     + 'flushes that older document straight back over what you wrote. Both directions lose work, '
@@ -480,7 +494,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       meta: z.record(z.any()).describe('The COMPLETE sidecar object to write — read it back with modoki_get_asset_meta first and edit that, since this replaces rather than merges.'),
       discardUnsaved: z.boolean().optional().describe(
         `${DISCARD_UNSAVED_BASE}. Here that work is a parked Inspector import-settings edit for this `
-        + 'asset. It is dropped AFTER the write succeeds (#872), so a failed write costs the human '
+        + 'asset. It is dropped AFTER the write succeeds, so a failed write costs the human '
         + 'nothing — and `discardUnconfirmed` in the reply says the drop could not be confirmed, '
         + 'which is the case where something stale CAN still flush back over you.',
       ),
@@ -566,8 +580,8 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'standing worry.',
     {
       target: z.string().describe('What to find references TO: an asset GUID, an entity GUID (EntityAttributes.guid, or a prefab instance\'s own guid), or a virtual asset path starting with "/" (e.g. /assets/textures/wood.png).'),
-      limit: z.number().int().positive().optional().describe('Cap the returned referrer entries (default 50, max 1000). `returnedCount`/`totalCount` are always present; truncated when it bites.'),
-      maxDepth: z.number().int().positive().optional().describe('How many reference hops back to walk (default 6, max 20). 1 = direct referrers only.'),
+      limit: z.number().int().positive().max(1000).optional().describe('Cap the returned referrer entries (default 50, max 1000). `returnedCount`/`totalCount` are always present; truncated when it bites.'),
+      maxDepth: z.number().int().positive().max(20).optional().describe('How many reference hops back to walk (default 6, max 20). 1 = direct referrers only.'),
       reachableOnly: z.boolean().optional().describe('List only references that survive a production build (reachable from a scene root) — drops referrers living in dead/unreferenced files and counts them in `unreachableSkipped`. `unreferenced` still counts them: an asset only a dead file uses is not safe to delete.'),
     },
     async ({ target, limit, maxDepth, reachableOnly }) => {

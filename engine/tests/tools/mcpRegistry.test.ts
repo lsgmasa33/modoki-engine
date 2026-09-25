@@ -44,6 +44,7 @@ import {
   toolCount,
   clearRegistry,
 } from '../../tools/modoki-mcp/src/registry';
+import { PER_TOOL_MEANING } from './perToolMeaning';
 import { loadSurface, sumSchemaBytes, type Surface } from './mcpSurface';
 import { perToolBytes, surfaceBytes, toolBytes } from '../../tools/modoki-mcp/surfaceBytes';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
@@ -267,15 +268,8 @@ describe('the real registered surface', () => {
   // type stated each time — `path`'s pattern exactly. A label you ASSIGN is a different job, so it
   // became `displayName` rather than being excused here. Four addressing meanings remain, so the
   // containment check still cannot police this word; do not read the rename as clearing it.
-  const PER_TOOL_MEANING: readonly string[] = [
-    'path', 'name', 'kind', 'id', 'ids', 'key', 'limit', 'all', 'from', 'to', 'clear', 'since',
-    'guid', 'guids', 'quality', 'selector', 'button', 'steps', 'entity', 'parentId',
-    'parentGuid', 'action', 'type',
-    // #1152/#1153: an AIM on the input tools ("press the element labelled X") and a FILTER on
-    // modoki_handles ("list the handles labelled X"). Two jobs, deliberately one word: both match by
-    // the same `labelMatches` rule, so the filter previews exactly what the aim would hit.
-    'label',
-  ];
+  // The list itself lives in `perToolMeaning.ts` since #1559: the device surface runs the same check
+  // (`deviceToolSurface.test.ts`), and one pardon list is what keeps the two from judging a word differently.
 
   it('a param used by 3+ tools means ONE thing, or is declared per-tool', () => {
     // §2 ("a field or parameter name means the same thing in every tool that uses it") had a
@@ -357,7 +351,8 @@ describe('the real registered surface', () => {
       expect(shape.force, `${name} must no longer take \`force\``).toBeUndefined();
       const d = shape.discardUnsaved?.description ?? '';
       expect(d, `${name}.discardUnsaved must say it DESTROYS`).toMatch(/DESTRUCTIVE and IRREVERSIBLE/);
-      expect(d, `${name} must name the old spelling, so the habit has somewhere to land`).toMatch(/used to be called `force`/);
+      // Present tense since #1555 — a pointer at the other name, not the history of the rename.
+      expect(d, `${name} must name \`force\`, so the habit has somewhere to land`).toMatch(/Not `force`: that is the NON-destructive flag/);
     }
     for (const name of harmless) {
       const shape = getTool(name)!.shape as Record<string, { description?: string }>;
@@ -486,7 +481,8 @@ describe('the real registered surface', () => {
     for (const name of DUAL_ADDRESSED) {
       const s2 = loadSurface();
       try {
-        await expect(s2.call(name, { entity: { name: 'Crate' } })).rejects.toThrow(/accepts only: guid, id/);
+        // `guid, id` on duplicate/focus, `guid` alone on play_clip (its op has no id resolver, #1545).
+        await expect(s2.call(name, { entity: { name: 'Crate' } })).rejects.toThrow(/unrecognized key 'name' — an entity ref here accepts only: guid(, id)?(?![\w,])/);
         // …and nothing was dispatched on the way to that refusal.
         expect(s2.requests.some((q) => q.path.startsWith('/api/editor-action'))).toBe(false);
       } finally { s2.restore(); }
@@ -660,7 +656,19 @@ describe('the real registered surface', () => {
   // 171,084 pin (booked in their ledgers). #1414 adds 228 B to modoki_save_all's `path`, which the
   // owner's ruling required to say that a
   // path naming another file is a Save As with a FRESH id that OVERWRITES what is there.
-  const DEFINITION_BYTES = 175_280;
+  // 2026-09-25 (#1554 + #1555, work-ai2): RE-PINNED DOWN to 165,715 — the first deliberate cut.
+  // −9,867 B from the 175,582 last booked (ledger/work-ai2.csv), nearly all #1555: the aim prose every input tool carried
+  // a copy of (entity/surface/allowOccluded, now ONE wording in `tools/shared/aimVocabulary.ts`,
+  // with nested copies pointing at the statement in the same tool), drag's `to` pointing at `from`,
+  // a shorter `precision`/`force`, and history narrative out of descriptions. #1554's rename is +2 B
+  // per mention. The device server, which this pin does not price, lost ~2.4 KB the same way; the
+  // repeated-prose ceiling in `mcpDescriptionProse.test.ts` covers both servers.
+  // 2026-09-25 (#1553 + #1560, work-ai2): RE-PINNED to 166,332 — +617 B net over 27 tools (ledger/work-ai2.csv).
+  // #1553 made the 17 action descriptions name their reply fields instead of "Returns editor state"
+  // (roughly a wash per tool, and it saves ~1.5 KB of RESULT on every call, which this pin cannot see).
+  // #1560 added real params agents kept guessing (`create_entity.name`, `modoki_scroll.dx/dy`,
+  // `delete_asset.path`), stated the max on bounded numbers, and shared one `t` wording.
+  const DEFINITION_BYTES = 166_332;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

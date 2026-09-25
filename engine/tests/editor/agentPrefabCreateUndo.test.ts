@@ -17,7 +17,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, PrefabInstance,
-  deriveInstanceMemberGuids, getCurrentWorld, Transient,
+  deriveInstanceMemberGuids, getCurrentWorld, Transient, UIAction,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, undo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
@@ -53,8 +53,17 @@ beforeEach(() => {
   registerAsset(CHILD_GUID, CHILD_PATH, 'prefab');
   setPrefabCache(CHILD_GUID, childPrefab as never);
   origFetch = globalThis.fetch;
-  // Test stub — every backend call succeeds; the op's IO is not what is under test here.
-  globalThis.fetch = (async () => ({ ok: true, json: async () => ({ ok: true, files: [] }), text: async () => '' } as Response)) as typeof globalThis.fetch;
+  // Test stub — every backend API call succeeds; the op's IO is not what is under test here.
+  // ⚠️ A GET for an ASSET is answered 404, not `200` with an empty body (#1468). The prefab being
+  // created is not on disk in this fixture, and since `classifyExistingPrefabId` started telling
+  // "absent" apart from "unreadable", a 200 serving zero bytes is a DAMAGED file — which the op now
+  // refuses, correctly. The real dev server answers an absent asset with its SPA fallback or a 404,
+  // never with an empty 200, so the old stub was modelling a response nothing produces.
+  globalThis.fetch = (async (url: unknown) => (
+    String(url).includes('/api/')
+      ? { ok: true, status: 200, json: async () => ({ ok: true, files: [] }), text: async () => '{}' } as Response
+      : { ok: false, status: 404, json: async () => ({}), text: async () => '' } as Response
+  )) as typeof globalThis.fetch;
 });
 afterEach(() => {
   globalThis.fetch = origFetch;
@@ -96,8 +105,18 @@ describe('agent prefab create — undo restores the links the tree already had (
    *
    *  The reload is driven, not mimicked: blanking the members' guids and running the REAL
    *  `deriveInstanceMemberGuids` is exactly what `loadSceneFile` does at the end of a load. A test
-   *  that hand-wrote a different guid would prove only that a different string fails to resolve. */
-  it('survives a Play→Stop reload re-deriving the nested instance guids (#1272)', async () => {
+   *  that hand-wrote a different guid would prove only that a different string fails to resolve.
+   *
+   *  ⚠️ **#1461 removed the re-mint from this flow**, and this test caught it: Create Prefab now
+   *  stamps each member with the guid the reload derives, so blanking and re-deriving is IDEMPOTENT
+   *  and the premise this test used to assert ("the guid is NOT the one the snapshot captured") is
+   *  false here. Both guarantees are still pinned, separately, because they fail for different
+   *  reasons: the idempotence below is #1461's, and the surviving link after a guid DOES diverge is
+   *  #1272's. The divergence is hand-written now, with the caveat above answered — what it models is
+   *  a tree whose members were never stamped (a scene authored before #1461, or any other path that
+   *  re-mints), and what it proves is that the scoped untag never strips the held link in the first
+   *  place, so the reattach is not asked to resolve it. */
+  it('the derive is idempotent after the create (#1461), and the link survives a guid that diverges anyway (#1272)', async () => {
     const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-reload-r' }));
     const hull = game!.spawn(Transform(), EntityAttributes({ name: 'Hull', parentId: r.id(), guid: 'g-reload-hull' }));
     const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-reload-bolt' }));
@@ -106,17 +125,27 @@ describe('agent prefab create — undo restores the links the tree already had (
 
     await runAgentOp('prefab', { action: 'create', entityGuid: 'g-reload-r', path: NEW_PATH });
 
-    // ── Play → Stop: the world is rebuilt from the snapshot, and the nested instance comes back
-    // with no serialized guid, so the loader derives one off the new root.
-    const before = (hull.get(EntityAttributes) as { guid: string }).guid;
+    // ⚠️ REWRITTEN for scene v16 (#1468). This used to simulate Play→Stop by clearing the guids and
+    // re-deriving, and assert that the create had already stamped the guid the derive produces. That
+    // premise is gone: the tag makes Hull an OWNED nested root of the new prefab, which is KEYED, so
+    // the save states its guid and the reload PINS it — the stamp deliberately skips it, and a
+    // derive-only simulation no longer models a reload at all.
+    //
+    // What #1461 asked for still holds, and it holds better: nothing is re-identified, so the guid
+    // every live ref already names is the one that survives.
+    // `memberRowsToWrite`, not `memberRowKeysIn`: the message claims the SAVE will state this guid,
+    // and that is the narrower predicate — keyed AND holding a durable guid to write down.
+    const { memberRowsToWrite } = await import('../../packages/modoki/src/runtime/core/ecs/memberRows');
+    expect((hull.get(EntityAttributes) as { guid: string }).guid, 'the create leaves a keyed member alone').toBe('g-reload-hull');
+    expect(memberRowsToWrite(r.id()).has(hull.id()), 'and the save will state that guid').toBe(true);
+    // Bolt is a member of Hull's OWN instance, whose template is a pre-v5 fixture — so it is NOT
+    // keyed, and the stamp still covers it. That split is the reason the stamp could not be deleted.
+    expect(memberRowsToWrite(r.id()).has(bolt.id())).toBe(false);
+
+    // Now force the divergence #1272 was reported against — see the caveat in the docblock.
     for (const e of [hull, bolt]) {
-      e.set(EntityAttributes, { ...(e.get(EntityAttributes) as object), guid: '' });
+      e.set(EntityAttributes, { ...(e.get(EntityAttributes) as object), guid: `stale-${(e.get(EntityAttributes) as { name: string }).name}` });
     }
-    deriveInstanceMemberGuids(getCurrentWorld());
-    const after = (hull.get(EntityAttributes) as { guid: string }).guid;
-    // The premise of the whole issue: the guid the snapshot captured is NOT the guid now live.
-    expect(after, 'the reload must actually re-mint the guid, or this test proves nothing').not.toBe(before);
-    expect(after).toBeTruthy();
 
     await undo();
 
@@ -126,6 +155,39 @@ describe('agent prefab create — undo restores the links the tree already had (
     // A row this prefab owned is no longer owned by anything once the owner is removed.
     expect((hull.get(PrefabInstance) as { parentLocalId: number }).parentLocalId).toBe(0);
     expect(r.has(PrefabInstance), 'the created prefab tag must still be gone').toBe(false);
+  });
+
+  /** #1461's undo half, REWRITTEN for scene v16 (#1468).
+   *
+   *  It used to assert that the create renames each member to the guid the reload will derive, and
+   *  that undo puts the originals back. For a member of the new (v5) prefab there is no longer a
+   *  rename to reverse: the member is keyed, the save states its guid, and the stamp skips it. So the
+   *  property is now the stronger one — the guid never moves, and neither does any ref to it.
+   *
+   *  ⚠️ `unstampMemberGuids` is still WIRED and still needed, for members the rows do not cover (a
+   *  pre-v5 template). Its order against `reattachPrefabInstance` is pinned in
+   *  `packages/modoki/tests/editor/createPrefabUndo.test.ts`, whose mock records the call sequence —
+   *  not here, and an earlier version of this comment claimed nothing pinned it, on a mutation run
+   *  with `--config engine/vite.config.ts`, which per CLAUDE.md § Tests is NOT the package suite. */
+  it('undo puts the members\' original guids back, and every ref with them (#1461)', async () => {
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-undo-r' }));
+    const a = game!.spawn(Transform(), EntityAttributes({ name: 'A', parentId: r.id(), guid: 'g-undo-a' }));
+    // A ref from OUTSIDE the tree, aimed at the entity that is about to become a member.
+    const x = game!.spawn(Transform(), EntityAttributes({ name: 'X', guid: 'g-undo-x' }),
+      UIAction({ bindings: [{ event: 'click', kind: 'call' as const, action: 'noop', target: 'g-undo-a' }] }));
+    const targetOfX = () => ((x.get(UIAction) as { bindings: { target: string }[] }).bindings)[0].target;
+
+    await runAgentOp('prefab', { action: 'create', entityGuid: 'g-undo-r', path: NEW_PATH });
+
+    const { memberRowsToWrite } = await import('../../packages/modoki/src/runtime/core/ecs/memberRows');
+    expect(memberRowsToWrite(r.id()).has(a.id()), 'fixture: the member is one a row will state').toBe(true);
+    expect((a.get(EntityAttributes) as { guid: string }).guid, 'the create does not re-identify it').toBe('g-undo-a');
+    expect(targetOfX(), 'so the ref never had to follow anything').toBe('g-undo-a');
+
+    await undo();
+
+    expect((a.get(EntityAttributes) as { guid: string }).guid).toBe('g-undo-a');
+    expect(targetOfX()).toBe('g-undo-a');
   });
 
   /** The report must not fire on the flow the fix makes WORK (close-out review F1).

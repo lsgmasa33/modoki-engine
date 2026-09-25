@@ -30,7 +30,8 @@
  *  Platform backend selection (localStorage / @capacitor/preferences) is layered on
  *  in Phase 2; app-shell init/flush wiring in Phase 3. */
 
-import { InMemoryBackend, PREFS_KEY_ROOT, type PrefsBackend } from './backends';
+import { InMemoryBackend, type PrefsBackend } from './backends';
+import { sanitizeNamespace, prefixFor } from './prefsKey';
 import { createSupersessionToken } from '../core/liveness';
 
 /** A plain JSON-serializable value. No functions, class instances, Map/Set, or cycles. */
@@ -233,18 +234,10 @@ let writeChain: Promise<void> = Promise.resolve();
 let initChain: Promise<void> = Promise.resolve();
 
 // ── Keys ──────────────────────────────────────────────────────────
-function sanitizeNamespace(ns: string): string {
-  // Keep the `mk:<ns>:` delimiter unambiguous — collapse any ':' in the namespace.
-  return ns.replace(/:/g, '_') || 'default';
-}
-/** Single place that knows the `mk:<ns>:` format. `doInit()` needs this for the INCOMING
- *  namespace before that global is swapped in, so it calls this directly with a local;
- *  `drain()` similarly calls it with the namespace it captured at the start of its batch (see
- *  `drain()`'s doc comment, #438) rather than reading the live global — a full key is never
- *  built off whatever `namespace` happens to be at the moment a write settles. */
-function prefixFor(ns: string): string {
-  return `${PREFS_KEY_ROOT}${ns}:`;
-}
+// `sanitizeNamespace` / `prefixFor` live in `prefsKey.ts`, the single owner of the `mk:<ns>:` format.
+// `doInit()` calls `prefixFor` for the INCOMING namespace before that global is swapped in, and
+// `drain()` with the namespace it captured at the start of its batch (#438) — a full key is never
+// built off whatever `namespace` happens to be at the moment a write settles.
 
 // ── Envelope ──────────────────────────────────────────────────────
 /** Result of parsing one stored envelope string — see `readEnvelope`'s doc comment for what each

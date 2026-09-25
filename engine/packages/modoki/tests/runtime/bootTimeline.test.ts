@@ -71,6 +71,17 @@ describe('bootTimeline', () => {
     expect(getBootTimeline().spans[0].endMs).toBeCloseTo(5, 6);
   });
 
+  it('a handle from before a reset closes nothing — not the unrelated span now in its slot (#1477 close-out)', () => {
+    const stale = beginBootSpan('window-blur'); // open for minutes, across an agent's boot-reset
+    resetBootTimeline();
+    const fresh = beginBootSpan('acquire:texture');
+    advanceManual(40);
+    endBootSpan(stale);
+    expect(getBootTimeline().spans[0], 'the new span in slot 0 is still open').toMatchObject({ name: 'acquire:texture', endMs: -1 });
+    endBootSpan(fresh);
+    expect(getBootTimeline().spans[0].endMs).toBeCloseTo(40, 6);
+  });
+
   it('bootSpan closes on a throw', () => {
     expect(() => bootSpan('boom', () => { advanceManual(7); throw new Error('x'); })).toThrow('x');
     const { spans } = getBootTimeline();

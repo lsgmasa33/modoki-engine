@@ -285,6 +285,16 @@ copy.
 **The test to apply before reaching for an epoch: does this function write anything the caller can
 observe BEFORE its first deferral?** If yes, a liveness token is guarding the wrong half of it.
 
+**Adding an await in FRONT of such a lock (#1579).** Every editor world switch now waits for the undo
+step in flight before it touches the world (editor.md § A user world switch waits for the undo in
+flight). That wait is a new first deferral, so where it goes decides what the lock covers. The order
+is: refusals and latches first, synchronously; then `prepareWorldSwitch()` / `beginWorldSwitch()`;
+then the await; then the pre-await writes that used to come first. A latch set after the wait would
+let a second Create Scene through while the first waits. A path written before the wait would make
+the undo's key check skip against the scene that has not loaded yet. The same wait split one counter
+into two. A load waiting for the undo is IN FLIGHT (`isSceneLoadInFlight`, which Play reads) but not
+yet SWAPPING (`isSceneLoadSwapping`, which the undo reads). One count could not serve both readers.
+
 ⚠️ Neither guard sees this. `livenessTokenIsShared` looks for a counter, and there is none; nothing
 looks for "an async function with pre-await writes and no mutual exclusion" — that is the same
 statement-order analysis § Enforcement declines to build.

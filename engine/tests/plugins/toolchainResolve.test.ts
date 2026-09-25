@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { expectInOrder } from '@modoki/engine/testing/inOrder'
 import fs from 'node:fs'
 import path from 'node:path'
-import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, toolOwnedDirs, shouldSweepProcesses, winSweepCommand, sweepAlt, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
+import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, toolOwnedDirs, shouldSweepProcesses, winSweepCommand, sweepAlt, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, whichSync, type DetectResult } from '../../toolchain'
 import { makeDirLink } from '../helpers/linkFixture';
 import { TOOLCHAIN_OWNED_ENTRIES } from '../../scripts/toolchainRoot.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
@@ -15,8 +15,8 @@ import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** Write a fake tool binary that answers a `--version`/`-v` probe cross-platform. On POSIX it's a
  *  `#!/bin/sh` script (chmod +x); when `binPath` ends in `.cmd` (the Windows npm shim the code
- *  resolves via npmToolBin) it's a batch file the toolchain runs through a shell (needsWinShell →
- *  shell:true). Module-scoped so every describe's userData-install detect tests can use it. */
+ *  resolves via npmToolBin) it's a batch file the toolchain runs through cmd.exe (needsWinShell →
+ *  toSpawn's escaped line, #1537). Module-scoped so every describe's userData-install detect tests can use it. */
 const writeExecStub = (binPath: string, versionOut: string) => {
   fs.mkdirSync(path.dirname(binPath), { recursive: true })
   if (binPath.endsWith('.cmd')) {
@@ -128,8 +128,6 @@ describe('toolchain npmSpawnSpec() — the swappable npm seam', () => {
     const spec = npmSpawnSpec()
     expect(spec.command).toBe(NODE)
     expect(spec.prefixArgs).toEqual([])
-    // A real executable (node/node.exe) spawns directly — a shell is needed only for a .cmd/.bat shim.
-    expect(spec.shell).toBe(false)
   })
 
   it('falls back to system `npm` on PATH, resolved to its ABSOLUTE shim (Windows: npm.cmd)', () => {
@@ -139,10 +137,9 @@ describe('toolchain npmSpawnSpec() — the swappable npm seam', () => {
     // name: Windows execFile does no PATHEXT lookup, so a bare `npm` was unspawnable/unprobeable.
     const spec = npmSpawnSpec()
     if (process.platform === 'win32') {
-      // …and a .cmd shim goes through a shell, QUOTED so `C:\Program Files\…` survives the split.
-      expect(spec.shell).toBe(true)
-      expect(spec.command).toMatch(/^"?.*npm\.cmd"?$/i)
-      expect(spec.command.includes(' ') ? spec.command.startsWith('"') : true).toBe(true)
+      // The spec stays RAW — no pre-quoting (#1537): `spawnSpecCall`/`toSpawn` builds the cmd.exe line.
+      expect(path.isAbsolute(spec.command)).toBe(true)
+      expect(spec.command).toMatch(/npm\.cmd$/i)
     } else {
       expect(path.isAbsolute(spec.command)).toBe(true)
       expect(path.basename(spec.command)).toBe('npm')
@@ -185,24 +182,6 @@ describe('toolchain whichSync() — PATH resolution (the Windows PATHEXT fix)', 
     expect(whichSync('tool', { platform: 'linux', pathEnv: dir })).toBeNull() // not chmod +x yet
     fs.chmodSync(bin, 0o755)
     expect(whichSync('tool', { platform: 'linux', pathEnv: dir })).toBe(bin)
-  })
-})
-
-describe('toolchain spawnable() — shell + quoting for resolved commands', () => {
-  // Node concatenates argv into one command line for shell:true, so an unquoted path with a space
-  // ("C:\Users\Jane Doe\…\gltf-transform.cmd", or a project under "My Games\") got split by cmd.exe
-  // and failed with "'C:\Users\Jane' is not recognized as an internal or external command".
-  it('quotes the command AND args when a Windows batch shim needs a shell', () => {
-    const s = spawnable('C:\\Program Files\\x\\gltf-transform.cmd', ['weld', 'C:\\My Games\\a.glb', '--v'], 'win32')
-    expect(s.shell).toBe(true)
-    expect(s.command).toBe('"C:\\Program Files\\x\\gltf-transform.cmd"')
-    expect(s.args).toEqual(['weld', '"C:\\My Games\\a.glb"', '--v']) // only the ones that need it
-  })
-
-  it('passes a real executable through untouched (no shell, no quoting)', () => {
-    const s = spawnable('C:\\Program Files\\x\\ffmpeg.exe', ['-i', 'C:\\My Games\\a.wav'], 'win32')
-    expect(s).toEqual({ command: 'C:\\Program Files\\x\\ffmpeg.exe', args: ['-i', 'C:\\My Games\\a.wav'], shell: false })
-    expect(spawnable('/usr/bin/gltf-transform', ['a b'], 'darwin').shell).toBe(false)
   })
 })
 
