@@ -35,6 +35,7 @@ import { promisify } from 'util';
 
 import { openInOS, revealInOS } from '../../plugins/backend/osOpen';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { canonicalPath } from '../../scripts/pathIdentity.mjs';
 
 const execFileAsync = promisify(execFile);
 const onWin32 = process.platform === 'win32';
@@ -434,7 +435,11 @@ describe.skipIf(!onWin32)('openInOS against the real launcher (win32)', () => {
     // The claim a mock cannot reach: something really opened our file. `openInOS`
     // resolving proves only that a process was spawned — #1508's shape exactly.
     expect(hit, 'no window appeared titled for the opened file').toBeTruthy();
-    expect(hit!.title, 'the app received a different path than the one opened').toBe(file);
+    // Compared as ON-DISK spellings: a GitHub runner's %TEMP% is the 8.3 short form
+    // (`C:\Users\RUNNER~1\…`) while the app receives the long one (`runneradmin`) — one file,
+    // two strings, red on every windows-latest run while local Windows (long %TEMP%) was green.
+    // Still an exact check: a mangled path names no file, so `canonicalPath` hands it back as-is.
+    expect(canonicalPath(hit!.title), 'the app received a different path than the one opened').toBe(canonicalPath(file));
     expect(beforeIds!.has(hit!.id), 'the handler window belongs to a process that was already running').toBe(false);
 
     // #1534's whole defect was residue nobody looked for. A run must leave NOTHING that
