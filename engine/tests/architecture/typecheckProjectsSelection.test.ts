@@ -44,7 +44,7 @@ function git(cwd: string, ...args: string[]) {
  *  MACHINERY_PATHS, so leaving it untracked would make every fixture look like "the machinery
  *  changed" and escalate to a full sweep — every selection assertion below would then pass for
  *  the wrong reason. */
-function makeRepo({ template = false }: { template?: boolean } = {}) {
+function makeRepo({ template = false, projects = true }: { template?: boolean; projects?: boolean } = {}) {
   const dir = makeScratchDir('tcp-sel-');
   tmpRepos.push(dir);
   git(dir, 'init', '-q', '-b', 'main');
@@ -64,7 +64,9 @@ function makeRepo({ template = false }: { template?: boolean } = {}) {
   writeFileSync(join(tscBin, 'tsc'), 'process.exit(0);\n');
 
   // Opt-in, so the selection tests above keep asserting on the PROJECT selection alone.
-  const dirs = ['games/alpha', 'games/beta', 'demos/gamma', ...(template ? ['engine/templates/starter'] : [])];
+  // `projects: false` is the public OSS snapshot's shape — neither games/ nor demos/ ships there.
+  const dirs = [...(projects ? ['games/alpha', 'games/beta', 'demos/gamma'] : []),
+    ...(template ? ['engine/templates/starter'] : [])];
   for (const p of dirs) {
     mkdirSync(join(dir, p), { recursive: true });
     writeFileSync(join(dir, p, 'game.ts'), 'export const x = 1;\n');
@@ -274,6 +276,22 @@ describe('the scaffolder template (#1544)', () => {
     const bare = select(dir, 'starter');
     expect(bare.code).toBe(1);
     expect(bare.out).toContain('unknown project(s): starter');
+  });
+
+  it('is still checked in a PROJECT-LESS checkout — the public snapshot ships the template and no games/', () => {
+    // The public gate runs in exactly this shape. An early "no games/ or demos/" exit skipped the
+    // template there, so the one thing the snapshot has to typecheck was never typechecked.
+    const { code, out } = select(makeRepo({ template: true, projects: false }));
+    expect(code).toBe(0);
+    expect(out).toContain('scaffolder template(s), checked on every run');
+    expect(out).toContain('engine/templates/starter');
+    expect(out).not.toContain('nothing to typecheck');
+  });
+
+  it('a checkout with neither project roots nor a template still exits 0, having checked nothing', () => {
+    const { code, out } = select(makeRepo({ projects: false }));
+    expect(code).toBe(0);
+    expect(out).toContain('nothing to typecheck');
   });
 
   it('is found in the REAL repo — discovery keys on a directory, and a move would empty it silently', () => {

@@ -299,15 +299,19 @@ function main() {
   const templates = discoverTemplates();
   if (all.length === 0) {
     const rootsOnDisk = PROJECT_ROOT_DIRS.filter((r) => existsSync(path.join(repoRoot, r)));
-    if (rootsOnDisk.length === 0) {
+    // A project-less checkout (the public OSS snapshot) still ships the scaffolder template, and
+    // the template is the one thing there to check — so fall through to it rather than exit.
+    if (rootsOnDisk.length === 0 && templates.length === 0) {
       console.log(`[typecheck-projects] no ${PROJECT_ROOT_DIRS.map((r) => `${r}/`).join(' or ')} `
         + `directory in ${repoRoot} — nothing to typecheck.`);
       process.exit(0);
     }
-    console.error(`[typecheck-projects] ${rootsOnDisk.map((r) => `${r}/`).join(' and ')} present `
-      + `under ${repoRoot}, but discovery returned ZERO projects. That is a discovery miss, not an `
-      + 'empty checkout — a pass here would have typechecked nothing.');
-    process.exit(1);
+    if (rootsOnDisk.length > 0) {
+      console.error(`[typecheck-projects] ${rootsOnDisk.map((r) => `${r}/`).join(' and ')} present `
+        + `under ${repoRoot}, but discovery returned ZERO projects. That is a discovery miss, not an `
+        + 'empty checkout — a pass here would have typechecked nothing.');
+      process.exit(1);
+    }
   }
 
   let projects;
