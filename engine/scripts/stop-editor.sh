@@ -60,8 +60,9 @@ reap_repo_process "$MAIN"
 # the last commit — the saved panel layout, panel/expansion state, and the game's
 # `@editor`-namespace PlayerPrefs. Measured 2026-08-19 (docs/player-prefs.md § Gotchas): a
 # value confirmed present in localStorage survives a graceful stop and is GONE after a
-# SIGKILL, at 0s and at 8s after the write, so waiting for the flush is not an option — only
-# letting the process exit on its own is.
+# SIGKILL, at 0s and at 8s after the write. Even a graceful stop is not reliable for a raw
+# write made seconds before it (#1578). The dependable lever is an explicit
+# `modoki:flush-storage-data` (session.flushStorageData) BEFORE the stop.
 #
 # 5s turned out to be short enough that a healthy-but-slow exit hit the force path twice in
 # one session. The trade is deliberately one-sided: a genuinely wedged editor now costs 10

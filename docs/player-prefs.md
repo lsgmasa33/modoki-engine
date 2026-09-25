@@ -390,6 +390,12 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   | `SIGKILL` 8 s after `flush()` | **lost** |
 
   Not a timing race at the time — waiting did not help, because nothing committed until shutdown.
+  ⚠️ For a RAW `localStorage.setItem` that never goes through `flush()` (the editor's own
+  layout/prefs keys, a QA case's eval), the "survives" row does NOT hold when the write is seconds
+  old. In 2026-09-25's #1578 runs, such writes were lost after a graceful stop 5 times out of 7,
+  and calling `modoki:flush-storage-data` saved them 3 of 3. PlayerPrefs' own `flush()` already
+  makes that call (#335), so this is not a measured PlayerPrefs loss. The mechanism is open.
+  Measurements: `qa/knowledge.md` § 5.
 
   **RE-MEASURED against the #335 fix** (2026-08-26, `games/anim-bug`, backend 5182, this clone's
   dev editor): wrote a key, called `flush()` (confirmed the IPC round-trip returns `{ok:true}`),
