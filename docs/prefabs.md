@@ -637,7 +637,8 @@ warm:
 
 Paths that also reload:
 - Prefab-EDIT mode reloads on exit (`exitPrefabEditing` → `loadScene(target)`).
-- Undo/redo of an Apply reloads (`restoreSnapshot` → `loadScene`).
+- Undo/redo of an Apply reloads (`restoreSnapshot` → `loadScene`). An Apply made in prefab-edit
+  mode reloads at that world's synthetic path (#1573).
 
 **An external `.prefab.json` write** (a hand edit, `git checkout`) goes through the scene hot
 reload. `handleSceneChanged` evicts and then reloads (#1169, [editor-hmr.md](editor-hmr.md)), and
@@ -799,6 +800,33 @@ shows there in normal mode too.
 - **Re-saving preserves the file's `localId` numbering and `name`** — see "localId
   stability" above; this is what makes prefab-edit safe to drive as a scripted
   round-trip rather than only a human UI action.
+- **Undoing an Apply made here reloads this world from its scene snapshot** (#1573). The
+  Inspector offers Apply on a nested instance whose source is not the prefab being edited, and the
+  agent `apply` op reaches it too. Apply's undo restores the world from the `serializeScene`
+  snapshot it took on each side. The scene branch reloads that snapshot at the scene path, and this
+  world's scene path is `null`, so before #1573 only the applied prefab's file came back. The
+  applied instance lost its edit, every other instance of that prefab in this world kept the
+  applied state, and the next save wrote that state as an override on each of them. The same
+  snapshot is now reloaded at the world's synthetic path (`prefabEditWorldPath()`), without the
+  save: the Apply never wrote the edited prefab, and Cmd+S still does.
+  - ⚠️ **Not a rebuild from the edited prefab's document**, which the first fix tried. A template
+    document carries no live guid, so everything added in the session came back under a new one.
+    Every later undo entry addressing it by guid silently missed. A new entity that inherited a
+    deleted row's localId sentinel was saved with that row's durable nodeGuid. The scene snapshot
+    keeps live guids, as it does in scene mode.
+  - It does not carry template keys (a scene never writes `key`), and the reload does not re-mark
+    them either: the loader recovers keys only from documents instantiated into the world, and the
+    edited prefab never is in its own edit world. The editor's `recoverTemplateKey` recovers each
+    from the node's guid against the whole prefab cache when a save or apply next reads it. A key a
+    file holds therefore survives the undo, and one only ever minted in memory does not.
+  - It reloads only if that world is still the live one. The file install before it is awaited, and
+    an Exit landing in that window would otherwise have the synthetic world loaded under the real
+    scene's path, where `saveScene` writes it into the scene file.
+  - ⚠️ **A rebase is not a substitute either.** It rebuilds the applied instance with the overrides
+    it holds against the applied document, which are none, so the edit being undone is lost from
+    the prefab AND the instance.
+  - `prefabEditApplyUndo.test.ts` mutation-checks each of these. An untitled scene has no path to
+    reload at, and is not covered by this (#1575).
 
 **Reachable headlessly.** `openPrefabForEditing` / `savePrefabEdit` / `exitPrefabEditing` are
 exposed as the `prefab` agent op / `modoki_prefab` MCP tool's `prefabAction: 'edit-open' |

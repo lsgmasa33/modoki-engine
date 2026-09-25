@@ -534,8 +534,12 @@ LINE count, not seconds — `-t 60` on the S22 covered 11 s, so a filter for any
 "No logs". It now passes `-T <epoch seconds>`, which has no timezone or year to get wrong. The MCP
 also sends a `timeoutMs` sized from `seconds` (5 s + 5 ms/s, capped at 20 s; the slope is a guess,
 not a measurement), because the relay's deadline is otherwise the lease transport's fixed 5000 ms
-(#153). ⚠️ **What was observed:** the iOS predicate on macOS's OSLogStore, and `-T` with raw adb on
-the S22. Neither fix has yet run through the plugin on a device. That check is QA-TOOL-0013. A
+(#153). **Observed through the plugin on 2026-09-25 (QA-TOOL-0013):** on the S22, a 20 s read held
+only the newest marker and a 120 s read held all 202 older lines (0.3–0.6 s). On the iPad (iOS 26.6.2),
+with the app up 11 minutes, a 30 s read returned 49 lines, the oldest 34 s old, and none of the
+~3,700-line launch burst. The first read after idle costs ~4–5 s whatever the window (opening
+OSLogStore), and repeat reads ~2 s. ⚠️ **Not yet run on the iPhone 8**, where every read used to time
+out: its USB lease was refused because usbmuxd listed it over WiFi first. A
 failed read now arrives in `error` on both platforms (iOS used to send it as a log line, and a
 logcat that rejects its arguments used to read as "No logs"). `seconds` is a whole number from 1
 to 30 days, and `limit` is at least 1 (`limit:0` crashed the iOS reader). An app binary built before
@@ -1170,6 +1174,23 @@ same actions + state a person has in the editor. They relay to the renderer over
   queued; from PAUSED (where `enterPlay` awaits nothing) the op waits itself, like `resume`.
   `device_step` waits inside its own `timeoutMs` budget and refuses with `physicsLoading: [...]` only
   when that runs out (retry), or names a permanent failure.
+  **The reply is built from what the controller DID, never from the state re-read after it** (#1574):
+  `enterPlay`/`stopPlay` return a `PlayOutcome`/`StopOutcome` (`editor/scene/playMode.ts`), because a
+  refused Play reads `'stopped'` exactly like a Play nobody asked for, and the op used to answer
+  `ok:true` over every refusal.
+
+  | Outcome | `play` / `stop` reply |
+  |---|---|
+  | Play refused: `scene-swap` (a load or an authored restore in flight), `restore-failed`, `already-starting`, `load-landed` (mid-snapshot) | `ok:false, code:'REFUSED_BY_OP', reason, error` — `error` is the same string the toolbar's console warn prints |
+  | Play started, then a Stop queued during startup ended it | `ok:false, code:'REFUSED_BY_OP', reason:'stopped-during-startup', reverted` — `reverted` is that Stop's answer; its restore THROWING lands here too, as `reverted:false` |
+  | Stop ran its restore | `ok:true, reverted:true` |
+  | Stop skipped it (scene changed during Play or preview; no snapshot) | `ok:true, reverted:false, reason` — the snapshot was not restored, so after a Play the live world keeps what Play did (after a preview it is the scene that replaced it) |
+  | Stop only waited for a restore a panel had already started | `ok:true`, no `reverted` — that restore's outcome is the panel's |
+  | Stop while a Play is still starting | `ok:true, queued:true` — the startup performs the revert; the PLAY reply says how it went |
+  | Stop's restore THREW | `ok:false, code:'REFUSED_BY_OP'` — no longer an escaped throw, which the relay called `NOT_AVAILABLE_HERE` ("relaunch") |
+
+  `play` while playing and `stop` while stopped stay `ok:true`: the state the reply reports IS the
+  one asked for, and the live sweep's `{"action":"stop"}` relies on it.
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/canvas2d/ui/camera/light/
   environment/particle — identical to the Hierarchy menu), `modoki_duplicate_entity`, `modoki_delete_entities`,
   `modoki_reparent_entity`, `modoki_set_selection`, `modoki_set_gizmo`, `modoki_focus_entity`,

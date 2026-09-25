@@ -454,8 +454,7 @@ export async function openPrefabForEditing(
   // discarded by this swap, and so is its undo stack (#1409). Read on both sides of the await.
   const dirtyBeforeSwap = worldHasUnsavedEdits();
   try {
-    await sceneManager.loadScene(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { preloaded: sceneData });
-    applyEditWorldMoves(prefab);
+    await loadPrefabEditWorld(guid, prefab, sceneData);
   } catch (e) {
     console.error('[PrefabEdit] failed to load edit scene:', e);
     return;
@@ -472,6 +471,13 @@ export async function openPrefabForEditing(
   clearAllSceneDirty();
   useEditorStore.getState().openPrefabEditor({ path: asset.path, guid, name: prefab.name }, returnScene);
   console.log(`[PrefabEdit] editing "${prefab.name}"`);
+}
+
+/** Build the prefab-edit world for `prefab` (the document of the prefab `guid`) in place of the live world — the
+ *  world half of `openPrefabForEditing`, which owns entering the session (history, dirty baseline, the store). */
+export async function loadPrefabEditWorld(guid: string, prefab: PrefabFile, sceneData: SceneData = buildPrefabEditScene(prefab)): Promise<void> {
+  await sceneManager.loadScene(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { preloaded: sceneData });
+  applyEditWorldMoves(prefab);
 }
 
 /** Locate the live ECS id of the prefab root in the edit world (by sentinel guid). */
@@ -555,50 +561,9 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
     );
     return NOT_SAVED;
   }
-  const rootId = findPrefabEditRoot();
-  if (!rootId) { console.error('[PrefabEdit] cannot save — prefab root not found'); return NOT_SAVED; }
-
-  // The file as it was when we opened it (openPrefabForEditing seeds this cache). It supplies
-  // the two things a re-save must NOT re-derive from the live world: the existing localId
-  // numbering, and the asset's own name. Refuse rather than fall back to renumbering — a
-  // silent renumber drops every localId-keyed override in every scene that instantiates this
-  // prefab, which is precisely the damage this path exists to avoid.
-  const previous = getCachedPrefabSync(editingPrefab.guid);
-  if (!previous) {
-    console.error(
-      `[PrefabEdit] cannot save "${editingPrefab.name}" — the opened prefab is no longer in the ` +
-      'editor cache, so its localId numbering cannot be preserved. Saving now would renumber ' +
-      "members and break every scene override keyed to them. Re-open the prefab and try again.",
-    );
-    return NOT_SAVED;
-  }
-
-  // A prefab containing a UIScrollView spawns pooled rows INSIDE the prefab-edit world (the pool
-  // runs while stopped), so this save legitimately drops them — and says so, because this path
-  // already has a `warnings` array the agent op surfaces and a console nobody reads (review F4).
-  let runtimeExcluded = 0;
-  const preservedLocalIds = collectPreservedLocalIds(previous.rootLocalId, rootId);
-  // …and the node identity each of those rows already had (#1468). The edit world holds the document
-  // as PLAIN entities with no prefab link, so the baseline file is the only thing that still knows
-  // which row a given live entity is; without this every node would be re-minted on every Cmd+S, and
-  // an identity that changes on each save is worse than none. A row of a pre-v5 document has no guid
-  // to keep and is simply absent here, so the save mints it one — which is how a file migrates
-  // (#1468 design record: on next save, never on load).
-  const nodeGuidByLocalId = new Map(previous.entities.map((e) => [e.localId, e.nodeGuid ?? '']));
-  const preserveNodeGuids = new Map<number, string>();
-  for (const [ecsId, localId] of preservedLocalIds) {
-    const g = nodeGuidByLocalId.get(localId);
-    if (g) preserveNodeGuids.set(ecsId, g);
-  }
-  const prefab = serializePrefab(rootId, editingPrefab.guid, {
-    preserveLocalIds: preservedLocalIds,
-    preserveNodeGuids,
-    name: previous.name,
-    // A row the prefab's own move placed under a nested member keeps its original row parent (#1437).
-    rowParents: new Map(previous.entities.map((e) => [e.localId, ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0])),
-    onRuntimeExcluded: (n) => { runtimeExcluded = n; },
-  });
-  if (!prefab) { console.error('[PrefabEdit] serialize produced no prefab'); return NOT_SAVED; }
+  const serialized = serializePrefabEditWorld(editingPrefab.guid);
+  if ('error' in serialized) { console.error(`[PrefabEdit] cannot save "${editingPrefab.name}" — ${serialized.error}`); return NOT_SAVED; }
+  const { prefab, runtimeExcluded } = serialized;
   // The version `prefab` represents, captured BEFORE the write. `writePrefabFile` is a real fetch
   // to the dev server, and the human keeps working during it — a bone drag or an agent op lands as
   // an ordinary `pushAction`. Re-reading the version after the await would fold that edit into the
@@ -633,6 +598,55 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   markSceneSaved(savedAtEditVersion);
   console.log(`[PrefabEdit] saved "${prefab.name}" (${prefab.entities.length} entities)`);
   return { saved: true, warnings };
+}
+
+/** The live prefab-edit world as the document of the prefab `guid` — what Save writes. `runtimeExcluded` counts
+ *  the runtime-spawned entities it left out. An `error` says why there is no document, phrased to follow
+ *  "cannot save …". Pure: it writes nothing. */
+export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; runtimeExcluded: number } | { error: string } {
+  const rootId = findPrefabEditRoot();
+  if (!rootId) return { error: 'prefab root not found' };
+
+  // The file as it was when we opened it (openPrefabForEditing seeds this cache). It supplies
+  // the two things a re-save must NOT re-derive from the live world: the existing localId
+  // numbering, and the asset's own name. Refuse rather than fall back to renumbering — a
+  // silent renumber drops every localId-keyed override in every scene that instantiates this
+  // prefab, which is precisely the damage this path exists to avoid.
+  const previous = getCachedPrefabSync(guid);
+  if (!previous) {
+    return {
+      error: 'the opened prefab is no longer in the ' +
+        'editor cache, so its localId numbering cannot be preserved. Saving now would renumber ' +
+        'members and break every scene override keyed to them. Re-open the prefab and try again.',
+    };
+  }
+
+  // A prefab containing a UIScrollView spawns pooled rows INSIDE the prefab-edit world (the pool
+  // runs while stopped), so this save legitimately drops them — and says so, because this path
+  // already has a `warnings` array the agent op surfaces and a console nobody reads (review F4).
+  let runtimeExcluded = 0;
+  const preservedLocalIds = collectPreservedLocalIds(previous.rootLocalId, rootId);
+  // …and the node identity each of those rows already had (#1468). The edit world holds the document
+  // as PLAIN entities with no prefab link, so the baseline file is the only thing that still knows
+  // which row a given live entity is; without this every node would be re-minted on every Cmd+S, and
+  // an identity that changes on each save is worse than none. A row of a pre-v5 document has no guid
+  // to keep and is simply absent here, so the save mints it one — which is how a file migrates
+  // (#1468 design record: on next save, never on load).
+  const nodeGuidByLocalId = new Map(previous.entities.map((e) => [e.localId, e.nodeGuid ?? '']));
+  const preserveNodeGuids = new Map<number, string>();
+  for (const [ecsId, localId] of preservedLocalIds) {
+    const g = nodeGuidByLocalId.get(localId);
+    if (g) preserveNodeGuids.set(ecsId, g);
+  }
+  const prefab = serializePrefab(rootId, guid, {
+    preserveLocalIds: preservedLocalIds,
+    preserveNodeGuids,
+    name: previous.name,
+    // A row the prefab's own move placed under a nested member keeps its original row parent (#1437).
+    rowParents: new Map(previous.entities.map((e) => [e.localId, ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0])),
+    onRuntimeExcluded: (n) => { runtimeExcluded = n; },
+  });
+  return prefab ? { prefab, runtimeExcluded } : { error: 'serialize produced no prefab' };
 }
 
 /** Leave prefab-edit mode: reload the scene the prefab was opened from — that

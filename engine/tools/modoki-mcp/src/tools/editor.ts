@@ -267,7 +267,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'frame runs, so a stepped frame always simulates. A permanent physics init failure is refused ' +
       '(ok:false) by `resume`/`step` and by `play` from paused; `play` from stopped still starts and reports it as `physicsError`. ' +
       'This is how you TEST the game like a human pressing Play. After play, exercise it with ' +
-      'modoki_tap/drag, read modoki_get_scene_state, then stop to revert. Returns {ok, playState, runMode, advancing} (+frameLoop when the frame loop is unhealthy); the rest of the editor state is modoki_get_editor_state.',
+      'modoki_tap/drag, read modoki_get_scene_state, then stop to revert. Returns {ok, playState, runMode, advancing} (+frameLoop when the frame loop is unhealthy); the rest of the editor state is modoki_get_editor_state. ' +
+      'A Play the editor declines (a scene load in flight, a failed restore, a Play already starting) is REFUSED_BY_OP with `reason`; ' +
+      '`stop` adds `reverted` (false + `reason` when it skipped the revert — the authored snapshot was not restored) or `queued` while a Play is still starting.',
     { action: z.enum(['play', 'stop', 'pause', 'resume', 'step'])
       .describe("Transport command. 'step' advances ONE fixed-dt frame while paused. This IS the editor-action op name on the wire.") },
     async ({ action }) => editorAction(action),

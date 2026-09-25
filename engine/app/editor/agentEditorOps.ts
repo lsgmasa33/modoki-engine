@@ -35,7 +35,7 @@ import { makeEvalApi } from './evalApi';
 import {
   useEditorStore, type SelectedAsset, GIZMO_MODES, GIZMO_SPACES, SCENE_VIEW_MODES,
   type AssetEditorKind, type AssetEditorMount, colliderEditBlocker,
-  enterPlay, stopPlay, pausePlay,
+  enterPlay, stopPlay, pausePlay, type PlayOutcome, type StopOutcome,
   undoStep, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk,
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
@@ -2039,6 +2039,13 @@ export function registerEditorAgentOps(): void {
     error: `${op} refused — physics failed to initialize, so the world would advance with NO physics: ${error}`,
     playState: getPlayState(),
   });
+  // `enterPlay` DECLINES without throwing, so the reply is built from what it says it did — never from
+  // the state re-read afterwards, which reads 'stopped' for a refused Play and a Play nobody asked for
+  // alike (#1574). A refusal is coded (§5) and carries the same message the toolbar's console warn does.
+  const playOutcomeRefusal = (o: PlayOutcome) =>
+    o.kind === 'refused' || o.kind === 'stopped-during-startup'
+      ? { ok: false, code: 'REFUSED_BY_OP', error: o.message, ...(o.kind === 'refused' ? { reason: o.reason } : { reason: o.kind, reverted: o.reverted }), ...playStateFields() }
+      : null;
   registerAgentOp('play', async () => {
     let physicsError: string | null = null;
     if (getPlayState() === 'paused') {
@@ -2049,9 +2056,11 @@ export function registerEditorAgentOps(): void {
       const pausedError = await physicsFailure();
       if (pausedError) return physicsRefused('play', pausedError);
       if (getPlayState() !== 'paused') return { ok: false, error: 'play from PAUSED — the play state changed while physics was loading', playState: getPlayState() };
-      await enterPlay();
+      const refused = playOutcomeRefusal(await enterPlay());
+      if (refused) return refused;
     } else {
-      await enterPlay();
+      const refused = playOutcomeRefusal(await enterPlay());
+      if (refused) return refused;
       // From stopped, enterPlay awaited readiness inside `_entering`, so anything still pending here
       // is a permanent failure (the loader memoises the rejection) — this await settles immediately.
       physicsError = getPlayState() === 'playing' ? await physicsFailure() : null;
@@ -2081,10 +2090,32 @@ export function registerEditorAgentOps(): void {
     // Re-read after the await: from anything but paused, enterPlay would run a full Play — the very
     // outcome this op exists to refuse.
     if (getPlayState() !== 'paused') return { ok: false, error: 'resume requires the PAUSED state — the play state changed while physics was loading', playState: getPlayState() };
-    await enterPlay();
+    const refused = playOutcomeRefusal(await enterPlay());
+    if (refused) return refused;
     return { ok: true, ...playStateFields() };
   });
-  registerAgentOp('stop', async () => { await stopPlay(); return { ok: true, ...playStateFields() }; });
+  // Stop's reply says whether the revert happened (#1574): `reverted:false` + `reason` when Stop
+  // deliberately skipped it, `queued` while a Play is still starting. A restore that THROWS is a coded
+  // refusal rather than an escaped throw, which the relay turns into NOT_AVAILABLE_HERE ("relaunch") —
+  // the mode already reads 'stopped' then, and the live world may still be the Play world.
+  registerAgentOp('stop', async () => {
+    let o: StopOutcome;
+    try {
+      o = await stopPlay();
+    } catch (e) {
+      return {
+        ok: false,
+        code: 'REFUSED_BY_OP',
+        error: `Stopped, but restoring the authored world FAILED (${e instanceof Error ? e.message : String(e)}) — the live world may still be the Play or posed world. Reload the scene before saving or pressing Play.`,
+        ...playStateFields(),
+      };
+    }
+    if (o.kind === 'queued') return { ok: true, queued: true, ...playStateFields(), note: 'A Play startup is still in flight — this Stop is queued behind it, and that startup performs the revert (read the play reply, or playState, for how it ended).' };
+    if (o.kind === 'stopped' || o.kind === 'preview-exited') {
+      return { ok: true, ...playStateFields(), ...('reverted' in o ? { reverted: o.reverted } : {}), ...('reason' in o && o.reason ? { reason: o.reason } : {}) };
+    }
+    return { ok: true, ...playStateFields() };
+  });
   registerAgentOp('pause', () => {
     const st = getPlayState();
     if (st !== 'playing') {

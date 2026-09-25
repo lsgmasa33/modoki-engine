@@ -122,3 +122,4 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-25,work-ai,modoki_wait_for,67,2391,167291,c50df8693
 2026-09-25,work-ai,modoki_wait_for_edit,29,1836,167291,c50df8693
 2026-09-25,work-ai,modoki_watch,-36,4184,167291,c50df8693
+2026-09-25,work-ai,modoki_play_control,281,1415,168051,1298717c4

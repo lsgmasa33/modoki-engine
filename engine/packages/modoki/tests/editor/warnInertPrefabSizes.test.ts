@@ -161,7 +161,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     assertExemptionLedger({
       label: 'prefab serializers that never call warnInertPrefabSizes (#1251)',
       population: producers.filter((p) => !p.warns).map((p) => ({ item: `${p.file}::${p.in}`, site: p.file })),
-      exempt: GENERATED_PREFAB_WRITERS,
+      exempt: [...GENERATED_PREFAB_WRITERS, ...SERIALIZE_FOR_A_CALLER],
       scanned: producers.length,
       floor: 6,
       fix: 'an AUTHORING write calls warnInertPrefabSizes(<the prefab>, <its source>) before writing; a prefab generated from a model or rig gets an exempt row saying so',
@@ -359,6 +359,12 @@ const GENERATED_PREFAB_WRITERS = [
   { item: 'packages/modoki/src/editor/panels/Assets.tsx::importModelWithMeta', reason: 'model import: the prefab is serialized from the GLB it just spawned — mesh/bone entities, no UIElement' },
   { item: 'packages/modoki/src/editor/panels/assetViews/ModelAssetView.tsx::ModelAssetView', reason: 'model re-import regenerates the model prefab from the GLB — mesh/bone entities, no UIElement' },
   { item: 'packages/modoki/src/editor/scene/skinPrefab.ts::makeRigPrefabAsset', reason: 'a 2D skin rig prefab built from bone definitions — Bone/skin entities, no UIElement' },
+];
+
+/** Functions that serialize a prefab for a CALLER and write nothing themselves: whether it is written, and so warned,
+ *  is the caller's, which the write census above holds to it. */
+const SERIALIZE_FOR_A_CALLER = [
+  { item: 'packages/modoki/src/editor/scene/prefabEdit.ts::serializePrefabEditWorld', reason: 'the prefab-edit world as a document: savePrefabEditReport warns what it writes (the write census row for it), and the tests read it as what a Save would write' },
 ];
 
 /** Whether `e` calls THE engine `warnInertPrefabSizes` — by its bare name, resolving to an import or to its own

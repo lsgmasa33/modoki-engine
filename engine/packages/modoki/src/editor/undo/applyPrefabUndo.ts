@@ -14,7 +14,11 @@
  *  Therefore undo is "record before/after of BOTH, reverse it": snapshot the prefab
  *  file and the serialized scene before and after, and restore by writing the prefab
  *  snapshot back and rebuilding the scene from its snapshot (which re-instantiates
- *  every instance exactly, preserving each one's overrides). */
+ *  every instance exactly, preserving each one's overrides).
+ *
+ *  An apply made INSIDE the prefab editor restores the same scene snapshot, reloaded at that
+ *  world's synthetic path: it has no scene file (#1573). Same reason, same rule: a rebase alone
+ *  is not a substitute. */
 
 import { pushAction, type UndoAction } from './undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -33,6 +37,7 @@ import { useEditorStore } from '../store/editorStore';
 import { repairPrefabMemberPaths } from '../backend/editorBackend';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { ensureGuid } from './entityRef';
+import { prefabEditWorldPath } from '../scene/prefabEditWorld';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
@@ -48,6 +53,8 @@ async function restoreSnapshot(
   /** The prefab document the files on disk were last repaired for, when the apply moved member paths
    *  (#1437): they are repaired from it to `prefab`, the way the apply repaired them the other way. */
   repairFrom?: PrefabFile,
+  /** The prefab-edit world's synthetic path, when the apply was made there (#1573): `scene` is reloaded at it. */
+  editWorldPath?: string | null,
 ): Promise<void> {
   await installPrefabSnapshot(source, prefab);
   if (repairFrom && prefab.id) {
@@ -71,6 +78,22 @@ async function restoreSnapshot(
     // against the one just restored before anything captures them — the save below included (#1483 review 3).
     await rebaseStaleInstances();
     await saveScene(); // persist the restored world so disk matches the live state
+  } else if (editWorldPath) {
+    // The prefab-edit world has no scene file, so the scene branch above never ran there and the world stayed
+    // built from the applied document (#1573). It is a scene loaded at a synthetic path, so the same snapshot
+    // restores it — with the live guids every other undo entry addresses its entities by, which a rebuild from the
+    // edited prefab's document would re-mint (review of the first #1573 fix). Not saved, and no scene path set:
+    // the apply never wrote the edited prefab, and that world reaches its file through Save alone.
+    // Still THAT world? The awaits above (the file install, the member-path repair) are a window an Exit can land in:
+    // its reload swaps a real scene in and sets its path, and loading the edit world over it would leave a synthetic
+    // world under a real scene path, which `saveScene` then writes into that scene's file (close-out re-review).
+    // The scene branch needs no such check: it sets the path it loads.
+    if (prefabEditWorldPath() !== editWorldPath) {
+      console.warn(`[ApplyPrefab] ${editWorldPath} is no longer the live world; restored the prefab file only`);
+      return;
+    }
+    await sceneManager.loadScene(editWorldPath, { preloaded: clone(scene) });
+    await rebaseStaleInstances();
   }
   const id = selGuid ? entityIdForGuid(selGuid) : 0;
   useEditorStore.getState().selectEntity(id || null);
@@ -127,6 +150,7 @@ function makeApplyPrefabAction(opts: {
   sceneBefore: SceneData;
   sceneAfter: SceneData;
   scenePath: string | null;
+  editWorldPath: string | null;
   selGuid: string;
   memberPathsChanged?: boolean;
   affectedScenes: string[];
@@ -140,11 +164,11 @@ function makeApplyPrefabAction(opts: {
     // The world restore reaches only the primary; every carried base instance of the prefab is
     // re-derived against the prefab being restored, and the applied one rebuilt from its capture.
     undo: async () => {
-      await restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.scenePath, opts.selGuid, paths ? opts.prefabAfter : undefined);
+      await restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.scenePath, opts.selGuid, paths ? opts.prefabAfter : undefined, opts.editWorldPath);
       await rederiveBaseInstances(opts.source, opts.prefabAfter, opts.prefabBefore, opts.baseBefore);
     },
     redo: async () => {
-      await restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.scenePath, opts.selGuid, paths ? opts.prefabBefore : undefined);
+      await restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.scenePath, opts.selGuid, paths ? opts.prefabBefore : undefined, opts.editWorldPath);
       await rederiveBaseInstances(opts.source, opts.prefabBefore, opts.prefabAfter, opts.baseAfter);
     },
   };
@@ -158,6 +182,7 @@ export async function applyToPrefabWithUndo(
   selectedKeys: Set<string>,
 ): Promise<ApplyResult> {
   const scenePath = getCurrentScenePath();
+  const editWorldPath = scenePath ? null : prefabEditWorldPath();
   // assignGuids so every entity (incl. the selection) has a stable guid the snapshot
   // and selection-restore can key on.
   const sceneBefore = (await serializeScene({ assignGuids: true })) as unknown as SceneData;
@@ -203,6 +228,7 @@ export async function applyToPrefabWithUndo(
     sceneBefore,
     sceneAfter,
     scenePath,
+    editWorldPath,
     selGuid,
     memberPathsChanged: result.memberPathsChanged,
     affectedScenes,

@@ -53,7 +53,8 @@ vi.mock('../../src/editor/scene/prefab', () => ({
 
 let currentBaseScene: string | undefined;
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
-  sceneManager: { loadScene: (...a: any[]) => loadScene(...a), getCurrentBaseScene: () => currentBaseScene },
+  // `getCurrent`: a real scene, so the Apply is not the prefab-edit world's (#1573).
+  sceneManager: { loadScene: (...a: any[]) => loadScene(...a), getCurrentBaseScene: () => currentBaseScene, getCurrent: () => ({ path: '/scenes/main.json' }) },
 }));
 
 vi.mock('../../src/editor/store/editorStore', () => ({

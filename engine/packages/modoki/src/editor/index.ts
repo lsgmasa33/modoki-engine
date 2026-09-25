@@ -26,6 +26,7 @@ export {
 } from '../runtime/scene/entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode, getModeOwner, onModeOwnerChange } from './scene/playMode';
+export type { PlayOutcome, StopOutcome } from './scene/playMode';
 export { isWorldAuthored, whyWorldNotAuthored } from './scene/authoredWorld';
 export { envelopeExitOptions } from './scene/envelopeExits';
 export { lastRestoreFailed } from './scene/authoredSnapshot';

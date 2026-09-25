@@ -1882,6 +1882,16 @@ is refused outright (returns without doing anything) rather than starting a conc
 two independent in-flight Plays could otherwise race their `finally` clears and leave the editor
 `'playing'` with no snapshot left to revert.
 
+**Every decline is RETURNED, not only warned (#1574).** `enterPlay` resolves to a `PlayOutcome`
+(`started` · `resumed` · `already-playing` · `refused` with its `reason` · `stopped-during-startup`,
+carrying the queued Stop's own `reverted` — including a restore that threw, which the tail logs and
+folds in rather than rejecting the Play press)
+and `stopPlay` to a `StopOutcome` (`reverted` true/false + `reason`, `queued`, `already-stopped`,
+`preview-exited`). The toolbar ignores both and keeps its console warn; the agent `play`/`stop` ops
+build their reply from them — the reply table is in
+[debug-tools-mcp.md](./debug-tools-mcp.md) § "Editor debugging — DEFAULT to Electron (modoki MCP)" (the Play/test bullet). A new early return in either
+function needs its own outcome, or the agent reads it as success again.
+
 
 ### One envelope at a time, one exit, one owner, one "is it authored?" (#1546–#1550)
 

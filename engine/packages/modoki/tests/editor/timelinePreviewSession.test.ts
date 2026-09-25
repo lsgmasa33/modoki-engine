@@ -1014,13 +1014,13 @@ describe('a begin during Stop\'s restore is refused (#1572)', () => {
   // Drained after EVERY case, pass or fail: a red assertion otherwise leaves Stop's load parked on a
   // promise nothing resolves, `authoredRestoreInFlight()` stays true, and every later case in the file
   // fails with it (close-out review — a mutation run reported 5 failures where 2 were the target).
-  let parked: { open: () => void; stopping: Promise<void> } | null = null;
+  let parked: { open: () => void; stopping: Promise<unknown> } | null = null;
   afterEach(async () => {
     if (parked) { parked.open(); await parked.stopping; parked = null; }
     if (getPlayState() !== 'stopped') await stopPlay();
   });
 
-  async function stopWithRestoreParked(beforeStop?: () => void): Promise<{ open: () => void; stopping: Promise<void> }> {
+  async function stopWithRestoreParked(beforeStop?: () => void): Promise<{ open: () => void; stopping: Promise<unknown> }> {
     await enterPlay();
     expect(getPlayState()).toBe('playing');
     beforeStop?.();

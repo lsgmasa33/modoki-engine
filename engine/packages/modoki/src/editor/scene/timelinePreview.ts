@@ -366,6 +366,13 @@ export async function beginTimelinePreviewSession(): Promise<boolean> {
  *  because BOTH preview panels end sessions here and each resolves its own root. No-op restore
  *  when the scene changed since the snapshot. */
 export async function endTimelinePreviewSession(opts: { restore: boolean; rebind?: () => number | null }): Promise<number | null> {
+  return (await endTimelinePreviewSessionReporting(opts)).root;
+}
+
+/** `endTimelinePreviewSession`, also saying whether the snapshot was actually restored — false when
+ *  the scene changed since the begin (the guard below refuses to load it over the new scene). For
+ *  toolbar Stop's agent reply (#1574), which otherwise cannot tell a revert from a skip. */
+export async function endTimelinePreviewSessionReporting(opts: { restore: boolean; rebind?: () => number | null }): Promise<{ root: number | null; reverted: boolean }> {
   // #1164: taken synchronously, before anything else. Panels call this WITHOUT awaiting and flip the
   // run mode to 'stopped' on the next line, so without the token that flip would count as settled
   // and a deferred hot reload would start a load under the restore below — see `authoringSettle.ts`.
@@ -377,7 +384,7 @@ export async function endTimelinePreviewSession(opts: { restore: boolean; rebind
   }
 }
 
-async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: () => number | null }): Promise<number | null> {
+async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: () => number | null }): Promise<{ root: number | null; reverted: boolean }> {
   // ⚠️ Invalidate any in-flight `begin` FIRST. `beginTimelinePreviewSession` seats its snapshot on
   // `if (!_snap)` alone, so a begin still awaiting `serializeScene()` when the envelope is exited
   // used to seat a session AFTERWARDS — and the pose chained onto it then ran with run-mode back at
@@ -400,7 +407,7 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
     // No restore (or a snapshot for a different scene — don't clobber): the world keeps the session's
     // edits, so their entries stay valid, and pushes from here on are authored.
     clearPreviewUndoSession(session);
-    return null;
+    return { root: null, reverted: false };
   }
   // From here until the drop, every undo/redo is refused and the session's mark stays on (#1148
   // review): an edit pushed while the restore is awaiting lands in the posed world the swap throws
@@ -415,7 +422,7 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
     await whenUndoIdle();
     // ⚠️ Re-check the path AFTER that wait: a scene opened meanwhile must not have this snapshot
     // loaded over it (the check above ran before the yield).
-    if (currentSceneKey() !== snap.key) return null;
+    if (currentSceneKey() !== snap.key) return { root: null, reverted: false };
     await restoreAuthoredSnapshot(snap);
     reverted = true;
   } finally {
@@ -430,7 +437,7 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
     // them, or an undo after Exit writes a posed value into the authored scene (#1148).
     finishPreviewRestore(session, { drop: reverted });
   }
-  return opts.rebind?.() ?? null;
+  return { root: opts.rebind?.() ?? null, reverted: true };
 }
 
 function releaseSideState(): void {
