@@ -10,7 +10,7 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { type ToolResult, MAX_PAYLOAD_CHARS } from '../result.js';
 import { summarizeAssets, summarizeTraits, type AssetEntry, type TraitSchema } from '../summarize.js';
-import { mutateOpSchema, precisionParam, unsavedForceParam } from '../shapes.js';
+import { mutateOpSchema, precisionParam, unsavedForceParam, unknownKeysErrorMap } from '../shapes.js';
 import { describeShape } from '../../../shared/mcpResult.js';
 
 export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
@@ -22,6 +22,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
     'Read the LIVE ECS world. This reads the running engine, NOT the scene file — so it ' +
       'PROVES an edit actually took effect. The primary, deterministic, cheap way to verify ' +
       'your work after a mutate (prefer it over a screenshot for "did the data change?"). ' +
+      '(A physics ray/shape/point cast is modoki_scene_query.) ' +
       'CALLED BARE it returns an INDEX: each entity\'s id, guid, name, parentId, layer and its ' +
       'trait NAMES — no field values. That is the cheap "what exists?" question; ask it first. ' +
       'To get VALUES, target or enrich: trait=<Trait> | id=<n> | name=<substr> | ' +
@@ -39,7 +40,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       where: z.string().optional().describe('Filter by predicate "Trait.field op value", op ∈ = != > >= < <= ~ (~=contains). E.g. "Transform.y>5". Unparseable/unknown-trait/unknown-field → a `warnings` entry, not a silent full dump.'),
       full: z.boolean().optional().describe('Include EVERY persistent trait field (AoS/object fields like animSets/materials/onClickSet), not just the curated Inspector subset. Default false (bare = a names-only index). NOTE: an UNTARGETED full=1 on a real scene exceeds the response cap and comes back as an elision envelope — combine it with trait=/id=/name=/where= or limit=.'),
       resources: z.boolean().optional().describe('Force-include resource entities (mesh/material/prefab/env holders + config singletons Time/Physics/NPRPostFX). Excluded from the DEFAULT untargeted listing only — any id/trait/name/where filter already includes them.'),
-      limit: z.number().int().nonnegative().optional().describe('Cap the entities returned. `returnedCount` is what came back and `totalCount` every match before the cap (both always); truncated:true when it bites. The untargeted INDEX applies a default cap; an explicit limit always wins, and a targeted query is never capped unless you pass one.'),
+      limit: z.number().int().nonnegative().optional().describe('Cap the entities returned. `returnedCount` is what came back and `totalCount` every match before the cap (both always); truncated:true when it bites. The untargeted INDEX is capped at 200 by default; an explicit limit always wins, and a targeted query is never capped unless you pass one.'),
       world: z.boolean().optional().describe('Add each entity\'s RESOLVED world transform (position/rotation/scale after parent-chain propagation) + activeInHierarchy flag. Default false (local Transform only). Saves composing the parent chain by hand.'),
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect (screen {x,y,w,h} CSS px) + onScreen flag, plus (3D only) worldAABB {size:[x,y,z], center:[x,y,z]} — the TRUE geometric extent in world units (distinct from the authored scale). Geometry without a separate get_layout_bounds call. Default false. Needs the renderer.'),
       contacts: z.boolean().optional().describe('Add each body\'s CURRENT physics contacts as GUID arrays (rolled up to bodies; a partner with no guid appears as `id:<n>`): `contacts` (solid, load-bearing — resting on the ground) + `overlaps` (sensor/trigger — inside a zone). The STATE view ("what is it touching NOW"), vs the @contact/@sensor journal EVENTS ("when did they touch"). Present only on bodies currently touching something. Default false.'),
@@ -178,7 +179,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
         id: z.number().int().optional(),
         name: z.string().optional(),
         guid: z.string().optional(),
-      }).strict('an entity ref accepts only: guid, name, id')
+      }, { errorMap: unknownKeysErrorMap('an entity ref accepts only: guid, name, id') }).strict()
         .describe('Entity ref — exactly one of {guid} | {name} | {id}. Live: {id} only for an entity with no guid; file-direct: {id} is the authored file id.'),
       // It said "World position" and wrote Transform.x/y/z, which is LOCAL. Measured on a parented
       // entity: asking for its OWN current world position moved it by the parent offset

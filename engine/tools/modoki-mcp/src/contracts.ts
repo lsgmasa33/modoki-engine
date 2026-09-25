@@ -592,8 +592,9 @@ const DECLS: Record<string, Decl> = {
     mutating: true, persists: 'session', requires: ['editor', 'renderer'],
     filters: ['type', 'level', 'limit'],
     notes: "IMPURE READ, and a mutating GET: action:'start'/'stop' opens/closes a Tier-2 capture " +
-      'window and clear:true empties the 10,000-event ring — both via GET, so isFailureBody never ' +
-      'checks them. No `since` filter, unlike modoki_editor_journal.',
+      'window and clear:true empties the 10,000-event ring — both via GET, which the tool runs through ' +
+      'the failure check at its call site (conventions §4), so a refusal cannot arrive as success. ' +
+      'No `since` filter, unlike modoki_editor_journal.',
   },
   modoki_resolve_refs: {
     kind: 'read', method: 'GET', route: '/api/resolve-refs', requires: ['project'],

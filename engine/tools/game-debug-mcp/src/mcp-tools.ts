@@ -19,6 +19,7 @@ import { identityMismatch, tokenMismatchWarning, describeIdentity } from '../../
 // `timeoutMs` and the device's own internal step budget can never independently drift (#822).
 import { simStepDefaultTimeout, SIM_STEP_MAX_FRAMES } from '../../shared/simStepTiming.js';
 import { DEVICE_KEY_MODIFIERS, KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../shared/inputVocabulary.js';
+import { nestedUnknownKeyMessage } from '../../shared/unknownParam.js';
 import { CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, vocabularyProse, type CreateEntityKind } from '../../shared/createEntityVocabulary.js';
 import { ignoredHandleFilter, parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../shared/handlesReply.js';
 import { INVALIDATABLE_ASSET_TYPES } from '../../shared/invalidateAssets.js';
@@ -63,6 +64,19 @@ const DEVICE_ALLOW_OCCLUDED =
   + 'Applies to `entity` and `selector` aims; raw x/y is never refused, because a coordinate is exactly what you asked for.';
 
 /** A FACTORY, as the editor's is: a schema reused by reference is emitted as a `$ref` a client may not resolve. */
+/** The unit clash a raw device coordinate walks into (2026-09-25 audit, C-1): the input tools take
+ *  SCREENSHOT pixels and scale them on-device (`screenshotToCSS`), while every device READ reports
+ *  viewport CSS px. A point copied from a read lands at 1/DPR of where it was meant — and a raw
+ *  coordinate is exempt from the occlusion refusal, so the tap answers ok. Said on both sides. */
+const SCREENSHOT_PX = 'in SCREENSHOT px (device_screenshot) — NOT the CSS px device_layout_bounds/hit_regions/handles report';
+const CSS_PX_NOTE = ' Coordinates here are viewport CSS px — device_tap/drag/pointer/scroll x,y take SCREENSHOT px, so aim those by entity/selector rather than copying a point.';
+
+/** zod 4's twin of the editor's `unknownKeysErrorMap` (`modoki-mcp/src/shapes.ts`): the nested
+ *  object's fixed sentence, prefixed with the key(s) actually sent. Any other issue keeps zod's own
+ *  text — a string where an object belongs is "expected object", not "accepts only: …". */
+const unknownKeysError = (accepts: string) => (issue: { code?: string; keys?: readonly string[] }) =>
+  (issue.code === 'unrecognized_keys' ? nestedUnknownKeyMessage(accepts, issue.keys ?? []) : undefined);
+
 const makeDeviceEntitySpec = () => z.strictObject({
   guid: z.string().optional(),
   name: z.string().optional(),
@@ -73,7 +87,7 @@ const makeDeviceEntitySpec = () => z.strictObject({
       "the game's canvases; 'game-ui' = its DOM UI layer. (No 'scene-view' — that is the editor's viewport.)"),
   allowOccluded: z.boolean().optional()
     .describe('Aim at the entity even when something is in front of it, and report what was hit. Default false — a covered aim is REFUSED.'),
-}, { error: 'an entity aim accepts only: guid, name, id, surface, allowOccluded' }).describe(
+}, { error: unknownKeysError('an entity aim accepts only: guid, name, id, surface, allowOccluded') }).describe(
   'Aim at a SCENE ENTITY by exactly one of {guid} | {name} | {id}, resolved to its live screen rect ON ' +
   'THE DEVICE inside this call — no screenshot, no read-then-tap race. Prefer guid; {id} only for an ' +
   'entity with no guid (runtime ids are reassigned on every reload). A name matching several entities ' +
@@ -88,7 +102,7 @@ const makeDevicePointSpec = () => z.strictObject({
   x: z.number().optional(),
   y: z.number().optional(),
   allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
-}, { error: 'a drag endpoint accepts only: entity, selector, x, y, allowOccluded' });
+}, { error: unknownKeysError('a drag endpoint accepts only: entity, selector, x, y, allowOccluded') });
 
 type DeviceEntityAim = { guid?: string; name?: string; id?: number; surface?: string; allowOccluded?: boolean };
 
@@ -118,7 +132,7 @@ const specFieldSchema = (kind: CreateEntityKind) => {
 const makeDeviceCreateEntitySpec = () => z.discriminatedUnion('kind', CREATE_ENTITY_KINDS.map((kind) => {
   const field = specFieldSchema(kind);
   return z.strictObject({ kind: z.literal(kind), ...field },
-    { error: `a "${kind}" spec accepts only: ${['kind', ...Object.keys(field)].join(', ')}` });
+    { error: unknownKeysError(`a "${kind}" spec accepts only: ${['kind', ...Object.keys(field)].join(', ')}`) });
 }) as unknown as [z.ZodObject, ...z.ZodObject[]],
 // The union's own miss (an unknown or missing kind) says only "Invalid input" unless told otherwise; the op
 // used to answer this case with the kinds as options, so the schema that now refuses it first names them too.
@@ -1027,7 +1041,8 @@ export function registerTools(server: McpServer) {
 
   tool('device_get_scene_state',
     'Read the live ECS world on the connected device as DATA (no screenshot). Bare call = a compact ' +
-      'INDEX (entity id/guid/name/traits, no values); drill down with a filter or enricher. Address ' +
+      'INDEX (entity id/guid/name/traits, no values); drill down with a filter or enricher (a physics ' +
+      'cast is device_scene_query). Address ' +
       'entities by guid, never by id. Every entity has one; a code-spawned entity\'s runtime guid is ' +
       'valid only until the scene reloads. Floats are rounded — verify with a ' +
       'tolerance, not ===. RESOURCE entities (mesh/material/prefab/env holders + config singletons ' +
@@ -1044,7 +1059,7 @@ export function registerTools(server: McpServer) {
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect + onScreen flag.'),
       contacts: z.boolean().optional().describe('Add current physics contacts/overlaps (GUID arrays; a partner with no guid appears as `id:<n>`) per body.'),
       resources: z.boolean().optional().describe('Force-include resource entities (mesh/material/prefab/env holders + config singletons Time/Physics/NPRPostFX). Excluded from the DEFAULT untargeted listing only — any id/guid/trait/name/where filter already includes them.'),
-      limit: z.number().optional().describe('Cap entities returned: `returnedCount` came back of `totalCount` matched (both always); truncated:true when it bites.'),
+      limit: z.number().optional().describe('Cap entities returned: `returnedCount` came back of `totalCount` matched (both always); truncated:true when it bites. The untargeted INDEX is capped at 200 by default; a targeted query is uncapped unless you pass one.'),
       precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),
     },
     async (args) => perceptCall('device_get_scene_state', 'scene-state', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
@@ -1094,7 +1109,7 @@ export function registerTools(server: McpServer) {
     {
       refs: z.array(z.union([z.string(), z.number()])).describe('Refs to resolve — GUIDs and/or numeric ids.'),
     },
-    async (args) => perceptCall('device_resolve_refs', 'resolve-refs', args, 'resolve asset refs on the device'),
+    async (args) => perceptCall('device_resolve_refs', 'resolve-refs', args, 'resolve journal/entity refs on the device'),
   );
 
   tool('device_introspect',
@@ -1166,7 +1181,8 @@ export function registerTools(server: McpServer) {
   tool('device_scene_query',
     'Cast a ray, sweep a sphere/circle, or pick a point against the LIVE PHYSICS world on the ' +
       'device — "what is over there / would this fit / what is under this point", answered as DATA ' +
-      'instead of from a screenshot. All six engine queries (raycast/shapecast/point, 2D and 3D) ' +
+      'instead of from a screenshot. NOT an entity search — find entities by name/trait with ' +
+      'device_get_scene_state. All six engine queries (raycast/shapecast/point, 2D and 3D) ' +
       'behind one tool; every one is a pure read.\n\n' +
       'A MISS AND A REFUSAL ARE DIFFERENT ANSWERS. The engine functions return the same null for a ' +
       'clean miss, an absent physics world, and a zero-length direction; the last two are ruled out ' +
@@ -1239,7 +1255,7 @@ export function registerTools(server: McpServer) {
     'Numeric screen-space layout on the device (viewport CSS px) — UI DOM rects, 2D, and 3D world ' +
       'AABBs projected through the game camera (editor-style HANDLES: device_handles). Use instead of eyeballing a screenshot to check ' +
       'alignment/overlap/clipping. Bare = COUNTS + the cheap offScreen/zeroSize guid lists; pass ids/layer ' +
-      'for per-entity rects, overlaps=true for the O(n²) pair list. Floats rounded — verify by tolerance.',
+      'for per-entity rects, overlaps=true for the O(n²) pair list. Floats rounded — verify by tolerance.' + CSS_PX_NOTE,
     {
       layer: z.enum(['ui', '2d', '3d']).optional().describe('Limit to one layer (implies per-entity rects).'),
       ids: z.array(z.number()).optional().describe('Limit to these entity ids (implies per-entity rects). Volatile across reloads — prefer guids.'),
@@ -1273,7 +1289,7 @@ export function registerTools(server: McpServer) {
       expireFrames: z.number().optional().describe('(start) Auto-remove after N frames (0 = never).'),
       id: z.string().optional().describe('(read/clear) Watch id from start/list. Omit on clear to clear ALL.'),
       name: z.string().optional().describe('(read) Filter returned series to entities whose name contains this.'),
-      limit: z.number().optional().describe('(read) Cap the number of series returned.'),
+      limit: z.number().optional().describe('(read) Cap the number of series returned (default 100; sets seriesTruncated when it drops some).'),
       clear: z.boolean().optional().describe('(read) Clear the series THIS CALL RETURNED (not the whole watch — a read is capped/filterable, so series you did not see keep their samples). The reply echoes `cleared` + `clearedScope`.'),
       samples: z.boolean().optional().describe('(read) Include the RAW time-series (default false — stats only).'),
       precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),
@@ -1391,7 +1407,7 @@ export function registerTools(server: McpServer) {
       'WHAT it missed and BY HOW MUCH. THIS IS THE SURFACE THAT MATTERS ON A PHONE — touch targets ' +
       'are missed by fingers, and a device screenshot can only show what was DRAWN, which is often ' +
       'not the shape that is hit-tested. action:read returns the regions as data (viewport CSS px, ' +
-      'the same space device_input_watch records presses in). action:show/hide toggles an on-screen ' +
+      'the same space device_input_watch records presses in — NOT the screenshot px device_tap x,y take). action:show/hide toggles an on-screen ' +
       'overlay that also plots the last few recorded presses, green inside a region and red ' +
       'outside. Pass at:{x,y} — a press coordinate straight from device_input_watch — to get ' +
       'hitsAt, and when empty, nearest {id, kind, label, distancePx}. A region may carry ' +
@@ -1573,8 +1589,8 @@ export function registerTools(server: McpServer) {
     {
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device to the element center; refuses if occluded). Preferred for DOM targets.'),
-      x: z.number().optional().describe('X (screenshot pixels) — used when no entity or selector.'),
-      y: z.number().optional().describe('Y (screenshot pixels) — used when no entity or selector.'),
+      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Used when no entity or selector.`),
+      y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
       allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
     },
     async ({ entity, selector, x, y, allowOccluded }) => {
@@ -1645,8 +1661,8 @@ export function registerTools(server: McpServer) {
       to: makeDevicePointSpec().optional().describe('End point: {entity} | {selector} | {x,y}, plus an optional allowOccluded for this end.'),
       fromSelector: z.string().optional().describe('CSS selector for the start point (flat form of from.selector).'),
       toSelector: z.string().optional().describe('CSS selector for the end point (flat form of to.selector).'),
-      fromX: z.number().optional(), fromY: z.number().optional(),
-      toX: z.number().optional(), toY: z.number().optional(),
+      fromX: z.number().optional().describe('Flat alias of from.x (screenshot px).'), fromY: z.number().optional().describe('Flat alias of from.y.'),
+      toX: z.number().optional().describe('Flat alias of to.x (screenshot px).'), toY: z.number().optional().describe('Flat alias of to.y.'),
       allowOccluded: z.boolean().optional().describe(`${DEVICE_ALLOW_OCCLUDED} Applies to BOTH endpoints; set it on \`from\`/\`to\` to allow just one.`),
       steps: z.number().optional().describe('Intermediate steps (default: 5)'),
       delayMs: z.number().optional().describe('Delay per step ms (default: 20)'),
@@ -1740,8 +1756,8 @@ export function registerTools(server: McpServer) {
       action: z.enum(POINTER_ACTIONS).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device; refuses if occluded). Preferred for DOM targets.'),
-      x: z.number().optional().describe('X (screenshot pixels) — used when no entity or selector.'),
-      y: z.number().optional().describe('Y (screenshot pixels) — used when no entity or selector.'),
+      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Used when no entity or selector.`),
+      y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
       allowOccluded: z.boolean().optional().describe(`${DEVICE_ALLOW_OCCLUDED} Applies to action:'down' only — a move/up is delivered to whatever captured the press.`),
     },
@@ -2106,7 +2122,7 @@ export function registerTools(server: McpServer) {
       'counts (byEditor/byKind); pass a filter to get geometry. A filtered call that matches nothing ' +
       'names what IS live rather than returning a bare empty list, so a typo cannot read as a ' +
       'correct negative answer. A shipped game has no authoring editors: its handles are the ones the ' +
-      'game registers, plus `chrome` — every `data-ui-id` element in its DOM.',
+      'game registers, plus `chrome` — every `data-ui-id` element in its DOM.' + CSS_PX_NOTE,
     {
       editor: z.string().optional().describe('Filter to one editor/provider, e.g. "chrome", or one the game registers.'),
       kind: z.string().optional().describe('Filter to one handle kind, e.g. "button".'),
@@ -2290,8 +2306,8 @@ async function coordScaleOrRefusal(
     {
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to hover (preferred for DOM targets).'),
-      x: z.number().optional().describe('X (screenshot pixels) — used when no entity or selector.'),
-      y: z.number().optional().describe('Y (screenshot pixels) — used when no entity or selector.'),
+      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Used when no entity or selector.`),
+      y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
       allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
     },
     async ({ entity, selector, x, y, allowOccluded }) => {
@@ -2337,8 +2353,8 @@ async function coordScaleOrRefusal(
       dy: z.number().optional().describe('Alias for deltaY, kept for existing callers.'),
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to scroll over.'),
-      x: z.number().optional().describe('X (screenshot pixels) — the point to scroll over.'),
-      y: z.number().optional().describe('Y (screenshot pixels).'),
+      x: z.number().optional().describe(`X ${SCREENSHOT_PX} — the point to scroll over.`),
+      y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
       allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
     },
     async ({ deltaX, deltaY, dx, dy, entity, selector, x, y, allowOccluded }) => {

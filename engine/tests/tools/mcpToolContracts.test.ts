@@ -610,6 +610,11 @@ describe('descriptions an agent reads under deferral (#1208)', () => {
     ['device_input_watch', 'device_hit_regions'],
     ['device_eval', 'device_eval_api'],
     ['device_layout_bounds', 'device_handles'],
+    // 2026-09-25 audit (C-9): measured, not theoretical — agents called scene_query with
+    // entity-search params (`name`, `limit`, `where`, `traits`) 23 times; it is a PHYSICS query.
+    ['modoki_scene_query', 'modoki_get_scene_state'],
+    ['device_scene_query', 'device_get_scene_state'],
+    ['modoki_play_clip', 'modoki_pose_clip'],
   ];
 
   /** Emptied by #1208 Phase 4 on the day the guard landed. A new row needs a reason an agent

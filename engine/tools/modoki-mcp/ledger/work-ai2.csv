@@ -115,3 +115,8 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-19,work-ai2,modoki_prefab,93,5036,175294,da8379f83
 2026-09-19,work-ai2,modoki_reparent_entity,456,1233,175750,a05fef3ef
 2026-09-19,work-ai2,modoki_mutate_scene,59,2775,175801,94ab9ad5a
+2026-09-25,work-ai2,modoki_get_scene_state,62,3706,175582,d1149a15d
+2026-09-25,work-ai2,modoki_play_clip,-428,895,175582,d1149a15d
+2026-09-25,work-ai2,modoki_pose_clip,54,1715,175582,d1149a15d
+2026-09-25,work-ai2,modoki_scene_query,80,3227,175582,d1149a15d
+2026-09-25,work-ai2,modoki_watch,13,4341,175582,d1149a15d

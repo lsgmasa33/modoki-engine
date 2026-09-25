@@ -39,6 +39,20 @@ not outrank #1.
 **Every tool validates its arguments strictly, on every path a call can arrive by.** An unknown or
 misspelled key is a **refusal** naming the tool's real parameter names — never silently dropped.
 
+**The refusal names the offending key too, and which nested param has a field of that name** (#1545):
+``modoki_tap received an unrecognized parameter: 'surface'. 'surface' is not a top-level parameter;
+`entity` has a field of that name (entity: …). It accepts: …``; a nested object says `unrecognized key 'values' — setTrait
+accepts: …`. The MCP SDK delivers only each zod issue's `message` (plus `at <path>` when nested) —
+never zod's `keys` — so a refusal that merely listed the options left the caller diffing its own
+call against the list; measured, 5 of 8 retries after a misplaced `surface` failed again. One
+wording for every surface in `engine/tools/shared/unknownParam.ts` (the editor's zod-3 `errorMap`,
+the device's zod-4 `error` fn, `modoki_batch`'s pre-flight, and the nested objects via
+`unknownKeysErrorMap`/`unknownKeysError`). ⚠️ A fixed `.strict('message')` string cannot see the
+key — a new strict object uses the helper, not a literal. ⚠️ **The nested match is a FACT, never an
+instruction** ("goes inside X"): a name match is not a meaning match — `set_selection
+{name:'Capsule'}` meant an entity, and its only nested `name` is `asset.name`, an asset selection —
+so the refusal states which param has the field and quotes that param's own description.
+
 Why: zod strips unknown keys by default, and the MCP SDK builds a plain `z.object` (no `.strict()`)
 — verified in `@modelcontextprotocol/sdk`'s `objectFromShape` (`.../zod-compat.js`). For a tool
 whose params are all optional, that turns a typo into **a different operation**:
@@ -847,8 +861,9 @@ variance is machine-readable while it lasts.
 found the predictable result of treating them as separate: the device server had **no
 `isFailureBody` equivalent**, so a 200-with-`{ok:false}` was reported to the agent as success across
 all six device Percept tools — the exact class fixed on the editor side and silently unfixed there.
-(Closed since: `perceptCall` runs the shared `isFailureBody`. Its sibling `writeCall` and two inline
-checks still carry hand-copied predicates, #1208 C-16.)
+(Closed since: `perceptCall`, `writeCall` and the inline relay check all run the shared
+`isFailureBody` (#1211 C-16). `device_type_text` deliberately does not — it always answers `ok`, so
+it reads its own verification field instead; the reason is at the call site.)
 
 - **A rule implemented twice diverges.** `result.ts` and `summarize.ts` exist in both MCP servers,
   diverged (136 vs 64 lines). Shared behaviour lives in ONE module both import (F5).

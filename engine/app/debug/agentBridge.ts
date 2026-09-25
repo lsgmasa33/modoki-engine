@@ -1502,7 +1502,7 @@ registerAgentOp('watch-start', (params) => startWatch((params ?? {}) as StartWat
 // ~160KB–1MB), unlike sibling reads (journal, get_scene_state) which default-cap. Cap HERE at the op —
 // NOT in readWatch, which WatchTab.tsx calls directly and needs every series for its chart. seriesTotal/
 // seriesTruncated (already emitted by readWatch when limit < matched) announce the truncation.
-const DEFAULT_WATCH_SERIES_LIMIT = 100;
+export const DEFAULT_WATCH_SERIES_LIMIT = 100;
 registerAgentOp('watch-read', (params) => {
   const p = (params ?? {}) as { id?: string; clear?: boolean; samples?: boolean; precision?: number; name?: string; guids?: string[]; limit?: number };
   const sig = resolvePrecision(p.precision);

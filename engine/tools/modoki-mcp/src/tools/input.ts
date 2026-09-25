@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, TIMEOUT_MS_BASE, allowOccludedParam, makeEntitySpec, makeLabelAimParam, makeWithinParam, modifierEnum, makePointSpec } from '../shapes.js';
+import { unknownKeysErrorMap, ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, TIMEOUT_MS_BASE, allowOccludedParam, makeEntitySpec, makeLabelAimParam, makeWithinParam, modifierEnum, makePointSpec } from '../shapes.js';
 import { KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../shared/inputVocabulary.js';
 import { parseHandleIds } from '../../../shared/handlesReply.js';
 
@@ -320,7 +320,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     selector: z.string().optional(),
     x: z.number().optional(),
     y: z.number().optional(),
-  }).strict('a dnd endpoint accepts only: selector, x, y')
+  }, { errorMap: unknownKeysErrorMap('a dnd endpoint accepts only: selector, x, y') }).strict()
     .refine((e) => !!e.selector || (typeof e.x === 'number' && typeof e.y === 'number'),
       { message: 'a dnd endpoint needs {selector} or BOTH {x,y} — this tool cannot be aimed by entity (HTML5 DnD is a DOM-element protocol)' });
   tool(

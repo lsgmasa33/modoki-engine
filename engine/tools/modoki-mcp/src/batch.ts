@@ -29,6 +29,7 @@ import { z, type ZodRawShape } from 'zod';
 import type { ToolResult } from './result.js';
 import { getTool as defaultGetTool, toolNames } from './registry.js';
 import { CONTRACTS } from './contracts.js';
+import { unknownParamMessage } from '../../shared/unknownParam.js';
 
 /** How much of a step's payload comes back. See the module header for why `'none'` is safe. */
 export type ResultMode = 'none' | 'ack' | 'full';
@@ -296,11 +297,13 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
       const where = issue.path.join('.') || '(root)';
-      const known = Object.keys(entry.shape).join(', ');
-      // Name the accepted keys on an unrecognized-key error: the whole failure is "you used a name
-      // this tool doesn't have", so the answer is the list of names it does.
-      const extra = issue.code === 'unrecognized_keys' ? ` — accepted params: ${known}` : '';
-      return { rejected: `batch: ${at}: invalid args — ${where}: ${issue.message}${extra}` };
+      // A TOP-LEVEL unknown key gets the same refusal a direct call does (`shared/unknownParam.ts`):
+      // the key, where it belongs when a nested param declares it, and the accepted params. A
+      // nested one keeps zod's text, which already names the key beside its path.
+      if (issue.code === 'unrecognized_keys' && issue.path.length === 0) {
+        return { rejected: `batch: ${at}: invalid args — ${unknownParamMessage(entry.name, entry.shape as Record<string, unknown>, issue.keys)}` };
+      }
+      return { rejected: `batch: ${at}: invalid args — ${where}: ${issue.message}` };
     }
   }
   return { tools: resolved };

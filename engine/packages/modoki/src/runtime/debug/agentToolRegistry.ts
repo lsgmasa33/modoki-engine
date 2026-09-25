@@ -51,8 +51,9 @@ export interface AgentToolDef {
   /** The tool's FULL name, exactly as it will appear over MCP (e.g. `court_load_level`).
    *
    *  The game supplies the whole name rather than a bare verb the engine namespaces, so there is
-   *  no synthesized prefix that can drift from what the agent actually calls. The convention —
-   *  and the bridge enforces it — is `<gameId>_<verb>`. */
+   *  no synthesized prefix that can drift from what the agent actually calls. The convention is
+   *  `<gameId>_<verb>`, checked STATICALLY by `tests/architecture/gameAgentToolNames.test.ts` —
+   *  not at runtime, since this registry cannot tell which game is calling (docs/agent-tools.md). */
   name: string;
   /** What the tool does, in the CALLER's terms. This is the only thing an agent sees before
    *  choosing it, so say what question it answers and what it returns. */

@@ -1202,10 +1202,13 @@ await withCleanup(async () => {
 const typo = await client.callTool({ name: 'modoki_batch', arguments: { steps: [
   { tool: 'modoki_set_selection', args: { name: 'Capsule' } },
 ] } });
-if (!typo.isError || !/Unrecognized key/.test(text(typo))) {
+if (!typo.isError || !/unrecognized parameter: 'name'/.test(text(typo))) {
   throw new Error(`an unknown arg key must be refused: ${text(typo)}`);
 }
-if (!/accepted params:/.test(text(typo))) throw new Error('the refusal must name the accepted params');
+if (!/It accepts: .*\bguid\b/.test(text(typo))) throw new Error('the refusal must name the accepted params');
+// `name` is a field of `asset` (an ASSET selection) — the refusal may say so as a fact, never as
+// "it goes inside asset": the caller here meant an entity (#1545 review).
+if (/goes inside/.test(text(typo))) throw new Error(`the refusal must not instruct a nested home: ${text(typo)}`);
 console.log('batch pre-flight refuses an unknown arg key and lists the real ones ✓');
 
 // ── modoki_hit_regions (#139) ────────────────────────────────────────────────

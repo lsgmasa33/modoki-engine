@@ -257,7 +257,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_pose_clip',
     'Pose the bound rig at a time in the open animation clip — the thing modoki_set_playhead ' +
-      'deliberately does NOT do. This is the human scrub gesture, driven by the same code: it ' +
+      'deliberately does NOT do (to switch a PLAYING entity\'s clip, modoki_play_clip). This is the human scrub gesture, driven by the same code: it ' +
       'moves the playhead AND samples the clip into the live world, so a render or capture taken ' +
       'afterwards shows the posed rig.\n\n' +
       'It poses INSIDE the editor\'s preview envelope, opening one if needed. That matters: the ' +

@@ -125,7 +125,7 @@ describe('pre-flight — nothing runs until everything validates', () => {
     expect(isRejection(r)).toBe(true);
     expect((r as BatchRejection).rejected).toMatch(/invalid args/);
     // The message must carry the fix: the parameter names this tool actually has.
-    expect((r as BatchRejection).rejected).toMatch(/accepted params:.*guid/);
+    expect((r as BatchRejection).rejected).toMatch(/It accepts:.*guid/);
     expect(ran).toEqual([]);
   });
 

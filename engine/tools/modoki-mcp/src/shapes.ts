@@ -9,6 +9,15 @@
 
 import { z } from 'zod';
 import { EDITOR_INPUT_MODIFIERS } from '../../shared/inputVocabulary.js';
+import { nestedUnknownKeyMessage } from '../../shared/unknownParam.js';
+
+/** The refusal for a NESTED strict object: its fixed "X accepts only: …" sentence, prefixed with
+ *  the key(s) the caller actually sent (`shared/unknownParam.ts`). An `errorMap` rather than
+ *  `.strict(message)`, because a fixed string cannot see `issue.keys` — and the SDK reports only
+ *  the message plus the path. Any other issue on the object keeps zod's own text. */
+export const unknownKeysErrorMap = (accepts: string): z.ZodErrorMap => (issue, ctx) => ({
+  message: issue.code === 'unrecognized_keys' ? nestedUnknownKeyMessage(accepts, issue.keys) : ctx.defaultError,
+});
 
 /* `SAVE_PARAM` was here. REMOVED 2026-08-22 (owner decision).
  *
@@ -54,7 +63,7 @@ export const makeEntitySpec = () => z.object({
       'on EVERY scope, whether the cover is another entity or a DOM element over the viewport (a ' +
       'modal, a menu, a panel), because the press lands on it either way. `occlusionScope` in the ' +
       'response says how far the check could SEE.'),
-}).strict('an entity aim accepts only: guid, name, id, surface, allowOccluded').describe(
+}, { errorMap: unknownKeysErrorMap('an entity aim accepts only: guid, name, id, surface, allowOccluded') }).strict().describe(
   'Aim at a SCENE ENTITY by exactly one of {guid} | {name} | {id}, resolved to its live screen rect ' +
   'INSIDE this call, so there is no read-then-tap race. {id} only for an entity with no guid: ' +
   'runtime ids are reassigned on every reload. A name matching several entities is REFUSED, never first-match. A 2D/3D entity ' +
@@ -115,7 +124,7 @@ export const MODIFIERS_BASE = 'Held modifier keys';
 export const flatEntityAlias = z.object({
   guid: z.string().optional(),
   id: z.number().optional(),
-}).strict('an entity ref here accepts only: guid, id')
+}, { errorMap: unknownKeysErrorMap('an entity ref here accepts only: guid, id') }).strict()
   .optional().describe(
     'Alternative to this tool\'s flat `guid`/`id`: the same nested ref shape the aimed-input tools '
     + 'take, accepted here so one addressing form works across the surface. {id} only for an entity '
@@ -125,6 +134,18 @@ export const flatEntityAlias = z.object({
     + 'as a misleading "this ref is stale"). Look the guid up with modoki_get_scene_state {name} '
     + 'first. Passing both this and a flat `guid`/`id` is refused rather than silently preferring '
     + 'one.',
+  );
+
+/** `flatEntityAlias` for a tool whose op addresses by GUID ONLY (`modoki_play_clip`). Sharing the
+ *  guid/id alias advertised an `id` the op refuses — and #1545's refusals quote a param's
+ *  description, so `play_clip {id:3}` was told "`entity` has a field of that name (entity:
+ *  Alternative to this tool's flat `guid`/`id`…)" and sent to a shape that is refused too. */
+export const guidOnlyEntityAlias = z.object({
+  guid: z.string().optional(),
+}, { errorMap: unknownKeysErrorMap('an entity ref here accepts only: guid') }).strict()
+  .optional().describe(
+    'Alternative to this tool\'s flat `guid`, in the nested shape the aimed-input tools take. GUID '
+    + 'only — this op has no id or name resolver; look the guid up with modoki_get_scene_state {name}.',
   );
 
 /** Fold a nested `entity` ref into the flat `{guid, id}` a tool's handler already passes on.
@@ -341,7 +362,7 @@ const makeEntityRef = () => z.object({
   id: z.number().int().optional(),
   name: z.string().optional(),
   guid: z.string().optional(),
-}).strict('an entity ref accepts only: id, name, guid');
+}, { errorMap: unknownKeysErrorMap('an entity ref accepts only: id, name, guid') }).strict();
 
 export const mutateOpSchema = z.discriminatedUnion('op', [
   z.object({
@@ -350,24 +371,24 @@ export const mutateOpSchema = z.discriminatedUnion('op', [
     trait: z.string(),
     fields: z.record(z.any()).optional(),
     space: z.enum(['local', 'world']).optional(),
-  }).strict("setTrait accepts: op, entity, trait, fields, space (note `fields`, not `feilds`)"),
+  }, { errorMap: unknownKeysErrorMap("setTrait accepts: op, entity, trait, fields, space (note `fields`, not `feilds`)") }).strict(),
   z.object({
     op: z.literal('removeTrait'),
     entity: makeEntityRef(),
     trait: z.string(),
-  }).strict('removeTrait accepts: op, entity, trait'),
+  }, { errorMap: unknownKeysErrorMap('removeTrait accepts: op, entity, trait') }).strict(),
   z.object({
     op: z.literal('addEntity'),
     name: z.string().optional(),
     parentId: z.union([z.number(), z.string()]).optional(),
     traits: z.record(z.union([z.record(z.any()), z.boolean()])).optional(),
-  }).strict('addEntity accepts: op, name, parentId, traits'),
+  }, { errorMap: unknownKeysErrorMap('addEntity accepts: op, name, parentId, traits') }).strict(),
   z.object({
     op: z.literal('removeEntity'),
     entity: makeEntityRef(),
-  }).strict('removeEntity accepts: op, entity'),
+  }, { errorMap: unknownKeysErrorMap('removeEntity accepts: op, entity') }).strict(),
   z.object({
     op: z.literal('setBaseScene'),
     baseScene: z.string().nullable(),
-  }).strict('setBaseScene accepts: op, baseScene'),
+  }, { errorMap: unknownKeysErrorMap('setBaseScene accepts: op, baseScene') }).strict(),
 ]);

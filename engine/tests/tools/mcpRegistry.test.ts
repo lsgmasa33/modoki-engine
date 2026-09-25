@@ -486,7 +486,8 @@ describe('the real registered surface', () => {
     for (const name of DUAL_ADDRESSED) {
       const s2 = loadSurface();
       try {
-        await expect(s2.call(name, { entity: { name: 'Crate' } })).rejects.toThrow(/accepts only: guid, id/);
+        // `guid, id` on duplicate/focus, `guid` alone on play_clip (its op has no id resolver, #1545).
+        await expect(s2.call(name, { entity: { name: 'Crate' } })).rejects.toThrow(/unrecognized key 'name' — an entity ref here accepts only: guid(, id)?(?![\w,])/);
         // …and nothing was dispatched on the way to that refusal.
         expect(s2.requests.some((q) => q.path.startsWith('/api/editor-action'))).toBe(false);
       } finally { s2.restore(); }

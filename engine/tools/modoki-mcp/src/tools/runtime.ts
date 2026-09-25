@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { flatEntityAlias, foldEntityRef, precisionParam } from '../shapes.js';
+import { foldEntityRef, guidOnlyEntityAlias, precisionParam } from '../shapes.js';
 import { PROFILER_ACTIONS, PROFILER_READ_ACTIONS } from '../../../shared/profilerActions.js';
 
 export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
@@ -102,28 +102,27 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_play_clip',
     'Switch an entity\'s active animation clip BY NAME — the unified engine.playClip action, which ' +
       'drives whichever animator the entity carries (keyframe Animator, 2D SpriteAnimator, or GLB ' +
-      'SkeletalAnimator). Only while Playing (modoki_play_control play first). This switches WHICH ' +
+      'SkeletalAnimator). Only while Playing (modoki_play_control play first; to scrub a clip in the ' +
+      'editor instead, modoki_pose_clip). This switches WHICH ' +
       'clip plays; it does NOT edit clip data — that is modoki_anim_set_clip. Discover the valid ' +
       'names from the `clipNames` field on the animator trait in modoki_get_scene_state; verify the ' +
       'switch with get_scene_state (the trait\'s activeClip / clip).',
     {
       guid: z.string().optional().describe('GUID of the animator entity. Required unless `entity` is given.'),
-      entity: flatEntityAlias,
+      entity: guidOnlyEntityAlias,
       clip: z.string().describe('Clip NAME to play (one of the target\'s clipNames).'),
     },
     async ({ guid, entity, clip }) => {
       const ref = foldEntityRef({ guid }, entity);
-      if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'play a clip on an entity', why: ref.conflict, expected: 'either `guid`, or `entity:{guid|name|id}` — not both' });
-      // This op addresses the animator by GUID specifically — unlike duplicate/focus, an `id` does
-      // not work either, so both the missing case and the id-only case are refused HERE rather than
-      // sent on to fail less clearly downstream.
+      if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'play a clip on an entity', why: ref.conflict, expected: 'either `guid`, or `entity:{guid}` — not both' });
+      // This op addresses the animator by GUID only — unlike duplicate/focus, an `id` does not work,
+      // which is why `entity` is `guidOnlyEntityAlias` and an `{id}` is refused by the schema. What
+      // is left to refuse here is the call that addressed nothing.
       if (!ref.guid) {
         return fail({
           code: 'NOT_FOUND',
-          what: ref.id != null ? `play a clip on entity id ${ref.id}` : 'play a clip',
-          why: ref.id != null
-            ? 'engine.playClip addresses the animator by GUID, and only an id was given.'
-            : 'no entity was addressed.',
+          what: 'play a clip',
+          why: 'no entity was addressed.',
           expected: 'guid:"…", or entity:{guid}',
           options: ['look the guid up with modoki_get_scene_state (name= or id=), then pass it here'],
         });
@@ -182,7 +181,8 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_scene_query',
     'Cast a ray, sweep a sphere/circle, or pick a point against the LIVE PHYSICS world — the ' +
       '"what is over there / would this fit / what is under this point" question, answered as ' +
-      'DATA instead of from a screenshot. All six engine queries (raycast/shapecast/point, in 2D ' +
+      'DATA instead of from a screenshot. NOT an entity search — find entities by name/trait with ' +
+      'modoki_get_scene_state. All six engine queries (raycast/shapecast/point, in 2D ' +
       'and 3D) behind one tool; every one is a pure read that writes nothing.\n\n' +
       'REQUIRES A RUNNING SIM. A Rapier world is built by the physics system on its first tick and ' +
       'freed on Stop, so a STOPPED editor has none and every query REFUSES with ' +
@@ -410,7 +410,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       expireFrames: z.number().int().nonnegative().optional().describe('(start) Auto-remove the watch after N observed frames (0 = never). Default 0.'),
       id: z.string().optional().describe('(read/clear) Watch id from start/list. Omit on clear to clear ALL.'),
       name: z.string().optional().describe('(read) Filter the returned series to entities whose name contains this (case-insensitive) — isolate one entity in a broad watch. `seriesTotal` still reports the full match count.'),
-      limit: z.number().int().nonnegative().optional().describe('(read) Cap the number of series returned (sets seriesTruncated when it drops some). Pair with name=/guids= on a broad watch so the response does not blow the cap.'),
+      limit: z.number().int().nonnegative().optional().describe('(read) Cap the number of series returned (default 100; sets seriesTruncated when it drops some). Pair with name=/guids= on a broad watch so the response does not blow the cap.'),
       clear: z.boolean().optional().describe('(read) Clear the series THIS CALL RETURNED (not the whole watch — a read is capped/filterable, so the ones you did not see keep their samples). The reply echoes `cleared` + `clearedScope`.'),
       samples: z.boolean().optional().describe('(read) Include the RAW time-series per field. Default false — read returns stats only. A full read is ~40 chars/sample and the caps allow 512 series x 5000 samples, so ask for samples only when the stats are not enough (e.g. plotting the curve shape).'),
       precision: precisionParam(),

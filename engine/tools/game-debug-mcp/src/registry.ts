@@ -19,6 +19,7 @@
 
 import { z, type ZodRawShape } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { unknownParamMessage } from '../../shared/unknownParam.js';
 
 export type DeviceToolResult = { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>; isError?: boolean };
 
@@ -40,12 +41,13 @@ export function parseDeviceArgs(name: string, args: unknown): { ok: true; data: 
   return r.success ? { ok: true, data: r.data } : { ok: false, error: r.error.issues.map((i) => i.message).join('; ') };
 }
 
-/** zod 4 here (the editor server pins zod 3) — `.strict()` takes NO message, so the accepted-param
- *  list goes through `strictObject`'s `error` option. Same contract, different dialect. */
+/** zod 4 here (the editor server pins zod 3) — `.strict()` takes NO message, so the refusal goes
+ *  through `strictObject`'s `error` option. Same contract and the same wording as the editor
+ *  server (`shared/unknownParam.ts`): the key, where it belongs, the accepted params. Returning
+ *  `undefined` for any other issue keeps zod's default text. */
 function strictSchema(name: string, shape: ZodRawShape) {
-  const params = Object.keys(shape);
   return z.strictObject(shape, {
-    error: `${name} received an unrecognized parameter. It accepts: ${params.length ? params.join(', ') : '(no parameters)'}.`,
+    error: (issue) => (issue.code === 'unrecognized_keys' ? unknownParamMessage(name, shape, issue.keys) : undefined),
   });
 }
 
