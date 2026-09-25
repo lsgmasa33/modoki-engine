@@ -80,6 +80,15 @@ function parseForValidation(absPath: string, urlPath: string): { data: unknown }
 export function toFsUrl(abs: string): string {
   return path.posix.join('/@fs/', abs.replace(/\\/g, '/'));
 }
+
+/** `modoki_find_references`' ceilings. The MCP schema refuses above them (#1560) and hand-copies the
+ *  numbers (it bundles standalone); `numericRangeInSchema.test.ts` holds the copy to these. */
+export const FIND_REFERENCES_MAX_LIMIT = 1000;
+export const FIND_REFERENCES_MAX_DEPTH = 20;
+/** `modoki_render_sequence`'s ceilings — the same hand-copy arrangement as the two above. */
+export const RENDER_SEQUENCE_MAX_FRAMES = 120;
+export const RENDER_SEQUENCE_MAX_FPS = 60;
+
 /** The 403 for a path that resolves outside the project's asset roots — carrying its OWN options (#1254).
  *
  *  Without them the MCP's `httpFailure` fell back to its bare-403 option, "the backend belongs to a DIFFERENT
@@ -2436,8 +2445,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // frames). Body adds {frames?, fps?} to render-scene's. Returns frame paths.
   if (urlPath === '/api/render-sequence' && method === 'POST') {
     const b = (body ?? {}) as { frames?: number; fps?: number; width?: number; height?: number; quality?: number; camera?: unknown };
-    const frames = Math.max(1, Math.min(Math.round(b.frames ?? 8), 120));
-    const fps = Math.max(1, Math.min(b.fps ?? 10, 60));
+    const frames = Math.max(1, Math.min(Math.round(b.frames ?? 8), RENDER_SEQUENCE_MAX_FRAMES));
+    const fps = Math.max(1, Math.min(b.fps ?? 10, RENDER_SEQUENCE_MAX_FPS));
     const frameOpts = { width: b.width, height: b.height, quality: b.quality, camera: b.camera };
     const paths: string[] = [];
     // Hoisted alongside `paths` (#994 close-out F5) so the catch below can report the timings of
@@ -3558,8 +3567,8 @@ async function describeUnresolvedAgainstLiveWorld(
       }
 
       const result = findReferences(graph, node, {
-        limit: clampInt(query.get('limit'), 50, 1, 1000),
-        maxDepth: clampInt(query.get('maxDepth'), 6, 1, 20),
+        limit: clampInt(query.get('limit'), 50, 1, FIND_REFERENCES_MAX_LIMIT),
+        maxDepth: clampInt(query.get('maxDepth'), 6, 1, FIND_REFERENCES_MAX_DEPTH),
         reachableOnly: query.get('reachableOnly') === '1',
       });
       const body: FindReferencesResponse = {

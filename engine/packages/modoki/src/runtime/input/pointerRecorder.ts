@@ -118,7 +118,7 @@ interface InFlight extends InputPressRecord {
 }
 
 const DEFAULT_MAX = 40;
-const MAX_CEIL = 500;
+export const MAX_CEIL = 500;
 /** Guards against unbounded growth if `pointerup` is never delivered for some pointer (a browser
  *  reclaiming a touch without a cancel). Real multi-touch never approaches this. */
 const MAX_IN_FLIGHT = 10;

@@ -61,6 +61,29 @@ whose params are all optional, that turns a typo into **a different operation**:
 fixed for `modoki_batch`'s pre-flight — and left in place for every direct call, which is where
 most calls happen (V2).
 
+**A string-encoded value is DECODED, not refused — lossless cases only** (#1560; owner decision
+2026-09-25). `"12"` → 12, `"true"`/`"false"` → boolean, and a string that `JSON.parse`s to the
+object or array the schema wants → that value. Only where the schema at that path REJECTS the string:
+a plain `z.string()`, an enum or a `string | array` union is never rewritten. The decoded args then
+go through the same strict parse, so `"12abc"` still refuses, and so does a decoded object with a
+typo'd key, naming the key. Why: agents send `"limit":"12"`, `"bounds":"1"` and
+`"entity":"{\"name\":…}"`, and Claude Code itself sometimes packs a nested object into a string
+(the `$ref` corollary below). Each of these used to cost a raw `Expected number, received string`
+and a re-send of the same value.
+One helper, `engine/tools/shared/coerceArgs.ts`, keyed on the schema's own type-mismatch issues, so
+it works on both zod dialects. It reaches every path:
+- **Direct calls, both servers:** `installArgCoercion` wraps `McpServer.validateToolInput`. It is
+  installed by `registerAllTools`/`registerTools`, so no server can register tools without it.
+- **`modoki_batch`:** decodes in its pre-flight and writes the result back onto the step.
+- **Game tools:** `coerceAgentToolArgs` in the op-side validator decodes numbers and booleans
+  against the declaration.
+
+⚠️ **Not `z.preprocess` on the schema:** that makes it an effects/pipe schema, the SDK's
+`normalizeObjectSchema` stops recognising an object, and `tools/list` would advertise an EMPTY
+input schema for every tool. ⚠️ `installArgCoercion` **fails loud** if the SDK drops
+`validateToolInput` — a skip-if-absent would quietly return this to "refused".
+Tests: `engine/tests/tools/coerceStringEncoded.test.ts`, including a real-SDK round trip per server.
+
 Corollaries:
 - `modoki_batch`'s envelope itself is strict too, including **inside** each step object: `arg` for
   `args` currently runs the step with no arguments (S1.batch).
@@ -365,8 +388,9 @@ legitimate exception: it *measures* a path).
 - **A ROLE prefix is not a second spelling.** `parentGuid`/`entityGuid` (`modoki_prefab`) and
   `sampleGuid` (`modoki_capture_gesture`) name WHICH entity, because those tools address two, and a
   bare `guid` could not say which. A tool that addresses one entity uses bare `id`/`guid`.
-  `set_selection`'s `entityId`/`entityIds` beside `guid`/`guids` is the one mixed spelling left
-  (#1208 P1-5).
+  `set_selection`'s `entityId`/`entityIds` beside `guid`/`guids` was the last mixed spelling
+  (#1208 P1-5); #1560 renamed them `id`/`ids`. Its reply's `selection` object still reports
+  `entityId`/`entityIds`, because that is `get_editor_state`'s shape and is read, not sent.
 - **A `guid` and an `id` given together are REFUSED (`AMBIGUOUS`)**, flat or nested, and so are
   `parentGuid` beside ANY `parentId` (0 included: "the root" and "under this entity" are two answers)
   and `entityGuid` beside `entityId` (#1223 D1, which
@@ -385,7 +409,7 @@ legitimate exception: it *measures* a path).
   every aimed tool on both surfaces. They used to be settled by precedence (`entity` → `selector` →
   `{x,y}`) while `label` beside either was refused, which is two answers to one question. One
   predicate, `engine/tools/shared/aimAddresses.ts`, is read by every layer that sees a caller's aim.
-  The SET-shaped params (`guids`, `entityIds`, `get_scene_state`'s filters) are deliberately
+  The SET-shaped params (`guids`, `ids`, `get_scene_state`'s filters) are deliberately
   untouched — they take a set, not an aim, and a singular `entity` there would be a third shape
   rather than one fewer.
   ⚠️ **The flat-side alias takes `{guid|id}` only — no `name` — and is `.strict()`.** Both halves
@@ -686,7 +710,14 @@ Rules:
       nobody asked for. Two exceptions, both documented on the tool: a clamp the reply REPORTS
       (`set-playhead`'s `clampedFrom`), and a TIMEOUT budget (`timeoutMs`), which is clamped to its
       stated range like `modoki_eval`'s, because it bounds the wait rather than choosing the work.
-      A non-finite timeout is still refused (`sim-step`).
+      A non-finite timeout is still refused (`sim-step`). **The refusal lives in the SCHEMA** — a
+      param whose description states "max N" publishes `maximum: N` (#1560). The 2026-09-25 usage
+      audit (C-16) found `find_references`, `profiler`, `watch`, `input_watch` and
+      `device_duplicate_entity` advertising a max that the schema let through, to be clamped later
+      (`court_list_levels` also turned `limit:0` into 20). Guarded on both surfaces by
+      `engine/tests/tools/numericRangeInSchema.test.ts`. A max the schema cannot hold, because it
+      depends on another param, is refused by the op and listed in that test's `EXEMPT` with the
+      reason: `profiler` capture-read's 20 beside boot's 200, and the iOS system-capture window.
     - **An explicit argument that CONTRADICTS what the op can infer is refused** (`read-asset-def`'s
       `type` vs the path's suffix), rather than winning and producing a confident wrong negative.
   - **An op that acts ON an editor refuses when that editor is not showing anything** (#1213). The
@@ -844,6 +875,23 @@ variance is machine-readable while it lasts.
   from the same place the write landed (`read_asset_def` reads the LIVE cache, because an unsaved
   edit exists only there). A write whose effect cannot be read back cannot be verified without
   judging pixels, which this surface tells agents not to do.
+- **An action replies with what it CHANGED, read back — not with the whole editor state** (#1553).
+  `modoki_play_control` answers `{ok, playState, runMode, advancing}`, `modoki_history`
+  `{did, undo, unsavedChanges}`, a view setter the one field it set; the full state is
+  `modoki_get_editor_state`. The fields come from `editorStateFields(...)` in
+  `agentEditorOps.ts`, which re-reads the stores AFTER the action, so the reply is still evidence
+  of the post-state (§11) rather than an echo of the arguments. Scar: seventeen action ops spread
+  `readEditorState()` into their reply — ~1.7k chars a call, and `play_control` alone was 10.1% of
+  all MCP result tax (usage audit 2026-09-25 T-1). The size also pushed every such reply over
+  `modoki_batch`'s 1,500-char verbatim cap, so a batch elided the one field its step was run to
+  see. Guarded by `engine/tests/editor/actionReplyShape.test.ts`, which scans the source for any
+  new `readEditorState(` caller and pins each op's reply keys. ⚠️ **The HEALTH fields still ride on
+  every action reply** (`ACTION_HEALTH_KEYS`: `staleGameCode`, `frameLoop`, `rendererGate`, `gpu`,
+  `gameBootFaults`, `discardedUnsavedEdits`), each only while FAULTED: `frameLoop` only when
+  `stalled` and `rendererGate` only when `failed`. A hidden window and a `pending` renderer are
+  expected states, still reported by `get_editor_state`. The first cut dropped the faults with the
+  rest, so Play on a stale editor stopped saying `staleGameCode:true` in the one reply the agent
+  was reading (#1553 review). Pinned per key by `engine/tests/editor/actionReplyHealth.test.ts`.
 - **A file write invalidates the cache the runtime reads.** A `.particle.json` write currently
   leaves the renderer's particle cache stale, so a read-back returns the pre-write def as live truth
   and a read→modify→write round-trip silently reverts the file (S1) — the bug already fixed for
@@ -1286,6 +1334,27 @@ These needed owner sign-off because each changes the advertised surface. All are
    the Skin editor's "Make Prefab" writes it as a root entity name into a `.prefab.json`). A
    constant that satisfies the containment check states its claim N times — check it on every
    member, not on the one you wrote it for.
+
+7. **One word per concept — second pass, and when an alias is allowed (#1560, 2026-09-25).** Hard
+   renames, the same way as item 5:
+   - Whole-asset writers take **`path`**: `anim_set_clip`'s `clipPath` and
+     `timeline_set`/`timeline_add_clip`'s `timelinePath`, beside `particle_set`/`write_asset`.
+   - Asset kind is **`type`** on `create_registered_asset`, as on `create_asset`.
+   - Clip time is **`t`** on `anim_add_key`, as on `set_playhead`/`pose_clip` and in the clip
+     file's own `Keyframe.t`. That tool's name-path became **`target`**, the timeline's word for
+     it, which freed `path` for the clip.
+   - `set_selection`'s `entityId(s)` became **`id`/`ids`** (§3).
+   - `device_drag` lost its six flat endpoint aliases.
+
+   The op wire names are unchanged; the MCP layer maps them, and
+   `engine/tests/tools/paramVocabulary.test.ts` pins each mapping.
+   **An alias is kept only where the guessed word is ALREADY another tool's vocabulary** for the
+   same thing: `modoki_scroll` took `device_scroll`'s `dx`/`dy`, and `delete_asset` took `path` for
+   one file beside `paths`. Both-at-once is `AMBIGUOUS`. The transcript guesses that fail that test
+   stay refused by name: `batch.calls`, `prefab.op`, `type_text.clear` and `create_entity.parent`,
+   because each of those words means something else elsewhere. `history.limit` has no list to
+   limit, and `handles.limit` is covered by the reply's own summary budget. A guess that named a
+   real missing capability became one: `create_entity {name}`, on both ops.
 
 The remaining known asymmetries are recorded rather than churned: the device↔editor NAMING
 differences (`device_console_logs` vs `modoki_get_console_logs`, …) are tabulated in

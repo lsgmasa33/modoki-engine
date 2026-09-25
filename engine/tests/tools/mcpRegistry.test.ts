@@ -275,6 +275,10 @@ describe('the real registered surface', () => {
     // modoki_handles ("list the handles labelled X"). Two jobs, deliberately one word: both match by
     // the same `labelMatches` rule, so the filter previews exactly what the aim would hit.
     'label',
+    // `target` is the thing a tool is AIMED at, typed each time — the `path` pattern: a look-at point
+    // on the render tools, an asset/entity GUID on modoki_find_references, a relative name-path on the
+    // animation/timeline key-adders (#1560 gave anim_add_key the timeline's word for that path).
+    'target',
   ];
 
   it('a param used by 3+ tools means ONE thing, or is declared per-tool', () => {
@@ -669,7 +673,12 @@ describe('the real registered surface', () => {
   // a shorter `precision`/`force`, and history narrative out of descriptions. #1554's rename is +2 B
   // per mention. The device server, which this pin does not price, lost ~2.4 KB the same way; the
   // repeated-prose ceiling in `mcpDescriptionProse.test.ts` covers both servers.
-  const DEFINITION_BYTES = 165_715;
+  // 2026-09-25 (#1553 + #1560, work-ai2): RE-PINNED to 166,332 — +617 B net over 27 tools (ledger/work-ai2.csv).
+  // #1553 made the 17 action descriptions name their reply fields instead of "Returns editor state"
+  // (roughly a wash per tool, and it saves ~1.5 KB of RESULT on every call, which this pin cannot see).
+  // #1560 added real params agents kept guessing (`create_entity.name`, `modoki_scroll.dx/dy`,
+  // `delete_asset.path`), stated the max on bounded numbers, and shared one `t` wording.
+  const DEFINITION_BYTES = 166_332;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

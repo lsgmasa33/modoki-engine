@@ -1513,7 +1513,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
 | `modoki_create_entity` | POST `/api/editor-action` `create-entity` | live · undoable | editor + scene | — | `{"kind":"empty"}` |
-| `modoki_create_registered_asset` | POST `/api/editor-action` `create-registered-asset` | file | editor + project | asset | `{"kind":"material","path":"/assets/materials/probe.mat.json"}` |
+| `modoki_create_registered_asset` | POST `/api/editor-action` `create-registered-asset` | file | editor + project | asset | `{"type":"material","path":"/assets/materials/probe.mat.json"}` |
 | `modoki_delete_asset` | POST `/api/delete-asset` | file | project | asset | `{"paths":["/assets/particles/probe.particle.json"]}` |
 | `modoki_delete_entities` | POST `/api/editor-action` `delete-entities` | live · undoable | editor + scene | entity | *(no args)* |
 | `modoki_discard_asset_edits` | POST `/api/editor-action` `discard-asset-edits` | session | editor | — | `{"all":true}` |
@@ -1529,8 +1529,8 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
-| `modoki_anim_add_key` | POST `/api/editor-action` `anim-add-key` | live · undoable | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","trait":"Transform","field":"x","time":0,"value":1}` |
-| `modoki_anim_set_clip` | POST `/api/editor-action` `anim-set-clip` | live · undoable | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","clip":{}}` |
+| `modoki_anim_add_key` | POST `/api/editor-action` `anim-add-key` | live · undoable | editor | asset | `{"path":"/assets/anim/probe.anim.json","trait":"Transform","field":"x","t":0,"value":1}` |
+| `modoki_anim_set_clip` | POST `/api/editor-action` `anim-set-clip` | live · undoable | editor | asset | `{"path":"/assets/anim/probe.anim.json","clip":{}}` |
 | `modoki_create_asset` | POST `/api/create-asset` | file | project | asset | `{"type":"particle","path":"/assets/particles/probe.particle.json"}` |
 | `modoki_create_folder` | POST `/api/create-folder` | file | project | asset | `{"path":"/assets/probe-folder"}` |
 | `modoki_duplicate_asset` | POST `/api/duplicate-asset` | file | project | asset | `{"from":"/assets/particles/probe.particle.json","to":"/assets/particles/probe-copy.particle.json"}` |
@@ -1538,8 +1538,8 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_move_asset` | POST `/api/move-file` | file | project | asset | `{"from":"/assets/particles/probe.particle.json","to":"/assets/particles/moved.particle.json"}` |
 | `modoki_particle_set` | POST `/api/editor-action` `particle-set` | live · undoable | editor | asset | `{"path":"/assets/particles/probe.particle.json","def":{}}` |
 | `modoki_reimport_asset` | POST `/api/reimport` | file | project | asset | `{"path":"/assets/textures/probe.png"}` |
-| `modoki_timeline_add_clip` | POST `/api/editor-action` `timeline-add-clip` | live · undoable | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","trackType":"animation","item":{}}` |
-| `modoki_timeline_set` | POST `/api/editor-action` `timeline-set` | live · undoable | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","timeline":{}}` |
+| `modoki_timeline_add_clip` | POST `/api/editor-action` `timeline-add-clip` | live · undoable | editor | asset | `{"path":"/assets/timelines/probe.timeline.json","trackType":"animation","item":{}}` |
+| `modoki_timeline_set` | POST `/api/editor-action` `timeline-set` | live · undoable | editor | asset | `{"path":"/assets/timelines/probe.timeline.json","timeline":{}}` |
 | `modoki_write_asset` | POST `/api/asset-write` | file | project | asset | `{"path":"/assets/particles/probe.particle.json","type":"particle","data":{}}` |
 | `modoki_write_asset_meta` | POST `/api/write-meta` | file | project | asset | `{"path":"/assets/textures/probe.png","meta":{}}` |
 

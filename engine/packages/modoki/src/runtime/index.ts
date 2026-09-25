@@ -589,6 +589,7 @@ export {
   subscribeAgentTools,
   agentToolsVersion,
   validateAgentToolArgs,
+  coerceAgentToolArgs,
   clearAgentTools,
 } from './debug/agentToolRegistry';
 export {

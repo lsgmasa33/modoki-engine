@@ -30,6 +30,7 @@ import type { ToolResult } from './result.js';
 import { getTool as defaultGetTool, toolNames } from './registry.js';
 import { CONTRACTS } from './contracts.js';
 import { unknownParamMessage } from '../../shared/unknownParam.js';
+import { coerceStringEncoded, decodeStringEncoded, NOT_DECODED } from '../../shared/coerceArgs.js';
 import { aimAddresses, ambiguousAimMessage } from '../../shared/aimAddresses.js';
 
 /** How much of a step's payload comes back. See the module header for why `'none'` is safe. */
@@ -291,7 +292,11 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
     const args = (step.args ?? {}) as Record<string, unknown>;
 
     if (tool === WAIT) {
-      const ms = args.ms;
+      // A string-encoded `ms` is decoded like any other tool's number (#1560) — and written back,
+      // because the executor sleeps on `step.args.ms`.
+      const decodedMs = typeof args.ms === 'string' ? decodeStringEncoded(args.ms, 'number') : args.ms;
+      if (decodedMs !== args.ms && decodedMs !== NOT_DECODED) step.args = { ...args, ms: decodedMs };
+      const ms = decodedMs;
       if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return { rejected: `batch: ${at}: wait needs {ms: <number ≥ 0>}.` };
       if (ms > MAX_WAIT_MS) return { rejected: `batch: ${at}: wait ms ${ms} exceeds the cap of ${MAX_WAIT_MS}.` };
       continue;
@@ -305,8 +310,6 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
       return { rejected: `batch: ${at}: unknown tool — ${known} tools are registered, and nothing ran. `
         + `Check the name; the \`modoki_\` prefix is optional, so this is not a prefix problem.` };
     }
-    const rawXY = usesRawXY(tool, args);
-    if (rawXY) return { rejected: `batch: ${at}: raw ${rawXY} aiming is not allowed inside a batch — ${AIM_HINT}` };
 
     // STRICT: an unknown key is an error here, not something to strip.
     //
@@ -318,7 +321,17 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
     // batch, because there is no intermediate response to notice it in. (The
     // `timeScale`-instead-of-`scale` typo WAS caught the same day — but only because `scale` is
     // required; an all-optional schema catches nothing.)
-    const parsed = z.object(entry.shape as ZodRawShape).strict().safeParse(args);
+    // String-encoded values are decoded first (#1560), as a direct call's are by
+    // `installArgCoercion` — and written BACK onto the step, because the step runs on `step.args`.
+    const schema = z.object(entry.shape as ZodRawShape).strict();
+    const decoded = coerceStringEncoded(schema, args);
+    if (decoded !== args) step.args = decoded;
+    // ⚠️ AFTER decoding, on what the step will actually RUN with (#1560 review): checked on the raw
+    // args, `{x:'100', y:'200'}` was not "a number" to `usesRawXY`, passed, and then decoded into the
+    // raw-coordinate tap this rule exists to refuse.
+    const rawXY = usesRawXY(tool, decoded);
+    if (rawXY) return { rejected: `batch: ${at}: raw ${rawXY} aiming is not allowed inside a batch — ${AIM_HINT}` };
+    const parsed = schema.safeParse(decoded);
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
       const where = issue.path.join('.') || '(root)';
@@ -333,7 +346,9 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
     // AFTER the strict parse (second close-out review): a key the tool does not take — a `label` on a
     // dnd endpoint, a `label:null` — must be named as THAT, not as two addresses whose advice ("keep
     // one") leads straight into the schema refusal. Still before any step runs.
-    const twoAddresses = twoAddressAim(tool, args);
+    // On the DECODED args, like `usesRawXY` above: a JSON-string endpoint holding two addresses must
+    // not slip past as a non-object and then decode into one (#1560 merge follow-up).
+    const twoAddresses = twoAddressAim(tool, decoded);
     if (twoAddresses) return { rejected: `batch: ${at}: AMBIGUOUS — ${twoAddresses} Nothing ran.` };
   }
   return { tools: resolved };

@@ -172,11 +172,12 @@ describe('a nested unknown key is named too', () => {
     expect(v.error).toMatch(/unrecognized key 'surfce' — an entity aim accepts only: guid, name, id, surface, allowOccluded/);
   });
 
-  it('device accept side: a STRING where the aim object belongs is a type error, not "accepts only"', async () => {
-    // Transcripts show `"entity":"{\"name\":…}"` — a JSON-encoded object. The fixed sentence used
-    // to answer that too, telling the caller its keys were wrong when its TYPE was.
+  it('device accept side: a STRING that is not an encoded object, where the aim object belongs, is a type error, not "accepts only"', async () => {
+    // A JSON-encoded object here is now DECODED (#1560, coerceStringEncoded.test.ts). What is left to
+    // refuse is a string that is no object at all — and the fixed sentence used to answer that too,
+    // telling the caller its keys were wrong when its TYPE was.
     const d = (device = await loadDeviceSurface());
-    const v = d.validate('device_tap', { entity: '{"name":"Btn"}' });
+    const v = d.validate('device_tap', { entity: 'Btn' });
     expect(v.ok).toBe(false);
     expect(v.error).not.toMatch(/accepts only/);
     expect(v.error).toMatch(/object/i);

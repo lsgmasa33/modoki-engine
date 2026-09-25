@@ -31,7 +31,7 @@
  *  ops to the runtime ones. Nobody designed it as a safety mechanism: removing or `@vite-ignore`-ing
  *  the `main.tsx` import, or adding an accept boundary here, would quietly break it. */
 
-import { opReplyFor } from './opRefusal';
+import { opReplyFor, OpRefusal } from './opRefusal';
 import {
   hasDocKey,
   sceneManager,
@@ -155,7 +155,7 @@ import {
   getFrameLoopHealth,
 } from '@modoki/engine/runtime';
 import {
-  listAgentTools, getAgentTool, agentToolsVersion, validateAgentToolArgs, type AgentToolDef,
+  listAgentTools, getAgentTool, agentToolsVersion, validateAgentToolArgs, coerceAgentToolArgs, type AgentToolDef,
 } from '@modoki/engine/runtime';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
@@ -1048,7 +1048,8 @@ registerAgentOp('game-tool-call', async (params) => {
       known,
     };
   }
-  const args = p.args ?? {};
+  // String-encoded numbers/booleans are decoded against the declaration first (#1560).
+  const args = coerceAgentToolArgs(tool, p.args ?? {});
   // Enforce the DECLARATION here, so every caller inherits it — the curl API, device_eval's
   // modoki.call, and the device relays all land on this op, and only the editor MCP rebuilds a
   // zod schema of its own. A declaration honoured by one caller in four is not a contract.
@@ -1354,6 +1355,11 @@ registerAgentOp('diagnose', (params) => {
 // frame time, not every frame. A 300-frame capture with a full marker tree each is far past any
 // response budget, and "which frames were slow, and what did they spend it on" is the question —
 // the whole capture is still exportable as JSON for the cases that genuinely need it.
+/** The profiler's two `limit` ceilings — capture-read's worst frames and boot's rows per section.
+ *  The MCP schemas publish the larger and the op refuses capture-read above the smaller (#1560);
+ *  `numericRangeInSchema.test.ts` holds both servers' copies to these. */
+export const PROFILER_CAPTURE_READ_MAX = 20;
+export const PROFILER_BOOT_MAX = 200;
 registerAgentOp('profiler', (raw: unknown) => {
   const params = (raw ?? {}) as Record<string, unknown>;
   const action = params.action ?? 'read';
@@ -1388,7 +1394,12 @@ registerAgentOp('profiler', (raw: unknown) => {
       return { cleared: true };
     case 'capture-read': {
       const cap = getCapture();
-      const limit = Math.max(1, Math.min(20, Number(params.limit ?? 5)));
+      // The schema caps `limit` at boot's 200; a capture-read over ITS 20 is refused here rather than
+      // clamped (§5, #1560) — a silent 20-of-50 reads as "only 20 frames were captured".
+      if (params.limit != null && Number(params.limit) > PROFILER_CAPTURE_READ_MAX) {
+        throw new OpRefusal('REFUSED_BY_OP', `profiler capture-read: limit ${params.limit} is over the max of ${PROFILER_CAPTURE_READ_MAX} worst frames. Nothing was read.`, { options: [`limit:${PROFILER_CAPTURE_READ_MAX}`] });
+      }
+      const limit = Math.max(1, Math.min(PROFILER_CAPTURE_READ_MAX, Number(params.limit ?? 5)));
       // Sorted by cost, so the interesting frames come first regardless of when they happened.
       const worst = [...cap.frames].sort((a, b) => b.frameMs - a.frameMs).slice(0, limit);
       // #682: `captureFrame` is called from inside `runFrame` (a frame callback) — a dead loop
@@ -1442,7 +1453,7 @@ registerAgentOp('profiler', (raw: unknown) => {
       // Relative to the boot origin, so every number in this response is on one axis.
       const stallRel = stall ? { startMs: round(stall.startMs - origin), endMs: round(stall.endMs - origin) } : null;
       const closed = tl.spans.filter((sp) => sp.endMs >= 0);
-      const limit = Math.max(1, Math.min(200, Number(params.limit ?? 15)));
+      const limit = Math.max(1, Math.min(PROFILER_BOOT_MAX, Number(params.limit ?? 15)));
       const out: Record<string, unknown> = {
         spanCount: tl.spans.length,
         dropped: tl.dropped,
@@ -2439,7 +2450,7 @@ registerAgentOp('read-asset-def', (params) => {
 
 // ── Scene swap (#166 P5) — load another scene on the device with NO rebuild.
 //
-// The editor's `load-scene` guards unsaved editor work and returns editor state; neither exists
+// The editor's `load-scene` guards unsaved editor work and returns the editor's scene fields; neither exists
 // here. What DOES carry over is the failure discipline: a load that did not happen must never be
 // reported as one, which is why the current path is read back after the swap rather than echoed.
 registerAgentOp('load-scene', async (params) => {

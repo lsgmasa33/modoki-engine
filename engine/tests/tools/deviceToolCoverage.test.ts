@@ -118,7 +118,7 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_eval_api: {},   // discovery for device_eval's injected `modoki` object (#83) — no params
   device_screenshot: {},
   device_tap: { selector: '#play' },
-  device_drag: { fromSelector: '#a', toSelector: '#b' },
+  device_drag: { from: { selector: '#a' }, to: { selector: '#b' } },
   device_pointer: { action: 'down', selector: '#play' },
   device_hover: { selector: '#play' },
   device_scroll: { selector: '#list', deltaY: 120 },   // canonical name — see the twin-parity note in mcp-tools.ts

@@ -13,7 +13,7 @@ import { KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../sh
 import { parseHandleIds } from '../../../shared/handlesReply.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
-  const { getJson, postJson, evalRenderer, editorAction } = ctx;
+  const { getJson, postJson, evalRenderer, editorAction, fail } = ctx;
 
   /** Built-in panel ids, shared by the two `panel` params so they cannot drift. Deliberately
    *  NOT a z.enum: a game can register custom panels, so the real vocabulary is only knowable
@@ -155,11 +155,22 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       entity: makeEntitySpec().optional(),
       deltaX: z.number().optional().describe('Horizontal wheel delta (default 0). At least ONE of deltaX/deltaY must be non-zero — a zero-delta scroll is REFUSED, not dispatched as a silent no-op.'),
       deltaY: z.number().optional().describe('Vertical wheel delta; positive = content down. Default 0, but a call with neither delta non-zero is REFUSED (~120 ≈ one wheel tick).'),
+      dx: z.number().optional().describe('Alias for deltaX — device_scroll\'s spelling. Not together with deltaX.'),
+      dy: z.number().optional().describe('Alias for deltaY — device_scroll\'s spelling. Not together with deltaY.'),
       modifiers: z.array(modifierEnum)
         .optional().describe(`${MODIFIERS_BASE}, set on the wheel event (e.g. ["control"] or ["meta"] for Ctrl/Cmd+wheel zoom).`),
       allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, label, within, entity, deltaX, deltaY, modifiers, allowOccluded }) => postJson('/api/input/scroll', { x, y, selector, label, within, entity, deltaX, deltaY, modifiers, allowOccluded }),
+    async ({ x, y, selector, label, within, entity, deltaX, deltaY, dx, dy, modifiers, allowOccluded }) => {
+      // `dx`/`dy`: the most-guessed missing keys on this tool (#1560), and its device twin's aliases —
+      // so the same two names work on both surfaces. Both spellings of one delta is AMBIGUOUS, as there.
+      const doubled = [deltaX != null && dx != null ? 'deltaX/dx' : null, deltaY != null && dy != null ? 'deltaY/dy' : null]
+        .filter((e): e is string => e !== null);
+      if (doubled.length) {
+        return fail({ code: 'AMBIGUOUS', what: 'scroll', why: `${doubled.join(' and ')} given together — one parameter under two names, so choosing one would ignore the other.`, expected: 'deltaX/deltaY (canonical) or dx/dy — not both' });
+      }
+      return postJson('/api/input/scroll', { x, y, selector, label, within, entity, deltaX: deltaX ?? dx, deltaY: deltaY ?? dy, modifiers, allowOccluded });
+    },
   );
 
   // ── eval — evaluate JS in the editor renderer (Electron editor only) ──

@@ -83,12 +83,11 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
     expect(cap.lines).toEqual(['still going'])
   })
 
-  it('clamps the window to MAX_CAPTURE_SECONDS rather than honouring an unbounded ask', async () => {
+  it('REFUSES a window over MAX_CAPTURE_SECONDS rather than clamping it (§5, #1560)', async () => {
     const goIos = stubGoIos(line('x'))
-    // Not awaited to completion at 60s — assert the clamp through the returned window on a short
-    // run instead, and the ceiling itself by constant.
     expect(MAX_CAPTURE_SECONDS).toBe(60)
     expect(DEFAULT_CAPTURE_SECONDS).toBeLessThan(MAX_CAPTURE_SECONDS)
+    await expect(captureIosSyslog({ udid: 'x', seconds: MAX_CAPTURE_SECONDS + 1, goIos })).rejects.toThrow(/over the iOS system-capture max of 60/)
     const cap = await captureIosSyslog({ udid: 'x', seconds: 0, goIos })  // floor is 1, not 0
     expect(cap.capturedFor).toBe(1)
   })

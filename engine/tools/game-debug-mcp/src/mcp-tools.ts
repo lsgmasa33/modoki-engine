@@ -15,6 +15,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createDeviceToolDef, type DeviceToolResult } from './registry.js';
 import { identityMismatch, tokenMismatchWarning, describeIdentity } from '../../shared/identity.js';
+import { installArgCoercion } from '../../shared/coerceArgs.js';
 // Single-sourced with the DEVICE side (`agentBridge.ts`'s `sim-step` op) so this tool's outbound
 // `timeoutMs` and the device's own internal step budget can never independently drift (#822).
 import { simStepDefaultTimeout, SIM_STEP_MAX_FRAMES } from '../../shared/simStepTiming.js';
@@ -186,9 +187,8 @@ type DragEndpoint = { entity?: DeviceEntityAim; selector?: string; x?: number; y
 /** One drag endpoint from either form — the caller has already refused both at once. */
 function endpointOf(
   nested: { entity?: DeviceEntityAim; selector?: string; x?: number; y?: number; allowOccluded?: boolean } | undefined,
-  selector: string | undefined, x: number | undefined, y: number | undefined,
 ): DragEndpoint {
-  const e = nested ?? { selector, x, y };
+  const e = nested ?? {};
   return { ...e, resolvable: hasEntityAim(e.entity) || !!e.selector };
 }
 
@@ -654,6 +654,8 @@ function unverifiedNote(body: Record<string, unknown>): string {
 // ── Tool registration ────────────────────────────────────────
 
 export function registerTools(server: McpServer) {
+  // String-encoded args are decoded before the SDK validates them (#1560, tools/shared/coerceArgs.ts).
+  installArgCoercion(server);
   // Every tool goes through this definer: STRICT validation on the wire (an unknown key is
   // refused, not silently stripped into a different operation) and an entry a test can call.
   // See `registry.ts` for the two defects this closes.
@@ -1296,8 +1298,8 @@ export function registerTools(server: McpServer) {
       fields: z.array(z.string()).optional().describe('(start) Restrict to these numeric fields; omit for all.'),
       epsilon: z.number().optional().describe('(start) Change threshold (default 1e-4).'),
       everyNFrames: z.number().optional().describe('(start) Sample every Nth frame (default 1).'),
-      maxSamples: z.number().optional().describe('(start) Ring cap per series (default 600).'),
-      maxSeries: z.number().optional().describe('(start) Cap on LIVE moving series (default 512) — a despawned entity gives its slot back.'),
+      maxSamples: z.number().int().positive().max(5000).optional().describe('(start) Ring cap per series (default 600, max 5000).'),
+      maxSeries: z.number().int().positive().max(4096).optional().describe('(start) Cap on LIVE moving series (default 512, max 4096) — a despawned entity gives its slot back.'),
       expireFrames: z.number().optional().describe('(start) Auto-remove after N frames (0 = never).'),
       id: z.string().optional().describe('(read/clear) Watch id from start/list. Omit on clear to clear ALL.'),
       name: z.string().optional().describe('(read) Filter returned series to entities whose name contains this.'),
@@ -1365,7 +1367,7 @@ export function registerTools(server: McpServer) {
       'recorded; action:clear drops recorded presses without closing the window.',
     {
       action: z.enum(['start', 'read', 'stop', 'clear']).describe('open the window | read presses | close (keeps presses) | drop recorded presses'),
-      maxPresses: z.number().optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not device_watch\'s `maxSamples`, which caps each series separately.'),
+      maxPresses: z.number().int().positive().max(500).optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not device_watch\'s `maxSamples`, which caps each series separately.'),
       limit: z.number().optional().describe('(read) Most-recent N presses to return (default 20).'),
       unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter."),
       precision: z.number().optional().describe('(read) Significant digits for float fields (default 9; 0 = exact).'),
@@ -1664,8 +1666,7 @@ export function registerTools(server: McpServer) {
     'Drag between two points on the connected device. Give each end as `from`/`to` — the same nested ' +
       'shape modoki_drag takes: `{entity}` ({guid}|{name}, plus `surface` for a 2D/3D entity), ' +
       '`{selector}`, or `{x,y}` in screenshot pixels (take a device_screenshot first) — resolved and ' +
-      'occlusion-checked on-device. The flat `fromSelector`/`fromX`/`fromY`/`toSelector`/`toX`/`toY` ' +
-      'still work; giving one endpoint both ways is refused (`AMBIGUOUS`). A covered endpoint is ' +
+      'occlusion-checked on-device. A covered endpoint is ' +
       'REFUSED unless `allowOccluded` (top-level for both ends, or on `from`/`to` for one). TRUSTED ' +
       'OS-level input when a route is available — CDP on Android, WebDriverAgent on iOS — else ' +
       'synthetic DOM events, fronted by a loud banner. Check device_status\'s input-mechanism line to ' +
@@ -1673,34 +1674,16 @@ export function registerTools(server: McpServer) {
     {
       from: makeDevicePointSpec().optional().describe('Start point: {entity} | {selector} | {x,y}, plus an optional allowOccluded for this end.'),
       to: makeDevicePointSpec({ sameAs: 'from' }).optional().describe('End point: {entity} | {selector} | {x,y}, plus an optional allowOccluded for this end.'),
-      fromSelector: z.string().optional().describe('CSS selector for the start point (flat form of from.selector).'),
-      toSelector: z.string().optional().describe('CSS selector for the end point (flat form of to.selector).'),
-      fromX: z.number().optional().describe('Flat alias of from.x (screenshot px).'), fromY: z.number().optional().describe('Flat alias of from.y.'),
-      toX: z.number().optional().describe('Flat alias of to.x (screenshot px).'), toY: z.number().optional().describe('Flat alias of to.y.'),
       allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}. Applies to BOTH endpoints; set it on \`from\`/\`to\` to allow just one.`),
       steps: z.number().optional().describe('Intermediate steps (default: 5)'),
       delayMs: z.number().optional().describe('Delay per step ms (default: 20)'),
       dom: z.boolean().optional().describe('Drag DOM chrome (a debug widget, slider) by dispatching the pointer sequence ON the grabbed element instead of the game canvas. Auto-engages when the grab lands on a non-canvas element; pass false to force the canvas/world path.'),
     },
-    async ({ from, to, fromSelector, toSelector, fromX, fromY, toX, toY, allowOccluded, steps, delayMs, dom }) => {
-      // One address per endpoint (§3): the nested and flat forms both naming the start is two aims for
-      // one point, and picking one by precedence would silently ignore the other.
-      const doubled = [
-        from && (fromSelector != null || fromX != null || fromY != null) ? 'from' : null,
-        to && (toSelector != null || toX != null || toY != null) ? 'to' : null,
-      ].filter((e): e is string => e !== null);
-      if (doubled.length) {
-        return deviceFail({
-          code: 'AMBIGUOUS',
-          tool: 'device_drag',
-          what: 'drag on the device',
-          why: `the ${doubled.join(' and ')} endpoint was given twice — nested \`${doubled[0]}\` AND the flat ${doubled[0]}Selector/${doubled[0]}X/${doubled[0]}Y — so which one to aim at would be a guess.`,
-          got: { from, to, fromSelector, fromX, fromY, toSelector, toX, toY },
-          options: ['give each endpoint once: from:{entity|selector|x,y} (preferred), or the flat fields'],
-        });
-      }
-      const f = endpointOf(from, fromSelector, fromX, fromY);
-      const t = endpointOf(to, toSelector, toX, toY);
+    async ({ from, to, allowOccluded, steps, delayMs, dom }) => {
+      // The nested `from`/`to` only (#1560): the six flat aliases (`fromSelector`/`fromX`/…) went —
+      // one shape per concept, the one modoki_drag takes. A stale flat key refuses by name (§1).
+      const f = endpointOf(from);
+      const t = endpointOf(to);
       const twoAddresses = ambiguousDeviceAim('device_drag', 'drag on the device', {
         from: { entity: f.entity, selector: f.selector, x: f.x, y: f.y },
         to: { entity: t.entity, selector: t.selector, x: t.x, y: t.y },
@@ -1714,8 +1697,8 @@ export function registerTools(server: McpServer) {
           tool: 'device_drag',
           what: 'drag on the device with an incomplete endpoint',
           why: `${!haveFrom ? 'the START' : 'the END'} endpoint has no entity, no selector and not both coordinates, so the gesture has no defined path.`,
-          got: { from, to, fromSelector, fromX, fromY, toSelector, toX, toY },
-          expected: 'each endpoint as from/to:{entity} | {selector} | {x,y} (or the flat fromSelector | fromX+fromY, toSelector | toX+toY)',
+          got: { from, to },
+          expected: 'each endpoint as from/to:{entity} | {selector} | {x,y}',
         });
       }
       try {
@@ -1959,11 +1942,12 @@ export function registerTools(server: McpServer) {
       'to disk and a relaunch is the undo. Verify with device_get_scene_state.',
     {
       spec: makeDeviceCreateEntitySpec().describe(`What to create, e.g. {kind:"primitive", mesh:"sphere"} or {kind:"2d", shape:"square"} or {kind:"ui", preset:"button"}. kind is one of ${vocabularyProse(CREATE_ENTITY_KINDS)}; primitive takes mesh, 2d shape, ui preset, light light, and every other kind nothing. A key its kind does not take is REFUSED, not ignored — a typo would otherwise build the default entity.`),
+      name: z.string().min(1).optional().describe("The new entity's name (default: the kind's, e.g. \"Cube\")."),
       parentGuid: z.string().optional().describe('Stable guid of the parent. Preferred over parentId — a stale id would orphan the new entity.'),
       parentId: z.number().optional().describe('Live parent id (0 = root). Only for a parent with no guid — use parentGuid.'),
     },
-    async ({ spec, parentGuid, parentId }) => writeCall('device_create_entity', 'create-entity', {
-      spec, ...(parentGuid !== undefined ? { parentGuid } : {}), ...(parentId !== undefined ? { parentId } : {}),
+    async ({ spec, name, parentGuid, parentId }) => writeCall('device_create_entity', 'create-entity', {
+      spec, ...(name !== undefined ? { name } : {}), ...(parentGuid !== undefined ? { parentGuid } : {}), ...(parentId !== undefined ? { parentId } : {}),
     }, 'create an entity in the live world on the device', [
       'device_get_scene_state shows what exists now',
       'kind:"primitive" needs a valid mesh name — the refusal lists them',
@@ -1979,7 +1963,7 @@ export function registerTools(server: McpServer) {
     {
       guid: z.string().optional().describe('Stable guid of the entity to copy. Preferred — an id can be recycled by a scene reload and name a different entity.'),
       id: z.number().optional().describe('Live id of the entity to copy — only for an entity with no guid. Use guid.'),
-      count: z.number().optional().describe('How many copies to make (default 1, max 1000). This is the knob for a load test.'),
+      count: z.number().int().min(1).max(1000).optional().describe('How many copies to make (default 1, max 1000). This is the knob for a load test.'),
     },
     async ({ guid, id, count }) => writeCall('device_duplicate_entity', 'duplicate-entity', {
       ...(guid !== undefined ? { guid } : {}), ...(id !== undefined ? { id } : {}), ...(count !== undefined ? { count } : {}),
@@ -2115,7 +2099,7 @@ export function registerTools(server: McpServer) {
       action: z.enum(PROFILER_ACTIONS)
         .optional().describe('Default "read" (the live aggregate). capture-* records/reads frames; gpu-* toggles GPU timestamps; reset clears markers + captures; boot reads the boot-phase timeline; boot-reset re-arms it.'),
       markers: z.number().optional().describe('action:read — how many marker rows to return (default 12).'),
-      limit: z.number().optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200).'),
+      limit: z.number().int().positive().max(200).optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200). Over the max is refused.'),
       all: z.boolean().optional().describe('action:boot only — return EVERY recorded span, not just the stall overlap and the costliest. Large.'),
     },
     async ({ action, markers, limit, all }) => perceptCall('device_profiler', 'profiler', {
@@ -2363,8 +2347,8 @@ async function coordScaleOrRefusal(
   tool('device_scroll',
     'Scroll on the device by dispatching a wheel event. Aim by `entity`, CSS `selector` or screenshot ' +
       'pixel `x`/`y` (defaults to viewport center). Positive `deltaY` scrolls down, positive `deltaX` ' +
-      'scrolls right; ~120 ≈ one wheel tick. `dx`/`dy` are accepted aliases (the editor twin ' +
-      'modoki_scroll uses deltaX/deltaY, so those are canonical here too); giving both names is refused. A call whose deltas both ' +
+      'scrolls right; ~120 ≈ one wheel tick. `dx`/`dy` are accepted aliases, on modoki_scroll ' +
+      'too (deltaX/deltaY are canonical); giving both names is refused. A call whose deltas both ' +
       'resolve to 0 is REFUSED rather than dispatched as a silent no-op. Trusted-CDP on Android when ' +
       'a session is reachable; on iOS this stays SYNTHETIC by design — WebDriverAgent has no wheel ' +
       'action at all. Check device_status\'s input-mechanism line to know which.',

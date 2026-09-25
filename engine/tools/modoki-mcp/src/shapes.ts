@@ -205,6 +205,11 @@ export const DISPLAY_NAME_BASE =
 export const displayNameParam = (extra?: string) => z.string().optional()
   .describe(`${DISPLAY_NAME_BASE}.${extra ? ` ${extra}` : ''}`);
 
+/** `t` — a time along the open animation clip, in seconds: ONE word and one wording on every tool
+ *  that takes it (#1560), matching the clip file's own keyframe field (`Keyframe.t`). */
+export const CLIP_TIME_BASE = 'Clip time in seconds (`t`, the clip file\'s own keyframe field)';
+export const clipTimeParam = (extra?: string) => z.number().describe(`${CLIP_TIME_BASE}.${extra ? ` ${extra}` : ''}`);
+
 /** `force` — "proceed even though the editor has unsaved work", in ONE wording.
  *
  *  Shared by the five tools that work FROM THE FILES while the editor holds edits the files do not

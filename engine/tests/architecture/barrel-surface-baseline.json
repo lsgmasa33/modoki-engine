@@ -316,6 +316,7 @@
   "clientToDesign2D",
   "clipRefForKey",
   "cloneTraitValues",
+  "coerceAgentToolArgs",
   "coerceParamValue",
   "collapsedParentAxes",
   "collectHandles",

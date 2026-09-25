@@ -425,6 +425,48 @@ function readEditorState() {
   };
 }
 
+type EditorState = ReturnType<typeof readEditorState>;
+
+/**
+ * An ACTION op's reply: the editor-state fields that action changed, READ BACK from the stores
+ * after it ran (#1553). The whole `readEditorState()` used to be spread into 17 action replies —
+ * ~1.7k chars a call, 10% of all MCP result tax on `play_control` alone, and over batch's
+ * verbatim cap so a batch elided the one field the step was run to see. The full state stays one
+ * `modoki_get_editor_state` away. Read back rather than echoed from the args, so the reply is
+ * still evidence of the post-state (§11), not a restatement of the request.
+ * A key the state omits (the optional-when-healthy/empty ones) stays omitted here.
+ */
+function editorStateFields<K extends keyof EditorState>(...keys: K[]): Pick<EditorState, K> {
+  const s = readEditorState();
+  const out = {} as Pick<EditorState, K>;
+  for (const k of keys) if (k in s) out[k] = s[k];
+  for (const k of ACTION_HEALTH_KEYS) if (k in s && isActionFault(k, s)) (out as Record<string, unknown>)[k] = s[k];
+  return out;
+}
+
+/** A health field is a FAULT on an action reply only in its failing states. `get_editor_state`
+ *  reports `frameLoop` for a hidden window or after a recovered re-arm and `rendererGate` while
+ *  `pending` — useful there, expected here: a hidden window is "not a fault" by frameDriver's own
+ *  word, and a 2D/UI-only project sits in `pending` for its whole session, so reporting them would
+ *  hang a false alarm (and the bytes #1553 removed) on every action (#1553 second review). */
+function isActionFault(k: typeof ACTION_HEALTH_KEYS[number], s: EditorState): boolean {
+  if (k === 'frameLoop') return s.frameLoop?.status === 'stalled';
+  if (k === 'rendererGate') return s.rendererGate?.status === 'failed';
+  return true;
+}
+
+/** The HEALTH fields every action reply still carries — each only while FAULTED ({@link isActionFault}),
+ *  so a healthy editor pays nothing for them. An agent that presses Play on a stale editor must still hear
+ *  `staleGameCode:true` in that reply (CLAUDE.md § Hot reload: measurements from it are suspect);
+ *  #1553 dropped these with the rest of the state until review caught it. `hmrUpdates` is NOT here:
+ *  it is present on any editor that ever hot-reloaded, i.e. a count, not a fault. */
+export const ACTION_HEALTH_KEYS = [
+  'staleGameCode', 'discardedUnsavedEdits', 'frameLoop', 'rendererGate', 'gpu', 'gameBootFaults',
+] as const satisfies ReadonlyArray<keyof EditorState>;
+
+/** The play-state trio every play_control transition reports (+ the health fields, when unhealthy). */
+const playStateFields = () => editorStateFields('playState', 'runMode', 'advancing');
+
 /** CSS viewport size + zoom, read live from the renderer window. Guarded for the
  *  headless/SSR case (no `window`) so this stays safe if ever called off the renderer. */
 function readViewport() {
@@ -440,7 +482,7 @@ function readViewport() {
 // ── Param shapes ───────────────────────────────────────────────────────────
 
 interface SetSelectionParams { entityId?: number | null; entityIds?: number[]; guid?: string; guids?: string[]; asset?: SelectedAsset | null }
-interface CreateEntityParams { spec: CreateEntitySpec; parentId?: number; parentGuid?: string }
+interface CreateEntityParams { spec: CreateEntitySpec; parentId?: number; parentGuid?: string; name?: unknown }
 /** The prefab operations. The three `edit-*` actions drive PREFAB-EDIT MODE — opening a
  *  `.prefab.json` in isolation, saving the edited template back, and returning to the scene
  *  it was opened from. They are the only route that re-serializes a prefab file, which is why
@@ -1439,7 +1481,7 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as SetSelectionParams;
     if (p.asset !== undefined) {
       useEditorStore.setState({ selectedAsset: p.asset, selectedEntityId: null, selectedEntityIds: [] });
-      return readEditorState();
+      return { ok: true, ...editorStateFields('selection') };
     }
     // Resolve every requested ref to a LIVE id through the shared resolver, keeping only ids that resolve.
     // Selecting a nonexistent/stale id used to "succeed" and echo it back as selected, so a
@@ -1466,7 +1508,7 @@ export function registerEditorAgentOps(): void {
     // An explicit request to select IS a request to see it: re-selecting the entity already
     // selected changes no value, so without this a row collapsed since stays hidden (#1156).
     if (resolved.length) useEditorStore.getState().requestEntityReveal();
-    const state = readEditorState();
+    const state = { ok: true, ...editorStateFields('selection') };
     return missing.length
       ? { ...state, skipped: missing, warning: `${missing.length} requested entity ref(s) matched no live entity and were skipped` }
       : state;
@@ -1488,7 +1530,7 @@ export function registerEditorAgentOps(): void {
     const store = useEditorStore.getState();
     if (p.mode !== undefined) store.setGizmoMode(p.mode);
     if (p.space !== undefined) store.setGizmoSpace(p.space);
-    return readEditorState();
+    return { ok: true, ...editorStateFields('gizmoMode', 'gizmoSpace') };
   });
 
   // ── SceneView mode + collider-edit ── the toolbar's native <select> ('3d'|'ui')
@@ -1501,7 +1543,7 @@ export function registerEditorAgentOps(): void {
     // success (#1213 B-7) — the precedent `set-animation-view-mode` below was written against.
     refuseUnknownValue('set-scene-view-mode', 'mode', p.mode ?? null, SCENE_VIEW_MODES, 'the view was not changed');
     useEditorStore.getState().setSceneViewMode(p.mode as typeof SCENE_VIEW_MODES[number]);
-    return readEditorState();
+    return { ok: true, ...editorStateFields('sceneViewMode') };
   });
 
   // ── Animation editor: Dopesheet vs Curves (#369) ──
@@ -1534,7 +1576,7 @@ export function registerEditorAgentOps(): void {
       };
     }
     useEditorStore.getState().setAnimationViewMode(p.mode);
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('animationViewMode', 'animationView') };
   });
 
   // ── GameView device simulation (#367) ──
@@ -1740,7 +1782,7 @@ export function registerEditorAgentOps(): void {
       }
     }
     useEditorStore.getState().setColliderEditMode(p.on);
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('colliderEditMode') };
   });
   // Open the Particle Editor dock panel on a .particle.json (normally a double-click in
   // Assets). Mounts CurveEditor/GradientEditor, whose interaction-handle providers then
@@ -1757,7 +1799,7 @@ export function registerEditorAgentOps(): void {
     const path = p.path!;
     await awaitEditorMount('particle', path, 'open-particle-editor',
       'The store now names this asset, but the Particle editor tab did not mount to show it.');
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('openEditors') };
   });
   // Open the Sprite slicer / 9-slice modal on a texture (normally the Texture-Inspector
   // buttons). Selects the texture + requests the modal → its handle providers mount.
@@ -1788,7 +1830,7 @@ export function registerEditorAgentOps(): void {
     useEditorStore.getState().requestTextureEditor(p.path!, 'sprite', p.displayName);
     const path = p.path!;
     await awaitTextureModal('sprite', path, 'open-sprite-editor');
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('openEditors', 'spriteEditorSelection') };
   });
   registerAgentOp('open-nine-slice-editor', async (params) => {
     const p = (params ?? {}) as { path?: string; displayName?: string };
@@ -1796,7 +1838,7 @@ export function registerEditorAgentOps(): void {
     useEditorStore.getState().requestTextureEditor(p.path!, 'nineslice', p.displayName);
     const path = p.path!;
     await awaitTextureModal('nineslice', path, 'open-nine-slice-editor');
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('openEditors') };
   });
   // Select a slice in the currently-open Sprite Editor, so its 8 resize handles + pivot
   // register (`spriteEditorSelection` — #373: the modal opens with nothing selected, and
@@ -1806,7 +1848,7 @@ export function registerEditorAgentOps(): void {
     // Deselecting needs no open editor — there is nothing it could select wrongly.
     if (p.guid === undefined || p.guid === null) {
       useEditorStore.getState().setSpriteEditorSelection(null);
-      return { ...readEditorState(), ok: true };
+      return { ok: true, ...editorStateFields('spriteEditorSelection') };
     }
     // #1213 B-1: any string used to be stored as the selection, with or without a Sprite Editor on
     // screen — then `modoki_handles editor=sprite` came back empty, which reads as "no slices".
@@ -1819,7 +1861,7 @@ export function registerEditorAgentOps(): void {
         { options: [...slices] });
     }
     useEditorStore.getState().setSpriteEditorSelection(p.guid);
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('spriteEditorSelection') };
   });
   // Open the Skin (2D rig) editor on a .rig2d.json — normally reached from the Assets panel
   // double-click or the Texture Inspector's "Auto Rig". Neither `editingSkinAsset` (which
@@ -1834,7 +1876,7 @@ export function registerEditorAgentOps(): void {
     const path = p.path!;
     await awaitEditorMount('skin', path, 'open-skin-editor',
       'The store now names this rig, but the Skin editor tab did not mount to show it.');
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('openEditors', 'editingSkinAsset', 'skinMode') };
   });
   registerAgentOp('set-skin-mode', (params) => {
     const p = (params ?? {}) as { mode?: unknown };
@@ -1854,7 +1896,7 @@ export function registerEditorAgentOps(): void {
     // answered ok and the caller read the empty `bone-joint` handle list as "no rig".
     requireEditorOpen('skin', 'set-skin-mode');
     useEditorStore.getState().setSkinMode(p.mode);
-    return { ...readEditorState(), ok: true };
+    return { ok: true, ...editorStateFields('skinMode') };
   });
 
   // Open a .anim.json in the Animation editor and BIND it to an entity, exactly as a
@@ -1942,8 +1984,8 @@ export function registerEditorAgentOps(): void {
     // perfectly and bind to nothing (no entity in the scene carries a matching Animator), and a
     // caller told only "opened" would then get a NOT_FOUND from pose_clip with no idea why.
     return {
-      ...readEditorState(),
       ok: true,
+      ...editorStateFields('openEditors', 'animationViewMode', 'animationView'),
       openedClip: clip.name ?? name,
       animatorRootEntityId: st.animatorRootEntityId,
       animatorRootGuid: st.animatorRootEntityId != null ? liveGuidOf(st.animatorRootEntityId) : null,
@@ -2003,8 +2045,8 @@ export function registerEditorAgentOps(): void {
       physicsError = getPlayState() === 'playing' ? await physicsFailure() : null;
     }
     return physicsError
-      ? { ...readEditorState(), physicsError: `Play started, but physics failed to initialize — bodies will not simulate: ${physicsError}` }
-      : readEditorState();
+      ? { ok: true, ...playStateFields(), physicsError: `Play started, but physics failed to initialize — bodies will not simulate: ${physicsError}` }
+      : { ok: true, ...playStateFields() };
   });
   // `resume` and `pause` are TRANSITIONS, and both used to accept any state and report the editor
   // state back as a success. From STOPPED, `resume` ran a full `enterPlay()` — a snapshot + run,
@@ -2028,9 +2070,9 @@ export function registerEditorAgentOps(): void {
     // outcome this op exists to refuse.
     if (getPlayState() !== 'paused') return { ok: false, error: 'resume requires the PAUSED state — the play state changed while physics was loading', playState: getPlayState() };
     await enterPlay();
-    return readEditorState();
+    return { ok: true, ...playStateFields() };
   });
-  registerAgentOp('stop', async () => { await stopPlay(); return readEditorState(); });
+  registerAgentOp('stop', async () => { await stopPlay(); return { ok: true, ...playStateFields() }; });
   registerAgentOp('pause', () => {
     const st = getPlayState();
     if (st !== 'playing') {
@@ -2042,7 +2084,7 @@ export function registerEditorAgentOps(): void {
       };
     }
     pausePlay();
-    return readEditorState();
+    return { ok: true, ...playStateFields() };
   });
   // Step one frame while Paused: flip to 'playing' around a single synchronous
   // frame, then freeze again (exactly GameView's stepOnce).
@@ -2056,7 +2098,7 @@ export function registerEditorAgentOps(): void {
     setPlayState('playing');
     stepOneFrame();
     setPlayState('paused');
-    return readEditorState();
+    return { ok: true, ...playStateFields() };
   });
 
   // ── Undo / redo ── (async — undo/redo may run async undo closures).
@@ -2073,7 +2115,7 @@ export function registerEditorAgentOps(): void {
   const undoOrRefuse = async (op: 'undo' | 'redo') => {
     const { did, refused } = await undoStep(op);
     if (refused !== null) throw new OpRefusal('REFUSED_BY_OP', `${op}: ${refused} Nothing was undone or redone, and the stack is untouched.`);
-    return { did, ...readEditorState() };
+    return { did, ...editorStateFields('undo', 'unsavedChanges') };
   };
   registerAgentOp('undo', () => undoOrRefuse('undo'));
   registerAgentOp('redo', () => undoOrRefuse('redo'));
@@ -2249,7 +2291,11 @@ export function registerEditorAgentOps(): void {
         error: `load-scene for "${path}" was superseded — a LATER scene load won the swap, and `
           + `"${sceneManager.getCurrent()?.path ?? 'null'}" is now the active scene. This op's own `
           + `load did not fail; this says nothing about whether "${path}" exists.`,
-        ...readEditorState(),
+        // The health faults, then the WINNER's path from the scene manager, for the reason above — not
+        // `editorStateFields('scenePath')`, which reads the tracked path this comment says may still be
+        // pre-swap (#1553 review).
+        ...editorStateFields(),
+        scenePath: sceneManager.getCurrent()?.path ?? null,
       };
     }
     // #1425: the scene loaded, but a manager failed to start. Say so rather than a bare ok.
@@ -2257,7 +2303,7 @@ export function registerEditorAgentOps(): void {
     return {
       ok: true,
       ...(startupErrors.length ? { warnings: startupErrors.map((e) => `manager failed to start (the scene is still loaded): ${e}`) } : {}),
-      ...readEditorState(),
+      ...editorStateFields('scenePath', 'worldEntityTotal', 'unsavedChanges'),
     };
   });
   registerAgentOp('new-scene', async (params) => {
@@ -2271,7 +2317,7 @@ export function registerEditorAgentOps(): void {
     // op's error, the same shape `guardUnsaved` above uses.
     await newScene();
     setSelectionRaw(null, []);
-    return readEditorState();
+    return { ok: true, ...editorStateFields('scenePath', 'worldEntityTotal', 'unsavedChanges') };
   });
   // save_all is the tool the whole "create live, then edit the file" story depends on, so it
   // must never claim a write that didn't happen. It used to hardcode {ok:true} over a
@@ -2602,7 +2648,10 @@ export function registerEditorAgentOps(): void {
     }
     // parentGuid and parentId are ONE address (both given → refused, #1223); 0 alone = root stays literal.
     const parentId = resolveParentId(p, 'create-entity parent');
-    const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId);
+    if (p.name !== undefined && (typeof p.name !== 'string' || !p.name.trim())) {
+      throw new OpRefusal('REFUSED_BY_OP', `create-entity: name must be a non-empty string (got ${JSON.stringify(p.name)}) — nothing was created.`);
+    }
+    const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId, p.name as string | undefined);
     const id = createEntityWithUndo(`Create ${name}`, parentId, specs as TraitSpec[], (i) => setSelectionRaw(i, i != null ? [i] : []));
     // null = nothing was created. Reporting {id:null} as a success let an agent proceed as
     // if the entity existed — say so instead. (C7)
@@ -3113,7 +3162,7 @@ export function registerEditorAgentOps(): void {
         /** The scene saved + remembered on the way in; 'edit-exit' reloads it. */
         returnScene: scenePathBefore,
         savedReturnScene: scenePathBefore != null,
-        ...readEditorState(),
+        ...editorStateFields('scenePath', 'prefabEditWorld', 'worldEntityTotal'),
       };
     }
     if (which === 'edit-save') {
@@ -3142,7 +3191,7 @@ export function registerEditorAgentOps(): void {
     }
     if (which === 'edit-exit') {
       // Report not-editing rather than throwing: leaving a mode you are not in is a legitimate no-op.
-      if (!isEditingPrefab()) return { ok: true, wasEditing: false, ...readEditorState() };
+      if (!isEditingPrefab()) return { ok: true, wasEditing: false, ...editorStateFields('scenePath') };
       // Exiting reloads the return scene, which DISCARDS the prefab world — so it refuses on unsaved
       // work exactly as edit-open and load-scene do (#1424: it answered ok:true over an unsaved
       // delete, with the undo stack gone). This deliberately ends "call it blindly after a failed
@@ -3150,7 +3199,7 @@ export function registerEditorAgentOps(): void {
       // the caller makes with discardUnsaved:true, not a side effect of tidying up.
       guardUnsaved('prefab edit-exit', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
       const returned = await exitPrefabEditing();
-      return { ok: true, wasEditing: true, returnedTo: returned, ...readEditorState() };
+      return { ok: true, wasEditing: true, returnedTo: returned, ...editorStateFields('scenePath', 'worldEntityTotal', 'unsavedChanges') };
     }
     throw new Error(
       `unknown prefab action '${which}' — pass prefabAction: 'instantiate' | 'create' | 'detach' ` +

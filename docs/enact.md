@@ -1020,8 +1020,8 @@ cannot see those would be a false positive on legitimate flows. The warning comp
 RUNTIME op that has always run on a device, so nothing about a scene entity needs an editor to
 resolve it. `bridge.ts`'s `resolveAim` simply never called it.
 - **`entity`** on `device_tap`/`hover`/`scroll`/`pointer`, and on each end of `device_drag` (nested
-  `from`/`to`, the `modoki_drag` shape; the flat `fromSelector`/`fromX`… still work, and one endpoint
-  given both ways is refused `AMBIGUOUS`). The page resolves it through the same op, and accepts or
+  `from`/`to`, the `modoki_drag` shape — the only shape since #1560 removed the six flat
+  `fromSelector`/`fromX`… aliases, so a stale one refuses by name). The page resolves it through the same op, and accepts or
   refuses the answer through the same function the editor's `resolvePoint` uses
   (`app/debug/entityAimRefusal.ts`), so one resolution is refused identically on both surfaces.
   The trusted CDP/WDA routes resolve through `handleResolveAim`, which reads the endpoint's keys from

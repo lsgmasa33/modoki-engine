@@ -108,6 +108,11 @@ export function captureIosSyslog(opts: {
   // `truncated` still reads false). Coerce through a finite check rather than trusting the types:
   // the wire is untyped.
   const num = (v: unknown, fallback: number): number => (Number.isFinite(Number(v)) ? Number(v) : fallback);
+  // Over the max is REFUSED, not clamped (§5, #1560): a capture you wait out for 60s while asking
+  // for 300 reads as "nothing else was logged".
+  if (num(opts.seconds, 0) > MAX_CAPTURE_SECONDS) {
+    return Promise.reject(new Error(`seconds ${opts.seconds} is over the iOS system-capture max of ${MAX_CAPTURE_SECONDS}. Nothing was captured.`));
+  }
   const seconds = Math.min(Math.max(1, Math.floor(num(opts.seconds, DEFAULT_CAPTURE_SECONDS))), MAX_CAPTURE_SECONDS);
   const limit = Math.max(1, Math.floor(num(opts.limit, 50)));
   const needle = opts.filter?.toLowerCase();

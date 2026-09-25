@@ -628,7 +628,8 @@ describe('descriptions an agent reads under deferral (#1208)', () => {
    *  `modoki_*` tool — so it catches a tool that points nowhere, not one that points at the wrong
    *  read (the ledger's B-12 lists those). */
   const VERIFICATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = [
-    { item: 'modoki_set_selection', reason: 'the reply IS the post-state (returns the new editor state)' },
+    { item: 'modoki_set_selection', reason: 'the reply IS the post-state (`selection`, read back from the store after the write — #1553)' },
+    { item: 'modoki_set_gizmo', reason: 'the reply IS the post-state (`gizmoMode`/`gizmoSpace`, read back from the store after the write — #1553)' },
     { item: 'modoki_project_settings', reason: 'its own action:get is the read-back' },
     { item: 'modoki_watch', reason: 'its own action:read/list is the read-back' },
     { item: 'modoki_input_watch', reason: 'its own action:read is the read-back' },

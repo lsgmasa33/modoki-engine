@@ -29,6 +29,7 @@ import { registerProjectTools } from './tools/project.js';
 import { registerRuntimeTools } from './tools/runtime.js';
 import { registerAssetTools } from './tools/assets.js';
 import { unknownParamMessage } from '../../shared/unknownParam.js';
+import { installArgCoercion } from '../../shared/coerceArgs.js';
 
 /** The registration groups, in surface order. Exported so a test can assert the surface is
  *  fully covered rather than trusting that a new group was wired in here. */
@@ -137,6 +138,9 @@ export function defineTool<S extends ZodRawShape>(
 type ToolResultLike = Awaited<ReturnType<Parameters<ToolDef>[3]>>;
 
 export function registerAllTools(server: McpServer, ctx: ToolContext): void {
+  // String-encoded args (`"limit":"12"`) are decoded before the SDK validates them (#1560) — here,
+  // beside the registration, so the server cannot exist with tools but without it.
+  installArgCoercion(server);
   const tool = createToolDef(server, ctx);
   for (const register of TOOL_GROUPS) register(tool, ctx);
 }

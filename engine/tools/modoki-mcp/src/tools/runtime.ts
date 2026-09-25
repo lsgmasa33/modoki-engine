@@ -338,7 +338,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       action: z.enum(PROFILER_ACTIONS)
         .optional().describe('Default "read" (the live aggregate). capture-* record/read frames; gpu-* toggle GPU timestamps; reset clears markers + captures; boot reads the boot-phase timeline; boot-reset re-arms it.'),
       markers: z.number().optional().describe('action:read only — how many marker rows to return (default 12).'),
-      limit: z.number().optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200).'),
+      limit: z.number().int().positive().max(200).optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200). Over the max is refused.'),
       all: z.boolean().optional().describe('action:boot only — return EVERY recorded span, not just the stall overlap and the costliest. Large.'),
     },
     async ({ action, markers, limit, all }) => {
@@ -404,8 +404,8 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       fields: z.array(z.string()).optional().describe('(start) Restrict to these numeric fields; omit for all numeric fields of the component.'),
       epsilon: z.number().optional().describe('(start) Change threshold — record only when a value moves more than this. Default 1e-4.'),
       everyNFrames: z.number().int().positive().optional().describe('(start) Sample every Nth frame (decimation). Default 1.'),
-      maxSamples: z.number().int().positive().optional().describe('(start) Ring cap per series. Default 600.'),
-      maxSeries: z.number().int().positive().optional().describe('(start) Cap on MOVING series — max distinct (entity,field) series that record movement. Default 512, max 4096. A static/never-moved entity does NOT consume this budget (its baseline is kept cheaply), so a screen of static tiles can\'t crowd out a late-joining mover (e.g. a projectile spawned mid-scene). A DESPAWNED entity gives its slot back, and at the 4096 memory ceiling the oldest despawned series are evicted first (read reports evictedDespawned), so a per-shot spawner cannot fill the watch with dead shots.'),
+      maxSamples: z.number().int().positive().max(5000).optional().describe('(start) Ring cap per series. Default 600, max 5000.'),
+      maxSeries: z.number().int().positive().max(4096).optional().describe('(start) Cap on MOVING series — max distinct (entity,field) series that record movement. Default 512, max 4096. A static/never-moved entity does NOT consume this budget (its baseline is kept cheaply), so a screen of static tiles can\'t crowd out a late-joining mover (e.g. a projectile spawned mid-scene). A DESPAWNED entity gives its slot back, and at the 4096 memory ceiling the oldest despawned series are evicted first (read reports evictedDespawned), so a per-shot spawner cannot fill the watch with dead shots.'),
       expireFrames: z.number().int().nonnegative().optional().describe('(start) Auto-remove the watch after N observed frames (0 = never). Default 0.'),
       id: z.string().optional().describe('(read/clear) Watch id from start/list. Omit on clear to clear ALL.'),
       name: z.string().optional().describe('(read) Filter the returned series to entities whose name contains this (case-insensitive) — isolate one entity in a broad watch. `seriesTotal` still reports the full match count.'),
@@ -502,7 +502,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'REFUSED naming the right action rather than silently dropped.',
     {
       action: z.enum(['start', 'read', 'stop', 'clear']).describe('open the window | read presses | close (keeps presses) | drop recorded presses (window stays open if it was)'),
-      maxPresses: z.number().int().positive().optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not modoki_watch\'s `maxSamples`, which caps each series separately.'),
+      maxPresses: z.number().int().positive().max(500).optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not modoki_watch\'s `maxSamples`, which caps each series separately.'),
       limit: z.number().int().positive().optional().describe('(read) Most-recent N presses to return (default 20).'),
       unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter: this is the one question this tool exists to answer, so start here when a reported gesture apparently did nothing."),
       precision: precisionParam('x/y/upX/upY/maxD/heldMs'),

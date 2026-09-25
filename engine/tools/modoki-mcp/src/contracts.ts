@@ -735,7 +735,7 @@ const DECLS: Record<string, Decl> = {
   modoki_create_registered_asset: {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'create-registered-asset',
     mutating: true, persists: 'file', requires: ['editor', 'project'], aim: 'asset',
-    minimalArgs: { kind: 'material', path: '/assets/materials/probe.mat.json' },
+    minimalArgs: { type: 'material', path: '/assets/materials/probe.mat.json' },
     notes: "Routes around the panel's native save dialog (a modal panel only a human can answer) by taking an explicit path, which is what made the whole 'New X' surface agent-unreachable (#288 gap 5). Separate from modoki_create_asset, whose `type` is a fixed enum while this registry is dynamic and game-extensible. REFUSES create-override kinds: `scene`'s override discards the live world, and the dialog it normally goes through IS the guard an explicit path removes — modoki_new_scene has the REQUIRES_SAVE check instead. REFUSES an existing path (409 from `/api/write-file` `ifNoneMatch`) rather than replacing that asset under a new guid (#1215); only the Assets panel replaces, and it keeps the replaced guid.",
   },
   modoki_open_animation_editor: {
@@ -784,22 +784,22 @@ const DECLS: Record<string, Decl> = {
   modoki_anim_set_clip: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'anim-set-clip',
     mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
-    minimalArgs: { clipPath: '/assets/anim/probe.anim.json', clip: {} },
+    minimalArgs: { path: '/assets/anim/probe.anim.json', clip: {} },
   },
   modoki_anim_add_key: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'anim-add-key',
     mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
-    minimalArgs: { clipPath: '/assets/anim/probe.anim.json', trait: 'Transform', field: 'x', time: 0, value: 1 },
+    minimalArgs: { path: '/assets/anim/probe.anim.json', trait: 'Transform', field: 'x', t: 0, value: 1 },
   },
   modoki_timeline_set: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'timeline-set',
     mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
-    minimalArgs: { timelinePath: '/assets/timelines/probe.timeline.json', timeline: {} },
+    minimalArgs: { path: '/assets/timelines/probe.timeline.json', timeline: {} },
   },
   modoki_timeline_add_clip: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'timeline-add-clip',
     mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
-    minimalArgs: { timelinePath: '/assets/timelines/probe.timeline.json', trackType: 'animation', item: {} },
+    minimalArgs: { path: '/assets/timelines/probe.timeline.json', trackType: 'animation', item: {} },
   },
   // ── the six routes that had no tool (2026-08-21 audit F6, owner: expose all six) ──
   // Each was reachable only through modoki_eval + modoki.api(). Two of them were DOCUMENTED as

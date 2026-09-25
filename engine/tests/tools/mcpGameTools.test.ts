@@ -62,7 +62,7 @@ function harness(reply: () => { status?: number; body?: unknown }) {
 
 /** The static surface needs a server too, and it must share nothing with the harness's fake beyond
  *  being a valid sink — the assertions here are about the REGISTRY, which both write into. */
-const server2 = (_h: ReturnType<typeof harness>) => ({ registerTool: () => ({ remove: () => {} }) }) as never;
+const server2 = (_h: ReturnType<typeof harness>) => ({ registerTool: () => ({ remove: () => {} }), validateToolInput: async (_t: unknown, a: unknown) => a }) as never;
 
 afterEach(() => { vi.unstubAllGlobals(); clearRegistry(); });
 
@@ -222,7 +222,7 @@ describe('sync', () => {
     // and "unreachable" is not a guarantee. The engine tool must win, and the game must be told.
     // Registering the static surface first is what makes the collision real rather than theoretical.
     const h = harness(() => ({ body: { version: 1, tools: [decl({ name: 'modoki_tap' })] } }));
-    registerAllTools({ registerTool: () => ({ remove: () => {} }) } as never, createToolContext({ backend: STUB }));
+    registerAllTools({ registerTool: () => ({ remove: () => {} }), validateToolInput: async (_t: unknown, a: unknown) => a } as never, createToolContext({ backend: STUB }));
     const r = await h.sync.refresh();
     expect(r.registered).toEqual([]);
     expect(r.refused.modoki_tap).toMatch(/already registered|duplicate/i);

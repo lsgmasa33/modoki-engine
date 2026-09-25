@@ -171,7 +171,19 @@ export function isCreateEntityKind(kind: string): kind is CreateEntitySpec['kind
   return hasDocKey(CREATE_ENTITY_KIND_TABLE, kind);
 }
 
-export function buildEntityCreateSpecs(spec: CreateEntitySpec, parentId: number): CreateSpecs {
+export function buildEntityCreateSpecs(spec: CreateEntitySpec, parentId: number, name?: string): CreateSpecs {
+  const built = buildDefaultSpecs(spec, parentId);
+  if (name === undefined) return built;
+  // A caller-chosen name replaces the kind's default in BOTH places it appears — the undo label and
+  // EntityAttributes — so the created entity is addressable by it in the same call (#1560: agents
+  // guessed `create_entity {name}`, then needed a follow-up mutate to rename).
+  return {
+    name,
+    specs: built.specs.map((s) => (s.name === 'EntityAttributes' ? { ...s, data: { ...(s.data as object), name } } : s)),
+  };
+}
+
+function buildDefaultSpecs(spec: CreateEntitySpec, parentId: number): CreateSpecs {
   switch (spec.kind) {
     case 'empty': return emptySpecs(parentId);
     case 'primitive': return primitiveSpecs(spec.mesh, parentId);

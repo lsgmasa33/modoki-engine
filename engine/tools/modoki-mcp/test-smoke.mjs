@@ -1030,7 +1030,7 @@ if (!kinds.kinds.some((k) => k.kind === 'material' && k.agentCreatable === true)
 //    flip unlikely. It still fires on the real failure: a scene created at
 //    `${SMOKE_DIR}/mcp-smoke-NEVER.json` yields a DIFFERENT ref.
 const beforeRefusal = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
-const refused = text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'scene', path: `${SMOKE_DIR}/mcp-smoke-NEVER.json` } }));
+const refused = text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { type: 'scene', path: `${SMOKE_DIR}/mcp-smoke-NEVER.json` } }));
 if (!/REFUSED_BY_OP/.test(refused) || !/modoki_new_scene/.test(refused)) {
   throw new Error(`UC13 a scene create must be refused and point at modoki_new_scene, got: ${refused.slice(0, 400)}`);
 }
@@ -1042,7 +1042,7 @@ if (sceneAfter !== sceneBefore) {
 }
 await withCleanup(async () => {
   const made = JSON.parse(text(await client.callTool({
-    name: 'modoki_create_registered_asset', arguments: { kind: 'material', path: REG_PROBE },
+    name: 'modoki_create_registered_asset', arguments: { type: 'material', path: REG_PROBE },
   })));
   if (!made.ok || !made.guid) throw new Error(`UC13 create failed: ${JSON.stringify(made).slice(0, 300)}`);
   // The extension is appended server-side. Without it the file would be written as a plain .json
@@ -1481,9 +1481,9 @@ if (canUC3) {
       // and by id only for a guid-less member; the op takes both in one call.
       const guids = before.guids.filter(Boolean);
       const entityIds = before.entityIds.filter((_, i) => !before.guids[i]);
-      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { ...(guids.length ? { guids } : {}), ...(entityIds.length ? { entityIds } : {}) } });
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { ...(guids.length ? { guids } : {}), ...(entityIds.length ? { ids: entityIds } : {}) } });
     } else if (before?.entityIds?.length) {
-      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { entityIds: before.entityIds } });
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { ids: before.entityIds } });
     } else {
       restore = await client.callTool({ name: 'modoki_set_selection', arguments: {} });
     }
@@ -1523,7 +1523,17 @@ if (canUC3) {
     console.log(`dispatch_action SKIPPED — ${reason}`);
   } else {
     await withCleanup(async () => {
-      await client.callTool({ name: 'modoki_play_control', arguments: { action: 'play' } });
+      // #1553: an action replies with the fields it changed, not the whole editor state (~1.7k chars).
+      // Live, because the unit test cannot see what the MCP relay adds on the way out.
+      const played = JSON.parse(text(await client.callTool({ name: 'modoki_play_control', arguments: { action: 'play' } })));
+      // + the health fields (ACTION_HEALTH_KEYS, each present only when unhealthy) and physicsError.
+      const allowed = ['ok', 'playState', 'runMode', 'advancing', 'physicsError',
+        'staleGameCode', 'discardedUnsavedEdits', 'frameLoop', 'rendererGate', 'gpu', 'gameBootFaults'];
+      const extra = Object.keys(played).filter((k) => !allowed.includes(k));
+      if (played.playState !== 'playing' || extra.length) {
+        throw new Error(`play_control must reply {ok, playState, runMode, advancing} — got playState=${played.playState}, extra keys ${JSON.stringify(extra)}`);
+      }
+      console.log('play_control replies with the play state only ✓');
 
       // `haptics.toggle` REFUSES when the open scene authors no `HapticSettings` entity, which is the
       // common case — and since #1129 the op reports a handler's refusal as a failed call naming it,
@@ -2033,9 +2043,9 @@ const errCode = (r) => { try { return JSON.parse(text(r)).error?.code ?? ''; } c
 }
 await withCleanup(async () => {
   // A-1: the second create at the same path is refused, and the first asset keeps its guid.
-  const first = JSON.parse(text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'material', path: UC15_MAT } })));
+  const first = JSON.parse(text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { type: 'material', path: UC15_MAT } })));
   if (!first.ok || !first.guid) throw new Error(`UC15 first create failed: ${JSON.stringify(first).slice(0, 300)}`);
-  const again = await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'material', path: UC15_MAT } });
+  const again = await client.callTool({ name: 'modoki_create_registered_asset', arguments: { type: 'material', path: UC15_MAT } });
   if (!again.isError || errCode(again) !== 'REFUSED_BY_OP' || !/already exists/.test(text(again))) {
     throw new Error(`UC15 a create over an existing asset must be refused, got: ${text(again).slice(0, 300)}`);
   }
