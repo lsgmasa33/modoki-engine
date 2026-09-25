@@ -424,6 +424,62 @@ The #1490 half: after Apply of a MOVED nested root, the pose is in the reference
 save's by-value subtraction drops it from the source. A later edit to that row pose moves the instance.
 Tests: `engine/tests/editor/nestedRowFieldSave.test.ts`.
 
+### Undoing an Apply
+
+An Apply changes two things: the prefab file, and every live instance of it. So its undo
+(`applyPrefabUndo.ts`) puts back both. It installs the prefab snapshot, then reloads the live world from
+the `serializeScene` snapshot taken on that side of the Apply. Only the scene snapshot tells the
+applied instance (an override again after the undo) apart from the ones that merely inherited the
+value (back to the old base). Neither a rebase nor a rebuild from the prefab's document can recover that.
+
+**The snapshot is reloaded under the key of the world the undo belongs to when it RUNS**
+(`currentSceneKey()`, the key Stop's restore uses), not under a path captured at the Apply (#1575):
+- **a scene's path**: reloaded there, the editor's path and base re-synced, and saved;
+- **the prefab-edit world's synthetic path**: reloaded there, not saved (#1573, § Prefab edit mode);
+- **an untitled scene** (`null`): reloaded under `''`, as `restoreAuthoredSnapshot` reloads one on
+  Stop. Nothing is fetched, the world is not marked as a loaded scene, the editor's path stays null
+  (so Save still asks where), and nothing is saved. `replaceWorldContent`, which builds an untitled
+  world, cannot do this: its populate callback is synchronous, and a prefab instance needs the async
+  loader.
+
+Before #1575 an untitled scene matched neither captured path, so only the file came back. The other
+instances kept the applied value, the applied one lost its override, and a later Save As wrote that as
+an override on each. Reading the key at undo time also covers an untitled scene saved with **Save As**
+after the Apply. That save sets the editor's path but keeps the undo history, so the Apply entry is
+still undone, now under a real path.
+
+**The reload happens only if that world is still live.** The file install and the member-path repair
+before it are awaited. A scene load, an Exit from prefab edit, or a Create Scene can land in that
+window. The reload is skipped in any of three cases, and only the file is restored, with a warning:
+- the key changed;
+- the world object changed (checked for every key);
+- a scene load is still in flight (`isSceneLoadInFlight()`, or `sceneManager.getNext()`).
+
+The world is compared for every key because a scene load swaps the world first. It sets the path and
+the history only in its tail, after awaiting the scene managers, so for that window the key still
+reads as the old scene's. Every untitled world shares the key `null`, which is why the world check was
+first written for that case. A skipped restore also skips `rederiveBaseInstances`, which would
+otherwise rebuild the prefab's base instances in whatever world is live. **And the step throws.** It
+applied only half, the file and not the world, so the undo manager drops it with a loud report
+(#310's policy, [editor.md](editor.md) § A throwing undo/redo closure). The entry is never left on a
+redo stack as though undone. Where the history has already swapped, the manager would drop it anyway
+(§ A step that awaits across a scene switch). Otherwise its redo would load this snapshot under the
+new scene's key and save it there.
+
+⚠️ **These are guards at the step, not a fix for the race.** Nothing serializes an undo against the
+user opening a scene, creating one, entering or leaving prefab edit, or pressing Play. Four windows
+are still open and tracked together in #1579:
+- Play pressed during the install;
+- a base the incoming scene keeps, whose instance keeps the applied build;
+- a load's tail discarding the outgoing history that the throw marked dirty;
+- a pending load that then fails, leaving the file at "before" and the instances at "after".
+
+The proposed fix is for the world-switch entry points to await `whenUndoIdle()`, which would make
+every one of these guards defence in depth.
+
+Tests: `engine/tests/editor/untitledApplyUndo.test.ts` (each rule above mutation-checked),
+`prefabEditApplyUndo.test.ts`, `applyPrefabDirtiesBase.test.ts`.
+
 ### A capture reads the document the frame was EXPANDED from (#1483)
 
 A localId means something only together with the document it was read from. Every capture
@@ -637,8 +693,9 @@ warm:
 
 Paths that also reload:
 - Prefab-EDIT mode reloads on exit (`exitPrefabEditing` → `loadScene(target)`).
-- Undo/redo of an Apply reloads (`restoreSnapshot` → `loadScene`). An Apply made in prefab-edit
-  mode reloads at that world's synthetic path (#1573).
+- Undo/redo of an Apply reloads (`restoreSnapshot` → `loadScene`), under the key of the world the
+  undo belongs to when it runs (`currentSceneKey()`): the scene's path, the prefab-edit world's
+  synthetic path (#1573), or `''` for an untitled scene (#1575). See § Undoing an Apply.
 
 **An external `.prefab.json` write** (a hand edit, `git checkout`) goes through the scene hot
 reload. `handleSceneChanged` evicts and then reloads (#1169, [editor-hmr.md](editor-hmr.md)), and
@@ -825,8 +882,8 @@ shows there in normal mode too.
   - ⚠️ **A rebase is not a substitute either.** It rebuilds the applied instance with the overrides
     it holds against the applied document, which are none, so the edit being undone is lost from
     the prefab AND the instance.
-  - `prefabEditApplyUndo.test.ts` mutation-checks each of these. An untitled scene has no path to
-    reload at, and is not covered by this (#1575).
+  - `prefabEditApplyUndo.test.ts` mutation-checks each of these. The untitled-scene case is
+    § Undoing an Apply (#1575).
 
 **Reachable headlessly.** `openPrefabForEditing` / `savePrefabEdit` / `exitPrefabEditing` are
 exposed as the `prefab` agent op / `modoki_prefab` MCP tool's `prefabAction: 'edit-open' |

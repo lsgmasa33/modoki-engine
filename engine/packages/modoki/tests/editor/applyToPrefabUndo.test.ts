@@ -37,6 +37,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   getCurrentScenePath: () => 'scenes/test.json',
   setCurrentScenePath: vi.fn(),
   setCurrentBaseScene: (...a: any[]) => setCurrentBaseScene(...a),
+  isSceneLoadInFlight: () => false,
 }));
 
 vi.mock('../../src/editor/scene/prefab', () => ({
@@ -54,7 +55,7 @@ vi.mock('../../src/editor/scene/prefab', () => ({
 let currentBaseScene: string | undefined;
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   // `getCurrent`: a real scene, so the Apply is not the prefab-edit world's (#1573).
-  sceneManager: { loadScene: (...a: any[]) => loadScene(...a), getCurrentBaseScene: () => currentBaseScene, getCurrent: () => ({ path: '/scenes/main.json' }) },
+  sceneManager: { loadScene: (...a: any[]) => loadScene(...a), getCurrentBaseScene: () => currentBaseScene, getCurrent: () => ({ path: '/scenes/main.json' }), getNext: () => null },
 }));
 
 vi.mock('../../src/editor/store/editorStore', () => ({
@@ -63,6 +64,8 @@ vi.mock('../../src/editor/store/editorStore', () => ({
 
 vi.mock('../../src/editor/undo/undoManager', () => ({
   pushAction: (a: UndoAction) => { pushed = a; },
+  // The restore reads its target from `currentSceneKey` (#1575), whose module registers a barrier on import.
+  registerUndoRestoreBarrier: () => {},
 }));
 
 async function getModule() { return import('../../src/editor/undo/applyPrefabUndo'); }

@@ -69,6 +69,7 @@ import {
   type MarqueeCandidate,
 } from '../scene/marqueeSelect';
 import { resolvePickSelection, pickRequestsReveal, type PickModifiers } from '../scene/pickSelection';
+import { pressReachesCanvas } from '../scene/pickReach';
 import { getCanvas2DRouting, getPaintOrder } from './sceneView2DGraph';
 import { UIRenderer } from '../../runtime/ui/UIRenderer';
 import { useEditorStore } from '../store/editorStore';
@@ -2982,17 +2983,23 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         : camPos.clone().sub(origin).normalize();
       // Which of three's internal pickers a press would select. Same defensive read as the pick
       // provider below: a rename on upgrade degrades to "cannot tell" rather than throwing.
-      const pickerNameAt = (px: number, py: number): string | null => {
+      // `undefined` = cannot tell (no readable picker); `null` = a press here selects no handle.
+      const pickerNameAt = (px: number, py: number): string | null | undefined => {
         const picker = (gizmo as unknown as { _gizmo?: { picker?: Record<string, THREE.Object3D> } })._gizmo?.picker?.[gizmo.getMode()];
-        if (!picker || !picker.children.length) return null;
+        if (!picker || !picker.children.length) return undefined;
         const n = { x: ((px - r.left) / r.width) * 2 - 1, y: -((py - r.top) / r.height) * 2 + 1 };
         raycaster.setFromCamera(new THREE.Vector2(n.x, n.y), gizmoCam);
-        const hit = raycaster.intersectObjects(picker.children, true)[0];
+        // The first VISIBLE hit, as three's own `intersectObjectWithRay` takes it: the gizmo hides
+        // the pickers of an axis it has flipped or collapsed, and those are not what a press selects.
+        const hit = raycaster.intersectObjects(picker.children, true).find((h) => h.object.visible);
         return hit ? (hit.object.parent?.name || hit.object.name || null) : null;
       };
       if (gizmoMode === 'translate' || gizmoMode === 'scale') {
         for (const ax of ['x', 'y', 'z'] as const) {
-          const aim = axisPickAim({ origin, dir: axisDir(ax), offsetWorld: AXIS_PICKER_CENTER * worldScale, eye, project: projectPlain, reachable });
+          const aim = axisPickAim({
+            origin, dir: axisDir(ax), offsetWorld: AXIS_PICKER_CENTER * worldScale, eye, project: projectPlain, reachable,
+            picksAxis: (p) => { const name = pickerNameAt(p.x, p.y); return name === undefined ? null : name === ax.toUpperCase(); },
+          });
           if (!aim) continue;
           out.push({ id: `gizmo3d:${gizmoMode}:${ax}`, kind: 'gizmo-axis', editor: 'gizmo3d', x: aim.x, y: aim.y, label: `${gizmoMode} ${ax}`, meta: { axis: ax, mode: gizmoMode, space: gizmoSpace, approximate: true, world: [aim.world.x, aim.world.y, aim.world.z] }, owner: renderer.domElement });
         }
@@ -3016,7 +3023,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         const planeAxes: Record<'x' | 'y' | 'z', ['x' | 'y' | 'z', 'x' | 'y' | 'z']> = { x: ['y', 'z'], y: ['z', 'x'], z: ['x', 'y'] };
         for (const ax of ['x', 'y', 'z'] as const) {
           const [ua, va] = planeAxes[ax];
-          const aim = rotateRingAim({ origin, u: axisDir(ua), vAxis: axisDir(va), radius, project: projectPlain, reachable });
+          const aim = rotateRingAim({
+            origin, u: axisDir(ua), vAxis: axisDir(va), radius, project: projectPlain, reachable,
+            picksRing: (p) => { const name = pickerNameAt(p.x, p.y); return name === undefined ? null : name === ax.toUpperCase(); },
+          });
           if (!aim) continue;
           out.push({ id: `gizmo3d:rotate:${ax}`, kind: 'gizmo-axis', editor: 'gizmo3d', x: aim.x, y: aim.y, label: `rotate ${ax}`, meta: { axis: ax, mode: gizmoMode, space: gizmoSpace, approximate: true, world: [aim.world.x, aim.world.y, aim.world.z] }, owner: renderer.domElement });
         }
@@ -3501,6 +3511,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     function pickEntityAtViewportPoint(clientX: number, clientY: number): number | null {
       const { camera: activeCam, canvas: r, rect: drawRect } = viewProjection();
       if (clientX < r.left || clientX > r.right || clientY < r.top || clientY > r.bottom) return null;
+      // #1576 — a canvas on top (the Canvas2D pick overlay) absorbs a press it misses and deselects;
+      // this viewport never sees it, so it must not predict one. Always true for `onPointerDown`'s
+      // own press, which this canvas received — see `pickReach.ts`.
+      if (!pressReachesCanvas(renderer.domElement, clientX, clientY)) return null;
       // In UI mode the 3D render is letterboxed to the game aspect ratio, so NDC is computed
       // relative to the letterboxed draw rect, not the full canvas — the SAME rect and camera the
       // bounds provider projects the aim through, so an aim and its pick can't disagree (#1489).

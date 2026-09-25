@@ -160,6 +160,26 @@ the occlusion check could see, because `occluded:false` does not mean the same t
   canvas in the combined DOM+canvas paint stack, then additionally reconciles that against real UI
   elements sharing the same preview, so it must be asked first or its reconciliation would never
   run.
+  ⚠️ **`pickAt` takes the first NON-NULL answer, so a provider's `null` means "ask the next one"
+  — and an overlay that ABSORBS a press answers `null` too** (#1576). A Canvas2D host's pick
+  overlay that misses deselects, and the press never reaches the Three.js canvas below it. The
+  3D viewport, asked next, named the mesh under the point anyway, so on `2D Animation.scene` (a
+  full-screen Canvas2D host) `modoki_tap` reported ok on a cube that no click could select. The
+  3D viewport's pick function therefore asks `pressReachesCanvas` (`editor/scene/pickReach.ts`)
+  first, and answers only when no OTHER canvas is on top at the point. The check goes INSIDE the one
+  function that both the pointer handler and the registration call, because
+  `pickProviderSharedPath.test.ts` forbids a wrapper. For a real press it is always true. A non-canvas cover (a toolbar, a dialog)
+  still gets an answer, because that cover is the DOM check's flag (`occluded` + `hitTarget`),
+  and withholding the pick would turn the flag into a refusal that misnames what covers it.
+  **The same mechanism existed one layer up**, in the 'ui' arbiter: `resolvePreviewPick` went on
+  down the stack past a topmost Canvas2D that missed, and could predict a LOWER canvas's sprite.
+  When the press lands ON a pick overlay (a canvas tops the stack), that overlay takes it, and on a
+  miss it resolves UI nodes only. So in that case only its own hit-test counts. ⚠️ **Not when a
+  UI node tops the stack.** Then `UIEditorOverlay`'s capture handler owns the press and runs the
+  same arbiter for the REAL selection, and #337's "a genuine 2D hit beats decorative UI above it"
+  still descends the whole stack. A first cut skipped lower canvases in both cases, which changed
+  real clicks, not just the prediction. This was found by reading (no fixture has overlapping
+  hosts) and both sides are pinned in `uiPreviewPick.test.ts`.
 
 Reporting the scope is what stops the weaker check from being read as the stronger one; a bare
 `occluded:false` on `'canvas'` would be a false clean bill of health. The `'entity'` scope also
@@ -553,6 +573,14 @@ The handle shape carries three fields that make chrome addressing robust:
   walks up for the nearest ancestor that names anything (a bare `"div"` identifies nothing), and
   the SceneView toolbar — chrome that structurally overlaps the top of the viewport — carries
   `data-ui-id="sceneView.toolbar"` so it names itself.
+  ⚠️ **A GAME UI node is named as its entity BEFORE that walk** (#1570): `entity "Top UI" [<guid>]`,
+  or `entity 13` when no live entity has the id. A UINode host is a bare `div` whose only identity
+  is `data-entity-id`, so the walk used to skip it and reach the dock. A 3D gizmo handle under a
+  scene's own HUD bar in SceneView 'ui' was reported as covered by `div inside
+  div.flexlayout__tab_moveable`, and filed as "under the dock tab chrome". In 'ui' the HUD
+  **wins the press** over a gizmo drawn beneath it (owner ruling, 2026-09-25), so that refusal is
+  correct. It only needed to say whose it was. The canvas-cover check (`canvasOcclusionAt`) uses
+  the same describer.
 
   **A handle CLIPPED by a neighbouring panel is a cover too, and every handle refusal is a coded
   400** (#1565). `computeHandles` marks a handle inside the window but outside its own panel's
@@ -598,6 +626,17 @@ The handle shape carries three fields that make chrome addressing robust:
   plates in the gizmo's positive octant, and a ray can cross one before reaching the uniform box —
   measured on a two-entity selection, whose proxy has no rotation so the plates lie in the world
   planes, the drag came back with `sy` UNCHANGED and x/z grown, i.e. a silent two-axis scale.
+  (d) **A translate/scale AXIS verifies its picker too** (#1570, `picksAxis`). three's axis pickers
+  are fat two-ended cones (`CylinderGeometry(0.2, 0, 0.6)` at ±0.3), and under an oblique camera a
+  ray at one axis's cone can cross a neighbour's first. Measured 2026-09-25 on tropical-island's cube
+  in SceneView 'ui': the published `translate:x` point dragged the cube along **z** only. The aim now
+  samples three points along each half of the cone and ranks them: selects THIS axis, then reachable,
+  then the cone centre, then separation. An axis where every point is known to select something
+  else is not published, because a handle that drags the wrong axis and reports ok is worse than no
+  handle. `pickerNameAt` takes the first VISIBLE hit, as three's `intersectObjectWithRay` does: a
+  flipped or collapsed axis hides its pickers, and those are not what a press selects. A rotate
+  RING gets the same check (`picksRing`). Its 45° diagonals avoid the rings' 3D intersections, but
+  not the points where their projected ellipses cross on screen.
 
   The rule is enforced by `engine/tests/architecture/handleProviderOwner.test.ts` — a SOURCE guard,
   because these providers live inside panel mount effects that cannot be invoked without a real

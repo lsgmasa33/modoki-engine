@@ -67,7 +67,7 @@ import { setPrefabCache, getCachedPrefabSync, type PrefabFile } from '../../pack
 import { loadPrefabEditWorld, serializePrefabEditWorld, PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
-import { undo, redo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo, canRedo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { writeTraitFieldWithUndo, reparentEntity } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -301,12 +301,15 @@ describe('undoing an Apply in the prefab editor after the world has left it (#15
     writeTraitFieldWithUndo(inRow('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     await applyFromA((k) => k.fields);
     const REAL = '/scenes/Real.json';
-    sm.duringWrite = () => { sm.path = REAL; }; // the Exit's reload swaps the real scene in
+    sm.duringWrite = () => { sm.path = REAL; swapHistory(REAL); }; // the Exit's reload swaps the real scene and its history in
 
     await quietly(() => undo());
     expect(sm.duringWrite).toBeNull(); // precondition: the install really awaited a write
     expect(sm.path).toBe(REAL);
     expect(midOnDisk().entities.find((e) => e.name === 'Box')!.traits.Transform).toMatchObject({ x: 0 }); // the file still came back
+    // …and the Apply is not left on the real scene's redo stack, where a redo would load the edit world under the
+    // real scene's key and save it into that file (#1575 close-out review).
+    expect(canRedo()).toBe(false);
   });
 });
 

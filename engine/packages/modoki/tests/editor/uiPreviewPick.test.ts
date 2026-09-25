@@ -134,6 +134,30 @@ describe('resolvePreviewPick', () => {
     expect(pick).toEqual({ kind: 'ui', id: 7 });
   });
 
+  it('#1576 — a LOWER canvas\'s 2D hit never wins once the topmost canvas has missed', () => {
+    // The topmost pick overlay takes the press; on a miss it resolves UI nodes only. So sprite 99 on
+    // canvas 11, under a full-bleed canvas 50 that paints nothing here, is not what a click selects.
+    const pick2DAt = (canvas: number) => (canvas === 11 ? 99 : null);
+    expect(resolvePreviewPick([{ kind: '2d', canvasEntityId: 50 }, { kind: '2d', canvasEntityId: 11 }], pick2DAt)).toBeNull();
+    // …the UI node below both still answers, as the real miss path would select it…
+    expect(resolvePreviewPick([
+      { kind: '2d', canvasEntityId: 50 }, { kind: '2d', canvasEntityId: 11 }, { kind: 'ui', entityId: 7, opaque: true },
+    ], pick2DAt)).toEqual({ kind: 'ui', id: 7 });
+    // …and accept side: with canvas 11 on TOP, its sprite wins as before.
+    expect(resolvePreviewPick([{ kind: '2d', canvasEntityId: 11 }, { kind: '2d', canvasEntityId: 50 }], pick2DAt)).toEqual({ kind: '2d', id: 99 });
+  });
+
+  it('…but with a UI node ON TOP the whole stack is descended — that press is the arbiter\'s, and #337 holds', () => {
+    // The press lands on decorative node 7, so no pick overlay handles it: UIEditorOverlay's capture
+    // handler runs this very function and selects its answer. Sprite 99 showing through the empty
+    // canvas 50 is a genuine 2D hit under decorative UI, which #337 says wins (close-out §2d review:
+    // the first cut of the skip answered 7 here and changed what a REAL click selects).
+    const pick2DAt = (canvas: number) => (canvas === 11 ? 99 : null);
+    expect(resolvePreviewPick([
+      { kind: 'ui', entityId: 7, opaque: false }, { kind: '2d', canvasEntityId: 50 }, { kind: '2d', canvasEntityId: 11 },
+    ], pick2DAt)).toEqual({ kind: '2d', id: 99 });
+  });
+
   it('defaults to the old behaviour when no ancestor test is supplied', () => {
     // The parameter is optional so every existing caller and test keeps its meaning.
     const stack: PreviewStackEntry[] = [

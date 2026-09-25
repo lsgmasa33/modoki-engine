@@ -24,7 +24,7 @@ import { OpRefusal } from './opRefusal';
 // ⚠️ The RUNTIME's own veto, not a copy of the rule (#1016). `resolveTapZoneVeto` is what
 // `pressOrigin.ts` uses to route a real press, so the aim surface and the router cannot disagree
 // about who gets the click — §9: a rule implemented twice diverges, and this pair already had.
-import { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, collectHandles, normalizeHandleLabel } from '@modoki/engine/runtime';
+import { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, collectHandles, normalizeHandleLabel, findEntity, entityDisplayName, guidOfEntityId } from '@modoki/engine/runtime';
 
 // Re-exported so existing importers (domDnd, agentBridge) keep one import site.
 export type { DomPointSpec, DomPointResolution, DomRect, AimGesture } from './domPointContract';
@@ -274,8 +274,7 @@ export function describeOccluder(el: Element | null | undefined): string | null 
   const zone = el?.closest?.(`[${UI_TAP_ZONE_ATTR}]`);
   if (zone) {
     const host = zone.parentElement;
-    const entityId = host?.getAttribute('data-entity-id');
-    const named = entityId ? `entity ${entityId}` : (host ? describeElement(host) : null);
+    const named = host ? (describeEntityHost(host) ?? describeElement(host)) : null;
     // Falls through to the ancestor walk when the host names nothing at all, rather than
     // announcing an anonymous owner — "of div" tells the caller strictly less than the panel does.
     // ⚠️ `/[.#[]/` — "did `describeElement` find a real name, or fall back to a bare tag?" — NOT
@@ -288,8 +287,40 @@ export function describeOccluder(el: Element | null | undefined): string | null 
     return anon ? `the minTapSize tap zone in ${describeOccluderContext(el!) ?? anon}` : null;
   }
   const own = describeElement(el);
-  if (!own || /[.#[]/.test(own)) return own; // already identifiable
+  if (!own) return own;
+  // ⚠️ A GAME UI node is named as its entity before the ancestor walk (#1570). A UINode host is a
+  // bare `div` whose one identity is `data-entity-id`, so the walk skipped past it to the dock: a
+  // gizmo handle under a scene's own HUD bar was reported as covered by `div inside
+  // div.flexlayout__tab_moveable`, and filed as "under the dock tab chrome". The entity is what an
+  // agent can act on, and it says the cover is the SCENE's, not the editor's.
+  // But only AFTER an element that names itself (`data-ui-id` chrome, an `id`, a class, a `title`):
+  // that name is the more specific one, and the entity above it may be the very carrier the cover
+  // sits inside (`carrierCover.ts`'s "shared ancestor's own drawing" must read as `span#hud-frame`).
+  if (/[.#[]/.test(own)) return own; // already identifiable
+  const host = el!.closest('[data-entity-id]');
+  const entity = host ? describeEntityHost(host) : null;
+  if (entity) return entity;
   return describeOccluderContext(el!) ?? own;
+}
+
+/** Name a game UI node's host by the entity it renders: `entity "Top UI" [<guid>]`, or `entity 13`
+ *  when the id resolves to no live entity (the DOM can outlive its entity by a frame, and a unit
+ *  test's DOM has no world behind it). `null` when the attribute is not an id at all.
+ *
+ *  The guid is what makes the name addressable: runtime ids are reassigned on every scene
+ *  hot-reload, and a display name need not be unique. Looked up by id (`findEntity`, O(1)) rather
+ *  than by scanning every entity, because a handle list can describe many covers in one call. */
+function describeEntityHost(host: Element): string | null {
+  const raw = host.getAttribute('data-entity-id');
+  const id = raw ? Number(raw) : NaN;
+  if (!Number.isFinite(id) || id <= 0) return null;
+  try {
+    if (findEntity(id)) {
+      const guid = guidOfEntityId(id);
+      return `entity "${entityDisplayName(id)}"${guid ? ` [${guid}]` : ` (id:${id})`}`;
+    }
+  } catch { /* no current world to ask — name it by id */ }
+  return `entity ${id}`;
 }
 
 /** Walk up for the nearest ancestor that names something, and say where the element sits. Split out

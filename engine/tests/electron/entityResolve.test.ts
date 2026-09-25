@@ -48,6 +48,11 @@ vi.mock('@modoki/engine/runtime', () => ({
     return e ? { guid: e.guid ?? '', name: e.name } : null;
   },
   classifyRuntimeGuidMiss: () => null,
+  // `describeOccluder` names a covering game UI node by its entity (#1570) — answered from the same
+  // mocked list, so a cover's name and guid agree with every other lookup here.
+  findEntity: (id: number) => (getAllEntities() as Ent[]).find((e) => e.id === id) ?? null,
+  entityDisplayName: (id: number) => (getAllEntities() as Ent[]).find((e) => e.id === id)?.name ?? `Entity ${id}`,
+  guidOfEntityId: (id: number) => (getAllEntities() as Ent[]).find((e) => e.id === id)?.guid || null,
   resolveTapZoneVeto: (...a: unknown[]) => (resolveTapZoneVeto as (...x: unknown[]) => unknown)(...a),
   // The REAL constants, not string copies: this file already has them in scope from the
   // `importActual` above, and a hand-synced duplicate of a value you are holding is the
@@ -205,6 +210,29 @@ describe('2D/3D entities (canvas scope)', () => {
     overlay.id = 'modal';
     stubTopmost(overlay);
     expect(aimPuck()).toMatchObject({ occluded: true, hitTarget: 'div#modal' });
+  });
+
+  it('names a game UI node covering the canvas as its ENTITY, not the dock it sits in (#1570)', () => {
+    // Shipping shape: a UINode host is a bare `div` whose one identity is `data-entity-id`, inside
+    // the dock's anonymous chrome. Named by the old walk, this read `div inside
+    // div.flexlayout__tab_moveable` — and #1570 was filed against the dock when the cover was the
+    // scene's own HUD bar.
+    getAllEntities.mockReturnValue([PUCK, { id: 13, name: 'Top UI', guid: 'g-top', layer: 'ui' }]);
+    const dock = document.createElement('div');
+    dock.className = 'flexlayout__tab_moveable';
+    const host = document.createElement('div');
+    host.setAttribute('data-entity-id', '13');
+    const text = document.createElement('div');
+    dock.appendChild(host); host.appendChild(text);
+    stubTopmost(text);
+    expect(aimPuck()).toMatchObject({ occluded: true, hitTarget: 'entity "Top UI" [g-top]' });
+  });
+
+  it('names a covering UI node by its bare id when no live entity has it (the DOM outlived it)', () => {
+    const host = document.createElement('div');
+    host.setAttribute('data-entity-id', '99');
+    stubTopmost(host);
+    expect(aimPuck()).toMatchObject({ occluded: true, hitTarget: 'entity 99' });
   });
 
   it('treats a child of the canvas as reaching it', () => {

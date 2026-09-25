@@ -197,6 +197,18 @@ if (inner?.code !== 'NOT_FOUND') throw new Error(`a missing scene must be NOT_FO
 if (!/does-not-exist/.test(inner.why)) throw new Error('the failing step must name WHICH scene was missing');
 console.log('batch failure → code:', fe.code, ' failedAt:', fj.failedAt, ' step2:', inner.code, '✓');
 
+/** The `set_game_view_device` args that put back a device read off `gameView`/`current` — shared by
+ *  every case that pins the device, so they cannot restore differently. A CUSTOM size is restored
+ *  by size, not as 'Free' (UC3 pins the device on every run, so a lossy restore would reset a
+ *  custom preview — one an agent set, the only way to make one — every time). Its `logical` reads back POST-rotation — 640x480 set with
+ *  `orientation:'landscape'` reads 480x640 — so a landscape one is swapped back before re-setting.
+ *  MEASURED 2026-09-25: portrait custom, landscape custom and a landscape preset all round-trip. */
+const gameViewRestoreArgs = (gv) => {
+  if (gv.device !== 'Custom') return { device: gv.device, orientation: gv.orientation };
+  const land = gv.orientation === 'landscape';
+  return { logicalWidth: land ? gv.logical.h : gv.logical.w, logicalHeight: land ? gv.logical.w : gv.logical.h, dpr: gv.dpr, orientation: gv.orientation };
+};
+
 // ── Case preconditions (Issue #41) ───────────────────────────────────────────
 // UC3/UC5/UC6/UC8 below depend on state that only games/3d-test provides — a scene, a prefab, a
 // particle def, an entity named 'cube'. Probed ONCE up front via the TOOL SURFACE (never the
@@ -215,6 +227,7 @@ console.log('batch failure → code:', fe.code, ' failedAt:', fj.failedAt, ' ste
 const FIXTURE_SCENE = '/assets/scenes/skinned-test.scene.json';
 const FIXTURE_PREFAB = '/assets/models/skinned-test/cone.prefab.json';
 const FIXTURE_PARTICLE = '/assets/particles/confetti.particle.json';
+const UC3_SCENE = '/assets/scenes/tropical-island.scene.json';
 const [scenesR, prefabsR, particlesR, cubeR, coneR, awayR, identityR] = await Promise.all([
   client.callTool({ name: 'modoki_list_scenes', arguments: {} }),
   client.callTool({ name: 'modoki_list_assets', arguments: { type: 'prefab' } }),
@@ -250,6 +263,13 @@ const PRECOND = {
   particle: { ok: (JSON.parse(text(particlesR)).assets ?? []).some((a) => a.path === FIXTURE_PARTICLE), need: `the particle def ${FIXTURE_PARTICLE}` },
   cube: { ok: (cubeState.entities ?? []).length > 0, need: "an entity named 'cube' in the OPEN scene" },
   awayTarget: { ok: !!AWAY_GUID, need: "an entity named 'Sphere013' in the OPEN scene (tropical-island's island prefab) — UC3's 'ui' pass frames it to point the editor camera away from the cube" },
+  // UC3's GEOMETRY is tropical-island's, not merely its entities (#1570/#1576). `cube` and
+  // `Sphere013` also exist in `2D Animation.scene.json` (the same island prefab), so the two probes
+  // above pass there — and in 'ui' mode that scene's full-screen Canvas2D host covers the whole
+  // preview, where a real press on the cube lands on the 2D layer and selects nothing. The tap is
+  // then correctly REFUSED, which reads as the tool breaking. The gizmo step below likewise needs
+  // the HUD this scene draws, at the device it pins. Name the scene rather than let a lookalike run.
+  uc3Scene: { ok: OPEN_SCENE === UC3_SCENE, need: `the scene ${UC3_SCENE} OPEN (launch with \`launch-editor.sh games/3d-test --scene tropical-island\`) — UC3's aim and gizmo geometry is measured on it` },
   // UC5 aims by NAME on purpose (the ergonomic form is what finds bugs), so it needs 'Cone' to be
   // unambiguous AFTER its instantiate adds one. Any pre-existing Cone makes the name ambiguous,
   // and an ambiguous name is REFUSED everywhere by design — so the case cannot run, and the
@@ -283,7 +303,7 @@ const PRECOND = {
     need: `the Game tab to be OPEN and SELECTED (open/select it in the editor) — mounted now: ${(mountedSurfaces ?? []).join(', ') || 'none'}`,
   },
 };
-const CASE_NEEDS = { UC3: ['cube', 'sceneView', 'awayTarget'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'], gameViewDevice: ['gameView'] };
+const CASE_NEEDS = { UC3: ['cube', 'sceneView', 'awayTarget', 'uc3Scene'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'], gameViewDevice: ['gameView'] };
 
 /** True when `uc`'s preconditions all hold. Otherwise pushes ONE skip reason — naming the open
  *  project AND scene, since either can be the cause — and logs it, so the F12 verdict at the end
@@ -478,7 +498,15 @@ const AWAY = AWAY_GUID; // probed with the other preconditions; a missing one SK
 // Mode AND space: the space is persisted too, and the fixture cube is rotated, so in 'local' space
 // its X handle moves world x AND z and the "along one axis only" check below would fail on a
 // setting, not on the code (#1489 review).
-const { gizmoMode: foundGizmoMode, gizmoSpace: foundGizmoSpace } = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+const { gizmoMode: foundGizmoMode, gizmoSpace: foundGizmoSpace, gameView: foundGameView } = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+// The Game View DEVICE is pinned for the 'ui' pass too (#1570), and restored in the cleanup. 'ui'
+// draws through the game camera into a letterbox of that device's shape, with the scene's own HUD
+// laid over it — so the device decides whether the Top UI bar covers the cube's gizmo. It is
+// persisted editor state like the mode and space above: MEASURED at a 1217x736 window, 'Free' left
+// no translate axis clear of the HUD (every one under `Top UI`), 'iPhone 16 Pro' portrait left x
+// and z clear. A HUD over the gizmo wins the press — owner ruling 2026-09-25, so the refusal is
+// the tool being right, and the fixture is what has to control it.
+const UC3_UI_DEVICE = { device: 'iPhone 16 Pro', orientation: 'portrait' };
 // Set once the gizmo drag has landed and cleared by its undo, so the cleanup can undo a drag whose
 // check threw — otherwise the run leaves the cube moved.
 let gizmoDragPending = null;
@@ -487,6 +515,7 @@ await withCleanup(async () => {
 for (const mode of ['3d', 'ui']) {
 const uc3 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
   { tool: 'modoki_set_scene_view_mode', args: { mode }, result: 'none' },
+  ...(mode === 'ui' ? [{ tool: 'modoki_set_game_view_device', args: UC3_UI_DEVICE, result: 'none' }] : []),
   // Clear the selection first. A selected entity carries a transform gizmo, and a press on the
   // gizmo answers "the selection stays" — the selected entity's own id — whatever mesh is under it.
   // After the '3d' pass selects the cube, the 'ui' pass would otherwise be "confirmed" by the
@@ -566,7 +595,16 @@ if (mode === 'ui') {
   // not near edge-on (a short on-screen offset makes the drag direction noise).
   const axis = hs.filter((h) => /^gizmo3d:translate:[xyz]$/.test(h.id) && !h.occludedBy && centre
     && Math.hypot(h.x - centre.x, h.y - centre.y) > 15)[0];
-  if (!centre || !axis) throw new Error(`UC3 [ui] no draggable translate axis on the selected cube: ${JSON.stringify(hs).slice(0, 600)}`);
+  if (!centre || !axis) {
+    // Say WHAT covers each axis, and at which device and panel size — the raw handle dump was cut
+    // at 600 chars mid-list, and its cover read as editor chrome, so #1570 was filed against the
+    // dock when the cover was the scene's own HUD.
+    const gv = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }))).gameView;
+    const axes = hs.filter((h) => /^gizmo3d:translate:[xyz]$/.test(h.id)).map((h) =>
+      `${h.meta?.axis}: ${h.occludedBy ? `covered by ${h.occludedBy}` : `${Math.hypot(h.x - (centre?.x ?? h.x), h.y - (centre?.y ?? h.y)).toFixed(1)} px from the centre handle`}`);
+    throw new Error(`UC3 [ui] no draggable translate axis on the selected cube (device ${gv?.device}/${gv?.orientation}, `
+      + `panel ${gv?.panelSize?.w}x${gv?.panelSize?.h}; an axis needs to be uncovered and > 15 px from the centre): ${axes.join('; ') || 'no translate axis handles'}`);
+  }
   const ax = axis.meta.axis;
   const readT = async () => JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { guid: CUBE_GUID, trait: 'Transform' } }))).entities[0].traits.Transform;
   const t0 = await readT();
@@ -594,15 +632,20 @@ if (mode === 'ui') {
   const modeNow = () => client.callTool({ name: 'modoki_get_editor_state', arguments: {} }).then((r) => JSON.parse(text(r)).sceneViewMode);
   if (foundMode && (await modeNow()) !== foundMode) await client.callTool({ name: 'modoki_set_scene_view_mode', arguments: { mode: foundMode } });
   const now = await modeNow();
+  // Settings BEFORE the drag-undo check below, which can throw: a throw there must not also leave
+  // the human's device and gizmo pinned to UC3's (#1570 close-out review).
+  if (foundGameView?.device) {
+    await client.callTool({ name: 'modoki_set_game_view_device', arguments: gameViewRestoreArgs(foundGameView) });
+  }
+  if (foundGizmoMode || foundGizmoSpace) {
+    await client.callTool({ name: 'modoki_set_gizmo', arguments: { ...(foundGizmoMode ? { mode: foundGizmoMode } : {}), ...(foundGizmoSpace ? { space: foundGizmoSpace } : {}) } });
+  }
   if (gizmoDragPending) {
     // The drag landed and a check threw before its undo. Undo it by label, so a Select entry the
     // tap pushed is never popped in its place.
     const st = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
     if (/^Transform /.test(st.undo?.undoLabel ?? '')) await client.callTool({ name: 'modoki_history', arguments: { action: 'undo' } });
     else throw new Error(`UC3 could not undo its gizmo drag: the top undo entry is '${st.undo?.undoLabel}', not a Transform`);
-  }
-  if (foundGizmoMode || foundGizmoSpace) {
-    await client.callTool({ name: 'modoki_set_gizmo', arguments: { ...(foundGizmoMode ? { mode: foundGizmoMode } : {}), ...(foundGizmoSpace ? { space: foundGizmoSpace } : {}) } });
   }
   if (foundMode && now !== foundMode) throw new Error(`UC3 left the SceneView in '${now}', not the '${foundMode}' it found`);
 });
@@ -1332,10 +1375,7 @@ if (canGameViewDevice) {
 
     console.log(`set_game_view_device sets by name, by explicit size, and refuses an unknown one ✓ (${catalog.presets.length} presets)`);
   }, async () => {
-    await client.callTool({
-      name: 'modoki_set_game_view_device',
-      arguments: { device: before.device === 'Custom' ? 'Free' : before.device, orientation: before.orientation },
-    });
+    await client.callTool({ name: 'modoki_set_game_view_device', arguments: gameViewRestoreArgs(before) });
   });
 }
 

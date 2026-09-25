@@ -373,6 +373,16 @@ describe('describeOccluder', () => {
     expect(describeOccluder(anon)).toBe('div in the "scene" panel');
   });
 
+  it('names a game UI node by its entity before walking to the chrome around it (#1570)', () => {
+    // No world behind this DOM, so the entity is named by its id — the fallback for a node whose
+    // entity is gone. The named form is covered in entityResolve.test.ts, which mocks the lookup.
+    document.body.innerHTML = '<div class="flexlayout__tab_moveable"><div data-entity-id="13"><div></div></div></div>';
+    expect(describeOccluder(document.querySelector('[data-entity-id] div')!)).toBe('entity 13');
+    // Tagged editor chrome still names itself, wherever it sits.
+    document.body.innerHTML = '<div data-entity-id="13"><button data-ui-id="x.y"></button></div>';
+    expect(describeOccluder(document.querySelector('button')!)).toBe('button[data-ui-id="x.y"]');
+  });
+
   it('falls back to the nearest NAMED ancestor when no panel is in the chain', () => {
     document.body.innerHTML = '<section class="overlay"><div><span></span></div></section>';
     // The intermediate div names nothing either, so the walk keeps going.

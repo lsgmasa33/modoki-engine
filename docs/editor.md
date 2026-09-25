@@ -3968,6 +3968,29 @@ resolves `false` rather than throwing. It was fixed anyway because "just throw s
 on the stack" is the obvious-looking design the next change will reach for, and it did not work
 until this landed.
 
+### A step that awaits across a scene switch drops its entry too (#1575)
+
+`swapHistory` parks the outgoing world's stacks and refills the live `undoStack`/`redoStack` **in
+place** with the incoming world's. A step still awaiting when a scene load, an Exit from prefab edit
+or a Create Scene swaps the history would push its entry onto the new world's stack, where a later
+undo or redo runs it against a world it was never recorded on. It was latent until #1575. Apply's
+undo then started reloading its snapshot under the key live when it runs (see prefabs.md § Undoing
+an Apply). A skipped undo's redo then loaded the old world's snapshot under the new scene's key and
+saved it into that scene's file.
+
+So `runStep` captures a history liveness token (the shared `createTeardownToken`, docs/async-lifetime.md)
+before the await. Every effective `swapHistory` and `clearHistory` invalidates it. A step whose
+capture went stale is **dropped**, as a throwing one is, with a
+console warning, because the world it belongs to is gone. Its journal event carries `dropped: true`.
+It marks neither the incoming world edited nor its own `affectedScenes` dirty. Those are usually
+scenes of the world that left, and a dirty mark on a scene that is not loaded makes the incoming
+world read as unsaved: a load then refuses, and its next switch discards its history. ⚠️ A base the
+incoming scene KEEPS is the exception, since its edit is still live. That, and the other windows an
+unserialized undo leaves open, are #1579. An `_isFileDirect` entry is kept, because the asset file outlives the swap; `parkSurvivors`
+already keeps those across a discard. The step itself still ran, and whatever it did to disk stands.
+Tests: `packages/modoki/tests/editor/undoSpansSceneSwitch.test.ts`, and the scene-switch cases in
+`untitledApplyUndo.test.ts` / `prefabEditApplyUndo.test.ts`.
+
 
 ## Quick reference
 

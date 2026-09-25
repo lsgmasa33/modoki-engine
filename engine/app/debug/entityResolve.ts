@@ -26,7 +26,7 @@
 
 import { getAllEntities, collectScreenBounds, pickAt, type BoundsSurface, type ScreenRect } from '@modoki/engine/runtime';
 import { resolveEntityAddress } from './entityRef';
-import { describeElement, occlusionAt, resolveElementPoint, NOTHING_AT_POINT } from './domResolve';
+import { describeElement, describeOccluder, occlusionAt, resolveElementPoint, NOTHING_AT_POINT } from './domResolve';
 import { uiNodesFor, namedUiSurface } from './uiSurface';
 import type { EntityPointSpec, EntityPointResolution, AimedAt } from './entityPointContract';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
@@ -74,7 +74,9 @@ function canvasOcclusionAt(x: number, y: number): string | null {
   const top = typeof document === 'undefined' ? null : document.elementFromPoint(x, y);
   if (!top) return NOTHING_AT_POINT;
   if (top.tagName === 'CANVAS' || top.closest('canvas')) return null;
-  return describeElement(top) ?? NOTHING_AT_POINT;
+  // `describeOccluder`, not `describeElement`: the cover over a canvas is most often a game UI node
+  // in the SceneView's 'ui' preview, and only the former names it as its entity (#1570).
+  return describeOccluder(top) ?? NOTHING_AT_POINT;
 }
 
 /** Names the OTHER panel when (x,y) lands on a canvas that is not the aimed surface's, else null.

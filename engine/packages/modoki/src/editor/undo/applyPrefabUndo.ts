@@ -16,14 +16,15 @@
  *  snapshot back and rebuilding the scene from its snapshot (which re-instantiates
  *  every instance exactly, preserving each one's overrides).
  *
- *  An apply made INSIDE the prefab editor restores the same scene snapshot, reloaded at that
- *  world's synthetic path: it has no scene file (#1573). Same reason, same rule: a rebase alone
- *  is not a substitute. */
+ *  The snapshot is reloaded under the key of the world the undo belongs to when it RUNS: the scene's
+ *  path; the prefab editor's synthetic path, since that world has no scene file (#1573); or '' for an
+ *  untitled scene, as Stop reloads one (#1575). Same reason, same rule in each: a rebase alone is not a
+ *  substitute, and neither is a rebuild from the prefab's document. */
 
 import { pushAction, type UndoAction } from './undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
-import { serializeScene, saveScene, getCurrentScenePath, setCurrentScenePath, setCurrentBaseScene } from '../scene/serialize';
+import { serializeScene, saveScene, getCurrentScenePath, setCurrentScenePath, setCurrentBaseScene, isSceneLoadInFlight } from '../scene/serialize';
 import {
   applyToPrefabSelective, installPrefabSnapshot, guidForEntityId, entityIdForGuid,
   resolveInstanceContext, getPrefabSource, captureInstanceOverrides, captureInstanceStructure,
@@ -37,25 +38,32 @@ import { useEditorStore } from '../store/editorStore';
 import { repairPrefabMemberPaths } from '../backend/editorBackend';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { ensureGuid } from './entityRef';
-import { prefabEditWorldPath } from '../scene/prefabEditWorld';
+import { PREFAB_EDIT_SCENE_PREFIX } from '../scene/prefabEditWorld';
+import { currentSceneKey } from '../scene/authoredSnapshot';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
 /** Restore a (prefab, scene) snapshot: install the prefab base, then rebuild the live
  *  world from the scene snapshot (runtime loadScene — no history clear) and persist it.
- *  Re-selects the previously-inspected entity by guid (ids change on rebuild). */
+ *  Re-selects the previously-inspected entity by guid (ids change on rebuild). Resolves `false` when the world it
+ *  belongs to is no longer live, having restored the prefab file only.
+ *
+ *  The snapshot goes back to the world this undo stack belongs to NOW — `currentSceneKey()`, the key Stop restores
+ *  under — not to a path captured at the Apply (#1575). An untitled world has no path at all, and one saved with
+ *  Save As since keeps its history under a path the Apply never saw. */
 async function restoreSnapshot(
   source: string,
   prefab: PrefabFile,
   scene: SceneData,
-  scenePath: string | null,
   selGuid: string,
   /** The prefab document the files on disk were last repaired for, when the apply moved member paths
    *  (#1437): they are repaired from it to `prefab`, the way the apply repaired them the other way. */
   repairFrom?: PrefabFile,
-  /** The prefab-edit world's synthetic path, when the apply was made there (#1573): `scene` is reloaded at it. */
-  editWorldPath?: string | null,
-): Promise<void> {
+): Promise<boolean> {
+  // Read before the first await: the file install and the member-path repair below are a window a scene load, an
+  // Exit or a Create Scene can land in, and the snapshot must not be loaded over whatever world that put in.
+  const key = currentSceneKey();
+  const world = getCurrentWorld();
   await installPrefabSnapshot(source, prefab);
   if (repairFrom && prefab.id) {
     // The live records of each template reference node's moves go back as the apply re-pointed them (#1564): the world
@@ -67,9 +75,35 @@ async function restoreSnapshot(
     rewriteNodeMoves(getCurrentWorld(), (moved, src) => rewriteFrameMoves(moved, src, read(repairFrom), read(prefab)));
     await repairPrefabMemberPaths(prefab.id, repairFrom);
   }
-  if (scenePath) {
-    await sceneManager.loadScene(scenePath, { preloaded: clone(scene) });
-    setCurrentScenePath(scenePath);
+  // Still THAT world? An Exit swaps a real scene in under the edit world's undo (#1573 close-out re-review), where
+  // loading the synthetic world would leave it under a real path for `saveScene` to write into that file. Every
+  // untitled world shares the key `null`, so a Create Scene there is told apart by the world itself (#1575). The
+  // world is compared for EVERY key: a scene load swaps the world first and sets its path only in its tail, after
+  // awaiting the scene managers, so for that window the key still reads as this scene's (#1575 close-out
+  // re-review). And a load still in flight is not raced: loading this snapshot over it would leave its tail setting
+  // the other scene's path and history over this world.
+  if (currentSceneKey() !== key || getCurrentWorld() !== world || isSceneLoadInFlight() || sceneManager.getNext() !== null) {
+    console.warn(`[ApplyPrefab] ${key ?? 'the untitled scene'} is no longer the live world; restored the prefab file only`);
+    return false;
+  }
+  if (key === null) {
+    // An untitled world: reloaded under '' as Stop reloads it (`restoreAuthoredSnapshot`) — no file is read and none
+    // is marked loaded, and the editor's scene path stays null, so Save still asks where. Not saved: there is no
+    // file, and the undo itself dirties the scene. Not rebuilt through `replaceWorldContent`, whose populate is
+    // synchronous and cannot instantiate a prefab (#1575).
+    await sceneManager.loadScene('', { preloaded: clone(scene) });
+    await rebaseStaleInstances();
+  } else if (key.startsWith(PREFAB_EDIT_SCENE_PREFIX)) {
+    // The prefab-edit world has no scene file, so before #1573 the world stayed built from the applied document. It
+    // is a scene loaded at a synthetic path, so the same snapshot restores it — with the live guids every other undo
+    // entry addresses its entities by, which a rebuild from the edited prefab's document would re-mint (review of
+    // the first #1573 fix). Not saved, and no scene path set: the apply never wrote the edited prefab, and that world
+    // reaches its file through Save alone.
+    await sceneManager.loadScene(key, { preloaded: clone(scene) });
+    await rebaseStaleInstances();
+  } else {
+    await sceneManager.loadScene(key, { preloaded: clone(scene) });
+    setCurrentScenePath(key);
     // A3: sceneManager.loadScene({preloaded}) records the base ref internally, but
     // the editor's own baseScene tracking (re-emitted by serializeScene) is separate
     // module state — must be re-synced explicitly, same as setCurrentScenePath above.
@@ -78,25 +112,10 @@ async function restoreSnapshot(
     // against the one just restored before anything captures them — the save below included (#1483 review 3).
     await rebaseStaleInstances();
     await saveScene(); // persist the restored world so disk matches the live state
-  } else if (editWorldPath) {
-    // The prefab-edit world has no scene file, so the scene branch above never ran there and the world stayed
-    // built from the applied document (#1573). It is a scene loaded at a synthetic path, so the same snapshot
-    // restores it — with the live guids every other undo entry addresses its entities by, which a rebuild from the
-    // edited prefab's document would re-mint (review of the first #1573 fix). Not saved, and no scene path set:
-    // the apply never wrote the edited prefab, and that world reaches its file through Save alone.
-    // Still THAT world? The awaits above (the file install, the member-path repair) are a window an Exit can land in:
-    // its reload swaps a real scene in and sets its path, and loading the edit world over it would leave a synthetic
-    // world under a real scene path, which `saveScene` then writes into that scene's file (close-out re-review).
-    // The scene branch needs no such check: it sets the path it loads.
-    if (prefabEditWorldPath() !== editWorldPath) {
-      console.warn(`[ApplyPrefab] ${editWorldPath} is no longer the live world; restored the prefab file only`);
-      return;
-    }
-    await sceneManager.loadScene(editWorldPath, { preloaded: clone(scene) });
-    await rebaseStaleInstances();
   }
   const id = selGuid ? entityIdForGuid(selGuid) : 0;
   useEditorStore.getState().selectEntity(id || null);
+  return true;
 }
 
 /** A BASE scene's instance, as it stood on one side of the apply (#1431). `restoreSnapshot` rebuilds
@@ -143,14 +162,14 @@ export async function rederiveBaseInstances(source: string, fromPrefab: PrefabFi
   if (id) useEditorStore.getState().selectEntity(id);
 }
 
+const worldLeft = () => new Error('the scene changed while it ran, so only the prefab file was restored — the instances were not');
+
 function makeApplyPrefabAction(opts: {
   source: string;
   prefabBefore: PrefabFile;
   prefabAfter: PrefabFile;
   sceneBefore: SceneData;
   sceneAfter: SceneData;
-  scenePath: string | null;
-  editWorldPath: string | null;
   selGuid: string;
   memberPathsChanged?: boolean;
   affectedScenes: string[];
@@ -163,12 +182,16 @@ function makeApplyPrefabAction(opts: {
     affectedScenes: opts.affectedScenes,
     // The world restore reaches only the primary; every carried base instance of the prefab is
     // re-derived against the prefab being restored, and the applied one rebuilt from its capture.
+    // Not when the restore found its world gone: the rederive rebuilds every base instance of the prefab in whatever
+    // world is live, which is then a scene this Apply never touched (#1575 close-out re-review). And the step THROWS
+    // then, because it applied only half — the file, not the world. `runStep` drops a throwing step with a loud report
+    // (#310), rather than pushing it to the other stack as if the world had followed.
     undo: async () => {
-      await restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.scenePath, opts.selGuid, paths ? opts.prefabAfter : undefined, opts.editWorldPath);
+      if (!await restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.selGuid, paths ? opts.prefabAfter : undefined)) throw worldLeft();
       await rederiveBaseInstances(opts.source, opts.prefabAfter, opts.prefabBefore, opts.baseBefore);
     },
     redo: async () => {
-      await restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.scenePath, opts.selGuid, paths ? opts.prefabBefore : undefined, opts.editWorldPath);
+      if (!await restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.selGuid, paths ? opts.prefabBefore : undefined)) throw worldLeft();
       await rederiveBaseInstances(opts.source, opts.prefabBefore, opts.prefabAfter, opts.baseAfter);
     },
   };
@@ -182,7 +205,6 @@ export async function applyToPrefabWithUndo(
   selectedKeys: Set<string>,
 ): Promise<ApplyResult> {
   const scenePath = getCurrentScenePath();
-  const editWorldPath = scenePath ? null : prefabEditWorldPath();
   // assignGuids so every entity (incl. the selection) has a stable guid the snapshot
   // and selection-restore can key on.
   const sceneBefore = (await serializeScene({ assignGuids: true })) as unknown as SceneData;
@@ -227,8 +249,6 @@ export async function applyToPrefabWithUndo(
     prefabAfter: result.prefabAfter,
     sceneBefore,
     sceneAfter,
-    scenePath,
-    editWorldPath,
     selGuid,
     memberPathsChanged: result.memberPathsChanged,
     affectedScenes,

@@ -5,6 +5,7 @@ import { markSceneDirty } from '../scene/sceneDirty';
 import { reportUndoThrew } from './undoFailure';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 import { canEdit, getRunMode } from '../../runtime/core/playState';
+import { createTeardownToken } from '../../runtime/core/liveness';
 
 /** Structured diff for a trait-field edit — the machine-readable companion to an
  *  action's human `label`, forwarded into the editor journal's `!edit` event so
@@ -434,17 +435,31 @@ async function runStep(
   _executing = true;
   let ok = false;
   let error: unknown;
+  const sameHistory = _historyLiveness.capture();
   // Not `catch { }` + a sentinel: a closure may legitimately throw `undefined`, and testing the
   // caught value for one would read that as success.
   try { await run(); ok = true; } catch (e) { error = e; } finally { _executing = false; }
 
-  if (ok) pushTo.push(action);
+  // A history swap during the await (a scene load, an Exit from prefab edit, a Create Scene) refilled `pushTo` IN
+  // PLACE with the incoming world's stack. Pushed there, the entry would be undone or redone later against a world it
+  // was never recorded on: a skipped Apply undo's redo loaded the old world's snapshot under the new scene's key and
+  // saved it into that scene's file (#1575 close-out review). So it is DROPPED, as a throwing step's is, since the
+  // world it belongs to is gone. An `_isFileDirect` entry edits an asset file, which outlives any world swap
+  // (`parkSurvivors` keeps them too), so it stays.
+  const worldGone = !sameHistory() && !action._isFileDirect;
+  if (ok && !worldGone) pushTo.push(action);
+  if (worldGone) console.warn(`[undo] ${direction} of "${action.label}" spanned a scene switch; it is dropped from the history`);
 
-  if (!action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
-  markAffectedScenesDirty(action);
+  // The world it moved is no longer the live one, so it dirties neither the incoming world nor the scenes it names:
+  // those belong to the world that left, and a dirty mark on a scene that is not loaded makes the incoming world read
+  // as unsaved (a load then refuses, and its next switch discards its history) and points Save All at a scene it
+  // cannot write.
+  if (!worldGone && !action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
+  if (!worldGone) markAffectedScenesDirty(action);
   notifyUndoChanged();
   const payload = buildEditorPayload(action);
   if (!ok) payload.failed = true;
+  if (worldGone) payload.dropped = true; // it ran, and it is on neither stack
   editorEmit(event, payload);
 
   // Reported LAST, and guarded. `reportUndoThrew` reaches into the editor store to toast, and
@@ -601,6 +616,7 @@ export function redoLabel(): string {
 
 /** Clear all history. */
 export function clearHistory() {
+  _historyLiveness.invalidateAll();
   undoStack.length = 0;
   redoStack.length = 0;
   _coalesce = null;
@@ -633,6 +649,10 @@ export function truncateUndoTo(depth: number) {
 // is preserved + barrier-truncated. Keyed by scene path.
 
 let _activeKey = '';
+/** Invalidated each time the live stacks are refilled or emptied for another world — every effective
+ *  `swapHistory`, and `clearHistory`. `runStep` captures it across its await: the stacks are the SAME arrays before
+ *  and after a swap, so it is the only way a step can tell its entry's world has gone (#1575 close-out review). */
+const _historyLiveness = createTeardownToken();
 const _histories = new Map<string, { undo: UndoAction[]; redo: UndoAction[] }>();
 
 /** Save the active stacks under the current key and load `key`'s stacks (empty
@@ -654,6 +674,7 @@ export function swapHistory(
   { discardOutgoing = false, freshIncoming = false }: { discardOutgoing?: boolean; freshIncoming?: boolean } = {},
 ) {
   if (key === _activeKey && !discardOutgoing && !freshIncoming) return;
+  _historyLiveness.invalidateAll();
   _coalesce = null; // a context switch ends any in-flight edit chain
   if (discardOutgoing) parkSurvivors(_activeKey, undoStack, redoStack);
   else _histories.set(_activeKey, { undo: [...undoStack], redo: [...redoStack] });
@@ -692,6 +713,7 @@ export function forgetHistory(key: string): void {
 
 /** Test-only: reset the context map + active key. */
 export function _resetHistoryContexts() {
+  _historyLiveness.invalidateAll();
   _histories.clear();
   _activeKey = '';
   _captureStack.length = 0; // a test that threw mid-batch must not leak a capture frame

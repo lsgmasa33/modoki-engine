@@ -6,7 +6,8 @@
  *  OUTER2 holds an INNER row whose `added` has a reference node → MID; MID's own row 3 expands INNER. Driven through
  *  the real prefab-edit scene builder, the real saves and both loaders. Each case names the mutation that turns it red. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest';
+import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { setRunMode as setRunModeForAuthoring } from '../../packages/modoki/src/runtime/core/playState';
 import { createWorld } from 'koota';
 
@@ -1278,9 +1279,12 @@ describe('#1564: an Apply that renumbers member paths re-points every carrier', 
 
   // …and its undo puts the record back: a Persistent or base root is CARRIED across the undo's world swap with its
   // record whole, then rebased onto the restored MID. Modelled without the swap — the carry copies the record verbatim
-  // (`SceneManager`'s `carriedFrameDocs`) — and with the rebase the swap is followed by.
+  // (`SceneManager`'s `carriedFrameDocs`) — and with the rebase the swap is followed by. The swap is stubbed out
+  // explicitly: this world has no scene loaded, which the undo now reloads under '' like any untitled one (#1575).
   // Mutation: in `restoreSnapshot`, skip `rewriteNodeMoves`.
   it('its undo puts the live move record back on the restored paths', async () => {
+    const swap = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() } as never);
+    onTestFinished(() => swap.mockRestore());
     install(midDoc());
     const first = await openInEditor(outer2());
     reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
@@ -1291,6 +1295,7 @@ describe('#1564: an Apply that renumbers member paths re-points every carrier', 
     const res = await quietly(() => applyToPrefabWithUndo(byName('MidRoot').id, new Set(moved)));
     expect(res.memberPathsChanged).toBe(true); // precondition
     await quietly(() => undo());
+    expect(swap).toHaveBeenCalledOnce(); // precondition: the undo reached the swap this case models away
     expect(prefabs.get(MID) ?? null).not.toBeNull();
     await quietly(() => rebaseStaleInstances());
     expect(nameOf(parentOf(all().find((e) => e.name === 'InnerRoot' && under(e.id, 'MidRoot'))!.id))).toBe('Slot'); // precondition: MID restored
