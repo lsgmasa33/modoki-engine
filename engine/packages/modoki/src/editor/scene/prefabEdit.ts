@@ -210,13 +210,24 @@ function editGuidAt(prefab: PrefabFile, path: readonly MemberStep[]): string | n
 /** A payload `depth` frames below the prefab's root, with every member token that climbs back to the
  *  root replaced by the edit world's guid for it. The edit world flattens the root's own rows into
  *  plain scene entities, so no instantiate call there has the root as a frame. A token relative to an
- *  inner frame is left for the loader, which expands that row as a scene instance. */
+ *  inner frame is left for the loader, which expands that row as a scene instance.
+ *
+ *  A REFERENCE node (an `added` node carrying `prefab`) is left whole, as the loader's `rebaseAddedTokens`
+ *  leaves it: its payload is in its own instance's frame, and a token there never climbs out of it (#1538) —
+ *  counted from this depth, a `^` that only reaches the node's root would read as one reaching the prefab's. */
 function editWorldRefs(prefab: PrefabFile, value: unknown, depth: number): unknown {
   return mapStringValues(value, (s) => {
     const t = isMemberToken(s) ? parseMemberToken(s) : null;
     if (!t || t.up !== depth) return s;
     return editGuidAt(prefab, t.path) ?? s;
-  });
+  }, isReferenceNode);
+}
+
+/** An `added` node carrying `prefab` — told apart by the node's own shape, since a trait's field bag may hold a
+ *  `prefab` string too (a spawner's), and that bag's tokens must still be rewritten. */
+function isReferenceNode(v: object): boolean {
+  const n = v as { prefab?: unknown; parentLocalId?: unknown; children?: unknown };
+  return !Array.isArray(v) && typeof n.prefab === 'string' && typeof n.parentLocalId === 'number' && Array.isArray(n.children);
 }
 
 /** `paths` with each entry mapped at its depth below the prefab's root: 1 for the row, plus one per path step. */

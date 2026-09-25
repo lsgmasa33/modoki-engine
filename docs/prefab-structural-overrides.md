@@ -401,7 +401,8 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
     The chain's member tokens are first resolved by `baseTokenResolver` from the nested root: its own
     frame, with `^` climbing to the instance whose row expanded it. The loader applies every value in
     that frame, whichever layer authored it. A reference node's payload is in its own instance's frame
-    and is left whole, as `rebaseAddedTokens` leaves it. The live side holds
+    and is left whole, as `rebaseAddedTokens` leaves it; a template writes it tokenized in that frame
+    (#1538). The live side holds
     guids, so an unresolved `@member:` token never compared equal and froze the old target. A trait
     the chain ADDS is captured whole, schema defaults included, so an unauthored field equal to its
     default counts as the chain's too.
@@ -544,7 +545,9 @@ row states its nested frames per member" below.
 
 The row carrier is written two ways, both **with a writer**, which is the order CLAUDE.md requires
 for an authored field:
-- **Promotion** (Apply to Prefab, `insertAddedSubtree`) copies a reference node's slot into the row.
+- **Promotion** (Apply to Prefab, `insertAddedSubtree`) re-captures a reference node's channels from its
+  live instance through the row writer (`captureRowChannels`, #1533), at every depth: a reference node
+  under a promoted plain node reaches the same branch through the recursion (#1538).
 - **A prefab-edit save / Create Prefab** (`serializePrefab` → `planPrefabRows`) **captures** each
   row's channels from its live expansion with the same `captureNestedChannels` walk the other two
   carriers use. Captured, not passed through: `buildPrefabEditScene` forwards both channels onto the
@@ -566,6 +569,11 @@ for an authored field:
   An owned nested instance whose prefab is uncached still re-expands from its owner's row, so it and
   everything under it are skipped. Anything added inside it is dropped with a warning, following the
   `captureNestedRef` precedent; every caller warms the cache first (#1295).
+
+⚠️ **A reference node written into a TEMPLATE is a row carrier, not a scene one (#1538).** The carrier
+is the reference node, but the rule follows the DOCUMENT: in a prefab file it is written by the row
+writer — see "A template reference node is written by the row writer" below. A reference node in a
+scene keeps the scene's rule (#1358).
 
 ⚠️ **Why the channels are not folded into the row at promotion instead.** A reference node's
 `nestedStructure` is keyed by paths inside ITS OWN prefab, so no key ever targets a row the promoted
@@ -1166,19 +1174,95 @@ it, and after MID restores `Leaf`, OUTER still hides it.
 - **Format: prefab v6.** Following the owner's ruling on #1468 (option B), an older build OPENS a v6
   prefab normally and shows the inner template through for rowed frames. The write gate stops it
   saving over the file, which would drop the rows. No migration: the committed corpus had no row using
-  the slot (scan 2026-09-25, 250 prefabs, 441 nested rows).
+  the slot (scan 2026-09-25: 105 tracked prefabs, 118 nested rows, every one v5 with a `nodeGuid` on
+  every row. An earlier count of 250 prefabs / 441 rows, 145 of them pre-v5, walked the untracked build
+  copies under `dist/`, `ios/` and `android/` too).
 - **Not covered:**
-  - A frame through a pre-v5 inner prefab (no `nodeGuid`, 145 of the 250 committed prefabs) cannot be
-    keyed, so it stays on the pinning slot, as on the scene side.
+  - A frame through a pre-v5 inner prefab (no `nodeGuid`) cannot be keyed, so it stays on the pinning
+    slot, as on the scene side. No tracked prefab is pre-v5 today; one from an older project would be.
   - `memberPaths` does not walk the `own` children of a template NODE row. A ref to one is not
     followed across a move.
-  - A reference node that a TEMPLATE authors (an `added` node with `prefab`) still carries a whole
-    slot, and one written on every save, including a no-op save: #1538, filed from this close-out. Its
-    payload is deliberately left untokenized, and #1293 keeps `members` off template nodes, so it needs
-    a design pass of its own.
   - Apply's promotion does not tokenize, so a row node holding a ref to a member keeps the live guid,
     as the promoted slot always did.
   - Everything the v17 section above lists as not covered also applies here.
+
+### A template reference node is written by the row writer (#1538)
+
+**The third carrier, brought to the row's rules.** A reference node a prefab TEMPLATE authors — an
+`added` node carrying `prefab`, in a row's `added`, a slot's or a member row's — was written by
+`captureNestedRef` with the scene's rule, and so had none of what the row writer had gained:
+- no `omitUnchanged` (#1381): every non-empty frame was restated, so an untouched save pinned the inner
+  prefab's own statements (MID's row removes `Leaf`; OUTER2 saved untouched; MID restores `Leaf`; OUTER2
+  still hid it);
+- no member rows (#1533): an edit anywhere in the node's frames restated the whole frame;
+- no tokenization (#1352): `templateTokenizer` leaves a reference node whole, so a member ref inside it
+  was written as the edit world's live guid and named nothing in any instance.
+
+What changed:
+- **One writer.** In template form `captureNestedRef` hands the node to `finishTemplateReferenceNode`:
+  `captureRowChannels` (deferred compare), then the step `serializePrefab` runs for a row, extracted as
+  `finishRowChannels` — tokenize each payload in the frame it applies in, THEN drop an unchanged slot,
+  tokenize `nestedOverrides` and `members`. It runs over a tokenizer rooted at the node's OWN frame
+  (`templateTokenizer(…, ownFrame)`), indexed with `memberPathIndex`, which is what the loader resolves
+  against. At capture time rather than deferred to `serializePrefab`: node identity is lost before then
+  (`templateFormOf` and `chainNodesAsPlaced` copy nodes), and the comparers below need the file's bytes.
+  A token may step only through a key some file declares, and both template writers now ask that of
+  what they WRITE and the prefabs it nests (`declaredTemplateKeys`) — never of every cached document:
+  prefab-edit keeps the OLD copy of the file being saved in the cache until the write lands, so a key it
+  declared in a slot the save drops stayed "declared", and the token through it named nothing on reload.
+  ⚠️ That makes the written value a guid, and **the ref still dangles in the one case that reaches it**: a
+  legacy key-less node an old file's slot re-stated under a key. The edit world spawned it from the slot,
+  so its guid derives through that key; the dropped slot then lets the reload spawn it with its own legacy
+  guid. Writing the right value needs the baseline node's identity, which the no-op compare does not
+  hand back. Narrow (an old-writer file over a pre-v5 inner prefab's legacy node) and not a regression —
+  the token it replaced named nothing too.
+- **The node consumes the nested instances it owns.** Like a row (#1382), a template reference node
+  re-expands every owned nested instance inside it, so its capture counts them as consumed. It did not,
+  before #1538 too: `planPrefabRows` took MID's own INNER, inside the node, for a free-standing nested
+  instance and wrote it again as a row at the prefab root, so every instance spawned a duplicate.
+- **The node is its own token frame.** The loaders open a token scope at a reference node's top
+  instantiate call and never resolve a `^` out of it (`loadSceneFile.ts`, `if (!t || t.up) return
+  token`), so the writer never climbs out either: `enclosing(root)` is 0. A ref from inside the node to a
+  member of the prefab AROUND it therefore stays a guid — the one case not covered, since it needs the
+  loader to resolve across the call: #1541 (observed: the edit world's placeholder guid is saved, and
+  names nothing in any instance).
+- **Member rows on a template node — owner's decision (2026-09-25).** #1293 kept `members` off template
+  nodes for two reasons: a member row stated a per-instance guid, and the frozen format had no rows. A
+  template-form row keys by `nodeGuid` paths and carries no guid (the #1533 rows already do this on a
+  prefab row), and v6 has rows. So a template reference node carries them. **No kept orphan rows go
+  back out for it**, and that is a real loss, not only a safe default: R2's store is keyed by a stored
+  root guid, which a template reference root does not have. So a row whose member the inner prefab
+  dropped is erased by the next save of the outer prefab, and the edit does not come back when the
+  member does. A prefab row keeps it. #1542. Nor does a template node state a MOVE: a member re-parented
+  inside it in the prefab editor reloads under its template parent (#1543: a template capture records
+  no moves, and a template row carries no `parent`).
+- **The comparers ask both forms (`sameAddedNode`).** `nodeDiffDeps.sameReference` (the scene and row
+  writers' node diff) and `subtractChainStructure` (the rebuild, and `ownInstanceStructure`) matched a
+  live node's scene-form capture to the chain's node. A node the template writer wrote omits and
+  tokenizes where the live capture restates and holds guids, so every such node read as EDITED — pinned
+  again by the next scene save and respawned by every rebuild. A chain node holding a template reference
+  node is now also compared against the live node written as a template would write it (read-only: a
+  key is read or recovered, never minted or stamped, or a scene-authored node would be taken for a
+  template-added one). Either form matching is unchanged, so an older file still compares as it did. A
+  live node carrying instance identity (a member guid the scene stored, a member it moved — on a row,
+  or in a nested slot's `moved` where no row can key the member) is edited whatever the template form
+  says: that form has no place for it.
+  ⚠️ **The second compare costs a template capture per reference node.** It runs only when the
+  scene-form compare differs, which is every untouched template reference node written by the template
+  writer. Measured by the close-out review: 60 such instances in a 2481-entity scene, one save 2308 ms →
+  3002 ms (about 12 ms per node, growing with world size: the tokenizer indexes the whole world). No
+  tracked scene has one today.
+- **Readers.** The runtime loader already folded a reference node's `members`. The editor's own spawn
+  passed them only as re-parent statements; it now folds the node's slots and rows as the outermost
+  layer, as the loader does. The #1506 enclosing layer folds them at the node's frame and seeds them into
+  the chain below it. `templateKeysOf` walks them. The prefab-edit world's token rewrite leaves a
+  reference node whole (`editWorldRefs`), since a `^` inside it climbs only to the node's root. Apply's
+  promotion re-captures at every depth (above). The tree-shaker, the remint, `memberPaths` and the
+  resource collector already read `members` on any carrier.
+- **Format.** No bump: v6 had not shipped, and no tracked prefab holds a template reference node (scan
+  2026-09-25).
+- **Tests:** `engine/tests/editor/templateReferenceNodeRows.test.ts`, one per symptom and per reader,
+  each mutation-checked.
 
 ### The #1468 design record — why identity is stored this way
 

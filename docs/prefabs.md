@@ -377,8 +377,9 @@ field half, with tokens resolved. The layer can be one of two things:
   same chain;
 - **a reference node that a prefab TEMPLATE authored** (a keyed `added` node with `prefab`, in a row of the
   frame it hangs in): the node's own channels (`overrides`, `added`, `removed`, `removedTraits`, `moved`,
-  with its `members` folded as the loader folds them). A chain of rows UNDER such a node starts from the
-  node's `nestedOverrides`/`nestedStructure` (the `seed` argument of both `resolveEffective…` walkers).
+  with its `members` folded as the loader folds them — a template node carries template-form rows since
+  #1538). A chain of rows UNDER such a node starts from the node's `nestedOverrides`/`nestedStructure`
+  and its `members` (the seed arguments of the `resolveEffective…` walkers).
   The node is found by template key (`templateReferenceNode`), using the marker first and the
   guid-derived recovery if the marker was lost. A node the SCENE added has no enclosing layer: the scene
   writes it as that instance's own.

@@ -456,18 +456,19 @@ export function remapGuidValues(value: unknown, remap: ReadonlyMap<string, strin
 /** `value` with every string VALUE replaced by `fn(value)` — the walk under `remapGuidValues`, and
  *  under the template member-token rebase (`templateRefs.ts`, #1352). Same copy-on-write rules:
  *  object KEYS are not rewritten; arrays and PLAIN objects are copied only where something inside
- *  them changed; anything else is returned as-is. */
-export function mapStringValues(value: unknown, fn: (s: string) => string): unknown {
+ *  them changed; anything else is returned as-is. `keep`, when given, returns a sub-value it accepts unwalked. */
+export function mapStringValues(value: unknown, fn: (s: string) => string, keep?: (v: object) => boolean): unknown {
   if (typeof value === 'string') return fn(value);
+  if (keep && value && typeof value === 'object' && keep(value)) return value;
   if (Array.isArray(value)) {
-    const out = value.map((v) => mapStringValues(v, fn));
+    const out = value.map((v) => mapStringValues(v, fn, keep));
     return out.some((v, i) => v !== value[i]) ? out : value;
   }
   if (value && typeof value === 'object') {
     const proto = Object.getPrototypeOf(value);
     if (proto !== Object.prototype && proto !== null) return value;
     const entries = Object.entries(value);
-    const mapped = entries.map(([, v]) => mapStringValues(v, fn));
+    const mapped = entries.map(([, v]) => mapStringValues(v, fn, keep));
     if (mapped.every((v, i) => v === entries[i]![1])) return value;
     // Every key is DEFINED, not assigned: a parsed document can carry an own `__proto__` key, which
     // `out[k] = v` would turn into a prototype assignment instead of a copied field.

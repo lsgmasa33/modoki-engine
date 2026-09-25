@@ -19,14 +19,14 @@ import { deriveMemberGuid, addedKeyStep, entityStep, memberRowNodes, type Member
 import type { PackedEntity } from '../core/ecs/entityTable';
 
 /** The slice of a prefab document the key walk reads (a `PrefabFile` / loader doc fits structurally). */
-type KeyedNode = { key?: string; children?: KeyedNode[]; added?: KeyedNode[]; nestedStructure?: StructurePaths };
+type KeyedNode = { key?: string; children?: KeyedNode[]; added?: KeyedNode[]; nestedStructure?: StructurePaths; members?: MemberRows };
 type StructurePaths = Record<string, { added?: KeyedNode[] } | undefined>;
 type MemberRows = Record<string, { added?: unknown; own?: unknown } | null | undefined>;
 export type TemplateKeyDoc = { entities: Array<{ added?: KeyedNode[]; nestedStructure?: StructurePaths; members?: MemberRows }> };
 
 /** Every template key a prefab document declares — its rows' `added`, their `nestedStructure[*].added`
- *  and `members` rows' nodes (prefab v6, #1533), and a reference node's own `added`/`nestedStructure`,
- *  recursively. Memoised per document object. */
+ *  and `members` rows' nodes (prefab v6, #1533), and a reference node's own `added`/`nestedStructure`/`members`
+ *  (a template reference node carries rows too since #1538), recursively. Memoised per document object. */
 const keysByDoc = new WeakMap<object, string[]>();
 export function templateKeysOf(doc: TemplateKeyDoc): string[] {
   const memo = keysByDoc.get(doc);
@@ -38,7 +38,11 @@ export function templateKeysOf(doc: TemplateKeyDoc): string[] {
       nodes(n.children);
       nodes(n.added);
       structure(n.nestedStructure);
+      rows(n.members);
     }
+  };
+  const rows = (members: MemberRows | undefined): void => {
+    for (const row of Object.values(members ?? {})) nodes(memberRowNodes(row) as KeyedNode[]);
   };
   const structure = (paths: StructurePaths | undefined): void => {
     for (const delta of Object.values(paths ?? {})) nodes(delta?.added);
@@ -46,7 +50,7 @@ export function templateKeysOf(doc: TemplateKeyDoc): string[] {
   for (const pe of doc.entities ?? []) {
     nodes(pe.added);
     structure(pe.nestedStructure);
-    for (const row of Object.values(pe.members ?? {})) nodes(memberRowNodes(row) as KeyedNode[]);
+    rows(pe.members);
   }
   keysByDoc.set(doc, keys);
   return keys;
