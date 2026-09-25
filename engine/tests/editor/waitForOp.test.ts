@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
-import { runAgentOp } from '../../app/debug/agentBridge';
+import { runAgentOp, relayResponseFor } from '../../app/debug/agentBridge';
 import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor } from '@modoki/engine/editor';
 import { setRunMode, setManualNow, restoreRealClock, createTestWorld, Transform, EntityAttributes } from '@modoki/engine/runtime';
 import { recordConsoleRingEntry } from '@modoki/engine/runtime/core/consoleRing';
@@ -19,11 +19,23 @@ type Result = { satisfied: boolean; timedOut?: boolean; observation?: Record<str
 beforeEach(() => { setRunMode('stopped'); clearEditorJournal(); setEditorJournalEnabled(true); });
 afterEach(() => { document.body.innerHTML = ''; });
 
+/** The refusal's message: RETURNED as `{ok:false, code, error}` since #1559 (the device relay keeps a
+ *  returned code and would flatten a thrown one); a throw is still read, for an op that throws. */
 async function refusalText(p: Promise<unknown>): Promise<string> {
-  try { return JSON.stringify(await p); } catch (e) { return e instanceof Error ? e.message : String(e); }
+  try {
+    const r = await p as { error?: unknown };
+    return typeof r?.error === 'string' ? r.error : JSON.stringify(r);
+  } catch (e) { return e instanceof Error ? e.message : String(e); }
 }
 
 describe('wait-for op', () => {
+  // #1559 review: the editor REPLACES the runtime registration, and with it the runtime's `accepts`
+  // predicate — so the editor serves the chrome/editor waits a runtime-only page declines.
+  it('the editor serves a chrome wait on the relay — it does not inherit the runtime decline', async () => {
+    const r = await relayResponseFor({ id: 1, op: 'wait-for', params: { chrome: { id: 'no-such-control', absent: true }, timeoutMs: 50 } });
+    expect(r.declined).toBeUndefined();
+  });
+
   it('refuses an unevaluable condition up front instead of timing out on it', async () => {
     const started = performance.now();
     const text = await refusalText(runAgentOp('wait-for', { chrome: {}, timeoutMs: 5000 }));

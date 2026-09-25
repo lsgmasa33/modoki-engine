@@ -10,6 +10,7 @@ import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import { join } from 'node:path';
 import { loadDeviceSurface, deviceReply, DEVICE_STUB_BACKEND, type DeviceSurface } from './deviceSurface';
 import { readScannedSource } from '@modoki/engine/testing';
+import { PER_TOOL_MEANING } from './perToolMeaning';
 
 let surface: DeviceSurface | undefined;
 afterEach(() => { surface?.restore(); surface = undefined; });
@@ -42,6 +43,51 @@ describe('S2.7 — an unknown argument key is REFUSED, not silently stripped', (
       const v = s.validate(name, { definitelyNotAParam__: 1 });
       expect(v.ok, `${name} accepted an unknown key`).toBe(false);
     }
+  });
+});
+
+/** §11 and §2 on the DEVICE surface (#1559). Both checks lived in `mcpRegistry.test.ts`, which loads
+ *  the modoki registry only — so `device_console_logs.level` went undocumented and `precision` was worded
+ *  three ways across six device tools with nothing to notice. Same rules, same pardon list. */
+describe('the device surface keeps the editor surface\'s param rules (#1559)', () => {
+  type Field = { description?: string };
+
+  it('every parameter is documented — in its own .describe() or the tool description', async () => {
+    const s = (surface = await loadDeviceSurface());
+    const missing: string[] = [];
+    for (const name of s.names) {
+      const desc = s.descriptionOf(name);
+      for (const [param, field] of Object.entries(s.shapeFor(name) as Record<string, Field>)) {
+        if (!field.description && !new RegExp(`\\b${param}\\b`).test(desc)) missing.push(`${name}.${param}`);
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  it('a param used by 3+ tools means ONE thing, or is declared per-tool', async () => {
+    // The editor check's rule exactly: the shortest wording is the shared base, and every longer
+    // one must contain it verbatim (a tool adds its nuance AFTER the shared rule, never instead).
+    const s = (surface = await loadDeviceSurface());
+    const byParam = new Map<string, Map<string, string[]>>();
+    for (const name of s.names) {
+      for (const [param, field] of Object.entries(s.shapeFor(name) as Record<string, Field>)) {
+        const forParam = byParam.get(param) ?? new Map<string, string[]>();
+        const d = field.description ?? '';
+        forParam.set(d, [...(forParam.get(d) ?? []), name]);
+        byParam.set(param, forParam);
+      }
+    }
+    const drifted: string[] = [];
+    for (const [param, byDesc] of byParam) {
+      if (PER_TOOL_MEANING.includes(param)) continue;
+      const described = [...byDesc].filter(([d]) => d !== '');
+      const users = described.flatMap(([, tools]) => tools);
+      if (users.length < 3 || described.length === 1) continue;
+      const descs = described.map(([d]) => d);
+      const base = descs.reduce((a, b) => (a.length <= b.length ? a : b));
+      if (descs.some((d) => !d.includes(base.replace(/\.$/, '')))) drifted.push(`${param} (${users.join(', ')})`);
+    }
+    expect(drifted, 'put the shared wording in tools/shared/paramBases.ts and concatenate onto it').toEqual([]);
   });
 });
 

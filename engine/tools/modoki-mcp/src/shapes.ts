@@ -71,9 +71,10 @@ export const makeEntitySpec = (brief?: { sameAs: string }) => z.object({
 export { ALLOW_OCCLUDED_BASE };
 export const allowOccludedParam = z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`);
 
-/** The shared half of every `timeoutMs` description (#1154 made it three tools). Each tool
- *  CONCATENATES its own default and ceiling, which really do differ. */
-export const TIMEOUT_MS_BASE = 'How long to wait before giving up, in ms';
+/** `timeoutMs`'s and `precision`'s shared wordings live in `tools/shared/paramBases.ts` (#1559) —
+ *  the device server uses them too. Re-exported so the tools keep one import site. */
+import { TIMEOUT_MS_BASE, PRECISION_BASE } from '../../shared/paramBases.js';
+export { TIMEOUT_MS_BASE, PRECISION_BASE };
 
 /** The shared half of every `modifiers` description. A tool that needs to say more CONCATENATES —
  *  `${MODIFIERS_BASE}, e.g. …` — rather than replacing, so the rule reads identically everywhere
@@ -125,46 +126,10 @@ export const guidOnlyEntityAlias = z.object({
     + 'only — this op has no id or name resolver; look the guid up with modoki_get_scene_state {name}.',
   );
 
-/** Fold a nested `entity` ref into the flat `{guid, id}` a tool's handler already passes on.
- *
- *  Refuses BOTH-at-once rather than picking: a caller who sent two addresses does not know which
- *  one this tool uses, and choosing for them is exactly the silent-wrong-target class §0 ranks
- *  first. Returns the flat pair, or a message for the caller to refuse with.
- *
- *  ⚠️ `flatEntityAlias` is `.strict()` and carries no `name` ON PURPOSE — both halves matter.
- *  Without `name` but not strict, zod STRIPS the key (a nested `z.object` is not strict just
- *  because its parent is), so `entity:{name:'Crate'}` would arrive here as `{}`, fold to the empty
- *  flat ref, and surface as "entity ref matched no live entity — it may be stale": a §0 rank-4
- *  unclear failure pointing at the wrong cause. That is the §1 silent-key-strip bug one level down,
- *  and it is why `mutateOpSchema`'s entity ref is strict too. */
-export function foldEntityRef(
-  flat: { guid?: string; id?: number },
-  entity: { guid?: string; id?: number } | undefined,
-): { guid?: string; id?: number } | { conflict: string } {
-  if (!entity || Object.keys(entity).length === 0) return flat;
-  // `!== undefined`, not truthiness: `id: 0` is the ROOT entity, and a truthiness test would read
-  // it as "no address given" and silently fall through to the other branch.
-  // An empty string is ABSENT, as in the live resolver (`app/debug/entityRef.ts`, #1223).
-  const flatKeys = Object.entries(flat).filter(([, v]) => v !== undefined && v !== '').map(([k]) => k);
-  if (flatKeys.length) {
-    return { conflict: `both \`entity\` and the flat ${flatKeys.join('/')} were given — they are two ways to say the same thing, and sending both leaves it ambiguous which target you meant. Pass exactly one.` };
-  }
-  return entity;
-}
+/** `foldEntityRef` lives in `tools/shared` since #1559 — `device_duplicate_entity` takes the same alias. */
+export { foldEntityRef } from '../../shared/foldEntityRef.js';
 
 
-/** `precision`, in ONE wording (§2).
- *
- *  It said the same thing four ways across seven tools — the long form, a terse "(read)" form, a
- *  per-tool field list, and a scene-query variant. Nothing was wrong with any of them, which is the
- *  point: a param an agent has to re-read per tool to check it still means what it meant is the
- *  cost §2 is about, and every one of these drifted by being restated rather than shared.
- *
- *  `fields` keeps the one genuinely per-tool part — WHICH floats get rounded — without forking the
- *  rule that governs them. */
-export const PRECISION_BASE =
-  'Significant digits for the returned floats (default 9; 0 = exact float64). Verify a value with '
-  + 'a TOLERANCE, never string/=== equality';
 export const precisionParam = (fields?: string) => z.number().int().nonnegative().optional()
   .describe(`${PRECISION_BASE}.${fields ? ` Rounded fields: ${fields}.` : ''}`);
 

@@ -9,6 +9,9 @@ import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { DISCARD_UNSAVED_BASE, TIMEOUT_MS_BASE, discardUnsavedParam, displayNameParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
+import { EPOCH_BASE, SINCE_CURSOR_BASE } from '../../../shared/sinceCursor.js';
+import { WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS } from '../../../shared/waitForTiming.js';
+import { CONSOLE_LEVELS, CONSOLE_LOGS_PARAM_DOCS } from '../../../shared/consoleLevels.js';
 import {
   CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, LIGHT_KINDS, PRIMITIVE_MESHES, SPRITE_SHAPES, UI_PRESETS, vocabularyProse,
 } from '../../../shared/createEntityVocabulary.js';
@@ -119,8 +122,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     {
       type: z.string().optional().describe('Only editor events of this type, e.g. !edit | !select | !create | !transform | !save — every type starts with `!`; an unknown one is refused, listing them all. (Filters the `editor` array only.)'),
       source: z.enum(['human', 'agent']).optional().describe('Only events by the human at the keyboard, or by the agent (your MCP ops). Omit for both. (Filters the `editor` array only.)'),
-      since: z.number().optional().describe('Forward cursor for the `editor` array: returns the OLDEST events with seq greater than this (contiguous, oldest-first) + a `nextSeq` when truncated. Advance with `nextSeq` each poll — a cursored poll NEVER skips events (unlike the bare newest-last call). Does NOT window the merged timeline (use sinceCap).'),
-      epoch: z.string().optional().describe('The `epoch` returned with the cursor; send it back. A reload restarts the counters, and a stale epoch replays with `cursorReset`.'),
+      since: z.number().optional().describe(`${SINCE_CURSOR_BASE}, for the \`editor\` array: returns the OLDEST events with seq greater than this (contiguous, oldest-first) + a \`nextSeq\` when truncated.` + ' Advance with `nextSeq` each poll — a cursored poll NEVER skips events (unlike the bare newest-last call). Does NOT window the merged timeline (use sinceCap).'),
+      epoch: z.string().optional().describe(`${EPOCH_BASE}.`),
       sinceCap: z.number().optional().describe('Forward cursor for the merged `timeline`: returns the OLDEST interleaved events with cap greater than this (contiguous, oldest-first) + a `nextCap` when truncated. Advance with `nextCap` each poll to fetch newer events with no gap.'),
       merged: z.boolean().optional().describe('Also include the game journal under `game` (raw) AND the interleaved `timeline`. Both are tailed too — cursor with sinceCap for a precise incremental slice.'),
       limit: z.number().optional().describe('Return the last N events per stream (default 100). An explicit limit always wins.'),
@@ -168,8 +171,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'polls. Satisfied → `{satisfied:true, elapsedMs, observation}`. A timeout is a NORMAL result, not ' +
       'an error: `{satisfied:false, timedOut:true, lastObservation}` — read `lastObservation` to see ' +
       'why (`ambiguous`: a state test needs one control; `live`: what IS there). An `absent` wait true on the ' +
-      'FIRST check adds `alreadyAbsent` + a live-vocabulary `hint` (labels, ids or names — as you aimed) — a typo is always absent. `timeoutMs` defaults to 5000, ' +
-      'clamped to [50, 120000]. An unevaluable condition (no ' +
+      'FIRST check adds `alreadyAbsent` + a live-vocabulary `hint` (labels, ids or names — as you aimed) — a typo is always absent. ' +
+      `\`timeoutMs\` defaults to ${WAIT_FOR_DEFAULT_MS}, clamped to [${WAIT_FOR_MIN_MS}, ${WAIT_FOR_MAX_MS}]. An unevaluable condition (no ` +
       'label/id, unknown trait) is refused BEFORE parking. Works as a modoki_batch step and as ' +
       'modoki.waitFor() in eval (whose 25s cap bounds it there).',
     {
@@ -177,7 +180,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       entity: entityCond.optional().describe('A get_scene_state match by guid/name/where — present, or `absent`.'),
       console: z.object({
         match: z.string().describe('Case-sensitive substring of the logged text.'),
-        level: z.enum(['log', 'info', 'warn', 'error']).optional(),
+        level: z.enum(CONSOLE_LEVELS).optional().describe(CONSOLE_LOGS_PARAM_DOCS.level),
         lookbackMs: z.number().min(0).max(60_000).optional().describe('Also accept a line logged up to this many ms BEFORE the call — for the batch step that logged it just before this wait.'),
       }).strict().optional().describe('A renderer console line logged after the call starts (or within lookbackMs before it).'),
       editor: z.object({
@@ -189,7 +192,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async ({ chrome, entity, console: consoleCond, editor, timeoutMs }) => {
       // Transport must outlast the op's park AND the relay's headroom over it (+10s), or a
       // legitimate long wait reads as an unreachable backend.
-      const transportTimeoutMs = Math.max(50, Math.min(120_000, timeoutMs ?? 5_000)) + 15_000;
+      const transportTimeoutMs = Math.max(WAIT_FOR_MIN_MS, Math.min(WAIT_FOR_MAX_MS, timeoutMs ?? WAIT_FOR_DEFAULT_MS)) + 15_000;
       return postJson('/api/wait-for', { chrome, entity, console: consoleCond, editor, timeoutMs }, transportTimeoutMs, 'wait for a condition in the editor');
     },
   );
@@ -206,14 +209,14 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'to keep watching; `skipped` counts events that arrived but did not match `type`/`source`. `source` defaults to "human" (the whole point is noticing what the HUMAN ' +
       'did, not your own MCP-driven edits). Same event shape/types as modoki_editor_journal, same ' +
       'forward `since`/`nextSeq` cursor (advance with the returned `nextSeq`, never re-use a stale ' +
-      'one). `timeoutMs` defaults to 30s and is capped at 120s server-side — for a longer watch, ' +
+      'one); omit `since` to wait for the NEXT event from now, not to replay history. `timeoutMs` defaults to 30s and is capped at 120s server-side — for a longer watch, ' +
       'call again. This BLOCKS the tool call for up to that long; do not set a short client-side ' +
       'timeout expectation around it.',
     {
       type: z.string().optional().describe('Only wake for this editor event type, e.g. !edit, !select, !transform. Omit to wake on any type. An unknown type (e.g. `edit` without `!`) is refused up front rather than waited on.'),
       source: z.enum(['human', 'agent']).optional().describe('Who must have done it. Defaults to "human" — pass "agent" only if you specifically want to notice your own MCP-driven edits.'),
-      since: z.number().optional().describe('Forward cursor (a prior `seq`/`nextSeq`). Omit to wait for the NEXT event from now, not to replay history.'),
-      epoch: z.string().optional().describe('The `epoch` returned with `nextSeq`; send it back. A reload restarts `seq`, and a stale epoch replays with `cursorReset`.'),
+      since: z.number().optional().describe(`${SINCE_CURSOR_BASE}.`),
+      epoch: z.string().optional().describe(`${EPOCH_BASE}.`),
       timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}. Default 30000, clamped to [50, 120000].`),
     },
     async ({ type, source, since, epoch, timeoutMs }) => {

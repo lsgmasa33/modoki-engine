@@ -602,6 +602,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_list_actions: {
     kind: 'read', method: 'GET', route: '/api/game-introspect', requires: ['editor', 'renderer'],
+    filters: ['name'],
   },
   modoki_dispatch_action: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'dispatch-action',

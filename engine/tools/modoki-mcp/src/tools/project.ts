@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { unsavedForceParam } from '../shapes.js';
+import { CONSOLE_LEVELS, CONSOLE_LOGS_PARAM_DOCS, CONSOLE_LOGS_REPLY_DOC } from '../../../shared/consoleLevels.js';
 
 /** What `modoki_project_settings action=get` shows instead of a signing password (#370).
  *
@@ -98,24 +99,26 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_get_console_logs',
     'Read the editor renderer\'s recent console output (errors/warns/logs + uncaught errors ' +
       'and unhandled rejections). Use to diagnose a failed scene/mesh load or a runtime throw ' +
-      'without a devtools attach (game events: modoki_journal; editor activity: modoki_editor_journal). RETURNS {returnedCount, totalCount, ringTotal, byLevel, dropped, logs}: `returnedCount` is what ' +
-      'came back (last 50 by default), `totalCount` is what MATCHED level=/since=, and `ringTotal`+`byLevel` ' +
-      'describe the WHOLE ring regardless of the filter — so a level="warn" read still tells ' +
-      'you whether any errors exist. The ring holds 1000 entries in the editor (512 on a debug device ' +
+      'without a devtools attach (game events: modoki_journal; editor activity: modoki_editor_journal). ' +
+      CONSOLE_LOGS_REPLY_DOC + ' The ring holds 1000 entries in the editor (512 on a debug device ' +
       'build), of which the first 128 are a PINNED boot prefix that is never evicted. ⚠️ `dropped` > 0 ' +
       'means entries between that boot prefix and the recent tail were evicted, so the log is NOT ' +
       'contiguous — do not read a gap as "nothing was logged". (Error entries carry full stacks, so the ' +
       'ring can exceed 20k tokens.) Raise limit=N for more, or narrow with level=/since=.',
     {
-      level: z.enum(['log', 'warn', 'error']).optional().describe('Filter to one level.'),
-      limit: z.number().optional().describe('Return the last N entries (default 50). An explicit limit always wins; pass a large one for the whole ring.'),
-      since: z.number().optional().describe('Only entries with ts > this (ms epoch).'),
+      level: z.enum(CONSOLE_LEVELS).optional().describe(CONSOLE_LOGS_PARAM_DOCS.level),
+      limit: z.number().optional().describe(CONSOLE_LOGS_PARAM_DOCS.limit),
+      since: z.number().optional().describe(CONSOLE_LOGS_PARAM_DOCS.since),
+      sinceMs: z.number().optional().describe(CONSOLE_LOGS_PARAM_DOCS.sinceMs),
+      epoch: z.string().optional().describe(CONSOLE_LOGS_PARAM_DOCS.epoch),
     },
-    async ({ level, limit, since }) => {
+    async ({ level, limit, since, sinceMs, epoch }) => {
       const q = new URLSearchParams();
       if (level) q.set('level', level);
       if (limit != null) q.set('limit', String(limit));
       if (since != null) q.set('since', String(since));
+      if (sinceMs != null) q.set('sinceMs', String(sinceMs));
+      if (epoch) q.set('epoch', epoch);
       const qs = q.toString();
       return getJson(`/api/console-logs${qs ? `?${qs}` : ''}`);
     },

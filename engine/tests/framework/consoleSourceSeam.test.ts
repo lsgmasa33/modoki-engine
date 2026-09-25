@@ -30,8 +30,8 @@ describe('console source seam — the device ring reaches diagnose (#157)', () =
   });
 
   it('a registered ring is what a reader sees', () => {
-    setConsoleSource(() => [{ level: 'error', ts: 1000, text: 'boom' }]);
-    expect(readConsoleSource()).toEqual([{ level: 'error', ts: 1000, text: 'boom' }]);
+    setConsoleSource(() => [{ seq: 1, level: 'error', ts: 1000, text: 'boom' }]);
+    expect(readConsoleSource()).toEqual([{ seq: 1, level: 'error', ts: 1000, text: 'boom' }]);
   });
 
   /** The exact scenario measured on the Samsung: the ring holds a boot stall, and diagnose
@@ -40,8 +40,8 @@ describe('console source seam — the device ring reaches diagnose (#157)', () =
     game = createTestWorld({});
     const now = 2_000_000;
     setConsoleSource(() => [
-      { level: 'log', ts: now - 1000, text: '[MeshCache] Loaded 114 templates' },
-      { level: 'error', ts: now - 2000, text: '[frameDriver] FRAME LOOP STALLED — no frame for 3926ms' },
+      { seq: 1, level: 'log', ts: now - 1000, text: '[MeshCache] Loaded 114 templates' },
+      { seq: 2, level: 'error', ts: now - 2000, text: '[frameDriver] FRAME LOOP STALLED — no frame for 3926ms' },
     ]);
     const d = computeDiagnostics({ consoleErrors: readConsoleSource()!.filter((e) => e.level === 'error'), now, errorWindowMs: 300_000 });
     expect(d.consoleErrors).toHaveLength(1);
@@ -55,7 +55,7 @@ describe('console source seam — the device ring reaches diagnose (#157)', () =
   it('an aged-out device boot error is reported as olderErrors, not dropped', () => {
     game = createTestWorld({});
     const now = 2_000_000;
-    setConsoleSource(() => [{ level: 'error', ts: now - 600_000, text: '[frameDriver] FRAME LOOP STALLED' }]);
+    setConsoleSource(() => [{ seq: 1, level: 'error', ts: now - 600_000, text: '[frameDriver] FRAME LOOP STALLED' }]);
     const d = computeDiagnostics({ consoleErrors: readConsoleSource()!, now, errorWindowMs: 300_000 });
     expect(d.consoleErrors).toHaveLength(0);          // outside the verdict window
     expect(d.olderErrors?.count).toBe(1);             // but not invisible

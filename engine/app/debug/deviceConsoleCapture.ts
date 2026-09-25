@@ -44,30 +44,32 @@ export { CONSOLE_CAPTURE_MARKER } from './uncaughtCapture';
 export { unpatchedLog } from '@modoki/engine/runtime/core/consoleRing';
 
 /** Project one shared-ring entry into this bridge's `ConsoleLine` shape. `timestamp` must be
- *  EPOCH — `bridge.ts`'s `handleConsoleLogs` and `diagnose` compare it against wall-clock windows —
+ *  EPOCH — `console-logs`' `sinceMs` and `diagnose` compare it against wall-clock windows —
  *  while the shared ring stores MONOTONIC `mono` (`performance.now()`; L0 cannot touch
  *  `Date.now()`, see the determinism guard). The conversion is exact
  *  (`performance.timeOrigin` is the epoch instant `performance.now()`'s zero point measures from)
  *  and belongs here, in the unscanned app layer, rather than in the engine's
  *  determinism-guarded `runtime/**`. */
-function toConsoleLine(entry: { level: ConsoleLine['level']; args: string[]; mono: number }): ConsoleLine {
+function toConsoleLine(entry: { seq: number; level: ConsoleLine['level']; args: string[]; mono: number }): ConsoleLine {
   return {
     type: 'console',
+    seq: entry.seq,
     level: entry.level,
     args: entry.args,
     timestamp: Math.round(performance.timeOrigin + entry.mono),
   };
 }
 
-/** Public shape mirrors what `bridgeHelpers.ts`'s `createConsoleRing` used to expose —
- *  `bridge.ts`'s `handleConsoleLogs` calls `.query()` on this. `createConsoleRing` itself is GONE (#596/#597
+/** Public shape mirrors what `bridgeHelpers.ts`'s `createConsoleRing` used to expose. Its `.query()` went
+ *  with `bridge.ts`'s `handleConsoleLogs` in #1559 — `device_console_logs` now reads the shared
+ *  `console-logs` agent op, the editor's own reader. `createConsoleRing` itself is GONE (#596/#597
  *  close-out review): it had no production caller left anywhere, only `bridge.test.ts`'s "console
  *  ring" tests, which pinned a private buffer nothing shipped ever read while THIS one — the one
  *  actually wired to `bridge.ts` — carried no unit contract of its own. Those tests are repointed
  *  at THIS object directly now, which is also why they can catch something the dead copy never
  *  could: a broken serializer in the shared ring's own `record()` path (`consoleRing.ts`'s
  *  `stringifyArg`) — exactly the Error-stack regression this same review found. What changed from
- *  the old private buffer is the backing: `entries`/`query` now PROJECT the shared ring instead of
+ *  the old private buffer is the backing: `entries` now PROJECTS the shared ring instead of
  *  owning one. `push` records DIRECTLY into the shared ring (see its own doc comment below) — it
  *  has no caller left in this file since Stage 3a moved the `window` listeners to
  *  `./uncaughtCapture.ts` (which calls `recordConsoleRingEntry` itself), but stays exported as this
@@ -84,11 +86,6 @@ export const consoleRing = {
    *  `recordConsoleRingEntry`'s doc comment and `globalErrors.ts`'s `alreadyReported` doc. */
   push(level: ConsoleLine['level'], args: unknown[]): void {
     recordConsoleRingEntry(level, args);
-  },
-  query(limit: number, level?: string): ConsoleLine[] {
-    const all = getConsoleRingEntries().map(toConsoleLine);
-    const filtered = level ? all.filter((l) => l.level === level) : all;
-    return filtered.slice(-limit);
   },
 };
 
@@ -107,6 +104,7 @@ export function installDeviceConsoleCapture(): void {
 
   // Publish the ring — `setConsoleSource` is a bare assignment, so it cannot throw.
   setConsoleSource(() => consoleRing.entries.map((e) => ({
+    seq: e.seq,
     // The ring carries 'info' as a distinct level; the reader's vocabulary has three. Fold it into
     // 'log' rather than dropping the entry — losing a line to a vocabulary mismatch is the same
     // class of silent omission this whole seam exists to end.

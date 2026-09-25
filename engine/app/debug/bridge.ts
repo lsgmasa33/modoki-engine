@@ -15,8 +15,7 @@ import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
 import { setJournalEnabled, getFrameLoopHealth, hasDocKey } from '@modoki/engine/runtime';
 import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
-import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
-import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
+import { installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
 import { domCodeForKey, normalizeKeyName, refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import {
   safeStringify,
@@ -33,7 +32,6 @@ import { deviceAimKeys, type AimGesture } from './domPointContract';
 import type { EntityPointResolution, EntityPointSpec } from './entityPointContract';
 import { entityAimOutcome, type AimRefusal } from './entityAimRefusal';
 import { encodeDeviceRefusal } from '../../tools/shared/deviceRefusal';
-import { histogram } from '../../tools/shared/filterDisclosure';
 
 interface Request {
   id: string;
@@ -677,24 +675,6 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})${driftAtFrom}${superseded}`);
 }
 
-/** ⚠️ SHAPE CHANGE, coordinated with `engine/tools/game-debug-mcp/src/mcp-tools.ts`'s
- *  `device_console_logs` (the only consumer of this bridge method — do not change one without the
- *  other). Used to return the bare array `consoleRing.query()` produces; now wraps it with
- *  `dropped`, for the same reason the editor's `console-logs` agent op does (see its own comment,
- *  `agentBridge.ts`) — the ring is `[pinned] ++ [tail]`, discontiguous once it wraps, and on device
- *  there is no devtools console to notice the gap any other way. */
-export function handleConsoleLogs(params: Record<string, unknown>): { logs: ReturnType<typeof consoleRing.query>; dropped: number; ringTotal: number; byLevel: Record<string, number> } {
-  const ring = consoleRing.entries;
-  return {
-    logs: consoleRing.query((params.limit as number) || 50, params.level as string | undefined),
-    dropped: getConsoleRingDropped(),
-    // #1214: the WHOLE ring, level filter ignored — the editor `console-logs` op's contract. Without it
-    // `level:'error'` on a ring of 800 warnings printed "No console logs.", i.e. "the game logged nothing".
-    ringTotal: ring.length,
-    byLevel: histogram(ring, (l) => l.level),
-  };
-}
-
 // --- App identity (#88) ---
 
 /** Which app is actually holding this socket — the on-device twin of `modoki_identity`.
@@ -1327,7 +1307,6 @@ async function handleMessage(req: Request): Promise<unknown> {
     case 'hover': return await handleHover(p);
     case 'scroll': return await handleScroll(p);
     case 'type-text': return await handleType(p);
-    case 'consoleLogs': return handleConsoleLogs(p);
     case 'app-identity': return await handleAppIdentity();
     // Percept / Enact on device (device_get_scene_state, device_diagnose, device_journal, …).
     // Delegate any other method to the SHARED runtime op registry (engine/app/debug/agentBridge)

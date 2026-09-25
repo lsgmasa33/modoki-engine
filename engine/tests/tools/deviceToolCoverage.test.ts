@@ -86,6 +86,7 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_layout_bounds: {},
   device_resolve_refs: { refs: ['g-1'] },
   device_introspect: {},
+  device_wait_for: { entity: { name: 'P' }, timeoutMs: 50 },
   // #288 Phase 6 — the device half of PlayerPrefs + scene queries. Both ops live in
   // `agentBridge.ts` (runtime), so the device runtime already had them and shipping only the
   // editor tools would have been the §9 asymmetry that rule calls a finding.

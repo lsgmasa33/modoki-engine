@@ -100,7 +100,7 @@ describe('screenshotToCSS', () => {
 // directly: same public shape (`push`/`entries`/`query`), but backed by the ONE shared ring
 // (`runtime/core/consoleRing.ts`) rather than a disconnected duplicate. Concretely, that means these
 // tests now run through `recordConsoleRingEntry` → `record` → `stringifyArg` — the actual shared
-// serializer `bridge.ts`'s `handleConsoleLogs` depends on — so a regression there (the Error-stack one this same
+// serializer every console read depends on — so a regression there (the Error-stack one this same
 // review found and fixed) would fail HERE too, which the dead copy structurally could not do.
 describe('console ring (the live shared-ring projection, deviceConsoleCapture.ts)', () => {
   afterEach(() => {
@@ -120,18 +120,6 @@ describe('console ring (the live shared-ring projection, deviceConsoleCapture.ts
     installConsoleRing({ capacity: 3, bootPrefix: 0 });
     for (const c of ['a', 'b', 'c', 'd']) consoleRing.push('log', [c]);
     expect(consoleRing.entries.map((e) => e.args[0])).toEqual(['b', 'c', 'd']);
-  });
-
-  it('query returns last N', () => {
-    installConsoleRing();
-    for (let i = 0; i < 10; i++) consoleRing.push('log', [`msg${i}`]);
-    expect(consoleRing.query(3).map((e) => e.args[0])).toEqual(['msg7', 'msg8', 'msg9']);
-  });
-
-  it('query filters by level', () => {
-    installConsoleRing();
-    consoleRing.push('log', ['a']); consoleRing.push('error', ['b']); consoleRing.push('log', ['c']); consoleRing.push('error', ['d']);
-    expect(consoleRing.query(10, 'error').map((e) => e.args[0])).toEqual(['b', 'd']);
   });
 
   // The assertion that matters: aimed at the dead `createConsoleRing`, this could only ever exercise

@@ -28,18 +28,18 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       'where="Transform.y>3" | full=true (every field, incl. AoS/object fields the compact dump ' +
       'omits) | world/bounds/contacts. Address entities by `guid` — runtime ids are reassigned ' +
       'on every scene hot-reload. Every entity has a guid: a code-spawned one carries a runtime guid, valid ' +
-      'until the scene reloads. The index applies a default limit (see `hint`/`truncated`); a ' +
-      'targeted query is never silently capped. A bad `where` returns a `warnings` array rather ' +
+      'until the scene reloads. Both modes are capped by default (index 200, targeted 20); a capped ' +
+      'reply says truncated:true and how many MORE matched, before the rows. A bad `where` returns a `warnings` array rather ' +
       'than silently ignoring the filter.',
     {
-      trait: z.string().optional().describe('Only include this trait\'s data (still lists all entities).'),
+      trait: z.string().optional().describe('Only the entities that carry this trait, with only this trait\'s data.'),
       id: z.number().int().optional().describe('Only include this single entity id (returned even if it is a resource).'),
       guid: z.string().optional().describe('Only include the entity with this stable guid — PREFER this over id for addressing (runtime ids are reassigned on every scene hot-reload). A guid that matches nothing returns an empty set + a `warnings` note.'),
       name: z.string().optional().describe('Filter to entities whose name contains this (case-insensitive).'),
       where: z.string().optional().describe('Filter by predicate "Trait.field op value", op ∈ = != > >= < <= ~ (~=contains). E.g. "Transform.y>5". Unparseable/unknown-trait/unknown-field → a `warnings` entry, not a silent full dump.'),
       full: z.boolean().optional().describe('Include EVERY persistent trait field (AoS/object fields like animSets/materials/onClickSet), not just the curated Inspector subset. Default false (bare = a names-only index). NOTE: an UNTARGETED full=1 on a real scene exceeds the response cap and comes back as an elision envelope — combine it with trait=/id=/name=/where= or limit=.'),
       resources: z.boolean().optional().describe('Force-include resource entities (mesh/material/prefab/env holders + config singletons Time/Physics/NPRPostFX). Excluded from the DEFAULT untargeted listing only — any id/trait/name/where filter already includes them.'),
-      limit: z.number().int().nonnegative().optional().describe('Cap the entities returned. `returnedCount` is what came back and `totalCount` every match before the cap (both always); truncated:true when it bites. The untargeted INDEX is capped at 200 by default; an explicit limit always wins, and a targeted query is never capped unless you pass one.'),
+      limit: z.number().int().nonnegative().optional().describe('Cap the entities returned. `returnedCount` is what came back and `totalCount` every match before the cap (both always); truncated:true when it bites. Defaults: 200 for the untargeted INDEX, 20 for a targeted read (id/guid/trait/name/where); an explicit limit always wins.'),
       world: z.boolean().optional().describe('Add each entity\'s RESOLVED world transform (position/rotation/scale after parent-chain propagation) + activeInHierarchy flag. Default false (local Transform only). Saves composing the parent chain by hand.'),
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect (screen {x,y,w,h} CSS px) + onScreen flag, plus (3D only) worldAABB {size:[x,y,z], center:[x,y,z]} — the TRUE geometric extent in world units (distinct from the authored scale). Geometry without a separate get_layout_bounds call. Default false. Needs the renderer.'),
       contacts: z.boolean().optional().describe('Add each body\'s CURRENT physics contacts as GUID arrays (rolled up to bodies; a partner with no guid appears as `id:<n>`): `contacts` (solid, load-bearing — resting on the ground) + `overlaps` (sensor/trigger — inside a zone). The STATE view ("what is it touching NOW"), vs the @contact/@sensor journal EVENTS ("when did they touch"). Present only on bodies currently touching something. Default false.'),

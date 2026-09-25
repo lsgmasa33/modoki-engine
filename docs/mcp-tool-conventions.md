@@ -939,6 +939,17 @@ substituted for the missing tools — eval adds composition and zero capability.
 runtime-only op in the editor file is therefore not a stylistic slip; it is how the write gap
 opened one op at a time, each new capability landing wherever its first caller happened to live.
 An op registered in `agentEditorOps.ts` whose handler reaches nothing from `editor/` is a finding.
+`wait-for` was one (#1559 C-12): two of its four conditions read only the runtime, so it now registers
+in `agentBridge.ts` and the editor REPLACES that registration with the editor-only readers added —
+the same shape `player-prefs-write` uses.
+
+**Twin PARAMETERS are compared too, and the param rules run on both surfaces (#1559).** Each server
+declares its own zod shapes, so a param added on one twin is silently absent from the other.
+`twinParamParity.test.ts` fails on any unrecorded difference (a param, a stated default, a device tool
+with no twin); `deviceToolSurface.test.ts` runs §11's documented-param check and §2's one-meaning
+check over the device surface, with the editor's pardon list (`perToolMeaning.ts`). Wordings both
+servers need live in `tools/shared/` (`paramBases.ts`, `sinceCursor.ts`, `consoleLevels.ts`), not in
+modoki-mcp's `shapes.ts`, which the device server cannot import.
 
 ## 9-bis. A cross-runtime reply is DECODED, never cast (#644 → #647/#648)
 

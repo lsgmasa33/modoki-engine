@@ -21,6 +21,8 @@ export function kebabToCamel(op: string): string {
 
 export interface ConsoleLine {
   type: 'console';
+  /** The shared ring's seq (#1559). */
+  seq: number;
   level: 'log' | 'warn' | 'error' | 'info';
   args: string[];
   timestamp: number;

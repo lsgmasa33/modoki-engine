@@ -44,6 +44,7 @@ import {
   toolCount,
   clearRegistry,
 } from '../../tools/modoki-mcp/src/registry';
+import { PER_TOOL_MEANING } from './perToolMeaning';
 import { loadSurface, sumSchemaBytes, type Surface } from './mcpSurface';
 import { perToolBytes, surfaceBytes, toolBytes } from '../../tools/modoki-mcp/surfaceBytes';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
@@ -267,19 +268,8 @@ describe('the real registered surface', () => {
   // type stated each time — `path`'s pattern exactly. A label you ASSIGN is a different job, so it
   // became `displayName` rather than being excused here. Four addressing meanings remain, so the
   // containment check still cannot police this word; do not read the rename as clearing it.
-  const PER_TOOL_MEANING: readonly string[] = [
-    'path', 'name', 'kind', 'id', 'ids', 'key', 'limit', 'all', 'from', 'to', 'clear', 'since',
-    'guid', 'guids', 'quality', 'selector', 'button', 'steps', 'entity', 'parentId',
-    'parentGuid', 'action', 'type',
-    // #1152/#1153: an AIM on the input tools ("press the element labelled X") and a FILTER on
-    // modoki_handles ("list the handles labelled X"). Two jobs, deliberately one word: both match by
-    // the same `labelMatches` rule, so the filter previews exactly what the aim would hit.
-    'label',
-    // `target` is the thing a tool is AIMED at, typed each time — the `path` pattern: a look-at point
-    // on the render tools, an asset/entity GUID on modoki_find_references, a relative name-path on the
-    // animation/timeline key-adders (#1560 gave anim_add_key the timeline's word for that path).
-    'target',
-  ];
+  // The list itself lives in `perToolMeaning.ts` since #1559: the device surface runs the same check
+  // (`deviceToolSurface.test.ts`), and one pardon list is what keeps the two from judging a word differently.
 
   it('a param used by 3+ tools means ONE thing, or is declared per-tool', () => {
     // §2 ("a field or parameter name means the same thing in every tool that uses it") had a

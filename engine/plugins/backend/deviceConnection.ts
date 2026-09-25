@@ -13,6 +13,7 @@
  */
 
 import net from 'net';
+import { DEVICE_REQUEST_MAX_MS } from '../../tools/shared/waitForTiming';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -330,7 +331,8 @@ const REQUEST_TIMEOUT_MS = 5000;
  *  answers must still fail in bounded time, or a hung request holds the link open past the point
  *  where reconnect logic would have noticed the phone was gone. Generous enough that every real op
  *  budget (the 25s editor eval ceiling and anything the device is likely to grow) fits under it. */
-const MAX_REQUEST_TIMEOUT_MS = 60_000;
+/** Shared with `device_wait_for`'s ceiling, which is derived from it (#1559). */
+const MAX_REQUEST_TIMEOUT_MS = DEVICE_REQUEST_MAX_MS;
 /** Fail a hung TCP connect fast instead of waiting ~75s for the OS to time out — a silent packet
  *  drop (wrong IP / not same WiFi / server not listening / firewall) otherwise looks "stuck". */
 const CONNECT_TIMEOUT_MS = 6000;

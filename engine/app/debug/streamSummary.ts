@@ -58,7 +58,8 @@ export function tailWithCounts<T>(
  *  Exported so no caller is tempted to re-derive it. `agentEditorOps`' merged `timeline` did,
  *  and re-created the `slice(-0)` bug this comment describes. */
 export function takeTail<T>(items: readonly T[], limit: number | undefined, defaultLimit: number): { items: T[]; truncated: boolean } {
-  const n = typeof limit === 'number' && Number.isFinite(limit) ? limit : defaultLimit;
+  // A negative limit is 0 — else `0 > -3` reports an EMPTY list as truncated (#1559 review).
+  const n = Math.max(0, typeof limit === 'number' && Number.isFinite(limit) ? limit : defaultLimit);
   const truncated = items.length > n;
   return { items: n <= 0 ? [] : truncated ? items.slice(-n) : [...items], truncated };
 }
@@ -70,7 +71,7 @@ export function takeTail<T>(items: readonly T[], limit: number | undefined, defa
  *  window instead; pair it with a nextCursor = the last returned item's seq/cap so the next poll
  *  continues contiguously with no gap. Same NaN/`slice(0,0)` guards as takeTail. */
 export function takeHead<T>(items: readonly T[], limit: number | undefined, defaultLimit: number): { items: T[]; truncated: boolean } {
-  const n = typeof limit === 'number' && Number.isFinite(limit) ? limit : defaultLimit;
+  const n = Math.max(0, typeof limit === 'number' && Number.isFinite(limit) ? limit : defaultLimit);
   const truncated = items.length > n;
   return { items: n <= 0 ? [] : truncated ? items.slice(0, n) : [...items], truncated };
 }

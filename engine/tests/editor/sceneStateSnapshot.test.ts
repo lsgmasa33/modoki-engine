@@ -6,9 +6,10 @@
 
 import { describe, it, expect, beforeAll } from 'vitest';
 import { trait } from 'koota';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import { registerTrait, getCurrentWorld, EntityAttributes } from '@modoki/engine/runtime';
 import { worldTransforms, deactivatedEntities } from '@modoki/engine/runtime';
-import { dumpSceneState, DEFAULT_INDEX_LIMIT } from '../../app/debug/agentBridge';
+import { dumpSceneState, DEFAULT_INDEX_LIMIT, DEFAULT_TARGETED_LIMIT } from '../../app/debug/agentBridge';
 
 // SoA trait whose curated meta.fields OMITS `b` (present in the koota schema) — the
 // exact shape that exposes the readTraitData-vs-readTraitDataFull discrepancy.
@@ -249,10 +250,10 @@ describe('dumpSceneState — index mode (untargeted default)', () => {
     expect(d.truncated).toBeUndefined();
   });
 
-  it('a TARGETED query is never silently capped by the index default', () => {
-    // Narrowing to trait=X and then losing rows off the end would be worse than a big answer.
-    const d = dumpSceneState({ trait: 'EntityAttributes' });
+  it('a TARGETED query under its cap is not truncated', () => {
+    const d = dumpSceneState({ name: 'P2' });
     expect(d.truncated).toBeUndefined();
+    expect(d.returnedCount).toBe(d.totalCount);
   });
 
   it('the DEFAULT index limit actually fires past DEFAULT_INDEX_LIMIT entities', () => {
@@ -283,5 +284,56 @@ describe('dumpSceneState — index mode (untargeted default)', () => {
   it('a VALID where still returns values (it is a real target)', () => {
     const d = dumpSceneState({ where: 'P2Where.y>5' }) as { entities: Array<Record<string, unknown>> };
     expect(Array.isArray(d.entities[0].traits)).toBe(false);
+  });
+});
+
+/** #1557 — the read tail. Two months of transcripts put targeted reads at the top of the MCP result
+ *  tax: `trait=CourtConfig` answered 274 rows (273 of them `traits:{}`) for one config entity, and a
+ *  `name=` substring matching 17+ UI entities answered 36k chars because targeted reads were uncapped. */
+describe('dumpSceneState — #1557 trait= selects, targeted reads carry a disclosed cap', () => {
+  const T1557 = trait({ v: 0 });
+  beforeAll(() => {
+    registerTrait({ name: 'T1557', trait: T1557, category: 'component', fields: { v: { type: 'number' } } });
+    const w = getCurrentWorld();
+    w.spawn(EntityAttributes({ name: 'T1557Carrier', guid: 't1557-carrier' }), T1557({ v: 7 }));
+    for (let i = 0; i < DEFAULT_TARGETED_LIMIT + 5; i++) w.spawn(EntityAttributes({ name: `Cap1557-${i}`, guid: `cap1557-${i}` }));
+  });
+
+  it('trait= returns only the entities that carry the trait', () => {
+    const d = dumpSceneState({ trait: 'T1557' });
+    expect(names(d)).toEqual(['T1557Carrier']);
+    expect(d.totalCount).toBe(1);
+    expect((d.entities[0].traits as Record<string, { v: number }>).T1557.v).toBe(7);
+  });
+
+  it('an unregistered trait= selects nothing, and the warning says the NAME is wrong', () => {
+    const d = dumpSceneState({ trait: 't1557' }) as ReturnType<typeof dumpSceneState> & { warnings?: string[]; hint?: string };
+    expect(d.entities).toEqual([]);
+    expect(d.warnings?.[0]).toMatch(/not a REGISTERED trait.*Did you mean: T1557/);
+    expect(d.hint).toBeUndefined(); // the warning already explains the empty answer
+  });
+
+  it(`a targeted read past ${DEFAULT_TARGETED_LIMIT} matches is capped, and says how many more there are`, () => {
+    const d = dumpSceneState({ name: 'Cap1557-' }) as ReturnType<typeof dumpSceneState> & { hint?: string };
+    expect(d.entities).toHaveLength(DEFAULT_TARGETED_LIMIT);
+    expect(d.totalCount).toBe(DEFAULT_TARGETED_LIMIT + 5);
+    expect(d.truncated).toBe(true);
+    expect(d.hint).toContain('5 MORE are not shown');
+    expect(d.hint).toContain(`limit=${DEFAULT_TARGETED_LIMIT + 5}`);
+    // The disclosure comes BEFORE the rows, so a reader skimming the payload meets it first.
+    expectInOrder(Object.keys(d), ['truncated', 'entities']);
+    expectInOrder(Object.keys(d), ['hint', 'entities']);
+  });
+
+  it("an empty trait= filters nothing (an eval body passing a blank field through)", () => {
+    const d = dumpSceneState({ trait: '', name: 'T1557Carrier' }) as ReturnType<typeof dumpSceneState> & { warnings?: string[] };
+    expect(names(d)).toEqual(['T1557Carrier']);
+    expect(d.warnings).toBeUndefined();
+  });
+
+  it('an explicit limit beats the targeted cap', () => {
+    const d = dumpSceneState({ name: 'Cap1557-', limit: 1000 });
+    expect(d.entities).toHaveLength(DEFAULT_TARGETED_LIMIT + 5);
+    expect(d.truncated).toBeUndefined();
   });
 });

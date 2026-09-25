@@ -27,6 +27,10 @@ import { CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, vocabularyProse, type Create
 import { ignoredHandleFilter, parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../shared/handlesReply.js';
 import { INVALIDATABLE_ASSET_TYPES } from '../../shared/invalidateAssets.js';
 import { PROFILER_ACTIONS } from '../../shared/profilerActions.js';
+import { CONSOLE_LEVELS, CONSOLE_LOGS_PARAM_DOCS, CONSOLE_LOGS_REPLY_DOC } from '../../shared/consoleLevels.js';
+import { WAIT_FOR_DEFAULT_MS, WAIT_FOR_MIN_MS, DEVICE_WAIT_FOR_MAX_MS } from '../../shared/waitForTiming.js';
+import { foldEntityRef } from '../../shared/foldEntityRef.js';
+import { TIMEOUT_MS_BASE, PRECISION_BASE } from '../../shared/paramBases.js';
 import { z } from 'zod';
 import { writeFileSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { execFile } from 'child_process';
@@ -39,7 +43,7 @@ import {
   encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody, codeFromBody, optionsFromBody, BackendError, BackendShapeError,
   deviceFail, caughtFailure, deviceReplyFailure, type DeviceResult,
 } from './result.js';
-import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, parseNativeLogsReply, deviceListDecoder, describeClaim, SYNTHETIC_MECHANISM, decodeLeaseStatus, decodeDeviceRequestReply, decodeIdentity, decodeToolchain, type Decoder, type DeviceRequestReply, type LeaseStatus, type DeviceListClaim } from './reply.js';
+import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseNativeLogsReply, deviceListDecoder, describeClaim, SYNTHETIC_MECHANISM, decodeLeaseStatus, decodeDeviceRequestReply, decodeIdentity, decodeToolchain, type Decoder, type DeviceRequestReply, type LeaseStatus, type DeviceListClaim } from './reply.js';
 
 const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
 
@@ -915,7 +919,7 @@ export function registerTools(server: McpServer) {
     {
       code: z.string().describe('JavaScript code. Use `return` for a value.'),
       timeoutMs: z.number().int().positive().optional().describe(
-        'How long the body may run before it is abandoned. Default 4000, max 20000 (clamped, not ' +
+        `${TIMEOUT_MS_BASE} — how long the body may run before it is abandoned. Default 4000, max 20000 (clamped, not ` +
         'refused). Anything ABOVE the 4000 default also lifts the transport deadline with it — the ' +
         "backend sizes the device request's deadline from this number + 5s of headroom, so " +
         'the timeout that fires is the eval\'s own and the error names what the code was doing. ' +
@@ -1066,15 +1070,15 @@ export function registerTools(server: McpServer) {
       id: z.number().int().optional().describe('Only the entity with this runtime id — reassigned on every scene hot-reload, so PREFER guid. Useful to resolve a numeric id pulled from a journal/contact payload.'),
       guid: z.string().optional().describe('Only the entity with this stable guid.'),
       name: z.string().optional().describe('Filter to entities whose name CONTAINS this (case-insensitive).'),
-      trait: z.string().optional().describe('Only include this trait\'s data (still lists all entities).'),
+      trait: z.string().optional().describe('Only the entities that carry this trait, with only this trait\'s data.'),
       where: z.string().optional().describe('Predicate "Trait.field <op> value", op ∈ = != > >= < <= ~ (~ = contains).'),
       full: z.boolean().optional().describe('Every persistent trait field, not just the curated Inspector subset.'),
       world: z.boolean().optional().describe('Add resolved WORLD transform + activeInHierarchy per entity.'),
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect + onScreen flag.'),
       contacts: z.boolean().optional().describe('Add current physics contacts/overlaps (GUID arrays; a partner with no guid appears as `id:<n>`) per body.'),
       resources: z.boolean().optional().describe('Force-include resource entities (mesh/material/prefab/env holders + config singletons Time/Physics/NPRPostFX). Excluded from the DEFAULT untargeted listing only — any id/guid/trait/name/where filter already includes them.'),
-      limit: z.number().optional().describe('Cap entities returned: `returnedCount` came back of `totalCount` matched (both always); truncated:true when it bites. The untargeted INDEX is capped at 200 by default; a targeted query is uncapped unless you pass one.'),
-      precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),
+      limit: z.number().optional().describe('Cap entities returned: `returnedCount` came back of `totalCount` matched (both always); truncated:true when it bites. Defaults: 200 for the untargeted INDEX, 20 for a targeted read (id/guid/trait/name/where); an explicit limit always wins.'),
+      precision: z.number().optional().describe(`${PRECISION_BASE}.`),
     },
     async (args) => perceptCall('device_get_scene_state', 'scene-state', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
       'read the device scene state'),
@@ -1088,8 +1092,11 @@ export function registerTools(server: McpServer) {
       '`consoleErrors` covers only the last `errorWindowMs` (the window that gates `ok`); anything ' +
       'older is counted in `olderErrors` — BOOT errors live there, since nobody connects a device ' +
       'and attaches an agent inside the window. Read them with device_console_logs level=error.',
-    {},
-    async () => perceptCall('device_diagnose', 'diagnose', {}, 'diagnose the device scene'),
+    {
+      // #1559: the `diagnose` op is runtime and already honoured this; only the device schema lacked it.
+      video: z.boolean().optional().describe('Include the downloaded-video cache index (used/budget bytes + per-clip entries). Default false.'),
+    },
+    async ({ video }) => perceptCall('device_diagnose', 'diagnose', video ? { video: true } : {}, 'diagnose the device scene'),
   );
 
   tool('device_journal',
@@ -1127,10 +1134,13 @@ export function registerTools(server: McpServer) {
   );
 
   tool('device_introspect',
-    'Discover what the game on the device exposes: dispatchable action names (+ param schemas) and ' +
-      'live named read-values (e.g. canGoBack, timeSinceGameStart). Use before device_dispatch_action.',
-    {},
-    async () => perceptCall('device_introspect', 'game-introspect', {}, "read the connected game's actions and state"),
+    'Discover what the game on the device exposes: dispatchable action NAMES and live named ' +
+      'read-values (e.g. canGoBack, timeSinceGameStart). Use before device_dispatch_action. Bare = ' +
+      'names only; name=<substr> returns the matching actions with their param schemas.',
+    {
+      name: z.string().optional().describe('Case-insensitive substring of an action name; the matches come back as {name, params}.'),
+    },
+    async ({ name }) => perceptCall('device_introspect', 'game-introspect', name ? { name } : {}, "read the connected game's actions and state"),
   );
 
   // ── PlayerPrefs + scene queries (#288 Phase 6) ──────────────────────────────
@@ -1217,7 +1227,7 @@ export function registerTools(server: McpServer) {
       maxDistance: z.number().optional().describe('Cap the cast length in world units. Default: unbounded, matching the engine functions.'),
       solid: z.boolean().optional().describe('raycast only. Default true: a ray starting INSIDE a collider hits it at distance 0. Pass false to ignore the collider you start inside.'),
       exclude: z.string().optional().describe("raycast only — a guid or exact entity NAME (never a raw id) whose body is never reported as a hit. An ambiguous name is REFUSED. Refused outright for kind:shapecast, whose engine function takes no exclusion filter."),
-      precision: z.number().optional().describe('Significant digits for the returned floats. Default 9 — verify a position with a TOLERANCE, never ===.'),
+      precision: z.number().optional().describe(`${PRECISION_BASE}.`),
     },
     async (args) => perceptCall('device_physics_query', 'scene-query',
       Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
@@ -1278,7 +1288,7 @@ export function registerTools(server: McpServer) {
       entities: z.boolean().optional().describe('Force the per-entity rect list on an untargeted call.'),
       overlaps: z.boolean().optional().describe('Materialize the overlapping-pair list (O(n²); default off).'),
       limit: z.number().optional().describe('Cap per-entity rects (`returnedCount` of `totalCount` rects; `entityTotal` = distinct entities); truncated:true when it bites.'),
-      precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),
+      precision: z.number().optional().describe(`${PRECISION_BASE}.`),
     },
     async (args) => perceptCall('device_layout_bounds', 'layout-bounds', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
       'read the device layout bounds'),
@@ -1306,7 +1316,7 @@ export function registerTools(server: McpServer) {
       limit: z.number().optional().describe('(read) Cap the number of series returned (default 100; sets seriesTruncated when it drops some).'),
       clear: z.boolean().optional().describe('(read) Clear the series THIS CALL RETURNED (not the whole watch — a read is capped/filterable, so series you did not see keep their samples). The reply echoes `cleared` + `clearedScope`.'),
       samples: z.boolean().optional().describe('(read) Include the RAW time-series (default false — stats only).'),
-      precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),
+      precision: z.number().optional().describe(`${PRECISION_BASE}.`),
     },
     async (args) => {
       const { action, id } = args;
@@ -1370,7 +1380,7 @@ export function registerTools(server: McpServer) {
       maxPresses: z.number().int().positive().max(500).optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not device_watch\'s `maxSamples`, which caps each series separately.'),
       limit: z.number().optional().describe('(read) Most-recent N presses to return (default 20).'),
       unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter."),
-      precision: z.number().optional().describe('(read) Significant digits for float fields (default 9; 0 = exact).'),
+      precision: z.number().optional().describe(`${PRECISION_BASE}. Applies to the read.`),
     },
     async (args) => {
       const { action } = args;
@@ -1436,7 +1446,7 @@ export function registerTools(server: McpServer) {
       ids: z.array(z.string()).optional().describe('(read) Only these region ids.'),
       at: z.object({ x: z.number(), y: z.number() }).optional().describe('(read) A viewport CSS point to test — returns hitsAt, and nearest when nothing contains it.'),
       limit: z.number().optional().describe('(read) Max regions returned (default 60).'),
-      precision: z.number().optional().describe('(read) Significant digits for float fields (default 9; 0 = exact).'),
+      precision: z.number().optional().describe(`${PRECISION_BASE}. Applies to the read.`),
     },
     async (args) => {
       const action = args.action ?? 'read';
@@ -1964,12 +1974,20 @@ export function registerTools(server: McpServer) {
       guid: z.string().optional().describe('Stable guid of the entity to copy. Preferred — an id can be recycled by a scene reload and name a different entity.'),
       id: z.number().optional().describe('Live id of the entity to copy — only for an entity with no guid. Use guid.'),
       count: z.number().int().min(1).max(1000).optional().describe('How many copies to make (default 1, max 1000). This is the knob for a load test.'),
+      // #1559 C-13: modoki_duplicate_entity's nested alias, so one addressing form works on both twins.
+      entity: z.strictObject({ guid: z.string().optional(), id: z.number().optional() },
+        { error: unknownKeysError('an entity ref here accepts only: guid, id') }).optional()
+        .describe('Alternative to the flat guid/id, in the nested shape the aimed tools take. No name here — the op addresses by guid/id only; look the guid up with device_get_scene_state {name}. Not together with a flat guid/id.'),
     },
-    async ({ guid, id, count }) => writeCall('device_duplicate_entity', 'duplicate-entity', {
-      ...(guid !== undefined ? { guid } : {}), ...(id !== undefined ? { id } : {}), ...(count !== undefined ? { count } : {}),
-    }, 'duplicate a live entity on the device', [
-      'a stale guid is the usual cause — re-read it with device_get_scene_state',
-    ]),
+    async ({ guid, id, count, entity }) => {
+      const ref = foldEntityRef({ guid, id }, entity);
+      if ('conflict' in ref) return deviceFail({ code: 'AMBIGUOUS', tool: 'device_duplicate_entity', what: 'duplicate a live entity on the device', why: ref.conflict });
+      return writeCall('device_duplicate_entity', 'duplicate-entity', {
+        ...(ref.guid !== undefined ? { guid: ref.guid } : {}), ...(ref.id !== undefined ? { id: ref.id } : {}), ...(count !== undefined ? { count } : {}),
+      }, 'duplicate a live entity on the device', [
+        'a stale guid is the usual cause — re-read it with device_get_scene_state',
+      ]);
+    },
   );
 
   tool('device_delete_entities',
@@ -2009,7 +2027,7 @@ export function registerTools(server: McpServer) {
     {
       frames: z.number().int().min(1).max(SIM_STEP_MAX_FRAMES).optional().describe(`How many real frames to advance (default 1, max ${SIM_STEP_MAX_FRAMES}; a value outside that is refused, not clamped).`),
       scale: z.number().optional().describe('timeScale to run at during the step (default 1). Use <1 to advance less sim time per frame.'),
-      timeoutMs: z.number().optional().describe('Give up if the frames do not arrive. Default is DERIVED from frames (40ms each + margin, min 3000, max 20000) so the max frames:600 fits its own budget; max 20000. The world is always re-frozen, including on timeout.'),
+      timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}, if the frames do not arrive.` + ' Default is DERIVED from frames (40ms each + margin, min 3000, max 20000) so the max frames:600 fits its own budget; max 20000. The world is always re-frozen, including on timeout.'),
     },
     async ({ frames, scale, timeoutMs }) => writeCall('device_step', 'sim-step', {
       ...(frames !== undefined ? { frames } : {}), ...(scale !== undefined ? { scale } : {}),
@@ -2359,7 +2377,7 @@ async function coordScaleOrRefusal(
       dy: z.number().optional().describe('Alias for deltaY, kept for existing callers.'),
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to scroll over.'),
-      x: z.number().optional().describe(`X ${SCREENSHOT_PX} — the point to scroll over.`),
+      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Only without entity/selector — the point to scroll over.`),
       y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
       allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
     },
@@ -2411,64 +2429,59 @@ async function coordScaleOrRefusal(
 
   // ── Console Logs ───────────────────────────────────────────
 
-  tool('device_console_logs',
-    'Return captured console.log/warn/error/info from the game (semantic game events: device_journal).',
+  // ── wait_for (#1559 C-12) ── the device twin of modoki_wait_for, for the two condition kinds that read
+  // the RUNTIME. `chrome`/`editor` read the editor, which a device does not have — not in this schema.
+  tool('device_wait_for',
+    'PARK until a condition holds on the device, instead of sleeping a guessed number of ms. The twin ' +
+      'of modoki_wait_for for the conditions a device can answer. Give EXACTLY ONE of: `entity` (a ' +
+      'device_get_scene_state guid/name/where matches, or `absent`), `console` (a line containing `match` ' +
+      'is logged after the call starts, or within `lookbackMs` before it). Satisfied → `{satisfied:true, ' +
+      'elapsedMs, observation}`. A timeout is a NORMAL result: `{satisfied:false, timedOut:true, ' +
+      `lastObservation}\`. \`timeoutMs\` defaults to ${WAIT_FOR_DEFAULT_MS}, max ${DEVICE_WAIT_FOR_MAX_MS} (the device ` +
+      'transport caps a request at 60s). An unevaluable condition is refused BEFORE parking.',
     {
-      limit: z.number().optional().describe('Max entries (default: 50)'),
-      level: z.enum(['log', 'warn', 'error', 'info']).optional(),
+      entity: z.object({
+        guid: z.string().optional(),
+        name: z.string().optional().describe('Case-insensitive substring, as device_get_scene_state.'),
+        where: z.string().optional().describe('device_get_scene_state\'s predicate: "Trait.field <op> value", op ∈ = != > >= < <= ~.'),
+        absent: z.boolean().optional().describe('Wait until NO entity matches (destroyed, filtered out).'),
+      }).strict().optional().describe('A device_get_scene_state match by guid/name/where — present, or `absent`.'),
+      console: z.object({
+        match: z.string().describe('Case-sensitive substring of the logged text.'),
+        level: z.enum(CONSOLE_LEVELS).optional().describe(CONSOLE_LOGS_PARAM_DOCS.level),
+        lookbackMs: z.number().min(0).max(60_000).optional().describe('Also accept a line logged up to this many ms BEFORE the call.'),
+      }).strict().optional().describe('A console line logged after the call starts (or within lookbackMs before it).'),
+      timeoutMs: z.number().min(WAIT_FOR_MIN_MS).max(DEVICE_WAIT_FOR_MAX_MS).optional()
+        .describe(`${TIMEOUT_MS_BASE}.`),
     },
-    async ({ limit, level }) => {
-      const what = 'read the captured console output from the device';
-      try {
-        const raw = await deviceRequest('consoleLogs', { limit: limit ?? 50, ...(level ? { level } : {}) });
-        // The device signals a handler failure by RETURNING an `Error: …` STRING, which the transport
-        // resolves as a normal result (that is why `isDeviceError` exists). Without this check the
-        // string fell through to the shape parser below, misread as an unrecognised reply — a
-        // device-side refusal would be reported with the wrong remedy. Found by the Phase-8
-        // table-driven device sweep.
-        if (isDeviceError(raw)) return deviceReplyFailure('device_console_logs', what, raw);
-        // #644: `bridge.ts`'s `handleConsoleLogs` returns `{logs, dropped}` today but returned a
-        // BARE ARRAY before `6f5e81b48` — and this MCP server is a LONG-LIVED process that does not
-        // pick up a rebuilt tree, so a session straddling that commit runs the OLD parser against
-        // the NEW bridge shape (or vice versa). This used to blindly destructure `{logs, dropped}`
-        // and call `.map` on whatever came out, which threw `result.map is not a function` on the
-        // other shape — a version-skew crash, misclassified by `caughtFailure` as a TRANSPORT
-        // failure ("the device app may have been backgrounded or killed; relaunch it"), which sent
-        // the reporter chasing the wrong fix. `parseConsoleLogsReply` tolerates both wire shapes
-        // (plus a quiet/empty ring) and reports anything else as a shape mismatch, not a crash.
-        const parsed = parseConsoleLogsReply(raw);
-        if (!parsed.ok) {
-          return deviceFail({
-            code: 'NOT_AVAILABLE_HERE',
-            tool: 'device_console_logs',
-            what,
-            why: `the device answered, but not in a shape this tool understands (${parsed.got}). ` +
-              'The lease is fine — this is a version skew between this MCP server and the console bridge inside the app.',
-            options: [
-              'restart the MCP server — it is a LONG-LIVED process started with the session and does NOT pick up a rebuilt tree, so a git pull or a branch switch mid-session leaves it running the old reply parser (this is what produced #644)',
-              'if the APP is the old side, rebuild and redeploy it — engine/app/debug/bridge.ts handleConsoleLogs is the other half of this contract',
-              "device_status still answers, and device_native_logs source:'system' reads the device log from the HOST with no bridge involved",
-            ],
-          });
-        }
-        // `dropped` is how many entries were evicted from the ring's tail BETWEEN the pinned boot
-        // prefix and this window (the ring is `[pinned] ++ [tail]`, discontiguous once it wraps), so
-        // a non-zero value means the log below has a real gap in it, not that boot was quiet.
-        const gapNote = parsed.dropped > 0 ? `\n(${parsed.dropped} earlier ${parsed.dropped === 1 ? 'entry' : 'entries'} dropped between the boot log and this window.)` : '';
-        // #1214: an empty LEVEL-filtered read said "No console logs." — "the game logged nothing" —
-        // for a ring full of other levels. Name the filter, and the whole ring when the app reports it.
-        const ringNote = parsed.ringTotal === undefined ? ''
-          : ` The ring holds ${parsed.ringTotal} ${parsed.ringTotal === 1 ? 'entry' : 'entries'} at any level${parsed.byLevel && parsed.ringTotal ? ` (${Object.entries(parsed.byLevel).map(([k, n]) => `${k} ${n}`).join(', ')})` : ''}.`;
-        const empty = level ? `No console entries at level=${level}.${ringNote}` : `No console logs.${ringNote}`;
-        const text = (parsed.logs.length === 0
-          ? empty
-          : parsed.logs.map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level}] ${l.args.join(' ')}`).join('\n')
-            + (level && ringNote ? `\n(level=${level} only.${ringNote})` : '')) + gapNote;
-        return { content: [{ type: 'text' as const, text }] };
-      } catch (e) {
-        return caughtFailure('device_console_logs', what, e);
-      }
+    // ALWAYS forward timeoutMs: `/api/device/request` sizes the transport deadline from it (op + 5s), and
+    // an omitted one falls back to the connection default — the same length as the op's own default
+    // park, so a wait that timed out normally would race its transport (#822's shape, on device_step).
+    async ({ entity, console: consoleCond, timeoutMs }) => perceptCall('device_wait_for', 'wait-for', {
+      ...(entity ? { entity } : {}), ...(consoleCond ? { console: consoleCond } : {}),
+      timeoutMs: timeoutMs ?? WAIT_FOR_DEFAULT_MS,
+    }, 'wait for a condition on the device'),
+  );
+
+  tool('device_console_logs',
+    'Read the game\'s captured console output on the device (log/info/warn/error + uncaught errors; ' +
+      'semantic game events: device_journal). The same op and reply as modoki_get_console_logs. ' +
+      CONSOLE_LOGS_REPLY_DOC + ' ⚠️ `dropped` > 0 means entries between the pinned boot prefix and the ' +
+      'recent tail were evicted — the log is not contiguous.',
+    {
+      level: z.enum(CONSOLE_LEVELS).optional().describe(CONSOLE_LOGS_PARAM_DOCS.level),
+      limit: z.number().optional().describe(CONSOLE_LOGS_PARAM_DOCS.limit),
+      since: z.number().optional().describe(CONSOLE_LOGS_PARAM_DOCS.since),
+      sinceMs: z.number().optional().describe(CONSOLE_LOGS_PARAM_DOCS.sinceMs),
+      epoch: z.string().optional().describe(CONSOLE_LOGS_PARAM_DOCS.epoch),
     },
+    // The shared runtime `console-logs` op, not a device-only bridge command: the device used to keep its
+    // own projection (`handleConsoleLogs`, prose reply, exact-match level, no counts, no since) beside
+    // the editor's, and the two drifted apart one field at a time (#1559 C-4, §9 "a rule implemented
+    // twice diverges").
+    async (args) => perceptCall('device_console_logs', 'console-logs',
+      Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      'read the captured console output from the device'),
   );
 
   // ── Crash reports ──────────────────────────────────────────

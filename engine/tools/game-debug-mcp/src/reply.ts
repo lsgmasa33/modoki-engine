@@ -19,42 +19,6 @@ export function isDeviceError(v: unknown): v is string {
   return isDeviceFailureText(v);
 }
 
-// ── device_console_logs reply shape (#644) ─────────────────────────────────
-export type ConsoleLogEntry = { level: string; args: string[]; timestamp: number };
-export type ConsoleLogsReply =
-  /** `ringTotal`/`byLevel` (#1214) describe the whole ring, level filter ignored — absent from an app
-   *  built before them, so they stay optional rather than defaulting to a false 0. */
-  | { ok: true; logs: ConsoleLogEntry[]; dropped: number; ringTotal?: number; byLevel?: Record<string, number> }
-  | { ok: false; got: string };
-
-/** Shape-tolerant parse of `handleConsoleLogs`'s (`engine/app/debug/bridge.ts`) reply.
- *
- *  Root cause of #644: the tool used to assert exactly one wire shape (`const {logs, dropped} =
- *  parseReply(raw)`) and blow up with `result.map is not a function` on anything else. That
- *  "anything else" is not hypothetical — `handleConsoleLogs` returned a BARE ARRAY before
- *  `6f5e81b48`, and this MCP server is a LONG-LIVED process (started once per session) that does
- *  NOT pick up a rebuilt tree, so a session straddling that commit runs the OLD parser against a
- *  device on the NEW bridge (or vice versa). Tolerating both shapes here turns a version-skew
- *  CRASH into a normal read.
- *
- *  `got`, for the unrecognised case, is built from the value's SHAPE only, never its content — a
- *  captured console line can be long and can carry secrets, so it must never appear in a tool
- *  reply's error text. */
-export function parseConsoleLogsReply(raw: unknown): ConsoleLogsReply {
-  const v = parseReply<unknown>(raw);
-  if (v == null) return { ok: true, logs: [], dropped: 0 }; // an empty ring is an ANSWER, not a failure
-  if (Array.isArray(v)) return { ok: true, logs: v as ConsoleLogEntry[], dropped: 0 }; // pre-6f5e81b48 bridge
-  if (typeof v === 'object' && 'logs' in v && Array.isArray((v as { logs: unknown }).logs)) {
-    const obj = v as { logs: ConsoleLogEntry[]; dropped?: unknown; ringTotal?: unknown; byLevel?: unknown };
-    return {
-      ok: true, logs: obj.logs, dropped: typeof obj.dropped === 'number' ? obj.dropped : 0,
-      ...(typeof obj.ringTotal === 'number' ? { ringTotal: obj.ringTotal } : {}),
-      ...(obj.byLevel && typeof obj.byLevel === 'object' && !Array.isArray(obj.byLevel) ? { byLevel: obj.byLevel as Record<string, number> } : {}),
-    };
-  }
-  return { ok: false, got: describeShape(v) };
-}
-
 // ── device_native_logs reply shape (#648) ──────────────────────────────────
 export type NativeLogsReply =
   | { ok: true; logs: string[]; error?: string }

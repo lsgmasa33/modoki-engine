@@ -38,6 +38,8 @@
 /** The shape `dumpConsoleLogs` serves. Mirrors `agentBridge`'s own entry so a registered source is
  *  indistinguishable from the native buffer at the read site. */
 export interface ConsoleSourceEntry {
+  /** The shared ring's seq — the cursor `console-logs`' `since` reads (#1559). */
+  seq: number;
   level: 'log' | 'warn' | 'error';
   ts: number;
   text: string;

@@ -41,6 +41,7 @@ Grouped:
   native logs" below) · `device_crash_reports` (iOS crash + jetsam reports — the only surface that
   explains a death that already happened).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
+  `device_wait_for` (the runtime half of `modoki_wait_for`: `entity`/`console` conditions only) ·
   `device_resolve_refs` · `device_introspect` · `device_game_tools` (what TOOLS the connected
   game registers — [agent-tools.md](agent-tools.md); invoke one with `device_game_tool_call`) ·
   `device_layout_bounds` · `device_watch` ·
@@ -1009,6 +1010,17 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
   - `editor {playState|runMode|advancing|scenePath}` — every given field must equal
     `get_editor_state`'s.
 
+  **Where it is registered (#1559 C-12).** The op registers in the RUNTIME (`agentBridge.ts`) with the
+  `entity` and `console` readers, so the device has it as `device_wait_for`; the editor replaces
+  that registration with the same readers plus `chrome` and `editor`, the two only it can answer. The
+  runtime registration carries an `accepts` predicate, so on the HMR relay a page with no editor (a
+  `#/game/<id>` tab) DECLINES a `chrome`/`editor` wait rather than refusing it — the relay settles on
+  the first answer that is not a decline (#1030), and the instant refusal used to beat the editor's
+  park. On a device a `chrome`/`editor` condition is refused by name, and `device_wait_for` caps its park at
+  55 s: `/api/device/request` sizes the transport deadline as the op's `timeoutMs` + 5 s, capped at
+  60 s, so a longer park would outlive its own transport. The console `level` is a threshold there
+  too (below).
+
   It checks at once, then polls every 50 ms, which keeps working while `advancing:false` freezes
   frames. Satisfied → `{satisfied:true, elapsedMs, observation}`; a timeout is a NORMAL result
   `{satisfied:false, timedOut:true, lastObservation}` — read `lastObservation` for why. A condition
@@ -1626,10 +1638,20 @@ existing agent call for a cosmetic win. Read across:
 | screen-space rects | `modoki_get_layout_bounds` | `device_layout_bounds` |
 | a picture of it | `modoki_capture_viewport` | `device_screenshot` |
 | what can I dispatch? | `modoki_list_actions` | `device_introspect` |
+| wait for a condition | `modoki_wait_for` | `device_wait_for` (entity/console only) |
 | the GAME's own tools | they appear as tools (`court_load_level`) | `device_game_tools` + `device_game_tool_call` — deliberately NOT a dynamic tail; see [agent-tools.md](agent-tools.md) |
 
 **Editor-only BY NATURE, recorded rather than filed as a gap — the §9 ledger.** A capability on one
 surface and not the other is a *finding*: either closed, or written down here with the reason.
+
+**PARAMETER-level differences between twins are enforced, not tabulated here (#1559).**
+`engine/tests/tools/twinParamParity.test.ts` walks both live registries and fails on a param one twin
+takes and the other lacks, a differing stated default, or a device tool with no editor twin — unless
+its `RECORDED` / `RECORDED_DEFAULTS` / `DEVICE_ONLY` table gives the reason, and a record that no longer
+holds fails too. That is where `label`/`within`/`modifiers` (editor chrome and mouse, not the device),
+`duplicate_entity.count` (a device load-test knob), `drag.steps` 5 vs 10 (different pacing models) and
+the `wait_for` `chrome`/`editor` conditions are written down. The 2026-09-25 audit found four such
+gaps nobody had recorded; nothing compared the twins before.
 
 | Editor-only tool | Why there is nothing for a device counterpart to do |
 |---|---|
@@ -2132,7 +2154,31 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   evicted; the rest rolls. No cap survives an error loop, and an error loop is precisely when the
   boot lines are wanted, so size alone cannot deliver the guarantee. 1000 entries in the editor, 512
   on a debug device build (matching the 200+300 it replaced).
-- **Console:** `modoki_get_console_logs` returns the **last 50** plus three numbers that do NOT mean the
+- **Console:** `modoki_get_console_logs` and `device_console_logs` are ONE op (`console-logs`) since
+  #1559 — the device kept its own bridge command before, with a prose reply, no counts, no `since` and
+  an exact-match `level` that disagreed with the editor's about `info`. Its filters, owner decisions
+  2026-09-25:
+  - **`level` is a threshold** — that level or worse, as on the journals (`warn` → warn + error);
+    `log` and `info` rank together. It used to be an exact match, so `level:'warn'` hid the errors.
+    `wait_for`'s console condition reads it the same way.
+  - **`since` is the ring's seq cursor**, with editor_journal's contract: entries carry `seq`, the
+    reply hands back `nextSeq` and `epoch`, and a `since` read pages **oldest-first** — a truncated
+    page's `nextSeq` is its last row, so polling never skips a line. (A tail here handed back the
+    newest 50 of an error storm and a cursor past the rest, so the first error — the cause — was
+    unreachable; the close-out review observed it.) An untruncated read moves `nextSeq` to the newest
+    seq in the WHOLE ring, so a `level:'error'` poll does not re-read what it filtered out. A bare
+    read is still the newest 50.
+  - **`epoch` is the ring's identity for this page load.** Send it back with `since`: a mismatch
+    means the ring restarted (a reload — a game-code edit forces one) and the read starts over with
+    `cursorReset` (a sentence, as on the journal). Without it only a cursor ABOVE the new ring's
+    newest seq can be recognised, and once the reloaded page has logged past the old cursor its boot
+    lines — where the error the edit caused sits — were skipped silently (observed in review).
+  - **`sinceMs` is the clock form** (epoch ms). Both together are refused `AMBIGUOUS`; a timestamp
+    passed as `since` (≥ 1e11, which no seq reaches) is refused with a pointer to `sinceMs`, because
+    `since` WAS epoch ms before and an old caller would otherwise silently match nothing — and a seq
+    passed as `sinceMs` (< 1e11, an instant in 1970) is refused with a pointer to `since`.
+
+  A bare read returns the **last 50** (a `since` read, the oldest 50 after the cursor) plus three numbers that do NOT mean the
   same thing: `returnedCount` (what came back), `totalCount` (what matched `level=`/`since=`), and
   `ringTotal`+`byLevel` (the WHOLE ring — 1000 entries in the editor, 512 on a debug device build
   since #596/#597 — regardless of the filter). That last part is the
@@ -2159,8 +2205,8 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `SkeletalAnimator.activeClip`/`normalizedTime` and RigidBody `isSleeping`), `world` (resolved world TRS
   + `activeInHierarchy`), `bounds` (per-entity `screen` rect + `onScreen` + 3D `worldAABB {size,center}`),
   `contacts` (live solid `contacts` + sensor `overlaps`, GUIDs — a code-spawned partner has a runtime guid (#1210); `id:<n>` only for one with no guid — since #1248 only an entity whose EntityAttributes was removed after spawn), `resources` (include resource entities,
-  excluded by default), `limit` (`truncated` when it bites; `returnedCount`/`totalCount` are always present; an explicit `limit` always wins, and a
-  targeted query is never silently capped). **Floats are rounded to 9 significant digits**
+  excluded by default), `limit` (`truncated` when it bites; `returnedCount`/`totalCount` are always present; an explicit `limit` always wins; defaults are
+  200 for the untargeted index and 20 for a targeted read, and a capped reply puts `truncated` and a hint naming the hidden count BEFORE its rows — #1557). **Floats are rounded to 9 significant digits**
   (`247.13061935179246` → `247.130619`; max error 3.5e-7) — ~18–21% of the tokens on a Transform
   drill-down. **Verify an edit with a TOLERANCE, not `===`.** `precision=0` returns exact float64;
   the same param exists on `get_layout_bounds` and `watch`.
@@ -2630,7 +2676,7 @@ its plugin set, so the heal reports that case rather than rewriting it. For a pr
 Dev-only endpoints + scene hot-reload so an AI agent (or any tooling) can edit scenes via plain `curl` and verify the result **without driving a browser/screenshot**. All dev-only (the asset-scanner middleware only runs under `vite` dev). Server: `engine/plugins/vite-asset-scanner.ts`. Browser client: `engine/app/debug/agentBridge.ts` (gated on `import.meta.hot`, stripped from prod). Pure logic (shared Node + browser): `packages/modoki/src/runtime/scene/{sceneValidation,sceneMutate,sceneSchema}.ts`; ref predicates in import-free `runtime/core/assetRefRules.ts`.
 
 - **Scene/prefab hot-reload** — editing a scene file on disk (the `Edit` tool, `git checkout`, `/api/scene-mutate`) auto-reloads the **active** scene in the browser; editor camera + selection are preserved (selection via the existing GUID-keyed `selectionRestore`). A prefab edit reloads the current scene (instances re-expand). The watcher classifies files with the scanner's own `detectType()` — **scene files are positively identified by the `.scene.json` suffix** (or, as a legacy fallback, a plain `.json` under a `scenes/` dir — issue #54). The editor's own Cmd+S saves (`/api/write-file`) are suppressed (1.5s self-write guard) so they don't bounce the live scene; external edits still reload.
-- **`curl localhost:5173/api/scene-state[?trait=Transform][&id=N]`** — returns the **live ECS world** as JSON. **Bare it is an INDEX** (`{scenePath, returnedCount, totalCount, resourcesExcluded?, entities:[{id,guid,name,parentId,layer,traits:[names]}], hint}`), capped at a default `limit` of 200 entities — past that it clips and gains `truncated`. `returnedCount` is the rows returned and `totalCount` every entity the query matched before the limit; both are always present. Pass a target (`trait`/`id`/`name`/`where`) or an enricher (`full`/`world`/`bounds`/`contacts`) to get trait **values** (`traits` becomes an object); a targeted query is never capped unless you pass `limit`. Relays to the open tab over the HMR socket (504 if no app is open). Because it reads the live world (not the file), a changed value here proves a hot-reload actually took effect. **Prefer this over screenshots to verify scene edits.**
+- **`curl localhost:5173/api/scene-state[?trait=Transform][&id=N]`** — returns the **live ECS world** as JSON. **Bare it is an INDEX** (`{scenePath, returnedCount, totalCount, resourcesExcluded?, entities:[{id,guid,name,parentId,layer,traits:[names]}], hint}`), capped at a default `limit` of 200 entities — past that it clips and gains `truncated`. `returnedCount` is the rows returned and `totalCount` every entity the query matched before the limit; both are always present. Pass a target (`trait`/`id`/`name`/`where`) or an enricher (`full`/`world`/`bounds`/`contacts`) to get trait **values** (`traits` becomes an object); `trait=` also SELECTS — only the entities carrying it come back. A targeted query is capped at 20 by default, disclosed (`truncated` + a hint with the hidden count, before the rows); pass `limit` for more. Relays to the open tab over the HMR socket (504 if no app is open). Because it reads the live world (not the file), a changed value here proves a hot-reload actually took effect. **Prefer this over screenshots to verify scene edits.**
 - **`curl .../api/validate-scene?path=/games/.../x.json`** — warn-but-load validation: unknown trait/field, type mismatch, and the literal-asset-path-instead-of-GUID mistake (see "Asset References" in `CLAUDE.md`). Needs a tab open to push the trait schema (`schemaAvailable:false` ⇒ ref checks still run, type checks skipped).
 - **`POST .../api/scene-mutate {path, ops}`** — validated `setTrait`/`removeTrait`/`addEntity`/`removeEntity` (entity ref by `id`/`name`/`guid`; mints GUIDs); writes atomically; returns `{ok, changed, errors, warnings}`. Hot-reload then reflects it. It does **NOT** echo the scene back (that fired on every edit and cost ~10k tokens of context for data nobody read — and it was the pre-expansion *file*, not the live world). Pass `returnScene:true` if you actually want the written file; **to verify an edit, read `/api/scene-state`.**
 - **`GET .../api/editor-state`** + **`POST .../api/editor-action {action, …}`** (allowlisted) + **`GET .../api/scenes`** + **`POST .../api/import-file {srcPath, destFolder}`** — the editor-parity surface (live UI state read; selection/play/undo/scene/prefab/entity actions; scene list; Finder-style import). `editor-state`/`editor-action` relay to the renderer, so they need a tab/editor open. See the modoki MCP section above for the tool wrappers.

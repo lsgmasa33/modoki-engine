@@ -283,6 +283,7 @@ import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, 
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
+import { DEVICE_REQUEST_HEADROOM_MS, WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS } from '../../tools/shared/waitForTiming';
 import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import { PROFILER_MUTATING_ACTIONS, PROFILER_READ_ACTIONS } from '../../tools/shared/profilerActions';
 import { decodeSceneOpsReply } from './sceneOpsReply';
@@ -1534,10 +1535,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // browser. Lets tooling read editor errors (failed scene/mesh loads, etc.)
   // without a devtools/MCP attach — the curl-able sibling of /api/scene-state.
   if (urlPath === '/api/console-logs' && method === 'GET') {
-    const params: { level?: string; limit?: number; since?: number } = {};
+    const params: { level?: string; limit?: number; since?: number; sinceMs?: number; epoch?: string } = {};
     const level = query.get('level');
     const limit = query.get('limit');
     const since = query.get('since');
+    const sinceMs = query.get('sinceMs');
     if (level) params.level = level;
     // NaN-guard, like the /api/journal and /api/editor-journal siblings. `?limit=abc` would
     // otherwise pass NaN through to the op's tail: `NaN ?? 50` is NaN (nullish coalescing does
@@ -1546,6 +1548,9 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // `ts > NaN` is false, so it returns zero logs and hides real errors.
     if (limit != null && limit !== '' && !Number.isNaN(Number(limit))) params.limit = Number(limit);
     if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
+    if (sinceMs != null && sinceMs !== '' && !Number.isNaN(Number(sinceMs))) params.sinceMs = Number(sinceMs);
+    const epoch = query.get('epoch');
+    if (epoch) params.epoch = epoch;
     return relayJson(ctx, 'console-logs', params);
   }
 
@@ -1582,7 +1587,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // ── GET /api/game-introspect (M→R) ── discoverable dispatchable actions (+ param
   // schemas) and live named read-values, so an agent knows what it can trigger/read.
   if (urlPath === '/api/game-introspect' && method === 'GET') {
-    return relayJson(ctx, 'game-introspect', {});
+    const name = query.get('name');
+    return relayJson(ctx, 'game-introspect', name ? { name } : {});
   }
 
   // ── GET /api/game-tools (M→R) ── the GAME's own MCP tool declarations (#270). The MCP server
@@ -1816,7 +1822,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       const opTimeout = Number((b.params as { timeoutMs?: unknown } | undefined)?.timeoutMs);
       // Headroom for the round trip in BOTH directions. Deliberately smaller than /api/eval's
       // 10s — that one crosses an HMR websocket relay; this is one LAN/USB hop.
-      const deadline = Number.isFinite(opTimeout) && opTimeout > 0 ? opTimeout + 5_000 : undefined;
+      const deadline = Number.isFinite(opTimeout) && opTimeout > 0 ? opTimeout + DEVICE_REQUEST_HEADROOM_MS : undefined;
       const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p, deadline);
       // SYSTEM logs come from the HOST, not the app (see deviceSyslog.ts). Handled before every
       // lease-dependent path below, and deliberately NOT gated on the lease: the questions this
@@ -2669,8 +2675,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
  * Probes each ref with a TARGETED query, one at a time. A BARE `scene-state` would be wrong
  * in two ways that both manufacture a NEW lie ("really is absent") in the function written to
  * stop lying: the untargeted index DROPS resource entities (`all.filter(e => !e.isResource)`)
- * and is CAPPED at DEFAULT_INDEX_LIMIT. Targeting opts back into the uncapped,
- * resource-inclusive path — which is exactly why those params exist.
+ * and is CAPPED at DEFAULT_INDEX_LIMIT. Targeting opts back into the
+ * resource-inclusive path (and `isLive` lifts the targeted cap with an explicit limit, #1557).
  *
  * Best-effort by construction: no editor connected (headless curl / pure runtime) → no hint,
  * and the plain error stands. It must never turn a mutate into a 500.
@@ -2679,7 +2685,9 @@ async function describeUnresolvedAgainstLiveWorld(
   ctx: BackendContext,
   unresolved: EntityRef[],
 ): Promise<string | null> {
-  /** Is THIS ref live? Targeted probe ⇒ uncapped + includes resource entities. */
+  /** Is THIS ref live? Targeted probe ⇒ includes resource entities. Uncapped by an explicit `limit`:
+   *  a targeted read defaults to 20 rows (#1557), and a `name` probe re-checks the EXACT name among
+   *  every CONTAINS match, so the exact one sitting past row 20 would read as "not live". */
   const isLive = async (ref: EntityRef): Promise<boolean | null> => {
     // `guid`, not a `where EntityAttributes.guid=` string compare: the filter resolves through
     // `findEntityByGuid`, which follows a runtime guid a save re-minted (#1223).
@@ -2687,7 +2695,7 @@ async function describeUnresolvedAgainstLiveWorld(
       ? { guid: ref.guid }
       : ref.id != null
         ? { id: ref.id }
-        : { name: ref.name };
+        : { name: ref.name, limit: 100_000 };
     const r = (await ctx.requestBrowser('scene-state', params, 2000)) as
       | { entities?: Array<{ name?: string }> }
       | null;
@@ -5478,13 +5486,13 @@ async function describeUnresolvedAgainstLiveWorld(
   // unevaluable condition is the op's refusal, before it parks. The body is forwarded whole so the
   // op — not this relay — owns validation, and a field added there cannot be dropped here.
   //
-  // The relay deadline must clear the op's own, exactly as /api/wait-for-edit below: the clamp
-  // (WAIT_FOR_DEFAULT_MS 5000, [50, 120000] in waitFor.ts) is restated, not imported — plugins/
-  // cannot import app/.
+  // The relay deadline must clear the op's own, exactly as /api/wait-for-edit below: the clamp is the
+  // op's, from `tools/shared/waitForTiming.ts` (#1559 — it was restated here while plugins/ could not
+  // import app/, and the shared module is what ended that).
   if (urlPath === '/api/wait-for' && method === 'POST') {
     const b = (body ?? {}) as Record<string, unknown>;
-    const t = typeof b.timeoutMs === 'number' && Number.isFinite(b.timeoutMs) ? b.timeoutMs : 5000;
-    const opTimeout = Math.max(50, Math.min(120_000, Math.floor(t)));
+    const t = typeof b.timeoutMs === 'number' && Number.isFinite(b.timeoutMs) ? b.timeoutMs : WAIT_FOR_DEFAULT_MS;
+    const opTimeout = Math.max(WAIT_FOR_MIN_MS, Math.min(WAIT_FOR_MAX_MS, Math.floor(t)));
     return relayJson(ctx, 'wait-for', b, opTimeout + 10_000);
   }
 

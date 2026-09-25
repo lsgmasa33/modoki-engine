@@ -183,10 +183,36 @@ returns the elision envelope + hint — correct, but it means "give me literally
 longer one call; use `trait=`/`id=`/`limit=`.
 
 The default `limit` applies only when the caller passed none, so an explicit `limit:100000` still
-wins. Implemented at the **route/tool boundary**, not in `dumpSceneState()`:
-`engine/electron/main.ts`'s `/api/capture-gesture` route (`captureGesture`'s Watch sampler)
-calls the `scene-state` op with `trait:'Transform'` — targeted, so it keeps values regardless,
-and the producer is untouched.
+wins. Both defaults live in `dumpSceneState()` (`DEFAULT_INDEX_LIMIT`, `DEFAULT_TARGETED_LIMIT`), so
+the editor and device twins share them.
+
+### Targeted reads: `trait=` selects, and a cap of 20 that says so (#1557)
+
+Two months of transcripts (2026-07-26 → 09-25), grouped by ARGUMENTS, put the tail of this tool on
+**targeted** reads, not on `full`:
+
+| Call | Chars | Why |
+|---|---|---|
+| `trait=CourtConfig` | 35–44k | 274 rows, **273 of them `traits:{}`** — `trait=` projected fields but did not select rows |
+| `name=Account` | 36k | a substring matching 17+ UI entities at ~2k per row, and targeted reads were uncapped |
+| `name=…` (all) | 546k over 101 calls, p90 17k | the heaviest argument group |
+
+So `trait=X` now **selects** the entities that carry X (an unregistered name selects nothing and its
+warning says the name is wrong), and a targeted read defaults to **20** rows. It used to be uncapped
+on purpose — losing rows *silently* would be worse than a large answer — so the cap is never silent
+(owner, 2026-09-25): a capped reply puts `truncated:true` and a hint ("Showing 20 of 37 matches — 17
+MORE are not shown … Pass limit=37 for all of them") **before** `entities`, where a reader skimming the
+rows meets it first. Internal callers that need every match pass an explicit `limit`
+(`editorBackendRouter.ts`'s `isLive` name probe); `wait_for` asks for `limit:1` and reads
+`totalCount`, and `capture_gesture` samples one guid.
+
+### `list_actions` / `device_introspect` — names first (#1557)
+
+Both twins read one op, `game-introspect`. Every row used to carry its param schema — `null` for
+nearly all of them — so "what can I dispatch?" cost a median **5.7k chars** per call (38 calls, 194k in
+the 2026-09-25 transcripts). A bare call now answers `actionCount` + `actions: string[]` + the live
+`readValues`; `name=<substr>` (case-insensitive, as `get_scene_state`'s `name`) returns the matches as
+`{name, params}`, and a miss carries the empty-filter hint naming the closest live action.
 
 ### `get_layout_bounds` — counts-first, `overlaps` opt-in
 
@@ -301,7 +327,7 @@ never in the producer. The ceilings below are **measured** (bytes/entry × ring 
 
 | Tool | Producer (untouched) | Seam | Boundary default | Measured ceiling |
 |---|---|---|---|---|
-| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 + `returnedCount`/`totalCount`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
+| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 bare, oldest 50 after a `since` cursor (#1559) + `returnedCount`/`totalCount`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
 | `watch` (`read`) | `readWatch()` — `WatchTab.tsx`'s `WatchCard` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
 | `journal` | `journalEvents()` — cap `journal.ts`'s `MAX_EVENTS` — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
 | `editor_journal` | `readEditorJournal()` — cap `editorJournal.ts`'s `MAX_EVENTS` | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |

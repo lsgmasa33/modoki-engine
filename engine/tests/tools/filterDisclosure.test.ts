@@ -4,7 +4,6 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { describeFilter, emptyFilterHint, histogram, liveSet } from '../../tools/shared/filterDisclosure';
-import { parseConsoleLogsReply } from '../../tools/game-debug-mcp/src/reply';
 import { loadDeviceSurface, deviceReply, type DeviceSurface } from './deviceSurface';
 import { loadSurface } from './mcpSurface';
 
@@ -48,41 +47,6 @@ describe('filterDisclosure', () => {
       .toBe('no entity matches name=X — and none exist to match (0 unfiltered), so the filter is not why this is empty.');
     const h = emptyFilterHint({ what: 'entity', filter: 'name=Plyer', unfilteredCount: 2, live: { name: ['Enemy', 'Player'], empty: [''] }, near: { name: 'Plyer' } });
     expect(h).toBe('no entity matches name=Plyer, but 2 exist unfiltered. Live now: name ∈ {Player, Enemy}. Check the spelling, or drop the filter.');
-  });
-});
-
-describe('device_console_logs discloses the whole ring (#1214)', () => {
-  let s: DeviceSurface | undefined;
-  afterEach(() => { s?.restore(); s = undefined; });
-  const call = async (reply: unknown, args: Record<string, unknown>) => {
-    s = await loadDeviceSurface((req) => req.path === '/api/device/request' ? deviceReply(reply) : undefined);
-    const r = await s.call('device_console_logs', args);
-    expect(r.isError).toBeFalsy();
-    return s.text(r);
-  };
-
-  it('the parser keeps ringTotal/byLevel, and leaves them out for an older app', () => {
-    expect(parseConsoleLogsReply({ logs: [], dropped: 0, ringTotal: 3, byLevel: { warn: 3 } }))
-      .toEqual({ ok: true, logs: [], dropped: 0, ringTotal: 3, byLevel: { warn: 3 } });
-    expect(parseConsoleLogsReply({ logs: [], dropped: 0 })).toEqual({ ok: true, logs: [], dropped: 0 });
-  });
-
-  it('an empty level-filtered read names the level and the ring', async () => {
-    const text = await call({ logs: [], dropped: 0, ringTotal: 800, byLevel: { warn: 3, log: 797 } }, { level: 'error' });
-    expect(text).toBe('No console entries at level=error. The ring holds 800 entries at any level (warn 3, log 797).');
-  });
-
-  it('an older app (no ringTotal) still names the level', async () => {
-    expect(await call({ logs: [], dropped: 0 }, { level: 'error' })).toBe('No console entries at level=error.');
-  });
-
-  it('a filtered read with rows says it is filtered', async () => {
-    const text = await call({ logs: [{ level: 'error', args: ['boom'], timestamp: 0 }], dropped: 0, ringTotal: 5, byLevel: { error: 1, log: 4 } }, { level: 'error' });
-    expect(text).toMatch(/\[error\] boom\n\(level=error only\. The ring holds 5 entries/);
-  });
-
-  it('an unfiltered empty ring stays "No console logs."', async () => {
-    expect(await call({ logs: [], dropped: 0, ringTotal: 0, byLevel: {} }, {})).toBe('No console logs. The ring holds 0 entries at any level.');
   });
 });
 

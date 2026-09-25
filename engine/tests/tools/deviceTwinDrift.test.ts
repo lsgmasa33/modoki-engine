@@ -197,3 +197,53 @@ describe('device_layout_bounds: guid and name filters reach the device (#1208 P1
     expect(relayed(s).params).toMatchObject({ guids: ['g-1'], name: 'Puck' });
   });
 });
+
+describe('device_wait_for (#1559 C-12): the runtime wait-for op, reached from the device', () => {
+  it('relays wait-for and ALWAYS forwards timeoutMs — the transport deadline is sized from it', async () => {
+    s = await loadDeviceSurface(() => deviceReply({ satisfied: true, elapsedMs: 0, condition: 'entity', observation: {} }));
+    const r = await s.call('device_wait_for', { entity: { name: 'Player' } });
+    expect(r.isError).toBeFalsy();
+    expect(relayed(s)).toEqual({ method: 'wait-for', params: { entity: { name: 'Player' }, timeoutMs: 5000 } });
+  });
+
+  it('takes no chrome/editor condition — those read the editor', async () => {
+    s = await loadDeviceSurface(() => deviceReply({}));
+    expect(s.validate('device_wait_for', { editor: { playState: 'playing' } }).ok).toBe(false);
+    expect(s.validate('device_wait_for', { chrome: { label: 'Play' } }).ok).toBe(false);
+  });
+
+  it('refuses a park the device transport could not outlast', async () => {
+    s = await loadDeviceSurface(() => deviceReply({}));
+    expect(s.validate('device_wait_for', { entity: { name: 'P' }, timeoutMs: 56_000 }).ok).toBe(false);
+    expect(s.validate('device_wait_for', { entity: { name: 'P' }, timeoutMs: 55_000 }).ok).toBe(true);
+  });
+});
+
+describe('device_duplicate_entity takes the entity alias its editor twin takes (#1559 C-13)', () => {
+  it('entity:{guid} relays as the flat guid', async () => {
+    s = await loadDeviceSurface(() => deviceReply({ ok: true, guids: ['g-2'] }));
+    await s.call('device_duplicate_entity', { entity: { guid: 'g-1' }, count: 2 });
+    expect(relayed(s)).toEqual({ method: 'duplicate-entity', params: { guid: 'g-1', count: 2 } });
+  });
+
+  it('entity beside a flat guid is refused AMBIGUOUS and relays nothing', async () => {
+    s = await loadDeviceSurface(() => deviceReply({ ok: true }));
+    const r = await s.call('device_duplicate_entity', { guid: 'g-1', entity: { guid: 'g-9' } });
+    expect(r.isError).toBe(true);
+    expect(s.text(r)).toMatch(/AMBIGUOUS/);
+    expect(s.real().some((q) => q.path.startsWith('/api/device/request'))).toBe(false);
+  });
+
+  it('entity takes no name — the op has no name resolver', async () => {
+    s = await loadDeviceSurface(() => deviceReply({}));
+    expect(s.validate('device_duplicate_entity', { entity: { name: 'Crate' } }).ok).toBe(false);
+  });
+});
+
+describe('device_diagnose takes video, as its editor twin does (#1559)', () => {
+  it('forwards video:true to the diagnose op', async () => {
+    s = await loadDeviceSurface(() => deviceReply({ ok: true }));
+    await s.call('device_diagnose', { video: true });
+    expect(relayed(s)).toEqual({ method: 'diagnose', params: { video: true } });
+  });
+});

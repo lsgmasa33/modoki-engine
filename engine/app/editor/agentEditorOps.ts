@@ -25,9 +25,8 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, dumpSceneState, whereError } from '../debug/agentBridge';
-import { conditionError, waitForCondition, clampWaitTimeout, type WaitCondition, type WaitReaders } from '../debug/waitFor';
-import { getConsoleRingEntries } from '@modoki/engine/runtime/core/consoleRing';
+import { registerAgentOp as _registerAgentOp, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
 import { getGameBootFaults } from './gameBootFaults';
@@ -83,7 +82,7 @@ import {
   getAllTraits, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
-  sceneManager, assetUrl, type AssetSchemaType, collectHandles, rawNow, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
+  sceneManager, assetUrl, type AssetSchemaType, collectHandles, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -1388,39 +1387,19 @@ export function registerEditorAgentOps(): void {
   // `debug/waitFor.ts`; this binds its readers to the resolvers the matching READ tools use.
   // Unwrapped for wait-for-edit's reason below: it parks, and the agent wrapper would attribute
   // every human edit made during the park to 'agent'. Listed in evalApi.ts's ATTRIBUTION_OPS too.
+  //
+  // #1559 C-12: the runtime registers `wait-for` itself with the `entity`/`console` readers, so a device
+  // has it too (§9); the editor REPLACES that registration with the same readers plus the two only it
+  // can answer, `chrome` and `editor`.
   const waitReaders: WaitReaders = {
+    ...runtimeWaitReaders,
     chrome: ({ label, id }) => collectHandles({ editor: 'chrome', ...(label ? { label } : {}), ...(id ? { ids: [id] } : {}) })
       .map((h) => ({ id: h.id, label: h.label, meta: h.meta as Record<string, unknown> | undefined })),
-    whereError,
-    entities: ({ guid, name, where }) => {
-      // `trait` narrows the one returned row to the trait the predicate reads, keeping the
-      // observation small; `limit:1` because the wait needs a count and one example, not a dump.
-      const trait = where ? /^\s*(\w+)\./.exec(where)?.[1] : undefined;
-      const r = dumpSceneState({ guid, name, where, ...(trait ? { trait } : {}), limit: 1 }) as { entities: unknown[]; totalCount: number };
-      return { count: r.totalCount, first: r.entities[0] };
-    },
-    consoleSince: (seq) => getConsoleRingEntries(seq),
-    consoleWatermark: (lookbackMs) => {
-      const all = getConsoleRingEntries();
-      if (!lookbackMs) return all.at(-1)?.seq ?? 0;
-      // `mono` is the ring's own `rawNow()` stamp, so the cutoff is on the same clock.
-      const cutoff = rawNow() - lookbackMs;
-      let mark = 0;
-      for (const e of all) { if (e.mono < cutoff) mark = e.seq; else break; }
-      return mark;
-    },
     editorState: () => readEditorState() as unknown as Record<string, unknown>,
     chromeLabels: () => collectHandles({ editor: 'chrome' }).map((h) => h.label ?? '').filter(Boolean),
     chromeIds: () => collectHandles({ editor: 'chrome' }).map((h) => h.id),
-    entityNames: () => getAllEntities().map((e) => e.name ?? '').filter(Boolean),
   };
-  _registerAgentOp('wait-for', (params) => {
-    const p = (params ?? {}) as WaitCondition & { timeoutMs?: unknown };
-    const { timeoutMs, ...cond } = p;
-    const why = conditionError(cond, waitReaders);
-    if (why) throw new OpRefusal('REFUSED_BY_OP', `wait-for: ${why} — nothing was waited for.`);
-    return waitForCondition(cond, { readers: waitReaders, timeoutMs: clampWaitTimeout(timeoutMs) });
-  });
+  _registerAgentOp('wait-for', (params) => runWaitFor(params, waitReaders));
 
   // ── wait-for-edit (#28) ── long-poll twin of editor-journal: park until the human does
   // something instead of the agent polling in a loop. Registered as a plain renderer op

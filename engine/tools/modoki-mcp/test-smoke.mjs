@@ -1514,11 +1514,11 @@ if (canUC3) {
   const actions = JSON.parse(text(await client.callTool({ name: 'modoki_list_actions', arguments: {} })));
   const missingActions = !Array.isArray(actions.actions) || actions.actions.length === 0;
   // ENGINE-level actions, present regardless of which project is open.
-  const missingHaptics = !missingActions && !actions.actions.some((a) => a.name === 'haptics.toggle');
+  const missingHaptics = !missingActions && !actions.actions.includes('haptics.toggle');
   if (missingActions || missingHaptics) {
     const reason = missingActions
       ? `list_actions returned no actions: ${JSON.stringify(actions)}`
-      : `list_actions is missing the engine-level 'haptics.toggle' action: ${JSON.stringify(actions.actions.map((a) => a.name))}`;
+      : `list_actions is missing the engine-level 'haptics.toggle' action: ${JSON.stringify(actions.actions)}`;
     skipped.push(`dispatch_action — ${reason}`);
     console.log(`dispatch_action SKIPPED — ${reason}`);
   } else {

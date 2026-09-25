@@ -78,10 +78,13 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_list_actions',
-    'Discover what the game exposes: dispatchable UI/game action names (+ their param schemas) ' +
-      'and live named read-values (e.g. canGoBack, timeSinceGameStart). Use before modoki_dispatch_action.',
-    {},
-    async () => getJson('/api/game-introspect'),
+    'Discover what the game exposes: dispatchable UI/game action NAMES and live named read-values ' +
+      '(e.g. canGoBack, timeSinceGameStart). Use before modoki_dispatch_action. Bare = names only; ' +
+      'name=<substr> returns the matching actions with their param schemas.',
+    {
+      name: z.string().optional().describe('Case-insensitive substring of an action name; the matches come back as {name, params}.'),
+    },
+    async ({ name }) => getJson(`/api/game-introspect${name ? `?name=${encodeURIComponent(name)}` : ''}`),
   );
   tool(
     'modoki_dispatch_action',

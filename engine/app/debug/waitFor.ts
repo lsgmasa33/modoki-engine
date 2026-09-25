@@ -19,15 +19,13 @@
 
 import { PLAY_STATES, RUN_MODES, type PlayState, type RunMode } from '@modoki/engine/runtime';
 import { LIVE_VOCABULARY_CAP, liveSet } from '../../tools/shared/filterDisclosure';
+import { CONSOLE_LEVELS, atConsoleLevel, type ConsoleLevel } from '../../tools/shared/consoleLevels';
 
-export const WAIT_FOR_DEFAULT_MS = 5_000;
-export const WAIT_FOR_MIN_MS = 50;
-/** Same ceiling as `wait-for-edit`: long enough for a scene load or a human, short enough that a
- *  wedged renderer does not hold an HTTP request open indefinitely. Call again to keep waiting. */
-export const WAIT_FOR_MAX_MS = 120_000;
+import { WAIT_FOR_DEFAULT_MS, WAIT_FOR_MIN_MS, WAIT_FOR_MAX_MS } from '../../tools/shared/waitForTiming';
+export { WAIT_FOR_DEFAULT_MS, WAIT_FOR_MIN_MS, WAIT_FOR_MAX_MS };
 export const WAIT_FOR_POLL_MS = 50;
 
-export const CONSOLE_LEVELS = ['log', 'info', 'warn', 'error'] as const;
+export { CONSOLE_LEVELS };
 /** How far before the call a `console.lookbackMs` may reach. */
 export const CONSOLE_LOOKBACK_MAX_MS = 60_000;
 const TEXT_CAP = 300;
@@ -85,7 +83,8 @@ export interface ConsoleEntryLike {
   args: string[];
 }
 export interface WaitReaders {
-  chrome(filter: { label?: string; id?: string }): ChromeHandleLike[];
+  /** Editor chrome — absent on a surface with no editor (a device), where a `chrome` wait is refused. */
+  chrome?(filter: { label?: string; id?: string }): ChromeHandleLike[];
   /** `null` when the expression parses; the parse error otherwise. */
   whereError(where: string): string | null;
   entities(q: { guid?: string; name?: string; where?: string }): { count: number; first?: unknown };
@@ -93,7 +92,8 @@ export interface WaitReaders {
   /** The newest seq logged more than `lookbackMs` ago (0 = the newest seq of all): entries after
    *  it are the ones the wait may match. */
   consoleWatermark(lookbackMs: number): number;
-  editorState(): Record<string, unknown>;
+  /** The editor's state — absent on a surface with no editor, where an `editor` wait is refused. */
+  editorState?(): Record<string, unknown>;
   /** Every live chrome label / entity name, unfiltered (#1214). Optional: a wait that matched nothing
    *  names what IS live from these, so a typo is visible in the same reply. */
   chromeLabels?(): string[];
@@ -178,10 +178,20 @@ export function conditionError(cond: unknown, readers: Pick<WaitReaders, 'whereE
   }
 }
 
+/** Why THIS surface cannot evaluate the condition, or null (#1559 C-12). `entity`/`console` read the
+ *  runtime and run everywhere; `chrome`/`editor` read the editor, which a device does not have — so the
+ *  runtime registration leaves those readers out, and a wait on one is refused by name rather than
+ *  parked on a reader that is absent. */
+export function surfaceError(cond: unknown, readers: Pick<WaitReaders, 'chrome' | 'editorState'>): string | null {
+  const c = (cond ?? {}) as Record<string, unknown>;
+  const kind = c.chrome !== undefined && !readers.chrome ? 'chrome' : c.editor !== undefined && !readers.editorState ? 'editor' : null;
+  return kind ? `${kind} conditions read the EDITOR, and this surface has none — on a device, wait on entity or console` : null;
+}
+
 interface Evaluation { satisfied: boolean; observation: unknown }
 
 function evalChrome(c: ChromeCondition, readers: WaitReaders): Evaluation {
-  const matches = readers.chrome({ label: c.label, id: c.id });
+  const matches = readers.chrome!({ label: c.label, id: c.id });
   const summary = (h: ChromeHandleLike) => ({ id: h.id, ...(h.label ? { label: h.label } : {}), ...(h.meta ? { meta: h.meta } : {}) });
   if (c.absent) return { satisfied: matches.length === 0, observation: { matches: matches.length, ...(matches.length ? { first: summary(matches[0]) } : {}) } };
   const wanted = CHROME_STATE_FIELDS.filter((f) => c[f] !== undefined);
@@ -223,7 +233,7 @@ function evalEntity(c: EntityCondition, readers: WaitReaders): Evaluation {
 }
 
 function evalEditor(c: EditorCondition, readers: WaitReaders): Evaluation {
-  const state = readers.editorState();
+  const state = readers.editorState!();
   const keys = FIELDS.editor.filter((f) => (c as Record<string, unknown>)[f] !== undefined);
   const observation = Object.fromEntries(keys.map((k) => [k, state[k]]));
   return { satisfied: keys.every((k) => state[k] === (c as Record<string, unknown>)[k]), observation };
@@ -287,7 +297,8 @@ export async function waitForCondition(cond: WaitCondition, deps: WaitDeps): Pro
       else {
         const c = cond.console!;
         const fresh = readers.consoleSince(consoleFrom);
-        const hit = fresh.find((e) => (!c.level || e.level === c.level) && e.args.join(' ').includes(c.match));
+        // `level` is a threshold (#1559): waiting for `warn` is satisfied by an error too.
+        const hit = fresh.find((e) => (!c.level || atConsoleLevel(e.level, c.level as ConsoleLevel)) && e.args.join(' ').includes(c.match));
         ev = hit
           ? { satisfied: true, observation: { seq: hit.seq, level: hit.level, text: hit.args.join(' ').slice(0, TEXT_CAP) } }
           : { satisfied: false, observation: { newEntries: fresh.length } };

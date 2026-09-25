@@ -932,7 +932,7 @@ describe('device_read_asset_def\'s enum lists exactly what THIS op dispatches (#
  *  ⚠️ Tested as MEMBERSHIP rather than through `runAgentOp`'s throw, because that is the whole
  *  point: catching `/unknown agent op/` from the dispatch would miscount an op that legitimately
  *  throws those words, and would have RUN the op before deciding whether it existed. */
-describe('hasAgentOp — the relay decline test (#1030)', () => {
+describe('hasAgentOp — the membership half of the relay decline test (#1030; servesAgentOp adds `accepts`, #1559)', () => {
   it('is true for a registered op and false for an unregistered one', () => {
     const registered = listAgentOps();
     expect(registered.length).toBeGreaterThan(0);
@@ -960,7 +960,7 @@ describe('hasAgentOp — the relay decline test (#1030)', () => {
 
 /** ⚠️ A SOURCE guard, and the only kind available here (#1030 close-out F1).
  *
- *  `relayResponseFor`'s DEFAULTS are `hasAgentOp` and `runAgentOp`, so the handler calls it with
+ *  `relayResponseFor`'s DEFAULTS are `servesAgentOp` and `runAgentOp`, so the handler calls it with
  *  the message alone — nothing to pass is nothing to mis-wire. But an argument can still be ADDED,
  *  and `relayResponseFor(msg, () => true)` makes every client claim every op, restoring #1030's
  *  race with the whole suite green. The handler lives inside `initAgentBridge` behind a live Vite

@@ -90,11 +90,13 @@ describe('console-logs: the op tails, the producer does not', () => {
     console.warn('careful');
     for (let i = 0; i < 5; i++) console.log(`m${i}`);
 
-    const r = await runAgentOp('console-logs', { level: 'warn' }) as {
+    // `level` is a THRESHOLD since #1559 (`warn` would admit the error too), so the top level is the one
+    // filter that still selects a strict subset of this ring.
+    const r = await runAgentOp('console-logs', { level: 'error' }) as {
       logs: Array<{ level: string }>; returnedCount: number; totalCount: number; ringTotal: number; byLevel: Record<string, number>;
     };
     // What came back is filtered…
-    expect(r.logs.every((l) => l.level === 'warn')).toBe(true);
+    expect(r.logs.every((l) => l.level === 'error')).toBe(true);
     expect(r.returnedCount).toBe(1);
     expect(r.totalCount).toBe(1);
     // …but the ring-wide numbers are not.
