@@ -102,8 +102,13 @@ export const SCENE_FORMAT_VERSION = 17;
  *  `nestedStructure` slot, which pinned everything an inner prefab put in that frame. An older build
  *  OPENS a v6 file (the loading path still reads no version, by owner ruling) and shows the inner
  *  template through for those frames; the write gate stops it SAVING over the file, which would drop
- *  the rows. No migration: the committed corpus had no row using the slot when this landed. */
-export const PREFAB_FORMAT_VERSION = 6;
+ *  the rows. No migration: the committed corpus had no row using the slot when this landed.
+ *
+ *  v7: an optional `templateMoved` map on a template REFERENCE node (#1543) — the moves the node states inside its own
+ *  frame, in the shape of the document-level `moved`. An older build opens a v7 file without applying them, and would
+ *  save the node with the moves gone, so the write gate stops it. No migration: no committed prefab held a template
+ *  reference node when this landed. */
+export const PREFAB_FORMAT_VERSION = 7;
 
 // The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
 // docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time

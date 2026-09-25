@@ -35,7 +35,7 @@ import { mapStringValues } from '../core/assetRefRules';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
 import { memberPathIndex, identityTree } from '../core/ecs/memberHome';
-import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
+import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, noteNodeMoves, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
 export { memberPathIndex } from '../core/ecs/memberHome';
 
 /** The structural delta an OUTER layer (a scene, or an ancestor prefab) applies INSIDE a nested
@@ -102,6 +102,12 @@ export interface AddedEntity {
    *  Phase 3 has its moves nowhere else. A row that also moves the member wins (`applyStructureCore`);
    *  a v5 member's move migrates onto its row on the next save, a pre-v5 one stays here. */
   moved?: Record<number, string>;
+  /** v7 (#1543): a TEMPLATE reference node's own moves, in its own frame — member path → member token, the shape of a
+   *  prefab's document-level `moved`, applied after the node's prefab's own moves (so outermost wins) and part of where
+   *  the template puts a member. The template form has no other place for a move inside the node: its member rows carry
+   *  no `parent` (#1293) and the legacy `moved` above is keyed by localId. A scene-form capture carries it through
+   *  unchanged, as the statement of the template it is. */
+  templateMoved?: Record<string, string>;
   /** The nested instance's deep overrides reaching into ITS nested descendants. */
   nestedOverrides?: NestedOverridePaths;
   /** v16+: this nested instance's members, keyed by minted identity — see {@link SceneMemberRow}
@@ -963,7 +969,9 @@ export function applyStructureCore(
         traitArgs.push(meta.trait(d));
       }
       if (!traitArgs.length) return;
-      if (!node.guid && node.key) traitArgs.push(TemplateAddedKey({ key: node.key }));
+      // The key is the node's TEMPLATE identity, independent of the guid: a node can carry both (a rebuild's kept row,
+      // `keySceneNodes`), and dropping the key there made the next template save mint a new one (#1567).
+      if (node.key) traitArgs.push(TemplateAddedKey({ key: node.key }));
       const newId = ops.spawnAdded(traitArgs);
       for (const child of node.children) spawnNode(child, newId);
     };
@@ -1199,8 +1207,14 @@ export function applyStructureByLocalToEcs(
         // stable root guid instead of off a fresh one.
         if (rootEcsId && node.guid) applyRootGuid(world, rootEcsId, node.guid);
         // A reference node written into a TEMPLATE has no guid to restore — its root derives one per
-        // instance from the key, like a keyed plain node (#1387).
-        else if (rootEcsId && node.key) setTemplateKey(findEntityById(rootEcsId, world) as EntityHandle | undefined, node.key);
+        // instance from the key, like a keyed plain node (#1387). A node carrying both keeps both (#1567).
+        if (rootEcsId && node.key) setTemplateKey(findEntityById(rootEcsId, world) as EntityHandle | undefined, node.key);
+        // The node's own moves, queued after its prefab's (which `instantiatePrefabIntoWorld` just queued), so they win (#1543).
+        if (rootEcsId && node.templateMoved) {
+          queuePrefabMoves(world, rootEcsId, node.templateMoved, '[loadSceneFile]');
+          const root = findEntityById(rootEcsId, world);
+          if (root) noteNodeMoves(world, root as Entity, node.prefab!, child as TemplateDoc, node.templateMoved);
+        }
       },
     },
     localToEcs,

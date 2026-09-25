@@ -40,6 +40,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   registerEntity: (e: any) => entityIndex.set(e.id(), e),
   unregisterEntity: (e: any) => entityIndex.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => entityIndex.delete(e.id()))(e); e.destroy(); },
+
+  // The scene-form capture reads each added node's template key by guid (#1567); no case here holds a keyed node.
+  findEntityByGuid: () => undefined,
 }));
 
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({

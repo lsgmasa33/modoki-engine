@@ -77,7 +77,11 @@ export interface IdentityParents {
  *  new entity that falls through to the per-source record below. A swapped-out world takes both maps with
  *  it, like the loader's other per-world state (`templateKeyRecovery`) — `WeakMap<World, …>`, so the
  *  owner clears (`entityTable.ts` § world swap). */
-const rootDocsByWorld = new WeakMap<World, Map<PackedEntity, { source: string; doc: TemplateDoc }>>();
+/** A frame root's own record. `nodeMoved`: the moves the template REFERENCE node that spawned this root states in its
+ *  frame (`AddedEntity.templateMoved`, #1543) — applied on top of `doc`'s own, and so part of where the template puts a
+ *  member. Kept on the root's record, not the doc, so a stale-frame compare (#1483) still sees the document alone. */
+type FrameRootRecord = { source: string; doc: TemplateDoc; nodeMoved?: Record<string, string> };
+const rootDocsByWorld = new WeakMap<World, Map<PackedEntity, FrameRootRecord>>();
 /** …and per source, the document it was LAST expanded from: the answer for a frame whose root has no
  *  record of its own. */
 const docsByWorld = new WeakMap<World, Map<string, TemplateDoc>>();
@@ -105,18 +109,24 @@ const pruneFloor = new WeakMap<object, number>();
 
 /** The document `root`'s OWN frame record says it was expanded from — `undefined` for a root with no record of
  *  its own (the per-source fallback is not an answer about this root). What a flat respawn must carry (#1483). */
-export function frameRootDoc(world: World, root: Entity): { source: string; doc: TemplateDoc } | undefined {
+export function frameRootDoc(world: World, root: Entity): FrameRootRecord | undefined {
   return rootDocsByWorld.get(world)?.get(packedOf(root));
 }
 /** Re-record a CARRIED root's document in the world it was respawned into (#1483) — root only: a carried frame
  *  is not what `world` last expanded its source from, so the per-source record is left to the world's own
  *  loads. Without it a kept base's instance read as expanded from whatever the cache held, and a prefab that
  *  changed across the carry had its members diffed against another member's row. */
-export function noteFrameRootDoc(world: World, root: Entity, rec: { source: string; doc: TemplateDoc }): void {
+export function noteFrameRootDoc(world: World, root: Entity, rec: FrameRootRecord): void {
   let roots = rootDocsByWorld.get(world);
   if (!roots) { roots = new Map(); rootDocsByWorld.set(world, roots); }
   roots.set(packedOf(root), rec);
 }
+/** Record the moves the template reference node that spawned `root` states in its frame (#1543), on the root's own
+ *  record — which the spawn has just written (`noteFrameDoc`), or one made here for the document it expanded. */
+export function noteNodeMoves(world: World, root: Entity, source: string, doc: TemplateDoc, moved: Record<string, string>): void {
+  noteFrameRootDoc(world, root, { ...(frameRootDoc(world, root) ?? { source, doc }), nodeMoved: moved });
+}
+
 /** How many frame-root records `world` holds — for the sweep's test. */
 export function frameDocRootCount(world: World): number {
   return rootDocsByWorld.get(world)?.size ?? 0;

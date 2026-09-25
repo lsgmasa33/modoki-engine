@@ -251,6 +251,8 @@ no row can key (a pre-v5 template's). The rule and the reasons:
 A prefab FILE can carry a `moved` map of its own (v4, #1437): `"<member path>": "@member:<path>"`,
 for a member it places under a parent no row relation can express. Both halves are member paths in
 the prefab's frame. See [prefab-structural-overrides.md § Moved members](./prefab-structural-overrides.md#moved-members-1437).
+A template REFERENCE node carries the same map for its own frame, as `templateMoved` (v7, #1543):
+[§ A move inside a template reference node](./prefab-structural-overrides.md#a-move-inside-a-template-reference-node-1543-prefab-v7).
 
 The marking is **presence-based, not a flag**: a field is "overridden" purely by
 appearing in `overrides` (`localId → traitName → field → value`), and it stores **only
