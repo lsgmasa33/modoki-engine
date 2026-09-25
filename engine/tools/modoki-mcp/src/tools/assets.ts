@@ -206,7 +206,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_create_registered_asset',
     'Create one of the Assets panel\'s "New X" assets at a path you supply. The agent-reachable ' +
       'half of that surface: the panel\'s own flow opens the native save dialog FIRST — a modal ' +
-      'panel only a human can answer — so the whole "New X" surface was unreachable from here. ' +
+      'panel only a human can answer — so without `path` the whole "New X" surface is unreachable from here. ' +
       'Passing the path routes around it; the human\'s dialog is untouched.\n\n' +
       'DIFFERENT FROM modoki_create_asset, which takes a fixed enum of engine asset types. ' +
       'This drives the live, game-extensible registry — read modoki_list_creatable_assets for what ' +
@@ -465,7 +465,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + '⚠️ Texture settings are load-bearing on real hardware — block-compressed KTX2 needs '
     + 'multiple-of-4 dimensions, and a non-mult-4 texture with mipmaps renders SOLID BLACK on '
     + 'Adreno/mobile GPUs. That failure appears on a phone, not in the editor.\n\n'
-    + 'THIS WRITES DISK. Since #845 a human\'s Inspector import-settings change is PARKED in the '
+    + 'THIS WRITES DISK. A human\'s Inspector import-settings change is PARKED in the '
     + 'editor rather than written, and this replaces the file wholesale — so if one is pending for '
     + 'this path, writing DESTROYS it: your bytes land, the park survives, and their next Cmd+S '
     + 'flushes that older document straight back over what you wrote. Both directions lose work, '
@@ -480,7 +480,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       meta: z.record(z.any()).describe('The COMPLETE sidecar object to write — read it back with modoki_get_asset_meta first and edit that, since this replaces rather than merges.'),
       discardUnsaved: z.boolean().optional().describe(
         `${DISCARD_UNSAVED_BASE}. Here that work is a parked Inspector import-settings edit for this `
-        + 'asset. It is dropped AFTER the write succeeds (#872), so a failed write costs the human '
+        + 'asset. It is dropped AFTER the write succeeds, so a failed write costs the human '
         + 'nothing — and `discardUnconfirmed` in the reply says the drop could not be confirmed, '
         + 'which is the case where something stale CAN still flush back over you.',
       ),

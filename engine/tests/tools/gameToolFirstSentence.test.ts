@@ -23,7 +23,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { readScannedSource } from '../../packages/modoki/tests/helpers/sourceScanner';
-import { firstSentenceDefect } from './firstSentence';
+import { DESCRIPTION_HISTORY, firstSentenceDefect } from './firstSentence';
 import { callsTo, parseSource, propertyValue, unwrapValue, ts } from '../../packages/modoki/tests/helpers/sourceAst';
 import { assertExemptionLedger } from '../../packages/modoki/tests/helpers/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
@@ -247,6 +247,23 @@ describe.skipIf(!hasInternalGames())("a game tool's first sentence says what the
       scanned: tools.length,
       floor: 5,
       fix: 'rewrite the first sentence as what the tool DOES; move the issue number, caveat or question after it.',
+    });
+  });
+
+  // #1555's history rule, over the WHOLE description rather than the first sentence. The engine
+  // surfaces hold it in `mcpDescriptionProse.test.ts`; a game tool registers at runtime and no
+  // surface loader reaches it — the gap #1218 closed for the first-sentence rule above.
+  // ⚠️ Tool-level descriptions only: the extractor does not read a param's `description`, so a
+  // `(#345)` inside a param is caught by nothing here.
+  it('no description narrates history or carries a bare issue number (#1555)', () => {
+    assertExemptionLedger({
+      label: 'GAME_TOOL_HISTORY in gameToolFirstSentence',
+      population: tools.filter((t) => DESCRIPTION_HISTORY.test(t.description))
+        .map((t) => ({ item: t.name, site: `${t.file} — ${t.name}: "${t.description.match(new RegExp(`.{0,50}(?:${DESCRIPTION_HISTORY.source}).{0,20}`))?.[0]}"` })),
+      sanctioned: [],
+      scanned: tools.length,
+      floor: 5,
+      fix: 'say what the tool does NOW; move the issue number or the history to a code comment.',
     });
   });
 });

@@ -620,7 +620,7 @@ const DECLS: Record<string, Decl> = {
     requires: ['editor', 'renderer'], filters: ['guids', 'name', 'ids', 'layer', 'limit', 'precision'],
     notes: 'One row PER PROVIDER: an entity on screen in both Scene and Game panels reports twice.',
   },
-  modoki_scene_query: {
+  modoki_physics_query: {
     kind: 'read', method: 'POST', route: '/api/scene-query', requires: ['editor', 'scene'], aim: 'point',
     minimalArgs: { kind: 'point', dim: '3d', point: [0, 0, 0] },
     notes: "All six engine scene queries (#288 gap 1) behind one tool — §7-legal because no argument changes the method, the route, or whether anything is written; every kind is a pure read. POST despite being a read for the same reason capture_viewport/render_scene are: the input is nested vectors. Its substance is the REFUSAL taxonomy — the engine functions collapse 'no physics world', 'zero-length direction' and a genuine miss onto one null, so the first two are ruled out BEFORE casting and only what is left is reported as hit:null. The raw coordinates are a MEASUREMENT, not an aim (the capture_gesture carve-out), so this must never be added to batch.ts's XY_AIMED map.",

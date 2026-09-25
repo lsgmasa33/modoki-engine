@@ -610,10 +610,10 @@ describe('descriptions an agent reads under deferral (#1208)', () => {
     ['device_input_watch', 'device_hit_regions'],
     ['device_eval', 'device_eval_api'],
     ['device_layout_bounds', 'device_handles'],
-    // 2026-09-25 audit (C-9): measured, not theoretical — agents called scene_query with
-    // entity-search params (`name`, `limit`, `where`, `traits`) 23 times; it is a PHYSICS query.
-    ['modoki_scene_query', 'modoki_get_scene_state'],
-    ['device_scene_query', 'device_get_scene_state'],
+    // NOT `*_physics_query`/`*_get_scene_state` (#1554). Agents called the tool with entity-search
+    // params 23 times while it was named `scene_query` (2026-09-25 audit U-2), and the pair sat here
+    // until the rename removed the collision it existed for. The rename is the fix; a group here would
+    // only pay for pointers between two names that no longer look alike.
     ['modoki_play_clip', 'modoki_pose_clip'],
   ];
 
@@ -689,6 +689,19 @@ describe('descriptions an agent reads under deferral (#1208)', () => {
         floor: 30,
         fix: 'name the look-alike in the description ("for X use modoki_Y instead"), so a deferred-schema agent can tell them apart.',
       });
+    } finally { s.restore(); d.restore(); }
+  });
+
+  it('the physics cast is named for physics on both servers, not for the scene (#1554)', async () => {
+    // Under deferral the name is the whole interface, and `*_scene_query` read as "query the scene":
+    // 23 schema-invalid calls guessed entity-search params. Renamed without an alias (owner ruling,
+    // 2026-09-25), so a surviving old name is a regression, not a compatibility shim.
+    const s = loadSurface();
+    const d = await loadDeviceSurface();
+    try {
+      const registered = [...s.names, ...d.names];
+      expect(registered.filter((n) => /_scene_query$/.test(n)), 'the old name is back').toEqual([]);
+      expect(registered.filter((n) => /_physics_query$/.test(n)).sort()).toEqual(['device_physics_query', 'modoki_physics_query']);
     } finally { s.restore(); d.restore(); }
   });
 

@@ -35,8 +35,7 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
       'it dirty it can hand you a frame from minutes ago, and repeated captures come back ' +
       'BYTE-IDENTICAL through a change you just made. (Measured 2026-08-18: painting a visible ' +
       'material red left three successive captures identical until a camera move re-armed the ' +
-      'gate.) So a capture that "did not change" is NOT evidence the change failed to render — ' +
-      'this description used to claim the opposite and cost a QA session a wrong verdict. To ' +
+      'gate.) So a capture that "did not change" is NOT evidence the change failed to render. To ' +
       'force one, use modoki_render_scene (a real offscreen render, Game panel only), or move ' +
       'the SceneView camera first. For the TRUE framebuffer use CDP Page.captureScreenshot ' +
       '(see CLAUDE.md). ',
@@ -68,7 +67,7 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
     {
       width: z.number().int().positive().max(4096).optional().describe('Output width px (default: live viewport; ≤4096).'),
       height: z.number().int().positive().max(4096).optional().describe('Output height px (default: live viewport; ≤4096).'),
-      quality: z.number().int().min(1).max(100).optional().describe('JPEG quality 1-100 (default 85) — the SAME unit as capture_viewport. It used to be a 0..1 fraction, and a 1-100 value was then silently ignored by canvas.toDataURL. The effective value comes back as `quality`.'),
+      quality: z.number().int().min(1).max(100).optional().describe('JPEG quality 1-100 (default 85) — the SAME unit as capture_viewport. The effective value comes back as `quality`.'),
       camera: z.object({
         position: z.array(z.number()).length(3).optional().describe('World camera position [x,y,z].'),
         target: z.array(z.number()).length(3).optional().describe('Look-at target [x,y,z].'),

@@ -91,7 +91,7 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   // editor tools would have been the §9 asymmetry that rule calls a finding.
   device_player_prefs: {},
   device_write_player_prefs: { action: 'flush' },
-  device_scene_query: { kind: 'point', dim: '3d', point: [0, 0, 0] },
+  device_physics_query: { kind: 'point', dim: '3d', point: [0, 0, 0] },
   device_game_tools: {},
   // The ergonomic form is a name and nothing else: `args` is optional, and a game tool with no
   // required params is called bare — which is also the shape the device VALIDATES against the

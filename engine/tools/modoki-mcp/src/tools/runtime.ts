@@ -178,7 +178,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
 
   // ── scene queries (#288 gap 1) ──
   tool(
-    'modoki_scene_query',
+    'modoki_physics_query',
     'Cast a ray, sweep a sphere/circle, or pick a point against the LIVE PHYSICS world — the ' +
       '"what is over there / would this fit / what is under this point" question, answered as ' +
       'DATA instead of from a screenshot. NOT an entity search — find entities by name/trait with ' +
@@ -225,8 +225,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_player_prefs',
     'READ the engine\'s PlayerPrefs store — the durable per-key JSON save data a game writes ' +
-      '(progress, settings, unlocks). Until now this was reachable only through modoki_eval + a ' +
-      'dynamic import.\n\n' +
+      '(progress, settings, unlocks).\n\n' +
       'NOT modoki_persistence, which is the EDITOR\'s scene/asset save mode and is unrelated — ' +
       'that name collision is the confusion this description exists to stop.\n\n' +
       'CALLED BARE it returns the KEY INDEX (`keys`, `totalCount`) plus `pendingWrites`. ' +
@@ -327,7 +326,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'deliberately opt-in because enabling costs real time (two timestamps per pass) and the ' +
       'profiler must not change what it measures; where the backend cannot support them the status ' +
       'comes back "unsupported" with a reason and NO number is invented. reset clears markers and ' +
-      'captures. boot reads the BOOT-PHASE timeline (#238) — always-on spans across scene load, ' +
+      'captures. boot reads the BOOT-PHASE timeline — always-on spans across scene load, ' +
       'asset acquire, shader prewarm and renderer init — and intersects them with the worst dropped ' +
       'frame, so a cold-boot freeze is attributed by measurement instead of guessed from the frame ' +
       'aggregate (which cannot see it: a stall is DROPPED from the percentiles by design). ' +

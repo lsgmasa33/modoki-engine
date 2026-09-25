@@ -1198,6 +1198,24 @@ The description is the tool's contract with the agent — it is read far more of
   scanner can go quiet: a description shape it cannot parse is recorded as unreadable rather than
   excused, and an independent count of `registerAgentTool` call sites catches a registration it
   never saw at all (a call made through a variable yields no row, so nothing else could).
+- **A description says what is true NOW** (#1555). "Used to be called…", "this description used to
+  claim…" and a bare `(#32)` are history, which a maintainer needs and an agent choosing arguments
+  does not — put them in a code comment or the feature doc. The exception is history that IS the
+  reason for current behaviour (`set_transform`'s `space` has no default because it was once
+  documented wrong); `mcpDescriptionProse.test.ts` holds the rule over both servers, with those
+  exceptions as named ledger rows.
+- **Repeat the structure, not the prose** (#1555). §1's no-`$ref` rule makes every aimed input tool
+  carry its own copy of the aim schema, and before #1555 the prose rode along — 26.8 KB of
+  description strings over 80 B repeated ≥3× across both servers (measured 2026-09-25), re-read on
+  every turn after a schema loads. So: one base wording per concept in
+  `engine/tools/shared/aimVocabulary.ts` (plain strings — the servers are on different zod
+  dialects), which a tool EXTENDS rather than rewords; and a nested restatement of a rule the same
+  tool already states POINTS at it (`ALLOW_OCCLUDED_NESTED`; drag's `to` is `As \`from.entity\`.`).
+  ⚠️ **Point within the tool, never at another tool** — under deferral a pointer at a different tool
+  costs that tool's whole schema load, which is the cost being cut. Guarded by the same test: a
+  ceiling on repeated prose, every aim field extending the shared wording, at most ONE full aim
+  statement per tool (a ceiling alone missed the device drag's `to`), and every pointer resolving
+  to a field in its own tool that is not itself a pointer.
 
 ## Decisions taken (the surface changes these rules implied)
 

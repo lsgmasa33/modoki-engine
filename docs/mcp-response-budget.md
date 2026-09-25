@@ -462,12 +462,14 @@ client that does not resolve JSON-Schema `$ref` saw an untyped field and mis-enc
 nobody should "optimize" the factory into a shared const, independent of what it would or would not
 save in bytes.
 
-**Declined: a briefer `entity` description for `modoki_drag`'s `to` endpoint.** Only `modoki_drag`
-pays the entity-spec blob TWICE — once for `from`, once for `to` — via `makePointSpec`. Giving `to`
-a shorter description than `from` would save ~1,800 chars. Declined: it would add a second
-entity-spec shape to `shapes.ts` that a future tool could reach for wrongly — the same class of
-cleverness the `$ref`-avoidance comment above already warns against. One entity-spec shape, always
-the same wording, is worth more than 1,800 chars.
+**Taken in #1555, after being declined: a briefer `entity` description for drag's `to` endpoint.**
+Drag pays the aim schema TWICE (`from` and `to`) on both servers. The earlier decline argued that a
+second entity-spec SHAPE in `shapes.ts` was cleverness a future tool could reach for wrongly. What
+landed is not a second shape: it is the same factory with `sameAs`, which keeps the structure and
+the `$ref`-free inline object and swaps only the prose for `As \`from.entity\`.`-style pointers. The
+risk the decline named — a pointer used where there is nothing to point at — is now a test failure:
+`mcpDescriptionProse.test.ts` requires every pointer to resolve to a described field in the same
+tool.
 
 ## Definition surface under tool deferral (measured 2026-08-31)
 
@@ -577,9 +579,14 @@ concrete consequences:
   generic `open_editor` whose mode enum costs a round-trip to discover. The view-mode group is also
   incoherent on its own terms — three different `mode` enums, and `set_game_view_device` isn't a
   view mode at all.
-- **Trimming descriptions for size.** Under deferral a description is paid only when its schema is
-  fetched, so shrinking it saves near-nothing — and conventions §11 already says a description "is
-  read far more often than this file."
+- ~~**Trimming descriptions for size.**~~ **REVERSED by measurement (#1555, owner-approved
+  2026-09-25).** The decline rested on "under deferral a description is paid only when its schema is
+  fetched, so shrinking it saves near-nothing." That premise misprices both halves: a loaded schema
+  costs ~958 tokens (median), there were 5,295 loads over two months, and a loaded schema then sits
+  in the prefix and is re-read on EVERY later turn. What was cut is prose that said nothing new:
+  26.8 KB of description strings over 80 B repeated three or more times (15.5 KB after), plus
+  history narrative. That took `DEFINITION_BYTES` from 175,582 to 165,715. The rules that came out of it
+  are conventions §11's last two bullets; a description's CONTENT still outranks its size.
 
 See [mcp-tool-conventions.md](./mcp-tool-conventions.md) § 2a for the tool-name audit this same work
 produced.

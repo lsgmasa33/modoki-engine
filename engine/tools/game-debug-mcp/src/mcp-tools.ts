@@ -19,6 +19,7 @@ import { identityMismatch, tokenMismatchWarning, describeIdentity } from '../../
 // `timeoutMs` and the device's own internal step budget can never independently drift (#822).
 import { simStepDefaultTimeout, SIM_STEP_MAX_FRAMES } from '../../shared/simStepTiming.js';
 import { DEVICE_KEY_MODIFIERS, KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../shared/inputVocabulary.js';
+import { ALLOW_OCCLUDED_BASE, ALLOW_OCCLUDED_NESTED, ENTITY_AIM_BASE, SURFACE_AIM_BASE, sameAs } from '../../shared/aimVocabulary.js';
 import { nestedUnknownKeyMessage } from '../../shared/unknownParam.js';
 import { CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, vocabularyProse, type CreateEntityKind } from '../../shared/createEntityVocabulary.js';
 import { ignoredHandleFilter, parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../shared/handlesReply.js';
@@ -58,10 +59,6 @@ const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(
 /** The surfaces a shipped game can show an entity on. */
 const DEVICE_AIM_SURFACES = ['game-3d', 'game-2d', 'game-ui'] as const;
 
-const DEVICE_ALLOW_OCCLUDED =
-  'Aim there even though something covers the target (default false = REFUSED as OCCLUDED, naming the '
-  + 'cover). A covered press lands on the covering element, so reporting ok would be a false success. '
-  + 'Applies to `entity` and `selector` aims; raw x/y is never refused, because a coordinate is exactly what you asked for.';
 
 /** A FACTORY, as the editor's is: a schema reused by reference is emitted as a `$ref` a client may not resolve. */
 /** The unit clash a raw device coordinate walks into (2026-09-25 audit, C-1): the input tools take
@@ -77,31 +74,25 @@ const CSS_PX_NOTE = ' Coordinates here are viewport CSS px — device_tap/drag/p
 const unknownKeysError = (accepts: string) => (issue: { code?: string; keys?: readonly string[] }) =>
   (issue.code === 'unrecognized_keys' ? nestedUnknownKeyMessage(accepts, issue.keys ?? []) : undefined);
 
-const makeDeviceEntitySpec = () => z.strictObject({
+const makeDeviceEntitySpec = (brief?: { sameAs: string }) => z.strictObject({
   guid: z.string().optional(),
   name: z.string().optional(),
   id: z.number().int().optional(),
   surface: z.enum(DEVICE_AIM_SURFACES).optional()
-    .describe('Which on-screen surface to aim in. REQUIRED for a 2D/3D entity, even when only one ' +
-      "surface shows it. For a UI entity it is optional unless the entity is mounted more than once. 'game-3d'/'game-2d' = " +
-      "the game's canvases; 'game-ui' = its DOM UI layer. (No 'scene-view' — that is the editor's viewport.)"),
-  allowOccluded: z.boolean().optional()
-    .describe('Aim at the entity even when something is in front of it, and report what was hit. Default false — a covered aim is REFUSED.'),
+    .describe(brief ? sameAs(`${brief.sameAs}.surface`) : `${SURFACE_AIM_BASE}. 'game-3d'/'game-2d' = the ` +
+      "game's canvases; 'game-ui' = its DOM UI layer. (No 'scene-view' — that is the editor's viewport.)"),
+  allowOccluded: z.boolean().optional().describe(ALLOW_OCCLUDED_NESTED),
 }, { error: unknownKeysError('an entity aim accepts only: guid, name, id, surface, allowOccluded') }).describe(
-  'Aim at a SCENE ENTITY by exactly one of {guid} | {name} | {id}, resolved to its live screen rect ON ' +
-  'THE DEVICE inside this call — no screenshot, no read-then-tap race. Prefer guid; {id} only for an ' +
-  'entity with no guid (runtime ids are reassigned on every reload). A name matching several entities ' +
-  'is REFUSED (AMBIGUOUS, the guids as options), never first-match; a runtime guid from an earlier world ' +
-  'is NOT_FOUND with `stale`. A 2D/3D entity REQUIRES `surface`. Overrides `selector` and x/y. The game ' +
-  'ships no mesh picker unless it registers one, so on a 3D canvas only DOM covering is checked — the ' +
-  'reply\'s occlusionScope says how far the check could see.');
+  brief ? sameAs(brief.sameAs) : `${ENTITY_AIM_BASE}. On the DEVICE: a runtime guid from an earlier world ` +
+  'is NOT_FOUND with `stale`, and the game ships no mesh picker unless it registers one, so on a 3D ' +
+  'canvas only DOM covering is checked — the reply\'s occlusionScope says how far the check could see.');
 
-const makeDevicePointSpec = () => z.strictObject({
-  entity: makeDeviceEntitySpec().optional(),
+const makeDevicePointSpec = (brief?: { sameAs: string }) => z.strictObject({
+  entity: makeDeviceEntitySpec(brief && { sameAs: `${brief.sameAs}.entity` }).optional(),
   selector: z.string().optional(),
   x: z.number().optional(),
   y: z.number().optional(),
-  allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
+  allowOccluded: z.boolean().optional().describe(ALLOW_OCCLUDED_NESTED),
 }, { error: unknownKeysError('a drag endpoint accepts only: entity, selector, x, y, allowOccluded') });
 
 type DeviceEntityAim = { guid?: string; name?: string; id?: number; surface?: string; allowOccluded?: boolean };
@@ -664,7 +655,7 @@ export function registerTools(server: McpServer) {
     'Report the Modoki device lease (connected device, or how to connect) AND which editor backend '
     + 'holds it — repo + branch, since clones run side by side and every call would otherwise succeed '
     + "against another clone's device without saying so. When connected, also reports the app "
-    + 'package/bundle id the SOCKET is actually held by (#88) — a fixed shared port means a stale '
+    + 'package/bundle id the SOCKET is actually held by — a fixed shared port means a stale '
     + "backgrounded app can silently answer every device_* call instead of the one you just "
     + 'launched, and this is the one-call check for that instead of a logcat hunt. Also reports the '
     + 'input FIDELITY every device_tap/drag/pointer/press_key/hover/scroll/type_text call uses, so '
@@ -893,7 +884,7 @@ export function registerTools(server: McpServer) {
 
   tool('device_eval',
     'Execute JavaScript in the connected game page context. `code` sees an injected `modoki` ' +
-      'scripting object (#83) — the device\'s live agent-op registry as `modoki.call(op, params)` ' +
+      'scripting object — the device\'s live agent-op registry as `modoki.call(op, params)` ' +
       'plus a generated `modoki.<camelCase>(params)` method per op (see device_eval_api for the ' +
       'full list). Narrower than the editor\'s: no `modoki.api()`/`modoki.composite()` (device has ' +
       'no editor backend to fetch and no undo stack). ' + DEVICE_EVAL_UNREACHABLE_SUMMARY,
@@ -902,7 +893,7 @@ export function registerTools(server: McpServer) {
       timeoutMs: z.number().int().positive().optional().describe(
         'How long the body may run before it is abandoned. Default 4000, max 20000 (clamped, not ' +
         'refused). Anything ABOVE the 4000 default also lifts the transport deadline with it — the ' +
-        "backend sizes the device request's deadline from this number + 5s of headroom (#153), so " +
+        "backend sizes the device request's deadline from this number + 5s of headroom, so " +
         'the timeout that fires is the eval\'s own and the error names what the code was doing. ' +
         'Still below the editor twin\'s 25000: the device pays a real network hop the editor does not.',
       ),
@@ -1041,8 +1032,7 @@ export function registerTools(server: McpServer) {
 
   tool('device_get_scene_state',
     'Read the live ECS world on the connected device as DATA (no screenshot). Bare call = a compact ' +
-      'INDEX (entity id/guid/name/traits, no values); drill down with a filter or enricher (a physics ' +
-      'cast is device_scene_query). Address ' +
+      'INDEX (entity id/guid/name/traits, no values); drill down with a filter or enricher. Address ' +
       'entities by guid, never by id. Every entity has one; a code-spawned entity\'s runtime guid is ' +
       'valid only until the scene reloads. Floats are rounded — verify with a ' +
       'tolerance, not ===. RESOURCE entities (mesh/material/prefab/env holders + config singletons ' +
@@ -1178,7 +1168,7 @@ export function registerTools(server: McpServer) {
       "write the game's PlayerPrefs store on the device"),
   );
 
-  tool('device_scene_query',
+  tool('device_physics_query',
     'Cast a ray, sweep a sphere/circle, or pick a point against the LIVE PHYSICS world on the ' +
       'device — "what is over there / would this fit / what is under this point", answered as DATA ' +
       'instead of from a screenshot. NOT an entity search — find entities by name/trait with ' +
@@ -1205,7 +1195,7 @@ export function registerTools(server: McpServer) {
       exclude: z.string().optional().describe("raycast only — a guid or exact entity NAME (never a raw id) whose body is never reported as a hit. An ambiguous name is REFUSED. Refused outright for kind:shapecast, whose engine function takes no exclusion filter."),
       precision: z.number().optional().describe('Significant digits for the returned floats. Default 9 — verify a position with a TOLERANCE, never ===.'),
     },
-    async (args) => perceptCall('device_scene_query', 'scene-query',
+    async (args) => perceptCall('device_physics_query', 'scene-query',
       Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
       'run a physics scene query on the device'),
   );
@@ -1584,14 +1574,14 @@ export function registerTools(server: McpServer) {
       'unless `allowOccluded:true`; a missed entity is `NOT_FOUND` (with `stale` when a runtime guid ' +
       'outlived its world), an ambiguous name `AMBIGUOUS` with the guids as options. ' +
       'TRUSTED OS-level input when a route is available — CDP on Android, WebDriverAgent on iOS ' +
-      '(#32) — else a synthetic DOM event, which is fronted by a loud banner saying so. Check ' +
+      '— else a synthetic DOM event, which is fronted by a loud banner saying so. Check ' +
       'device_status\'s input-mechanism line to know which you will get.',
     {
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device to the element center; refuses if occluded). Preferred for DOM targets.'),
       x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Used when no entity or selector.`),
       y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
-      allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
+      allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
     },
     async ({ entity, selector, x, y, allowOccluded }) => {
       const resolvable = hasEntityAim(entity) || !!selector;
@@ -1653,17 +1643,17 @@ export function registerTools(server: McpServer) {
       'occlusion-checked on-device. The flat `fromSelector`/`fromX`/`fromY`/`toSelector`/`toX`/`toY` ' +
       'still work; giving one endpoint both ways is refused (`AMBIGUOUS`). A covered endpoint is ' +
       'REFUSED unless `allowOccluded` (top-level for both ends, or on `from`/`to` for one). TRUSTED ' +
-      'OS-level input when a route is available — CDP on Android, WebDriverAgent on iOS (#32) — else ' +
+      'OS-level input when a route is available — CDP on Android, WebDriverAgent on iOS — else ' +
       'synthetic DOM events, fronted by a loud banner. Check device_status\'s input-mechanism line to ' +
       'know which you will get.',
     {
       from: makeDevicePointSpec().optional().describe('Start point: {entity} | {selector} | {x,y}, plus an optional allowOccluded for this end.'),
-      to: makeDevicePointSpec().optional().describe('End point: {entity} | {selector} | {x,y}, plus an optional allowOccluded for this end.'),
+      to: makeDevicePointSpec({ sameAs: 'from' }).optional().describe('End point: {entity} | {selector} | {x,y}, plus an optional allowOccluded for this end.'),
       fromSelector: z.string().optional().describe('CSS selector for the start point (flat form of from.selector).'),
       toSelector: z.string().optional().describe('CSS selector for the end point (flat form of to.selector).'),
       fromX: z.number().optional().describe('Flat alias of from.x (screenshot px).'), fromY: z.number().optional().describe('Flat alias of from.y.'),
       toX: z.number().optional().describe('Flat alias of to.x (screenshot px).'), toY: z.number().optional().describe('Flat alias of to.y.'),
-      allowOccluded: z.boolean().optional().describe(`${DEVICE_ALLOW_OCCLUDED} Applies to BOTH endpoints; set it on \`from\`/\`to\` to allow just one.`),
+      allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}. Applies to BOTH endpoints; set it on \`from\`/\`to\` to allow just one.`),
       steps: z.number().optional().describe('Intermediate steps (default: 5)'),
       delayMs: z.number().optional().describe('Delay per step ms (default: 20)'),
       dom: z.boolean().optional().describe('Drag DOM chrome (a debug widget, slider) by dispatching the pointer sequence ON the grabbed element instead of the game canvas. Auto-engages when the grab lands on a non-canvas element; pass false to force the canvas/world path.'),
@@ -1747,10 +1737,10 @@ export function registerTools(server: McpServer) {
       'move/up goes to whatever captured the press. move/up reuse the button from the down; a move/up with ' +
       'nothing held, or a down while already held, is REFUSED rather than silently re-pressing/re-aiming. ' +
       'Always dispatches synthetic DOM events, never OS-level trusted input — this op is not ' +
-      'routed through the trusted paths on either platform (#32), and says so on every reply. ' +
+      'routed through the trusted paths on either platform, and says so on every reply. ' +
       'RELEASE WHAT YOU PRESS: a down left un-released latches the engine pointer source, and until ' +
-      'a real finger presses again (or the lease drops, which now sends the up for you) the game ' +
-      'reads NO dragging at all — including the human\'s (#299). The reply says where the press ' +
+      'a real finger presses again (or the lease drops, which sends the up for you) the game ' +
+      'reads NO dragging at all — including the human\'s. The reply says where the press ' +
       'landed: `dom:<element>` when it went to DOM UI, `canvas:<how>` when it went to the game surface.',
     {
       action: z.enum(POINTER_ACTIONS).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
@@ -1759,7 +1749,7 @@ export function registerTools(server: McpServer) {
       x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Used when no entity or selector.`),
       y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
-      allowOccluded: z.boolean().optional().describe(`${DEVICE_ALLOW_OCCLUDED} Applies to action:'down' only — a move/up is delivered to whatever captured the press.`),
+      allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}. Applies to action:'down' only — a move/up is delivered to whatever captured the press.`),
     },
     async ({ action, entity, selector, x, y, button, allowOccluded }) => {
       const resolvable = hasEntityAim(entity) || !!selector;
@@ -1951,8 +1941,7 @@ export function registerTools(server: McpServer) {
 
   tool('device_duplicate_entity',
     'Copy a live entity ON THE DEVICE, optionally many times — this is the "spawn N more of ' +
-      'THIS and watch the frame" perf experiment, which previously cost a full rebuild+reinstall ' +
-      'per question. DESCENDANTS ARE INCLUDED: a copy of a parent brings its children, each with a ' +
+      'THIS and watch the frame" perf experiment, with no rebuild. DESCENDANTS ARE INCLUDED: a copy of a parent brings its children, each with a ' +
       'FRESH guid (two entities answering to one address would break every read tool). Live only — ' +
       'a relaunch is the undo. CONFIRM the copies with device_get_scene_state, which is where the '
       + 'new guids come from; device_profiler / device_diagnose measure the EFFECT, not the edit.',
@@ -2085,7 +2074,7 @@ export function registerTools(server: McpServer) {
       'cost (not the most recent), so a hitch is findable after the fact. gpu-on/gpu-off enable GPU ' +
       'timestamp queries, which have a real cost and so must be deliberate; on a backend without ' +
       'timer-query support the status comes back "unsupported" with a reason and NO number is ' +
-      'fabricated. boot reads the BOOT-PHASE timeline (#238): always-on spans across scene load, ' +
+      'fabricated. boot reads the BOOT-PHASE timeline: always-on spans across scene load, ' +
       'asset acquire, shader prewarm and renderer init, intersected with the worst dropped frame — ' +
       'the read that attributes a cold-boot freeze, which the frame aggregate cannot see because a ' +
       'stall is dropped from its percentiles by design. This is the tool for a phone-only perf ' +
@@ -2198,7 +2187,7 @@ export function registerTools(server: McpServer) {
       'bubbles to window, where the menu and input sources listen. The hold lets per-frame input ' +
       'sampling catch the down edge. Trusted-CDP on Android when a session is reachable; on iOS this ' +
       'stays SYNTHETIC by design — a WebDriverAgent key reaches only a FOCUSED element, so it would ' +
-      'do nothing with a game canvas focused (#32). Check device_status\'s input-mechanism line.',
+      'do nothing with a game canvas focused. Check device_status\'s input-mechanism line.',
     {
       key: z.string().describe(KEY_ARG_DESCRIPTION),
       modifiers: z.array(z.enum(DEVICE_KEY_MODIFIERS)).optional().describe('Held modifiers, e.g. ["meta"] for Cmd+key.'),
@@ -2228,7 +2217,7 @@ export function registerTools(server: McpServer) {
       'UNLIKE the editor\'s modoki_type_text, this dispatches a SYNTHETIC value-set + `input` event ' +
       '(a device WebView has no equivalent of Electron\'s trusted `sendInputEvent`) — a React ' +
       'controlled input still fires its real onChange (the native property setter is used, not a ' +
-      'plain assignment), but this is not OS-level trusted input; see #32.',
+      'plain assignment), but this is not OS-level trusted input.',
     {
       text: z.string().describe('Text to type into the focused input.'),
       clearFirst: z.boolean().optional().describe('Empty the field before typing (replace vs append).'),
@@ -2301,14 +2290,14 @@ async function coordScaleOrRefusal(
       'tooltips, and hover-gated UI activate. Aim by `entity` ({guid}|{name}, plus `surface` for a ' +
       '2D/3D entity), CSS `selector` (both resolved on-device, refused when covered unless ' +
       '`allowOccluded`) or screenshot pixel `x`/`y`. Trusted-CDP on Android when a session is reachable; on iOS this ' +
-      'stays SYNTHETIC by design — a touchscreen has no hover state to deliver (#32). Check ' +
+      'stays SYNTHETIC by design — a touchscreen has no hover state to deliver. Check ' +
       'device_status\'s input-mechanism line to know which.',
     {
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to hover (preferred for DOM targets).'),
       x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Used when no entity or selector.`),
       y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
-      allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
+      allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
     },
     async ({ entity, selector, x, y, allowOccluded }) => {
       const resolvable = hasEntityAim(entity) || !!selector;
@@ -2345,7 +2334,7 @@ async function coordScaleOrRefusal(
       'modoki_scroll uses deltaX/deltaY, so those are canonical here too); giving both names is refused. A call whose deltas both ' +
       'resolve to 0 is REFUSED rather than dispatched as a silent no-op. Trusted-CDP on Android when ' +
       'a session is reachable; on iOS this stays SYNTHETIC by design — WebDriverAgent has no wheel ' +
-      'action at all (#32). Check device_status\'s input-mechanism line to know which.',
+      'action at all. Check device_status\'s input-mechanism line to know which.',
     {
       deltaX: z.number().optional().describe('Horizontal wheel delta (default 0). Canonical name — same as modoki_scroll.'),
       deltaY: z.number().optional().describe('Vertical wheel delta (default 0; positive = down). Canonical name — same as modoki_scroll.'),
@@ -2355,7 +2344,7 @@ async function coordScaleOrRefusal(
       selector: z.string().optional().describe('CSS selector to scroll over.'),
       x: z.number().optional().describe(`X ${SCREENSHOT_PX} — the point to scroll over.`),
       y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
-      allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
+      allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
     },
     async ({ deltaX, deltaY, dx, dy, entity, selector, x, y, allowOccluded }) => {
       // An alias beside its canonical name is refused, not resolved by precedence (#1217, #1223 D1's

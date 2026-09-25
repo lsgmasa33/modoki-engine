@@ -35,7 +35,7 @@ const codeOf = (text: string) => envelope(text).error.code;
 const TOOLS: ReadonlyArray<{ name: string; args?: Record<string, unknown> }> = [
   // perceptCall
   { name: 'device_get_scene_state' },
-  { name: 'device_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, 0, 0], direction: [0, 0, -1] } },
+  { name: 'device_physics_query', args: { kind: 'raycast', dim: '3d', origin: [0, 0, 0], direction: [0, 0, -1] } },
   { name: 'device_journal' },
   { name: 'device_watch', args: { action: 'list' } },
   { name: 'device_input_watch', args: { action: 'read' } },

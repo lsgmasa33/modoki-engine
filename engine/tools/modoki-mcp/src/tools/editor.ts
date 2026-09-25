@@ -28,7 +28,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'and `persistenceMode` (always \'manual\' — see modoki_persistence). ' +
       'Also `heldPointer` — the sustained modoki_pointer press currently held ({button,x,y,heldMs}), ' +
       'or null. Check it when the Game panel has stopped responding to drags: a press left held ' +
-      'latches pointer input for the human as well as the agent, and nothing else reports it (#302). ' +
+      'latches pointer input for the human as well as the agent, and nothing else reports it. ' +
       'Also `gameView` — WHICH SCREEN the Game panel is previewing at (device name, orientation, '
       + 'logical + physical size, dpr, safe-area insets). Read it before quoting any layout '
       + 'measurement: the same HUD is correct on one device and broken on another, so a number '
@@ -319,7 +319,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'it has no path yet, so save_all REQUIRES one. WARNING: this DISCARDS the live world; ' +
       'anything created and not saved is gone (it refuses if there are unsaved changes — pass ' +
       'discardUnsaved:true to discard them deliberately). ALSO refuses while a prefab is being ' +
-      'edited (#853) — exit prefab-edit first; discardUnsaved does NOT bypass that one, because ' +
+      'edited — exit prefab-edit first; discardUnsaved does NOT bypass that one, because ' +
       'it is not about unsaved work. The replacement is a real world swap, so every id-keyed ' +
       'cache clears and the outgoing scene\'s resources are released immediately — entity ids ' +
       'are reassigned, so re-read any id you were holding.',
@@ -349,8 +349,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_discard_asset_edits',
     'ABANDON parked asset writes — the counterpart to modoki_save_all for the dirty-asset registry '
       + '(the pending asset defs — any ASSET_SCHEMA_TYPES type, not just particle/anim/timeline — '
-      + 'listed as `dirtyAssetPaths` by modoki_get_editor_state). Persistence is manual, and until now a save was the ONLY exit: an '
-      + 'exploratory modoki_particle_set / anim_set_clip / timeline_set could not be backed out.\n\n'
+      + 'listed as `dirtyAssetPaths` by modoki_get_editor_state). Persistence is manual, so besides a save this is the ONLY '
+      + 'way out of an exploratory modoki_particle_set / anim_set_clip / timeline_set.\n\n'
       + 'DO NOT "undo" one by re-applying the old def — that is not equivalent and the difference '
       + 'bites: it re-parks a write (so the doc is still dirty and the next save_all commits it), and '
       + 'the def you can read back is the MIGRATED one, so a legacy `gravity: 6` is rewritten as '
@@ -641,7 +641,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'Selects the texture + opens the modal. ⚠️ It opens with NOTHING selected, and the 8 ' +
       "corner/edge handles + pivot only exist for the SELECTED slice — so modoki_handles " +
       "editor=sprite returns an empty list right after this call; that is the normal case, not " +
-      'a bug (#373). Call modoki_select_sprite_slice next. ' +
+      'a bug. Call modoki_select_sprite_slice next. ' +
       "Pass the texture's served path (e.g. '/assets/textures/sheet.png'). Waits (up to 3s) for the " +
       "modal to open — it opens from the texture's Inspector view — and refuses NOT_AVAILABLE_HERE " +
       'if it does not. Returns editor state; openEditors.sprite confirms it.',
@@ -654,7 +654,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Select (or deselect) a slice in the currently-open Sprite Editor — normally a click on a ' +
       "rect or its row in the Sprites list. This is what makes a slice's 8 resize handles + " +
       "pivot appear in modoki_handles editor=sprite: the modal opens with nothing selected and " +
-      'had no other route to change that (#373). A guid is REFUSED unless a Sprite Editor is open ' +
+      'had no other route to change that. A guid is REFUSED unless a Sprite Editor is open ' +
       '(NOT_FOUND) and holds that slice (REFUSED_BY_OP, the slice guids as options); a deselect ' +
       'always works. Returns editor state, which reports the result as `spriteEditorSelection`.',
     { guid: z.string().nullable().optional().describe('The slice guid to select (a slice of the open texture\'s sidecar), or omit/null to deselect.') },
@@ -673,8 +673,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_open_skin_editor',
     'Open the Skin (2D rig) editor panel on a .rig2d.json asset — normally an Assets-panel ' +
-      'double-click or the Texture Inspector "Auto Rig" button. There was previously NO agent ' +
-      "route to open this panel at all (#373). Once open, modoki_handles editor=skin lists its " +
+      'double-click or the Texture Inspector "Auto Rig" button. Once open, ' +
+      "modoki_handles editor=skin lists its " +
       "bone-joint handles in skinMode 'rig' or 'weights' — NOT 'parts' (modoki_set_skin_mode). " +
       "Pass the rig's served path (e.g. '/assets/characters/hero.rig2d.json'). Waits (up to 3s) for the panel to show the rig and refuses NOT_AVAILABLE_HERE if it does not. Returns editor state; openEditors.skin confirms it.",
     { path: z.string().describe("The rig's served path, e.g. '/assets/characters/hero.rig2d.json'."),

@@ -1089,8 +1089,13 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // the entity out from under the toolbar moved it correctly on the first try). A press that
       // provably lands on something else is a miss, and a miss reported as a success is how a tool
       // manufactures a phantom product bug. `allowOccluded:true` still forces it through.
-      const blockedReason = (hd: ResolvedHandle, allowOccluded?: boolean): string | null =>
-        hd.onScreen === false
+      // Returns the refusal's text and, for a COVERED handle, the `OCCLUDED` code every other aimed
+      // route sends for the same condition (#1555 review). Without it the reply had no code and
+      // reached the agent as REFUSED_BY_OP — while `allowOccluded`'s shared description promises
+      // OCCLUDED, and a covered handle read as an invalid one is the misreading that got a working
+      // gizmo handle filed at severity high. Off-screen and disabled keep no code: neither is a cover.
+      const blockedReason = (hd: ResolvedHandle, allowOccluded?: boolean): { reason: string; code?: 'OCCLUDED' } | null => {
+        const reason = hd.onScreen === false
           // `clipped` = inside the window but outside its OWN panel's visible box. Same refusal,
           // different remedy: scrolling is what fixes a panel taller than its dock row, and is
           // useless for a gizmo handle projected past the edge of its viewport (there the panel
@@ -1103,6 +1108,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
             : hd.occludedBy !== undefined && !allowOccluded
               ? `covered by ${hd.occludedBy} — the press would land on THAT, not on the handle. Move the covering panel/menu (or the target) out of the way, or pass allowOccluded:true to press anyway and see what happens`
               : null;
+        if (reason === null) return null;
+        return hd.onScreen !== false && hd.meta?.disabled !== true ? { reason, code: 'OCCLUDED' } : { reason };
+      };
 
       const from = await resolve(h.id);
       if (!from) return json({ error: `no live handle with id '${h.id}' (query /api/enact-handles to list current handles)` }, 404);
@@ -1112,7 +1120,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // finished moving reads exactly as "this handle is inert", which is how a working 2D gizmo
       // handle got filed at severity high.
       if (fromBlocked) {
-        return json({ ok: false, error: `handle '${h.id}' is ${fromBlocked}${await settlingHint(requestRenderer)}`, handle: { id: h.id, x: from.x, y: from.y, onScreen: from.onScreen ?? true } });
+        return json({ ok: false, error: `handle '${h.id}' is ${fromBlocked.reason}${await settlingHint(requestRenderer)}`, ...(fromBlocked.code ? { code: fromBlocked.code } : {}), handle: { id: h.id, x: from.x, y: from.y, onScreen: from.onScreen ?? true } });
       }
       // S3.17 — `occluded` means the SAME thing here as on every other aimed route: a BOOLEAN,
       // always present, with the covering element's identity in `occludedBy`. The handle routes
@@ -1149,7 +1157,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
         if (!t) return json({ error: `no live handle with toId '${h.toId}'` }, 404);
         const tBlocked = blockedReason(t, h.allowOccluded);
         if (tBlocked) {
-          return json({ ok: false, error: `toId handle '${h.toId}' is ${tBlocked}${await settlingHint(requestRenderer)}`, handle: { id: h.toId, x: t.x, y: t.y, onScreen: t.onScreen ?? true } });
+          return json({ ok: false, error: `toId handle '${h.toId}' is ${tBlocked.reason}${await settlingHint(requestRenderer)}`, ...(tBlocked.code ? { code: tBlocked.code } : {}), handle: { id: h.toId, x: t.x, y: t.y, onScreen: t.onScreen ?? true } });
         }
         to = { x: t.x, y: t.y };
         toHandle = t;

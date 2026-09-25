@@ -1494,12 +1494,12 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_list_scenes` | GET `/api/scenes` | read-only | project | — | *(no args)* |
 | `modoki_list_traits` | GET `/api/trait-schema` | read-only | editor | — | *(no args)* |
 | `modoki_ota_status` | GET `/api/ota/status` | read-only | project | — | *(no args)* |
+| `modoki_physics_query` | POST `/api/scene-query` | read-only | editor + scene | point | `{"kind":"point","dim":"3d","point":[0,0,0]}` |
 | `modoki_player_prefs` | GET `/api/player-prefs` | read-only | editor | — | *(no args)* |
 | `modoki_read_asset_def` | GET `/api/asset-def` | read-only | editor | asset | `{"path":"/assets/particles/probe.particle.json"}` |
 | `modoki_render_scene` | POST `/api/render-scene` | read-only | editor + renderer + scene | — | *(no args)* |
 | `modoki_render_sequence` | POST `/api/render-sequence` | read-only | editor + renderer + scene | — | *(no args)* |
 | `modoki_resolve_refs` | GET `/api/resolve-refs` | read-only | project | — | `{"refs":["00000000-0000-0000-0000-000000000000"]}` |
-| `modoki_scene_query` | POST `/api/scene-query` | read-only | editor + scene | point | `{"kind":"point","dim":"3d","point":[0,0,0]}` |
 | `modoki_unused_assets` | GET `/api/unused-assets` | read-only | project | — | *(no args)* |
 | `modoki_validate_prefab` | GET `/api/validate-prefab` | read-only | project | asset | `{"path":"/assets/prefabs/probe.prefab.json"}` |
 | `modoki_validate_scene` | GET `/api/validate-scene` | read-only | project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
@@ -1639,7 +1639,7 @@ surface and not the other is a *finding*: either closed, or written down here wi
 | `modoki_pose_clip` · `modoki_open_animation_editor` · `modoki_exit_pose_envelope` | all three turn on the editor's **preview envelope** — a snapshot of the authored world that ⏹ Exit reverts to, plus a run-mode that blocks a scene save. A device build has no Animation panel, no envelope, and nothing to revert a pose *to*. |
 
 **Closed rather than recorded (#288 Phase 6):** `device_player_prefs`,
-`device_write_player_prefs` and `device_scene_query` ship alongside their `modoki_*` twins, because
+`device_write_player_prefs` and `device_physics_query` ship alongside their `modoki_*` twins, because
 both ops register in `agentBridge.ts` (runtime) and the device runtime therefore already had them.
 Prefs in particular matter *more* here: on a device the store is a real player's save data,
 namespaced by appId, which is why `action:'clear'` requires `confirm:true` on **both** surfaces —
@@ -2021,7 +2021,7 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
     it and its own review caught it.
 
   Frame-fed READS
-  (`world`/`bounds`, `layout_bounds`, `hit_regions`, `scene_query`, profiler, watch, and the
+  (`world`/`bounds`, `layout_bounds`, `hit_regions`, `physics_query`, profiler, watch, and the
   enact/resolve-point ops the trusted routes aim from) carry a staleness note on the existing
   `warnings` array rather than a new payload shape.
 

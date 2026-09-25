@@ -357,7 +357,8 @@ describe('the real registered surface', () => {
       expect(shape.force, `${name} must no longer take \`force\``).toBeUndefined();
       const d = shape.discardUnsaved?.description ?? '';
       expect(d, `${name}.discardUnsaved must say it DESTROYS`).toMatch(/DESTRUCTIVE and IRREVERSIBLE/);
-      expect(d, `${name} must name the old spelling, so the habit has somewhere to land`).toMatch(/used to be called `force`/);
+      // Present tense since #1555 — a pointer at the other name, not the history of the rename.
+      expect(d, `${name} must name \`force\`, so the habit has somewhere to land`).toMatch(/Not `force`: that is the NON-destructive flag/);
     }
     for (const name of harmless) {
       const shape = getTool(name)!.shape as Record<string, { description?: string }>;
@@ -661,7 +662,14 @@ describe('the real registered surface', () => {
   // 171,084 pin (booked in their ledgers). #1414 adds 228 B to modoki_save_all's `path`, which the
   // owner's ruling required to say that a
   // path naming another file is a Save As with a FRESH id that OVERWRITES what is there.
-  const DEFINITION_BYTES = 175_280;
+  // 2026-09-25 (#1554 + #1555, work-ai2): RE-PINNED DOWN to 165,715 — the first deliberate cut.
+  // −9,867 B from the 175,582 last booked (ledger/work-ai2.csv), nearly all #1555: the aim prose every input tool carried
+  // a copy of (entity/surface/allowOccluded, now ONE wording in `tools/shared/aimVocabulary.ts`,
+  // with nested copies pointing at the statement in the same tool), drag's `to` pointing at `from`,
+  // a shorter `precision`/`force`, and history narrative out of descriptions. #1554's rename is +2 B
+  // per mention. The device server, which this pin does not price, lost ~2.4 KB the same way; the
+  // repeated-prose ceiling in `mcpDescriptionProse.test.ts` covers both servers.
+  const DEFINITION_BYTES = 165_715;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

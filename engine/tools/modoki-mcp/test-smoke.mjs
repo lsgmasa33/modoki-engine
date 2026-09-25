@@ -904,7 +904,7 @@ await withCleanup(async () => {
 // Rapier world is built by the physics system on its first tick, so a scene with NO physics
 // colliders never has one — and `tropical-island`, the scene this whole gate pins itself to, has
 // exactly zero (measured: `scene-state?trait=Collider3D` returns 0 entities, playing or stopped).
-// So `modoki_scene_query`'s ergonomic form correctly refuses NOT_AVAILABLE_HERE there, forever,
+// So `modoki_physics_query`'s ergonomic form correctly refuses NOT_AVAILABLE_HERE there, forever,
 // and an EXPECTED_REFUSALS entry covers it. That entry proves the ROUTE is alive; it proves
 // nothing whatsoever about the casting path. This case builds a world so something does.
 //
@@ -937,7 +937,7 @@ await withCleanup(async () => {
   // The world is built on the physics system's first TICK after Play, which is a frame, not a fixed
   // time — a slow first frame on a cold or loaded editor outlasted the 400ms this used to wait
   // (#1260). So wait for the op to stop saying "not built yet", and fail with its own words if it never does.
-  const down0 = { tool: 'modoki_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, -1, 0], maxDistance: 200 } };
+  const down0 = { tool: 'modoki_physics_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, -1, 0], maxDistance: 200 } };
   for (const deadline = Date.now() + 5000; ;) {
     const r = await client.callTool({ name: down0.tool, arguments: down0.args });
     if (!r.isError) break;
@@ -952,10 +952,10 @@ await withCleanup(async () => {
     steps: [
       // Straight down from just above the floor's top surface (y = -499).
       { ...down0, result: 'full' },
-      { tool: 'modoki_scene_query', args: { kind: 'point', dim: '3d', point: [0, -500, 0] }, result: 'full' },
+      { tool: 'modoki_physics_query', args: { kind: 'point', dim: '3d', point: [0, -500, 0] }, result: 'full' },
       // A cast the same length in the OPPOSITE direction — the distinguishing observation. Without
       // it, a tool that reported a hit unconditionally would pass every assertion above.
-      { tool: 'modoki_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, 1, 0], maxDistance: 200 }, result: 'full' },
+      { tool: 'modoki_physics_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, 1, 0], maxDistance: 200 }, result: 'full' },
     ],
   } })));
   if (!built.ok) throw new Error(`UC12 query batch failed at: ${failedStep(built)}`);

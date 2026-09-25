@@ -949,7 +949,9 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   });
 
   it('tap-handle REFUSES an off-screen handle (ok:false) and dispatches nothing', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.off' }) as { body: { ok: boolean; error: string } };
+    const res = await post('/api/input/tap-handle', { id: 'bone.off' }) as { body: { ok: boolean; error: string; code?: string } };
+    // Off-screen is not a cover: allowOccluded cannot force it, so it must not be OCCLUDED (#1555 review).
+    expect(res.body.code).toBeUndefined();
     expect(res.body.ok).toBe(false);
     expect(res.body.error).toMatch(/off-screen/);
     expect(ops.tap).not.toHaveBeenCalled();
@@ -958,7 +960,9 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   it('a CLIPPED handle is refused with the remedy that actually applies, not "scroll it"', async () => {
     // Off the PANEL, not off the window: the press would land on whichever panel owns those
     // pixels, and telling the caller to scroll is wrong for a handle drawn past a viewport edge.
-    const res = await post('/api/input/tap-handle', { id: 'grad.clipped' }) as { body: { ok: boolean; error: string } };
+    const res = await post('/api/input/tap-handle', { id: 'grad.clipped' }) as { body: { ok: boolean; error: string; code?: string } };
+    // Off-screen is not a cover: allowOccluded cannot force it, so it must not be OCCLUDED (#1555 review).
+    expect(res.body.code).toBeUndefined();
     expect(res.body.ok).toBe(false);
     expect(res.body.error).toMatch(/OUTSIDE its own panel/);
     expect(ops.tap).not.toHaveBeenCalled();
@@ -968,12 +972,16 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     const res = await post('/api/input/tap-handle', { id: 'bone.disabled' }) as { body: { ok: boolean; error: string } };
     expect(res.body.ok).toBe(false);
     expect(res.body.error).toMatch(/disabled/);
+    // Not a cover, so not OCCLUDED — the code is reserved for what allowOccluded can override.
+    expect((res.body as { code?: string }).code).toBeUndefined();
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
   it('tap-handle REFUSES an occluded handle, naming the cover and the escape hatch', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { body: { ok: boolean; error: string } };
+    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { body: { ok: boolean; error: string; code?: string } };
     expect(res.body.ok).toBe(false);
+    // The code every aimed route sends for a cover, and the one `allowOccluded` promises (#1555).
+    expect(res.body.code).toBe('OCCLUDED');
     expect(res.body.error).toMatch(/covered by div\.modal/);
     expect(res.body.error).toMatch(/allowOccluded/);
     expect(ops.tap).not.toHaveBeenCalled();
@@ -1004,13 +1012,21 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   });
 
   it('drag-handle REFUSES a covered source, and drags it under allowOccluded', async () => {
-    const refused = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { body: { ok: boolean; error: string } };
+    const refused = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { body: { ok: boolean; error: string; code?: string } };
     expect(refused.body.ok).toBe(false);
+    expect(refused.body.code).toBe('OCCLUDED');
     expect(refused.body.error).toMatch(/covered by div\.modal/);
     expect(ops.drag).not.toHaveBeenCalled();
     const forced = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 }, allowOccluded: true }) as { body: Record<string, unknown> };
     expect(ops.drag).toHaveBeenCalledWith({ x: 40, y: 40 }, { x: 5, y: 5 }, expect.anything());
     expect(forced.body).toMatchObject({ ok: true, occluded: true, occludedBy: 'div.modal' });
+  });
+
+  it('drag-handle REFUSES a covered toId destination with OCCLUDED (#1555 review)', async () => {
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.covered' }) as { body: { ok: boolean; error: string; code?: string } };
+    expect(res.body).toMatchObject({ ok: false, code: 'OCCLUDED' });
+    expect(res.body.error).toMatch(/toId handle 'bone\.covered' is covered by div\.modal/);
+    expect(ops.drag).not.toHaveBeenCalled();
   });
 
   it('drag-handle says WHICH endpoint was covered (S3.17)', async () => {

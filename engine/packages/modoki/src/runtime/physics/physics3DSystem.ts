@@ -127,7 +127,7 @@ export const disposeAllPhysics3D = registry.disposeAll;
  *  world, and a zero-length direction are one value — and for a human reading code that collapse
  *  is harmless, because the next line is usually `if (hit)`. For an agent tool it is §0's rank-2
  *  failure: "could not look" reported as "nothing is there", stated authoritatively and
- *  unrecoverable. `modoki_scene_query` calls this FIRST and refuses instead of answering a miss.
+ *  unrecoverable. `modoki_physics_query` calls this FIRST and refuses instead of answering a miss.
  *
  *  Note a world only exists once `physics3DSystem` has run, i.e. while the sim is PLAYING — a
  *  stopped editor has no physics world, which is a real answer and not a defect. */

@@ -71,7 +71,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       '(asset→slot, reparent) use modoki_dnd, NOT this. Requires the Electron editor.',
     {
       from: makePointSpec().describe('Drag origin: {entity} | {selector} | {label, within?} | {x,y}.'),
-      to: makePointSpec().describe('Drag destination: {entity} | {selector} | {label, within?} | {x,y}.'),
+      to: makePointSpec({ sameAs: 'from' }).describe('Drag destination: {entity} | {selector} | {label, within?} | {x,y}.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button (default 'left')."),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
@@ -96,7 +96,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'gesture cannot coexist with a held press). Both dispatch the real mouseup, and the next ' +
       'move/up then tells you it happened. This exists because a press left held latches the ' +
       "renderer's pointer input and kills dragging for the HUMAN too, with no error anywhere " +
-      '(#302) — so release with `action:"up"` when you are done, and keep a long gesture moving. ' +
+      '— so release with `action:"up"` when you are done, and keep a long gesture moving. ' +
       'modoki_get_editor_state reports `heldPointer` if you need to check. ' +
       'Requires the Electron editor.',
     {
@@ -168,7 +168,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'Evaluate JavaScript in the editor RENDERER and return the value — the editor twin of ' +
       'device_eval; list the injected `modoki` ops with modoki_eval_api. Reads/pokes LIVE renderer state a static file read cannot (a global like ' +
       'window.__3d, window.innerWidth/devicePixelRatio, a React fiber value, WGSL validation, or ' +
-      'dispatching a bridge event), so you no longer need a raw CDP client for it. Runs as a ' +
+      'dispatching a bridge event). Runs as a ' +
       'function body: use `return` to yield a value. The result is safe-stringified in the renderer, ' +
       'so return a PROJECTION for anything large/circular (e.g. `return {w: innerWidth, h: innerHeight}` ' +
       '— a bare `window` or DOM node serializes poorly). A thrown error is reported as a tool error. ' +
@@ -229,8 +229,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_press_key',
     'Press a single trusted key chord into the focused element — keyDown+keyUp, plus a `char` ' +
       'event for Enter/Return so the press can actually INSERT: a bare keyDown/keyUp pair carries ' +
-      'no text for ANY spelling (measured, Electron 43.2.0), which is why pressing Enter in a ' +
-      'textarea used to do nothing at all. ⚠️ A MODIFIED Enter sends no char — Cmd/Ctrl+Enter is ' +
+      'no text for ANY spelling (measured, Electron 43.2.0). ⚠️ A MODIFIED Enter sends no char — Cmd/Ctrl+Enter is ' +
       '"commit, do not insert" — and Shift+Enter therefore does not soft-break either. The ' +
       'standalone keys typeText can only send as a terminal submitKey: Escape (close modal/' +
       'picker), Delete/Backspace, arrows (nudge), and editor hotkeys (W/E/R gizmo mode, F ' +
@@ -247,7 +246,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       + 'which modoki_focus with no selector clears, and (2) the KEYBOARD SCOPE — while any '
       + 'panel other than the Game panel owns it, the editor gate suppresses input to the '
       + 'running game entirely. A bare modoki_focus {} fixes only the first. Pass panel:"game" '
-      + 'to drive the game. The response now echoes `focusedPanel` on every press, and warns '
+      + 'to drive the game. The response echoes `focusedPanel` on every press, and warns '
       + 'when a press reached NOTHING (no editor binding claimed it and the gate blocked it). '
       + 'CAVEAT: this is renderer-level input — it does NOT trigger native Electron MENU ' +
       'accelerators, so a chord the OS menu claims (Cmd+R reload, Cmd+Alt+I devtools, and on ' +
@@ -382,7 +381,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
         + 'clip with 2+ numeric tracks until one is selected — see modoki_get_editor_state '
         + '`animationView`). "collider2d" needs modoki_set_scene_view_mode \'ui\' + '
         + 'modoki_set_collider_edit, AND the SceneView 2D layer toggle left on — a human can turn it '
-        + 'off with no agent-readable state or route back on yet (#373 part 2; the toolbar button '
+        + 'off with no agent-readable state or route back on yet (the toolbar button '
         + 'is chrome-tappable at data-ui-id "sceneView.toolbar.layer.show2D" with data-ui-state '
         + '"on"/"off", but blindly tapping it can turn 2D OFF if that was never the problem — '
         + 'check the state first). "sprite" (open with action:open-sprite-editor) additionally '
@@ -424,7 +423,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       '`allowOccluded:true` to press anyway and see what happens. Requires the Electron editor.',
     {
       id: z.string().describe('Handle id from modoki_handles.'),
-      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button to click with (default 'left'). This tool CLICKS — the 'held during the drag' wording here was copy-pasted from modoki_drag_handle."),
+      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button to click with (default 'left'). This tool CLICKS; no button is held across a gesture."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click — same meaning as modoki_tap.'),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, e.g. ["shift"] to add to a marquee selection — same meaning as modoki_tap.`),
       allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Here the target is a HANDLE, and a covered one reads as an inert one — which is how a working gizmo handle under the SceneView toolbar got filed as a high-severity bug.`),
@@ -474,9 +473,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'you the field rejected it. `typed` is MEASURED (the focused element\'s value delta), not the length of ' +
       'what you asked for, and `valueAfter` echoes the field — so a short insert is a FAILURE naming ' +
       'what landed. NON-ASCII (Japanese, emoji, accented) text DOES insert — measured on Electron ' +
-      '43. This used to say it could not, and steered agents to modoki_eval, which is a ' +
-      'NON-input write a controlled input never sees, so the advice was worse than the path it ' +
-      'replaced. When text really does not land, the live cause is a field that reformats or ' +
+      '43 — do not route it through modoki_eval, a NON-input write a controlled input never sees. When text really does not land, the live cause is a field that reformats or ' +
       'rejects input as you type — read `valueAfter`, it names what is actually there. ' +
       'Requires the Electron editor.',
     {

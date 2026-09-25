@@ -885,7 +885,7 @@ describe('a 200 refusal relays the op\'s options', () => {
   it('POST (postJson)', async () => {
     const s = (surface = loadSurface((req) => req.path === '/api/scene-query'
       ? { body: { ok: false, error: 'unknown kind', options: ['raycast', 'overlap'] } } : undefined));
-    const e = envelope(s, await s.call('modoki_scene_query', { kind: 'raycast', dim: '3d', origin: [0, 0, 0], direction: [0, 0, -1] }));
+    const e = envelope(s, await s.call('modoki_physics_query', { kind: 'raycast', dim: '3d', origin: [0, 0, 0], direction: [0, 0, -1] }));
     expect(e.code).toBe('REFUSED_BY_OP');
     expect(e.options).toEqual(['raycast', 'overlap']);
   });

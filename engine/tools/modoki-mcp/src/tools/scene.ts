@@ -22,7 +22,6 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
     'Read the LIVE ECS world. This reads the running engine, NOT the scene file — so it ' +
       'PROVES an edit actually took effect. The primary, deterministic, cheap way to verify ' +
       'your work after a mutate (prefer it over a screenshot for "did the data change?"). ' +
-      '(A physics ray/shape/point cast is modoki_scene_query.) ' +
       'CALLED BARE it returns an INDEX: each entity\'s id, guid, name, parentId, layer and its ' +
       'trait NAMES — no field values. That is the cheap "what exists?" question; ask it first. ' +
       'To get VALUES, target or enrich: trait=<Trait> | id=<n> | name=<substr> | ' +
@@ -332,15 +331,14 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_get_asset_meta',
     'Read an asset\'s .meta.json sidecar (import settings for textures/models, etc.), PREFERRING a '
       + 'parked Inspector edit over the file.\n\n'
-      + 'WHY that matters (#845/#872): an Inspector import-settings change is MANUAL-SAVE — it is '
+      + 'WHY that matters: an Inspector import-settings change is MANUAL-SAVE — it is '
       + 'parked in the editor and reaches disk only at modoki_save_all. So the FILE is the '
-      + 'PRE-EDIT document for as long as a park is unflushed, and this tool used to return it '
-      + 'with no way to tell. `source` says where the answer came from: `parked` (an unsaved '
+      + 'PRE-EDIT document for as long as a park is unflushed. `source` says where the answer came from: `parked` (an unsaved '
       + 'editor edit — `unsaved:true`, and modoki_get_editor_state lists it under '
       + '`pendingImportSettings`) or `disk`.\n\n'
       + 'HEADLESS: with no editor running, `editorConnected:false` comes back with the file\'s '
       + 'contents — a real answer, but one that could not check for a park.\n\n'
-      + 'An empty `meta` is AMBIGUOUS: it means no sidecar, a sidecar that does not PARSE (#778), '
+      + 'An empty `meta` is AMBIGUOUS: it means no sidecar, a sidecar that does not PARSE, '
       + 'or — when `read:"failed"` — that the read itself failed. Do NOT write an empty document '
       + 'back with modoki_write_asset_meta: that route REPLACES the sidecar, so a write built on '
       + 'one drops the asset GUID and the scanner mints a new one, orphaning every reference to it.',

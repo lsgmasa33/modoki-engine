@@ -35,3 +35,16 @@ export function firstSentenceDefect(d: string): string | null {
   if (/#\d+/.test(f)) return 'carries an issue number';
   return null;
 }
+
+/** History in a description, ANYWHERE in it (#1555): a past state narrated ("used to",
+ *  "previously") or a bare issue number. A maintainer needs it; an agent choosing arguments does
+ *  not, and a loaded schema is re-read every turn. Shared by `mcpDescriptionProse.test.ts` (both
+ *  engine servers) and `gameToolFirstSentence.test.ts` (game tools), for the same reason as the
+ *  first-sentence detector above. An issue number is `#` + digits wherever it sits — `(#32)`,
+ *  `see #32.`, `(#373 part 2;` — the first version matched only the closed-paren form and missed the
+ *  other two (#1555 review). Not after a word character or `&`, so an HTML entity (`&#39;`) and
+ *  `#fff` stay out; at most five digits, so a six- or eight-digit colour (`#000000`) does too.
+ *  ⚠️ A THREE-digit all-numeric colour (`#000`) still matches — none is on the surface; if one is
+ *  ever needed, write it with a letter (`#0a0`) or add a ledger row. "Until now" is history told in
+ *  the present tense, the form the second review found five of. */
+export const DESCRIPTION_HISTORY = /\bused to\b|\bpreviously\b|\b[Uu]ntil now\b|(?<![\w&])#\d{1,5}\b/;
