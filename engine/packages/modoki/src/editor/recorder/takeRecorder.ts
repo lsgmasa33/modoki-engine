@@ -23,7 +23,8 @@ import { PlayerPrefs } from '../../runtime/storage/playerPrefs';
 import { prefsKeyPrefix } from '../../runtime/storage/prefsKey';
 import { getActiveGameId } from '../../runtime/managers/managerRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
-import { enterPlay, stopPlay } from '../scene/playMode';
+import { pressPlay, pressStop, playFeedback } from '../scene/playPressFeedback';
+import { useEditorStore } from '../store/editorStore';
 import { hasUnsavedChanges } from '../scene/serialize';
 import { backendFetch, jsonFileBody, writeAssetFile } from '../backend/editorBackend';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
@@ -175,10 +176,20 @@ function requestAssetFingerprint(): Promise<TakeAssets | null> {
     });
 }
 
+/** True from a ⏺ press until that take is armed or abandoned. `recording` is set only after the
+ *  save flush, so without this a double-click in that window started a SECOND take, which was then
+ *  refused against the first one's Play — orphaning the first take's listeners, unsaved. */
+let starting = false;
+
 /** Snapshot the starting state, press Play, and record until stopped. Resolves with an error
  *  message when it cannot start, or null when it did. */
 export async function startTakeRecording(safeArea: Take['safeArea']): Promise<string | null> {
-  if (recording) return 'already recording';
+  if (recording || starting) return 'already recording';
+  starting = true;
+  try { return await armAndPlay(safeArea); } finally { starting = false; }
+}
+
+async function armAndPlay(safeArea: Take['safeArea']): Promise<string | null> {
   if (getPlayState() !== 'stopped') return 'stop play first — a take records from the Play press';
   // The replay loads the scene from DISK; Play runs the in-memory one. An unsaved edit would be in
   // the take the owner played and missing from the video.
@@ -274,17 +285,30 @@ export async function startTakeRecording(safeArea: Take['safeArea']): Promise<st
 
   // `enterPlay` can decline without throwing (a scene swap in flight, a cancelled Play) — and a
   // recorder left armed after that turns the NEXT ordinary Play into the take, with this press's
-  // save, clock and scene. So a Play that did not start disarms everything.
+  // save, clock and scene. So a Play that did not start disarms everything. ⏺ is a Play press to the
+  // human, so it goes through `pressPlay`: a refusal (or a Stop queued behind this Play) reaches
+  // the editor toast, not only this return value (#1577). `null` = Play threw, already toasted.
   const abandon = (why: string): string => {
     if (recording === rec) { recording = null; rec.detach(); notify(); }
     return why;
   };
-  try {
-    await enterPlay();
-  } catch (err) {
-    return abandon(`Play failed to start: ${err instanceof Error ? err.message : String(err)}`);
+  const outcome = await pressPlay();
+  if (outcome === null) return abandon('Play failed to start — nothing was recorded');
+  if (!rec.started) {
+    // A second ⏺ during startup queued the Stop — the take ended as asked, nothing to say.
+    if (outcome.kind === 'stopped-during-startup') return abandon('Stopped before the take began — nothing was recorded');
+    // A Play is running (or about to) that this press did not start: ▶'s, which reached 'playing'
+    // while this press awaited the save flush — so "did not start" would be false on screen.
+    const otherPlay = (outcome.kind === 'refused' && outcome.reason === 'already-starting')
+      || outcome.kind === 'already-playing' || outcome.kind === 'resumed';
+    const why = otherPlay
+      ? 'Not recording — another Play was already starting or running. Stop it, then press ⏺ to record from the start.'
+      : 'Play did not start — nothing was recorded';
+    // pressPlay already said why when the outcome speaks; a ▶ double-press is silent there, but ⏺
+    // ABANDONS the take on it, so the human is owed the reason here (#1577).
+    if (playFeedback(outcome) === null) useEditorStore.getState().showToast(why, 'warn');
+    return abandon(why);
   }
-  if (!rec.started) return abandon('Play did not start — nothing was recorded');
   return null;
 }
 
@@ -299,7 +323,11 @@ export async function finishTakeRecording(): Promise<string | null> {
   if (rec.started) drainTakeJournal(rec);
   rec.detach();
   notify();
-  if (getPlayState() !== 'stopped') await stopPlay();
+  // `pressStop`, not `stopPlay`: a Stop that skipped its revert, or whose restore threw, reaches the
+  // human as a toast instead of an unhandled rejection from GameView's `void` (#1577). A take whose
+  // Play has not reached 'playing' yet may still be STARTING (the state reads 'stopped' throughout),
+  // so it is stopped too: stopPlay queues behind the startup (#470), or answers 'already-stopped'.
+  if (getPlayState() !== 'stopped' || !rec.started) await pressStop();
   if (!rec.started) return null;
   if (rec.builder.events.length === 0 && rec.takeTime === 0) {
     console.info('[takeRecorder] stopped before the first frame — nothing to save');

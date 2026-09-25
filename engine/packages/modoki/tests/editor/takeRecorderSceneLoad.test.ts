@@ -8,8 +8,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
 vi.mock('../../src/editor/scene/playMode', () => ({
-  enterPlay: async () => { (await import('../../src/runtime/core/playState')).setPlayState('playing'); },
-  stopPlay: async () => {},
+  enterPlay: async () => { (await import('../../src/runtime/core/playState')).setPlayState('playing'); return { kind: 'started' }; },
+  stopPlay: async () => ({ kind: 'stopped', reverted: true }),
 }));
 vi.mock('../../src/editor/scene/serialize', () => ({ hasUnsavedChanges: () => false }));
 vi.mock('../../src/runtime/managers/managerRegistry', async (importOriginal) => ({

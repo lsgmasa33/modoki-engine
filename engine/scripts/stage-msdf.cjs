@@ -123,6 +123,14 @@ exports.default = async function stageMsdf(context) {
 
   const bin = pinnedToolForStaging('msdf-atlas-gen');
   if (!bin) {
+    // A skipped stage must not re-ship an EARLIER run's copy — electron-builder ships all of
+    // build/bin, so a pack that could not provision the pin would still bundle whatever an older pack
+    // left there (stage-toktx's `clearStaged` rule; #1571 found this branch was the one without it).
+    // libktx belongs to stage-toktx, as in the prune below.
+    const stale = fs.existsSync(BIN_DIR)
+      ? fs.readdirSync(BIN_DIR).filter((n) => n === 'msdf-atlas-gen' || (n.endsWith('.dylib') && !n.startsWith('libktx')))
+      : [];
+    rmStaged(stale.map((n) => path.join(BIN_DIR, n)));
     console.warn('[stage-msdf] no pinned msdf-atlas-gen (MODOKI_MSDF_ATLAS_GEN, or ' +
       '`npm run toolchain:install -- msdf-atlas-gen`) — skipping bundle; font import will show an install hint.');
     return;

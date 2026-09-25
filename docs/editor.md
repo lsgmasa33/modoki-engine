@@ -1887,8 +1887,14 @@ two independent in-flight Plays could otherwise race their `finally` clears and 
 carrying the queued Stop's own `reverted` — including a restore that threw, which the tail logs and
 folds in rather than rejecting the Play press)
 and `stopPlay` to a `StopOutcome` (`reverted` true/false + `reason`, `queued`, `already-stopped`,
-`preview-exited`). The toolbar ignores both and keeps its console warn; the agent `play`/`stop` ops
-build their reply from them — the reply table is in
+`preview-exited`). **Both surfaces read them, and print the same string.** The toolbar ▶/⏹, the
+`mod+p` chord and the take recorder's ⏺ (a Play press, then a Stop press — the recorder adds its own
+toast where it abandons a take, [gameplay-recorder.md](./gameplay-recorder.md)) go through `pressPlay`/`pressStop` (`editor/scene/playPressFeedback.ts`, #1577), which
+raise a warn toast carrying the outcome's `message`/`reason` for a refused Play (except a
+double-press, `already-starting`) and for any Play or Stop that ended without reverting — including a
+Stop whose restore THREW, which under the old `void stopPlay()` was an unhandled rejection. Until
+#1577 the toolbar discarded the outcome, so a correct refusal looked like a dead button. The agent
+`play`/`stop` ops build their reply from the same outcomes — the reply table is in
 [debug-tools-mcp.md](./debug-tools-mcp.md) § "Editor debugging — DEFAULT to Electron (modoki MCP)" (the Play/test bullet). A new early return in either
 function needs its own outcome, or the agent reads it as success again.
 

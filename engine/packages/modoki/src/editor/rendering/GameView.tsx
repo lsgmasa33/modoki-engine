@@ -7,7 +7,8 @@ import { stepOneFrame } from '../../runtime/rendering/frameDriver';
 import { getPlayState, setPlayState, onPlayStateChange } from '../../runtime/core/playState';
 import { setShowColliders2D, isShowColliders2D } from '../../runtime/rendering';
 import { setAudioMuted, isAudioMuted } from '../../runtime/audio/audioService';
-import { enterPlay, stopPlay, pausePlay } from '../scene/playMode';
+import { pausePlay } from '../scene/playMode';
+import { pressPlay, pressStop } from '../scene/playPressFeedback';
 import { useEditorStore } from '../store/editorStore';
 import { computeDeviceLetterbox } from '../scene/sceneViewMath';
 import { resolveLogicalSize, resolveSafeArea, safeAreaCssVars, type DevicePreset } from '../scene/devicePresets';
@@ -142,8 +143,8 @@ export default function GameView({ uiLayer }: GameViewProps) {
 
   // Play snapshots the authored world; Stop reverts to it (discarding play-mode
   // mutations); Pause freezes the sim in place. See editor/scene/playMode.ts.
-  const onPlay = useCallback(() => { void enterPlay(); }, []);
-  const onStop = useCallback(() => { void stopPlay(); }, []);
+  const onPlay = useCallback(() => { void pressPlay(); }, []);
+  const onStop = useCallback(() => { void pressStop(); }, []);
   const onPause = useCallback(() => { pausePlay(); }, []);
 
   // Step one frame while Paused: briefly run the sim for a single frame, then

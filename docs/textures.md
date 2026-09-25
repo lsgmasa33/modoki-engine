@@ -49,7 +49,8 @@ into the app bundle (macOS-only — the only signed target today):
   under the hardened runtime.
 - **`engine/electron/main.ts`** (`app.isPackaged`) points
   `process.env.MODOKI_TOKTX` at `<resourcesPath>/bin/toktx` when the env isn't
-  already set, so `toktxBinary()` picks up the bundled copy.
+  already set, so the pinned lookup (`ensureKtxCli()` → `pinnedConversionCli`)
+  picks up the bundled copy.
 - **Graceful degradation**: if the pinned `toktx` cannot be provisioned on the
   *build* machine (offline), the hook logs a warning and skips — the packaged app
   then falls back to shipping source textures, exactly as a dev build without

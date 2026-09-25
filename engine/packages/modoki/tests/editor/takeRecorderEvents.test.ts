@@ -14,7 +14,10 @@ const h = vi.hoisted(() => ({
 
 vi.mock('../../src/editor/scene/playMode', async () => {
   const ps = await import('../../src/runtime/core/playState');
-  return { enterPlay: async () => { ps.setPlayState('playing'); }, stopPlay: async () => { ps.setPlayState('stopped'); } };
+  return {
+    enterPlay: async () => { ps.setPlayState('playing'); return { kind: 'started' }; },
+    stopPlay: async () => { ps.setPlayState('stopped'); return { kind: 'stopped', reverted: true }; },
+  };
 });
 vi.mock('../../src/editor/scene/serialize', () => ({ hasUnsavedChanges: () => false }));
 vi.mock('../../src/runtime/managers/managerRegistry', () => ({ getActiveGameId: () => 'court' }));

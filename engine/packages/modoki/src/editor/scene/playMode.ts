@@ -94,8 +94,8 @@ export function aSceneSwapIsHappening(): boolean {
     || authoredRestoreInFlight();
 }
 
-/** What a Play press did (#1574). The toolbar ignores it — a refusal there is the `console.warn` —
- *  but the agent `play` op cannot read the console, and it used to answer `ok:true` over every
+/** What a Play press did (#1574). The toolbar turns a decline into a warn toast (`playPressFeedback.ts`, #1577)
+ *  and the agent `play` op builds its reply from it — it cannot read the console, and it used to answer `ok:true` over every
  *  refusal because the state it re-read afterwards ('stopped') looked the same as a Play that had not
  *  been asked for. `message` is the one string both surfaces print. */
 export type PlayOutcome =

@@ -96,7 +96,12 @@ is, and why:
 - Presses Play. The `onPlayStateChange` listener fires synchronously inside `setPlayState`, before the first play frame. It seeds the world and starts the take clock.
 
 A Play that declines (a scene swap in flight) or throws disarms the recorder. Otherwise the next
-ordinary Play would become the take, carrying this press's save, clock and scene.
+ordinary Play would become the take, carrying this press's save, clock and scene. ⏺ presses Play
+through `pressPlay` (#1577), so a refusal reaches the editor toast; when a Play this press did not
+start is already starting or running (▶ pressed first), the recorder raises its own toast, since ▶'s
+double-press silence would read as a dead ⏺. A second ⏺ while the take's Play is still starting
+stops that Play (the Stop queues behind startup, #470), and a double-click before the take arms is
+ignored — it used to start a second take and orphan the first.
 
 Window capture-phase pointer listeners then record transitions over the runtime UI root
 (`[data-modoki-ui-root="runtime"]`, the same element in the editor and on the game page).
