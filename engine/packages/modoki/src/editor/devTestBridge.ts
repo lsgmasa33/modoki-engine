@@ -13,10 +13,7 @@ import { importModel } from './scene/modelImport';
 import { loadScene, newScene, setCurrentScenePath, type SceneLoadOutcome } from './scene/serialize';
 import { isSkeletalPreviewing } from '../runtime/core/skeletalPreview';
 import { getModeOwner } from './scene/playMode';
-import { previewTimelineAt } from '../runtime/timeline/timelineSystem';
 import { getCurrentWorld } from '../runtime/core/ecs/world';
-import { fireDirtyListeners } from '../runtime/core/ecs/entityUtils';
-import { normalizeTimeline, type TimelineDef } from '../runtime/timeline/types';
 import { getEditorViewportCamera, isEcsObjectVisible } from './scene/sceneViewBus';
 import { worldTransforms } from '../runtime/core/ecs/transformPropagationSystem';
 import { editorScene2DRenderer } from './rendering/editorScene2D';
@@ -78,12 +75,6 @@ export interface EditorTestBridge {
    *  with a timeline doc open the Timeline's own loop advances it too — so the owner is the
    *  discriminating read, and without it the E2E would pass under both correct and broken. */
   previewModeOwner(): string | null;
-  /** Pose a Director's timeline at absolute time `t` while STOPPED — the same
-   *  scrub-preview path the Timeline panel drives (previewTimelineAt + repaint).
-   *  Lets an E2E verify skeletal seek-scrub (Phase 5) deterministically: scrub,
-   *  then read back SkeletalAnimator.time / capture the pose. `def` is the raw
-   *  timeline JSON (normalized here). */
-  scrubTimeline(directorId: number, def: unknown, t: number): void;
   /** Project an entity's WORLD position through the live 3D SceneView camera into PAGE (client)
    *  coordinates — the same camera + canvas-rect math the real marquee/raycast use (see
    *  ThreeJSViewport's marquee `consider()`). Lets an E2E compute a click/drag target for an
@@ -160,10 +151,6 @@ export function installEditorTestBridge(): void {
     },
     previewModeOwner() {
       return getModeOwner();
-    },
-    scrubTimeline(directorId, def, t) {
-      previewTimelineAt(getCurrentWorld(), directorId, normalizeTimeline(def as Partial<TimelineDef>), t);
-      fireDirtyListeners();
     },
     screenPositionOf(entityId) {
       const cam = getEditorViewportCamera();

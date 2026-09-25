@@ -201,6 +201,10 @@ const insideScanDirs = (rel: string): boolean =>
  *    first-match query: it `continue`s on a falsy `coValidate(base)` and `break`s on the first
  *    accepted candidate. Same shape as `pickAt`. Surfaced only once the detector learned object and
  *    nested patterns, which is also how it found `engine/electron/main.ts`'s rejector loop.
+ *  - `editor/scene/authoredWorld.ts` `whyWorldNotAuthored` — `for (const [label, isPosed] of
+ *    _sources)`, a first-match query returning the first source that reports a possibly-posed world
+ *    (#1548). It notifies nobody; a THROWING source is caught there and counted as posed, because
+ *    the question gates a disk write and "cannot tell" must refuse the write, not skip the source.
  *
  *  ── async-sequential ──
  *  - `runtime/scene/SceneManager.ts` `fireBeforeSwapHooks` — beforeSwap hooks (shader prewarm),
@@ -236,6 +240,7 @@ const EXEMPT: Readonly<Record<string, ExemptKind>> = {
   'engine/packages/modoki/src/editor/panels/assetEditorBindings.ts :: repair': 'query',
   'engine/plugins/load-project-config.ts :: read': 'query',
   'games/wordweave/runtime/stem.ts :: coValidate': 'query',
+  'engine/packages/modoki/src/editor/scene/authoredWorld.ts :: isPosed': 'query',
   'engine/packages/modoki/src/runtime/scene/SceneManager.ts :: hook': 'async-sequential',
   'engine/packages/modoki/src/editor/undo/compositeAction.ts :: step': 'async-sequential',
   'engine/tools/modoki-mcp/src/registerAll.ts :: register': 'registration',

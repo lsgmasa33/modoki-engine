@@ -29,6 +29,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 }));
 const SCENE = { version: 1, entities: [], resources: [] };
 vi.mock('../../src/editor/scene/serialize', () => ({
+  registerBeforeSceneLoad: () => {},
   serializeScene: async () => SCENE,
   getCurrentScenePath: () => '/assets/scenes/main.scene.json',
   sceneLoadGeneration: () => 0,
@@ -40,6 +41,8 @@ vi.mock('../../src/editor/scene/timelinePreview', () => ({
   cancelPreviewGestures: () => {},
   whenPreviewRestoresLanded: async () => {},
   endTimelinePreviewSession: async () => null,
+  holdPreviewSessionsClosed: () => () => {},
+  cancelPendingPreviewBegins: () => {},
 }));
 vi.mock('../../src/editor/panels/aiSettingsModel', () => ({
   fetchAiSettings: async () => ({}),

@@ -20,6 +20,7 @@
  *  `fetch` behind `backendFetch`, exactly as assetUndo.test.ts does. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { setRunMode as setRunModeForAuthoring } from '../../src/runtime/core/playState';
 
 const setPrefabCacheSpy = vi.fn();
 const tagSpy = vi.fn();
@@ -117,9 +118,13 @@ afterEach(() => { for (const s of spies) s.mockRestore(); spies = []; vi.unstubA
 
 async function makeAction() {
   const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
-  if (!res || res === 'declined') throw new Error(`expected a created prefab, got ${res}`);
+  if (!res || res === 'declined' || 'refused' in res) throw new Error(`expected a created prefab, got ${res}`);
   return res.action;
 }
+
+// The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing), and
+// every writer of the live world refuses outside an authored world (#1548) — so the premise is stated.
+beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('createPrefabFromEntity — undo', () => {
   it('does not untag the live tree or clear the cache when the trash fails, and reports', async () => {
@@ -232,7 +237,7 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
   it('a fresh path writes create-only and never asks', async () => {
     let asked = false;
     const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => { asked = true; return true; });
-    expect(res && res !== 'declined' && res.prefab.id).toBe('g-new');
+    expect(res && res !== 'declined' && !('refused' in res) && res.prefab.id).toBe('g-new');
     expect(asked).toBe(false);
     expect(written.map((w) => w.createOnly)).toEqual([true]);
   });
@@ -240,7 +245,7 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
   it('a YES replaces KEEPING the replaced prefab\'s guid — in the file, the registration and the cache', async () => {
     onDisk.set(PATH, OLD_TEXT);
     const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
-    if (!res || res === 'declined') throw new Error(String(res));
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
     expect(res.prefab.id).toBe(OLD_ID);
     expect(written).toHaveLength(1);
     expect(written[0].createOnly).toBe(false);
@@ -253,7 +258,7 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     const ON_DISK = '/p/Thing.prefab.json';
     onDisk.set(ON_DISK, OLD_TEXT);
     const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
-    if (!res || res === 'declined') throw new Error(String(res));
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
     expect(res.savePath).toBe(ON_DISK);
     expect(registerAssetSpy).toHaveBeenCalledWith(OLD_ID, ON_DISK, 'prefab');
     // The written prefab is handed to tagging so it can check its freshly-computed plan against
@@ -273,7 +278,7 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
   it('UNDO of a replace RESTORES the replaced bytes and never trashes the file', async () => {
     onDisk.set(PATH, OLD_TEXT);
     const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
-    if (!res || res === 'declined') throw new Error(String(res));
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
     setPrefabCacheSpy.mockClear();
     await res.action.undo();
     expect(onDisk.get(PATH)).toBe(OLD_TEXT);
@@ -322,7 +327,7 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
   it('undo of a REPLACE untags, then restores the prior links', async () => {
     onDisk.set('/p/thing.prefab.json', `{"id":"${OLD_ID}","entities":[]}\n`);
     const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
-    if (!res || res === 'declined') throw new Error(String(res));
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
     calls.length = 0;
     await res.action.undo();
     expect(calls).toEqual(['unstamp', 'untag', 'reattach']);
@@ -332,7 +337,7 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
   it('redo after a successful undo of a REPLACE re-snapshots too', async () => {
     onDisk.set('/p/thing.prefab.json', `{"id":"${OLD_ID}","entities":[]}\n`);
     const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
-    if (!res || res === 'declined') throw new Error(String(res));
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
     await res.action.undo();
     calls.length = 0;
     await res.action.redo();
@@ -376,11 +381,11 @@ describe('createPrefabFromEntity — the runtime-exclusion count reaches the cal
   it('carries what serializePrefab reported, so the panel can surface it', async () => {
     runtimeExcludedFixture = 3;
     const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
-    expect(res && res !== 'declined' ? res.runtimeExcluded : null).toBe(3);
+    expect(res && res !== 'declined' && !('refused' in res) ? res.runtimeExcluded : null).toBe(3);
   });
 
   it('reports 0 when the selection lost nothing', async () => {
     const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
-    expect(res && res !== 'declined' ? res.runtimeExcluded : null).toBe(0);
+    expect(res && res !== 'declined' && !('refused' in res) ? res.runtimeExcluded : null).toBe(0);
   });
 });

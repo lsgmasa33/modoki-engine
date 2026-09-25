@@ -1,5 +1,6 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
+import { whyWorldNotAuthored } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
@@ -4769,6 +4770,14 @@ export async function applyToPrefabSelective(
   rootInstanceId: number,
   selectedKeys: Set<string>,
 ): Promise<ApplyResult> {
+  // ⚠️ Read the instance's values only from an AUTHORED world (#1548). Apply copies live trait values
+  // into the template, and a pose or a Play value on the instance shows up as an override the dialog
+  // pre-checks — so this wrote a preview frame into a .prefab.json every scene shares, which no ⏹ Exit
+  // can revert. Refused here, the one function both the dialog and the agent `prefab apply` reach.
+  const notAuthored = whyWorldNotAuthored();
+  if (notAuthored) {
+    return { ...NOOP_APPLY, refused: `the live world is not authored (${notAuthored}) — exit the preview / stop Play first, or a pose would be written into the prefab` };
+  }
   const ctx = resolveInstanceContext(rootInstanceId);
   if (!ctx) {
     console.warn('[Prefab] Selected entity is not a prefab instance');

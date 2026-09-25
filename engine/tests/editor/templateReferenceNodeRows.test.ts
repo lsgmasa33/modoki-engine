@@ -7,6 +7,7 @@
  *  the real prefab-edit scene builder, the real saves and both loaders. Each case names the mutation that turns it red. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { setRunMode as setRunModeForAuthoring } from '../../packages/modoki/src/runtime/core/playState';
 import { createWorld } from 'koota';
 
 const prefabs = new Map<string, unknown>();
@@ -157,6 +158,10 @@ beforeEach(() => {
   install(innerDoc);
   clearKeptMemberOrphans();
 });
+
+// The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing), and
+// every writer of the live world refuses outside an authored world (#1548) — so the premise is stated.
+beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('a template reference node does not pin what its inner prefab put there (#1538)', () => {
   // The case #1538 was observed with. Mutation: in `captureNestedRef`, skip the template branch (the scene rule).

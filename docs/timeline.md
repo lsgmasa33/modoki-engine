@@ -526,7 +526,11 @@ label), so preview **snapshots the authored world at ▶ and reverts it** (`seri
 `SceneManager.loadScene({preloaded})`, mirroring editor Play/Stop — `editor/scene/timelinePreview.ts`)
 when you **⏮/scrub, close/switch the panel, or press global Play**; Pause holds the mutated frame
 (session kept, audio+dispatch gates closed). The revert reloads the world (new entity ids), so the
-panel re-resolves the Director root after restore. Nothing preview mutates ever reaches disk.
+panel re-resolves the Director root after restore. No preview mutation of the WORLD reaches disk —
+every writer refuses until the restore has landed ([editor.md](editor.md) § One envelope at a time).
+⚠️ **State OUTSIDE the world is not covered:** an action a signal marker fires (a bus volume,
+PlayerPrefs, `iap.buy`, `system.openUrl`, `engine.reload`, game stores) runs for real and no snapshot
+reverts it — #1551.
 
 **Item inspector** (`timeline/ItemInspector.tsx`, pure helpers in `timeline/itemEdit.ts`): click a
 clip/marker/cue/span to edit its **values** — animation clip name/start/duration/scrub, signal

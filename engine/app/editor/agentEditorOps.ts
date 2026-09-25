@@ -70,7 +70,7 @@ import {
   describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
   type DevicePreset, type Orientation,
   type PrefabFile,
-  causeSpecs, flushParked, getModeOwner, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath,
+  causeSpecs, flushParked, getModeOwner, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath, whyWorldNotAuthored,
   dirtyAssetEditorHolds,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
@@ -2384,7 +2384,10 @@ export function registerEditorAgentOps(): void {
       const note = landed.length
         ? ` The ${landed.length} parked item(s) WERE written (${landed.join(', ')}) — those are authored documents and are not affected by run mode.`
         : '';
-      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing, because saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene, and Stop would revert the live world anyway. Stop the editor first (modoki_play_control {action:"stop"}).${note}`);
+      // The REASON, not a fixed "stop the editor" (#1548 close-out review): a preview restore still
+      // landing is cleared by retrying, not by Stop, which is a no-op there.
+      const why = whyWorldNotAuthored() ?? 'the live world is not authored';
+      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing (${why}). Saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene. Stop Play (modoki_play_control {action:"stop"}), exit a preview (modoki_exit_pose_envelope), or — if a restore is landing — retry in a moment.${note}`);
     }
     // ⚠️ "NOTHING was written" was a claim about the WHOLE save, and a failed scene write does not
     // undo the parked flushes — so with anything in `landed` it was a real write reported as a
@@ -2697,6 +2700,9 @@ export function registerEditorAgentOps(): void {
       if ((p.entityId == null && !p.entityGuid) || !p.path) throw new Error('prefab create requires { entityId | entityGuid, path }');
       const path = p.path;
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // both given → refused (#1223 D1)
+      // The live subtree is what gets written — refuse a posed/played one (#1548), as the human path does.
+      const notAuthored = whyWorldNotAuthored();
+      if (notAuthored) throw new Error(`prefab create refused: ${notAuthored} — exit the preview (exit-pose-envelope) / stop Play first, or the pose is written into the prefab`);
       const existing = await classifyExistingPrefabId(path);
       // ⚠️ Refuse rather than mint a fresh file guid over a prefab that is THERE and unreadable — a
       // 500, corrupt bytes, or one a newer build wrote (#1468, #896's class). The agent asked to
@@ -3183,8 +3189,13 @@ export function registerEditorAgentOps(): void {
       boundClip: clip.name ?? null,
       ...(clamped !== t ? { clampedFrom: t, duration } : {}),
       saved: false,
-      note: 'The rig is posed INSIDE the preview envelope, so this is revertible (⏹ Exit Preview) '
-        + 'and a scene save cannot bake it. It is NOT an undo-stack entry — Cmd-Z does not reach it.',
+      // Two envelopes, two ways out (#1546): during Play the pose goes into the PLAY world and opens
+      // no preview session, so ⏹ Exit Preview / exit-pose-envelope have nothing to revert — Stop does.
+      note: getRunMode() === 'playing'
+        ? 'The rig is posed inside PLAY (no preview session opens while playing): Stop reverts it with '
+          + 'the rest of the play session, and a scene save is refused until then. It is NOT an undo-stack entry.'
+        : 'The rig is posed INSIDE the preview envelope, so this is revertible (⏹ Exit Preview) '
+          + 'and a scene save cannot bake it. It is NOT an undo-stack entry — Cmd-Z does not reach it.',
     };
   });
 

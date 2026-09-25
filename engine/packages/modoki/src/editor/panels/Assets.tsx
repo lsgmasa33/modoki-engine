@@ -1614,6 +1614,7 @@ export default function Assets() {
     // Asked when a prefab of that name is already in the folder; a Replace keeps its guid (#1264).
     const result = await createPrefabFromEntity(id, savePath, `Save prefab "${name}"`, confirmReplaceAsset);
     if (result === 'declined') return;
+    if (result && 'refused' in result) { useEditorStore.getState().showToast(result.refused, 'warn'); return; }
     if (!result) { console.error(`[Assets] Failed to create prefab ${savePath}`); return; }
     console.log(`[Assets] Created prefab: ${savePath}`);
     if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');

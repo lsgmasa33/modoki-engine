@@ -25,7 +25,8 @@ export {
   buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type LightKind,
 } from '../runtime/scene/entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
-export { enterPlay, stopPlay, pausePlay, resetPlayMode, getModeOwner } from './scene/playMode';
+export { enterPlay, stopPlay, pausePlay, resetPlayMode, getModeOwner, onModeOwnerChange } from './scene/playMode';
+export { isWorldAuthored, whyWorldNotAuthored } from './scene/authoredWorld';
 export { onAuthoringSettled, isWorldReplacementInFlight } from './scene/authoringSettle';
 // GameView device simulation. Exported for the agent ops behind `modoki_set_game_view_device` /
 // `modoki_game_view_devices` (#367) — the catalog is the single source of truth for what screens

@@ -35,6 +35,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 // The editor's FILE path — null in prefab-edit, which is the whole point.
 let filePath: string | null = null;
 vi.mock('../../src/editor/scene/serialize', () => ({
+  registerBeforeSceneLoad: () => {},
   serializeScene: async () => ({ version: 1, entities: [], resources: [] }),
   getCurrentScenePath: () => filePath,
   // enterPlay samples this on both sides of its snapshot awaits, to cancel Play when a scene load
@@ -49,6 +50,8 @@ vi.mock('../../src/editor/scene/timelinePreview', () => ({
   cancelPreviewGestures: () => {},
   whenPreviewRestoresLanded: async () => {},
   endTimelinePreviewSession: async () => {},
+  holdPreviewSessionsClosed: () => () => {},
+  cancelPendingPreviewBegins: () => {},
 }));
 vi.mock('../../src/editor/panels/aiSettingsModel', () => ({
   fetchAiSettings: async () => ({}),

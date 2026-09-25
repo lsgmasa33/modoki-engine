@@ -10,6 +10,7 @@
  *  that turns it red. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { setRunMode as setRunModeForAuthoring } from '../../packages/modoki/src/runtime/core/playState';
 import { createWorld } from 'koota';
 
 const prefabs = new Map<string, unknown>();
@@ -149,6 +150,10 @@ beforeEach(() => {
   install(innerDoc);
   clearKeptMemberOrphans();
 });
+
+// The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing), and
+// every writer of the live world refuses outside an authored world (#1548) — so the premise is stated.
+beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('an outer prefab\'s edit in a nested frame does not pin what the inner prefab put there (#1533)', () => {
   // The case #1533 was observed with. Mutation: in `planPrefabRows`, skip `moveChannelsOntoRows` (keep the whole

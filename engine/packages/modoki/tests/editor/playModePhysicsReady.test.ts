@@ -32,6 +32,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 }));
 let loadGeneration = 0;
 vi.mock('../../src/editor/scene/serialize', () => ({
+  registerBeforeSceneLoad: () => {},
   serializeScene: async () => ({ version: 1, entities: [], resources: [] }),
   getCurrentScenePath: () => currentPath,
   sceneLoadGeneration: () => loadGeneration,
@@ -43,6 +44,8 @@ vi.mock('../../src/editor/scene/timelinePreview', () => ({
   cancelPreviewGestures: () => {},
   whenPreviewRestoresLanded: async () => {},
   endTimelinePreviewSession: async () => {},
+  holdPreviewSessionsClosed: () => () => {},
+  cancelPendingPreviewBegins: () => {},
 }));
 vi.mock('../../src/editor/panels/aiSettingsModel', () => ({
   fetchAiSettings: async () => ({}),

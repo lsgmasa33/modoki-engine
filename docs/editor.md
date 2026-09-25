@@ -1756,14 +1756,25 @@ edits reflect immediately.
 The Play/Stop controller (`editor/scene/playMode.ts`) implements Unity-style
 enter-play / revert-on-stop:
 
-- **Play** (`enterPlay`) snapshots the live world **in memory** with the same
-  `serializeScene()` the save path uses — deliberately **without** `assignGuids`, so Play
-  never writes authored data — records the scene path and the current undo depth (the
-  "barrier"), then flips to `'playing'`. Resuming from Pause does **not** re-snapshot.
+- **Play** (`enterPlay`) snapshots the live world **in memory** — the primary AND every base in
+  the chain, through `editor/scene/authoredSnapshot.ts`, the same capture the preview session uses —
+  deliberately **without** `assignGuids`, so Play never writes authored data. It records the scene
+  key and the current undo depth (the "barrier"), then flips to `'playing'`. Resuming from Pause
+  does **not** re-snapshot.
 - **Pause** (`pausePlay`) freezes the sim but keeps the mutated play world.
 - **Stop** (`stopPlay`) reverts by reloading that snapshot through `SceneManager`
   (`preloaded:` — no disk fetch; resources reused via the scene refcount), discarding every
-  play-mode mutation, then `truncateUndoTo(barrier)` drops the during-play edits.
+  play-mode mutation, then `truncateUndoTo(barrier)` drops the during-play edits. The reload
+  **carries** kept bases and the primary's `Persistent` roots instead of rebuilding them, so
+  `restoreAuthoredSnapshot` replays their authored fields afterwards (#1547). ⚠️ A snapshot is
+  SPARSE — the serializer omits every field at its trait default — so the replay fills schema
+  defaults back in (skipping `runtimeOnly` and `entityId` fields); replaying only the keys present
+  silently skipped every posed field whose authored value was the default. `EntityAttributes` is
+  replayed too, minus its structural fields (`parentId`, `sortOrder`, `guid`, `sourceScene`,
+  `editorFolder`) — skipping it wholesale left an activation-hidden Persistent HUD hidden after Stop.
+  ⚠️ Only a PLAIN entity is schema-filled: what a prefab entry omits comes from its template, so it
+  is replayed only as far as it states — a prefab root with no root overrides writes a bare
+  `EntityAttributes {parentId}`, and filling that blanked the instance's name and forced it active.
   **Pre-play undo history survives** the world rebuild because undo actions resolve their
   targets by stable GUID. A guard skips the revert if the active scene changed since Play
   (the snapshot is for a different scene).
@@ -1787,9 +1798,10 @@ before it, TimelineEditor's `if (getRunMode() === 'preview')` cleanup clobbers t
 entered. But that ordering is **necessary, not sufficient**: it makes the guard decline only when the
 new mode is `'scrub'`; a `'preview'` displacer passes it and steals the ownership back. What makes it
 safe is that **no displacement callback re-enters a mode transition** — they only stop their own rAF.
-Second, **a displaced panel must stop its own rAF, never call `setPreviewPlaying(false)`** —
-`isPreviewPlaying` is one flag BOTH panels read, so that stops the global preview rather than the
-panel. Third, and the reason `previewOwner` exists: **both panels' preview effects fire on one ▶
+Second, **a displaced panel must never clear `isPreviewPlaying` UNCONDITIONALLY** — it is one flag
+BOTH panels read, so that stops the global preview rather than the panel. It drops the flag only
+when IT started the run (`stopPreviewIfOwnedBy`, owner-strict), which is the half #1546 added: a
+panel that stopped only its loop left its flag up, and the next re-render re-entered preview. Third, and the reason `previewOwner` exists: **both panels' preview effects fire on one ▶
 press**, so each would take the mode from the other — and the Timeline always lands second (its entry
 is behind an await), so it always won and always stopped the Animation panel's loop. Pressing ▶ in
 the Animation panel played nothing at all. A panel now drives the preview only when it owns it.
@@ -1823,8 +1835,9 @@ store action's clothes.
   used to be silently undone by the reopen.
 - **The restore window reaches the other authored writers too.** Exit clears the session and sets
   `stopped` before the swap lands, so anything that only checks those would act on the posed world.
-  Cmd+S waits for the restore (`whenPreviewRestoresLanded`) instead of writing the pose, and Play
-  treats a landing restore as a world swap (`aSceneSwapIsHappening`). A Stop pressed during that
+  Cmd+S waits for the restore (`whenPreviewRestoresLanded`) instead of writing the pose, every other
+  writer refuses through `isWorldAuthored` (below), and Play treats a landing restore as a world
+  swap (`aSceneSwapIsHappening`). A Stop pressed during that
   window waits for the restore and then returns to stopped. The exception is a Stop pressed while
   Play is starting up: it still goes to #470's queue, because Play's own preview restore produces
   the same state.
@@ -1861,6 +1874,81 @@ Stop that arrives while it's set is queued instead of dropped, and `enterPlay`'s
 is refused outright (returns without doing anything) rather than starting a concurrent snapshot —
 two independent in-flight Plays could otherwise race their `finally` clears and leave the editor
 `'playing'` with no snapshot left to revert.
+
+
+### One envelope at a time, one exit, one owner, one "is it authored?" (#1546–#1550)
+
+Phase 3 of [plans/preview-mode-refactor.md](plans/preview-mode-refactor.md). A review found every
+remaining leak sat where two of the envelope's many pieces of state disagreed, so each rule below
+makes ONE place answer a question several used to answer separately.
+
+- **A preview session and Play never coexist.** `beginTimelinePreviewSession` refuses while Play runs,
+  is paused, or is starting (`holdPreviewSessionsClosed`). A pose during Play goes straight into the
+  Play world (`poseEnvelopeHeld`): Stop reverts it with everything else, and saving is refused until
+  then. It used to open a session anyway — `enterScrubMode` no-ops in Play, the begin did not — and
+  that session snapshotted the RUNNING world, outlived Stop, and later restored the Play world as
+  authored (on ⏹ Exit, the Cmd+S cycle, or the next Play press).
+- **Play, Stop and a scene load take the envelope down through one path.** `takeDownPreviewEnvelope`
+  restores, cancels pending begins and grab chains, and drops the mode; the mode OWNER is released by
+  a run-mode listener on every change out of scrub/preview, and the owner hears it as a displacement —
+  so the panel stands down fully (loop, ▶ flag, recording). A scene load reaches it through
+  `registerBeforeSceneLoad`, awaited inside the load's token BEFORE the load flips the mode — it used
+  to drop the mode and leave the session to the swap, so a REFUSED or failed load stranded an
+  owner-less session, and a successful one carried posed bases/Persistent roots across. A load that a
+  newer one superseded while it waited returns `'superseded'` without reaching SceneManager.
+  `openPrefabForEditing`, which swaps through SceneManager directly, runs the same takedown
+  (`takeDownEnvelopeBeforeWorldSwap`) before its save and swap. Any OTHER world swap (a prefab undo's
+  reload, a new scene) abandons the session without restoring (its snapshot belongs to the world that
+  went away).
+- **One capture, one restore** (`editor/scene/authoredSnapshot.ts`): see Stop above. The preview
+  restore had drifted from Play's — no base replay, and it keyed on the editor's file path, so ⏹ Exit
+  inside prefab-edit reloaded under `''` and Cmd+S then opened Save As.
+- **One "is the live world authored?"** (`editor/scene/authoredWorld.ts`). `saveScene` (and so Save
+  All, agent `save-all`, Create Scene, the save before prefab-edit), `savePrefabEdit`, Apply to Prefab
+  and Create Prefab all ask `whyWorldNotAuthored()`: the run mode, plus registered sources — a held
+  session, a preview restore in flight, any authored restore in flight (Stop reads `stopped` while the
+  Play world is still live). Apply to Prefab had no guard at all and wrote poses into shared
+  templates. ⚠️ It is deliberately NOT the world-replacement token: the Cmd+S preview cycle holds that
+  across its own save. A source that throws counts as posed — the write is refused, not waved through.
+  A restore that THROWS is a source of its own until the next world swap: the envelope has ended and
+  every counter has dropped, but the live world may still be the posed one. While it holds, a new
+  preview session AND Play are refused too — either would snapshot that world as authored, and its
+  own successful restore (a swap) would clear the guard and wave the pose through a save.
+- **One owner field decides "is this envelope mine?"** Both panels read `getModeOwner()` through
+  `onModeOwnerChange` (every write goes through one notifying setter — B taking scrub from A leaves
+  the MODE unchanged, so a run-mode subscriber never hears it). The Timeline's ⏹, status text and
+  Cmd+S handler key on `owner === 'timeline'` (it used to register for an Animation envelope, win the
+  save, and strand the Animation ⏹); the Animation panel's `inPreview` is derived, not a `useState`
+  that missed every exit it did not make. The decisions live in `openPreviewSession.ts`
+  (`panelOwnsEnvelope`, `mayEndSharedSession`, `undoMayRepose`).
+- **An asset undo does not open an envelope.** Clip/timeline undo+redo re-pose only into the panel's
+  own held session, through a ref (a pose OPENS the envelope, so Cmd+Z after ⏹ Exit — or with the
+  panel closed — used to re-enter scrub with no ⏹ anywhere).
+- **Recording lives inside the envelope.** Switching record ON opens it, so every recorded value is
+  preview-only and lives in the clip (Unity's record mode is a preview mode too). It used to open only
+  after the first recorded write had landed, so that one value — and only that one — was saved into
+  the scene. ⚠️ The guard is the INVARIANT, not a list of exits: the record hook runs AFTER the edit
+  is written, so it keys only when the Animation panel already holds a live session
+  (`ownsHeldSession`), and otherwise stops recording and says the edit stayed a normal scene edit. A
+  first cut turned recording off at ⏹ and on displacement and missed four other ways to leave (an
+  agent exit, a Timeline ⏹, Record pressed in Play or under a Timeline envelope). Record ON refuses at
+  once when the envelope it opens is not the Animation panel's.
+- **The Animation rebind finds the same entity by guid** before falling back to "the first Animator
+  whose bank lists the clip", which picked none for a "+ New Animation" bind and the wrong one when
+  two Animators share a clip.
+
+Still open, and why:
+- signal/`OnSequence` actions fired by ▶ mutate state outside the world (bus volume, PlayerPrefs,
+  IAP, URLs) that no snapshot restores — #1551, a design fork, not a snapshot fix;
+- a takedown from OUTSIDE the panel (Play, Stop, a scene load) passes no rebind, so the Animation
+  root is re-taken by NUMBER by `editorRefLiveness` — right while load order is deterministic, which
+  it is for an unedited scene; only ⏹ Exit and Cmd+S rebind by guid;
+- Record ON can briefly show lit with no envelope when its session begin is refused (⏺ pressed while
+  a restore is still landing): the record hook's `ownsHeldSession` check stops it at the first edit —
+  safe, but the notice comes after the edit rather than at the press;
+- Cmd+S while recording saves the clip but refuses the scene half ("edited inside the preview"): the
+  recorded edits bump the edit version like any in-envelope edit. Nothing is lost — exiting reverts
+  exactly those preview-only values — but the message overstates it.
 
 ## Panel registrations in module-level slots — why the unguarded ones are safe (#811)
 

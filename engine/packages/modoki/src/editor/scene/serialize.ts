@@ -21,7 +21,8 @@ import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegist
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
-import { setPlayState, getRunMode } from '../../runtime/core/playState';
+import { setPlayState } from '../../runtime/core/playState';
+import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
 import { swapHistory, forgetHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
@@ -1275,16 +1276,20 @@ export async function saveScene(opts: {
   // TRANSIENCE guard (preview-mode-refactor, Phase 2): only ever WRITE authored data. While
   // scrub/preview/play is live the world holds preview mutations (a signal action moved the
   // camera, `isActive` toggled, a control prefab spawned) — the Transient skip drops spawns, but
-  // authored-trait mutations would still leak. Refuse the save until stopped. (Phase 3 replaces
-  // this with a mandatory snapshot session so the authored data is always recoverable to save.)
+  // authored-trait mutations would still leak. Refuse the save until the world is authored again.
   //
-  // This subsumes the earlier Play/Pause-only refusal (C7): run-mode 'playing' ⇒ a live/paused
-  // Play, so this also blocks baking the RUNTIME world (physics-settled positions, spawned
-  // entities) over the authored scene — and additionally blocks 'scrub'/'preview', where
-  // playState is still 'stopped'. modoki_save_all's doc CLAIMED "Blocked during Play" and
-  // nothing enforced it; /api/scene-mutate already refuses for the mirror-image reason.
-  if (getRunMode() !== 'stopped') {
-    console.warn(`[Editor] Save refused — run-mode is '${getRunMode()}', not 'stopped'. Stop preview/play before saving so preview mutations don't reach disk.`);
+  // This subsumes the earlier Play/Pause-only refusal (C7): a live/paused Play is refused, so this
+  // also blocks baking the RUNTIME world (physics-settled positions, spawned entities) over the
+  // authored scene — and additionally 'scrub'/'preview', where playState is still 'stopped'.
+  // modoki_save_all's doc CLAIMED "Blocked during Play" and nothing enforced it; /api/scene-mutate
+  // already refuses for the mirror-image reason.
+  //
+  // ⚠️ `isWorldAuthored`, not the run mode (#1548): an envelope's exit reads 'stopped' before its
+  // restore has swapped the posed world out, and the agent `save-all` in that window wrote the pose
+  // and replied ok:true. Only the human Cmd+S waited for the restore; every caller inherits this.
+  const notAuthored = whyWorldNotAuthored();
+  if (notAuthored) {
+    console.warn(`[Editor] Save refused — ${notAuthored}. Stop preview/play (and let it finish reverting) before saving so preview mutations don't reach disk.`);
     return { saved: false, path: explicitPath || _currentScenePath, reason: 'playing' };
   }
   // Saving is the authored write that persists identity — commit minted guids
@@ -1401,6 +1406,28 @@ export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
  *  exists. See the doc comment on `loadScene` for why this can't just be a boolean. */
 export type SceneLoadOutcome = 'loaded' | 'superseded' | 'failed' | 'refused';
 
+/** Work that must finish before `loadScene` touches the world — registered by a module this one
+ *  cannot import without a cycle: `playMode.ts`'s preview-envelope takedown, the only one. A single
+ *  slot, not a listener set: there is one owner of the envelope, and a second registrant would need
+ *  an ordering decision nobody has made. Returns a promise ONLY when there is work to wait for, so a
+ *  load with no envelope still flips to 'stopped' in the same synchronous run it always did. */
+let _beforeSceneLoad: (() => Promise<unknown> | null) | null = null;
+
+export function registerBeforeSceneLoad(fn: () => Promise<unknown> | null): void {
+  _beforeSceneLoad = fn;
+}
+
+/** Take a preview envelope down before replacing the world by any route — for a caller that swaps
+ *  through `sceneManager` directly rather than `loadScene` (`openPrefabForEditing`). Null when there
+ *  is nothing to wait for. Wraps a failure so it is not mistaken for the load's own. */
+export function takeDownEnvelopeBeforeWorldSwap(): Promise<void> | null {
+  const takedown = _beforeSceneLoad?.() ?? null;
+  if (!takedown) return null;
+  return takedown.then(() => undefined, (e: unknown) => {
+    throw new Error(`could not revert the preview before replacing the scene: ${(e as Error)?.message ?? String(e)}`);
+  });
+}
+
 /** Set alongside a `'failed'` or `'refused'` outcome PRODUCED BY THIS MODULE'S OWN `loadScene`
  *  below — the message from the throw that caused it, since `SceneLoadOutcome` stays a bare
  *  string (every existing caller compares it with `===`/`!==`, so widening it to an object would
@@ -1468,6 +1495,22 @@ export async function loadScene(
   // must not replay into the middle of this load — see `authoringSettle.ts`. Released in `finally`.
   const releaseReplacement = beginWorldReplacement();
   try {
+    // A preview envelope is taken down FIRST — restored, not abandoned (#1548 close-out review).
+    // Loading out of one used to drop the mode at the line below and leave the session to be
+    // abandoned at the swap: a load that was then REFUSED or FAILED never swapped, stranding a held
+    // session with no owner (⏹ gone from both panels, saves refused "a preview session is open",
+    // `exit-pose-envelope` answering "nothing to exit"), and one that succeeded carried kept bases
+    // and Persistent roots across with the pose still on them. Awaited inside this load's token and
+    // in-flight count, so neither a hot-reload settle nor a Play press can start in the gap.
+    // NOT isolated: a takedown that throws has left the world in an unknown state, and loading over
+    // it is not the recovery — the load fails with that error instead.
+    const takedown = takeDownEnvelopeBeforeWorldSwap();
+    if (takedown) {
+      await takedown;
+      // A newer load started while this one waited: it owns the world now, and continuing would call
+      // SceneManager AFTER it — superseding the winner with the loser.
+      if (!stillLive()) return 'superseded';
+    }
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
     // Read on BOTH sides of the await (#1409): the outgoing world stays live and editable while the
@@ -1526,6 +1569,9 @@ export async function loadScene(
     // the epoch guard above); it's expected, not a failure worth a red console error, and it's
     // the same outcome as the tail-supersede case above: this op's own load did not fail.
     if ((e as Error)?.name === 'AbortError') return 'superseded';
+    // A newer load took over while this one was still reverting the preview (#1548 re-review): the
+    // world is the winner's now, so "failed — the previous scene is still loaded" would be false.
+    if (!stillLive()) return 'superseded';
     // A format-version refusal (docs/format-versioning.md § 2b-bis — Scene is REFUSE, #784
     // phase C3): distinct from 'failed' because "Failed to load — check the path" is a WRONG
     // diagnosis for a right symptom — the path exists and the bytes are fine, this build just

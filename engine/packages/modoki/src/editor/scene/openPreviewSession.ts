@@ -13,8 +13,8 @@
  *  test (docs/editor.md § Panels). `exitPreviewMode` is owner-guarded, so handing back a mode another
  *  panel has since taken is a no-op. */
 
-import { beginTimelinePreviewSession } from './timelinePreview';
-import { enterScrubMode, exitPreviewMode } from './playMode';
+import { beginTimelinePreviewSession, hasTimelinePreviewSession } from './timelinePreview';
+import { enterScrubMode, exitPreviewMode, getModeOwner } from './playMode';
 
 /** Resolves `true` once `pose` has run inside a held session; `false` when nothing was posed. */
 export function openPreviewSessionThen(owner: 'animation' | 'timeline', pose: () => void): Promise<boolean> {
@@ -57,4 +57,41 @@ export async function reopenPreviewAfterRestore(
   if (!isLive()) return false;
   enterScrubMode(owner);
   return openPreviewSessionThen(owner, pose);
+}
+
+// ── Which panel may act on the SHARED envelope (#1549) ──────────────────────────────────────────
+//
+// The session and the run mode are single globals both panels read. Each panel used to decide "is
+// this mine?" from a different piece of state — the Timeline from the run mode alone (so it
+// registered its Cmd+S handler and showed ⏹ for an ANIMATION envelope, and its handler then won the
+// save), the Animation panel from a hand-kept `useState` that some exits never reset. Every such
+// decision now reads the one owner field, through these, so the two panels cannot answer differently.
+
+/** Does `me` hold the envelope — show ⏹, register a Cmd+S handler, drive the status text? */
+export function panelOwnsEnvelope(me: 'animation' | 'timeline'): boolean {
+  return getModeOwner() === me;
+}
+
+/** May `me` END the shared session (opening/switching its own asset)? Its own, or an orphan nobody
+ *  owns — never the other panel's, whose world a restore would swap out from under it. */
+export function mayEndSharedSession(me: 'animation' | 'timeline'): boolean {
+  const owner = getModeOwner();
+  return owner === me || owner === null;
+}
+
+/** Should an undo/redo of `me`'s ASSET edit re-pose the world? Only into `me`'s own held session.
+ *
+ *  The closures used to pose unconditionally, and a pose OPENS the envelope — so Cmd+Z of a clip edit
+ *  after ⏹ Exit (or with the panel closed) silently re-entered scrub: Cmd+S refused "exit the
+ *  preview" with no ⏹ anywhere to press (#1550). An asset undo changes the asset; the world only needs
+ *  re-posing when it is already showing a preview of it. */
+export function undoMayRepose(me: 'animation' | 'timeline'): boolean {
+  return ownsHeldSession(me);
+}
+
+/** Does `me` own the mode AND is a session actually held — i.e. is the live world `me`'s preview?
+ *  The Animation record hook asks this before keying (#1550 close-out review): a recorded edit is
+ *  preview-only ONLY if the envelope was open before the edit was written. */
+export function ownsHeldSession(me: 'animation' | 'timeline'): boolean {
+  return getModeOwner() === me && hasTimelinePreviewSession();
 }

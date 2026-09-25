@@ -10,6 +10,7 @@
  *     the outer-refresh path — documented here so a future fix flips this assert). */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { setRunMode as setRunModeForAuthoring } from '../../src/runtime/core/playState';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -172,6 +173,10 @@ function xsNamed(name: string): number[] {
   });
   return out;
 }
+
+// The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing), and
+// every writer of the live world refuses outside an authored world (#1548) — so the premise is stated.
+beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('nested override serialization', () => {
   it('a per-instance override on a nested child serializes into the outer reference row', async () => {

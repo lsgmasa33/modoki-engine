@@ -2,6 +2,7 @@
  *  land in the new prefab file; unselected fields keep their old base values. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { setRunMode as setRunModeForAuthoring } from '../../packages/modoki/src/runtime/core/playState';
 import { getCurrentWorld, Transient, findEntity, getAllEntities } from '@modoki/engine/runtime';
 import { collectTransientSubtreeIds } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -44,6 +45,10 @@ function findChildEcsId(rootId: number, localId: number): number {
   });
   return id;
 }
+
+// The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing), and
+// every writer of the live world refuses outside an authored world (#1548) — so the premise is stated.
+beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('applyToPrefabSelective', () => {
   beforeEach(() => {

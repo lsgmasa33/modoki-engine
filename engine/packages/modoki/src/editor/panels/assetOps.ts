@@ -12,6 +12,7 @@
  *  `${targetFolder}/…`). They now live here so a fix lands in ONE place, and
  *  the logic is unit-testable without rendering a React panel. */
 
+import { whyWorldNotAuthored } from '../scene/authoredWorld';
 import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
@@ -507,7 +508,11 @@ export async function createPrefabFromEntity(
    *  the path, taking the original prefab with it. A yes replaces the content and KEEPS the prefab's
    *  guid (owner 2026-09-15), so placed instances stay linked; undo restores the replaced bytes. */
   confirmReplace: (path: string) => Promise<boolean>,
-): Promise<CreatePrefabResult | 'declined' | null> {
+): Promise<CreatePrefabResult | 'declined' | { refused: string } | null> {
+  // The live subtree is what gets written, so it must be authored (#1548) — a posed or played
+  // entity saved as a prefab carries the pose into every future instance.
+  const notAuthored = whyWorldNotAuthored();
+  if (notAuthored) return { refused: `Create Prefab refused — ${notAuthored}. Exit the preview / stop Play first.` };
   // serializePrefab reads nested children from the editor prefab cache SYNCHRONOUSLY, and
   // nothing else on this path warms it — after an ordinary scene load it is empty, so a held
   // nested instance was flattened into copies with only a console.warn (#1284).

@@ -8,7 +8,7 @@
  *  unfocused. Edits coalesce per group; the clip document is PARKED in the dirty-asset registry
  *  and written by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259). */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { jsonFileBody } from '../backend/editorBackend';
 import { writeNewAssetDocument } from '../scene/createAssetDocument';
 import { useEditorStore } from '../store/editorStore';
@@ -47,13 +47,14 @@ import CurvesView from './animation/CurvesView';
 import AddPropertyPicker, { type PropertyCandidate } from './animation/AddPropertyPicker';
 import BindAnimatorPicker from './animation/BindAnimatorPicker';
 import { bindClipToEntity } from '../animation/bindAnimator';
-import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope, onPoseEnvelopeExited } from '../animation/poseClip';
+import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope } from '../animation/poseClip';
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
 import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { chooseNewAssetPath } from '../utils/saveDialog';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced, getModeOwner, onModeOwnerChange } from '../scene/playMode';
+import { undoMayRepose, ownsHeldSession } from '../scene/openPreviewSession';
 import {
-  beginTimelinePreviewSession, hasTimelinePreviewSession,
+  beginTimelinePreviewSession, poseEnvelopeHeld,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
 import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
@@ -155,11 +156,14 @@ export default function AnimationEditor() {
 
   const [showPicker, setShowPicker] = useState(false);
   const [showBindPicker, setShowBindPicker] = useState(false);
-  // True while THIS panel holds a scrub/preview envelope — drives the ⏹ Exit Preview button.
-  // Local (not derived from getRunMode()) because the run-mode is a plain module global with no
-  // subscription: reading it during render would leave the button stale until something else
-  // re-rendered the panel. We set it on our own transitions, which is exactly its meaning.
-  const [inPreview, setInPreview] = useState(false);
+  // True while THIS panel holds the envelope — drives the ⏹ Exit Preview button and the Cmd+S handler
+  // registration. DERIVED from the one owner field (#1549), not kept by hand: a `useState` set on this
+  // panel's own transitions missed every exit it did not make itself (displacement by the Timeline,
+  // Play, toolbar Stop, the Timeline ending the shared session), so ⏹ stayed up and the save handler
+  // stayed registered for an envelope that was gone. `onModeOwnerChange` is the subscription the
+  // run-mode lacked when this was a `useState`.
+  const modeOwner = useSyncExternalStore(onModeOwnerChange, getModeOwner);
+  const inPreview = modeOwner === 'animation';
   const [selectedTrack, setSelectedTrack] = useState<number | null>(null);
   // Multi-track selection (indices). `selectedTrack` stays the "primary" (drives the
   // curve focus + single-key inspector); `selectedTracks` adds shift/cmd multi-pick
@@ -280,7 +284,7 @@ export default function AnimationEditor() {
   // The pose WRITE itself now lives in `editor/animation/poseClip.ts`, so `modoki_pose_clip`
   // drives the SAME code rather than a second copy of it (#288 gap 2). Re-deriving it there would
   // have recreated the measured bake-in bug described below; sharing it cannot. What stays here is
-  // the component-local half: `setInPreview`, and the fast path the ▶ rAF loop needs.
+  // the fast path the ▶ rAF loop needs.
 
   /** Pose INSIDE the preview envelope, opening it first if it is not already held.
    *
@@ -302,28 +306,21 @@ export default function AnimationEditor() {
    *  and what keeps the snapshot free of the pose it is meant to revert. */
   const pose = useCallback((c: AnimationClipDef | null, t: number) => {
     if (!c || rootId == null) return;
-    // `setInPreview` is the only piece that stays here — a `useState` driving the ⏹ Exit button,
-    // i.e. the one genuinely component-local dependency. Everything else moved into `poseClip.ts`,
-    // which is why an agent can pose with NO Animation panel mounted.
+    // Everything moved into `poseClip.ts`, which is why an agent can pose with NO Animation panel
+    // mounted. The ⏹ button follows the mode OWNER, which `poseClipAtTime` claims when it opens the
+    // envelope and hands back when it cannot — so there is no panel state to keep in step here.
     //
-    // The already-held branch stays SYNCHRONOUS and skips `setInPreview`, matching what this
-    // function did before the extraction: it is driven once per frame by the ▶ preview rAF below,
-    // where a promise and a setState per frame would both be new work for no gain.
-    if (hasTimelinePreviewSession()) { applyPoseAtTime(c, rootId, t); return; }
-    setInPreview(true);
-    // No session opened (#1167: a restore still landing, or an Exit mid-snapshot), or the snapshot
-    // threw: `poseClipAtTime` posed nothing and handed the mode back, so the ⏹ Exit button must not
-    // stay up for an envelope that does not exist.
-    void poseClipAtTime(c, rootId, t, 'animation').then(
-      (r) => { if (r.refused) setInPreview(false); },
-      (e: unknown) => { setInPreview(false); console.error('[AnimationEditor] could not open the preview session — nothing posed', e); },
+    // The already-held branch stays SYNCHRONOUS: it is driven once per frame by the ▶ preview rAF
+    // below, where a promise per frame would be new work for no gain.
+    if (poseEnvelopeHeld()) { applyPoseAtTime(c, rootId, t); return; } // a held session, or Play (#1546)
+    void poseClipAtTime(c, rootId, t, 'animation').catch(
+      (e: unknown) => { console.error('[AnimationEditor] could not open the preview session — nothing posed', e); },
     );
   }, [rootId]);
 
   // ── Load the clip when the open target changes ──
   useEffect(() => {
     void endAnimationPreview(true); // opening/switching a clip ends our envelope: revert the pose, back to stopped
-    setInPreview(false);
     lastAction.current = null;
     lastGroup.current = undefined;
     setSel(new Set());
@@ -446,8 +443,9 @@ export default function AnimationEditor() {
         // interrupt a preview and rewrite the scene file on every save while authoring. The agent
         // twins have set this since S2.27; the panels never did.
         _isFileDirect: true,
-        undo: () => { useEditorStore.getState().applyAnimationClip(path, before); poseLatest(before); },
-        redo: () => { useEditorStore.getState().applyAnimationClip(path, a._after); poseLatest(a._after); },
+        // Re-pose only into our own held session — a pose OPENS the envelope (#1550; `undoMayRepose`).
+        undo: () => { useEditorStore.getState().applyAnimationClip(path, before); if (undoMayRepose('animation')) poseLatestRef.current(before); },
+        redo: () => { useEditorStore.getState().applyAnimationClip(path, a._after); if (undoMayRepose('animation')) poseLatestRef.current(a._after); },
       };
       pushAction(a);
       lastAction.current = a;
@@ -459,6 +457,10 @@ export default function AnimationEditor() {
 
   // Pose helper that reads the current playhead (used by undo/redo closures).
   const poseLatest = useCallback((c: AnimationClipDef) => pose(c, useEditorStore.getState().playheadTime), [pose]);
+  // The undo/redo closures outlive the render that made them; through the ref they pose with the
+  // CURRENT root, not one a restore has since replaced (#1550).
+  const poseLatestRef = useRef(poseLatest);
+  poseLatestRef.current = poseLatest;
 
   // Replace a single track's keys immutably.
   const mutateTrack = useCallback((trackIdx: number, fn: (t: AnimationTrack) => AnimationTrack, group: string) => {
@@ -474,7 +476,6 @@ export default function AnimationEditor() {
     // Claim the run-mode for THIS panel even when a session is already held, so the "exit to save"
     // message names the Animation panel rather than whichever one opened the envelope first.
     enterScrubMode('animation'); // clip scrub is a silent pose — carry the global run-mode (shared with the Timeline panel)
-    setInPreview(true);
     // The MANDATORY session (snapshot the authored world BEFORE the envelope's first pose, so
     // "⏹ Exit Preview" can revert it — plan Phase 3 / M1) now lives inside `pose`, which is the one
     // place that writes a pose and therefore the one place that can guarantee it.
@@ -501,12 +502,11 @@ export default function AnimationEditor() {
   // exited. `resume` re-poses at the current playhead, and `pose` re-opens the session for it.
   // `pose` is read through a ref so the handler OBJECT can be stable: `suspend()` rebuilds the
   // world and re-resolves the Animator root, so the `pose` closure captured at registration time
-  // is dead by the time `resume()` runs. This panel's registration happens to survive a save cycle
-  // (`endAnimationPreview` does not touch `inPreview`, so the effect below is not torn down) —
-  // unlike the Timeline panel's, which the suspend deregistered and which is why `saveCommand`
-  // now falls back to the handler it started with (bug `tSv0EWjWICpEl9HSjRe9`). That fallback is
-  // only safe if a captured handler still calls the CURRENT closures, so both panels dispatch
-  // through a ref rather than only the one that needed it.
+  // is dead by the time `resume()` runs. The suspend releases the mode, so — like the Timeline
+  // panel's — this registration is torn down during the save cycle, and `saveCommand` falls back to
+  // the handler it started with (bug `tSv0EWjWICpEl9HSjRe9`, `resumeHandlerFor`). That fallback is
+  // only safe if a captured handler still calls the CURRENT closures, which is why both panels
+  // dispatch through a ref.
   const poseRef = useRef(pose);
   poseRef.current = pose;
   // See TimelineEditor: a finished save cycle uses this to tell a CLOSED panel (do not resume)
@@ -521,24 +521,10 @@ export default function AnimationEditor() {
       suspend: () => endAnimationPreview(true),
       resume: () => {
         const st = useEditorStore.getState();
-        setInPreview(true);
         poseRef.current(st.editingAnimationClip, st.playheadTime);
       },
     };
   }
-  // An exit can now come from OUTSIDE this component (the `exit-pose-envelope` agent op). Without
-  // observing it, `inPreview` would stay true against a closed envelope — leaving the save handler
-  // below registered, so the human's next Cmd+S would suspend (a no-op), serialize, and then
-  // `resume()` by RE-POSING a world the agent had just reverted.
-  //
-  // ⚠️ KEYED ON `hmrEpoch`, not `[]`. React Fast Refresh does not re-run a `[]`-deps effect
-  // (measured — see hmrEpoch.ts), and `poseClip.ts` holds its listeners in a module-level Set that
-  // a hot update REPLACES. Unlike the keymap registries, that module does not force a full reload
-  // when it changes, so a `[]` effect would stay subscribed to the dead Set: the next exit — the
-  // agent's OR the human's ⏹, both of which go through `exitPoseEnvelope` — would close the
-  // envelope without notifying this panel, and the very Cmd+S re-pose above would be back. The
-  // epoch is a frozen 0 with no hot context, so this is byte-for-byte `[]` in a shipped build.
-  useEffect(() => onPoseEnvelopeExited(() => setInPreview(false)), [hmrEpoch]);
 
   useEffect(() => {
     if (!inPreview) return;
@@ -559,7 +545,7 @@ export default function AnimationEditor() {
   // loop (just below, keyed `[playing, pose]`) to stop, and its tick body never consults
   // `getRunMode()` either.
   //
-  // ⚠️ Must NOT call `setPreviewPlaying(false)` — that flag is SHARED with the Timeline panel
+  // ⚠️ Must NOT call `setPreviewPlaying(false)` UNCONDITIONALLY — that flag is SHARED with the Timeline panel
   // (both read `useEditorStore((s) => s.isPreviewPlaying)`), so flipping it off here does not stop
   // "our" preview, it stops BOTH panels' preview effects. With both docked, one ▶ press could stop
   // itself: this panel enters first (no notify yet, nothing owned the mode), Timeline's async
@@ -569,8 +555,18 @@ export default function AnimationEditor() {
   // run's guard is what avoids it — see `previewLoopGuard.ts`. Registered for the panel's whole
   // lifetime, not gated on `playing` — a displacement can arrive between preview sessions just as
   // easily as during one, and the callback is a no-op when no guard is live.
+  //
+  // Standing down means ALL of it (#1546): the loop, the ⏹ button + save-handler registration
+  // (derived from the owner, so nothing to do), and the ▶ flag when this panel started it. Stopping only the loop left the effect
+  // below keyed on a still-true flag, so the next re-render (a restore changes the root) re-entered
+  // preview and reopened the envelope — after toolbar Stop, into the Play world after Play. The flag
+  // clear is owner-strict (`stopPreviewIfOwnedBy`), so the shared-flag hazard above cannot recur:
+  // when the Timeline's ▶ displaces us, the flag is the Timeline's and stays up.
   useEffect(() => registerModeOwnerDisplaced('animation', () => {
     previewLoopGuardRef.current?.stop();
+    useEditorStore.getState().stopPreviewIfOwnedBy('animation');
+    // Recording without our envelope would write the next recorded edit into the authored world (#1550).
+    if (useEditorStore.getState().isRecording) useEditorStore.getState().setRecording(false);
   }), []);
 
   // ── Preview playback loop ──
@@ -581,7 +577,6 @@ export default function AnimationEditor() {
     if (!playing) return;
     if (!panelDrivesPreview(playing, previewOwner, 'animation')) return; // the Timeline panel's ▶, not ours
     enterPreviewMode(true, 'animation');
-    setInPreview(true);
     const guard = createPreviewLoopGuard();
     previewLoopGuardRef.current = guard;
     let last = 0;
@@ -603,7 +598,6 @@ export default function AnimationEditor() {
     const refuse = () => {
       guard.stop();
       exitPreviewMode('animation');
-      setInPreview(false);
       // This panel drives the flag's current run, and that run never began — see TimelineEditor's ▶.
       useEditorStore.getState().setPreviewPlaying(false);
     };
@@ -633,13 +627,53 @@ export default function AnimationEditor() {
   // The explicit way out: revert to the authored snapshot and return to `stopped` so Cmd+S works
   // again. The Timeline panel has had this since Phase 2; without it here, any scrub wedged saves
   // with no reachable exit but closing the panel.
-  const exitPreview = useCallback(() => { endAnimationPreview(true); setInPreview(false); }, []);
+  // ⏹ also ends RECORDING (#1550): a recorded edit is only preview-only while the envelope is open
+  // BEFORE it lands (see the effect below), so recording on with no envelope is the state that baked
+  // the first recorded value into the scene.
+  const exitPreview = useCallback(() => {
+    const st = useEditorStore.getState();
+    if (st.isRecording) st.setRecording(false);
+    void endAnimationPreview(true);
+  }, []);
+
+  // ── Recording lives INSIDE the envelope (#1550) ──
+  // The record hook below runs AFTER the edit has been written (entityActions writes, pushes an
+  // authored undo entry, then notifies), and the envelope used to open only there — so its snapshot
+  // was taken AFTER the first recorded write: that value landed in the scene on the next Cmd+S, while
+  // every later recorded value was reverted by Exit. Opening the envelope when recording is switched
+  // ON makes every recorded value preview-only and lives in the clip, which is what record mode means
+  // (Unity's record mode is a preview mode too). Only on the off→on edge: poses after that are the
+  // hook's own. When the envelope cannot be OURS — no Animator bound, Play running (the pose goes
+  // into Play's envelope and claims no owner), or the Timeline holding the mode — recording is
+  // refused at once, with the reason, rather than left on to bake the next edit. The hook below is
+  // the backstop for every way the envelope can end afterwards.
+  useEffect(() => {
+    if (!recording) return;
+    const st = useEditorStore.getState();
+    poseRef.current(st.editingAnimationClip, st.playheadTime);
+    // `pose` claims the owner synchronously when it opens the envelope (the snapshot lands later).
+    if (getModeOwner() !== 'animation') {
+      st.setRecording(false);
+      st.showToast('Record needs the Animation preview: bind an Animator, and stop Play / exit the Timeline preview first.', 'warn');
+    }
+  }, [recording]);
 
   // ── Record hook: a field edit keys the clip at the playhead ──
   useEffect(() => {
     if (!recording) { setRecordHook(null); return; }
     setRecordHook((entityId, traitName, field, value) => {
       const store = useEditorStore.getState();
+      // ⚠️ The INVARIANT, not a list of exits (#1550 close-out review): this runs AFTER the edit was
+      // written, so the edit is preview-only only if OUR session was already held. Every exit that
+      // did not tell this panel — an agent `exit-pose-envelope`, a Timeline ⏹, a failed restore —
+      // lands here with recording still on, and keying then would open a NEW envelope whose snapshot
+      // already contains the edit: exactly the first-value bake. So stop recording and say the edit
+      // stayed an ordinary scene edit (it is on the undo stack like one).
+      if (!ownsHeldSession('animation')) {
+        store.setRecording(false);
+        store.showToast('Recording stopped — the Animation preview was not open, so that edit stayed a normal scene edit (not keyed).', 'warn');
+        return;
+      }
       const cur = store.editingAnimationClip;
       const root = store.animatorRootEntityId;
       if (!cur || root == null) return;

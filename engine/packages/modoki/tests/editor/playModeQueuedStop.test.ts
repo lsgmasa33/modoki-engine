@@ -50,6 +50,7 @@ let filePath: string | null = '/assets/scenes/main.scene.json';
 let loadGeneration = 0;
 let loadInFlight = false;
 vi.mock('../../src/editor/scene/serialize', () => ({
+  registerBeforeSceneLoad: () => {},
   serializeScene: (...args: unknown[]) => serializeScene(...(args as [])),
   getCurrentScenePath: () => filePath,
   sceneLoadGeneration: () => loadGeneration,
@@ -63,6 +64,8 @@ vi.mock('../../src/editor/scene/timelinePreview', () => ({
   cancelPreviewGestures: () => {},
   whenPreviewRestoresLanded: async () => {},
   endTimelinePreviewSession: async () => {},
+  holdPreviewSessionsClosed: () => () => {},
+  cancelPendingPreviewBegins: () => {},
 }));
 vi.mock('../../src/editor/panels/aiSettingsModel', () => ({
   fetchAiSettings: async () => ({}),

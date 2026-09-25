@@ -12,7 +12,7 @@ import type { PrefabFile } from './prefab';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX } from './prefabEditGuids';
 import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs, refreshPrefabSourceForPath, rebaseStaleInstances } from './prefab';
 import { runtimeExcludedMessage } from './authoringScope';
-import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
+import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, takeDownEnvelopeBeforeWorldSwap, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
@@ -21,7 +21,7 @@ import type { SceneData, SceneEntityEntry } from '../../runtime/loaders/loadScen
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { linkOwnerBeforeMove } from '../../runtime/core/ecs/identityParents';
-import { getRunMode } from '../../runtime/core/playState';
+import { whyWorldNotAuthored } from './authoredWorld';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
@@ -401,6 +401,12 @@ export async function openPrefabForEditing(
   // first so the round trip is non-destructive. Skip when there's no real scene file
   // to write to — an unsaved new scene, or already inside prefab-edit opening a
   // NESTED prefab (both have a null current path) — which would pop a Save-As picker.
+  // A preview envelope comes down FIRST, restored (#1548 re-review): the swap below goes straight
+  // through SceneManager, so `loadScene`'s own takedown never runs — the session was abandoned at the
+  // swap, a posed Persistent root rode the carry into prefab-edit and back, and the save just below
+  // was silently refused ("a preview session is open") instead of persisting the round trip.
+  const envelopeDown = takeDownEnvelopeBeforeWorldSwap();
+  if (envelopeDown) await envelopeDown;
   if (getCurrentScenePath()) await saveScene();
   if (opts.confirmDiscard && worldHasUnsavedEdits() && !(await opts.confirmDiscard(`edit prefab ${asset.name}`))) return;
 
@@ -503,10 +509,12 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   // every caller inherits it and none can forget. It was in exactly one caller — the Cmd+S
   // handler's `!canEdit()` early return — which meant the AGENT path (`prefab edit-save`) never
   // had it at all, and deleting that early return in #259 (so parked asset docs could still flush
-  // during preview) removed the human's too. One guard, both paths.
-  if (getRunMode() !== 'stopped') {
+  // during preview) removed the human's too. One guard, both paths. `isWorldAuthored`, not the run
+  // mode, for the same reason as `saveScene` (#1548): an exit reads 'stopped' before its restore lands.
+  const notAuthored = whyWorldNotAuthored();
+  if (notAuthored) {
     console.error(
-      `[PrefabEdit] cannot save "${editingPrefab.name}" — run-mode is '${getRunMode()}', not 'stopped'. ` +
+      `[PrefabEdit] cannot save "${editingPrefab.name}" — ${notAuthored}. ` +
       'Saving now would bake preview/play mutations (a posed rig, a spawned prefab) into the prefab ' +
       'file, and every scene that instantiates it would inherit them. Exit preview / stop first.',
     );
