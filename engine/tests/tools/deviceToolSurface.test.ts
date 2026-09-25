@@ -351,7 +351,8 @@ describe('#1558 — device_native_logs gives the in-process read a budget sized 
     const s = (surface = await loadDeviceSurface((q) => (q.path === '/api/device/request' ? deviceReply(['line']) : undefined)));
     await s.call('device_native_logs', { seconds: 600 });
     expect(nativeLogsParams(s)?.timeoutMs).toBe(nativeLogsAppTimeoutMs(600));
-    expect(nativeLogsAppTimeoutMs(600)).toBeGreaterThan(5_000);
+    // Pinned exactly: a looser bound held for any base and any slope, so it could not fail.
+    expect(nativeLogsAppTimeoutMs(600)).toBe(18_000);
   });
 
   it('source:system sends none — the router answers it host-side, before the device relay', async () => {
@@ -385,8 +386,9 @@ describe('#1558 — device_native_logs gives the in-process read a budget sized 
   });
 
   it('the budget is bounded at both ends', () => {
-    expect(nativeLogsAppTimeoutMs(0)).toBe(5_000);
-    expect(nativeLogsAppTimeoutMs(-5)).toBe(5_000);
-    expect(nativeLogsAppTimeoutMs(1_000_000)).toBe(20_000);
+    // The base covers the worst measured iPhone 8 read (10.6 s, whatever the window) with margin (#1558).
+    expect(nativeLogsAppTimeoutMs(0)).toBe(15_000);
+    expect(nativeLogsAppTimeoutMs(-5)).toBe(15_000);
+    expect(nativeLogsAppTimeoutMs(1_000_000)).toBe(25_000);
   });
 });

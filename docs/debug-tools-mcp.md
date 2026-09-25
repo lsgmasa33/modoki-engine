@@ -532,14 +532,21 @@ real if the code bounds it, and neither did. **iOS:** a position alone does not 
 `device request timed out after 5000ms`, however small `seconds` was. **Android:** `logcat -t N` is a
 LINE count, not seconds — `-t 60` on the S22 covered 11 s, so a filter for anything older answered
 "No logs". It now passes `-T <epoch seconds>`, which has no timezone or year to get wrong. The MCP
-also sends a `timeoutMs` sized from `seconds` (5 s + 5 ms/s, capped at 20 s; the slope is a guess,
-not a measurement), because the relay's deadline is otherwise the lease transport's fixed 5000 ms
+also sends a `timeoutMs` sized from `seconds` (15 s + 5 ms/s, capped at 25 s; the base covers the
+worst iPhone 8 read below with margin, and the slope is still a guess), because the relay's deadline
+is otherwise the lease transport's fixed 5000 ms
 (#153). **Observed through the plugin on 2026-09-25 (QA-TOOL-0013):** on the S22, a 20 s read held
 only the newest marker and a 120 s read held all 202 older lines (0.3–0.6 s). On the iPad (iOS 26.6.2),
 with the app up 11 minutes, a 30 s read returned 49 lines, the oldest 34 s old, and none of the
 ~3,700-line launch burst. The first read after idle costs ~4–5 s whatever the window (opening
-OSLogStore), and repeat reads ~2 s. ⚠️ **Not yet run on the iPhone 8**, where every read used to time
-out: its USB lease was refused because usbmuxd listed it over WiFi first. A
+OSLogStore), and repeat reads ~2 s. On the **iPhone 8** (over WiFi), where every read used to time
+out, the window now holds: a 30 s read
+returned 54 lines, the oldest 29 s old. But **every read cost 6.2–10.6 s whatever the window**, over
+two runs (a 600 s read of 917 lines took no longer than a 30 s one). That fixed cost is opening the
+log store, and it is why the budget's base is 15 s. On the second run the 120 s read took 10.59 s,
+and the original 5 s base gave that read a relay deadline of exactly 10.6 s. ⚠️ **Unmeasured:**
+whether that cost grows with uptime past the ~10 minutes both runs had. They differed by 40% at the
+same uptime, so a long-running app on the iPhone 8 is the case to watch. A
 failed read now arrives in `error` on both platforms (iOS used to send it as a log line, and a
 logcat that rejects its arguments used to read as "No logs"). `seconds` is a whole number from 1
 to 30 days, and `limit` is at least 1 (`limit:0` crashed the iOS reader). An app binary built before

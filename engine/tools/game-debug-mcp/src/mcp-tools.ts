@@ -646,13 +646,18 @@ async function deviceRequestFull(method: string, params: Record<string, unknown>
   return backendPost('/api/device/request', { method, params }, decodeDeviceRequestReply);
 }
 
-/** The device-request budget for an in-process `nativeLogs` read (#1558): the 5000ms the relay
- *  used before, plus a little per second of lookback, capped so a mistyped hour-long window
- *  still fails in bounded time. ⚠️ The 5 ms/s slope is a GUESS, not a measurement: the only
- *  number behind it is a macOS OSLogStore scan (20,000 entries ≈ 3.4 s over a ~1.4 s fixed cost),
- *  and entries per second depend on how chatty the app is. Exported for its test. */
+/** The device-request budget for an in-process `nativeLogs` read (#1558), capped so a mistyped
+ *  long window still fails in bounded time. The BASE is measured, on the slowest supported handset
+ *  (QA-TOOL-0013, 2026-09-25): an iPhone 8 read cost 6.2–10.6 s whatever the window over two runs
+ *  (30 s → 54 lines and 600 s → 917 lines cost the same), because opening OSLogStore dominates; the
+ *  iPad paid 2–5 s. With a 5 s base, the relay deadline (+5 s headroom) for a 120 s read was 10.6 s,
+ *  against a measured 10.59 s. The base is 15 s, about 1.4× the worst read, so the op's own budget
+ *  covers the op, and the relay's +5 s headroom is left for the round trip it exists for (#153).
+ *  ⚠️ Two unknowns: the 5 ms/s slope is a guess (no window changed the cost), and whether the cost
+ *  grows with uptime past the ~10 min both runs had (they differed by 40% at the same uptime).
+ *  Exported for its test. */
 export function nativeLogsAppTimeoutMs(seconds: number): number {
-  return Math.min(20_000, 5_000 + Math.max(0, seconds) * 5);
+  return Math.min(25_000, 15_000 + Math.max(0, seconds) * 5);
 }
 
 /** The `⚠️` caveat line for a host-side reply the router could not tie to the lease
