@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState } from '@modoki/engine/runtime';
 import { markSceneSaved, clearHistory, clearDirtyAssets, markAssetDirty } from '@modoki/engine/editor';
-import { getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
+import { getEditVersion, pushAction, undo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -110,5 +110,28 @@ describe('prefab edit-exit and unsaved prefab-world edits (#1424)', () => {
     dirtyTheWorld();
     const err = await runAgentOp('load-scene', { path: '/assets/scenes/other.scene.json' }).catch((e: Error) => e);
     expect(String((err as Error).message)).toMatch(/Run modoki_save_all to write all of it/);
+  });
+});
+
+/** #1579 — the gate reads the world once the undo in flight has landed. An undo's dirty mark comes at its END, so a
+ *  gate read during the step passed a world the step then dirtied, and the swap (which waits for the step) discarded
+ *  it with no refusal. One op stands for the four that share `guardUnsavedAfterUndo` (load-scene, new-scene, prefab
+ *  edit-open, edit-exit). Mutation: drop the helper's wait — this goes red (the exit runs). */
+describe('the agent unsaved-work gate and an undo in flight (#1579)', () => {
+  it('an undo still running when edit-exit arrives: the gate waits for it, sees its dirty mark, and refuses', async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((r) => { open = r; });
+    pushAction({ label: 'Edit', undo: () => gate, redo: () => {} });
+    markSceneSaved(); // saved after the edit: clean until the undo lands
+    const step = undo();
+    for (let i = 0; i < 5; i++) await Promise.resolve(); // the step is running
+
+    const exit = runAgentOp('prefab', { prefabAction: 'edit-exit' });
+    exit.catch(() => {});
+    await new Promise((r) => setTimeout(r, 10));
+    open();
+    expect(await step).toBe(true);
+    await expect(exit).rejects.toMatchObject({ code: 'REQUIRES_SAVE' });
+    expect(prefab.exit).not.toHaveBeenCalled();
   });
 });

@@ -12,7 +12,7 @@ import type { PrefabFile } from './prefab';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs, refreshPrefabSourceForPath, rebaseStaleInstances } from './prefab';
 import { runtimeExcludedMessage } from './authoringScope';
-import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, takeDownEnvelopeBeforeWorldSwap, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
+import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
@@ -406,6 +406,24 @@ export async function openPrefabForEditing(
     confirmDiscard?: (action: string) => Promise<boolean>;
   } = {},
 ): Promise<void> {
+  // Refuses new undo steps for the whole switch, fetch included, and names the one in flight (#1579).
+  const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: true });
+  try {
+    // The undo in flight finishes BEFORE the fetch below (#1579 close-out review): an Apply undo installs the prefab
+    // file, so a fetch during its write read the applied file and `setPrefabCache` overwrote the undo's restored copy —
+    // the edit world was built from the applied document, and saving it put the Apply back on disk.
+    if (worldSwitch.idle) await worldSwitch.idle;
+    await openPrefabForEditingSwitching(asset, opts, worldSwitch.ready);
+  } finally {
+    worldSwitch.release();
+  }
+}
+
+async function openPrefabForEditingSwitching(
+  asset: { path: string; name: string },
+  opts: { confirmDiscard?: (action: string) => Promise<boolean> },
+  switchReady: () => Promise<void> | null,
+): Promise<void> {
   let prefab: PrefabFile;
   try {
     const res = await fetch(asset.path);
@@ -436,12 +454,14 @@ export async function openPrefabForEditing(
   // first so the round trip is non-destructive. Skip when there's no real scene file
   // to write to — an unsaved new scene, or already inside prefab-edit opening a
   // NESTED prefab (both have a null current path) — which would pop a Save-As picker.
-  // A preview envelope comes down FIRST, restored (#1548 re-review): the swap below goes straight
-  // through SceneManager, so `loadScene`'s own takedown never runs — the session was abandoned at the
-  // swap, a posed Persistent root rode the carry into prefab-edit and back, and the save just below
-  // was silently refused ("a preview session is open") instead of persisting the round trip.
-  const envelopeDown = takeDownEnvelopeBeforeWorldSwap();
-  if (envelopeDown) await envelopeDown;
+  // The undo in flight finishes first (#1579), and then a preview envelope comes down, restored
+  // (#1548 re-review): the swap below goes straight through SceneManager, so `loadScene`'s own takedown
+  // never runs — the session was abandoned at the swap, a posed Persistent root rode the carry into
+  // prefab-edit and back, and the save just below was silently refused ("a preview session is open")
+  // instead of persisting the round trip. The undo goes first because it reloads the world this save
+  // writes and this swap replaces.
+  const ready = switchReady();
+  if (ready) await ready;
   if (getCurrentScenePath()) await saveScene();
   if (opts.confirmDiscard && worldHasUnsavedEdits() && !(await opts.confirmDiscard(`edit prefab ${asset.name}`))) return;
 

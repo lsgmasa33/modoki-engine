@@ -453,7 +453,8 @@ before it are awaited. A scene load, an Exit from prefab edit, or a Create Scene
 window. The reload is skipped in any of three cases, and only the file is restored, with a warning:
 - the key changed;
 - the world object changed (checked for every key);
-- a scene load is still in flight (`isSceneLoadInFlight()`, or `sceneManager.getNext()`).
+- a scene load is swapping the world (`isSceneLoadSwapping()`, or `sceneManager.getNext()`). A load
+  that is only WAITING for this undo does not count: skipping on it recreated the window #1579 closed.
 
 The world is compared for every key because a scene load swaps the world first. It sets the path and
 the history only in its tail, after awaiting the scene managers, so for that window the key still
@@ -466,16 +467,12 @@ redo stack as though undone. Where the history has already swapped, the manager 
 (§ A step that awaits across a scene switch). Otherwise its redo would load this snapshot under the
 new scene's key and save it there.
 
-⚠️ **These are guards at the step, not a fix for the race.** Nothing serializes an undo against the
-user opening a scene, creating one, entering or leaving prefab edit, or pressing Play. Four windows
-are still open and tracked together in #1579:
-- Play pressed during the install;
-- a base the incoming scene keeps, whose instance keeps the applied build;
-- a load's tail discarding the outgoing history that the throw marked dirty;
-- a pending load that then fails, leaving the file at "before" and the instances at "after".
-
-The proposed fix is for the world-switch entry points to await `whenUndoIdle()`, which would make
-every one of these guards defence in depth.
+**These are guards at the step, and since #1579 they are defence in depth.** Opening a scene,
+Create Scene, entering or leaving prefab edit, and pressing Play all wait for the undo in flight
+before they swap, and refuse new undo steps until they land. So the undo applies whole, file and
+world, and the switch lands after it. The guards still cover a route that swaps through
+`sceneManager` directly. Mechanism: [editor.md](editor.md) § A user world switch waits for the undo
+in flight.
 
 Tests: `engine/tests/editor/untitledApplyUndo.test.ts` (each rule above mutation-checked),
 `prefabEditApplyUndo.test.ts`, `applyPrefabDirtiesBase.test.ts`.

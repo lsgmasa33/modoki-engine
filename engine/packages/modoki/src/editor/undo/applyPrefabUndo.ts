@@ -24,7 +24,7 @@
 import { pushAction, type UndoAction } from './undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
-import { serializeScene, saveScene, getCurrentScenePath, setCurrentScenePath, setCurrentBaseScene, isSceneLoadInFlight } from '../scene/serialize';
+import { serializeScene, saveScene, getCurrentScenePath, setCurrentScenePath, setCurrentBaseScene, isSceneLoadSwapping } from '../scene/serialize';
 import {
   applyToPrefabSelective, installPrefabSnapshot, guidForEntityId, entityIdForGuid,
   resolveInstanceContext, getPrefabSource, captureInstanceOverrides, captureInstanceStructure,
@@ -82,7 +82,10 @@ async function restoreSnapshot(
   // awaiting the scene managers, so for that window the key still reads as this scene's (#1575 close-out
   // re-review). And a load still in flight is not raced: loading this snapshot over it would leave its tail setting
   // the other scene's path and history over this world.
-  if (currentSceneKey() !== key || getCurrentWorld() !== world || isSceneLoadInFlight() || sceneManager.getNext() !== null) {
+  // Since #1579 every user world switch waits for this step before it swaps, so these are defence in depth, for a
+  // route that swaps through `sceneManager` directly. `isSceneLoadSwapping`, not `isSceneLoadInFlight`: the latter
+  // also counts a load still WAITING for this very step, and skipping on it recreated the window #1579 closed.
+  if (currentSceneKey() !== key || getCurrentWorld() !== world || isSceneLoadSwapping() || sceneManager.getNext() !== null) {
     console.warn(`[ApplyPrefab] ${key ?? 'the untitled scene'} is no longer the live world; restored the prefab file only`);
     return false;
   }

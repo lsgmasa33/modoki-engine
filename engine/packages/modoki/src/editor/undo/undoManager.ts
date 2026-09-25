@@ -189,6 +189,63 @@ export function finishPreviewRestore(session: number, opts: { drop: boolean }): 
 export function whenUndoIdle(): Promise<void> {
   return _inFlight.then(() => undefined);
 }
+
+/** `whenUndoIdle()` when an undo/redo step is queued or running, else null — so a caller with nothing to wait for
+ *  stays synchronous. The unsaved-work gates await it before they read the dirty state (#1579): an undo's
+ *  conservative dirty mark (#310) lands at its END, so a gate read during the step answered "clean", and the switch
+ *  that then waited for the step discarded the history it had just dirtied without asking. */
+export function undoStepPending(): Promise<void> | null {
+  return _stepsPending > 0 ? whenUndoIdle() : null;
+}
+
+/** How long a world switch waits for an undo step before `beginWorldSwitch` warns. An Apply undo is one prefab file
+ *  write and a scene reload; ten seconds is far past either. */
+export const WORLD_SWITCH_STALL_WARN_MS = 10_000;
+
+/** World switches in progress — a scene load, Create Scene, entering prefab edit, a Play startup (#1579). While any
+ *  is, every undo/redo step is refused (`undoRefusedReason`), read when the step RUNS, so a step queued behind the
+ *  one the switch is waiting for is refused rather than started over the incoming world. A COUNT, since two switches
+ *  can overlap (a load superseding another). */
+let _worldSwitches = 0;
+
+/** Begin a world switch (#1579): refuse every undo/redo step from now until `release`, and report the step that is
+ *  already queued or running as `idle` — resolved once it has finished, or null when there is none, so a caller with
+ *  nothing to wait for stays synchronous (a load with no envelope and no undo still flips to 'stopped' in the same
+ *  run). Call it synchronously at the top of the switch, AFTER the switch's own refusals and in-flight latches
+ *  (#887), and await `idle` before the switch touches the world or the editor's scene path.
+ *
+ *  Why: an undo step awaits across a prefab file write and a world reload (`applyPrefabUndo.restoreSnapshot`), and
+ *  a switch landing in that window resumed the step over a world or history that had changed under it. #1575's
+ *  close-out guarded the step itself four times and each round found the next window; waiting HERE, where the switch
+ *  starts, closes all of them at once. `timelinePreview`'s restore has always done the same with `whenUndoIdle`.
+ *
+ *  ⚠️ Never call a world switch from inside an undo/redo closure: it would wait for the chain it is part of, forever.
+ *  Closures that must replace the world call `sceneManager` directly (`applyPrefabUndo`, `authoredSnapshot`).
+ *  `isExecutingUndoRedo()` cannot tell the two apart — it reads true for a concurrent user gesture too. */
+export function beginWorldSwitch(): { idle: Promise<void> | null; release: () => void } {
+  _worldSwitches += 1;
+  notifyUndoChanged(); // the Edit menu's enabled state reads the refusal
+  let released = false;
+  const idle = undoStepPending();
+  // A step that never settles now holds every switch with it — scene opens hang, Play refuses, every undo is refused —
+  // and nothing else says why. Warn once, so the hang names its cause (#1579 close-out review).
+  const stall = idle ? setTimeout(() => {
+    console.warn(`[undo] a scene switch has waited ${WORLD_SWITCH_STALL_WARN_MS / 1000}s for the undo/redo step in flight — `
+      + 'until that step settles, no scene can be opened or created and Play cannot start');
+  }, WORLD_SWITCH_STALL_WARN_MS) : null;
+  const clearStall = () => { if (stall !== null) clearTimeout(stall); };
+  void idle?.then(clearStall);
+  return {
+    idle,
+    release: () => {
+      clearStall();
+      if (released) return;
+      released = true;
+      _worldSwitches -= 1;
+      notifyUndoChanged();
+    },
+  };
+}
 let _truncationWarned = false;
 
 // ── Change subscription ───────────────────────────────────
@@ -260,10 +317,16 @@ export function isExecutingUndoRedo(): boolean { return _executing; }
 // strictly one-at-a-time, in call order, and each pops the stack only when it is
 // actually its turn (editor-prefab-system.md F6).
 let _inFlight: Promise<unknown> = Promise.resolve();
+/** Steps queued or running on `_inFlight` — lets `beginWorldSwitch` tell "nothing to wait for" apart without an await. */
+let _stepsPending = 0;
 /** Serialize `op` after any in-flight undo/redo. The chain never rejects (each
  *  op is isolated) so one failing undo can't wedge the queue. */
 function serialize<T>(op: () => Promise<T>): Promise<T> {
+  _stepsPending += 1;
   const run = _inFlight.then(op, op);
+  // A side branch, not a `.finally` on `run`: that would delay every caller and the chain by a tick.
+  const settled = () => { _stepsPending -= 1; };
+  run.then(settled, settled);
   _inFlight = run.catch(() => {});
   return run;
 }
@@ -516,6 +579,7 @@ export function registerUndoRestoreBarrier(isRestoring: () => boolean): void {
 export function undoRefusedReason(direction: 'undo' | 'redo' = 'undo'): string | null {
   const top = direction === 'undo' ? undoStack[undoStack.length - 1] : redoStack[redoStack.length - 1];
   if (!top) return null; // nothing to undo is never a refusal, whatever the mode
+  if (_worldSwitches > 0) return `A scene switch is in progress — ${direction} again once it has landed.`;
   if (_restoringSessions.size > 0) return `The preview is closing — ${direction} again once the scene has been restored.`;
   if (_restoreBarriers.some((isRestoring) => isRestoring())) return `The scene is being restored after Stop — ${direction} again once it has landed.`;
   if (canEdit()) return null;

@@ -1920,7 +1920,8 @@ makes ONE place answer a question several used to answer separately.
   owner-less session, and a successful one carried posed bases/Persistent roots across. A load that a
   newer one superseded while it waited returns `'superseded'` without reaching SceneManager.
   `openPrefabForEditing`, which swaps through SceneManager directly, runs the same takedown
-  (`takeDownEnvelopeBeforeWorldSwap`) before its save and swap. Any OTHER world swap (a prefab undo's
+  (through `prepareWorldSwitch`, after the undo wait — § A user world switch waits for the undo in
+  flight) before its save and swap. Any OTHER world swap (a prefab undo's
   reload, a new scene) abandons the session without restoring (its snapshot belongs to the world that
   went away).
 - **A session is seated only under a live mode claim, and leaving the claim cancels its begin
@@ -3991,11 +3992,68 @@ console warning, because the world it belongs to is gone. Its journal event carr
 It marks neither the incoming world edited nor its own `affectedScenes` dirty. Those are usually
 scenes of the world that left, and a dirty mark on a scene that is not loaded makes the incoming
 world read as unsaved: a load then refuses, and its next switch discards its history. ⚠️ A base the
-incoming scene KEEPS is the exception, since its edit is still live. That, and the other windows an
-unserialized undo leaves open, are #1579. An `_isFileDirect` entry is kept, because the asset file outlives the swap; `parkSurvivors`
+incoming scene KEEPS is the exception, since its edit is still live. Since #1579 no editor entry point
+swaps under a running step (next section), so this drop is reachable only through a route that swaps
+through `sceneManager` directly. An `_isFileDirect` entry is kept, because the asset file outlives the swap; `parkSurvivors`
 already keeps those across a discard. The step itself still ran, and whatever it did to disk stands.
 Tests: `packages/modoki/tests/editor/undoSpansSceneSwitch.test.ts`, and the scene-switch cases in
 `untitledApplyUndo.test.ts` / `prefabEditApplyUndo.test.ts`.
+
+### A user world switch waits for the undo in flight (#1579)
+
+The drop above, and the guards inside Apply's undo (prefabs.md § Undoing an Apply), are guards at the
+STEP. #1575's close-out added one per review round and each round found the next window, because
+nothing serialized a step against the user switching worlds during its awaits. Four windows were left:
+Play pressed during an Apply undo's file install, a kept base keeping the applied build, a load's tail
+discarding the history the step had just dirtied, and a pending load that then failed.
+
+The serialization now lives where a switch STARTS, not in the step:
+- **`beginWorldSwitch()`** (`undoManager.ts`) refuses every undo/redo from the call until `release`
+  ("A scene switch is in progress — undo again once it has landed."). The refusal is read when a step
+  runs, so a step queued behind the running one is refused too. It returns `idle`, the step already
+  running, or `null` when there is none, so a switch with nothing to wait for stays synchronous.
+- **`prepareWorldSwitch({ takeDownEnvelope })`** (`serialize.ts`) composes it with the preview-envelope
+  takedown. `serialize.loadScene`, `newScene` and `openPrefabForEditing` call it; `enterPlay` calls
+  `beginWorldSwitch` directly (its envelope goes down through `takeDownPreviewEnvelope`). Those four
+  cover the menu, the Assets panel, the agent ops, prefab Exit (`exitPrefabEditing` → `loadScene`),
+  boot and the toolbar. **Every one WAITS**; none refuses. Play starts late by the undo's length, and
+  the agent `play` op's reply table (#1574) is unchanged.
+- **Ordering, per #887:** a switch's own refusals and in-flight latches (`_newSceneInFlight`,
+  `_loadsInFlight`, the load epoch, `_entering`) stay synchronous and come FIRST, so a second gesture
+  is still refused while the first waits. Then the switch is raised, then awaited. `loadScene`
+  re-checks `stillLive()` after the wait. `newScene` writes the editor path only after it: the undo
+  restores under the CURRENT scene's key, and would skip if the path already named the new one.
+  `openPrefabForEditing` waits (`prepareWorldSwitch().idle`) before it even FETCHES the prefab: an
+  Apply undo installs that file, so a fetch during the write read the applied bytes and overwrote
+  the undo's restored copy in the editor cache, and the edit world came up applied (close-out
+  review). The envelope takedown stays where it was, after the fetch.
+- **Waiting is not swapping.** `isSceneLoadInFlight()` counts a load that is still waiting for the
+  undo, and Apply's undo skipped its reload on it, recreating the fourth window. So there is a second
+  count, `isSceneLoadSwapping()` (loads past their wait), and the undo reads that one. Play and the
+  Hierarchy keep `isSceneLoadInFlight`, the conservative answer for them.
+- **The unsaved-work gates wait too** — for a step already running when they are asked. A step's conservative dirty mark (#310) lands at its END. A gate
+  read during it answered "clean", the switch then waited for the step, and `adoptReplacedWorld`
+  discarded the history the step had just dirtied with no prompt. `confirmDiscardUnsaved` (world-swap
+  scope only; a page unload must not hang on a step) and the agent ops' `guardUnsavedAfterUndo`
+  (load-scene, new-scene, prefab edit-open and edit-exit) await `undoStepPending()` before they read.
+
+⚠️ **Never call a world switch from inside an undo/redo closure.** It would wait for the chain it is
+part of, forever. Closures that must replace the world call `sceneManager` directly, and
+`isExecutingUndoRedo()` cannot serve as an escape hatch, because it reads true for a concurrent user
+gesture too. `engine/tests/architecture/editorWorldSwitchWaitsForUndo.test.ts` keeps editor callers of
+`sceneManager.loadScene`/`replaceWorldContent` to a reviewed list, each with the reason it cannot race
+a step. Nothing guards the deadlock direction mechanically. The corollary: a step that never settles
+now holds every switch with it. So `beginWorldSwitch` warns once when a switch has waited
+`WORLD_SWITCH_STALL_WARN_MS` (10 s) for its step, so the hang names its cause.
+
+**Not covered:** the disk hot reload (`agentBridge`) and `NavigationManager` during Play, where undo is
+refused anyway. The hot reload's own deferral (`authoringSettle`) counts world-replacement tokens and
+the run mode, not undo steps, so it gives no protection against a running step. #1575's step guards stay, as defence
+in depth for those routes.
+
+Tests: the #1579 describe in `engine/tests/editor/untitledApplyUndo.test.ts` (one case per entry point,
+the failed load, the gate and the #887 latch, each mutation-checked), `beginWorldSwitch` in
+`packages/modoki/tests/editor/undoManager.test.ts`, and the agent gate in `prefabEditExitGuard.test.ts`.
 
 
 ## Quick reference

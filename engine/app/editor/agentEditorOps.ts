@@ -36,7 +36,7 @@ import {
   useEditorStore, type SelectedAsset, GIZMO_MODES, GIZMO_SPACES, SCENE_VIEW_MODES,
   type AssetEditorKind, type AssetEditorMount, colliderEditBlocker,
   enterPlay, stopPlay, pausePlay, type PlayOutcome, type StopOutcome,
-  undoStep, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
+  undoStep, undoStepPending, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk,
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
@@ -2292,11 +2292,19 @@ export function registerEditorAgentOps(): void {
       + `${consequence}${survives}${remedy}`,
     );
   };
+  /** `guardUnsaved`, read once the undo in flight has landed (#1579). Its dirty mark (#310) comes at its END, and the
+   *  swap waits for the step anyway — read during it, the gate passed a world the step then dirtied, and the swap
+   *  discarded that scene's history with no refusal. */
+  const guardUnsavedAfterUndo = async (op: string, discardUnsaved: boolean | undefined) => {
+    const pending = undoStepPending();
+    if (pending) await pending;
+    guardUnsaved(op, discardUnsaved);
+  };
   registerAgentOp('load-scene', async (params) => {
     const p = (params ?? {}) as { path: string; discardUnsaved?: boolean; force?: boolean };
     const { path } = p;
     if (!path) throw new Error('load-scene requires { path }');
-    guardUnsaved('load-scene', p.discardUnsaved ?? p.force);
+    await guardUnsavedAfterUndo('load-scene', p.discardUnsaved ?? p.force);
     // Read BEFORE the load — `loadScene()` never gets far enough to change this on a
     // refusal/failure, but capturing it up front (mirrors `agentBridge.ts`'s runtime twin,
     // #486 finding A) lets the message say whether the PREVIOUS scene is still what's loaded,
@@ -2353,7 +2361,7 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as { discardUnsaved?: boolean; force?: boolean };
     // In prefab-edit, `newScene` refuses whatever is dirty (below), so the unsaved-work refusal would
     // only send the caller to save and then hit that one anyway (#1424 review). Let it speak first.
-    if (!isEditingPrefab()) guardUnsaved('new-scene', p.discardUnsaved ?? p.force);
+    if (!isEditingPrefab()) await guardUnsavedAfterUndo('new-scene', p.discardUnsaved ?? p.force);
     // Async since #853 — `newScene` now swaps the world through SceneManager instead of
     // respawning in place, so `onWorldSwap` fires and every id-keyed cache clears. It also
     // REFUSES during prefab edit; that throw carries its own message and propagates as this
@@ -3183,7 +3191,7 @@ export function registerEditorAgentOps(): void {
       // same way and must refuse for the same reason. It additionally SAVES the current scene on
       // the way in (prefabEdit.ts does this deliberately, so the return trip's reload-from-disk
       // is non-destructive) — which is a write the caller should not discover afterwards.
-      guardUnsaved('prefab edit-open', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
+      await guardUnsavedAfterUndo('prefab edit-open', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
       const scenePathBefore = getCurrentScenePath();
       const name = p.path.split('/').pop()?.replace(/\.prefab\.json$/, '') ?? p.path;
       await openPrefabForEditing({ path: p.path, name });
@@ -3240,7 +3248,7 @@ export function registerEditorAgentOps(): void {
       // delete, with the undo stack gone). This deliberately ends "call it blindly after a failed
       // edit-save": after a failed save the edits ARE unsaved, and dropping them must be a choice
       // the caller makes with discardUnsaved:true, not a side effect of tidying up.
-      guardUnsaved('prefab edit-exit', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
+      await guardUnsavedAfterUndo('prefab edit-exit', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
       const returned = await exitPrefabEditing();
       return { ok: true, wasEditing: true, returnedTo: returned, ...editorStateFields('scenePath', 'worldEntityTotal', 'unsavedChanges') };
     }

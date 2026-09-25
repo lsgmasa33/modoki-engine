@@ -37,7 +37,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   getCurrentScenePath: () => 'scenes/test.json',
   setCurrentScenePath: vi.fn(),
   setCurrentBaseScene: (...a: any[]) => setCurrentBaseScene(...a),
-  isSceneLoadInFlight: () => false,
+  isSceneLoadSwapping: () => false,
 }));
 
 vi.mock('../../src/editor/scene/prefab', () => ({

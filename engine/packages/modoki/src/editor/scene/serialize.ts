@@ -24,7 +24,7 @@ import { useEditorStore } from '../store/editorStore';
 import { setPlayState } from '../../runtime/core/playState';
 import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
-import { swapHistory, forgetHistory, getEditVersion } from '../undo/undoManager';
+import { swapHistory, forgetHistory, getEditVersion, beginWorldSwitch } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
@@ -1398,6 +1398,13 @@ export function sceneLoadGeneration(): number { return loadEpoch.current; }
 let _loadsInFlight = 0;
 export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
 
+/** How many of those loads are past their wait for the undo in flight (#1579) — the ones that may be swapping the
+ *  world now. `isSceneLoadInFlight` also counts a load still WAITING for an undo to finish, and an undo that skipped
+ *  on it would skip against the very load that is waiting for it: the prefab file restored, the world not, and the
+ *  step dropped (the window #1579 closes, recreated by its own fix). `applyPrefabUndo.restoreSnapshot` reads this. */
+let _loadsSwapping = 0;
+export function isSceneLoadSwapping(): boolean { return _loadsSwapping > 0; }
+
 /** `loadScene`'s outcome. `'superseded'` covers BOTH ways a load can lose to a newer one:
  *  cancelled early (SceneManager aborts the in-flight load — rejects with AbortError) and
  *  superseded in the winner's TAIL (`SceneManager.loadScene`'s step-11 tail guard — nothing left to cancel, so the
@@ -1417,15 +1424,46 @@ export function registerBeforeSceneLoad(fn: () => Promise<unknown> | null): void
   _beforeSceneLoad = fn;
 }
 
-/** Take a preview envelope down before replacing the world by any route — for a caller that swaps
- *  through `sceneManager` directly rather than `loadScene` (`openPrefabForEditing`). Null when there
- *  is nothing to wait for. Wraps a failure so it is not mistaken for the load's own. */
-export function takeDownEnvelopeBeforeWorldSwap(): Promise<void> | null {
+/** Take a preview envelope down before replacing the world by any route. Null when there is nothing
+ *  to wait for. Wraps a failure so it is not mistaken for the load's own. Called through
+ *  `prepareWorldSwitch`, which waits for the undo in flight first. */
+function takeDownEnvelopeBeforeWorldSwap(): Promise<void> | null {
   const takedown = _beforeSceneLoad?.() ?? null;
   if (!takedown) return null;
   return takedown.then(() => undefined, (e: unknown) => {
     throw new Error(`could not revert the preview before replacing the scene: ${(e as Error)?.message ?? String(e)}`);
   });
+}
+
+/** Everything a user-initiated world switch must do before it touches the world or the editor's scene
+ *  path (#1579): refuse new undo/redo steps from the call on, then — when `ready()` is called — wait for
+ *  the step in flight and, with `takeDownEnvelope`, take a preview envelope down. The one entry for
+ *  `loadScene`, `newScene` and `openPrefabForEditing` (`enterPlay` takes the undo half from
+ *  `beginWorldSwitch` directly, and its envelope through `takeDownPreviewEnvelope`).
+ *
+ *  Call it synchronously AFTER the switch's own refusals and in-flight latches (#887), so a second
+ *  gesture is still refused while this one waits. Call `ready()` where the switch used to take the
+ *  envelope down, and await it when non-null — null keeps a switch with nothing to wait for
+ *  synchronous. Call `release` in a `finally` once the switch is done. `ready` is lazy so nothing
+ *  starts before the caller reaches it (`openPrefabForEditing` fetches first, and a takedown started
+ *  before a failed fetch would reject with nobody awaiting it).
+ *
+ *  Why the undo wait: an undo step awaits across a prefab file write and a world reload, and a switch
+ *  landing in that window resumed it over a changed world or history — see `beginWorldSwitch`. */
+export function prepareWorldSwitch(opts: { takeDownEnvelope: boolean }): {
+  /** The undo step in flight alone, for a switch that must READ something the step writes before it reaches `ready`
+   *  (`openPrefabForEditing` fetches the prefab the undo is installing). */
+  idle: Promise<void> | null;
+  ready: () => Promise<void> | null;
+  release: () => void;
+} {
+  const { idle, release } = beginWorldSwitch();
+  const takedown = () => (opts.takeDownEnvelope ? takeDownEnvelopeBeforeWorldSwap() : null);
+  return {
+    idle,
+    release,
+    ready: () => (idle ? idle.then(() => takedown() ?? undefined) : takedown()),
+  };
 }
 
 /** Set alongside a `'failed'` or `'refused'` outcome PRODUCED BY THIS MODULE'S OWN `loadScene`
@@ -1494,6 +1532,9 @@ export async function loadScene(
   // #1164: `setPlayState('stopped')` below is a settle edge, and a hot reload deferred during Play
   // must not replay into the middle of this load — see `authoringSettle.ts`. Released in `finally`.
   const releaseReplacement = beginWorldReplacement();
+  // Refuses new undo steps from here, and names the one in flight (#1579) — released in `finally`.
+  const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: true });
+  let swapping = false;
   try {
     // A preview envelope is taken down FIRST — restored, not abandoned (#1548 close-out review).
     // Loading out of one used to drop the mode at the line below and leave the session to be
@@ -1504,13 +1545,17 @@ export async function loadScene(
     // in-flight count, so neither a hot-reload settle nor a Play press can start in the gap.
     // NOT isolated: a takedown that throws has left the world in an unknown state, and loading over
     // it is not the recovery — the load fails with that error instead.
-    const takedown = takeDownEnvelopeBeforeWorldSwap();
-    if (takedown) {
-      await takedown;
+    // The undo in flight finishes FIRST (#1579): it reloads the world under this scene's key, and a load
+    // swapping over it left the step to resume over the incoming world.
+    const ready = worldSwitch.ready();
+    if (ready) {
+      await ready;
       // A newer load started while this one waited: it owns the world now, and continuing would call
       // SceneManager AFTER it — superseding the winner with the loser.
       if (!stillLive()) return 'superseded';
     }
+    _loadsSwapping += 1;
+    swapping = true;
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
     // Read on BOTH sides of the await (#1409): the outgoing world stays live and editable while the
@@ -1607,6 +1652,8 @@ export async function loadScene(
     // Load-bearing: if anything above throws, this must still return to zero, or every later
     // reader of `isSceneLoadInFlight()` would believe a load is running forever.
     _loadsInFlight -= 1;
+    if (swapping) _loadsSwapping -= 1;
+    worldSwitch.release();
     // Beside the count it mirrors, and above the store call, so a throw there cannot leak the token
     // (a leaked token means no deferred reload ever replays again).
     releaseReplacement();
@@ -1685,7 +1732,14 @@ export async function newScene(path: string | null = null): Promise<void> {
   // resource release or a world destroy in its tail), and a latch left stuck true would brick
   // Create Scene for the rest of the session.
   _newSceneInFlight = true;
+  // After the latch, so a second Create Scene is still refused while this one waits (#887, #1579).
+  // No envelope takedown: Create Scene never took one (unchanged here).
+  const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: false });
   try {
+    // The undo in flight finishes before the path is written (#1579): it restores under the CURRENT scene's key,
+    // and reading this scene's path there would skip it — the prefab file restored, the world not.
+    const ready = worldSwitch.ready();
+    if (ready) await ready;
     // Set the editor path BEFORE the swap, not after. `setCurrentWorld` fires `onWorldSwap`
     // synchronously and the Hierarchy's restore reads `getCurrentScenePath()` one frame later;
     // `aSceneSwapIsHappening()` is false on this path, so there is no settle-wait to save us
@@ -1734,6 +1788,7 @@ export async function newScene(path: string | null = null): Promise<void> {
     clearAllSceneDirty();
     console.log('[Editor] New scene created');
   } finally {
+    worldSwitch.release();
     _newSceneInFlight = false;
   }
 }

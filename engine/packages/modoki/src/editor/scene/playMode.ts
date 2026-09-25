@@ -19,7 +19,7 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad } from './serialize';
 import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
 import { beginWorldReplacement } from './authoringSettle';
-import { undoDepth, truncateUndoTo } from '../undo/undoManager';
+import { undoDepth, truncateUndoTo, beginWorldSwitch } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 import {
@@ -157,6 +157,13 @@ export async function enterPlay(): Promise<PlayOutcome> {
   _entering = true;
   // No preview session may open from here until Play owns the world (#1546) — released in `finally`.
   const reopenPreviewSessions = holdPreviewSessionsClosed();
+  // Refuses new undo steps until Play owns the world, and names the one in flight (#1579) — released in `finally`.
+  // An Apply undo reloads the world after its prefab file write, and `aSceneSwapIsHappening()` above cannot see a step
+  // that has not reached that reload yet: Play snapshotted the applied world, the reload landed inside Play, and Stop
+  // put the applied world back over a prefab file already at "before". So Play WAITS for it and snapshots the undone
+  // world — the #1579 design's choice over refusing: Play starts late by the undo's length, and the `play` op's reply
+  // table (#1574) needs no new reason.
+  const worldSwitch = beginWorldSwitch();
   // Which scene we are snapshotting. `_entering` refuses a concurrent PLAY, but nothing refuses a
   // concurrent scene LOAD — the menu and the agent `load-scene` op both reach one while the awaits
   // below are in flight. A load landing there leaves `_snapshot`
@@ -165,6 +172,7 @@ export async function enterPlay(): Promise<PlayOutcome> {
   // of the SAME path is just as fatal here and a path comparison cannot see it.
   const enteredLoadGeneration = sceneLoadGeneration();
   try {
+    if (worldSwitch.idle) await worldSwitch.idle;
     // A preview envelope may hold a posed world; revert it to the authored snapshot FIRST so Play
     // captures authored data (not the previewed camera/text), and stand its panel down so its ▶ loop
     // does not go on posing into the Play world (#1546).
@@ -230,6 +238,7 @@ export async function enterPlay(): Promise<PlayOutcome> {
     }
     return { kind: 'started' };
   } finally {
+    worldSwitch.release();
     reopenPreviewSessions();
     _entering = false;
     // Belt-and-braces clear, not a duplicate of the consume above: a SECOND stopPlay() can
