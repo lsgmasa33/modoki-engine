@@ -2571,9 +2571,9 @@ export function assetScannerPlugin(): Plugin {
           const IOS_DEST = user.device.iosDeviceId;
           const IOS_DEVICECTL = user.device.iosDevicectlId;
           // go-ios: the hands-free install path for a device `devicectl` cannot reach (iOS ≤16).
-          // Resolved to an ABSOLUTE path where possible, and QUOTED at every use — the provisioned
-          // one lives under "…/Application Support/Modoki Editor/toolchain/…" (spaces), and these
-          // commands are interpolated into a bash string, the same trap `adb` documents below.
+          // Resolved to an ABSOLUTE path where possible. The provisioned one lives under
+          // "…/Application Support/Modoki Editor/toolchain/…" (spaces), so the install `shell` step
+          // reads it as a `ref()` ("$MODOKI_ARG_GO_IOS"), never as text spliced into the script (#1537).
           //
           // `goIosUsable` is "present, or we can get it": the toolchain dir is where install() puts
           // it, so being able to provision counts. The async phase before the steps run does the
