@@ -108,13 +108,12 @@ export interface Canvas2DSlot {
    *  not the canvas, so a listener left on a replaced or destroyed canvas keeps mutating a live
    *  slot — and Pixi forces a context loss on every `app.destroy()`, so that fires for real. */
   detachCanvasListeners?: () => void;
-  /** Disposer for this slot's WebGPU `device.lost` listener (#794). Kept and detached
-   *  DEFENSIVELY, not because our own teardown is known to resolve `device.lost` — it does not
-   *  (verified: `GpuDeviceSystem.destroy()` only nulls `gpu`/`extensions`/`_renderer`, and Pixi
-   *  never calls `GPUDevice.destroy()` anywhere in its own source). But the listener closes over
-   *  the SLOT, so leaving it attached past a rebuild costs nothing to avoid and would be a real
-   *  bug the moment either Pixi starts calling `device.destroy()` or something OUTSIDE Pixi
-   *  destroys the device — see `attachDeviceLostListener`'s own doc comment. */
+  /** Disposer for this slot's WebGPU `device.lost` listener (#794). It MUST be detached before
+   *  this slot's own `app.destroy()`: since pixi.js 8.21.0, `GpuDeviceSystem.destroy()` calls
+   *  `GPUDevice.destroy()` (observed live — our own destroy resolves `device.lost` with reason
+   *  `'destroyed'`, #1540), so a listener left attached would read our teardown as a device loss
+   *  and rebuild the slot it is tearing down. `isStale` backs the detach up; see
+   *  `attachDeviceLostListener`'s own doc comment. */
   detachDeviceLost?: () => void;
   /** This slot's WebGL context has been lost and not restored — every draw into it is a no-op.
    *
@@ -335,14 +334,23 @@ export class Canvas2DPool {
    *  is a silent no-op there.
    *
    *  ⚠️ Not filtering on `info.reason === 'destroyed'` (unlike `activeRenderer.ts`'s 3D twin,
-   *  which does) is still correct here, but for a DIFFERENT reason than this comment used to give.
-   *  It used to say our own `app.destroy()` resolves `device.lost`, which is FALSE — verified
-   *  against `GpuDeviceSystem.destroy()` (`rendering/renderers/gpu/GpuDeviceSystem.mjs`), which
-   *  only nulls `gpu`/`extensions`/`_renderer`, and a repo-wide `grep` for `device.destroy` in
-   *  `node_modules/pixi.js/lib` finds nothing — Pixi never calls `GPUDevice.destroy()` at all. So
-   *  since Pixi itself can never be the source of a `'destroyed'` resolution here, one arriving
-   *  means someone OUTSIDE Pixi destroyed the device — which is a real loss for this surface, not
-   *  a reason to filter it out. */
+   *  which does) rests on OUR teardown never being heard, not on Pixi never destroying the device.
+   *  Since pixi.js 8.21.0, `GpuDeviceSystem.destroy()` DOES call `GPUDevice.destroy()` (up to
+   *  8.20.1 it only nulled `gpu`/`extensions`/`_renderer`), so our own `app.destroy()` resolves
+   *  `device.lost` with `'destroyed'` — observed live, #1540. Every path that destroys a slot's
+   *  Application therefore detaches this listener FIRST (`rebuildSlotApp`, `teardownSlot`), or
+   *  destroys an Application whose listener was never attached (the orphan in
+   *  `initSlotApp`); `isStale` is the backstop. With our own destroys unheard, a `'destroyed'` that
+   *  DOES arrive means something outside this slot destroyed the device — a real loss for this
+   *  surface, not a reason to filter it out.
+   *
+   *  Also since 8.21.0 (pixijs#12173), Pixi restores a lost device by itself: `_setGpu` hangs
+   *  `_restoreDevice` off `device.lost`, which requests a new device into the SAME renderer. That
+   *  runs alongside the rebuild this listener requests. Read from the source it is benign — if our
+   *  rebuild destroys the old Application first, Pixi's pending restore sees `!this._renderer` and
+   *  destroys the device it just made; if Pixi finishes first, our rebuild's `destroy()` takes the
+   *  restored device down with the Application — one spare device either way. NOT observed on a
+   *  real loss. */
   private attachDeviceLostListener(slot: Canvas2DSlot, app: Application): void {
     // `_gpu`/`device` are WebGPU-backend-only internals with no convenient public type here — one
     // localised, commented cast, mirroring the `_gpuData` pattern in `gpuResourceInvalidation.ts`.
@@ -359,11 +367,10 @@ export class Canvas2DPool {
       // entities. The `(#794)` tag restores the issue reference the shared module's generic
       // handler-failure catch message (rendererLossHandling.ts) doesn't carry per-caller.
       label: () => `canvas2DPool:${slot.entityId} (#794)`,
-      // Our own teardown (`app.destroy()`) does NOT resolve `device.lost` — Pixi never calls
-      // `GPUDevice.destroy()` (see this method's doc comment above). This guard is defensive: it
-      // costs nothing to keep, is required if Pixi ever adopts `device.destroy()`, and is correct
-      // today if something OUTSIDE Pixi destroys the device. `slot.app !== app` means a later
-      // rebuild already superseded this listener's Application.
+      // Backstop for the detach every teardown does first: since pixi.js 8.21.0 our own
+      // `app.destroy()` resolves `device.lost` (see this method's doc comment above), so a
+      // resolution reaching a destroyed or superseded slot is our own teardown, never a loss.
+      // `slot.app !== app` means a later rebuild already superseded this listener's Application.
       isStale: () => !!slot.destroyed || slot.app !== app,
       describe: (e) =>
         `[canvas2DPool] WebGPU DEVICE LOST on the 2D canvas for entity ${slot.entityId} ` +
@@ -440,10 +447,9 @@ export class Canvas2DPool {
     // redundant rebuild through `recovery.request()`'s `again` flag.
     slot.detachCanvasListeners?.();
     slot.detachCanvasListeners = undefined;
-    // Same reasoning as the line above, for WebGPU (#794): the listener closes over the SLOT, so
-    // leaving it attached past this rebuild costs nothing to avoid — it is defensive, not because
-    // our own `app.destroy()` below is known to resolve `device.lost` (it does not; see
-    // `attachDeviceLostListener`'s doc comment).
+    // Same for WebGPU (#794), and REQUIRED, not defensive: since pixi.js 8.21.0 the
+    // `app.destroy()` below resolves `device.lost` with 'destroyed', which an attached listener
+    // would read as a loss of the slot we are rebuilding (see `attachDeviceLostListener`, #1540).
     slot.detachDeviceLost?.();
     slot.detachDeviceLost = undefined;
     if (slot.initialized) {
@@ -781,10 +787,8 @@ export class Canvas2DPool {
     slot.initWatchdog?.(); // stop the FIRST-init watchdog — it must never fire into a torn-down slot
     slot.detachCanvasListeners?.();
     slot.detachCanvasListeners = undefined;
-    // Same reasoning, for WebGPU (#794): the listener closes over the SLOT, so leaving it attached
-    // past a for-good teardown costs nothing to avoid — defensive, not because `app.destroy()`
-    // below is known to resolve `device.lost` (it does not; see `attachDeviceLostListener`'s doc
-    // comment).
+    // Same for WebGPU (#794), and REQUIRED: since pixi.js 8.21.0 the `app.destroy()` below
+    // resolves `device.lost` with 'destroyed' (see `attachDeviceLostListener`, #1540).
     slot.detachDeviceLost?.();
     slot.detachDeviceLost = undefined;
     slot.unpassthrough?.();

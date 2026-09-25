@@ -40,8 +40,11 @@ const initGate: { hold: Promise<void> | null } = { hold: null };
  *  CONSTRUCTION time (mirroring real Pixi, where the device exists as soon as the renderer does),
  *  so a test must set this BEFORE the allocate()/mount() call that creates the Application it
  *  wants wired. `null` (the default) means "no `renderer.gpu` at all" — the WebGL-backend shape
- *  every other test in this file already relies on. */
-const deviceLostGate: { promise: Promise<{ reason?: string; message?: string }> | null } = { promise: null };
+ *  every other test in this file already relies on.
+ *  `selfDestroy` (#1540) models pixi.js 8.21.0 instead: every Application gets its OWN device, and
+ *  its `destroy()` resolves that device's `lost` with `reason: 'destroyed'` — because 8.21.0's
+ *  `GpuDeviceSystem.destroy()` calls `GPUDevice.destroy()` (observed live in the editor). */
+const deviceLostGate: { promise: Promise<{ reason?: string; message?: string }> | null; selfDestroy: boolean } = { promise: null, selfDestroy: false };
 vi.mock('pixi.js', () => {
   class Container {
     children: unknown[] = [];
@@ -73,13 +76,17 @@ vi.mock('pixi.js', () => {
     uid = nextRendererUid++;
     renderer!: { resize(): void; screen: { width: number; height: number }; uid: number; gpu?: { device: { lost: Promise<{ reason?: string; message?: string }> } } };
     private rec = { destroyed: false, destroyArg: undefined as unknown };
+    private destroyOwnDevice?: (info: { reason?: string; message?: string }) => void;
     constructor() {
       this.renderer = { resize() {}, screen: { width: 0, height: 0 }, uid: this.uid };
-      if (deviceLostGate.promise) this.renderer.gpu = { device: { lost: deviceLostGate.promise } };
+      if (deviceLostGate.selfDestroy) {
+        const lost = new Promise<{ reason?: string; message?: string }>((r) => { this.destroyOwnDevice = r; });
+        this.renderer.gpu = { device: { lost } };
+      } else       if (deviceLostGate.promise) this.renderer.gpu = { device: { lost: deviceLostGate.promise } };
       created.push(this.rec);
     }
     async init() { if (initGate.hold) await initGate.hold; /* resolved = context acquired */ }
-    destroy(arg: unknown) { this.rec.destroyed = true; this.rec.destroyArg = arg; }
+    destroy(arg: unknown) { this.rec.destroyed = true; this.rec.destroyArg = arg; this.destroyOwnDevice?.({ reason: 'destroyed', message: 'Device was destroyed.' }); }
   }
   // #1000: `teardownSlot` redeems a deferred global-pool release through this — see the note in
   // canvas2DPool.test.ts's mock.
@@ -115,7 +122,7 @@ const newPool = () => { const p = new Canvas2DPool(); pools.push(p); return p; }
 // The live-Application count is module state and outlives a test file, so a pool abandoned by an
 // earlier test would otherwise leave it permanently above zero and make every count assertion
 // below read a number nobody set.
-beforeEach(() => { created.length = 0; passthroughs.length = 0; initGate.hold = null; deviceLostGate.promise = null; __resetPixiApplicationTrackingForTest(); pool = newPool(); });
+beforeEach(() => { created.length = 0; passthroughs.length = 0; initGate.hold = null; deviceLostGate.promise = null; deviceLostGate.selfDestroy = false; __resetPixiApplicationTrackingForTest(); pool = newPool(); });
 afterEach(() => {
   // #1058/#1059 — a rebuild armed on the REAL clock and never disposed fires inside a later test's
   // fake-timer window and inflates `created` there. Real timers FIRST: the recovery timers this
@@ -779,14 +786,11 @@ describe('canvas2DPool — WebGPU device.lost (#794)', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     const madeBefore = created.length;
 
-    // `{reason:'destroyed'}` is what a real `GPUDevice.destroy()` resolves `device.lost` with.
-    // ⚠️ NOT provoked by our own teardown: Pixi never calls `GPUDevice.destroy()` at all
-    // (`GpuDeviceSystem.destroy()` only nulls `gpu`/`extensions`/`_renderer`), so this reason can
-    // only come from OUTSIDE Pixi. That is exactly why the `disposed` guard is worth pinning — the
-    // window it defends is an external destruction landing after `detachDeviceLost()`, not a
-    // self-inflicted one. (An earlier comment here claimed our own `app.destroy()` provoked it;
-    // that claim is retracted — see `gpuResourceInvalidation.ts`'s header. The WebGL twin above,
-    // `fireLost(slot.canvas)`, IS self-provoked, and its comment is correct as written.)
+    // `{reason:'destroyed'}` is what a real `GPUDevice.destroy()` resolves `device.lost` with —
+    // and since pixi.js 8.21.0 our OWN `app.destroy()` provokes it (`GpuDeviceSystem.destroy()` now
+    // calls `GPUDevice.destroy()`; up to 8.20.1 it did not, and this comment used to say "never").
+    // This test isolates the guard alone; the two tests below drive the self-provoked version
+    // through real teardown and rebuild paths (#1540).
     resolveLost({ reason: 'destroyed' });
     await Promise.resolve();
     await Promise.resolve();
@@ -798,6 +802,53 @@ describe('canvas2DPool — WebGPU device.lost (#794)', () => {
     await vi.advanceTimersByTimeAsync(5000);
     vi.useRealTimers();
     expect(created.length, 'no rebuild must be queued from a phantom device loss').toBe(madeBefore);
+  });
+
+  // #1540 — the WebGPU twin of "stays SILENT when the context loss is our OWN teardown". Since
+  // pixi.js 8.21.0, `app.destroy()` destroys the GPUDevice, so every teardown resolves the slot's
+  // own `device.lost` with 'destroyed' — self-provoked, like the WebGL `loseContext()` above.
+  // ⚠️ Two mechanisms stand between that resolution and a phantom loss: the detach before
+  // `destroy()` and the `isStale` backstop. Breaking ONE leaves these green; they go red only
+  // with both broken, which is the redundancy the guard's comment claims.
+  it('stays SILENT when our own disposal destroys the device (pixi 8.21.0)', async () => {
+    deviceLostGate.selfDestroy = true;
+    const slot = pool.mount(42)!;
+    await slot.ready;
+    expect(slot.detachDeviceLost, 'precondition: the listener actually attached').toBeTypeOf('function');
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const madeBefore = created.length;
+
+    pool.unmount(42);
+    pool.destroyPool();
+    expect(created[madeBefore - 1].destroyed, 'precondition: our own destroy() really ran').toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(err, 'our own teardown must not be reported as a lost device').not.toHaveBeenCalled();
+    expect(slot.contextLost, 'a disposed slot must not flip to lost').toBeFalsy();
+  });
+
+  it('a rebuild that destroys the OLD device does not queue a second rebuild (pixi 8.21.0)', async () => {
+    deviceLostGate.selfDestroy = true;
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const slot = pool.allocate(43)!;
+    await slot.ready;
+    const madeBefore = created.length;
+
+    fireLost(slot.canvas);                      // one real loss → exactly one rebuild
+    await vi.advanceTimersByTimeAsync(2000);
+    await slot.ready;
+    expect(created.length, 'the loss must rebuild once').toBe(madeBefore + 1);
+    expect(created[madeBefore - 1].destroyed, 'precondition: the rebuild destroyed the old app').toBe(true);
+    const errorsAfterRebuild = err.mock.calls.length;
+
+    await vi.advanceTimersByTimeAsync(5000);   // room for a phantom-triggered second rebuild
+    vi.useRealTimers();
+    expect(created.length, 'the old device\'s own destruction must not trigger another rebuild').toBe(madeBefore + 1);
+    expect(err.mock.calls.length, 'nor be logged as a new loss').toBe(errorsAfterRebuild);
+    expect(slot.contextLost, 'the slot is healthy after the one rebuild').toBe(false);
   });
 });
 

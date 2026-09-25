@@ -137,7 +137,7 @@ function mockDeps() {
     }
     // `buffers` mirrors real Pixi Geometry: a truthy array until `destroy(true)` nulls it, which
     // is what `releaseGeometry`'s `!g.buffers` idempotency guard checks (a second call must not
-    // re-run unload/destroy, exactly like the real Geometry.destroy() nulling `buffers`).
+    // re-run destroy, exactly like the real Geometry.destroy() nulling `buffers`).
     class MeshGeometry {
       buffers: unknown[] | null = [];
       positions: Float32Array;
@@ -153,7 +153,6 @@ function mockDeps() {
         if (name !== 'aPosition') throw new TypeError(`[mock] no attribute '${name}' on this geometry`);
         return this._posBuffer;
       };
-      unload = vi.fn();
       destroy = vi.fn(() => { this.buffers = null; });
       addAttribute = vi.fn();
       constructor(public opts?: any) {
@@ -750,8 +749,9 @@ describe('Scene2D.renderFrame', () => {
     // drives the same targets; PERMANENT when it drives none.
     //
     // The fix is a RESET in place, not a rebuild: see Scene2D.tsx's comment at the re-stamp for why
-    // rebuilding the Shader here would trade this bug for #699's unbounded `BindGroupSystem._hash`
-    // growth on exactly the pooled-respawn path. So the slot reuse asserted by the #848 test above
+    // rebuilding the Shader here would trade this bug for #699's `BindGroupSystem._hash` growth
+    // (no longer permanent since pixi.js 8.21.0's GC sweep, #1540 — still two entries per rebuild) on
+    // exactly the pooled-respawn path. So the slot reuse asserted by the #848 test above
     // is still expected to hold in every test below — that is what makes these two coexist rather
     // than one inverting the other.
     describe('a respawned entity does not inherit the dead one\u2019s uniform values (#873)', () => {
@@ -975,14 +975,10 @@ describe('Scene2D.renderFrame', () => {
 
       expect(mesh.destroyed).toBe(true);
       expect(shader.destroyed).toBe(true);          // shader torn down with the slot
-      expect(mesh.geometry.destroy).toHaveBeenCalled();
-      // releaseGeometry must call unload() BEFORE destroy(true) — Pixi's Geometry.destroy()
-      // tears off the "unload" listener before firing it, so the ORDER is what actually frees
-      // the GL VAO; a mock that merely records both calls (without this) can't tell the fix
-      // apart from the bug it fixes.
-      expect(mesh.geometry.unload).toHaveBeenCalled();
-      expect(mesh.geometry.unload.mock.invocationCallOrder[0])
-        .toBeLessThan(mesh.geometry.destroy.mock.invocationCallOrder[0]);
+      // Through releaseGeometry, so the buffers go with it. Whether that frees the GL VAO is
+      // pixi's own destroy order, which a mock cannot model — geometryReleaseVao.test.ts pins it
+      // against the installed pixi.js (#1540).
+      expect(mesh.geometry.destroy).toHaveBeenCalledWith(true);
       expect(pool.getSlot(canvas.id())!.container.children.length).toBe(0);
     });
 
@@ -1250,9 +1246,9 @@ describe('Scene2D.renderFrame', () => {
     });
 
     // #692 site 2: `matSig` used to include width/height/pivot, so an animated size rebuilt the
-    // whole Mesh+Shader+Geometry every frame — and every Shader rebuild leaks a permanent entry
-    // into WebGPU's BindGroupSystem._hash (#699, filed upstream as pixijs/pixijs#12214), making an
-    // animated size an unbounded grow. (It does NOT also leak a pixi GCManagedHash key, as this
+    // whole Mesh+Shader+Geometry every frame — and every Shader rebuild adds an entry to WebGPU's
+    // BindGroupSystem._hash (#699, pixijs/pixijs#12214): permanent before pixi.js 8.21.0, held for
+    // 60s+ before the GC sweeps it since (#1540). (It does NOT also leak a pixi GCManagedHash key, as this
     // comment claimed until 2026-09-18 — that cache tombstones and compacts at 10k.) `matBuildSig`/`matQuadSig` split the two: a size/pivot
     // change now resizes the existing quad's 8 position floats in place instead.
     describe('material quad resize is in-place, not a rebuild (#692)', () => {

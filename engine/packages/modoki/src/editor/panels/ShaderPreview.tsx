@@ -52,12 +52,10 @@ function buildQuad(w: number, h: number): MeshGeometry {
  *  `destroyPixiApplication` alone. `Mesh`/`Container` order `unload()` before `destroy()` correctly,
  *  so a bare `mesh.destroy()` is safe and frees the mesh's own per-instance GPU state.
  *
- *  The geometry is released SEPARATELY, through `releaseGeometry` (exported from `Scene2D.tsx`):
- *  PixiJS 8.19.0's `Geometry.destroy()` tears off its `"unload"` listener before `unload()`
- *  fires, orphaning the WebGL VAO unless the release goes through `releaseGeometry`'s
- *  `unload()`-then-`destroy(true)` order — see that function's own comment in `Scene2D.tsx`, and
- *  the repo-wide static guard (`tests/architecture/geometryRelease.test.ts`) that forbids a
- *  second, un-audited copy of that ordering anywhere else. Capture `mesh.geometry` BEFORE
+ *  The geometry is released SEPARATELY, through `releaseGeometry` (exported from `Scene2D.tsx`),
+ *  which destroys its buffers with it and makes a second release a no-op — see that function's
+ *  own comment, and the repo-wide static guard (`tests/architecture/geometryRelease.test.ts`)
+ *  that routes every Geometry teardown through it. Capture `mesh.geometry` BEFORE
  *  `mesh.destroy()` — `Mesh.destroy()` nulls `_geometry`, so reading it after would hand
  *  `releaseGeometry` `undefined`. */
 function destroyMesh(mesh: Mesh<MeshGeometry, Shader> | null): void {
@@ -157,10 +155,10 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
           { canvas, device: (app.renderer as unknown as { gpu?: { device?: { lost?: Promise<{ reason?: string; message?: string }> } } })?.gpu?.device },
           { label: 'ShaderPreview', isStale: () => disposed || stateRef.current.serial !== serial, ...makePreviewLossPolicy({ label: 'ShaderPreview', teardown }) },
         );
-        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) destroyPixiApplication(app, releasePixiApp); markDestroyed(); return; }
+        if (disposed || stateRef.current.serial !== serial) { detachLoss(); if (app.renderer) destroyPixiApplication(app, releasePixiApp); markDestroyed(); return; }
         app.ticker.stop();
         const program = await buildPixiShaderProgram(path);
-        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) destroyPixiApplication(app, releasePixiApp); markDestroyed(); return; }
+        if (disposed || stateRef.current.serial !== serial) { detachLoss(); if (app.renderer) destroyPixiApplication(app, releasePixiApp); markDestroyed(); return; }
         stateRef.current.app = app;
         stateRef.current.program = program;
         if (program) {
@@ -174,6 +172,11 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
         // init/build rejected — free any GL context we opened; leave state cleared. `ownMesh`, not
         // `stateRef.current.mesh`: a later run may already have stored ITS mesh on the shared ref.
         destroyMesh(ownMesh);
+        // Detach BEFORE destroying: since pixi.js 8.21.0 `app.destroy()` calls `GPUDevice.destroy()`,
+        // which resolves `device.lost` with reason 'destroyed' — and nothing here has made
+        // `isStale` true, so a still-attached listener would report a shader that failed to COMPILE
+        // as a lost GPU device (#1540). Every destroy of our own app in this effect detaches first.
+        detachLoss();
         if (app.renderer) destroyPixiApplication(app, releasePixiApp);
         markDestroyed(); // no-op unless init actually succeeded before something else threw
       }
