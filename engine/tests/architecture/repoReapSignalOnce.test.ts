@@ -44,8 +44,13 @@ const pause = (s: number) => execFileSync('bash', ['-c', `sleep ${s}`]);
 const CHILD = `const fs=require('fs');const out=process.argv[1];let n=0;fs.writeFileSync(out+'.pid',String(process.pid));process.on('SIGTERM',()=>{n++;fs.writeFileSync(out,String(n));});setInterval(()=>{},1e9);`;
 
 /** The npm wrapper: spawns CHILD and forwards SIGTERM to it, as `electron/cli.js` does. Its argv
- *  carries `<root>/node_modules/.bin/electron <marker>`, the shape launch-editor.sh produces. */
-const WRAPPER = `const {spawn}=require('child_process');const [code,out,...rest]=process.argv.slice(1);const c=spawn(process.execPath,['-e',code,out,...rest.slice(1)],{stdio:'ignore'});process.on('SIGTERM',()=>c.kill('SIGTERM'));setInterval(()=>{},1e9);`;
+ *  carries `<root>/node_modules/.bin/electron <marker>`, the shape launch-editor.sh produces.
+ *  ⚠️ It forwards after a 100 ms DELAY, on purpose. Forwarded at once, the second SIGTERM lands
+ *  while the child's first is still PENDING, and the kernel merges two pending standard signals
+ *  into one — so the CONTROL counted 1, not 2, on public CI (ubuntu AND macos-14, 2026-09-25,
+ *  release 0.7.3 rc). The delay keeps the two deliveries distinct; the question every case asks is
+ *  WHICH processes were signalled, and that is unchanged by when the wrapper passes one on. */
+const WRAPPER = `const {spawn}=require('child_process');const [code,out,...rest]=process.argv.slice(1);const c=spawn(process.execPath,['-e',code,out,...rest.slice(1)],{stdio:'ignore'});process.on('SIGTERM',()=>setTimeout(()=>c.kill('SIGTERM'),100));setInterval(()=>{},1e9);`;
 
 /** `wrapper: false` is an Electron main started with no forwarding parent (a direct launch, as a
  *  Playwright or IDE launch does): the child alone carries the markers. */
