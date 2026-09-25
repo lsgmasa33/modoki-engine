@@ -2492,8 +2492,10 @@ app.on('before-quit', (e) => {
       // MACHINE-WIDE state that outlives this process, and until #225 nothing in production called
       // this at all — the only caller was `/api/device/disconnect`, i.e. the case where a human had
       // already tidied up. All of it is sync, so it completes even if a step below wedges and the
-      // 5s race times the teardown out. It does NOT cover a SIGTERM (`stop-editor.sh`) or a crash:
-      // Chromium takes the signal and this listener never runs — that is what the startup sweep in
+      // 5s race times the teardown out. A single SIGTERM (`stop-editor.sh`) DOES reach it: Chromium
+      // takes the signal and quits through this listener (measured, #1580). A SECOND signal during
+      // the quit kills the process outright, which is why `stop-editor.sh` sends exactly one. A
+      // crash or `kill -9` never reaches it; that is what the startup sweep in
       // `reclaimStaleDeviceStateAtStartup` is for.
       try { releaseDeviceResourcesOnExit(); } catch { /* never let cleanup block the quit */ }
       await backendHandle?.close().catch(() => {});
