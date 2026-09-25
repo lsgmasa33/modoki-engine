@@ -424,10 +424,24 @@ registerBeforeSceneLoad(() => (getRunMode() === 'playing' ? null : takeDownPrevi
  *  kept posing, its ⏹ stayed up, and `get_editor_state.modeOwner` reported a preview that did not
  *  exist. A mode change that drops the owner WITHOUT the owner's own `exitPreviewMode` (which clears
  *  `_modeOwner` before it sets the mode, so it never reaches the notify here) is a displacement, and
- *  the owner hears it through the same callback a rival panel's scrub already uses. */
+ *  the owner hears it through the same callback a rival panel's scrub already uses.
+ *
+ *  **Leaving the envelope also cancels any `begin` still serializing (#1569)** — here, for the same
+ *  reason the owner release is here: every way out passes through this listener, and no single exit
+ *  path can be trusted to remember. A teardown ends only a HELD session (`hasTimelinePreviewSession()
+ *  && end…`), so a scrub's begin still awaiting its snapshot used to survive a timeline switch, an
+ *  unmount, a world swap or the Animation panel's ⏹, and seat a session after the mode was already
+ *  `stopped`: a posed world, no owner, no ⏹ anywhere. The invariant this keeps is that a session is
+ *  only ever seated under a live mode claim, so every begin must be made under one (the Timeline ▶
+ *  claims a frozen `preview` before its begin for exactly this reason — `openPlaybackSession`).
+ *  A move WITHIN the envelope (scrub ⇄ preview, a pause freezing it) cancels nothing. */
+let _lastRunMode = getRunMode();
 onRunModeChange(() => {
   const m = getRunMode();
+  const wasEnvelope = _lastRunMode === 'scrub' || _lastRunMode === 'preview';
+  _lastRunMode = m;
   if (m === 'scrub' || m === 'preview') return;
+  if (wasEnvelope) cancelPendingPreviewBegins();
   const previousOwner = _modeOwner;
   if (previousOwner === null) return;
   setModeOwner(null);

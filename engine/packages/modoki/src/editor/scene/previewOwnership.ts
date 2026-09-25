@@ -4,9 +4,10 @@
  *  their preview effects on it, so a single ▶ press starts both. Each then calls
  *  `enterPreviewMode` and takes the single-valued `RunMode` from the other — harmless ownership
  *  churn until #810 gave displacement real teeth, after which the loser's rAF is stopped. The
- *  Timeline ALWAYS lands second (its entry sits behind an awaited `beginTimelinePreviewSession()`),
- *  so it always won and always stopped the Animation panel's loop; with no timeline doc open its
- *  own tick then early-returns every frame, so pressing ▶ in the Animation panel played NOTHING.
+ *  Timeline then ALWAYS landed second (its entry sat behind an awaited session begin; since #1569 it
+ *  claims before the await, and which panel lands second is React's effect order instead), so it
+ *  always won and always stopped the Animation panel's loop; with no timeline doc open its own tick
+ *  then early-returns every frame, so pressing ▶ in the Animation panel played NOTHING.
  *
  *  The fix is to record WHICH panel's ▶ started the preview (`editorStore.previewOwner`) and let
  *  only that panel drive it. This lives in its own module, not inline in the two `.tsx` panels,

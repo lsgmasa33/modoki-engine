@@ -25,12 +25,12 @@ import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
 import {
-  beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
+  endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
   capturePreviewGesture, cancelPreviewGestures, poseEnvelopeHeld,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode, freezePreviewIfOwnedBy, registerModeOwnerDisplaced, getModeOwner, onModeOwnerChange } from '../scene/playMode';
-import { openPreviewSessionThen, reopenPreviewAfterRestore, mayEndSharedSession, undoMayRepose } from '../scene/openPreviewSession';
+import { openPreviewSessionThen, openPlaybackSession, reopenPreviewAfterRestore, mayEndSharedSession, undoMayRepose } from '../scene/openPreviewSession';
 import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
 import { panelDrivesPreview, panelMayStopPreview } from '../scene/previewOwnership';
 import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/core/playState';
@@ -582,8 +582,9 @@ export default function TimelineEditor() {
   // ⚠️ Must NOT call `setPreviewPlaying(false)` UNCONDITIONALLY — that flag is SHARED with the Animation panel
   // (both read `useEditorStore((s) => s.isPreviewPlaying)`), so flipping it off here does not stop
   // "our" preview, it stops BOTH panels' preview effects. With both docked, one ▶ press could stop
-  // itself: Animation enters first (no notify yet), Timeline's async session-open resolves a
-  // microtask later and takes the mode, displacing Animation — whose callback (the first #810
+  // itself: Animation entered first (no notify yet), Timeline's async session-open resolved a
+  // microtask later and took the mode (it claims before the await since #1569, same effect),
+  // displacing Animation — whose callback (the first #810
   // pass) then killed the flag Timeline's own just-started preview was keyed on. Confirmed live in
   // `previewDisplacementSharedFlag.test.ts` before this fix. Stopping only THIS run's guard is
   // what avoids it — see `previewLoopGuard.ts`. Registered for the panel's whole lifetime, not
@@ -614,13 +615,10 @@ export default function TimelineEditor() {
     let last = performance.now();
     let cancelled = false;
     void (async () => {
-      let opened = false;
-      try {
-        opened = await beginTimelinePreviewSession(); // snapshot authored world (idempotent across pause/resume)
-      } catch (e) {
-        console.error('[TimelineEditor] could not open the preview session — ▶ not started', e);
-      }
-      if (cancelled || guard.stopped) return; // displaced before we ever took the mode ourselves
+      // Claims a frozen 'preview' BEFORE the snapshot, so a teardown in the gap cancels it (#1569);
+      // idempotent across pause/resume. A refusal or a throw has already handed the claim back.
+      const opened = await openPlaybackSession('timeline');
+      if (cancelled || guard.stopped) return; // displaced, or torn down, while the snapshot serialized
       if (!opened) {
         // No session (#1167: ▶ pressed while an Exit's restore is still landing, or the snapshot
         // threw). The loop below poses AND fires signals with nothing to revert them, so it must not

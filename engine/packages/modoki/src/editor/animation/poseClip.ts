@@ -36,6 +36,7 @@ import { useEditorStore } from '../store/editorStore';
 import { enterScrubMode, exitPreviewMode, getModeOwner } from '../scene/playMode';
 import { beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, poseEnvelopeHeld } from '../scene/timelinePreview';
 import { resolveAnimatorRootForClip } from '../panels/openAssetInEditor';
+import { handBackPreviewClaim } from '../scene/openPreviewSession';
 
 /** Write the clip's sampled values into the bound entities. Returns how many channels applied.
  *
@@ -111,14 +112,15 @@ export async function poseClipAtTime(
     // error) an unguarded throw leaves the editor pinned at `scrub` with NO session — Cmd+S
     // blocked, and nothing to revert, which is the wedge this whole module exists to avoid. Hand
     // the mode back before rethrowing so the failure costs the caller a retry, not their editor.
-    exitPreviewMode(owner);
+    handBackPreviewClaim(owner);
     throw e;
   }
   if (!opened) {
     // No session: a restore was in progress, or an Exit landed while the snapshot serialized (#1167).
     // Pose nothing — it would be unrevertible — and hand the mode back, for the same reason as the
     // throw above. `rootId` was also resolved before that swap, so it may name a dead entity.
-    exitPreviewMode(owner);
+    // Not over a newer begin's claim, though — see `handBackPreviewClaim`.
+    handBackPreviewClaim(owner);
     return { applied: 0, openedSession: false, refused: true };
   }
   return { applied: applyPoseAtTime(clip, rootId, t), openedSession: true };

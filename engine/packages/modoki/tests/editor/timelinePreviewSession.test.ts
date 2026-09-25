@@ -67,10 +67,10 @@ import {
 } from '../../src/editor/undo/undoManager';
 import { setRunMode } from '../../src/runtime/core/playState';
 import { onAuthoringSettled } from '../../src/editor/scene/authoringSettle';
-import { openPreviewSessionThen, reopenPreviewAfterRestore } from '../../src/editor/scene/openPreviewSession';
+import { openPreviewSessionThen, openPlaybackSession, reopenPreviewAfterRestore } from '../../src/editor/scene/openPreviewSession';
 import { capturePreviewGesture, whenPreviewRestoresLanded, poseEnvelopeHeld } from '../../src/editor/scene/timelinePreview';
 import { createTeardownToken } from '../../src/runtime/core/liveness';
-import { enterScrubMode, exitPreviewMode, aSceneSwapIsHappening, stopPlay, enterPlay, enterPreviewMode, getModeOwner, registerModeOwnerDisplaced } from '../../src/editor/scene/playMode';
+import { enterScrubMode, exitPreviewMode, aSceneSwapIsHappening, stopPlay, enterPlay, enterPreviewMode, getModeOwner, registerModeOwnerDisplaced, freezePreviewIfOwnedBy } from '../../src/editor/scene/playMode';
 import { getPlayState } from '../../src/runtime/core/playState';
 import { getRunMode } from '../../src/runtime/core/playState';
 import { getBusVolumes, setBusVolume } from '../../src/runtime/audio/audioService';
@@ -819,6 +819,190 @@ describe('a preview session and Play never coexist (#1546)', () => {
       expect(hasTimelinePreviewSession()).toBe(false);
       expect(h.loadCalls).toHaveLength(0);                 // abandoned, NOT restored over the new scene
     } finally { unregister(); setCurrentWorld(before); next.destroy(); }
+  });
+});
+
+/** #1569 — a begin still serializing when its envelope ends must seat nothing. Every teardown ends
+ *  only a HELD session, so the cancel lives on the mode transition out of scrub/preview instead. */
+describe('leaving the envelope cancels a begin still serializing (#1569)', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  function gate(): () => void {
+    let open!: () => void;
+    h.serializeGate = new Promise<void>((r) => { open = r; });
+    return () => { h.serializeGate = null; open(); };
+  }
+
+  it('a timeline switch mid-snapshot: the scrub seats nothing and its pose never runs', async () => {
+    const open = gate();
+    enterScrubMode('timeline');
+    const pose = vi.fn();
+    const scrub = openPreviewSessionThen('timeline', pose);
+    await tick();
+    exitPreviewMode('timeline');                          // TimelineEditor's open/switch effect, no session held yet
+    open();
+    // MUTATION TARGET: drop `cancelPendingPreviewBegins()` from playMode's run-mode listener and this
+    // resolves true — the reviewer's repro: a session held under 'stopped', owner null, pose applied.
+    expect(await scrub).toBe(false);
+    expect(pose).not.toHaveBeenCalled();
+    expect(hasTimelinePreviewSession()).toBe(false);
+    expect(getRunMode()).toBe('stopped');
+    expect(getModeOwner()).toBe(null);
+  });
+
+  it('a mode drop that bypasses exitPreviewMode (a scene load setting stopped) cancels it too', async () => {
+    const open = gate();
+    enterScrubMode('timeline');
+    const begin = beginTimelinePreviewSession();
+    await tick();
+    setRunMode('stopped');                                // what `serialize.loadScene` does to the mode
+    open();
+    expect(await begin).toBe(false);
+    expect(hasTimelinePreviewSession()).toBe(false);
+  });
+
+  it('the Animation ⏹ over a pose still snapshotting: refused, nothing applied, no session', async () => {
+    const { poseClipAtTime, exitPoseEnvelope } = await import('../../src/editor/animation/poseClip');
+    const open = gate();
+    const clip = { duration: 1, loop: false, frameRate: 30, tracks: [] } as never;
+    const posing = poseClipAtTime(clip, 1, 0.5, 'animation');   // enterScrubMode('animation') + begin
+    await tick();
+    expect((await exitPoseEnvelope(true)).exited).toBe(true);  // no session held → used to end nothing
+    open();
+    const r = await posing;
+    expect(r.refused).toBe(true);
+    expect(r.openedSession).toBe(false);
+    expect(hasTimelinePreviewSession()).toBe(false);
+    expect(getRunMode()).toBe('stopped');
+  });
+
+  it('Timeline ▶ claims the mode BEFORE its begin, so closing the panel in the gap cancels it', async () => {
+    const open = gate();
+    const playing = openPlaybackSession('timeline');
+    // MUTATION TARGET: drop `enterPreviewMode(false, owner)` from openPlaybackSession and the mode is
+    // still 'stopped' here — the unmount's exitPreviewMode below is a no-op and the begin seats.
+    expect(getRunMode()).toBe('preview');
+    expect(getModeOwner()).toBe('timeline');
+    expect(getPlayState()).toBe('stopped');                // frozen: a claim, not an advancing preview
+    await tick();
+    exitPreviewMode('timeline');                          // TimelineEditor's unmount cleanup
+    open();
+    expect(await playing).toBe(false);
+    expect(hasTimelinePreviewSession()).toBe(false);
+  });
+
+  it('ACCEPT SIDE: a Pause in the gap keeps the claim, so ▶ seats a paused preview', async () => {
+    const open = gate();
+    const playing = openPlaybackSession('timeline');
+    await tick();
+    freezePreviewIfOwnedBy('timeline');                   // the ▶ effect's cleanup on Pause
+    open();
+    expect(await playing).toBe(true);
+    expect(hasTimelinePreviewSession()).toBe(true);
+    expect(getRunMode()).toBe('preview');
+    exitPreviewMode('timeline');
+  });
+
+  it('a refused ▶ hands its claim back', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    h.failSerialize = true;
+    // MUTATION TARGET: drop the `handBackPreviewClaim` from openPlaybackSession and the mode stays
+    // pinned at 'preview' with no session — Cmd+S refused and no ⏹ to press.
+    expect(await openPlaybackSession('timeline')).toBe(false);
+    expect(getRunMode()).toBe('stopped');
+    expect(getModeOwner()).toBe(null);
+    expect(err).toHaveBeenCalled();
+    err.mockRestore();
+    h.failSerialize = false;
+  });
+
+  it('ACCEPT SIDE: scrub → preview with a begin pending cancels nothing — both are inside the envelope', async () => {
+    const open = gate();
+    enterScrubMode('timeline');
+    const begin = beginTimelinePreviewSession();
+    await tick();
+    enterPreviewMode(false, 'timeline');                  // ▶ pressed while the first scrub still snapshots
+    open();
+    // MUTATION TARGET: cancel on ANY run-mode change instead of on leaving the envelope and this is false.
+    expect(await begin).toBe(true);
+    exitPreviewMode('timeline');
+  });
+
+  it('a stale refusal does not take a LATER click\'s claim — the later click still poses', async () => {
+    const openFirst = gate();
+    enterScrubMode('timeline');
+    const pose1 = vi.fn();
+    const first = openPreviewSessionThen('timeline', pose1);
+    await tick();
+    exitPreviewMode('timeline');                          // a timeline switch cancels the first click
+    const openSecond = gate();                            // the second click's own snapshot
+    enterScrubMode('timeline');
+    const pose2 = vi.fn();
+    const second = openPreviewSessionThen('timeline', pose2);
+    await tick();
+    openFirst();
+    expect(await first).toBe(false);                      // cancelled, and resolves before the second seats
+    // MUTATION TARGET: hand the claim back unconditionally (plain `exitPreviewMode`) and the stale
+    // refusal drops the second click's scrub — which now cancels its begin, so its pose is lost.
+    expect(getRunMode()).toBe('scrub');
+    openSecond();
+    expect(await second).toBe(true);
+    expect(pose1).not.toHaveBeenCalled();
+    expect(pose2).toHaveBeenCalledTimes(1);
+    exitPreviewMode('timeline');
+  });
+
+  /** The same stale-refusal ordering for every OTHER hand-back site (close-out review: only the one
+   *  above was pinned, and plain `exitPreviewMode` at the other four stayed green). The stale caller
+   *  starts, its envelope ends, a later scrub claims and begins, then the stale begin lands — refused
+   *  or thrown — while the later one is still serializing. The later claim must survive it. */
+  async function laterClaimSurvives(
+    owner: 'timeline' | 'animation', startStale: () => Promise<unknown>, opts: { staleThrows: boolean },
+  ): Promise<void> {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const openStale = gate();
+      const stale = startStale().catch(() => 'threw');
+      await tick();
+      exitPreviewMode(owner);                             // a switch / unmount / ⏹ cancels it
+      const openLater = gate();
+      enterScrubMode(owner);
+      const pose = vi.fn();
+      const later = openPreviewSessionThen(owner, pose);
+      await tick();
+      h.failSerialize = opts.staleThrows;                 // read after the gate: only the stale one throws
+      openStale();
+      await stale;
+      h.failSerialize = false;
+      expect(getRunMode(), 'the stale refusal took the later claim').toBe('scrub');
+      openLater();
+      expect(await later).toBe(true);
+      expect(pose).toHaveBeenCalledTimes(1);
+      exitPreviewMode(owner);
+    } finally { err.mockRestore(); }
+  }
+
+  it('…a stale ▶ refusal (openPlaybackSession) — a same-Director timeline switch, then a scrub', async () => {
+    // MUTATION TARGET: plain `exitPreviewMode` in openPlaybackSession.
+    await laterClaimSurvives('timeline', () => openPlaybackSession('timeline'), { staleThrows: false });
+  });
+
+  it('…a stale scrub whose snapshot THROWS (openPreviewSessionThen reject branch)', async () => {
+    // MUTATION TARGET: plain `exitPreviewMode` in openPreviewSessionThen's reject handler.
+    await laterClaimSurvives('timeline', () => { enterScrubMode('timeline'); return openPreviewSessionThen('timeline', vi.fn()); }, { staleThrows: true });
+  });
+
+  it('…a stale Animation pose refused (poseClipAtTime !opened)', async () => {
+    const { poseClipAtTime } = await import('../../src/editor/animation/poseClip');
+    const clip = { duration: 1, loop: false, frameRate: 30, tracks: [] } as never;
+    // MUTATION TARGET: plain `exitPreviewMode` in poseClipAtTime's `!opened` branch.
+    await laterClaimSurvives('animation', () => poseClipAtTime(clip, 1, 0.5, 'animation'), { staleThrows: false });
+  });
+
+  it('…a stale Animation pose whose snapshot THROWS (poseClipAtTime catch)', async () => {
+    const { poseClipAtTime } = await import('../../src/editor/animation/poseClip');
+    const clip = { duration: 1, loop: false, frameRate: 30, tracks: [] } as never;
+    // MUTATION TARGET: plain `exitPreviewMode` in poseClipAtTime's catch.
+    await laterClaimSurvives('animation', () => poseClipAtTime(clip, 1, 0.5, 'animation'), { staleThrows: true });
   });
 });
 

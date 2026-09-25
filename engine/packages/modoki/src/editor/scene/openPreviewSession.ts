@@ -13,23 +13,61 @@
  *  test (docs/editor.md § Panels). `exitPreviewMode` is owner-guarded, so handing back a mode another
  *  panel has since taken is a no-op. */
 
-import { beginTimelinePreviewSession, hasTimelinePreviewSession } from './timelinePreview';
-import { enterScrubMode, exitPreviewMode, getModeOwner } from './playMode';
+import { beginTimelinePreviewSession, hasTimelinePreviewSession, isPreviewSessionPending } from './timelinePreview';
+import { enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner } from './playMode';
+
+/** Hand `owner`'s mode claim back after its begin opened nothing — unless a NEWER begin is live.
+ *
+ *  A begin that opened nothing was usually cancelled: its envelope ended while the snapshot
+ *  serialized. A click made after that end claims the mode again and starts its own begin, and this
+ *  refusal can land while the new begin is still serializing. Handing the mode back then takes the
+ *  newer click's claim, and leaving the envelope cancels that begin too (#1569), so the click would
+ *  pose nothing. A live pending begin is always the newer one, because a begin joins a live one
+ *  instead of starting its own, and it resolves its own claim when it lands. `exitPreviewMode` is
+ *  owner-guarded, so another panel's claim was never at risk here. */
+export function handBackPreviewClaim(owner: 'animation' | 'timeline'): void {
+  if (!isPreviewSessionPending()) exitPreviewMode(owner);
+}
 
 /** Resolves `true` once `pose` has run inside a held session; `false` when nothing was posed. */
 export function openPreviewSessionThen(owner: 'animation' | 'timeline', pose: () => void): Promise<boolean> {
   return beginTimelinePreviewSession().then(
     (opened) => {
-      if (!opened) { exitPreviewMode(owner); return false; }
+      if (!opened) { handBackPreviewClaim(owner); return false; }
       pose();
       return true;
     },
     (e: unknown) => {
-      exitPreviewMode(owner);
+      handBackPreviewClaim(owner);
       console.error(`[preview:${owner}] could not open the preview session — nothing posed`, e);
       return false;
     },
   );
+}
+
+/** Open the session for a ▶ playthrough, claiming the mode FIRST: a frozen `preview`, which the
+ *  caller turns into an advancing one once its loop starts.
+ *
+ *  The Timeline ▶ used to begin with no claim and take the mode only after the snapshot landed. A
+ *  teardown in that gap (closing the panel, switching timelines) then found the mode already
+ *  `stopped` and no session held, so it cancelled nothing, and the begin seated a session nobody
+ *  owned, with no ⏹ to end it (#1569). With the claim made first, that teardown's
+ *  `exitPreviewMode` leaves the envelope, and leaving it cancels the begin. A Pause in the gap
+ *  keeps the frozen claim, so the session seats as a paused preview, which is what a Pause means.
+ *
+ *  Resolves `true` only when a session is held. A refusal or a thrown snapshot hands the claim back
+ *  (unless a newer begin owns it, see `handBackPreviewClaim`), so ▶ never leaves the mode pinned.
+ *  The Animation ▶ claims its own mode before its begin, so it does not need this. */
+export async function openPlaybackSession(owner: 'animation' | 'timeline'): Promise<boolean> {
+  enterPreviewMode(false, owner);
+  let opened = false;
+  try {
+    opened = await beginTimelinePreviewSession();
+  } catch (e) {
+    console.error(`[preview:${owner}] could not open the preview session — ▶ not started`, e);
+  }
+  if (!opened) handBackPreviewClaim(owner);
+  return opened;
 }
 
 /** Reopen the envelope after a gesture's OWN restore — the Timeline's "grab the playhead while ▶ is

@@ -3,7 +3,8 @@
  *  The seam no unit test reaches. `isPreviewPlaying` is ONE editor-store flag and BOTH preview
  *  panels key their preview effect on it, so a single ▶ press ran both. Each then called
  *  `enterPreviewMode`, taking the single-valued `RunMode` from the other — and the Timeline ALWAYS
- *  lands second, because its entry sits behind an awaited `beginTimelinePreviewSession()`. It
+ *  landed second, because its entry sat behind an awaited session begin (since #1569 it claims
+ *  before the await, and React's effect order decides who lands second). It
  *  therefore always won `_modeOwner`, and once #810 gave displacement real teeth it stopped the
  *  Animation panel's rAF every time. Both panels auto-dock into the SAME tabset
  *  (`EditorApp.tsx`'s two auto-dock effects) and FlexLayout keeps a tab mounted once shown, so
@@ -119,8 +120,8 @@ test('▶ in the Animation panel drives the ANIMATION panel, with the Timeline p
   // ▶ in the ANIMATION panel — exactly what its transport button does, owner tag and all.
   await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(true, 'animation'));
 
-  // Let both panels' effects run. The Timeline's entry lands a microtask (plus a session open)
-  // after the Animation panel's, so this window has to be long enough for it to have competed —
+  // Let both panels' effects run. The Timeline's entry used to land a microtask (plus a session
+  // open) after the Animation panel's, so this window has to be long enough for it to have competed —
   // sampling too early would pass even with the bug present.
   await page.waitForTimeout(1000);
 

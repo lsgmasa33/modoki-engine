@@ -1900,6 +1900,20 @@ makes ONE place answer a question several used to answer separately.
   (`takeDownEnvelopeBeforeWorldSwap`) before its save and swap. Any OTHER world swap (a prefab undo's
   reload, a new scene) abandons the session without restoring (its snapshot belongs to the world that
   went away).
+- **A session is seated only under a live mode claim, and leaving the claim cancels its begin
+  (#1569).** Every teardown ends only a HELD session. A begin still serializing its snapshot therefore
+  survived a timeline switch, the panel's unmount, a world swap or the Animation ⏹, and seated a
+  session after the mode was back at `stopped`: a posed world, no owner, no ⏹ anywhere. The cancel
+  now lives in the same run-mode listener as the owner release: any change OUT of scrub/preview
+  calls `cancelPendingPreviewBegins()`, so no exit path has to remember it. A move within the
+  envelope (scrub ⇄ preview, a pause freezing it) cancels nothing. That makes one rule for callers:
+  **claim the mode before you begin.** Scrubs, `poseClipAtTime` and the Animation ▶ always did. The
+  Timeline ▶ used to begin first and claim `preview` after the snapshot landed, so a teardown in that
+  gap found the mode `stopped` and nothing to cancel. It now goes through `openPlaybackSession`,
+  which claims a frozen `preview` first. A refused begin hands its claim back through
+  `handBackPreviewClaim`, which skips the hand-back while a newer begin is live. Without that check, a
+  cancelled click's refusal would drop a later click's claim, and the cancel would then lose that
+  click's pose too.
 - **One capture, one restore** (`editor/scene/authoredSnapshot.ts`): see Stop above. The preview
   restore had drifted from Play's — no base replay, and it keyed on the editor's file path, so ⏹ Exit
   inside prefab-edit reloaded under `''` and Cmd+S then opened Save As.

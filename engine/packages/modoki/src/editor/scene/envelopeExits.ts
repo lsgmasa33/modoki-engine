@@ -35,11 +35,10 @@ export function envelopeExitOptions(owner: string | null | undefined): { options
         // the human did inside it is discarded. The old text asked the HUMAN to press ⏹; handing an
         // unattended agent the same button without the caution is not an improvement.
         "modoki_play_control {action:'stop'} — ends the Timeline preview session and returns the run-mode to stopped, then retry. ⚠️ DESTRUCTIVE: it restores the snapshot taken when the envelope opened, discarding anything the human authored inside it. Prefer asking them if they are at the screen",
-        // ⚠️ NOT "a plain drag-scrub holds no session" — that was true before Phase 3. Every
-        // `enterScrubMode` call site pairs with `beginTimelinePreviewSession()`, so the only
-        // no-session window left is the async gap before the snapshot resolves — and the right
-        // advice there is to retry, not to go looking for a human.
-        'if the run-mode is STILL not stopped, the session had not finished seating yet (the snapshot is async) — retry stop once before escalating to the human’s ⏹ Exit Preview',
+        // ⚠️ NOT "a plain drag-scrub holds no session" — that was true before Phase 3. And no longer
+        // "retry stop, the session had not finished seating": since #1569, Stop in the snapshot gap
+        // cancels the begin, so a single stop ends the envelope and a retry has nothing left to do.
+        'if the run-mode is STILL not stopped after that, escalate to the human’s ⏹ Exit Preview',
       ],
       hint: 'Do not reach for modoki_exit_pose_envelope here — it deliberately refuses a timeline-owned envelope, because ending that session would revert its world mid-run. Use modoki_play_control stop instead, minding the caution above.',
     };

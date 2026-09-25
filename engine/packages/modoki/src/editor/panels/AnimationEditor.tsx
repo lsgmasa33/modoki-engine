@@ -51,8 +51,8 @@ import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope } from '../animation/
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
 import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { chooseNewAssetPath } from '../utils/saveDialog';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode, freezePreviewIfOwnedBy, registerModeOwnerDisplaced, getModeOwner, onModeOwnerChange } from '../scene/playMode';
-import { undoMayRepose, ownsHeldSession } from '../scene/openPreviewSession';
+import { enterScrubMode, enterPreviewMode, freezePreviewIfOwnedBy, registerModeOwnerDisplaced, getModeOwner, onModeOwnerChange } from '../scene/playMode';
+import { undoMayRepose, ownsHeldSession, handBackPreviewClaim } from '../scene/openPreviewSession';
 import {
   beginTimelinePreviewSession, poseEnvelopeHeld,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
@@ -548,8 +548,9 @@ export default function AnimationEditor() {
   // ⚠️ Must NOT call `setPreviewPlaying(false)` UNCONDITIONALLY — that flag is SHARED with the Timeline panel
   // (both read `useEditorStore((s) => s.isPreviewPlaying)`), so flipping it off here does not stop
   // "our" preview, it stops BOTH panels' preview effects. With both docked, one ▶ press could stop
-  // itself: this panel enters first (no notify yet, nothing owned the mode), Timeline's async
-  // session-open resolves a microtask later and takes the mode, displacing us — and the first
+  // itself: this panel entered first (no notify yet, nothing owned the mode), Timeline's async
+  // session-open resolved a microtask later and took the mode (it claims before the await since
+  // #1569, same effect), displacing us — and the first
   // #810 pass's callback then killed the flag Timeline's own just-started preview was keyed on.
   // Confirmed live in `previewDisplacementSharedFlag.test.ts` before this fix. Stopping only THIS
   // run's guard is what avoids it — see `previewLoopGuard.ts`. Registered for the panel's whole
@@ -597,7 +598,7 @@ export default function AnimationEditor() {
     // a begin that opened nothing (a restore still landing) left every frame posing with no snapshot.
     const refuse = () => {
       guard.stop();
-      exitPreviewMode('animation');
+      handBackPreviewClaim('animation'); // not over a newer begin's claim — see the helper
       // This panel drives the flag's current run, and that run never began — see TimelineEditor's ▶.
       useEditorStore.getState().setPreviewPlaying(false);
     };

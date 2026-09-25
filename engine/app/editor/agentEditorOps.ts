@@ -1114,8 +1114,9 @@ export function countTimelineItems(t: Partial<TimelineDef> | undefined): number 
 
 /** The exits for a world that is not authored, picked by WHICH condition holds (§5: name real exits
  *  only). An envelope in scrub/preview has its owner's exits. A session held with the mode already
- *  'stopped' (a begin that seated after its panel left the mode) has no ⏹ to press, but Stop takes a
- *  held session down. A failed restore clears on the next world swap; a restore still landing clears
+ *  'stopped' has no ⏹ to press, but Stop takes a held session down. The known way into that state (a
+ *  begin that seated after its panel left the mode) was closed by #1569, so this branch is a backstop
+ *  for one nobody has found yet. A failed restore clears on the next world swap; a restore still landing clears
  *  on its own. */
 function posedWorldExits(): { options: string[]; hint?: string; owner: string | null } {
   const mode = getRunMode();
