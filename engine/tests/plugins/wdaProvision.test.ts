@@ -22,7 +22,7 @@ import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
  *     iOS input op back to a synthetic fallback while Build Support claimed WDA was installed.
  */
 
-const NPM: NpmInvocation = { command: 'npm', prefixArgs: [], shell: false, env: {} }
+const NPM: NpmInvocation = { command: 'npm', prefixArgs: [], env: {} }
 
 /** An `embedded.mobileprovision`-shaped blob: binary CMS noise wrapped around an XML plist, which
  *  is what the real file is. The noise matters — parsing must survive it. */

@@ -31,7 +31,9 @@
  */
 
 import path from 'node:path';
-import type { BuildStep } from './buildStepShell';
+import fs from 'node:fs';
+import { execStep, type BuildStep, type ExecStep } from './buildStepShell';
+import { openInOS } from './backend/osOpen';
 
 /** The `/api/build?variant=` values. `debug` is the historical behaviour and the DEFAULT — an
  *  omitted `variant` must keep meaning exactly what it meant before this existed, or every caller
@@ -212,8 +214,14 @@ export const IOS_EXPORT_OPTIONS_PATH = 'ios/App/build/exportOptions.plist';
  *  `CFBundleVersion`. Empty when there is no number, so the committed value is used. The export step
  *  takes none: `-exportArchive` does not compile, and with `manageAppVersionAndBuildNumber` pinned
  *  off it ships the archive's own value. */
+export function xcodeBuildNumberArgs(buildNumber: number | undefined): string[] {
+  return isInjectableBuildNumber(buildNumber) ? [`CURRENT_PROJECT_VERSION=${buildNumber}`] : [];
+}
+
+/** {@link xcodeBuildNumberArgs} as the space-led text a hand-run build appends from its arguments
+ *  file (`writeBuildNumberArgFiles`). Safe to join: a number and a constant name, nothing variable. */
 export function xcodeBuildNumberArg(buildNumber: number | undefined): string {
-  return isInjectableBuildNumber(buildNumber) ? ` CURRENT_PROJECT_VERSION=${buildNumber}` : '';
+  return xcodeBuildNumberArgs(buildNumber).map((a) => ` ${a}`).join('');
 }
 
 /** Where the build writes {@link renderAndroidVersionCodeInitScript}, relative to the project root. Inside
@@ -237,10 +245,15 @@ export const IOS_BUILD_NUMBER_ARGS_PATH = 'ios/App/build/modoki-build-number.arg
  *
  *  The path is relative to `-p android`, not to the command's cwd: gradle resolves `--init-script`
  *  against the project dir it was pointed at. */
-export function gradleBuildNumberArg(buildNumber: number | undefined): string {
-  if (!isInjectableBuildNumber(buildNumber)) return '';
+export function gradleBuildNumberArgs(buildNumber: number | undefined): string[] {
+  if (!isInjectableBuildNumber(buildNumber)) return [];
   const script = path.posix.relative('android', ANDROID_VERSION_CODE_INIT_SCRIPT_PATH);
-  return ` -PmodokiVersionCode=${buildNumber} --init-script ${script}`;
+  return [`-PmodokiVersionCode=${buildNumber}`, '--init-script', script];
+}
+
+/** {@link gradleBuildNumberArgs} as space-led text, for the arguments file (see xcodeBuildNumberArg). */
+export function gradleBuildNumberArg(buildNumber: number | undefined): string {
+  return gradleBuildNumberArgs(buildNumber).map((a) => ` ${a}`).join('');
 }
 
 /** The init script {@link gradleBuildNumberArg} points gradle at. Static — the number arrives as a
@@ -274,16 +287,21 @@ function isInjectableBuildNumber(n: number | undefined): n is number {
  *  one variant nobody checked. The deploy steps around them stay in the build route. */
 export function iosDebugBuildStep(o: {
   iosCwd: string;
-  iosXcodeTarget: string;
+  /** `['-workspace', 'ios/App/App.xcworkspace']` or the `-project` twin. */
+  iosXcodeTarget: string[];
   deviceId: string;
   buildNumber: number | undefined;
-}): BuildStep {
-  return {
-    label: 'Building Xcode project...',
-    cmd: `xcodebuild ${o.iosXcodeTarget} -scheme App -configuration Debug -destination 'id=${o.deviceId}' ` +
-      `-allowProvisioningUpdates build${xcodeBuildNumberArg(o.buildNumber)}`,
-    cwd: o.iosCwd,
-  };
+}): ExecStep {
+  return execStep('Building Xcode project...', o.iosCwd, 'xcodebuild', [
+    ...o.iosXcodeTarget, '-scheme', 'App', '-configuration', 'Debug', '-destination', `id=${o.deviceId}`,
+    '-allowProvisioningUpdates', 'build', ...xcodeBuildNumberArgs(o.buildNumber),
+  ]);
+}
+
+/** gradlew as an exec step: posix `android/gradlew`, Windows `android\\gradlew.bat` (a batch file, so
+ *  it goes through toSpawn's escaped cmd.exe line). */
+function gradleStep(label: string, cwd: string, env: Record<string, string>, args: string[]): ExecStep {
+  return execStep(label, cwd, 'android/gradlew', ['-p', 'android', ...args], { winCommand: 'android\\gradlew.bat', env });
 }
 
 /** gradlew wrapper: posix `android/gradlew` vs Windows `android\\gradlew.bat`, with JAVA_HOME/ANDROID_HOME
@@ -302,15 +320,15 @@ export function androidDebugBuildStep(o: {
   env: Record<string, string>;
   ota: boolean;
   buildNumber: number | undefined;
-}): BuildStep {
-  const tail = `${o.ota ? 'clean ' : ''}assembleDebug --no-daemon${gradleBuildNumberArg(o.buildNumber)}`;
-  return {
-    label: 'Building Android APK...',
-    cmd: `android/gradlew -p android ${tail}`,
-    winCmd: `android\\gradlew.bat -p android ${tail}`,
-    env: o.env,
-    cwd: o.androidCwd,
-  };
+}): ExecStep {
+  return gradleStep('Building Android APK...', o.androidCwd, o.env,
+    [...(o.ota ? ['clean'] : []), 'assembleDebug', '--no-daemon', ...gradleBuildNumberArgs(o.buildNumber)]);
+}
+
+/** The "reveal the artifacts" step: opens the folder in Finder/Explorer from this process
+ *  (osOpen.ts — no shell, the path handed over verbatim). */
+function revealStep(label: string, absDir: string): BuildStep {
+  return { kind: 'inproc', label, run: () => openInOS(absDir) };
 }
 
 /** The Android release step list: sign-configured gradle → AAB **and** release APK → reveal.
@@ -330,23 +348,10 @@ export function androidReleaseSteps(o: {
   /** From `injectedBuildNumbers` — undefined builds with the committed versionCode. */
   buildNumber: number | undefined;
 }): BuildStep[] {
-  const clean = o.ota ? 'clean ' : '';
-  const bn = gradleBuildNumberArg(o.buildNumber);
-  const outputs = 'android/app/build/outputs';
   return [
-    {
-      label: 'Building signed AAB + release APK...',
-      cmd: `android/gradlew -p android ${clean}bundleRelease assembleRelease --no-daemon${bn}`,
-      winCmd: `android\\gradlew.bat -p android ${clean}bundleRelease assembleRelease --no-daemon${bn}`,
-      env: o.env,
-      cwd: o.androidCwd,
-    },
-    {
-      label: 'Revealing release artifacts...',
-      cmd: `open ${JSON.stringify(outputs)}`,
-      winCmd: `start "" "${outputs}"`,
-      cwd: o.androidCwd,
-    },
+    gradleStep('Building signed AAB + release APK...', o.androidCwd, o.env,
+      [...(o.ota ? ['clean'] : []), 'bundleRelease', 'assembleRelease', '--no-daemon', ...gradleBuildNumberArgs(o.buildNumber)]),
+    revealStep('Revealing release artifacts...', path.join(o.androidCwd, 'android/app/build/outputs')),
   ];
 }
 
@@ -360,7 +365,7 @@ export function androidReleaseSteps(o: {
  *  that reads like a code problem. */
 export function iosReleaseSteps(o: {
   iosCwd: string;
-  iosXcodeTarget: string;
+  iosXcodeTarget: string[];
   /** From `injectedBuildNumbers` — undefined builds with the committed CURRENT_PROJECT_VERSION. */
   buildNumber: number | undefined;
 }): BuildStep[] {
@@ -371,29 +376,25 @@ export function iosReleaseSteps(o: {
       // file in this folder": a failed export after a successful archive would otherwise leave the
       // PREVIOUS run's .ipa sitting there, looking like the artifact of the run that just finished.
       // Both paths are inside `ios/App/build/`, which is gitignored and holds nothing else of ours.
+      kind: 'inproc',
       label: 'Clearing previous archive/export...',
-      cmd: `rm -rf ${JSON.stringify(IOS_ARCHIVE_PATH)} ${JSON.stringify(IOS_EXPORT_DIR)}`,
-      cwd: o.iosCwd,
+      // Async: a large .xcarchive would block the backend's event loop (SSE, other requests) under a
+      // synchronous rm — the `rm -rf` child this replaced never did (#1537 review).
+      run: async () => {
+        for (const p of [IOS_ARCHIVE_PATH, IOS_EXPORT_DIR]) await fs.promises.rm(path.join(o.iosCwd, p), { recursive: true, force: true });
+      },
     },
-    {
-      label: 'Archiving (Release)...',
-      cmd: `xcodebuild ${o.iosXcodeTarget} -scheme App -configuration Release ` +
-        `-destination 'generic/platform=iOS' -archivePath ${JSON.stringify(IOS_ARCHIVE_PATH)} ` +
-        `-allowProvisioningUpdates archive${xcodeBuildNumberArg(o.buildNumber)}`,
-      cwd: o.iosCwd,
-    },
-    {
-      label: 'Exporting .ipa...',
-      cmd: `xcodebuild -exportArchive -archivePath ${JSON.stringify(IOS_ARCHIVE_PATH)} ` +
-        `-exportOptionsPlist ${JSON.stringify(IOS_EXPORT_OPTIONS_PATH)} ` +
-        `-exportPath ${JSON.stringify(IOS_EXPORT_DIR)} -allowProvisioningUpdates`,
-      cwd: o.iosCwd,
-    },
-    {
-      label: 'Revealing .ipa...',
-      cmd: `open ${JSON.stringify(IOS_EXPORT_DIR)}`,
-      cwd: o.iosCwd,
-    },
+    execStep('Archiving (Release)...', o.iosCwd, 'xcodebuild', [
+      ...o.iosXcodeTarget, '-scheme', 'App', '-configuration', 'Release',
+      '-destination', 'generic/platform=iOS', '-archivePath', IOS_ARCHIVE_PATH,
+      '-allowProvisioningUpdates', 'archive', ...xcodeBuildNumberArgs(o.buildNumber),
+    ]),
+    execStep('Exporting .ipa...', o.iosCwd, 'xcodebuild', [
+      '-exportArchive', '-archivePath', IOS_ARCHIVE_PATH,
+      '-exportOptionsPlist', IOS_EXPORT_OPTIONS_PATH,
+      '-exportPath', IOS_EXPORT_DIR, '-allowProvisioningUpdates',
+    ]),
+    revealStep('Revealing .ipa...', path.join(o.iosCwd, IOS_EXPORT_DIR)),
   ];
 }
 

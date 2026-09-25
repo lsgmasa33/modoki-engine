@@ -27,8 +27,8 @@ import os from 'node:os';
  *  came to pass on Windows and Linux and fail on macOS. Anything that needs to know where these
  *  paths land must CALL this, never re-derive it.
  *
- *  ⚠️ **Pure/platform-injectable — the shape `needsWinShell`/`spawnable` use in
- *  `engine/toolchain/index.ts` (NOT in this file; an earlier draft said "below") — and for a reason this
+ *  ⚠️ **Pure/platform-injectable — the shape `needsWinShell`/`toSpawn` use in
+ *  `engine/scripts/winSpawn.mjs` (NOT in this file; an earlier draft said "below") — and for a reason this
  *  file learned the hard way.** Reading `process.platform` directly would make the RULE itself
  *  unpinnable — every leg could only assert its own shape, and the darwin shape is the one no gate
  *  this repo runs would ever execute. Deriving callers off a shared helper stops them drifting from

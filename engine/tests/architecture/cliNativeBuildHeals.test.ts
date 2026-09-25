@@ -166,7 +166,7 @@ describe('build-web.mjs heals through the ONE shared sequence (#148, #150, #685,
   });
 
   it('heals BEFORE the typecheck, which resolves plugin types out of the project node_modules', () => {
-    expectInOrder(readScannedSource(buildWeb).code, ['await healNativeProject()', 'tsconfig.app.scoped.json`'], 'the native build');
+    expectInOrder(readScannedSource(buildWeb).code, ['await healNativeProject()', "'engine/tsconfig.app.scoped.json']"], 'the native build');
   });
 
   it('FAILS the build (throws) on a stale node_modules, a failed install and a Firebase auth manifest refusal (#1062) — never merely logs', () => {
@@ -273,16 +273,23 @@ function scaffoldRunnerEnvs(sf: ts.SourceFile): Array<{ namesPlatform: boolean }
     });
 }
 
-/** The `MODOKI_NATIVE_PLATFORM` each `node engine/scripts/build-web.mjs --target native` step of `const <plan>` sets. */
+/** The `MODOKI_NATIVE_PLATFORM` each `node engine/scripts/build-web.mjs --target native` step of `const <plan>` sets.
+ *  A step is an `execStep(label, cwd, 'node', [argv…], { env })` call (#1537: argv, not a command string). */
 function planBuildWebPlatforms(sf: ts.SourceFile, plan: string): Array<string | undefined> {
   const decls = variablesNamed(sf, plan);
   expect(decls.length, `${plan} is gone — re-anchor`).toBe(1);
   const list = decls[0]!.initializer && unwrapValue(decls[0]!.initializer);
   expect(list && ts.isArrayLiteralExpression(list), `${plan} is no longer an array literal`).toBe(true);
-  return (list as ts.ArrayLiteralExpression).elements.filter(ts.isObjectLiteralExpression)
-    .filter((step) => stringValueOf(propertyValue(step, 'cmd') as ts.Expression | undefined) === 'node engine/scripts/build-web.mjs --target native')
-    .map((step) => {
-      const env = propertyValue(step, 'env');
+  const argvOf = (call: ts.CallExpression): string | undefined => {
+    const [, , program, args] = call.arguments;
+    if (!args || !ts.isArrayLiteralExpression(args)) return undefined;
+    return [stringValueOf(program), ...args.elements.map((e) => stringValueOf(e as ts.Expression))].join(' ');
+  };
+  return (list as ts.ArrayLiteralExpression).elements.filter(ts.isCallExpression)
+    .filter((call) => accessPath(call.expression) === 'execStep' && argvOf(call) === 'node engine/scripts/build-web.mjs --target native')
+    .map((call) => {
+      const extra = call.arguments[4];
+      const env = extra && ts.isObjectLiteralExpression(extra) ? propertyValue(extra, 'env') : undefined;
       return stringValueOf(propertyValue(env && ts.isExpression(env) ? env : undefined, 'MODOKI_NATIVE_PLATFORM') as ts.Expression | undefined);
     });
 }
@@ -302,7 +309,7 @@ function refusalBlock(sf: ts.SourceFile): { statuses: string[]; endsWith: string
       return a && ts.isTemplateExpression(a) ? a.head.text : stringValueOf(a) ?? '';
     }),
     endsWith: stmts.slice(-2).map((s) => ts.isExpressionStatement(s) ? printedText(s.expression) : ts.isReturnStatement(s) && !s.expression ? 'return' : printedText(s)),
-    buildCalls: calledNames(then).filter((n) => ['runScaffoldShell', 'spawnBuildCommand', 'execSync'].includes(n)),
+    buildCalls: calledNames(then).filter((n) => ['runScaffoldShell', 'spawnBuildStep', 'execSync'].includes(n)),
   };
 }
 
@@ -457,8 +464,8 @@ describe('the build-web.mjs / /api/build readers see the unit, not a slice of te
 
   it('reads the editor build\'s refusal block, plan steps and runner envs as units', () => {
     const sf = probe([
-      "const iosPrefixSteps = [{ label: '}', cmd: 'node engine/scripts/build-web.mjs --target native',",
-      "  env: { MODOKI_NATIVE_PLATFORM: 'ios' }, cwd }, { cmd: 'other', env: { MODOKI_NATIVE_PLATFORM: 'android' } }] as const;",
+      "const iosPrefixSteps = [execStep('}', cwd, 'node', ['engine/scripts/build-web.mjs', '--target', 'native'],",
+      "  { env: { MODOKI_NATIVE_PLATFORM: 'ios' } }), execStep('x', cwd, 'node', ['other'], { env: { MODOKI_NATIVE_PLATFORM: 'android' } })] as const;",
       "run({ env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' } });",
       "run({ env: {\n  ...buildEnv,\n  MODOKI_ICONS_HANDLED: '1',\n} });",
       "run({ env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'ios' } });",

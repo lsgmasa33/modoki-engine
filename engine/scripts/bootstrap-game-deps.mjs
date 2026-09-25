@@ -55,17 +55,17 @@ import { discoverProjects } from './projectRoots.mjs';
 import { projectNeedsInstall } from './projectNeedsInstall.mjs';
 import { loadVendorPlugins } from './loadVendorPlugins.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
+import { toSpawn } from './winSpawn.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-// On Windows npm is `npm.cmd`, which execFile can't resolve (ENOENT) — and naming
-// `npm.cmd` explicitly now throws EINVAL under Node's CVE-2024-27980 hardening
-// (spawning a .cmd/.bat requires a shell). Run through the shell on Windows so
-// cmd.exe resolves npm → npm.cmd; the args below are static literals, so this is
-// injection-safe. (POSIX keeps the direct exec — no shell.)
-const isWindows = process.platform === 'win32';
-const npmRun = (args, cwd) =>
-  execFileSync('npm', args, { cwd, stdio: 'inherit', shell: isWindows });
+// On Windows npm is `npm.cmd`, which execFile can't resolve (ENOENT) and cannot spawn without
+// cmd.exe (EINVAL since CVE-2024-27980). `toSpawn` resolves it on PATH and runs the batch file
+// through an escaped cmd.exe line — no `shell:true` (#1537). POSIX is a direct exec either way.
+const npmRun = (args, cwd) => {
+  const s = toSpawn('npm', args);
+  execFileSync(s.command, s.args, { ...s.options, cwd, stdio: 'inherit' });
+};
 
 // Projects live under games/ AND demos/ (see engine/scripts/projectRoots.mjs).
 // Not all checkouts ship either folder (e.g. a packaged/external project, or the

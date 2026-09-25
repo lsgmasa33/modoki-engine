@@ -2,7 +2,7 @@
  *  content-addressed tarball COPIES (never symlinks). Exercised against temp
  *  project + engine dirs with `npm pack` / `npm run build` mocked so the suite is
  *  hermetic (no real npm, no network). */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as tar from 'tar';
@@ -47,6 +47,21 @@ vi.mock('node:child_process', () => ({
   spawnSync: spawnSyncMock,
   default: { execFileSync: execFileSyncExport, spawnSync: spawnSyncMock },
 }));
+
+// npm as a real EXECUTABLE (this node), via the toolchain's MODOKI_NPM override: the mock above reads
+// `args[0]` as npm's own subcommand. A PATH npm is `npm.cmd` on Windows, which `toSpawn` runs through
+// an escaped cmd.exe line (#1537) — so the mock would see `/d /v:off /s /c "<line>"`, not `pack`. The
+// override keeps this suite about vendoring on every platform; the batch route is winSpawn.test.ts's.
+// MODOKI_NODE + MODOKI_NPM_CLI (the provisioned-Node pair, set by the Electron main process and the
+// /api/build handler) win over MODOKI_NPM in npmSpawnSpec, and would put npm-cli.js at args[0] — so
+// they are cleared for the file too, or a run inheriting them reds all 40 tests (review, observed).
+const NPM_KEYS = ['MODOKI_NPM', 'MODOKI_NODE', 'MODOKI_NPM_CLI'] as const;
+const savedNpmEnv = Object.fromEntries(NPM_KEYS.map((k) => [k, process.env[k]]));
+for (const k of NPM_KEYS) delete process.env[k];
+process.env.MODOKI_NPM = process.execPath;
+afterAll(() => {
+  for (const k of NPM_KEYS) { if (savedNpmEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedNpmEnv[k]; }
+});
 
 // Import AFTER the mock is registered.
 const { vendorEnginePlugins, pluginContentHash, packedVersion } = await import('../../plugins/vendorPlugins');

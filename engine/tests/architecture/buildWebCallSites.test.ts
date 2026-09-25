@@ -52,10 +52,10 @@ const ALLOWLIST: ReadonlyArray<{ item: string; count?: number; reason: string }>
       'matched, never a command being spawned, so it carries no --target.',
   },
   {
-    item: "plugins/vite-asset-scanner.ts::'node engine/scripts/build-web.mjs'",
-    reason: "`steps[0]?.cmd?.startsWith('node engine/scripts/build-web.mjs')` checks an already-" +
-      'built step\'s cmd PREFIX to decide whether to drop it from the scaffold flow — it does not ' +
-      'spawn build-web.mjs itself, so it carries no --target.',
+    item: "plugins/vite-asset-scanner.ts::'engine/scripts/build-web.mjs'",
+    reason: "`first.args[0] === 'engine/scripts/build-web.mjs'` checks an already-built step's argv " +
+      'to decide whether to drop it from the scaffold flow (#1537 made steps argv; it was a ' +
+      '`cmd.startsWith` prefix check before) — it does not spawn build-web.mjs itself, so it carries no --target.',
   },
 ];
 
@@ -252,9 +252,12 @@ describe('every build-web.mjs invocation passes --target (regression guard)', ()
 
 /** Every template literal that runs `${…viteBin…} build` — its whole text, however it wraps. */
 function viteBuildCommands(code: string, label: string): string[] {
-  return findNodes(parseSource(code, label), ts.isTemplateExpression)
-    .filter((t) => t.templateSpans.some((span) => /\bviteBin\b/.test(flatText(span.expression)) && /^\s+build\b/.test(span.literal.text)))
-    .map((t) => flatText(t));
+  // An args array led by `viteBin` then `'build'` (#1537: build-web.mjs runs `node` with argv, not a
+  // command template), read whole — a flag anywhere in the SAME array is part of this invocation.
+  return findNodes(parseSource(code, label), ts.isArrayLiteralExpression)
+    .filter((a) => a.elements.length > 1 && ts.isIdentifier(a.elements[0]!) && a.elements[0].text === 'viteBin'
+      && stringValueOf(a.elements[1] as ts.Expression) === 'build')
+    .map((a) => a.elements.map((e) => stringValueOf(e as ts.Expression) ?? flatText(e)).join(' '));
 }
 
 /** How many `spawn(…)` calls pass `'--configLoader', 'runner'` as adjacent elements of their own args array. */
@@ -287,8 +290,8 @@ describe('vite build must not use the runner config loader', () => {
   const read = (p: string) => readScannedSource(path.join(__dirname, '../..', p)).code;
 
   it('build-web.mjs runs `vite build` WITHOUT --configLoader runner', () => {
-    // The whole command template, read as one node (#1179) — the line that held `viteBin)} build` was
-    // all the line reader saw, so a flag wrapped onto the next line of the same template passed.
+    // The whole args array, read as one node (#1179) — a line reader saw only the line holding
+    // `viteBin`, so a flag wrapped onto the next line of the same invocation passed.
     const builds = viteBuildCommands(read('scripts/build-web.mjs'), 'build-web.mjs');
     expect(builds.length, 'could not find the `vite build` invocation in build-web.mjs').toBe(1);
     expect(builds[0], '--configLoader runner breaks build-hook dynamic imports (rigged-model '
@@ -302,8 +305,8 @@ describe('vite build must not use the runner config loader', () => {
   });
 
   it('reads the build template and the spawn args from their own nodes (#1179)', () => {
-    expect(viteBuildCommands('run(`${q(node)} ${q(viteBin)} build --config x\n  --configLoader runner`);\nrun(`${q(viteBin)} preview`);', 'f.mjs'))
-      .toEqual(['`${q(node)} ${q(viteBin)} build --config x --configLoader runner`']);
+    expect(viteBuildCommands("run(node, [viteBin, 'build', '--config', x,\n  '--configLoader', 'runner']);\nrun(node, [viteBin, 'preview']);\nconst other = ['build', viteBin];", 'f.mjs'))
+      .toEqual(['viteBin build --config x --configLoader runner']);
     expect(spawnsWithRunnerLoader(`spawn(process.execPath, [entry, '--configLoader',
       'runner']);
       const note = ['--configLoader', 'runner'];

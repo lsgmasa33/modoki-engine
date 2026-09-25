@@ -27,7 +27,7 @@ const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
  *  ERR_MODULE_NOT_FOUND went to a stderr no assertion read. `runNode` now surfaces that
  *  specific failure loudly; this list is why it should not recur. If you add an import to any
  *  module below, add it HERE. */
-const CLAIM_STORE_SCRIPTS = ['buildClaimsStore.mjs', 'deviceClaimsStore.mjs', 'pathIdentity.mjs'];
+const CLAIM_STORE_SCRIPTS = ['buildClaimsStore.mjs', 'deviceClaimsStore.mjs', 'pathIdentity.mjs', 'winSpawn.mjs'];
 
 function copyClaimStoreScripts(repoRoot: string): void {
   for (const name of CLAIM_STORE_SCRIPTS) {

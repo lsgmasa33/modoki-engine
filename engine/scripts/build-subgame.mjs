@@ -8,7 +8,7 @@
  *  sub-game build shouldn't fail because a sibling game's native plugin types aren't
  *  built in this worktree. */
 
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
@@ -62,8 +62,9 @@ const binDir = path.join(repoRoot, 'node_modules', '.bin');
 const sep = process.platform === 'win32' ? ';' : ':';
 const runEnv = { ...process.env, MODOKI_SUBGAME: '1', PATH: `${binDir}${sep}${process.env.PATH ?? ''}` };
 const node = process.execPath;
-const q = (s) => JSON.stringify(s);
-const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: repoRoot, env: runEnv });
+// argv, never a command string (#1537): `node` is process.execPath and the bins live under the
+// install dir, so a folder holding `%`, `$(…)` or a space reached a shell through JSON.stringify quoting.
+const run = (file, args) => execFileSync(file, args, { stdio: 'inherit', cwd: repoRoot, env: runEnv });
 
 const tscBin = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 const viteBin = path.join(repoRoot, 'node_modules', 'vite', 'bin', 'vite.js');
@@ -73,8 +74,8 @@ const stampStart = readGitProvenance(abs);
 try {
   if (existsSync(tscBin)) {
     writeFileSync(scopedPath, JSON.stringify({ extends: './tsconfig.app.json', include }, null, 2) + '\n');
-    run(`${q(node)} ${q(tscBin)} -p engine/tsconfig.app.scoped.json`);
-    run(`${q(node)} ${q(tscBin)} -p engine/tsconfig.node.json`);
+    run(node, [tscBin, '-p', 'engine/tsconfig.app.scoped.json']);
+    run(node, [tscBin, '-p', 'engine/tsconfig.node.json']);
   } else {
     console.log('[build-subgame] typescript not installed — skipping typecheck (packaged build).');
   }
@@ -86,7 +87,7 @@ try {
   // This site was missed when that landed; nothing calls it from the editor UI TODAY (a sub-game
   // build is still run by hand, see docs/ota-subgame-modules.md), so the bug was latent — which
   // is exactly how it would have shipped the moment that gets wired to a button.
-  run(`${q(node)} ${q(viteBin)} build --config ${chooseViteConfig(engineDir)}`);
+  run(node, [viteBin, 'build', '--config', chooseViteConfig(engineDir)]);
   const stamp = settleBuildStamp(stampStart, readHeadCommit(abs));
   writeBuildStamp(subgameOutDir(abs), stamp);
   console.log(`[build-subgame] ${BUILD_STAMP_FILENAME}: commit ${stamp.commit ?? 'unknown'}, dirty ${stamp.dirty ?? 'unknown'}.`);

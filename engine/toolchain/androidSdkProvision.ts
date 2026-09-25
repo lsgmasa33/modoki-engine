@@ -19,6 +19,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
+import { toSpawn } from '../scripts/winSpawn.mjs'
 import { extractArchive, type FetchLike } from './nodeProvision'
 // The shared replace pre-flight (#883/#1006) — policy lives in replaceGuard.ts.
 import { refuseUnsafeReplace } from './replaceGuard'
@@ -143,10 +144,10 @@ export async function runSdkmanager(sdkRoot: string, packages: string[], opts: {
  *  install confirmations) and resolving on exit 0. Rejects on non-zero exit or spawn error. */
 function spawnAnswering(cmd: string, args: string[], env: NodeJS.ProcessEnv, log: (line: string) => void): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    // sdkmanager is `sdkmanager.bat` on Windows — spawning a .bat without a shell throws
-    // `spawn EINVAL` since Node ≥18.20 (CVE-2024-27980). Route it through the shell there.
-    const shell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(cmd)
-    const p = spawn(shell ? `"${cmd}"` : cmd, args, { env, shell })
+    // sdkmanager is `sdkmanager.bat` on Windows, which cannot spawn without cmd.exe — and
+    // `--sdk_root=` carries the user's profile path, so it goes through the ONE escaper (#1537).
+    const s = toSpawn(cmd, args)
+    const p = spawn(s.command, s.args, { ...s.options, env })
     const feed = () => { try { p.stdin.write('y\n') } catch { /* stream closed */ } }
     // sdkmanager prompts on stdout; answer each prompt, and prime a few up front for the
     // license batch (it asks once per unaccepted license before printing anything parseable).

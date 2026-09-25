@@ -111,8 +111,8 @@ vi.mock('../../plugins/buildStepShell', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../plugins/buildStepShell')>();
   return {
     ...real,
-    spawnBuildCommand: (cmd: string) => {
-      spawned.push(cmd);
+    spawnBuildStep: (step: { label: string }) => {
+      spawned.push(step.label);
       const proc = new EventEmitter() as EventEmitter & { stdout: null; stderr: null; pid: undefined };
       proc.stdout = null; proc.stderr = null; proc.pid = undefined;
       setTimeout(() => proc.emit('close', 0), 0);

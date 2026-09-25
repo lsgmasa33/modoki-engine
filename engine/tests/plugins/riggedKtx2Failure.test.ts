@@ -40,7 +40,7 @@ vi.mock('../../toolchain', async (orig) => {
       : actual.detect(id as never))),
     forgetDetection: vi.fn(),
     gltfTransformInvocation: vi.fn(() => ({ command: 'gltf-transform', prefixArgs: [] })),
-    spawnable: vi.fn((command: string, args: string[]) => ({ command, args, shell: false })),
+    toSpawn: vi.fn((command: string, args: string[]) => ({ command, args, options: { shell: false } })),
     withToolOnPath: vi.fn(() => process.env),
   };
 });

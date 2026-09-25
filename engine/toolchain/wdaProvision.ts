@@ -77,7 +77,7 @@ export const WDA_EXPIRY_WARN_DAYS = 14
 export type CommandRunner = (
   command: string,
   args: string[],
-  opts: { cwd?: string; env?: NodeJS.ProcessEnv; shell?: boolean; onLog?: (line: string) => void },
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv; onLog?: (line: string) => void },
 ) => Promise<void>
 
 /** How to invoke npm (mirrors index.ts's SpawnSpec without importing it — index imports THIS module,
@@ -85,7 +85,6 @@ export type CommandRunner = (
 export interface NpmInvocation {
   command: string
   prefixArgs: string[]
-  shell: boolean
   env: NodeJS.ProcessEnv
 }
 
@@ -296,7 +295,7 @@ async function fetchWdaSource(baseDir: string, npm: NpmInvocation, run: CommandR
   const spec = `${PINNED_WDA.npmPackage}@${PINNED_WDA.version}`
   log(`Downloading ${spec}…`)
   await run(npm.command, [...npm.prefixArgs, 'pack', spec, '--pack-destination', versionDir, '--no-audit', '--no-fund'], {
-    cwd: versionDir, env: npm.env, shell: npm.shell, onLog: log,
+    cwd: versionDir, env: npm.env, onLog: log,
   })
 
   const tarball = fs.readdirSync(versionDir).find((f) => f.endsWith('.tgz'))

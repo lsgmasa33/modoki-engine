@@ -20,6 +20,9 @@
  *  version of that same function (which matched `gcloud: command not found`). It says
  *  nothing about this one, which requires `not found: 404` and so never matched that. */
 
+import { execFileSync } from 'node:child_process';
+import { toSpawn } from '../winSpawn.mjs';
+
 /** Classifies a `gcloud storage cat`/`objects describe` failure's stderr: a missing object
  *  is the ONLY shape that means "safe to proceed" — `gcloud storage cat` reports it as
  *  "not found: 404" or "matched no objects or files" on stderr. Every other failure (auth
@@ -42,22 +45,18 @@ export function isGcloudNoMatchError(stderr) {
   return /matched no objects/i.test(stderr);
 }
 
-/** Wraps a value for interpolation into a command run through a real shell — `/bin/sh` on POSIX,
- *  `cmd.exe` on Windows, which is why these calls go through `execSync` at all: Windows resolves
- *  `gcloud` to `gcloud.cmd`, which a shell-less spawn cannot run.
+/** Run `gcloud <args>` — argv, NO shell (#1537), on both platforms. Returns stdout like
+ *  `execFileSync`, and throws its error (with `stdout`/`stderr` attached) on a non-zero exit.
  *
- *  DEFENSE IN DEPTH, not the primary guard: bundle names, versions and buckets are rejected against
- *  OTA_SAFE_TOKEN/OTA_SAFE_BUCKET before they get here, so none of those can carry a shell
- *  metacharacter. What this still protects are paths a script derives itself (mkdtemp staging dirs,
- *  a repo checked out under a path with a space), which must round-trip through the shell intact.
- *
- *  POSIX single quotes suppress all expansion; `'\''` is the standard way to put a literal `'` inside
- *  one. The old `JSON.stringify` form emitted DOUBLE quotes, inside which `$(...)`, backticks and
- *  `${...}` still expand — it only ever JSON-escaped (#649). win32 keeps the double-quote form: cmd.exe
- *  does not treat `'` as a quote at all, so single-quoting would paste the quote characters into the
- *  argument. ⚠️ That win32 branch is UNVALIDATED against a real Windows shell from this machine. */
-export function shellQuote(value) {
-  return process.platform === 'win32'
-    ? JSON.stringify(String(value))
-    : `'${String(value).replace(/'/g, "'\\''")}'`;
+ *  This replaced a `shellQuote` + `execSync` pair. POSIX was already safe (single quotes), but the
+ *  win32 branch double-quoted, and cmd.exe expands `%VAR%` inside double quotes — so a staging dir
+ *  under a profile path holding `%` changed the upload target. `toSpawn` resolves `gcloud` to
+ *  `gcloud.cmd` on Windows and runs it through an escaped cmd.exe line; everything else is a plain exec.
+ *  Bundle names, versions and buckets are still refused against OTA_SAFE_TOKEN/OTA_SAFE_BUCKET upstream. */
+export function gcloudSync(args, opts = {}) {
+  // No `!` special case: the real gcloud.cmd enables delayed expansion only for its python probing and
+  // runs `SETLOCAL DisableDelayedExpansion` before forwarding `%*` (SDK 581; verified by the #1537
+  // review against the installed script, which retracted an earlier fixture that modelled it wrong).
+  const s = toSpawn('gcloud', args, { env: opts.env });
+  return execFileSync(s.command, s.args, { ...s.options, ...opts });
 }

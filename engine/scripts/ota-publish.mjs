@@ -54,14 +54,13 @@
  *  content-addressed store across versions is a possible later optimization; it would
  *  change publish-time storage only, not the manifest/release contract.
  */
-import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildManifestFiles } from './ota/buildManifest.mjs';
-import { isGcloudObjectNotFoundError, shellQuote } from './ota/gcloud.mjs';
+import { isGcloudObjectNotFoundError, gcloudSync } from './ota/gcloud.mjs';
 import { createManifest, createRelease, manifestHashPayload, validateManifest, validateRelease } from './ota/schema.mjs';
 import { OTA_DEFAULT_BUNDLE_NAME, OTA_DEFAULT_ENGINE_API, otaBundleDistKindRefusal, otaSubgameEngineApi } from './ota/publishGuards.mjs';
 import { otaPublishPreflight, readRawOtaBlock } from './ota/publishPreflight.mjs';
@@ -74,9 +73,6 @@ import { acquireBuildClaim } from './buildClaimsStore.mjs';
 import { samePath } from './pathIdentity.mjs';
 
 const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-// Quotes a value for the `execSync` calls below, each of which runs through a real shell — see
-// `shellQuote` (ota/gcloud.mjs, shared with the #836 prune) for why, and why it is defense in depth.
-const q = shellQuote;
 
 function parseArgs(argv) {
   // `mandatory` starts `undefined` (not `false`) so the release-merge loop can tell
@@ -158,7 +154,7 @@ async function main() {
       'bad-project-subgames': `${projectConfigPath}'s ota.subgames is present but not a list of project ids (got ${JSON.stringify(ota?.subgames)}) — it decides which sub-game names may be published into this shell, so this publish cannot be checked.`,
       'bad-project-retain-versions': `${projectConfigPath}'s ota.retainVersions is present but not a positive integer (got ${JSON.stringify(ota?.retainVersions)}) — it decides how many versions of "${name}" this publish keeps in the bucket, so it cannot prune. Set it in project.config.json, or remove the key to keep the default.`,
       'ambiguous-bundle': `--name "${name}" is BOTH ${projectConfigPath}'s own ota.bundleName and a sub-game listed in its ota.subgames — it cannot say whether it publishes the shell or that sub-game. Rename one.`,
-      'unknown-bundle': `--name "${name}" is neither ${projectConfigPath}'s own ota.bundleName ("${r.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(r.subgames)}). A sub-game is published into this shell only once the shell lists it (Project Settings → OTA → Sub-games) — the same rule the editor's Publish OTA Update… enforces (#837, #827). Pass --name ${q(String(r.bundleName))} to publish this project as itself.`,
+      'unknown-bundle': `--name "${name}" is neither ${projectConfigPath}'s own ota.bundleName ("${r.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(r.subgames)}). A sub-game is published into this shell only once the shell lists it (Project Settings → OTA → Sub-games) — the same rule the editor's Publish OTA Update… enforces (#837, #827). Pass --name ${JSON.stringify(String(r.bundleName))} to publish this project as itself.`,
       'key-missing': `Signing key not found: ${path.relative(repoRoot, String(r.keyPath))}. Run: node engine/scripts/ota-keygen.mjs ${args.key}`,
       'key-unparseable': `Signing key "${args.key}" (${r.keyPath}) could not be parsed as JSON — regenerate it: node engine/scripts/ota-keygen.mjs ${args.key}`,
       'no-key-public-half': `Signing key "${args.key}" (${r.keyPath}) has no publicKey field — regenerate it: node engine/scripts/ota-keygen.mjs ${args.key}`,
@@ -173,7 +169,7 @@ async function main() {
   const distIsSubgameModule = existsSync(path.join(distDir, 'subgame.json'));
   const kindRefusal = otaBundleDistKindRefusal({ targetKind: target.kind, distIsSubgameModule });
   if (kindRefusal === 'subgame-name-with-shell-dist') {
-    fail(`--name "${name}" is a sub-game listed in ${projectConfigPath}'s ota.subgames, but ${path.relative(repoRoot, distDir)} is a plain shell dist/ (no subgame.json) — publishing it would ship this project's own shell content under "${name}"'s identity. Build a real sub-game module dist (build-subgame.mjs) if you meant to publish "${name}" as a sub-game, or pass --name ${q(projectBundleName)} to publish this project as itself.`);
+    fail(`--name "${name}" is a sub-game listed in ${projectConfigPath}'s ota.subgames, but ${path.relative(repoRoot, distDir)} is a plain shell dist/ (no subgame.json) — publishing it would ship this project's own shell content under "${name}"'s identity. Build a real sub-game module dist (build-subgame.mjs) if you meant to publish "${name}" as a sub-game, or pass --name ${JSON.stringify(projectBundleName)} to publish this project as itself.`);
   }
   if (kindRefusal === 'shell-name-with-subgame-dist') {
     fail(`--name "${name}" matches ${projectConfigPath}'s own ota.bundleName, but ${path.relative(repoRoot, distDir)} is a sub-game module dist (subgame.json present) — publishing it under "${name}" would replace this project's shell bundle with a module the OTA client cannot boot standalone. Publish it under its own sub-game --name instead.`);
@@ -325,7 +321,7 @@ async function main() {
     const versionedManifestPath = `${bucket}/bundles/${name}/${version}/manifest.json`;
     let existingManifestRaw = null;
     try {
-      existingManifestRaw = execSync(`gcloud storage cat ${q(versionedManifestPath)}`, { stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8');
+      existingManifestRaw = gcloudSync(['storage', 'cat', versionedManifestPath], { stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8');
     } catch (e) {
       // A missing object is the ONLY stderr shape that means "safe to proceed" — anything
       // else (auth expired, network blip, wrong bucket permissions) must NOT be silently
@@ -373,8 +369,8 @@ async function main() {
       console.log(`[ota-publish] Uploading ${fileCount} content-addressed files to ${bundlePrefix}/files/ ...`);
       // Deliberately NO --delete-unmatched-destination-objects: this is the new version's own
       // prefix, and old versions are removed only by the bounded prune after release.json (#836).
-      execSync(`gcloud storage rsync --recursive ${q(stageDir)} ${q(`${bundlePrefix}/files`)}`, { stdio: 'inherit' });
-      execSync(`gcloud storage objects update ${q(`${bundlePrefix}/files/**`)} --cache-control="public, max-age=31536000, immutable"`, { stdio: 'inherit' });
+      gcloudSync(['storage', 'rsync', '--recursive', stageDir, `${bundlePrefix}/files`], { stdio: 'inherit' });
+      gcloudSync(['storage', 'objects', 'update', `${bundlePrefix}/files/**`, '--cache-control=public, max-age=31536000, immutable'], { stdio: 'inherit' });
 
       const manifestStageDir = mkdtempSync(path.join(tmpdir(), 'modoki-ota-manifest-'));
       try {
@@ -388,10 +384,10 @@ async function main() {
         // this version. `bundle.zip` before `manifest.json` (files/ above already went
         // first); `release.json` stays last of ALL, further below — that ordering is
         // separately load-bearing and untouched by this reordering.
-        execSync(`gcloud storage cp ${q(zipPath)} ${q(`${bundlePrefix}/bundle.zip`)}`, { stdio: 'inherit' });
-        execSync(`gcloud storage objects update ${q(`${bundlePrefix}/bundle.zip`)} --cache-control="public, max-age=31536000, immutable"`, { stdio: 'inherit' });
-        execSync(`gcloud storage cp ${q(manifestPath)} ${q(`${bundlePrefix}/manifest.json`)}`, { stdio: 'inherit' });
-        execSync(`gcloud storage objects update ${q(`${bundlePrefix}/manifest.json`)} --cache-control="no-cache, max-age=0"`, { stdio: 'inherit' });
+        gcloudSync(['storage', 'cp', zipPath, `${bundlePrefix}/bundle.zip`], { stdio: 'inherit' });
+        gcloudSync(['storage', 'objects', 'update', `${bundlePrefix}/bundle.zip`, '--cache-control=public, max-age=31536000, immutable'], { stdio: 'inherit' });
+        gcloudSync(['storage', 'cp', manifestPath, `${bundlePrefix}/manifest.json`], { stdio: 'inherit' });
+        gcloudSync(['storage', 'objects', 'update', `${bundlePrefix}/manifest.json`, '--cache-control=no-cache, max-age=0'], { stdio: 'inherit' });
       } finally {
         rmSync(manifestStageDir, { recursive: true, force: true });
       }
@@ -420,11 +416,11 @@ async function main() {
       let generation = '0';
       let describeSucceeded = false;
       try {
-        const rawGeneration = execSync(`gcloud storage objects describe ${q(releasePath)} --format="value(generation)"`, { stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8').trim();
+        const rawGeneration = gcloudSync(['storage', 'objects', 'describe', releasePath, '--format=value(generation)'], { stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8').trim();
         if (!/^\d+$/.test(rawGeneration)) fail(`Unexpected generation value from gcloud: ${JSON.stringify(rawGeneration)}`);
         generation = rawGeneration;
         describeSucceeded = true;
-        const raw = execSync(`gcloud storage cat ${q(releasePath)}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
+        const raw = gcloudSync(['storage', 'cat', releasePath], { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
         existingRelease = JSON.parse(raw);
         // Shape-check what JSON.parse handed back (F4): `null`, an array, or an object
         // missing an object-typed `bundles` field all parse "successfully" — JSON.parse alone
@@ -496,8 +492,8 @@ async function main() {
       const tmpReleasePath = path.join(releaseStageDir, 'release.json');
       writeFileSync(tmpReleasePath, JSON.stringify(release, null, 2));
       try {
-        execSync(`gcloud storage cp ${q(tmpReleasePath)} ${q(releasePath)} --if-generation-match=${generation}`, { stdio: ['ignore', 'ignore', 'pipe'] });
-        execSync(`gcloud storage objects update ${q(releasePath)} --cache-control="no-cache, max-age=0"`, { stdio: 'inherit' });
+        gcloudSync(['storage', 'cp', tmpReleasePath, releasePath, `--if-generation-match=${generation}`], { stdio: ['ignore', 'ignore', 'pipe'] });
+        gcloudSync(['storage', 'objects', 'update', releasePath, '--cache-control=no-cache, max-age=0'], { stdio: 'inherit' });
         published = true;
       } catch (e) {
         const stderr = e?.stderr?.toString() ?? '';
@@ -540,7 +536,7 @@ async function main() {
     for (const object of ['manifest.json', 'bundle.zip']) {
       const objectPath = `${bucket}/bundles/${name}/${version}/${object}`;
       try {
-        execSync(`gcloud storage objects describe ${q(objectPath)} --format="value(generation)"`, { stdio: ['ignore', 'pipe', 'pipe'] });
+        gcloudSync(['storage', 'objects', 'describe', objectPath, '--format=value(generation)'], { stdio: ['ignore', 'pipe', 'pipe'] });
       } catch (e) {
         const stderr = e?.stderr?.toString() ?? '';
         if (isGcloudObjectNotFoundError(stderr)) { // real text, measured: `…manifest.json not found: 404.`

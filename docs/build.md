@@ -975,6 +975,15 @@ storage objects update …; done`. `kill('SIGTERM')` on that one pid killed the 
 immediately admits. The `(D6)` comments claimed a disconnect left nothing that "can't conflict with
 a retry"; that was never true, and #173's slot only narrowed the window.
 
+**What a step IS (#1537).** A `BuildStep` is one of three kinds — `exec` (program + argv, no
+shell; `winCommand` swaps in `gradlew.bat`), `shell` (only the compound Mac iOS-install steps; text
+built by the `sh` template, every value a `ref()` carried in env), or `inproc` (reveal in
+Finder/Explorer, favicon copy, the release archive clear). A step no longer has a command STRING, so
+no path or config value is ever parsed by bash or cmd.exe; `when` gates one at run time (the CDN
+step runs per extension dist/ actually holds). The custom web deploy command is the one shell text
+the project author writes (`authoredShell`). Why: [windows.md](windows.md) § "Never hand a shell a
+command line".
+
 The fix lives entirely in `engine/plugins/buildStepShell.ts`: posix steps spawn `detached` (their
 own process group) and every abort path calls `killBuildProcess`, which signals `-pid` — SIGTERM,
 then SIGKILL to the group after a 5s grace. Two things fall out for free: a group signal reaches a
@@ -994,7 +1003,8 @@ Windows takes the other road: no `detached` (there it allocates a new **console*
 editor would flash per step) and `taskkill /T /F /PID <pid>`, which walks the tree by parent pid.
 **Validated on a real Windows box (#182)**, and the premise turned out to be worse there than on
 posix: `spawn(cmd, {shell:true})` is `cmd.exe /d /s /c "<command>"`, and Windows has no
-exec-replace, so **every** step carries the extra `cmd.exe` layer — where on posix only the three
+exec-replace, so **every** step carried the extra `cmd.exe` layer (since #1537 only a `shell` step or
+an exec of a `.cmd`/`.bat` — gradlew.bat, npx.cmd — does; an `.exe` like node is spawned directly) — where on posix only the three
 compound steps did. Measured: aborting a real build killed a 5-process, 4-level tree
 (`cmd.exe` → `node build-web.mjs` → `cmd.exe` → `tsc`) in **350ms**, against an **11175ms**
 uninterrupted lifetime in the control run. No console window ever appeared (`MainWindowHandle` 0

@@ -10,7 +10,7 @@
  *
  *  Full cross-game coverage still lives in `npm run typecheck` (tsc -b engine). */
 
-import { execSync, spawnSync } from 'node:child_process';
+import { execFileSync, execSync, spawnSync } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { isProjectDir } from './projectRoots.mjs';
@@ -67,8 +67,9 @@ const runEnv = {
   ...childEnv,
 };
 const node = process.execPath;
-const q = (s) => JSON.stringify(s);
-const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: repoRoot, env: runEnv });
+// argv, never a command string (#1537): `node` is process.execPath and the bins live under the
+// install dir, so a folder holding `%`, `$(…)` or a space reached a shell through JSON.stringify quoting.
+const run = (file, args) => execFileSync(file, args, { stdio: 'inherit', cwd: repoRoot, env: runEnv });
 
 /** Cross-process build claim (#650). `buildLock.ts`'s in-process slot cannot see this script — a
  *  hand-run `npm run build` is a SEPARATE process — so nothing stopped it racing the editor's own
@@ -331,8 +332,8 @@ try {
     // makes the write unnecessary too. Doing it unconditionally EPERM'd every build from
     // such an install, dev or packaged, before the target-specific work even started.
     writeFileSync(scopedPath, JSON.stringify(scopedTsconfigContent(include), null, 2) + '\n');
-    run(`${q(node)} ${q(tscBin)} -p engine/tsconfig.app.scoped.json`); // app + active game (scoped)
-    run(`${q(node)} ${q(tscBin)} -p engine/tsconfig.node.json`);        // vite config / electron
+    run(node, [tscBin, '-p', 'engine/tsconfig.app.scoped.json']); // app + active game (scoped)
+    run(node, [tscBin, '-p', 'engine/tsconfig.node.json']);        // vite config / electron
   } else {
     console.log('[build-web] typescript not installed — skipping typecheck (packaged build).');
   }
@@ -367,7 +368,7 @@ try {
   // Either way the packaged editor should not write inside its own bundle at all, and the fix is
   // to hand Vite a CJS config, whose loader branch compiles in memory. Which config, and why the
   // choice is by file existence, is `viteConfigChoice.mjs` — not restated here.
-  run(`${q(node)} ${q(viteBin)} build --config ${chooseViteConfig(engineDir)}`);
+  run(node, [viteBin, 'build', '--config', chooseViteConfig(engineDir)]);
   if (stampStart) {
     const projectRoot = path.resolve(repoRoot, proj);
     const stamp = settleBuildStamp(stampStart, readHeadCommit(projectRoot));
@@ -383,7 +384,7 @@ try {
   // throws by design on a directory that does not look like a Modoki project, and names which
   // markers are missing — precisely the message a headless/CI caller needs, and precisely the
   // caller this path exists for. (`vendorEnginePlugins` had the same shape before #150.)
-  // `execSync` failures carry `status`/`signal`; an ordinary Error does not, which is what
+  // `execFileSync` failures carry `status`/`signal`; an ordinary Error does not, which is what
   // separates the two without having to thread a flag out of `healNativeProject`.
   const fromChild = e && (typeof e.status === 'number' || e.signal != null);
   if (!fromChild) console.error(`[build-web] ${e instanceof Error ? e.message : String(e)}`);

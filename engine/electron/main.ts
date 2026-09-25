@@ -248,7 +248,7 @@ if (adoptedLegacyState.length) {
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { createAssetBackend, type ElectronAssetBackend } from './assetBackend';
-import { npmSpawnSpec, ensureNode, PINNED_NODE } from '../toolchain';
+import { npmSpawnSpec, spawnSpecCall, ensureNode, PINNED_NODE } from '../toolchain';
 import { startBackendServer, type BackendServerHandle, type HostRoutes } from './backendServer';
 import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
 import { captureViewport, CaptureUnavailableError, captureRefusalBody, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
@@ -383,10 +383,11 @@ async function ensureNodeProvisioned(): Promise<void> {
 function runNpm(cwd: string, args: string[]): Promise<number> {
   const spec = npmSpawnSpec();
   return new Promise((resolve, reject) => {
-    const child = spawn(spec.command, [...spec.prefixArgs, ...args], {
+    const s = spawnSpecCall(spec, args);
+    const child = spawn(s.command, s.args, {
+      ...s.options,
       cwd,
       stdio: ['ignore', 'inherit', 'inherit'],
-      shell: spec.shell,
       env: spec.env,
     });
     child.on('error', reject);

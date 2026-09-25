@@ -439,6 +439,12 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
       + 'output as walk() above, and a deletion rather than a read, so there is no corpus at all.',
   },
   {
+    file: 'engine/plugins/vite-asset-scanner.ts', rule: 'walker', walker: 'walk',
+    reason: 'distHasExtension()\'s walk() over the web BUILD OUTPUT (dist/), asking whether any .glb/.ktx2/.webp '
+      + 'was produced so the CDN step for it runs (#1537) — build output, never tracked, same class as '
+      + 'inlinePlayable\'s walk().',
+  },
+  {
     file: 'engine/plugins/vite-asset-scanner.ts', rule: 'walker', walker: 'scanDir',
     reason: 'Build-time scanDir() over the open project\'s assets to emit the manifest. Project '
       + 'dir, not repo corpus.',

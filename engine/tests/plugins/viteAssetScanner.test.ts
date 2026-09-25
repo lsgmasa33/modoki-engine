@@ -18,7 +18,7 @@ import {
   settleRelayReply, countLiveBridgeClients,
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot, absToAssetUrl, pathToClassifyForChange, isSiblingRaisedChange,
-  isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
+  isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps, distHasExtension, cdnBinaryCacheSteps,
   otaPublishTarget, otaSubgameProjectDir, otaResolveSubgameDir, otaPublishSteps, otaSigningKeyRefusal,
   otaPublishBuildStepEnv,
   type AssetRoot,
@@ -27,9 +27,16 @@ import { findGamesEntry } from '../../plugins/findGamesEntry';
 import { readScannedSource } from '@modoki/engine/testing';
 import { accessPath, findNodes, functionsNamed, parseSource, referencesToPath, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 
 // engine/tests/plugins/ → repo root (games/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
+
+/** The value following `flag` in an argv list (#1537: steps carry argv, not command strings). */
+const argAfter = (args: string[], flag: string): string | undefined => {
+  const i = args.indexOf(flag);
+  return i < 0 ? undefined : args[i + 1];
+};
 // No project-presence gate here any more: the game-directory-discovery cases used to skip when
 // games/ was absent, which meant zero coverage of that path in the CI snapshot. They now build a
 // monorepo-shaped tree in tmpdir and run everywhere (#98).
@@ -342,17 +349,53 @@ describe('isSseRoute (catch-all exclusion)', () => {
     const steps = playableBuildSteps('/repo', '/repo/games/space-invader');
     expect(steps).toHaveLength(2);
     // Step 1 = the inliner build, steered by VITE_PLAYABLE=1, run from the editor root.
-    expect(steps[0]).toMatchObject({ cmd: 'node engine/scripts/build-web.mjs --target playable', env: { VITE_PLAYABLE: '1' }, cwd: '/repo' });
-    // Step 2 = reveal the project's ads/ dir (posix `open`, win `start`) — NO favicon/deploy step.
-    // The SUT joins the path with the host's `path.join`, so on Windows both fields carry
-    // backslashes (`winCmd` = `start "" "C:\…\ads"`, the correct Windows form actually executed;
-    // `cmd` = `open "\\…"` where JSON.stringify doubles the backslash for shell-quoting — but `cmd`
-    // is macOS-only-consumed). Collapse any run of / or \ to one `/` so the SEMANTIC path is
-    // asserted regardless of host separator or JSON escaping.
-    const normSep = (s: string | undefined) => (s ?? '').replace(/[\\/]+/g, '/');
-    expect(normSep(steps[1].cmd)).toContain('/repo/games/space-invader/ads');
-    expect(normSep(steps[1].winCmd)).toContain('games/space-invader/ads');
-    expect(steps.some((s) => /favicon|gcloud|rsync|deploy/i.test(s.cmd))).toBe(false);
+    expect(steps[0]).toMatchObject({ kind: 'exec', command: 'node', args: ['engine/scripts/build-web.mjs', '--target', 'playable'], env: { VITE_PLAYABLE: '1' }, cwd: '/repo' });
+    // Step 2 = reveal the project's ads/ dir, in-process (osOpen.ts) — NO favicon/deploy step.
+    expect(steps[1]).toMatchObject({ kind: 'inproc', label: 'Revealing ads/...' });
+    expect(steps.some((s) => /favicon|gcloud|rsync|deploy/i.test(s.label))).toBe(false);
+  });
+
+  it('distHasExtension: the run-time scan behind the CDN steps\' per-extension `when` (it replaced a bash find loop, #1537)', () => {
+    const dist = makeScratchDir('modoki-dist-scan-');
+    try {
+      expect(distHasExtension(path.join(dist, 'missing'), 'glb'), 'a missing dist is "no", not a throw').toBe(false);
+      fs.mkdirSync(path.join(dist, 'assets', 'models'), { recursive: true });
+      fs.writeFileSync(path.join(dist, 'assets', 'models', 'a.glb'), '');
+      fs.writeFileSync(path.join(dist, 'index.webp.txt'), '');
+      expect(distHasExtension(dist, 'glb'), 'found two levels down').toBe(true);
+      expect(distHasExtension(dist, 'webp'), 'a suffix, not a substring').toBe(false);
+      expect(distHasExtension(dist, 'ktx2')).toBe(false);
+    } finally {
+      fs.rmSync(dist, { recursive: true, force: true });
+    }
+  });
+
+  it('cdnBinaryCacheSteps: one gcloud update per extension, each due ONLY when dist/ holds it (#1537)', () => {
+    const dist = makeScratchDir('modoki-cdn-steps-');
+    try {
+      fs.writeFileSync(path.join(dist, 'a.glb'), '');
+      const steps = cdnBinaryCacheSteps('gs://b', dist, '/repo');
+      expect(steps.map((s) => argAfter(s.args, 'update'))).toEqual(['gs://b/**.glb', 'gs://b/**.ktx2', 'gs://b/**.webp']);
+      // A zero-match glob fails the whole deploy, so an absent type must NOT be due.
+      expect(steps.map((s) => s.when?.())).toEqual([true, false, false]);
+    } finally {
+      fs.rmSync(dist, { recursive: true, force: true });
+    }
+  });
+
+  it('the /api/build step loop consults a step\'s `when` before running it (#1537)', () => {
+    // The seam cdnBinaryCacheSteps depends on: a plan can say "not due", but only the loop can skip.
+    const sf = parseSource(readScannedSource(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts')).code, 'vite-asset-scanner.ts');
+    const loops = findNodes(sf, ts.isForStatement).filter((l) => /\bsteps\.length\b/.test(l.condition?.getText(sf) ?? ''));
+    expect(loops.length, 'the /api/build step loop').toBe(1);
+    const loop = loops[0]!.statement;
+    const gates = findNodes(loop, ts.isIfStatement).filter((s) => /^step\.when\s*&&\s*!step\.when\(\)$/.test(s.expression.getText(sf)));
+    expect(gates.length, 'the loop must test a step\'s when()').toBe(1);
+    // SKIP means `continue` — logging "(skipped)" and falling through to the spawn was green before
+    // this was asserted (review mutation), and would run the zero-match gcloud glob anyway.
+    expect(findNodes(gates[0]!.thenStatement, (n): n is ts.ContinueStatement => ts.isContinueStatement(n)).length,
+      'a step whose when() is false must be SKIPPED (continue), not merely logged').toBe(1);
+    expectInOrder(loop.getText(sf), [gates[0]!.getText(sf), 'spawnBuildStep('], 'the /api/build step loop');
   });
 
   it('does not match unrelated /api routes (they flow through the backend dispatch)', () => {
@@ -1696,25 +1739,25 @@ describe('otaPublishSteps (#837)', () => {
 
   it('a shell target builds this project with build-web.mjs and publishes its dist/ with the shell engine API', () => {
     const s = otaPublishSteps({ ...base, target: { kind: 'shell' } });
-    expect(s.buildCmd).toBe('node engine/scripts/build-web.mjs --target native');
+    expect([s.build.command, ...s.build.args]).toEqual(['node', 'engine/scripts/build-web.mjs', '--target', 'native']);
     expect(s.buildEnv.MODOKI_PROJECT).toBe('/repo/games/ota-test');
     expect(s.distDir).toBe(path.join('/repo/games/ota-test', 'dist'));
-    expect(s.publishCmd).toContain(`--dist ${JSON.stringify(path.join('/repo/games/ota-test', 'dist'))}`);
-    expect(s.publishCmd).toContain('--engine-api 4');
-    expect(s.publishCmd).toContain('--project "/repo/games/ota-test"');
+    expect(argAfter(s.publish.args, '--dist')).toBe(path.join('/repo/games/ota-test', 'dist'));
+    expect(argAfter(s.publish.args, '--engine-api')).toBe('4');
+    expect(argAfter(s.publish.args, '--project')).toBe('/repo/games/ota-test');
   });
 
   it('a sub-game target builds THAT project, uploads its subgame-dist under its id into the SHELL project, and passes no --engine-api', () => {
     const s = otaPublishSteps({
       ...base, bundleName: 'ota-subgame-test', target: { kind: 'subgame', id: 'ota-subgame-test' }, subgameDir: '/repo/games/ota-subgame-test',
     });
-    expect(s.buildCmd).toBe('node engine/scripts/build-subgame.mjs');
+    expect([s.build.command, ...s.build.args]).toEqual(['node', 'engine/scripts/build-subgame.mjs']);
     expect(s.buildEnv.MODOKI_PROJECT).toBe('/repo/games/ota-subgame-test');
     expect(s.distDir).toBe(path.join('/repo/games/ota-subgame-test', 'subgame-dist'));
-    expect(s.publishCmd).toContain(`--dist ${JSON.stringify(path.join('/repo/games/ota-subgame-test', 'subgame-dist'))}`);
-    expect(s.publishCmd).toContain('--name "ota-subgame-test"');
-    expect(s.publishCmd).toContain('--project "/repo/games/ota-test"');
-    expect(s.publishCmd).not.toContain('--engine-api');
+    expect(argAfter(s.publish.args, '--dist')).toBe(path.join('/repo/games/ota-subgame-test', 'subgame-dist'));
+    expect(argAfter(s.publish.args, '--name')).toBe('ota-subgame-test');
+    expect(argAfter(s.publish.args, '--project')).toBe('/repo/games/ota-test');
+    expect(s.publish.args).not.toContain('--engine-api');
   });
 
   it('a sub-game target without its resolved folder throws rather than building the shell by accident', () => {
@@ -1722,9 +1765,18 @@ describe('otaPublishSteps (#837)', () => {
   });
 
   it('carries the tri-state mandatory flag through to both targets', () => {
-    expect(otaPublishSteps({ ...base, target: { kind: 'shell' }, mandatory: true }).publishCmd).toMatch(/ --mandatory$/);
-    expect(otaPublishSteps({ ...base, target: { kind: 'shell' }, mandatory: false }).publishCmd).toMatch(/ --no-mandatory$/);
-    expect(otaPublishSteps({ ...base, target: { kind: 'shell' } }).publishCmd).not.toMatch(/mandatory/);
+    expect(otaPublishSteps({ ...base, target: { kind: 'shell' }, mandatory: true }).publish.args.at(-1)).toBe('--mandatory');
+    expect(otaPublishSteps({ ...base, target: { kind: 'shell' }, mandatory: false }).publish.args.at(-1)).toBe('--no-mandatory');
+    expect(otaPublishSteps({ ...base, target: { kind: 'shell' } }).publish.args.join(' ')).not.toMatch(/mandatory/);
+  });
+
+  it('a hostile bucket, name or path is ONE argv element, never shell text (#1537)', () => {
+    const hostile = 'a b"$(touch x)%OS%&c';
+    const s = otaPublishSteps({ ...base, bucket: hostile, bundleName: hostile, projectRoot: `/p/${hostile}`, target: { kind: 'shell' } });
+    expect(s.publish.kind).toBe('exec');
+    expect(argAfter(s.publish.args, '--bucket')).toBe(hostile);
+    expect(argAfter(s.publish.args, '--name')).toBe(hostile);
+    expect(argAfter(s.publish.args, '--dist')).toBe(path.join(`/p/${hostile}`, 'dist'));
   });
 });
 
@@ -1803,7 +1855,7 @@ describe('/api/ota/publish route has no collision guard of its own (#577)', () =
   it('isolates the route handler body and the helper it runs', () => {
     const { route, helper } = otaPublishUnits(sf);
     // The handler must still run the helper's command, or scanning the helper covers nothing it does.
-    expect(referencesToPath(route, 'steps.publishCmd').length).toBeGreaterThan(0);
+    expect(referencesToPath(route, 'steps.publish').length).toBeGreaterThan(0);
     expect(stringPieces(helper).some((p) => p.includes('ota-publish.mjs'))).toBe(true);
   });
 

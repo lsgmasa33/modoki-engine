@@ -53,6 +53,7 @@ import { isEntryPoint } from './entryPoint.mjs';
 import { loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
 import { resolveIconInputs, stampExtrasFrom } from './iconInputs.mjs';
 import { claimProjectOrExit } from './cliBuildClaim.mjs';
+import { toSpawn } from './winSpawn.mjs';
 
 /** The one directory each platform's run owns. Everything the generator writes here is its
  *  product and is kept; everything it writes elsewhere is collateral and is undone. Measured,
@@ -396,11 +397,9 @@ async function main() {
   const nativeDirs = [path.join(projectRoot, 'ios'), path.join(projectRoot, 'android')];
   const snapshot = new Map(nativeDirs.flatMap((d) => [...collect(d, productAbs)]));
 
-  const res = spawnSync('npx', ['--yes', ICON_TOOL, 'generate', `--${platform}`, ...iconColorArgs()], {
-    cwd: projectRoot,
-    stdio: 'inherit',
-    shell: process.platform === 'win32', // npx on Windows is a .cmd
-  });
+  // npx is `npx.cmd` on Windows — toSpawn resolves it and runs it through an escaped cmd.exe line (#1537).
+  const npx = toSpawn('npx', ['--yes', ICON_TOOL, 'generate', `--${platform}`, ...iconColorArgs()]);
+  const res = spawnSync(npx.command, npx.args, { ...npx.options, cwd: projectRoot, stdio: 'inherit' });
 
   const { restored, failed } = restoreSnapshot(snapshot, projectRoot);
   for (const d of nativeDirs) {

@@ -5,8 +5,9 @@
 
 import fs from 'fs';
 import path from 'path';
-import { execFileSync, type ExecFileSyncOptions } from 'child_process';
-import { withPathEntry, spawnable, whichSync } from '../../toolchain';
+import type { ExecFileSyncOptions } from 'child_process';
+import { withPathEntry } from '../../toolchain';
+import { gcloudSync } from '../../scripts/ota/gcloud.mjs';
 import { loginShellCommandPath } from './loginShellProbe';
 
 const GCLOUD_NAMES = ['gcloud', 'gcloud.cmd'];
@@ -18,12 +19,12 @@ export function withGcloudOnPath<E extends NodeJS.ProcessEnv>(env: E, gcloudDir:
 }
 
 /** `execFileSync('gcloud', args)` that also runs on Windows, where the CLI is `gcloud.cmd`: a bare
- *  name gets no PATHEXT lookup without a shell, and a `.cmd` needs `shell:true` (docs/windows.md
+ *  name gets no PATHEXT lookup without a shell, and a `.cmd` needs cmd.exe (`toSpawn`, docs/windows.md
  *  § PATHEXT). Resolved against `opts.env.PATH`, so the gcloud dir must already be on it. */
 export function execGcloudSync(args: string[], opts: ExecFileSyncOptions & { env: NodeJS.ProcessEnv }): string | Buffer {
-  const resolved = whichSync('gcloud', { pathEnv: opts.env.PATH ?? '' }) ?? 'gcloud';
-  const s = spawnable(resolved, args);
-  return execFileSync(s.command, s.args, { ...opts, shell: s.shell });
+  // The ONE gcloud call shape, shared with the OTA CLI (#1537): argv, no shell, `gcloud.cmd` resolved
+  // on `opts.env`'s PATH.
+  return gcloudSync(args, opts);
 }
 
 /** Resolve the directory containing the `gcloud` CLI, or null if not installed. A

@@ -68,7 +68,7 @@ export function binInAppDir(appDir, name = productName(), platform = process.pla
   // ⚠️ The macOS branch keys on the ARGUMENT, not the platform — deliberately, per the docblock:
   // a caller handed a `.app` bundle gets its layout wherever the check runs. Only the win32/else
   // split is platform-derived, and `platform` is injectable for the same reason `appSupportRoot`'s
-  // is (and `needsWinShell`/`spawnable` in `engine/toolchain/index.ts`): otherwise each leg can
+  // is (and `needsWinShell`/`toSpawn` in `engine/scripts/winSpawn.mjs`): otherwise each leg can
   // pin only its own branch,
   // and this function had NO per-platform test at all until close-out swept for its shape.
   if (appDir.endsWith('.app')) return path.join(appDir, 'Contents', 'MacOS', path.basename(appDir, '.app'));

@@ -1,52 +1,151 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 import { execSync, execFileSync } from 'node:child_process'
-import { resolveBuildStep, spawnBuildCommand, killBuildProcess, killBuildProcessSync, winKillTreeArgs, type BuildStep } from '../../plugins/buildStepShell'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir'
+import {
+  planBuildStep, spawnBuildStep, sh, ref, authoredShell, execStep,
+  killBuildProcess, killBuildProcessSync, winKillTreeArgs, type ShellStep,
+} from '../../plugins/buildStepShell'
+
+/** A shell step running `text` from the cwd — the process-tree shape the kill suites below need
+ *  (a shell between us and the tool). `authoredShell` is the sanctioned raw-text door. */
+const spawnShell = (text: string) =>
+  spawnBuildStep({ kind: 'shell', label: 'test', script: authoredShell(text), cwd: process.cwd() }, process.env)
+
+/** Collect a child's stdout/stderr and exit code. */
+const finish = (proc: ReturnType<typeof spawnBuildStep>) => new Promise<{ code: number | null; out: string; err: string }>((resolve) => {
+  let out = ''
+  let err = ''
+  proc.stdout?.on('data', (d: Buffer) => { out += d.toString() })
+  proc.stderr?.on('data', (d: Buffer) => { err += d.toString() })
+  proc.on('close', (code) => resolve({ code, out, err }))
+})
 
 /**
- * Guards the W-6 cross-platform build-step branching WITHOUT spawning anything — the
- * pure `resolveBuildStep` decides which command string + env a step runs with on each
- * platform. (The actual spawn — bash on posix, cmd.exe on Windows — is covered by the two
- * integration suites at the bottom of this file, one per platform.)
+ * #1537 — a step used to be one command STRING, and the values in it (paths, bucket names, device
+ * ids) were parsed by bash or cmd.exe: `%VAR%` expanded inside cmd's quotes, `$(…)` ran inside
+ * bash's. `planBuildStep` is the pure decision of what gets spawned; the round trips below prove a
+ * hostile value arrives byte-exact through the real shells.
  */
-describe('buildStepShell — resolveBuildStep (platform branching)', () => {
+describe('buildStepShell — planBuildStep (pure, every host)', () => {
   const baseEnv = { PATH: '/usr/bin', MODOKI_NODE: '/tc/node' } as NodeJS.ProcessEnv
 
-  it('uses the posix `cmd` on darwin/linux even when a winCmd exists', () => {
-    const step: BuildStep = { label: 'gradle', cmd: 'android/gradlew assembleDebug', winCmd: 'android\\gradlew.bat assembleDebug', cwd: '/p' }
-    expect(resolveBuildStep(step, baseEnv, 'darwin').cmd).toBe('android/gradlew assembleDebug')
-    expect(resolveBuildStep(step, baseEnv, 'linux').cmd).toBe('android/gradlew assembleDebug')
+  it('an exec step spawns its program + argv with NO shell on posix, argv untouched', () => {
+    const hostile = 'a b"$(touch x)%OS%&c'
+    for (const platform of ['darwin', 'linux'] as const) {
+      const p = planBuildStep(execStep('gradle', '/p', 'android/gradlew', ['-p', 'android', hostile], { winCommand: 'android\\gradlew.bat' }), baseEnv, platform)
+      expect(p).toMatchObject({ command: 'android/gradlew', args: ['-p', 'android', hostile], options: { shell: false } })
+    }
   })
 
-  it('uses `winCmd` on win32 when present', () => {
-    const step: BuildStep = { label: 'gradle', cmd: 'android/gradlew assembleDebug', winCmd: 'android\\gradlew.bat assembleDebug', cwd: '/p' }
-    expect(resolveBuildStep(step, baseEnv, 'win32').cmd).toBe('android\\gradlew.bat assembleDebug')
+  it('on win32 an exec step takes winCommand, and a batch file runs through cmd.exe with a verbatim line', () => {
+    const p = planBuildStep(execStep('gradle', '/p', 'android/gradlew', ['assembleDebug'], { winCommand: 'android\\gradlew.bat' }), baseEnv, 'win32')
+    expect(p.options).toEqual({ shell: false, windowsVerbatimArguments: true })
+    expect(p.args.slice(0, 4)).toEqual(['/d', '/v:off', '/s', '/c'])
+    expect(p.args[4]).toContain('gradlew.bat')
   })
 
-  it('falls back to `cmd` on win32 when there is no winCmd (pure program+args steps)', () => {
-    const step: BuildStep = { label: 'sync', cmd: 'npx cap sync android', cwd: '/p' }
-    expect(resolveBuildStep(step, baseEnv, 'win32').cmd).toBe('npx cap sync android')
+  it('on win32 a BARE command is resolved on the step env PATH — no shell does the PATHEXT lookup any more', () => {
+    const dir = makeScratchDir('modoki-bare-')
+    try {
+      // Only in the fixture dir, and reachable only through the STEP's env PATH (baseEnv's is /usr/bin).
+      // A real `npx.cmd` on this machine's PATH would let a resolver that ignored the step env pass.
+      fs.writeFileSync(path.join(dir, 'modoki-fixture-npx.cmd'), '@echo off')
+      const p = planBuildStep(execStep('sync', '/p', 'modoki-fixture-npx', ['cap', 'sync'], { env: { PATH: dir } }), baseEnv, 'win32')
+      // Resolved to the shim, so it went the batch route: cmd.exe running <dir>\npx.cmd.
+      expect(p.args[4]).toContain('modoki-fixture-npx.cmd')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 
-  it('merges the step env OVER the shared build env (replaces bash export/FOO=bar prefixes)', () => {
-    const step: BuildStep = { label: 'apk', cmd: 'android/gradlew assembleDebug', env: { JAVA_HOME: '/jdk21', ANDROID_HOME: '/sdk' }, cwd: '/p' }
-    const { env } = resolveBuildStep(step, baseEnv, 'win32')
-    expect(env.JAVA_HOME).toBe('/jdk21')
-    expect(env.ANDROID_HOME).toBe('/sdk')
-    expect(env.PATH).toBe('/usr/bin') // shared env preserved
-    expect(env.MODOKI_NODE).toBe('/tc/node')
+  it('merges the step env OVER the shared build env', () => {
+    const p = planBuildStep(execStep('apk', '/p', 'gradlew', [], { env: { JAVA_HOME: '/jdk21', MODOKI_NODE: '/over' } }), baseEnv, 'darwin')
+    expect(p.env).toMatchObject({ JAVA_HOME: '/jdk21', MODOKI_NODE: '/over', PATH: '/usr/bin' })
   })
 
-  it('returns the shared env unchanged (same ref) when the step has no env', () => {
-    const step: BuildStep = { label: 'build', cmd: 'npm run build', cwd: '/p' }
-    expect(resolveBuildStep(step, baseEnv, 'darwin').env).toBe(baseEnv)
+  it('a shell step runs its posix text under bash -c and its win text under cmd.exe, with its refs in env', () => {
+    const step: ShellStep = { kind: 'shell', label: 's', cwd: '/p', script: sh`echo ${ref('APP_ID', 'com.x')}` }
+    const posix = planBuildStep(step, baseEnv, 'darwin')
+    expect(posix).toMatchObject({ command: 'bash', args: ['-c', 'echo "$MODOKI_ARG_APP_ID"'] })
+    expect(posix.env.MODOKI_ARG_APP_ID).toBe('com.x')
+    const win = planBuildStep(step, baseEnv, 'win32')
+    expect(win.args).toEqual(['/d', '/v:off', '/s', '/c', '"echo "%MODOKI_ARG_APP_ID%""'])
+    expect(win.env.MODOKI_ARG_APP_ID).toBe('com.x')
+  })
+})
+
+describe('buildStepShell — sh / ref (the only way to write shell text)', () => {
+  it('renders every ref QUOTED and carries its value in env, never in the text', () => {
+    const s = sh`xcrun devicectl --device ${ref('DEV', 'id$(x)')} ${ref('APP', 'a%OS%b')}`
+    expect(s.posix).toBe('xcrun devicectl --device "$MODOKI_ARG_DEV" "$MODOKI_ARG_APP"')
+    expect(s.win).toBe('xcrun devicectl --device "%MODOKI_ARG_DEV%" "%MODOKI_ARG_APP%"')
+    expect(s.env).toEqual({ MODOKI_ARG_DEV: 'id$(x)', MODOKI_ARG_APP: 'a%OS%b' })
+    expect(s.posix + s.win).not.toContain('$(x)')
   })
 
-  it('step env overrides a shared-env key of the same name', () => {
-    const step: BuildStep = { label: 'web', cmd: 'npm run build', env: { BASE_PATH: '/demo', VITE_GAME_ONLY: 'true' }, cwd: '/p' }
-    const merged = { ...baseEnv, BASE_PATH: '/old' } as NodeJS.ProcessEnv
-    const { env } = resolveBuildStep(step, merged, 'win32')
-    expect(env.BASE_PATH).toBe('/demo')
-    expect(env.VITE_GAME_ONLY).toBe('true')
+  it('a raw string cannot be interpolated — the old shape is a TYPE error', () => {
+    const path = '/Users/x/My Game'
+    // @ts-expect-error a string is not a ShellRef — the #1537 guard, checked by `npm run typecheck`
+    const s = sh`open ${path}`
+    expect(s).toBeDefined()
+  })
+
+  it('nested fragments splice text and merge env; one name bound to two values throws', () => {
+    const inner = sh`echo ${ref('WHY', 'because')}`
+    const outer = sh`${inner}; open ${ref('P', '/x')}`
+    expect(outer.posix).toBe('echo "$MODOKI_ARG_WHY"; open "$MODOKI_ARG_P"')
+    expect(outer.env).toEqual({ MODOKI_ARG_WHY: 'because', MODOKI_ARG_P: '/x' })
+    expect(() => sh`${ref('A', '1')} ${ref('A', '2')}`).toThrow(/two different values/)
+    expect(() => ref('lower', 'x')).toThrow(/UPPER_SNAKE/)
+  })
+})
+
+/**
+ * The round trips — each spawns a real bash or cmd.exe, because the defect is a property of how
+ * those shells parse, and no pure test can observe it.
+ */
+describe('buildStepShell — hostile values survive a real spawn (#1537)', () => {
+  // `%OS%` is defined on every Windows box and `$HOME` on every posix one, so an expansion is
+  // always visible; the `$(…)` would create a file; `&` would start a second command.
+  const HOSTILE = process.platform === 'win32'
+    ? ['C:\\p\\%OS%\\a&echo INJ&b', 'x"&echo INJ&"y', '100% done', '']
+    : ['/p/$(touch pwned)/a', '`touch pwned2`', '$HOME', 'a"b\'c', '']
+
+  it('an exec step hands every hostile arg to the program byte-exact', async () => {
+    const dir = makeScratchDir('modoki-exec-')
+    try {
+      fs.writeFileSync(path.join(dir, 'argv.js'), 'process.stdout.write(JSON.stringify(process.argv.slice(2)))\n')
+      const r = await finish(spawnBuildStep(execStep('argv', dir, 'node', ['argv.js', ...HOSTILE]), process.env))
+      expect(r.err).toBe('')
+      expect(JSON.parse(r.out)).toEqual(HOSTILE)
+      expect(fs.readdirSync(dir)).toEqual(['argv.js']) // no `pwned` file: nothing was evaluated
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('a shell step prints a hostile ref literally — expanded once, never re-parsed', async () => {
+    const dir = makeScratchDir('modoki-shell-')
+    try {
+      // A `"` is excluded on win32 because planBuildStep REFUSES it there (next test).
+      for (const value of HOSTILE.filter((v) => v && !(process.platform === 'win32' && v.includes('"')))) {
+        // node, not echo: cmd's echo would print the quotes too. The ref arrives as ONE argument.
+        const script = sh`node -e "process.stdout.write(process.argv[1])" ${ref('V', value)}`
+        const r = await finish(spawnBuildStep({ kind: 'shell', label: 's', cwd: dir, script }, process.env))
+        expect({ value, out: r.out, err: r.err }).toEqual({ value, out: value, err: '' })
+      }
+      expect(fs.readdirSync(dir)).toEqual([])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('on win32 a ref holding a double quote is REFUSED — it would close cmd\'s quotes and free its `&`', () => {
+    const step: ShellStep = { kind: 'shell', label: 'deploy', cwd: '/p', script: sh`echo ${ref('V', 'x"&echo INJ&"y')}` }
+    expect(() => planBuildStep(step, {}, 'win32')).toThrow(/deploy.*MODOKI_ARG_V holds a double quote/)
+    expect(() => planBuildStep(step, {}, 'darwin')).not.toThrow() // bash carries it inside "$X" fine
   })
 })
 
@@ -82,7 +181,7 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
   const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
 
   it('CONTROL: a plain proc.kill() signals only the shell, orphaning the real child', async () => {
-    const proc = spawnBuildCommand(COMPOUND, { cwd: process.cwd(), env: process.env })
+    const proc = spawnShell(COMPOUND)
     await settle()
     const kids = childrenOf(proc.pid!)
     expect(kids.length, 'bash should have forked a grandchild for a compound command').toBeGreaterThan(0)
@@ -95,7 +194,7 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
   })
 
   it('killBuildProcess reaches the grandchild via the process group', async () => {
-    const proc = spawnBuildCommand(COMPOUND, { cwd: process.cwd(), env: process.env })
+    const proc = spawnShell(COMPOUND)
     await settle()
     const kids = childrenOf(proc.pid!)
     expect(kids.length).toBeGreaterThan(0)
@@ -117,7 +216,7 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
     // `expected 0 to be greater than 0`. bash 3.2 (macOS) lacks that optimization and forks,
     // which is why this was green on every Mac and red on `ci/main` only. A TERM trap does not
     // suppress the optimization — only EXIT/ERR traps do.
-    const proc = spawnBuildCommand(`trap "" TERM; ${COMPOUND}`, { cwd: process.cwd(), env: process.env })
+    const proc = spawnShell(`trap "" TERM; ${COMPOUND}`)
     await settle()
     const kids = childrenOf(proc.pid!)
     expect(kids.length).toBeGreaterThan(0)
@@ -138,7 +237,7 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
   })
 
   it('is a no-op on an already-exited child (never signals a REUSED pid/group)', async () => {
-    const proc = spawnBuildCommand('true', { cwd: process.cwd(), env: process.env })
+    const proc = spawnShell('true')
     await new Promise((r) => proc.once('close', r))
     expect(() => killBuildProcess(proc)).not.toThrow()
   })
@@ -153,9 +252,9 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
  *
  *  - The command is SIMPLE (`ping`), not compound. On posix a simple command is the case bash
  *    exec-replaces away, so there is no grandchild and nothing to orphan — which is why #176
- *    was a three-step edge case there. Windows has no exec-replace: `spawn(cmd, {shell:true})`
- *    is `cmd.exe /d /s /c "<command>"`, and cmd.exe launches the tool as a child and waits.
- *    So EVERY step has the extra layer, simple or not.
+ *    was a three-step edge case there. Windows has no exec-replace: a shell step is
+ *    `cmd.exe /d /s /c "<command>"`, and cmd.exe launches the tool as a child and waits — as does
+ *    an exec step whose program is a `.cmd`/`.bat` (gradlew.bat, npx.cmd), via toSpawn.
  *  - The CONTROL asserts something the posix control cannot: `close` FIRES while the tool is
  *    still alive. `proc.kill()` does kill cmd.exe, so the step loop sees a completed step and
  *    frees the build slot while `gradlew`/`java` runs on — orphaned, holding no slot, free to
@@ -240,8 +339,9 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
     spawned.length = 0
   })
 
-  const spawnAndFindTool = async (): Promise<{ proc: ReturnType<typeof spawnBuildCommand>; kids: number[] }> => {
-    const proc = spawnBuildCommand(SIMPLE, { cwd: process.cwd(), env: process.env })
+  const spawnAndFindTool = async (): Promise<{ proc: ReturnType<typeof spawnBuildStep>; kids: number[] }> => {
+    // A SHELL step, so cmd.exe sits between us and the tool — the tree this suite is about.
+    const proc = spawnShell(SIMPLE)
     // Each `childrenOf` call is a PowerShell CIM query costing ~1-3s (docs/windows.md), so a 5s
     // deadline allowed only 2-3 samples — the observed cause of the child-discovery flake above.
     // The tool runs `ping -n 30`, so 15s is still well inside its window. NOT verified on
@@ -316,7 +416,7 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
   }, 60_000)
 
   it('is a no-op on an already-exited child (never taskkills a REUSED pid)', async () => {
-    const proc = spawnBuildCommand('exit 0', { cwd: process.cwd(), env: process.env })
+    const proc = spawnShell('exit 0')
     await new Promise((r) => proc.once('close', r))
     expect(() => killBuildProcess(proc)).not.toThrow()
   }, 60_000)
@@ -343,7 +443,7 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
   }, 60_000)
 
   it('killBuildProcessSync is a no-op on an already-exited child', async () => {
-    const proc = spawnBuildCommand('exit 0', { cwd: process.cwd(), env: process.env })
+    const proc = spawnShell('exit 0')
     await new Promise((r) => proc.once('close', r))
     expect(() => killBuildProcessSync(proc)).not.toThrow()
   }, 60_000)

@@ -44,21 +44,24 @@ from an empty `command -v` is a **false blocker** — the editor bundles it.
 name whose real file is `npm.cmd` / `toktx.exe` throws `ENOENT`, which reads as "not found" —
 this is exactly how Build Support reported "Node / npm — not found" on a machine that had both.
 
-Use `whichSync()` (resolves a bare name over PATH × PATHEXT to an absolute path *before*
-probing) and `spawnable()` (decides `{shell}` and quotes accordingly), both in
-[engine/toolchain/index.ts](../engine/toolchain/index.ts). Never hand a bare name to `execFile`.
+Spawn through `toSpawn(command, args, { env })` in
+[engine/scripts/winSpawn.mjs](../engine/scripts/winSpawn.mjs) (re-exported by `engine/toolchain`):
+it resolves a bare name over PATH × PATHEXT with `whichSync()` (on the CHILD's `env` when you pass
+one) and runs a resulting `.cmd`/`.bat` through cmd.exe itself — see the next section for why that
+is not `shell:true`. Never hand a bare name to `execFile`.
 
-⚠️ Node throws `EINVAL` on spawning a `.cmd`/`.bat` without `shell:true` (the CVE-2024-27980
-fix), so "just add a `.cmd` shim" is not a workaround for an unexecutable stub either.
+⚠️ Node throws `EINVAL` on spawning a `.cmd`/`.bat` without a shell (the CVE-2024-27980 fix), so
+"just add a `.cmd` shim" is not a workaround for an unexecutable stub either.
 
 **gcloud is the same case (#1444).** On Windows the Cloud SDK's CLI is `gcloud.cmd` (beside an
-extensionless bash shim), so the two `execFileSync('gcloud', …)` calls (`/api/ota/status`, the
-OTA publish's CORS update) could never run there; they go through `execGcloudSync`
-(`engine/plugins/backend/gcloud.ts`), which is `whichSync` + `spawnable`. The same issue found the
+extensionless bash shim). Every gcloud call — `/api/ota/status`, the OTA publish, the version prune —
+goes through ONE helper, `gcloudSync` ([engine/scripts/ota/gcloud.mjs](../engine/scripts/ota/gcloud.mjs);
+`execGcloudSync` in `engine/plugins/backend/gcloud.ts` delegates to it). The same issue found the
 gcloud dir prepended to `PATH` with a literal `:` — on win32 that glues the dir onto the first
 entry, so the dir is never searched and the old first entry is lost. What still does NOT work on
-Windows: the built-in web GCS deploy (its steps are bash `find`/`for`), and gcloud auto-detection
-— a Windows user sets the gcloud path in Project Settings.
+Windows: the built-in web GCS deploy is gated off (`resolveGcloudDir`; its steps no longer need bash
+since #1537, but enabling it is a separate decision), and gcloud auto-detection — a Windows user sets
+the gcloud path in Project Settings.
 
 ### A COPY of `process.env` has no `PATH` key on Windows — it has `Path`
 
@@ -1197,6 +1200,56 @@ normalise again — `path.resolve` is platform-specific, so on POSIX a Windows-s
 `E:\Projects\x` is not absolute and gets anchored under the cwd, after which the drive letter is
 no longer leading and cannot be folded.
 
+## Never hand a shell a command line (#1537)
+
+**The rule: variable data never appears in shell text.** Every spawn is a program + argv through
+`toSpawn`; a build step is an `execStep`; the few genuinely compound build steps (the Mac-only iOS
+device install) are `shell` steps whose text only the `sh` tagged template can build, with every
+value a `ref()` carried in the child's env (`buildStepShell.ts`). `engine/tests/architecture/noShellSpawn.test.ts`
+fails on any `shell:` option but `false` and on any `child_process` `exec`/`execSync` of a
+non-constant string.
+
+**Why quoting could never close it.** cmd.exe expands `%VAR%` even INSIDE double quotes, and an
+unquoted `&` starts a second command. Observed on the win clone before the fix: the old
+`spawnable()` quoted a path for `shell:true`, and `C:\proj\%OS%\a.glb` still reached gltf-transform
+as `C:\proj\Windows_NT\a.glb`; a build step's `"…%OS%…"` expanded the same way. There is no escape
+for `%` inside quotes. (bash's twin is `$(…)` inside double quotes — #649.)
+
+**How `toSpawn` runs a batch file.** It spawns `%ComSpec% /d /v:off /s /c "<line>"` with
+`windowsVerbatimArguments`, where the line is every arg MSVCRT-quoted and then `^`-escaped OUTSIDE
+quotes for every cmd metacharacter (`%` included) — the args TWICE, because the batch re-parses them
+when it expands `%*`. Measured on the win clone: `%OS%`, `&`, `^`, `!`, `()`, `"`, a trailing `\`,
+a space, an empty arg and `a\"b` all arrive byte-exact through the real npm cmd-shim and a
+gradlew-style `.bat` (`winSpawn.test.ts` pins it, each arg alone AND together — together, one arg's
+odd quote count re-quoted the next arg's `&` and hid a single-escape mutation).
+
+**`cross-spawn` was probed and rejected**: it merges an arg ending in `\` into the next one, its `^%`
+trick fails when a variable named `OS^` exists, and it double-escapes only shims under
+`node_modules/.bin` — not `gcloud.cmd`, `gradlew.bat` or `sdkmanager.bat`.
+
+**Residuals — what `toSpawn` cannot carry, each observed:**
+- **`!` into a batch that forwards `%*` WHILE delayed expansion is on.** Measured with a synthetic
+  batch: `a!OS!b` arrives as `aWindows_NTb` and a lone `!` vanishes (`&`, `%`, `^`, `"` still exact).
+  Escaping `!` for it would leave a stray `^` in every arg of an ordinary `%*` batch. No batch the
+  engine runs does this. ⚠️ A first draft of #1537 claimed gcloud.cmd did and refused `!` for every
+  gcloud call; the review read the installed SDK (581): gcloud.cmd enables delayed expansion only to
+  probe for python and runs `SETLOCAL DisableDelayedExpansion` BEFORE its `%*` lines, and a copy of
+  the real script carried `a!OS!b` exact. The refusal was removed. Read the real script, not a
+  grep of it — the probe that missed this filtered the lines it searched.
+- **A batch that reads `%1` itself** instead of forwarding `%*` sees the caret-escaped token. Every
+  batch the engine runs forwards `%*` (npm cmd-shim, gradlew.bat, gcloud.cmd, sdkmanager.bat).
+- **A `"` inside a `shell` step's ref, on win32.** `"%X%"` expands to the value between those quotes,
+  so a `"` in it closes them and frees the rest (observed: `x"&echo INJ&"y` ran `echo INJ`).
+  `planBuildStep` refuses it; a Windows path cannot contain `"`, and no ref-bearing step runs there.
+- **An `&` in the npm cmd-shim's OWN install directory** breaks the shim before our line is involved:
+  it runs `SET dp0=%~dp0` unquoted ("\ was unexpected at this time"). npm's defect, not ours.
+- **The custom web deploy command** stays the project author's own shell text (`authoredShell`), with
+  `{dist}`/`{base}` substituted raw — an owner ruling on #1537. A project folder holding shell
+  metacharacters is the author's to quote there. ⚠️ One behaviour change on Windows: every `shell` step
+  now runs `cmd /d /v:off`, so on a machine whose registry sets `DelayedExpansion=1` the author's own
+  `!VAR!` no longer expands (before, `shell:true` passed no `/v` switch). The default Windows setting
+  is unaffected; an author who needs it writes `cmd /v:on /c …` inside the command.
+
 ## Never shell out to a platform binary whose shape you assumed
 
 `extractArchive()` used to call `tar`, which made one subprocess the single OS dependency of the
@@ -1728,7 +1781,7 @@ blamed for a defect a **function parameter** would have caught.
 
 | | what it is | how it gets covered |
 |---|---|---|
-| **platform RULE** | pure logic that merely BRANCHES on the platform — `appSupportRoot`, path-shape derivation, `needsWinShell`, `spawnable`, a reap pattern's construction | make it **injectable** (`platform`, `env`, `home`) and every leg pins EVERY branch. No runner, no minutes, no decision. |
+| **platform RULE** | pure logic that merely BRANCHES on the platform — `appSupportRoot`, path-shape derivation, `needsWinShell`, `toSpawn`/`winBatchCommandLine`, a reap pattern's construction | make it **injectable** (`platform`, `env`, `home`) and every leg pins EVERY branch. No runner, no minutes, no decision. |
 | **platform BEHAVIOUR** | what the OS actually DOES — `/var` → `/private/var` aliasing, `rmSync` unlinking a dir symlink and sparing the payload, a mount point traversed, junction semantics, whether `os.homedir()` honours `HOME` | only the platform can answer. No amount of injection reaches it. |
 
 ⚠️ **A rule wearing behaviour's clothing is the trap.** `cleanPackagedCacheLinkGuard`'s exemption case

@@ -41,11 +41,14 @@ PATH-resolved `toktx`/`gltfpack`/`java` — as **"✗ not found"**, even with th
 `whichSync` walks `PATH` × `PATHEXT` (never the extension-less shim) and requires the execute bit on
 POSIX; the absolute result also gives every PATH-found tool a usable `path`/`dir` for `withToolOnPath`.
 
-`spawnable(command, args)` is the companion: it decides whether a resolved command needs
-`{shell:true}` (a `.cmd`/`.bat` shim — see `needsWinShell`) and **quotes the command AND its args**
-when it does. Node concatenates argv into one command line for `shell:true`, so an unquoted
-`C:\Program Files\…\gltf-transform.cmd` (or an asset under `My Games\`) was split by cmd.exe. **Every
-spawn of a toolchain-resolved command should go through `spawnable`.**
+`toSpawn(command, args, { env })` is the companion (from `engine/scripts/winSpawn.mjs`, re-exported
+here): a bare name is resolved with `whichSync` on the child's PATH, and a `.cmd`/`.bat` shim (see
+`needsWinShell`) runs through cmd.exe with an escaped, verbatim command line — **never `shell:true`**.
+Its predecessor `spawnable()` quoted args for `shell:true`, which survived a space but not a `%VAR%`:
+cmd expands it inside quotes, so an asset under `C:\proj\%OS%\` reached gltf-transform as
+`C:\proj\Windows_NT\` (#1537, observed). **Every spawn of a toolchain-resolved command goes through
+`toSpawn`**, spreading its `options`; `npmSpawnSpec()` stays raw and is spawned via `spawnSpecCall`.
+Mechanism and residuals: [windows.md](windows.md) § "Never hand a shell a command line".
 
 Related helpers: `withToolOnPath(id, env)` prepends a resolved tool's dir to a child's PATH (so a tool
 that shells another by bare name — e.g. `@gltf-transform/cli` calling `toktx` — finds our copy);
@@ -455,7 +458,7 @@ via `gltfTransformInvocation()` / `gltfpackInvocation()`: prefer the resolved bi
 install), else fall back to `npx --no-install @gltf-transform/cli` / a bare PATH `gltfpack` for a dev
 checkout. Those fallbacks are the **machine's** npm, so they're refused in bundled-only mode — the
 invocation throws the tool's actionable "install it from Build Support" message instead. Every spawn
-goes through `spawnable()` so a `.cmd` shim and a path with spaces both survive.
+goes through `toSpawn()` so a `.cmd` shim and a path holding a space or `%` both survive.
 
 ## Adding a new tool
 
@@ -485,7 +488,7 @@ Two shipping targets: **macOS arm64** (`dmg` + `zip`) and **Windows x64** (`nsis
 `electron-builder.yml`. Every pinned download in the on-demand provisioners is keyed by
 `<platform>-<arch>`; the `*Provision.ts` modules already carry Windows URLs + checksums, and the
 `.exe`/`.cmd` path handling lives in `index.ts` (`whichSync` does the PATHEXT lookup, `npmToolBin` picks
-the `.cmd` shim, `spawnable()`/`needsWinShell()` force + quote `{shell:true}`,
+the `.cmd` shim, `toSpawn()`/`needsWinShell()` run a `.cmd` through an escaped cmd.exe line (no `shell:true`, #1537),
 `ffmpegToolBin`/`ffprobeToolBin` append `.exe`). So the packaged Windows editor
 provisions its own Android toolchain (Node + JDK 21 + sdkmanager all exist there) and can build Android —
 but **never iOS** (`xcodebuild` is macOS-only).
