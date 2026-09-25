@@ -91,8 +91,8 @@ if reap_repo_alive "$MAIN"; then
   reap_repo_force "$MAIN"
 fi
 
-# Let the Vite the editor owns finish dying before calling it orphaned. Electron's SIGTERM hook
-# SIGKILLs its child (devServer.ts installExitHook), but the child is not reaped the instant the
+# Let the Vite the editor owns finish dying before calling it orphaned. Electron's quit stops it and
+# its process-exit hook SIGKILLs it (devServer.ts installExitHook), but the child is not reaped the instant the
 # parent is — measured, the main process is gone within one 0.25s poll while its Vite lags. Both
 # outcomes have been observed on this machine: sometimes the Vite is gone by the second poll,
 # sometimes it outlives the whole 3s window and really is left behind. So this wait is not a
