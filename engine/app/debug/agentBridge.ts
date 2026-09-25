@@ -686,6 +686,13 @@ export function registerAgentOp(name: string, handler: AgentOpHandler): void {
   agentOps.set(name, handler);
 }
 
+/** The handler registered under `name` right now, or undefined. For a client that REPLACES a shared op
+ *  and must still run the original — the editor's `player-prefs-write` adds its envelope refusal in
+ *  front of this module's handler (#1551 review) rather than copying it. */
+export function agentOpHandler(name: string): AgentOpHandler | undefined {
+  return agentOps.get(name);
+}
+
 /** The currently-registered op names (testing / diagnostics). */
 export function listAgentOps(): string[] {
   return [...agentOps.keys()];

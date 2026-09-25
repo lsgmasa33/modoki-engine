@@ -206,7 +206,9 @@ below).
    formula collapses to "trait field always wins" in the legacy case).
 3. **Advance** — every live mixer advances by `mixerAdvanceDelta`: playing → engine *visual* delta
    (smoothed cadence × `timeScale`, so skeletal respects pause/slow-mo/time-stop); stopped/paused →
-   frozen (dt 0), **except** while the Animation editor previews (`skeletalPreviewDelta`). No
+   frozen (dt 0), with no editor-preview exception: the Animation and Timeline previews pose a rig
+   explicitly (a keyframe write, or a `skeletalSeek`), and the old "advance every mixer while
+   previewing" flag (`skeletalPreview`) was deleted as dead in #1552. No
    wall-clock read — "not playing → no animation" — which is why `scene3DSync` left the determinism
    wall-clock allowlist.
 

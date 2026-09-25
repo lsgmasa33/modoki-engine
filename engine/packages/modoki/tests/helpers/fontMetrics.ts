@@ -1,3 +1,7 @@
+/// <reference types="node" />
+// Declared HERE, not borrowed from the importer (#1544): a game's tsconfig loads `vite/client` types
+// only, so this `node:*` import compiled only in a project that happened to carry this line in some
+// OTHER file. A fresh scaffold carries none, and its first build failed on this helper.
 /**
  * Real glyph advances, read out of a shipped `.ttf` — so a width budget measures THE STRING rather
  * than a calibrated average of a charset (#1119).

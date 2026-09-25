@@ -4,7 +4,7 @@ import { whyWorldNotAuthored } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
-import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, frameRootDoc } from '../../runtime/core/ecs/identityParents';
+import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, frameRootDoc, templateFrameClimber } from '../../runtime/core/ecs/identityParents';
 import { memberRowKeysIn, memberRowsIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
 import { isPrefabEditRowGuid } from './prefabEditGuids';
 import { nestedMoveRef, toLocalIdKeys } from './overrideKeyGrammar';
@@ -271,22 +271,100 @@ function captureRowChannels(rootEcs: number, source: string, childPrefab: Prefab
   const channels = captureNestedChannels(source, ref.ownedNested, { omitUnchanged: true, template: true, readOnly, ...(deferCompare ? { baselinesOut: structureBaselines } : {}) });
   const rowed = moveChannelsOntoRows(rootEcs, childPrefab, source, { nestedStructure: channels.nestedStructure }, {}, channels.frames, { template: true });
   // R2 for this carrier: a row the load found no template node for was KEPT (`applyStoredMemberRows`, under the root's
-  // stored guid) and goes back out, as the scene writer puts its own back (`captureInstanceMembers`) — dropped, an
-  // inner template that restores the node would not get the edit back.
-  // ⚠️ ONLY under a prefab-edit world's row sentinel, whose kept rows were read from this very TEMPLATE. Under a scene
-  // root (Create Prefab over a scene instance, Apply's promotion of a reference node) the kept rows are SCENE rows —
-  // member guids, scene-guid nodes — and written into a template they would give every instance one guid (#1293,
-  // close-out re-review).
+  // guid) and goes back out, as the scene writer puts its own back (`captureInstanceMembers`) — dropped, an inner
+  // template that restores the node would not get the edit back.
+  // ⚠️ ONLY where the kept rows were read from this very TEMPLATE (`keepsTemplateRows`). Under a scene root (Create
+  // Prefab over a scene instance, Apply's promotion of a reference node) they are SCENE rows — member guids, scene-guid
+  // nodes — and written into a template they would give every instance one guid (#1293, close-out re-review).
   const eaMeta = getTraitByName('EntityAttributes');
   const rootGuid = eaMeta ? durableGuid((readTraitData(rootEcs, eaMeta) as { guid?: string } | null)?.guid) : '';
   const members: Record<string, SceneMemberRow> = { ...rowed.members };
-  const kept = isPrefabEditRowGuid(rootGuid) ? keptMemberOrphans(rootGuid) ?? {} : {};
-  for (const [key, row] of Object.entries(kept)) if (!members[key]) members[key] = row;
+  const kept = keepsTemplateRows(rootEcs, rootGuid) ? keptMemberOrphans(rootGuid) ?? {} : {};
+  for (const [key, row] of Object.entries(kept)) {
+    if (members[key]) continue;
+    const t = templateRowOf(row);
+    if (t) members[key] = t;
+  }
   return {
     channels, structureBaselines,
     nestedStructure: rowed.channels.nestedStructure,
     members: Object.keys(members).length ? members : undefined,
   };
+}
+
+/** A kept row as a TEMPLATE writes it: no member identity (`guid`, `name`), no scene move (`parent`), and each SCENE
+ *  node in it (one carrying a guid) as a template node; undefined when nothing is left. Two sources fill the store: the
+ *  load keeps a template's own rows, already in this form, and a Refresh's settle keeps what a SCENE save would write
+ *  (`savedMemberRows`), which has to stay in that form for the settle's own live replay to put each member's guid
+ *  back. So the conversion is here, at the re-emit, and touches only the scene parts: a template node passes through
+ *  whole, its own `members` included. Re-emitted unconverted, a member a Refresh dropped came back out of the next
+ *  prefab-edit save carrying its edit-world guid (#1293; found by the #1541/#1542 close-out review, older than both).
+ *  A scene node needs its `key` already (`keySceneNodes`, read while it was live), or `toTemplateNodes` mints a new one
+ *  on every save. A scene reference node keeps its own rows, each converted the same way. */
+function templateRowOf(row: SceneMemberRow): SceneMemberRow | undefined {
+  const { guid: _guid, name: _name, parent: _parent, ...rest } = row;
+  const out: SceneMemberRow = { ...rest };
+  // A node is a scene node when anything in its subtree holds a guid: a node whose own guid is a runtime one is
+  // written `guid: ''` by the scene capture, and its durable child would otherwise pass through (close-out re-review).
+  const holdsGuid = (n: AddedEntity): boolean => !!n.guid || [...(n.children ?? []), ...(n.added ?? [])].some(holdsGuid);
+  const node = (n: AddedEntity): AddedEntity => {
+    if (!holdsGuid(n)) return n;
+    const t = toTemplateNodes([n])![0]!;
+    // A scene REFERENCE node's own rows are keyed as a template's are (member identity paths); only their identity goes.
+    const rows = n.prefab && n.members ? templateRowsOf(n.members) : undefined;
+    return rows ? { ...t, members: rows } : t;
+  };
+  if (rest.own) out.own = rest.own.map(node);
+  if (rest.added) out.added = rest.added.map(node);
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** {@link templateRowOf} over a row set, leaving out the rows nothing is left of. */
+function templateRowsOf(rows: Record<string, SceneMemberRow>): Record<string, SceneMemberRow> | undefined {
+  const out: Record<string, SceneMemberRow> = {};
+  for (const [k, r] of Object.entries(rows)) { const t = templateRowOf(r); if (t) out[k] = t; }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** `rows` with every scene node in them carrying the template key of the live entity it is — marker, else recovered,
+ *  else minted once here — so `templateRowOf` can write it after that entity is gone. The guid stays: the settle's live
+ *  replay respawns the node by it. */
+function keySceneNodes(rows: Record<string, SceneMemberRow>): Record<string, SceneMemberRow> {
+  const keyed = (nodes: AddedEntity[] | undefined): AddedEntity[] | undefined => nodes?.map((n) => {
+    const live = n.guid ? localToEcsGuid(n.guid) : 0;
+    const key = n.key || (live ? templateKeyOf(findEntity(live)) || recoverTemplateKey(live) : '') || newGuid();
+    const out: AddedEntity = { ...n, key, children: keyed(n.children) ?? [] };
+    if (n.added) out.added = keyed(n.added);
+    if (n.members) out.members = keySceneNodes(n.members);
+    return out;
+  });
+  return Object.fromEntries(Object.entries(rows).map(([k, r]) => [k, {
+    ...r, ...(r.own ? { own: keyed(r.own) } : {}), ...(r.added ? { added: keyed(r.added) } : {}),
+  }]));
+}
+
+/** Were the rows kept for the root `rootEcs` (guid `rootGuid`) read from the template being written? — the #1293 gate on
+ *  R2's re-emit. Two carriers qualify, both only inside the prefab-edit world:
+ *  - a prefab ROW, spawned as a scene entry under its row sentinel, whose rows the load read off that entry;
+ *  - a TEMPLATE reference node that such an entry's own statements declare (#1542): it stores no guid and derives one,
+ *    and the load kept its rows under that (`keepTemplateNodeOrphans`). Its root carries a template key and sits
+ *    below a row sentinel. A scene never holds one — a scene-form reference node stores a guid (#1438) — so the
+ *    sentinel ancestor is what separates the two. */
+function keepsTemplateRows(rootEcs: number, rootGuid: string): boolean {
+  if (isPrefabEditRowGuid(rootGuid)) return true;
+  // The marker, or the key recovered from the root's derived guid: a rebuild respawns the node without its marker, and a
+  // second Refresh before any save read it as no template node at all (#1541/#1542 close-out re-review).
+  if (!rootGuid || !(templateKeyOf(findEntity(rootEcs)) || recoverTemplateKey(rootEcs))) return false;
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!eaMeta) return false;
+  const seen = new Set<number>();
+  for (let id = rootEcs; id && !seen.has(id);) {
+    seen.add(id);
+    const ea = readTraitData(id, eaMeta) as { guid?: string; parentId?: number } | null;
+    if (id !== rootEcs && isPrefabEditRowGuid(ea?.guid)) return true;
+    id = ea?.parentId ?? 0;
+  }
+  return false;
 }
 
 /** The template write of a row's captured channels (`captureRowChannels` with `deferCompare`): every payload
@@ -353,13 +431,18 @@ function declaredTemplateKeys(written: Parameters<typeof templateKeysOf>[0], sou
  *  non-empty frame whole, no member rows, payload untokenized — so an untouched save pinned the inner prefab's own
  *  statements into the outer file, and a member ref inside it kept the edit world's live guid, naming nothing in any
  *  instance. Now: the row writer (`captureRowChannels`: frames per member, omitted when unchanged), tokenized in the
- *  node's OWN frame (the loaders open a token scope at its top call and never resolve a `^` out of it), then the
- *  shared finish. No kept orphan rows go back out: the node's root never carries the prefab-edit row sentinel.
+ *  node's OWN frame (the loaders open a token scope at its top call), climbing out of it only for a ref no frame inside
+ *  can name (#1541, `templateTokenizer`'s `ownFrame`), then the shared finish. Its kept orphan rows go back out inside the prefab-edit world (#1542), under the guid its root derives:
+ *  the load keeps them there (`keepTemplateNodeOrphans`), and `keepsTemplateRows` gates the re-emit.
  *
  *  `readOnly` (a comparison, not a write): read each node's template key, never mint or stamp one. */
 function finishTemplateReferenceNode(
   ecsId: number, source: string, childPrefab: PrefabFile, readOnly: boolean,
 ): { ref: InstanceReference; consumedEcsIds: Set<number>; channels: Pick<AddedEntity, 'overrides' | 'added' | 'removed' | 'removedTraits' | 'moved' | 'nestedOverrides' | 'nestedStructure' | 'members'> } {
+  // The node's key before anything reads it: `keepsTemplateRows` and the climb out of the node (`templateFrameClimber`)
+  // both ask it, and a Refresh respawns the node from a scene-form capture that carries none. The caller stamps it
+  // anyway (`addedNodeIdentity`); after the capture was too late (#1541/#1542 close-out review).
+  if (!readOnly) addedNodeIdentity(ecsId, true);
   const ref = captureInstanceReference(ecsId, source, childPrefab, { template: true, readOnly });
   const rc = captureRowChannels(ecsId, source, childPrefab, ref, true, readOnly);
   const tokens = templateTokenizer(ecsId, filterAuthoringVisible(getAllEntities()), new Map(), new Map(), true);
@@ -561,8 +644,12 @@ function authoringEntitiesFor(selectedEntityId: number, all: EntityInfo[]): { en
  *
  *  `ownFrame`: `rootEcsId` is a template REFERENCE node's live root rather than the written root. Its
  *  frame is then indexed as every other instance frame is (`memberPathIndex`, what the loader resolves
- *  a token against), and nothing encloses it — the loader never resolves a `^` out of the node's own
- *  top call, so a ref only an outer frame can name stays a guid. */
+ *  a token against). A ref no frame inside the node can name climbs OUT of its root the way the loader
+ *  climbs (`templateFrameClimber`, #1541): to the instance holding the node, then the frames around it,
+ *  still to the nearest that names it. Under `serializePrefab` it stays below the root being written:
+ *  that root's frame is named by the new localIds, which do not exist yet while rows are planned, so a
+ *  guid the climb could not name there is left as an exit marker for `serializePrefab` to finish
+ *  (`nodeExits`). In the prefab-edit world the climb ends at the row entry for the same reason. */
 function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLocal: Map<number, number>, rowParent: Map<number, number> = new Map(), ownFrame = false) {
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
@@ -625,14 +712,61 @@ function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLocal: Map
   };
   /** token → the guid it was written for, so `undeclaredKeys` can put one back. */
   const origin = new Map<string, string>();
+  /** The tokens that climbed out of a reference node's root: their keys are the enclosing file's to declare, which
+   *  only the outer write can see (`nodeExits.origins`), so the node's own `undeclaredKeys` leaves them alone. */
+  const exited = new Set<string>();
+  let climb: ReturnType<typeof templateFrameClimber> | undefined;
+  let liveGuids: Set<string> | undefined;
+  const parentById = new Map(all.map((e) => [e.id, e.parentId]));
+  /** Is `frame` strictly below the root `serializePrefab` is writing (`nodeExits.root`)? */
+  const belowWrittenRoot = (frame: number): boolean => {
+    const seen = new Set<number>();
+    for (let p = parentById.get(frame) ?? 0; p && !seen.has(p); p = parentById.get(p) ?? 0) {
+      if (p === nodeExits?.root) return true;
+      seen.add(p);
+    }
+    return false;
+  };
   const value = (v: unknown, frame: number): unknown => mapStringValues(v, (str) => {
     if (!str) return str;
-    for (let f = frame, up = 0; f; f = enclosing(f), up++) {
+    let up = 0;
+    for (let f = frame; f; f = enclosing(f), up++) {
       const p = pathsIn(f).get(str);
       if (p) { const t = memberToken(up, p); origin.set(t, str); return t; }
     }
+    if (!ownFrame) return str;
+    // Out of the node's root, as the loader resolves a `^` left over at the node's top call (#1541). Inside a
+    // `serializePrefab` the climb stays inside the tree being written, below its root: the root's own frame is named by
+    // the NEW localIds (`nameAtRoot`, once they exist), and a frame outside the tree is not the file's to name. So
+    // the climb stops at the root, at the edge of the tree, or where no frame is left (a prefab-edit row entry, whose
+    // next frame is the edited prefab's root) — and a live guid it stops on becomes an exit marker.
+    climb ??= templateFrameClimber(getCurrentWorld());
+    for (let f = climb(rootEcsId, 1); f && (!nodeExits || belowWrittenRoot(f)); f = climb(f, 1), up++) {
+      const p = pathsIn(f).get(str);
+      if (!p) continue;
+      const t = memberToken(up, p);
+      origin.set(t, str);
+      exited.add(t);
+      nodeExits?.origins.set(t, str);
+      return t;
+    }
+    if (nodeExits && (liveGuids ??= new Set(all.map((e) => e.guid).filter((g): g is string => !!g))).has(str)) {
+      const marker = `${NODE_EXIT_PREFIX}${nodeExits.markers.size}`;
+      nodeExits.markers.set(marker, { up, guid: str });
+      return marker;
+    }
     return str;
   });
+  /** The token the written root's frame names `guid` by, `up` climbs out — an exit marker's finish. */
+  const nameAtRoot = (guid: string, up: number): string | undefined => {
+    const p = pathInRoot.get(guid);
+    if (!p) return undefined;
+    const t = memberToken(up, p);
+    origin.set(t, guid);
+    return t;
+  };
+  /** Adopt the origins of tokens a reference node's writer climbed out with, so `undeclaredKeys` can put them back. */
+  const adoptOrigins = (from: ReadonlyMap<string, string>): void => { for (const [t, g] of from) if (!origin.has(t)) origin.set(t, g); };
   /** `v` with every token that steps through a key no file declares turned back into its guid. The key
    *  was minted for a live node the write then left out, because the file's pre-key version of that
    *  interior still counts as unchanged (`sameStructure`). A token for it would name nothing on
@@ -641,7 +775,7 @@ function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLocal: Map
    *  copy derived its guid through that key. The slot drops, the reload spawns the node's own legacy guid,
    *  and the guid written here names nothing either (#1538 close-out; docs/prefab-structural-overrides.md). */
   const undeclaredKeys = (v: unknown, declared: ReadonlySet<string>): unknown => mapStringValues(v, (str) => {
-    const t = isMemberToken(str) ? parseMemberToken(str) : null;
+    const t = isMemberToken(str) && !exited.has(str) ? parseMemberToken(str) : null;
     if (!t || !t.path.some((step) => typeof step === 'string' && !isFrameStep(step) && !declared.has(step.slice(1)))) return str;
     return origin.get(str) ?? str;
   });
@@ -679,30 +813,31 @@ function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLocal: Map
   };
   /** A live entity's path in the written prefab's frame, or undefined when it is not one it can name. */
   const pathOf = (id: number): MemberStep[] | undefined => pathById.get(id);
-  return { value, added, frameAt, undeclaredKeys, pathOf, root: rootEcsId };
+  return { value, added, frameAt, undeclaredKeys, pathOf, nameAtRoot, adoptOrigins, root: rootEcsId };
 }
+
+/** Exit markers stand in, inside a template reference node's payload, for a ref only the edited prefab's written ROOT
+ *  can name (#1541). The prefab-edit world spawns each row as a scene entry, so the node's writer, which runs while
+ *  `serializePrefab` is still planning its rows, cannot name that root's rows yet: it writes a marker, and
+ *  `serializePrefab` replaces it with the token (`nameAtRoot`) once it has the rows' new localIds. Set only while
+ *  `serializePrefab` plans its rows; a marker it cannot name is written back as the guid it stood for, so none
+ *  reaches a file. Not a member token (`isMemberToken` is false), so no token pass reads one. */
+const NODE_EXIT_PREFIX = '@member-exit:';
+let nodeExits: { root: number; markers: Map<string, { up: number; guid: string }>; origins: Map<string, string> } | null = null;
 
 /** Resolves the member tokens in a prefab BASE value against the live instance rooted at
  *  `rootInstanceId`, so it can be compared with the live value, which holds guids (#1352). A `^`
- *  climbs to the instance whose row expanded this one. A token that names nothing stays as it is. */
+ *  climbs as the loader climbs (`templateFrameClimber`): to the instance whose row expanded this one —
+ *  its owner, for a moved nested root (#1437) — and out of a template reference node's root to the
+ *  instance holding it (#1541). A token that names nothing stays as it is. */
 export function baseTokenResolver(rootInstanceId: number): (value: unknown) => unknown {
   const world = getCurrentWorld();
-  const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
   const indexes = new Map<number, ReturnType<typeof memberPathIndex>>();
-  let identity: ReturnType<typeof worldIdentityParents> | undefined;
-  const frameUp = (root: number, up: number): number => {
-    let r = root;
-    for (let i = 0; i < up && r; i++) {
-      const pi = piMeta ? readTraitData(r, piMeta) : null;
-      if (!pi?.parentLocalId || !eaMeta) return 0; // a stored root is its own frame: nothing above it
-      r = (identity ??= worldIdentityParents(world)).ownerOf(r); // a moved nested root's frame is its owner's (#1437)
-    }
-    return r;
-  };
+  let climb: ReturnType<typeof templateFrameClimber> | undefined;
   const resolve = (token: string): string => {
     const t = parseMemberToken(token);
-    const frame = t ? frameUp(rootInstanceId, t.up) : 0;
+    const frame = !t ? 0 : t.up ? (climb ??= templateFrameClimber(world))(rootInstanceId, t.up) : rootInstanceId;
     if (!t || !frame || !eaMeta) return token;
     let index = indexes.get(frame);
     if (!index) { index = memberPathIndex(world, frame); indexes.set(frame, index); }
@@ -866,7 +1001,11 @@ export function serializePrefab(
   const tree = collectTree(selectedEntityId, allEntities);
   if (tree.length === 0) return null;
 
-  const plan = planPrefabRows(tree, selectedEntityId, existingId, opts?.preserveLocalIds);
+  const exits: NonNullable<typeof nodeExits> = { root: selectedEntityId, markers: new Map(), origins: new Map() };
+  const outerExits = nodeExits;
+  nodeExits = exits;
+  let plan: ReturnType<typeof planPrefabRows>;
+  try { plan = planPrefabRows(tree, selectedEntityId, existingId, opts?.preserveLocalIds); } finally { nodeExits = outerExits; }
   if (!plan) return null; // cycle — planPrefabRows already reported it
   const { nestedRefs, flatTree, ecsToLocal } = plan;
 
@@ -878,6 +1017,7 @@ export function serializePrefab(
   // A ref from one member of the written tree to another becomes a member TOKEN (#1352): the file is a
   // template, and the live guid it held names the SOURCE entity in every instance.
   const tokens = templateTokenizer(selectedEntityId, allEntities, ecsToLocal, rowParent);
+  tokens.adoptOrigins(exits.origins);
 
   for (const entityInfo of flatTree) {
     const localId = ecsToLocal.get(entityInfo.id)!;
@@ -986,6 +1126,19 @@ export function serializePrefab(
         if (typeof v !== 'string' || !v || isGuid(v)) continue;
         const g = getGuidForPath(v);
         if (g) obj[field] = g;
+      }
+    }
+  }
+
+  // A template reference node's refs to the written root's own members, marked while the rows were planned (#1541).
+  if (exits.markers.size) {
+    const finish = (v: unknown): unknown => mapStringValues(v, (s) => {
+      const m = exits.markers.get(s);
+      return m ? tokens.nameAtRoot(m.guid, m.up) ?? m.guid : s;
+    });
+    for (const pe of prefabEntities) {
+      for (const field of ['added', 'nestedStructure', 'members'] as const) {
+        if (pe[field]) (pe as unknown as Record<string, unknown>)[field] = finish(pe[field]);
       }
     }
   }
@@ -5941,6 +6094,9 @@ function captureRowsForSettle(
   prefabCache.set(source, baseline);
   let rows: Record<string, SceneMemberRow>;
   try { rows = savedMemberRows(rowRoot, rowSource); } finally { if (current) prefabCache.set(source, current); else prefabCache.delete(source); }
+  // In the prefab-edit world the rows kept here go back into the TEMPLATE (`captureRowChannels` → `templateRowOf`), which
+  // needs each node's key: read now, while the node is still live (#1541/#1542 close-out review).
+  if (keepsTemplateRows(rowRoot, rowRootGuid)) rows = keySceneNodes(rows);
   const before = remapGuidValues(Object.fromEntries(Object.entries(rows).filter(([k]) => torn(k))), remap) as Record<string, SceneMemberRow>;
   // The row-writing root is the rebuilt root itself, respawned as `newRootId`, or a stored root ENCLOSING it, which
   // the teardown does not reach and whose id therefore stands.

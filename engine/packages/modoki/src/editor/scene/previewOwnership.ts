@@ -24,8 +24,8 @@ export type PreviewOwner = 'timeline' | 'animation';
  *  Strict: an unclaimed preview (`owner === null`) drives NOTHING. An earlier cut let either panel
  *  drive when unclaimed, to keep a programmatic `setPreviewPlaying(true)` working — but that is
  *  #810 verbatim on that path (both panels run, the Timeline lands second, wins the mode and stops
- *  the other's loop), and the e2e it was written for asserts `isSkeletalPreviewing() === false`,
- *  which passes either way. So the fallback protected nothing and re-armed the bug; every caller
+ *  the other's loop), and the e2e it was written for asserted a skeletal-preview flag that nothing
+ *  could set any more (#1552), so it passed either way. So the fallback protected nothing and re-armed the bug; every caller
  *  names its panel instead, and `setPreviewPlaying` warns in DEV if one does not. Nothing playing
  *  is the safe failure here; two panels fighting over a single-valued RunMode is not. */
 export function panelDrivesPreview(

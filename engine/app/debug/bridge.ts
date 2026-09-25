@@ -274,7 +274,9 @@ async function resolveSelectorPoint(selector: string, gesture: AimGesture | unde
 
 /** Resolve an aim point from an ENTITY (`{guid|name|id, surface}`, #1223 P3), a CSS `selector`
  *  (resolved + occlusion-checked on-device), or screenshot pixel coords (converted via the last
- *  capture) — in that precedence, the editor routes' order (`resolvePoint`). `selKey`/`xKey`/`yKey`
+ *  capture), read in that order. The order is NOT a caller-facing precedence: the device MCP refuses
+ *  a caller's two addresses (#1556), so it only ever arbitrates the entity against the MCP's own
+ *  `ENTITY_AIM_SKEW_SELECTOR`. `selKey`/`xKey`/`yKey`
  *  name the params (tap uses selector/x/y; drag uses fromSelector/fromX/fromY and
  *  toSelector/toX/toY); the entity and `allowOccluded` keys follow from `selKey` (`deviceAimKeys`).
  *  A miss or a covered target returns a refusal (surfaced as isError by the MCP client). */

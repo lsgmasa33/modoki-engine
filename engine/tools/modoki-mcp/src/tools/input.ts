@@ -44,7 +44,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       // The example must name a selector that EXISTS: `inspector.header.kebab` did not (the
       // Inspector has no kebab menu at all), and being the docstring example is exactly how a
       // wrong selector propagates — it was copied into a QA case brief before anyone checked.
-      selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.delete\"]'. Overrides x/y."),
+      selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.delete\"]'. Not with x/y, label or entity."),
       label: makeLabelAimParam(),
       within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
@@ -103,7 +103,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       action: z.enum(POINTER_ACTIONS).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
-      selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Overrides x/y.'),
+      selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Not with x/y, label or entity.'),
       label: makeLabelAimParam(),
       within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
@@ -124,7 +124,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     {
       x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
-      selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
+      selector: z.string().optional().describe('CSS selector to aim at. Not with x/y, label or entity.'),
       label: makeLabelAimParam(),
       within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
@@ -149,7 +149,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     {
       x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
-      selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
+      selector: z.string().optional().describe('CSS selector to aim at. Not with x/y, label or entity.'),
       label: makeLabelAimParam(),
       within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
@@ -327,7 +327,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'Synthesize an HTML5 drag-and-drop (dragstart→dragover→drop) — the DnD interactions a ' +
       'trusted pointer-drag CANNOT emit: Hierarchy reparent/reorder, Assets file-move & ' +
       'prefab-instantiate, Skin sprite-onto-part / part-reorder / bone-reparent (a canvas or gizmo drag is modoki_drag). Address ' +
-      'each endpoint by CSS `selector` (targets its center) OR viewport `{x,y}`. Lets the ' +
+      'each endpoint by CSS `selector` (targets its center) OR viewport `{x,y}` — both is AMBIGUOUS. Lets the ' +
       "app's own dragstart handler fill the DataTransfer (never fabricated). Returns the " +
       'MIME `types` written (empty ⇒ wrong source element) and `accepted` (target took the ' +
       'drop). AIM: this is the ONE input tool that cannot be aimed by `entity` — HTML5 DnD is a ' +

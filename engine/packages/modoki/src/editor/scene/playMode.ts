@@ -367,6 +367,16 @@ export function enterPreviewMode(advancing: boolean, owner: string): void {
   notifyDisplaced(previousOwner, owner);
 }
 
+/** Pause: hold the live preview as a FROZEN frame (`preview` + `advancing:false`, session still held),
+ *  but only when `owner`'s preview is still the live mode. A scrub/⏮ that already set `scrub`, a
+ *  teardown that already returned to `stopped`, or another panel that took the mode is left alone —
+ *  freezing then would clobber that transition or steal the mode back. #1552: the Animation panel's
+ *  pause never called anything, so a paused ▶ kept reporting an advancing preview. */
+export function freezePreviewIfOwnedBy(owner: string): void {
+  if (getRunMode() !== 'preview' || _modeOwner !== owner) return;
+  setRunMode('preview', { advancing: false });
+}
+
 /** Return to `stopped` from a scrub/preview (panel teardown, world-swap, asset-switch). No-op
  *  during Play (Stop owns play→stopped) AND when a DIFFERENT panel owns the live mode — a second
  *  editor must never tear down another's active preview/scrub (review H1). */

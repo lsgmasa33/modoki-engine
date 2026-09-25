@@ -21,6 +21,7 @@ import { simStepDefaultTimeout, SIM_STEP_MAX_FRAMES } from '../../shared/simStep
 import { DEVICE_KEY_MODIFIERS, KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../shared/inputVocabulary.js';
 import { ALLOW_OCCLUDED_BASE, ALLOW_OCCLUDED_NESTED, ENTITY_AIM_BASE, SURFACE_AIM_BASE, sameAs } from '../../shared/aimVocabulary.js';
 import { nestedUnknownKeyMessage } from '../../shared/unknownParam.js';
+import { aimAddresses, ambiguousAimMessage } from '../../shared/aimAddresses.js';
 import { CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, vocabularyProse, type CreateEntityKind } from '../../shared/createEntityVocabulary.js';
 import { ignoredHandleFilter, parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../shared/handlesReply.js';
 import { INVALIDATABLE_ASSET_TYPES } from '../../shared/invalidateAssets.js';
@@ -135,13 +136,34 @@ const makeDeviceCreateEntitySpec = () => z.discriminatedUnion('kind', CREATE_ENT
  *  viewport-centre default: `device_scroll {entity}` scrolled the centre and answered ok. */
 export const ENTITY_AIM_SKEW_SELECTOR = '[data-modoki-app-predates-entity-aim]';
 
-/** The aim half of a request: the entity (with the skew selector when no real one rides along) and/or
- *  the caller's selector. Precedence on the page is entity → selector, so a real selector is kept. */
+/** The aim half of a request: the entity with the skew selector beside it, or the caller's selector.
+ *  A caller's entity AND selector never reach here — `ambiguousDeviceAim` refused them (#1556) — so the
+ *  page's entity-first order only ever arbitrates the skew selector. */
 function aimWire(entity: DeviceEntityAim | undefined, selector: string | undefined, prefix = ''): Record<string, unknown> {
   const sel = prefix ? `${prefix}Selector` : 'selector';
   const ent = prefix ? `${prefix}Entity` : 'entity';
   if (!hasEntityAim(entity)) return selector ? { [sel]: selector } : {};
-  return { [ent]: entity, [sel]: selector || ENTITY_AIM_SKEW_SELECTOR };
+  return { [ent]: entity, [sel]: ENTITY_AIM_SKEW_SELECTOR };
+}
+
+/** A device aim giving two addresses, refused as the editor's is (#1556) — or null. Checked on the
+ *  CALLER's spec, before `aimWire` adds `ENTITY_AIM_SKEW_SELECTOR`, which is the one deliberate second
+ *  address on the wire. `ends` maps an endpoint name (`''` for a single-point aim) to its spec. */
+function ambiguousDeviceAim(
+  tool: string, what: string,
+  ends: Record<string, { entity?: DeviceEntityAim; selector?: string; x?: number; y?: number }>,
+): DeviceResult | null {
+  for (const [end, spec] of Object.entries(ends)) {
+    const msg = ambiguousAimMessage(aimAddresses(spec));
+    if (!msg) continue;
+    return deviceFail({
+      code: 'AMBIGUOUS', tool, what,
+      why: `${end ? `the ${end} endpoint: ` : ''}${msg} Nothing was sent.`,
+      got: spec,
+      options: ['aim by ONE of entity (preferred), selector, or x+y in screenshot pixels'],
+    });
+  }
+  return null;
 }
 
 /** An entity aim that names something. `{}` is not one — the page would fall through to selector/x,y. */
@@ -1570,7 +1592,7 @@ export function registerTools(server: McpServer) {
       '`surface` for a 2D/3D entity) resolves to the entity\'s live screen rect ON the device inside this ' +
       'call, and a CSS `selector` (e.g. a button) to the element centre — both occlusion-checked, both ' +
       'needing no screenshot. Otherwise pass screenshot pixel `x`/`y` (take a device_screenshot first). ' +
-      'Precedence entity → selector → x/y, as in modoki_tap. A covered target is REFUSED (`OCCLUDED`) ' +
+      'Aim by ONE of entity / selector / x,y — two are refused (AMBIGUOUS), as in modoki_tap. A covered target is REFUSED (`OCCLUDED`) ' +
       'unless `allowOccluded:true`; a missed entity is `NOT_FOUND` (with `stale` when a runtime guid ' +
       'outlived its world), an ambiguous name `AMBIGUOUS` with the guids as options. ' +
       'TRUSTED OS-level input when a route is available — CDP on Android, WebDriverAgent on iOS ' +
@@ -1579,11 +1601,13 @@ export function registerTools(server: McpServer) {
     {
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device to the element center; refuses if occluded). Preferred for DOM targets.'),
-      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Used when no entity or selector.`),
+      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Only without entity/selector.`),
       y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
       allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
     },
     async ({ entity, selector, x, y, allowOccluded }) => {
+      const twoAddresses = ambiguousDeviceAim('device_tap', 'tap on the device', { '': { entity, selector, x, y } });
+      if (twoAddresses) return twoAddresses;
       const resolvable = hasEntityAim(entity) || !!selector;
       if (!resolvable && (x == null || y == null)) {
         return deviceFail({
@@ -1677,6 +1701,11 @@ export function registerTools(server: McpServer) {
       }
       const f = endpointOf(from, fromSelector, fromX, fromY);
       const t = endpointOf(to, toSelector, toX, toY);
+      const twoAddresses = ambiguousDeviceAim('device_drag', 'drag on the device', {
+        from: { entity: f.entity, selector: f.selector, x: f.x, y: f.y },
+        to: { entity: t.entity, selector: t.selector, x: t.x, y: t.y },
+      });
+      if (twoAddresses) return twoAddresses;
       const haveFrom = f.resolvable || (f.x != null && f.y != null);
       const haveTo = t.resolvable || (t.x != null && t.y != null);
       if (!haveFrom || !haveTo) {
@@ -1746,12 +1775,14 @@ export function registerTools(server: McpServer) {
       action: z.enum(POINTER_ACTIONS).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device; refuses if occluded). Preferred for DOM targets.'),
-      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Used when no entity or selector.`),
+      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Only without entity/selector.`),
       y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
       allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}. Applies to action:'down' only — a move/up is delivered to whatever captured the press.`),
     },
     async ({ action, entity, selector, x, y, button, allowOccluded }) => {
+      const twoAddresses = ambiguousDeviceAim('device_pointer', 'pointer on the device', { '': { entity, selector, x, y } });
+      if (twoAddresses) return twoAddresses;
       const resolvable = hasEntityAim(entity) || !!selector;
       if (!resolvable && (x == null || y == null)) {
         return deviceFail({
@@ -2295,11 +2326,13 @@ async function coordScaleOrRefusal(
     {
       entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to hover (preferred for DOM targets).'),
-      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Used when no entity or selector.`),
+      x: z.number().optional().describe(`X ${SCREENSHOT_PX}. Only without entity/selector.`),
       y: z.number().optional().describe(`Y ${SCREENSHOT_PX}.`),
       allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
     },
     async ({ entity, selector, x, y, allowOccluded }) => {
+      const twoAddresses = ambiguousDeviceAim('device_hover', 'hover on the device', { '': { entity, selector, x, y } });
+      if (twoAddresses) return twoAddresses;
       const resolvable = hasEntityAim(entity) || !!selector;
       if (!resolvable && (x == null || y == null)) {
         return deviceFail({
@@ -2376,6 +2409,8 @@ async function coordScaleOrRefusal(
       // A coordinate-aimed scroll needs the same screenshot->CSS scale a tap does; without it an
       // adb lease scrolls over the wrong point and reports ok. (A scroll with NEITHER selector nor
       // coords is aimed at the viewport centre on-device, which needs no scale.)
+      const twoAddresses = ambiguousDeviceAim('device_scroll', 'scroll on the device', { '': { entity, selector, x, y } });
+      if (twoAddresses) return twoAddresses;
       const resolvable = hasEntityAim(entity) || !!selector;
       const byCoords = !resolvable && (x != null || y != null);
       const scale = await coordScaleOrRefusal('device_scroll', `scroll at (${x},${y}) on the adb-connected device`, !byCoords);

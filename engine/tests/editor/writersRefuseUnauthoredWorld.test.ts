@@ -139,3 +139,152 @@ describe('whyWorldNotAuthored — the sources, and the Stop reload window (#1548
     expect(isWorldAuthored()).toBe(true);
   });
 });
+
+describe('the live-world agent ops refuse an envelope instead of replying ok (#1552)', () => {
+  it('create / duplicate / delete / reparent / prefab instantiate each refuse, change nothing, and name the exit', async () => {
+    const g = createTestWorld({});
+    try {
+      const a = g.spawn(EntityAttributes({ name: 'A', guid: 'g-a-1552' } as never), Transform({} as never));
+      const b = g.spawn(EntityAttributes({ name: 'B', guid: 'g-b-1552' } as never), Transform({} as never));
+      const count = () => g.world.query(EntityAttributes).length;
+      const before = count();
+      setRunMode('stopped');
+      enterScrubMode('animation');
+      // MUTATION TARGET: drop `refuseEditOfPosedWorld` from any one op and its call resolves (or fails
+      // for an unrelated reason that does not name the envelope).
+      const calls: Array<[string, unknown]> = [
+        ['create-entity', { spec: { kind: 'empty' } }],
+        ['duplicate-entity', { guid: 'g-a-1552' }],
+        ['delete-entities', { guids: ['g-a-1552'] }],
+        ['reparent-entity', { guid: 'g-b-1552', parentGuid: 'g-a-1552' }],
+        ['prefab', { action: 'instantiate', path: '/assets/prefabs/none.prefab.json' }],
+        ['prefab', { action: 'detach', entityGuid: 'g-a-1552' }],
+        ['prefab', { action: 'revert', entityGuid: 'g-a-1552' }],
+      ];
+      for (const [op, params] of calls) {
+        const err = await runAgentOp(op, params).then(() => null, (e: unknown) => e as { message?: string; options?: string[] });
+        expect(err?.message, op).toMatch(/refused: run-mode is 'scrub'.*owned by the animation panel.*Nothing was changed/);
+        expect(err?.options?.[0], op).toMatch(/^modoki_exit_pose_envelope/);
+      }
+      expect(count()).toBe(before);
+      expect(b.get(EntityAttributes)!.parentId).not.toBe(a.id());
+
+      // ACCEPT SIDE: out of the envelope the same create goes through.
+      exitPreviewMode('animation');
+      await runAgentOp('create-entity', { spec: { kind: 'empty' } });
+      expect(count()).toBe(before + 1);
+      // …and Play is exempt on purpose: editing the play world is how an agent drives a running game.
+      setRunMode('playing');
+      await runAgentOp('create-entity', { spec: { kind: 'empty' } });
+      expect(count()).toBe(before + 2);
+    } finally { setRunMode('stopped'); g.dispose(); }
+  });
+});
+
+describe('outside an envelope the refusal names the exit that exists (#1552 review)', () => {
+  it('a restore still landing says retry; a FAILED restore says reload — neither offers ⏹ Exit Preview', async () => {
+    const g = createTestWorld({});
+    try {
+      setRunMode('stopped');
+      let land!: () => void;
+      const load = vi.spyOn(sceneManager, 'loadScene').mockImplementation(() => new Promise((r) => { land = () => r({} as never); }) as never);
+      const restoring = restoreAuthoredSnapshot({ primary: { entities: [] } as never, key: '/s.json', bases: new Map() });
+      const landing = await runAgentOp('create-entity', { spec: { kind: 'empty' } }).then(() => null, (e: unknown) => e as { message?: string; options?: string[] });
+      // MUTATION TARGET: hand every reason the envelope exits and this names ⏹ Exit Preview.
+      expect(landing?.message).toMatch(/restore is still landing.*about to be replaced/);
+      expect(landing?.options).toEqual([expect.stringMatching(/^retry in a moment/)]);
+      land(); await restoring;
+
+      load.mockImplementation(() => Promise.reject(new Error('disk gone')) as never);
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      await restoreAuthoredSnapshot({ primary: { entities: [] } as never, key: '/s.json', bases: new Map() }).catch(() => {});
+      const failed = await runAgentOp('create-entity', { spec: { kind: 'empty' } }).then(() => null, (e: unknown) => e as { message?: string; options?: string[] });
+      expect(failed?.message).toMatch(/FAILED/);
+      expect(failed?.options).toEqual([expect.stringMatching(/^modoki_load_scene/)]);
+      err.mockRestore();
+    } finally {
+      // A failed restore stays flagged until a world swap — make one, as a reload from disk would.
+      const { getCurrentWorld, setCurrentWorld } = await import('../../packages/modoki/src/runtime/core/ecs/worldRegistry');
+      const { createWorld } = await import('koota');
+      const before = getCurrentWorld(); const scratch = createWorld();
+      setCurrentWorld(scratch); setCurrentWorld(before); scratch.destroy();
+      g.dispose();
+    }
+  });
+
+  it('player-prefs-write: outside an envelope a set goes through', async () => {
+    const { PlayerPrefs, InMemoryBackend, resetPlayerPrefsForTest } = await import('../../packages/modoki/src/runtime/storage');
+    await PlayerPrefs.init({ namespace: 'refuse-1552', backend: new InMemoryBackend() });
+    try {
+      setRunMode('stopped');
+      const r = await runAgentOp('player-prefs-write', { action: 'set', key: 'agentSetup', value: 1 }) as { ok?: boolean };
+      expect(r.ok).toBe(true);
+      expect(PlayerPrefs.get('agentSetup')).toBe(1);
+    } finally { resetPlayerPrefsForTest(); }
+  });
+});
+
+describe('refusals that depend on a HELD session, and prefab create (#1551/#1552 re-review)', () => {
+  async function withSession(fn: () => Promise<void>): Promise<void> {
+    const g = createTestWorld({});
+    const m = new Map<string, string>();
+    (globalThis as { localStorage?: unknown }).localStorage = {
+      getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => { m.set(k, v); },
+      removeItem: (k: string) => { m.delete(k); }, clear: () => m.clear(), key: () => null, length: 0,
+    };
+    const { PlayerPrefs, InMemoryBackend, resetPlayerPrefsForTest } = await import('../../packages/modoki/src/runtime/storage');
+    await PlayerPrefs.init({ namespace: 'refuse-held', backend: new InMemoryBackend() });
+    try {
+      setCurrentScenePath('/assets/scenes/t.scene.json');
+      g.spawn(EntityAttributes({ name: 'A', guid: 'g-held-a' } as never), Transform({} as never));
+      setRunMode('stopped');
+      await fn();
+    } finally { resetPlayerPrefsForTest(); g.dispose(); }
+  }
+  const refusal = (op: string, params: unknown) =>
+    runAgentOp(op, params).then(() => null, (e: unknown) => e as { message?: string; options?: string[] });
+
+  it('player-prefs-write refuses inside a held session with the owner\'s exits', () => withSession(async () => {
+    enterScrubMode('timeline');
+    expect(await tp.beginTimelinePreviewSession()).toBe(true);
+    const r = await refusal('player-prefs-write', { action: 'set', key: 'agentSetup', value: 1 });
+    // MUTATION TARGET: drop refusePrefsWriteInSession from the wrapper and this resolves.
+    expect(r?.message).toMatch(/player-prefs-write refused: a preview session is open \(owned by the timeline panel\)/);
+    expect(r?.options?.[0]).toMatch(/^modoki_play_control/);
+    // MUTATION TARGET: refuse flush too and this throws — a flush changes no value.
+    await runAgentOp('player-prefs-write', { action: 'flush' });
+  }));
+
+  it('ACCEPT SIDE: a PlayerPrefs write while a Stop restore lands goes through — nothing will put it back', () => withSession(async () => {
+    let land!: () => void;
+    vi.spyOn(sceneManager, 'loadScene').mockImplementation(() => new Promise((r) => { land = () => r({} as never); }) as never);
+    const restoring = restoreAuthoredSnapshot({ primary: { entities: [] } as never, key: '/s.json', bases: new Map() });
+    expect(whyWorldNotAuthored()).toMatch(/restore is still landing/);
+    // MUTATION TARGET: gate the wrapper on whyWorldNotAuthored() again and this is refused.
+    const r = await runAgentOp('player-prefs-write', { action: 'set', key: 'agentSetup', value: 1 }) as { ok?: boolean };
+    expect(r.ok).toBe(true);
+    land(); await restoring;
+  }));
+
+  it('a session held with the mode already stopped names Stop, not "a restore is landing"', () => withSession(async () => {
+    enterScrubMode('timeline');
+    expect(await tp.beginTimelinePreviewSession()).toBe(true);
+    exitPreviewMode('timeline');                  // the mode left; the session did not
+    expect(whyWorldNotAuthored()).toMatch(/a preview session is open/);
+    const r = await refusal('create-entity', { spec: { kind: 'empty' } });
+    // MUTATION TARGET: drop the held-session arm of posedWorldExits and this says "retry in a moment".
+    expect(r?.options).toEqual([expect.stringMatching(/^modoki_play_control \{action:'stop'\}/)]);
+  }));
+
+  it('prefab create: an envelope gets its owner\'s exits; Play is refused too, since a FILE is written', () => withSession(async () => {
+    enterScrubMode('timeline');
+    const inEnvelope = await refusal('prefab', { action: 'create', entityGuid: 'g-held-a', path: '/assets/prefabs/x.prefab.json' });
+    // MUTATION TARGET: restore the old hard-coded "exit-pose-envelope" text and a timeline envelope is sent to an op that refuses it.
+    expect(inEnvelope?.options?.[0]).toMatch(/^modoki_play_control/);
+    exitPreviewMode('timeline');
+    setRunMode('playing');
+    const inPlay = await refusal('prefab', { action: 'create', entityGuid: 'g-held-a', path: '/assets/prefabs/x.prefab.json' });
+    expect(inPlay?.message).toMatch(/prefab create refused: run-mode is 'playing'.*stop Play first/);
+    setRunMode('stopped');
+  }));
+});

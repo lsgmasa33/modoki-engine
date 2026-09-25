@@ -652,6 +652,12 @@ function scheduleClockCheck(ctx: AudioContext, retried: boolean, after: AudioClo
   }, CLOCK_SETTLE_MS);
 }
 
+/** A copy of every bus's last-set volume (0..1). Read by the editor's preview envelope, which puts
+ *  back what a ▶ preview's `audio.setBusVolume` changed (#1551). */
+export function getBusVolumes(): Record<BusName, number> {
+  return { ...busVolumes };
+}
+
 /** Set a bus's volume. Returns whether the bus was ACCEPTED — `false` means nothing was written,
  *  and a caller mirroring the volume anywhere else (the `audio.setBusVolume` action's mixer store)
  *  must take this answer rather than re-deciding it: a second copy of the rule is how the store

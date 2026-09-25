@@ -23,7 +23,7 @@ export const ENTITY_AIM_BASE =
   'Aim at a SCENE ENTITY by exactly one of {guid} | {name} | {id}, resolved to its live screen rect '
   + 'inside this call — no read-then-tap race. {id} only for an entity with no guid: runtime ids '
   + 'change on every reload. A name matching several entities is REFUSED, never first-match. A 2D/3D '
-  + 'entity REQUIRES `surface`. Overrides `selector` and x/y';
+  + 'entity REQUIRES `surface`. Alone — a second address beside it is AMBIGUOUS';
 
 /** `entity.surface`. Each server appends what its enum values mean — the editor has `scene-view` and
  *  mounts every UI entity in two panels; a shipped game has neither. */

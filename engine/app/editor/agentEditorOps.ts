@@ -25,7 +25,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, dumpSceneState, whereError } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, dumpSceneState, whereError } from '../debug/agentBridge';
 import { conditionError, waitForCondition, clampWaitTimeout, type WaitCondition, type WaitReaders } from '../debug/waitFor';
 import { getConsoleRingEntries } from '@modoki/engine/runtime/core/consoleRing';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
@@ -70,7 +70,7 @@ import {
   describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
   type DevicePreset, type Orientation,
   type PrefabFile,
-  causeSpecs, flushParked, getModeOwner, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath, whyWorldNotAuthored,
+  causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath, whyWorldNotAuthored,
   dirtyAssetEditorHolds,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
@@ -1069,6 +1069,63 @@ export function countTimelineItems(t: Partial<TimelineDef> | undefined): number 
     }
   }
   return n;
+}
+
+/** The exits for a world that is not authored, picked by WHICH condition holds (§5: name real exits
+ *  only). An envelope in scrub/preview has its owner's exits. A session held with the mode already
+ *  'stopped' (a begin that seated after its panel left the mode) has no ⏹ to press, but Stop takes a
+ *  held session down. A failed restore clears on the next world swap; a restore still landing clears
+ *  on its own. */
+function posedWorldExits(): { options: string[]; hint?: string; owner: string | null } {
+  const mode = getRunMode();
+  const owner = getModeOwner();
+  if (mode === 'scrub' || mode === 'preview') return { ...envelopeExitOptions(owner), owner };
+  if (hasTimelinePreviewSession()) {
+    return { owner, options: ["modoki_play_control {action:'stop'} — ends the held preview session (restoring the snapshot it took), then retry"] };
+  }
+  if (lastRestoreFailed()) {
+    return { owner, options: ['modoki_load_scene — reload the scene from disk (the failed-restore guard clears on the next world swap), then retry'] };
+  }
+  return { owner, options: ['retry in a moment — the restore is still landing and clears on its own'] };
+}
+
+/** Refuse a live-world edit the world will not keep (#1552): inside a scrub/preview envelope the world
+ *  is snapshotted and reverts on Exit, and while a restore is still landing (or after one FAILED) the
+ *  world is about to be replaced. These ops replied `ok` and the edit then vanished — the same hole
+ *  `/api/scene-mutate` closed for the file-shaped path in #1122, and the same exits.
+ *
+ *  Asks `whyWorldNotAuthored()`, the one question every disk writer asks (#1548), not the run mode:
+ *  an Exit reads 'stopped' before its restore has swapped the posed world out.
+ *  ⚠️ Play is exempt ON PURPOSE. Editing the play world is how an agent exercises a running game, and
+ *  Stop discarding it is Play's documented contract, not a silent loss.
+ *  `consequence` replaces the default "why this edit would be lost" for a caller whose risk differs. */
+function refuseEditOfPosedWorld(op: string, consequence?: string): void {
+  if (getRunMode() === 'playing') return;
+  const why = whyWorldNotAuthored();
+  if (!why) return;
+  const { options, hint, owner } = posedWorldExits();
+  const envelope = getRunMode() === 'scrub' || getRunMode() === 'preview';
+  const lost = consequence ?? (envelope
+    ? 'the live world reverts when the envelope ends, so this edit would reply ok and then be silently discarded'
+    : 'the live world may still hold a pose and is about to be replaced, so this edit could be lost');
+  throw new OpRefusal('REFUSED_BY_OP',
+    `${op} refused: ${why}${owner ? ` (owned by the ${owner} panel)` : ''} — ${lost}. Nothing was changed.`
+    + (hint ? ` ${hint}` : ''),
+    { options });
+}
+
+/** PlayerPrefs is put back only by a held preview SESSION (#1551, `previewSideState.ts`), so only a held
+ *  session refuses — not every "world not authored" reason. A Stop restore landing, or a failed one,
+ *  leaves PlayerPrefs alone, and refusing there sent the agent to reload the scene for a write that
+ *  was never at risk (#1551 re-review). */
+function refusePrefsWriteInSession(): void {
+  if (!hasTimelinePreviewSession()) return;
+  const { options, hint, owner } = posedWorldExits();
+  throw new OpRefusal('REFUSED_BY_OP',
+    `player-prefs-write refused: a preview session is open${owner ? ` (owned by the ${owner} panel)` : ''} — `
+    + 'ending it puts PlayerPrefs back to its state when the session opened, whoever wrote it, so this '
+    + 'write would reply ok and then be undone. Nothing was changed.' + (hint ? ` ${hint}` : ''),
+    { options });
 }
 
 export function registerEditorAgentOps(): void {
@@ -2510,8 +2567,26 @@ export function registerEditorAgentOps(): void {
     };
   });
 
+  // ── PlayerPrefs writes refuse an envelope too (#1551 review) ──
+  // Ending a preview puts PlayerPrefs back to its state when the envelope opened, whoever wrote it — it
+  // cannot tell a ▶ action's write from an agent's. So an agent write made inside one replied ok and
+  // was deleted at ⏹/Stop/Play. The op itself lives in the shared bridge (the device runs it too, and
+  // has no envelope), so the editor wraps it here instead of copying it. `flush` changes no value.
+  const bridgePrefsWrite = agentOpHandler('player-prefs-write');
+  if (bridgePrefsWrite) {
+    registerAgentOp('player-prefs-write', (params) => {
+      if ((params as { action?: string } | null)?.action !== 'flush') {
+        refusePrefsWriteInSession();
+      }
+      return bridgePrefsWrite(params);
+    });
+  }
+
   // ── Entity create / duplicate / delete / reparent ── (undoable, like the menus).
+  // Each refuses inside a scrub/preview envelope, or while its restore is landing (#1552) — see
+  // `refuseEditOfPosedWorld`.
   registerAgentOp('create-entity', (params) => {
+    refuseEditOfPosedWorld('create-entity');
     const p = (params ?? {}) as CreateEntityParams;
     if (!p.spec) throw new Error('create-entity requires { spec }');
     // The ONE vocabulary check both create-entity ops share (#1070) — `resolveCreateEntitySpec`
@@ -2544,6 +2619,7 @@ export function registerEditorAgentOps(): void {
     return { id, name, guid: ensureGuid(id), saved: false };
   });
   registerAgentOp('duplicate-entity', (params) => {
+    refuseEditOfPosedWorld('duplicate-entity');
     const p = (params ?? {}) as { id?: number; guid?: string };
     const id = requireLiveId(p, 'duplicate-entity'); // throws on a stale, ambiguous or id-for-a-guid ref (#1223)
     if (isResourceEntity(id)) {
@@ -2556,6 +2632,7 @@ export function registerEditorAgentOps(): void {
     return { id: newId, guid: ensureGuid(newId), saved: false }; // stable handle — see create-entity (C7)
   });
   registerAgentOp('delete-entities', (params) => {
+    refuseEditOfPosedWorld('delete-entities');
     // Accept guids (stable) and/or ids, resolving each to a LIVE id. This closes the C7 residual:
     // a numeric id recycled by a hot-reload passed the old findEntity() guard and deleted a
     // DIFFERENT valid entity (data loss reported as success). A guid resolves to the RIGHT entity
@@ -2597,6 +2674,7 @@ export function registerEditorAgentOps(): void {
     return { ok: true, ...named, ...also, saved: false, ...(missing.length ? { skipped: missing, warning: `${missing.length} ref(s) matched no live entity and were skipped (ids are reassigned on scene reload — prefer guid)` } : {}) };
   });
   registerAgentOp('reparent-entity', async (params) => {
+    refuseEditOfPosedWorld('reparent-entity');
     // Both the moved entity and the new parent resolve through the shared resolver (#1223): one address
     // each, `{id}` only for a guid-less entity — a recycled id would silently move the wrong node.
     const p = (params ?? {}) as { id?: number; guid?: string; parentId?: number; parentGuid?: string; sortOrder?: number; moveToScene?: boolean };
@@ -2656,6 +2734,7 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as PrefabParams;
     const which = p.prefabAction ?? p.action;
     if (which === 'instantiate') {
+      refuseEditOfPosedWorld('prefab instantiate');
       if (!p.path) throw new Error('prefab instantiate requires { path }');
       const path = p.path;
       const prefab = await getPrefabSource(path);
@@ -2701,8 +2780,13 @@ export function registerEditorAgentOps(): void {
       const path = p.path;
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // both given → refused (#1223 D1)
       // The live subtree is what gets written — refuse a posed/played one (#1548), as the human path does.
-      const notAuthored = whyWorldNotAuthored();
-      if (notAuthored) throw new Error(`prefab create refused: ${notAuthored} — exit the preview (exit-pose-envelope) / stop Play first, or the pose is written into the prefab`);
+      // Unlike the live-world edits, Play is NOT exempt here: this writes a FILE, and a played subtree
+      // would be baked into the template.
+      if (getRunMode() === 'playing') {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${whyWorldNotAuthored()} — stop Play first, or the played pose is written into the prefab.`,
+          { options: ["modoki_play_control {action:'stop'} — returns to the authored world, then retry"] });
+      }
+      refuseEditOfPosedWorld('prefab create', 'the subtree may carry a pose, which would be written into the prefab file');
       const existing = await classifyExistingPrefabId(path);
       // ⚠️ Refuse rather than mint a fresh file guid over a prefab that is THERE and unreadable — a
       // 500, corrupt bytes, or one a newer build wrote (#1468, #896's class). The agent asked to
@@ -2776,6 +2860,7 @@ export function registerEditorAgentOps(): void {
       return { ok, source: path, saved: ok, sceneLinkageSaved: false, ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'detach') {
+      refuseEditOfPosedWorld('prefab detach');
       if (p.entityId == null && !p.entityGuid) throw new Error('prefab detach requires { entityId | entityGuid }');
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab detach'); // both given → refused (#1223 D1)
       const snapshot = detachPrefabInstance(entityId);
@@ -2844,6 +2929,9 @@ export function registerEditorAgentOps(): void {
     }
     if (which === 'apply' || which === 'revert') {
       const verb = which; // 'apply' | 'revert'
+      // Revert edits THIS instance in the live world (#1552 review); apply writes the template and is
+      // refused further down by `applyToPrefabSelective`'s own gate.
+      if (verb === 'revert') refuseEditOfPosedWorld('prefab revert');
       if (p.entityId == null && !p.entityGuid) throw new Error(`prefab ${verb} requires { entityId | entityGuid }`);
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, `prefab ${verb}`);
       const ctx = resolveInstanceContext(entityId);

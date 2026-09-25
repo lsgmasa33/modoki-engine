@@ -61,6 +61,11 @@ function fakeRegistry(): (name: string) => RegisteredTool | undefined {
       },
       handler: async () => { ran.push('tap'); return okResult('{"ok":true}'); },
     },
+    modoki_focus: {
+      name: 'modoki_focus', description: '',
+      shape: { selector: z.string().optional(), label: z.string().optional(), within: z.string().optional() },
+      handler: async () => { ran.push('focus'); return okResult('{"ok":true}'); },
+    },
     modoki_drag: {
       name: 'modoki_drag', description: '',
       shape: { from: z.record(z.any()), to: z.record(z.any()) },
@@ -301,18 +306,48 @@ describe('raw {x,y} aiming is refused inside a batch', () => {
     expect(ran).toEqual(['tap', 'tap']);
   });
 
-  it('a LABEL aim is an aim too — stray x/y beside it do not trip the refusal (#1153)', async () => {
-    const r = await run({ steps: [
-      { tool: 'modoki_tap', args: { label: 'Console', x: 1, y: 2 } },
-      { tool: 'modoki_drag', args: { from: { label: 'Console', x: 1, y: 2 }, to: { selector: '#go' } } },
-    ] });
-    expect(isRejection(r)).toBe(false);
+  // #1556: two addresses in one aim are refused by the route as AMBIGUOUS — so the pre-flight refuses
+  // them BEFORE step 1 runs (close-out review): a batch is not a transaction, and a refusal at step N
+  // would leave steps 1..N-1 applied. Named as AMBIGUOUS, never as a raw-x/y aim, whose advice
+  // ("aim by selector instead") would be wrong here — the caller already gave one.
+  it.each([
+    ['a label beside x/y', { tool: 'modoki_tap', args: { label: 'Console', x: 1, y: 2 } }, 'label AND {x,y}'],
+    ['an entity beside x/y', { tool: 'modoki_tap', args: { entity: { guid: 'g-1' }, x: 1, y: 2 } }, 'entity AND {x,y}'],
+    ['a drag endpoint', { tool: 'modoki_drag', args: { from: { label: 'Console', x: 1, y: 2 }, to: { selector: '#go' } } }, 'from: give ONE of'],
+    ['a dnd endpoint', { tool: 'modoki_dnd', args: { from: { selector: '#a' }, to: { selector: '#b', x: 3, y: 4 } } }, 'to: give ONE of'],
+    ['two drag_handle destinations', { tool: 'modoki_drag_handle', args: { id: 'h', toId: 'h2', delta: { dx: 1, dy: 1 } } }, 'toId AND delta'],
+  ])('refuses %s up front as AMBIGUOUS, and nothing runs', async (_what, step, named) => {
+    const r = await run({ steps: [{ tool: 'modoki_tap', args: { selector: '#ok' } }, step] });
+    expect(isRejection(r)).toBe(true);
+    const msg = (r as BatchRejection).rejected;
+    expect(msg).toContain('AMBIGUOUS');
+    expect(msg).toContain(named);
+    expect(msg).not.toMatch(/raw .*aiming is not allowed/);
+    expect(ran).toEqual([]);
   });
 
-  it('does NOT trip on coordinates sitting beside a winning aim', async () => {
-    // `resolvePoint` gives entity/selector precedence, so stray x/y here is inert. Refusing it
-    // would reject a call that is already aimed correctly.
-    const r = await run({ steps: [{ tool: 'modoki_tap', args: { entity: { guid: 'g-1' }, x: 1, y: 2 } }] });
+  it("refuses modoki_focus with a label AND a selector up front — the route's own rule (second review)", async () => {
+    const r = await run({ steps: [{ tool: 'modoki_tap', args: { selector: '#ok' } }, { tool: 'modoki_focus', args: { selector: '#a', label: 'Go' } }] });
+    expect(isRejection(r)).toBe(true);
+    expect((r as BatchRejection).rejected).toContain('AMBIGUOUS');
+    expect(ran).toEqual([]);
+  });
+
+  it('a value the SCHEMA refuses is named as that, not as two addresses — the schema check runs first (second review)', async () => {
+    // `label:null` fails the schema, and a direct call gets that type error. Checked first, the pair
+    // rule counted it (`label !== undefined`) and answered AMBIGUOUS — advice that leads nowhere.
+    const r = await run({ steps: [{ tool: 'modoki_tap', args: { selector: '#a', label: null } }] });
+    expect(isRejection(r)).toBe(true);
+    expect((r as BatchRejection).rejected).toContain('invalid args');
+    expect((r as BatchRejection).rejected).not.toContain('AMBIGUOUS');
+  });
+
+  it('…and ONE address still runs — the accept side', async () => {
+    const r = await run({ steps: [
+      { tool: 'modoki_tap', args: { entity: { guid: 'g-1' } } },
+      { tool: 'modoki_tap', args: { entity: {}, selector: '#go' } }, // `{}` is not an address
+      { tool: 'modoki_drag_handle', args: { id: 'h', toId: 'h2' } },
+    ] });
     expect(isRejection(r)).toBe(false);
   });
 

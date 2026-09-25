@@ -44,7 +44,7 @@ function git(cwd: string, ...args: string[]) {
  *  MACHINERY_PATHS, so leaving it untracked would make every fixture look like "the machinery
  *  changed" and escalate to a full sweep — every selection assertion below would then pass for
  *  the wrong reason. */
-function makeRepo() {
+function makeRepo({ template = false }: { template?: boolean } = {}) {
   const dir = makeScratchDir('tcp-sel-');
   tmpRepos.push(dir);
   git(dir, 'init', '-q', '-b', 'main');
@@ -63,7 +63,9 @@ function makeRepo() {
   mkdirSync(tscBin, { recursive: true });
   writeFileSync(join(tscBin, 'tsc'), 'process.exit(0);\n');
 
-  for (const p of ['games/alpha', 'games/beta', 'demos/gamma']) {
+  // Opt-in, so the selection tests above keep asserting on the PROJECT selection alone.
+  const dirs = ['games/alpha', 'games/beta', 'demos/gamma', ...(template ? ['engine/templates/starter'] : [])];
+  for (const p of dirs) {
     mkdirSync(join(dir, p), { recursive: true });
     writeFileSync(join(dir, p, 'game.ts'), 'export const x = 1;\n');
   }
@@ -228,6 +230,57 @@ describe('the scoped-typecheck project selection', () => {
 
     const { out } = select(dir, '--all');
     for (const p of ['games/alpha', 'games/beta', 'demos/gamma']) expect(out).toContain(p);
+  });
+});
+
+describe('the scaffolder template (#1544)', () => {
+  // A template is in no WIDE program, so no project's touched-set can speak for it: an engine change
+  // that breaks it reddens nothing else. These pin that it is checked on every run but a named one.
+  it('is checked even when the branch touched NO project', () => {
+    const dir = makeRepo({ template: true });
+    git(dir, 'checkout', '-qb', 'work');
+    git(dir, 'commit', '-q', '--allow-empty', '-m', 'diverge');
+
+    const { code, out } = select(dir);
+    expect(code).toBe(0);
+    // ⚠️ The case that matters: 0 projects touched used to be "nothing to check", and a fresh
+    // scaffold's first build failed while every branch's gate printed exactly that.
+    expect(out).toContain('projects touched vs origin/main (0 of 3)');
+    expect(out).toContain('engine/templates/starter');
+    expect(out).not.toContain('nothing to check');
+  });
+
+  it('rides along with a touched project, without widening the project selection', () => {
+    const dir = makeRepo({ template: true });
+    git(dir, 'checkout', '-qb', 'work');
+    writeFileSync(join(dir, 'games/alpha/game.ts'), 'export const x = 8;\n');
+    git(dir, 'commit', '-qam', 'touch alpha');
+
+    const { out } = select(dir);
+    expect(out).toContain('games/alpha');
+    expect(out).toContain('engine/templates/starter');
+    expect(out).not.toContain('games/beta');
+  });
+
+  it('is left out of a NAMED run, and is nameable only root-qualified', () => {
+    const dir = makeRepo({ template: true });
+    expect(select(dir, 'games/alpha').out).not.toContain('engine/templates/starter');
+
+    const named = select(dir, 'engine/templates/starter');
+    expect(named.code).toBe(0);
+    expect(named.out).toContain('checking 1 project(s): engine/templates/starter');
+
+    // A bare `starter` is not a project name — it must not silently match the template.
+    const bare = select(dir, 'starter');
+    expect(bare.code).toBe(1);
+    expect(bare.out).toContain('unknown project(s): starter');
+  });
+
+  it('is found in the REAL repo — discovery keys on a directory, and a move would empty it silently', () => {
+    const { code, out } = select(REPO);
+    expect(code).toBe(0);
+    expect(out).toContain('scaffolder template(s), checked on every run');
+    expect(out).toContain('engine/templates/starter');
   });
 });
 

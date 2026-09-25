@@ -17,7 +17,7 @@ import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
 import { clearAllSceneDirty } from './sceneDirty';
-import type { SceneData, SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
+import type { SceneData, SceneEntityEntry, AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { linkOwnerBeforeMove } from '../../runtime/core/ecs/identityParents';
@@ -212,15 +212,54 @@ function editGuidAt(prefab: PrefabFile, path: readonly MemberStep[]): string | n
  *  plain scene entities, so no instantiate call there has the root as a frame. A token relative to an
  *  inner frame is left for the loader, which expands that row as a scene instance.
  *
- *  A REFERENCE node (an `added` node carrying `prefab`) is left whole, as the loader's `rebaseAddedTokens`
- *  leaves it: its payload is in its own instance's frame, and a token there never climbs out of it (#1538) —
- *  counted from this depth, a `^` that only reaches the node's root would read as one reaching the prefab's. */
+ *  A REFERENCE node (an `added` node carrying `prefab`) is not in this payload's frame: its payload is in its
+ *  own instance's, applied by a top call of its own, as the loader's `rebaseAddedTokens` leaves it. So it is
+ *  mapped at ITS depth, one below this (`editReferenceNodeRefs`) — counted from this depth, a `^` that only
+ *  reaches the node's root would read as one reaching the prefab's (#1538). A `^` that does climb out of the node
+ *  to the prefab's root is rewritten like any other (#1541); one reaching only a frame between is the loader's. */
 function editWorldRefs(prefab: PrefabFile, value: unknown, depth: number): unknown {
-  return mapStringValues(value, (s) => {
+  const mapped = mapStringValues(value, (s) => {
     const t = isMemberToken(s) ? parseMemberToken(s) : null;
     if (!t || t.up !== depth) return s;
     return editGuidAt(prefab, t.path) ?? s;
   }, isReferenceNode);
+  return swapReferenceNodes(mapped, (n) => editReferenceNodeRefs(prefab, n, depth + 1));
+}
+
+/** A reference node's own payload, its root `depth` frames below the prefab's root: each channel at the depth of the
+ *  frame it applies in, as a row's are (`buildPrefabEditScene`). */
+function editReferenceNodeRefs(prefab: PrefabFile, n: AddedEntity, depth: number): AddedEntity {
+  const at = <T,>(v: T, d: number): T => editWorldRefs(prefab, v, d) as T;
+  const byPath = <T,>(paths: Record<string, T> | undefined) =>
+    paths && Object.fromEntries(Object.entries(paths).map(([k, v]) => [k, at(v, depth + k.split('.').length)]));
+  return {
+    ...n,
+    traits: at(n.traits, depth),
+    children: at(n.children, depth),
+    ...(n.overrides ? { overrides: at(n.overrides, depth) } : {}),
+    ...(n.added ? { added: at(n.added, depth) } : {}),
+    ...(n.nestedOverrides ? { nestedOverrides: byPath(n.nestedOverrides) } : {}),
+    ...(n.nestedStructure ? { nestedStructure: byPath(n.nestedStructure) } : {}),
+    ...(n.members ? { members: byRowDepth(n.members, n.prefab, (v, d) => at(v, depth - 1 + d)) } : {}),
+  };
+}
+
+/** `value` with every reference node in it (they sit in node lists: `added`, `children`, a row's `own`) replaced by
+ *  `fn(node)`. Copy-on-write, like `mapStringValues`. */
+function swapReferenceNodes(value: unknown, fn: (n: AddedEntity) => AddedEntity): unknown {
+  if (Array.isArray(value)) {
+    const out = value.map((v) => (v && typeof v === 'object' && isReferenceNode(v) ? fn(v as AddedEntity) : swapReferenceNodes(v, fn)));
+    return out.some((v, i) => v !== value[i]) ? out : value;
+  }
+  if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) return value;
+  let out: Record<string, unknown> | undefined;
+  for (const [k, v] of Object.entries(value)) {
+    const w = swapReferenceNodes(v, fn);
+    if (w === v) continue;
+    out ??= { ...(value as Record<string, unknown>) };
+    Object.defineProperty(out, k, { value: w, enumerable: true, writable: true, configurable: true });
+  }
+  return out ?? value;
 }
 
 /** An `added` node carrying `prefab` — told apart by the node's own shape, since a trait's field bag may hold a

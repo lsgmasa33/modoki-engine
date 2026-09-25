@@ -41,7 +41,7 @@ export function registerBatchTool(tool: ToolDef, ctx: ToolContext): void {
       'changes, use a modoki_wait_for step instead of guessing ms.\n\n' +
       'REFUSED at pre-flight (nothing runs): raw {x,y} aiming on ' + XY_AIMED_TOOLS.join('/') + ' — ' +
       'aim by `entity` ({guid|name|id}), `selector`, a handle id, or (drag_handle) toId/delta, which ' +
-      'resolve inside their own call and cannot go stale mid-batch; and ' +
+      'resolve inside their own call and cannot go stale mid-batch; an aim giving TWO addresses (AMBIGUOUS); and ' +
       [...DENIED].filter((t) => t !== 'modoki_batch').sort().join(' / ') +
       ', and a nested modoki_batch — all of which belong in their own call. Max ' + MAX_STEPS + ' steps.\n\n' +
       'UNDO: each step is a separate undoable action, so a human\'s Cmd-Z unwinds a batch one ' +

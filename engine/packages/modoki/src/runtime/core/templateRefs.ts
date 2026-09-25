@@ -77,12 +77,16 @@ export function memberPathKey(path: readonly MemberStep[]): string {
 
 /** `value` with every member token rebased onto `segments`: the path from the top call's root to
  *  the instance the value is applied to, one segment per nesting level. A `^` climbs one segment. A
- *  token that climbs past the top stays as it is. Copy-on-write, like `remapGuidValues`. */
+ *  token that climbs past the top keeps the climbs left over, counted from the top call's root: a
+ *  template reference node's top call resolves those in the frame around it (#1541,
+ *  `templateFrameClimber`), and anywhere else they name nothing, as before. Copy-on-write, like
+ *  `remapGuidValues`. */
 export function rebaseMemberTokens(value: unknown, segments: readonly (readonly MemberStep[])[]): unknown {
   if (!segments.length) return value;
   return mapStringValues(value, (s) => {
     const t = isMemberToken(s) ? parseMemberToken(s) : null;
-    if (!t || t.up > segments.length) return s;
+    if (!t) return s;
+    if (t.up > segments.length) return memberToken(t.up - segments.length, t.path);
     return memberToken(0, [...segments.slice(0, segments.length - t.up).flat(), ...t.path]);
   });
 }

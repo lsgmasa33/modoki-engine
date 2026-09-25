@@ -19,6 +19,8 @@
 
 import type { DomPointSpec, DomPointResolution, DomRect, AimGesture } from './domPointContract';
 import { isClickShaped } from './domPointContract';
+import { aimAddresses, ambiguousAimMessage } from '../../tools/shared/aimAddresses';
+import { OpRefusal } from './opRefusal';
 // ⚠️ The RUNTIME's own veto, not a copy of the rule (#1016). `resolveTapZoneVeto` is what
 // `pressOrigin.ts` uses to route a real press, so the aim surface and the router cannot disagree
 // about who gets the click — §9: a rule implemented twice diverges, and this pair already had.
@@ -418,12 +420,11 @@ function resolveLabel(label: string, within: string | undefined): CoreResolution
  *  the DnD path and the trusted-input path. Returns an error as data; the wrappers decide
  *  whether to throw. */
 function resolveCore(spec: DomPointSpec): CoreResolution {
-  if (spec.label !== undefined) {
-    if (spec.selector) {
-      return { error: 'give a label OR a selector, not both — two addresses for one target', code: 'AMBIGUOUS' };
-    }
-    return resolveLabel(spec.label, spec.within);
-  }
+  // One address (#1556) — the chain below is otherwise precedence: `modoki_dnd`'s endpoint schema
+  // accepts {selector, x, y} together, and the selector silently won.
+  const twoAddresses = ambiguousAimMessage(aimAddresses(spec));
+  if (twoAddresses) return { error: twoAddresses, code: 'AMBIGUOUS' };
+  if (spec.label !== undefined) return resolveLabel(spec.label, spec.within);
   if (spec.within !== undefined) return { error: '`within` scopes a `label` aim; it has no meaning without one' };
   if (spec.selector) {
     let el: Element | null;
@@ -450,7 +451,9 @@ function resolveCore(spec: DomPointSpec): CoreResolution {
  *  Element itself (DnD dispatch). */
 export function resolveDomPoint(spec: DomPointSpec, which = 'target'): DomPointHit {
   const r = resolveCore(spec);
-  if ('error' in r) throw new Error(`${which}: ${r.error}`);
+  // A CODED miss throws coded: a plain Error loses it at `opReplyFor`, and `modoki_dnd` answered two
+  // addresses as REFUSED_BY_OP while its description (and #1556) say AMBIGUOUS (close-out review).
+  if ('error' in r) throw r.code ? new OpRefusal(r.code, `${which}: ${r.error}`) : new Error(`${which}: ${r.error}`);
   return r;
 }
 

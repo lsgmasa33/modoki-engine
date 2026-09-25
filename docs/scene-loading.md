@@ -1511,7 +1511,8 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   applied to. A leading `^` climbs one enclosing instance, and `@member:` alone is that root.
   - **Frames.** A member's own bag is in its prefab's frame. A row's `overrides`/`added` are in the
     nested child's frame. A `nestedOverrides`/`nestedStructure` entry is in the frame of the
-    instance its path addresses. A reference node's payload is its own frame and is never rewritten.
+    instance its path addresses. A reference node's payload is in its own frame, which its own top
+    call resolves; the enclosing pass never rewrites it.
   - **Write.** `serializePrefab` (`templateTokenizer`) rewrites a guid to the NEAREST frame that
     names it. That keeps the spelling canonical, which #1381's no-op comparison relies on: MID's own
     save and OUTER's save of the same MID interior must write the same token, or OUTER pins an
@@ -1536,13 +1537,50 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   - **Prefab editor.** The editor flattens the prefab's own rows, so `buildPrefabEditScene` maps
     every token that climbs to the root onto an edit-world guid: a row's sentinel, or
     `deriveMemberGuid(sentinel, rest)` past a nested row. The save maps them back.
+  - **Across a reference node (#1541).** A template reference node's payload is applied by a top call
+    of its own, so a ref from inside it to a member of the prefab around it needs a `^` that crosses
+    that call. One rule says where a `^` lands, `templateFrameClimber` (`identityParents.ts`): an owned
+    nested root climbs to its owner, and a template reference node's root (a stored root carrying a
+    template key) to the instance that holds it. Any other stored root is the top. Every side uses it:
+    - **Read.** `rebaseMemberTokens` keeps the climbs left over past the top call's root instead of
+      leaving the token as written, and `resolveTemplateFrames` climbs them from the node's root.
+      Anywhere else, a leftover climb names nothing, as before.
+    - **Compare.** `baseTokenResolver` climbs the same way. Otherwise the override list, and the
+      scene's field capture under a row chain, would list the node's ref as the instance's own.
+    - **Write.** The node's `templateTokenizer` (`ownFrame`) climbs out of the node's root to the
+      NEAREST frame that names the ref, as a row's tokens do. Under `serializePrefab` it stays strictly
+      below the root being written (`belowWrittenRoot`). That root's frame is named by the NEW localIds,
+      which do not exist while the rows are planned, and a frame outside the tree is not the file's to
+      name. In the prefab-edit world the climb also ends at the row entry, because the edited prefab's
+      own root is not an instance there. Where the climb stops, a live guid is written as an exit marker
+      (`@member-exit:N`, not a member token), and `serializePrefab` swaps it for the token once it knows
+      the new localIds (`nodeExits`, `nameAtRoot`). A marker it cannot name goes back to the guid it
+      stood for, so a ref out of the written tree stays a guid. The close-out review found both
+      failures of an unbounded climb: Create Prefab from a scene instance named a member by its OLD
+      localId, and Create Prefab on a member re-pointed a ref to the instance root at the new root.
+    - **The key is read first.** Both the climb and `keepsTemplateRows` ask the node root's template
+      key, and a Refresh respawns the node from a scene-form capture that carries none. So
+      `finishTemplateReferenceNode` takes the node's identity (`addedNodeIdentity`) before capturing.
+      Before that, the first save after a Refresh wrote the placeholder guid again.
+    - **Prefab editor.** `editWorldRefs` maps a reference node's payload at the node's own depth,
+      rather than leaving it whole, so a `^` that climbs out of the node to the root becomes that row's
+      sentinel. One that reaches only a frame in between is left for the loader.
+    - **Declared keys.** A token that climbed out goes through keys the enclosing file declares, which
+      the node's own writer cannot see, so the node's `undeclaredKeys` pass leaves it. `serializePrefab`
+      adopts its origin (`nodeExits.origins`), and its final pass reverts it if its key is undeclared.
   - **Not covered.**
     - A ref OUT of the prefab dangles in other scenes, as it always did.
     - A token left unresolved and then stored into a SCENE override by a marked edit is rebased again
       on the next load, so its path changes. It already named nothing.
     - A ref to a node PROMOTED by Apply is left as a guid.
-    - A ref inside a reference node's payload is left as a guid.
-  Tests: `engine/tests/editor/prefabTemplateIdentity.test.ts` § "#1352".
+    - A ref that climbs out of a reference node through a key nobody declares is reverted only by
+      `serializePrefab`. Apply's promotion and Create Prefab from a scene do not revert it.
+    - A WHOLE slot inside a reference node (a frame through a pre-v5 prefab) that holds a ref to the
+      edited prefab's own root is compared while that ref is still an exit marker. It differs from the
+      file's token, so the slot is restated even when unchanged. That needs a pre-v5 inner prefab and a
+      ref out of it at once.
+  Tests: `engine/tests/editor/prefabTemplateIdentity.test.ts` § "#1352";
+  `engine/tests/editor/templateReferenceNodeRows.test.ts` § "#1541".
 - **An owned nested instance ROOT that leaves its row is saved as REMOVED from the outer instance
   (#1355).** This is the depth-1 root case; a structural edit INSIDE an owned nested instance rides the
   owner's `nestedStructure` slot (#1358). `captureInstanceStructure` used to skip every nested prefab row in its removal pass,

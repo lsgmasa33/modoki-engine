@@ -27,6 +27,7 @@ import { registerPosedWorldSource } from './authoredWorld';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { clearControlSpawns } from '../../runtime/timeline/controlSpawnRegistry';
 import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, type AuthoredSnapshot } from './authoredSnapshot';
+import { capturePreviewSideState, restorePreviewSideState, type PreviewSideState } from './previewSideState';
 import { beginWorldReplacement } from './authoringSettle';
 import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
 import { createTeardownToken } from '../../runtime/core/liveness';
@@ -36,6 +37,9 @@ import { notifyListeners } from '../../runtime/core/notifyListeners';
  *  key it belongs to (so a scene swap mid-preview can't revert the wrong scene). Captured and
  *  restored by `authoredSnapshot.ts`, the same code Play/Stop uses (#1547). */
 let _snap: AuthoredSnapshot | null = null;
+/** The non-world stores ▶ actions can change (#1551), seated and released WITH `_snap` — see
+ *  `previewSideState.ts`. Restored on every end, including the ones that leave the world alone. */
+let _side: PreviewSideState | null = null;
 /** The scene edit-version when the snapshot was taken, so `previewHasAuthoredEdits` can tell an
  *  authored change made INSIDE the envelope from one that predates it. */
 let _snapEditVersion = 0;
@@ -337,7 +341,7 @@ export async function beginTimelinePreviewSession(): Promise<boolean> {
   const mine: Promise<void> = (async () => {
     const snap = await captureAuthoredSnapshot();
     // Only seat it if no session end intervened (see endTimelinePreviewSession).
-    if (!_snap && stillLive()) { _snap = snap; _snapEditVersion = version; }
+    if (!_snap && stillLive()) { _snap = snap; _side = capturePreviewSideState(); _snapEditVersion = version; }
   })().finally(() => {
     // Only its OWN slot: a begin made after an Exit cancelled this one may already hold `_pending`.
     if (_pending === mine) _pending = null;
@@ -383,6 +387,9 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
   const snap = _snap;
   const session = _undoSessionSeq;
   _snap = null;
+  // Before the world branch below, and whichever way it goes (#1551): a restore:false end, or one
+  // for a scene that has since changed, still ends the session whose actions changed these stores.
+  releaseSideState();
   // `currentSceneKey`, NOT the editor's file path: prefab-edit nulls that path on purpose, and the
   // restore used to reload under `''` — dropping the editor out of prefab-edit (#1547).
   if (!opts.restore || !snap || snap.key !== currentSceneKey()) {
@@ -422,6 +429,12 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
   return opts.rebind?.() ?? null;
 }
 
+function releaseSideState(): void {
+  const side = _side;
+  _side = null;
+  if (side) restorePreviewSideState(side);
+}
+
 /** A world swap this module did not make ends the session WITHOUT a restore (#1546).
  *
  *  The snapshot belongs to the world that just went away: its restore would either no-op (a
@@ -437,6 +450,9 @@ onWorldSwap(() => {
   if (!_snap && !isPreviewSessionPending()) return;
   beginLiveness.invalidateAll();
   _snap = null;
+  // The world is not put back, but the audio/prefs/tier the session's actions changed are (#1551):
+  // an `engine.loadScene` fired by ▶ is exactly the swap that lands here.
+  releaseSideState();
   // Nothing will restore: the scene edits made during the session live on in no world at all, and
   // edits from here on are authored.
   clearPreviewUndoSession(_undoSessionSeq);

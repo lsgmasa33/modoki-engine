@@ -33,11 +33,13 @@ import {
 } from '@modoki/engine/runtime';
 import { serializeScene, deleteEntitiesWithUndo, writeTraitFieldWithUndo, setActionCallback, pushAction } from '@modoki/engine/editor';
 import {
-  setPrefabCache, instantiatePrefab, serializePrefab, applyToPrefabSelective, ownInstanceStructure, type PrefabFile,
+  setPrefabCache, instantiatePrefab, instantiatePrefabAsync, setPrefabSource, serializePrefab, applyToPrefabSelective, ownInstanceStructure,
+  rebaseStaleInstances, type PrefabFile,
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { collectInstanceOverrideFields } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { templateKeysOf } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
-import { clearKeptMemberOrphans, deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { clearKeptMemberOrphans, deriveInstanceMemberGuids, keptMemberOrphans, setKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { templateKeyOf, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { reparentEntity } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -464,4 +466,354 @@ describe('#1538 close-out: declared keys, both sides', () => {
     expect(saved.entities.find((e) => e.prefab === MID)!.nestedStructure).toBeUndefined();
     expect(JSON.stringify(saved.entities.find((e) => e.name === 'Panel')!.traits)).not.toContain(KN);
   });
+});
+
+describe('#1542: a template reference node keeps the rows its inner prefab no longer backs (R2)', () => {
+  /** INNER while it has the member G(99), which OUTER2's node edits through MID's row 3. */
+  const innerWithGone = () => ({ ...innerDoc, entities: [...innerDoc.entities, row(3, G(99), 'Gone', 1)] });
+  const orphan = { [`/${G_MID_NESTED}/${G(99)}`]: { traits: { Transform: { x: 3 } } } };
+  const quiet = <T,>(f: () => Promise<T>): Promise<T> => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    return f().finally(() => warn.mockRestore());
+  };
+
+  // The case #1542 was observed with. Mutations: skip `keepTemplateNodeOrphans` after the derive; in
+  // `keepsTemplateRows`, drop the template-node branch (a row sentinel alone).
+  it('an untouched save keeps the node\'s orphan row, and INNER restoring the member brings the edit back', async () => {
+    install(midDoc());
+    const root = await quiet(() => openInEditor(outer2({ members: orphan })));
+    const saved = serializePrefab(root, OUTER2)!;
+    expect(refNodeOf(saved).members).toEqual(orphan);
+    install(innerWithGone());
+    await eachExpansion(saved, (where) => expect(traitOf(inMid('Gone')[0]!.id, 'Transform'), where).toMatchObject({ x: 3 }));
+  });
+
+  // A Refresh is the other route INNER's change reaches the open prefab by, and it must leave the store as a reload
+  // would (#1535): the row INNER backs again is replayed live, and the save states it as a live edit (a field edit is a
+  // `nestedOverrides` path, not a row).
+  // Mutation: skip `keepTemplateNodeOrphans` after the derive — nothing is kept, so the settle has nothing to replay.
+  it('a Refresh that restores the member replays the kept row, live and on save', async () => {
+    install(midDoc());
+    const root = await quiet(() => openInEditor(outer2({ members: orphan })));
+    install(innerWithGone());
+    await rebaseStaleInstances();
+    expect(traitOf(inMid('Gone')[0]!.id, 'Transform')).toMatchObject({ x: 3 });
+    const saved = serializePrefab(root, OUTER2)!;
+    await eachExpansion(saved, (where) => expect(traitOf(inMid('Gone')[0]!.id, 'Transform'), where).toMatchObject({ x: 3 }));
+  });
+
+  // The REJECT side (#1293): outside the prefab-edit world a template node's kept rows are not the template's, so a
+  // template written from a scene instance does not take them. The store is seeded directly — what a rebuild's settle
+  // keeps for that root in a scene. Mutation: in `keepsTemplateRows`, drop the sentinel-ancestor walk.
+  it('a template written from a scene instance does not carry rows kept for the node there', async () => {
+    const SCENE_G = 'ffffffff-0000-4000-8000-000000001542';
+    install(midDoc());
+    install(outer2());
+    await load(sceneWith(OUTER2, 'OuterRoot'));
+    const nodeGuid = all().find((e) => e.name === 'MidRoot')!.guid!;
+    expect(nodeGuid).toBeTruthy();
+    setKeptMemberOrphans(nodeGuid, { [`/${G_MID_NESTED}/${G(99)}`]: { guid: SCENE_G, name: 'Gone' } });
+    const created = serializePrefab(all().find((e) => e.name === 'OuterRoot')!.id)!;
+    expect(JSON.stringify(created)).not.toContain(SCENE_G);
+  });
+
+  // A load resets the store for the node — every node, rows or not — so a set the file no longer states is not written
+  // back. Mutation: in `keepTemplateNodeOrphans`, skip a node whose file states no rows.
+  it('reopening the prefab without the row drops what an earlier open kept', async () => {
+    install(midDoc());
+    await quiet(() => openInEditor(outer2({ members: orphan })));
+    const root = await openInEditor(outer2());
+    expect(refNodeOf(serializePrefab(root, OUTER2)!).members).toBeUndefined();
+    expect(keptMemberOrphans(all().find((e) => e.name === 'MidRoot')!.guid!)).toBeUndefined();
+  });
+});
+
+describe('#1541: a ref from inside a template reference node climbs out of it', () => {
+  /** OUTER2's own Panel, and the INNER row's own Leaf — neither is inside the MID node. */
+  const panel = () => all().find((e) => e.name === 'Panel')!;
+  const rowLeaf = () => all().find((e) => e.name === 'Leaf' && !under(e.id, 'MidRoot'))!;
+  const saveWithNavUp = async (target: () => { guid?: string }) => {
+    install(midDoc());
+    const root = await openInEditor(outer2());
+    writeTraitFieldWithUndo(inMid('Leaf')[0]!.id, getTraitByName('UIFocusable')!, 'navUp', target().guid!);
+    return serializePrefab(root, OUTER2)!;
+  };
+
+  // The case #1541 was observed with: Leaf (in MID's INNER) → MID → the INNER row → OUTER2, three climbs.
+  // Mutations: in `templateTokenizer`, drop the climb out of the node's root; skip the exit marker (the edit world
+  // stops at the row entry); in `rebaseMemberTokens`, leave a token that climbs past the top as it is; in
+  // `resolveTemplateFrames`, return a `^` token unresolved; in `templateFrameClimber`, drop the reference-node step;
+  // in `editWorldRefs`, keep a reference node whole.
+  it('a ref to a member of the prefab around the node is saved as a token, and names that instance\'s own', async () => {
+    const saved = await saveWithNavUp(panel);
+    expect(refNodeOf(saved).nestedOverrides).toEqual({ 3: { 2: { UIFocusable: { navUp: '@member:^.^.^.2' } } } });
+    install(saved);
+    await eachExpansion(saved, (where) => {
+      expect(panel().guid, where).toBeTruthy();
+      expect(traitOf(inMid('Leaf')[0]!.id, 'UIFocusable')?.navUp, where).toBe(panel().guid);
+    });
+  });
+
+  // One level out: the frame holding the node. Nothing above the row entry is needed, so no marker is involved.
+  // Mutations: in `templateTokenizer`, drop the climb out of the node's root; in `templateFrameClimber`, drop the
+  // reference-node step.
+  it('a ref to a member of the instance holding the node resolves in that instance', async () => {
+    const saved = await saveWithNavUp(rowLeaf);
+    expect(refNodeOf(saved).nestedOverrides).toEqual({ 3: { 2: { UIFocusable: { navUp: '@member:^.^.2' } } } });
+    install(saved);
+    await eachExpansion(saved, (where) => expect(traitOf(inMid('Leaf')[0]!.id, 'UIFocusable')?.navUp, where).toBe(rowLeaf().guid));
+  });
+
+  // The override list reads each member's base with the enclosing rows' tokens resolved (`baseTokenResolver`), and
+  // that climb must cross the node's root as the loader's does, or the value OUTER2's node states lists as the
+  // instance's own. Mutation: in `baseTokenResolver`, climb only an owned root's owner (its pre-#1541 rule).
+  it('the override list of an instance inside the node does not list the node\'s climbing ref as its own', async () => {
+    install(midDoc());
+    install(outer2({ nestedOverrides: { 3: { 2: { UIFocusable: { navUp: '@member:^.^.^.2' } } } } }));
+    await load(sceneWith(OUTER2, 'OuterRoot'));
+    expect(traitOf(inMid('Leaf')[0]!.id, 'UIFocusable')?.navUp).toBe(panel().guid); // precondition: resolved
+    const nodes = collectInstanceOverrideFields(inMid('InnerRoot')[0]!.id, innerDoc as unknown as PrefabFile);
+    expect(nodes.filter((n) => n.name === 'Leaf')).toEqual([]);
+  });
+
+  // The scene save compares the node with its template form, which holds the climbing token: the live node, written as
+  // a template would write it, must climb the same way, or every untouched instance restates (pins) the node. The file
+  // is authored by hand, so the side under test is the comparison alone. Mutations: in `templateTokenizer`, drop the
+  // climb out of the node's root; in `resolveTemplateFrames`, return a `^` token unresolved.
+  it('an untouched scene instance of OUTER2 whose node climbs out states nothing about the node', async () => {
+    install(midDoc());
+    install(outer2({ nestedOverrides: { 3: { 2: { UIFocusable: { navUp: '@member:^.^.^.2' } } } } }));
+    await load(sceneWith(OUTER2, 'OuterRoot'));
+    expect(traitOf(inMid('Leaf')[0]!.id, 'UIFocusable')?.navUp).toBe(panel().guid); // precondition: resolved
+    const entry = (await serializeScene()).entities.find((e) => (e as { prefab?: string }).prefab === OUTER2) as unknown as Record<string, unknown>;
+    const rows = Object.values((entry.members ?? {}) as Record<string, Record<string, unknown>>);
+    expect(rows.flatMap((r) => Object.keys(r).filter((k) => k !== 'guid' && k !== 'name'))).toEqual([]);
+    expect(entry.nestedStructure).toBeUndefined();
+    expect(entry.nestedOverrides).toBeUndefined();
+    expect(entry.added).toBeUndefined();
+  });
+});
+
+describe('#1541/#1542 close-out review', () => {
+  const climbing = () => outer2({ nestedOverrides: { 3: { 2: { UIFocusable: { navUp: '@member:^.^.^.2' } } } } });
+  const innerPlus = () => ({ ...innerDoc, entities: [...innerDoc.entities, row(4, G(98), 'Extra4', 1)] });
+  const innerNoLeaf = () => ({ ...innerDoc, entities: innerDoc.entities.slice(0, 1) });
+  const quietly = async <T,>(f: () => Promise<T>): Promise<T> => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try { return await f(); } finally { warn.mockRestore(); }
+  };
+
+  // A Refresh respawns the node from a scene-form capture, which carries no key, and the climb reads the key.
+  // Mutation: drop the `addedNodeIdentity` call at the top of `finishTemplateReferenceNode`.
+  it('a Refresh in the prefab editor does not turn the node\'s climbing ref back into a placeholder', async () => {
+    install(midDoc());
+    const root = await openInEditor(climbing());
+    install(innerPlus());
+    await rebaseStaleInstances();
+    expect(refNodeOf(serializePrefab(root, OUTER2)!).nestedOverrides).toEqual({ 3: { 2: { UIFocusable: { navUp: '@member:^.^.^.2' } } } });
+  });
+
+  // …and `keepsTemplateRows` reads the key too: INNER dropping Leaf keeps the node's edit to it, in template form.
+  // Mutations: drop the `addedNodeIdentity` call (the row is not re-emitted); in `captureRowChannels`, re-emit a kept row
+  // without `templateRowOf` (it carries the edit world's guid and the member's name).
+  it('a Refresh that drops a member the node edits keeps the edit as a template row', async () => {
+    install(midDoc());
+    const root = await openInEditor(outer2({ members: { [`/${G_MID_NESTED}/${G_LEAF}`]: { traits: { Transform: { x: 5 } } } } }));
+    install(innerNoLeaf());
+    await quietly(() => rebaseStaleInstances());
+    expect(refNodeOf(serializePrefab(root, OUTER2)!).members).toEqual({ [`/${G_MID_NESTED}/${G_LEAF}`]: { traits: { Transform: { x: 5 } } } });
+  });
+
+  // The same settle on a prefab ROW, older than #1542: the settle keeps what a SCENE save writes, and the row
+  // re-emitted it with the member's edit-world guid (#1293). Mutation: in `captureRowChannels`, re-emit a kept row
+  // without `templateRowOf`.
+  it('a Refresh that drops a member a prefab row edits keeps the edit without the member\'s guid', async () => {
+    install(midDoc());
+    const root = await openInEditor(outer2());
+    writeTraitFieldWithUndo(all().find((e) => e.name === 'Leaf' && !under(e.id, 'MidRoot'))!.id, getTraitByName('Transform')!, 'x', 5);
+    install(innerNoLeaf());
+    await quietly(() => rebaseStaleInstances());
+    const saved = serializePrefab(root, OUTER2)!;
+    expect(saved.entities.find((e) => e.prefab === INNER)!.members).toEqual({ [`/${G_LEAF}`]: { traits: { Transform: { x: 5 } } } });
+  });
+
+  /** OUTER2 numbered sparsely: Create Prefab renumbers Panel 7 → 2. */
+  const sparse = () => ({ ...outer2(), entities: [
+    row(1, G(21), 'OuterRoot', 0), row(7, G(22), 'Panel', 1), row(5, G(25), 'InnerRow', 7, { prefab: INNER, added: [refNode()] }),
+  ] }) as unknown as PrefabFile;
+
+  // Create Prefab over a scene instance: the root's frame is named by the NEW file's localIds. Mutation: in
+  // `templateTokenizer`, climb without `belowWrittenRoot` (the token names Panel by the old localId 7).
+  it('Create Prefab from a scene instance names the root\'s member by the new file\'s localId', async () => {
+    install(midDoc());
+    install(sparse());
+    await load(sceneWith(OUTER2, 'OuterRoot'));
+    writeTraitFieldWithUndo(inMid('Leaf')[0]!.id, getTraitByName('UIFocusable')!, 'navUp', panel().guid!);
+    const created = serializePrefab(all().find((e) => e.name === 'OuterRoot')!.id)!;
+    const panelLid = created.entities.find((e) => e.name === 'Panel')!.localId;
+    expect(JSON.stringify(refNodeOf(created).nestedOverrides)).toContain(`@member:^.^.^.${panelLid}`);
+    install(created);
+    await load(emptyScene);
+    instantiatePrefab(created as never);
+    deriveInstanceMemberGuids(getCurrentWorld());
+    expect(traitOf(inMid('Leaf')[0]!.id, 'UIFocusable')?.navUp).toBe(panel().guid);
+  });
+
+  // A ref out of the written tree stays the guid it was, as every other ref out of it does. Mutation: in
+  // `templateTokenizer`, climb without `belowWrittenRoot` (it names OUTER2's root, which the reload reads as Panel).
+  it('Create Prefab on a member leaves a ref out of the written tree as its guid', async () => {
+    install(midDoc());
+    install(outer2());
+    await load(sceneWith(OUTER2, 'OuterRoot'));
+    writeTraitFieldWithUndo(inMid('Leaf')[0]!.id, getTraitByName('UIFocusable')!, 'navUp', ROOT);
+    const created = serializePrefab(panel().id)!;
+    expect(refNodeOf(created).nestedOverrides).toEqual({ 3: { 2: { UIFocusable: { navUp: ROOT } } } });
+  });
+
+  // A template row carries no member identity; one holding a guid anyway (a hand-edited file) is kept, never pinned —
+  // the fold that applies the row in a scene ignores it too, and this runs past the collision guard.
+  // Mutation: in `keepTemplateNodeOrphans`, call `applyStoredMemberRows` without `keepOnly`.
+  it('a guid on a node\'s template row is not stamped on the member in the prefab editor', async () => {
+    const STRAY = 'eeeeeeee-0000-4000-8000-000000001542';
+    install(midDoc());
+    await openInEditor(outer2({ members: { [`/${G_MID_NESTED}/${G_LEAF}`]: { guid: STRAY, traits: { Transform: { x: 5 } } } } }));
+    expect(inMid('Leaf')[0]!.guid).toBeTruthy();
+    expect(inMid('Leaf')[0]!.guid).not.toBe(STRAY);
+  });
+
+  // A kept row the LOAD read is a template row already, and goes back out verbatim — a reference node in its `own` keeps
+  // its own rows. Mutation: in `templateRowOf`, convert every node, not only a scene one (`toTemplateNodes` drops a
+  // node's `members`).
+  it('an untouched save keeps a kept template row\'s reference node with its own rows', async () => {
+    const KX = 'dddddddd-0000-4000-8000-000000041538';
+    const own = { parentLocalId: 0, key: KX, guid: '', name: 'MidRoot', prefab: MID, traits: {}, children: [],
+      members: { [`/${G_MID_NESTED}/${G_LEAF}`]: { traits: { Transform: { x: 7 } } } } };
+    const rowMembers = { [`/${G_LEAF}`]: { own: [own] } };
+    install(midDoc());
+    install(innerNoLeaf());
+    const doc = outer2();
+    (doc.entities.find((e) => e.prefab === INNER) as unknown as Record<string, unknown>).members = rowMembers;
+    const root = await quietly(() => openInEditor(doc));
+    expect(serializePrefab(root, OUTER2)!.entities.find((e) => e.prefab === INNER)!.members).toEqual(rowMembers);
+  });
+
+  // A node a Refresh drops keeps the key it was authored with, save after save. Mutation: in `captureRowsForSettle`,
+  // skip `keySceneNodes` (the node is gone by the save, and `toTemplateNodes` mints a key each time).
+  it('a node a Refresh drops keeps its authored key across saves', async () => {
+    const KK = 'dddddddd-0000-4000-8000-000000051538';
+    const n1 = { parentLocalId: 2, guid: '', key: K1, name: 'N1', traits: { EntityAttributes: { name: 'N1' }, Transform: {} }, children: [] };
+    const kid = { parentLocalId: 0, guid: '', key: KK, name: 'Kid', traits: { EntityAttributes: { name: 'Kid' }, Transform: { x: 4 } }, children: [] };
+    install(midDoc({ added: [n1] }));
+    const root = await openInEditor(outer2({ members: { [`/${G_MID_NESTED}/a+${K1}`]: { own: [kid] } } }));
+    expect(inMid('Kid')).toHaveLength(1); // precondition: the node row spawned its node
+    install(midDoc());
+    await quietly(() => rebaseStaleInstances());
+    const first = JSON.stringify(refNodeOf(serializePrefab(root, OUTER2)!).members ?? {});
+    expect(first).toContain(KK);
+    expect(JSON.stringify(refNodeOf(serializePrefab(root, OUTER2)!).members ?? {})).toBe(first); // a second save: same bytes
+  });
+
+  const innerWith = (...extra: ReturnType<typeof row>[]) => ({ ...innerDoc, entities: [innerDoc.entities[0]!, ...extra] });
+  const leafRow = () => row(2, G_LEAF, 'Leaf', 1, {}, { UIAction: {}, UIFocusable: {} });
+  const extraRow = () => row(4, G(98), 'Extra4', 1);
+
+  // A rebuild respawns the node without its key marker, and a SECOND Refresh before any save must still keep both edits
+  // in template form. Mutation: in `captureRowChannels`, re-emit a kept row without `templateRowOf`. (Reading the marker
+  // alone in `keepsTemplateRows` does not turn this one red — rows with no node convert the same either way — the next
+  // case covers that.)
+  it('two Refreshes in a row keep both dropped edits as template rows', async () => {
+    install(midDoc());
+    install(innerWith(leafRow(), extraRow()));
+    const root = await openInEditor(outer2({ members: {
+      [`/${G_MID_NESTED}/${G_LEAF}`]: { traits: { Transform: { x: 5 } } },
+      [`/${G_MID_NESTED}/${G(98)}`]: { traits: { Transform: { x: 6 } } },
+    } }));
+    install(innerWith(extraRow()));
+    await quietly(() => rebaseStaleInstances());
+    install(innerWith());
+    await quietly(() => rebaseStaleInstances());
+    expect(refNodeOf(serializePrefab(root, OUTER2)!).members).toEqual({
+      [`/${G_MID_NESTED}/${G_LEAF}`]: { traits: { Transform: { x: 5 } } },
+      [`/${G_MID_NESTED}/${G(98)}`]: { traits: { Transform: { x: 6 } } },
+    });
+  });
+
+  // The same after an innocuous Refresh: a dropped node row's own node goes back as a template node, its key kept.
+  // Mutations: in `keepsTemplateRows`, read the marker alone; in `templateRowOf`, keep scene nodes as they are.
+  it('a node row dropped after an earlier Refresh keeps its node as a template node', async () => {
+    const KK = 'dddddddd-0000-4000-8000-000000051538';
+    const n1 = { parentLocalId: 2, guid: '', key: K1, name: 'N1', traits: { EntityAttributes: { name: 'N1' }, Transform: {} }, children: [] };
+    const kid = { parentLocalId: 0, guid: '', key: KK, name: 'Kid', traits: { EntityAttributes: { name: 'Kid' }, Transform: { x: 4 } }, children: [] };
+    install(midDoc({ added: [n1] }));
+    install(innerWith(leafRow()));
+    const root = await openInEditor(outer2({ members: { [`/${G_MID_NESTED}/a+${K1}`]: { own: [kid] } } }));
+    install(innerWith(leafRow(), extraRow()));
+    await quietly(() => rebaseStaleInstances());
+    install(midDoc());
+    await quietly(() => rebaseStaleInstances());
+    const out = refNodeOf(serializePrefab(root, OUTER2)!).members![`/${G_MID_NESTED}/a+${K1}`]!.own![0]!;
+    expect(out.guid).toBe('');
+    expect(out.key).toBe(KK);
+    expect(JSON.stringify(out)).not.toMatch(/"guid":"[0-9a-f]/);
+  });
+
+  // The settle keeps SCENE form, so its own live replay puts a node's guid back: a ref to a node the user added (never
+  // saved, so it has no template key to derive from) survives the drop and the restore. Mutation: in
+  // `captureRowsForSettle`, keep the rows as `templateRowOf` writes them (the guid is gone before the replay).
+  it('a Refresh that drops and restores a node keeps the guid of an unsaved node added under it', async () => {
+    const n1 = { parentLocalId: 2, guid: '', key: K1, name: 'N1', traits: { EntityAttributes: { name: 'N1' }, Transform: {} }, children: [] };
+    const ADDED = 'eeeeeeee-0000-4000-8000-00000000abcd';
+    install(midDoc({ added: [n1] }));
+    install(innerWith(leafRow()));
+    await openInEditor(outer2());
+    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Added', parentId: inMid('N1')[0]!.id, guid: ADDED }));
+    install(midDoc());
+    await quietly(() => rebaseStaleInstances());
+    install(midDoc({ added: [n1] }));
+    await quietly(() => rebaseStaleInstances());
+    expect(inMid('Added').map((e) => e.guid)).toEqual([ADDED]);
+  });
+
+  // A node whose own guid is a runtime one is captured `guid: ''`, and its durable child must not pass through whole.
+  // Mutation: in `templateRowOf`, test only the node's own guid (not `holdsGuid` over its subtree).
+  it('a dropped member\'s node with a runtime guid does not carry its child\'s guid into the template', async () => {
+    const CG = 'eeeeeeee-0000-4000-8000-0000000000c1';
+    install(midDoc());
+    install(innerWith(leafRow()));
+    const root = await openInEditor(outer2());
+    const p = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'P', parentId: inMid('Leaf')[0]!.id }));
+    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'C', parentId: p.id(), guid: CG }));
+    install(innerWith());
+    await quietly(() => rebaseStaleInstances());
+    const saved = serializePrefab(root, OUTER2)!;
+    expect(JSON.stringify(refNodeOf(saved).members ?? {})).toContain('"C"'); // the node is kept…
+    expect(JSON.stringify(saved)).not.toContain(CG); // …without its live guid
+  });
+
+  // A scene reference node added under a node the Refresh drops keeps its own member edit, as template rows.
+  // Mutations: in `templateRowOf`, leave a scene reference node's `members` to `toTemplateNodes` (which drops them); in
+  // `keySceneNodes`, skip a node's `members` (XNode then gets a new key on every save).
+  it('a reference node added under a dropped node keeps its member edit', async () => {
+    const X = 'aaaaaaaa-0000-4000-8000-000000091538';
+    const xDoc = { id: X, version: 6, name: 'X', rootLocalId: 1, entities: [row(1, G(71), 'XRoot', 0), row(2, G(72), 'XKid', 1)] };
+    const n1 = { parentLocalId: 2, guid: '', key: K1, name: 'N1', traits: { EntityAttributes: { name: 'N1' }, Transform: {} }, children: [] };
+    install(xDoc);
+    install(midDoc({ added: [n1] }));
+    install(innerWith(leafRow()));
+    const root = await openInEditor(outer2());
+    const xr = await instantiatePrefabAsync(xDoc as never, inMid('N1')[0]!.id);
+    setPrefabSource(xr, X);
+    writeTraitFieldWithUndo(all().find((e) => e.name === 'XKid')!.id, getTraitByName('Transform')!, 'x', 9);
+    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'XNode', parentId: all().find((e) => e.name === 'XKid')!.id, guid: 'eeeeeeee-0000-4000-8000-0000000000d1' }));
+    install(midDoc());
+    await quietly(() => rebaseStaleInstances());
+    const members = JSON.stringify(refNodeOf(serializePrefab(root, OUTER2)!).members ?? {});
+    expect(members).toContain('"x":9');
+    expect(members).toContain('"XNode"');
+    expect(members).not.toMatch(/"guid":"[0-9a-f]/);
+    // XNode's key was read while it was live: a second save writes the same bytes.
+    expect(JSON.stringify(refNodeOf(serializePrefab(root, OUTER2)!).members ?? {})).toBe(members);
+  });
+
+  function panel() { return all().find((e) => e.name === 'Panel')!; }
 });

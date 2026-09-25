@@ -286,7 +286,7 @@ export const discardUnsavedParam = z.boolean().optional().describe(`${DISCARD_UN
  *  the `$ref`-dedup reason `makePointSpec` documents below — drag's `from`/`to` both carry them. */
 export const makeLabelAimParam = () => z.string().optional().describe(
   'Editor chrome (data-ui-id control or dock tab) by its WHOLE label, e.g. "Console"; case-insensitive. '
-  + 'Refused unless exactly one on-screen match. Not with selector/entity.',
+  + 'Refused unless exactly one on-screen match. Not with selector, entity or x/y.',
 );
 export const makeWithinParam = () => z.string().optional().describe(
   'CSS selector scoping `label`, e.g. \'[data-panel-scope="assets"]\'.',

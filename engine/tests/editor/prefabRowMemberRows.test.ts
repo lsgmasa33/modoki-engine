@@ -369,7 +369,7 @@ describe('#1533 close-out review', () => {
 
   // Re-review: R2's re-emit is for a TEMPLATE's own kept rows only. Under a scene root the kept rows are scene rows —
   // member guids and scene-guid nodes — and in a template every instance would spawn them with one guid (#1293).
-  // Mutation: drop the `isPrefabEditRowGuid` gate in `captureRowChannels`.
+  // Mutation: make `keepsTemplateRows` (`captureRowChannels`' gate) return true.
   const SCENE_G = 'ffffffff-0000-4000-8000-000000000001';
   const NODE_G = 'ffffffff-0000-4000-8000-000000000002';
   const GONE = G(99);

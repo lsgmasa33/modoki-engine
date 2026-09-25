@@ -348,9 +348,22 @@ describe('tap', () => {
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('a selector wins over stale coordinates passed alongside it', async () => {
-    await post('/api/input/tap', { selector: '#kebab', x: 1, y: 2 });
-    expect(ops.tap).toHaveBeenCalledWith(210, 110, expect.anything());
+  // #1556 (owner-approved breaking): this used to be "a selector WINS over stale coordinates". Two
+  // addresses are now refused on EVERY aimed route, before the renderer is asked anything.
+  it.each([
+    ['/api/input/tap', { selector: '#kebab', x: 1, y: 2 }],
+    ['/api/input/tap', { selector: '#kebab', x: 1 }],
+    ['/api/input/pointer', { action: 'down', selector: '#kebab', x: 1, y: 2 }],
+    ['/api/input/hover', { selector: '#kebab', x: 1, y: 2 }],
+    ['/api/input/scroll', { selector: '#kebab', x: 1, y: 2, deltaY: 10 }],
+    ['/api/input/drag', { from: { selector: '#kebab', x: 1, y: 2 }, to: { x: 9, y: 9 } }],
+    ['/api/input/drag', { from: { x: 1, y: 1 }, to: { selector: '#kebab', x: 9, y: 9 } }],
+  ])('%s with a selector AND coordinates is REFUSED AMBIGUOUS, nothing dispatched (#1556)', async (url, body) => {
+    const res = await post(url, body) as { status: number; body: { code?: string; error?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(res.body.error).toContain('selector AND {x,y}');
+    for (const op of [ops.tap, ops.drag, ops.pointerDown, ops.hover, ops.scroll]) expect(op).not.toHaveBeenCalled();
   });
 
   it('forwards button, clickCount and modifiers', async () => {
@@ -683,7 +696,8 @@ describe('sustained pointer: the backend releases a stranded press (#302)', () =
     'a mid-gesture %s leaves the hold ALONE — those are legitimate during a drag',
     async (route) => {
       await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
-      await post(`/api/input/${route}`, { key: 'Shift', text: 'x', deltaY: 10, x: 1, y: 1, selector: '#kebab' });
+      // One address — a selector AND x/y here would now be refused (#1556) and pass this vacuously.
+      await post(`/api/input/${route}`, { key: 'Shift', text: 'x', deltaY: 10, selector: '#kebab' });
       // Constraining a drag with Shift, cancelling with Escape, or scrolling a list while dragging
       // over it are real interactions; stealing the press would break the thing under test.
       expect(ops.pointerUp).not.toHaveBeenCalled();
@@ -886,6 +900,27 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.drag).toHaveBeenCalledWith({ x: 11, y: 22 }, { x: 16, y: 20 }, expect.anything());
   });
 
+  it.each([
+    [{ to: { x: 50, y: 60 }, delta: { dx: 5, dy: 5 } }, 'to AND delta'],
+    [{ toId: 'bone.1', delta: { dx: 5, dy: 5 } }, 'toId AND delta'],
+    [{ to: { x: 50, y: 60 }, toId: 'bone.1' }, 'to AND toId'],
+  ])('drag-handle refuses two destinations as AMBIGUOUS — they were settled by precedence (#1556) %j', async (dest, named) => {
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', ...dest }) as { status: number; body: { code?: string; error?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(res.body.error).toContain(named);
+    expect(ops.drag).not.toHaveBeenCalled();
+  });
+
+  it('drag-handle refuses two destinations BEFORE resolving the handle — a bad id cannot hide it', async () => {
+    // Observed live: with the check after the resolve, `{id:'nope', to, delta}` answered 404 "no live
+    // handle", so the caller fixed the id and only then learned the destination was ambiguous.
+    const res = await post('/api/input/drag-handle', { id: 'nope', to: { x: 1, y: 1 }, delta: { dx: 1, dy: 1 } }) as { body: { code?: string } };
+    expect(res.body.code).toBe('AMBIGUOUS');
+    // The route's own lease/focus probes still run; the HANDLE lookup must not.
+    expect(requestRenderer.mock.calls.map((c) => c[0])).not.toContain('enact-handles');
+  });
+
   it('drag-handle refuses a zero delta — the easiest way to reach the degenerate drag', async () => {
     // `delta:{dx:0,dy:0}` is a TRUTHY object, so it sails past the `if (!to && h.delta)` guard
     // and produces to === from. This route already refuses off-screen and disabled handles;
@@ -921,9 +956,12 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.drag).not.toHaveBeenCalled();
   });
 
-  it('an explicit `to` wins over toId and delta', async () => {
-    await post('/api/input/drag-handle', { id: 'bone.0', to: { x: 1, y: 1 }, toId: 'bone.1', delta: { dx: 9, dy: 9 } });
-    expect(ops.drag).toHaveBeenCalledWith({ x: 11, y: 22 }, { x: 1, y: 1 }, expect.anything());
+  it('all three destinations at once are refused, not "an explicit `to` wins" (#1556)', async () => {
+    // This test used to pin the precedence; the tool description said "ONE of" the whole time.
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', to: { x: 1, y: 1 }, toId: 'bone.1', delta: { dx: 9, dy: 9 } }) as { body: { code?: string; error?: string } };
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(res.body.error).toContain('to AND toId AND delta');
+    expect(ops.drag).not.toHaveBeenCalled();
   });
 
   it('drag-handle forwards steps/button/modifiers', async () => {
@@ -1176,6 +1214,15 @@ describe('entity-aimed input (the third target surface)', () => {
     expect(ops.pointerMove).toHaveBeenCalled();
   });
 
+  it('…and a held move with an EMPTY entity beside x/y is a coordinate move, as on down (close-out review)', async () => {
+    // The carve-out used to spread `allowOccluded:true` into `{}`, giving it a key — so `aimAddresses`
+    // counted an entity and refused "entity AND {x,y}" on move while down accepted the same args.
+    await post('/api/input/pointer', { action: 'down', entity: {}, x: 40, y: 50 });
+    const moved = await post('/api/input/pointer', { action: 'move', entity: {}, x: 60, y: 70 }) as { status: number; body: { code?: string } };
+    expect(moved.body.code).not.toBe('AMBIGUOUS');
+    expect(ops.pointerMove).toHaveBeenCalled();
+  });
+
   it('…and an explicit entity.allowOccluded:false does NOT re-impose a refusal on that move', async () => {
     // The carve-out is about DELIVERY — the press already captured the target — so it overrides
     // the caller's flag instead of losing to it via `??`. Before this, the top-level force reached
@@ -1203,9 +1250,17 @@ describe('entity-aimed input (the third target surface)', () => {
     expect(calls.filter((c) => !c.startsWith('renderer:')), 'no INPUT was dispatched').toEqual([]);
   });
 
-  it('takes precedence over selector and {x,y}', async () => {
-    await post('/api/input/tap', { entity: { guid: 'g-puck' }, selector: '#kebab', x: 1, y: 2 });
-    expect(calls).toEqual(['renderer:resolve-entity-point', 'tap(400,300)']);
+  // #1556: this used to "take precedence over selector and {x,y}" — the entity was pressed and the
+  // other two addresses silently dropped. Refused before ANY resolve, so no renderer round trip either.
+  it.each([
+    [{ entity: { guid: 'g-puck' }, selector: '#kebab' }, 'entity AND selector'],
+    [{ entity: { guid: 'g-puck' }, x: 1, y: 2 }, 'entity AND {x,y}'],
+    [{ entity: { guid: 'g-puck' }, selector: '#kebab', x: 1, y: 2 }, 'entity AND selector AND {x,y}'],
+  ])('an entity beside another address is REFUSED AMBIGUOUS (%j)', async (body, named) => {
+    const res = await post('/api/input/tap', body) as { status: number; body: { code?: string; error?: string } };
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(res.body.error).toContain(named);
+    expect(calls).toEqual([]);
   });
 
   it('an EMPTY entity object falls through to the other aim modes', async () => {
@@ -2060,9 +2115,10 @@ describe('label aim (#1153)', () => {
     expect(calls.filter((c) => c.startsWith('renderer:'))).toEqual([]); // refused before any resolve
   });
 
-  it('…but stray x/y beside a label are inert, exactly as beside a selector', async () => {
-    await post('/api/input/tap', { label: 'Console', x: 1, y: 1 });
-    expect(calls[calls.length - 1]).toBe('tap(360,546)');
+  it('…and so is x/y beside a label — no longer "inert" (#1556)', async () => {
+    const res = await post('/api/input/tap', { label: 'Console', x: 1, y: 1 }) as { body: { code?: string } };
+    expect(res.body.code).toBe('AMBIGUOUS');
+    expect(calls).toEqual([]);
   });
 
   it('`within` without a label is refused rather than silently ignored', async () => {

@@ -7,7 +7,7 @@
  *  timeline scrub can't pose it through a trait — the runtime scrub entry point
  *  (`timelineSystem.previewTimelineAt`) can't touch THREE.
  *
- *  This module is the bridge, mirroring `skeletalPreview`. The EDITOR scrub path registers an
+ *  This module is the bridge. The EDITOR scrub path registers an
  *  absolute clip time per skeletal animation-track target via `requestSkeletalSeek`; the
  *  render sync consumes it with `getSkeletalSeek`, seeking that rig's mixer action to the exact
  *  time (`action.time = t; mixer.update(0)`) instead of advancing it. `previewTimelineAt`
@@ -16,7 +16,7 @@
  *  `requestSkeletalSeek`, so `hasSkeletalSeeks()` is false and behaviour is unchanged
  *  (frozen-at-bind while stopped, mixer-advanced while playing).
  *
- *  Why a module-level singleton (mirrors `playState` / `skeletalPreview`): both 3D viewports
+ *  Why a module-level singleton (mirrors `playState`): both 3D viewports
  *  (editor SceneView + GameView Scene3D) run on the one frame driver and each owns an
  *  independent mixer clone — reading the same seek request poses each clone to the same time.
  *  Force-cleared on any world swap (below), mirroring `controlSpawnRegistry`.

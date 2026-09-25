@@ -30,6 +30,7 @@ import type { ToolResult } from './result.js';
 import { getTool as defaultGetTool, toolNames } from './registry.js';
 import { CONTRACTS } from './contracts.js';
 import { unknownParamMessage } from '../../shared/unknownParam.js';
+import { aimAddresses, ambiguousAimMessage } from '../../shared/aimAddresses.js';
 
 /** How much of a step's payload comes back. See the module header for why `'none'` is safe. */
 export type ResultMode = 'none' | 'ack' | 'full';
@@ -187,9 +188,9 @@ function usesRawXY(tool: string, args: Record<string, unknown>): string | null {
   const hasXY = (o: unknown): boolean =>
     !!o && typeof o === 'object' && typeof (o as { x?: unknown }).x === 'number'
       && typeof (o as { y?: unknown }).y === 'number';
-  // An entity/selector/label aim WINS over stray coordinates in `resolvePoint`, so coordinates
-  // sitting beside one are inert and must not trip this. Only a call that would actually BE
-  // coordinate-aimed is refused.
+  // Coordinates beside an entity/selector/label are not a RAW-coordinate aim, which is all this
+  // guard is about: `resolvePoint` refuses that pair itself as AMBIGUOUS (#1556 — it used to let the
+  // aim win and drop the coordinates). Only a call that would actually BE coordinate-aimed is refused.
   const aimed = (o: unknown): boolean =>
     !!o && typeof o === 'object'
       && (!!(o as { selector?: string }).selector
@@ -202,6 +203,30 @@ function usesRawXY(tool: string, args: Record<string, unknown>): string | null {
   for (const end of ['from', 'to'] as const) {
     const spec = args[end];
     if (hasXY(spec) && !aimed(spec)) return `${end}.x/y`;
+  }
+  return null;
+}
+
+/** A step whose aim gives two addresses (#1556) — the route refuses it `AMBIGUOUS`, so refuse it HERE,
+ *  before step 1 runs: a batch is not a transaction, and failing at step N leaves 1..N-1 applied. Same
+ *  predicate as the routes (`shared/aimAddresses.ts`); `drag_handle` checks its destination. */
+function twoAddressAim(tool: string, args: Record<string, unknown>): string | null {
+  // `modoki_focus` aims by label OR selector and has its OWN rule on the route (`/api/input/focus`:
+  // both present, by `!== undefined`) — mirrored here rather than `aimAddresses`, so the pre-flight
+  // and the route cannot disagree (second close-out review: it slipped through to step N).
+  if (tool === 'modoki_focus') {
+    return args.label !== undefined && args.selector !== undefined ? 'give a label OR a selector, not both' : null;
+  }
+  const where = XY_AIMED[tool];
+  if (!where) return null;
+  if (where === 'to') {
+    const dest = (['to', 'toId', 'delta'] as const).filter((k) => !!args[k]);
+    return dest.length > 1 ? `give ONE destination of to, toId or delta — this step gave ${dest.join(' AND ')}` : null;
+  }
+  const specs: Array<[string, unknown]> = where === 'top' ? [['', args]] : [['from', args.from], ['to', args.to]];
+  for (const [end, spec] of specs) {
+    const msg = ambiguousAimMessage(aimAddresses(spec && typeof spec === 'object' ? spec as Record<string, unknown> : null));
+    if (msg) return `${end ? `${end}: ` : ''}${msg}`;
   }
   return null;
 }
@@ -305,6 +330,11 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
       }
       return { rejected: `batch: ${at}: invalid args — ${where}: ${issue.message}` };
     }
+    // AFTER the strict parse (second close-out review): a key the tool does not take — a `label` on a
+    // dnd endpoint, a `label:null` — must be named as THAT, not as two addresses whose advice ("keep
+    // one") leads straight into the schema refusal. Still before any step runs.
+    const twoAddresses = twoAddressAim(tool, args);
+    if (twoAddresses) return { rejected: `batch: ${at}: AMBIGUOUS — ${twoAddresses} Nothing ran.` };
   }
   return { tools: resolved };
 }

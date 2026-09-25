@@ -29,7 +29,7 @@ import {
   capturePreviewGesture, cancelPreviewGestures, poseEnvelopeHeld,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced, getModeOwner, onModeOwnerChange } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode, exitPreviewMode, freezePreviewIfOwnedBy, registerModeOwnerDisplaced, getModeOwner, onModeOwnerChange } from '../scene/playMode';
 import { openPreviewSessionThen, reopenPreviewAfterRestore, mayEndSharedSession, undoMayRepose } from '../scene/openPreviewSession';
 import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
 import { panelDrivesPreview, panelMayStopPreview } from '../scene/previewOwnership';
@@ -665,9 +665,8 @@ export default function TimelineEditor() {
     // clobber the just-set scrub back to 'preview'. Also: a DISPLACEMENT (not a scrub/exit of our
     // own) already stopped the guard and cleared `previewRafRef` above, and does NOT flip `playing`
     // (see the registration comment) — so this cleanup only runs here for OUR OWN teardown, never
-    // as a side effect of losing the mode to another panel. If it ever ran on displacement too, the
-    // `getRunMode() === 'preview'` check below would already read the NEW owner's mode and decline
-    // — same guard `enterPreviewMode`'s ordering relies on (see playMode.ts).
+    // as a side effect of losing the mode to another panel. If it ever ran on displacement too,
+    // `freezePreviewIfOwnedBy` would read the NEW owner and decline.
     return () => {
       cancelled = true;
       guard.stop();
@@ -678,7 +677,7 @@ export default function TimelineEditor() {
       if (previewLoopGuardRef.current === guard) previewLoopGuardRef.current = null;
       previewRafRef.current = 0;
       setTimelinePreviewActive(false);
-      if (getRunMode() === 'preview') enterPreviewMode(false, 'timeline');
+      freezePreviewIfOwnedBy('timeline');
     };
   }, [playing, previewOwner, rootId]);
 

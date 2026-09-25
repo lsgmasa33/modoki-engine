@@ -380,6 +380,11 @@ legitimate exception: it *measures* a path).
   2026-08-22 the singular-aim tools accept **either**, so one shape works across the surface.
   Sending BOTH is refused (`AMBIGUOUS`) rather than resolved by precedence: a caller who gave two
   addresses does not know which one the tool used, and picking for them is the §0 rank-1 class.
+  ⚠️ **The same rule covers the aim MODES, not just the entity's two shapes** (#1556, owner-approved
+  breaking change): any two of `entity` / `selector` / `label` / `{x,y}` are refused `AMBIGUOUS`, on
+  every aimed tool on both surfaces. They used to be settled by precedence (`entity` → `selector` →
+  `{x,y}`) while `label` beside either was refused, which is two answers to one question. One
+  predicate, `engine/tools/shared/aimAddresses.ts`, is read by every layer that sees a caller's aim.
   The SET-shaped params (`guids`, `entityIds`, `get_scene_state`'s filters) are deliberately
   untouched — they take a set, not an aim, and a singular `entity` there would be a third shape
   rather than one fewer.

@@ -331,7 +331,8 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
   }
   // Node rows LAST, over whatever the member rows left: a member's `added: []` (v16) or removal takes its
   // template nodes with it. A row naming no node applies nowhere; R2 reports and keeps it
-  // (`applyStoredMemberRows`), since only the whole template can say the node is gone.
+  // (`applyStoredMemberRows`), since only the whole template can say the node is gone — for a stored
+  // root by its guid, for a template reference node by the guid its root derives (`keepTemplateNodeOrphans`, #1542).
   if (nodeRows.size) added = applyNodeRows(added as unknown as KeyedNode<never>[] | undefined, nodeRows as never).nodes as unknown as A[] | undefined;
   return {
     overrides, added, removedTraits,

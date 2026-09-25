@@ -889,7 +889,8 @@ here; that is how the ~110s `verify` figure above went stale.
 the 82-86s wall-clock does not hold. Owner's call, taken deliberately (2026-09-08): a fresh clone
 that checks nothing and reports green is the failure this gate exists to prevent. The hub's normal
 path is the cheap one — right after `git merge origin/<branch>` the `--first-parent --no-merges`
-walk sees nothing, so the leg selects 0 projects.
+walk sees nothing, so the leg selects 0 projects — plus the scaffolder template, which it checks on
+every run (below).
 
 A
 typical worker branch selects 2. ⚠️ **The in-lane cost is stated in ONE place — the scoped leg's
@@ -908,6 +909,24 @@ Scoping it that way is *sound*, not merely cheap — the mask can only bite the 
 | The sibling DROPS the dep it was leaking | The WIDE program stops resolving too, so plain `npm run typecheck` goes red first |
 | A new project is added | It is "touched" by definition (the selection reads untracked files too) |
 | Engine `app/**` changes | Present in the wide program AND in every scoped one; already covered |
+| Anything that breaks the scaffolder template | **Not covered by touched-only at all — so the template is checked on EVERY run** (next paragraph) |
+
+⚠️ **The scaffolder template (`engine/templates/<name>`) is checked on every run but a named one
+(#1544).** It sits in no wide program — `tsconfig.app.json` includes `app`, `../games` and
+`../demos`, not `templates/` — so an engine or package change that breaks it reddens nothing else.
+It is also the one program with no sibling to borrow ambient types from. The scar: the template's
+`tests/tapTargets.test.ts` imports `@modoki/engine/testing/tapTargetFloor`, which imports `node:fs`,
+and a game's tsconfig loads `vite/client` types only. Every existing project compiled it because
+some UNRELATED test of its carried `/// <reference types="node" />` (Court's `bonusTabletFit`,
+sling's `sling-assets`, wordweave's `tutorialFetchStub` — confirmed with `tsc --explainFiles`). A
+fresh scaffold carried none, so its first in-repo build failed while every gate was green. The fix
+has two halves: each `@modoki/engine/testing/*` helper that imports a Node builtin declares the
+reference itself, which also repairs projects scaffolded with the old template, since the reference
+is program-wide (guarded by `testingHelpersDeclareNodeTypes.test.ts`, with the population derived
+from the package's `exports`). The other half is this leg, which typechecks the template in place.
+That check is faithful because the scaffolder's `__TOKEN__`s sit inside string literals. Cost is
+~6.5s standalone. It did not reach packaged-editor users: `build-web.mjs` skips the typecheck
+when `typescript` is not installed, and the packaged editor does not ship it.
 
 The one thing that changes the scoped SHAPE for a project you did *not* touch is the scoping
 machinery itself, so touching `engine/tsconfig.app.json`, `scopedTsconfig.mjs`, `build-web.mjs` or

@@ -332,7 +332,7 @@ point (keyframe scrub + activation), shared with the editor scrub-preview via
 **During editor SCRUB, 3D skeletal IS posed to the exact time** (Phase 5). A `SkeletalAnimator`'s pose
 lives in a `THREE.AnimationMixer` the render layer owns — the runtime scrub path can't sample it like a
 keyframe `Animator`. So `previewTimelineAt` publishes a **seek request** per skeletal target through
-`runtime/core/skeletalSeek.ts` (a plain module singleton mirroring `skeletalPreview`); the render
+`runtime/core/skeletalSeek.ts` (a plain module singleton, like `playState`); the render
 sync (`scene3DSync.syncSkinnedModels`) consumes it with `blendSkeletal`, which sets each requested
 clip's action to its time+weight (one clip = a seek at weight 1; two = a **crossfade** — Phase B) and
 bakes the pose with `mixer.update(0)`
@@ -528,9 +528,25 @@ when you **⏮/scrub, close/switch the panel, or press global Play**; Pause hold
 (session kept, audio+dispatch gates closed). The revert reloads the world (new entity ids), so the
 panel re-resolves the Director root after restore. No preview mutation of the WORLD reaches disk —
 every writer refuses until the restore has landed ([editor.md](editor.md) § One envelope at a time).
-⚠️ **State OUTSIDE the world is not covered:** an action a signal marker fires (a bus volume,
-PlayerPrefs, `iap.buy`, `system.openUrl`, `engine.reload`, game stores) runs for real and no snapshot
-reverts it — #1551.
+**State OUTSIDE the world the engine knows about is put back too** (#1551,
+`editor/scene/previewSideState.ts`): the audio bus volumes (the service AND the mixer store that
+mirrors them), PlayerPrefs, and the applied quality tier are captured when the session seats its
+snapshot and restored on every end — ⏹ Exit, Stop, Play, a scene load, and a world swap that abandons
+the session (an `engine.loadScene` fired by ▶ lands there). So a cutscene that ducks the music no
+longer leaves the editor muted. Each store writes only what changed.
+⚠️ **What it cannot cover, by the owner's decision** (the alternative — skipping "unsafe" actions in
+preview — was declined so ▶ keeps matching Play): effects that are not state — a real `iap.buy`, a
+browser tab from `system.openUrl`, `engine.reload`, a sound already played — and a game's own module
+state or stores. Those still happen for real during ▶. A PlayerPrefs key this build cannot read is
+not captured, so an action deleting one is not undone. A page reload while a session is held (an
+`engine.reload`, a game `.ts` edit, closing the window) runs no end at all, so a preview write that
+has already flushed to PlayerPrefs survives it.
+⚠️ **The restore cannot tell who wrote a store.** It puts back the state from when the envelope opened,
+so ANY write made inside one is undone at its end, not only a ▶ action's. That is why the agent's
+`player-prefs-write` refuses while a preview session is held (the editor wraps the shared bridge op) —
+only then, since nothing else puts PlayerPrefs back ([editor.md](editor.md) § One envelope at a time).
+No editor UI writes PlayerPrefs. ⚠️ A game's own agent tools (`game-tool-call`) are NOT gated: one that
+persists (Court's piece moves save the session) replies ok inside a session and is undone at its end.
 
 **Item inspector** (`timeline/ItemInspector.tsx`, pure helpers in `timeline/itemEdit.ts`): click a
 clip/marker/cue/span to edit its **values** — animation clip name/start/duration/scrub, signal

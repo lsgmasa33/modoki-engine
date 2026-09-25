@@ -10,6 +10,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resolveDomPoint, resolveDomPointReport, describeElement, describeOccluder } from '../../app/debug/domResolve';
+import { opReplyFor } from '../../app/debug/opRefusal';
 
 /** Give `el` a real-looking rect. jsdom reports all zeroes otherwise. */
 function stubRect(el: Element, r: { left: number; top: number; width: number; height: number }) {
@@ -494,9 +495,23 @@ describe('label aim (#1153)', () => {
     expect(resolveDomPointReport({ label: 'Delete', gesture: 'tap' })).toMatchObject({ ok: true, occluded: true, hitTarget: 'div.modal' });
   });
 
+  it('the THROWING resolver keeps the code through the relay — modoki_dnd answers AMBIGUOUS (#1556)', async () => {
+    // Close-out review: `resolveDomPoint` threw a plain Error, `opReplyFor` keeps a code only for an
+    // OpRefusal, so dnd's two addresses reached the agent as REFUSED_BY_OP. Through the real relay wrapper.
+    const two = await opReplyFor(() => resolveDomPoint({ selector: '#x', x: 1, y: 1 }, 'from'));
+    expect(two).toMatchObject({ result: { ok: false, code: 'AMBIGUOUS' } });
+    expect((two as { result: { error: string } }).result.error).toMatch(/^from: give ONE of/);
+    // An uncoded miss stays an uncoded error — the coded branch must not invent a code.
+    const miss = await opReplyFor(() => resolveDomPoint({ selector: '#absent-1556' }, 'from'));
+    expect(miss).toEqual({ error: expect.stringContaining('from: no element matches') });
+  });
+
   it('label + selector is AMBIGUOUS, `within` alone is an error, an empty label matches nothing', () => {
     control('a.b.c', 'Go', { left: 10, top: 10, width: 80, height: 20 });
     expect(resolveDomPointReport({ label: 'Go', selector: '#x' })).toMatchObject({ ok: false, code: 'AMBIGUOUS' });
+    // #1556: selector + {x,y} too — `modoki_dnd`'s endpoint reaches here, and the selector used to win.
+    expect(resolveDomPointReport({ selector: '[data-ui-id="a.b.c"]', x: 1, y: 1 })).toMatchObject({ ok: false, code: 'AMBIGUOUS' });
+    expect(resolveDomPointReport({ label: 'Go', x: 1, y: 1 })).toMatchObject({ ok: false, code: 'AMBIGUOUS' });
     expect(resolveDomPointReport({ selector: '[data-ui-id="a.b.c"]', within: '.x' }).ok).toBe(false);
     // The empty-label guard, not the filter: without it '' "matches" nothing yet suggests EVERY label
     // (a substring of all of them) under a NOT_FOUND code. Asserting only ok:false could not tell.

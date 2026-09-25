@@ -93,15 +93,36 @@ describe('the input tools send an entity aim to the device', () => {
 });
 
 describe('an entity aim to an app build that predates it is refused there, not acted on', () => {
-  /** A real selector beside the entity is the caller's own, and is kept rather than overwritten. */
-  it('the skew selector matches nothing, and never replaces a selector the caller gave', async () => {
-    const s = await loadDeviceSurface(onDevice('ok'));
-    try {
-      await s.call('device_scroll', { entity: { guid: 'g-1', surface: 'game-3d' }, selector: '#list', deltaY: 120 });
-      expect(sentTo(s.real(), 'scroll')[0]).toMatchObject({ entity: { guid: 'g-1', surface: 'game-3d' }, selector: '#list' });
-    } finally { s.restore(); }
+  it('the skew selector matches nothing', () => {
     document.body.innerHTML = '<canvas></canvas><div data-ui-id="x"></div>';
     expect(document.querySelector(SKEW)).toBeNull();
+  });
+});
+
+/** #1556 (owner-approved breaking): two of entity / selector / {x,y} are refused on the device too.
+ *  This used to keep a caller's selector beside its entity and let the page's order pick one. The
+ *  check reads the CALLER's spec, so the skew selector — the one deliberate second address on the
+ *  wire — is not what trips it (the entity-only tests above still send it). */
+describe('a device aim giving two addresses is REFUSED AMBIGUOUS, and nothing is sent', () => {
+  const entity = { guid: 'g-1', surface: 'game-3d' };
+  it.each([
+    ['device_tap', 'tap', { entity, selector: '#list' }, 'entity AND selector'],
+    ['device_tap', 'tap', { selector: '#list', x: 5, y: 6 }, 'selector AND {x,y}'],
+    ['device_hover', 'hover', { entity, x: 5, y: 6 }, 'entity AND {x,y}'],
+    ['device_scroll', 'scroll', { entity, selector: '#list', deltaY: 120 }, 'entity AND selector'],
+    ['device_pointer', 'pointer', { action: 'down', selector: '#list', x: 5 }, 'selector AND {x,y}'],
+    ['device_drag', 'drag', { from: { entity, x: 1, y: 1 }, to: { x: 9, y: 9 } }, 'the from endpoint'],
+    ['device_drag', 'drag', { from: { x: 1, y: 1 }, to: { selector: '#list', x: 9, y: 9 } }, 'the to endpoint'],
+  ])('%s %j', async (tool, method, args, named) => {
+    const s = await loadDeviceSurface(onDevice('ok'));
+    try {
+      const r = await s.call(tool, args);
+      expect(r.isError).toBe(true);
+      const e = envelope(s.text(r));
+      expect(e.code).toBe('AMBIGUOUS');
+      expect(e.why).toContain(named);
+      expect(sentTo(s.real(), method)).toEqual([]);
+    } finally { s.restore(); }
   });
 });
 

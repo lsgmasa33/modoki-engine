@@ -64,7 +64,12 @@ three were rare under `auto` and are routine now:
   is the predicate, and its docblock names `mutate` by name; it just had no caller on this route.
   The refusal names the exit that actually works, which depends on `modeOwner`: an ANIMATION-owned
   envelope is ended by `modoki_exit_pose_envelope`, and a TIMELINE-owned one is not — that op
-  deliberately refuses it, so there the reply asks for the human's ⏹ Exit Preview instead.
+  deliberately refuses it, so there the reply offers `modoki_play_control {action:'stop'}`, marked
+  DESTRUCTIVE because it restores the envelope's snapshot over anything the human did inside it.
+  The live-world entity ops (`create_entity`, `duplicate_entity`, `delete_entities`,
+  `reparent_entity`, `prefab` instantiate) refuse the same way with the same exits since #1552 —
+  they used to reply `ok` and be reverted on Exit. The exits live in one place,
+  `editor/scene/envelopeExits.ts`.
 - **A game-code (`.ts`) edit force-reloads the editor and DISCARDS unsaved scene edits** after a 5s
   countdown (CLAUDE.md). This is the sharpest one: accumulated unsaved work is more exposed than it
   was under `auto`.
@@ -899,6 +904,25 @@ referenced a scene replaced by Save As no longer resolves. It is not drift from 
   close-out reviews). A
   scene with no path yet (`new_scene`) already has a fresh id. A base loaded under the open scene is
   refused as a target. The human Save As is unaffected: it is offered only for an untitled scene.
+- **The reply names every file in the asset-root form (#1562).** The renderer builds the reply from
+  its own paths, and the open scene's path is whatever spelling it was opened under. That is Vite's
+  `/@fs/<abs>` for a boot candidate or an explicit `/@fs/` load. So a Save As answered
+  `scenePath: "/assets/…"` (the backend's disk spelling of the copy) beside
+  `savedAsCopyOf: "/@fs/…"` for the scene the caller addresses as `/assets/…`, and the live smoke read
+  that as "a copy of some other file". A plain save answered `scenePath: "/@fs/…"`, which
+  `modoki_mutate_scene {path}` refuses. The `/api/editor-action` relay now maps every `/@fs/` string
+  in the reply (top-level, in a list, or a list entry's `path`) through `toAssetRef`, the same
+  canonicalizer that gives `editor-state` its `scenePathRef`. ⚠️ It maps by VALUE, not by field name:
+  the first cut named five fields and missed a sixth (`savedImportSettings`), and the next field
+  added to the op would have been missed the same way. A path outside every asset root keeps the
+  renderer's spelling. The raw open path still drives the same-file compare and the plain-save
+  write, because those have to match what the editor holds.
+  **Every OTHER editor-action reply** that carries the editor state (`load_scene`, play, undo,
+  prefab edit-open and about a dozen more spread `readEditorState()`) gains the same additive
+  `scenePathRef` that `modoki_get_editor_state` has. `load_scene` was observed answering
+  `scenePath: "/@fs/…"` with no ref at all. Save All carries `scenePathRef` too, so the field means
+  one thing on every reply of the route, and prefab edit-open's `returnScene` gains a
+  `returnSceneRef` the same way.
 
 **A Replace never crosses KINDS.** The scene flows write plain `.json`, so their destination can be
 `Enemy.prefab.json`. Kept, that guid would be re-registered as a scene, and every `PrefabInstance.source`

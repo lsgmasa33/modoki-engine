@@ -1165,7 +1165,8 @@ it, and after MID restores `Leaf`, OUTER still hides it.
   as the scene writer does (review F3). It does that under an edit-world sentinel ONLY. Under a scene
   root (Create Prefab, Apply's promotion) the kept rows are scene rows, with member guids and nodes
   carrying scene guids, and in a template every instance would spawn them with one guid (#1293,
-  re-review).
+  re-review). The gate is `keepsTemplateRows`, and a template reference node below such a sentinel
+  passes it too (#1542, next section).
 - **Readers.** Two walkers already read `members` on ANY carrier: the build's tree-shaker
   (`walkCarrier`) and the duplicate remint (`asset-fs-ops`). The runtime collector does too, and
   `SceneManager` runs it over a cached prefab's entities. `templateKeysOf` (the key heal's candidates)
@@ -1220,20 +1221,18 @@ What changed:
   re-expands every owned nested instance inside it, so its capture counts them as consumed. It did not,
   before #1538 too: `planPrefabRows` took MID's own INNER, inside the node, for a free-standing nested
   instance and wrote it again as a row at the prefab root, so every instance spawned a duplicate.
-- **The node is its own token frame.** The loaders open a token scope at a reference node's top
-  instantiate call and never resolve a `^` out of it (`loadSceneFile.ts`, `if (!t || t.up) return
-  token`), so the writer never climbs out either: `enclosing(root)` is 0. A ref from inside the node to a
-  member of the prefab AROUND it therefore stays a guid — the one case not covered, since it needs the
-  loader to resolve across the call: #1541 (observed: the edit world's placeholder guid is saved, and
-  names nothing in any instance).
+- **The node is its own token frame, and a `^` climbs out of it (#1541).** The loaders open a token
+  scope at a reference node's top instantiate call, so its payload is tokenized in the node's own frame.
+  Until #1541 no `^` crossed that call in either direction, and a ref from inside the node to a member of
+  the prefab AROUND it was saved as the edit world's placeholder guid, which named nothing in any
+  instance. How it climbs now: `docs/scene-loading.md` § "Guid uniqueness is a PER-FILE rule, not a
+  repo-wide one", the "Across a reference node" bullet under "Template identity, refs".
 - **Member rows on a template node — owner's decision (2026-09-25).** #1293 kept `members` off template
   nodes for two reasons: a member row stated a per-instance guid, and the frozen format had no rows. A
   template-form row keys by `nodeGuid` paths and carries no guid (the #1533 rows already do this on a
-  prefab row), and v6 has rows. So a template reference node carries them. **No kept orphan rows go
-  back out for it**, and that is a real loss, not only a safe default: R2's store is keyed by a stored
-  root guid, which a template reference root does not have. So a row whose member the inner prefab
-  dropped is erased by the next save of the outer prefab, and the edit does not come back when the
-  member does. A prefab row keeps it. #1542. Nor does a template node state a MOVE: a member re-parented
+  prefab row), and v6 has rows. So a template reference node carries them, and **its kept orphan rows go
+  back out** as a prefab row's do (#1542) — see "R2 for a template reference node" below. Nor does a
+  template node state a MOVE: a member re-parented
   inside it in the prefab editor reloads under its template parent (#1543: a template capture records
   no moves, and a template row carries no `parent`).
 - **The comparers ask both forms (`sameAddedNode`).** `nodeDiffDeps.sameReference` (the scene and row
@@ -1264,6 +1263,70 @@ What changed:
 - **Tests:** `engine/tests/editor/templateReferenceNodeRows.test.ts`, one per symptom and per reader,
   each mutation-checked.
 
+
+### R2 for a template reference node (#1542)
+
+**The symptom.** OUTER2's reference node → MID carried a row for a member INNER (inside MID) no longer
+had. An untouched save of OUTER2 dropped it, while the same orphan on a prefab ROW survived. So if an
+inner prefab briefly deleted a node, any save of the outer prefab erased the outer prefab's edit to
+it for good.
+
+**The mechanism.** R2's store (`orphanMemberRows`, read through `keptMemberOrphans`) is keyed by an
+instance root's guid, and the load found a reference node's rows by the guid the node STORES
+(`collectReferenceNodeRows`). A template reference node stores none: it has a `key`, and its root
+derives a guid. So its rows never reached `applyStoredMemberRows`. The fold skipped the unmatched row
+without a word, and the writer's re-emit had nothing to read.
+
+**The fix: the same store, keyed by the guid the root derives.**
+- **Load.** `collectReferenceNodeRows` also hands back key-only reference nodes, and the loader
+  collects them per scene ENTRY, from the entry's own statements only (`added`, its slots' `added`,
+  its rows' nodes, recursively). Once the derive has run, `keepTemplateNodeOrphans` finds each node's
+  root by its key below that entry's root and runs `applyStoredMemberRows` on it. Every node counts,
+  rows or not, so a reload resets the store. In the prefab-edit world an entry is a row of the edited
+  prefab, so the rows kept are exactly the ones that file stated. A node that a NESTED template
+  declares is folded inside the instantiation, never reaches that walk, and is never kept: it belongs
+  to the other file.
+- **Why the derived guid rather than a composite key.** A Refresh settles the store by the row-writing
+  root's guid (`captureRowsForSettle`, #1535), and for a template reference node that root is the
+  node's own. Keyed any other way, a Refresh that restores the member would find nothing to replay.
+- **Re-emit.** `captureRowChannels` reads the store behind `keepsTemplateRows`. It passes a prefab-edit
+  row sentinel, as before, or a root that carries a template key and has such a sentinel as an
+  ancestor. A scene never holds a key-only reference node (a scene-form node stores a guid, #1438), so
+  outside the edit world the gate stays shut and #1293 holds. A template written from a scene
+  instance does not carry rows kept for its node there.
+- **Kept rows re-enter a template in template form (`templateRowOf`, `keySceneNodes`).** A Refresh's
+  settle (`captureRowsForSettle`) keeps what a SCENE save would write (`savedMemberRows`): the member's
+  guid and name, and scene nodes. `captureRowChannels` re-emits kept rows into the template, so a member
+  the Refresh dropped came back out of the next prefab-edit save carrying its edit-world guid. That is
+  #1293, on prefab rows as well as template nodes, and older than #1542; the close-out review found it.
+  The store keeps two forms: the load's template rows, and the settle's scene rows, which must STAY
+  scene rows because the settle's own live replay respawns a node by its guid. So the conversion is at
+  the re-emit, and it touches only the scene parts: the row's `guid`, `name` and `parent`, and every node
+  carrying a guid. A template node passes through whole, its own `members` included. A scene node needs
+  its key, and nothing can recover that once the node is gone, so the settle reads it BEFORE the
+  teardown (`keySceneNodes`: marker, recovered, or minted once) and stores it beside the guid.
+  Three attempts failed first, and each was found by a review:
+  - converting every node at the re-emit stripped a load-kept template node's `members`;
+  - storing template form lost the guid the replay needs, so a user-added node came back with another;
+  - keying without it minted a fresh key on every save.
+  A node is a scene node when anything in its SUBTREE holds a guid: a node with a runtime guid is captured
+  `guid: ''` and its durable child would otherwise pass through. A scene REFERENCE node keeps its own
+  rows, converted the same way, since its rows are keyed as a template's are.
+  ⚠️ **Not covered:** a keyed node whose guid is not derived from its key (a reference node the user
+  dropped this session) loses its key marker in a rebuild and cannot recover it. Its kept rows then
+  re-key on every save, and the node's own key changes across a Refresh: #1567. A row created this
+  session keeps no orphan rows at all, and a runtime-guid node re-homed by the re-apply is duplicated
+  on restore: #1568.
+- **The node's key is read before its capture, and recovered where it is read.** A Refresh respawns the
+  node without its template key marker. `finishTemplateReferenceNode` stamps or recovers the key before
+  capturing (`addedNodeIdentity`). `keepsTemplateRows` accepts a recovered key (`recoverTemplateKey`)
+  as well as the marker, because the settle asks it too: a second Refresh before any save found no
+  marker, so it kept scene rows as if outside a template.
+- **Kept, never pinned.** `keepTemplateNodeOrphans` runs after the derive, past the collision guard,
+  so it keeps rows only (`applyStoredMemberRows`' `keepOnly`). A guid a template row holds anyway (a
+  hand-edited file) is not stamped on the member, just as the scene-side fold ignores it.
+
+Tests: `templateReferenceNodeRows.test.ts` § #1542. Each one names its mutation.
 ### The #1468 design record — why identity is stored this way
 
 The design, the decisions and the rules behind scene v16 and prefab v5. The plan that carried them

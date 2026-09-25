@@ -1936,10 +1936,26 @@ makes ONE place answer a question several used to answer separately.
 - **The Animation rebind finds the same entity by guid** before falling back to "the first Animator
   whose bank lists the clip", which picked none for a "+ New Animation" bind and the wrong one when
   two Animators share a clip.
+- **The agent's live-world edits refuse an envelope** (#1552). `create-entity`, `duplicate-entity`,
+  `delete-entities`, `reparent-entity` and `prefab` instantiate / detach / revert edited the
+  snapshotted world, replied `ok`, and vanished on Exit. They ask `whyWorldNotAuthored()` like the disk
+  writers. The exits follow which condition holds (`posedWorldExits`): inside an envelope, the exits
+  `/api/scene-mutate` offers — one copy, `editor/scene/envelopeExits.ts`; a session still held after
+  the mode left, Stop; a restore landing, retry; a FAILED restore, reload the scene. `prefab create`
+  shares the refusal and, since it writes a FILE, refuses Play as well. `player-prefs-write` (not
+  `flush`) refuses only while a session is HELD — that is the only thing that puts PlayerPrefs back
+  (#1551). Play is exempt on purpose: editing the play world is how an agent drives a running game,
+  and Stop discarding it is Play's contract, not a silent loss. Game agent tools are not gated.
+- **Pause says it is paused.** Both panels pause through `freezePreviewIfOwnedBy` (`preview` +
+  `advancing:false`, session still held). The Animation ▶ never froze the mode, so `get_editor_state`
+  reported an advancing preview while it sat still (#1552). The helper declines when a scrub, an
+  exit or another panel already changed the mode, which is what the Timeline's own inline guard did.
 
 Still open, and why:
-- signal/`OnSequence` actions fired by ▶ mutate state outside the world (bus volume, PlayerPrefs,
-  IAP, URLs) that no snapshot restores — #1551, a design fork, not a snapshot fix;
+- signal/`OnSequence` actions fired by ▶ still run for real where the effect is not state the engine
+  knows (`iap.buy`, `system.openUrl`, `engine.reload`, a game's own stores). The known stores — bus
+  volumes, PlayerPrefs, the applied quality tier — are put back on every end (#1551,
+  [timeline.md](timeline.md) § ▶ Preview);
 - a takedown from OUTSIDE the panel (Play, Stop, a scene load) passes no rebind, so the Animation
   root is re-taken by NUMBER by `editorRefLiveness` — right while load order is deterministic, which
   it is for an unedited scene; only ⏹ Exit and Cmd+S rebind by guid;

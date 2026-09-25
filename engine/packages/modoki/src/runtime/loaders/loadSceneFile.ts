@@ -35,7 +35,7 @@ import { mapStringValues } from '../core/assetRefRules';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
 import { memberPathIndex, identityTree } from '../core/ecs/memberHome';
-import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, setRuntimeFrameDocFallback, type IdentityNode, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
+import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
 export { memberPathIndex } from '../core/ecs/memberHome';
 
 /** The structural delta an OUTER layer (a scene, or an ancestor prefab) applies INSIDE a nested
@@ -1366,21 +1366,55 @@ export type ReferenceNodeRows = [rootGuid: string, members: Record<string, Scene
  *  Collected from the DOCUMENT rather than at the spawn, because those spawns happen several frames
  *  down inside `applyStructureCore`'s ops and the node's own stored `guid` is a perfectly good handle
  *  to the root once it exists. */
-export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[] = []): ReferenceNodeRows[] {
+export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[] = [], keyed?: ReferenceNodeRows[]): ReferenceNodeRows[] {
   if (!Array.isArray(nodes)) return out;
   for (const n of nodes as AddedEntity[]) {
     if (!n || typeof n !== 'object') continue;
     // Every reference node, rows or not: the load resets the kept-orphan store per root (R2), and a node whose file
     // states no rows keeps none (#1535 close-out re-review — a stale set otherwise went straight back to disk).
     if (n.prefab && n.guid) out.push([n.guid, n.members ?? {}, n.prefab]);
-    collectReferenceNodeRows(n.added, out);
-    collectReferenceNodeRows(n.children, out);
-    for (const delta of Object.values(n.nestedStructure ?? {})) collectReferenceNodeRows(delta?.added, out);
+    // A TEMPLATE reference node (#1542) stores no guid — its root derives one — so it is handed back by its KEY, for a
+    // caller that can find its root once the derive has run (`keepTemplateNodeOrphans`).
+    else if (n.prefab && n.key) keyed?.push([n.key, n.members ?? {}, n.prefab]);
+    collectReferenceNodeRows(n.added, out, keyed);
+    collectReferenceNodeRows(n.children, out, keyed);
+    for (const delta of Object.values(n.nestedStructure ?? {})) collectReferenceNodeRows(delta?.added, out, keyed);
     // …and a member row's `added` (Phase 4, #1468): a reference node hanging under a member now
     // rides on that member's row, and its own rows must be pinned exactly as before.
-    for (const r of Object.values(n.members ?? {})) collectReferenceNodeRows(memberRowNodes<AddedEntity>(r), out);
+    for (const r of Object.values(n.members ?? {})) collectReferenceNodeRows(memberRowNodes<AddedEntity>(r), out, keyed);
   }
   return out;
+}
+
+/** R2 for a TEMPLATE reference node (#1542): the node's rows the template it expands no longer backs are kept under its
+ *  root's DERIVED guid, which is what a later save (`captureRowChannels`) and a Refresh (`settleKeptOrphans`) read it
+ *  by. Runs after the derive, because until then the root has no guid to key by.
+ *
+ *  `keyed` is what `collectReferenceNodeRows` found in ONE scene entry's own statements — the file that entry came
+ *  from, which in the prefab-edit world is the prefab being edited. A node a NESTED template declares is folded inside
+ *  the instantiation and never reaches that walk, so its rows are never kept here: they are that template's, and no
+ *  save of this file writes them. The root is found by its key below the entry's root — a key is minted per node, so
+ *  one entry declares it once. */
+function keepTemplateNodeOrphans(world: World, entryRootId: number, keyed: readonly ReferenceNodeRows[]): void {
+  const eaMeta = getTraitByName('EntityAttributes');
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!eaMeta || !piMeta || !keyed.length) return;
+  const parentOf = new Map<number, number>();
+  const byKey = new Map<string, number[]>();
+  for (const e of world.entities as Iterable<Entity>) {
+    if (!e.has(eaMeta.trait)) continue;
+    parentOf.set(e.id(), (e.get(eaMeta.trait) as { parentId?: number }).parentId ?? 0);
+    const key = templateKeyOf(e);
+    if (key && e.has(piMeta.trait) && isStoredRoot(e.get(piMeta.trait) as MemberPi, e.id())) byKey.set(key, [...(byKey.get(key) ?? []), e.id()]);
+  }
+  const under = (id: number): boolean => {
+    for (let p = parentOf.get(id) ?? 0, hops = 0; p && hops < 10000; p = parentOf.get(p) ?? 0, hops++) if (p === entryRootId) return true;
+    return false;
+  };
+  for (const [key, members, source] of keyed) {
+    const roots = (byKey.get(key) ?? []).filter(under);
+    if (roots.length === 1) applyStoredMemberRows(world, roots[0]!, members, source, undefined, true);
+  }
 }
 
 /** Put the GUIDS a scene stored for this instance's members back on them (v16, #1468) — the read half
@@ -1408,6 +1442,9 @@ export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[
  *  member. */
 function applyStoredMemberRows(
   world: World, rootEcsId: number, members: Record<string, SceneMemberRow>, source: string, pinned?: Set<number>,
+  /** Keep the orphans only (R2), pinning no guid: a TEMPLATE node's rows, read after the derive (`keepTemplateNodeOrphans`),
+   *  carry no member identity, and a guid one held anyway must not land past the collision guard. */
+  keepOnly = false,
 ): void {
   const attrMeta = getTraitByName('EntityAttributes');
   if (!attrMeta) return;
@@ -1417,7 +1454,7 @@ function applyStoredMemberRows(
     if (guid) orphanMemberRows.delete(guid);
     return;
   }
-  for (const [ecsId, key] of memberRowKeysIn(rootEcsId, world)) {
+  for (const [ecsId, key] of keepOnly ? [] : memberRowKeysIn(rootEcsId, world)) {
     const row = members[key];
     if (!row) continue;
     const guid = durableGuid(row.guid);
@@ -1803,15 +1840,26 @@ function resolveTemplateFrames(world: World): void {
   if (!attrMeta || !piMeta) return;
   const traits = getAllTraits().filter((m) => m.category !== 'tag');
   const tree = identityTree(world);
+  const indexes = new Map<number, ReturnType<typeof memberPathIndex>>();
+  const indexOf = (frame: number) => {
+    let index = indexes.get(frame);
+    if (!index) { index = memberPathIndex(world, frame, tree); indexes.set(frame, index); }
+    return index;
+  };
+  let climb: ReturnType<typeof templateFrameClimber> | undefined;
   for (const rootId of new Set(roots)) {
     const root = findEntityById(rootId, world) as EntityHandle | undefined;
     const pi = root?.has(piMeta.trait) ? root.get(piMeta.trait) as { rootInstanceId?: number } : null;
     if (!root || pi?.rootInstanceId !== rootId) continue; // gone, or the id now names something else
-    const index = memberPathIndex(world, rootId, tree);
+    const index = indexOf(rootId);
+    // A `^` left after the rebase climbs out of this top call's root. Only a template reference node's root has a
+    // frame above it (#1541): the instance holding the node, and from there the frames around that.
     const guidAt = (token: string): string => {
       const t = parseMemberToken(token);
-      if (!t || t.up) return token;
-      const target = index.get(memberPathKey(t.path));
+      if (!t) return token;
+      const frame = t.up ? (climb ??= templateFrameClimber(world))(rootId, t.up) : rootId;
+      if (!frame) return token;
+      const target = (t.up ? indexOf(frame) : index).get(memberPathKey(t.path));
       const guid = target ? ((target.get(attrMeta.trait) as { guid?: string }).guid ?? '') : '';
       return guid || token;
     };
@@ -2916,7 +2964,9 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   const storedMembers: [number, Record<string, SceneMemberRow>, string][] = [];
   /** The same, for every nested instance a REFERENCE node spawns (`collectReferenceNodeRows`). */
   const addedInstanceRows: ReferenceNodeRows[] = [];
-  const collectAddedRows = (nodes: unknown): void => { collectReferenceNodeRows(nodes, addedInstanceRows); };
+  /** …and every TEMPLATE reference node in an entry's own statements, per entry root (#1542, `keepTemplateNodeOrphans`). */
+  const templateNodeRows: [number, ReferenceNodeRows[]][] = [];
+  const collectAddedRows = (nodes: unknown, keyed?: ReferenceNodeRows[]): void => { collectReferenceNodeRows(nodes, addedInstanceRows, keyed); };
   // Re-instantiate prefab instances — delegated to caller (editor vs runtime specific)
   if (options.onInstantiatePrefab) {
     // Every placeholder a prefab entry below may still replace (#1353). Over-inclusive on purpose —
@@ -3011,9 +3061,11 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         // one whose entry states no rows keeps none — a stale set left behind would be replayed by the editor's
         // next rebuild (`settleKeptOrphans`, #1535 close-out review F4).
         storedMembers.push([rootEcsId, entry.members ?? {}, source]);
-        collectAddedRows(entry.added);
-        for (const delta of Object.values(entry.nestedStructure ?? {})) collectAddedRows(delta?.added);
-        for (const r of Object.values(entry.members ?? {})) collectAddedRows(memberRowNodes<AddedEntity>(r));
+        const keyed: ReferenceNodeRows[] = [];
+        collectAddedRows(entry.added, keyed);
+        for (const delta of Object.values(entry.nestedStructure ?? {})) collectAddedRows(delta?.added, keyed);
+        for (const r of Object.values(entry.members ?? {})) collectAddedRows(memberRowNodes<AddedEntity>(r), keyed);
+        if (keyed.length) templateNodeRows.push([rootEcsId, keyed]);
       } else {
         // Nothing replaced the placeholder: the detached references get their `onMissing` value, and a
         // later entry's numeric parent must resolve to 0 too, not to the freed id.
@@ -3059,4 +3111,5 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   // name all land here, deriving exactly what they always did.
   deriveInstanceMemberGuids(world);
   if (pinned.size) dropCollidingPins(world, pinned);
+  for (const [entryRootId, keyed] of templateNodeRows) keepTemplateNodeOrphans(world, entryRootId, keyed);
 }

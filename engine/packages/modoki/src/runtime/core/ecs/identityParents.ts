@@ -35,6 +35,7 @@ import { getTraitByName } from './traitRegistry';
 import { getStructureVersion } from './entityUtils';
 import { packedOf, isPackedAlive, type PackedEntity } from './entityTable';
 import { durableGuid, isOwnedRoot, isStoredRoot, isFrameStep, FRAME_STEP, type MemberStep } from '../assetRefRules';
+import { templateKeyOf } from '../templateIdentity';
 
 /** What the resolver reads of a prefab document: its rows' localIds, parents and nested sources. */
 export type TemplateDoc = {
@@ -381,4 +382,36 @@ export function linkOwnerBeforeMove(world: World, id: number): void {
     if (owner && e.id() === owner) { guid = e.has(eaMeta.trait) ? durableGuid((e.get(eaMeta.trait) as { guid?: string }).guid) : ''; break; }
   }
   if (guid) self.set(piMeta.trait, { ...pi, ownerGuid: guid });
+}
+
+/** Where a member token's `^` lands, counted from the instance frame `frame` (#1541): `up` climbs, each one frame out.
+ *  0 when the climb leaves what a template can name. The ONE spelling for the loaders' resolver, the editor's base
+ *  compare (`baseTokenResolver`) and the writer's climb out of a template reference node (`templateTokenizer`), since
+ *  a token one of them writes and another reads must mean the same frame to both.
+ *  - An OWNED nested root's frame is its owner's: the instance whose row expanded it ({@link IdentityParents.ownerOf}).
+ *  - A TEMPLATE reference node's root — a stored root carrying a template key, spawned by a node a prefab document
+ *    adds — is in the frame of the instance that holds it: its identity parent's instance. Its payload is applied by
+ *    a top call of its own, so this is the one place a `^` crosses a call boundary.
+ *  - Any other stored root is the top: a scene instance, a scene-authored reference node, a prefab-edit row entry. */
+export function templateFrameClimber(world: World, identity: IdentityParents = worldIdentityParents(world)): (frame: number, up: number) => number {
+  const piMeta = getTraitByName('PrefabInstance');
+  const byId = new Map<number, Entity>();
+  for (const e of world.entities as Iterable<Entity>) byId.set(e.id(), e);
+  const rootOf = (id: number): number => {
+    const e = byId.get(id);
+    return e && piMeta && e.has(piMeta.trait) ? ((e.get(piMeta.trait) as IdentityPi)?.rootInstanceId ?? 0) : 0;
+  };
+  const out = (frame: number): number => {
+    const e = byId.get(frame);
+    if (!e || !piMeta || !e.has(piMeta.trait)) return 0;
+    const pi = e.get(piMeta.trait) as NonNullable<IdentityPi>;
+    if (pi.rootInstanceId !== frame) return 0;
+    if (isOwnedRoot(pi, frame)) return identity.ownerOf(frame);
+    return templateKeyOf(e) ? rootOf(identity.parentOf(frame)) : 0;
+  };
+  return (frame, up) => {
+    let f = frame;
+    for (let i = 0; i < up && f; i++) f = out(f);
+    return f;
+  };
 }

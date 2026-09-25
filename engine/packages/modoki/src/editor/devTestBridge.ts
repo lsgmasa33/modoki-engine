@@ -11,8 +11,9 @@ import { getAllEntities, readTraitData, deleteEntity } from '../runtime/core/ecs
 import { getTraitByName } from '../runtime/core/ecs/traitRegistry';
 import { importModel } from './scene/modelImport';
 import { loadScene, newScene, setCurrentScenePath, type SceneLoadOutcome } from './scene/serialize';
-import { isSkeletalPreviewing } from '../runtime/core/skeletalPreview';
+import { mixerAdvanceDelta } from '../runtime/rendering/scene3DSync';
 import { getModeOwner } from './scene/playMode';
+import { getRunMode, isAdvancing } from '../runtime/core/playState';
 import { getCurrentWorld } from '../runtime/core/ecs/world';
 import { getEditorViewportCamera, isEcsObjectVisible } from './scene/sceneViewBus';
 import { worldTransforms } from '../runtime/core/ecs/transformPropagationSystem';
@@ -59,11 +60,11 @@ export interface EditorTestBridge {
   importModel(glbPath: string, prefix?: string, postprocessorId?: string): Promise<number>;
   /** Delete an entity (E2E cleanup of imported entities). */
   deleteEntity(entityId: number): void;
-  /** Whether the runtime "advance skeletal mixers while stopped" flag is set.
-   *  The Animation-editor preview of a keyframe clip must NOT turn this on (it
-   *  would animate every rig's baked clip out of Play mode and clobber the
-   *  keyframe pose) — the E2E asserts it stays false during preview. */
-  isSkeletalPreviewing(): boolean;
+  /** This frame's skeletal-mixer advance in seconds (`mixerAdvanceDelta` on the live world) — the
+   *  number every rig's baked clip moves by. An editor preview must leave it at 0: advancing it
+   *  animates every rig out of Play and clobbers the pose the preview wrote (#1552 replaced a flag
+   *  read here that nothing could set, so its e2e could not fail). */
+  skeletalMixerAdvance(): number;
   /** WHICH panel currently owns the editor scrub/preview run mode ('timeline' | 'animation'), or
    *  null when stopped. This is `playMode.ts`'s `_modeOwner` — module state, so an E2E cannot
    *  reach it through the store.
@@ -75,6 +76,11 @@ export interface EditorTestBridge {
    *  with a timeline doc open the Timeline's own loop advances it too — so the owner is the
    *  discriminating read, and without it the E2E would pass under both correct and broken. */
   previewModeOwner(): string | null;
+  /** The run mode and whether it is advancing — what `get_editor_state` reports as `runMode` /
+   *  `advancing`. Exposed so an E2E can tell a live preview from a paused one: #1552's paused
+   *  Animation ▶ kept reporting `advancing:true`, and the pause is wired in the panel, which no unit
+   *  test mounts. */
+  runModeState(): { mode: string; advancing: boolean };
   /** Project an entity's WORLD position through the live 3D SceneView camera into PAGE (client)
    *  coordinates — the same camera + canvas-rect math the real marquee/raycast use (see
    *  ThreeJSViewport's marquee `consider()`). Lets an E2E compute a click/drag target for an
@@ -146,11 +152,14 @@ export function installEditorTestBridge(): void {
     deleteEntity(entityId) {
       deleteEntity(entityId);
     },
-    isSkeletalPreviewing() {
-      return isSkeletalPreviewing();
+    skeletalMixerAdvance() {
+      return mixerAdvanceDelta(getCurrentWorld());
     },
     previewModeOwner() {
       return getModeOwner();
+    },
+    runModeState() {
+      return { mode: getRunMode(), advancing: isAdvancing() };
     },
     screenPositionOf(entityId) {
       const cam = getEditorViewportCamera();

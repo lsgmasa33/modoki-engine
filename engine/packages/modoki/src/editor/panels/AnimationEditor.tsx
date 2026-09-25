@@ -51,7 +51,7 @@ import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope } from '../animation/
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
 import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { chooseNewAssetPath } from '../utils/saveDialog';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced, getModeOwner, onModeOwnerChange } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode, exitPreviewMode, freezePreviewIfOwnedBy, registerModeOwnerDisplaced, getModeOwner, onModeOwnerChange } from '../scene/playMode';
 import { undoMayRepose, ownsHeldSession } from '../scene/openPreviewSession';
 import {
   beginTimelinePreviewSession, poseEnvelopeHeld,
@@ -615,7 +615,13 @@ export default function AnimationEditor() {
       },
     );
     // Release the ref only if it is still OURS — see the same note in TimelineEditor's cleanup.
-    return () => { guard.stop(); if (previewLoopGuardRef.current === guard) previewLoopGuardRef.current = null; };
+    // Pause holds a FROZEN frame (#1552): the loop stopped, the session stays held, and the run
+    // mode must say so — `get_editor_state` reported an advancing preview while paused.
+    return () => {
+      guard.stop();
+      if (previewLoopGuardRef.current === guard) previewLoopGuardRef.current = null;
+      freezePreviewIfOwnedBy('animation');
+    };
   }, [playing, previewOwner, pose]);
 
   // Panel gone → revert the previewed pose and return the global run-mode to stopped (drops a

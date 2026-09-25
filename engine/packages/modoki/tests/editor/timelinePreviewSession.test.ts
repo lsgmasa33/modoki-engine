@@ -73,6 +73,7 @@ import { createTeardownToken } from '../../src/runtime/core/liveness';
 import { enterScrubMode, exitPreviewMode, aSceneSwapIsHappening, stopPlay, enterPlay, enterPreviewMode, getModeOwner, registerModeOwnerDisplaced } from '../../src/editor/scene/playMode';
 import { getPlayState } from '../../src/runtime/core/playState';
 import { getRunMode } from '../../src/runtime/core/playState';
+import { getBusVolumes, setBusVolume } from '../../src/runtime/audio/audioService';
 
 // The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing),
 // and a begin during Play is refused (#1546) — so the premise is set, not inherited from test order.
@@ -950,5 +951,58 @@ describe('a failed restore refuses Play as well as a new session (#1548 re-revie
     expect(getPlayState()).toBe('stopped');
     expect(warn.mock.calls.some((c) => /restore FAILED/.test(String(c[0])))).toBe(true);
     warn.mockRestore();
+  });
+});
+
+describe('the session puts back the non-world state its actions changed, on every end (#1551)', () => {
+  // The music bus is the probe: `audio.setBusVolume` is the engine action a cutscene fires to duck it.
+  // The store list itself is pinned in previewSideState.test.ts; these pin the SESSION seams.
+  afterEach(() => { setBusVolume('music', 1); });
+
+  it('⏹ Exit (restore:true) puts the bus back alongside the world', async () => {
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    setBusVolume('music', 0.2);
+    await endTimelinePreviewSession({ restore: true });
+    // MUTATION TARGET: drop `releaseSideState()` from endSessionHoldingReplacement.
+    expect(getBusVolumes().music).toBe(1);
+  });
+
+  it('an end that leaves the world alone (restore:false, or a scene changed since) still puts it back', async () => {
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    setBusVolume('music', 0.2);
+    await endTimelinePreviewSession({ restore: false });
+    // MUTATION TARGET: move `releaseSideState()` below the restore:false early return.
+    expect(getBusVolumes().music).toBe(1);
+
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    setBusVolume('music', 0.3);
+    h.scenePath = 'B.json';                                 // the path guard's no-op branch
+    await endTimelinePreviewSession({ restore: true });
+    expect(h.loadCalls).toHaveLength(0);
+    expect(getBusVolumes().music).toBe(1);
+  });
+
+  it('a world swap that abandons the session (an engine.loadScene fired by ▶) still puts it back', async () => {
+    const { createWorld } = await import('koota');
+    const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/worldRegistry');
+    const before = getCurrentWorld();
+    const next = createWorld();
+    try {
+      expect(await beginTimelinePreviewSession()).toBe(true);
+      setBusVolume('music', 0.2);
+      setCurrentWorld(next);
+      expect(hasTimelinePreviewSession()).toBe(false);
+      // MUTATION TARGET: drop `releaseSideState()` from the onWorldSwap abandon.
+      expect(getBusVolumes().music).toBe(1);
+    } finally { setCurrentWorld(before); next.destroy(); }
+  });
+
+  it('ACCEPT SIDE: a change made AFTER the session ended is the human\'s, and stays', async () => {
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    await endTimelinePreviewSession({ restore: true });
+    setBusVolume('music', 0.4);
+    // A second end with no session held must not replay a stale snapshot over it.
+    await endTimelinePreviewSession({ restore: true });
+    expect(getBusVolumes().music).toBe(0.4);
   });
 });

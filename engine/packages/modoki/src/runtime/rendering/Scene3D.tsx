@@ -11,7 +11,6 @@ import { onTextDirty } from './text/textDirty';
 import { isSimRunning, getPlayState, onPlayStateChange, inPreviewSession } from '../core/playState';
 import { getVisualDelta } from '../core/getTime';
 import { ease } from './cameraFraming';
-import { isSkeletalPreviewing } from '../core/skeletalPreview';
 import { sceneManager } from '../scene/SceneManager';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_3D } from './frameDriver';
 import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, type SceneRenderer } from './offscreenCapture';
@@ -546,9 +545,8 @@ export default function Scene3D() {
         // No overlay renewal: that ceiling counts from the gate's kick, which already promised it.
         if (isPrecompileActive(renderer, rawNow())) return;
         // Idle gate: while paused/stopped only dirty events + the grace window
-        // need a redraw; while playing — or while the Animation editor is previewing
-        // skeletal animation (mixer advancing) — render unconditionally.
-        if (idleGrace.shouldIdle(isSimRunning() || isSkeletalPreviewing())) return;
+        // need a redraw; while playing render unconditionally.
+        if (idleGrace.shouldIdle(isSimRunning())) return;
         const world = getCurrentWorld();
         // Profiler-plan P2, second pass. `render3d-0` used to be ONE opaque span, which is how a
         // 170ms frame on the A23 could report only 37.9ms of engine CPU with no interior to

@@ -13,7 +13,6 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
 import { getCurrentWorld, peekCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
 import { isSimRunning, onPlayStateChange, inPreviewSession } from '../../runtime/core/playState';
-import { setSkeletalPreview } from '../../runtime/core/skeletalPreview';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
@@ -4956,7 +4955,6 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       renderer.domElement.removeEventListener('pointermove', onPointerMoveCapture, true);
       renderer.domElement.removeEventListener('pointerup', onPointerUpCapture, true);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
-      setSkeletalPreview(false, 0); // don't leave the runtime preview flag stuck on
       clearSkeletalSeeks(); // drop any timeline scrub-preview seek so a rig isn't pinned to a scrubbed frame
       controls.dispose();
       gizmo.removeEventListener('dragging-changed', onGizmoDraggingChanged);

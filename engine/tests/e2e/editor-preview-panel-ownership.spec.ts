@@ -170,3 +170,30 @@ test('closing the idle Timeline panel does not stop an Animation-owned preview',
 
   await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(false));
 });
+
+test('an Animation ▶ never advances the skeletal mixers, and pausing it reports a frozen preview (#1552)', async ({ page }) => {
+  // Moved here from editor-animation-preview.spec.ts, which pressed ▶ with no clip open: no panel
+  // drove the preview, so the run mode never left 'stopped' and its "mixers stay frozen" assertion
+  // held whatever the mixers did. This file opens a real clip, so the precondition below can hold.
+  await gotoEditorWithScene(page);
+  await openBothPanels(page);
+  const read = () => page.evaluate(() => {
+    const t = (window as any).__modokiEditorTest;
+    return { advance: t.skeletalMixerAdvance() as number, owner: t.previewModeOwner(), ...t.runModeState() };
+  });
+  expect((await read()).advance).toBe(0);
+
+  await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(true, 'animation'));
+  await page.waitForTimeout(600);
+  const live = await read();
+  // PRECONDITION: the Animation panel is really previewing — without it the next line proves nothing.
+  expect(live).toMatchObject({ owner: 'animation', mode: 'preview', advancing: true });
+  // A preview poses rigs itself; advancing every rig's mixer animates baked clips out of Play and
+  // clobbers the keyframe pose it just wrote.
+  expect(live.advance).toBe(0);
+
+  // ⏸: the loop stops, the session stays held, and the run mode must SAY it is frozen.
+  await page.evaluate(() => (window as any).__modokiEditorTest.store.getState().setPreviewPlaying(false));
+  await page.waitForTimeout(300);
+  expect(await read()).toMatchObject({ owner: 'animation', mode: 'preview', advancing: false, advance: 0 });
+});

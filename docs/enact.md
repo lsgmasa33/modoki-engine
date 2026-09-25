@@ -369,9 +369,18 @@ Three compounding papercuts motivated the fix, all now addressed by the pieces b
 
 ## Selector-aware raw input
 
-`modoki_tap` / `drag` / `hover` / `scroll` / `pointer` accept an optional `selector` (and an
-`entity`, above) alongside `{x,y}`, resolved **server-side** so there's no race between reading a
-position and acting on it. Precedence is `entity` → `selector` → `{x,y}`.
+`modoki_tap` / `drag` / `hover` / `scroll` / `pointer` accept a `selector` (or an `entity`, above,
+or a chrome `label`) in place of `{x,y}`, resolved **server-side** so there's no race between
+reading a position and acting on it. **Exactly ONE address per aim — two are refused `AMBIGUOUS`**
+(#1556, owner-approved as a breaking change, both surfaces). It used to be precedence, `entity` →
+`selector` → `{x,y}`, which pressed one target and answered ok while the caller's other address
+named something else; the conventions doc's §3 rule ("sending both is refused rather than resolved
+by precedence") had always said otherwise. The rule, and what counts as given (`entity:{}` and
+`selector:''` do not; a lone stray `x` does), is `aimAddresses` in
+`engine/tools/shared/aimAddresses.ts`. Three layers read it: the editor host's `resolvePoint`, the
+renderer's `resolveCore` (what `modoki_dnd`'s `{selector, x, y}` endpoint reaches), and the device
+MCP. `modoki_drag_handle`'s destination (`to` / `toId` / `delta`) was the same precedence under
+another name and refuses the same way.
 
 - `resolveDomPointReport` lives in `engine/app/debug/domResolve.ts` (extracted from the DnD path in
   `engine/app/debug/domDnd.ts`).
@@ -407,9 +416,8 @@ Transcripts showed 213 `modoki_eval` calls finding a button by its visible text 
   "Save All" and turn every short label into an ambiguity. A miss *suggests* labels that contain
   the text; it never aims at them.
 - **It rides `resolvePoint`'s selector branch.** Occlusion, scrolled-out and layout-settling
-  diagnoses are the same code for both aims. `label` together with `selector` or `entity` is
-  refused `AMBIGUOUS`. The older `entity` → `selector` → `{x,y}` order is precedence only because
-  legacy calls sent both; nothing ever sent a label alongside another aim. `modoki_focus` resolves
+  diagnoses are the same code for both aims. `label` beside any other address is refused
+  `AMBIGUOUS`, and since #1556 so is every other pair. `modoki_focus` resolves
   a label through the same op and focuses the returned `uiId`.
 
 A label is the element's `data-ui-label`, else its text, else `title`/`aria-label`. A `<select>`
@@ -1034,9 +1042,11 @@ resolve it. `bridge.ts`'s `resolveAim` simply never called it.
 - ⚠️ **Version skew is made loud, not handled.** An app built before this change has no entity branch
   and fell through to its pixel or viewport-centre default: `device_scroll {entity}` scrolled the
   centre and answered ok (review finding). So the MCP sends a selector that matches nothing
-  (`ENTITY_AIM_SKEW_SELECTOR`) beside any entity aim without one. The new page resolves the entity
-  first and never reads it; the old one resolves it, misses, and refuses naming
-  `[data-modoki-app-predates-entity-aim]`. Rebuild the app.
+  (`ENTITY_AIM_SKEW_SELECTOR`) beside every entity aim. The new page resolves the entity first and
+  never reads it; the old one resolves it, misses, and refuses naming
+  `[data-modoki-app-predates-entity-aim]`. Rebuild the app. ⚠️ This is the ONE deliberate second
+  address on the wire, which is why the device MCP checks the CALLER's spec for two addresses
+  (#1556) before it adds this selector. The page keeps its entity-first order only to arbitrate it.
 - **Found on the way:** the backend fronts a synthetic-fallback reply with a banner, a refusal
   included, and the device MCP judged failure by `startsWith('Error:')`. So every refused synthetic tap
   (the iPhone 8, an Android without adb) came back as `Tapped — ⚠️ SYNTHETIC INPUT … Error: …`, ok.

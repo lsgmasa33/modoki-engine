@@ -1044,7 +1044,9 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
     capture (`"modoki_wait"` is accepted for it too).
   - **Refused at pre-flight, so nothing runs:** unknown tool, args that fail the tool's real schema,
     raw `{x,y}` aiming on `tap`/`hover`/`scroll`/`pointer`/`drag`/`dnd`/`drag_handle` (aim by
-    `entity`/`selector`/handle id, or `drag_handle`'s `toId`/`delta`), and
+    `entity`/`selector`/handle id, or `drag_handle`'s `toId`/`delta`), an aim giving TWO addresses
+    (`AMBIGUOUS`, #1556 — refused up front, since the route would refuse it only after the steps
+    before it had run), and
     `modoki_build`/`modoki_add_native_target`/`modoki_ota_publish`/`modoki_capture_gesture`/a nested
     batch (run those alone — `capture_gesture`'s `from`/`to` are REQUIRED raw coordinates, so it has
     no stale-proof aim to offer).
@@ -2176,9 +2178,10 @@ agent can do anything a mouse+keyboard can, in dev AND the DMG. Reach for it whe
 Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor trusted input except
 `dnd`/`handles`, which ride the editor-action relay and work in dev too. (Design:
 [enact.md](./enact.md).)
-- **Never aim by pixels. There are three aim modes, and `{x,y}` is the last resort.** Precedence is
-  `entity` → `selector` → `{x,y}`; the first two resolve **server-side in the same call**, so nothing
-  can move between reading a coordinate and acting on it.
+- **Never aim by pixels. There are three aim modes, and `{x,y}` is the last resort.** Give exactly
+  ONE — two are refused `AMBIGUOUS` on both surfaces, never settled by precedence (#1556). `entity`
+  and `selector` resolve **server-side in the same call**, so nothing can move between reading a
+  coordinate and acting on it.
   - **`selector`** (a CSS selector) for **editor chrome** — resolved to the element's centre. Drag
     takes one point spec per endpoint.
   - **`entity: {guid|name|id}`** for a **scene entity** in a viewport — resolved to the entity's live
@@ -2302,8 +2305,8 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
     `save-dialog`, …), which is the attribute the shell puts on every backdrop — the plain-DOM form
     too, since #1471. The plain-DOM prompt/confirm (`save-dialog`) names its controls
     `save-dialog.confirm` / `save-dialog.cancel` / `save-dialog.input`, and a choice modal names
-    each button `<kind>.<value>` (#1470). Label together with
-    `selector` or `entity` also refuses `AMBIGUOUS`.
+    each button `<kind>.<value>` (#1470). Label beside any other address also refuses
+    `AMBIGUOUS`.
   - **Limits.**
     - An untagged element has no label to aim at — tag it.
     - A field is labelled only by its `data-ui-label` (many Inspector fields pass one) or its

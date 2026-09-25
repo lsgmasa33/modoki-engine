@@ -181,3 +181,11 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-18,work-qa,modoki_prefab,-9,4943,174998,595ccde25
 2026-09-18,work-qa,modoki_write_asset,-9,2616,174998,595ccde25
 2026-09-18,work-qa,modoki_write_asset_meta,-9,3254,174998,595ccde25
+2026-09-25,work-qa,modoki_batch,41,2662,165983,24c1faaf3
+2026-09-25,work-qa,modoki_dnd,20,1635,165983,24c1faaf3
+2026-09-25,work-qa,modoki_drag,27,3367,165983,24c1faaf3
+2026-09-25,work-qa,modoki_focus,8,2451,165983,24c1faaf3
+2026-09-25,work-qa,modoki_hover,43,2201,165983,24c1faaf3
+2026-09-25,work-qa,modoki_pointer,43,3633,165983,24c1faaf3
+2026-09-25,work-qa,modoki_scroll,43,3010,165983,24c1faaf3
+2026-09-25,work-qa,modoki_tap,43,3282,165983,24c1faaf3

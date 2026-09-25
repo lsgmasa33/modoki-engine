@@ -26,6 +26,7 @@ import type { MouseButton, InputModifier } from './rendererOps';
 // than re-declared because both sides speak this shape over the bridge, and a second copy
 // of a wire contract silently drifts.
 import type { AimGesture } from '../app/debug/domPointContract';
+import { aimAddresses, ambiguousAimMessage } from '../tools/shared/aimAddresses';
 import type { DomPointResolution } from '../app/debug/domPointContract';
 import type { EntityPointSpec, EntityPointResolution, OcclusionScope, AimedAt } from '../app/debug/entityPointContract';
 // A VALUE, DOM-free for the same reason: the entity-aim refuse/accept decision the device page shares.
@@ -103,18 +104,16 @@ export type InputRoutesHandler =
  *  auto-release would describe a mouseup that never happened. */
 export type HeldLossReason = 'idle' | 'superseded' | 'reload';
 
-/** A point the agent wants to act on: an ENTITY, a CSS selector, or explicit coordinates.
- *
- *  Precedence is `entity` → `selector` → `{x,y}`, extending the existing
- *  selector-overrides-coordinates rule rather than replacing it (the tool descriptions have
- *  documented that ordering since selectors landed, so re-litigating it here would break
- *  callers for no gain). */
+/** A point the agent wants to act on: an ENTITY, a CSS selector, a chrome LABEL, or explicit
+ *  coordinates — exactly ONE of them. Two are refused `AMBIGUOUS` (#1556, owner-approved as a
+ *  breaking change); the rule and what counts as "given" live in `aimAddresses`
+ *  (`tools/shared/aimAddresses.ts`), shared with the renderer and the device MCP. It used to be
+ *  precedence (`entity` → `selector` → `{x,y}`), which pressed one target and answered ok while the
+ *  caller's other address named something else. */
 export interface PointSpec {
   x?: number; y?: number; selector?: string; entity?: EntityPointSpec;
   /** Editor chrome by its LABEL (#1153) — resolved in the renderer over the same set
-   *  `modoki_handles {editor:'chrome'}` lists. Ranks with `selector` (both name a DOM thing), so
-   *  combining it with `selector` or `entity` is REFUSED rather than settled by precedence:
-   *  unlike `selector`-over-`{x,y}` there is no legacy call shape that sends both incidentally. */
+   *  `modoki_handles {editor:'chrome'}` lists. Rides the selector path below (both name a DOM thing). */
   label?: string;
   /** CSS selector scoping a `label` aim to one panel or dialog. */
   within?: string;
@@ -218,20 +217,14 @@ export async function resolvePoint(
   // have re-introduced the permissive path this parameter exists to remove.
   gesture?: AimGesture,
 ): Promise<{ point: ResolvedPoint } | AimRefusal> {
-  const hasEntity = !!spec?.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0;
-  if (spec && spec.label !== undefined && (spec.selector || hasEntity)) {
-    return {
-      error: `${which}: give ONE of label, selector or entity — ${spec.selector ? 'label and selector' : 'label and entity'} `
-        + 'are two addresses for one target, and picking one by precedence would silently ignore the other.',
-      code: 'AMBIGUOUS',
-    };
-  }
+  // One address, before anything resolves (#1556): the chain below reads them in order, and with two
+  // present that order WOULD be precedence — the first to resolve wins and the other is dropped.
+  const twoAddresses = ambiguousAimMessage(aimAddresses(spec));
+  if (twoAddresses) return { error: `${which}: ${twoAddresses}`, code: 'AMBIGUOUS' };
   if (spec && spec.within !== undefined && spec.label === undefined) {
     return { error: `${which}: \`within\` scopes a \`label\` aim and has no meaning without one — pass label, or drop within.`, code: 'REFUSED_BY_OP' };
   }
   // ── entity: resolve {guid}/{name}/{id} to the entity's LIVE screen rect in the renderer. ──
-  // Highest precedence: it is the most specific thing the caller can say, and (unlike a
-  // selector) there is no legacy call shape that passes it incidentally.
   if (spec && spec.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0) {
     let res: EntityPointResolution | null;
     // A top-level `allowOccluded` means the same thing whichever aim is used, so forward it —
@@ -797,7 +790,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const r = await resolvePoint(
         {
           x, y, selector, label, within,
-          entity: held && entity ? { ...entity, allowOccluded: true } : entity,
+          // Only a REAL entity aim gets the flag: `{}` + allowOccluded would have a key, and
+          // `aimAddresses` would count it — refusing `{entity:{}, x, y}` on move/up but not on down.
+          entity: held && entity && Object.keys(entity).length > 0 ? { ...entity, allowOccluded: true } : entity,
           allowOccluded: held ? true : allowOccluded,
         },
         `pointer ${action}`, requestRenderer,
@@ -1068,6 +1063,15 @@ export function createInputRoutes(deps: InputRouteDeps) {
         refuseUnknownValues(`${verb} modifiers`, h.modifiers, EDITOR_INPUT_MODIFIERS),
       );
       if (unknownVocab) return unknownVocab;
+      // drag-handle's destination is ONE of to{}, toId or delta — checked HERE, before any handle
+      // resolves, so a bad `id` cannot hide it. Two used to be settled by precedence (to → toId →
+      // delta) while the tool said "ONE of": the same mechanism #1556 removed from the point aims.
+      const destinations = [h.to ? 'to' : null, h.toId ? 'toId' : null, h.delta ? 'delta' : null]
+        .filter((d): d is string => d !== null);
+      if (verb === 'drag-handle' && destinations.length > 1) {
+        return bad(`drag-handle: give ONE of to{x,y}, toId or delta{dx,dy} — this call gave ${destinations.join(' AND ')}, `
+          + 'which are two destinations for one drag, and picking one by precedence would silently ignore the other.', 'AMBIGUOUS');
+      }
       // Carry the aimability annotations computeHandles already produces — the old closure narrowed
       // the result to {id,x,y} and DROPPED them, so tap/drag fired unconditionally: an off-screen
       // handle taps nothing, an occluded one hits the covering element, a disabled one is inert, and
@@ -1149,7 +1153,8 @@ export function createInputRoutes(deps: InputRouteDeps) {
         await ops.tap(from.x, from.y, { button: h.button, clickCount: h.clickCount, modifiers: h.modifiers });
         return json({ ok: true, tappedHandle: { id: h.id, x: from.x, y: from.y }, ...occlusion(from) });
       }
-      // drag-handle: destination is an explicit to{}, another handle (toId), or from+delta.
+      // drag-handle: destination is an explicit to{}, another handle (toId), or from+delta — the
+      // one-of check ran before any resolve, above.
       let to: { x: number; y: number } | null = h.to ?? null;
       let toHandle: ResolvedHandle | null = null;
       if (!to && h.toId) {

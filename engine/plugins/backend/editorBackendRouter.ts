@@ -36,6 +36,7 @@ import fs from 'fs';
 //      — see docs/build.md, guarded by tests/electron/mainBundleExternals.test.ts.
 import { hasDocKey } from '../../packages/modoki/src/runtime/core/docKeys';
 import { PREFAB_EDIT_SCENE_PREFIX } from '../../packages/modoki/src/runtime/core/ecs/sceneLoaded';
+import { envelopeExitOptions } from '../../packages/modoki/src/editor/scene/envelopeExits';
 import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
@@ -108,6 +109,50 @@ function toAssetRef(ctx: BackendContext, scenePath: string | undefined): string 
   if (scenePath.startsWith('/@fs/')) return ctx.absToAssetUrl(fromFsUrl(scenePath));
   // Not an /@fs URL: only claim it if the edit routes would actually accept it.
   return ctx.resolveAssetPath(scenePath) ? scenePath : null;
+}
+
+/** A `save-all` reply with every file path it names in the asset-root form (#1562).
+ *
+ *  The renderer builds this reply from its own paths, and the OPEN scene's is whatever spelling it
+ *  was opened under — Vite's `/@fs/<abs>` for a boot candidate or an explicit `/@fs/` load. So one
+ *  reply named two files in two address spaces: a Save As answered `scenePath: "/assets/…"` (the
+ *  backend's disk spelling of the copy) beside `savedAsCopyOf: "/@fs/…"` (the same scene the caller
+ *  addresses as `/assets/…`), and a caller comparing them read "a copy of some other file". A plain
+ *  save answered `scenePath: "/@fs/…"`, which `modoki_mutate_scene {path}` refuses with a 403.
+ *  Mapped HERE because this process owns the asset roots, with the same `toAssetRef` that gives
+ *  `editor-state` its `scenePathRef`. A path outside every root is left as the renderer spelled it,
+ *  never dropped. */
+function saveReplyAssetRefs(ctx: BackendContext, body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  // ⚠️ By VALUE, not by field name: a hand list named five of the reply's six path fields
+  // (`savedImportSettings` was missing — close-out review), and the next one added to the op would
+  // have been missed the same way. Only a `/@fs/` string is renderer-spelled, so only it is mapped —
+  // top-level, in a list, or as a list entry's `path`.
+  const ref = (v: unknown) => (typeof v === 'string' && v.startsWith('/@fs/') ? toAssetRef(ctx, v) ?? v : v);
+  const entry = (e: unknown) => (e && typeof e === 'object' && !Array.isArray(e) && 'path' in e
+    ? { ...e, path: ref((e as { path?: unknown }).path) } : ref(e));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(body as Record<string, unknown>)) out[k] = Array.isArray(v) ? v.map(entry) : ref(v);
+  return out;
+}
+
+/** An editor-action reply carrying the editor state (`...readEditorState()` — load-scene, play,
+ *  undo, prefab edit-open and a dozen more) gains the `scenePathRef` `/api/editor-state` gives, from
+ *  the same `toAssetRef` (#1562's sibling, close-out sweep). Its `scenePath` is the renderer's
+ *  spelling, `/@fs/<abs>` for a scene opened that way, which `modoki_mutate_scene {path}` refuses;
+ *  observed live on `load_scene`. Additive, exactly as on editor-state: `scenePath` keeps its value. */
+function withScenePathRef(ctx: BackendContext, body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const out: Record<string, unknown> = { ...(body as Record<string, unknown>) };
+  // `returnScene` is prefab edit-open's scene-to-return-to, captured in the same renderer spelling
+  // (second close-out review) — the same field shape, so the same additive ref.
+  for (const key of ['scenePath', 'returnScene'] as const) {
+    const v = out[key];
+    if (typeof v !== 'string' || `${key}Ref` in out) continue;
+    const ref = toAssetRef(ctx, v);
+    if (ref) out[`${key}Ref`] = ref;
+  }
+  return out;
 }
 
 /** A `setTrait` naming an unknown field on a KNOWN trait — a certain typo — or null.
@@ -2862,47 +2907,9 @@ async function describeUnresolvedAgainstLiveWorld(
             + 'back successfully, and then silently discarded. Nothing was written.',
           runMode: st.runMode,
           ...(owner ? { modeOwner: owner } : {}),
-          // §5: name REAL exits only. `modoki_exit_pose_envelope` is a real exit for an
-          // ANIMATION-owned envelope and a guaranteed refusal for a timeline-owned one (it will
-          // not end another panel's session), so which one is listed depends on the owner.
-          //
-          // ⚠️ `options` holds only things the agent can DO. The reason NOT to reach for the pose
-          // op goes in `hint` instead: an entry that names a tool in order to warn against it is
-          // still an entry with a tool name in it, and an agent scanning the list for something to
-          // call will call it.
-          // ⚠️ THREE arms, and the generic one is not padding. A previous draft collapsed it into
-          // the timeline arm, which then answered "Stop also ends a TIMELINE preview" to a
-          // renderer reporting no `modeOwner` at all (the field is omit-when-null) or a future
-          // third panel — the same "nobody remembers the next one" failure the mode allowlist
-          // above exists to prevent, one expression over.
-          options: owner === 'animation'
-            ? [
-              'modoki_exit_pose_envelope — closes the ANIMATION preview, restores the authored world and returns the run-mode to stopped; then retry this call',
-            ]
-            : owner === 'timeline'
-              ? [
-                // ⚠️ A timeline envelope DOES have an agent exit, and an earlier draft denied it,
-                // sending the agent to find a human over a one-call fix. `stopPlay()` ends a
-                // scrub/preview holding a preview session; the `stop` agent op is unguarded.
-                // ⚠️ …but it is DESTRUCTIVE, and saying so is the difference between an exit and a
-                // trap: it runs `endTimelinePreviewSession({restore:true})`, a full scene reload
-                // from the snapshot taken when the envelope opened, so anything the human did
-                // inside it is discarded. The old text asked the HUMAN to press ⏹; handing an
-                // unattended agent the same button without the caution is not an improvement.
-                "modoki_play_control {action:'stop'} — ends the Timeline preview session and returns the run-mode to stopped, then retry. ⚠️ DESTRUCTIVE: it restores the snapshot taken when the envelope opened, discarding anything the human authored inside it. Prefer asking them if they are at the screen",
-                // ⚠️ NOT "a plain drag-scrub holds no session" — that was true before Phase 3 and
-                // is copied from a `stopPlay` comment that is now stale. Every `enterScrubMode`
-                // call site pairs with `beginTimelinePreviewSession()`, so the only no-session
-                // window left is the async gap before `serializeScene()` resolves — and the right
-                // advice there is to retry, not to go looking for a human.
-                'if the run-mode is STILL not stopped, the session had not finished seating yet (the snapshot is async) — retry stop once before escalating to the human’s ⏹ Exit Preview',
-              ]
-              : [
-                'exit the scrub/preview envelope — ⏹ Exit Preview in whichever panel is driving it — then retry',
-              ],
-          ...(owner === 'timeline'
-            ? { hint: 'Do not reach for modoki_exit_pose_envelope here — it deliberately refuses a timeline-owned envelope, because ending that session would revert its world mid-run. Use modoki_play_control stop instead, minding the caution above.' }
-            : {}),
+          // The exits, by owner — one copy shared with the live-world agent ops (#1552); the §5
+          // reasoning for each arm lives with it.
+          ...envelopeExitOptions(owner),
         }, 409);
       }
       // ── Live-world path (mcp-persistence.md Phase 2) ──
@@ -5692,7 +5699,14 @@ async function describeUnresolvedAgainstLiveWorld(
     // them generous headroom over the default relay timeout. Through `relayJson` because this route
     // carries most of the ops that NAME a §5 code: a bare `json(raw)` sent their refusal as a 200
     // (#1012), which only `postJson`'s `isFailureBody` rescued.
-    return relayJson(ctx, action, relayParams, 60_000);
+    const relayed = await relayJson(ctx, action, relayParams, 60_000);
+    // A success only: a refusal's `error` names paths in prose, and its status must pass untouched.
+    if (relayed.kind === 'json' && relayed.status === undefined) {
+      // save-all's `scenePath` is MAPPED (it names the file written), and it still gets the ref, so
+      // `scenePathRef` means one thing on every reply of this route (second close-out review).
+      return json(withScenePathRef(ctx, action === 'save-all' ? saveReplyAssetRefs(ctx, relayed.body) : relayed.body));
+    }
+    return relayed;
   }
 
   // ── GET /api/scenes (M) ── list the project's scene assets (guid/path/name)
