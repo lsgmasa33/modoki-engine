@@ -62,8 +62,9 @@ private final class PurchaseProbe: @unchecked Sendable {
     ///
     /// - `Logger` (os_log) reaches Xcode's console and `OSLogStore`. But `device_native_logs
     ///   source:'app'` reads `OSLogStore` from inside the process, and on an iPhone 8 that scan
-    ///   **exceeds the 5 s device timeout at every window size, including 20 s unfiltered** — so
-    ///   over MCP, on the oldest supported handset, os_log is unreadable in practice.
+    ///   **exceeded the 5 s device timeout at every window size, including 20 s unfiltered** — the
+    ///   size did not matter because the reader walked the whole log since launch (#1558, fixed but
+    ///   not re-measured here; docs/iap.md), so os_log over MCP is not yet a proven route.
     /// - `idevicesyslog` does not carry an app's own os_log at all (measured: 14 `App[]` lines in a
     ///   6-minute capture, every one from the launcher shim, and the plugin's own NSLog absent).
     ///

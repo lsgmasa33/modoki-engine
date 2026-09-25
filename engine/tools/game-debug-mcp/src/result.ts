@@ -117,6 +117,10 @@ export function caughtFailure(tool: string, what: string, e: unknown): DeviceRes
       tool, what,
       why: msg,
       options: [
+        // #1558: listing devices + claims needs no editor, and 20 of 120 agents refused here fell
+        // back to raw `adb devices`/devicectl — which show no claims (#285's bypass). Name the
+        // claim-aware CLI FIRST, so the natural next move keeps the claims in view.
+        ...(tool === 'device_list' ? ['`npm run device:list` lists the attached devices AND their claims with no editor running — use it rather than raw adb/devicectl, which show no claims'] : []),
         'start this clone\'s editor: engine/scripts/launch-editor.sh games/<id> (it derives THIS clone\'s port — no MODOKI_BACKEND_PORT prefix needed)',
         // Do NOT enumerate the ports here. This line used to read "(main=5179, work-ai=5180,
         // work-ai2=5181)" — written when there were three clones and silently stale from the

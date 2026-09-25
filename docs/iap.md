@@ -601,8 +601,11 @@ Both cost a cycle here, and neither is discoverable from the tool description:
 - **`idevicesyslog` does not carry an app's own `os_log`.** Measured: 14 `App[]` lines in a 6-minute
   capture, every one from the Xcode 16 launcher shim, with the plugin's own `NSLog` absent too. A
   silent syslog is not evidence the code did not run.
-- **`device_native_logs source:'app'` is unusable on the iPhone 8** — it reads `OSLogStore` in-process
-  and exceeds the 5 s device timeout at EVERY window size, including 20 s unfiltered.
+- **`device_native_logs source:'app'` timed out on the iPhone 8** — it reads `OSLogStore` in-process
+  and exceeded the 5 s device timeout at EVERY window size, including 20 s unfiltered. The window size
+  did not matter because the plugin ignored it: every read walked the app's whole log since launch
+  (#1558, now fixed — [debug-tools-mcp.md](debug-tools-mcp.md) § "Two sources of native logs"). A
+  build with that fix has not been re-measured on the iPhone 8, so keep the `print()` route below.
 - **What DOES work:** `storekitd`'s own entries in `idevicesyslog` (wall-clock, and it brackets the
   sheet), plus `device_journal`. For app-side probes on this hardware, `print()` to stdout captured
   by `idevicedebug run` is the only headless route — `Logger` alone is Xcode-only.

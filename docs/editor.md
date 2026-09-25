@@ -1826,7 +1826,14 @@ store action's clothes.
   would restore a pose. The owner chose **refuse** over **wait** (2026-09-13). Waiting would have
   kept a drag's last position, but the pose that followed would aim at entity ids resolved before
   the swap. Refusing matches #1148, which already refuses every undo/redo for the same window. A
-  scrub drag poses again on its next move once the restore has landed. One chain has its own
+  scrub drag poses again on its next move once the restore has landed. **"A restore" means ANY
+  authored restore, Stop's included (#1572)**: `authoredRestoreInFlight()`, next to the preview's
+  own counter. Stop sets `stopped` before its restore, and the session's `onWorldSwap` abandon
+  covers only a begin that seats before the swap. A scrub in the post-swap tail (managers disposing
+  and initialising) snapshotted Persistent roots and kept bases still at their Play values, and
+  that session's Exit or Cmd+S cycle wrote them back as authored. The same window refuses Play
+  (`aSceneSwapIsHappening`) and undo/redo (`registerUndoRestoreBarrier`): `canEdit()` reads true
+  there, so an undo wrote a Play-time value into the reloaded world with nothing left to revert it. One chain has its own
   restore: grabbing the playhead while ▶ plays reverts the forward run and then reopens a scrub
   session. That chain goes through `reopenPreviewAfterRestore`, which re-claims scrub, because a drag
   move refused during its restore handed the mode back and the reopen then posed under `stopped`. It

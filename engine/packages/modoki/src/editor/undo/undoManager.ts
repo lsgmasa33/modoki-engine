@@ -488,10 +488,21 @@ async function runStep(
  *  ⚠️ Read `canEdit()`, NOT `getPlayState()`: the 3-value shim calls a preview `'stopped'`, which is
  *  how every Undo gate — and the panel buttons and agent ops, which were never gated at all — said
  *  "safe" inside an envelope. The gate lives HERE so every caller shares it. */
+/** Authored restores still landing — Stop's included — registered by `authoredSnapshot.ts` rather than
+ *  imported, so this module stays free of the scene-loading graph (#1572). Stop sets 'stopped' before
+ *  its restore, so `canEdit()` reads true while the world is mid-reload: an undo there wrote a
+ *  Play-time value into the reloaded world (the during-Play entries are truncated right after, so
+ *  nothing reverted it), or undid a Persistent root that the restore's replay then overwrote. */
+const _restoreBarriers: Array<() => boolean> = [];
+export function registerUndoRestoreBarrier(isRestoring: () => boolean): void {
+  _restoreBarriers.push(isRestoring);
+}
+
 export function undoRefusedReason(direction: 'undo' | 'redo' = 'undo'): string | null {
   const top = direction === 'undo' ? undoStack[undoStack.length - 1] : redoStack[redoStack.length - 1];
   if (!top) return null; // nothing to undo is never a refusal, whatever the mode
   if (_restoringSessions.size > 0) return `The preview is closing — ${direction} again once the scene has been restored.`;
+  if (_restoreBarriers.some((isRestoring) => isRestoring())) return `The scene is being restored after Stop — ${direction} again once it has landed.`;
   if (canEdit()) return null;
   const mode = getRunMode();
   if (mode === 'playing') return `Stop the game to ${direction} — disabled during Play.`;

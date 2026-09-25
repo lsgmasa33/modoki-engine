@@ -645,6 +645,15 @@ async function deviceRequestFull(method: string, params: Record<string, unknown>
   return backendPost('/api/device/request', { method, params }, decodeDeviceRequestReply);
 }
 
+/** The device-request budget for an in-process `nativeLogs` read (#1558): the 5000ms the relay
+ *  used before, plus a little per second of lookback, capped so a mistyped hour-long window
+ *  still fails in bounded time. ⚠️ The 5 ms/s slope is a GUESS, not a measurement: the only
+ *  number behind it is a macOS OSLogStore scan (20,000 entries ≈ 3.4 s over a ~1.4 s fixed cost),
+ *  and entries per second depend on how chatty the app is. Exported for its test. */
+export function nativeLogsAppTimeoutMs(seconds: number): number {
+  return Math.min(20_000, 5_000 + Math.max(0, seconds) * 5);
+}
+
 /** The `⚠️` caveat line for a host-side reply the router could not tie to the lease
  *  (`unverified` on the `crashReports`/`nativeLogs` route bodies — editorBackendRouter.ts,
  *  `pickGoIosDevice`). Same tone/shape as `wdaLauncher.ts`'s `launchWarning`: reported, not
@@ -2540,9 +2549,9 @@ async function coordScaleOrRefusal(
     'something that already happened), while on Android it dumps logcat BACKWARD, so it needs no ' +
     'capture window and `seconds` is ignored there.',
     {
-      limit: z.number().optional().describe('Max lines (default: 50)'),
+      limit: z.number().int().min(1).optional().describe('Max lines (default: 50)'),
       filter: z.string().optional().describe('Text filter (case-insensitive). Only return lines containing this string.'),
-      seconds: z.number().optional().describe("Window in seconds. source:'app' looks BACK this far (default 60). source:'system' on iOS CAPTURES for this long (default 10, max 60) and you wait it out; on Android it is IGNORED — logcat already holds the past."),
+      seconds: z.number().int().min(1).max(2_592_000).optional().describe("Window in whole seconds, 1 to 2592000 (30 days). source:'app' looks BACK this far (default 60). source:'system' on iOS CAPTURES for this long (default 10, max 60) and you wait it out; on Android it is IGNORED — logcat already holds the past."),
       source: z.enum(['app', 'system']).optional().describe("'app' (default) = in-process, needs the app running and connected. 'system' = host-side device log (go-ios syslog on iOS, adb logcat on Android); needs no lease and works when the app is dead."),
       platform: z.enum(['ios', 'android']).optional().describe("Which platform to read, when no lease says. Needed ONLY when both an iPhone and an Android are attached — then the call refuses rather than picking one, because reading the wrong phone gives a confidently wrong answer."),
     },
@@ -2556,6 +2565,11 @@ async function coordScaleOrRefusal(
           ...(source ? { source } : {}),
           ...(platform ? { platform } : {}),
           ...(filter ? { filter } : {}),
+          // The app reads its own log IN-PROCESS, and that read grows with the window. Without a
+          // budget the relay used the lease transport's fixed 5000ms, and every long lookback
+          // timed out as a dead link (#1558). The router sizes its deadline off `timeoutMs`
+          // (#153); `system` is answered host-side before that relay and needs none.
+          ...(source === 'system' ? {} : { timeoutMs: nativeLogsAppTimeoutMs(seconds ?? 60) }),
         });
         const raw = body.result;
         // Same class as device_console_logs above: an `Error: …` reply would be String()'d straight
@@ -2585,7 +2599,13 @@ async function coordScaleOrRefusal(
             code: 'NOT_AVAILABLE_HERE',
             what: 'read the native device logs (logcat / os_log)',
             why: `the native log reader refused: ${parsed.error}`,
-            options: ['check the app has the entitlement/permission its platform needs for os_log / logcat'],
+            options: [
+              // #1558: an Android `logcat exited N` is logcat refusing its ARGUMENTS (e.g. a malformed
+              // -T start), not a missing permission — the MCP bounds `seconds`, so an old app binary
+              // or a direct bridge caller is the likely source.
+              ...(/logcat exited/.test(parsed.error) ? ['logcat rejected the read itself (see the -T start in the message) — a whole `seconds` from 1 up is what the reader expects; an app binary from before #1558 may need a rebuild'] : []),
+              'check the app has the entitlement/permission its platform needs for os_log / logcat',
+            ],
           });
         }
         // A partial read (some logs AND an error) keeps the logs and states the error — dropping

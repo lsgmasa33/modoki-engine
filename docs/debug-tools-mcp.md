@@ -524,6 +524,24 @@ logs it already has. The response says which read you got (`logcat dump, backwar
 forward for Ns`), because an empty result means *"nothing was logged"* in one case and *"nothing
 happened while I watched"* in the other, and those lead to opposite next moves.
 
+⚠️ **On the `app` path, `seconds` was ignored on BOTH platforms until #1558** — the window is only
+real if the code bounds it, and neither did. **iOS:** a position alone does not bound
+`OSLogStore.getEntries` — measured on macOS, a boot-relative and a date position both returned all
+20,000 of the process's entries (4.8 s), and only a `date >= since` **predicate** returned the window
+(1.4 s). So every read walked the app's whole log since launch, grew with uptime, and ended as
+`device request timed out after 5000ms`, however small `seconds` was. **Android:** `logcat -t N` is a
+LINE count, not seconds — `-t 60` on the S22 covered 11 s, so a filter for anything older answered
+"No logs". It now passes `-T <epoch seconds>`, which has no timezone or year to get wrong. The MCP
+also sends a `timeoutMs` sized from `seconds` (5 s + 5 ms/s, capped at 20 s; the slope is a guess,
+not a measurement), because the relay's deadline is otherwise the lease transport's fixed 5000 ms
+(#153). ⚠️ **What was observed:** the iOS predicate on macOS's OSLogStore, and `-T` with raw adb on
+the S22. Neither fix has yet run through the plugin on a device. That check is QA-TOOL-0013. A
+failed read now arrives in `error` on both platforms (iOS used to send it as a log line, and a
+logcat that rejects its arguments used to read as "No logs"). `seconds` is a whole number from 1
+to 30 days, and `limit` is at least 1 (`limit:0` crashed the iOS reader). An app binary built before
+#1558 still has both bugs, so keep that in mind when an old build gives an empty or timed-out `app`
+read.
+
 ⚠️ **On the iOS forward path, `seconds` is a window of SYSLOG and starts when `ios syslog` is UP** —
 not when the route asked for it. Host fork/exec latency used to be billed against the caller's window,
 which is invisible on an idle Mac and load-dependent everywhere else: a 1 s capture could return an
@@ -658,6 +676,11 @@ roughly 7x the 60,000-char budget, and nothing else on this path truncates.
 
 Two questions, one mechanism each. `device_list` answers both in one call — attached Androids
 (`adb devices -l`), paired iPhones (`devicectl` + the legacy `xctrace` listing), and who holds each.
+
+⚠️ **`device_list` goes through the editor (`/api/device/list`), so it refuses when no editor runs** —
+but its question needs none. **`npm run device:list` answers the same thing host-side**, claims
+included, and the refusal names it first (#1558). Don't fall back to raw `adb devices`/`devicectl`:
+they list phones with no claims, which is #285's bypass — measured, 20 of 120 refused agents did.
 
 **Which one — the serial is resolved ONCE, at connect, and carried on the lease.** Every adb call on
 this surface used to be un-targeted, which is fine with one phone and fails outright with two: adb

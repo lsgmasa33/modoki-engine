@@ -1006,6 +1006,116 @@ describe('leaving the envelope cancels a begin still serializing (#1569)', () =>
   });
 });
 
+/** #1572 — Stop sets 'stopped' BEFORE its restore lands, so a scrub in that window used to open a
+ *  session over a world the editor itself reports as not-authored. The mocked SceneManager never
+ *  swaps worlds, so a parked load here models the post-swap tail the session's own `onWorldSwap`
+ *  cannot cover: Persistent roots still at their Play values until the restore's replay. */
+describe('a begin during Stop\'s restore is refused (#1572)', () => {
+  // Drained after EVERY case, pass or fail: a red assertion otherwise leaves Stop's load parked on a
+  // promise nothing resolves, `authoredRestoreInFlight()` stays true, and every later case in the file
+  // fails with it (close-out review — a mutation run reported 5 failures where 2 were the target).
+  let parked: { open: () => void; stopping: Promise<void> } | null = null;
+  afterEach(async () => {
+    if (parked) { parked.open(); await parked.stopping; parked = null; }
+    if (getPlayState() !== 'stopped') await stopPlay();
+  });
+
+  async function stopWithRestoreParked(beforeStop?: () => void): Promise<{ open: () => void; stopping: Promise<void> }> {
+    await enterPlay();
+    expect(getPlayState()).toBe('playing');
+    beforeStop?.();
+    let open!: () => void;
+    h.loadGate = new Promise<void>((r) => { open = r; });
+    const stopping = stopPlay();
+    parked = { open, stopping };
+    await new Promise((r) => setTimeout(r, 0));
+    expect(getRunMode()).toBe('stopped');                 // the premise: the mode already reads stopped
+    return { open, stopping };
+  }
+
+  it('undo is refused while the restore lands — a during-Play entry must not write into the reloaded world', async () => {
+    clearHistory();
+    const prePlay = vi.fn();
+    pushAction({ label: 'authored before Play', undo: prePlay, redo: () => {} });
+    const duringPlay = vi.fn();
+    const { open, stopping } = await stopWithRestoreParked(
+      () => pushAction({ label: 'edit during Play', undo: duringPlay, redo: () => {} }),
+    );
+    // MUTATION TARGET: drop the `_restoreBarriers` check from undoRefusedReason and this is null —
+    // canEdit() reads true, and the during-Play entry's undo runs into the world being reloaded.
+    expect(undoRefusedReason('undo')).toMatch(/being restored after Stop/);
+    expect(await undo()).toBe(false);
+    expect(duringPlay).not.toHaveBeenCalled();
+    open(); await stopping;
+    // ACCEPT SIDE: Stop truncated the during-Play entry, and the authored history undoes normally.
+    expect(undoRefusedReason('undo')).toBe(null);
+    expect(await undo()).toBe(true);
+    expect(prePlay).toHaveBeenCalledTimes(1);
+    expect(duringPlay).not.toHaveBeenCalled();
+    clearHistory();
+  });
+
+  it('a scrub in the window opens no session and snapshots nothing', async () => {
+    const { open, stopping } = await stopWithRestoreParked();
+    const before = h.snapshots.length;
+    enterScrubMode('timeline');
+    const pose = vi.fn();
+    // MUTATION TARGET: drop `authoredRestoreInFlight()` from the begin's refusal and this is true —
+    // a session holding a snapshot of the not-yet-restored world, still held after Stop lands.
+    expect(await openPreviewSessionThen('timeline', pose)).toBe(false);
+    expect(pose).not.toHaveBeenCalled();
+    expect(h.snapshots.length, 'the begin must not serialize the world').toBe(before);
+    expect(getRunMode()).toBe('stopped');                 // the scrub's claim was handed back
+    open(); await stopping;
+    expect(hasTimelinePreviewSession()).toBe(false);
+  });
+
+  it('an agent pose_clip in the window is refused, not applied', async () => {
+    const { poseClipAtTime } = await import('../../src/editor/animation/poseClip');
+    const { open, stopping } = await stopWithRestoreParked();
+    const clip = { duration: 1, loop: false, frameRate: 30, tracks: [] } as never;
+    const r = await poseClipAtTime(clip, 1, 0.5, 'animation');
+    expect(r.refused).toBe(true);
+    expect(r.openedSession).toBe(false);
+    expect(getModeOwner()).toBe(null);
+    open(); await stopping;
+    expect(hasTimelinePreviewSession()).toBe(false);
+  });
+
+  it('Play pressed in the same window is refused — it would snapshot the not-yet-restored world', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { open, stopping } = await stopWithRestoreParked();
+    try {
+      const before = h.snapshots.length;
+      // MUTATION TARGET: drop `authoredRestoreInFlight()` from aSceneSwapIsHappening and Play arms
+      // with a snapshot whose Persistent roots still hold the previous run's values.
+      await enterPlay();
+      expect(getPlayState()).toBe('stopped');
+      expect(h.snapshots.length, 'Play must not snapshot the world mid-restore').toBe(before);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/Play refused/));
+      open(); await stopping;
+      // ACCEPT SIDE: once the restore has landed, Play starts.
+      await enterPlay();
+      expect(getPlayState()).toBe('playing');
+    } finally {
+      // A failed assertion above must not leave Play running or the restore parked for later tests.
+      open(); await stopping;
+      if (getPlayState() !== 'stopped') await stopPlay();
+      warn.mockRestore();
+    }
+  });
+
+  it('ACCEPT SIDE: once Stop\'s restore has landed, a scrub opens normally', async () => {
+    const { open, stopping } = await stopWithRestoreParked();
+    open(); await stopping;
+    enterScrubMode('timeline');
+    const pose = vi.fn();
+    expect(await openPreviewSessionThen('timeline', pose)).toBe(true);
+    expect(pose).toHaveBeenCalledTimes(1);
+    exitPreviewMode('timeline');
+  });
+});
+
 describe('stopPreviewIfOwnedBy — a displaced panel drops only ITS OWN ▶ (#1546)', () => {
   it('clears the flag for its owner and leaves the other panel\'s ▶ running', async () => {
     const { useEditorStore } = await import('../../src/editor/store/editorStore');

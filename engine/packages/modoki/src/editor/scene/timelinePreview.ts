@@ -26,7 +26,7 @@ import { onWorldSwap } from '../../runtime/core/ecs/world';
 import { registerPosedWorldSource } from './authoredWorld';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { clearControlSpawns } from '../../runtime/timeline/controlSpawnRegistry';
-import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, type AuthoredSnapshot } from './authoredSnapshot';
+import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
 import { capturePreviewSideState, restorePreviewSideState, type PreviewSideState } from './previewSideState';
 import { beginWorldReplacement } from './authoringSettle';
 import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
@@ -306,7 +306,8 @@ export function cancelPendingPreviewBegins(): void {
  *
  *  **Resolves `true` only when a session is held**, and every caller must honour `false` by posing
  *  nothing and handing back the run mode it claimed. `false` means one of:
- *   - **a restore is in progress** (#1167, owner-settled: refuse, not wait). The ending session has
+ *   - **a restore is in progress** — a preview Exit's or Play's Stop (#1572) — (#1167, owner-settled:
+ *     refuse, not wait). The ending session has
  *     already cleared `_snap`, so a begin here would serialize the still-POSED world as the new
  *     "authored" snapshot, and the next Exit would restore a pose. Waiting instead was declined: the
  *     pose that follows would aim at entity ids resolved before the swap. The same window already
@@ -324,7 +325,10 @@ export async function beginTimelinePreviewSession(): Promise<boolean> {
   if (lastRestoreFailed()) return false;
   if (_snap) return true;
   if (_pending && _pendingLive()) { await _pending; return _snap !== null; }
-  if (_restoresInFlight > 0) return false;
+  // #1167's refusal covers ANY authored restore, not only a preview one (#1572). Stop sets 'stopped'
+  // before its restore, so a scrub in that window saw a world the editor itself calls not-authored
+  // (Persistent roots still at their Play values until the post-swap replay) and snapshotted it.
+  if (_restoresInFlight > 0 || authoredRestoreInFlight()) return false;
   const stillLive = beginLiveness.capture();
   // ⚠️ Sample the edit-version BEFORE the await, not after. `serializeScene()` is async, and an
   // authored edit landing during it may or may not be in `snap` — but folding its bump into the

@@ -48,7 +48,7 @@ vi.mock('../../src/editor/panels/aiSettingsModel', () => ({
   fetchAiSettings: async () => ({}),
   getCachedAiSettings: () => ({}),
 }));
-vi.mock('../../src/editor/undo/undoManager', () => ({ undoDepth: () => 0, truncateUndoTo: vi.fn() }));
+vi.mock('../../src/editor/undo/undoManager', () => ({ undoDepth: () => 0, truncateUndoTo: vi.fn(), registerUndoRestoreBarrier: () => {} }));
 vi.mock('../../src/editor/editorJournal', () => ({ editorEmit: vi.fn() }));
 
 const { enterPlay, stopPlay } = await import('../../src/editor/scene/playMode');

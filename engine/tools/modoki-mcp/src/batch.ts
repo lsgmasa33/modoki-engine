@@ -262,7 +262,9 @@ type PreflightResult = { rejected: string } | { tools: string[] };
 function preflight(input: BatchInput, getTool: typeof defaultGetTool): PreflightResult {
   const { steps } = input;
   if (!Array.isArray(steps) || steps.length === 0) return { rejected: 'batch: `steps` must be a non-empty array.' };
-  if (steps.length > MAX_STEPS) return { rejected: `batch: ${steps.length} steps exceeds the cap of ${MAX_STEPS}.` };
+  // Each cap refusal names the next move, not just the limit (#1558): measured, every cap refusal
+  // was followed by a re-sent batch, so the one line that says HOW to get under it is the fix.
+  if (steps.length > MAX_STEPS) return { rejected: `batch: ${steps.length} steps exceeds the cap of ${MAX_STEPS} — split it into ${Math.ceil(steps.length / MAX_STEPS)} batches; nothing ran.` };
 
   /** The resolved name PER STEP, handed to the executor — see PreflightResult. */
   const resolved: string[] = [];
@@ -298,7 +300,7 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
       if (decodedMs !== args.ms && decodedMs !== NOT_DECODED) step.args = { ...args, ms: decodedMs };
       const ms = decodedMs;
       if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return { rejected: `batch: ${at}: wait needs {ms: <number ≥ 0>}.` };
-      if (ms > MAX_WAIT_MS) return { rejected: `batch: ${at}: wait ms ${ms} exceeds the cap of ${MAX_WAIT_MS}.` };
+      if (ms > MAX_WAIT_MS) return { rejected: `batch: ${at}: wait ms ${ms} exceeds the cap of ${MAX_WAIT_MS} — to wait UNTIL something appears or changes, use a modoki_wait_for step instead of a longer sleep; nothing ran.` };
       continue;
     }
     if (DENIED.has(tool)) {

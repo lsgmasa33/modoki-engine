@@ -23,9 +23,12 @@ import { serializeScene, saveScene, getCurrentScenePath, setCurrentScenePath, se
 import {
   applyToPrefabSelective, installPrefabSnapshot, guidForEntityId, entityIdForGuid,
   resolveInstanceContext, getPrefabSource, captureInstanceOverrides, captureInstanceStructure,
-  rebuildInstance, preloadNestedPrefabsForSubtree, refreshBaseInstances, rebaseStaleInstances,
+  rebuildInstance, preloadNestedPrefabsForSubtree, refreshBaseInstances, rebaseStaleInstances, getCachedPrefabSync,
   type ApplyResult, type PrefabFile,
 } from '../scene/prefab';
+import { rewriteNodeMoves } from '../../runtime/core/ecs/identityParents';
+import { rewriteFrameMoves } from '../../runtime/loaders/memberPaths';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { useEditorStore } from '../store/editorStore';
 import { repairPrefabMemberPaths } from '../backend/editorBackend';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
@@ -47,7 +50,16 @@ async function restoreSnapshot(
   repairFrom?: PrefabFile,
 ): Promise<void> {
   await installPrefabSnapshot(source, prefab);
-  if (repairFrom && prefab.id) await repairPrefabMemberPaths(prefab.id, repairFrom);
+  if (repairFrom && prefab.id) {
+    // The live records of each template reference node's moves go back as the apply re-pointed them (#1564): the world
+    // swap below CARRIES a Persistent or base root with its record whole, and the rebase then rebuilds it against
+    // `prefab` — with the apply's paths, which name nothing there. Before the await, as the apply does it before its
+    // refresh: nothing that rebuilds in the meantime can read the old paths.
+    const id = prefab.id;
+    const read = (doc: PrefabFile) => (g: string) => (g === id ? doc : getCachedPrefabSync(g));
+    rewriteNodeMoves(getCurrentWorld(), (moved, src) => rewriteFrameMoves(moved, src, read(repairFrom), read(prefab)));
+    await repairPrefabMemberPaths(prefab.id, repairFrom);
+  }
   if (scenePath) {
     await sceneManager.loadScene(scenePath, { preloaded: clone(scene) });
     setCurrentScenePath(scenePath);

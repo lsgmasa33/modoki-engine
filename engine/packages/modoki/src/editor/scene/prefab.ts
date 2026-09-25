@@ -4,13 +4,13 @@ import { whyWorldNotAuthored } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
-import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, noteNodeMoves, frameRootDoc, templateFrameClimber } from '../../runtime/core/ecs/identityParents';
+import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, noteNodeMoves, frameRootDoc, templateFrameClimber, rewriteNodeMoves } from '../../runtime/core/ecs/identityParents';
 import { memberRowKeysIn, memberRowsIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
-import { isPrefabEditRowGuid } from './prefabEditGuids';
+import { isPrefabEditRowGuid, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { nestedMoveRef, toLocalIdKeys } from './overrideKeyGrammar';
 import { diffFrameAdded, type FrameAddedDiff, type NodeDiffDeps } from './nodeRowDiff';
 import { IDENTITY_TRS, mergeTrs, localToWorldTrs, sameOrientation, sameRotationScale } from '../../runtime/scene/transformSpace';
-import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, type PrefabReader } from '../../runtime/loaders/memberPaths';
+import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, rewriteFrameMoves, type PrefabReader } from '../../runtime/loaders/memberPaths';
 import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { collectUnknownFields, mergeUnknownFields } from '../../runtime/core/formatVersion';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
@@ -345,13 +345,14 @@ function keySceneNodes(rows: Record<string, SceneMemberRow>): Record<string, Sce
 
 /** Were the rows kept for the root `rootEcs` (guid `rootGuid`) read from the template being written? — the #1293 gate on
  *  R2's re-emit. Two carriers qualify, both only inside the prefab-edit world:
- *  - a prefab ROW, spawned as a scene entry under its row sentinel, whose rows the load read off that entry;
- *  - a TEMPLATE reference node that such an entry's own statements declare (#1542): it stores no guid and derives one,
+ *  - a prefab ROW (`isPrefabEditRow`): spawned as a scene entry under its row sentinel, whose rows the load read off
+ *    that entry, or dropped in this session, whose rows only a Refresh's settle kept (#1568);
+ *  - a TEMPLATE reference node that such a row's own statements declare (#1542): it stores no guid and derives one,
  *    and the load kept its rows under that (`keepTemplateNodeOrphans`). Its root carries a template key and sits
- *    below a row sentinel. A scene never holds one — a scene-form reference node stores a guid (#1438) — so the
- *    sentinel ancestor is what separates the two. */
+ *    below a row. A scene never holds one — a scene-form reference node stores a guid (#1438) — so the row ancestor
+ *    is what separates the two. */
 function keepsTemplateRows(rootEcs: number, rootGuid: string): boolean {
-  if (isPrefabEditRowGuid(rootGuid)) return true;
+  if (isPrefabEditRow(rootEcs, rootGuid)) return true;
   // The marker, or the key recovered from the root's derived guid: a rebuild respawns the node without its marker, and a
   // second Refresh before any save read it as no template node at all (#1541/#1542 close-out re-review).
   if (!rootGuid || !(templateKeyOf(findEntity(rootEcs)) || recoverTemplateKey(rootEcs))) return false;
@@ -361,8 +362,30 @@ function keepsTemplateRows(rootEcs: number, rootGuid: string): boolean {
   for (let id = rootEcs; id && !seen.has(id);) {
     seen.add(id);
     const ea = readTraitData(id, eaMeta) as { guid?: string; parentId?: number } | null;
-    if (id !== rootEcs && isPrefabEditRowGuid(ea?.guid)) return true;
+    if (id !== rootEcs && isPrefabEditRow(id, ea?.guid)) return true;
     id = ea?.parentId ?? 0;
+  }
+  return false;
+}
+
+/** Is `id` (guid `guid`) a ROW of the prefab being edited — one the prefab-edit save writes as a row of its own? A row
+ *  the edit world was built with carries its sentinel guid. One the user dropped in during this session does not, until
+ *  the prefab is saved and reopened, and read by its guid alone it kept no orphan rows for the rest of the session
+ *  (#1568). So it is also recognised by where it sits, by the save's own row rule (`planPrefabRows`: an instance root
+ *  that no enclosing instance consumed): a self-rooted instance root whose ancestors, up to the edit world's root, are
+ *  all plain entities. Nothing in a scene sits under that root. */
+function isPrefabEditRow(id: number, guid: string | undefined): boolean {
+  if (isPrefabEditRowGuid(guid)) return true;
+  const eaMeta = getTraitByName('EntityAttributes');
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!eaMeta || !piMeta || (readTraitData(id, piMeta)?.rootInstanceId as number | undefined) !== id) return false;
+  const seen = new Set<number>([id]);
+  for (let p = (readTraitData(id, eaMeta) as { parentId?: number } | null)?.parentId ?? 0; p && !seen.has(p);) {
+    seen.add(p);
+    const ea = readTraitData(p, eaMeta) as { guid?: string; parentId?: number } | null;
+    if (ea?.guid === PREFAB_EDIT_ROOT_GUID) return true;
+    if (readTraitData(p, piMeta)) return false;
+    p = ea?.parentId ?? 0;
   }
   return false;
 }
@@ -5451,6 +5474,10 @@ export async function applyToPrefabSelective(
   // would then drop its per-copy overrides with no warning at all (#1284).
   for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
   const remap = rowsReparented && prefabId ? liveMemberGuidRemap(prefabId, readOld, readNew, rootsToRefresh) : new Map<string, string>();
+  // …and each template reference node's live moves, path-keyed in its frame (#1564): the rebuilds below re-queue them — a
+  // rebuilt root's carry, and the moves of the frames around a rebuilt instance — and a stale path names nothing, so the
+  // member went back to its template home and the next save dropped the node's move.
+  if (rowsReparented && prefabId) rewriteNodeMoves(getCurrentWorld(), (moved, src) => rewriteFrameMoves(moved, src, readOld, readNew));
   refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap, { rootId: rootInstanceId, fields: appliedFields });
   if (remap.size) remapWorldGuidRefs(remap);
   // …and every other file that uses the prefab. The open scene's own file too: its live world is already
@@ -6140,6 +6167,9 @@ function captureRowsForSettle(
   const frameIds = new Map<string, number>([['', rowRoot]]);
   for (const [id, key] of memberRowKeysIn(rowRoot)) frameIds.set(key, id);
   const torn = (key: string) => toDestroy.has(frameIds.get(rowFrameKey(key)) ?? 0);
+  // The rows keyed by a nested ROOT: their nodes hang at that instance's root, and die with it when the template drops
+  // its row — nothing re-homes them (`unhomed` below). Read now, while the ids are the torn-down tree's.
+  const frameRootKeys = new Set([...frameIds].filter(([key, id]) => key && piMeta && (readTraitData(id, piMeta)?.rootInstanceId as number) === id).map(([key]) => key));
   const current = prefabCache.get(source);
   prefabCache.set(source, baseline);
   let rows: Record<string, SceneMemberRow>;
@@ -6160,20 +6190,26 @@ function captureRowsForSettle(
     // A kept row's `added`/`own` nodes the re-apply RE-HOMED (an addition whose anchor the template dropped moves to
     // the instance root, `applyStructureCore`) are live elsewhere now, and saved there: kept here too, a restore of the
     // member spawned them a second time, with the same guid (review F1). Only the ones nothing live carries stay.
+    // A node with a RUNTIME guid is captured with none, so no guid can say it is live (#1568): the re-apply's own rule
+    // does — a node added under a member the template dropped is re-anchored to its frame's root, so if that frame is
+    // live, so is the node. Two rows are not re-homed: a NODE row's nodes went with their template node, and a nested
+    // ROOT's with its instance (close-out review).
     const liveGuids = new Set(getAllEntities().map((e) => e.guid).filter((g): g is string => !!g));
-    const unhomed = (row: SceneMemberRow): SceneMemberRow => {
+    const liveFrames = new Set(['', ...memberRowKeysIn(root).values()]);
+    const unhomed = (key: string, row: SceneMemberRow): SceneMemberRow => {
       const out: SceneMemberRow = { ...row };
+      const rehomed = !nodeRowKey(key.slice(key.lastIndexOf('/') + 1)) && !frameRootKeys.has(key) && liveFrames.has(rowFrameKey(key));
       for (const ch of ['added', 'own'] as const) {
         const nodes = row[ch];
         if (!nodes) continue;
-        const left = nodes.filter((n) => !liveGuids.has(n.guid));
+        const left = nodes.filter((n) => !liveGuids.has(n.guid) && !(rehomed && !n.guid));
         if (left.length === nodes.length) continue;
         if (left.length) out[ch] = left;
         else delete out[ch];
       }
       return out;
     };
-    for (const [k, row] of Object.entries(before)) if (!(k in kept) && !backed(k)) next[k] = unhomed(row);
+    for (const [k, row] of Object.entries(before)) if (!(k in kept) && !backed(k)) next[k] = unhomed(k, row);
     for (const [k, row] of Object.entries(kept)) (backed(k) ? replay : next)[k] = row;
     for (const k of replayRowsLive(root, replay)) next[k] = replay[k]!;
     setKeptMemberOrphans(rowRootGuid, next);

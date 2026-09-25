@@ -10,6 +10,7 @@ import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import { join } from 'node:path';
 import { loadDeviceSurface, deviceReply, DEVICE_STUB_BACKEND, type DeviceSurface } from './deviceSurface';
 import { readScannedSource } from '@modoki/engine/testing';
+import { nativeLogsAppTimeoutMs } from '../../tools/game-debug-mcp/src/mcp-tools';
 import { PER_TOOL_MEANING } from './perToolMeaning';
 
 let surface: DeviceSurface | undefined;
@@ -337,5 +338,55 @@ describe('device_status reports the app identity the SOCKET actually holds (#88)
     }));
     await s.call('device_status');
     expect(s.real().some((q) => q.path === '/api/device/request')).toBe(false);
+  });
+});
+
+describe('#1558 — device_native_logs gives the in-process read a budget sized from its window', () => {
+  const nativeLogsParams = (s: DeviceSurface) =>
+    (s.real().find((q) => q.path === '/api/device/request')?.body as { params?: Record<string, unknown> } | undefined)?.params;
+
+  it('source:app forwards timeoutMs, so a long lookback is not cut off at the relay\'s fixed 5000ms', async () => {
+    // Without it the router's deadline is the lease transport's default, and the transcripts show
+    // every long `seconds` read ending "device request timed out after 5000ms".
+    const s = (surface = await loadDeviceSurface((q) => (q.path === '/api/device/request' ? deviceReply(['line']) : undefined)));
+    await s.call('device_native_logs', { seconds: 600 });
+    expect(nativeLogsParams(s)?.timeoutMs).toBe(nativeLogsAppTimeoutMs(600));
+    expect(nativeLogsAppTimeoutMs(600)).toBeGreaterThan(5_000);
+  });
+
+  it('source:system sends none — the router answers it host-side, before the device relay', async () => {
+    const s = (surface = await loadDeviceSurface((q) => (q.path === '/api/device/request' ? deviceReply(['line']) : undefined)));
+    await s.call('device_native_logs', { source: 'system', seconds: 10 });
+    expect(nativeLogsParams(s)).toBeDefined();
+    expect(nativeLogsParams(s)?.timeoutMs).toBeUndefined();
+  });
+
+  it('refuses a window or limit the native readers would turn into a silent "No logs." or a crash', async () => {
+    // #1558 review: limit 0 crashed the iOS ring (removeFirst on empty); seconds < 1 is a start in
+    // the FUTURE (empty on both platforms); a non-integer made Capacitor's getInt return nil, so
+    // the window silently became 60 s; a huge one overflowed Android's -T into a malformed time.
+    const s = (surface = await loadDeviceSurface());
+    for (const bad of [{ limit: 0 }, { limit: 2.5 }, { seconds: 0 }, { seconds: -5 }, { seconds: 1.5 }, { seconds: 2_000_000_000 }]) {
+      expect(s.validate('device_native_logs', bad).ok, JSON.stringify(bad)).toBe(false);
+    }
+    expect(s.validate('device_native_logs', { limit: 1, seconds: 1 }).ok).toBe(true);
+    expect(s.validate('device_native_logs', { seconds: 2_592_000 }).ok).toBe(true);
+  });
+
+  it('a logcat that rejected its arguments is refused as that, not as a missing permission', async () => {
+    const reply = (error: string) => (q: { path: string }) => (q.path === '/api/device/request' ? deviceReply({ logs: [], error }) : undefined);
+    const s = (surface = await loadDeviceSurface(reply('logcat exited 1 (-T -1234.-567)')));
+    const r = await s.call('device_native_logs', {});
+    expect(s.text(r)).toContain('NOT_AVAILABLE_HERE');
+    expect(s.text(r)).toContain('logcat rejected the read itself');
+    surface.restore();
+    const denied = (surface = await loadDeviceSurface(reply('OSLogStore error: denied')));
+    expect(denied.text(await denied.call('device_native_logs', {}))).not.toContain('logcat rejected');
+  });
+
+  it('the budget is bounded at both ends', () => {
+    expect(nativeLogsAppTimeoutMs(0)).toBe(5_000);
+    expect(nativeLogsAppTimeoutMs(-5)).toBe(5_000);
+    expect(nativeLogsAppTimeoutMs(1_000_000)).toBe(20_000);
   });
 });

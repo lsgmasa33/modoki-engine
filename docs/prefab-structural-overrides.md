@@ -979,7 +979,22 @@ say it, and always takes the member's live Transform with it (its pose relative 
   instance. The references follow, in three places:
   - live: `liveMemberGuidRemap` pairs old and new paths per live instance, the rebuild translates what
     it looks up by guid, and `remapWorldGuidRefs` rewrites every trait value afterwards;
-  - the prefab's own `@member:` tokens (`rewritePrefabMemberTokens`, runtime/loaders/memberPaths.ts);
+  - the prefab's own `@member:` tokens (`rewritePrefabMemberTokens`, runtime/loaders/memberPaths.ts), each
+    read in the frame its value applies in. That covers a row's traits, a nested row's `overrides` and `added`,
+    both path-keyed slots, and the document's `moved`. It also covers a row's `members` (#1533), each read in the
+    frame its key less its last component names. A template REFERENCE node in any `added` list is a frame of its
+    own (`<owner>/a<key>`, as `memberPathRecords` names it): its root's `traits` are read where it hangs, and all
+    of its payload in its own frame, including `members` and `templateMoved`. Its members' paths sit past its
+    anchor (`2.3.+K|2.3.2`), and the index keeps them. Before #1564 the walk skipped a reference node, a row's
+    `members` and those paths, so an Apply that moved Panel left `@member:^.^.^.2` inside OUTER2's node naming
+    nothing. One moves-map rewrite (`movesIn`) serves `doc.moved`, a node's `templateMoved` and the live record
+    below;
+  - the live record of each template reference node's moves (`FrameRootRecord.nodeMoved`, #1543), re-pointed
+    by `rewriteNodeMoves` through `rewriteFrameMoves` BEFORE `refreshInstances`. The rebuilds re-queue it (a
+    rebuilt root's carry, and the moves of the frames around a rebuilt instance), so a stale path sent the
+    member back to its template home and the next save dropped the move (#1564). The undo and redo re-point it
+    back the same way (`restoreSnapshot`, beside the file repair): the world swap CARRIES a Persistent or base
+    root with its record whole, and the rebase then rebuilds it against the restored document;
   - every OTHER file: `/api/prefab-member-paths` runs `planMemberPathRepair` — scene guids through
     `memberGuidRemap`, prefab tokens through the token rewrite — over every file naming the prefab,
     transitively. A file an asset view holds unsaved is left and named (`ApplyResult.fileRepair`);
@@ -1289,8 +1304,11 @@ without a word, and the writer's re-emit had nothing to read.
   root's guid (`captureRowsForSettle`, #1535), and for a template reference node that root is the
   node's own. Keyed any other way, a Refresh that restores the member would find nothing to replay.
 - **Re-emit.** `captureRowChannels` reads the store behind `keepsTemplateRows`. It passes a prefab-edit
-  row sentinel, as before, or a root that carries a template key and has such a sentinel as an
-  ancestor. A scene never holds a key-only reference node (a scene-form node stores a guid, #1438), so
+  row, as before, or a root that carries a template key and has such a row as an ancestor. A row is
+  `isPrefabEditRow`: its sentinel guid, or, for a row the user dropped in this session (which has no
+  sentinel until the prefab is saved and reopened), the save's own row rule, `planPrefabRows`. That rule
+  is a self-rooted instance root whose ancestors, up to the edit root, are all plain entities. Read by
+  the sentinel alone, a session row's kept orphans never reached the save (#1568). A scene never holds a key-only reference node (a scene-form node stores a guid, #1438), so
   outside the edit world the gate stays shut and #1293 holds. A template written from a scene
   instance does not carry rows kept for its node there.
 - **Kept rows re-enter a template in template form (`templateRowOf`, `keySceneNodes`).** A Refresh's
@@ -1311,8 +1329,13 @@ without a word, and the writer's re-emit had nothing to read.
   A node is a scene node when anything in its SUBTREE holds a guid: a node with a runtime guid is captured
   `guid: ''` and its durable child would otherwise pass through. A scene REFERENCE node keeps its own
   rows, converted the same way, since its rows are keyed as a template's are.
-  ⚠️ **Not covered:** a row created this session keeps no orphan rows at all, and a runtime-guid node
-  re-homed by the re-apply is duplicated on restore: #1568.
+- **The settle drops a node the re-apply re-homed (`unhomed`).** A kept row's nodes that the re-apply
+  re-anchored to the instance root (an addition whose member the template dropped) are live there and
+  saved there, so a restore of the member must not spawn them again (review F1). A durable guid says so
+  directly. A node with a RUNTIME guid is captured `guid: ''`, so it matched nothing, and the restore
+  spawned it again with its durable child, two entities sharing one guid (#1568). For a guid-less node the
+  re-apply's own rule answers instead: a node on a MEMBER row whose frame is live was re-anchored to that
+  frame's root. A NODE row's (`a+<key>`) nodes went with their template node and are not re-homed.
 - **A rebuild carries every torn-down node's key (#1567).** `rebuildInstance` respawns from a scene-form
   capture, which holds a node's guid and never its key, and only a guid DERIVED from the key can recover
   it. So a node whose guid is not derived — a reference node the user dropped this session (a v4 guid),
@@ -1343,7 +1366,7 @@ without a word, and the writer's re-emit had nothing to read.
   so it keeps rows only (`applyStoredMemberRows`' `keepOnly`). A guid a template row holds anyway (a
   hand-edited file) is not stamped on the member, just as the scene-side fold ignores it.
 
-Tests: `templateReferenceNodeRows.test.ts` § #1542 and § #1567. Each one names its mutation.
+Tests: `templateReferenceNodeRows.test.ts` § #1542, § #1567 and § #1568. Each one names its mutation.
 
 ### A move inside a template reference node (#1543, prefab v7)
 
@@ -1392,18 +1415,18 @@ frame: the shape of the document-level `moved`, for the node.
 no-identity rule for template rows. A path token names a member of the node's frame by its template
 identity, which every instance shares.
 
+An Apply that renumbers the member paths re-points `templateMoved` on disk and the live `nodeMoved`
+(#1564, § Moved members above). Neither can hold a value that climbs out of the node, because of the
+first gap below.
+
 **Not covered:**
 - a member moved OUT of the node's subtree (the written tree is the node's subtree);
 - an older editor re-saving a SCENE that restates a template node whole (a `replace` of an edited node,
   only where a member's list cannot be stated node by node) drops the node's `templateMoved`. The scene
   format was not bumped for it: the prefab bump already stops an older build from writing the prefab,
   and a restated node is already a pin of everything else in it;
-- Apply's member-token re-pointer (`rewritePrefabMemberTokens`), which does not walk `templateMoved`
-  either: #1564, which already covers every reference-node payload. The live record goes stale the same
-  way: an Apply that changes the node's prefab's member paths re-queues the carried `nodeMoved` under the
-  old paths, and the move is silently lost (observed by the close-out re-review, recorded on #1564).
 
-Tests: `templateReferenceNodeRows.test.ts` § #1543. Each one names its mutation.
+Tests: `templateReferenceNodeRows.test.ts` § #1543 and § #1564. Each one names its mutation.
 ### The #1468 design record — why identity is stored this way
 
 The design, the decisions and the rules behind scene v16 and prefab v5. The plan that carried them

@@ -491,9 +491,15 @@ public class GameDebugPlugin extends Plugin {
 
         new Thread(() -> {
             try {
-                // Read logcat for this process, limited to recent time window
+                // Read logcat for this process since `seconds` ago. `-T <start>`, NOT `-t <n>`
+                // (#1558): `-t` is a LINE COUNT, so `seconds:60` read the last 60 lines (measured on
+                // the S22: 11 s of system_server) and a filter looking further back answered "No
+                // logs". The start is epoch seconds, which logcat accepts and which carries no
+                // timezone or year to get wrong.
+                long sinceMs = System.currentTimeMillis() - seconds * 1000L;
+                String since = String.format(java.util.Locale.US, "%d.%03d", sinceMs / 1000, sinceMs % 1000);
                 Process process = Runtime.getRuntime().exec(new String[]{
-                    "logcat", "-d", "-v", "time", "--pid=" + pid, "-t", String.valueOf(seconds)
+                    "logcat", "-d", "-v", "time", "--pid=" + pid, "-T", since
                 });
                 BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
@@ -508,6 +514,9 @@ public class GameDebugPlugin extends Plugin {
                     lines.add(line);
                 }
                 reader.close();
+                // logcat rejecting its arguments exits non-zero with EMPTY stdout (measured: a
+                // malformed -T exits 1), which read as "No logs." — say it failed instead.
+                int exit = process.waitFor();
 
                 // Return last N lines
                 int start = Math.max(0, lines.size() - limit);
@@ -518,6 +527,7 @@ public class GameDebugPlugin extends Plugin {
 
                 JSObject result = new JSObject();
                 result.put("logs", arr);
+                if (exit != 0) result.put("error", "logcat exited " + exit + " (-T " + since + ")");
                 call.resolve(result);
             } catch (Exception e) {
                 JSObject result = new JSObject();

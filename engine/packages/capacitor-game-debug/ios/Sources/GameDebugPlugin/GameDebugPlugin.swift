@@ -537,25 +537,41 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Native Logs (os_log via OSLogStore)
 
     @objc func getNativeLogs(_ call: CAPPluginCall) {
-        let limit = call.getInt("limit") ?? 50
+        // At least 1: the ring below calls removeFirst() once it is full, which on an empty array
+        // is a precondition failure — `limit:0` killed the app under test (#1558 review). The MCP
+        // refuses limit < 1 too; this is the floor for any other caller.
+        let limit = max(1, call.getInt("limit") ?? 50)
         let seconds = call.getInt("seconds") ?? 60
         let filter = call.getString("filter")  // optional text filter (case-insensitive)
         let subsystem = call.getString("subsystem")  // optional subsystem filter
 
         DispatchQueue.global(qos: .userInitiated).async {
             var lines: [String] = []
+            // A failed read is reported in `error`, never as a log line: the MCP decoder (#648)
+            // turns `{logs:[], error}` into a refusal, while a line reading "OSLogStore error: …"
+            // was indistinguishable from log content (#1558 review).
+            var readError: String? = nil
 
             if #available(iOS 15.0, *) {
                 do {
                     let store = try OSLogStore(scope: .currentProcessIdentifier)
-                    let position = store.position(timeIntervalSinceLatestBoot: -Double(seconds))
+                    // The window is a DATE PREDICATE, not just a position (#1558). This was
+                    // `position(timeIntervalSinceLatestBoot: -seconds)` — N seconds BEFORE BOOT —
+                    // and a position alone does not bound getEntries anyway: measured on macOS's
+                    // OSLogStore, both a boot-relative and a date position returned all 20,000 of
+                    // the process's entries (4.8 s), while the predicate returned only the window
+                    // (1.4 s). So `seconds` did nothing, and the scan grew with app uptime until it
+                    // outran the 5 s device-request budget.
+                    let since = Date(timeIntervalSinceNow: -Double(seconds))
+                    let position = store.position(date: since)
+                    let inWindow = NSPredicate(format: "date >= %@", since as NSDate)
                     let formatter = ISO8601DateFormatter()
                     let filterLower = filter?.lowercased()
 
                     // Collect into a ring buffer — avoids .suffix() which iterates everything
                     var ring: [String] = []
                     ring.reserveCapacity(limit)
-                    for entry in try store.getEntries(at: position) {
+                    for entry in try store.getEntries(at: position, matching: inWindow) {
                         guard let logEntry = entry as? OSLogEntryLog else { continue }
 
                         // Subsystem filter
@@ -588,14 +604,15 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                     }
                     lines = ring
                 } catch {
-                    lines.append("OSLogStore error: \(error.localizedDescription)")
+                    readError = "OSLogStore error: \(error.localizedDescription)"
                 }
             } else {
-                lines.append("Native logs require iOS 15+")
+                readError = "Native logs require iOS 15+"
             }
 
             var result = JSObject()
             result["logs"] = lines
+            if let readError { result["error"] = readError }
             call.resolve(result)
         }
     }

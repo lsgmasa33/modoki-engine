@@ -27,6 +27,7 @@ import { writeTraitField } from '../../runtime/core/ecs/entityUtils';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { soaSchema, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { registerPosedWorldSource } from './authoredWorld';
+import { registerUndoRestoreBarrier } from '../undo/undoManager';
 
 export interface AuthoredSnapshot {
   /** The primary scene's serialization — what the restore reloads. */
@@ -224,6 +225,11 @@ export async function restoreAuthoredSnapshot(snap: AuthoredSnapshot): Promise<v
 
 /** Restores that have not finished — the old world (posed, or the Play world) is still live. */
 let _restoring = 0;
+/** Is ANY authored restore still landing — Stop's as well as a preview Exit's? Until it has, the live
+ *  world is not the authored one, so nothing may snapshot it as authored (#1572). */
+export function authoredRestoreInFlight(): boolean {
+  return _restoring > 0;
+}
 /** The last restore THREW: the reload or a replay failed, so the live world may still hold the pose
  *  or the Play world while every other source reads clear — the envelope already ended, the counters
  *  already dropped (#1548 close-out review). Cleared by the next world swap (a load from disk, or a
@@ -237,5 +243,6 @@ export function lastRestoreFailed(): boolean {
   return _restoreFailed;
 }
 registerPosedWorldSource('a Play/preview restore is still landing', () => _restoring > 0);
+registerUndoRestoreBarrier(() => _restoring > 0);
 registerPosedWorldSource('the last Play/preview restore FAILED — reload the scene before saving', () => _restoreFailed);
 onWorldSwap(() => { _restoreFailed = false; });

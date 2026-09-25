@@ -9,7 +9,7 @@
 
 import type { Entity } from 'koota';
 import type { PrefabFile } from './prefab';
-import { PREFAB_EDIT_LOCAL_GUID_PREFIX } from './prefabEditGuids';
+import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs, refreshPrefabSourceForPath, rebaseStaleInstances } from './prefab';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, takeDownEnvelopeBeforeWorldSwap, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
@@ -30,10 +30,6 @@ import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZ
 import { deriveMemberGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
 import { isMemberToken, parseMemberToken, type MemberStep } from '../../runtime/core/templateRefs';
 
-/** Sentinel guid stamped on the prefab root in the synthetic edit scene so the
- *  save path can locate it after the loader reassigns ECS ids. Lives only in the
- *  throwaway edit world; serializePrefab clears guids in the written file. */
-export const PREFAB_EDIT_ROOT_GUID = '__prefab_edit_root__';
 /** Guid prefix stamped on EVERY member of the synthetic edit scene, carrying that member's
  *  ORIGINAL localId (`__prefab_edit_local__7`).
  *
@@ -44,7 +40,7 @@ export const PREFAB_EDIT_ROOT_GUID = '__prefab_edit_root__';
  *  them silently drops those overrides. Riding on `guid` is safe because serializePrefab
  *  CLEARS EntityAttributes.guid on every row it writes — a template carries no per-instance
  *  identity — so the sentinel can never reach the file. */
-export { PREFAB_EDIT_LOCAL_GUID_PREFIX };
+export { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID };
 /** Default HDR for the edit-mode environment (wooden_motel_2k — already in the
  *  asset manifest). Purely scaffolding; never written into the prefab. */
 export const PREFAB_EDIT_HDR_GUID = '984275f1-3ebd-4848-927f-012595c76500';

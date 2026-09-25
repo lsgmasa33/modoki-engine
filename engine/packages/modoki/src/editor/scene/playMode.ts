@@ -17,7 +17,7 @@
 import { getPlayState, setPlayState, getRunMode, setRunMode, onRunModeChange } from '../../runtime/core/playState';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad } from './serialize';
-import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, type AuthoredSnapshot } from './authoredSnapshot';
+import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
 import { beginWorldReplacement } from './authoringSettle';
 import { undoDepth, truncateUndoTo } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
@@ -81,9 +81,17 @@ let _stopRequested = false;
  *  also calls `sceneManager.loadScene` directly, and it first awaits `whenUndoIdle()`, so for that
  *  wait `getNext()` is still null while the world about to be discarded is still POSED. Play pressed
  *  then snapshotted the pose and Stop put it back as the authored world (#1167's mechanism, from the
- *  Play side). */
+ *  Play side).
+ *
+ *  ⚠️ A FOURTH, because "past the swap the world is right" (above) is false for an AUTHORED restore
+ *  — Stop's, or a preview Exit's once its load starts (#1572). `restoreAuthoredSnapshot` replays the
+ *  Persistent roots and bases only AFTER `sceneManager.loadScene` resolves, and that load awaits
+ *  manager dispose/init after its swap, with `getNext()` already null. Play pressed in that tail
+ *  snapshotted Persistent roots and kept bases still at the previous run's values, and the next Stop put them back
+ *  as authored. `authoredRestoreInFlight()` spans the whole restore, replay included. */
 export function aSceneSwapIsHappening(): boolean {
-  return isSceneLoadInFlight() || sceneManager.getNext() !== null || isPreviewRestoreInFlight();
+  return isSceneLoadInFlight() || sceneManager.getNext() !== null || isPreviewRestoreInFlight()
+    || authoredRestoreInFlight();
 }
 
 export async function enterPlay(): Promise<void> {

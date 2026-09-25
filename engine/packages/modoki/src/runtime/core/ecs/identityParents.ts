@@ -127,6 +127,19 @@ export function noteNodeMoves(world: World, root: Entity, source: string, doc: T
   noteFrameRootDoc(world, root, { ...(frameRootDoc(world, root) ?? { source, doc }), nodeMoved: moved });
 }
 
+/** Re-point every live root's node moves (`nodeMoved`) through `rewrite`, which answers `null` for a record it leaves as
+ *  it is. They are path-keyed in the node's frame, so an Apply that renumbers a prefab's member paths must follow them
+ *  in the live world as it does in files (#1564) — and before the rebuilds that re-queue them read them. */
+export function rewriteNodeMoves(world: World, rewrite: (moved: Record<string, string>, source: string) => Record<string, string> | null): void {
+  const roots = rootDocsByWorld.get(world);
+  if (!roots) return;
+  for (const [packed, rec] of roots) {
+    if (!rec.nodeMoved || !isPackedAlive(packed)) continue;
+    const next = rewrite(rec.nodeMoved, rec.source);
+    if (next) roots.set(packed, { ...rec, nodeMoved: next });
+  }
+}
+
 /** How many frame-root records `world` holds — for the sweep's test. */
 export function frameDocRootCount(world: World): number {
   return rootDocsByWorld.get(world)?.size ?? 0;

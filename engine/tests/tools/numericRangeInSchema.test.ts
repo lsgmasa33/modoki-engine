@@ -66,7 +66,7 @@ const EXEMPT = [
   { item: 'modoki_profiler.limit', reason: 'mode-dependent max — the schema holds boot\'s 200, the op refuses a capture-read over 20' },
   { item: 'device_profiler.limit', reason: 'mode-dependent max — the schema holds boot\'s 200, the op refuses a capture-read over 20' },
   // Source-dependent: 60 bounds an iOS SYSTEM capture (you wait for it); source:'app' is a look-back.
-  { item: 'device_native_logs.seconds', reason: "source-dependent — the backend refuses a system capture over 60; an app look-back has no cap" },
+  { item: 'device_native_logs.seconds', reason: "source-dependent — the backend refuses a system capture over 60; an app look-back is capped at 30 days (2592000)" },
 ];
 
 type Row = { item: string; site: string };

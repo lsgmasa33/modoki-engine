@@ -158,6 +158,18 @@ describe('pre-flight — nothing runs until everything validates', () => {
     expect((await run({ steps: [{ tool: 'wait', args: { ms: MAX_WAIT_MS + 1 } }] }) as BatchRejection).rejected)
       .toContain(`cap of ${MAX_WAIT_MS}`);
   });
+
+  // #1558: every cap refusal in the transcripts was followed by a re-sent batch, so the refusal
+  // must say HOW to get under the cap, not only that it was hit.
+  it('a cap refusal names the next move — split the batch, or wait_for instead of a longer sleep', async () => {
+    const many = Array.from({ length: MAX_STEPS + 1 }, () => ({ tool: 'modoki_save_all' }));
+    expect((await run({ steps: many }) as BatchRejection).rejected).toContain('split it into 2 batches');
+    // The count follows N — "two" for 45 steps would be refused again (#1558 review).
+    const lots = Array.from({ length: MAX_STEPS * 2 + 5 }, () => ({ tool: 'modoki_save_all' }));
+    expect((await run({ steps: lots }) as BatchRejection).rejected).toContain('split it into 3 batches');
+    expect((await run({ steps: [{ tool: 'wait', args: { ms: MAX_WAIT_MS + 1 } }] }) as BatchRejection).rejected)
+      .toContain('modoki_wait_for');
+  });
 });
 
 describe('the `modoki_` prefix is optional on a step\'s tool name (#295)', () => {

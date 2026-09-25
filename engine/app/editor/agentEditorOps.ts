@@ -3279,8 +3279,8 @@ export function registerEditorAgentOps(): void {
       return {
         ok: false, code: 'REFUSED_BY_OP', playhead: clamped, boundClip: clip.name ?? null,
         ...(clamped !== t ? { clampedFrom: t, duration } : {}),
-        error: 'the preview is closing — the scene was being restored (or the envelope was exited) when '
-          + 'this pose tried to open its session, so nothing was posed.',
+        error: 'the scene was being restored (a preview closing, or Play stopping) or the envelope was '
+          + 'exited when this pose tried to open its session, so nothing was posed.',
         options: ['pose again once the restore has landed (it takes one scene reload)'],
       };
     }
