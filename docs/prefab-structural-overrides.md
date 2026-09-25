@@ -535,10 +535,12 @@ a document with no `resources[]` an unqueued ref reaches `vite-asset-scanner`'s 
 
 ⚠️ **Three carriers — a scene entry, a reference node, and a prefab ROW (#1381).** Each is the
 outermost layer for its own paths *within its document*, and a path steps only through nested ROWS.
-Where two meet during expansion the outer one wins **per path, whole** (`mergeNestedStructurePaths`
-— never element-wise, for the same un-delete reason as above), and `resolveEffectivePrefabStructure`
-descends the rows' slots path-keyed exactly as `resolveEffectivePrefabOverride` does, so a scene's
-baseline includes what an intermediate row already did to the interior.
+Where two meet during expansion the outer one wins **per path, whole** — never element-wise, for the
+same un-delete reason as above — and `resolveEffectivePrefabStructure` descends the rows' slots
+path-keyed exactly as `resolveEffectivePrefabOverride` does, so a scene's baseline includes what an
+intermediate row already did to the interior. Since prefab v6 (#1533) each carrier is a separate
+LAYER that also holds member rows, and the loaders fold the layers one after another — see "A prefab
+row states its nested frames per member" below.
 
 The row carrier is written two ways, both **with a writer**, which is the order CLAUDE.md requires
 for an authored field:
@@ -548,6 +550,9 @@ for an authored field:
   carriers use. Captured, not passed through: `buildPrefabEditScene` forwards both channels onto the
   row's scene entry, so the edit world IS the expansion, and an edit made inside a row's nested row
   in the prefab editor must replace the file's value rather than be overwritten by it.
+  Since prefab v6 (#1533) that capture is then split member by member onto the row's `members`,
+  and only a frame that cannot be split stays in the slot — see "A prefab row states its nested
+  frames per member" below.
   ⚠️ **The row writer does NOT use the scene's "restate when the baseline is non-empty" rule**
   (`omitUnchanged`). A path whose live interior equals what the inner prefab chain already applies
   is omitted. Otherwise a no-op save of the outer prefab pins the inner prefab's own authored
@@ -567,10 +572,12 @@ for an authored field:
 (outer) prefab owns — its direct lists already land in the row's `added`/`removed`. The only fold
 possible would write into the inner prefab's file, changing every instance of it.
 
-**No `PREFAB_FORMAT_VERSION` bump for the row slot, deliberately.** Unlike a scene (v14, REFUSE),
-nothing on the prefab loading path reads the version at all (see `PREFAB_FORMAT_VERSION`'s docblock),
-so a bump would protect nothing: an older build still loads the file, ignores the field and would
-drop it on its next save. That is the same exposure every optional prefab field has had since v1.
+**No `PREFAB_FORMAT_VERSION` bump was made for the row slot (#1381), and that reasoning has since
+expired.** At the time, nothing read the prefab version at all, so a bump protected nothing: an older
+build loaded the file, ignored the field and dropped it on its next save. #1468 then added the WRITE
+gate (`plugins/prefabWriteGuard.ts`: an older build opens a newer prefab but refuses to save over
+it), so a bump now does protect a new field. v6 (#1533) takes one for `members`. The slot itself
+predates the gate and was never bumped for.
 
 History: the row slot was declared during #1358 and removed because nothing wrote it, and the
 descend in `resolveEffectivePrefabStructure` was removed as dead for the same reason. Both came back
@@ -1087,14 +1094,91 @@ all, and every untouched sibling was pinned: a later template change to it never
   tree-shaker (a miss drops the asset from the build, #53), a duplicate's remint, the serializer's path
   flags. Node rows ride the same loops. `sceneMemberRowReaders.test.ts` puts the only copy of a ref on
   each channel.
-- **Not covered:** the prefab-side twin — a prefab nested row's `nestedStructure` slot still owns a whole
-  frame (#1533, designed to reuse `diffFrameAdded`/`applyNodeRows`); field-level edits inside a template
+- **Not covered:** field-level edits inside a template
   reference node; per-field Apply/Revert of a node row; a template node anchored at an owned NESTED
   row's localId (the loader puts it under that row's root, the capture attributes it to the inner frame, so
   the diff reads it as re-parented — seen only in a hand-authored fixture, no writer known to produce it). **A scene saved before v17 is not un-pinned by
   resaving it:** the v16 list is read as the scene's state, so every field of a pinned node that has since
   drifted from the template is restated on that node's row and stays pinned. Only fields still equal to
   the template, and nodes still equal throughout, go back to the template.
+
+### A prefab row states its nested frames per member (prefab v6, #1533)
+
+**The prefab-side twin of the section above.** A prefab's nested ROW carried a nested frame's
+structure only as the whole `nestedStructure[path]` slot, and the prefab-edit save wrote the frame's
+full lists whenever anything in it differed from the chain. So an outer prefab that changed ONE thing
+in a nested frame restated everything the inner prefabs put there, and a later edit to the inner prefab
+stopped reaching the outer one. The first repro: MID's row removes `Leaf`, OUTER adds one node beside
+it, and after MID restores `Leaf`, OUTER still hides it.
+
+- **The shape: the scene's member rows, on the row.** A nested row gains `members`, keyed from its own
+  expansion with the scene's grammar (`/<frame chain>/<nodeGuid>`, node rows `…/a+<key>`), holding the
+  same structural channels: `removed`, `traitRemovals`, `own`, node rows' `traits`/`traitRemovals`/`own`/
+  `removed`, and the fallback `added`/`removedTraits`. It holds **no identity** (`guid`, `name`,
+  `parent`), because a template never carries per-instance identity (#1293). Values stay in
+  `nestedOverrides`, which was per field already. The writer uses it for NESTED frames only: the row's
+  direct `added`/`removed`/`removedTraits` are its own statements over template members and never pinned
+  anything.
+- **One writer.** Both writers of a row's channels share `captureRowChannels`: a prefab-edit save or
+  Create Prefab (`planPrefabRows`), and Apply's promotion of a reference node. The promotion used to copy
+  the node's whole scene-form slot onto the new row, which was the pin by another route (close-out review
+  F2). The helper hands the row's captured `nestedStructure` to the scene writer's own split
+  (`moveChannelsOntoRows`, `template: true`), so the two carriers cannot disagree about what counts as
+  an edit. Template mode changes two things. Every KEYED member may carry a row: the scene's
+  durable-guid gate exists because a scene row states a guid, and a template row states none. And
+  nodes are written in template form, found by the template key the capture stamped on the live
+  entity (`templateFormOf`), where the scene writer finds its nodes by guid. `serializePrefab` then
+  tokenizes each row in the frame it applies in (`tokenizeRowMembers`). A frame the split cannot state
+  member by member stays whole in the slot and keeps #1381's no-op rule, exactly as a scene's
+  fallback frame does.
+- **Layers, not a merge (`descendStructureLayers` / `foldStructureLayers`, `prefabOverrides.ts`).**
+  Both spawners, the baseline resolver and the prefab-edit world read the same helpers. Structure now
+  reaches a frame as a list of LAYERS, innermost first: the row that expands the frame, then each
+  enclosing row, then the scene entry or reference node. Each layer is folded over the result of the
+  one inside it.
+  - **Why the rows cannot be merged:** a member row's `added` states the member's whole list, and that
+    list already contains what the layers inside it appended through `own`. Merging two layers' rows
+    key by key would spawn those nodes twice.
+  - **Why the slots are kept apart as well:** a slot owns its frame whole, and it was captured from a
+    live interior that already showed every layer inside it. So at that frame the rows of the inner
+    layers are dropped (`foldFrom`). What they say about the frames BELOW still applies, because a slot
+    owns one frame. That covers their deeper rows, and also a nested ROOT's row, whose interior half
+    (`own`, `traitRemovals`) is forwarded even from a dropped layer. Missing the second part lost a
+    prefab row's additions under a nested root whenever a scene slot sat one frame up (review F1). Once there are two
+    row layers, a merged slot map cannot say which layer a slot came from, and without that the loader
+    would re-apply a row's deletion over a scene slot that un-deleted the member.
+- **The scene over a row.** `resolveEffectivePrefabStructure` folds the row layers along the path, so
+  a scene's baseline includes what the prefab rows state and an untouched scene writes nothing for them.
+  A scene row that un-deletes what a prefab row deleted is folded after it, and wins.
+- **The prefab-edit world** forwards a row's `members` onto the scene entry it builds, rebasing member
+  tokens at the depth of the frame each row applies in (`byRowDepth`). Only the documents can tell
+  whether a key's last component names a member or a nested root. A row the load could not match is
+  kept (R2, under the edit world's stored root guid), and `captureRowChannels` writes it back out,
+  as the scene writer does (review F3). It does that under an edit-world sentinel ONLY. Under a scene
+  root (Create Prefab, Apply's promotion) the kept rows are scene rows, with member guids and nodes
+  carrying scene guids, and in a template every instance would spawn them with one guid (#1293,
+  re-review).
+- **Readers.** Two walkers already read `members` on ANY carrier: the build's tree-shaker
+  (`walkCarrier`) and the duplicate remint (`asset-fs-ops`). The runtime collector does too, and
+  `SceneManager` runs it over a cached prefab's entities. `templateKeysOf` (the key heal's candidates)
+  and `memberPaths` (ref remaps across moves) were extended. The member-path walk unions a row's rows
+  with the ones handed down, because over-generating is harmless there.
+- **Format: prefab v6.** Following the owner's ruling on #1468 (option B), an older build OPENS a v6
+  prefab normally and shows the inner template through for rowed frames. The write gate stops it
+  saving over the file, which would drop the rows. No migration: the committed corpus had no row using
+  the slot (scan 2026-09-25, 250 prefabs, 441 nested rows).
+- **Not covered:**
+  - A frame through a pre-v5 inner prefab (no `nodeGuid`, 145 of the 250 committed prefabs) cannot be
+    keyed, so it stays on the pinning slot, as on the scene side.
+  - `memberPaths` does not walk the `own` children of a template NODE row. A ref to one is not
+    followed across a move.
+  - A reference node that a TEMPLATE authors (an `added` node with `prefab`) still carries a whole
+    slot, and one written on every save, including a no-op save: #1538, filed from this close-out. Its
+    payload is deliberately left untokenized, and #1293 keeps `members` off template nodes, so it needs
+    a design pass of its own.
+  - Apply's promotion does not tokenize, so a row node holding a ref to a member keeps the live guid,
+    as the promoted slot always did.
+  - Everything the v17 section above lists as not covered also applies here.
 
 ### The #1468 design record — why identity is stored this way
 

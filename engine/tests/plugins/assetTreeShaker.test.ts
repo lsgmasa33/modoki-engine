@@ -1613,6 +1613,32 @@ describe('asset-tree-shaker', () => {
     expect(result.unreachableRefs).toEqual([]);
   });
 
+  it('keeps refs held only in a PREFAB nested row`s member rows (prefab v6, #1533)', () => {
+    // A prefab row states its nested frames' structure on `members` now, so a node an outer prefab added inside a
+    // nested frame lives only there. Mutation: skip `node.members` in `walkCarrier` — row.mat is shaken out.
+    const matG = 'abab1111-2222-4333-8444-555555555521';
+    const prefabG = 'abab1111-2222-4333-8444-555555555522';
+    fx.writeJson('/games/test/assets/mats/row.mat.json', { id: matG, version: 1 });
+    fx.writeJson('/games/test/assets/prefabs/outer.prefab.json', {
+      id: prefabG, version: 6, name: 'Outer', rootLocalId: 1,
+      entities: [
+        { localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } },
+        { localId: 2, name: 'Row', prefab: 'abab1111-2222-4333-8444-555555555523', traits: { EntityAttributes: { name: 'Row', parentId: 1 } },
+          members: { '/abab1111-2222-4333-8444-5555555555f1/abab1111-2222-4333-8444-5555555555f2': {
+            own: [{ parentLocalId: 0, guid: '', key: 'k-1533', name: 'X', traits: { Renderable3DPrimitive: { material: matG } }, children: [] }],
+          } } },
+      ],
+    });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 17,
+      entities: [{ id: 1, prefab: prefabG, traits: {} }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/mats/row.mat.json');
+  });
+
   it('does NOT flag a video the module toggle dropped on purpose (ordering, not luck)', () => {
     // The guard runs BEFORE the excludeVideo prune for exactly this case. `build.modules.video:false`
     // removes clips from the keep-set AFTER the walk, so a scene that legitimately references one

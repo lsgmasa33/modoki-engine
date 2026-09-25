@@ -225,6 +225,27 @@ function byPathDepth<T>(paths: Record<string, T> | undefined, fn: (v: T, depth: 
   return Object.fromEntries(Object.entries(paths).map(([k, v]) => [k, fn(v, 1 + k.split('.').length) as T]));
 }
 
+/** A prefab row's `members` (#1533) with each row mapped at the depth of the frame it applies in — {@link byPathDepth}
+ *  for the identity-keyed channel. A row applies in the frame its key names a member of (the key less its last
+ *  component), except a nested ROOT's row, which lands at that root and so applies in the root's own frame; only the
+ *  documents on the way tell the two apart, so they are walked from the row's prefab. */
+function byRowDepth<T>(rows: Record<string, T> | undefined, rowPrefab: string | undefined, fn: (v: T, depth: number) => unknown): Record<string, T> | undefined {
+  if (!rows) return rows;
+  const depthOf = (key: string): number => {
+    let doc = rowPrefab ? getCachedPrefabSync(rowPrefab) : null;
+    let depth = 1;
+    const parts = key.split('/').slice(1);
+    for (let i = 0; i < parts.length && doc; i++) {
+      const nested = doc.entities.find((e) => e.nodeGuid === parts[i] && e.prefab && e.localId !== (doc!.rootLocalId ?? 1));
+      if (!nested) break;
+      depth++;
+      doc = getCachedPrefabSync(nested.prefab!);
+    }
+    return depth;
+  };
+  return Object.fromEntries(Object.entries(rows).map(([k, v]) => [k, fn(v, depthOf(k)) as T]));
+}
+
 /** Show the prefab's own moves (#1437) in the loaded edit world: each member goes under its target, found by
  *  the guids the edit world gives both. A linked member (inside a nested row's instance) keeps deriving from
  *  the row parent it left, as a loaded move does — read from its document (`identityParents.ts`), with an
@@ -283,6 +304,8 @@ export function buildPrefabEditScene(prefab: PrefabFile): SceneData {
       // save re-captures them from this live expansion (`planPrefabRows`).
       nestedOverrides: byPathDepth(pe.nestedOverrides, (v, d) => editWorldRefs(prefab, v, d)),
       nestedStructure: byPathDepth(pe.nestedStructure, (v, d) => editWorldRefs(prefab, v, d)),
+      // …and its member rows (prefab v6, #1533), the outermost layer here as a scene entry's are.
+      ...(pe.members ? { members: byRowDepth(pe.members, pe.prefab, (v, d) => editWorldRefs(prefab, v, d)) } : {}),
     };
   });
   entities.push(...scaffoldEntities());

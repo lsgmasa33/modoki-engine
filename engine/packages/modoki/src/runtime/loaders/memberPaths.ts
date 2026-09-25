@@ -22,7 +22,7 @@ class MemberWalkTooLarge extends Error {}
 
 /** The fields of a scene row or an `added[]` node that decide which members derive under it. */
 export type AddedNode = { guid?: unknown; key?: unknown; prefab?: unknown; added?: unknown; children?: unknown; nestedStructure?: unknown; members?: unknown };
-type PrefabRow = { localId?: number; nodeGuid?: string; prefab?: string; added?: unknown; nestedStructure?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
+type PrefabRow = { localId?: number; nodeGuid?: string; prefab?: string; added?: unknown; nestedStructure?: unknown; members?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
 /** Scene member rows (v16), relative to one frame: `/<nodeGuid>[/…]` → a row whose `added` (#1468
  *  Phase 4) holds nodes added under that member. Only `added` matters to this walk. */
 type MemberRows = Record<string, { added?: unknown } | null>;
@@ -38,6 +38,17 @@ const descendRows = (rows: MemberRows | undefined, nodeGuid: string | undefined)
   const prefix = `/${nodeGuid}/`;
   let out: MemberRows | undefined;
   for (const [k, v] of Object.entries(rows)) if (k.startsWith(prefix)) (out ??= {})[k.slice(prefix.length - 1)] = v;
+  return out;
+};
+/** Two frames' worth of rows as one, for this walk only (#1533): a prefab ROW's own `members` and the rows
+ *  an outer layer handed down, key by key, a shared key keeping both rows' nodes. The loader folds the two
+ *  layers one after another; this walk only needs every node either could spawn, and over-generating is
+ *  harmless (see {@link derivedMemberPathsByAnchor}). */
+const unionRows = (inner: MemberRows | undefined, outer: MemberRows | undefined): MemberRows | undefined => {
+  if (!inner) return outer;
+  if (!outer) return inner;
+  const out: MemberRows = { ...inner };
+  for (const [k, v] of Object.entries(outer)) out[k] = out[k] ? { added: [...memberRowNodes(out[k]), ...memberRowNodes(v)] } : v;
   return out;
 };
 /** A path-keyed structural slot (`nestedStructure`): '<localId>[.<localId>…]' → that expansion's delta. */
@@ -171,7 +182,7 @@ export function memberPathRecords(
         const rowAdded = [...(Array.isArray(row.added) ? row.added : []), ...(Array.isArray(direct?.added) ? direct.added : []), ...fromRow];
         // A nested row expands under parent 0, so ITS orphans are unaddressable.
         expand(docOf(row.prefab)!, here, SKIP, rowAdded, [...stack, row.prefab], depth + 1, here.id,
-          mergeNestedStructurePaths(slotsOf(row.nestedStructure), forward), descendRows(memberRows, row.nodeGuid));
+          mergeNestedStructurePaths(slotsOf(row.nestedStructure), forward), unionRows(rowsOf(row.members), descendRows(memberRows, row.nodeGuid)));
       }
     }
     // A member row's added nodes (Phase 4, #1468) hang under the member the row names — the same

@@ -35,9 +35,9 @@ import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runt
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { writtenTraitKeys } from './traitDefault';
 import { adoptParentScene, resolveAffectedScenes } from './sceneDirty';
-import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, NestedStructureDelta, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
-import { foldMemberRowChannels, mergeTraitRemovals } from '../../runtime/loaders/prefabOverrides';
+import { foldMemberRowChannels, mergeTraitRemovals, descendStructureLayers, foldStructureLayers, type StructureLayer as FrameLayer } from '../../runtime/loaders/prefabOverrides';
 import { rebaseMemberTokens, isMemberToken, parseMemberToken, memberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
 
 /** Fields that persist in a SCENE but must never be baked into a prefab TEMPLATE,
@@ -100,8 +100,16 @@ export interface PrefabEntity {
   /** This row's OWN structural edits inside its nested descendants (path-keyed, #1381) — the
    *  structural twin of `nestedOverrides`. Written by promotion (a reference node's slot becomes
    *  the row's) and by a prefab-edit save (captured from the row's live expansion). An outer layer
-   *  that addresses the same path replaces the entry whole. */
+   *  that addresses the same path replaces the entry whole. Since v6 (#1533) written only for a frame
+   *  `members` cannot state member by member. */
   nestedStructure?: NestedStructurePaths;
+  /** This row's MEMBER ROWS (prefab v6, #1533), keyed from its own expansion exactly as a scene
+   *  entry's `members` are: the structure of the nested frames inside it, per member (`removed`,
+   *  `traitRemovals`, `own`, the fallback `added`/`removedTraits`) and per template-added node (a node
+   *  row, `…/a+<key>`). What lets an outer prefab change one thing in a nested frame without restating
+   *  — and so pinning — everything the inner prefabs put there. Structural channels only: a template
+   *  carries no member identity (`guid`, `name`, `parent`), and values stay in `nestedOverrides`. */
+  members?: Record<string, SceneMemberRow>;
 }
 
 /** The format version this serializer writes. Every writer stamps THIS — never a value derived
@@ -206,6 +214,33 @@ function collectTree(entityId: number, allEntities: EntityInfo[]): EntityInfo[] 
  *  reference node rather than skipped as a member.
  *
  *  Returns null when a nested ref would make the prefab transitively contain itself. */
+/** A prefab row's member rows with member refs rewritten as tokens (#1352), each in the frame its row applies in: a
+ *  member or node row the frame its key names a member of (the key less its last component), and a nested ROOT's row
+ *  (whose key IS a frame's key: what it states lands at that root) that frame. `rowRoot` is the row's live
+ *  instance root, whose key space the rows are written in. */
+function tokenizeRowMembers(
+  members: Record<string, SceneMemberRow>,
+  frames: ReadonlyMap<string, { root: number }>,
+  rowRoot: number,
+  frameOf: (pathKey: string) => number,
+  tokens: ReturnType<typeof templateTokenizer>,
+): Record<string, SceneMemberRow> {
+  const keyOf = memberRowKeysIn(rowRoot);
+  const pathByKey = new Map<string, string>();
+  for (const [path, { root }] of frames) { const k = keyOf.get(root); if (k) pathByKey.set(k, path); }
+  const out: Record<string, SceneMemberRow> = {};
+  for (const [key, row] of Object.entries(members)) {
+    const path = pathByKey.get(key) ?? pathByKey.get(key.slice(0, key.lastIndexOf('/')));
+    const frame = path ? frameOf(path) : rowRoot;
+    const r: SceneMemberRow = { ...row };
+    if (r.traits) r.traits = tokens.value(r.traits, frame) as SceneMemberRow['traits'];
+    if (r.added) r.added = tokens.added(r.added, frame);
+    if (r.own) r.own = tokens.added(r.own, frame);
+    out[key] = r;
+  }
+  return out;
+}
+
 /** One nested-instance row `planPrefabRows` decided on: the reference capture plus the row's own
  *  nested channels (#1381). */
 interface PlannedNestedRow {
@@ -214,7 +249,42 @@ interface PlannedNestedRow {
   structureBaselines: Map<string, InstanceStructureData>;
   childPrefab: PrefabFile;
   nestedOverrides?: NestedOverridePaths;
+  /** The frames `members` cannot state member by member, whole — each compared once tokenized. */
   nestedStructure?: NestedStructurePaths;
+  /** The row's member rows (prefab v6, #1533), in template form but not yet tokenized. */
+  members?: Record<string, SceneMemberRow>;
+  /** Path key → the live nested root it addresses, from the capture — what places a row in its frame. */
+  frames: ReadonlyMap<string, { root: number; path: number[] }>;
+}
+
+/** A prefab ROW's nested channels, read from the live instance it will re-expand (`rootEcs`, of prefab `source`):
+ *  each nested frame's structure split per member and per node onto `members` where it can be (#1533), whole in
+ *  `nestedStructure` where it cannot, plus the kept orphan rows (R2) going back out. The ONE writer of a row's
+ *  channels, shared by a prefab-edit save / Create Prefab (`planPrefabRows`) and Apply's promotion of a reference
+ *  node — the second writer that still restated the whole frame, and so pinned it, after the first was fixed.
+ *
+ *  `deferCompare` hands the slot's no-op compare to the caller (`baselinesOut`), for a writer that tokenizes first. */
+function captureRowChannels(rootEcs: number, source: string, childPrefab: PrefabFile, ref: InstanceReference, deferCompare: boolean) {
+  const structureBaselines = new Map<string, InstanceStructureData>();
+  const channels = captureNestedChannels(source, ref.ownedNested, { omitUnchanged: true, template: true, ...(deferCompare ? { baselinesOut: structureBaselines } : {}) });
+  const rowed = moveChannelsOntoRows(rootEcs, childPrefab, source, { nestedStructure: channels.nestedStructure }, {}, channels.frames, { template: true });
+  // R2 for this carrier: a row the load found no template node for was KEPT (`applyStoredMemberRows`, under the root's
+  // stored guid) and goes back out, as the scene writer puts its own back (`captureInstanceMembers`) — dropped, an
+  // inner template that restores the node would not get the edit back.
+  // ⚠️ ONLY under a prefab-edit world's row sentinel, whose kept rows were read from this very TEMPLATE. Under a scene
+  // root (Create Prefab over a scene instance, Apply's promotion of a reference node) the kept rows are SCENE rows —
+  // member guids, scene-guid nodes — and written into a template they would give every instance one guid (#1293,
+  // close-out re-review).
+  const eaMeta = getTraitByName('EntityAttributes');
+  const rootGuid = eaMeta ? durableGuid((readTraitData(rootEcs, eaMeta) as { guid?: string } | null)?.guid) : '';
+  const members: Record<string, SceneMemberRow> = { ...rowed.members };
+  const kept = isPrefabEditRowGuid(rootGuid) ? keptMemberOrphans(rootGuid) ?? {} : {};
+  for (const [key, row] of Object.entries(kept)) if (!members[key]) members[key] = row;
+  return {
+    channels, structureBaselines,
+    nestedStructure: rowed.channels.nestedStructure,
+    members: Object.keys(members).length ? members : undefined,
+  };
 }
 
 function planPrefabRows(
@@ -256,9 +326,14 @@ function planPrefabRows(
       // edits itself — the same writer a scene entry and a reference node use (#1381). Captured from
       // the live expansion rather than passed through from the file, or an edit made in the prefab
       // editor inside a nested row would be overwritten by the value it replaced.
-      const structureBaselines = new Map<string, InstanceStructureData>();
-      const channels = captureNestedChannels(source, ref.ownedNested, { omitUnchanged: true, template: true, baselinesOut: structureBaselines });
-      nestedRefs.set(e.id, { ref, childPrefab, structureBaselines, nestedOverrides: channels.nestedOverrides, nestedStructure: channels.nestedStructure });
+      // Each frame's structure per member and per node where it can be (#1533) — the scene writer's own split, so
+      // an edit to one thing in a nested frame does not restate, and pin, what the inner prefabs put there. A frame
+      // it cannot state that way stays whole in `nestedStructure`, compared by the no-op rule once tokenized.
+      const { channels, structureBaselines, nestedStructure, members } = captureRowChannels(e.id, source, childPrefab, ref, true);
+      nestedRefs.set(e.id, {
+        ref, childPrefab, structureBaselines, nestedOverrides: channels.nestedOverrides,
+        nestedStructure, ...(members ? { members } : {}), frames: channels.frames,
+      });
       // Exclude the nested instance's members (except the root, which becomes a
       // reference row) and any added subtrees it folded in.
       for (const m of ref.memberEcsIds) if (m !== e.id) skip.add(m);
@@ -717,6 +792,7 @@ export function serializePrefab(
       const nestedOverrides = nested.nestedOverrides
         ? Object.fromEntries(Object.entries(nested.nestedOverrides).map(([k, v]) => [k, tokens.value(v, frameOf(k))]))
         : undefined;
+      const members = nested.members ? tokenizeRowMembers(nested.members, nested.frames, entityInfo.id, frameOf, tokens) : undefined;
       prefabEntities.push({
         localId,
         nodeGuid: nodeGuidOf(entityInfo.id),
@@ -729,6 +805,7 @@ export function serializePrefab(
         removedTraits: nested.ref.removedTraits,
         nestedOverrides: nestedOverrides as NestedOverridePaths | undefined,
         nestedStructure,
+        ...(members ? { members } : {}),
       });
       continue;
     }
@@ -1233,8 +1310,14 @@ export function instantiatePrefab(
    *  twin's parameter (#1352). Absent on a top call, which registers its root for member-token
    *  resolution; callers run `deriveInstanceMemberGuids`, which resolves it. */
   _segments?: MemberStep[][],
+  /** The structural LAYERS reaching this frame, innermost first — the loader twin's parameter (#1533).
+   *  A top call has one, the outer layer's slots; each nested row adds its own. */
+  _layers?: FrameLayer<NestedStructureDelta, SceneMemberRow>[],
+  /** What each of `_layers` forwarded to this frame's nested roots when the caller folded it here. */
+  _forwardRoots: readonly (ReadonlyMap<number, SceneMemberRow> | undefined)[] = [],
 ): number {
   const segments = _segments ?? [];
+  const layers = _layers ?? [{ slots: _nestedStructure }];
   // The loader twin's token scope: a tree holding no member token registers no frame (#1352 review).
   const outerScope = _segments ? null : openTokenScope();
   noteTokens(prefab.entities, _nestedOverrides, _nestedStructure);
@@ -1282,13 +1365,22 @@ export function instantiatePrefab(
       // (pe.nestedOverrides) are merged under the outer layer (outer wins).
       const { direct: outerDirect, forward: outerForward } = descendNestedOverrides(_nestedOverrides, pe.localId);
       const childNested = mergeNestedOverridePaths(pe.nestedOverrides, outerForward);
-      // The structural split, as the loader does it: an outer layer that addresses this row OWNS its
-      // interior (all three lists, an absent one read as empty); `structForward` reaches deeper.
-      const { direct: structDirect, forward: outerStructForward } = descendPathKeyed(_nestedStructure, pe.localId);
+      // The structural split, as the loader does it, per LAYER (#1533): an outer layer that addresses this
+      // row OWNS its interior (all three lists, an absent one read as empty), and the rows of every layer
+      // it does not replace fold over that, inner first. `structForward` reaches deeper.
+      const { layers: childLayers, direct: structDirect, foldFrom } = descendStructureLayers(layers, pe, _forwardRoots);
+      const { forward: outerStructForward } = descendPathKeyed(_nestedStructure, pe.localId);
       // The row's OWN deep structure (#1381) sits under the outer layer's — the loader's rule.
       const structForward = mergeNestedStructurePaths(pe.nestedStructure, outerStructForward);
+      const childOverrides = outerDirect ? mergeOverrideMaps(pe.overrides, outerDirect) : pe.overrides;
+      const base = structDirect
+        ? { overrides: childOverrides, added: structDirect.added ?? [], removed: structDirect.removed ?? [], removedTraits: structDirect.removedTraits ?? {} }
+        : { overrides: childOverrides, added: pe.added, removed: pe.removed, removedTraits: pe.removedTraits };
+      // Folded BEFORE the recursion, unlike the lists' application below: what a row forwards to a nested
+      // root of the child has to reach the child's own expansion of that root.
+      const { channels: childStructure, forwardRoots: childForwardRoots } = foldStructureLayers(child, childLayers, foldFrom, base);
       const childSegments = [...segments, rowPathInPrefab(prefab, pe.localId)];
-      const childRoot = instantiatePrefab(child, 0, stack, childNested, structForward, childSegments);
+      const childRoot = instantiatePrefab(child, 0, stack, childNested, structForward, childSegments, childLayers, childForwardRoots);
       if (!childRoot) continue;
       setPrefabSource(childRoot, pe.prefab);
       // Stamp parentLocalId so serialize knows which row produced this nested
@@ -1306,14 +1398,13 @@ export function instantiatePrefab(
       }
       // Applied HERE rather than inside the child call (the loader's shape), so rebased here, onto the
       // child's segments: these values are in the child's frame (#1352).
-      const childOverrides = outerDirect ? mergeOverrideMaps(pe.overrides, outerDirect) : pe.overrides;
-      if (childOverrides) applyOverridesByRootInstance(childRoot, rebaseMemberTokens(childOverrides, childSegments) as typeof childOverrides);
-      if (structDirect) {
+      // A row's `traits` fold into the overrides as the loader folds them.
+      const folded = childStructure.overrides;
+      if (folded) applyOverridesByRootInstance(childRoot, rebaseMemberTokens(folded, childSegments) as typeof folded);
+      if (structDirect || childStructure !== base || pe.added?.length || pe.removed?.length || pe.removedTraits) {
         applyStructureByRootInstance(childRoot, child, {
-          added: rebaseAddedMemberTokens(structDirect.added ?? [], childSegments), removed: structDirect.removed ?? [], removedTraits: structDirect.removedTraits ?? {},
+          added: rebaseAddedMemberTokens(childStructure.added, childSegments), removed: childStructure.removed, removedTraits: childStructure.removedTraits,
         });
-      } else if (pe.added?.length || pe.removed?.length || pe.removedTraits) {
-        applyStructureByRootInstance(childRoot, child, { added: rebaseAddedMemberTokens(pe.added, childSegments), removed: pe.removed, removedTraits: pe.removedTraits });
       }
       localToEcs.set(pe.localId, childRoot);
       continue;
@@ -3027,23 +3118,34 @@ function resolveEffectivePrefabStructure(
   //
   // (Before #1381 only a scene capture wrote the slot, so this descend had no producer and was
   // removed as dead code — correctly at the time. It returned with its producer.)
+  //
+  // Per LAYER since #1533, the loaders' walk (`descendStructureLayers` / `foldStructureLayers`): a row's
+  // `members` fold over the lists at each frame on the way, so the baseline holds what every row on the
+  // path already states member by member, and the scene writer does not restate (and so pin) it.
   let prefab: PrefabFile | null = typeof topSource === 'string' ? getCachedPrefabSync(topSource) : topSource;
-  let pending: NestedStructurePaths | undefined = seed; // as `resolveEffectivePrefabOverride`'s seed (#1506)
+  // `seed` as `resolveEffectivePrefabOverride`'s seed (#1506): a template reference node's slots, no rows.
+  let layers: FrameLayer<NestedStructureDelta, SceneMemberRow>[] = [{ slots: seed }];
+  let forwardRoots: readonly (ReadonlyMap<number, SceneMemberRow> | undefined)[] = [];
   let result: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> } = {};
   for (let i = 0; i < path.length; i++) {
     if (!prefab) return result;
     const row = prefab.entities.find((e) => e.localId === path[i] && e.prefab);
     if (!row) return result;
-    const { direct, forward } = descendPathKeyed(pending, path[i]!);
+    const d = descendStructureLayers(layers, row, forwardRoots);
+    // An outer row addressing this path OWNS the interior — all three lists, absent read as empty
+    // (the loader's `structDirect` rule).
+    const base = d.direct
+      ? { added: d.direct.added ?? [], removed: d.direct.removed ?? [], removedTraits: d.direct.removedTraits ?? {} }
+      : { added: row.added, removed: row.removed, removedTraits: row.removedTraits };
+    const child = getCachedPrefabSync(row.prefab!);
+    const folded = child ? foldStructureLayers(child, d.layers, d.foldFrom, base) : { channels: base, forwardRoots: [] };
     if (i === path.length - 1) {
-      // An outer row addressing this path OWNS the interior — all three lists, absent read as empty
-      // (the loader's `structDirect` rule).
-      result = direct
-        ? { added: direct.added ?? [], removed: direct.removed ?? [], removedTraits: direct.removedTraits ?? {}, moved: direct.moved ?? {} }
-        : { added: row.added, removed: row.removed, removedTraits: row.removedTraits };
+      const { added, removed, removedTraits } = folded.channels;
+      result = { added, removed, removedTraits, ...(d.direct ? { moved: d.direct.moved ?? {} } : {}) };
     }
-    pending = mergeNestedStructurePaths(row.nestedStructure, forward);
-    prefab = getCachedPrefabSync(row.prefab!);
+    layers = d.layers;
+    forwardRoots = folded.forwardRoots;
+    prefab = child;
   }
   return result;
 }
@@ -3317,11 +3419,17 @@ export function moveChannelsOntoRows(
   ch: InstanceChannels,
   members: Record<string, SceneMemberRow>,
   nestedFrames: ReadonlyMap<string, { root: number; path: number[] }> = new Map(),
+  opts: {
+    /** Writing a prefab ROW's rows (#1533) rather than a scene's: every keyed member may carry a row (a
+     *  template states no guid, so the scene's durable-guid gate has nothing to protect), and nodes are
+     *  written in TEMPLATE form — keyed, no live guid — from `ch`'s template capture. */
+    template?: boolean;
+  } = {},
 ): { channels: InstanceChannels; members: Record<string, SceneMemberRow> } {
   const piMeta = getTraitByName('PrefabInstance');
   if (!piMeta) return { channels: ch, members };
-  const rowed = memberRowsToWrite(rootId);
   const keyOf = memberRowKeysIn(rootId);
+  const rowed = opts.template ? keyOf : memberRowsToWrite(rootId);
   const out: Record<string, SceneMemberRow> = { ...members };
   const row = (key: string): SceneMemberRow => (out[key] = { ...(out[key] ?? {}) });
 
@@ -3456,7 +3564,7 @@ export function moveChannelsOntoRows(
         keys.set(lid, k);
       }
       if (keys.size !== touched.size) { keep[path] = live; continue; }
-      const writerForm = writerFormOf(live.added);
+      const writerForm = opts.template ? templateFormOf(live.added) : writerFormOf(live.added);
       for (const [lid, t] of touched) {
         const r = row(keys.get(lid)!);
         if (t.removed) r.removed = liveRemoved.has(lid);
@@ -4670,6 +4778,18 @@ export async function applyToPrefabSelective(
       insertAddedSubtree(newPrefab, node, node.parentLocalId, nextLocalId, promotedRows);
       if (node.prefab) promoteReferenceMoves(newPrefab, node, rowLid, localToEcs, instancePaths);
       const liveEcs = localToEcsGuid(guid);
+      // The promoted row's nested frames are stated as a prefab-edit save states them (#1533): the node's own slot
+      // was captured in scene form, whole, and copied onto the row, so every frame it held pinned what the inner
+      // prefabs put there — MID's added node, beside a Leaf the scene deleted, stopped following MID.
+      const promoted = node.prefab && liveEcs ? newPrefab.entities.find((e) => e.localId === rowLid && e.prefab === node.prefab) : undefined;
+      const promotedChild = promoted ? getCachedPrefabSync(node.prefab!) : null;
+      if (promoted && promotedChild) {
+        const ref = captureInstanceReference(liveEcs, node.prefab!, promotedChild, { template: true });
+        const rc = captureRowChannels(liveEcs, node.prefab!, promotedChild, ref, false);
+        promoted.nestedStructure = rc.nestedStructure;
+        if (rc.members) promoted.members = rc.members;
+        else delete promoted.members;
+      }
       if (liveEcs) liveAddedRootsToDelete.push(liveEcs, ...(node.prefab ? membersLivingOutside(liveEcs) : []));
       writtenCount++;
       continue;
@@ -6645,6 +6765,23 @@ function writerFormOf(writer: readonly AddedEntity[] | undefined): (nodes: reado
   };
   index(writer);
   return (nodes) => nodes.map((n) => ({ ...(byGuid.get(n.guid) ?? n), parentLocalId: 0 }));
+}
+
+/** {@link writerFormOf} for a prefab ROW's rows (#1533): the TEMPLATE capture of the same entity, found by the template
+ *  key the capture stamped on it (`addedNodeIdentity`) — a template node has no guid to find it by. A node the capture
+ *  did not reach (none known) is converted as promotion converts one (`toTemplateNodes`). */
+function templateFormOf(template: readonly AddedEntity[] | undefined): (nodes: readonly AddedEntity[]) => AddedEntity[] {
+  const byKey = new Map<string, AddedEntity>();
+  const index = (list: readonly AddedEntity[] | undefined) => {
+    for (const n of list ?? []) { if (n.key) byKey.set(n.key, n); index(n.children); }
+  };
+  index(template);
+  return (nodes) => nodes.map((n) => {
+    const live = n.guid ? localToEcsGuid(n.guid) : 0;
+    const key = live ? templateKeyOf(findEntity(live)) : '';
+    const found = key ? byKey.get(key) : undefined;
+    return { ...(found ?? toTemplateNodes([n])![0]!), parentLocalId: 0 };
+  });
 }
 
 /** The structural keys (localId form) in capture `full` that the layers enclosing the instance author rather than the

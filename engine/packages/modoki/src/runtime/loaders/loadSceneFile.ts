@@ -14,7 +14,8 @@ import { emptyDocMap, hasDocKey } from '../core/docKeys';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import {
   mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, foldTraitOverride,
-  descendPathKeyed, nestedPathKey, mergeNestedStructurePaths, foldMemberRowChannels,
+  descendPathKeyed, nestedPathKey, mergeNestedStructurePaths,
+  descendStructureLayers, foldStructureLayers, type StructureLayer,
   type NestedOverridePaths,
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION } from '../core/version';
@@ -853,7 +854,7 @@ export function applyStructureCore(
   );
   /** ecsId → the guid of the parent its ROW says it sits under (Phase 3, #1468). Keys are relative
    *  to THIS instance root, which is what makes one spelling serve every caller: the scene entry's
-   *  own map, a user-added reference node's, and a nested frame's after `descendMemberRows` has
+   *  own map, a user-added reference node's, and a nested frame's after `descendStructureLayers` has
    *  dropped one component. */
   const rowMoves = new Map<number, string>();
   if (structure.members) {
@@ -1080,26 +1081,6 @@ function drainAfterDerive(world: World): void {
   for (const d of q.deletes) d.ops.deleteEntities(d.ecsIds);
 }
 
-/** The member rows that belong INSIDE the nested instance a row with identity `component` expands to
- *  — the member-row twin of `descendNestedOverrides`/`descendPathKeyed`.
- *
- *  A row key is a `/`-joined chain of minted identities, one per FRAME, so descending one frame is
- *  literally dropping the leading component: `/outer/inner` seen from the outer instance is `/inner`
- *  seen from the nested one. That is the whole reason D2(b) could collapse `nestedStructure.moved`
- *  onto the rows — a member two frames down HAS an address here, where the path-keyed channels
- *  existed only because it had none. */
-function descendMemberRows(
-  members: Record<string, SceneMemberRow> | undefined, component: string,
-): Record<string, SceneMemberRow> | undefined {
-  if (!members || !component) return undefined;
-  const prefix = `/${component}/`;
-  let out: Record<string, SceneMemberRow> | undefined;
-  for (const [key, row] of Object.entries(members)) {
-    if (key.startsWith(prefix)) (out ??= {})[key.slice(prefix.length - 1)] = row;
-  }
-  return out;
-}
-
 /** Whether the entity whose guid is `parentGuid` sits inside `ecsId`'s subtree (itself included) right now. */
 function isInsideMember(world: World, ecsId: number, parentGuid: string): boolean {
   const attrMeta = getTraitByName('EntityAttributes');
@@ -1245,6 +1226,10 @@ type PrefabFileEntry = {
   /** A prefab row's OWN structural edits inside its nested descendants (#1381) — the structural
    *  twin of `nestedOverrides`. An outer layer addressing the same path replaces it whole. */
   nestedStructure?: NestedStructurePaths;
+  /** A prefab row's member rows (prefab v6, #1533), keyed from the row's own expansion — the scene's
+   *  `members` channel, so the row states its nested frames' structure per member and per node instead
+   *  of whole (`nestedStructure`). Structural channels only: a template carries no member identity. */
+  members?: Record<string, SceneMemberRow>;
 };
 
 /** A prefab cache to read documents from: the runtime's by default, the editor's for the editor's rebuild. */
@@ -1868,20 +1853,26 @@ export function instantiatePrefabIntoWorld(
    *  Absent on a top call, which registers its root for member-token resolution. Every value this call
    *  applies is rebased onto it (`rebaseMemberTokens`). */
   _segments?: MemberStep[][],
+  /** The structural LAYERS reaching this frame, innermost first (#1533) — set by the recursion only. A
+   *  top call has one, built from `structure.members` and `nestedStructure`; each nested row it expands
+   *  adds its own (`descendStructureLayers`). */
+  _layers?: StructureLayer<NestedStructureDelta, SceneMemberRow>[],
+  /** The first of `_layers` whose direct rows fold at this frame (`descendStructureLayers`). */
+  _foldFrom = 0,
 ): number {
   const segments = _segments ?? [];
+  const layers = _layers ?? [{ slots: nestedStructure, rows: structure?.members, rootRow: structure?.rootRow }];
   // The frame's member ROWS, translated into this document's localIds and folded over the legacy
   // channels (Phase 4, #1468) — FIRST, so everything below, token noting included, sees one set of
   // channels in the address space of the document it is expanding. A row names its member by minted
   // identity, so this is the moment a template renumber stops mattering: `prefab` is the CURRENT
-  // document, whatever it was when the scene was saved.
+  // document, whatever it was when the scene was saved. Every layer's rows fold, inner first (#1533).
   const lower = { overrides, added: structure?.added, removed: structure?.removed, removedTraits: structure?.removedTraits };
-  const folded = foldMemberRowChannels(prefab, structure?.members, lower, structure?.rootRow);
+  const { channels: folded, forwardRoots } = foldStructureLayers(prefab, layers, _foldFrom, lower);
   if (folded !== lower && structure) {
     overrides = folded.overrides;
     structure = { ...structure, added: folded.added, removed: folded.removed, removedTraits: folded.removedTraits };
   }
-  const forwardRoot = folded.forwardRoot;
   // The keys this document declares are the candidates a later heal of this world tries (#1426).
   noteTemplateDoc(world, prefab as Parameters<typeof noteTemplateDoc>[1]);
   // Identity walks read a frame's document; one whose root record is gone (a flat respawn) falls back to
@@ -1925,11 +1916,16 @@ export function instantiatePrefabIntoWorld(
       // structure REPLACES the row's per-field lists rather than merging element-wise — a scene that
       // deleted a member of this expansion is stating the whole list for that instance, and merging
       // two `removed` arrays would make an un-delete unrepresentable.
-      const { direct: structDirect, forward: outerStructForward } = descendPathKeyed(nestedStructure, rowLocalId);
+      // Per LAYER since #1533: the row's own (`nestedStructure`, `members`) joins the ones reaching this frame,
+      // innermost, and `structDirect` is the slot of the outermost layer that addresses the row.
+      const { layers: childLayers, direct: structDirect, foldFrom } = descendStructureLayers(layers, entry, forwardRoots);
+      const { forward: outerStructForward } = descendPathKeyed(nestedStructure, rowLocalId);
       // The row's OWN deep structure (#1381) sits under what the outer layer forwarded — outer wins per path.
+      // Kept beside the layers for what reads the merged view (token noting); the layers are what apply.
       const structForward = mergeNestedStructurePaths(entry.nestedStructure, outerStructForward);
-      // This row's own frame, one component down the identity chain (Phase 3, #1468).
-      const childMembers = descendMemberRows(structure?.members, entry.nodeGuid ?? '');
+      // This row's own frame, one component down the identity chain (Phase 3, #1468) — the OUTERMOST layer's
+      // rows, which `applyStructureCore` reads for moves (a template's rows carry none).
+      const childMembers = childLayers[childLayers.length - 1]!.rows;
       const childRoot = instantiatePrefabIntoWorld(
         world, child, 0, undefined, entry.prefab, childOverrides,
         // Once an outer layer addresses this path it OWNS the interior: all three lists come from
@@ -1941,11 +1937,12 @@ export function instantiatePrefabIntoWorld(
         // this row's three structural lists says nothing about identity, and a `structDirect` that
         // omitted the rows would drop every stored guid inside this expansion.
         structDirect
-          ? { added: structDirect.added ?? [], removed: structDirect.removed ?? [], removedTraits: structDirect.removedTraits ?? {}, moved: structDirect.moved, members: childMembers, rootRow: forwardRoot?.get(rowLocalId) }
-          : { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, members: childMembers, rootRow: forwardRoot?.get(rowLocalId) },
+          ? { added: structDirect.added ?? [], removed: structDirect.removed ?? [], removedTraits: structDirect.removedTraits ?? {}, moved: structDirect.moved, members: childMembers }
+          : { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, members: childMembers },
         stack, childNested,
         structForward,
         [...segments, rowPathInPrefab(prefab, rowLocalId)],
+        childLayers, foldFrom,
       );
       // Stamp parentLocalId so a later serialize knows which row produced this
       // instance (and can store/restore its scene-level overrides).

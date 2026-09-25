@@ -853,8 +853,8 @@ is stored in the parent prefab file as a single *reference row* — one
 instance. The child's members are **not** listed; they expand from the child
 file at load.
 
-Every file this serializer writes carries `PREFAB_FORMAT_VERSION` (**5** since #1468; this
-paragraph said **2** until then, which is the drift a hardcoded number in prose always ends in —
+Every file this serializer writes carries `PREFAB_FORMAT_VERSION` (**6** since #1533, **5** from #1468; this
+paragraph said **2** until #1468, which is the drift a hardcoded number in prose always ends in —
 read `runtime/core/version.ts`, which is where the constant lives now and which lists what each
 version added). It used to be derived from
 the document's content (`nestedRefs.size > 0 ? 2 : 1`, so flat prefabs stayed at 1),

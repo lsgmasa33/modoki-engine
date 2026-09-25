@@ -340,6 +340,99 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
   };
 }
 
+/** One frame down a member-row map (`/<component>/…` → `/…`): the rows the nested row whose identity
+ *  is `component` hands its own expansion. A row key is a chain of minted identities, one per frame, so
+ *  descending one frame is dropping the leading component. */
+export function descendMemberRowKeys<R>(rows: Record<string, R> | undefined, component: string): Record<string, R> | undefined {
+  if (!rows || !component) return undefined;
+  const prefix = `/${component}/`;
+  let out: Record<string, R> | undefined;
+  for (const [key, row] of Object.entries(rows)) {
+    if (key.startsWith(prefix)) (out ??= emptyDocMap() as Record<string, R>)[key.slice(prefix.length - 1)] = row;
+  }
+  return out;
+}
+
+/** One structural LAYER over an instance frame (#1533): what one document says about the frame's
+ *  structure — a scene entry or reference node (the outermost), or a prefab nested ROW on the way
+ *  down. Everything is keyed from the frame it is handed to.
+ *
+ *  A layer is kept SEPARATE rather than merged into its neighbours, because its channels do not
+ *  commute: a row's `added` states a member's whole list, which already holds what the layers below
+ *  added through `own`, so merging two layers' rows key by key would spawn those nodes twice. So
+ *  layers fold ONE AFTER ANOTHER, inner first ({@link foldStructureLayers}).
+ *
+ *  Before #1533 there was one row layer (the scene's) and the path-keyed slots of every layer were
+ *  merged, outer winning per path. A prefab row's `members` makes a second row layer, and that is what
+ *  forces the slots apart too: a slot owns its frame's interior WHOLE and was captured from a live
+ *  interior that already showed every layer inside it, so the rows of an inner layer must not fold
+ *  again over an outer slot — which a merged slot map cannot tell apart from the row's own slot. */
+export interface StructureLayer<D, R> {
+  /** Path-keyed whole-frame slots for this frame's nested descendants (`nestedStructure`). */
+  slots?: Record<string, D>;
+  /** Member rows keyed from this frame (`members`): direct keys fold here, deeper ones descend. */
+  rows?: Record<string, R>;
+  /** What this layer's row in the frame ABOVE says about this frame's root (`forwardRoot`). */
+  rootRow?: R;
+}
+
+/** The layers reaching the expansion of nested row `row`, innermost first — the row's own layer (its
+ *  `nestedStructure` and `members`, over its own lists), then each of `layers` descended one frame.
+ *  `forwardRoots[i]` is what folding `layers[i]` at the current frame forwarded to nested roots.
+ *
+ *  `direct` is the whole-frame slot the OUTERMOST layer addressing this row states for its expansion,
+ *  and `foldFrom` the index (into the returned `layers`) of the first layer whose direct rows still
+ *  apply there. A slot owns the three lists, so the layers inside it are replaced — their rows at this
+ *  frame were captured into the slot, and folding them again would re-apply it (re-delete what the slot
+ *  un-deleted, append a node the slot already holds). What they say about the frames BELOW still
+ *  applies — their deeper rows, and a nested root's row, whose interior half is forwarded
+ *  ({@link foldStructureLayers}) — because a slot owns one frame, not the frames nested under it. */
+export function descendStructureLayers<D, R>(
+  layers: readonly StructureLayer<D, R>[],
+  row: { localId?: number; nodeGuid?: string; nestedStructure?: Record<string, D>; members?: Record<string, R> },
+  forwardRoots: readonly (ReadonlyMap<number, R> | undefined)[] = [],
+): { layers: StructureLayer<D, R>[]; direct?: D; foldFrom: number } {
+  const lid = row.localId ?? 0;
+  const out: StructureLayer<D, R>[] = [{ slots: row.nestedStructure, rows: row.members }];
+  let direct: D | undefined;
+  let foldFrom = 0;
+  layers.forEach((layer, i) => {
+    const { direct: d, forward } = descendPathKeyed(layer.slots, lid);
+    if (d) { direct = d; foldFrom = i + 1; }
+    out.push({ slots: forward, rows: descendMemberRowKeys(layer.rows, row.nodeGuid ?? ''), rootRow: forwardRoots[i]?.get(lid) });
+  });
+  return { layers: out, direct, foldFrom };
+}
+
+/** Fold the direct rows of `layers[foldFrom..]` over a frame's lists, one layer after another
+ *  ({@link foldMemberRowChannels} per layer — see {@link StructureLayer} for why not merged). Returns
+ *  the folded channels (`lower` itself when no layer changed anything) and, per layer index, what that
+ *  layer forwarded to the frame's nested roots. */
+export function foldStructureLayers<A extends { parentLocalId: number }>(
+  doc: Parameters<typeof foldMemberRowChannels<A>>[0],
+  layers: readonly StructureLayer<unknown, MemberRowChannels<A>>[],
+  foldFrom: number,
+  lower: FrameChannels<A>,
+): { channels: FrameChannels<A>; forwardRoots: (Map<number, MemberRowChannels<A>> | undefined)[] } {
+  let channels: FrameChannels<A> = lower;
+  const forwardRoots: (Map<number, MemberRowChannels<A>> | undefined)[] = [];
+  for (let i = 0; i < layers.length; i++) {
+    const layer = layers[i]!;
+    // A layer inside the slot still FORWARDS: what its row states about a nested root's interior (`own`,
+    // `traitRemovals`…) belongs to the frame below, which the slot does not own. Only its statements about
+    // THIS frame are replaced — the nested root's `removed` included, which `forwardRoot` never carries.
+    if (i < foldFrom) {
+      if (layer.rows) forwardRoots[i] = foldMemberRowChannels(doc, layer.rows, {}).forwardRoot;
+      continue;
+    }
+    if (!layer.rows && !layer.rootRow) continue;
+    const r = foldMemberRowChannels(doc, layer.rows, channels, layer.rootRow);
+    forwardRoots[i] = r.forwardRoot;
+    if (r !== channels) channels = { overrides: r.overrides, added: r.added, removed: r.removed, removedTraits: r.removedTraits };
+  }
+  return { channels, forwardRoots };
+}
+
 /** Fold ONE trait's override fields onto its current values — the per-trait rule the spawner
  *  applies (`applyOverridesByLocalToEcs`) and `effectivePrefabMemberTraits` models, kept in one place
  *  so the two cannot disagree about precedence or about which fields count.

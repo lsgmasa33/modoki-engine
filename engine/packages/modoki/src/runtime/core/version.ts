@@ -95,8 +95,15 @@ export const SCENE_FORMAT_VERSION = 17;
  *  and the guids cannot be recovered, because minting them again would produce different ones. That is
  *  what the write gate exists for (`plugins/prefabWriteGuard.ts`), and it is why the gate had to land
  *  BEFORE this bump rather than alongside it. Still no migration ladder and still nothing version-gated
- *  on the loading path: a row with no `nodeGuid` is one the next SAVE mints for. */
-export const PREFAB_FORMAT_VERSION = 5;
+ *  on the loading path: a row with no `nodeGuid` is one the next SAVE mints for.
+ *
+ *  v6: an optional `members` map on a nested-instance row (#1533) — the scene's member rows, so an outer
+ *  prefab states the structure of a nested frame per member and per node rather than as one whole
+ *  `nestedStructure` slot, which pinned everything an inner prefab put in that frame. An older build
+ *  OPENS a v6 file (the loading path still reads no version, by owner ruling) and shows the inner
+ *  template through for those frames; the write gate stops it SAVING over the file, which would drop
+ *  the rows. No migration: the committed corpus had no row using the slot when this landed. */
+export const PREFAB_FORMAT_VERSION = 6;
 
 // The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
 // docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time
