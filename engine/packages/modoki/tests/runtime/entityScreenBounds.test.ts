@@ -159,6 +159,14 @@ describe('computeEntityScreenBounds — shared by both 3D surfaces', () => {
     expect(out[0].surface).toBe('game-3d');
   });
 
+  it('reports the rect it drew into — a letterboxed one, not the origin (#1563)', () => {
+    // An offset, non-canvas-shaped vp, as the SceneView's `ui` letterbox is: a stamp of the
+    // canvas, of {0,0,…}, or of the projected rect would each fail one of these fields.
+    const letterbox = { left: 370, top: 67, width: 366, height: 550 };
+    const out = computeEntityScreenBounds({ ...empty(), ecsObjects: [[1, boxMesh(), LIVE]] }, camera(), letterbox, 'scene-view');
+    expect(out[0].drawRect).toEqual({ x: 370, y: 67, w: 366, h: 550 });
+  });
+
   it('measures a skinned root on the game surface (the Scene3D gap)', () => {
     const root = new THREE.Object3D(); root.add(boxMesh());
     const out = computeEntityScreenBounds({ ...empty(), skinned: [[4, root, LIVE]] }, camera(), VP, 'game-3d');

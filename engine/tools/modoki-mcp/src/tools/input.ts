@@ -428,10 +428,12 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'vertex/bone without eyeballing pixels. `button`/`clickCount`/`modifiers` as in ' +
       'modoki_tap (e.g. clickCount:2 to insert/rename, modifiers:["shift"] to add to a ' +
       'marquee selection). Reports `occluded` (BOOLEAN — same meaning as modoki_tap) plus ' +
-      '`occludedBy` naming the covering element. An off-screen, disabled, or OCCLUDED handle is ' +
-      'REFUSED rather than tapped: a press that provably lands on the covering element is a miss, ' +
-      'and reporting one as ok:true is how a covered handle reads as an inert one. Pass ' +
-      '`allowOccluded:true` to press anyway and see what happens. Requires the Electron editor.',
+      '`occludedBy` naming the covering element. A handle that is covered, or clipped by a ' +
+      'neighbouring panel, is REFUSED as OCCLUDED rather than tapped: a press that provably lands ' +
+      'on something else is a miss, and reporting one as ok:true is how a covered handle reads as ' +
+      'an inert one. Pass `allowOccluded:true` to press anyway and see what happens. An ' +
+      'off-window or disabled handle is refused outright, and allowOccluded does not open it. ' +
+      'Requires the Electron editor.',
     {
       id: z.string().describe('Handle id from modoki_handles.'),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button to click with (default 'left'). This tool CLICKS; no button is held across a gesture."),
@@ -454,9 +456,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'key for the whole drag (see modoki_drag). Occlusion is reported PER ' +
       'ENDPOINT — `fromTarget`/`toTarget` each carry `occluded` (boolean) + `occludedBy` — so a ' +
       'covered source and a covered destination are distinguishable (they need different fixes); ' +
-      '`toTarget` appears only for a `toId` destination. An off-screen, disabled, or OCCLUDED ' +
-      'endpoint is REFUSED rather than dragged (the press would land on the cover, which reads as ' +
-      '"this handle does nothing"); `allowOccluded:true` forces it. Requires the Electron editor.',
+      '`toTarget` appears only for a `toId` destination. An endpoint that is covered, or clipped ' +
+      'by a neighbouring panel, is REFUSED as OCCLUDED rather than dragged (the press would land on ' +
+      'the cover, which reads as "this handle does nothing"); `allowOccluded:true` forces it. An ' +
+      'off-window or disabled endpoint is refused outright. Requires the Electron editor.',
     {
       id: z.string().describe('Handle id to drag (from modoki_handles).'),
       to: z.object({ x: z.number(), y: z.number() }).optional().describe('Absolute destination in viewport CSS px.'),

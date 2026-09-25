@@ -24,7 +24,7 @@
  *  a click that lands somewhere plausible and reports success. See
  *  `docs/enact.md` ("Aimed input has THREE target surfaces"). */
 
-import { getAllEntities, collectScreenBounds, pickAt, type BoundsSurface } from '@modoki/engine/runtime';
+import { getAllEntities, collectScreenBounds, pickAt, type BoundsSurface, type ScreenRect } from '@modoki/engine/runtime';
 import { resolveEntityAddress } from './entityRef';
 import { describeElement, occlusionAt, resolveElementPoint, NOTHING_AT_POINT } from './domResolve';
 import { uiNodesFor, namedUiSurface } from './uiSurface';
@@ -56,6 +56,12 @@ function resolveEntity(spec: EntityPointSpec): { info: ReturnType<typeof getAllE
 function centreIsInWindow(x: number, y: number): boolean {
   if (typeof window === 'undefined') return true;
   return x >= 0 && y >= 0 && x <= window.innerWidth && y <= window.innerHeight;
+}
+
+/** The window as a rect, for `visiblePart` — or undefined off the DOM, where it clips nothing. */
+function windowRect(): ScreenRect | undefined {
+  if (typeof window === 'undefined') return undefined;
+  return { x: 0, y: 0, w: window.innerWidth, h: window.innerHeight };
 }
 
 /** DOM-level occlusion for a canvas-rendered (2D/3D) entity. The entity has no node of its own,
@@ -140,6 +146,28 @@ function* sampleAimPoints(x: number, y: number, w: number, h: number): Generator
   }
   pts.sort((a, b) => a.d - b.d);
   for (const p of pts) yield { x: p.x, y: p.y };
+}
+
+/** The part of a projected rect its surface actually draws: `screen ∩ drawRect`.
+ *
+ *  The aim centre and every sample come from this, not from the whole projected AABB. A press
+ *  outside the draw rect cannot select anything the surface drew — in the SceneView's `ui` mode
+ *  that is the letterbox bar, which picks nothing (#1489) — so a sample there is spent before it
+ *  is taken. MEASURED on games/3d-test (#1563): the cube's rect spilled above and right of the
+ *  letterbox, 13 of the 25 whole-rect samples landed outside it, and only one row of the grid
+ *  reached the cube's visible part. Whether that row landed on it came down to the panel's aspect,
+ *  so the same editor state passed on one clone's layout and refused on another's.
+ *
+ *  No `drawRect` (a provider that does not report one), or no overlap: the whole rect, exactly as
+ *  before. `onScreen` already requires an overlap, so the second case is defensive only. */
+export function visiblePart(screen: ScreenRect, drawRect: ScreenRect | undefined): ScreenRect {
+  if (!drawRect) return screen;
+  const x0 = Math.max(screen.x, drawRect.x);
+  const y0 = Math.max(screen.y, drawRect.y);
+  const x1 = Math.min(screen.x + screen.w, drawRect.x + drawRect.w);
+  const y1 = Math.min(screen.y + screen.h, drawRect.y + drawRect.h);
+  if (x1 <= x0 || y1 <= y0) return screen;
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
 /** Resolve an entity spec into a serializable report. Never throws — this runs in the renderer
@@ -267,18 +295,38 @@ export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointReso
 
   // Reasons are per-CANDIDATE: a rect can be aimable in one surface and off-screen in another,
   // so a single verdict would be a lie about one of them.
-  const aimable: { b: typeof all[number]; x: number; y: number }[] = [];
+  const aimable: { b: typeof all[number]; rect: ScreenRect; x: number; y: number; px: number; py: number }[] = [];
   const rejected: string[] = [];
   for (const b of wanted) {
     if (!b.screen || b.screen.w === 0 || b.screen.h === 0) { rejected.push(`${named(b)}: zero-size rect`); continue; }
     if (!b.onScreen) { rejected.push(`${named(b)}: off-screen (behind the camera or outside the viewport)`); continue; }
-    const cx = b.screen.x + b.screen.w / 2;
-    const cy = b.screen.y + b.screen.h / 2;
-    if (!centreIsInWindow(cx, cy)) {
-      rejected.push(`${named(b)}: only partly visible — centre (${Math.round(cx)}, ${Math.round(cy)}) is outside the window`);
+    // TWO centres, with different jobs. The REFUSALS below are judged on the PROJECTED centre, as
+    // they were before #1563: a rect whose centre is off the window, or on a neighbouring panel,
+    // is mostly not on its own surface, and on a surface with no picker (game-3d, device) nothing
+    // would check that the sliver left over holds the mesh at all. Judging them on the visible
+    // part's centre retired both refusals, because that centre is inside the draw rect by
+    // construction (#1563 review). The AIM — the first point tried and the sample grid — comes
+    // from the visible part, which is the only place a press can pick what the surface drew.
+    const px = b.screen.x + b.screen.w / 2;
+    const py = b.screen.y + b.screen.h / 2;
+    if (!centreIsInWindow(px, py)) {
+      rejected.push(`${named(b)}: only partly visible — centre (${Math.round(px)}, ${Math.round(py)}) is outside the window`);
       continue;
     }
-    aimable.push({ b, x: cx, y: cy });
+    // Clipped to the WINDOW as well as the draw rect: the first point pressed is this rect's centre,
+    // and it skips the sample loop's window check, so it must be inside the window by construction
+    // rather than by a second refusal (which refused a draw rect overhanging the window edge while
+    // naming the in-window projected centre as the culprit — #1563 re-review).
+    const rect = visiblePart(visiblePart(b.screen, b.drawRect), windowRect());
+    const cx = rect.x + rect.w / 2;
+    const cy = rect.y + rect.h / 2;
+    // Reachable only when screen ∩ drawRect ∩ window is EMPTY (visiblePart then falls back): the
+    // entity is drawn, but nowhere inside the window.
+    if (!centreIsInWindow(cx, cy)) {
+      rejected.push(`${named(b)}: the part its surface draws is outside the window (aim centre (${Math.round(cx)}, ${Math.round(cy)}))`);
+      continue;
+    }
+    aimable.push({ b, rect, x: cx, y: cy, px, py });
   }
   if (aimable.length === 0) {
     return fail(
@@ -302,7 +350,7 @@ export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointReso
       'nothing can currently disambiguate — aim at the host itself, or close the duplicate view.',
     );
   }
-  const { b: bounds, x: cx, y: cy } = aimable[0];
+  const { b: bounds, rect, x: cx, y: cy, px, py } = aimable[0];
   const surfaceName = named(bounds);
 
   // ── Ask the surface's own hit-test what a click here would actually select. ──
@@ -319,11 +367,11 @@ export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointReso
   // answered ok:true / occluded:false and the click landed in the Scene panel (!focus {panel:
   // "scene"} in the editor journal). `allowOccluded` does NOT open this: there is nothing covering
   // the target here — the coordinate simply is not on the surface that was asked for.
-  const foreign = foreignCanvasAt(cx, cy, surfaceName);
+  const foreign = foreignCanvasAt(px, py, surfaceName);
   if (foreign) {
     return fail(
       `entity ${matched} is not aimable in '${surfaceName}': its rect straddles that surface's edge, ` +
-      `so its centre (${Math.round(cx)}, ${Math.round(cy)}) lands on ${foreign} — a click there would ` +
+      `so its centre (${Math.round(px)}, ${Math.round(py)}) lands on ${foreign} — a click there would ` +
       'drive the wrong panel. Move the camera so the entity is framed fully inside its own surface, ' +
       'or aim at the surface it is actually on.',
       'OCCLUDED',
@@ -331,7 +379,6 @@ export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointReso
   }
 
   const allEntities = getAllEntities();
-  const rect = bounds.screen!;
   let x = cx;
   let y = cy;
   let aimedAt: AimedAt = 'centre';
@@ -390,7 +437,7 @@ export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointReso
     // ADDRESSING mode is the older 2026-07-29 change). `allowOccluded: true` is the
     // escape hatch and is named in the message so the capability is discoverable from the error.
     const searched = samplesTried > 1
-      ? ` Tried ${samplesTried} points across its projected rect (centre first); none of them picked it.`
+      ? ` Tried ${samplesTried} points across the visible part of its projected rect (centre first); none of them picked it.`
       : '';
     return fail(
       `entity ${matched} is not clickable in '${surfaceName}': a click at its aim point selects ` +

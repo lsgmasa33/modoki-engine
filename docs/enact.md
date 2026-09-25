@@ -163,12 +163,32 @@ the occlusion check could see, because `occluded:false` does not mean the same t
 
 Reporting the scope is what stops the weaker check from being read as the stronger one; a bare
 `occluded:false` on `'canvas'` would be a false clean bill of health. The `'entity'` scope also
-reports **`aimedAt`** (`'centre'` | `'sampled'`): the aim point starts at the centre of the
-entity's projected rect, which for a torus, an L-shape, a crescent — any concave or hollow mesh —
-is not on the entity at all. When the picker confirms the centre misses, the rect is searched (a
-small grid, closest-to-centre first, capped and reported as `samplesTried`) for a point that DOES
-pick the target; `aimedAt:'sampled'` marks that this happened, so a sampled aim is never mistaken
-for a clean centre hit.
+reports **`aimedAt`** (`'centre'` | `'sampled'`): the aim point starts at the centre of the part
+of the entity's projected rect that can be pressed (below), which for a torus, an L-shape, a
+crescent — any concave or hollow mesh — is not on the entity at all. When the picker confirms the
+centre misses, that rect is searched (a small grid, closest-to-centre first, capped and reported as
+`samplesTried`) for a point that DOES pick the target; `aimedAt:'sampled'` marks that this
+happened, so a sampled aim is never mistaken for a clean centre hit.
+
+**The rect that is searched is the part the surface DRAWS, inside the window** (#1563). Every
+engine provider reports `drawRect` — the rect it projected into: the canvas, or in the SceneView's
+`ui` mode the game-aspect letterbox (the 2D provider reports its host canvas). The aim's first point
+and its grid come from `screen ∩ drawRect ∩ window`. The projected AABB routinely spills past the
+draw rect, and a press outside it picks nothing (the letterbox bars, #1489), so a grid over the
+whole projection spends its samples where no click can land. Measured on `games/3d-test`: the
+cube's rect spilled above and right of the letterbox, 13 of 25 samples fell outside it, and one grid
+row reached the visible cube — so UC3 `[ui]` passed or refused as OCCLUDED ("selects Top UI") by the
+panel's aspect, on the same editor state. A revert-run at iPhone 16 Pro landscape reproduced that
+refusal; the clipped grid found the cube on its third sample. A provider that reports no `drawRect`
+keeps the whole-rect search.
+
+**The refusals do NOT move with the aim.** "Only partly visible" and "straddles its surface's
+edge" are still judged on the PROJECTED centre, exactly as before #1563: the searched rect's centre
+is inside the draw rect by construction, so judging them there retired both, and on a picker-less
+surface (game-3d, device) a 95%-off-canvas AABB was then aimed at a sliver nothing checks holds the
+mesh (#1563 review). One refusal is new: a rect whose drawn part lies wholly outside the window.
+The window is in the intersection rather than a second centre check, because such a check refused a
+draw rect merely overhanging the window edge (#1563 re-review).
 
 **Everything ambiguous is refused, never approximated** — an ambiguous `name`, an off-screen entity,
 a zero-size projection, a UI entity with no mounted node, and the subtle one: a rect that *overlaps*
@@ -533,6 +553,18 @@ The handle shape carries three fields that make chrome addressing robust:
   walks up for the nearest ancestor that names anything (a bare `"div"` identifies nothing), and
   the SceneView toolbar — chrome that structurally overlaps the top of the viewport — carries
   `data-ui-id="sceneView.toolbar"` so it names itself.
+
+  **A handle CLIPPED by a neighbouring panel is a cover too, and every handle refusal is a coded
+  400** (#1565). `computeHandles` marks a handle inside the window but outside its own panel's
+  visible box `clipped` (the exposed population is gizmo handles drawn past their viewport's edge).
+  The handle routes sent that down the off-screen branch — no code, and `allowOccluded` could not
+  reach it — while the selector path calls the same geometry `OCCLUDED` and lets `allowOccluded`
+  press it. The handle contract now matches (owner: overridable, 2026-09-25): covered or clipped →
+  `OCCLUDED`, forceable, and a forced press reports `occluded:true` (+ `clipped:true`) even when
+  the hit-test named no cover; off-WINDOW or disabled → `REFUSED_BY_OP`, which `allowOccluded`
+  does not open, since a press outside the window reaches nothing and a disabled handle is inert.
+  The refusals were HTTP 200 `{ok:false}` — the MCP relay re-derived the same envelope from the
+  body, but a direct caller read success — and are now 400 like every other aimed route's.
 
   **A 3D gizmo aim point is now geometry, not a pixel guess — for EVERY handle.** The old constants
   (52px for an arrow, 66px for a ring) could not work, and not because of camera distance: the gizmo

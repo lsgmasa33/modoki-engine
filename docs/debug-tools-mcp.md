@@ -1357,8 +1357,9 @@ so existing callers don't break; don't pass it.
   a cheerful `ok:true` with the bad news buried in a field. `unsavedChanges` on
   `get_editor_state` tells you where you stand. The re-audit swept this across the whole surface:
   `tap_handle`/`drag_handle` refuse an off-screen, disabled, or OCCLUDED handle and report
-  `occluded` (a BOOLEAN, always present) + `occludedBy`, per endpoint for `drag_handle` (S3.17) —
-  `allowOccluded:true` presses anyway. Occluded was a *warning that still dispatched* until
+  `occluded` (a BOOLEAN, always present) + `occludedBy`, per endpoint for `drag_handle` (S3.17).
+  A covered handle, or one clipped by a neighbouring panel, is `OCCLUDED` and `allowOccluded:true`
+  presses anyway; an off-window or disabled one is `REFUSED_BY_OP` and it does not (#1565). Occluded was a *warning that still dispatched* until
   2026-08-19: a 2D gizmo handle under the SceneView's own toolbar pressed the TOOLBAR and answered
   `ok:true`, and the covered press was filed as "the handle is completely inert" (testboard
   5jE5Tip6Qwp7s7YVAYoH — it was not; the same handle moved the entity on the first try once it was
@@ -2221,8 +2222,9 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
     caught, but **a mesh directly in front of the target reports `occluded:false`**, because
     nothing asked the scene what is actually there. Treat `'canvas'` + `occluded:false` as "the
     click reaches the canvas", not "the click hits the entity". A successful `'entity'`-scope
-    response also carries `aimedAt` (`'centre'` | `'sampled'` — whether the entity's projected-rect
-    centre picked it, or a concave/hollow shape needed a searched point instead) and, on a refusal
+    response also carries `aimedAt` (`'centre'` | `'sampled'` — whether the centre of the VISIBLE
+    part of the entity's projected rect picked it, or a concave/hollow/partly-covered shape needed
+    a searched point instead; the search stays inside the rect the surface draws, #1563) and, on a refusal
     or an `allowOccluded` dispatch, `occludedByEntity` naming who is actually there. Design +
     tests: [docs/enact.md](enact.md).
 - **Raw input modalities** (beyond `tap`/`drag`): `modoki_hover` (bare mouse-move → tooltips/hover-

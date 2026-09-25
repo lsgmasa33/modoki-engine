@@ -181,7 +181,8 @@ function makeRenderer(overrides?: Record<string, unknown>) {
         { id: 'bone.covered', x: 40, y: 40, onScreen: true, occludedBy: 'div.modal', occlusionChecked: true },
         { id: 'bone.canvas', x: 60, y: 60, onScreen: true },
         // Inside the window, outside its own panel's clip box (testboard AceYUBoBXbcGtIIFmzGb).
-        { id: 'grad.clipped', x: 200, y: 863, onScreen: false, clipped: true, occlusionChecked: true },
+        { id: 'grad.clipped', x: 200, y: 863, onScreen: false, clipped: true, occludedBy: 'div.flexlayout__tab', occlusionChecked: true },
+        { id: 'grad.clipped-bare', x: 210, y: 870, onScreen: false, clipped: true, occlusionChecked: true },
       ];
       return { handles: known.filter((h) => wanted.includes(h.id)) };
     }
@@ -927,7 +928,8 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     // a click wearing a drag's name is the same class of false success.
     const res = await post('/api/input/drag-handle', { id: 'bone.0', delta: { dx: 0, dy: 0 } });
     expect(ops.drag).not.toHaveBeenCalled();
-    expect(res).toMatchObject({ body: { ok: false } });
+    // A 400 like /api/input/drag's own zero-length refusal (#1565 — it was a bare 200).
+    expect(res).toMatchObject({ status: 400, body: { ok: false, code: 'REFUSED_BY_OP' } });
     expect((res as { body: { error?: string } }).body.error).toMatch(/tap-handle/);
   });
 
@@ -986,37 +988,59 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('tap-handle REFUSES an off-screen handle (ok:false) and dispatches nothing', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.off' }) as { body: { ok: boolean; error: string; code?: string } };
-    // Off-screen is not a cover: allowOccluded cannot force it, so it must not be OCCLUDED (#1555 review).
-    expect(res.body.code).toBeUndefined();
-    expect(res.body.ok).toBe(false);
-    expect(res.body.error).toMatch(/off-screen/);
+  // #1565 — every handle refusal is a 400 with its code, as on every other aimed route. They were
+  // 200 {ok:false}; the MCP relay re-derived the same envelope, but a direct caller read success.
+  it('tap-handle REFUSES an off-WINDOW handle as a hard 400 REFUSED_BY_OP — allowOccluded cannot force it', async () => {
+    for (const allowOccluded of [false, true]) {
+      const res = await post('/api/input/tap-handle', { id: 'bone.off', allowOccluded }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+      // A press outside the window reaches nothing: not a cover, so not OCCLUDED and not forceable.
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+      expect(res.body.error).toMatch(/off-screen/);
+    }
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('a CLIPPED handle is refused with the remedy that actually applies, not "scroll it"', async () => {
+  it('a CLIPPED handle is OCCLUDED like a clipped selector, with the remedy that applies (#1565)', async () => {
     // Off the PANEL, not off the window: the press would land on whichever panel owns those
-    // pixels, and telling the caller to scroll is wrong for a handle drawn past a viewport edge.
-    const res = await post('/api/input/tap-handle', { id: 'grad.clipped' }) as { body: { ok: boolean; error: string; code?: string } };
-    // Off-screen is not a cover: allowOccluded cannot force it, so it must not be OCCLUDED (#1555 review).
-    expect(res.body.code).toBeUndefined();
-    expect(res.body.ok).toBe(false);
+    // pixels. That is a cover, and the selector path calls it one — the handle path used to send
+    // it down the off-screen branch, uncoded and unforceable (owner: overridable, 2026-09-25).
+    const res = await post('/api/input/tap-handle', { id: 'grad.clipped' }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ ok: false, code: 'OCCLUDED' });
     expect(res.body.error).toMatch(/OUTSIDE its own panel/);
+    expect(res.body.error).toMatch(/lands on div\.flexlayout__tab/); // names the neighbour that would get the press
+    expect(res.body.error).toMatch(/allowOccluded:true/);
+    expect(res.body.error).not.toMatch(/scroll it into view/); // not the off-window remedy
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('tap-handle REFUSES a disabled handle (ok:false) and dispatches nothing', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.disabled' }) as { body: { ok: boolean; error: string } };
-    expect(res.body.ok).toBe(false);
-    expect(res.body.error).toMatch(/disabled/);
-    // Not a cover, so not OCCLUDED — the code is reserved for what allowOccluded can override.
-    expect((res.body as { code?: string }).code).toBeUndefined();
+  it('…and allowOccluded:true presses the clipped handle, reporting it occluded and clipped', async () => {
+    const res = await post('/api/input/tap-handle', { id: 'grad.clipped', allowOccluded: true }) as { status: number; body: Record<string, unknown> };
+    expect(ops.tap).toHaveBeenCalledWith(200, 863, expect.anything());
+    expect(res.body).toMatchObject({ ok: true, occluded: true, clipped: true, occludedBy: 'div.flexlayout__tab' });
+  });
+
+  it('a forced clipped press whose hit-test named NO cover still reports occluded:true', async () => {
+    // Clipped means its own panel does not own those pixels, whatever the hit-test answered.
+    const res = await post('/api/input/tap-handle', { id: 'grad.clipped-bare', allowOccluded: true }) as { body: Record<string, unknown> };
+    expect(res.body).toMatchObject({ ok: true, occluded: true, clipped: true, occludedBy: null });
+  });
+
+  it('tap-handle REFUSES a disabled handle as a hard 400 REFUSED_BY_OP — allowOccluded cannot force it', async () => {
+    for (const allowOccluded of [false, true]) {
+      const res = await post('/api/input/tap-handle', { id: 'bone.disabled', allowOccluded }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+      expect(res.status).toBe(400);
+      // Not a cover, so not OCCLUDED — the code is reserved for what allowOccluded can override.
+      expect(res.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+      expect(res.body.error).toMatch(/disabled/);
+    }
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
   it('tap-handle REFUSES an occluded handle, naming the cover and the escape hatch', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { body: { ok: boolean; error: string; code?: string } };
+    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+    expect(res.status).toBe(400);
     expect(res.body.ok).toBe(false);
     // The code every aimed route sends for a cover, and the one `allowOccluded` promises (#1555).
     expect(res.body.code).toBe('OCCLUDED');
@@ -1041,16 +1065,19 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   });
 
   it('drag-handle refuses an off-screen FROM, and a blocked toId, dispatching nothing', async () => {
-    const r1 = await post('/api/input/drag-handle', { id: 'bone.off', to: { x: 1, y: 1 } }) as { body: { ok: boolean } };
-    expect(r1.body.ok).toBe(false);
-    const r2 = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.disabled' }) as { body: { ok: boolean; error: string } };
-    expect(r2.body).toMatchObject({ ok: false });
+    const r1 = await post('/api/input/drag-handle', { id: 'bone.off', to: { x: 1, y: 1 } }) as { status: number; body: { ok: boolean } };
+    expect(r1.status).toBe(400);
+    expect(r1.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+    const r2 = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.disabled' }) as { status: number; body: { ok: boolean; error: string } };
+    expect(r2.status).toBe(400);
+    expect(r2.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
     expect(r2.body.error).toMatch(/disabled/);
     expect(ops.drag).not.toHaveBeenCalled();
   });
 
   it('drag-handle REFUSES a covered source, and drags it under allowOccluded', async () => {
-    const refused = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { body: { ok: boolean; error: string; code?: string } };
+    const refused = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+    expect(refused.status).toBe(400);
     expect(refused.body.ok).toBe(false);
     expect(refused.body.code).toBe('OCCLUDED');
     expect(refused.body.error).toMatch(/covered by div\.modal/);
@@ -1061,10 +1088,21 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   });
 
   it('drag-handle REFUSES a covered toId destination with OCCLUDED (#1555 review)', async () => {
-    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.covered' }) as { body: { ok: boolean; error: string; code?: string } };
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.covered' }) as { status: number; body: { ok: boolean; error: string; code?: string } };
+    expect(res.status).toBe(400);
     expect(res.body).toMatchObject({ ok: false, code: 'OCCLUDED' });
     expect(res.body.error).toMatch(/toId handle 'bone\.covered' is covered by div\.modal/);
     expect(ops.drag).not.toHaveBeenCalled();
+  });
+
+  it('drag-handle forced onto a CLIPPED toId reports it occluded, per endpoint and in the aggregate (#1565)', async () => {
+    // `grad.clipped-bare`: clipped, but the hit-test named no cover — so only `clipped` can make
+    // either `occluded` true, and a forced press must never read as a clean one.
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'grad.clipped-bare', allowOccluded: true }) as
+      { body: { ok: boolean; occluded?: boolean; toTarget?: Record<string, unknown> } };
+    expect(ops.drag).toHaveBeenCalledWith({ x: 11, y: 22 }, { x: 210, y: 870 }, expect.anything());
+    expect(res.body).toMatchObject({ ok: true, occluded: true });
+    expect(res.body.toTarget).toMatchObject({ id: 'grad.clipped-bare', occluded: true, clipped: true });
   });
 
   it('drag-handle says WHICH endpoint was covered (S3.17)', async () => {

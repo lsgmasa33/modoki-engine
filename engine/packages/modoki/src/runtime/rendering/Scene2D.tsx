@@ -2861,7 +2861,9 @@ export class Scene2DRenderer {
         const p1 = canvasPxToClient(b.maxX, b.maxY, rect, backingW, backingH);
         const x = p0.x, y = p0.y, w = p1.x - p0.x, h = p1.y - p0.y;
         const onScreen = x < rect.right && x + w > rect.left && y < rect.bottom && y + h > rect.top;
-        out.push({ id, layer: '2d', surface, screen: { x, y, w, h }, onScreen, canvasId });
+        // `drawRect` = the canvas this was projected into: the aim samples inside screen ∩ drawRect,
+        // since a press outside the host canvas cannot pick what it drew (#1563, `screenBounds.ts`).
+        out.push({ id, layer: '2d', surface, screen: { x, y, w, h }, onScreen, canvasId, drawRect: { x: rect.left, y: rect.top, w: rect.width, h: rect.height } });
       } catch { out.push({ id, layer: '2d', surface, screen: null, onScreen: false, canvasId }); }
     }
     return out;

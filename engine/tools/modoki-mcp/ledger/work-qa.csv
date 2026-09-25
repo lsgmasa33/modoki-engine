@@ -189,3 +189,5 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-25,work-qa,modoki_pointer,43,3633,165983,24c1faaf3
 2026-09-25,work-qa,modoki_scroll,43,3010,165983,24c1faaf3
 2026-09-25,work-qa,modoki_tap,43,3282,165983,24c1faaf3
+2026-09-25,work-qa,modoki_drag_handle,87,2048,166184,ed7bfa3cd
+2026-09-25,work-qa,modoki_tap_handle,114,1673,166184,ed7bfa3cd

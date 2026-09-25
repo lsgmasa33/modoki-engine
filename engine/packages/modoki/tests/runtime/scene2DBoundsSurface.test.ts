@@ -97,3 +97,25 @@ describe('Scene2DRenderer.bounds2DProvider — refuses a dead owner\'s slot (#11
     expect(r.bounds2DProvider().map((b) => b.id)).toEqual([id]);
   });
 });
+
+/** #1563 — a 2D rect reports the canvas it was projected into, so an entity aim can keep its samples
+ *  inside the host canvas instead of spending them where no press can pick it. The canvas here is
+ *  offset and scaled (backing 200x100 drawn at 400x200 from (50, 30)) so a stamp of the backing size,
+ *  of the origin, or of the entity's own rect would each fail. */
+describe('Scene2DRenderer.bounds2DProvider — reports its drawRect (#1563)', () => {
+  it('stamps the host canvas\'s client rect beside the entity\'s rect', () => {
+    type Internals = { slots: Map<number, unknown>; activeIds: Map<number, number>; canvasOfEntity: Map<number, number>; pool: unknown;
+      bounds2DProvider(ids?: Set<number>): Array<{ id: number; screen: unknown; drawRect?: unknown }> };
+    const r = new Scene2DRenderer({ pool: new Canvas2DPool(), primary: true }) as unknown as Internals;
+    const world = createWorld();
+    const e = world.spawn();
+    const rect = { left: 50, top: 30, width: 400, height: 200, right: 450, bottom: 230 };
+    r.slots.set(e.id(), { kind: 'graphics', obj: { getBounds: () => ({ minX: 10, minY: 10, maxX: 30, maxY: 20 }) } });
+    r.activeIds.set(e.id(), e.valueOf());
+    r.canvasOfEntity.set(e.id(), 99);
+    r.pool = { getSlot: () => ({ canvas: { isConnected: true, width: 200, height: 100, getBoundingClientRect: () => rect }, app: { renderer: { screen: { width: 200, height: 100 } } } }) };
+    const [b] = r.bounds2DProvider();
+    expect(b.screen).toEqual({ x: 70, y: 50, w: 40, h: 20 }); // premise: a real projection, not the null branch
+    expect(b.drawRect).toEqual({ x: 50, y: 30, w: 400, h: 200 });
+  });
+});
