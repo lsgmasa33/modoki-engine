@@ -14,12 +14,11 @@
  *
  *  THE ONE GENUINE DIFFERENCE this panel still needs, which the shared ring does not model by
  *  default: a `warn`/`error` row needs a stack even when the call passed no `Error` object — so it
- *  can still say WHERE `console.warn(...)` was called from — and formatting `.stack` is the
- *  expensive part in V8, so it must stay LAZY. That is `ConsoleRingOptions.retainCallSite`:
- *  `installConsoleRing.ts` turns it on for the editor only (a device build must never pay for
- *  retaining a live `Error` object per warn/error entry), and the ring itself allocates the `Error`
- *  at the console call site and exposes `entry.stack` as a lazily-memoized getter. This module just
- *  reads it.
+ *  can still say WHERE `console.warn(...)` was called from. That is
+ *  `ConsoleRingOptions.retainCallSite`: `installConsoleRing.ts` turns it on for the editor only (a
+ *  device build must never pay for a stack string per warn/error entry), and the ring itself
+ *  captures the stack at the console call site and stores it FORMATTED — never a live `Error`,
+ *  whose unread frames pin every closure scope on the call path (#1589). This module just reads it.
  *
  *  ⚠️ `formatError` USED TO live here (a `String(err)` + `cause`-chain formatter) but had ZERO
  *  production callers by the time #626/#633 were adversarially reviewed: `getEditorLogs()` below
@@ -140,24 +139,17 @@ export function getEditorLogs(): LogEntry[] {
   cachedRingVersion = ringVersion;
   cachedWatermark = clearWatermark;
   cachedLogs = getConsoleRingEntries(clearWatermark).map((e) => {
-    const row = {
+    // `stack` is a plain string the ring formatted at record time (#1589), so copying it here costs
+    // nothing per projection. It used to be a getter closing over the ring entry, which kept that
+    // entry's unread `Error` — and the ECS world its frames pinned — alive in `cachedLogs` even after
+    // the ring itself had evicted or cleared it.
+    return {
       id: e.seq,
       level: e.level === 'info' ? 'log' : e.level,
       message: e.args.join(' '),
       time: formatTime(new Date(performance.timeOrigin + e.mono)),
+      stack: e.stack ?? '',
     } as LogEntry;
-    // ⚠️ `stack` is re-exposed as a GETTER, never read here. The ring's own `stack` is itself a lazy
-    // getter (`retainCallSite`), and formatting `Error.stack` is the expensive part in V8 — the whole
-    // reason the capture is deferred. A plain `stack: e.stack ?? ''` in this map would READ it for
-    // every entry on every projection, formatting up to 1000 stacks each time the ring's version
-    // moves (i.e. on every new log line), which is worse than the pre-#626 panel and quietly undoes
-    // the capability this issue set out to keep. Console.tsx reads `.stack` for the SELECTED row only.
-    Object.defineProperty(row, 'stack', {
-      enumerable: true,
-      configurable: true,
-      get() { return e.stack ?? ''; },
-    });
-    return row;
   });
   return cachedLogs.slice();
 }

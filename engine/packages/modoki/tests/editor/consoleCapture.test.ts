@@ -34,20 +34,21 @@ async function load() {
 }
 
 describe('consoleCapture (editor projection)', () => {
-  it('exposes `stack` as a GETTER, so projecting does not format every entry\'s stack', async () => {
-    // The ring's own `stack` is lazy (retainCallSite) because formatting Error.stack is the
-    // expensive part in V8. A plain `stack: e.stack ?? ''` in the projection would read it for
-    // EVERY entry on every projection — up to 1000 stacks each time a new log lands — quietly
-    // undoing the one capability #626 set out to preserve. Pin the mechanism, not just the value.
+  it('copies the ring\'s already-formatted stack as a plain string — no getter closing over the entry (#1589)', async () => {
+    // The ring formats the stack at record time, so copying it costs nothing per projection. The
+    // row used to re-expose it as a getter over the ring ENTRY, which kept that entry — and, while
+    // the ring was lazy, its unread Error and the world its frames pinned — alive in this module's
+    // cache after the ring itself had evicted it. Collection is observed in
+    // `engine/tests/framework/consoleRingRetention.test.ts`.
     const { ring, cc } = await load();
     ring.installConsoleRing({ retainCallSite: true });
-    console.warn('lazy-please');
+    console.warn('where-from');
 
-    const row = cc.getEditorLogs().find((e) => e.message === 'lazy-please')!;
+    const row = cc.getEditorLogs().find((e) => e.message === 'where-from')!;
     const d = Object.getOwnPropertyDescriptor(row, 'stack');
-    expect(typeof d?.get).toBe('function');
-    expect(d?.value).toBeUndefined();
-    expect(row.stack).toBeTruthy(); // and it still resolves when actually read
+    expect(d?.get).toBeUndefined();
+    expect(d?.value).toBe(ring.getConsoleRingEntries().find((e) => e.args[0] === 'where-from')!.stack);
+    expect(row.stack).toBeTruthy();
   });
 
   it('returns a FRESH array but the identical cached ROW OBJECTS while nothing has changed (F9)', async () => {

@@ -1126,12 +1126,12 @@ Panels live in `editor/panels/`:
   the panel's layout config) plus a live text filter, live FPS/entity-count stats, and a
   detail pane for the selected line's message + stack. Rows are **virtualized**
   (`consoleVirtualization.ts` `computeVisibleRange`/`clampScrollTop`, uniform row height) so
-  a large log volume stays cheap. The interception itself lives in `consoleCapture.ts`,
-  installed at the **very start** of editor launch (from `createEditor`, before any lazy
-  panel loads) so nothing fired during early init is missed: it patches
-  `console.log/warn/error` and listens for `window` `error` + `unhandledrejection`, into a
-  1000-entry ring. Stacks are formatted **lazily** (only when a `warn`/`error` row is
-  expanded); `log`-level entries carry no stack.
+  a large log volume stays cheap. `consoleCapture.ts` intercepts nothing itself: it is a
+  projection of the shared console ring (`runtime/core/consoleRing.ts`, 1000 entries in the
+  editor), which `engine/app/installConsoleRing.ts` installs before `App.tsx` loads. In the
+  editor each `warn`/`error` entry carries its call-site stack, **formatted when recorded**
+  and stored as text — never a live `Error` (#1589); `log`-level entries carry no stack.
+  Ring detail: [debug-tools-mcp.md](debug-tools-mcp.md).
 - **ModelPreview** (`ModelPreview.tsx`) — an embeddable mini 3D viewer used by the Model
   inspector. It owns its own `WebGLRenderer`, orbit controls, and lights, with a toolbar
   for LOD-level switch, wireframe toggle, and camera reset; it disposes everything on

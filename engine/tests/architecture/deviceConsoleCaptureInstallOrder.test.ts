@@ -231,7 +231,7 @@ describe('device console capture install order (#591)', () => {
     // `console.*`. `packages/modoki/src/editor/consoleCapture.ts` (the editor Console panel) was the
     // one remaining separate wrapper for a while, kept apart because its entries carried lazily-built
     // stacks and it listened in the CAPTURE phase for resource-load errors — semantics the shared
-    // ring didn't model. #626 folded it in too: the lazy stack is now `ConsoleRingOptions
+    // ring didn't model. #626 folded it in too: the call-site stack is now `ConsoleRingOptions
     // .retainCallSite` (opt-in, editor-only), and the capture-phase resource-load listener moved to
     // `engine/app/debug/uncaughtCapture.ts`. agentBridge, deviceConsoleCapture, runtime/debug AND the
     // editor Console panel are now all projections of the one ring.

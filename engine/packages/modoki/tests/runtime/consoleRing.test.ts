@@ -410,18 +410,19 @@ describe('consoleRing', () => {
       expect(warnE.stack).not.toMatch(/^Error/);
     });
 
-    it('the stack getter is LAZY and MEMOIZED: reading it twice returns the identical string', () => {
+    it('the stack is FORMATTED at record time into a plain string — never a getter over a kept Error (#1589)', () => {
+      // It used to be a lazy getter closing over `new Error()`. An unread Error holds V8's captured
+      // frames and their closure scopes, which pinned a whole ECS world per entry. What collection
+      // looks like is observed in `engine/tests/framework/consoleRingRetention.test.ts`; this pins
+      // the shape that makes it possible — no accessor, so no closure left to hold anything.
       installConsoleRing({ retainCallSite: true });
       console.error('boom');
 
       const [entry] = getConsoleRingEntries();
       const descriptor = Object.getOwnPropertyDescriptor(entry, 'stack');
-      expect(descriptor?.get, 'stack must be backed by a getter, not a plain value, to stay lazy').toBeTypeOf('function');
-
-      const first = entry.stack;
-      const second = entry.stack;
-      expect(first).toBeTruthy();
-      expect(second).toBe(first); // memoized — same string instance, not recomputed
+      expect(descriptor?.get, 'a getter here is a closure that can keep the Error alive').toBeUndefined();
+      expect(descriptor?.value).toBeTypeOf('string');
+      expect(entry.stack).toBeTruthy();
     });
 
     it('a REPLAYED entry (the #633 shim drain) gets NO stack, even with retainCallSite: true', () => {

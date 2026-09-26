@@ -38,7 +38,7 @@ export interface ConsoleRingEntry {
    *  and could mutate after the fact). Not joined: a consumer decides how to render multiple
    *  args. */
   args: string[];
-  /** Call-site stack, lazily formatted on first read — see `ConsoleRingOptions.retainCallSite`.
+  /** Call-site stack, formatted at record time — see `ConsoleRingOptions.retainCallSite`.
    *  Only present on a `warn`/`error` entry recorded while `retainCallSite` is on (editor only),
    *  and never on a REPLAYED entry (the #633 shim drain) — see `record()`'s own doc comment.
    *  Absent everywhere else, including every `log`/`info` entry. */
@@ -51,9 +51,10 @@ export interface ConsoleRingOptions {
   /** How many of the EARLIEST entries are pinned and never evicted. Default 128. */
   bootPrefix?: number;
   /** Opt-in per-entry call-site capture for `warn`/`error` entries (#626). Default **false**.
-   *  Retaining a live `Error` object per warn/error entry is a real cost — the editor's Console
-   *  panel needs it (a `console.warn` row should have a stack even when no `Error` was passed), a
-   *  device build must never pay for it. `engine/app/installConsoleRing.ts` is the ONE place this
+   *  A formatted stack string per warn/error entry is a real cost — the editor's Console panel
+   *  needs it (a `console.warn` row should have a stack even when no `Error` was passed), a device
+   *  build must never pay for it. The `Error` itself is never kept (#1589 — an unread one pins
+   *  every closure scope on its call path, including an ECS world). `engine/app/installConsoleRing.ts` is the ONE place this
    *  is turned on, gated `__MODOKI_EDITOR__`. */
   retainCallSite?: boolean;
 }
@@ -236,9 +237,9 @@ function record(level: ConsoleRingLevel, args: unknown[], replay?: { mono?: numb
     };
     // Opt-in call-site capture (#626), OFF by default — see `ConsoleRingOptions.retainCallSite`.
     // Only the editor's Console panel needs a stack on a `warn`/`error` row that logged no `Error`
-    // (so it can still say WHERE the call came from); a device build must never pay for retaining a
-    // live `Error` object per entry, hence the flag. `log`/`info` never get one, matching the
-    // panel's existing cost decision.
+    // (so it can still say WHERE the call came from); a device build must never pay for a formatted
+    // stack string per entry, hence the flag. `log`/`info` never get one, matching the panel's
+    // existing cost decision.
     //
     // A REPLAYED entry (the #633 shim drain, `drainEarlyConsole` below) is skipped: the call site
     // captured HERE would point at the drain loop, not wherever the original console call actually
@@ -252,28 +253,23 @@ function record(level: ConsoleRingLevel, args: unknown[], replay?: { mono?: numb
       // caller. (V8/Chromium-only by design — the editor ships in Electron; on a non-V8 engine the
       // header line is absent and one real frame would be dropped, acceptable since retainCallSite
       // is never turned on there.)
-      let err: Error | undefined = new Error();
-      let computedStack: string | undefined;
-      Object.defineProperty(entry, 'stack', {
-        enumerable: true,
-        configurable: true,
-        get() {
-          if (computedStack === undefined) {
-            computedStack = (err?.stack || '').split('\n').slice(3).join('\n').trim();
-            // F10: release the retained Error the instant its stack IS READ. A strict improvement,
-            // but only for an entry whose stack someone actually looks at — an entry whose getter
-            // is NEVER called (most warn/error rows: nobody selected them in the Console panel)
-            // keeps its `Error` (and whatever it pins via V8's stack-trace machinery) alive in the
-            // CLOSURE for as long as the entry itself survives in the ring regardless of this fix,
-            // same as before it. This does NOT cap the worst case at some bounded number of live
-            // Errors — it only shortens the lifetime of the ones that get read. No practical unit
-            // test exists for this (asserting "an Error got garbage-collected" isn't observable
-            // from here); this comment is the only thing guarding the claim.
-            err = undefined;
-          }
-          return computedStack;
-        },
-      });
+      //
+      // ⚠️ Formatted NOW, and the `Error` dropped — never kept for a lazy getter (#1589). An Error
+      // whose `.stack` was never read holds V8's captured frames, and each frame holds its
+      // function's closure scope: a `console.warn` from inside a system pinned that system's
+      // whole ECS world for as long as the entry lived — FOREVER in the pinned boot prefix.
+      // Measured: every Play world of a session survived a forced GC, +1.7 MB per Play/Stop. The
+      // laziness bought nothing worth that — formatting measured ~2 µs per stack in Electron,
+      // once per entry; #626's real concern was re-formatting EVERY entry on every projection,
+      // which reading a stored string cannot do. `consoleRingRetention.test.ts` observes the
+      // collection with a forced GC.
+      let stack = '';
+      try {
+        stack = (new Error().stack || '').split('\n').slice(3).join('\n').trim();
+      } catch {
+        // A user `Error.prepareStackTrace` that throws — no call site, never a lost entry.
+      }
+      entry.stack = stack;
     }
     if (pinned.length < bootPrefix) {
       pinned.push(entry);

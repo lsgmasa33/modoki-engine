@@ -77,8 +77,8 @@ describe('errorText is the only Error-to-text rendering (#1055)', () => {
     for (const line of removed) expect(STACK_OR_MESSAGE.test(line), line).toBe(true);
 
     const legitimate = [
-      "get() { return e.stack ?? ''; },",
-      "computedStack = (err?.stack || '').split('\\n').slice(3).join('\\n').trim();",
+      "stack: e.stack ?? '',",
+      "stack = (new Error().stack || '').split('\\n').slice(3).join('\\n').trim();",
       "const stack = (new Error().stack ?? '').split('\\n').slice(3).join('\\n');",
       'if (stackStr) entry.stack = stackStr.slice(0, STASH_MAX_STACK);',
       'if (value instanceof Error) return errorText(value);',

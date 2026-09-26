@@ -2144,10 +2144,22 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   (resource-load errors, plus the ResizeObserver-loop swallow) was a *listener* concern, not a
   *buffer* one, and moved wholesale to `engine/app/debug/uncaughtCapture.ts` as a second,
   capture-phase `window` `error` listener registered from the shared ring's own install gate
-  (`engine/app/installConsoleRing.ts`). The lazy call-site stack turned out to be an opt-in the ring
+  (`engine/app/installConsoleRing.ts`). The call-site stack turned out to be an opt-in the ring
   itself could carry: `installConsoleRing({ retainCallSite })`, on for `__MODOKI_EDITOR__` only, off
-  on a device — so #154's low-end budget still pays nothing for it. The one genuine cost — retaining
-  a live `Error` per entry — is exactly what that flag gates, nothing more. Verified live on
+  on a device — so #154's low-end budget still pays nothing for it.
+
+  ⚠️ **The stack is FORMATTED at record time; the `Error` is never kept (#1589).** It began as a lazy
+  getter over a live `new Error()`, and an Error whose `.stack` was never read holds V8's captured
+  frames — each frame its function's closure scope. A `console.warn` from inside a system therefore
+  pinned that system's whole ECS world for as long as the entry lived, forever in the 128-entry
+  pinned prefix: every editor Play world of a session survived a forced GC, +1.7 MB per Play/Stop.
+  Formatting measured ~2–3 µs per warm stack (Electron; Node 24), once per entry — ~0.3 ms the
+  first time a freshly compiled script is formatted, and a warn FLOOD pays it for every entry the
+  tail then evicts (1000 warns/frame ≈ +3 ms/frame, editor only). Laziness never paid for a world.
+  **Never store an Error OBJECT long-term anywhere — store its text.**
+  `tests/framework/consoleRingRetention.test.ts` observes collection with a `WeakRef` + forced GC.
+
+  #626's merge of the panel into the ring was verified live on
   `games/sling`: after the change, the panel showed `18/18` and `modoki_get_console_logs` reported
   `ringTotal: 18` — the two now agree exactly, closing the gap the divergence measurement above
   documents. Clearing the panel took it to `0/0` while `modoki_get_console_logs` still reported

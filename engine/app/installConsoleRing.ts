@@ -55,10 +55,10 @@ import { installUncaughtCapture } from './debug/uncaughtCapture';
 
 if (!__MODOKI_PLAYABLE__ && (import.meta.env.DEV || import.meta.env.VITE_DEBUG_BRIDGE || __MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)) {
   // retainCallSite (#626): editor-only, deliberately gated on __MODOKI_EDITOR__ rather than left on
-  // unconditionally. Retaining up to 1000 live `Error` objects — one per warn/error entry, so the
-  // editor Console panel can still show WHERE a call came from even when it logged no `Error` — is
-  // exactly the cost #154's low-end device budget must not pay, and this flag is what keeps it off
-  // a device.
+  // unconditionally. Capturing and formatting a stack per warn/error entry (up to 1000 kept) — so
+  // the editor Console panel can still show WHERE a call came from even when it logged no `Error` —
+  // is exactly the cost #154's low-end device budget must not pay, and this flag is what keeps it
+  // off a device.
   installConsoleRing({ capacity: __MODOKI_EDITOR__ ? 1000 : 512, bootPrefix: 128, retainCallSite: __MODOKI_EDITOR__ });
   installUncaughtCapture();
 }

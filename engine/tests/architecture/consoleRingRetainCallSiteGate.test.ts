@@ -6,11 +6,11 @@ import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 import { callsTo, lineOf, parseSource, ts, unwrapValue } from '@modoki/engine/testing/sourceAst';
 
 /**
- * `ConsoleRingOptions.retainCallSite` (#626) opts a `warn`/`error` ring entry into retaining a live
- * `Error` object, captured at the console call site, so the editor Console panel can still show
- * WHERE a call came from even when it logged no `Error` itself. That per-entry retention is a real
- * cost — #154's low-end device budget must not pay it — so it must be turned on ONLY for the editor,
- * never unconditionally.
+ * `ConsoleRingOptions.retainCallSite` (#626) opts a `warn`/`error` ring entry into a call-site stack,
+ * captured and formatted at the console call (#1589 — never a kept `Error`), so the editor Console
+ * panel can still show WHERE a call came from even when it logged no `Error` itself. That per-entry
+ * capture is a real cost — #154's low-end device budget must not pay it — so it must be turned on
+ * ONLY for the editor, never unconditionally.
  *
  * Modeled on `deviceConsoleCaptureInstallOrder.test.ts`'s gate-text pins: this parses the actual
  * `installConsoleRing(...)` call rather than grepping loosely, so a comment that merely MENTIONS
@@ -49,8 +49,8 @@ describe('installConsoleRing retainCallSite gate (#626)', () => {
     expect(calls.length, 'could not find the installConsoleRing(...) call in app/installConsoleRing.ts').toBeGreaterThanOrEqual(1);
     expect(
       calls.filter((c) => c.value !== '__MODOKI_EDITOR__').map((c) => `line ${c.line}: retainCallSite = ${c.value}`),
-      'every installConsoleRing(...) call must pass "retainCallSite: __MODOKI_EDITOR__" — retaining a live '
-        + 'Error per warn/error ring entry is a real cost only the editor should pay, and a bare `true` turns '
+      'every installConsoleRing(...) call must pass "retainCallSite: __MODOKI_EDITOR__" — capturing and '
+        + 'formatting a stack per warn/error ring entry is a real cost only the editor should pay, and a bare `true` turns '
         + "it on for EVERY build (including a device one), which is exactly #154's low-end budget regression.",
     ).toEqual([]);
   });
