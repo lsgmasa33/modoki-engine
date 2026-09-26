@@ -28,6 +28,7 @@ import { getEnvCacheDir, envCachePathFor } from '../env-cache';
 import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from '../font-cache';
 import { getModelCacheDir, lodCachePath } from '../model-cache';
 import { atlasPageUrlPath } from '../atlas-cache';
+import { transcoderForUrl, transcoderSourceDir } from '../transcoders';
 import { getReimportHandler, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import type { TextureVariant } from '../../packages/modoki/src/runtime/loaders/textureSettings';
 import type { AtlasCacheBlock } from '../../packages/modoki/src/runtime/loaders/spriteAtlas';
@@ -176,38 +177,19 @@ export async function serveProjectAsset(
     return file(MIME_TYPES[ext] || 'application/octet-stream', absPath);
   }
 
-  // 2. The Basis transcoder (KTX2Loader fetches it via setTranscoderPath). Look in
-  //    the project's node_modules first, then fall back to the EDITOR's own three —
-  //    a FLAT project has no node_modules, so without the fallback this 404s, the
-  //    KTX2 worker blob ends up being the SPA index.html ("Unexpected identifier
-  //    'html'"), and every KTX2 texture silently fails to transcode (missing
-  //    textures). The transcoder bytes are identical across three copies.
-  if (urlPath === '/basis/basis_transcoder.js' || urlPath === '/basis/basis_transcoder.wasm') {
-    const rel = path.join('node_modules/three/examples/jsm/libs/basis', path.basename(urlPath));
-    const roots = [ctx.projectRoot, ctx.editorRoot].filter((r): r is string => !!r);
-    for (const root of roots) {
-      const transcoder = path.join(root, rel);
-      if (fs.existsSync(transcoder)) {
-        return file(urlPath.endsWith('.wasm') ? 'application/wasm' : 'text/javascript', transcoder, { ...IMMUTABLE });
-      }
-    }
-    return null;
-  }
-
-  // 2b. The PixiJS KTX2 transcoder (libktx). PixiJS's `loadKTX2` fetches it via
-  //     `setKTXTranscoderPath`; we point that at `/pixi-ktx/*` so KTX2 sprites
-  //     decode offline (default is a jsdelivr CDN). Bundled under pixi.js's
-  //     `transcoders/` dir — same project-then-editor fallback as Basis above.
-  if (urlPath === '/pixi-ktx/libktx.js' || urlPath === '/pixi-ktx/libktx.wasm') {
-    const rel = path.join('node_modules/pixi.js/transcoders/ktx', path.basename(urlPath));
-    const roots = [ctx.projectRoot, ctx.editorRoot].filter((r): r is string => !!r);
-    for (const root of roots) {
-      const transcoder = path.join(root, rel);
-      if (fs.existsSync(transcoder)) {
-        return file(urlPath.endsWith('.wasm') ? 'application/wasm' : 'text/javascript', transcoder, { ...IMMUTABLE });
-      }
-    }
-    return null;
+  // 2. The two KTX2 transcoder pairs: three's Basis transcoder at `/basis/*` (KTX2Loader fetches it
+  //    via setTranscoderPath) and PixiJS's libktx at `/pixi-ktx/*` (`setKTXTranscoderPath` points
+  //    there so KTX2 sprites decode offline instead of from jsdelivr). Look in the project's
+  //    node_modules first, then fall back to the EDITOR's own — a FLAT project has no node_modules,
+  //    so without the fallback this 404s, the KTX2 worker blob ends up being the SPA index.html
+  //    ("Unexpected identifier 'html'"), and every KTX2 texture silently fails to transcode. The
+  //    lookup is `transcoderSourceDir`, the same one the build's copy and its `?v=` version use (#1586).
+  const transcoder = transcoderForUrl(urlPath);
+  if (transcoder) {
+    const dir = transcoderSourceDir(transcoder, [ctx.projectRoot, ctx.editorRoot].filter((r): r is string => !!r));
+    const abs = dir && path.join(dir, path.basename(urlPath));
+    if (!abs || !fs.existsSync(abs)) return null;
+    return file(urlPath.endsWith('.wasm') ? 'application/wasm' : 'text/javascript', abs, { ...IMMUTABLE });
   }
 
   // 3. A converted model-LOD GLB from the local cache. URL form:

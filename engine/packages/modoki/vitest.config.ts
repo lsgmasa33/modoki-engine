@@ -17,6 +17,7 @@ export default defineConfig({
     __MODOKI_MODULE_PHYSICS2D__: 'true',
     __MODOKI_MODULE_PHYSICS3D__: 'true',
     __MODOKI_MODULE_VIDEO__: 'true',
+    __MODOKI_TRANSCODER_VERSIONS__: JSON.stringify({ basis: '', pixiKtx: '' }),
   },
   test: {
     globals: true,

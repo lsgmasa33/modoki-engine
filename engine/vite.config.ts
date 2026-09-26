@@ -20,6 +20,7 @@ import { earlyConsoleShimPlugin } from './plugins/earlyConsoleShim'
 import { projectLockfilesHash } from './plugins/projectLockfileHash'
 import { projectScanEntries } from './plugins/projectScanEntries'
 import { perfCoreWorkers } from './testWorkers'
+import { transcoderDefine } from './plugins/transcoders'
 
 // C3: engine/ is the vite root (this config + index.html + app/ live here). The
 // npm root + node_modules stay at the repo root (Capacitor needs them there), so
@@ -366,6 +367,11 @@ export default defineConfig(({ command }) => {
     // playable-overlay import DCEs out.
     __MODOKI_PLAYABLE__: JSON.stringify(isPlayable),
     __MODOKI_PLAYABLE_CLICK_URL__: JSON.stringify(isPlayable ? playableBuildCfg.playableClickUrl : ''),
+    // #1586: each KTX2 transcoder pair's content hash, which the runtime appends as `?v=` so a
+    // three/pixi bump cannot pair a CDN-cached old `.js` with a new `.wasm`. Same roots, in the same
+    // order, as the scanner's copy (`shipTranscoders`); blank in editor/playable — see transcoderDefine.
+    __MODOKI_TRANSCODER_VERSIONS__: JSON.stringify(
+      transcoderDefine({ editor: isEditorBuild, playable: isPlayable }, [buildProjectRoot, repoRoot])),
   },
   plugins: [
     react(),

@@ -10,14 +10,14 @@
  *
  *  The `/pixi-ktx/{libktx.js,libktx.wasm}` URL is served in dev by the backend
  *  static-asset handler (`staticAssets.ts`) and copied into `dist/` at build time
- *  (`shipPixiKtxTranscoder` in `vite-asset-scanner.ts`) — mirroring how the
+ *  (`shipTranscoders` in `engine/plugins/transcoders.ts`) — mirroring how the
  *  three.js Basis transcoder is provided at `/basis/` for the 3D KTX2 path.
  *
  *  `setKTXTranscoderPath` is a plain `Object.assign` into a module singleton, so
  *  calling it more than once is harmless; the guard just avoids redundant work. */
 
 import { setKTXTranscoderPath, loadKTX2, extensions } from 'pixi.js';
-import { assetUrl } from './assetUrl';
+import { pixiKtxTranscoderUrls } from './transcoderUrls';
 
 let configured = false;
 
@@ -28,8 +28,5 @@ export function ensurePixiKtxTranscoder(): void {
   if (configured) return;
   configured = true;
   extensions.add(loadKTX2); // v8 does NOT auto-register this — without it .ktx2 sprites can't parse
-  setKTXTranscoderPath({
-    jsUrl: assetUrl('/pixi-ktx/libktx.js'),
-    wasmUrl: assetUrl('/pixi-ktx/libktx.wasm'),
-  });
+  setKTXTranscoderPath(pixiKtxTranscoderUrls()); // `?v=<content hash>` on a published build (#1586)
 }

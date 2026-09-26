@@ -22,6 +22,7 @@ import {
   setActiveRendererHandle, ktx2CapsReady, areKtx2CapsReady, markKtx2CapsReady,
 } from '../core/activeRenderer';
 import { ktx2LoaderCtor, prewarmGlbLoaders } from './threeLoaderModules';
+import { basisTranscoderUrlModifier } from './transcoderUrls';
 import { warnVocabOnce } from '../core/warnVocab';
 import { hasDocKey } from '../core/docKeys';
 import { getActiveTextureSizeCap } from '../core/textureSizeCap';
@@ -55,7 +56,10 @@ export async function getKTX2Loader(): Promise<KTX2Loader> {
     // Whoever lands second must reuse the first loader, or `detectSupport` gets applied to a
     // loader nobody else holds and every KTX2 load after it rejects on missing caps.
     if (!ktx2Loader) {
-      ktx2Loader = new Ctor();
+      // #1586: the transcoder pair's URLs carry `?v=<content hash>` on a published build — see
+      // `basisTranscoderUrlModifier` for why that takes a manager rather than the path.
+      const modifyUrl = basisTranscoderUrlModifier();
+      ktx2Loader = new Ctor(modifyUrl ? new THREE.LoadingManager().setURLModifier(modifyUrl) : undefined);
       ktx2Loader.setTranscoderPath(assetUrl('/basis/'));
     }
   }

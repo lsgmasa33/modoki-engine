@@ -13,3 +13,8 @@ declare const __MODOKI_MODULE_RENDER2D__: boolean;
 declare const __MODOKI_MODULE_PHYSICS2D__: boolean;
 declare const __MODOKI_MODULE_PHYSICS3D__: boolean;
 declare const __MODOKI_MODULE_VIDEO__: boolean;
+
+/** #1586: each KTX2 transcoder pair's content hash (`engine/plugins/transcoders.ts`), appended to its
+ *  URLs as `?v=`. Blank strings in the editor, dev and playable builds. Supplied via the host's Vite
+ *  `define`. */
+declare const __MODOKI_TRANSCODER_VERSIONS__: { readonly basis: string; readonly pixiKtx: string };

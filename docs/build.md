@@ -2285,6 +2285,24 @@ values the native pass writes into the app bundle, so the browser tab never drif
 The editor keeps "Modoki" and the bear. A set-but-missing `iconSource` warns and falls back; a
 playable emits no favicon (it strips the link and would inline the file under its byte cap).
 
+**The KTX2 transcoder pairs carry `?v=<content hash>` too** (#1586). Every non-playable build copies
+three's Basis transcoder to `basis/basis_transcoder.{js,wasm}` and PixiJS's libktx to
+`pixi-ktx/libktx.{js,wasm}` under FIXED names, because the loaders ask for those names — and the site
+Worker caches non-HTML/JSON files for a day. So a three or pixi bump could leave a returning visitor
+with the OLD `.js` and the NEW `.wasm` (or the reverse), and every KTX2 texture would fail to decode
+until the cache expired. `engine/plugins/transcoders.ts` hashes each PAIR as one (both files, so the two
+URLs always move together) and `vite.config.ts` bakes the result into `__MODOKI_TRANSCODER_VERSIONS__`;
+`runtime/loaders/transcoderUrls.ts` appends it. Two details that are not obvious:
+- **three cannot take a query on its path** — `KTX2Loader` joins `setTranscoderPath(dir)` with the fixed
+  names — so `getKTX2Loader` builds the loader on a `LoadingManager` whose URL modifier versions just
+  those two names. Pixi's `setKTXTranscoderPath` takes the full URLs and gets the query directly.
+- **The copy, the version and the dev backend share ONE source lookup** (`transcoderSourceDir`,
+  project `node_modules` then the editor's), so the hash cannot describe bytes other than the shipped ones.
+
+The version is blank in the editor (served live from `node_modules`, no CDN) and in a playable (no
+transcoder ships), which leaves those URLs bare. A query rather than a versioned directory, because a
+page still running the previous bundle keeps asking for the bare URL and must not 404.
+
 #### `--target native` heals through the same function as the editor (#148, #150, #685, #827)
 
 Before its shell steps, a native build heals the project through **one function,

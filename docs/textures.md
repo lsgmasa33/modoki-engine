@@ -669,8 +669,10 @@ do on its own:
 `/pixi-ktx/*` is served in dev by the backend static-asset handler
 (`plugins/backend/staticAssets.ts`, from `node_modules/pixi.js/transcoders/ktx`,
 project-root-then-editor fallback) and copied into `dist/pixi-ktx/` at build time
-by `shipPixiKtxTranscoder()` in `vite-asset-scanner.ts` — mirroring how the
-three.js Basis transcoder is provided at `/basis/` for the 3D KTX2 path.
+by `shipTranscoders()` in `engine/plugins/transcoders.ts` — mirroring how the
+three.js Basis transcoder is provided at `/basis/` for the 3D KTX2 path. On a published build both
+pairs are requested with `?v=<content hash>` so a three/pixi bump cannot pair a CDN-cached `.js` with
+a fresh `.wasm` — [build.md](build.md) § "Web", the transcoder-pairs paragraph (#1586).
 
 ### The dev URL carries the content hash (#1022)
 

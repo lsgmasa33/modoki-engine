@@ -49,3 +49,8 @@ declare const __MODOKI_MODULE_VIDEO__: boolean;
  *  in vite.config.ts. See docs/playable-export.md. */
 declare const __MODOKI_PLAYABLE__: boolean;
 declare const __MODOKI_PLAYABLE_CLICK_URL__: string;
+
+/** #1586: each KTX2 transcoder pair's content hash (`engine/plugins/transcoders.ts`), appended to its
+ *  URLs as `?v=` by `runtime/loaders/transcoderUrls.ts`. Blank strings in the editor, dev and
+ *  playable builds. Defined via Vite `define` in vite.config.ts. */
+declare const __MODOKI_TRANSCODER_VERSIONS__: { readonly basis: string; readonly pixiKtx: string };

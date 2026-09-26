@@ -99,6 +99,7 @@ import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
 import { writeBackendResult } from './backend/writeResult';
 import { openInOS } from './backend/osOpen';
+import { shipTranscoders } from './transcoders';
 
 
 
@@ -285,44 +286,6 @@ function writeJsonAtomic(absPath: string, json: unknown): void {
   const tmp = absPath + '.tmp';
   fs.writeFileSync(tmp, assetJsonBytes(json));
   fs.renameSync(tmp, absPath);
-}
-
-/** Copy the three.js Basis transcoder (KTX2Loader runtime dep) into `dist/basis`.
- *  Needed by every build that renders KTX2 textures — the game web build and the
- *  editor build alike. No-op if three isn't present. */
-function shipBasisTranscoder(projectRoot: string, distDir: string, ...fallbackRoots: string[]): void {
-  // Resolve three's transcoder from the project's node_modules, falling back to
-  // the editor root's. A FLAT in-repo project (projectRoot = games/<id>) has no
-  // node_modules of its own — three lives at the editor/repo root — so without
-  // the fallback dist/basis is never written and the deployed build 404s on
-  // /basis/basis_transcoder.{js,wasm}, failing every KTX2 texture.
-  const basisSrc = [projectRoot, ...fallbackRoots]
-    .map((r) => path.join(r, 'node_modules/three/examples/jsm/libs/basis'))
-    .find((p) => fs.existsSync(p));
-  if (!basisSrc) return;
-  const basisDest = path.join(distDir, 'basis');
-  fs.mkdirSync(basisDest, { recursive: true });
-  for (const f of ['basis_transcoder.js', 'basis_transcoder.wasm']) {
-    const s = path.join(basisSrc, f);
-    if (fs.existsSync(s)) fs.copyFileSync(s, path.join(basisDest, f));
-  }
-}
-
-/** Copy the PixiJS KTX2 transcoder (libktx — `loadKTX2`'s runtime dep) into
- *  `dist/pixi-ktx`, mirroring {@link shipBasisTranscoder}. Needed by every build
- *  that renders KTX2 *sprites* (2D path). Bundled in pixi.js's `transcoders/` dir;
- *  falls back to the editor root for FLAT projects with no local node_modules. */
-function shipPixiKtxTranscoder(projectRoot: string, distDir: string, ...fallbackRoots: string[]): void {
-  const ktxSrc = [projectRoot, ...fallbackRoots]
-    .map((r) => path.join(r, 'node_modules/pixi.js/transcoders/ktx'))
-    .find((p) => fs.existsSync(p));
-  if (!ktxSrc) return;
-  const ktxDest = path.join(distDir, 'pixi-ktx');
-  fs.mkdirSync(ktxDest, { recursive: true });
-  for (const f of ['libktx.js', 'libktx.wasm']) {
-    const s = path.join(ktxSrc, f);
-    if (fs.existsSync(s)) fs.copyFileSync(s, path.join(ktxDest, f));
-  }
 }
 
 /** Write a fresh GUID into an asset's source file (JSON `id`) or its sidecar
@@ -3739,8 +3702,7 @@ export function assetScannerPlugin(): Plugin {
       // its texture set is WebP-only (browser-decoded), so it emits zero KTX2
       // variants and nothing loads the ~1.2 MB of transcoder wasm.
       if (!playable) {
-        shipBasisTranscoder(projectRoot, distDir, editorRoot);
-        shipPixiKtxTranscoder(projectRoot, distDir, editorRoot);
+        shipTranscoders(distDir, [projectRoot, editorRoot]);
       }
 
       // Editor builds (`MODOKI_EDITOR=true vite build`, the packaged Electron

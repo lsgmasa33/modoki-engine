@@ -9,7 +9,7 @@
  * The bundler turns each `new URL(…, import.meta.url)` into an emitted `assets/basis_transcoder-<hash>.*`
  * file (~585 KB together). The loader reads them only when `transcoderPath === ''`, and the engine's
  * one construction site (`getKTX2Loader` in `runtime/loaders/textureResolver.ts`) always calls
- * `setTranscoderPath(assetUrl('/basis/'))` — the unhashed copy `shipBasisTranscoder` writes. So the
+ * `setTranscoderPath(assetUrl('/basis/'))` — the copy `shipTranscoders` (`transcoders.ts`) writes. So the
  * hashed pair is never fetched: dead weight in every web/native build, and in a playable build the
  * stray `.js` trips `inlinePlayable`'s single-chunk guard and fails the export outright.
  *
