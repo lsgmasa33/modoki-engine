@@ -12,7 +12,9 @@
  *  what a build actually got wrong in review. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { bootSplashMarkup, BOOT_SPLASH_FILE } from '../../plugins/bootSplash';
+import path from 'node:path';
+import { bootSplashMarkup, bootSplashPlugin, bootSplashUrl, BOOT_SPLASH_FILE } from '../../plugins/bootSplash';
+import { loadProjectConfig } from '../../plugins/load-project-config';
 
 describe('bootSplashMarkup', () => {
   const html = bootSplashMarkup('/boot-splash.webp', '#0a0a1a');
@@ -109,3 +111,35 @@ describe('dismissBootSplash', () => {
     expect(hasBootSplash()).toBe(false);
   });
 });
+
+// The splash keeps a fixed file name behind a CDN that caches unhashed files for a day; the URL the
+// markup uses carries the content hash so a changed splash is a new URL (2026-09-26, the favicon's twin).
+describe('bootSplashUrl', () => {
+  it('is the file under the base with a content-hash query, whatever the base\'s trailing slash', () => {
+    const url = bootSplashUrl('/court/', Buffer.from('art'));
+    expect(url).toMatch(new RegExp(`^/court/${BOOT_SPLASH_FILE.replace('.', '\\.')}\\?v=[0-9a-f]{16}$`));
+    expect(bootSplashUrl('/court', Buffer.from('art'))).toBe(url);
+  });
+
+  it('changes when the art changes, and only then', () => {
+    expect(bootSplashUrl('/', Buffer.from('a'))).toBe(bootSplashUrl('/', Buffer.from('a')));
+    expect(bootSplashUrl('/', Buffer.from('a'))).not.toBe(bootSplashUrl('/', Buffer.from('b')));
+  });
+});
+
+// The function above is half of it: the plugin's HTML hook must USE it, or a revert of the one line
+// that injects the markup would leave every case here green. Driven the way Vite drives it, on Court's
+// real splash config.
+describe('bootSplashPlugin injects the versioned URL', () => {
+  const repoRoot = path.resolve(__dirname, '../../..');
+  const court = path.join(repoRoot, 'games/court');
+
+  it.each(['/court/', '/court'])('base %s', async (base) => {
+    const plugin = bootSplashPlugin(court, loadProjectConfig(court), repoRoot);
+    (plugin.configResolved as (c: { base: string }) => void)({ base });
+    await (plugin.buildStart as (this: unknown) => Promise<void>).call({ warn: (m: string) => { throw new Error(m); } });
+    const hook = plugin.transformIndexHtml as { handler: (h: string) => string };
+    expect(hook.handler('<body></body>')).toMatch(/url\('\/court\/boot-splash\.webp\?v=[0-9a-f]{16}'\)/);
+  });
+});
+

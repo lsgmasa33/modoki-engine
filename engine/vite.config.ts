@@ -14,6 +14,8 @@ import { ktx2LoaderAssetStripPlugin } from './plugins/ktx2LoaderAssetStrip'
 import { msdfWorkerAssetStripPlugin } from './plugins/msdfWorkerAssetStrip'
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
 import { bootSplashPlugin } from './plugins/bootSplash'
+import { documentTitlePlugin } from './plugins/documentTitle'
+import { faviconPlugin } from './plugins/favicon'
 import { earlyConsoleShimPlugin } from './plugins/earlyConsoleShim'
 import { projectLockfilesHash } from './plugins/projectLockfileHash'
 import { projectScanEntries } from './plugins/projectScanEntries'
@@ -265,33 +267,6 @@ function hostSharedDeps(): Plugin {
   }
 }
 
-// The editor's favicon is the engine's bundled Modoki icon. With publicDir off and
-// no public/ dir, the editor SPA build (`build:editor`) would otherwise ship NO
-// favicon — index.html's `<link rel="icon" href="%BASE_URL%favicon.png">` 404s. This
-// plugin (a) emits favicon.png at the dist root on build, so the packaged Electron
-// shell serves it, and (b) serves it in `vite` dev.
-function faviconPlugin(): Plugin {
-  const faviconSrc = path.join(engineDir, 'packages/modoki/src/runtime/assets/favicon.png')
-  return {
-    name: 'modoki:favicon',
-    generateBundle() {
-      try { this.emitFile({ type: 'asset', fileName: 'favicon.png', source: fs.readFileSync(faviconSrc) }) }
-      catch { /* favicon missing — skip (not fatal) */ }
-    },
-    configureServer(server) {
-      server.middlewares.use((req, res, next) => {
-        const reqUrl = (req.url || '').split('?')[0]
-        if (reqUrl !== '/favicon.png' && reqUrl !== `${server.config.base}favicon.png`) { next(); return }
-        try {
-          const buf = fs.readFileSync(faviconSrc)
-          res.setHeader('Content-Type', 'image/png')
-          res.end(buf)
-        } catch { next() }
-      })
-    },
-  }
-}
-
 // https://vite.dev/config/
 export default defineConfig(({ command }) => {
   // #29 teardown: the repo root is no longer a buildable game. Each game ships
@@ -394,7 +369,14 @@ export default defineConfig(({ command }) => {
   },
   plugins: [
     react(),
-    faviconPlugin(),
+    // The game's app icon on a game build, the engine's Modoki icon in the editor (2026-09-26).
+    faviconPlugin({
+      engineIcon: path.join(engineDir, 'packages/modoki/src/runtime/assets/favicon.png'),
+      projectRoot: buildProjectRoot,
+      iconSource: loadProjectConfig(buildProjectRoot).app.iconSource,
+      isEditorBuild,
+      isPlayable,
+    }),
     // Strips the inline early-console shim (#633) out of index.html when installConsoleRing.ts's
     // gate would leave nothing to drain it — see engine/plugins/earlyConsoleShim.ts for why this
     // mirrors that gate by hand instead of sharing it.
@@ -415,6 +397,10 @@ export default defineConfig(({ command }) => {
     // emits nothing and its boot is unchanged. Skipped for the EDITOR shell, which opens projects
     // at runtime and so has no project splash to bake in, and for a PLAYABLE, whose whole point is
     // one file under a byte cap.
+    // The tab title is the game's appName, not "Modoki" (#1583). Build-only; the editor keeps its own.
+    ...(process.env.MODOKI_EDITOR !== 'true'
+      ? [documentTitlePlugin(loadProjectConfig(buildProjectRoot).app.appName)]
+      : []),
     ...(process.env.MODOKI_EDITOR !== 'true' && !isPlayable
       ? [bootSplashPlugin(buildProjectRoot, loadProjectConfig(buildProjectRoot), repoRoot)]
       : []),

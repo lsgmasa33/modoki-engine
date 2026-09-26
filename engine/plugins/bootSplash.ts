@@ -33,6 +33,7 @@
  *  web boot splash lands on the same pixels rather than jumping.
  */
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Plugin } from 'vite';
@@ -63,6 +64,18 @@ function projectFile(projectRoot: string, raw: string | undefined): string | und
   const t = raw?.trim();
   if (!t) return undefined;
   return path.isAbsolute(t) ? t : path.join(projectRoot, t);
+}
+
+/** The splash URL the markup points at: the file under the resolved base, with a `?v=<content hash>`.
+ *  The file keeps its fixed name, the CDN in front of the published games caches unhashed files for a
+ *  day, and the web deploy marks every `**.webp` in the bucket `immutable` for a YEAR (this one
+ *  included), so without the query a changed splash would show the OLD art for a day at the edge and
+ *  far longer in a returning browser. The favicon hit exactly this on 2026-09-26. The query is the
+ *  engine's own cache-bust convention (textures and fonts carry it), and `index.html`, which holds
+ *  the markup, is no-cache. */
+export function bootSplashUrl(base: string, bytes: Buffer): string {
+  const v = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+  return `${base.endsWith('/') ? base : `${base}/`}${BOOT_SPLASH_FILE}?v=${v}`;
 }
 
 /** Emit the composited boot splash and inject the markup that shows it.
@@ -131,8 +144,7 @@ export function bootSplashPlugin(projectRoot: string, cfg: ProjectConfig, engine
       order: 'post',
       handler(html) {
         if (!composed) return html;
-        const url = `${base.endsWith('/') ? base : `${base}/`}${BOOT_SPLASH_FILE}`;
-        return html.replace('</body>', `${bootSplashMarkup(url, background)}</body>`);
+        return html.replace('</body>', `${bootSplashMarkup(bootSplashUrl(base, composed), background)}</body>`);
       },
     },
   };

@@ -96,8 +96,8 @@ export interface PlayableInput {
 
 /** Strip `<script type=module src>`, `<link rel=stylesheet|modulepreload>`, and the favicon
  *  `<link rel=icon>` external refs from the built HTML — everything is inlined into the bootstrap
- *  instead. The favicon is inlined+deleted from disk by the caller, so its `<link href=/favicon.png>`
- *  would otherwise be a dangling 404 in a "fully offline" artifact (and a playable needs no favicon). */
+ *  instead. A playable build emits no favicon at all (`faviconPlugin`'s `isPlayable`), so its
+ *  `<link href=…/favicon.png>` would otherwise be a dangling 404 in a "fully offline" artifact. */
 export function stripExternalRefs(html: string): string {
   return html
     .replace(/<script\b[^>]*\bsrc=["'][^"']*["'][^>]*><\/script>/gi, '')

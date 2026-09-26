@@ -625,7 +625,11 @@ alive for. `App.tsx` fades it out on the same "fully booted" signal that hides t
 so on device the native splash hands over to the identical composition rather than cutting to dark
 — and also whenever something must be seen underneath it (a boot error, an OTA download's
 progress), since a launch image outranking an error would turn an explained failure into a hang.
-Build-only, and skipped for the editor shell and for a playable.
+Build-only, and skipped for the editor shell and for a playable. The markup's URL carries a
+`?v=<content hash>` (`bootSplashUrl`): the file keeps its fixed name, and behind the published games'
+CDN an unhashed file stays cached for a day, and the deploy marks every `**.webp` immutable for a year
+(`cdnBinaryCacheSteps`), this file included, so without it a new splash would show the old art for
+that long in a returning browser.
 
 ⚠️ **The native splash is handed over as soon as the boot splash has painted**, not when the game
 is ready — `hasBootSplash()` gates it, so a project with no boot splash keeps the old
@@ -978,7 +982,7 @@ a retry"; that was never true, and #173's slot only narrowed the window.
 **What a step IS (#1537).** A `BuildStep` is one of three kinds — `exec` (program + argv, no
 shell; `winCommand` swaps in `gradlew.bat`), `shell` (only the compound Mac iOS-install steps; text
 built by the `sh` template, every value a `ref()` carried in env), or `inproc` (reveal in
-Finder/Explorer, favicon copy, the release archive clear). A step no longer has a command STRING, so
+Finder/Explorer, the release archive clear). A step no longer has a command STRING, so
 no path or config value is ever parsed by bash or cmd.exe; `when` gates one at run time (the CDN
 step runs per extension dist/ actually holds). The custom web deploy command is the one shell text
 the project author writes (`authoredShell`). Why: [windows.md](windows.md) § "Never hand a shell a
@@ -2270,6 +2274,16 @@ direction: defaulting would be silently wrong for one of the two callers.
 ⚠️ **A web build must be SERVED over HTTP.** Opening `games/<id>/dist/index.html` as `file://`
 fails with module, CORS and asset-fetch errors that look exactly like build bugs, and that
 misreading has cost time. Serve the `dist/` folder (any static server) before diagnosing anything.
+
+**A game build carries the GAME's identity, not the engine's** (2026-09-26, #1583). The shared
+`engine/index.html` says `<title>Modoki</title>` and links `favicon.png`; on every game build (any
+target, not the editor shell) `engine/plugins/documentTitle.ts` sets the title to `app.appName`, and
+`engine/plugins/favicon.ts` emits `app.iconSource` downscaled to 128² as `favicon.png`, linked from
+the no-cache `index.html` as `favicon.png?v=<content hash>` (the bare name sat stale behind the CDN
+for a day after Court's icon changed; the boot splash carries the same query) — the same
+values the native pass writes into the app bundle, so the browser tab never drifts from the app.
+The editor keeps "Modoki" and the bear. A set-but-missing `iconSource` warns and falls back; a
+playable emits no favicon (it strips the link and would inline the file under its byte cap).
 
 #### `--target native` heals through the same function as the editor (#148, #150, #685, #827)
 

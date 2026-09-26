@@ -110,7 +110,16 @@ There is no CDN invalidation step anymore — the old deploy ran
 `gcloud compute url-maps invalidate-cdn-cache static-lb`; that url-map no longer exists, and
 nothing purges Cloudflare on deploy. Staleness is bounded by the Worker's own edge TTLs
 (`ttlFor()`) instead:
-- `.html` → 60s, so a publish becomes visible in about a minute.
+- `.html` and `.json` → 60s, so a publish becomes visible in about a minute. JSON joined HTML on
+  2026-09-26: a published game (`/court/`, `/weaveling/`) loads `assets.manifest.json` and scene/prefab
+  JSON under STABLE names, and at a day's TTL a redeploy served the previous deploy's manifest — a
+  newly added texture resolved to nothing until the edge copy expired.
+  The Worker also sends those two `cache-control: no-cache` to the BROWSER: Cloudflare rewrites the
+  origin's `no-cache` to the zone's Browser Cache TTL (4h on HTML, 86400 on JSON, measured
+  2026-09-26), so without it a returning visitor kept the old manifest from their own cache.
+  ⚠️ Both halves live only once the Worker is re-uploaded (above) — and **a TTL DECREASE also needs a
+  purge**: an object already at the edge keeps the `cacheTtl` it was stored with. On 2026-09-26 the
+  manifests cached under the old 86400 were still served an hour after the new Worker went live.
 - everything else → 86400s (1 day). Vite/VitePress build assets are content-hashed in their
   filename so a changed file is a changed URL and can be cached hard regardless; the day-long
   TTL exists for **unhashed** media (models, textures, audio) sharing the bucket — long enough

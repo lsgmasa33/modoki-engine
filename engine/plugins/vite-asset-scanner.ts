@@ -2661,24 +2661,22 @@ export function assetScannerPlugin(): Plugin {
           // infrastructure (dist/, engine/, ios/, android/, package.json,
           // capacitor.config) lives at the repo/editor root, and `npm run build`
           // already writes dist there (npm runs scripts from the package root). For
-          // a FLAT in-repo project (projectRoot = games/<id>) the raw steps (favicon
-          // cp, gcloud rsync of dist, cap sync, gradlew) would otherwise resolve
+          // a FLAT in-repo project (projectRoot = games/<id>) the raw steps (gcloud
+          // rsync of dist, cap sync, gradlew) would otherwise resolve
           // engine/ + dist/ under the project and fail. MODOKI_PROJECT (inherited by
           // the build subprocess) still steers vite at the open project's assets.
           // (Truly external projects with their own native/ are the #29 rework.)
           const buildCwd = editorRoot || projectRoot;
           // #29: the build emits to the OPEN PROJECT's dist (games/<id>/dist; see
-          // vite.config buildProjectRoot). The favicon cp + gcloud rsync run from
+          // vite.config buildProjectRoot). The gcloud rsync runs from
           // buildCwd (repo root), so reference that dist relative to buildCwd
           // (e.g. "games/3d-test/dist"); falls back to "dist" for a repo-root build.
-          // #29: the web DEPLOY (favicon, rsync, cache) belongs to the game root —
+          // #29: the web DEPLOY (rsync, cache) belongs to the game root —
           // run it from the project (its dist is games/<id>/dist, so `dist` is
           // project-relative) and deploy to the project's own bucket. Only the
           // `npm run build` COMPILE stays at the editor root (shared vite/engine,
-          // steered by MODOKI_PROJECT). The favicon is an engine asset, so its
-          // source is resolved absolutely against the editor root.
+          // steered by MODOKI_PROJECT).
           const webCwd = projectRoot;
-          const faviconSrc = path.join(buildCwd, 'engine/packages/modoki/src/runtime/assets/favicon.png');
           // #29 per-game native: each flat project OWNS its native folders
           // (games/<id>/ios | android) — the shared repo-root native scaffold was
           // removed in the teardown. cap sync + the native build run FROM the
@@ -2884,13 +2882,14 @@ export function assetScannerPlugin(): Plugin {
               execStep('Installing on device...', androidCwd, adbBin, [...adbSerialArgs, 'install', '-r', 'android/app/build/outputs/apk/debug/app-debug.apk']),
               execStep('Launching app...', androidCwd, adbBin, [...adbSerialArgs, 'shell', 'am', 'start', '-n', `${APP_ID}/.MainActivity`]),
             ],
-            // Web build ALWAYS compiles to <project>/dist + favicon. Deploy is
+            // Web build ALWAYS compiles to <project>/dist (the build emits the favicon —
+            // the game's own icon, engine/plugins/favicon.ts; a copy step here used to
+            // overwrite it with the engine's). Deploy is
             // appended below per precedence: custom command > built-in gcloud (if a
             // bucket is set) > none (stop at dist). "Not everyone has a GCS bucket."
             web: [
               // env-var prefixes → spawn env (cross-platform; bash-only `FOO=bar cmd` fails on cmd).
               execStep('Building web assets (game-only)...', buildCwd, 'node', ['engine/scripts/build-web.mjs', '--target', 'web'], { env: { BASE_PATH: cfg.build.webBasePath, VITE_GAME_ONLY: 'true' } }),
-              { kind: 'inproc', label: 'Adding favicon...', run: () => fs.copyFileSync(faviconSrc, path.join(webCwd, 'dist', 'favicon.png')) },
             ],
             // Playable ad: a single self-contained HTML (VITE_PLAYABLE=1 → the asset
             // profile inlines every reachable asset + the single-file inliner emits
@@ -4248,8 +4247,7 @@ export function assetScannerPlugin(): Plugin {
       // We import vite dynamically so the plugin doesn't need a top-level
       // dependency on vite's runtime API surface beyond `type { Plugin }`.
       // Engine source + repo root for the build SSR server. Derive from editorRoot
-      // (= dirname(config.root) = repoRoot; the favicon copy below trusts the same
-      // editorRoot+'engine/...' join) — NOT the module-level import.meta.url consts,
+      // (= dirname(config.root) = repoRoot) — NOT the module-level import.meta.url consts,
       // which Vite breaks by relocating the bundled plugin into node_modules/.vite-temp
       // (so `../packages/...` resolves to engine/node_modules/packages/...). Fall back
       // to the consts only if editorRoot is somehow unset.
