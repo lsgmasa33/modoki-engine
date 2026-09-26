@@ -72,6 +72,18 @@ describe('loadProjectConfig', () => {
     expect(cfg.app.appId).toBe(DEFAULT_PROJECT_CONFIG.app.appId);
   });
 
+  it('#1588: a gcs project that names no CDN resolves to NO CDN step — the default is not a real url-map', () => {
+    // The web deploy runs `gcloud compute url-maps invalidate-cdn-cache <webCdnUrlMap>` whenever the
+    // resolved value is non-empty (vite-asset-scanner.ts). The default once named the deleted GCP
+    // load balancer, so a project that set neither key failed every deploy AFTER uploading.
+    fs.writeFileSync(configPath(), JSON.stringify({ build: { webDeployMode: 'gcs', webBasePath: '/g/' } }));
+    fs.writeFileSync(userConfigPath(), JSON.stringify({ build: { webBucket: 'gs://b/g' } }));
+    const cfg = loadProjectConfig(root);
+    expect(cfg.build.webBucket).toBe('gs://b/g');
+    expect(cfg.build.webCdnUrlMap).toBe('');
+    expect(cfg.build.webCdnBackendBucket).toBe('');
+  });
+
   it('defaults build.debugBuild to false (release ships no journal/debug menu/eval-capable bridge)', () => {
     // Absent from an existing config → the safe default. A game opts in explicitly.
     expect(loadProjectConfig(root).build.debugBuild).toBe(false);

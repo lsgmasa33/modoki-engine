@@ -739,7 +739,9 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     webDeployMode: 'gcs',
     webBucket: 'gs://modoki-www-site/demo',
     webBasePath: '/demo/',
-    webCdnUrlMap: 'static-lb',
+    // Empty = no CDN step. The old default named the GCP load balancer deleted 2026-08-03
+    // (docs/site-hosting.md) — a latent hazard for a project omitting the key (#1588).
+    webCdnUrlMap: '',
     webCdnBackendBucket: '',
     webDeployCommand: '',
     appleTeamId: '',
