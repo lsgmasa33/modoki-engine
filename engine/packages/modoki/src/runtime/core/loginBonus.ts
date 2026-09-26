@@ -39,7 +39,8 @@ export interface LoginBonusSegment {
   /** RELATIVE weight, not a percentage — the draw normalizes by the sum, so retuning one slice does
    *  not force a rebalance of the others. */
   weight: number;
-  /** Coins this slice pays. 0 on `no-ads` — its substitution is decided by `resolveLoginBonusPayout`. */
+  /** Coins this slice pays. 0 on `no-ads` — its substitution is decided by `resolveLoginBonusPayout` —
+   *  except under `noAdsPaysCoins`, where `no-ads` IS a coin slice. */
   coins: number;
   /** Minutes of ad-free play this slice pays. 0 on every coin slice. */
   noAdsMinutes: number;
@@ -65,6 +66,18 @@ export interface LoginBonusPolicy {
    * players who already paid, and the feature reads as broken.
    */
   noAdsSubstituteCoins: number;
+  /**
+   * `true` on a build that shows no ads at all (a game's published web build, #1585). The `no-ads`
+   * slot then becomes a COIN slice paying `noAdsSubstituteCoins` — at the same weight, under the
+   * same id — rather than a prize that does nothing where it is won.
+   *
+   * ⚠️ Decided HERE, when the wheel is composed, not in `resolveLoginBonusPayout`. A payout-time
+   * swap pays coins under a wedge that still shows the ad-free label and icon, because every game
+   * draws the wedge from the segment; composing a coin slice makes the label, the icon, the result
+   * line, the reveal card and a game's welcome-back lookup (`noAdsMinutes > 0`) all agree without a
+   * second check in each. Not an authored knob — a game derives it from its platform.
+   */
+  noAdsPaysCoins?: boolean;
 }
 
 /** The ids of the coin tiers, in ladder order — index `i` of `LoginBonusPolicy.tiers`. */
@@ -91,7 +104,13 @@ export function loginBonusSegments(policy: LoginBonusPolicy): LoginBonusSegment[
   });
   const minutes = Math.floor(policy.noAdsMinutes);
   if (policy.noAdsWeight > 0 && Number.isFinite(policy.noAdsWeight) && minutes > 0) {
-    out.push({ id: 'no-ads', weight: policy.noAdsWeight, coins: 0, noAdsMinutes: minutes });
+    if (policy.noAdsPaysCoins) {
+      // The coin-slice rule above applies to the substitute too: a slice paying nothing is a blank.
+      const coins = Math.floor(policy.noAdsSubstituteCoins);
+      if (coins > 0 && Number.isFinite(coins)) out.push({ id: 'no-ads', weight: policy.noAdsWeight, coins, noAdsMinutes: 0 });
+    } else {
+      out.push({ id: 'no-ads', weight: policy.noAdsWeight, coins: 0, noAdsMinutes: minutes });
+    }
   }
   return out;
 }

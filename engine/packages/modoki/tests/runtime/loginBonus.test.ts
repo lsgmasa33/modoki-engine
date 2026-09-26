@@ -62,6 +62,23 @@ describe('loginBonusSegments — composing the wheel', () => {
     expect(loginBonusSegments(policy).map((s) => s.id)).not.toContain('coins-1');
   });
 
+  it('noAdsPaysCoins turns the no-ads slot into a coin slice at the same weight — a build with no ads gets no ad-free prize (#1585)', () => {
+    const segs = loginBonusSegments({ ...POLICY, noAdsPaysCoins: true });
+    expect(segs.map((s) => s.id)).toEqual(['coins-1', 'coins-2', 'coins-3', 'coins-4', 'no-ads']);
+    const slot = segs.find((s) => s.id === 'no-ads')!;
+    expect(slot).toEqual({ id: 'no-ads', weight: 13, coins: 20, noAdsMinutes: 0 });
+    // No slice left pays minutes — the lookup a game's welcome-back gift uses finds nothing.
+    expect(segs.some((s) => s.noAdsMinutes > 0)).toBe(false);
+    // And the payout is the slice's own coins, not a substitution.
+    expect(resolveLoginBonusPayout(slot, POLICY, { noAdsForeverOwned: false, noAdsGrantable: true }))
+      .toEqual({ coins: 20, noAdsMinutes: 0, substituted: '' });
+  });
+
+  it('noAdsPaysCoins with a zero substitute drops the slot — a coin slice paying nothing is a blank', () => {
+    expect(loginBonusSegments({ ...POLICY, noAdsPaysCoins: true, noAdsSubstituteCoins: 0 }).map((s) => s.id))
+      .not.toContain('no-ads');
+  });
+
   it('drops the no-ads slice when its weight is zero', () => {
     expect(loginBonusSegments({ ...POLICY, noAdsWeight: 0 }).map((s) => s.id)).not.toContain('no-ads');
   });
