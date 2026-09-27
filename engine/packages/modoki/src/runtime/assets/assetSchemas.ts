@@ -64,7 +64,7 @@ export interface AssetSchema {
 
 // ── Material (standard MeshStandardMaterial surface the editor writes) ──
 const MATERIAL_FIELDS: FieldMeta[] = [
-  { key: 'version', type: 'number', note: 'the format this document was written by (MATERIAL_FORMAT_VERSION) — never hand-author it; the writer stamps it on save' },
+  { key: 'version', type: 'number', note: 'the format this document was written by (MATERIAL_FORMAT_VERSION) — never hand-author it; /api/asset-write stamps it on save when absent (a newer or non-integer one is refused)' },
   { key: 'shader', type: 'enum', enum: ['builtin', 'unlit', 'file'], default: 'builtin', note: 'builtin = MeshStandardMaterial' },
   { key: 'color', type: 'color', default: 0xffffff },
   { key: 'roughness', type: 'number', default: 1, min: 0, max: 1 },
@@ -109,7 +109,7 @@ export function defaultMaterial(): Record<string, unknown> {
 
 // ── Particle (top-level ParticleEffectDef surface) ──
 const PARTICLE_FIELDS: FieldMeta[] = [
-  { key: 'version', type: 'number', note: 'the format this document was written by (PARTICLE_FORMAT_VERSION) — never hand-author it; the writer stamps it on save' },
+  { key: 'version', type: 'number', note: 'the format this document was written by (PARTICLE_FORMAT_VERSION) — never hand-author it; /api/asset-write stamps it on save when absent (a newer or non-integer one is refused)' },
   { key: 'name', type: 'string' },
   { key: 'space', type: 'enum', enum: ['2d', '3d'], default: '3d', note: 'editor preview hint only (2d=PixiJS, 3d=Three.js); runtime routing is by Canvas2D ancestry, not this' },
   { key: 'duration', type: 'number', default: 5, note: 'loop period (s)' },
@@ -207,7 +207,7 @@ const ANIMSET_FIELDS: FieldMeta[] = [
 // (pages, frame map, hash) lives in the `.meta.json` sidecar and is never written through here. --
 const ATLAS_FIELDS: FieldMeta[] = [
   { key: 'id', type: 'string', note: 'stable GUID (mirrors .meta.json)' },
-  { key: 'version', type: 'number', note: 'the format this document was written by (ATLAS_FORMAT_VERSION) - never hand-author it; the writer stamps it on save' },
+  { key: 'version', type: 'number', note: 'the format this document was written by (ATLAS_FORMAT_VERSION) - never hand-author it; /api/asset-write stamps it on save when absent (a newer or non-integer one is refused)' },
   { key: 'members', type: 'array', note: 'sprite-slice GUID refs to pack, never literal paths' },
   { key: 'pageSize', type: 'number', default: 1024, note: 'square page edge in px; MUST be a multiple of 4 (block-compressed KTX2 renders black otherwise)' },
   { key: 'padding', type: 'number', default: 2, min: 0, note: 'gap in px between adjacent packed sprites' },
@@ -270,6 +270,17 @@ export function defaultAssetData(type: AssetSchemaType): unknown {
 
 const TS_TYPEOF: Partial<Record<AssetFieldType, string>> = { number: 'number', color: 'number', boolean: 'boolean', string: 'string', ref: 'string', enum: 'string' };
 
+/** The format-version constant per asset type — only the types whose documents carry a stamped
+ *  `version` (docs/format-versioning.md § 3). `.anim.json`, `.spriteanim.json`, `.timeline.json`
+ *  and `.rig2d.json` carry none, so they are deliberately absent rather than mapped to an invented
+ *  constant. The ONE table: `validateAssetData` checks an incoming version against it, and
+ *  `/api/asset-write` refuses a too-new file on disk and stamps an absent version from it. */
+export const ASSET_FORMAT_VERSION: Partial<Record<AssetSchemaType, number>> = {
+  material: MATERIAL_FORMAT_VERSION,
+  particle: PARTICLE_FORMAT_VERSION,
+  atlas: ATLAS_FORMAT_VERSION,
+};
+
 /** Warn-but-write validation: hard `errors` block the write (malformed doc);
  *  `warnings` (field type mismatch, out-of-range, unknown enum) are surfaced but
  *  don't block — mirrors sceneMutate / validate-scene. */
@@ -284,14 +295,20 @@ export function validateAssetData(type: AssetSchemaType, data: unknown): { error
   const byKey = new Map(schema.fields.map((f) => [f.key, f] as const));
 
   // Per-type required-field sanity (hard errors only for fundamentals).
-  // Strictly-greater only (docs/format-versioning.md § 2a) — the old `obj.version !== 1` flagged
-  // a legitimately OLDER/absent document exactly as loudly as a too-new one. Advisory only: this
-  // pushes to `warnings`, never `errors`, so nothing here blocks the write (the load-time REFUSAL
-  // for `.particle.json` lives in `particleCache.ts` / `ParticleEditor.tsx`).
-  if (type === 'particle') {
-    const verdict = classifyFormatVersion(obj, PARTICLE_FORMAT_VERSION);
+  // The FORMAT VERSION a writer sends (docs/format-versioning.md § 2a/§ 2b). Strictly-greater
+  // only — the old `obj.version !== 1` flagged a legitimately OLDER/absent document exactly as
+  // loudly as a too-new one. A HARD ERROR since #1590's close-out review, not advisory: this is
+  // the check `particle_set` runs BEFORE it parks, and the one `/api/asset-write` runs before it
+  // writes. As a warning, `particle_set {version: 2}` was applied and parked, and then every
+  // save_all was refused by the route, leaving the asset dirty forever. Absent is fine: the route
+  // stamps it.
+  const formatVersion = ASSET_FORMAT_VERSION[type];
+  if (formatVersion !== undefined) {
+    const verdict = classifyFormatVersion(obj, formatVersion);
     if (verdict.kind === 'too-new') {
-      warnings.push(`particle.version ${verdict.version} is newer than this build's PARTICLE_FORMAT_VERSION (${PARTICLE_FORMAT_VERSION})`);
+      errors.push(`${type}.version ${verdict.version} is newer than this build's format version (${formatVersion}) — omit \`version\`; the writer stamps it`);
+    } else if (verdict.kind === 'unreadable') {
+      errors.push(`${type}.version must be an integer (${verdict.reason}) — omit \`version\`; the writer stamps it`);
     }
   }
   if (type === 'animation' && !Array.isArray(obj.tracks) && obj.tracks !== undefined) {
@@ -321,10 +338,6 @@ export function validateAssetData(type: AssetSchemaType, data: unknown): { error
     // Adreno/Mali (CLAUDE.md § Texture Import Pipeline), so it warns loudly rather than silently
     // producing an unusable page.
     if (obj.members !== undefined && !Array.isArray(obj.members)) errors.push('atlas.members must be an array of sprite GUIDs');
-    const verdict = classifyFormatVersion(obj, ATLAS_FORMAT_VERSION);
-    if (verdict.kind === 'too-new') {
-      warnings.push(`atlas.version ${verdict.version} is newer than this build's ATLAS_FORMAT_VERSION (${ATLAS_FORMAT_VERSION})`);
-    }
     if (typeof obj.pageSize === 'number' && obj.pageSize % 4 !== 0) {
       warnings.push(`atlas.pageSize ${obj.pageSize} is not a multiple of 4 - a block-compressed page of this size renders SOLID BLACK on Adreno/Mali GPUs`);
     }

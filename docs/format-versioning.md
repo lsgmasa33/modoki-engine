@@ -114,6 +114,26 @@ helper stamps the constant. Two consequences worth stating because both were vio
   a document ends up claiming semantics the writing build does not implement (#763's defect).
   `Math.max(stored, current)` has the same trap and needs the same audit.
 
+**For assets this is `/api/asset-write`** (`editorBackendRouter.ts`). It covers every type in the
+ONE table, `ASSET_FORMAT_VERSION` (`assetSchemas.ts` — `particle`, `material`, `atlas`), and deals
+with the INCOMING `data.version` in two places (#1590):
+- **`validateAssetData`** errors on a **too-new or non-integer** version, so it is refused. This
+  is the check `particle_set` also runs before it applies and parks, so the op refuses at call
+  time. When this was only a warning, a `version: 2` def was applied and parked, and every
+  `save_all` then failed to flush it.
+- **The route** stamps an **absent** version with the constant, before the dropped-field guard.
+  Until #1590 nothing stamped at all, although the asset schema told every writer to omit the
+  field. So an agent's `particle_set` that obeyed was parked versionless, and every `save_all` was
+  refused for "dropping" the `version` the file on disk had.
+- **A present, readable** version is written as sent.
+
+⚠️ **Stamp an ABSENT version only, never over a present one.** `buildNextAtlasDoc` stamps on the
+same condition (it uses `??`, so it also stamps over `null`, which the route refuses as
+non-integer). The reason is the same: the writer cannot migrate. Stamping over an older version
+labels unmigrated content current. Stamping over a NEWER one disarms every later reader's too-new
+refusal: the close-out review reproduced a `version: 2` particle landing on disk as `1` under the
+first version of this fix.
+
 A writer that cannot route through the shared helper must do **both** halves itself — stamp *and*,
 if it can overwrite an existing document, refuse a `too-new` one. Doing only the refusal produces an
 unstamped document, which is the same defect wearing a different face; that exact mistake shipped

@@ -1130,6 +1130,57 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     });
   });
 
+  // ── #1597 — the pre-flight runs the SAME per-field check as the file validator. It used to carry
+  // its own copy, which lacked the entity-ref exemption (a guid parentId warned "expected number")
+  // and never looked inside a JSON-string bank (Animator.clips of bare GUIDs answered ok, silently
+  // clipless). Driven through the LIVE path, the one the report was made on. ──
+  describe('pre-flight value warnings (#1597)', () => {
+    const schema = { traits: {
+      EntityAttributes: { category: 'component' as const, fields: { parentId: { type: 'number' as const, entityId: true as const }, layer: { type: 'enum' as const, options: ['2d', '3d', 'ui'] } } },
+      Transform: { category: 'component' as const, fields: { x: { type: 'number' as const } } },
+      Animator: { category: 'component' as const, fields: { clips: { type: 'string' as const } } },
+    } };
+    const live = async (ops: unknown[]) => {
+      const scenePath = tempScene();
+      const ctx = makeCtx({
+        getSchema: () => schema,
+        requestBrowser: vi.fn(async (op: string) => {
+          if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+          return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [] };
+        }),
+      });
+      return (await post('/api/scene-mutate', { path: scenePath, ops }, ctx)) as { body: { ok: boolean; warnings: string[] } };
+    };
+    const GUID = '1827fb08-5b1e-4a8e-9d3c-0123456789ab';
+
+    it('a guid EntityAttributes.parentId on addEntity draws no type warning', async () => {
+      const r = await live([{ op: 'addEntity', name: 'Child', traits: { EntityAttributes: { parentId: GUID } } }]);
+      expect(r.body.ok).toBe(true);
+      expect(r.body.warnings.join('\n')).not.toMatch(/parentId/);
+    });
+
+    it('a non-entity number field given a string still warns (the exemption is not blanket)', async () => {
+      const r = await live([{ op: 'addEntity', name: 'Box', traits: { Transform: { x: GUID } } }]);
+      expect(r.body.warnings.join('\n')).toMatch(/Transform\.x: expected number, got string/);
+    });
+
+    it('Animator.clips of bare GUIDs warns that the whole bank is dropped', async () => {
+      const r = await live([{ op: 'setTrait', entity: { id: 1 }, trait: 'Animator', fields: { clips: GUID } }]);
+      expect(r.body.ok).toBe(true);
+      expect(r.body.warnings.join('\n')).toMatch(/ops\[0\]\.Animator\.clips is not valid JSON.*whole bank is dropped/);
+    });
+
+    it('Animator.clips as a JSON array of GUID strings warns per dropped entry', async () => {
+      const r = await live([{ op: 'setTrait', entity: { id: 1 }, trait: 'Animator', fields: { clips: JSON.stringify([GUID]) } }]);
+      expect(r.body.warnings.join('\n')).toMatch(/Animator\.clips\[0\] is not a \{name, clip\} object — the entry is silently dropped/);
+    });
+
+    it('a well-formed Animator.clips bank draws no warning', async () => {
+      const r = await live([{ op: 'setTrait', entity: { id: 1 }, trait: 'Animator', fields: { clips: JSON.stringify([{ name: 'fly', clip: GUID }]) } }]);
+      expect(r.body.warnings.join('\n')).not.toMatch(/Animator/);
+    });
+  });
+
   // ── A setTrait naming an unknown FIELD on a KNOWN trait is a certain typo (the loader drops
   // it), so with a schema available it must FAIL rather than report {ok:true, changed:1}. Kept
   // narrow — unknown trait + cold start stay warn-but-load.

@@ -47,6 +47,17 @@ describe('buildSceneSchema', () => {
     expect(fields.mode).toEqual({ type: 'enum', options: ['a', 'b'] });
   });
 
+  it('carries FieldHint.entityId as entityId:true, so the validator accepts a guid there (#1597)', () => {
+    const T = trait({ parent: 0, plain: 0 });
+    registerTrait({
+      name: 'SchemaEntityRefTrait', trait: T, category: 'component',
+      fields: { parent: { type: 'number', entityId: { onMissing: 'root' } }, plain: { type: 'number' } },
+    });
+    const fields = buildSceneSchema().traits['SchemaEntityRefTrait'].fields;
+    expect(fields.parent).toEqual({ type: 'number', default: 0, entityId: true });
+    expect(fields.plain).toEqual({ type: 'number', default: 0 });
+  });
+
   it('enumerates AoS trait fields (factory schema) so custom-section fields are KNOWN', () => {
     // An AoS trait (`trait(() => ({...}))`) stores its schema as a FACTORY, not an
     // object. Fields edited by a custom Inspector section (animSets/boneMaps here,

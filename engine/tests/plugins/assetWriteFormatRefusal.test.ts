@@ -106,3 +106,82 @@ describe('/api/asset-write — refuses to overwrite a document it cannot read', 
     expect(onDisk.name).toBe('Updated');
   });
 });
+
+/** #1590 — the route STAMPS the format version (docs/format-versioning.md § 2b). The schema tells
+ *  a writer never to hand-author `version`; a `particle_set` that obeyed was parked versionless, and
+ *  the dropped-field guard then refused every save because the file on disk has `version`. */
+describe('/api/asset-write — stamps the format version itself', () => {
+  const versionless = () => {
+    const { version: _drop, ...rest } = defaultParticleEffect();
+    return rest;
+  };
+
+  it('a versionless write over a versioned file is NOT refused as a drop, and lands stamped', async () => {
+    fs.writeFileSync(absPath(), JSON.stringify({ ...defaultParticleEffect(), id: 'guid-1', name: 'Old' }, null, 2));
+
+    const res = (await post('/api/asset-write', {
+      path: ASSET_PATH, type: 'particle', data: { ...versionless(), id: 'guid-1', name: 'Fireflies' },
+    }, makeCtx())) as { body: { ok?: boolean; error?: string } };
+
+    expect(res.body.error).toBeUndefined();
+    expect(res.body.ok).toBe(true);
+    const onDisk = JSON.parse(fs.readFileSync(absPath(), 'utf-8'));
+    expect(onDisk.name).toBe('Fireflies');
+    expect(onDisk.version).toBe(PARTICLE_FORMAT_VERSION);
+  });
+
+  it('keeps a present, readable caller version — it cannot migrate, so it does not relabel content current', async () => {
+    fs.writeFileSync(absPath(), JSON.stringify({ ...defaultParticleEffect(), id: 'guid-1', name: 'Old' }, null, 2));
+
+    const res = (await post('/api/asset-write', {
+      path: ASSET_PATH, type: 'particle', data: { ...defaultParticleEffect(), version: 0, id: 'guid-1', name: 'Legacy' },
+    }, makeCtx())) as { body: { ok?: boolean } };
+
+    expect(res.body.ok).toBe(true);
+    expect(JSON.parse(fs.readFileSync(absPath(), 'utf-8')).version).toBe(0);
+  });
+
+  it('REFUSES a too-new incoming version instead of stamping it down (close-out review)', async () => {
+    const before = JSON.stringify({ ...defaultParticleEffect(), id: 'guid-1', name: 'Old' }, null, 2);
+    fs.writeFileSync(absPath(), before);
+
+    const res = (await post('/api/asset-write', {
+      path: ASSET_PATH, type: 'particle',
+      data: { ...defaultParticleEffect(), version: PARTICLE_FORMAT_VERSION + 1, id: 'guid-1', futureField: 1 },
+    }, makeCtx())) as { status?: number; body: { ok?: boolean; errors?: string[] } };
+
+    // Refused by `validateAssetData` — the SAME check `particle_set` runs before it parks, so the
+    // op refuses at call time instead of parking a def every save_all then fails to flush.
+    expect(res.status).toBe(400);
+    expect(res.body.ok).toBe(false);
+    expect((res.body.errors ?? []).join('\n')).toMatch(/particle\.version \d+ is newer than this build/);
+    expect(fs.readFileSync(absPath(), 'utf-8')).toBe(before);
+  });
+
+  it('REFUSES a non-integer incoming version', async () => {
+    const before = JSON.stringify({ ...defaultParticleEffect(), id: 'guid-1', name: 'Old' }, null, 2);
+    fs.writeFileSync(absPath(), before);
+
+    const res = (await post('/api/asset-write', {
+      path: ASSET_PATH, type: 'particle', data: { ...defaultParticleEffect(), version: '1', id: 'guid-1' },
+    }, makeCtx())) as { status?: number; body: { ok?: boolean; errors?: string[] } };
+
+    expect(res.status).toBe(400);
+    expect(res.body.ok).toBe(false);
+    expect((res.body.errors ?? []).join('\n')).toMatch(/particle\.version must be an integer/);
+    expect(fs.readFileSync(absPath(), 'utf-8')).toBe(before);
+  });
+
+  it('adds no version to a type with no format constant (animation)', async () => {
+    const animAbs = path.join(projectRoot, 'assets/probe.anim.json');
+    fs.writeFileSync(animAbs, JSON.stringify({ id: 'guid-a', name: 'Clip', duration: 1, frameRate: 60, tracks: [] }));
+    const res = (await post('/api/asset-write', {
+      path: '/assets/probe.anim.json', type: 'animation',
+      data: { id: 'guid-a', name: 'Clip', duration: 1, frameRate: 60, tracks: [] },
+    }, makeCtx())) as { body: { ok?: boolean; error?: string } };
+
+    expect(res.body.error).toBeUndefined();
+    expect(res.body.ok).toBe(true);
+    expect('version' in JSON.parse(fs.readFileSync(animAbs, 'utf-8'))).toBe(false);
+  });
+});

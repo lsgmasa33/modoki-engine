@@ -191,16 +191,19 @@ function detectFieldTypos(
   // junk field the loader ignores — the identical silent no-op this guard exists to stop, reachable
   // through the identical tool. Checking one and not the other is the inconsistency class the
   // audit keeps finding (§9).
-  const fieldSets: Array<{ trait: string; fields: Record<string, unknown> }> = [];
-  for (const op of ops as Array<{ op?: string; trait?: string; fields?: Record<string, unknown>; traits?: Record<string, unknown> }>) {
-    if (op.op === 'setTrait' && op.trait && op.fields) fieldSets.push({ trait: op.trait, fields: op.fields });
+  // `at` labels a bank warning with the op that carries it (`ops[2]`), the one address a
+  // pre-flight has — the entity may not exist yet.
+  const fieldSets: Array<{ trait: string; fields: Record<string, unknown>; at: string }> = [];
+  (ops as Array<{ op?: string; trait?: string; fields?: Record<string, unknown>; traits?: Record<string, unknown> }>).forEach((op, i) => {
+    const at = `ops[${i}]`;
+    if (op.op === 'setTrait' && op.trait && op.fields) fieldSets.push({ trait: op.trait, fields: op.fields, at });
     else if (op.op === 'addEntity' && op.traits && typeof op.traits === 'object') {
       for (const [trait, data] of Object.entries(op.traits)) {
         // `true` is a tag (presence, no fields) and carries nothing to misspell.
-        if (data && typeof data === 'object' && !Array.isArray(data)) fieldSets.push({ trait, fields: data as Record<string, unknown> });
+        if (data && typeof data === 'object' && !Array.isArray(data)) fieldSets.push({ trait, fields: data as Record<string, unknown>, at });
       }
     }
-  }
+  });
   for (const op of fieldSets) {
     const ts = schema.traits[op.trait];
     if (!ts) continue; // unknown trait → warn-but-load, not a hard error
@@ -238,14 +241,16 @@ function detectFieldTypos(
     const ts = schema.traits[op.trait];
     if (!ts) continue;
     for (const [f, value] of Object.entries(op.fields)) {
-      const hint = ts.fields[f];
-      if (!hint?.type) continue;
-      const mismatch = typeMismatch(hint.type, value);
+      const hint = hasDocKey(ts.fields, f) ? ts.fields[f] : undefined;
+      if (!hint) continue;
+      // The SAME per-field check `validateSceneData` runs (#1597) — this loop used to carry its
+      // own copy, which lacked the entity-ref exemption and flagged a guid parentId.
+      const mismatch = fieldValueWarning(hint, value);
       if (mismatch) typeWarnings.push(`${op.trait}.${f}: ${mismatch}`);
-      else if (hint.type === 'enum' && hint.options && typeof value === 'string' && !hint.options.includes(value)) {
-        typeWarnings.push(`${op.trait}.${f}: '${value}' not in [${hint.options.join(', ')}]`);
-      }
     }
+    // JSON-string banks (`Animator.clips`, `AudioSource.clips`, `UIEntries.prefabs`): a string of
+    // the wrong shape passes the type check and is dropped by its parser without a word (#1597).
+    typeWarnings.push(...jsonBankWarnings({ [op.trait]: op.fields }, op.at));
   }
   if (!bad.length) return typeWarnings.length ? { error: '', extra: { typeWarnings } } : null;
   return {
@@ -279,7 +284,7 @@ import {
   PROJECT_CONFIG_FILENAME, PRIVATE_BUILD_FIELDS,
   findNullPatchPaths, DEFAULT_PROJECT_CONFIG, DEFAULT_PROJECT_USER_CONFIG, type RawProjectConfig,
 } from '../../project-config';
-import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver, type AssetRefResolver, makeAssetRefResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { validateSceneData, validatePrefabData, fieldValueWarning, jsonBankWarnings, type SceneSchema, type PrefabResolver, type AssetRefResolver, makeAssetRefResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
@@ -293,12 +298,9 @@ import { parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../t
 // message is not cosmetic on a surface whose whole job is telling an agent what it may pass.
 import {
   getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData,
-  ASSET_SCHEMA_TYPES, type AssetSchemaType,
+  ASSET_SCHEMA_TYPES, ASSET_FORMAT_VERSION, type AssetSchemaType,
 } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { classifyJsonFormatVersion } from '../../packages/modoki/src/runtime/core/formatVersion';
-import { PARTICLE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/particles/types';
-import { MATERIAL_FORMAT_VERSION } from '../../packages/modoki/src/runtime/traits/Renderable3D';
-import { ATLAS_FORMAT_VERSION } from '../../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 // Type-only, and deliberately from the DOM-free `frameLoopStatus` LEAF, not `frameDriver.ts`
 // itself: this router is reachable from `engine/electron/backendServer.ts`, compiled under
@@ -311,19 +313,12 @@ import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering
 // silently disarms the guard on a rename that `bridge.ts`'s type-checked twin would catch.
 import type { FrameLoopStatus } from '../../packages/modoki/src/runtime/rendering/frameLoopStatus';
 
-// Format-version constant per `AssetSchemaType`, for /api/asset-write's too-new/unreadable
-// refusal (docs/format-versioning.md § 2b). Only types that actually carry a stamped `version`
-// field belong here — `.anim.json`, `.spriteanim.json`, `.timeline.json` and `.rig2d.json`
-// don't (§ 3), so they are deliberately absent rather than mapped to an invented constant.
-const ASSET_WRITE_FORMAT_VERSION: Partial<Record<AssetSchemaType, number>> = {
-  material: MATERIAL_FORMAT_VERSION,
-  particle: PARTICLE_FORMAT_VERSION,
-  // #831: `.atlas.json` came onto this route when AtlasAssetView stopped autosaving. It carries a
-  // stamped `version`, and the PANEL already refuses a too-new one client-side
-  // (`classifyAtlasLoad`) — so without this row the refusal lived only in the UI and an agent's
-  // `modoki_write_asset` could overwrite a document this build cannot read.
-  atlas: ATLAS_FORMAT_VERSION,
-};
+// Format-version constant per `AssetSchemaType` — the ONE table lives beside `validateAssetData`
+// (`ASSET_FORMAT_VERSION`, assetSchemas.ts), which checks an INCOMING version against it; this
+// route uses it to refuse a too-new FILE and to stamp an absent version (#1590). It used to be a
+// second copy here. #831 is why `atlas` is in it: an atlas carries a stamped `version`, and without
+// the row a too-new one was refused only in the panel, never on an agent's `modoki_write_asset`.
+const ASSET_WRITE_FORMAT_VERSION = ASSET_FORMAT_VERSION;
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
 import { adbBinary, isUsable, listAndroidDevices, pickHostSideAndroidSerial, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
@@ -4494,8 +4489,23 @@ async function describeUnresolvedAgainstLiveWorld(
       if (prevText !== null) {
         try { prevDoc = JSON.parse(prevText) as Record<string, unknown>; } catch { prevDoc = null; }
       }
+      // ── Stamp an ABSENT format version HERE, for every writer (#1590, docs/format-versioning.md
+      // § 2b). The schema tells agents never to hand-author `version`, and nothing stamped it — so a
+      // `particle_set` that obeyed was parked versionless and every save_all hit the dropped-field
+      // guard below (the file on disk HAS `version`), leaving the asset dirty forever. Before the
+      // guard, so an obedient write is not a "drop".
+      // ⚠️ ABSENT only. A PRESENT version is the caller's claim about the content, and this route
+      // cannot migrate: stamping the constant over an older one would label unmigrated content
+      // current, and over a NEWER one would disarm every later reader's too-new refusal (close-out
+      // review, reproduced: a `version: 2` particle landed on disk as `1`). A too-new or
+      // non-integer incoming version never reaches here — `validateAssetData` above refuses it,
+      // the same check `particle_set` runs before it parks.
+      const writeFormatVersion = ASSET_WRITE_FORMAT_VERSION[type];
+      const doc: unknown = isObj && writeFormatVersion !== undefined && (data as Record<string, unknown>).version === undefined
+        ? { ...(data as Record<string, unknown>), version: writeFormatVersion }
+        : data;
       if (isObj && prevDoc && !(body as { replace?: boolean })?.replace) {
-        const incoming = new Set(Object.keys(data as object));
+        const incoming = new Set(Object.keys(doc as object));
         const dropped = Object.keys(prevDoc).filter((k) => k !== 'id' && !incoming.has(k));
         if (dropped.length) {
           return json({
@@ -4508,7 +4518,7 @@ async function describeUnresolvedAgainstLiveWorld(
           }, 409);
         }
       }
-      const out = normalizeAssetData(type, data) as Record<string, unknown>;
+      const out = normalizeAssetData(type, doc) as Record<string, unknown>;
       // Preserve identity: keep the existing file's id if the new doc omits one.
       // `!out.id`, NOT `out.id == null`: normalizeAssetData NORMALISES a missing id to an
       // EMPTY STRING (normalizeAnimationClip: `id: json.id ?? ''`), and '' == null is false —

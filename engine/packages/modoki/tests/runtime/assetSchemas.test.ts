@@ -55,11 +55,20 @@ describe('validateAssetData (warn-but-write)', () => {
     expect(validateAssetData('particle', {}).warnings.join('\n')).not.toMatch(/version/);
   });
 
-  it('particle: warns (advisory only) when the version is newer than this build supports', () => {
+  // Was "advisory only — never blocks the write". That expectation was wrong once `particle_set`
+  // relied on this check before parking (#1590 close-out review): a warned-through `version: 99`
+  // was applied live and parked, then refused by /api/asset-write on every save_all, leaving the
+  // asset dirty forever. A writer must not store a version it does not understand (§ 2b).
+  it('particle: ERRORS when the version is newer than this build supports, or not an integer', () => {
     const r = validateAssetData('particle', { version: 99 });
-    expect(r.errors).toEqual([]); // advisory only — never blocks the write
-    expect(r.warnings.join('\n')).toMatch(/version/);
-    expect(r.warnings.join('\n')).toContain('99');
+    expect(r.errors.join('\n')).toMatch(/particle\.version 99 is newer/);
+    expect(validateAssetData('particle', { version: '1' }).errors.join('\n')).toMatch(/must be an integer/);
+  });
+
+  it('material and atlas get the same version check from the one table', () => {
+    expect(validateAssetData('material', { version: 99 }).errors.join('\n')).toMatch(/material\.version 99 is newer/);
+    expect(validateAssetData('atlas', { version: 99 }).errors.join('\n')).toMatch(/atlas\.version 99 is newer/);
+    expect(validateAssetData('animation', { version: 99, tracks: [] }).errors).toEqual([]);
   });
 });
 

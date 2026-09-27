@@ -21,6 +21,11 @@ import {
 // The bank parser, NOT `traits/UIEntries` itself — that module calls `trait({...})` at import
 // time and this one is deliberately dependency-light (see module docs above).
 import { parseEntryPrefabs } from '../traits/entryPrefabBank';
+// The two clip-bank PARSERS (dependency-free leaves), so a bank entry is judged "dropped" by the
+// same code that drops it at runtime rather than by a second copy of its rule (#1597).
+import { parseAnimClipBankResult } from '../animation/animClipBank';
+import { parseClipBankResult } from '../audio/clipBank';
+import { parseColliderPoints } from '../core/colliderPoints';
 import { hasDocKey } from '../core/docKeys';
 import { readUILength, type UIElementLengthField } from '../traits/uiLength';
 import {
@@ -124,7 +129,13 @@ export interface TraitSchema {
   /** `default` is the trait's koota schema default, scalars only. Load-bearing now that
    *  serialize.ts OMITS a field still holding its default: without it a reader of a scene
    *  file cannot tell what an absent field's effective value is. */
-  fields: Record<string, { type?: FieldType; options?: string[]; default?: unknown }>;
+  fields: Record<string, {
+    type?: FieldType; options?: string[]; default?: unknown;
+    /** Carried from `FieldHint.entityId`: the field holds an ENTITY reference — a koota id at
+     *  runtime, serialized as the referenced entity's guid (or, in a legacy file, a raw id). Both
+     *  forms are valid, so the type check accepts a string or a number here (#1597). */
+    entityId?: true;
+  }>;
 }
 
 export interface SceneSchema {
@@ -811,20 +822,8 @@ export function validateSceneData(
             warnings.push(`${label}.${traitName}: unknown field '${field}'`);
             continue;
           }
-          if (!hint.type) continue; // known field, but no confident type to check
-          // EntityAttributes.parentId and PrefabInstance.rootInstanceId are numbers in
-          // the live trait schema (the runtime koota-id handle) but are SERIALIZED as a
-          // GUID string ('' / the referenced entity's guid — Phase 2, scene-loading.md)
-          // or, in a legacy file, a raw numeric id. Don't flag the on-disk guid form.
-          if (((traitName === 'EntityAttributes' && field === 'parentId')
-              || (traitName === 'PrefabInstance' && field === 'rootInstanceId'))
-              && (typeof value === 'string' || typeof value === 'number')) continue;
-          const mismatch = typeMismatch(hint.type, value);
-          if (mismatch) {
-            warnings.push(`${label}.${traitName}.${field}: ${mismatch}`);
-          } else if (hint.type === 'enum' && hint.options && typeof value === 'string' && !hint.options.includes(value)) {
-            warnings.push(`${label}.${traitName}.${field}: '${value}' not in [${hint.options.join(', ')}]`);
-          }
+          const mismatch = fieldValueWarning(hint, value);
+          if (mismatch) warnings.push(`${label}.${traitName}.${field}: ${mismatch}`);
         }
       }
 
@@ -908,7 +907,7 @@ export function validateSceneData(
 
     // #671 — the `UIEntries.prefabs` bank's own integrity. The edge it names is walked once,
     // scene-wide, after this loop.
-    warnings.push(...entryBankWarnings(e.traits, label, assetExists));
+    warnings.push(...jsonBankWarnings(e.traits, label, assetExists));
 
     // Prefab self-reference: an instance whose source is its OWN guid would recurse.
     const pi = e.traits?.PrefabInstance;
@@ -1154,9 +1153,101 @@ function entityLabel(entity: SceneEntityLike | undefined, idx: number): string {
   return `entity[${idx}]`;
 }
 
+/** The per-FIELD value check, shared by `validateSceneData` and the scene-mutate pre-flight
+ *  (`detectFieldTypos` in `editorBackendRouter.ts`) — null when the value fits.
+ *
+ *  ⚠️ One function because two copies drifted (#1597). The file validator exempted
+ *  `EntityAttributes.parentId`/`PrefabInstance.rootInstanceId` from the number check BY NAME
+ *  (they are koota ids at runtime but serialize as the referenced entity's guid); the pre-flight
+ *  did not, so an `addEntity` giving a guid parent — which the live op resolves correctly, and
+ *  which is the preferred address everywhere — was told "expected number, got string". The
+ *  exemption now keys off the field's declared `entityId` flag, so a new entity-ref field gets
+ *  it without anyone remembering a name list. */
+export function fieldValueWarning(
+  hint: { type?: FieldType; options?: string[]; entityId?: true },
+  value: unknown,
+): string | null {
+  if (!hint.type) return null; // known field, but no confident type to check
+  if (hint.entityId && (typeof value === 'string' || typeof value === 'number')) return null;
+  const mismatch = typeMismatch(hint.type, value);
+  if (mismatch) return mismatch;
+  if (hint.type === 'enum' && hint.options && typeof value === 'string' && !hint.options.includes(value)) {
+    return `'${value}' not in [${hint.options.join(', ')}]`;
+  }
+  return null;
+}
+
+/** The JSON-string CLIP banks: a trait field typed `string` whose content is a JSON array of
+ *  entries. The type check passes any string, and each bank's parser drops a malformed bank or
+ *  entry without a word — so `Animator.clips` set to bare GUIDs answered `ok`, the animator had
+ *  no clips, and the Timeline track driving it did nothing, with no error anywhere (#1597).
+ *  `UIEntries.prefabs` is the third bank and keeps its own richer check (`entryBankWarnings`,
+ *  which also resolves the prefab GUIDs). */
+const CLIP_BANKS: ReadonlyArray<{
+  trait: string; field: string; shape: string; keys: readonly string[]; effect: string;
+  parse: (src: unknown) => { entries: unknown[]; malformed: boolean };
+}> = [
+  {
+    trait: 'Animator', field: 'clips', shape: '{name, clip}', keys: ['name', 'clip'],
+    effect: 'the Animator has no clips, so anything playing one (a Timeline track, a play action) does nothing',
+    parse: parseAnimClipBankResult,
+  },
+  {
+    trait: 'AudioSource', field: 'clips', shape: '{key, ref}', keys: ['key', 'ref'],
+    effect: 'the AudioSource has no clips, so nothing in the bank can play',
+    parse: parseClipBankResult,
+  },
+];
+
+/** Integrity warnings for every JSON-string bank on ONE entity's trait bag — the clip banks
+ *  above, `UIEntries.prefabs`, and `Collider2D.points`. Shared by `validateSceneData` and the scene-mutate
+ *  pre-flight, so a live edit and a file edit answer the same way (#1597).
+ *
+ *  An entry is reported as dropped only when the bank's own PARSER drops it (it is re-parsed
+ *  alone), so this cannot drift from what the runtime does. A non-string value is left to the
+ *  type check, which already reports it. */
+export function jsonBankWarnings(
+  traits: unknown, label: string, assetExists?: AssetRefResolver,
+): string[] {
+  const out = entryBankWarnings(traits, label, assetExists);
+  if (!traits || typeof traits !== 'object') return out;
+  for (const bankDef of CLIP_BANKS) {
+    const t = (traits as Record<string, unknown>)[bankDef.trait];
+    if (!t || typeof t !== 'object') continue;
+    const bank = (t as Record<string, unknown>)[bankDef.field];
+    if (typeof bank !== 'string' || bank === '') continue;
+    const at = `${label}.${bankDef.trait}.${bankDef.field}`;
+    if (!bankDef.parse(bank).malformed) {
+      const raw = JSON.parse(bank) as unknown[];
+      raw.forEach((item, i) => {
+        if (bankDef.parse(JSON.stringify([item])).entries.length) return;
+        const missing = item && typeof item === 'object'
+          ? bankDef.keys.filter((k) => typeof (item as Record<string, unknown>)[k] !== 'string')
+          : [];
+        out.push(`${at}[${i}] is ${missing.length ? `missing string ${missing.join(' and ')}` : `not a ${bankDef.shape} object`} — the entry is silently dropped`);
+      });
+      continue;
+    }
+    let parsed = true;
+    try { JSON.parse(bank); } catch { parsed = false; }
+    out.push(`${at} ${parsed ? `must be a JSON ARRAY of ${bankDef.shape}` : `is not valid JSON (expected an array of ${bankDef.shape})`} — the whole bank is dropped, so ${bankDef.effect}`);
+  }
+  // `Collider2D.points` is the same JSON-string scalar with no names to drop: `parseColliderPoints`
+  // answers `[]` for ANY malformed list (bad JSON, an odd flat length, a non-finite coordinate), so
+  // the whole list is all-or-nothing. Judged by that parser, for the same reason as the banks.
+  const col = (traits as Record<string, unknown>).Collider2D;
+  const pts = col && typeof col === 'object' ? (col as Record<string, unknown>).points : undefined;
+  if (typeof pts === 'string' && pts.trim() !== '' && parseColliderPoints(pts).length === 0) {
+    out.push(`${label}.Collider2D.points is not a point list ([[x,y],…] or flat [x,y,…] of finite numbers) — it parses to NO points, so a polygon/polyline collider has no shape`);
+  }
+  return out;
+}
+
 /** Returns a human-readable mismatch message, or null if the value fits the type. */
-/** Exported so the scene-mutate PRE-FLIGHT can run the same type check the file-path validator
- *  runs (independent review, 2026-07-30). The live branch — which `canGoLive` made the path almost
+/** The bare TYPE primitive; both validators reach it through `fieldValueWarning`, which adds the
+ *  entity-ref exemption and the enum check (#1597). Still exported from the package index.
+ *  History: exported so the scene-mutate PRE-FLIGHT could run the same type check the file-path
+ *  validator runs (independent review, 2026-07-30). The live branch — which `canGoLive` made the path almost
  *  every agent edit takes — never called `validateSceneData`, so a field written with the wrong
  *  TYPE came back `{ok:true, changed:1, warnings:[]}` while the file branch warned about it. One
  *  primitive, both branches, so they cannot answer differently about the same op. */

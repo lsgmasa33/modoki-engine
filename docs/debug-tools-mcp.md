@@ -1112,6 +1112,16 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
 - `modoki_get_scene_state` / `modoki_mutate_scene` / `modoki_validate_scene` — same live-world
   data + validated edits as the curl `/api/*` endpoints, relayed over the IPC bridge.
   (`modoki_mutate_scene` ops: setTrait / **removeTrait** / addEntity / removeEntity.)
+  Its pre-flight runs the SAME per-field check as the file validator (`fieldValueWarning` +
+  `jsonBankWarnings` in `sceneValidation.ts`), so both paths catch the same things: a wrong-typed
+  value, an enum miss, or a malformed JSON-string bank (`Animator.clips`, `AudioSource.clips`,
+  `UIEntries.prefabs`, `Collider2D.points`) comes back in `warnings`, labelled `ops[i]`. The
+  file-direct path ALSO runs `validateSceneData` over the whole scene, so there the same defect is
+  reported a second time, labelled with the entity name. Only that whole-scene pass can check a
+  `UIEntries.prefabs` GUID against the manifest. The pre-flight needs a schema, so it is skipped
+  on a cold start. An
+  entity-ref field (`FieldHint.entityId` — `parentId`, `rootInstanceId`) takes a guid or an id
+  without a warning (#1597: the pre-flight once had its own copy and flagged a guid parent).
 - `modoki_list_traits` / `modoki_list_assets` / `modoki_get_asset_meta` / `modoki_reimport_asset`.
   The two list tools are **summary-first**: bare, `list_assets` returns per-type counts and
   `list_traits` returns trait NAMES by category. Narrow to get detail — `list_assets {type|folder|name}`,

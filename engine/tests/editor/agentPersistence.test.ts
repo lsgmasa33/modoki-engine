@@ -207,6 +207,23 @@ describe('Path A — particle/anim/timeline ops: apply live AND always persist, 
     expect(hasUnsavedChanges()).toBe(true); // a parked asset write IS unsaved work
   });
 
+  it('particle-set REFUSES a too-new version at call time — applies nothing, parks nothing (#1590 close-out)', async () => {
+    // Before, validateAssetData only WARNED on it: the op applied the def live and parked it, and
+    // /api/asset-write then refused it on every save_all, so the asset stayed dirty forever.
+    const p = '/assets/fx/phase0.particle.json';
+    // The dirty registry is module state an earlier test may have parked into — so assert it did
+    // not CHANGE, rather than that the path is absent.
+    const parkedBefore = peekDirtyAsset(p)?.data;
+    const liveBefore = getParticleEffect(p);
+    const r = await runAgentOp('particle-set', {
+      path: p, def: { version: 99, emitter: { shape: 'point' }, particle: { lifetime: 7 } },
+    }) as { ok: boolean; errors?: string[] };
+    expect(r.ok).toBe(false);
+    expect((r.errors ?? []).join('\n')).toMatch(/particle\.version 99 is newer/);
+    expect(peekDirtyAsset(p)?.data).toBe(parkedBefore);
+    expect(getParticleEffect(p)).toBe(liveBefore);
+  });
+
   it('undoing an agent particle edit restores the PREVIOUS def, not just the stack pointer', async () => {
     // An entry that pops without restoring anything would be worse than none: it consumes the
     // human's Cmd-Z and changes nothing they can see.

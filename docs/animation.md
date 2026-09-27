@@ -76,6 +76,15 @@ tracks at runtime is `entity.set(Animator, { clip: 'walk' })` — mirroring `Ske
 `SpriteAnimator`. `resolveActiveClip(anim)` maps the active name → its `.anim.json` GUID + per-clip
 overrides; `activeClip` (runtimeOnly) names the clip the Animator has SELECTED.
 
+⚠️ **A malformed bank WARNS; it does not fail** (#1597). The field is typed `string`, so any string
+passes the type check, and the decoder drops a bank that is not a JSON array, or an entry without a
+string `name` and `clip`, without a word — `clips` set to bare GUIDs once answered `ok`, left the
+Animator clipless, and the Timeline track driving it did nothing. `jsonBankWarnings`
+(`sceneValidation.ts`) now names the dropped bank or each dropped entry, from both
+`modoki_mutate_scene` (live and file) and `validate_scene`. It judges an entry by re-running this
+decoder on it, so the warning cannot drift from what the runtime drops. `AudioSource.clips` gets the
+same check, and so does `Collider2D.points` (all-or-nothing: a list its parser rejects gives no points).
+
 ⚠️ **It is not evidence the clip is playing.** `activeClip` and `fadeElapsed` both advance even
 when the clip FAILED TO LOAD, so reading them back to confirm an animation fix reports success on a
 clip that never arrived — two bugs survived months that way. **Verify by reading the target

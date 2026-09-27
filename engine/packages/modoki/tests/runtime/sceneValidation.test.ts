@@ -6,7 +6,7 @@ import {
   validateSceneData, type SceneSchema, type PrefabResolver, type AssetRefResolver, type AssetRefVerdict,
   makeAssetRefResolver, lineHeightUnitWarnings, LINE_HEIGHT_MULTIPLIER_CEILING,
   collectEntryKindUses, entryBankWarnings, entryPrefabRootWarnings, type EntryKindUse,
-  collapsedNewlineWarnings,
+  collapsedNewlineWarnings, jsonBankWarnings, fieldValueWarning,
 } from '../../src/runtime/loaders/sceneValidation';
 
 const GUID = 'a1b2c3d4-1111-2222-3333-444455556666';
@@ -23,7 +23,7 @@ const schema: SceneSchema = {
     },
     EntityAttributes: {
       category: 'component',
-      fields: { name: { type: 'string' }, guid: { type: 'string' }, layer: { type: 'enum', options: ['2d', '3d', 'ui'] }, parentId: { type: 'number' } },
+      fields: { name: { type: 'string' }, guid: { type: 'string' }, layer: { type: 'enum', options: ['2d', '3d', 'ui'] }, parentId: { type: 'number', entityId: true } },
     },
     UIElement: {
       category: 'component',
@@ -42,7 +42,7 @@ const schema: SceneSchema = {
       fields: {
         source: { type: 'string' },
         localId: { type: 'number' },
-        rootInstanceId: { type: 'number' },
+        rootInstanceId: { type: 'number', entityId: true },
         parentLocalId: { type: 'number' },
       },
     },
@@ -1226,6 +1226,58 @@ describe('collectEntryKindUses (#671)', () => {
 
 /** #671 — the `UIEntries.prefabs` bank's own JSON integrity: every failure shape
  *  `parseEntryPrefabs` silently drops, surfaced instead. */
+describe('jsonBankWarnings — the clip banks (#1597)', () => {
+  const G = '1827fb08-5b1e-4a8e-9d3c-0123456789ab';
+  const w = (traits: Record<string, unknown>) => jsonBankWarnings(traits, 'E').join('\n');
+
+  it('Animator.clips that is not JSON warns the whole bank is dropped', () => {
+    expect(w({ Animator: { clips: G } })).toMatch(/E\.Animator\.clips is not valid JSON.*whole bank is dropped/);
+  });
+  it('Animator.clips that is JSON but not an array warns the whole bank is dropped', () => {
+    expect(w({ Animator: { clips: JSON.stringify({ name: 'a', clip: G }) } })).toMatch(/must be a JSON ARRAY of \{name, clip\}/);
+  });
+  it('names each entry the parser drops, and which key is missing', () => {
+    const out = w({ Animator: { clips: JSON.stringify([G, { name: 'fly' }, { name: 'ok', clip: G }]) } });
+    expect(out).toMatch(/Animator\.clips\[0\] is not a \{name, clip\} object/);
+    expect(out).toMatch(/Animator\.clips\[1\] is missing string clip/);
+    expect(out).not.toMatch(/clips\[2\]/);
+  });
+  it('a well-formed bank, the default \'[]\', and an empty string are all clean', () => {
+    expect(w({ Animator: { clips: JSON.stringify([{ name: 'fly', clip: G, speed: 2 }]) } })).toBe('');
+    expect(w({ Animator: { clips: '[]' } })).toBe('');
+    expect(w({ Animator: { clips: '' } })).toBe('');
+  });
+  it('covers AudioSource.clips ({key, ref}) the same way', () => {
+    expect(w({ AudioSource: { clips: JSON.stringify([{ key: 'hit' }]) } })).toMatch(/AudioSource\.clips\[0\] is missing string ref/);
+    expect(w({ AudioSource: { clips: JSON.stringify([{ key: 'hit', ref: G }]) } })).toBe('');
+  });
+  it('Collider2D.points that parses to no points warns; a valid list (either form) and empty are clean', () => {
+    expect(w({ Collider2D: { points: '[[0,0],[1,0],[1]]' } })).toMatch(/Collider2D\.points is not a point list/);
+    expect(w({ Collider2D: { points: 'nope' } })).toMatch(/Collider2D\.points is not a point list/);
+    expect(w({ Collider2D: { points: '[[0,0],[1,0],[1,1]]' } })).toBe('');
+    expect(w({ Collider2D: { points: '[0,0,1,0,1,1]' } })).toBe('');
+    expect(w({ Collider2D: { points: '' } })).toBe('');
+  });
+  it('still carries the UIEntries.prefabs check', () => {
+    expect(w({ UIEntries: { prefabs: 'nope' } })).toMatch(/UIEntries\.prefabs is not valid JSON/);
+  });
+  it('validateSceneData reports a malformed clip bank on a scene entity', () => {
+    const res = validateSceneData(scene([{ id: 1, name: 'Cam', traits: { Animator: { clips: G } } }]), schema);
+    expect(res.warnings.join('\n')).toMatch(/Animator\.clips is not valid JSON/);
+  });
+});
+
+describe('fieldValueWarning (#1597)', () => {
+  it('accepts a guid or a number in an entityId field, and flags neither-typed values', () => {
+    expect(fieldValueWarning({ type: 'number', entityId: true }, 'abc')).toBeNull();
+    expect(fieldValueWarning({ type: 'number', entityId: true }, 3)).toBeNull();
+    expect(fieldValueWarning({ type: 'number', entityId: true }, true)).toMatch(/expected number/);
+  });
+  it('without entityId a string in a number field still warns', () => {
+    expect(fieldValueWarning({ type: 'number' }, 'abc')).toMatch(/expected number, got string/);
+  });
+});
+
 describe('entryBankWarnings (#671)', () => {
   const GUID_A = 'a7b8c9d0-1111-2222-3333-444455556666';
   /** A DIFFERENT guid, used to build a manifest that does not contain `GUID_A`. */
