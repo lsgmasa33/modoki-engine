@@ -58,6 +58,17 @@ describe('buildSceneSchema', () => {
     expect(fields.plain).toEqual({ type: 'number', default: 0 });
   });
 
+  it('carries FieldHint.runtimeOnly as runtimeOnly:true, so the validators can say it is never saved (#1592)', () => {
+    const T = trait({ readBack: 0, plain: 0 });
+    registerTrait({
+      name: 'SchemaRuntimeOnlyTrait', trait: T, category: 'component',
+      fields: { readBack: { type: 'number', runtimeOnly: true }, plain: { type: 'number' } },
+    });
+    const fields = buildSceneSchema().traits['SchemaRuntimeOnlyTrait'].fields;
+    expect(fields.readBack).toEqual({ type: 'number', default: 0, runtimeOnly: true });
+    expect(fields.plain).toEqual({ type: 'number', default: 0 });
+  });
+
   it('enumerates AoS trait fields (factory schema) so custom-section fields are KNOWN', () => {
     // An AoS trait (`trait(() => ({...}))`) stores its schema as a FACTORY, not an
     // object. Fields edited by a custom Inspector section (animSets/boneMaps here,

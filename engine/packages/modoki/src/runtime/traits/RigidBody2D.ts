@@ -9,7 +9,8 @@ export type BodyType2D = 'dynamic' | 'static' | 'kinematic';
 /** The *motion* half of a 2D physics entity (pair with `Collider2D` for a shape).
  *  Velocities are in world units/s and radians/s (screen frame, Y-down); the physics
  *  system converts them to Rapier's meter/Y-up frame via `Physics2D.pixelsPerMeter`.
- *  The velocity fields are read-back each frame for dynamic bodies (runtimeOnly). */
+ *  The velocity fields are read-back each frame for dynamic bodies (runtimeOnly — never saved);
+ *  the AUTHORED launch velocity is `initialVx/initialVy/initialAngularVel` (#1592). */
 export const RigidBody2D = trait({
   bodyType: 'dynamic' as BodyType2D,
   /** Linear velocity, world units/s (screen frame). Read-back for dynamic bodies. */
@@ -17,6 +18,14 @@ export const RigidBody2D = trait({
   vy: 0 as number,
   /** Angular velocity, radians/s. Read-back for dynamic bodies. */
   angularVel: 0 as number,
+  /** Authored launch velocity (world units/s, radians/s) a NEW body starts with, unless code
+   *  already wrote `vx/vy`/`angularVel` before the body existed. See physics/launchVelocity. */
+  initialVx: 0 as number,
+  initialVy: 0 as number,
+  initialAngularVel: 0 as number,
+  /** Runtime: this entity has had a DYNAMIC body this Play, so `initial*` is spent
+   *  (physics/launchVelocity). runtimeOnly; cleared on Stop. */
+  launched: false as boolean,
   linearDamping: 0 as number,
   angularDamping: 0 as number,
   /** Per-body gravity multiplier (0 = float, 1 = full world gravity). */

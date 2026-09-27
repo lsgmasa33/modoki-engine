@@ -24,7 +24,7 @@ import { getCurrentWorld, spawnEntity } from '../runtime/core/ecs/world';
 import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
 import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
-import { setCurrentScenePath, setScenePersistenceProject, lastSceneKey, beginBootSceneWalk, type SceneLoadOutcome } from './scene/serialize';
+import { setCurrentScenePath, getCurrentScenePath, setScenePersistenceProject, lastSceneKey, beginBootSceneWalk, type SceneLoadOutcome } from './scene/serialize';
 import { sceneManager } from '../runtime/scene/SceneManager';
 import { registerSelectionRestore } from './store/selectionRestore';
 import { registerEditorRefLiveness } from './store/editorRefLiveness';
@@ -222,7 +222,13 @@ export async function canonicalBootScenePath(
  *  collaborators — exported for unit testing. */
 export async function loadFirstScene(
   candidates: string[],
-  deps: { canonicalize: (p: string) => Promise<string>; load: (p: string) => Promise<SceneLoadOutcome> },
+  deps: {
+    canonicalize: (p: string) => Promise<string>;
+    load: (p: string) => Promise<SceneLoadOutcome>;
+    /** Wait until no world switch is in flight (`BootSceneWalk.settle`). Without it, a superseded load is answered
+     *  from whatever is current at that instant — see `attempt` below for why that is not enough (#1598). */
+    settle?: () => Promise<boolean>;
+  },
 ): Promise<string | null> {
   // A candidate that THROWS must not abort the fallback chain. `load` rejects (it
   // does not merely resolve 'failed') whenever the host serves something that isn't the
@@ -269,6 +275,27 @@ export async function loadFirstScene(
     );
     return active;
   };
+  // One load of `p`: the path loaded, what won a supersede (possibly null), or `undefined` for "missed, try the next".
+  // A superseded load says nothing about who wins: the switch that superseded it can still be in flight, or can
+  // fail after it (#1598 close-out reviews). So settle first, then decide:
+  // - a FOREIGN scene won (`settle` answers overtaken) → report it; the caller yields to it.
+  // - the editor ADOPTED `p` → it is loaded. A foreign open of the same scene the walk was loading lands here, and
+  //   answering null would run `initWorld` into it and name the last candidate. Asks the editor's path, not
+  //   `getCurrent()`: a load superseded in its post-swap tail leaves `p` current in SceneManager but never adopted
+  //   (no scene path, no history swap), and calling that "loaded" boots an untitled world showing `p`.
+  // - otherwise the superseding switch installed nothing → retry `p` ONCE, then move on to the next candidate.
+  //   Stopping here ran the fallback, naming a candidate that was never tried, although this one would have loaded.
+  const attempt = async (p: string): Promise<string | null | undefined> => {
+    for (let retried = false; ; retried = true) {
+      const outcome = await tryLoad(p);
+      if (outcome === 'loaded') return p;
+      if (outcome !== 'superseded') return undefined;
+      if (!deps.settle) return onSuperseded(p);
+      if (await deps.settle()) return onSuperseded(p);
+      if (getCurrentScenePath() === p) return p;
+      if (retried) return undefined;
+    }
+  };
   for (const candidate of candidates) {
     // Canonicalization is best-effort: fall back to the raw candidate if it throws.
     let canonical = candidate;
@@ -277,13 +304,11 @@ export async function loadFirstScene(
     } catch {
       // canonical is already `candidate` (the declaration default).
     }
-    const canonicalOutcome = await tryLoad(canonical);
-    if (canonicalOutcome === 'loaded') return canonical;
-    if (canonicalOutcome === 'superseded') return onSuperseded(canonical);
+    const canonicalResult = await attempt(canonical);
+    if (canonicalResult !== undefined) return canonicalResult;
     if (canonical !== candidate) {
-      const rawOutcome = await tryLoad(candidate);
-      if (rawOutcome === 'loaded') return candidate;
-      if (rawOutcome === 'superseded') return onSuperseded(candidate);
+      const rawResult = await attempt(candidate);
+      if (rawResult !== undefined) return rawResult;
     }
     console.warn(`[Editor] Scene not found at ${candidate}, trying next fallback…`);
   }
@@ -783,10 +808,13 @@ export function createEditor(options: EditorOptions): React.ComponentType {
       // `probing`: a miss on one candidate is a normal step of the fallback walk, not an error
       // (#91) — loadFirstScene raises the single real error if they ALL miss.
       load: (p) => bootWalk.load(p, options.gameId),
+      settle: () => bootWalk.settle(),
     });
     // A load or prefab edit-open that landed in one of the walk's gaps won (#1593): the walk yielded to it, and it
     // has already written its own path. Persisting or falling back here would overwrite what the user just opened.
-    if (bootWalk.overtaken()) {
+    // SETTLED first (#1598): one that superseded the walk's own load can still be in flight here, with nothing
+    // current yet — `loadedPath` is then null, and the fallback below would run `initWorld` under it.
+    if (await bootWalk.settle()) {
       console.info('[Editor] Boot scene walk yielded to a scene switch made while it ran.');
       return;
     }

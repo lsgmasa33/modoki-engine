@@ -38,7 +38,7 @@ import { syncVideoTextures } from './videoTextureSync';
 import { setEntityMeshCollector } from './materialBroker';
 import { getAnimationClip } from '../loaders/animationClipCache';
 import { resolveActiveClip, resolveClipByName } from '../animation/animClipBank';
-import { applyClipAtTime, applyClipAtTimeBlended } from '../animation/sampleClip';
+import { applyClipAtTime, applyClipAtTimeBlended, advanceClipTime } from '../animation/sampleClip';
 import { buildEntityIndex } from '../core/ecs/entityIndex';
 import type { AnimationClipDef } from '../animation/types';
 import {
@@ -1981,12 +1981,22 @@ export function driveAnimator(
   if (cur) {
     const p = resolveAnimSetParams(entry.clipParamSource?.get(entry.current!) || a.animSet, entry.current!);
     const speed = a.speed !== ANIMSET_DEFAULTS.speed ? a.speed : p.speed;
-    const loop = a.loop !== ANIMSET_DEFAULTS.loop ? a.loop : p.loop;
+    const loop = skeletalClipLoops(entry, a, entry.current!);
     cur.paused = !a.playing;
     cur.timeScale = speed;
     cur.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, loop ? Infinity : 1);
     cur.clampWhenFinished = !loop;
   }
+}
+
+/** Does clip `name` loop on this rig? The trait's `loop` is a per-entity OVERRIDE of the animset's
+ *  per-clip value (see driveAnimator). Shared by Play (driveAnimator) and the Timeline scrub seek
+ *  (blendSkeletal), so a scrub past a looping clip's end shows the pose Play shows (#1596). No
+ *  SkeletalAnimator (a bare rig autoplays its first clip on a loop) → loops. */
+function skeletalClipLoops(entry: SkinnedEntry, a: { animSet: string; loop: boolean } | undefined, name: string): boolean {
+  if (!a) return true;
+  if (a.loop !== ANIMSET_DEFAULTS.loop) return a.loop;
+  return resolveAnimSetParams(entry.clipParamSource?.get(name) || a.animSet, name).loop;
 }
 
 /** Timeline scrub-preview (Phase 5/B): pose a skeletal rig at EXACT local clip times instead of
@@ -1995,7 +2005,7 @@ export function driveAnimator(
  *  the fadeDuration crossfade Play shows); every OTHER action is stopped so nothing stale bleeds
  *  in. Missing clips fall back to `firstClip` (matching `driveAnimator`). The pose is baked with
  *  `mixer.update(0)` (dt 0 evaluates without advancing). Stopped-only (the editor scrub path). */
-function blendSkeletal(entry: SkinnedEntry, clips: { clip: string; time: number; weight: number }[]): void {
+export function blendSkeletal(entry: SkinnedEntry, clips: { clip: string; time: number; weight: number }[], anim: { animSet: string; loop: boolean } | undefined): void {
   // Resolve each requested clip to an action name (fallback firstClip); sum weights if the same
   // action is named twice, and keep the latest time.
   const wanted = new Map<string, { time: number; weight: number }>();
@@ -2013,8 +2023,9 @@ function blendSkeletal(entry: SkinnedEntry, clips: { clip: string; time: number;
     a.paused = false;
     if (!a.isRunning()) a.play();
     a.setEffectiveWeight(Math.max(0, Math.min(1, w.weight)));
-    const duration = a.getClip().duration;
-    a.time = duration > 0 ? Math.min(Math.max(w.time, 0), duration) : 0;
+    // A Timeline block longer than its clip wraps a looping clip and holds a one-shot at its end —
+    // what Play shows (#1596). This used to clamp unconditionally, so a scrub disagreed with Play.
+    a.time = advanceClipTime(w.time, 0, a.getClip().duration, skeletalClipLoops(entry, anim, n));
   }
   // Dominant clip (highest weight) drives the read-back / entry.current.
   let best = ''; let bestW = -1;
@@ -2485,7 +2496,7 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     // seeks (above) and falls through to driveAnimator.
     const seek = getPlayState() !== 'playing' ? getSkeletalSeek(entity) : undefined;
     if (seek) {
-      blendSkeletal(entry, seek);
+      blendSkeletal(entry, seek, anim);
     } else if (anim) {
       const prevClip = entry.current;
       driveAnimator(entry, anim);

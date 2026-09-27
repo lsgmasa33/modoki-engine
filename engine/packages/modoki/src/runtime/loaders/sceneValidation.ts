@@ -135,6 +135,9 @@ export interface TraitSchema {
      *  runtime, serialized as the referenced entity's guid (or, in a legacy file, a raw id). Both
      *  forms are valid, so the type check accepts a string or a number here (#1597). */
     entityId?: true;
+    /** Carried from `FieldHint.runtimeOnly`: a read-back the serializer never writes, so any
+     *  value given here is lost at the next Play snapshot or save (#1592). */
+    runtimeOnly?: true;
   }>;
 }
 
@@ -1164,9 +1167,13 @@ function entityLabel(entity: SceneEntityLike | undefined, idx: number): string {
  *  exemption now keys off the field's declared `entityId` flag, so a new entity-ref field gets
  *  it without anyone remembering a name list. */
 export function fieldValueWarning(
-  hint: { type?: FieldType; options?: string[]; entityId?: true },
+  hint: { type?: FieldType; options?: string[]; entityId?: true; runtimeOnly?: true },
   value: unknown,
 ): string | null {
+  // A runtimeOnly field is runtime state (a read-back or a per-frame input): the loader accepts it, but `serializeScene` never writes
+  // it, so it lasts until the next Play snapshot or save. An authored RigidBody2D `vx` launched
+  // once, then Stop restored 0 and a save lost it (#1592).
+  if (hint.runtimeOnly) return 'runtimeOnly — runtime state that is never saved: Stop resets it and a save drops it';
   if (!hint.type) return null; // known field, but no confident type to check
   if (hint.entityId && (typeof value === 'string' || typeof value === 'number')) return null;
   const mismatch = typeMismatch(hint.type, value);

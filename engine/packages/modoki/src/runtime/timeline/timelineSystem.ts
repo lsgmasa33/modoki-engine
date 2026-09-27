@@ -48,7 +48,7 @@ function spawnPrefabInstance(
 import { deleteEntity } from '../core/ecs/entityUtils';
 import { getControlSpawn, setControlSpawn, hasControlSpawn, deleteControlSpawn, listControlSpawns } from './controlSpawnRegistry';
 import { requestParticleControl, reflectParticleScrub, resetScrubParticleReflect, noteScrubParticleState, type ParticleControlAction } from '../core/particleControlRegistry';
-import { applyClipAtTime, applyClipAtTimeBlended } from '../animation/sampleClip';
+import { applyClipAtTime, applyClipAtTimeBlended, advanceClipTime } from '../animation/sampleClip';
 import { buildEntityIndex, resolveTrackTarget, isEntityActiveInHierarchy, type EntityIndex } from '../core/ecs/entityIndex';
 import { onWorldSwap } from '../core/ecs/worldRegistry';
 import { applyClipDeform } from '../animation/deform2DSystem';
@@ -236,7 +236,22 @@ function activeClipsAt(track: AnimationTrackDef, t: number, fade: number): ClipW
 function scrubAnimator(entity: Entity, clipName: string, localT: number): void {
   const cur = entity.get(Animator) as Record<string, unknown> | undefined;
   if (!cur) return;
-  entity.set(Animator, { ...cur, clip: clipName, activeClip: clipName, time: Math.max(0, localT), playing: false });
+  const time = keyframeBlockTime(cur as { clips: string; loop?: boolean }, clipName, localT);
+  entity.set(Animator, { ...cur, clip: clipName, activeClip: clipName, time, playing: false });
+}
+
+/** A keyframe clip's local time inside a Timeline block (#1596). A block longer than its clip
+ *  plays the clip with the clip's OWN loop setting — the bank entry's `loop`, else `Animator.loop`,
+ *  the same chain animationSystem uses outside a Timeline — so a looping clip wraps and a one-shot
+ *  holds its end. `playing:false` (the anti-fight guard) skips animationSystem's `advanceClipTime`,
+ *  which is the only place that wrap ever happened, so a Timeline used to hold the last key of
+ *  EVERY clip. An unloaded clip (duration unknown) passes the time through unchanged. */
+function keyframeBlockTime(anim: { clips: string; loop?: boolean }, clipName: string, localT: number): number {
+  const t = Math.max(0, localT);
+  const entry = resolveClipByName(anim, clipName);
+  const def = entry ? getAnimationClip(entry.ref) : null;
+  if (!entry || !def) return t;
+  return advanceClipTime(t, 0, def.duration, entry.loop ?? anim.loop ?? true);
 }
 
 /** Apply the idempotent STATE of a timeline at absolute time `t`: keyframe-Animator scrub
@@ -416,13 +431,14 @@ export function previewTimelineAt(world: World, rootId: number, def: TimelineDef
     const active = activeClipAt(track, t);
     if (!active || active.scrub === false) continue;
     if (entity.has(Animator)) {
-      const anim = entity.get(Animator) as { clips: string; clip?: string; fadeDuration?: number } | undefined;
+      const anim = entity.get(Animator) as { clips: string; clip?: string; fadeDuration?: number; loop?: boolean } | undefined;
       if (!anim) continue;
       // Crossfade duration = the incoming clip's per-clip fade (bank) or the animator default —
       // the SAME source animationSystem uses during Play.
       const bank = resolveClipByName(anim, active.clip);
       const fade = bank?.fadeDuration ?? anim.fadeDuration ?? 0;
-      const parts = activeClipsAt(track, t, fade);
+      const parts = activeClipsAt(track, t, fade)
+        .map((p) => ({ ...p, localT: keyframeBlockTime(anim, p.clip, p.localT) }));
       const defOf = (name: string) => { const e = resolveClipByName(anim, name); return e ? getAnimationClip(e.ref) : null; };
       if (parts.length === 2) {
         const from = defOf(parts[0].clip), to = defOf(parts[1].clip);

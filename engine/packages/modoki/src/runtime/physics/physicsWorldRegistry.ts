@@ -12,7 +12,7 @@
 
 import type { World } from 'koota';
 import { getPlayState, onPlayStateChange } from '../core/playState';
-import { onWorldSwap } from '../core/ecs/world';
+import { onWorldSwap, getCurrentWorld } from '../core/ecs/world';
 
 export interface PhysicsWorldRegistry<S> {
   /** The live per-World state map. Keyed by koota World; a regular Map so it can be iterated + freed. */
@@ -35,7 +35,14 @@ export interface PhysicsWorldRegistry<S> {
 /** Build a physics world registry. `freeState(state)` must release every WASM handle the state
  *  retains (typically `state.eventQueue.free()` + `state.world.free()`). The Stop + world-swap
  *  hooks are registered once here (module-load side effect in the caller). */
-export function createPhysicsWorldRegistry<S>(freeState: (state: S) => void): PhysicsWorldRegistry<S> {
+export function createPhysicsWorldRegistry<S>(
+  freeState: (state: S) => void,
+  /** Runs on Play→Stop for each simulated World, BEFORE its state is freed, while the Play world is
+   *  still alive — so it lands before Stop's authored restore snapshots the entities it CARRIES
+   *  (Persistent roots, kept base scenes), which keep runtimeOnly fields. Not run on a world swap:
+   *  a swap inside one Play carries runtime state on purpose. */
+  onStop?: (world: World) => void,
+): PhysicsWorldRegistry<S> {
   const worlds = new Map<World, S>();
 
   const dispose = (world: World): void => {
@@ -50,7 +57,21 @@ export function createPhysicsWorldRegistry<S>(freeState: (state: S) => void): Ph
   };
 
   // On Stop, discard every sim so the next Play rebuilds from the reverted authored transforms.
-  const offPlayState = onPlayStateChange(() => { if (getPlayState() === 'stopped') disposeAll(); });
+  const offPlayState = onPlayStateChange(() => {
+    if (getPlayState() !== 'stopped') return;
+    try {
+      if (onStop) {
+        // Plus the CURRENT world when it has no state yet: a scene swapped in during Play that
+        // Stop reaches before its first physics tick still holds carried bodies.
+        const targets = new Set(worlds.keys());
+        const current = getCurrentWorld();
+        if (current) targets.add(current);
+        for (const w of targets) onStop(w);
+      }
+    } finally {
+      disposeAll();   // a throwing hook must not leak every Rapier world
+    }
+  });
   // Each scene load creates a NEW koota world and destroys the old one; setCurrentWorld fires
   // this synchronously with the old world still alive, so free its Rapier state here —
   // otherwise a shipped game (which never Stops) leaks a Rapier world per scene swap.

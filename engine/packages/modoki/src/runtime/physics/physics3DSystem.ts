@@ -48,6 +48,7 @@ import {
   eulerToQuat, eulerToQuatInto, quatToEulerInto, type Vec3, type Quat, type Euler3,
 } from './physics3DConvert';
 import { resolveColliderBits } from './physicsLayers';
+import { launchVelocity, takeLaunch, resetLaunchOnStop } from './launchVelocity';
 import { registerRaycast3D } from '../core/raycast3DRegistry';
 
 type RWorld = import('@dimforge/rapier3d-compat').World;
@@ -113,7 +114,10 @@ interface PhysicsWorldState3D {
 
 // Per-World state + WASM lifecycle (the `worlds` Map, dispose/disposeAll, and the Stop /
 // world-swap hooks) live in the shared registry — freeState releases this system's WASM handles.
-const registry = createPhysicsWorldRegistry<PhysicsWorldState3D>((st) => { st.eventQueue.free(); st.world.free(); });
+const registry = createPhysicsWorldRegistry<PhysicsWorldState3D>(
+  (st) => { st.eventQueue.free(); st.world.free(); },
+  (world) => world.query(RigidBody3D).updateEach(([rb]: [RbData3]) => resetLaunchOnStop(rb, ['vx', 'vy', 'vz', 'avx', 'avy', 'avz'])),
+);
 const worlds = registry.worlds;
 /** Free the Rapier3D world for a koota world (test afterEach / scene teardown / zero-body early-out). */
 export const disposePhysics3D = registry.dispose;
@@ -259,6 +263,8 @@ function worldScaleOf(entity: Entity): { sx: number; sy: number; sz: number } {
 
 type RbData3 = {
   bodyType: BodyType3D; vx: number; vy: number; vz: number; avx: number; avy: number; avz: number;
+  initialVx: number; initialVy: number; initialVz: number;
+  initialAvx: number; initialAvy: number; initialAvz: number; launched: boolean;
   linearDamping: number; angularDamping: number; gravityScale: number;
   fixedRotation: boolean;
   lockRotX: boolean; lockRotY: boolean; lockRotZ: boolean;
@@ -493,7 +499,10 @@ function createBody(
   const wp = worldPoseOf(entity, tf);
   const pos = vecEcsToPhys(wp.x, wp.y, wp.z, cfg.upm);
   const quat = eulerToQuat(wp.rx, wp.ry, wp.rz);
-  const vel = vecEcsToPhys(rb.vx, rb.vy, rb.vz, cfg.upm);
+  const launched = takeLaunch(rb);
+  const [lvx, lvy, lvz] = launchVelocity(launched, [rb.vx, rb.vy, rb.vz], [rb.initialVx, rb.initialVy, rb.initialVz]);
+  const [lax, lay, laz] = launchVelocity(launched, [rb.avx, rb.avy, rb.avz], [rb.initialAvx, rb.initialAvy, rb.initialAvz]);
+  const vel = vecEcsToPhys(lvx, lvy, lvz, cfg.upm);
 
   let desc;
   if (rb.bodyType === 'static') desc = R.RigidBodyDesc.fixed();
@@ -508,7 +517,7 @@ function createBody(
   }
 
   desc.setTranslation(pos.x, pos.y, pos.z).setRotation(quat)
-    .setLinvel(vel.x, vel.y, vel.z).setAngvel({ x: rb.avx, y: rb.avy, z: rb.avz })
+    .setLinvel(vel.x, vel.y, vel.z).setAngvel({ x: lax, y: lay, z: laz })
     .setLinearDamping(rb.linearDamping).setAngularDamping(rb.angularDamping)
     .setGravityScale(rb.gravityScale).setCcdEnabled(rb.ccd).setCanSleep(rb.canSleep);
   // Rotation locks: fixedRotation locks all three; otherwise honor the per-axis flags.
@@ -901,7 +910,6 @@ export function physics3DSystem(world: World): void {
     let rec = st.bodies.get(id);
     if (rec && (rec.sig !== sig || rec.entityGen !== gen)) { removeBody(st, world, rec, exits); rec = undefined; }
     if (!rec) { createBody(st, id, gen, tf, rb, entity, children, cfg, sig); return; }
-
     // Material / filter / layer edits apply to the live collider(s) IN PLACE — no rebuild.
     const matSig = bodyMatSig(entity, children);
     if (rec.matSig !== matSig) { applyBodyMaterial(st, rec); rec.matSig = matSig; }

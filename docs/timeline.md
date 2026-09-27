@@ -322,6 +322,19 @@ to the SAME name pre-empts that reset, so the scrub value survives a mid-cutscen
 `timelineSystem` runs at 149 and `animationSystem` at 150, the timeline sets the trait and the animation
 system samples it the same frame.
 
+**A block longer than its clip plays the clip with the clip's OWN loop setting (#1596).** The
+setting is the Animator bank entry's `loop`, else `Animator.loop` (default `true`), which is the
+same chain Play uses outside a Timeline. A looping clip wraps and a one-shot holds its last key.
+The guard's `playing:false` skips `advanceClipTime`, the only place that wrap used to happen, so
+for a while a Timeline held the last key of EVERY clip. `keyframeBlockTime` in `timelineSystem.ts`
+now wraps the local time in both the Play pose and the editor scrub (crossfade parts included).
+The skeletal scrub seek uses the same rig loop rule that skeletal Play uses (`skeletalClipLoops`
+in `scene3DSync.ts`); before this it clamped even when Play looped. There is deliberately **no
+per-block `loop`**. Skeletal and sprite blocks are start-and-run triggers, so a block-level
+override would be read by keyframe targets only; change the clip's loop in the Animator bank
+instead. The `.anim.json`'s own `loop` is read by no runtime path (Timeline or not); only the
+Animation editor's preview uses it.
+
 **During PLAY, skeletal (`SkeletalAnimator`) and sprite (`SpriteAnimator`) are triggered, not
 scrubbed** — the timeline dispatches `engine.playClip` once as a clip block's `start` boundary is
 crossed, then lets the mixer run (start-and-run is correct for forward playback; there's no per-frame

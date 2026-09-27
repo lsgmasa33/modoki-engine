@@ -1,45 +1,58 @@
 /** A game build's favicon is its own app icon; the editor's is the engine's Modoki icon (2026-09-26). */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
 import { faviconPlugin, faviconSourceFor, FAVICON_SIZE, versionedFaviconRef, linkVersionedFavicon } from '../../plugins/favicon';
 import { loadProjectConfig } from '../../plugins/load-project-config';
 import { readScannedSource } from '@modoki/engine/testing';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const engineIcon = path.join(repoRoot, 'engine/packages/modoki/src/runtime/assets/favicon.png');
-const court = path.join(repoRoot, 'games/court');
-const courtIcon = loadProjectConfig(court).app.iconSource;
+// A fixture project, not a real game: `games/**` is absent from the public snapshot, where a test
+// reading Court's config ran against no file at all and went red on every CI leg (2026-09-27).
+let project = '';
+let projectIcon = '';
+beforeAll(async () => {
+  project = makeScratchDir('favicon-project-');
+  fs.writeFileSync(path.join(project, 'project.config.json'), JSON.stringify({ app: { iconSource: 'art/icon.png' } }));
+  projectIcon = loadProjectConfig(project).app.iconSource;
+  // Larger than FAVICON_SIZE and not equal to the engine icon's size, so "downscaled" is observable.
+  fs.mkdirSync(path.join(project, 'art'));
+  await sharp({ create: { width: 512, height: 512, channels: 4, background: '#3366cc' } }).png()
+    .toFile(path.join(project, projectIcon));
+});
 const template = readScannedSource(path.join(repoRoot, 'engine/index.html'), {
   comments: 'include', reason: 'the transform is handed the template verbatim, comments and all',
 }).raw;
 
 describe('faviconSourceFor', () => {
   it('a game build uses the project\'s app.iconSource', () => {
-    expect(faviconSourceFor({ engineIcon, projectRoot: court, iconSource: courtIcon, isEditorBuild: false }))
-      .toEqual({ path: path.join(court, courtIcon), isGameIcon: true });
+    expect(faviconSourceFor({ engineIcon, projectRoot: project, iconSource: projectIcon, isEditorBuild: false }))
+      .toEqual({ path: path.join(project, projectIcon), isGameIcon: true });
   });
 
   it('the editor keeps the engine icon, whatever project is open', () => {
-    expect(faviconSourceFor({ engineIcon, projectRoot: court, iconSource: courtIcon, isEditorBuild: true }))
+    expect(faviconSourceFor({ engineIcon, projectRoot: project, iconSource: projectIcon, isEditorBuild: true }))
       .toEqual({ path: engineIcon, isGameIcon: false });
   });
 
   it('falls back to the engine icon when the project authors none', () => {
-    expect(faviconSourceFor({ engineIcon, projectRoot: court, iconSource: '', isEditorBuild: false }))
+    expect(faviconSourceFor({ engineIcon, projectRoot: project, iconSource: '', isEditorBuild: false }))
       .toEqual({ path: engineIcon, isGameIcon: false });
   });
 
   it('a set-but-missing iconSource falls back AND is reported, not silent', () => {
-    expect(faviconSourceFor({ engineIcon, projectRoot: court, iconSource: 'art/nope.png', isEditorBuild: false }))
-      .toEqual({ path: engineIcon, isGameIcon: false, missing: path.join(court, 'art/nope.png') });
+    expect(faviconSourceFor({ engineIcon, projectRoot: project, iconSource: 'art/nope.png', isEditorBuild: false }))
+      .toEqual({ path: engineIcon, isGameIcon: false, missing: path.join(project, 'art/nope.png') });
   });
 });
 
 describe('faviconPlugin', () => {
   const run = async (o: Partial<Parameters<typeof faviconPlugin>[0]>) => {
-    const plugin = faviconPlugin({ engineIcon, projectRoot: court, iconSource: courtIcon, isEditorBuild: false, ...o });
+    const plugin = faviconPlugin({ engineIcon, projectRoot: project, iconSource: projectIcon, isEditorBuild: false, ...o });
     const emitted: { fileName: string; source: Buffer }[] = [];
     const warnings: string[] = [];
     const ctx = { warn: (m: string) => { warnings.push(m); }, emitFile: (f: { fileName: string; source: Buffer }) => { emitted.push(f); return ''; } };
@@ -76,7 +89,7 @@ describe('faviconPlugin', () => {
   });
 
   it('the dev server (the editor) emits and rewrites nothing', async () => {
-    const plugin = faviconPlugin({ engineIcon, projectRoot: court, iconSource: courtIcon, isEditorBuild: true });
+    const plugin = faviconPlugin({ engineIcon, projectRoot: project, iconSource: projectIcon, isEditorBuild: true });
     (plugin.configResolved as (c: { command: string }) => void)({ command: 'serve' });
     await (plugin.buildStart as (this: unknown) => Promise<void>).call({ warn: () => {} });
     expect((plugin.transformIndexHtml as (h: string) => string)(template)).toBe(template);
@@ -84,7 +97,8 @@ describe('faviconPlugin', () => {
 
   it('warns when the authored icon is missing, and still emits the engine icon', async () => {
     const { emitted, warnings } = await run({ iconSource: 'art/nope.png' });
-    expect(warnings.join('\n')).toMatch(/art\/nope\.png does not exist/);
+    // The native path, not a forward-slash one — the Windows leg printed D:\…\art\nope.png.
+    expect(warnings.join('\n')).toContain(`${path.join(project, 'art/nope.png')} does not exist`);
     expect(emitted.map((e) => e.fileName)).toEqual(['favicon.png']);
   });
 

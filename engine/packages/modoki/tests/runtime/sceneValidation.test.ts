@@ -142,6 +142,16 @@ describe('validateSceneData — schema checks', () => {
     expect(res.warnings.join('\n')).toMatch(/expected number, got string/);
   });
 
+  it('warns a runtimeOnly field is never saved — the value is lost at Stop or save (#1592)', () => {
+    const rt: SceneSchema = { traits: { Body: { category: 'component', fields: { vx: { type: 'number', runtimeOnly: true }, initialVx: { type: 'number' } } } } };
+    const out = validateSceneData(scene([{ id: 1, name: 'X', traits: { Body: { vx: 1500, initialVx: 1500 } } }]), rt).warnings.join('\n');
+    expect(out).toMatch(/X'? ?.*Body\.vx: runtimeOnly — runtime state that is never saved/);
+    expect(out).not.toMatch(/initialVx/);
+    // The same function the scene-mutate pre-flight calls — one answer for a file and a live edit.
+    expect(fieldValueWarning({ type: 'number', runtimeOnly: true }, 0)).toMatch(/never saved/);
+    expect(fieldValueWarning({ type: 'number' }, 0)).toBeNull();
+  });
+
   it('flags enum value not in options', () => {
     const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { EntityAttributes: { layer: 'nope' } } }]), schema);
     expect(res.warnings.join('\n')).toMatch(/not in \[2d, 3d, ui\]/);

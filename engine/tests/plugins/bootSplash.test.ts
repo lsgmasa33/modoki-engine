@@ -11,10 +11,13 @@
  *  a launch image that never goes away — is the worst outcome this feature can have, and it is
  *  what a build actually got wrong in review. */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
 import path from 'node:path';
+import sharp from 'sharp';
 import { bootSplashMarkup, bootSplashPlugin, bootSplashUrl, BOOT_SPLASH_FILE } from '../../plugins/bootSplash';
 import { loadProjectConfig } from '../../plugins/load-project-config';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 describe('bootSplashMarkup', () => {
   const html = bootSplashMarkup('/boot-splash.webp', '#0a0a1a');
@@ -128,18 +131,26 @@ describe('bootSplashUrl', () => {
 });
 
 // The function above is half of it: the plugin's HTML hook must USE it, or a revert of the one line
-// that injects the markup would leave every case here green. Driven the way Vite drives it, on Court's
-// real splash config.
+// that injects the markup would leave every case here green. Driven the way Vite drives it, on a
+// fixture project — `games/**` is absent from the public snapshot, where Court's config was no file at
+// all, the plugin composed nothing, and every CI leg went red (2026-09-27).
 describe('bootSplashPlugin injects the versioned URL', () => {
   const repoRoot = path.resolve(__dirname, '../../..');
-  const court = path.join(repoRoot, 'games/court');
+  let project = '';
+  beforeAll(async () => {
+    project = makeScratchDir('boot-splash-project-');
+    fs.mkdirSync(path.join(project, 'art'));
+    await sharp({ create: { width: 512, height: 512, channels: 4, background: '#55341a' } }).png()
+      .toFile(path.join(project, 'art/splash.png'));
+    fs.writeFileSync(path.join(project, 'project.config.json'), JSON.stringify({ app: { splashSource: 'art/splash.png' } }));
+  });
 
-  it.each(['/court/', '/court'])('base %s', async (base) => {
-    const plugin = bootSplashPlugin(court, loadProjectConfig(court), repoRoot);
+  it.each(['/project/', '/project'])('base %s', async (base) => {
+    const plugin = bootSplashPlugin(project, loadProjectConfig(project), repoRoot);
     (plugin.configResolved as (c: { base: string }) => void)({ base });
     await (plugin.buildStart as (this: unknown) => Promise<void>).call({ warn: (m: string) => { throw new Error(m); } });
     const hook = plugin.transformIndexHtml as { handler: (h: string) => string };
-    expect(hook.handler('<body></body>')).toMatch(/url\('\/court\/boot-splash\.webp\?v=[0-9a-f]{16}'\)/);
+    expect(hook.handler('<body></body>')).toMatch(/url\('\/project\/boot-splash\.webp\?v=[0-9a-f]{16}'\)/);
   });
 });
 

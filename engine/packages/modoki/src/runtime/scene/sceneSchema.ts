@@ -16,7 +16,7 @@ import { getAllTraits } from '../core/ecs/traitRegistry';
 import type { FieldType } from '../core/ecs/traitRegistry';
 import type { SceneSchema } from '../loaders/sceneValidation';
 
-type FieldEntry = { type?: FieldType; options?: string[]; default?: unknown; entityId?: true };
+type FieldEntry = { type?: FieldType; options?: string[]; default?: unknown; entityId?: true; runtimeOnly?: true };
 
 /** Scene files OMIT a field still holding its trait default (serialize.ts's
  *  `isTraitDefault`), so a reader of a scene file can no longer tell a missing field's
@@ -77,6 +77,8 @@ export function buildSceneSchema(): SceneSchema {
         ...(dflt === undefined ? {} : { default: dflt }),
         // The validator accepts a guid OR a numeric id in an entity-ref field (#1597).
         ...(hint.entityId ? { entityId: true as const } : {}),
+        // A value written here is never saved — the validators say so (#1592).
+        ...(hint.runtimeOnly ? { runtimeOnly: true as const } : {}),
       };
     }
 

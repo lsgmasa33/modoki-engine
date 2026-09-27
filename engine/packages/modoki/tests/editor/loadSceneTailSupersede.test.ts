@@ -47,6 +47,7 @@ vi.mock('../../src/editor/undo/undoManager', () => ({
   swapHistory: (path: string) => { h.swapHistoryCalls.push(path); },
   getEditVersion: () => 0,
   beginWorldSwitch: () => ({ idle: null, release: () => {} }),
+  worldSwitchesSettled: () => null,
 }));
 
 vi.mock('../../src/editor/editorJournal', () => ({

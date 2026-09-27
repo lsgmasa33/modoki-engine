@@ -12,7 +12,8 @@ export type BodyType3D = 'dynamic' | 'static' | 'kinematic';
  *  side there is NO axis flip: ECS and Rapier3D are both right-handed Y-up, so the
  *  physics system only scales lengths by `Physics3D.unitsPerMeter` (default 1) and
  *  converts Transform's Euler `rx/ry/rz` ↔ Rapier's quaternion.
- *  The velocity fields are read-back each frame for dynamic bodies (runtimeOnly). */
+ *  The velocity fields are read-back each frame for dynamic bodies (runtimeOnly — never saved);
+ *  the AUTHORED launch velocity is `initialVx…initialAvz` (#1592). */
 export const RigidBody3D = trait({
   bodyType: 'dynamic' as BodyType3D,
   /** Linear velocity, world units/s. Read-back for dynamic bodies. */
@@ -23,6 +24,17 @@ export const RigidBody3D = trait({
   avx: 0 as number,
   avy: 0 as number,
   avz: 0 as number,
+  /** Authored launch velocity (world units/s, radians/s) a NEW body starts with, unless code
+   *  already wrote `vx…`/`avx…` before the body existed. See physics/launchVelocity. */
+  initialVx: 0 as number,
+  initialVy: 0 as number,
+  initialVz: 0 as number,
+  initialAvx: 0 as number,
+  initialAvy: 0 as number,
+  initialAvz: 0 as number,
+  /** Runtime: this entity has had a DYNAMIC body this Play, so `initial*` is spent
+   *  (physics/launchVelocity). runtimeOnly; cleared on Stop. */
+  launched: false as boolean,
   linearDamping: 0 as number,
   angularDamping: 0 as number,
   /** Per-body gravity multiplier (0 = float, 1 = full world gravity). */

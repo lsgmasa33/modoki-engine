@@ -743,6 +743,35 @@ describe('scene3DSync', () => {
       expect(run.setLoop).toHaveBeenLastCalledWith(expect.anything(), Infinity); // inherited loop:true
     });
 
+    // #1596: a Timeline scrub past a clip's end seeks the pose Play shows — Play loops by the same
+    // trait-override-else-animset rule, so a looping clip wraps and a one-shot holds its end.
+    function seekEntry(clips: string[]): SkinnedEntry {
+      const entry = entryWith(clips);
+      for (const a of entry.actions.values()) {
+        Object.assign(a, { time: 0, isRunning: () => false, getEffectiveWeight: () => 0, getClip: () => ({ duration: 1 }) });
+      }
+      (entry as unknown as { mixer: unknown }).mixer = { update: vi.fn() };
+      return entry;
+    }
+    it('a skeletal scrub seek past a LOOPING clip\'s end wraps (#1596)', async () => {
+      mockAnimSet({ Sway: { loop: true } });
+      mockSceneSyncDeps();
+      const { blendSkeletal } = await import('../../src/runtime/rendering/scene3DSync');
+      const entry = seekEntry(['Sway']);
+      blendSkeletal(entry, [{ clip: 'Sway', time: 2.25, weight: 1 }], anim('Sway', { animSet: 'set' }));
+      expect((entry.actions.get('Sway') as unknown as { time: number }).time).toBeCloseTo(0.25, 9);
+    });
+    it('a skeletal scrub seek past a ONE-SHOT clip\'s end holds it — animset loop:false, or the trait override', async () => {
+      mockAnimSet({ Attack: { loop: false }, Sway: { loop: true } });
+      mockSceneSyncDeps();
+      const { blendSkeletal } = await import('../../src/runtime/rendering/scene3DSync');
+      const entry = seekEntry(['Attack', 'Sway']);
+      blendSkeletal(entry, [{ clip: 'Attack', time: 2.25, weight: 1 }], anim('Attack', { animSet: 'set' }));
+      expect((entry.actions.get('Attack') as unknown as { time: number }).time).toBe(1);
+      blendSkeletal(entry, [{ clip: 'Sway', time: 2.25, weight: 1 }], anim('Sway', { animSet: 'set', loop: false }));
+      expect((entry.actions.get('Sway') as unknown as { time: number }).time).toBe(1);
+    });
+
     it('uses the incoming clip\'s animset fadeDuration for the crossfade', async () => {
       mockAnimSet({ Idle: {}, Walk: { fadeDuration: 0.4 } });
       mockSceneSyncDeps();

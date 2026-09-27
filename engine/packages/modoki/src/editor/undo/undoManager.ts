@@ -207,6 +207,23 @@ export const WORLD_SWITCH_STALL_WARN_MS = 10_000;
  *  one the switch is waiting for is refused rather than started over the incoming world. A COUNT, since two switches
  *  can overlap (a load superseding another). */
 let _worldSwitches = 0;
+/** Resolved when `_worldSwitches` next drains to zero — see {@link worldSwitchesSettled}. */
+let _switchesDrained: { promise: Promise<void>; resolve: () => void } | null = null;
+
+/** The world switches in progress, as something to wait on: a promise that resolves once none is (a switch that
+ *  starts meanwhile holds it), or null when none is now. The editor's boot scene walk waits on this before each
+ *  candidate load (#1598) — it is the registry of PENDING switches, which the walk's "did a foreign scene win" check
+ *  cannot see: a load still fetching, or a prefab edit-open still reading its file, has installed nothing yet.
+ *  Resolves on drain, never rejects, and says nothing about whether any switch SUCCEEDED — ask the world after. */
+export function worldSwitchesSettled(): Promise<void> | null {
+  if (_worldSwitches === 0) return null;
+  if (!_switchesDrained) {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => { resolve = r; });
+    _switchesDrained = { promise, resolve };
+  }
+  return _switchesDrained.promise;
+}
 
 /** Begin a world switch (#1579): refuse every undo/redo step from now until `release`, and report the step that is
  *  already queued or running as `idle` — resolved once it has finished, or null when there is none, so a caller with
@@ -243,6 +260,11 @@ export function beginWorldSwitch(): { idle: Promise<void> | null; release: () =>
       released = true;
       _worldSwitches -= 1;
       notifyUndoChanged();
+      if (_worldSwitches === 0 && _switchesDrained) {
+        const { resolve } = _switchesDrained;
+        _switchesDrained = null;
+        resolve();
+      }
     },
   };
 }

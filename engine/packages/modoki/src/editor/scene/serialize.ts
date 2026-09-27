@@ -24,7 +24,7 @@ import { useEditorStore } from '../store/editorStore';
 import { setPlayState } from '../../runtime/core/playState';
 import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
-import { swapHistory, forgetHistory, getEditVersion, beginWorldSwitch } from '../undo/undoManager';
+import { swapHistory, forgetHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
@@ -1413,20 +1413,25 @@ export function isSceneLoadSwapping(): boolean { return _loadsSwapping > 0; }
  *  ahead, and the walk's next load then replaced its world: `new_scene` right after launch answered ok and the boot
  *  scene overwrote it ~80 ms later (observed). Two halves, because the switches differ:
  *  - `newScene` WAITS on {@link bootSceneWalkPending} (owner's call), and Play refuses on it.
- *  - Every other switch (a user/agent `loadScene`, a prefab edit-open) is not gated: the WALK yields to one that WON.
- *    `load` loads a candidate only while {@link BootSceneWalk.overtaken} is false, and the walk's caller checks it
- *    again before persisting or falling back — so a scene somebody opened in a gap is left standing. One check at the
- *    walk, rather than a gate on each caller (`loadScene` cannot wait on the walk: the walk calls it).
+ *  - Every other switch (a user/agent `loadScene`, a prefab edit-open) is not gated: the WALK waits for it, then
+ *    yields if it WON. {@link BootSceneWalk.settle} waits until no world switch is in progress (`worldSwitchesSettled`,
+ *    the registry every switch joins at its top — #1598), then asks {@link BootSceneWalk.overtaken}. `load` settles
+ *    before each candidate and the walk's caller settles again before persisting or falling back — so a scene
+ *    somebody opened in a gap, or is still opening when the next load would start, is left standing. One check at
+ *    the walk, rather than a gate on each caller (`loadScene` cannot wait on the walk: the walk calls it).
  *  - A `newScene` that waited on a walk which yielded is REFUSED ({@link lastBootWalkYielded}): the scene somebody
  *    opened meanwhile is the newer intent.
  *
- *  ⚠️ Not covered: a switch still IN FLIGHT when the walk's next load starts. A foreign `loadScene` mid-flight is
- *  superseded by the walk's load (SceneManager's newest-call-wins), and a prefab edit-open mid-fetch is aborted by
- *  it — both as before #1593. Covering them needs a registry of pending switches, which nothing has yet.
+ *  WAIT, then decide — not "yield while something is in flight" (#1598). A switch in flight has installed nothing,
+ *  and one that then fails or is refused installs nothing ever: yielding to it left the editor with no scene and no
+ *  fallback, the #1593 close-out finding again. Only a scene that is actually current once the switches drain wins.
  *
  *  `null` when no walk is running; otherwise a promise that resolves (never rejects) when it ends.
  *  ⚠️ Nothing in the walk has a timeout, so a walk that never ends holds a waiting `newScene` — and #887's latch — for
- *  the session. No realistic hang source is known (the walk's fetches are local); a slow boot only delays it. */
+ *  the session, and Play refuses meanwhile. Since #1598 the walk also waits on every foreign switch in flight, which
+ *  is bounded by a HUMAN, not a fetch: a prefab edit-open sitting on its `confirmDiscard` dialog (registered before
+ *  it), or a switch waiting on a stalled undo step (`beginWorldSwitch` warns after 10s). No hang with nobody to end it
+ *  is known; the walk's own fetches are local. */
 let _bootWalk: Promise<void> | null = null;
 let _lastBootWalkYielded = false;
 export function bootSceneWalkPending(): Promise<void> | null { return _bootWalk; }
@@ -1442,7 +1447,12 @@ export interface BootSceneWalk {
    *  nothing, and yielding to it left the editor with no scene and no fallback (close-out review). At boot
    *  `getCurrent()` is null until something loads, so any current scene is either the walk's own or foreign. */
   overtaken(): boolean;
-  /** Load one boot candidate — or answer `'superseded'` without touching the world when {@link overtaken}. */
+  /** Wait until no world switch is in progress — re-checked, since one can start while the walk waits — then answer
+   *  {@link overtaken}. The walk's own loads are awaited one after another, so at every point the walk calls this,
+   *  any switch still counted is foreign (#1598). */
+  settle(): Promise<boolean>;
+  /** Load one boot candidate — or answer `'superseded'` without touching the world when, once {@link settle}d, it
+   *  is {@link overtaken}. */
   load(path: string, gameId?: string): Promise<SceneLoadOutcome>;
 }
 
@@ -1457,6 +1467,10 @@ export function beginBootSceneWalk(): BootSceneWalk {
     const current = sceneManager.getCurrent()?.path;
     return current != null && !own.has(current);
   };
+  const settle = async (): Promise<boolean> => {
+    for (let pending = worldSwitchesSettled(); pending; pending = worldSwitchesSettled()) await pending;
+    return overtaken();
+  };
   return {
     release: () => {
       if (_bootWalk === walk) {
@@ -1466,13 +1480,20 @@ export function beginBootSceneWalk(): BootSceneWalk {
       resolve();
     },
     overtaken,
+    settle,
     load: (path, gameId) => {
+      // Synchronous when nothing is pending, so the load joins SceneManager's newest-call-wins order at the moment
+      // it was asked for — an extra tick would let a load started after it become the newer call.
+      if (worldSwitchesSettled()) return settle().then((won) => (won ? 'superseded' : loadOwn(path, gameId)));
       if (overtaken()) return Promise.resolve('superseded');
-      // `probing`: a miss on one candidate is a normal step of the fallback walk, not an error (#91).
-      own.add(path);
-      return loadScene(path, gameId, { probing: true });
+      return loadOwn(path, gameId);
     },
   };
+  function loadOwn(path: string, gameId: string | undefined): Promise<SceneLoadOutcome> {
+    // `probing`: a miss on one candidate is a normal step of the fallback walk, not an error (#91).
+    own.add(path);
+    return loadScene(path, gameId, { probing: true });
+  }
 }
 
 /** `loadScene`'s outcome. `'superseded'` covers BOTH ways a load can lose to a newer one:

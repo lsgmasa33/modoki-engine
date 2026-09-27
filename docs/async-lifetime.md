@@ -315,7 +315,7 @@ splits by what each switch can do:
 |---|---|
 | `newScene` | **waits** for the walk, then runs (owner's ruling: the request somebody made is the newer intent). Afterwards it refuses if the walk yielded to a scene opened meanwhile, if a prefab is being edited, or if a `loadScene` is still in flight |
 | Play | **refuses** (`scene-swap`), checked at `enterPlay`'s entry and deliberately NOT folded into `aSceneSwapIsHappening()`, which the Hierarchy's collapse restore also reads |
-| a user/agent `loadScene`, a prefab edit-open that COMPLETED in the gap | not gated: the **walk yields** to it. `BootSceneWalk.load` loads a candidate only while no scene the walk did not load is current, and `createEditor` skips its persist and fallback once overtaken |
+| a user/agent `loadScene` or a prefab edit-open, completed or still in flight | not gated: the **walk waits, then yields** to it. `BootSceneWalk.settle` waits until no world switch is in progress, then asks whether a scene the walk did not load is current. `load` settles before each candidate, and `createEditor` settles again before its persist and fallback (#1598) |
 
 The walk yields rather than gating `loadScene` because the walk *calls* `loadScene`, so a gate there
 would wait on itself. It asks the WORLD (`sceneManager.getCurrent()`, null at boot until something
@@ -323,9 +323,45 @@ loads) whether a foreign scene won, not the load epoch. The first version asked 
 foreign load that FAILED in a gap then moved it without installing anything: the walk yielded to
 nothing, and the editor ended with no scene and no fallback (close-out review).
 
-⚠️ **Still open:** a switch that is IN FLIGHT when the walk's next load starts. A foreign `loadScene`
-mid-flight is superseded by the walk's load (newest call wins), and a prefab edit-open mid-fetch is
-aborted by it, as before #1593. Closing that needs a registry of pending switches.
+**A switch still IN FLIGHT (#1598).** "Is a foreign scene current?" cannot see a switch that has
+started but has not installed its world yet. A `loadScene` mid-fetch was then superseded by the
+walk's next load (newest call wins), and a prefab edit-open mid-fetch was aborted by it. The registry
+of pending switches already existed: #1579's `beginWorldSwitch` count, which every user switch joins
+synchronously at its top (a prefab edit-open does so before its fetch). `worldSwitchesSettled()`
+exposes it as a promise that resolves when the count drains. The walk waits on it, re-checks, and
+only then asks the world. Its own loads are awaited one after another, so anything still counted at
+those points is foreign. Neither half of the #1593 table can deadlock it: `newScene` waits on the walk
+BEFORE it registers, and Play refuses during the walk instead of registering.
+
+It is **wait, then decide**, not "yield while something is in flight". A switch that then fails or is
+refused installs nothing, and yielding to it was the scene-less boot above. `load` stays synchronous
+when nothing is pending, so it joins SceneManager's newest-call-wins order at the moment it was
+called. An extra tick there would let a load started after it become the newer call.
+
+**A cancelled candidate settles too, and the first version of this fix got it wrong.** A foreign load
+that CANCELS the walk's own load (SceneManager aborts the older call) has installed nothing at that
+instant. `loadFirstScene` used to answer that case from whatever was current, which was nothing, so it
+returned null. The first version settled only in `createEditor`, after that null, and the close-out
+review found it made one case worse. If the foreign load was the SAME scene the walk was loading, the
+landed scene carried a path the walk had asked for, so it was not "overtaken". Then `initWorld` ran
+INTO it, and the editor named the last candidate. Before the fix, `initWorld` had run into the
+outgoing world and been harmlessly replaced.
+
+So `loadFirstScene`'s superseded branch now takes a `settle` dependency and waits, then decides:
+- **A foreign scene won** (`settle` answers overtaken): report it, and the caller yields.
+- **The editor ADOPTED the candidate** (`getCurrentScenePath() === p`): it is loaded. This is the
+  same-scene case.
+- **Otherwise**, the superseding switch installed nothing. Retry the candidate once, then move on to
+  the next candidate. Stopping ran the fallback, which named a candidate that was never tried.
+
+The second review found why the middle test must be "adopted" and not "something is current". A
+load superseded in its POST-SWAP tail leaves its scene current in SceneManager, but the wrapper
+returns before `setCurrentScenePath` and the history swap. If the superseding load then fails, the
+world shows the candidate while the editor holds no scene path. Calling that "loaded" booted an
+untitled world, where Save pops Save-As and hot reload never matches.
+
+The general lesson: **when you add a wait, re-read every branch that answered from the instant**, not
+only the one you were fixing.
 
 ⚠️ **Unverified, low severity:** "overtaken" assumes `getCurrent()` is null when the walk begins, which
 holds while `createEditor()` runs once per page load. If a hot update to `app/editor/setup.ts` ever

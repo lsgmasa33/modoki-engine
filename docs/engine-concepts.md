@@ -581,6 +581,10 @@ answer.
    `scrollApi` (`scrollBehavior` vs `scrollToBehavior`, #409). #409's comment says why it was
    needed: one request *"permanently overwrote an author's `smooth`, and the next save baked the
    overwrite into the scene as authored data."*
+   The reverse shape, **one field that is authored input AND a read-back**, gets the same answer.
+   `RigidBody2D/3D.vx…` were a launch velocity and a `runtimeOnly` solver read-back at once, so the
+   serializer dropped the authored half. The launch now lives in `initial*` (#1592,
+   [physics-2d.md](physics-2d.md)).
 3. **Snapshot the authored value** — from the prefab, or from the instance on the one frame before
    the writing starts. Multiply by it rather than replacing it, so `k = 0` returns the base exactly.
 4. **Keep a last-write baseline** (`physics2DSystem`'s `rec.lastX/lastY/lastAng`) when the value

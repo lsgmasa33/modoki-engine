@@ -45,6 +45,7 @@ import {
 } from './physics2DConvert';
 import { resolveColliderBits } from './physicsLayers';
 import { decomposeConcaveToPhys } from './concaveDecomp';
+import { launchVelocity, takeLaunch, resetLaunchOnStop } from './launchVelocity';
 import { colliderGeomSig as geomSigOf, type ColliderShapeParams } from '../traits/Collider2D';
 
 interface PhysicsConfig { gravityX: number; gravityY: number; ppm: number }
@@ -130,7 +131,10 @@ interface MotorJoint {
 
 // Per-World state + WASM lifecycle (the `worlds` Map, dispose/disposeAll, and the Stop /
 // world-swap hooks) live in the shared registry — freeState releases this system's WASM handles.
-const registry = createPhysicsWorldRegistry<PhysicsWorldState>((st) => { st.eventQueue.free(); st.world.free(); });
+const registry = createPhysicsWorldRegistry<PhysicsWorldState>(
+  (st) => { st.eventQueue.free(); st.world.free(); },
+  (world) => world.query(RigidBody2D).updateEach(([rb]: [RbData]) => resetLaunchOnStop(rb, ['vx', 'vy', 'angularVel'])),
+);
 const worlds = registry.worlds;
 /** Free the Rapier world for a koota world (test afterEach / scene teardown / zero-body early-out). */
 export const disposePhysics2D = registry.dispose;
@@ -354,6 +358,7 @@ function makeColliderDesc(st: PhysicsWorldState, c: {
 
 type RbData = {
   bodyType: BodyType2D; vx: number; vy: number; angularVel: number;
+  initialVx: number; initialVy: number; initialAngularVel: number; launched: boolean;
   linearDamping: number; angularDamping: number; gravityScale: number;
   fixedRotation: boolean; ccd: boolean; canSleep: boolean; isSleeping: boolean;
 };
@@ -405,7 +410,10 @@ function createBody(
   const wp = worldPoseOf2D(entity, tf);
   const pos = vecEcsToPhys(wp.x, wp.y, cfg.ppm);
   const ang = angEcsToPhys(wp.rz);
-  const vel = vecEcsToPhys(rb.vx, rb.vy, cfg.ppm);
+  const launched = takeLaunch(rb);
+  const [lvx, lvy] = launchVelocity(launched, [rb.vx, rb.vy], [rb.initialVx, rb.initialVy]);
+  const [lav] = launchVelocity(launched, [rb.angularVel], [rb.initialAngularVel]);
+  const vel = vecEcsToPhys(lvx, lvy, cfg.ppm);
 
   let desc;
   if (rb.bodyType === 'static') desc = R.RigidBodyDesc.fixed();
@@ -420,7 +428,7 @@ function createBody(
   }
 
   desc.setTranslation(pos.x, pos.y).setRotation(ang)
-    .setLinvel(vel.x, vel.y).setAngvel(angEcsToPhys(rb.angularVel))
+    .setLinvel(vel.x, vel.y).setAngvel(angEcsToPhys(lav))
     .setLinearDamping(rb.linearDamping).setAngularDamping(rb.angularDamping)
     .setGravityScale(rb.gravityScale).setCcdEnabled(rb.ccd).setCanSleep(rb.canSleep);
   if (rb.fixedRotation) desc.lockRotations();

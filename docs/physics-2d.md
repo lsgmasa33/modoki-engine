@@ -274,7 +274,8 @@ pixelsPerMeter: 100                  // scale that keeps the solver in its happy
 **`RigidBody2D`** — the motion half:
 ```
 bodyType: 'dynamic'                  // 'dynamic' | 'static' | 'kinematic' (enum)
-vx: 0, vy: 0, angularVel: 0          // runtimeOnly readback of live velocity
+vx: 0, vy: 0, angularVel: 0          // runtimeOnly readback of live velocity — never saved
+initialVx: 0, initialVy: 0, initialAngularVel: 0   // AUTHORED launch velocity (saved)
 linearDamping: 0, angularDamping: 0
 gravityScale: 1
 fixedRotation: false                 // lock rotation (top-down characters)
@@ -307,6 +308,35 @@ Editor metadata: `bodyType`/`shape`/`type` as `type:'enum'` with `options`; `isS
 `fixedRotation`/`ccd`/`canSleep` as `boolean`; velocities/damping/friction as `number` with `step`;
 `entityA/B` as `entityRef`. Live-velocity readback fields marked `runtimeOnly` so they don't
 serialize into the scene.
+
+**Launch velocity is `initial*`, not `vx/vy` (#1592).** The read-back fields are `runtimeOnly`, so
+the Play snapshot and every save drop them. An authored `vx` used to launch once; then Stop
+restored 0 and the next save lost it. The authored launch lives in `initialVx/initialVy/
+initialAngularVel` (3D: `initialVx/Vy/Vz`, `initialAvx/Avy/Avz`). `createBody` chooses the launch
+velocity through `physics/launchVelocity.ts`:
+- An entity launches **once**: the first time it gets a **dynamic** body. It uses whatever code
+  wrote into `vx…` before the body existed (a spawned projectile), or else `initial*`. Linear and
+  angular velocity are decided separately. A body that starts kinematic and is later released to
+  dynamic launches at the release.
+- "Once" means **once per Play**. It is tracked by the runtimeOnly `launched` flag on the ENTITY.
+  **On Play→Stop the physics system clears the flag and zeroes the `vx…` read-back on every body**
+  (`resetLaunchOnStop`, run from `createPhysicsWorldRegistry`'s Stop hook). That hook fires while
+  the Play world is still alive, before Stop's authored restore snapshots the entities it CARRIES
+  (Persistent roots, kept base scenes); the carry keeps runtimeOnly fields. A swap inside one Play
+  does not reset, so a carried body keeps flying.
+  Rejected shapes, all found in review before merge:
+  - **Keying on the physics body record.** A structural rebuild and a scene swap that carries the
+    entity into a fresh physics world both create a new record, so a resting body re-launched.
+  - **A boolean nothing reset.** Stop carried it set, so the next Play never launched the entity.
+  - **A per-Play session stamp.** It also had to guess at Play time whether a carried entity's
+    `vx…` was leftover read-back (discard it) or a velocity code had just written (keep it). The
+    guess dropped a code-written throw on a carried body. Resetting at Stop leaves nothing to
+    guess.
+- An entity copied DURING Play (live duplicate, undo-restore) copies the `launched` flag along with its
+  live `vx…`. The copy keeps flying as the original was; it does not launch again.
+
+Writing any `runtimeOnly` field through a scene file or `modoki_mutate_scene` now **warns**:
+`fieldValueWarning`, shared by both validators, says the value is never saved.
 
 ## The physics system (one reconciler, new pipeline tier)
 
