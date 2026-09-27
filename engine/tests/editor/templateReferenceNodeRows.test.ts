@@ -509,6 +509,9 @@ describe('#1542: a template reference node keeps the rows its inner prefab no lo
   // The REJECT side (#1293): outside the prefab-edit world a template node's kept rows are not the template's, so a
   // template written from a scene instance does not take them. The store is seeded directly — what a rebuild's settle
   // keeps for that root in a scene. Mutation: in `keepsTemplateRows`, drop the sentinel-ancestor walk.
+  // ⚠️ The row carries a field and the ROW's key is asserted absent: `templateRowOf` strips a row's guid whatever the
+  // gate says, and a bare `{guid, name}` row converts to nothing, so the guid assertion alone stayed green with the
+  // walk deleted (#1673 close-out review).
   it('a template written from a scene instance does not carry rows kept for the node there', async () => {
     const SCENE_G = 'ffffffff-0000-4000-8000-000000001542';
     install(midDoc());
@@ -516,9 +519,10 @@ describe('#1542: a template reference node keeps the rows its inner prefab no lo
     await load(sceneWith(OUTER2, 'OuterRoot'));
     const nodeGuid = all().find((e) => e.name === 'MidRoot')!.guid!;
     expect(nodeGuid).toBeTruthy();
-    setKeptMemberOrphans(nodeGuid, { [`/${G_MID_NESTED}/${G(99)}`]: { guid: SCENE_G, name: 'Gone' } });
+    setKeptMemberOrphans(nodeGuid, { [`/${G_MID_NESTED}/${G(99)}`]: { guid: SCENE_G, name: 'Gone', traits: { Transform: { x: 4 } } } });
     const created = serializePrefab(all().find((e) => e.name === 'OuterRoot')!.id)!;
     expect(JSON.stringify(created)).not.toContain(SCENE_G);
+    expect(JSON.stringify(created)).not.toContain(G(99));
   });
 
   // A load resets the store for the node — every node, rows or not — so a set the file no longer states is not written

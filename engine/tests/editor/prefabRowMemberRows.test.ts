@@ -370,6 +370,9 @@ describe('#1533 close-out review', () => {
   // Re-review: R2's re-emit is for a TEMPLATE's own kept rows only. Under a scene root the kept rows are scene rows —
   // member guids and scene-guid nodes — and in a template every instance would spawn them with one guid (#1293).
   // Mutation: make `keepsTemplateRows` (`captureRowChannels`' gate) return true.
+  // ⚠️ The guid assertions alone cannot fail under it: `templateRowOf` strips a row's `guid`/`name` and `toTemplateNodes`
+  // blanks a node's guid whatever the gate says (#1673's T2). So each case also asserts the orphan ROW itself is absent,
+  // and the first one's row carries a field that survives the conversion — a bare `{guid, name}` row converts to nothing.
   const SCENE_G = 'ffffffff-0000-4000-8000-000000000001';
   const NODE_G = 'ffffffff-0000-4000-8000-000000000002';
   const GONE = G(99);
@@ -377,10 +380,12 @@ describe('#1533 close-out review', () => {
     install(midDoc());
     install(outerDoc());
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await load(sceneWith({ members: { [`/${GONE}`]: { guid: SCENE_G, name: 'Gone' } } }));
+    await load(sceneWith({ members: { [`/${GONE}`]: { guid: SCENE_G, name: 'Gone', traits: { Transform: { x: 4 } } } } }));
     warn.mockRestore();
     const created = serializePrefab(getAllEntities().find((e) => e.name === 'Holder')!.id)!;
-    expect(JSON.stringify(created.entities.find((e) => e.prefab === OUTER)!.members ?? {})).not.toContain(SCENE_G);
+    const rows = JSON.stringify(created.entities.find((e) => e.prefab === OUTER)!.members ?? {});
+    expect(rows).not.toContain(SCENE_G);
+    expect(rows).not.toContain(GONE);
   });
 
   it('Apply\'s promotion does not carry a reference node\'s kept orphan rows into the template', async () => {
@@ -403,5 +408,6 @@ describe('#1533 close-out review', () => {
     const rows = JSON.stringify(written.entities.find((e) => e.prefab === MID)!.members ?? {});
     expect(rows).not.toContain(SCENE_G);
     expect(rows).not.toContain(NODE_G);
+    expect(rows).not.toContain(GONE);
   });
 });

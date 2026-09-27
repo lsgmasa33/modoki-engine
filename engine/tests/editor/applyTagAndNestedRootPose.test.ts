@@ -245,10 +245,13 @@ describe('an added TAG on a NESTED instance\'s member is kept (#1491 sibling)', 
     expect(hasTag(inInstance(ROOT1, 'A'), 'Paused')).toBe(true);
   });
 
-  it('is NOT restated when the nested row adds the same tag itself', async () => {
+  // Both spellings a row can hold for a tag: `{}` is what every writer produces, `true` only a hand- or agent-written
+  // row (the spawner adds the tag for either). Only `true` can fail under the mutation: for `{}` the chain subtraction's
+  // empty-trait drop takes the tag anyway, so the delete is load-bearing for `true` alone (#1673's T1).
+  it.each([['true', true], ['{}', {}]])('is NOT restated when the nested row adds the same tag itself (row spells it %s)', async (_s, spelling) => {
     // Mutation: keep a tag the row also adds (drop the `if (rowFields)` delete).
     const doc = oDoc();
-    (doc.entities[3] as Record<string, unknown>).overrides = { 2: { Paused: {} } };
+    (doc.entities[3] as Record<string, unknown>).overrides = { 2: { Paused: spelling } };
     install(pDoc(), doc);
     await load(scene(O, [ROOT1]));
     expect(hasTag(inInstance(ROOT1, 'A'), 'Paused')).toBe(true); // precondition: the row adds it
