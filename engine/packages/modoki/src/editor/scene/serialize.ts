@@ -7,7 +7,7 @@ import { collectTransientSubtreeIds } from './authoringScope';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
-import { spawnEntity, findEntityByGuid } from '../../runtime/core/ecs/world';
+import { spawnEntity, findEntityByGuid, getCurrentWorld } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
@@ -26,7 +26,7 @@ import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
 import { swapHistory, forgetHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances } from './prefab';
+import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances, refreshPrefabSourceForPath } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefab';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
@@ -902,6 +902,58 @@ export async function adoptWorldReloadedFromDisk(scenePath: string, keptBaseGuid
   if (rebuilt) console.log(`[Prefab] rebuilt ${rebuilt} carried instance(s) from the prefab that changed`);
 }
 
+/** The repair a world swap OUT of a prefab-edit world owes, whichever route made it (#1666) — a scene load (Exit, the
+ *  Assets double-click, the Inspector's Open Scene, agent `load-scene`) or opening another prefab for editing. Call
+ *  it once the swap has landed and the edit flag no longer names `leftPath`'s prefab (a scene load calls it through
+ *  {@link runOwedLeaveRepair}):
+ *  - `leftPath`: the editor's copy of the prefab that was open skipped every external-write refresh while it was open
+ *    (`refreshPrefabSourceForPath`), so it can be older than the file. Left so, Apply/Revert refused every instance
+ *    of it, and saves captured against the old rows (#1483 review).
+ *  - A `Persistent` root is carried into the edit world and out again, so a SAVED edit reaches it only here — the
+ *    load re-expands everything else from disk. Rebuilds nothing that is current.
+ *  Refresh FIRST: the rebase rebuilds each stale frame to the editor's copy, so that copy must be the file's. */
+export async function repairLeftPrefabEdit(leftPath: string | null): Promise<void> {
+  if (leftPath) await refreshPrefabSourceForPath(leftPath);
+  await rebaseStaleInstances();
+}
+
+/** The repair a scene load out of a prefab-edit world owes, once the world has actually been left (#1666 close-out
+ *  review). Recorded when such a load STARTS and run by the newest load at its end, whatever that load's outcome —
+ *  so a load superseded after its swap hands it to the one that won, and that one runs it even when it FAILS before
+ *  its own swap. Inferring it from the edit flag missed both: the flag is cleared by the breadcrumb's re-render on the
+ *  swap, and a load that fails never reaches its repair. Recorded at the start, not after the swap, because a newer
+ *  load can fail and finish before the older one's swap resolves.
+ *  Settled by {@link settleLeaveRepair} when the session ends without a load leaving the world (Exit in place, or
+ *  opening another prefab from inside it). */
+let owedLeaveRepair: { path: string | null } | null = null;
+
+/** Run the owed repair if the world is no longer a prefab-edit world; while it still is, nothing was left and it
+ *  stays owed. Cleared only by a repair that completed in the world it started in: a load swapping in during its
+ *  awaits makes the rebase rebuild nothing (it collected ids in the world that is gone), and the newer load runs it
+ *  again at its own end. At worst the refresh runs twice; it is idempotent. */
+async function runOwedLeaveRepair(): Promise<void> {
+  const owed = owedLeaveRepair;
+  if (!owed || isPrefabEditWorld()) return;
+  // The flag goes first: the refresh skips the prefab it names, and the session it names is over.
+  useEditorStore.getState().closePrefabEditor();
+  const world = getCurrentWorld();
+  await repairLeftPrefabEdit(owed.path);
+  if (getCurrentWorld() === world && owedLeaveRepair === owed) owedLeaveRepair = null;
+}
+
+/** {@link runOwedLeaveRepair} from a load's FAILURE branch: a repair that throws there is reported, not let out —
+ *  `loadScene` resolves an outcome and never rejects, and every caller relies on that. It stays owed. */
+async function runOwedLeaveRepairQuietly(): Promise<void> {
+  try { await runOwedLeaveRepair(); } catch (e) { console.error('[Editor] the repair owed for leaving prefab edit failed:', e); }
+}
+
+/** The session ends WITHOUT a scene load leaving its world — Exit with nowhere to go or a load that failed, or opening
+ *  another prefab from inside it: run the repair for `leftPath` here, and forget any a load recorded for it. */
+export async function settleLeaveRepair(leftPath: string | null): Promise<void> {
+  owedLeaveRepair = null;
+  await repairLeftPrefabEdit(leftPath);
+}
+
 /** WHICH kinds of unsaved work exist, told apart. The causes themselves — what each one is, what
  *  it is keyed by, and which half of a save writes it — are documented on `CAUSE_SPECS` below,
  *  which this derives from; they are not re-listed here.
@@ -1653,6 +1705,11 @@ export async function loadScene(
     // new one loads, so an edit made mid-load is discarded too. Nothing resets the dirty state until
     // `adoptReplacedWorld` below; the swap itself does not.
     const dirtBeforeLoad = readWorldDirt();
+    // Leaving a prefab-edit world by ANY route owes its repair (#1666). Read before the swap: after it the world is
+    // the incoming one, and the flag is what names the prefab that was open. A cleared flag in an edit world is an
+    // Exit that already repaired in place (no return scene, or a failed load): nothing more is owed.
+    const editingBefore = useEditorStore.getState().editingPrefab;
+    if (isPrefabEditWorld() && editingBefore) owedLeaveRepair = { path: editingBefore.path };
     const { keptBaseGuids, startupErrors = [] } = await sceneManager.loadScene(scenePath, {
       ...(gameId !== undefined ? { gameId } : {}),
       // Resources acquire in parallel; each completion (on a cold cache, a finished
@@ -1686,6 +1743,8 @@ export async function loadScene(
     // one undo replay it onto the fresh world. A kept base's dirty flag survives (#1417). Both
     // rules: `adoptReplacedWorld`.
     adoptReplacedWorld(scenePath, keptBaseGuids, dirtBeforeLoad);
+    await runOwedLeaveRepair();
+    if (!stillLive()) return 'superseded';
     _lastLoadStartupErrors = startupErrors.map(({ manager, error }) => `${manager}: ${(error as Error)?.message ?? String(error)}`);
     if (_lastLoadStartupErrors.length) {
       // The scene IS loaded, so this is not a failure toast; SceneManager already console.error'd each.
@@ -1725,6 +1784,7 @@ export async function loadScene(
       const msg = `[Editor] Refused to load scene "${scenePath}": ${e.message}`;
       console.error(msg);
       useEditorStore.getState().showToast(`Scene not loaded: ${e.message}`, 'warn');
+      await runOwedLeaveRepairQuietly(); // an earlier load may have swapped out of a prefab-edit world and handed it here
       return 'refused';
     }
     // `probing`: the caller is walking a CANDIDATE LIST (editor boot) and a miss here is a
@@ -1738,6 +1798,7 @@ export async function loadScene(
     const msg = `[Editor] Failed to load scene: ${e}`;
     if (opts?.probing) console.warn(`${msg} (trying the next boot candidate…)`);
     else console.error(msg);
+    await runOwedLeaveRepairQuietly(); // as the refusal above
     return 'failed';
   } finally {
     // Load-bearing: if anything above throws, this must still return to zero, or every later

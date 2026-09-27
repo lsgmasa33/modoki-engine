@@ -12,14 +12,11 @@ import {
   getPrefabSource,
   preloadNestedPrefabsForSubtree,
   ownInstanceStructure,
-  revertOverridesSelective,
   staleInstanceRefusal,
-  rebuildInstance,
   type PrefabFile,
 } from '../scene/prefab';
-import { pushAction } from '../undo/undoManager';
-import { entityRef } from '../undo/entityRef';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
+import { revertOverridesWithUndo } from '../undo/revertPrefabUndo';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { findEntity, getAllEntities } from '../../runtime/core/ecs/entityUtils';
@@ -297,43 +294,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
           // Revert's own refusal is a bare null (#1483); say why here, as Apply's notice does.
           const refusal = staleInstanceRefusal(liveId);
           if (refusal) { useEditorStore.getState().showToast(`Revert: nothing was reverted — ${refusal}`, 'warn'); return; }
-          const result = await revertOverridesSelective(liveId, checked);
-          if (result) {
-            // The rebuild assigns new ECS ids but preserves the instance root's guid
-            // (rebuildInstance carries it over), so a guid-based ref re-finds the live
-            // root across each rebuild AND across a world rebuild (Play→Stop).
-            const ref = entityRef(result.newRootId);
-            useEditorStore.getState().selectEntity(result.newRootId);
-            const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, affectedScenes } = result;
-            pushAction({
-              label: 'Revert prefab overrides',
-              affectedScenes,
-              undo: async () => {
-                const cur = ref.resolve(); if (cur == null) return;
-                // rebuildInstance -> captureNestedInstanceOverrides is a sync cache read with NO
-                // warning on a miss, so a cold cache silently resets a nested instance's per-copy
-                // overrides to the child prefab base (#1284). UndoAction.undo/redo are typed
-                // `(): void | Promise<void>` and undoManager awaits them under its own mutex, so
-                // awaiting here is supported rather than merely tolerated.
-                await preloadNestedPrefabsForSubtree(cur);
-                const after = ref.resolve(); if (after == null) return;
-                const id = rebuildInstance(after, source, prefab, fullOverrides, fullStructure);
-                useEditorStore.getState().selectEntity(id);
-              },
-              redo: async () => {
-                const cur = ref.resolve(); if (cur == null) return;
-                // rebuildInstance -> captureNestedInstanceOverrides is a sync cache read with NO
-                // warning on a miss, so a cold cache silently resets a nested instance's per-copy
-                // overrides to the child prefab base (#1284). UndoAction.undo/redo are typed
-                // `(): void | Promise<void>` and undoManager awaits them under its own mutex, so
-                // awaiting here is supported rather than merely tolerated.
-                await preloadNestedPrefabsForSubtree(cur);
-                const after = ref.resolve(); if (after == null) return;
-                const id = rebuildInstance(after, source, prefab, reducedOverrides, reducedStructure);
-                useEditorStore.getState().selectEntity(id);
-              },
-            });
-          }
+          await revertOverridesWithUndo(liveId, checked);
           closeDialog();
         },
       });

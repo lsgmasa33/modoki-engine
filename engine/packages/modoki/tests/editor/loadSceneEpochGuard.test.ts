@@ -37,6 +37,8 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
         h.loadCalls.push({ path, opts, resolve: () => resolve({ keptBaseGuids: new Set() }), reject });
       }),
     getCurrentBaseScene: () => undefined,
+    // `loadScene` asks whether the outgoing world is a prefab-edit world (#1666): none is.
+    getCurrent: () => null,
   },
 }));
 

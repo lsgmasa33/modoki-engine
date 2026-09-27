@@ -17,6 +17,8 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     loadScene: async () => { throw h.nextError; },
     getCurrentBaseScene: () => undefined,
+    // `loadScene` asks whether the outgoing world is a prefab-edit world (#1666): none is.
+    getCurrent: () => null,
   },
 }));
 

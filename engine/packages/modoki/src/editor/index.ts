@@ -76,10 +76,10 @@ export {
   preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
   captureInstanceOverrides, applyOverridesByRootInstance,
   applyToPrefab, applyToPrefabSelective, staleInstanceRefusal,
-  revertOverridesSelective, rebuildInstance,
+  revertOverridesSelective, rebuildInstance, rebuildInstanceFromCapture,
   writePrefabFile, warnInertPrefabSizes, classifyExistingPrefabId,
   tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
-  detachPrefabInstance, reattachPrefabInstance,
+  detachPrefabInstance, reattachPrefabInstance, reattachDetachedInstance,
   captureInstanceStructure, resolveInstanceContext,
   type PrefabFile, type RevertResult,
 } from './scene/prefab';
@@ -96,6 +96,10 @@ export {
 // `applyToPrefabSelective` above is the raw mutation the dialog/agent-op undo wrapper
 // calls into, kept exported too for callers that manage their own undo entry.
 export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
+// …and `revertOverridesWithUndo` the only way to revert them with one (#1671: the dialog and the agent op each
+// carried a copy of its closures).
+export { revertOverridesWithUndo } from './undo/revertPrefabUndo';
+export { detachPrefabInstanceWithUndo } from './undo/detachPrefabUndo';
 export {
   saveScene, saveAll, serializeScene, loadScene, newScene, NewSceneRefusedError,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,

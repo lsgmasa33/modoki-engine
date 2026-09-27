@@ -13,7 +13,8 @@ import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, clearOwnedNestedStampFromSnapshot, moveEntityToScene, planReparent, applyReparent, type EntitySnapshot } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
-import { instantiatePrefabInstance, detachPrefabInstance, reattachPrefabInstance, type PrefabFile } from '../scene/prefab';
+import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
+import { detachPrefabInstanceWithUndo } from '../undo/detachPrefabUndo';
 import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { focusEntityInSceneView, canFrameSelected } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
@@ -1163,23 +1164,9 @@ export default function Hierarchy() {
     // Resolve the instance root from whichever member was clicked.
     const pi = readTraitData(entity.id, piMeta);
     const rootId = (pi?.rootInstanceId as number) || entity.id;
-    const snapshot = detachPrefabInstance(rootId);
-    if (!snapshot.links.length) return;
     const name = getAllEntities().find(e => e.id === rootId)?.name ?? entity.name;
-    // Resolve the instance root by guid so redo detaches the right entity after a
-    // world rebuild (Play→Stop); undo rebuilds from the snapshot.
-    const ref = entityRef(rootId);
-    pushAction({
-      label: `Detach prefab "${name}"`,
-      // Detach leaves PLAIN entities, whose guids ARE serialized, so these refs survive a
-      // Play→Stop where Create Prefab's do not (#1272). Report a miss anyway rather than
-      // discard the count — that silence is what hid #1272 for as long as it did.
-      undo: () => {
-        const unresolved = reattachPrefabInstance(snapshot);
-        if (unresolved > 0) console.warn(`[Hierarchy] Detach undo: ${unresolved} prefab link(s) could not be put back — no longer addressable.`);
-      },
-      redo: () => { const id = ref.resolve(); if (id != null) detachPrefabInstance(id); },
-    });
+    // One undo entry, shared with the agent op: undo reattaches onto the current template, redo re-snapshots.
+    detachPrefabInstanceWithUndo(rootId, `Detach prefab "${name}"`, '[Hierarchy]');
   }, []);
 
   // Keyboard shortcut: Cmd+Backspace (Mac) / Delete (Windows) to delete selected entity

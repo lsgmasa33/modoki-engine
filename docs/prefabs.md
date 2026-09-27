@@ -589,12 +589,49 @@ member's row: false overrides, and Apply wrote one member's value into another's
   the third review, the enclosing instance read it as a stale nested frame, was skipped, and kept the
   member the undo had taken away. The snapshot restore also rebases the `Persistent` roots its scene
   load carries flat, before it saves.
-- **Leaving prefab-edit mode re-reads the edited prefab.** `refreshPrefabSourceForPath` skips the
-  prefab open in prefab-edit mode, so after an exit without saving, the editor's copy could be older
-  than the file the scene had just loaded from. Every instance of it was then refused, and a later
-  rebase rebuilt carried ones back to the old template. `exitPrefabEditing` re-reads it once the
-  editor is closed, then rebases, because a `Persistent` root is carried through prefab-edit mode and
-  back, so a SAVED edit reaches it only there.
+- **Leaving prefab-edit mode re-reads the edited prefab, by EVERY route** (`repairLeftPrefabEdit`,
+  `serialize.ts`). `refreshPrefabSourceForPath` skips the prefab open in prefab-edit mode, so after an
+  exit without saving, the editor's copy could be older than the file the scene had just loaded from.
+  Every instance of it was then refused, and a later rebase rebuilt carried ones back to the old
+  template. The repair re-reads it once the edit flag is cleared, then rebases, because a `Persistent`
+  root is carried through prefab-edit mode and back, so a SAVED edit reaches it only there. Until
+  #1666 it ran only in `exitPrefabEditing`, so the Assets double-click, the Inspector's Open Scene and
+  agent `load-scene` (all `serialize.loadScene`) left the carried instance built from the old template
+  and the prefab's copy stale for the session. It is now RECORDED as owed when any `loadScene` starts
+  out of a prefab-edit world (with the edit flag set), and run by the newest load at its end, whatever
+  that load's outcome, once the world is no longer an edit world (`runOwedLeaveRepair`). It is cleared
+  only by a repair that completed in the world it started in. Two things make inferring it wrong,
+  both found by the close-out review: the breadcrumb's re-render clears the edit flag on the swap, and a
+  load superseded after its swap by one that then FAILS left the world with no load reaching a repair.
+  It is recorded at the load's START because the newer load can fail and finish before the older one's
+  swap resolves. A load that fails before its swap leaves the edit world live and the flag set: nothing
+  was left, and it stays owed. The session ending WITHOUT a load leaving the world settles it
+  (`settleLeaveRepair`): `exitPrefabEditing` in place (no return scene, or its load failed), judged by
+  the world rather than the outcome, and opening another prefab from inside the edit world, once the
+  flag names the new one (that swap goes through `sceneManager` directly). A flag already cleared in an
+  edit world is an Exit that repaired in place, so a later load out owes nothing.
+- **An undo that puts an instance back from an older capture lands it on the CURRENT template**
+  (#1665). Revert's undo and redo rebuilt from the document the Revert read, and Detach's undo re-adds
+  links naming the pre-detach document. When the template changed in between (a prefab-edit save, an
+  Apply from another instance), both undid that change on this one instance, and the next save wrote a
+  member the template had gained as REMOVED by it. Revert (`revertOverridesWithUndo`, the one wrapper
+  the dialog and the agent op share) rebuilds through `rebuildInstanceFromCapture`, and Detach's undo
+  rebases after the reattach (`reattachDetachedInstance`). In production the template changes between
+  a Detach and its undo only across a world reload, which leaves the tree plain with no frame record, so
+  the detach snapshot carries each frame root's record and the reattach puts it back; without it the
+  rebase skipped the frame (close-out review). Always, not only where the world has none: the restored
+  localIds index the snapshot's document, and Create Prefab's Replace undo otherwise kept the SAME
+  prefab's newer record over them, so the instance read as stale (re-review). Detach's redo keeps
+  the snapshot of the detach it just made (`detachPrefabInstanceWithUndo`): the undo's rebase can bring
+  members in, and replaying the FIRST snapshot on the next undo left one of them plain. ⚠️ Not `rebuildInstance(…, cache, …, baseline = the Revert's document)`: `baseline` is two
+  things there — the numbering of what is carried, and the document the LIVE tree was expanded from,
+  whose chain the nested capture subtracts (not mark-gated for structure). At undo time they differ, so
+  `rebuildInstanceFromCapture` translates the carried state into the frame's recorded document and
+  passes THAT as the baseline, which is the rule `refreshInstances` follows. It only picks the
+  document; the effective base is still computed in one place (`captureNestedInstanceOverrides` →
+  `resolveEffectivePrefabOverride`/`Structure`). A stale NESTED frame refuses the step before anything
+  is rebuilt, with `UndoRefusedError` as Apply's undo refuses (#1664): `runStep` drops it (#310), marks
+  nothing edited, and toasts the reason.
 - **Apply and Revert refuse whatever is left** (`framesBuiltFromOtherRows`): any frame of the
   instance, nested ones included, whose recorded document does not hold the same rows as the cache:
   the same localIds, each naming the same `nodeGuid` where both carry one (`rowsMeanTheSame`). Both
@@ -669,7 +706,8 @@ would rebuild it to clear a refusal.
 ⚠️ **The save does not rebase for itself.** `serializeScene` is also the Play and timeline-preview
 snapshot and the before/after capture of Apply's undo, and a rebuild respawns entities, so it must not
 run inside them. A save is safe because every path that moves the cache under live instances brings
-those instances current first. The hot reload, leaving prefab-edit mode and Apply's undo call the rebase.
+those instances current first, and so does every undo that puts an instance back from an older capture
+(Revert's, Detach's). The hot reload, leaving prefab-edit mode and Apply's undo call the rebase.
 Apply's fan-out refreshes each instance of the source from that instance's own record. NOT CHECKED: the cache writers that
 do not rebase, which are Create Prefab's Replace and its undo (`assetOps.ts`), the skin-rig prefab
 update (`skinPrefab.ts`) and the model regenerate (`ModelAssetView.tsx`), when other live instances of
@@ -755,7 +793,8 @@ warm:
 - Create Prefab → Replace, and the skin-prefab writes (both through `setPrefabCache`).
 
 Paths that also reload:
-- Prefab-EDIT mode reloads on exit (`exitPrefabEditing` → `loadScene(target)`).
+- Prefab-EDIT mode reloads on exit (`exitPrefabEditing` → `loadScene(target)`), and so does any other scene load out
+  of it; the load runs the leaving repair (#1666).
 - Undo/redo of an Apply reloads (`restoreSnapshot` → `loadScene`), under the key of the world the
   undo belongs to when it runs (`currentSceneKey()`): the scene's path, the prefab-edit world's
   synthetic path (#1573), or `''` for an untitled scene (#1575). See § Undoing an Apply.

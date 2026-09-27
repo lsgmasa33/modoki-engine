@@ -4,7 +4,7 @@ import { whyWorldNotAuthored } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, identityTree, type DetachedMember, type IdentityTree } from '../../runtime/core/ecs/memberHome';
-import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, noteNodeMoves, frameRootDoc, templateFrameClimber, rewriteNodeMoves } from '../../runtime/core/ecs/identityParents';
+import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, noteNodeMoves, frameRootDoc, noteFrameRootDoc, templateFrameClimber, rewriteNodeMoves } from '../../runtime/core/ecs/identityParents';
 import { memberRowKeysIn, memberRowsIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
 import { isPrefabEditRowGuid, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { nestedMoveRef, toLocalIdKeys } from './overrideKeyGrammar';
@@ -4278,8 +4278,10 @@ export function untagEntityTreeAsInstance(rootEcsId: number, source: string): vo
 }
 
 /** A captured PrefabInstance trait, used to undo a detach. `ref`/`rootRef` are what reattach resolves
- *  through; `id` is the capture-time ECS id, kept for diagnostics only. */
-export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: EntityRef; data: Record<string, unknown>; }
+ *  through; `id` is the capture-time ECS id, kept for diagnostics only. `frame`, on a frame ROOT: the record of
+ *  the document it was expanded from (`frameRootDoc`) — a reload in between leaves the tree plain and
+ *  unrecorded, and without the record put back nothing could tell the restored frame is older than the cache. */
+export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: EntityRef; data: Record<string, unknown>; frame?: NonNullable<ReturnType<typeof frameRootDoc>>; }
 
 /** What a detach undoes: the links it stripped off the tree, and the members OUTSIDE the tree it promoted or
  *  unlinked because their frame ended with it (#1453). */
@@ -4335,7 +4337,9 @@ export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean
     const pi = entity.get(PrefabInstanceMeta.trait) as Record<string, unknown>;
     // Every field, `parentLocalId` included: it addresses a NESTED instance's per-instance overrides, and a
     // snapshot that dropped it reattached a nested instance as top-level (0) on undo (#1264 close-out).
+    const frame = pi.rootInstanceId === info.id ? frameRootDoc(getCurrentWorld(), entity) : undefined;
     snapshot.push({
+      ...(frame ? { frame } : {}),
       id: info.id, ref: entityRef(info.id), rootRef: entityRef(pi.rootInstanceId as number),
       data: { source: pi.source, localId: pi.localId, nodeGuid: pi.nodeGuid ?? '', rootInstanceId: pi.rootInstanceId, parentLocalId: pi.parentLocalId, parentNodeGuid: pi.parentNodeGuid ?? '', ownerGuid: pi.ownerGuid ?? '' },
     });
@@ -4372,6 +4376,11 @@ export function reattachPrefabInstance(
     const restored = root == null ? entry.data : { ...entry.data, rootInstanceId: root };
     if (entity.has(PrefabInstanceMeta.trait)) entity.set(PrefabInstanceMeta.trait, restored);
     else entity.add(PrefabInstanceMeta.trait(restored));
+    // The frame's record goes back with its links (#1665 close-out): the restored localIds index the document the
+    // snapshot recorded, so any other record is wrong for them — none after a plain reload, another prefab's after a
+    // retag, or the SAME prefab's newer document after Create Prefab's Replace (re-review: kept, it read v1 links
+    // against v2 rows and refused Apply/Revert on the instance).
+    if (entry.frame && restored.rootInstanceId === entity.id()) noteFrameRootDoc(getCurrentWorld(), entity, entry.frame);
   }
   markStructureDirty();
   if (!unresolvedEntries.length) return 0;
@@ -4396,6 +4405,18 @@ export function reattachPrefabInstance(
     present.add(`${pi.source}|${pi.localId}|${pi.parentLocalId ?? 0}`);
   }
   return unresolvedEntries.filter(({ data: d }) => !present.has(`${d.source}|${d.localId}|${d.parentLocalId ?? 0}`)).length;
+}
+
+/** Detach's undo: put the links back ({@link reattachPrefabInstance}), then bring the instance onto the editor's current
+ *  copy of its prefab. The links name the document the instance was built from BEFORE the detach, and the template can
+ *  change while it is detached — in practice across a world reload (a prefab-edit save and Exit, an external write),
+ *  which also leaves the tree plain and unrecorded. Left so, the next save captured a member the template had gained
+ *  as REMOVED by this instance (#1665's sibling, observed). The reattach puts each frame's record back from the
+ *  snapshot, so the rebase sees it. Returns the unresolved count, as the reattach. */
+export async function reattachDetachedInstance(detached: DetachSnapshot): Promise<number> {
+  const unresolved = reattachPrefabInstance(detached);
+  await rebaseStaleInstances();
+  return unresolved;
 }
 
 /** Seed (or evict) the in-memory prefab cache. Used by save/import flows so
@@ -6591,10 +6612,18 @@ function rebuildTeardown(
 function localIdTranslation(from: PrefabFile, to: PrefabFile): ((lid: number) => number) | null {
   if (from === to) return null;
   const toByGuid = new Map<string, number>();
-  for (const pe of to.entities) if (pe.nodeGuid && isGuid(pe.nodeGuid)) toByGuid.set(pe.nodeGuid, pe.localId);
+  // A `to` row with no identity of its own (a pre-v5 copy — a `git checkout` of an older file) can only be matched by
+  // its number, as `rowsMeanTheSame` matches it: a `from` row keeps its localId when `to` holds that localId unkeyed.
+  // Mapping it to 0 dropped every carried edit on it (#1665 close-out review).
+  const toUnkeyed = new Set<number>();
+  for (const pe of to.entities) {
+    if (pe.nodeGuid && isGuid(pe.nodeGuid)) toByGuid.set(pe.nodeGuid, pe.localId);
+    else toUnkeyed.add(pe.localId);
+  }
   const map = new Map<number, number>([[from.rootLocalId ?? 1, to.rootLocalId ?? 1]]);
   for (const pe of from.entities) {
-    if (pe.nodeGuid && isGuid(pe.nodeGuid) && pe.localId !== (from.rootLocalId ?? 1)) map.set(pe.localId, toByGuid.get(pe.nodeGuid) ?? 0);
+    if (!pe.nodeGuid || !isGuid(pe.nodeGuid) || pe.localId === (from.rootLocalId ?? 1)) continue;
+    map.set(pe.localId, toByGuid.get(pe.nodeGuid) ?? (toUnkeyed.has(pe.localId) ? pe.localId : 0));
   }
   if ([...map].every(([a, b]) => a === b)) return null;
   return (lid) => map.get(lid) ?? lid;
@@ -6870,6 +6899,56 @@ export function rebuildInstance(
     if (!to) console.warn(`[Prefab] rebuild: the parent ${p.parentGuid} of a member moved in here is gone, and so is its template parent; it stays at the scene root`);
   }
   return newRootId;
+}
+
+/** Rebuild instance `rootInstanceId` to `overrides`/`structure` — a state captured against `capturedFrom`, an earlier
+ *  copy of its document — onto the editor's CURRENT copy of `source` (#1665). What a Revert's undo and redo put back:
+ *  the template can have changed since the Revert (a prefab-edit save, an Apply from another instance), and a rebuild
+ *  from `capturedFrom` undid that change on this one instance — a member the template gained since then vanished, and
+ *  the next save wrote it as REMOVED by this instance.
+ *
+ *  ⚠️ Not `rebuildInstance(…, now, …, baseline = capturedFrom)`: `baseline` is two things at once there — the numbering
+ *  of what is carried, and the document the LIVE tree was expanded from, whose chain the nested capture subtracts. Here
+ *  they differ (the live tree was rebased since), so each is given its own: the carried state is translated into the
+ *  live frame's recorded document, which is then the baseline — the rule `refreshInstances` follows. The base itself
+ *  is still computed only where `rebuildInstance` computes it (`captureNestedInstanceOverrides`); this picks the
+ *  document, never the subtraction. `nestedMoves` keys are matched after the rebuild's own translation, so they go
+ *  straight to the target's numbering.
+ *
+ *  Returns null, rebuilding nothing, when a frame nested in the instance is stale — the refusal `refreshInstances` gives
+ *  (#1493): the nested capture would read it against the cached child rows. */
+export function rebuildInstanceFromCapture(
+  rootInstanceId: number,
+  source: string,
+  capturedFrom: PrefabFile,
+  overrides: Record<number, Record<string, Record<string, unknown>>>,
+  structure: Parameters<typeof rebuildInstance>[4],
+): number | null {
+  if (framesBuiltFromOtherRows(rootInstanceId, { nestedOnly: true }).length) return null;
+  const now = prefabCache.get(source) ?? capturedFrom;
+  const handle = findEntity(rootInstanceId);
+  const rec = handle ? frameRootDoc(getCurrentWorld(), handle) : undefined;
+  const live = rec && rec.source === source ? rec.doc as PrefabFile : now;
+  const toLive = localIdTranslation(capturedFrom, live);
+  if (toLive) ({ overrides, structure } = translateCarried(toLive, overrides, structure));
+  const toNow = localIdTranslation(capturedFrom, now);
+  if (toNow && structure.nestedMoves) structure = { ...structure, nestedMoves: translateNestedMoveKeys(structure.nestedMoves, toNow) };
+  return rebuildInstance(rootInstanceId, source, now, overrides, structure, live);
+}
+
+/** `nestedMoves` keys (`~moved.<chain>:<lid>`) with their chain's FIRST link — a row of the outer document — put through
+ *  `lid`; the rest are rows of child documents. A key whose row the target dropped is dropped. */
+function translateNestedMoveKeys(nm: NonNullable<InstanceStructure['nestedMoves']>, lid: (n: number) => number): NonNullable<InstanceStructure['nestedMoves']> {
+  const key = (k: string): string | null => {
+    const [chain = '', member = ''] = k.slice('~moved.'.length).split(':');
+    const [first, ...rest] = chain.split('.');
+    const to = lid(Number(first));
+    return to ? `~moved.${[to, ...rest].join('.')}:${member}` : null;
+  };
+  return {
+    ...(nm.drop ? { drop: nm.drop.map(key).filter((k): k is string => k !== null) } : {}),
+    ...(nm.set ? { set: Object.fromEntries(Object.entries(nm.set).flatMap(([k, g]) => { const t = key(k); return t ? [[t, g]] : []; })) } : {}),
+  };
 }
 
 /** Tear down each instance in `rootIds`, re-instantiate from `newPrefab`, and

@@ -53,8 +53,8 @@ import {
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
-  detachPrefabInstance, reattachPrefabInstance,
-  applyToPrefabWithUndo, revertOverridesSelective, staleInstanceRefusal, rebuildInstance, resolveInstanceContext,
+  detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo,
+  applyToPrefabWithUndo, revertOverridesWithUndo, staleInstanceRefusal, resolveInstanceContext,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey,
   pushAction, makePrefabInstantiateAction, entityRef,
   getEditorViewportCamera, focusEntityInSceneView, setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit,
@@ -3026,27 +3026,15 @@ export function registerEditorAgentOps(): void {
       refuseEditOfPosedWorld('prefab detach');
       if (p.entityId == null && !p.entityGuid) throw new Error('prefab detach requires { entityId | entityGuid }');
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab detach'); // both given → refused (#1223 D1)
-      const snapshot = detachPrefabInstance(entityId);
-      // detachPrefabInstance returns [] for a plain (non-instance) entity. Reporting {ok:true,
-      // detached:0} let an agent believe it had unpacked a prefab it hadn't — now a hard failure,
-      // matching the other structural ops. (C7 re-audit.)
+      const name = getAllEntities().find(e => e.id === entityId)?.name ?? String(entityId);
+      // Same entry the Hierarchy "Detach Prefab" menu pushes (`detachPrefabInstanceWithUndo`).
+      const snapshot = detachPrefabInstanceWithUndo(entityId, `Detach prefab "${name}"`, '[prefab detach]');
+      // It returns [] for a plain (non-instance) entity, recording nothing. Reporting {ok:true, detached:0} let an
+      // agent believe it had unpacked a prefab it hadn't — now a hard failure, matching the other structural ops.
+      // (C7 re-audit.)
       if (!snapshot.links.length) {
         throw new Error(`prefab detach: entity ${entityId} is not a prefab instance (nothing to unpack). Only an instantiated prefab can be detached.`);
       }
-      // Same entry the Hierarchy "Detach Prefab" menu pushes: undo re-attaches from the
-      // snapshot, redo re-resolves by guid (the raw id is stale after a world rebuild).
-      const name = getAllEntities().find(e => e.id === entityId)?.name ?? String(entityId);
-      const ref = entityRef(entityId);
-      pushAction({
-        label: `Detach prefab "${name}"`,
-        undo: () => {
-          // Detach leaves plain entities, whose guids ARE serialized, so these survive a
-          // Play→Stop where Create Prefab's do not (#1272). Reported, never discarded.
-          const unresolved = reattachPrefabInstance(snapshot);
-          if (unresolved > 0) console.warn(`[prefab detach] undo: ${unresolved} prefab link(s) could not be put back — no longer addressable.`);
-        },
-        redo: () => { const id = ref.resolve(); if (id != null) detachPrefabInstance(id); },
-      });
       return { ok: true, detached: snapshot.links.length, saved: false };
     }
     // ── Override discovery/apply/revert (#2Tkw8CiWRATmHck2ze7q) ──
@@ -3206,39 +3194,16 @@ export function registerEditorAgentOps(): void {
         };
       }
 
-      // which === 'revert' — mirrors ApplyPrefabDialog.handleRevert EXACTLY: revert itself
-      // pushes NO undo entry (rebuildInstance is a raw teardown+rebuild), so the caller must,
-      // with the same before/after rebuild-from-snapshot undo/redo the dialog wires.
+      // which === 'revert' — the dialog's own wrapper (`revertOverridesWithUndo`): revert itself pushes NO undo
+      // entry (rebuildInstance is a raw teardown+rebuild), so the wrapper records one, whose undo/redo rebuild
+      // onto the prefab as it is THEN (#1665).
       // A refusal states its own cause (#1483) — Revert's bare null would be reported below as a lost instance.
       const refusal = staleInstanceRefusal(ctx.rootInstanceId);
       if (refusal) throw new Error(`prefab revert refused: ${refusal}`);
-      const result = await revertOverridesSelective(ctx.rootInstanceId, keySet);
+      const result = await revertOverridesWithUndo(ctx.rootInstanceId, keySet);
       if (!result) {
         throw new Error(`prefab revert: revertOverridesSelective returned nothing for entity ${entityId} — it stopped being a prefab instance, or the prefab source could not be re-loaded for the rebuild (see the editor console for the [Prefab] warning).`);
       }
-      const ref = entityRef(result.newRootId);
-      useEditorStore.getState().selectEntity(result.newRootId);
-      const { source, prefab: revertedPrefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, affectedScenes } = result;
-      pushAction({
-        label: 'Revert prefab overrides',
-        affectedScenes,
-        undo: async () => {
-          const cur = ref.resolve(); if (cur == null) return;
-          // Same cold read as the dialog's closures (#1284); undoManager awaits undo/redo.
-          await preloadNestedPrefabsForSubtree(cur);
-          const after = ref.resolve(); if (after == null) return;
-          const id = rebuildInstance(after, source, revertedPrefab, fullOverrides, fullStructure);
-          useEditorStore.getState().selectEntity(id);
-        },
-        redo: async () => {
-          const cur = ref.resolve(); if (cur == null) return;
-          // Same cold read as the dialog's closures (#1284); undoManager awaits undo/redo.
-          await preloadNestedPrefabsForSubtree(cur);
-          const after = ref.resolve(); if (after == null) return;
-          const id = rebuildInstance(after, source, revertedPrefab, reducedOverrides, reducedStructure);
-          useEditorStore.getState().selectEntity(id);
-        },
-      });
       // revert is live-only — the prefab FILE is untouched, matching instantiate/detach.
       return { ok: true, newRootId: result.newRootId, guid: ensureGuid(result.newRootId), revertedKeys: [...keySet], saved: false };
     }

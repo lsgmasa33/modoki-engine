@@ -23,21 +23,6 @@ vi.mock('../../src/editor/scene/serialize', async (importOriginal) => {
   return { ...actual, loadScene: (p: string) => loadScene(p) };
 });
 
-// The editor's copy of the prefab that was open is re-read on exit (#1483 review) — recorded with what the
-// editor state was at the moment of the call, since the refresh skips a prefab that is still open.
-const refreshed: { path: string; editingAtCall: unknown }[] = [];
-vi.mock('../../src/editor/scene/prefab', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/editor/scene/prefab')>();
-  return {
-    ...actual,
-    refreshPrefabSourceForPath: async (path: string) => {
-      const { useEditorStore: store } = await import('../../src/editor/store/editorStore');
-      refreshed.push({ path, editingAtCall: store.getState().editingPrefab });
-    },
-    rebaseStaleInstances: async () => { refreshed.push({ path: '<rebase>', editingAtCall: null }); return 0; },
-  };
-});
-
 import { useEditorStore } from '../../src/editor/store/editorStore';
 import { exitPrefabEditing, PREFAB_EDIT_SCENE_PREFIX } from '../../src/editor/scene/prefabEdit';
 import { lastSceneKey, setScenePersistenceProject } from '../../src/editor/scene/serialize';
@@ -45,7 +30,6 @@ import { lastSceneKey, setScenePersistenceProject } from '../../src/editor/scene
 const PREFAB = { path: '/games/x/assets/prefabs/Ship.prefab.json', guid: 'g-ship', name: 'Ship' };
 
 beforeEach(() => {
-  refreshed.length = 0;
   loadScene.mockClear();
   localStorage.clear();
   useEditorStore.getState().closePrefabEditor();
@@ -105,13 +89,7 @@ describe('exitPrefabEditing — return-scene fallback', () => {
   });
 });
 
-describe('exitPrefabEditing re-reads the editor`s copy of the prefab that was open (#1483 review)', () => {
-  // Mutation: drop the refresh from exitPrefabEditing, or run it before closePrefabEditor (the refresh skips
-  // the prefab still open, so it would re-read nothing).
-  it('after the editor is closed, so the refresh does not skip it as the prefab being edited', async () => {
-    useEditorStore.getState().openPrefabEditor(PREFAB, '/assets/scenes/Station.json');
-    await exitPrefabEditing();
-    // …and then rebuilds a carried (Persistent) instance a saved edit left stale (close-out review 2).
-    expect(refreshed).toEqual([{ path: PREFAB.path, editingAtCall: null }, { path: '<rebase>', editingAtCall: null }]);
-  });
-});
+// The leaving repair (#1483 review: re-read the prefab that was open once the editor is closed, then rebase) moved
+// into `serialize.loadScene` in #1666, where every route out of the edit world reaches it. This file stubs the load,
+// so it cannot see it: the ordering and the exactly-once guarantee are pinned, through the real load, by
+// engine/tests/editor/prefabEditLeaveRepair.test.ts.

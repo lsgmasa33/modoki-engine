@@ -10,9 +10,9 @@
 import type { Entity } from 'koota';
 import type { PrefabFile } from './prefab';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
-import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs, refreshPrefabSourceForPath, rebaseStaleInstances } from './prefab';
+import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
 import { runtimeExcludedMessage } from './authoringScope';
-import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
+import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, settleLeaveRepair, type SerializedEntity } from './serialize';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
@@ -470,6 +470,10 @@ async function openPrefabForEditingSwitching(
     useEditorStore.getState().prefabReturnScenePath ?? null,
   );
   const sceneData = buildPrefabEditScene(prefab);
+  // Opening a prefab from INSIDE another's edit world leaves that one as a scene load would, and owes the same repair
+  // (#1666). Read before the swap and before the flag is re-pointed at this prefab.
+  const editingBefore = useEditorStore.getState().editingPrefab;
+  const leftPrefabEdit = isPrefabEditWorld() && editingBefore ? { prefab: editingBefore } : null;
   // Still dirty after the save above (an untitled scene, or a save that failed) → that work is
   // discarded by this swap, and so is its undo stack (#1409). Read on both sides of the await.
   const dirtyBeforeSwap = worldHasUnsavedEdits();
@@ -490,6 +494,9 @@ async function openPrefabForEditingSwitching(
   markSceneSaved();
   clearAllSceneDirty();
   useEditorStore.getState().openPrefabEditor({ path: asset.path, guid, name: prefab.name }, returnScene);
+  // After the flag names THIS prefab: the refresh skips the one it names. Re-opening the same prefab refreshes nothing
+  // — it was just fetched above.
+  if (leftPrefabEdit) await settleLeaveRepair(leftPrefabEdit.prefab?.path ?? null);
   console.log(`[PrefabEdit] editing "${prefab.name}"`);
 }
 
@@ -694,15 +701,13 @@ export async function exitPrefabEditing(): Promise<string | null> {
     .find((p): p is string => !!p && !p.startsWith(PREFAB_EDIT_SCENE_PREFIX)) ?? null;
   const edited = useEditorStore.getState().editingPrefab;
   if (target) await loadScene(target);
+  // A load that swapped out of this world ran the leaving repair itself, or handed it to the load that superseded it
+  // (`runOwedLeaveRepair`, #1666). Still in it — no return scene, or the load failed before its swap — the session
+  // ends in place, and the repair is this function's. Judged by the world, not the outcome: a load superseded by one
+  // that then failed reads 'superseded' either way.
+  const inPlace = isPrefabEditWorld();
   closePrefabEditor();
-  // The editor's copy of the prefab that was OPEN skipped every external-write refresh while it was open
-  // (`refreshPrefabSourceForPath`), so after an exit without saving it can be older than the file — which the
-  // scene just loaded from. Left so, Apply/Revert refused every instance of it and a later hot reload rebuilt
-  // carried ones back to the old template (#1483 review). Re-read now that nothing is editing it.
-  if (edited) await refreshPrefabSourceForPath(edited.path);
-  // A `Persistent` root is carried into the prefab-edit world and back, so a SAVED edit reaches it only here
-  // — the scene load re-expands everything else (close-out review 2). Rebuilds nothing that is current.
-  await rebaseStaleInstances();
+  if (inPlace) await settleLeaveRepair(edited?.path ?? null);
   return target;
 }
 
