@@ -323,8 +323,8 @@ export function stampDerivedMemberGuids(rootEcsId: number, world: World = getCur
  *  anyway moves a guid for no reader and drags every external reference along with it.
  *
  *  ⚠️ This is the **deliberate divergence from a QA-measured contract** #1468 design record R7 flags:
- *  `qa/knowledge.md`'s promotion row records that promotion today re-derives its members' guids. That stops
- *  being true where the template mints identity, and stays true where it does not — a pre-v5
+ *  `qa/knowledge.md`'s promotion row recorded that promotion re-derives its members' guids (it now names
+ *  both cases). That stops being true where the template mints identity, and stays true where it does not — a pre-v5
  *  template has no rows, so the reload really does derive and the rename is still what keeps the
  *  live world honest.
  *
