@@ -57,6 +57,18 @@ export function reportUndoFailure(opts: {
   }
 }
 
+/** A step that REFUSED before it changed anything (#1664) — thrown, so `runStep` drops the entry (#310), but reported
+ *  as what it is. The generic report below says part of the step may have applied and toasts a bare "FAILED", and
+ *  neither is true or useful here: nothing was applied, and `toast` says why, in words the user can act on. */
+export class UndoRefusedError extends Error {
+  readonly toast: string;
+  constructor(message: string, toast: string) {
+    super(message);
+    this.name = 'UndoRefusedError';
+    this.toast = toast;
+  }
+}
+
 /** Report an undo/redo closure that THREW, and whose action was therefore dropped (#310).
  *
  *  Distinct from `reportUndoFailure` above, which covers the common case: a helper resolved
@@ -67,7 +79,8 @@ export function reportUndoFailure(opts: {
  *
  *  Always toasts, unlike the two-level rule above. That rule distinguishes a failure the user
  *  can fix from one they cannot; this is neither — it is history loss, and it is worth
- *  interrupting for whatever caused it. */
+ *  interrupting for whatever caused it. An `UndoRefusedError` is the exception: nothing was applied,
+ *  so it gets its own wording and toast. */
 export function reportUndoThrew(opts: {
   direction: UndoDirection;
   label: string;
@@ -75,6 +88,11 @@ export function reportUndoThrew(opts: {
 }): void {
   const { direction, label, error } = opts;
   const detail = error instanceof Error ? error.message : String(error);
+  if (error instanceof UndoRefusedError) {
+    console.error(`[undo] ${direction} of "${label}" was REFUSED — ${detail} The entry was dropped from the history; nothing was applied.`);
+    useEditorStore.getState().showToast(`${direction} of "${label}" refused: ${error.toast}`, 'warn');
+    return;
+  }
   const other = direction === 'Undo' ? 'redone' : 'undone';
   console.error(
     `[undo] ${direction} of "${label}" THREW — ${detail}. The entry was DROPPED from the history: ` +

@@ -1,9 +1,8 @@
 /** SHA-256 of the UTF-8 encoding of a string, hex-encoded lowercase (#469).
  *
  *  This is the CLIENT half of the `ifMatch` precondition on `POST /api/asset-write`
- *  (`editorBackendRouter.ts`) — the only route a client actually threads `ifMatch` through
- *  today (`atlasPersist.ts`); `/api/write-file` carries the same precondition server-side
- *  but no client caller passes it yet (#835). The server hashes the raw file bytes with Node's
+ *  (`editorBackendRouter.ts`), threaded by `atlasPersist.ts`, and on `POST /api/write-file`,
+ *  threaded by Apply-to-Prefab's undo/redo (`installPrefabSnapshot`, #1664). The server hashes the raw file bytes with Node's
  *  `crypto.createHash('sha256')`, and both sides must agree on the same bytes for the
  *  same content, or every conditional write reports a spurious conflict. Kept here —
  *  not inlined in one panel — so any future conditional-write caller hashes the same

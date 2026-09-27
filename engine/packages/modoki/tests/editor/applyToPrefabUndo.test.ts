@@ -102,7 +102,7 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     // ── undo: BEFORE prefab + BEFORE scene ──
     installPrefabSnapshot.mockClear(); loadScene.mockClear();
     await pushed!.undo();
-    expect(installPrefabSnapshot).toHaveBeenCalledWith(SRC, prefabBefore);
+    expect(installPrefabSnapshot).toHaveBeenCalledWith(SRC, prefabBefore, prefabAfter);
     expect(loadScene).toHaveBeenCalledWith('scenes/test.json', { preloaded: sceneBefore });
     // selection re-anchored to the applied instance root by guid (id 1).
     expect(selectEntity).toHaveBeenLastCalledWith(1);
@@ -110,7 +110,7 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     // ── redo: AFTER prefab + AFTER scene ──
     installPrefabSnapshot.mockClear(); loadScene.mockClear();
     await pushed!.redo();
-    expect(installPrefabSnapshot).toHaveBeenCalledWith(SRC, prefabAfter);
+    expect(installPrefabSnapshot).toHaveBeenCalledWith(SRC, prefabAfter, prefabBefore);
     expect(loadScene).toHaveBeenCalledWith('scenes/test.json', { preloaded: sceneAfter });
   });
 

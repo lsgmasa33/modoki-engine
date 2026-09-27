@@ -96,12 +96,19 @@ export function jsonFileBody(data: unknown): string {
 export function postWriteFile(
   filePath: string, content: string, encoding?: string,
   /** `createOnly` sends `ifNoneMatch:'*'`: the route answers 409 instead of overwriting a file that
-   *  is already there (#1215). Absent, the write replaces — which every save depends on. */
-  opts?: { createOnly?: boolean },
+   *  is already there (#1215). Absent, the write replaces — which every save depends on.
+   *  `ifMatch` is the sha256 (`sha256Hex`) of the bytes the caller expects the file to hold NOW: the
+   *  route answers 409 `reason:'if-match'` instead of writing when they differ or the file is gone
+   *  (`ifMatchRefusal`, editorBackendRouter.ts). Apply-to-Prefab's undo/redo pass it (#1664). */
+  opts?: { createOnly?: boolean; ifMatch?: string },
 ): Promise<Response> {
   return backendFetch('/api/write-file', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: filePath, content, encoding, ...(opts?.createOnly ? { ifNoneMatch: '*' } : {}) }),
+    body: JSON.stringify({
+      path: filePath, content, encoding,
+      ...(opts?.createOnly ? { ifNoneMatch: '*' } : {}),
+      ...(opts?.ifMatch !== undefined ? { ifMatch: opts.ifMatch } : {}),
+    }),
   });
 }
 

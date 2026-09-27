@@ -4087,6 +4087,13 @@ a future change picks, these do not change:
 distinguishes a failure the user can fix from one they cannot, and this is neither: it is history
 loss, worth interrupting for whatever caused it.
 
+**A step that refuses before it changes anything throws an `UndoRefusedError` (#1664).** The drop
+policy is the same. The report is not: the reporter logs that the step was *refused* and nothing was
+applied, and it toasts the error's own `toast` text in place of the generic "FAILED". It also skips the
+dirty signals, since nothing moved. Apply-to-Prefab's undo is the one user today. It throws one when the
+prefab changed on disk since the Apply, and when the write failed (#1668)
+([prefabs.md](prefabs.md) § Undoing an Apply).
+
 ⚠️ **This was LATENT when fixed** — #308 closed the last live route (the base-scene field's
 `mutateScene` let a network-level rejection escape; it catches now), and every filesystem helper
 resolves `false` rather than throwing. It was fixed anyway because "just throw so the entry stays

@@ -474,8 +474,36 @@ world, and the switch lands after it. The guards still cover a route that swaps 
 `sceneManager` directly. Mechanism: [editor.md](editor.md) § A user world switch waits for the undo
 in flight.
 
+**The file is written only over the other side of the Apply (#1664).** The prefab file is global, but an
+Apply's entry lives on one scene's history. It survives a prefab-edit round trip (entering prefab edit
+parks the scene's stack, and Back restores it), and it survives another scene's Apply of the same prefab
+or a `git pull`. Before #1664 an undo wrote the pre-Apply document over whatever the file had become, and
+redo brought back only the Apply, so the later edit was lost for good.
+
+`installPrefabSnapshot` now takes the document the file should hold: undo expects the Apply's written
+document, and redo expects the one the undo wrote. It writes with `ifMatch` set to the sha256 of that
+document's `jsonFileBody` bytes, which `/api/write-file` checks against the bytes on disk. Both sides were
+written by the editor through the same serializer, so the match is exact. Anything else that rewrote the
+file refuses the step, even with the same content in other bytes, such as a formatter or a CRLF checkout.
+That is the safe direction.
+
+**A write that does not land changes nothing, and the step throws (#1668).** This covers a refusal and a
+failed write alike. The editor cache is set only after the write lands. Before #1668 the cache was seeded
+first and the write's result was ignored, so a failed write rebuilt and saved the world against a
+document the disk did not hold.
+
+The throw comes before the member-path repair and the world reload, so nothing is half-applied. The undo
+manager drops the entry (#310). It throws an `UndoRefusedError`, which the reporter renders as "refused"
+with its own toast. The toast reads *"Undo of "Apply to Prefab" refused: the prefab changed on disk since
+the Apply, and was left as it is"*, not the generic *"FAILED … part of it may already have been
+applied"*. It throws rather than using #308's report-and-return because that path moves the entry to the
+other stack as though it had applied. A refused entry would also refuse again on every retry, and so
+block every older undo behind it.
+
 Tests: `engine/tests/editor/untitledApplyUndo.test.ts` (each rule above mutation-checked),
-`prefabEditApplyUndo.test.ts`, `applyPrefabDirtiesBase.test.ts`.
+`prefabEditApplyUndo.test.ts`, `applyPrefabDirtiesBase.test.ts`, and `applyUndoIfMatch.test.ts` for the
+if-match and the failed write. That last one runs against a fake route holding the exact bytes it received,
+with the route's own if-match rule.
 
 ### A capture reads the document the frame was EXPANDED from (#1483)
 

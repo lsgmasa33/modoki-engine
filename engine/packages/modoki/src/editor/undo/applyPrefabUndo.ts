@@ -54,6 +54,9 @@ const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 async function restoreSnapshot(
   source: string,
   prefab: PrefabFile,
+  /** The document the file must hold now — the other side of the Apply — or the install refuses and throws, before
+   *  anything else here runs (#1664). */
+  expected: PrefabFile,
   scene: SceneData,
   selGuid: string,
   /** The prefab document the files on disk were last repaired for, when the apply moved member paths
@@ -64,7 +67,7 @@ async function restoreSnapshot(
   // Exit or a Create Scene can land in, and the snapshot must not be loaded over whatever world that put in.
   const key = currentSceneKey();
   const world = getCurrentWorld();
-  await installPrefabSnapshot(source, prefab);
+  await installPrefabSnapshot(source, prefab, expected);
   if (repairFrom && prefab.id) {
     // The live records of each template reference node's moves go back as the apply re-pointed them (#1564): the world
     // swap below CARRIES a Persistent or base root with its record whole, and the rebase then rebuilds it against
@@ -190,11 +193,11 @@ function makeApplyPrefabAction(opts: {
     // then, because it applied only half — the file, not the world. `runStep` drops a throwing step with a loud report
     // (#310), rather than pushing it to the other stack as if the world had followed.
     undo: async () => {
-      if (!await restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.selGuid, paths ? opts.prefabAfter : undefined)) throw worldLeft();
+      if (!await restoreSnapshot(opts.source, opts.prefabBefore, opts.prefabAfter, opts.sceneBefore, opts.selGuid, paths ? opts.prefabAfter : undefined)) throw worldLeft();
       await rederiveBaseInstances(opts.source, opts.prefabAfter, opts.prefabBefore, opts.baseBefore);
     },
     redo: async () => {
-      if (!await restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.selGuid, paths ? opts.prefabBefore : undefined)) throw worldLeft();
+      if (!await restoreSnapshot(opts.source, opts.prefabAfter, opts.prefabBefore, opts.sceneAfter, opts.selGuid, paths ? opts.prefabBefore : undefined)) throw worldLeft();
       await rederiveBaseInstances(opts.source, opts.prefabBefore, opts.prefabAfter, opts.baseAfter);
     },
   };

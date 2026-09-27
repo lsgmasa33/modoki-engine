@@ -161,10 +161,11 @@ describe('the queue survives a throw', () => {
 describe('a throwing REPORTER cannot skip the bookkeeping', () => {
   it('still notifies, still journals, still resolves false', async () => {
     vi.resetModules();
-    vi.doMock('../../src/editor/undo/undoFailure', () => ({
+    // Spread the real module, overriding only the reporter: an explicit export list broke the moment `runStep`
+    // imported `UndoRefusedError` from here (#1664).
+    vi.doMock('../../src/editor/undo/undoFailure', async (importOriginal) => ({
+      ...(await importOriginal<Record<string, unknown>>()),
       reportUndoThrew: () => { throw new Error('the reporter itself is broken'); },
-      reportUndoFailure: () => {},
-      COLLISION_STATUS: 409,
     }));
     (await import('../../src/runtime/core/playState')).setRunMode('stopped'); // reset above → fresh module
 

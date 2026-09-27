@@ -2,7 +2,7 @@
 
 import { editorEmit, type EditorJournalType } from '../editorJournal';
 import { markSceneDirty } from '../scene/sceneDirty';
-import { reportUndoThrew } from './undoFailure';
+import { reportUndoThrew, UndoRefusedError } from './undoFailure';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 import { canEdit, getRunMode } from '../../runtime/core/playState';
 import { createTeardownToken } from '../../runtime/core/liveness';
@@ -539,8 +539,12 @@ async function runStep(
   // those belong to the world that left, and a dirty mark on a scene that is not loaded makes the incoming world read
   // as unsaved (a load then refuses, and its next switch discards its history) and points Save All at a scene it
   // cannot write.
-  if (!worldGone && !action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
-  if (!worldGone) markAffectedScenesDirty(action);
+  // A REFUSED step (#1664) threw before it changed anything, so there is nothing to dirty: marking it would make the
+  // world read as unsaved over a change that never happened (an agent's load then refuses on "unsaved work"). A step
+  // that threw any other way may have moved the world partway, so it keeps the conservative marks (#310).
+  const refused = !ok && error instanceof UndoRefusedError;
+  if (!worldGone && !refused && !action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
+  if (!worldGone && !refused) markAffectedScenesDirty(action);
   notifyUndoChanged();
   const payload = buildEditorPayload(action);
   if (!ok) payload.failed = true;

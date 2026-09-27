@@ -15,6 +15,7 @@ import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { collectUnknownFields, mergeUnknownFields } from '../../runtime/core/formatVersion';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { postWriteFile, jsonFileBody, repairPrefabMemberPaths } from '../backend/editorBackend';
+import { sha256Hex } from '../utils/contentHash';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './authoringScope';
@@ -28,6 +29,7 @@ import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdenti
 import { templateKeysOf, recoverTemplateKey as recoverKeyFrom, type KeyRecoveryNode } from '../../runtime/loaders/templateKeyRecovery';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { entityRef, type EntityRef } from '../undo/entityRef';
+import { UndoRefusedError } from '../undo/undoFailure';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { assetIsAbsent, parseAssetJson, ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
 import { invalidatePrefab, replaceCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
@@ -4470,7 +4472,11 @@ export async function writePrefabFile(source: string, prefab: PrefabFile): Promi
  *  ⚠️ Deliberately a sibling rather than a widened return, for the reason `savePrefabEditReport`
  *  records about its own split: `{ ok: false, … }` is an always-truthy object, so a caller still
  *  written `if (!(await writePrefabFile(…)))` would compile and never see a failure again. */
-export async function writePrefabFileReport(source: string, prefab: PrefabFile): Promise<{ ok: boolean; error?: string }> {
+export async function writePrefabFileReport(
+  source: string, prefab: PrefabFile,
+  /** `ifMatch`: the sha256 of the bytes the file must hold now, or the route refuses the write (#1664). */
+  opts?: { ifMatch?: string },
+): Promise<{ ok: boolean; error?: string; /** The `ifMatch` precondition refused it: the file is not what the caller expected. */ conflict?: boolean }> {
   if (!prefab.id) prefab.id = newGuid();
   // `source` may be a GUID — resolve to the real file path before writing,
   // otherwise the dev-server API would create a file literally named by the guid.
@@ -4480,7 +4486,7 @@ export async function writePrefabFileReport(source: string, prefab: PrefabFile):
   registerAsset(prefab.id, path, 'prefab');
   const content = jsonFileBody(prefab);
   try {
-    const res = await postWriteFile(path, content);
+    const res = await postWriteFile(path, content, undefined, opts?.ifMatch !== undefined ? { ifMatch: opts.ifMatch } : undefined);
     if (res.ok) {
       // Put the bytes just written into the runtime refcounted prefab cache. Without
       // this, opening another scene that uses this prefab re-instantiates from the
@@ -4510,11 +4516,13 @@ export async function writePrefabFileReport(source: string, prefab: PrefabFile):
     // line used to log the status alone and throw the body away, so the save failed silently: the
     // server's own console.error goes to the DEV-SERVER TERMINAL, not the editor console, and
     // `savePrefabEditReport` returns `{saved:false}` with no warning to raise.
-    const why = await res.json().then(
-      (b: { error?: unknown; reason?: unknown }) => (typeof b?.error === 'string' ? b.error : typeof b?.reason === 'string' ? b.reason : ''),
-    ).catch(() => '');
+    const body = await res.json().catch(() => null) as { error?: unknown; reason?: unknown } | null;
+    const why = typeof body?.error === 'string' ? body.error : typeof body?.reason === 'string' ? body.reason : '';
+    // The if-match refusal, and only that one: the #1468 format gate also answers 409 `conflict:true`, runs first, and
+    // carries its own reason, which is a different thing to tell the user.
+    const conflict = res.status === 409 && body?.reason === 'if-match';
     console.error(`[Prefab] Could not write "${prefab.name}" → ${path} (HTTP ${res.status})${why ? ` — ${why}` : ''}`);
-    return { ok: false, ...(why ? { error: why } : {}) };
+    return { ok: false, ...(why ? { error: why } : {}), ...(conflict ? { conflict } : {}) };
   } catch (e) {
     console.error('[Prefab] Write failed:', e);
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -4525,15 +4533,48 @@ export async function writePrefabFileReport(source: string, prefab: PrefabFile):
   // means a genuine backend error — report it rather than silently misdirecting.
 }
 
-/** Install a prefab snapshot as the live source: update the editor cache, persist
- *  the file (which replaces the runtime refcounted cache entry), and preload nested children.
- *  Does NOT touch live instances — the caller rebuilds the scene, which re-instantiates
- *  every instance from this cache. Used by Apply-to-Prefab undo/redo to restore the
- *  prefab base before replaying the scene snapshot. */
-export async function installPrefabSnapshot(source: string, prefab: PrefabFile): Promise<void> {
+/** Install a prefab snapshot as the live source: persist the file (which replaces the runtime refcounted cache
+ *  entry), then update the editor cache and preload nested children. Does NOT touch live instances — the caller
+ *  rebuilds the scene, which re-instantiates every instance from this cache. Used by Apply-to-Prefab undo/redo to
+ *  restore the prefab base before replaying the scene snapshot.
+ *
+ *  **Only over `expected`** (#1664): the file is written with the hash of `expected`'s bytes as `ifMatch`, so it is
+ *  replaced only while it still holds the other side of the Apply — undo expects the Apply's written document, redo the
+ *  one the undo wrote, and both were serialized by `jsonFileBody` in `writePrefabFileReport`. The prefab file is
+ *  global and an Apply's entry outlives edits made elsewhere (a prefab-edit save, another scene's Apply, a `git pull`),
+ *  so without it an undo silently wrote the pre-Apply document over them, and redo could not bring them back.
+ *
+ *  **THROWS when the write does not land** — refused by that precondition, or failed (#1668) — and nothing is changed
+ *  then: the cache is set only after the write. The Apply undo's step then throws, and `runStep` drops the entry with a
+ *  toast saying why (`UndoRefusedError`, #310). Not the #308 report-and-return: that moves the entry to the other stack as though it had applied,
+ *  and a refused entry refuses again on every retry, so it would also wall off every older undo behind it. */
+export async function installPrefabSnapshot(source: string, prefab: PrefabFile, expected: PrefabFile): Promise<void> {
   const snap: PrefabFile = JSON.parse(JSON.stringify(prefab));
+  const where = isGuid(source) ? (resolveRef(source) || source) : source;
+  let ifMatch: string;
+  try {
+    ifMatch = await sha256Hex(jsonFileBody(expected));
+  } catch (e) {
+    // `crypto.subtle` exists only in a secure context — every origin the editor ships on is one, a dev URL on a LAN IP
+    // is not. Nothing has been written, so it is a refusal, not the generic "part of it may have applied".
+    throw new UndoRefusedError(
+      `${where} was not written: its expected contents could not be hashed (${e instanceof Error ? e.message : String(e)}), so the prefab and the scene were left as they are.`,
+      `the prefab file could not be written (see console)`,
+    );
+  }
+  const res = await writePrefabFileReport(source, snap, { ifMatch });
+  if (!res.ok) {
+    throw res.conflict
+      ? new UndoRefusedError(
+        `${where} changed on disk since the Apply (a later save of the prefab, another Apply, or an outside edit), so it was left as it is rather than overwritten.`,
+        `the prefab changed on disk since the Apply, and was left as it is`,
+      )
+      : new UndoRefusedError(
+        `${where} could not be written${res.error ? ` (${res.error})` : ''}, so the prefab and the scene were left as they are.`,
+        `the prefab file could not be written (see console)`,
+      );
+  }
   prefabCache.set(source, snap);
-  await writePrefabFile(source, snap);
   await preloadNestedPrefabs(snap);
 }
 
@@ -5075,6 +5116,11 @@ export async function applyToPrefabSelective(
   // NOT stamped on the undo snapshot: `installPrefabSnapshot` replays the BEFORE bytes, and
   // those must be what was actually on disk, version included.
   const prefabBefore: PrefabFile = JSON.parse(JSON.stringify(oldPrefab));
+  // A file with no id gets one HERE, on both sides, rather than from the write (which would stamp `newPrefab` alone).
+  // The member-path repair below keys on `newPrefab.id` and ran for nothing on an id-less file, while its undo reversed
+  // it; and the undo writes `prefabBefore` back with redo expecting exactly those bytes (#1664), so an id-less before
+  // side made every undo re-mint the file's guid and every redo refuse as "changed on disk".
+  if (!newPrefab.id) prefabBefore.id = newPrefab.id = newGuid();
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return NOOP_APPLY;
   const eaMetaForApply = getTraitByName('EntityAttributes');
