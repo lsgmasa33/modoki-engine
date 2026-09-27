@@ -424,6 +424,44 @@ The #1490 half: after Apply of a MOVED nested root, the pose is in the reference
 save's by-value subtraction drops it from the source. A later edit to that row pose moves the instance.
 Tests: `engine/tests/editor/nestedRowFieldSave.test.ts`.
 
+### A promoted added node keeps its guid (#1660)
+
+Promoting `+added.<guid>` writes the node into the template as a new row. It then deletes the live node, and
+the refresh re-expands the row as a member. A member **derives** its guid from the instance's anchor and its
+path, so before #1660 every ref naming the added node named nothing after the Apply. That covers a UI nav
+link, a UIAction target and a joint, in this scene or another file. `applyToPrefabWithUndo` then saved the
+scene that way, because a promotion always saves.
+
+`carryPromotedGuids` closes that gap. While the promoted entities are still live, it reads each one by where
+the refresh will put it back:
+- a plain node by the row it became;
+- a reference node's whole expansion by its nested row, then by path below the nested root
+  (`memberPathIndex`).
+
+After the refresh it pairs each re-expanded entity with its original, and then:
+- **A member the save writes a v16 row for takes the old guid back.** The row states it, so the reload pins
+  it, and a ref anywhere keeps resolving, in another file too. This is a carry, not a remap, because no remap
+  of the live world can reach another file. It is the same rule `stampDerivedMemberGuids` and
+  `promoteOwnedRoots` follow from the other side: where a row states a guid, identity does not move.
+- **An entity no row can pin keeps its derived guid, and the live refs follow it.** This covers a
+  template-keyed node and a member of a pre-v5 document. Renaming such an entity back would hold only until
+  the reload re-derived it. A node, or an instance, that the author added *inside* the promoted reference node
+  is one of these. The promotion writes it into the row's `added` as a template node, and it gets paired
+  anyway: the template write stamps the key it gives each node on the live entity (`addedNodeIdentity`), so
+  its step is the same before and after. `promotionPathIndex` continues the path index into such an
+  instance's own frame, which `memberPathIndex` stops at.
+- **A pairing that is not unique carries nothing**: an original two entities answer to, or the reverse.
+  Neither is a guid a live entity still holds. Each row is written once, so neither case is known to happen.
+  The guard is the floor under a pairing that stopped being unique.
+
+Undo and redo hold the carried guid on both sides. For the primary scene they reload its whole snapshot. For a base
+scene's instance (#1431), redo instead rebuilds it from the post-Apply capture, and the guid comes back from the
+member row that the undo's rebuild left in the kept-orphan store (`keptMemberOrphans`). **Not covered**
+(#1680): a ref in **another file** to an entity that kept its derived guid still dangles. Only a stored row
+could hold that identity, and a template-keyed node is never pinned (#1426).
+
+Tests: `engine/tests/editor/promotionGuidCarry.test.ts`.
+
 ### Undoing an Apply
 
 An Apply changes two things: the prefab file, and every live instance of it. So its undo

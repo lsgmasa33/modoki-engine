@@ -3,7 +3,7 @@
 import { whyWorldNotAuthored } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
-import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
+import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, identityTree, type DetachedMember, type IdentityTree } from '../../runtime/core/ecs/memberHome';
 import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, noteNodeMoves, frameRootDoc, templateFrameClimber, rewriteNodeMoves } from '../../runtime/core/ecs/identityParents';
 import { memberRowKeysIn, memberRowsIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
 import { isPrefabEditRowGuid, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
@@ -23,7 +23,7 @@ import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
-import { durableGuid, nodeRowComponent, nodeRowKey, mapStringValues, deriveMemberGuid, remapGuidValues, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, isDerivedMember, isFrameStep, FRAME_STEP, type MemberPi } from '../../runtime/core/assetRefRules';
+import { durableGuid, memberStepId, nodeRowComponent, nodeRowKey, mapStringValues, deriveMemberGuid, remapGuidValues, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, isDerivedMember, isFrameStep, FRAME_STEP, type MemberPi } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import { templateKeysOf, recoverTemplateKey as recoverKeyFrom, type KeyRecoveryNode } from '../../runtime/loaders/templateKeyRecovery';
@@ -4638,6 +4638,8 @@ function insertAddedSubtree(
   nextId: { v: number },
   /** Filled with each promoted node's live guid → the row it became, for a move into it (#1437). */
   rows?: Map<string, number>,
+  /** Filled with each promoted REFERENCE node's live guid → the nested row it became (#1660). */
+  refRows?: Map<string, number>,
 ): void {
   const myLocalId = nextId.v++;
 
@@ -4680,6 +4682,7 @@ function insertAddedSubtree(
       ...(recaptured?.members ? { members: recaptured.members } : {}),
     });
     if (prefab.version < PREFAB_FORMAT_VERSION) prefab.version = PREFAB_FORMAT_VERSION;
+    if (node.guid) refRows?.set(node.guid, myLocalId);
     return;
   }
 
@@ -4720,7 +4723,7 @@ function insertAddedSubtree(
   prefab.entities.push({ localId: myLocalId, nodeGuid: newGuid(), name: node.name, traits });
   // A PLAIN row only: a reference node's row is a nested instance, whose children are another frame.
   if (node.guid) rows?.set(node.guid, myLocalId);
-  for (const child of node.children) insertAddedSubtree(prefab, child, myLocalId, nextId, rows);
+  for (const child of node.children) insertAddedSubtree(prefab, child, myLocalId, nextId, rows, refRows);
 }
 
 /** The members of the instance rooted at `rootId` — its own, and its owned nested instances' — that were moved
@@ -5163,6 +5166,7 @@ export async function applyToPrefabSelective(
   const skipped: { key: string; reason: string }[] = [];
   const movedKeys: string[] = [];
   const promotedRows = new Map<string, number>(); // live guid of a promoted added node → its new row
+  const promotedRefRows = new Map<string, number>(); // …and of a promoted reference node → its nested row (#1660)
   // The row a live entity of THIS frame is: the root, a member, or an owned nested root (its row).
   const rowOfEcs = new Map<number, number>([[rootInstanceId, newPrefab.rootLocalId ?? 1]]);
   for (const [lid, ecs] of localToEcs) rowOfEcs.set(ecs, lid);
@@ -5194,7 +5198,7 @@ export async function applyToPrefabSelective(
       if (!node) continue;
       if (addedNestsPrefab(node, oldPrefab.id || source)) { skipped.push({ key, reason: 'it holds an instance of this prefab, and a prefab cannot contain itself' }); continue; }
       const rowLid = nextLocalId.v;
-      insertAddedSubtree(newPrefab, node, node.parentLocalId, nextLocalId, promotedRows);
+      insertAddedSubtree(newPrefab, node, node.parentLocalId, nextLocalId, promotedRows, promotedRefRows);
       if (node.prefab) promoteReferenceMoves(newPrefab, node, rowLid, localToEcs, instancePaths);
       const liveEcs = localToEcsGuid(guid);
       if (liveEcs) liveAddedRootsToDelete.push(liveEcs, ...(node.prefab ? membersLivingOutside(liveEcs) : []));
@@ -5498,6 +5502,10 @@ export async function applyToPrefabSelective(
   const ok = await writePrefabFile(source, newPrefab);
   if (!ok) return NOOP_APPLY;
 
+  // Who the promoted entities are, read while they still exist: the refresh re-expands each as a member with a
+  // DERIVED guid, and `carryPromotedGuids` below gives it back the one every ref names (#1660).
+  const promotedGuids = snapshotPromotedGuids(promotedRows, promotedRefRows);
+  const rootGuid = guidForEntityId(rootInstanceId);
   // Delete the live plain entities for applied additions BEFORE refresh, so the
   // re-instantiated prefab member replaces them instead of duplicating. Non-applied
   // additions stay live and are re-captured + re-spawned by the refresh.
@@ -5526,6 +5534,7 @@ export async function applyToPrefabSelective(
   if (rowsReparented && prefabId) rewriteNodeMoves(getCurrentWorld(), (moved, src) => rewriteFrameMoves(moved, src, readOld, readNew));
   refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap, { rootId: rootInstanceId, fields: appliedFields });
   if (remap.size) remapWorldGuidRefs(remap);
+  carryPromotedGuids(rootGuid, promotedGuids);
   // …and every other file that uses the prefab. The open scene's own file too: its live world is already
   // repaired, and the next save writes that.
   const fileRepair = rowsReparented && prefabId ? await repairPrefabMemberPaths(prefabId, oldPrefab) : undefined;
@@ -5545,6 +5554,122 @@ export async function applyToPrefabSelective(
     ...(skipped.length ? { skipped } : {}),
   };
 }
+
+/** A promotion's live entities, by where the refresh re-expands them (#1660): a plain node by the row it became
+ *  (row localId → its guid), and a reference node's whole expansion by the nested row it became and the path of
+ *  each entity inside it (row localId → path key → guid). */
+interface PromotedGuids { plain: Map<number, string>; refs: Map<number, Map<string, string>> }
+
+/** `memberPathIndex` below `rootEcsId`, continued into every STORED root under it — an instance the author dropped
+ *  inside a promoted reference node — where the index itself stops, with that frame's keys after the root's own
+ *  (`<root key>|<key>`). Both sides of a promotion are read through it: before, such a root is a stored instance
+ *  and each node added inside the reference node is plain; after, both are template nodes of the row's `added`.
+ *  The step is the same on both sides, because the promotion's template write stamps the key it gives each node
+ *  on the live entity (`addedNodeIdentity`) before Apply deletes it. A key two entities share names neither. */
+function promotionPathIndex(world: ReturnType<typeof getCurrentWorld>, rootEcsId: number, tree: IdentityTree): ReturnType<typeof memberPathIndex> {
+  const piMeta = getTraitByName('PrefabInstance');
+  const out: ReturnType<typeof memberPathIndex> = new Map();
+  const walk = (root: number, prefix: string, depth: number): void => {
+    for (const [key, e] of memberPathIndex(world, root, tree)) {
+      if (!key && prefix) continue; // a stored root, already recorded by the frame above it
+      const at = prefix ? `${prefix}|${key}` : key;
+      out.set(at, out.has(at) ? null : e);
+      const pi = e && piMeta && e.has(piMeta.trait) ? (e.get(piMeta.trait) as MemberPi) : null;
+      if (key && e && depth < 64 && isStoredRoot(pi, e.id())) walk(e.id(), at, depth + 1);
+    }
+  };
+  walk(rootEcsId, '', 0);
+  return out;
+}
+
+/** {@link PromotedGuids} for the rows `insertAddedSubtree` just wrote, read from the live entities BEFORE Apply
+ *  deletes them. */
+function snapshotPromotedGuids(plain: ReadonlyMap<string, number>, refs: ReadonlyMap<string, number>): PromotedGuids {
+  const out: PromotedGuids = { plain: new Map(), refs: new Map() };
+  for (const [guid, lid] of plain) out.plain.set(lid, guid);
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!refs.size || !eaMeta) return out;
+  const world = getCurrentWorld();
+  const tree = identityTree(world);
+  for (const [guid, lid] of refs) {
+    const ecs = localToEcsGuid(guid);
+    if (!ecs) continue;
+    const byPath = new Map<string, string>();
+    for (const [key, e] of promotionPathIndex(world, ecs, tree)) {
+      if (!e) continue;
+      const g = e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid : '';
+      if (g) byPath.set(key, g);
+    }
+    out.refs.set(lid, byPath);
+  }
+  return out;
+}
+
+/** Give each entity a promotion re-expanded the identity its live original had (#1660).
+ *
+ *  Promotion deletes the added node and lets the refresh expand the new row in its place, and an expanded member
+ *  DERIVES its guid from the instance's anchor and its path. So without this every ref naming the added node — a UI
+ *  nav link, a UIAction target, a joint, from this scene or from another file — named nothing after the Apply, and
+ *  `applyToPrefabWithUndo` then saved the scene that way.
+ *
+ *  Each re-expanded entity is paired with its original (a plain row by its localId in this instance's frame; a
+ *  nested row's expansion by path below the nested root, as `memberPathIndex` spells it) and then:
+ *  - **a member the save writes a ROW for takes the old guid back** (scene v16): the row states it, so the reload
+ *    pins it, and a ref anywhere — another file included — keeps resolving. The same rule `stampDerivedMemberGuids`
+ *    and `promoteOwnedRoots` apply the other way round: where a row states the guid, identity does not move.
+ *  - **anything else keeps its derived guid, and the live refs follow it** — a template-keyed node or a member of a
+ *    pre-v5 document, which no row can pin. A ref in another file to one of those still dangles; nothing short of a
+ *    row can hold that identity, and the reload would re-derive whatever this wrote live. */
+function carryPromotedGuids(rootGuid: string, promoted: PromotedGuids): void {
+  if (!promoted.plain.size && !promoted.refs.size) return;
+  const piMeta = getTraitByName('PrefabInstance');
+  const root = rootGuid ? localToEcsGuid(rootGuid) : 0;
+  if (!piMeta || !root) return;
+  const world = getCurrentWorld();
+  const tree = identityTree(world);
+  const all = getAllEntities();
+  const piOf = new Map(all.map((e) => [e.id, readTraitData(e.id, piMeta) as (MemberPi & { localId?: number }) | null]));
+  const inFrame = (id: number) => id === root || piOf.get(id)?.rootInstanceId === root;
+  const pairs: [old: string, id: number][] = [];
+  for (const e of all) {
+    const pi = piOf.get(e.id);
+    if (!pi || e.id === root) continue;
+    if (pi.rootInstanceId === root) {
+      const old = pi.localId !== undefined ? promoted.plain.get(pi.localId) : undefined;
+      if (old) pairs.push([old, e.id]);
+    } else if (isOwnedRoot(pi, e.id) && inFrame(tree.parents.parentOf(e.id))) {
+      const old = promoted.refs.get(memberStepId(pi)); // an owned root's step is the row it expanded from
+      if (!old) continue;
+      for (const [key, ent] of promotionPathIndex(world, e.id, tree)) {
+        const g = old.get(key);
+        if (g && ent) pairs.push([g, ent.id()]);
+      }
+    }
+  }
+  const writer = rowWritingRoot(root);
+  const rowed = writer ? memberRowsToWrite(writer) : new Map<number, string>();
+  const carry = new Map<string, string>(); // derived → old: the member takes its identity back
+  const follow = new Map<string, string>(); // old → derived: the refs move to the member
+  // Never guess. An original two entities answer to, or an entity two originals answer to, is left as the refresh
+  // made it: a guid carried onto the wrong one is worse than a derived one, and carried onto both is two entities
+  // with one guid. Nor is a guid taken from an entity still holding it — which DOES happen while #1682 stands: an
+  // original the delete above missed (a nested member moved out of a promoted plain node) survives beside its twin.
+  const claims = new Map<string | number, number>();
+  for (const [old, id] of pairs) for (const k of [old, id]) claims.set(k, (claims.get(k) ?? 0) + 1);
+  for (const [old, id] of pairs) {
+    if (claims.get(old)! > 1 || claims.get(id)! > 1 || localToEcsGuid(old)) continue;
+    const now = guidForEntityId(id);
+    if (!now || now === old) continue;
+    if (rowed.has(id) && durableGuid(old)) carry.set(now, old);
+    else follow.set(old, now);
+  }
+  applyGuidRemap(carry);
+  remapWorldGuidRefs(follow);
+}
+
+/** {@link carryPromotedGuids}, exported for the guard that it never guesses — a pairing that is not unique cannot
+ *  be built through Apply, so its test drives the step directly. */
+export const carryPromotedGuidsForTest = carryPromotedGuids;
 
 /** Old → new guid of every LIVE member of an instance in `roots` whose derived path differs between the
  *  two documents `readOld` and `readNew` give prefab `prefabId` (#1437: an applied move). Members pair by

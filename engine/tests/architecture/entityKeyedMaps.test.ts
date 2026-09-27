@@ -815,6 +815,9 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
   ...['SerializedEntity.overrides', 'SerializedEntity.removedTraits', 'SerializedEntity.moved', 'SerializedEntity.nestedOverrides'].map((f) => ({
     item: `engine/packages/modoki/src/editor/scene/serialize.ts::${f}`,
     reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id — the written twin of loaders/loadSceneFile.ts SceneEntityEntry; editor/scene/serialize.ts:41' })),
+  ...['PromotedGuids.plain', 'PromotedGuids.refs'].map((f) => ({
+    item: `engine/packages/modoki/src/editor/scene/prefab.ts::${f}`,
+    reason: 'not-entity: keyed by the row localId Apply\'s promotion just wrote into the prefab (the file\'s own id space); the values are guids, and the record lives only across one Apply\'s delete + refresh (#1660)' })),
   { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceStructure.moved',
     reason: 'not-entity: keyed by a prefab member\'s row localId (the prefab file\'s own id space); the value is a guid, never a runtime entity id (#1437)' },
   { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceStructure.unrowed',
