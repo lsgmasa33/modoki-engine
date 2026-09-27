@@ -1884,6 +1884,12 @@ Two consequences worth knowing:
   This matters beyond tidiness: `smoke-packaged.sh` and `assert-app-renders.sh` fail on **any**
   renderer console error, so a stale remembered scene path used to be able to fail a packaging gate
   for a reason unrelated to the commit under test.
+- **The boot walk yields to any switch made while it runs (#1593).** Between candidates nothing is in
+  flight, so a `load_scene`, a prefab edit-open or a Create Scene landing in a gap used to be replaced
+  by the walk's next load. Now Create Scene waits for the walk, Play refuses during it, and the walk
+  stops loading once a scene it did not load is current. A switch still in flight when the walk's
+  next load starts is not covered. Mechanism: async-lifetime.md § An operation made of
+  SEVERAL loads.
 
 `loadScene` flow — a scene may declare `baseScene`, so this is a **chain** load, not a
 single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistence)):

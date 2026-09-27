@@ -31,6 +31,7 @@ import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { createTestWorld, type TestWorld, RigidBody2D, setPlayState, getPlayState, sceneManager, getCurrentWorld, setCurrentWorld } from '@modoki/engine/runtime';
 import { createWorld } from 'koota';
 import { beginTimelinePreviewSession } from '../../packages/modoki/src/editor/scene/timelinePreview';
+import { beginBootSceneWalk } from '../../packages/modoki/src/editor/scene/serialize';
 import { setRunMode, getRunMode } from '@modoki/engine/runtime';
 
 registerEditorAgentOps();
@@ -71,6 +72,17 @@ describe('agent play — a refused Play is a coded refusal, not ok:true', () => 
     const r = await runAgentOp('play') as Reply;
     expect(r).toMatchObject({ ok: false, code: 'REFUSED_BY_OP', reason: 'scene-swap', playState: 'stopped' });
     expect(r.error).toMatch(/Play refused — a scene load is still in flight/);
+  });
+
+  it('the editor\'s boot scene walk pending → REFUSED_BY_OP, reason scene-swap (#1593)', async () => {
+    // Between the walk's loads nothing else reads "in flight", and a Play armed there snapshots a world the walk's
+    // next load replaces.
+    const walk = beginBootSceneWalk();
+    try {
+      const r = await runAgentOp('play') as Reply;
+      expect(r).toMatchObject({ ok: false, code: 'REFUSED_BY_OP', reason: 'scene-swap', playState: 'stopped' });
+    } finally { walk.release(); }
+    expect(await runAgentOp('play')).toMatchObject({ ok: true, playState: 'playing' });
   });
 
   it('a second play while the first is starting up → REFUSED_BY_OP, reason already-starting', async () => {

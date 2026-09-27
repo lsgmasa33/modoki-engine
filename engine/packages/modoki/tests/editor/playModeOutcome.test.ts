@@ -31,6 +31,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   getCurrentScenePath: () => h.scenePath,
   sceneLoadGeneration: () => h.generation,
   isSceneLoadInFlight: () => h.loadInFlight,
+  bootSceneWalkPending: () => null,
 }));
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {

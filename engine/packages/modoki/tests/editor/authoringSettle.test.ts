@@ -34,6 +34,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   getCurrentScenePath: () => '/assets/scenes/main.scene.json',
   sceneLoadGeneration: () => 0,
   isSceneLoadInFlight: () => false,
+  bootSceneWalkPending: () => null,
 }));
 vi.mock('../../src/editor/scene/timelinePreview', () => ({
   hasTimelinePreviewSession: () => false,

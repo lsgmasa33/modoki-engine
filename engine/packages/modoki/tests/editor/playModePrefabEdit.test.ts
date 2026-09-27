@@ -42,6 +42,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   // lands in that window (#573). Constant here: these cases never load a scene mid-snapshot.
   sceneLoadGeneration: () => 0,
   isSceneLoadInFlight: () => false,
+  bootSceneWalkPending: () => null,
 }));
 
 vi.mock('../../src/editor/scene/timelinePreview', () => ({

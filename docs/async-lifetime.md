@@ -299,6 +299,44 @@ yet SWAPPING (`isSceneLoadSwapping`, which the undo reads). One count could not 
 looks for "an async function with pre-await writes and no mutual exclusion" — that is the same
 statement-order analysis § Enforcement declines to build.
 
+### An operation made of SEVERAL loads has gaps no load-scoped count can see (#1593)
+
+`isSceneLoadInFlight()` and the load epoch cover the inside of ONE `loadScene`. The editor's boot
+(`createEditor`'s `sceneReady`) is a *walk*: the `/api/boot-scene` fetch, a canonicalize per candidate,
+a load per candidate, then an `initWorld` fallback. Between those awaits nothing reads as in flight, so a
+`new_scene` landing in a gap answered ok and the walk's next load replaced its world ~80 ms later
+(reproduced live on `demos/2d-physics-demo`). The count was right about each load and wrong about the
+operation.
+
+So the walk registers for its WHOLE length (`beginBootSceneWalk()` in `serialize.ts`), and the fix
+splits by what each switch can do:
+
+| switch landing in a gap | what happens |
+|---|---|
+| `newScene` | **waits** for the walk, then runs (owner's ruling: the request somebody made is the newer intent). Afterwards it refuses if the walk yielded to a scene opened meanwhile, if a prefab is being edited, or if a `loadScene` is still in flight |
+| Play | **refuses** (`scene-swap`), checked at `enterPlay`'s entry and deliberately NOT folded into `aSceneSwapIsHappening()`, which the Hierarchy's collapse restore also reads |
+| a user/agent `loadScene`, a prefab edit-open that COMPLETED in the gap | not gated: the **walk yields** to it. `BootSceneWalk.load` loads a candidate only while no scene the walk did not load is current, and `createEditor` skips its persist and fallback once overtaken |
+
+The walk yields rather than gating `loadScene` because the walk *calls* `loadScene`, so a gate there
+would wait on itself. It asks the WORLD (`sceneManager.getCurrent()`, null at boot until something
+loads) whether a foreign scene won, not the load epoch. The first version asked the epoch, and a
+foreign load that FAILED in a gap then moved it without installing anything: the walk yielded to
+nothing, and the editor ended with no scene and no fallback (close-out review).
+
+⚠️ **Still open:** a switch that is IN FLIGHT when the walk's next load starts. A foreign `loadScene`
+mid-flight is superseded by the walk's load (newest call wins), and a prefab edit-open mid-fetch is
+aborted by it, as before #1593. Closing that needs a registry of pending switches.
+
+⚠️ **Unverified, low severity:** "overtaken" assumes `getCurrent()` is null when the walk begins, which
+holds while `createEditor()` runs once per page load. If a hot update to `app/editor/setup.ts` ever
+re-ran it WITHOUT a page reload, the new walk would see the live scene as foreign and load nothing.
+That is harmless in itself, but a Create Scene waiting on that walk would then be refused with "A
+scene was opened while the editor was starting" when nobody opened one. Nobody has checked whether
+Vite re-runs that lazy import in place.
+
+**The test: is the thing the guard counts the same size as the operation that must not be
+interleaved?** A per-load count under a multi-load operation leaves every gap between loads open.
+
 ### A fourth shape the helper does NOT cover: capture, and let a THIRD PARTY consume it
 
 Every token above answers *am I still live?* from inside the continuation. `NavigationManager` (#808)

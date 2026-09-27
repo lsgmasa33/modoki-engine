@@ -56,6 +56,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   sceneLoadGeneration: () => loadGeneration,
   // A load already in flight when Play is pressed is the other half of the guard (#573).
   isSceneLoadInFlight: () => loadInFlight,
+  bootSceneWalkPending: () => null,
 }));
 
 vi.mock('../../src/editor/scene/timelinePreview', () => ({

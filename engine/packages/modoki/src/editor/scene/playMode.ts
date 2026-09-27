@@ -16,7 +16,7 @@
 
 import { getPlayState, setPlayState, getRunMode, setRunMode, onRunModeChange } from '../../runtime/core/playState';
 import { sceneManager } from '../../runtime/scene/SceneManager';
-import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad } from './serialize';
+import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad, bootSceneWalkPending } from './serialize';
 import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
 import { beginWorldReplacement } from './authoringSettle';
 import { undoDepth, truncateUndoTo, beginWorldSwitch } from '../undo/undoManager';
@@ -142,7 +142,11 @@ export async function enterPlay(): Promise<PlayOutcome> {
   // not fire either, so Stop restores the stale world over the reloaded one: the exact outcome this
   // guard exists to prevent, entered from the other side. So refuse up front too — this is
   // docs/async-lifetime.md's "Both? Use both."
-  if (aSceneSwapIsHappening()) {
+  // The editor's boot scene walk too (#1593): between its loads nothing above is in flight, and a Play armed in
+  // one of those gaps snapshots a world the walk's next load replaces. Checked HERE, not folded into
+  // `aSceneSwapIsHappening()`: the Hierarchy's collapse restore also reads that, and nothing re-arms the restore
+  // when a walk that ended in the `initWorld` fallback (no swap) releases.
+  if (aSceneSwapIsHappening() || bootSceneWalkPending() !== null) {
     return refusePlay('scene-swap', 'Play refused — a scene load is still in flight. Try again once it lands.');
   }
   // A failed restore may have left the posed (or previous Play) world live; Play's snapshot would take

@@ -24,7 +24,7 @@ import { getCurrentWorld, spawnEntity } from '../runtime/core/ecs/world';
 import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
 import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
-import { loadScene, setCurrentScenePath, setScenePersistenceProject, lastSceneKey, type SceneLoadOutcome } from './scene/serialize';
+import { setCurrentScenePath, setScenePersistenceProject, lastSceneKey, beginBootSceneWalk, type SceneLoadOutcome } from './scene/serialize';
 import { sceneManager } from '../runtime/scene/SceneManager';
 import { registerSelectionRestore } from './store/selectionRestore';
 import { registerEditorRefLiveness } from './store/editorRefLiveness';
@@ -716,6 +716,9 @@ export function createEditor(options: EditorOptions): React.ComponentType {
   // (`runtime/loaders/textureResolver.ts`), which every KTX2-touching load site awaits
   // individually rather than the whole scene load blocking up front. See `docs/editor.md`
   // (`createEditor()`) and `docs/textures.md` ("Runtime resolution") for the full rationale.
+  // Registered for the WHOLE walk, fallback included (#1593): its gaps between loads are invisible to
+  // `isSceneLoadInFlight`, and a Create Scene / Play landing in one was overwritten by the walk's own load.
+  const bootWalk = beginBootSceneWalk();
   const sceneReady = (async () => {
     // Populate the guid → path map BEFORE loading any scene — otherwise every
     // GUID ref resolves to undefined (missing meshes, black materials). The
@@ -779,8 +782,14 @@ export function createEditor(options: EditorOptions): React.ComponentType {
       canonicalize: (p) => canonicalBootScenePath(p, fetch, projectRoot),
       // `probing`: a miss on one candidate is a normal step of the fallback walk, not an error
       // (#91) — loadFirstScene raises the single real error if they ALL miss.
-      load: (p) => loadScene(p, options.gameId, { probing: true }),
+      load: (p) => bootWalk.load(p, options.gameId),
     });
+    // A load or prefab edit-open that landed in one of the walk's gaps won (#1593): the walk yielded to it, and it
+    // has already written its own path. Persisting or falling back here would overwrite what the user just opened.
+    if (bootWalk.overtaken()) {
+      console.info('[Editor] Boot scene walk yielded to a scene switch made while it ran.');
+      return;
+    }
     if (loadedPath) {
       // Don't clobber the remembered scene with a one-off override (#43) — a `--scene` launch
       // must not change where the human's NEXT bare launch lands, or an agent's throwaway
@@ -825,7 +834,7 @@ export function createEditor(options: EditorOptions): React.ComponentType {
       EntityAttributes({ name: 'Camera', sortOrder: 0 }),
     );
     console.log('[Editor] Created empty scene with default camera');
-  })();
+  })().finally(bootWalk.release);
 
   // Lazy-import EditorApp. sceneReady no longer depends on it mounting (that dependency was
   // the renderer gate this plan removed), but EditorApp still owns the SceneView/GameView that

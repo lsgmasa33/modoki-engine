@@ -1405,6 +1405,76 @@ export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
 let _loadsSwapping = 0;
 export function isSceneLoadSwapping(): boolean { return _loadsSwapping > 0; }
 
+/** The editor's BOOT scene walk (`createEditor`'s `sceneReady`), from its first await to its fallback (#1593).
+ *
+ *  Neither {@link isSceneLoadInFlight} nor the load epoch can see it: the walk is a chain of awaits — the
+ *  `/api/boot-scene` fetch, a canonicalize per candidate, the gap between candidates, the `initWorld` fallback —
+ *  and only the stretch INSIDE `loadScene` is counted. A world switch landing in a gap saw nothing in flight, went
+ *  ahead, and the walk's next load then replaced its world: `new_scene` right after launch answered ok and the boot
+ *  scene overwrote it ~80 ms later (observed). Two halves, because the switches differ:
+ *  - `newScene` WAITS on {@link bootSceneWalkPending} (owner's call), and Play refuses on it.
+ *  - Every other switch (a user/agent `loadScene`, a prefab edit-open) is not gated: the WALK yields to one that WON.
+ *    `load` loads a candidate only while {@link BootSceneWalk.overtaken} is false, and the walk's caller checks it
+ *    again before persisting or falling back — so a scene somebody opened in a gap is left standing. One check at the
+ *    walk, rather than a gate on each caller (`loadScene` cannot wait on the walk: the walk calls it).
+ *  - A `newScene` that waited on a walk which yielded is REFUSED ({@link lastBootWalkYielded}): the scene somebody
+ *    opened meanwhile is the newer intent.
+ *
+ *  ⚠️ Not covered: a switch still IN FLIGHT when the walk's next load starts. A foreign `loadScene` mid-flight is
+ *  superseded by the walk's load (SceneManager's newest-call-wins), and a prefab edit-open mid-fetch is aborted by
+ *  it — both as before #1593. Covering them needs a registry of pending switches, which nothing has yet.
+ *
+ *  `null` when no walk is running; otherwise a promise that resolves (never rejects) when it ends.
+ *  ⚠️ Nothing in the walk has a timeout, so a walk that never ends holds a waiting `newScene` — and #887's latch — for
+ *  the session. No realistic hang source is known (the walk's fetches are local); a slow boot only delays it. */
+let _bootWalk: Promise<void> | null = null;
+let _lastBootWalkYielded = false;
+export function bootSceneWalkPending(): Promise<void> | null { return _bootWalk; }
+/** Whether the most recent boot walk ended by yielding to a scene somebody else opened. */
+export function lastBootWalkYielded(): boolean { return _lastBootWalkYielded; }
+
+export interface BootSceneWalk {
+  /** End the walk, however it ends (`finally`). Only the latest walk's release clears the slot, so a stale release
+   *  cannot open the gate under a newer walk. */
+  release(): void;
+  /** True once a scene the walk did NOT load is current — a load or prefab edit-open that landed in a gap and WON.
+   *  Asks the WORLD, not the load epoch: a foreign load that failed or was refused moved the epoch but installed
+   *  nothing, and yielding to it left the editor with no scene and no fallback (close-out review). At boot
+   *  `getCurrent()` is null until something loads, so any current scene is either the walk's own or foreign. */
+  overtaken(): boolean;
+  /** Load one boot candidate — or answer `'superseded'` without touching the world when {@link overtaken}. */
+  load(path: string, gameId?: string): Promise<SceneLoadOutcome>;
+}
+
+/** Mark the boot walk begun. See {@link bootSceneWalkPending}. */
+export function beginBootSceneWalk(): BootSceneWalk {
+  let resolve!: () => void;
+  const walk = new Promise<void>((r) => { resolve = r; });
+  _bootWalk = walk;
+  // Every path the walk itself asked for — a candidate whose load swapped and then failed is still the walk's own.
+  const own = new Set<string>();
+  const overtaken = () => {
+    const current = sceneManager.getCurrent()?.path;
+    return current != null && !own.has(current);
+  };
+  return {
+    release: () => {
+      if (_bootWalk === walk) {
+        _lastBootWalkYielded = overtaken();
+        _bootWalk = null;
+      }
+      resolve();
+    },
+    overtaken,
+    load: (path, gameId) => {
+      if (overtaken()) return Promise.resolve('superseded');
+      // `probing`: a miss on one candidate is a normal step of the fallback walk, not an error (#91).
+      own.add(path);
+      return loadScene(path, gameId, { probing: true });
+    },
+  };
+}
+
 /** `loadScene`'s outcome. `'superseded'` covers BOTH ways a load can lose to a newer one:
  *  cancelled early (SceneManager aborts the in-flight load — rejects with AbortError) and
  *  superseded in the winner's TAIL (`SceneManager.loadScene`'s step-11 tail guard — nothing left to cancel, so the
@@ -1689,8 +1759,9 @@ let _newSceneInFlight = false;
  *  so `onWorldSwap` actually fires. Pass `path` when the new scene already has a file
  *  target (Assets → Create Scene); omit it for an untitled scene.
  *
- *  ⚠️ THROWS `NewSceneRefusedError` while a prefab is being edited, and while another `newScene()`
- *  is still in flight (#887). */
+ *  ⚠️ THROWS `NewSceneRefusedError` while a prefab is being edited, while another `newScene()`
+ *  is still in flight (#887), and while a `loadScene` is in flight. WAITS for the editor's boot scene
+ *  walk instead of refusing it (#1593). */
 export async function newScene(path: string | null = null): Promise<void> {
   // ⚠️ REFUSED while another Create Scene is still running (#887). Two callers reach here and
   // neither serialises against the other — Assets → Create Scene
@@ -1732,10 +1803,40 @@ export async function newScene(path: string | null = null): Promise<void> {
   // resource release or a world destroy in its tail), and a latch left stuck true would brick
   // Create Scene for the rest of the session.
   _newSceneInFlight = true;
-  // After the latch, so a second Create Scene is still refused while this one waits (#887, #1579).
-  // No envelope takedown: Create Scene never took one (unchanged here).
-  const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: false });
+  let worldSwitch: ReturnType<typeof prepareWorldSwitch> | null = null;
   try {
+    // WAIT for the editor's boot scene walk, then run (#1593, owner: wait, not refuse). The walk loads a scene
+    // nobody asked for, so the request somebody DID make is the newer intent and must land last; run in one of
+    // the walk's gaps, it was overwritten by the walk's own load. After the latch, so a second Create Scene is
+    // still refused while this one waits.
+    const bootWalk = bootSceneWalkPending();
+    if (bootWalk) {
+      await bootWalk;
+      // Re-asked: the walk can end on a prefab edit-open that landed in one of its gaps (the walk yields to it).
+      if (isPrefabEditWorld()) {
+        throw new NewSceneRefusedError(
+          'Create Scene is not available while editing a prefab — exit prefab edit mode first, '
+          + 'then create the scene.',
+        );
+      }
+      // The walk yielded to a scene somebody opened while this waited: that open is the newer intent, and
+      // replacing it with an empty scene would undo it in front of them (close-out review).
+      if (lastBootWalkYielded()) {
+        throw new NewSceneRefusedError(
+          'A scene was opened while the editor was starting — Create Scene again to replace it.',
+        );
+      }
+    }
+    // A load somebody started IS a competing intent, and this cannot supersede it — the path is written before
+    // the await below (see the #887 comment above). Refuse. (Narrower than Play's `aSceneSwapIsHappening()`, which
+    // also counts a Stop/preview restore — newScene never refused those, and still does not.)
+    if (isSceneLoadInFlight()) {
+      throw new NewSceneRefusedError(
+        'A scene is still loading — wait for it to finish, then create the scene.',
+      );
+    }
+    // No envelope takedown: Create Scene never took one (unchanged here).
+    worldSwitch = prepareWorldSwitch({ takeDownEnvelope: false });
     // The undo in flight finishes before the path is written (#1579): it restores under the CURRENT scene's key,
     // and reading this scene's path there would skip it — the prefab file restored, the world not.
     const ready = worldSwitch.ready();
@@ -1788,7 +1889,7 @@ export async function newScene(path: string | null = null): Promise<void> {
     clearAllSceneDirty();
     console.log('[Editor] New scene created');
   } finally {
-    worldSwitch.release();
+    worldSwitch?.release();
     _newSceneInFlight = false;
   }
 }

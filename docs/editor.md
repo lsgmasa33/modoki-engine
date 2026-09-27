@@ -4114,11 +4114,14 @@ The serialization now lives where a switch STARTS, not in the step:
   takedown. `serialize.loadScene`, `newScene` and `openPrefabForEditing` call it; `enterPlay` calls
   `beginWorldSwitch` directly (its envelope goes down through `takeDownPreviewEnvelope`). Those four
   cover the menu, the Assets panel, the agent ops, prefab Exit (`exitPrefabEditing` → `loadScene`),
-  boot and the toolbar. **Every one WAITS**; none refuses. Play starts late by the undo's length, and
+  boot and the toolbar. **Every one WAITS** for the undo; none refuses on it. (`newScene` also waits for
+the editor's boot scene walk, and refuses a `loadScene` still in flight after that wait. Both are #1593,
+not undo serialization; see async-lifetime.md § An operation made of SEVERAL loads.) Play starts late by the undo's length, and
   the agent `play` op's reply table (#1574) is unchanged.
 - **Ordering, per #887:** a switch's own refusals and in-flight latches (`_newSceneInFlight`,
   `_loadsInFlight`, the load epoch, `_entering`) stay synchronous and come FIRST, so a second gesture
-  is still refused while the first waits. Then the switch is raised, then awaited. `loadScene`
+  is still refused while the first waits. Then the switch is raised, then awaited. (`newScene` sets its
+  latch first, then awaits the boot walk and re-checks its refusals, and only then raises the switch.) `loadScene`
   re-checks `stillLive()` after the wait. `newScene` writes the editor path only after it: the undo
   restores under the CURRENT scene's key, and would skip if the path already named the new one.
   `openPrefabForEditing` waits (`prepareWorldSwitch().idle`) before it even FETCHES the prefab: an
