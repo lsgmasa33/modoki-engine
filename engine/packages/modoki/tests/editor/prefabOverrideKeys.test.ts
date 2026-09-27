@@ -11,12 +11,15 @@ import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
 const EngineFlame = trait({ idleScale: 0, boostScale: 0 });
-const EntityAttributes = trait({ name: '' as string, parentId: 0, guid: '' as string, sortOrder: 0 });
+const EntityAttributes = trait({ name: '' as string, parentId: 0, guid: '' as string, sortOrder: 0, editorFolder: '' as string });
 const PrefabInstance = trait({ source: '' as string, localId: 0, rootInstanceId: 0, parentLocalId: 0 });
 
 const TRAITS = [
   { name: 'Transform', trait: Transform, category: 'component', fields: { x: 0, y: 0, z: 0 } },
   { name: 'EngineFlame', trait: EngineFlame, category: 'component', fields: { idleScale: 0, boostScale: 0 } },
+  // No `editorFolder` here, on purpose: production leaves it out of `meta.fields` (no Inspector row,
+  // registerTraits.ts), so the override walk must find it through the koota schema. Listing it would
+  // let a `readTraitData` regression in `collectComparableTraits` pass this file.
   { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: 0, parentId: 0, guid: 0, sortOrder: 0 } },
   { name: 'PrefabInstance', trait: PrefabInstance, category: 'component', fields: { source: 0, localId: 0, rootInstanceId: 0, parentLocalId: 0 } },
 ] as const;
@@ -227,9 +230,30 @@ describe('the keys a caller must NOT be handed blindly (close-out review)', () =
   it('applyExcluded is empty when every override IS representable in a template', async () => {
     // The baseline half of the apply/revert asymmetry: a plain field override carries no
     // exclusion, so `apply` must not start reporting phantom skippedKeys for ordinary work.
+    // It needs a REAL override: with none, `fields` is empty too, and an exclusion that swallowed
+    // every key would still pass (#1670).
     const { root } = await setup();
+    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { collectInstanceOverrideKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
+    const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
     const keys = collectInstanceOverrideKeys(root, shipPrefab as any);
+    expect(keys.fields).toEqual(['2.EngineFlame.idleScale']);
     expect(keys.applyExcluded).toEqual([]);
+  });
+
+  it('applyExcluded lists a scene-only field override (editorFolder), and only that one', async () => {
+    // The accept side: `EntityAttributes.editorFolder` never goes into a template
+    // (SCENE_ONLY_TEMPLATE_FIELDS), so the agent op reports it as skipped instead of a phantom
+    // apply (#1670, #1661). The representable override beside it must stay out of the list.
+    const { root } = await setup();
+    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
+    const { collectInstanceOverrideKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
+    const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(root, TRAITS[2], 'editorFolder', 'Enemies'); markOverride(index.get(root), 'EntityAttributes', 'editorFolder');
+    const keys = collectInstanceOverrideKeys(root, shipPrefab as any);
+    expect(keys.fields).toEqual(expect.arrayContaining(['1.EntityAttributes.editorFolder', '2.EngineFlame.idleScale']));
+    expect(keys.applyExcluded).toEqual(['1.EntityAttributes.editorFolder']);
   });
 });
