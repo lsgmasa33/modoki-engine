@@ -70,6 +70,7 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_ota_publish: 'PUBLISHES to a real bucket',
   modoki_ota_keygen: 'writes signing keys',
   modoki_new_scene: 'discards the live world',
+  modoki_open_project: "reloads the human's editor into ANOTHER project; verified by hand against this clone's own editor (#1587)",
   modoki_duplicate_entity: 'needs a target entity; smoke covers create/delete instead',
   modoki_reparent_entity: 'needs two target entities',
   modoki_import_file: 'copies a file into the project',

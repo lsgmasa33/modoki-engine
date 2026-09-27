@@ -344,6 +344,7 @@ import { buildRefGraph, resolveTarget, findReferences, type FindReferencesRespon
 // The ONE 'same directory / inside it?' comparison (#869, #881) — see engine/scripts/pathIdentity.mjs.
 import { isUnderOrSame, samePath } from '../../scripts/pathIdentity.mjs';
 import type { ModuleUrlResolution, ModuleUrlError } from './moduleUrl';
+import { checkOpenProjectRequest, openProjectReply, sameRootVerdict, inFlightReply, withExpectedToken, type ProjectSwitchHost } from './openProjectRoute';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -419,6 +420,9 @@ export interface BackendContext {
    *  injects window-parented `dialog` panels; omitted ⇒ the async osascript fallback (macOS only,
    *  `{unsupported}` elsewhere). See `nativeChooser.ts` for why the two are not equivalent. */
   nativeChooser?: NativeChooser;
+  /** The Electron host's project open, behind `/api/open-project` (#1587). Omitted by the Vite
+   *  dev-server host, which cannot re-root itself — the route then refuses rather than guessing. */
+  projectSwitch?: ProjectSwitchHost;
 }
 
 /** What a handler returns. The host serializes it onto its response object. */
@@ -2288,6 +2292,51 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     } catch (e) {
       return json({ error: `module graph unreachable: ${e instanceof Error ? e.message : String(e)}` }, 502);
     }
+  }
+
+  // ── POST /api/open-project (M, Electron only) ── switch the running editor to another project
+  // (#1587), the same `setProject` path File → Open Project runs, minus the folder picker and the
+  // human's Save/Discard modal. Unsaved work is REFUSED here instead (§8 world swap: the reload
+  // destroys every registry, so the override is `discardUnsaved`). Pure parts: `openProjectRoute.ts`.
+  if (urlPath === '/api/open-project' && method === 'POST') {
+    if (!ctx.projectSwitch) {
+      return json({
+        ok: false, code: 'NOT_AVAILABLE_HERE',
+        error: 'open-project: this backend host cannot switch projects — only the Electron editor re-roots its dev server.',
+        options: ['relaunch the editor on the project: engine/scripts/launch-editor.sh <project dir>'],
+      }, 503);
+    }
+    const host = ctx.projectSwitch;
+    // Read at REPLY time, every reply: see `withExpectedToken`.
+    const answer = (b: Record<string, unknown>, status?: number) => json(withExpectedToken(b, host.expectedToken()), status);
+    const checked = checkOpenProjectRequest(body, { editorRoot: ctx.editorRoot, projectRoot: ctx.projectRoot });
+    if (checked.kind === 'refuse') return answer(checked.reply.body, checked.reply.status);
+    const { root, discardUnsaved, timeoutMs } = checked;
+    const verdict = sameRootVerdict(root, host.status(), samePath);
+    if (verdict === 'already-open') return answer({ ok: true, opened: false, alreadyOpen: true, projectRoot: root });
+    if (verdict === 'in-flight') { const r = inFlightReply(root); return answer(r.body, r.status); }
+    if (!discardUnsaved) {
+      const refused = unsavedRefusal(await unsavedGate(ctx, null, { registries: ALL_UNSAVED_REGISTRIES }), {
+        verb: 'open-project',
+        consequence: 'destroys',
+        consequenceText: 'Switching project reloads the editor window, which DESTROYS all of it — no registry survives the reload.',
+      });
+      if (refused) return answer(refused.body, refused.status);
+    }
+    let outcome;
+    try {
+      outcome = await host.open(root, { timeoutMs });
+    } catch (e) {
+      // Caught HERE, not by the server's generic catch: the open may already have switched the
+      // token, and that catch answers a bare 500 without it (#1587 close-out review 3).
+      return answer({
+        ok: false, code: 'REFUSED_BY_OP',
+        error: `open-project: opening ${root} threw: ${e instanceof Error ? e.message : String(e)}. The editor may be in an inconsistent state.`,
+        options: [`relaunch the editor: engine/scripts/launch-editor.sh "${root}"`],
+      }, 500);
+    }
+    const reply = openProjectReply(root, outcome);
+    return answer(reply.body, reply.status);
   }
 
   // ── GET /api/eval-api (M→R) ── discovery: the generated `modoki` scripting surface eval code

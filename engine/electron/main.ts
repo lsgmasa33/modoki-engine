@@ -276,6 +276,9 @@ import { acquireBuildClaim } from '../scripts/buildClaimsStore.mjs';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 // The ONE 'same directory?' comparison (#869).
 import { samePath } from '../scripts/pathIdentity.mjs';
+import { createRendererMountWaiter } from './rendererMountWaiter';
+import { createOpenStatus } from './openStatus';
+import type { ProjectOpenOutcome } from '../plugins/backend/openProjectRoute';
 import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling, setBeforeInstallGate } from './autoUpdate';
 import { restoreZoom, handleZoom, setUiPrefsDir } from './zoom';
 import { registerReimportHandler } from '../plugins/reimport-registry';
@@ -795,6 +798,10 @@ const unsavedGate = createUnsavedGateClient({
 /** True from the editor's first menu-structure push (EditorApp mounted, gate subscribed) until
  *  its document goes away (navigation, reload, crash, close). */
 let gateRendererReady = false;
+/** "Has the editor document loaded after THIS reload mounted?" — what an agent's project switch
+ *  waits on (#1587). An epoch, not `gateRendererReady`, which is still true from the OLD document
+ *  until its `did-navigate`: see `rendererMountWaiter.ts`. */
+const mountWaiter = createRendererMountWaiter();
 setBeforeInstallGate(() => unsavedGate.ask('restart to install the update'));
 
 // ── M→R: pending requestRenderer() calls keyed by a monotonic id. ──
@@ -1170,6 +1177,7 @@ async function createWindow(backendBase: string) {
   win.webContents.on('did-navigate', () => {
     gateRendererReady = false;
     unsavedGate.releaseAll();
+    mountWaiter.onNavigate();
   });
 
   win.webContents.on('did-finish-load', () => {
@@ -1334,23 +1342,54 @@ async function healConnectedMcp(): Promise<void> {
   }
 }
 
-function setProject(newRoot: string, opts?: { openSettingsAfter?: boolean }): Promise<void> {
+/** What one open did (#1587). The human paths ignore it — a failure is already a dialog there — and
+ *  the agent's `/api/open-project` answers from it, because an open that resolved the same way for
+ *  success, failure and supersession would report `ok` on all three. */
+type OpenResult =
+  | { kind: 'opened'; previousRoot: string; mountEpoch: number }
+  | Exclude<ProjectOpenOutcome, { kind: 'opened' } | { kind: 'timeout' }>;
+
+type OpenOpts = {
+  openSettingsAfter?: boolean;
+  /** The agent's open: report a failure in the result, not in a modal nobody asked to dismiss. */
+  quiet?: boolean;
+};
+
+function setProject(newRoot: string, opts?: OpenOpts): Promise<OpenResult> {
   // Queued synchronously, so the order of opens is the order of requests (#1160).
   requestedRoot = newRoot;
-  return opens.open((ticket) => openProject(newRoot, ticket, opts));
+  const gen = openTracker.begin(newRoot);
+  const settled = opens.open((ticket) => openProject(newRoot, ticket, opts));
+  void settled.then(async (r) => {
+    // An open that reloaded is still IN FLIGHT until its document mounts (#1587 close-out review):
+    // settling at the reload made a retry after a `mounting` TIMEOUT answer `alreadyOpen` about a
+    // window that had not loaded.
+    if (r.kind !== 'opened') { openTracker.settle(gen, newRoot, r.kind); return; }
+    const mounted = await mountWaiter.waitForMount(r.mountEpoch, OPEN_MOUNT_SETTLE_MS);
+    openTracker.settle(gen, newRoot, mounted ? 'opened' : 'failed');
+  }, () => openTracker.settle(gen, newRoot, 'threw'));
+  return settled;
 }
+
+/** Where the opens stand, for the agent's `/api/open-project` (#1587) — `openStatus.ts` says why
+ *  `requestedRoot` cannot answer "is this project open already?". */
+const openTracker = createOpenStatus();
+/** How long a reloaded open may take to mount before the tracker gives up on it — the agent route's
+ *  own maximum budget, so no call can outwait it. */
+const OPEN_MOUNT_SETTLE_MS = 600_000;
 
 /** The root of the NEWEST open requested, launch included (#1160). Open Project and Open Recent skip
  *  a pick equal to it. `state.root` would be wrong for that: with opens queued it holds the last
  *  root an open STARTED, so re-picking a project while a different one is queued would be dropped. */
 let requestedRoot = '';
 
-async function openProject(newRoot: string, ticket: OpenTicket, opts?: { openSettingsAfter?: boolean }): Promise<void> {
+async function openProject(newRoot: string, ticket: OpenTicket, opts?: OpenOpts): Promise<OpenResult> {
   // A newer open was requested while this one queued: it owns the editor now, so touch nothing.
   if (!ticket.isCurrent()) {
     console.log(`[modoki-electron] open of ${newRoot} superseded before it started`);
-    return;
+    return { kind: 'superseded', by: requestedRoot };
   }
+  const previousRoot = state.root;
   await state.backend.stop().catch(() => {});
   state.root = newRoot;
   refreshInstanceToken(); // the token is per-project — a new root means a new expected token
@@ -1381,7 +1420,7 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: { openSet
       };
       if (!(await healAndInstallOnOpen(newRoot, ticket, openStatus))) {
         console.log(`[modoki-electron] open of ${newRoot} superseded by ${state.root}, not starting its dev server`);
-        return;
+        return { kind: 'superseded', by: requestedRoot };
       }
       await startDevServer({ repoRoot: REPO_ROOT, projectRoot: newRoot, url: DEV_URL });
     } catch (e) {
@@ -1389,20 +1428,28 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: { openSet
       // A failure of an open the user has already moved on from is not theirs to dismiss (#1160).
       if (!ticket.isCurrent()) {
         console.warn(`[modoki-electron] superseded open of ${newRoot} failed (not shown): ${detail}`);
-        return;
+        return { kind: 'superseded', by: requestedRoot };
       }
       console.error('[modoki-electron] open project failed:', detail);
       mainWindow?.setTitle(titleFor(state.root));
-      const opts = {
-        type: 'error' as const,
-        title: 'Open Project failed',
-        message: 'Could not prepare the new project (dependency install or Vite server).',
-        detail: `${detail}\n\nThe editor may be in an inconsistent state — relaunch:\n  scripts/launch-editor.sh "${newRoot}"`,
-        buttons: ['OK'],
-      };
-      await showMessageBox(opts, mainWindow);
-      return;
+      if (!opts?.quiet) {
+        await showMessageBox({
+          type: 'error' as const,
+          title: 'Open Project failed',
+          message: 'Could not prepare the new project (dependency install or Vite server).',
+          detail: `${detail}\n\nThe editor may be in an inconsistent state — relaunch:\n  scripts/launch-editor.sh "${newRoot}"`,
+          buttons: ['OK'],
+        }, mainWindow);
+      }
+      return { kind: 'failed', detail };
     }
+  }
+  // A newer open was requested while this one prepared (#1587 close-out review). It will restart the
+  // dev server and reload the window itself, so this one must not reload into its own root or report
+  // `opened` — an agent waiting on this open would settle on the NEWER project's mount.
+  if (!ticket.isCurrent()) {
+    console.log(`[modoki-electron] open of ${newRoot} superseded after preparing, not reloading`);
+    return { kind: 'superseded', by: requestedRoot };
   }
   addRecentProject(newRoot);
   rebuildMenu();
@@ -1420,8 +1467,11 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: { openSet
   // GUIDs never register → textures fail) and dev texture variants, which carry
   // no cache-bust. Bypassing the cache here makes a project switch fetch the new
   // project's manifest + assets fresh, matching what a manual hard reload does.
+  // Numbered BEFORE the reload is issued, so the old document's last menu push cannot settle it.
+  const mountEpoch = mountWaiter.armReload();
   mainWindow?.webContents.reloadIgnoringCache();
   console.log(`[modoki-electron] opened project: ${newRoot}`);
+  return { kind: 'opened', previousRoot, mountEpoch };
 }
 
 // Latest editor menu structure pushed by the renderer (R→M). The OS menu carries
@@ -1650,6 +1700,7 @@ app.whenReady().then(async () => {
   if (!initialRoot) { app.quit(); return; } // packaged first-launch picker cancelled
   state.root = initialRoot;
   requestedRoot = initialRoot;
+  openTracker.launched(initialRoot);
   // The launch takes its place in the open sequence HERE, before `rebuildMenu` makes Open Project
   // reachable, so an open picked during provisioning queues behind the launch instead of being
   // superseded by it (#1160). Its body is supplied at the launch heal below, on every path.
@@ -1701,6 +1752,26 @@ app.whenReady().then(async () => {
     // #1440: the save/pick panels as sheets of the editor window, not an osascript child that
     // blocked this process and could not take ⌘V.
     nativeChooser: createElectronChooser(() => mainWindow),
+    // #1587: the agent's File → Open Project. Same `setProject` queue as the menu, minus the picker
+    // and the modal (the route refuses unsaved work itself). Settles only once the NEW document has
+    // mounted, or says which stage the budget ran out in — the open itself is never cancelled.
+    projectSwitch: {
+      status: () => openTracker.status(),
+      expectedToken: () => instanceToken,
+      open: async (root, { timeoutMs }): Promise<ProjectOpenOutcome> => {
+        const deadline = Date.now() + timeoutMs;
+        let timer: NodeJS.Timeout | undefined;
+        const outOfTime = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); });
+        const r = await Promise.race([setProject(root, { quiet: true }), outOfTime]).finally(() => clearTimeout(timer));
+        if (r === null) return { kind: 'timeout', stage: 'preparing' };
+        if (r.kind !== 'opened') return r;
+        if (!(await mountWaiter.waitForMount(r.mountEpoch, deadline - Date.now()))) return { kind: 'timeout', stage: 'mounting' };
+        // The waiter settles on ANY document committed after this reload, so a newer open (a human's
+        // Open Recent) during the wait would otherwise be reported as this project (#1587 review).
+        if (!samePath(requestedRoot, root)) return { kind: 'superseded', by: requestedRoot };
+        return { kind: 'opened', previousRoot: r.previousRoot };
+      },
+    },
   };
 
   // ── Trusted-input routes. `ops` binds each primitive to the live window lazily —
@@ -2031,6 +2102,7 @@ app.whenReady().then(async () => {
       // (and dynamic labels/enabled state) show natively.
       rendererMenuSpec = msg.data as RendererMenuSpec;
       gateRendererReady = true; // EditorApp is mounted, so its unsaved-gate subscription is live
+      mountWaiter.onMounted();
       rebuildMenu();
       // This push == the editor renderer has mounted (painted, not just page-loaded):
       // hand off from the splash to the now-ready window (no black gap).

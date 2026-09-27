@@ -264,13 +264,39 @@ describe('main.ts wires claimProjectForOpen the way its header requires', () => 
     expect(superseded.getText(sf)).toBe('() => !ticket.isCurrent()');
     const set = body('setProject');
     if (!ts.isBlock(set)) throw new Error('setProject has no block body');
-    expect(set.statements).toHaveLength(2);
     // The requested root is recorded BEFORE queueing, so a re-pick is compared with the newest request.
     expect(set.statements[0].getText(sf)).toBe('requestedRoot = newRoot;');
-    const ret = set.statements[1];
+    // #1587: the agent's open status is begun synchronously too, before the open is queued, so a
+    // repeat request while this one waits in the queue already reads as in flight.
+    expect(set.statements[1].getText(sf)).toBe('const gen = openTracker.begin(newRoot);');
+    // The queued open is what setProject returns (bound first, so its settle can be tracked).
+    const queued = set.statements[2];
+    if (!ts.isVariableStatement(queued)) throw new Error('setProject no longer binds the queued open');
+    const decl = queued.declarationList.declarations[0];
+    expect(decl.name.getText(sf)).toBe('settled');
+    expect(decl.initializer?.getText(sf)).toMatch(/^opens\.open\(/);
+    expect(calledNames(decl.initializer!)).toEqual(['open', 'openProject']);
+    const ret = set.statements[set.statements.length - 1];
     if (!ts.isReturnStatement(ret) || !ret.expression) throw new Error('setProject no longer returns the queued open');
-    expect(ret.expression.getText(sf)).toMatch(/^opens\.open\(/);
-    expect(calledNames(ret.expression)).toEqual(['open', 'openProject']);
+    expect(ret.expression.getText(sf)).toBe('settled');
+  });
+
+  // #1587: the two open-status mechanisms that live in main.ts wiring, where no unit test reaches.
+  it('setProject settles the open tracker at the MOUNT of a reloaded open, not at its reload', () => {
+    const set = body('setProject');
+    const waits = callsTo(set, 'waitForMount');
+    expect(waits, 'setProject no longer waits for the mount before settling').toHaveLength(1);
+    const settles = callsTo(set, 'settle').map((c) => c.arguments[2]?.getText(sf));
+    expect(settles).toContain("mounted ? 'opened' : 'failed'");
+  });
+
+  it('the agent open re-checks the newest requested root AFTER the mount, before answering opened', () => {
+    const checks = callsTo(sf, 'samePath').filter((c) => c.arguments.map((a) => a.getText(sf)).join(',') === 'requestedRoot,root');
+    expect(checks, 'the post-mount requestedRoot re-check is gone').toHaveLength(1);
+    const fn = enclosingFunction(checks[0]);
+    const wait = callsTo(fn!, 'waitForMount');
+    expect(wait).toHaveLength(1);
+    expect(wait[0].getStart(sf)).toBeLessThan(checks[0].getStart(sf));
   });
 
   it('healAndInstallOnOpen answers with the TICKET on every return, so a superseded heal never reads as current', () => {

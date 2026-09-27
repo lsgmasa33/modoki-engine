@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { unsavedForceParam } from '../shapes.js';
+import { unsavedForceParam, DISCARD_UNSAVED_BASE, TIMEOUT_MS_BASE } from '../shapes.js';
 import { CONSOLE_LEVELS, CONSOLE_LOGS_PARAM_DOCS, CONSOLE_LOGS_REPLY_DOC } from '../../../shared/consoleLevels.js';
 
 /** What `modoki_project_settings action=get` shows instead of a signing password (#370).
@@ -92,6 +92,49 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       'doing right now.',
     {},
     () => getJson('/api/identity'),
+  );
+
+  // ── open project — switch the running editor to another project (#1587) ──
+  tool(
+    'modoki_open_project',
+    'Switch the running editor to another project, the same way File → Open Project does, without ' +
+      'restarting the editor. Installs the project\'s deps if needed, restarts the dev server on it and ' +
+      'reloads the editor window, and replies only once the NEW project\'s editor has mounted: ' +
+      '{opened:true, projectRoot, previousRoot}. Opening the project that is already open answers ' +
+      '{opened:false, alreadyOpen:true} and reloads nothing. Refused with REQUIRES_SAVE while the editor ' +
+      'holds unsaved work (the reload destroys it): modoki_save_all first. A TIMEOUT means the open is ' +
+      'still running, not that it failed — do not repeat the call. "Mounted" is the editor, not its ' +
+      'scene: the boot scene can still be loading for a moment, so verify with modoki_get_editor_state ' +
+      'and wait for its scenePath to name the new project\'s scene before reading the world.',
+    {
+      path: z.string().describe('ABSOLUTE path of the project folder (the one holding project.config.json). A relative path is refused, and the refusal names the absolute folder it most likely meant.'),
+      discardUnsaved: z.boolean().optional().describe(`${DISCARD_UNSAVED_BASE}. Here the switch RELOADS the editor window, so it destroys every kind of unsaved work, parked edits included.`),
+      timeoutMs: z.number().int().min(1000).max(600000).optional().describe(`${TIMEOUT_MS_BASE}, for the new project to finish loading. Default 120000, range 1000-600000 — a first open can run npm install. Giving up does NOT cancel the open.`),
+    },
+    async ({ path, discardUnsaved, timeoutMs }) => {
+      const res = await postJson(
+        '/api/open-project',
+        { path, ...(discardUnsaved ? { discardUnsaved } : {}), ...(timeoutMs != null ? { timeoutMs } : {}) },
+        // Only a transport ceiling: the ROUTE owns the default and answers TIMEOUT itself, so an
+        // omitted budget is bounded by the schema's maximum rather than a copy of that default.
+        (timeoutMs ?? 600_000) + 15_000,
+        `open project ${path}`,
+        {
+          // The editor switches to the NEW project's token when an open STARTS (C6), so every reply
+          // carries the token it expects now — a TIMEOUT or failure included. Without adopting it,
+          // every later call from this process is refused as "WRONG EDITOR". Kept out of the agent's
+          // view: it acts on it, it has no use for reading it.
+          onBody: (body) => {
+            if (!body || typeof body !== 'object') return body;
+            const { token, ...rest } = body as Record<string, unknown>;
+            return typeof token === 'string' && ctx.adoptToken(token) ? { ...rest, tokenAdopted: true } : rest;
+          },
+        },
+      );
+      // The new project's game tools replace the old one's now, not on the next 5s poll.
+      if (!res.isError) await ctx.refreshGameTools().catch(() => { /* the poll reconciles anyway */ });
+      return res;
+    },
   );
 
   // ── console logs (endpoint already existed; this exposes it as a tool) ──

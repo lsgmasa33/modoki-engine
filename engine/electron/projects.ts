@@ -18,6 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 // The ONE 'same directory?' comparison (#869) — see engine/scripts/pathIdentity.mjs.
 import { samePath } from '../scripts/pathIdentity.mjs';
+import { isProjectFolder } from '../plugins/backend/openProjectRoute';
 
 const MAX_RECENTS = 10;
 // All recents live under a FIXED "modoki-app" dir (via the app-support root), NOT
@@ -221,7 +222,7 @@ export function chooseInitialProject(opts: {
  *  Used by the first-run flow so picking an empty folder creates a game (== File →
  *  New Project) instead of opening an empty, broken project. */
 export function projectFolderKind(dir: string): 'project' | 'empty' | 'occupied' {
-  if (fs.existsSync(path.join(dir, 'project.config.json'))) return 'project';
+  if (isProjectFolder(dir)) return 'project';
   let entries: string[];
   try { entries = fs.readdirSync(dir); } catch { return 'empty'; } // nonexistent → scaffoldable
   return entries.length === 0 ? 'empty' : 'occupied';

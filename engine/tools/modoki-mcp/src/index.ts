@@ -36,6 +36,7 @@ registerAllTools(server, ctx);
 // The DYNAMIC tail: tools the OPEN PROJECT's game registers (#270). Started after connect, so
 // the first `tools/list_changed` cannot race the transport handshake.
 const gameTools = createGameToolSync(server, ctx);
+ctx.refreshGameTools = async () => { await gameTools.refresh(); };
 
 async function main() {
   const transport = new StdioServerTransport();

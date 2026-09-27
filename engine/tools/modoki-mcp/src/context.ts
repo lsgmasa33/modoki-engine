@@ -64,7 +64,7 @@ export type ToolContext = {
    *  thing the caller asked for. Pass it wherever the intent isn't obvious from the route.
    *  `gotBudget` widens a 200-but-`ok:false` body's `got` past the 8k default, for a route whose
    *  failure body is also the receipt of the ops that DID apply (see `encodeError`). */
-  postJson: (path: string, payload: unknown, timeoutMs?: number, what?: string, opts?: { gotBudget?: number }) => Promise<ToolResult>;
+  postJson: (path: string, payload: unknown, timeoutMs?: number, what?: string, opts?: PostJsonOpts) => Promise<ToolResult>;
   evalRenderer: (code: string, timeoutMs?: number) => Promise<ToolResult>;
   editorAction: (action: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<ToolResult>;
   unsavedChangesWarning: () => Promise<string | null>;
@@ -75,6 +75,21 @@ export type ToolContext = {
    *  value: it is armed asynchronously by the first `ensureIdentity()`, so a snapshot taken at
    *  registration time would always read null. `modoki_batch` folds it into its own report. */
   getIdentityWarning: () => string | null;
+  /** Reconcile the open project's game tools NOW rather than on the next poll (#1587). A no-op until
+   *  `index.ts` points it at the game-tool sync, which is created after this context. */
+  refreshGameTools: () => Promise<void>;
+  /** Replace the instance token this MCP sends (C6) with the one the editor now expects, after this
+   *  MCP switched the editor's project (#1587). Only a process that was SENDING a token adopts one:
+   *  a config without a token keeps sending none. Returns whether the token CHANGED. */
+  adoptToken: (token: string) => boolean;
+};
+
+export type PostJsonOpts = {
+  gotBudget?: number;
+  /** Runs on EVERY parsed reply, success or refusal, before it is judged, and its return value is
+   *  what the rest of the path sees — for a reply that carries something the MCP must act on rather
+   *  than print (`modoki_open_project`'s token, which a refusal carries too). */
+  onBody?: (body: unknown) => unknown;
 };
 
 export function createToolContext(config: { backend: string; token?: string }): ToolContext {
@@ -85,8 +100,9 @@ export function createToolContext(config: { backend: string; token?: string }): 
    *  editor: if another editor now holds our port, the backend refuses these requests (403)
    *  instead of silently applying them to the wrong project. Absent ⇒ send nothing; the
    *  backend validates if-present, so a hand-written config still works. */
-  const TOKEN = config.token || '';
-  const AUTH_HEADERS: Record<string, string> = TOKEN ? { 'X-Modoki-Token': TOKEN } : {};
+  //  Mutable for one reason: `modoki_open_project` switches the editor's project, which switches the
+  //  token it expects, and the process that asked must keep working (#1587, `adoptToken`).
+  let token = config.token || '';
 
   /** Set once the backend has been identified as a DIFFERENT checkout than ours. Prepended
    *  to every tool result, because a mismatch makes every other result a lie — the calls
@@ -107,7 +123,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
       ...init,
       // Every call carries the token (C6) — merged UNDER the caller's headers so an explicit
       // Content-Type still wins. Callers only ever pass plain-object headers.
-      headers: { ...AUTH_HEADERS, ...(init?.headers as Record<string, string> | undefined) },
+      headers: { ...(token ? { 'X-Modoki-Token': token } : {}), ...(init?.headers as Record<string, string> | undefined) },
       signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await res.text();
@@ -321,7 +337,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
     }
   }
 
-  async function postJson(path: string, payload: unknown, timeoutMs?: number, what?: string, opts?: { gotBudget?: number }): Promise<ToolResult> {
+  async function postJson(path: string, payload: unknown, timeoutMs?: number, what?: string, opts?: PostJsonOpts): Promise<ToolResult> {
     const label = what ?? `POST ${path} on the editor backend`;
     try {
       await ensureIdentity();
@@ -329,7 +345,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      }, timeoutMs);
+      }, timeoutMs).then((r) => (opts?.onBody ? { ...r, body: opts.onBody(r.body) } : r));
       // Render endpoints return a 504 with a partial `{paths}` on a mid-sequence
       // failure — surface those frames (not just an error) so the agent keeps what
       // was rendered. The body already carries the error message.
@@ -672,7 +688,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
     await ensureIdentity();
     let res: Response;
     try {
-      res = await fetch(BACKEND + path, { headers: { ...AUTH_HEADERS, Accept: 'text/event-stream' }, signal: AbortSignal.timeout(timeoutMs) });
+      res = await fetch(BACKEND + path, { headers: { ...(token ? { 'X-Modoki-Token': token } : {}), Accept: 'text/event-stream' }, signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       return unreachable(e);
     }
@@ -760,5 +776,11 @@ export function createToolContext(config: { backend: string; token?: string }): 
     unsavedChangesWarning, consumeBuildStream, ensureIdentity, unreachable,
     htmlFallthrough, noSuchRoute,
     getIdentityWarning: () => identityWarning,
+    refreshGameTools: async () => {},
+    adoptToken: (next) => {
+      if (!token || !next || next === token) return false;
+      token = next;
+      return true;
+    },
   };
 }

@@ -541,6 +541,14 @@ const DECLS: Record<string, Decl> = {
     kind: 'read', method: null, route: null,
     notes: 'Answers from the once-per-process identity probe. Call it FIRST when edits seem to vanish.',
   },
+  modoki_open_project: {
+    kind: 'control', method: 'POST', route: '/api/open-project',
+    mutating: true, persists: 'session', requires: ['electron'],
+    minimalArgs: { path: '/abs/path/to/project' },
+    notes: 'Switches the project the editor has open (#1587): the same setProject queue as File → Open ' +
+      'Project, without the picker or the Save/Discard modal. Not undoable — it reloads the window. ' +
+      'Replies only once the NEW document has mounted; a TIMEOUT leaves the open running.',
+  },
   modoki_get_console_logs: {
     kind: 'read', method: 'GET', route: '/api/console-logs', filters: ['level', 'limit', 'since'],
     notes: 'Same job as the two journals, and like them (since #1561) purely a read. ' +

@@ -1532,7 +1532,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*106 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*107 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1641,6 +1641,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_open_animation_editor` | POST `/api/editor-action` `open-animation-editor` | session | editor + scene | asset | `{"path":"/assets/animations/probe.anim.json"}` |
 | `modoki_open_nine_slice_editor` | POST `/api/editor-action` `open-nine-slice-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_open_particle_editor` | POST `/api/editor-action` `open-particle-editor` | no persistence | editor | asset | `{"path":"/assets/particles/probe.particle.json"}` |
+| `modoki_open_project` | POST `/api/open-project` | session | electron | — | `{"path":"/abs/path/to/project"}` |
 | `modoki_open_skin_editor` | POST `/api/editor-action` `open-skin-editor` | no persistence | editor | asset | `{"path":"/assets/characters/probe.rig2d.json"}` |
 | `modoki_open_sprite_editor` | POST `/api/editor-action` `open-sprite-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_persistence` | POST `/api/persistence` | no persistence | editor | — | *(no args)* |

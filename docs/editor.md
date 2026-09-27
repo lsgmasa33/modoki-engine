@@ -3265,6 +3265,104 @@ OS-native picker's own "last folder" memory is keyed by app bundle id, which sev
 dev clones share — without this, opening a project in one clone would silently seed the starting
 folder for a sibling clone's picker.
 
+### Switching project from an agent — `modoki_open_project` (#1587)
+
+`POST /api/open-project` runs the same `setProject` queue as File → Open Project. It skips the
+folder picker and the human's Save/Discard modal. Before this existed, an agent could only switch
+projects by restarting the editor. A restart changes `tools/list`, which throws away the whole
+conversation cache and breaks a `verify` running at the same time (#475). The route lives in
+`editorBackendRouter.ts`. Its request checks and its replies are in `openProjectRoute.ts`, and the
+host supplies `projectSwitch` (`main.ts`). The Vite dev-server host has no `projectSwitch`, so the
+route answers `NOT_AVAILABLE_HERE` there.
+
+Order of checks:
+1. **The path must be absolute and be a project.** A relative path is refused (owner, 2026-09-27),
+   because guessing wrong reloads the editor into the wrong project. The refusal suggests the
+   absolute folder the caller probably meant. A folder with no `project.config.json` is
+   `NOT_FOUND`. `isProjectFolder` is also the test the first-run picker's `projectFolderKind` uses.
+2. **Opening the project that is already open is `ok`**, with `alreadyOpen:true` and no reload
+   (owner, 2026-09-27). "Open" means the last *settled* open succeeded for that root, which
+   `openStatus.ts` tracks. It is not `requestedRoot`: that is set when an open is queued and never
+   rolled back, so an earlier version answered `alreadyOpen` to a retry after a `TIMEOUT` (with the
+   install still running) or after a `failed` open (with the window never loaded). A repeat while
+   that same root's open is still running is refused (`REFUSED_BY_OP`, "wait for that one")
+   rather than queued, since a second open would only reload the window again. A failed open
+   clears the opened root, so a retry really does open it again. An open that reloaded stays **in
+   flight until its new document mounts** (`setProject` settles the tracker on the mount, not on
+   the reload). Otherwise a retry after a `mounting` TIMEOUT would answer `alreadyOpen` about a
+   window that had not loaded. Because a settle can now arrive minutes late, **only the newest
+   open's settle counts**. An older open mounting after a newer one failed would otherwise put
+   `opened` back over that failure.
+3. **Unsaved work is refused** through the shared unsaved-work gate, across every registry, with
+   `discardUnsaved` as the override. Here that flag means more than it does on `load_scene`: the
+   switch reloads the window, so parked edits are destroyed too.
+
+Two properties the human path did not need, and the agent path cannot work without:
+
+- **`openProject` reports what happened.** It used to resolve the same way whether it opened the
+  project, failed at the install or Vite step (shown only as a dialog), or was superseded by a
+  newer open. A route awaiting it would have answered `ok` in all three cases. It now returns
+  `opened`, `failed` or `superseded`. The human callers ignore the result, and the agent passes
+  `quiet` so a failure is returned in the reply instead of opening a modal.
+- **"Ready" means the NEW document has mounted**, tracked by reload epoch in
+  `rendererMountWaiter.ts`. `state.root` is set at the start of `openProject`, before the install,
+  the Vite restart and the reload, so waiting for `modoki_identity.projectRoot` to change would
+  succeed almost immediately. `gateRendererReady` is also wrong: it stays `true` from the old
+  document until that document's `did-navigate`, and the old editor can push its menu structure in
+  that gap.
+
+⚠️ **"Mounted" is the editor shell, not the scene.** The menu-structure push comes from
+EditorApp's mount, and the boot scene loads after that. Measured live (2026-09-27, switching
+wordweave → 3d-test): `get_editor_state` right after the reply answered `scenePath: null`, and the
+3d-test scene with 138 entities two seconds later. The reply is truthful about the project, since
+every project-level tool already acts on the new root. An agent that is about to read the WORLD
+should wait for `scenePath` first; the tool description says so.
+
+A `TIMEOUT` names the stage it ran out in (`preparing` or `mounting`) and does **not** cancel the
+open. The same call repeated while that open is still running is refused (point 2 above).
+
+**A superseded open does not reload.** If a newer open (a human's Open Recent, or another call)
+is requested while this one is still preparing, `openProject` checks `ticket.isCurrent()` once
+more after starting Vite and returns `superseded` before issuing the reload. Without that check it
+reloaded into its own root and reported `opened`. An agent waiting on it could then settle on the
+newer project's mount, because the waiter counts any document committed after its reload. The
+same can happen during the MOUNT wait, which comes after that check, so the agent path re-checks
+`requestedRoot` once the mount arrives and answers `superseded` if a newer open was requested
+meanwhile.
+
+**The MCP that asked keeps working: it adopts the new instance token** (owner's design,
+2026-09-27). The C6 token (`instanceToken.ts`, [connect-claude-code.md](connect-claude-code.md))
+is per PROJECT, so a switch makes the editor expect a new one. An MCP configured by
+AI → Connect Claude Code sends the old one baked into its env, and so would be refused as
+"WRONG EDITOR" on every later call, including the switch back. The `opened` reply therefore
+carries `token`, and so does **every other reply of the route**: a TIMEOUT, a failure, a
+supersession and every refusal included. The editor switches the token when an open STARTS, so a
+caller told only on success was still locked out by every other outcome, including the
+`get_editor_state` call the TIMEOUT reply itself recommends (second close-out review). The tool
+swaps it into the MCP's memory (the route also catches a throw from the host's open for this
+reason; the server's generic catch would answer a bare 500 without the token) (`adoptToken` in `context.ts`; only an
+MCP that was already sending a token adopts one) and tells the agent `tokenAdopted:true` without
+printing the value. Any other Claude still configured for the old project is refused, which is
+what the token check is for.
+
+**On disk, only the NEW project's config is updated, and the editor already does that.** Every
+open (the agent's included) runs `healConnectedMcp()`, which repairs a mismatched baked token in
+the `.mcp.json` Claude loads for the new root. The OLD project's config is deliberately left
+alone, for three reasons:
+- It still names that project, and rewriting it would get a restarted Claude refused once the
+  editor reopens the old project.
+- The MCP cannot know which config file launched it.
+- The heal refuses to rewrite a git-tracked `.mcp.json` without being asked (C9b).
+
+So a Claude restarted in the old folder while the editor sits on the new project is refused, with
+`modoki_identity` reporting `tokenCheck:'mismatch'`, exactly as after a human's File → Open
+Project.
+
+After a successful switch, the MCP tool reconciles the per-game tools right away rather than
+waiting for the next 5-second poll. The poll alone was already correct across a switch, because
+`gameTools.ts` has a grace window for the reload gap. Calling `refresh()` only makes the new
+tools show up sooner.
+
 ### Launching into a named scene (`--scene`)
 
 The editor remembers the last scene per project, and until #43 nothing could override it at
