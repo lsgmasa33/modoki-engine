@@ -104,7 +104,7 @@ function makeWorld(getClip: () => string, buttons: { guid: string; clipValue: st
 
 function mockDeps() {
   vi.doMock('../../src/runtime/core/ecs/world', () => ({ getCurrentWorld: vi.fn(), onWorldSwap: vi.fn() }));
-  vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+  vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn(), onStructureDirty: vi.fn() }));
   vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
     getAllTraits: () => [
       { name: 'RenderableUI', trait: RUI, category: 'component', fields: {} },

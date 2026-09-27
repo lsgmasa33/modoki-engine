@@ -32,6 +32,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'Also `heldPointer` — the sustained modoki_pointer press currently held ({button,x,y,heldMs}), ' +
       'or null. Check it when the Game panel has stopped responding to drags: a press left held ' +
       'latches pointer input for the human as well as the agent, and nothing else reports it. ' +
+      'Also `modal` ({kind, controls, controlCount}), present only while an editor dialog waits on '
+      + 'an answer: tap one of `controls` (e.g. save-dialog.confirm / save-dialog.cancel) to answer it. ' +
       'Also `gameView` — WHICH SCREEN the Game panel is previewing at (device name, orientation, '
       + 'logical + physical size, dpr, safe-area insets). Read it before quoting any layout '
       + 'measurement: the same HUD is correct on one device and broken on another, so a number '
@@ -704,17 +706,37 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       '`guid` (PREFER — stable) or `id`. Fails if the entity does not resolve, or if no SceneView ' +
       'is mounted to frame it in. ⚠️ `framed:true` means the focus request was DELIVERED, not that the '
       + 'camera moved: an entity with no mesh, no gizmo and no world transform resolves to no focus '
-      + 'target and the viewport returns early, reporting framed anyway. Verify the new pose in '
-      + 'modoki_get_editor_state.',
+      + 'target and the viewport returns early, reporting framed anyway — compare the returned `camera` '
+      + 'with the pose before. The move is INSTANT and final (no animation to wait out), so a scroll '
+      + 'may follow at once; for pixels use modoki_render_scene (capture_viewport shows the last '
+      + 'drawn frame). For a pose of your own choosing use modoki_set_view_camera.',
     {
       id: z.number().optional().describe('Runtime id. Only for an entity with no guid — use guid.'),
       guid: z.string().optional().describe('Stable entity guid (preferred). Not together with id.'),
       entity: flatEntityAlias,
+      distanceScale: z.number().positive().optional().describe('Multiplies the stand-off: 1 (default) frames edge to edge like the F key; 2–3 leaves room around it.'),
     },
-    async ({ id, guid, entity }) => {
+    async ({ id, guid, entity, distanceScale }) => {
       const ref = foldEntityRef({ id, guid }, entity);
       if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'frame an entity in the SceneView', why: ref.conflict, expected: 'either `guid`/`id`, or `entity:{guid|name|id}` — not both' });
-      return editorAction('focus-entity', ref);
+      return editorAction('focus-entity', { ...ref, ...(distanceScale !== undefined ? { distanceScale } : {}) });
     },
+  );
+  tool(
+    'modoki_set_view_camera',
+    'Set the SceneView (editor) orbit camera pose: `position` looks at `target`, the orbit pivot. '
+      + 'INSTANT and final — any coast left from a human drag is discarded first — so the returned '
+      + '`camera` is the pose that stays. `fov` (degrees) only on a perspective view, `orthoSize` '
+      + '(vertical half-height) only on an orthographic one; omitted, each keeps its value. The '
+      + 'write half of modoki_get_editor_state.camera, whose position/target/fov it takes back. '
+      + 'Refused when no SceneView is mounted, in UI mode while an active Camera entity drives the '
+      + 'view, or when position equals target.',
+    {
+      position: z.array(z.number()).length(3).describe('Camera world position [x,y,z].'),
+      target: z.array(z.number()).length(3).describe('Orbit pivot the camera looks at [x,y,z].'),
+      fov: z.number().optional().describe('Vertical field of view in degrees — perspective view only.'),
+      orthoSize: z.number().optional().describe('Vertical half-height — orthographic view only.'),
+    },
+    async (args) => editorAction('set-view-camera', args),
   );
 }

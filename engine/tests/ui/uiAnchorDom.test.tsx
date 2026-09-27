@@ -76,7 +76,7 @@ function mockDeps() {
   vi.doMock('../../packages/modoki/src/runtime/core/ecs/world', () => ({
     getCurrentWorld: vi.fn(), onWorldSwap: vi.fn(),
   }));
-  vi.doMock('../../packages/modoki/src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+  vi.doMock('../../packages/modoki/src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn(), onStructureDirty: vi.fn() }));
   vi.doMock('../../packages/modoki/src/runtime/core/ecs/traitRegistry', () => ({
     getAllTraits: () => [
       { name: 'RenderableUI', trait: RUI, category: 'component', fields: {} },

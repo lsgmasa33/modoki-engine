@@ -37,6 +37,15 @@ export function markUIDirty() {
   notifyEditorDirty();
 }
 
+/** Set the rebuild flag WITHOUT notifying editor subscribers — for a signal that fires once per
+ *  entity in a burst. `uiTreeStore` subscribes it to entity create/destroy (#1591): a scene load
+ *  registers one entity per spawn, and running `markUIDirty` there would call every editor
+ *  subscriber once per entity. The projection reads the flag once per frame, so a burst costs one
+ *  rebuild either way; the panels that care about structure have their own structure listeners. */
+export function flagUIDirty() {
+  _dirty = true;
+}
+
 /** Read-then-clear the dirty flag. Only `uiTreeProjection` should call this — it is the single
  *  place that rebuilds the tree and must own the read/clear pairing. */
 export function isUIDirty(): boolean {

@@ -15,6 +15,7 @@
 
 import { resolveDomPoint, aimProvenance, type DomPointSpec } from './domResolve';
 import { NOTHING_AT_POINT, type DomPointResolution } from './domPointContract';
+import { describeModalShell, openModalShells, type ModalDescription } from './modalShells';
 
 /** Where a drag endpoint is — either a CSS selector or viewport CSS coordinates.
  *  A selector targets the element's center; coordinates use `elementFromPoint`. */
@@ -96,7 +97,7 @@ export interface DomDndResult {
    *  the uncapped total.
    *  Only seen when it opens inside the settle window; a handler slower than that is still the
    *  "still running" case of `warning`. Undefined when no witness was supplied (no settle ran). */
-  pendingModal?: { kind: string; controls: string[]; controlCount: number };
+  pendingModal?: ModalDescription;
   /** Present only on a no-op (ok:false): why the drop didn't land. */
   error?: string;
   /** The drop landed, but something about it should stop a verdict resting on it. Joined with
@@ -137,12 +138,6 @@ export interface DomDndOptions {
   witness?: () => EditWitness;
 }
 
-/** How many of a raised modal's named buttons `pendingModal.controls` lists. A confirm has two; the
- *  cap is for a list dialog that names a button per row. */
-const PENDING_MODAL_CONTROL_CAP = 8;
-
-/** Every open modal shell, React or plain-DOM — both stamp `data-modal-shell` (modalBackdrop.ts). */
-const openModalShells = (): Element[] => Array.from(document.querySelectorAll('[data-modal-shell]'));
 
 /** Synthesize a full HTML5 drag-and-drop from → to.
  *
@@ -220,10 +215,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     // The LAST new shell is the top-most: both forms append to <body>, so document order is stack
     // order.
     const raised = openModalShells().filter((el) => !modalsBefore.has(el)).pop();
-    if (raised) {
-      const ids = Array.from(raised.querySelectorAll('button[data-ui-id]'), (b) => b.getAttribute('data-ui-id')!);
-      pendingModal = { kind: raised.getAttribute('data-modal-shell') ?? '', controls: ids.slice(0, PENDING_MODAL_CONTROL_CAP), controlCount: ids.length };
-    }
+    if (raised) pendingModal = describeModalShell(raised);
   }
   // A COVERED endpoint is a warning, never a refusal, and the asymmetry with every other aimed
   // input op is deliberate (#260). `docs/mcp-tool-conventions.md` §3 refuses a covered aim because

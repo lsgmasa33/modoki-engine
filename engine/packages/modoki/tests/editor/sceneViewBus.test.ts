@@ -13,6 +13,7 @@ import {
   setEditorViewportCamera, getEditorViewportCamera,
   setFocusEntityHandler, focusEntityInSceneView,
   setViewportController, snapEditorViewToAxis, toggleEditorProjection, getEditorProjection,
+  setEditorViewPose, getEditorViewTarget,
   type ViewportController,
 } from '../../src/editor/scene/sceneViewBus';
 
@@ -67,6 +68,9 @@ describe('sceneViewBus — viewport orientation controller (SceneViewGizmo)', ()
       snapToAxis: (d) => calls.push(['snap', d.x, d.y, d.z]),
       toggleProjection: () => calls.push(['toggle']),
       getProjection: () => 'perspective',
+      setPose: (p) => calls.push(['pose', p]),
+      getTarget: () => new THREE.Vector3(4, 5, 6),
+      uiPreviewFollowsOrbit: () => false,
       ...over,
     };
     return { ctrl, calls };
@@ -78,6 +82,17 @@ describe('sceneViewBus — viewport orientation controller (SceneViewGizmo)', ()
     expect(snapEditorViewToAxis(new THREE.Vector3(0, 1, 0))).toBe(false);
     expect(toggleEditorProjection()).toBe(false);
     expect(getEditorProjection()).toBeNull();
+    expect(setEditorViewPose({ position: [1, 2, 3], target: [0, 0, 0] })).toBe(false);
+    expect(getEditorViewTarget()).toBeNull();
+  });
+
+  it('routes the pose write and the pivot read (#1595)', () => {
+    const { ctrl, calls } = mkCtrl();
+    const un = setViewportController(ctrl);
+    expect(setEditorViewPose({ position: [1, 2, 3], target: [0, 0, 0], fov: 40 })).toBe(true);
+    expect(calls[0]).toEqual(['pose', { position: [1, 2, 3], target: [0, 0, 0], fov: 40 }]);
+    expect(getEditorViewTarget()).toEqual([4, 5, 6]);
+    un();
   });
 
   it('fires each command through to the registered controller', () => {

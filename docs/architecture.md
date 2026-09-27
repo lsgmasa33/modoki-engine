@@ -327,6 +327,17 @@ Zustand selector over `uiTreeStore`. The tree is rebuilt by `uiTreeProjection()`
 is set** — `markUIDirty()` flips it on any ECS UI write, and the projection checks it
 once per frame. No per-frame diffing, no extra rAF.
 
+⚠️ **Three things set the flag, and a spawn/destroy is one of them in its own right** (#1591):
+a helper-API trait write (`addDirtyListener(markUIDirty)`), a world swap, and any entity
+create/destroy (`onStructureDirty(flagUIDirty)`, the same subscription Scene2D, Scene3D and
+SceneView hold). The third was missing: a create path got its rebuild only by accident, when
+`ensureGuid` wrote a freshly minted guid. So an entity spawned already carrying a guid (an
+`addEntity` with an authored `EntityAttributes.guid`, a redone create, an undone delete, which
+both respawn from a snapshot) never reached the tree, and a Canvas2D host stayed black in both
+views until a reload. A create path must not rely on an incidental write to be seen. The
+structure subscription sets the flag **without** `notifyEditorDirty`, because a scene load fires it
+once per spawned entity.
+
 ## World Transforms
 
 `runtime/core/ecs/worldTransform.ts` is the canonical, **headless-safe** API that composes an

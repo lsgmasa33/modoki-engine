@@ -11,10 +11,10 @@
 import { create } from 'zustand';
 import { onWorldSwap } from '../core/ecs/world';
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
-import { addDirtyListener } from '../core/ecs/entityUtils';
+import { addDirtyListener, onStructureDirty } from '../core/ecs/entityUtils';
 import { isSimRunning } from '../core/playState';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
-import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
+import { markUIDirty, flagUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
 import { spriteEpoch } from '../core/textureRefs';
 import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
 import { UISettings } from '../traits/UISettings';
@@ -191,6 +191,17 @@ function ensureInitialized() {
   // path. Measure before optimizing; if it ever shows up, gate on a UI-trait OR
   // highlight-watched-trait predicate, not UI-trait-only.
   addDirtyListener(markUIDirty);
+  // A spawn or destroy is a rebuild trigger in its own right, as it already is for Scene2D, Scene3D
+  // and SceneView (#1591). Without this, the tree picked up a new entity only if something happened
+  // to WRITE a trait afterwards. `createEntityWithUndo` got that by accident (`ensureGuid` minting a
+  // guid), so an entity created with an authored guid, a redone create and an undone delete each left
+  // their UI entity out of the tree (a Canvas2D host rendered black) until a reload.
+  // COST, unlike F5 above: this one DOES reach gameplay. Every spawn/destroy in Play (a bullet, a
+  // pooled FX) forces one rebuild that frame, measured at ~4.5µs per UI entity on a Mac under Node
+  // (0.5ms at 100 UI entities, 14ms at 2900). No game spawns every frame beside a large UI tree
+  // today. If one does, gate this on the entity carrying RenderableUI, which needs the structure
+  // callback to pass the entity; do not drop the subscription.
+  onStructureDirty(flagUIDirty);
   // Force rebuild on world swap (scene change)
   onWorldSwap(() => {
     markUIDirty();

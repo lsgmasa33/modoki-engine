@@ -62,7 +62,7 @@ function makeWorld() {
  *  the scene's markUIDirty can land before game/editor setup has registered UI traits. */
 function mockDeps(registered: { current: unknown[] }) {
   vi.doMock('../../src/runtime/core/ecs/world', () => ({ getCurrentWorld: vi.fn(), onWorldSwap: vi.fn() }));
-  vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+  vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn(), onStructureDirty: vi.fn() }));
   vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({ getAllTraits: () => registered.current }));
 }
 

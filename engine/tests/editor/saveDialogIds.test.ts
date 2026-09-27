@@ -5,7 +5,8 @@
  *  points, and each id is asserted by CLICKING it: an id on the wrong button would pass a
  *  presence-only check and invert a destructive confirm for whoever aims at it. */
 import { describe, it, expect, afterEach } from 'vitest';
-import { confirmInEditor, confirmReplaceAsset } from '../../packages/modoki/src/editor/utils/saveDialog';
+import { alertInEditor, confirmInEditor, confirmReplaceAsset } from '../../packages/modoki/src/editor/utils/saveDialog';
+import { describeTopModal } from '../../app/debug/modalShells';
 import { clearOverlays } from '../../packages/modoki/src/editor/input/focusScope';
 
 const aim = (id: string) => document.querySelector<HTMLElement>(`[data-ui-id="${id}"]`);
@@ -39,5 +40,40 @@ describe('save-dialog shell ids (#1470)', () => {
     expect(aim('save-dialog.input')).toBeNull();
     aim('save-dialog.cancel')!.click();
     await answer;
+  });
+
+  it('a notice (alertInEditor, #1594) names ONE button, confirm, and resolves when it is clicked', async () => {
+    let settled = false;
+    const done = alertInEditor('File chooser failed', 'boom').then(() => { settled = true; });
+    expect(aim('save-dialog')?.textContent).toContain('boom');
+    expect(aim('save-dialog.cancel')).toBeNull();
+    await Promise.resolve();
+    expect(settled).toBe(false); // waits on the human, like the alert it replaces
+    aim('save-dialog.confirm')!.click();
+    await done;
+    expect(aim('save-dialog')).toBeNull();
+  });
+});
+
+describe('get_editor_state.modal reads the open shell (#1594)', () => {
+  it('none open → null; a confirm → its kind and both named buttons', async () => {
+    expect(describeTopModal()).toBeNull();
+    const answer = confirmInEditor('Auto-rig?', 'm', 'Auto-rig');
+    expect(describeTopModal()).toEqual({ kind: 'save-dialog', controls: ['save-dialog.cancel', 'save-dialog.confirm'], controlCount: 2 });
+    aim('save-dialog.cancel')!.click();
+    await answer;
+    expect(describeTopModal()).toBeNull();
+  });
+
+  it('two stacked → the TOP-most one, the one that takes input', async () => {
+    const under = document.createElement('div');
+    under.dataset.modalShell = 'under';
+    under.innerHTML = '<button data-ui-id="under.ok"></button>';
+    document.body.append(under);
+    const notice = alertInEditor('t', 'm');
+    expect(describeTopModal()).toEqual({ kind: 'save-dialog', controls: ['save-dialog.confirm'], controlCount: 1 });
+    aim('save-dialog.confirm')!.click();
+    await notice;
+    expect(describeTopModal()?.kind).toBe('under');
   });
 });

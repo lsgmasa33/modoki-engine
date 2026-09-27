@@ -1542,7 +1542,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*107 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*108 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1670,6 +1670,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_set_selection` | POST `/api/editor-action` `set-selection` | session | editor | entity | *(no args)* |
 | `modoki_set_skin_mode` | POST `/api/editor-action` `set-skin-mode` | session | editor | — | `{"mode":"rig"}` |
 | `modoki_set_timescale` | POST `/api/editor-action` `set-timescale` | no persistence | editor + renderer | — | `{"scale":1}` |
+| `modoki_set_view_camera` | POST `/api/editor-action` `set-view-camera` | no persistence | editor | — | `{"position":[12,15,20],"target":[0,0,0]}` |
 | `modoki_watch` | GET `/api/watch/list` *(both varies)* | session | editor + renderer | — | `{"action":"list"}` |
 
 #### Build — long-running toolchain work

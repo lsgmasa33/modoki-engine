@@ -31,7 +31,7 @@ import SkinCanvas from './SkinCanvas';
 import SkinBoneList from './SkinBoneList';
 import { autoRig2D } from '../../runtime/skinning/rig2dBuild';
 import { spriteThumbStyle } from './SpritePicker';
-import { chooseNewAssetPath, confirmReplaceAsset } from '../utils/saveDialog';
+import { chooseNewAssetPath, confirmInEditor, confirmReplaceAsset } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { AssetRefField, assetDisplayName } from './AssetRefField';
@@ -463,7 +463,9 @@ export default function SkinEditor() {
     if (s.activeSkinPart < 0) { setSaveMsg('No part selected'); return; }
     const ap = activePartOf(d, s.activeSkinPart);
     if (!ap.sprite) { setSaveMsg('Active part has no sprite'); return; }
-    if (d.bones?.length && !window.confirm('Auto-rig regenerates the whole skeleton + this part’s mesh + weights. Continue?')) return;
+    // The editor's own modal, not `window.confirm`: a native sheet blocks the renderer and no agent
+    // tool can see or answer it (#1594). `save-dialog.confirm` / `.cancel` are its aimable buttons.
+    if (d.bones?.length && !(await confirmInEditor('Auto-rig?', 'Auto-rig regenerates the whole skeleton + this part’s mesh + weights. Continue?', 'Auto-rig'))) return;
     const basis = captureSkinOpBasis(s);
     if (!basis) return;
     const dom = await resolveSpriteDomain(ap.sprite, ap.mesh?.verts ?? []);

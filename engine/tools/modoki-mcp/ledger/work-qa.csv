@@ -191,3 +191,6 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-25,work-qa,modoki_tap,43,3282,165983,24c1faaf3
 2026-09-25,work-qa,modoki_drag_handle,87,2048,166184,ed7bfa3cd
 2026-09-25,work-qa,modoki_tap_handle,114,1673,166184,ed7bfa3cd
+2026-09-27,work-qa,modoki_focus_entity,350,1658,171375,eb024afc9
+2026-09-27,work-qa,modoki_get_editor_state,187,2484,171375,eb024afc9
+2026-09-27,work-qa,modoki_set_view_camera,773,773,171375,eb024afc9

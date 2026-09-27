@@ -43,4 +43,13 @@ describe('describeEditorCamera', () => {
     o.updateMatrixWorld();
     expect(describeEditorCamera(o)!.orthoSize).toBeCloseTo(3, 9);
   });
+
+  it('reports the orbit pivot as `target` when the viewport gives one, and omits it otherwise (#1595)', () => {
+    const c = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    c.position.set(1, 2, 3);
+    c.updateMatrixWorld();
+    expect(describeEditorCamera(c, [4, 5, 6])!.target).toEqual([4, 5, 6]);
+    expect(describeEditorCamera(c, null)!).not.toHaveProperty('target');
+    expect(describeEditorCamera(c)!).not.toHaveProperty('target');
+  });
 });

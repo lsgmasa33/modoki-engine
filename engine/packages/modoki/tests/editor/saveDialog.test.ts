@@ -69,11 +69,17 @@ describe('chooseNewAssetPath — the chosen path', () => {
     expect(await saveAssetDialog(opts)).toBe('/games/x/assets/Walk.ANIM.JSON');
   });
 
-  it('alerts and returns null on outside-asset-roots', async () => {
+  it('tells the user in the IN-APP notice and returns null on outside-asset-roots (#1594)', async () => {
     backendFetch.mockResolvedValue(jsonResponse({ error: 'outside-asset-roots' }));
-    expect(await saveAssetDialog(opts)).toBeNull();
-    expect(alertSpy).toHaveBeenCalledOnce();
-    expect(modalInput()).toBeNull();
+    const p = saveAssetDialog(opts);
+    await tick();
+    // The editor's own modal, not a native alert: an agent can see and answer it (#1594).
+    const box = document.querySelector('[data-ui-id="save-dialog"]');
+    expect(box?.textContent).toContain('inside the project');
+    expect(modalInput()).toBeNull(); // a notice, not the path prompt
+    (document.querySelector('[data-ui-id="save-dialog.confirm"]') as HTMLElement).click();
+    expect(await p).toBeNull();
+    expect(alertSpy).not.toHaveBeenCalled();
   });
 
   it('falls back to an in-app modal when the native panel is unsupported', async () => {

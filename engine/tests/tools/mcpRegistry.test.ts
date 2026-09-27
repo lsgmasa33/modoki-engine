@@ -668,7 +668,13 @@ describe('the real registered surface', () => {
   // (roughly a wash per tool, and it saves ~1.5 KB of RESULT on every call, which this pin cannot see).
   // #1560 added real params agents kept guessing (`create_entity.name`, `modoki_scroll.dx/dy`,
   // `delete_asset.path`), stated the max on bounded numbers, and shared one `t` wording.
-  const DEFINITION_BYTES = 166_332;
+  // 2026-09-27 (#1594 + #1595, work-qa): RE-PINNED to 171,375 — +5,043 B over the 166,332 pin, of
+  // which work-qa's own share is +1,310 B (ledger/work-qa.csv): a new tool, `modoki_set_view_camera`
+  // (the write half of get_editor_state.camera, which agents had to fake with focus_entity + a timed
+  // wheel), `focus_entity.distanceScale`, and get_editor_state's `modal` sentence (the only way an
+  // agent learns a dialog is waiting on it). The other ~3.7 KB arrived through main from the other
+  // clones' ledgers since the last pin — work-ai3's `modoki_open_project` (+2,014 B) is most of it.
+  const DEFINITION_BYTES = 171_375;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

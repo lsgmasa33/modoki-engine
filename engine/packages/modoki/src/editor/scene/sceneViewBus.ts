@@ -40,7 +40,9 @@ export function getEditorViewportCamera(): EditorCamera | null {
 
 // ── Focus-entity command (SceneView F-key + Hierarchy "Focus" menu) ──
 
-type FocusHandler = (entityId: number) => void;
+/** `distanceScale` multiplies the framing stand-off (1 = the F-key's edge-to-edge framing). */
+export interface FocusOptions { distanceScale?: number }
+type FocusHandler = (entityId: number, opts?: FocusOptions) => void;
 let focusHandler: FocusHandler | null = null;
 
 /** SceneView registers its closure-scoped focus fn; returns an unregister to call on cleanup
@@ -54,9 +56,9 @@ export function setFocusEntityHandler(handler: FocusHandler): () => void {
 
 /** Frame an entity in the SceneView viewport. Returns false (a no-op) when no viewport is
  *  mounted, so an agent caller can tell "framed it" from "nothing to frame it in". */
-export function focusEntityInSceneView(entityId: number): boolean {
+export function focusEntityInSceneView(entityId: number, opts?: FocusOptions): boolean {
   if (!focusHandler) return false;
-  focusHandler(entityId);
+  if (opts) focusHandler(entityId, opts); else focusHandler(entityId);
   return true;
 }
 
@@ -83,6 +85,22 @@ export interface ViewportController {
   snapToAxis: (dir: THREE.Vector3) => void;
   toggleProjection: () => void;
   getProjection: () => EditorProjection;
+  /** Write the orbit pose instantly (#1595) — the agent's set_view_camera. */
+  setPose: (pose: EditorViewPose) => void;
+  /** The orbit pivot — what `position` looks at. Not derivable from the camera alone. */
+  getTarget: () => THREE.Vector3;
+  /** True when UI mode's 3D preview is posed FROM the orbit camera — no active Camera entity, so
+   *  SceneView's fallback drives the game camera from it. False when an authored Camera drives it. */
+  uiPreviewFollowsOrbit: () => boolean;
+}
+
+/** An editor orbit-camera pose. `fov` applies to a perspective view, `orthoSize` (vertical
+ *  half-height, the read-back's field) to an orthographic one; omitted, each keeps its value. */
+export interface EditorViewPose {
+  position: [number, number, number];
+  target: [number, number, number];
+  fov?: number;
+  orthoSize?: number;
 }
 
 let viewportController: ViewportController | null = null;
@@ -110,6 +128,27 @@ export function toggleEditorProjection(): boolean {
   if (!viewportController) return false;
   viewportController.toggleProjection();
   return true;
+}
+
+/** Set the editor viewport camera's orbit pose, instantly. Returns false when no viewport is
+ *  mounted. */
+export function setEditorViewPose(pose: EditorViewPose): boolean {
+  if (!viewportController) return false;
+  viewportController.setPose(pose);
+  return true;
+}
+
+/** Whether UI mode's 3D preview draws through the orbit camera (see
+ *  `ViewportController.uiPreviewFollowsOrbit`), or `null` when no viewport is mounted. */
+export function editorUiPreviewFollowsOrbit(): boolean | null {
+  return viewportController ? viewportController.uiPreviewFollowsOrbit() : null;
+}
+
+/** The editor orbit camera's pivot, or `null` when no viewport is mounted. */
+export function getEditorViewTarget(): [number, number, number] | null {
+  if (!viewportController) return null;
+  const t = viewportController.getTarget();
+  return [t.x, t.y, t.z];
 }
 
 /** Current editor projection, or `null` when no viewport is mounted. */

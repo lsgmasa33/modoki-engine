@@ -17,6 +17,7 @@ function mockDeps() {
   }));
   vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
     addDirtyListener: vi.fn(),
+    onStructureDirty: vi.fn(),
   }));
 }
 
@@ -90,6 +91,7 @@ describe('uiTreeStore', () => {
       }));
       vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
+        onStructureDirty: vi.fn(),
       }));
 
       const { uiTreeProjection, useUITreeStore } = await import('../../src/runtime/ui/uiTreeStore');
@@ -122,6 +124,7 @@ describe('uiTreeStore', () => {
       }));
       vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
+        onStructureDirty: vi.fn(),
       }));
 
       const { uiTreeProjection, markUIDirty } = await import('../../src/runtime/ui/uiTreeStore');
@@ -165,6 +168,7 @@ describe('uiTreeStore', () => {
       }));
       vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
+        onStructureDirty: vi.fn(),
       }));
 
       const uiElDefaults = {
@@ -256,7 +260,7 @@ describe('uiTreeStore', () => {
           { name: 'EntityAttributes', trait: attr, category: 'component', fields: {} },
         ],
       }));
-      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn(), onStructureDirty: vi.fn() }));
 
       const uiEl = {
         width: 0, height: 0, widthUnit: 'px', heightUnit: 'px',
@@ -331,6 +335,7 @@ describe('uiTreeStore', () => {
       }));
       vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
+        onStructureDirty: vi.fn(),
       }));
 
       const uiElDefaults = {
@@ -437,6 +442,7 @@ describe('uiTreeStore', () => {
       }));
       vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
         addDirtyListener: vi.fn(),
+        onStructureDirty: vi.fn(),
       }));
 
       const uiEl = {
@@ -520,7 +526,7 @@ describe('uiTreeStore', () => {
           { name: 'UIBinding', trait: bindingTrait, category: 'component', fields: {} },
         ],
       }));
-      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn(), onStructureDirty: vi.fn() }));
       const uiEl = {
         width: 0, height: 0, widthUnit: 'px', heightUnit: 'px',
         flexDirection: 'row', justifyContent: 'flex-start', alignItems: 'stretch',
@@ -639,6 +645,7 @@ describe('uiTreeProjection — lazy init latch ordering', () => {
     }));
     vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
       addDirtyListener: vi.fn(),
+      onStructureDirty: vi.fn(),
     }));
     const { uiTreeProjection } = await import('../../src/runtime/ui/uiTreeStore');
     const world = {} as any;
@@ -677,7 +684,7 @@ describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset ho
         { name: 'EntityAttributes', trait: attr, category: 'component', fields: {} },
       ],
     }));
-    vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+    vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn(), onStructureDirty: vi.fn() }));
 
     const { uiTreeProjection, useUITreeStore, markUIDirty } = await import('../../src/runtime/ui/uiTreeStore');
 

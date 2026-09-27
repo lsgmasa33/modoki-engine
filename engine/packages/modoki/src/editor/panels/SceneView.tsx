@@ -78,10 +78,10 @@ import { useHmrEpoch } from '../input/hmrEpoch';
 import { isTextEditable } from '../input/focusScope';
 import { worldToLocalTransform, clampScaleCrossingPivot, scaleCrossedPivot, scaleFromGizmoRatio, type ScaleSigns } from '../scene/gizmoTransform';
 import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBonePose';
-import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
+import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry, type FocusOptions, type EditorViewPose } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
 import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys';
-import { computeUIModeNDC, computeFullNDC, viewportDrawRect, transformControlsViewport, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, syncOutlineFor, disposeEdgeOutline, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
+import { computeUIModeNDC, computeFullNDC, viewportDrawRect, transformControlsViewport, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, syncOutlineFor, disposeEdgeOutline, resolveFocusTarget, discardOrbitMotion, applyOrbitPose, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID, exitPrefabEditing } from '../scene/prefabEdit';
 import { confirmDiscardUnsaved } from '../scene/unsavedGate';
@@ -3644,6 +3644,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     const gameOrthoCam = new THREE.OrthographicCamera(-8, 8, 4.5, -4.5, 0.1, 500);
     gameOrthoCam.layers.enable(PARTICLE_LAYER);
     let gameActiveCam: THREE.PerspectiveCamera | THREE.OrthographicCamera = gameCam;
+    // Whether the last synced frame posed gameCam FROM the orbit camera (the F1 fallback below: no
+    // active Camera entity). Then UI mode does draw through the orbit pose, and an agent write to it
+    // shows (#1595 review) — published through the viewport controller.
+    let uiPreviewFollowsOrbit = true;
 
     // The camera this viewport DRAWS with, and the client rect it draws into — the ONE place that
     // decides either (#1489). UI mode renders through the game camera into a letterbox; 3D mode
@@ -3909,7 +3913,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // current viewing direction. Registered on the sceneViewBus so the Hierarchy
     // panel's "Focus" menu item and the SceneView F-key can both invoke it —
     // renderState/controls are closure-scoped here.
-    const focusEntityInView = (entityId: number) => {
+    const focusEntityInView = (entityId: number, opts?: FocusOptions) => {
+      const distanceScale = opts?.distanceScale ?? 1;
       // Renderables are added to the scene ROOT with baked world transforms — the THREE
       // graph is flat, so an entity's children are NOT its object's children and
       // Box3.setFromObject can't see them. Walk the ECS parent links instead, and frame
@@ -3935,6 +3940,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
       const target = resolveFocusTarget(meshObjects, gizmoObjects, fallback);
       if (!target) return;
+      // Before the write: a gesture's damping coast would otherwise carry on past the framed pose.
+      stopCameraMotion();
       if (activeEditorCam === orthoCamera) {
         // Ortho has no fov to frame with: keep the current view dir, move to a fixed
         // stand-off, and size the frustum (zoom) to fit the radius instead.
@@ -3942,17 +3949,17 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         if (dir.lengthSq() < 1e-6) dir.set(1, 0.75, 1);
         dir.normalize();
         controls.target.copy(target.center);
-        orthoCamera.position.copy(target.center).addScaledVector(dir, Math.max(target.radius * 2.8, 1));
+        orthoCamera.position.copy(target.center).addScaledVector(dir, Math.max(target.radius * 2.8 * distanceScale, 1));
         const aspect = container.clientWidth / container.clientHeight || 1;
-        const f = orthoFrustumForHalfHeight(Math.max(target.radius * 1.4, 0.01), aspect);
+        const f = orthoFrustumForHalfHeight(Math.max(target.radius * 1.4 * distanceScale, 0.01), aspect);
         orthoCamera.left = f.left; orthoCamera.right = f.right;
         orthoCamera.top = f.top; orthoCamera.bottom = f.bottom;
         orthoCamera.zoom = 1;
         orthoCamera.near = Math.max(0.01, target.radius / 50);
-        orthoCamera.far = Math.max(2000, target.radius * 100);
+        orthoCamera.far = Math.max(2000, target.radius * 100, target.radius * 28 * distanceScale);
         orthoCamera.updateProjectionMatrix();
       } else {
-        frameCameraToBox(camera, controls.target, target.center, target.radius);
+        frameCameraToBox(camera, controls.target, target.center, target.radius, 2.8 * distanceScale);
       }
       controls.update();
     };
@@ -3971,6 +3978,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     let snapTo: THREE.Vector3 | null = null;     // offset at tween end
     let snapStart = 0;                           // performance.now() at start
     const snapToAxis = (dir: THREE.Vector3) => {
+      // A drag's damping coast would keep panning the pivot under the tween (#1595).
+      discardOrbitMotion(controls);
       const offset = new THREE.Vector3().subVectors(activeEditorCam.position, controls.target);
       const dist = offset.length() || 1;
       snapFrom = offset;
@@ -3994,6 +4003,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // once here (zoom=1) and dolly takes over afterward; on the way back the effective
     // half-height (top/zoom) is fed back into the perspective distance.
     const toggleProjection = () => {
+      discardOrbitMotion(controls); // #1595: the coast must not carry over onto the other camera
       const aspect = container.clientWidth / container.clientHeight || 1;
       const from = activeEditorCam;
       const dist = from.position.distanceTo(controls.target) || 1;
@@ -4027,10 +4037,29 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       gate.markDirty();
     };
 
+    // Stop every camera motion still in flight — an axis-snap tween and OrbitControls' damping coast —
+    // so a pose written next is the pose that stays (#1595). Hoisted-by-call: the focus handler above
+    // calls it, and only ever after this effect has finished running.
+    function stopCameraMotion() {
+      snapFrom = null; snapTo = null;
+      discardOrbitMotion(controls);
+    }
+
+    // The agent's set_view_camera (#1595): an instant write of the orbit pose. The op has already
+    // refused a fov on an ortho view and an orthoSize on a perspective one, and position == target.
+    const setPose = (pose: EditorViewPose) => {
+      snapFrom = null; snapTo = null; // applyOrbitPose discards the damping coast itself
+      applyOrbitPose(controls, activeEditorCam, pose, container.clientWidth / container.clientHeight || 1);
+      gate.markDirty();
+    };
+
     scope.add(setViewportController({
       snapToAxis,
       toggleProjection,
       getProjection: () => projection,
+      setPose,
+      getTarget: () => controls.target.clone(),
+      uiPreviewFollowsOrbit: () => uiPreviewFollowsOrbit,
     }));
 
     // Particle emitter gizmo icons + opt-in in-scene effect preview.
@@ -4220,6 +4249,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         gameCam.updateMatrixWorld(true);
         gameActiveCam = gameCam; // orbit fallback is perspective
       }
+      uiPreviewFollowsOrbit = !cameraMatched;
 
       // CameraFrame fit for the 2D-mode preview. gameCam is posed from the authored
       // Camera Transform above, but the game camera at RUNTIME is dollied/recentered by

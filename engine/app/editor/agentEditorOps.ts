@@ -20,6 +20,7 @@ import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { histogram } from '../../tools/shared/filterDisclosure';
 import { OpRefusal } from '../debug/opRefusal';
 import { liveGuidOf } from '../debug/liveLifecycle';
+import { describeTopModal, type ModalDescription } from '../debug/modalShells';
 import {
   resolveEntityAddress, guidListFields, descendantsOf, alsoDeletedFields, ALSO_DELETED_CAP,
   type EntityAddress, type EntityAddressKey,
@@ -56,7 +57,7 @@ import {
   applyToPrefabWithUndo, revertOverridesSelective, staleInstanceRefusal, rebuildInstance, resolveInstanceContext,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey,
   pushAction, makePrefabInstantiateAction, entityRef,
-  getEditorViewportCamera, focusEntityInSceneView,
+  getEditorViewportCamera, focusEntityInSceneView, setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit,
   upsertKey, findTrack, encodeValue,
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
   getCreatableAssets, createRegisteredAsset,
@@ -91,7 +92,7 @@ import {
  *  reconstruct framing or feed render-scene's camera override. The projection-aware shaping
  *  (fov for perspective, orthoSize for ortho) is the pure {@link describeEditorCamera}. */
 function readEditorCamera(): EditorCameraInfo | null {
-  return describeEditorCamera(getEditorViewportCamera());
+  return describeEditorCamera(getEditorViewportCamera(), getEditorViewTarget());
 }
 
 /** HMR staleness, kept OFF the payload when there is nothing to report — an editor that
@@ -113,6 +114,15 @@ function hmrFields(): { hmrUpdates?: number; staleGameCode?: true; discardedUnsa
  *  the norm and needs no words. `hidden` is reported too: it is benign (the OS window is
  *  occluded/minimised, so the browser throttles rAF) but it explains an `fps: 0` reading
  *  and a failing `capture_viewport`, which otherwise look identical to a real wedge. */
+/** The editor modal waiting on an answer, when one is open (#1594). Omitted otherwise, like the
+ *  health fields — it is the common case and a null would be noise. An agent that tapped something
+ *  and then finds the editor unresponsive to every aim is usually looking at one: `controls` names
+ *  the buttons to tap (`save-dialog.confirm` / `.cancel`, a choice modal's `<kind>.<value>`). */
+function modalFields(): { modal?: ModalDescription } {
+  const modal = describeTopModal();
+  return modal ? { modal } : {};
+}
+
 function frameLoopFields(): { frameLoop?: ReturnType<typeof getFrameLoopHealth> } {
   const h = getFrameLoopHealth();
   if (h.status === 'running' && h.recovered === 0) return {};
@@ -383,6 +393,7 @@ function readEditorState() {
     // the common payload stays small, present (with a `detail` string) the moment it is
     // not, because a wedge that an agent has to INFER from `fps: 0` is what made this
     // failure cost four debugging sessions.
+    ...(modalFields()),
     ...(frameLoopFields()),
     // Renderer-gate liveness — the INDEPENDENT twin of `frameLoop`. Measured: a viewport whose
     // renderer failed to init leaves the frame loop at a healthy 61fps while nothing renders and
@@ -2012,11 +2023,63 @@ export function registerEditorAgentOps(): void {
     // Accept guid (stable) or id; validate it resolves before claiming success. Report whether a
     // SceneView was actually mounted to frame it — the op used to return {ok:true} for a
     // nonexistent id AND when no viewport was open, so the camera didn't move either way. (C7 re-audit.)
-    const p = (params ?? {}) as { id?: number; guid?: string };
+    const p = (params ?? {}) as { id?: number; guid?: string; distanceScale?: unknown };
+    if (p.distanceScale !== undefined && !(typeof p.distanceScale === 'number' && Number.isFinite(p.distanceScale) && p.distanceScale > 0)) {
+      throw new OpRefusal('REFUSED_BY_OP', `focus-entity: distanceScale must be a positive number, got ${JSON.stringify(p.distanceScale)} — the camera was not moved.`);
+    }
     const id = requireLiveId(p, 'focus-entity');
-    const framed = focusEntityInSceneView(id);
+    const framed = focusEntityInSceneView(id, p.distanceScale !== undefined ? { distanceScale: p.distanceScale } : undefined);
     if (!framed) return { ok: false, framed: false, reason: 'no SceneView viewport is mounted, so there is nothing to frame the entity in (open/focus the 3D SceneView first).' };
-    return { ok: true, framed: true };
+    // Not refused in UI mode: the smoke suite frames through it there on purpose (docs/editor.md
+    // § SceneView modes). But say so when an authored Camera drives the view, so this pose shows nothing.
+    const uiMode = useEditorStore.getState().sceneViewMode === 'ui' && editorUiPreviewFollowsOrbit() === false;
+    return {
+      ok: true, framed: true, camera: readEditorCamera(),
+      ...(uiMode ? { note: 'The Scene view is in UI mode, which draws through the scene\'s active Camera, not the editor orbit camera — the pose moved but nothing on screen did. modoki_set_scene_view_mode {mode:"3d"} to see it.' } : {}),
+    };
+  });
+
+  // #1595 — the write half of get_editor_state.camera: an instant orbit pose. Instant on purpose, and
+  // any damping coast left by a human's last drag is discarded first, so the pose read back is the
+  // pose that stays — no settle wait for the caller to guess.
+  registerAgentOp('set-view-camera', (params) => {
+    const p = (params ?? {}) as { position?: unknown; target?: unknown; fov?: unknown; orthoSize?: unknown };
+    const vec3 = (v: unknown): v is [number, number, number] =>
+      Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === 'number' && Number.isFinite(n));
+    const refuse = (why: string, options?: string[]) => {
+      throw new OpRefusal('REFUSED_BY_OP', `set-view-camera: ${why} — the camera was not moved.`, options ? { options } : {});
+    };
+    if (!vec3(p.position) || !vec3(p.target)) refuse('`position` and `target` must each be [x, y, z] finite numbers');
+    const [position, target] = [p.position as [number, number, number], p.target as [number, number, number]];
+    if (Math.hypot(position[0] - target[0], position[1] - target[1], position[2] - target[2]) < 1e-6) {
+      refuse('`position` equals `target`, which gives the camera no direction to look');
+    }
+    // UI mode draws through the scene's active Camera entity, so a write here would answer ok and move
+    // nothing on screen. With NO active Camera the preview is posed from the orbit camera, and the
+    // write does show — so ask the viewport which, rather than the mode alone (#1595 review).
+    if (useEditorStore.getState().sceneViewMode === 'ui' && editorUiPreviewFollowsOrbit() === false) {
+      throw new OpRefusal('NOT_AVAILABLE_HERE', 'set-view-camera: the Scene view is in UI mode, which draws through the scene\'s active Camera, not the editor orbit camera — the camera was not moved.',
+        { options: ['modoki_set_scene_view_mode {mode:"3d"}, then retry'] });
+    }
+    const projection = getEditorProjection();
+    if (projection === null) {
+      throw new OpRefusal('NOT_AVAILABLE_HERE', 'set-view-camera: no SceneView viewport is mounted, so there is no camera to move.',
+        { options: ['open the Scene panel (3D mode) and retry'] });
+    }
+    if (p.fov !== undefined) {
+      if (!(typeof p.fov === 'number' && p.fov > 0 && p.fov < 180)) refuse(`fov must be a number of degrees in (0, 180), got ${JSON.stringify(p.fov)}`);
+      if (projection !== 'perspective') refuse('fov applies to a perspective view, and this one is orthographic — pass orthoSize instead');
+    }
+    if (p.orthoSize !== undefined) {
+      if (!(typeof p.orthoSize === 'number' && Number.isFinite(p.orthoSize) && p.orthoSize > 0)) refuse(`orthoSize must be a positive number, got ${JSON.stringify(p.orthoSize)}`);
+      if (projection !== 'orthographic') refuse('orthoSize applies to an orthographic view, and this one is perspective — pass fov instead');
+    }
+    setEditorViewPose({
+      position, target,
+      ...(p.fov !== undefined ? { fov: p.fov as number } : {}),
+      ...(p.orthoSize !== undefined ? { orthoSize: p.orthoSize as number } : {}),
+    });
+    return { ok: true, camera: readEditorCamera() };
   });
 
   // ── Play control ── matches the GameView transport bar.

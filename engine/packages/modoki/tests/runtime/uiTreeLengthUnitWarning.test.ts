@@ -81,7 +81,7 @@ function makeWorld(specs: Spec[]) {
 
 function mockDeps() {
   vi.doMock('../../src/runtime/core/ecs/world', () => ({ getCurrentWorld: vi.fn(), onWorldSwap: vi.fn() }));
-  vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+  vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn(), onStructureDirty: vi.fn() }));
   vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
     getAllTraits: () => [
       { name: 'RenderableUI', trait: RUI, category: 'component', fields: {} },
@@ -177,7 +177,7 @@ describe('length-unit mismatch warning re-fires for a NEW entity that inherits a
 
   function mockRealDeps() {
     vi.doMock('../../src/runtime/core/ecs/world', () => ({ getCurrentWorld: vi.fn(), onWorldSwap: vi.fn() }));
-    vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+    vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn(), onStructureDirty: vi.fn() }));
     vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
       getAllTraits: () => [
         { name: 'RenderableUI', trait: RenderableUI, category: 'component', fields: {} },

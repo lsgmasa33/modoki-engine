@@ -151,7 +151,19 @@ a drag-select that starts in a field and is released outside does not close the 
 stamp `data-modal-shell=<kind>` on the backdrop, so "which modals are open" is one DOM query —
 `modoki_dnd` reads it to report a drop that raised a confirm (`pendingModal`, #1471). The plain-DOM
 dialogs also name their box `<kind>` and each control `<kind>.<role>` (`save-dialog.confirm`,
-`<choice-kind>.<value>`, #1470) so an agent aims by name.
+`<choice-kind>.<value>`, #1470) so an agent aims by name. `get_editor_state.modal` reports the
+top-most open shell the same way (`{kind, controls, controlCount}`, omitted when none) — both read
+it through `engine/app/debug/modalShells.ts`, so the two cannot disagree.
+
+**No native `confirm` / `alert` / `prompt` in the editor (#1594).** In the Electron renderer they
+open a native sheet that BLOCKS the renderer, and nothing on the agent surface can see or answer
+one: Skin Editor's Auto-rig confirmed with `window.confirm`, a `modoki_tap` on it returned ok, and
+every later call timed out ("is the editor window open?") until a human clicked OK through macOS
+System Events. Use `confirmInEditor` / `alertInEditor` (`utils/saveDialog.ts`) or `openChoiceModal`.
+`prompt()` throws in Electron, so it announced itself; `confirm` and `alert` do not, which is why
+the trap came back after #1470 and why `tests/architecture/noNativeDialogs.test.ts` now reads source
+for it. Out of its reach by design: main-process `dialog.showMessageBox` (menu/startup driven) and
+the native Save/Open panels behind `/api/save-dialog` and `/api/pick-path`.
 
 **Agents are told.** `/api/input/key` warns when a press landed under a modal and no binding of the
 modal's own claimed it, instead of answering `ok:true` alone.

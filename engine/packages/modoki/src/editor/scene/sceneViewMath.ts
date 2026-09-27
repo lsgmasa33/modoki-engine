@@ -220,6 +220,62 @@ export function computeCamFrustumPositions(
   }
 }
 
+/** Throw away the orbit motion OrbitControls still owes from the last human gesture (#1595).
+ *
+ *  With `enableDamping` on, a rotate or pan does not stop when the pointer lifts: each `update()`
+ *  applies a `dampingFactor` share of the remaining delta and keeps the rest, so the camera coasts
+ *  for about 30 frames. A pose WRITTEN during that coast — a focus, an agent's set_view_camera —
+ *  gets the rest of the old gesture added on top: measured live, a pan drag followed by a focus
+ *  left the camera 0.4 units off the framed pose 600 ms later, on a 2.6-unit stand-off.
+ *
+ *  OrbitControls has no public "stop", so this spends the residue on the CURRENT pose in one
+ *  undamped `update()` (which applies the whole remaining delta, then zeroes it — a pending wheel
+ *  scale too). ⚠️ So call it BEFORE writing the new pose: afterwards it would move the new one. */
+export function discardOrbitMotion(controls: { enableDamping: boolean; update: () => boolean }): void {
+  const damping = controls.enableDamping;
+  controls.enableDamping = false;
+  controls.update();
+  controls.enableDamping = damping;
+}
+
+/** Write an orbit pose instantly — the agent's set_view_camera (#1595). Discards the damping coast
+ *  FIRST (see {@link discardOrbitMotion}), then sets pivot, position and the projection field the
+ *  pose names (`fov` on a perspective camera, `orthoSize` as the frustum half-height on an ortho
+ *  one — the caller has refused the mismatched pair). near/far are DERIVED from the new stand-off,
+ *  not kept: a pose written after a focus on something large would otherwise inherit its near plane
+ *  (radius/50) and clip its own pivot, and a far plane that only grew would leave a close pose with
+ *  a near/far ratio that z-fights. The floors are a fresh editor's: near 0.1 (less only for a pose
+ *  closer than 1 unit), far 500 perspective / 2000 ortho. Runs `controls.update()` last. */
+export function applyOrbitPose(
+  controls: { enableDamping: boolean; update: () => boolean; target: THREE.Vector3 },
+  cam: THREE.PerspectiveCamera | THREE.OrthographicCamera,
+  pose: { position: readonly [number, number, number]; target: readonly [number, number, number]; fov?: number; orthoSize?: number },
+  aspect: number,
+): void {
+  discardOrbitMotion(controls);
+  controls.target.set(pose.target[0], pose.target[1], pose.target[2]);
+  cam.position.set(pose.position[0], pose.position[1], pose.position[2]);
+  const dist = cam.position.distanceTo(controls.target);
+  if ((cam as THREE.OrthographicCamera).isOrthographicCamera) {
+    const o = cam as THREE.OrthographicCamera;
+    if (pose.orthoSize !== undefined) {
+      const f = orthoFrustumForHalfHeight(pose.orthoSize, aspect);
+      o.left = f.left; o.right = f.right; o.top = f.top; o.bottom = f.bottom;
+      o.zoom = 1;
+    }
+  } else if (pose.fov !== undefined) {
+    (cam as THREE.PerspectiveCamera).fov = pose.fov;
+  }
+  // near: 0.1 like a fresh editor unless the pose is closer than 1 unit, and never a ratio worse
+  // than 1:5000 against far. far: the camera's own floor (ortho 2000 — its view size does not
+  // depend on distance, so a close ortho pose must not cull the scene behind the pivot).
+  const isOrtho = (cam as THREE.OrthographicCamera).isOrthographicCamera === true;
+  cam.near = Math.max(Math.min(0.1, dist / 10), dist / 500);
+  cam.far = Math.max(isOrtho ? 2000 : 500, dist * 10);
+  cam.updateProjectionMatrix();
+  controls.update();
+}
+
 /** Frame `center`/`radius` in the orbit camera, preserving the current viewing direction
  *  (from `target` → `camera.position`). Degenerate direction falls back to a default angle.
  *  Mutates `camera` (position/near/far/projection) and `target`; the caller runs
@@ -239,7 +295,8 @@ export function frameCameraToBox(
   target.copy(center);
   camera.position.copy(center).addScaledVector(dir, dist);
   camera.near = Math.max(0.01, radius / 50);
-  camera.far = Math.max(500, radius * 100);
+  // `dist * 10` too: a `distanceScale` stand-off (#1595) can outrun `radius * 100`.
+  camera.far = Math.max(500, radius * 100, dist * 10);
   camera.updateProjectionMatrix();
 }
 

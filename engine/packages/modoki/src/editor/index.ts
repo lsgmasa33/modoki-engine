@@ -53,6 +53,7 @@ export {
 } from './editorJournal';
 export {
   getEditorViewportCamera, setEditorViewportCamera, focusEntityInSceneView,
+  setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit, type EditorViewPose,
 } from './scene/sceneViewBus';
 export {
   useBufferedValue, BufferedTextInput, BufferedNumberInput, parseNumber, parseString,
@@ -140,6 +141,8 @@ export { createRegisteredAsset, ensureExt } from './panels/createRegisteredAsset
  *  to repair the renderer's path-keyed state. */
 export { applyAssetPathMoves, unbindDeletedAssetEditors } from './panels/assetEditorBindings';
 export type { PathMove } from './utils/assetPaths';
+// The editor's own modals, for app-shell code that would otherwise reach for a native `alert`/`confirm` (#1594).
+export { alertInEditor, confirmInEditor } from './utils/saveDialog';
 export {
   registerCreatableAsset, unregisterCreatableAsset, getCreatableAssets, type CreatableAssetDef,
 } from './panels/creatableAssets';

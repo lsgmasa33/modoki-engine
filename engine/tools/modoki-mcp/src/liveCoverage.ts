@@ -88,6 +88,7 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_select_sprite_slice: "needs a live Sprite Editor session open on the human's texture",
   modoki_set_skin_mode: "needs a live Skin editor session open on the human's rig",
   modoki_focus_entity: "moves the human's camera",
+  modoki_set_view_camera: "moves the human's camera. Verified by hand on this clone instead (#1595): set a pose, read it back through get_editor_state.camera within tolerance, then a pan drag straight before a focus no longer drifts the framed pose",
   modoki_set_playhead: 'scrubs a live animation/timeline',
   modoki_pose_clip: "poses the human's LIVE world and opens a preview envelope over it. Verified by hand on this clone instead (#288 Phase 4): open a clip, pose at two different t, read a trait back at each — Circle 2D x went 2413.96 (authored) -> 2320.39 (t=0.9) -> 1143.25 (t=0.2) -> 2413.96 after exit. A single pose could coincide with the authored value; two cannot",
   modoki_open_animation_editor: "replaces whatever clip the human has open in the Animation panel, and re-points the panel's tab",

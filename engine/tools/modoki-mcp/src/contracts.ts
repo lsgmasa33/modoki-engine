@@ -535,6 +535,11 @@ const DECLS: Record<string, Decl> = {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'focus-entity',
     mutating: true, requires: ['editor', 'scene'], aim: 'entity',
   },
+  modoki_set_view_camera: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-view-camera',
+    mutating: true, requires: ['editor'], minimalArgs: { position: [12, 15, 20], target: [0, 0, 0] },
+    notes: 'Instant, and discards any OrbitControls damping coast first (#1595) — so no settle wait.',
+  },
 
   // ── project / toolchain ──
   modoki_identity: {

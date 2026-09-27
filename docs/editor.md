@@ -1253,6 +1253,26 @@ derives basic hints from a koota schema's default values; it has no internal cal
 The gizmo mode (`translate | rotate | scale`) and space (`world | local`) live in
 `editorStore` and are shared by both modes via a toolbar.
 
+**Writing the orbit camera: stop its motion first (#1595).** `OrbitControls` runs with damping, so a
+human's rotate or pan does not end on pointer-up: each `update()` applies a tenth of what is left,
+and the camera coasts for ~30 frames. A pose written during that coast — the F-key focus,
+`modoki_focus_entity`, `modoki_set_view_camera` — gets the rest of the gesture added on top.
+Measured live: a pan drag then a focus drifted the framed pose 0.4–0.7 units within 600 ms on a
+~2.6-unit stand-off, and a wheel sent after it dollied from wherever the drift had got to. That is
+the "focus races a follow-up scroll" report; focus was never animated. So every write — focus,
+`applyOrbitPose` (set_view_camera), the axis-snap start, the projection toggle — first calls
+`discardOrbitMotion` (`sceneViewMath.ts`), which spends the residue on the OLD pose in one undamped
+`update()`; focus and set_view_camera also cancel an in-flight axis-snap tween. Call order
+matters: after the write it would move the new pose instead. `applyOrbitPose` also DERIVES near/far
+from the new stand-off rather than keeping them, so a close pose after a focus on something large
+does not clip its own pivot. In UI mode the view draws through the scene's active Camera
+entity, so there `set_view_camera` refuses and `focus_entity` answers with a `note` — unless no
+active Camera exists, when SceneView's fallback poses the preview FROM the orbit camera and both
+writes show (`ViewportController.uiPreviewFollowsOrbit`). The agent pair
+is `get_editor_state.camera` (`position`, `direction`, `target`, `fov`|`orthoSize`) and
+`modoki_set_view_camera` (takes back `position`/`target`/`fov`|`orthoSize`); `focus_entity`'s
+`distanceScale` widens its edge-to-edge framing.
+
 **The two modes draw the 3D layer through DIFFERENT cameras, and exactly one place picks which.**
 3D mode renders through the editor orbit camera over the whole canvas; UI mode renders the 3D
 layer through the **game** camera into a letterbox sized to the game aspect. `viewCamera()` /

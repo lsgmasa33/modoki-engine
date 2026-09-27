@@ -38,6 +38,14 @@ export async function confirmInEditor(title: string, message: string, okLabel: s
   return (await openModal(title, message, okLabel, undefined, true)) !== null;
 }
 
+/** A notice in the editor's own modal: one OK button, resolved when it is dismissed. The in-app
+ *  replacement for `window.alert`, which opens a NATIVE sheet in the Electron renderer that blocks
+ *  it and that no agent tool can see or answer (#1594) — the same trap `window.confirm` was.
+ *  Resolves on OK, Escape or a backdrop click alike: there is nothing to decide. */
+export async function alertInEditor(title: string, message: string): Promise<void> {
+  await openModal(title, message, 'OK', undefined, true, true);
+}
+
 /** The prompt and the confirmation, in the plain-DOM form of the editor's modal shell (#1270), so the
  *  editor underneath takes no key and no menu command while it waits. With `initial` it is a text
  *  prompt resolving the trimmed value (null when empty); without it, a confirmation resolving '' on
@@ -50,7 +58,7 @@ export async function confirmInEditor(title: string, message: string, okLabel: s
  *  (`qaCaseReferences.test.ts` `knownUiIds`) derives citable ids from source text, and a template
  *  that STARTS with an interpolation has no static prefix it can read — a case citing
  *  `save-dialog.confirm` would then fail `npm test` against an id that exists. */
-function openModal(title: string, message: string, okLabel: string, initial?: string, multiline = false): Promise<string | null> {
+function openModal(title: string, message: string, okLabel: string, initial?: string, multiline = false, notice = false): Promise<string | null> {
   return new Promise((resolve) => {
     // Above every React dialog (99999): Create Prefab and the New buttons can ask from inside one.
     const { root: overlay, close } = openDomModalShell('save-dialog', { zIndex: 99999, onDismiss: () => done(null) });
@@ -82,7 +90,8 @@ function openModal(title: string, message: string, okLabel: string, initial?: st
     ok.textContent = okLabel;
     ok.dataset.uiId = 'save-dialog.confirm';
     ok.style.cssText = 'padding:4px 16px;border:1px solid #3a6;border-radius:3px;background:#244;color:#cfc;cursor:pointer;font-family:monospace;font-size:11px';
-    row.append(cancel, ok);
+    // A notice asks nothing, so it has no Cancel to aim at — only `save-dialog.confirm`.
+    if (notice) row.append(ok); else row.append(cancel, ok);
     box.append(heading, label, ...(input ? [input] : []), row);
     overlay.append(box);
 
@@ -102,7 +111,7 @@ function openModal(title: string, message: string, okLabel: string, initial?: st
     // it (the input, or the focused button), and a global listener is what keymapOwnership forbids.
     // Removed with the overlay, so nothing outlives a closed modal.
     overlay.onkeydown = onKey;
-    setTimeout(() => { if (input) { input.focus(); input.select(); } else { cancel.focus(); } }, 0);
+    setTimeout(() => { if (input) { input.focus(); input.select(); } else if (notice) { ok.focus(); } else { cancel.focus(); } }, 0);
   });
 }
 
@@ -160,7 +169,7 @@ export async function chooseNewAssetPath(
     return { path, confirmReplace: (p) => (p === panelChecked ? Promise.resolve(true) : confirmReplaceAsset(p)) };
   }
   if (res.error === 'outside-asset-roots') {
-    alert('Please choose a location inside the project (a game\'s assets/ folder or modoki/assets).');
+    await alertInEditor('Outside the project', 'Please choose a location inside the project (a game\'s assets/ folder or modoki/assets).');
     return null;
   }
   // Fallback: no native panel (a browser dev tab off macOS), a failed panel, or a server error —

@@ -10,7 +10,7 @@ import { createElement } from 'react';
 import type React from 'react';
 import {
   createEditor, setExtraMenus, useEditorStore, backendFetch, backendEventSource, fetchDeviceList,
-  installEditorPrefabCacheWarm,
+  installEditorPrefabCacheWarm, alertInEditor,
   type ExtraMenuItem, type DeviceListReply,
 } from '@modoki/engine/editor';
 import { GameView } from '@modoki/engine/editor/rendering';
@@ -757,7 +757,8 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
           if (!r.ok) {
             // A chooser that FAILED is not a Cancel (#1440) — say so, or Browse… just does nothing.
             const msg = await r.json().then((j: { error?: string }) => j?.error).catch(() => undefined);
-            alert(msg || `Could not open the file chooser (${r.status}).`);
+            // The editor's modal, not a native `alert` — that sheet blocks the renderer out of every agent tool's reach (#1594).
+            await alertInEditor('File chooser failed', msg || `Could not open the file chooser (${r.status}).`);
             return null;
           }
           const j = (await r.json()) as { path?: string };
