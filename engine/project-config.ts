@@ -291,11 +291,11 @@ export interface ProjectConfig {
      *  invalidates `<webBasePath>*` so a redeploy isn't masked by the edge cache.
      *  Empty = no CDN / skip invalidation. */
     webCdnUrlMap: string;
-    /** Cloud CDN backend-bucket name fronting the bucket. When set, the web deploy
+    /** GCP Cloud CDN backend-bucket name fronting the bucket. When set, the web deploy
      *  whitelists the `v` query param in its cache-key policy (idempotent) so the
-     *  content-hash `?v=<hash>` busts the edge cache per-version, and marks the
-     *  content-hashed binaries (.glb/.ktx2/.webp) immutable. Empty = leave the
-     *  binaries non-immutable. */
+     *  content-hash `?v=<hash>` busts the edge cache per-version. Empty = no GCP CDN step.
+     *  It does NOT gate the binaries' immutable headers — those are set on every gcs deploy
+     *  (#1588; `gcsCdnSteps` in vite-asset-scanner.ts, docs/build.md § Web deploy). */
     webCdnBackendBucket: string;
     /** Custom web-deploy command run AFTER the `dist/` build (webDeployMode
      *  `custom`). Placeholders: `{dist}` (abs path to the built dist dir),

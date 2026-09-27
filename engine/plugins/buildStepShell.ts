@@ -85,6 +85,9 @@ interface StepCommon {
   /** Evaluated when the step is reached, not when the plan is made — e.g. "does dist/ hold a .glb"
    *  after the build that produces dist/ has run. False skips the step. */
   when?: () => boolean;
+  /** Where this step makes the build LIVE (a bucket URL). Once such a step succeeds, a later
+   *  failure is reported as "published, but …" — a bare FAILED read as "nothing shipped" (#1588). */
+  publishes?: string;
 }
 
 /** A program + argv, spawned with no shell. `winCommand` replaces `command` on win32 (gradlew →
@@ -116,7 +119,7 @@ export type BuildStep = ExecStep | ShellStep | InprocStep;
 export type SpawnedStep = ExecStep | ShellStep;
 
 /** Shorthand for the common case. */
-export function execStep(label: string, cwd: string, command: string, args: string[], extra: Pick<ExecStep, 'env' | 'winCommand' | 'when'> = {}): ExecStep {
+export function execStep(label: string, cwd: string, command: string, args: string[], extra: Pick<ExecStep, 'env' | 'winCommand' | 'when' | 'publishes'> = {}): ExecStep {
   return { kind: 'exec', label, cwd, command, args, ...extra };
 }
 

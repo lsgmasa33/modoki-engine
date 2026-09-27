@@ -766,6 +766,50 @@ export function cdnBinaryCacheSteps(bucket: string, distDir: string, buildCwd: s
   ));
 }
 
+/** The built-in gcs web deploy's steps AFTER the upload — the CDN/cache half. Pure, so the gating
+ *  is unit-testable. Three independent gates:
+ *  - the binaries' immutable headers run on EVERY gcs deploy. glb/ktx2/webp keep stable filenames
+ *    and are fetched with a content-hash `?v=<hash>` (modelGlbUrl / resolveTextureVariantUrl /
+ *    resolveBrowserImageUrl), so a year's cache is safe exactly when the CDN keys on the query. That
+ *    was once proven only by `backendBucket` (the step below sets a GCP LB's key policy), so the
+ *    headers were gated on it — and went unset when that LB was deleted (#1588). The Cloudflare
+ *    Worker keys on the full query string, and so does GCS's own cache behind it (both measured
+ *    2026-09-27 — docs/build.md § Web deploy).
+ *  - `backendBucket` (a GCP Cloud CDN backend bucket): whitelist `v` in its cache key.
+ *  - `urlMap` (a GCP url-map): invalidate the deploy path. */
+export function gcsCdnSteps(o: { bucket: string; backendBucket: string; urlMap: string; basePath: string; distDir: string; buildCwd: string }): ExecStep[] {
+  const steps: ExecStep[] = [];
+  if (o.backendBucket) {
+    // Idempotent: re-running just re-asserts the policy. Whitelist ONLY the `v` cache-bust param
+    // (our sole query) so a distinct `?v=<hash>` keys a distinct edge object without fragmenting
+    // the cache on incidental/unknown query params.
+    steps.push(execStep('Enabling CDN query-string cache key (v only)...', o.buildCwd, 'gcloud',
+      ['compute', 'backend-buckets', 'update', o.backendBucket, '--cache-key-query-string-whitelist=v']));
+  }
+  steps.push(...cdnBinaryCacheSteps(o.bucket, o.distDir, o.buildCwd));
+  if (o.urlMap) {
+    // Cloud CDN had cached the old object, so a redeploy is invisible until the edge is flushed.
+    // `--async`: the synchronous form polls the op via extra gcloud API calls that can hang for
+    // minutes in the spawned build subprocess (observed: the dialog froze on this step while the op
+    // was never even created), even though the same command run interactively completes in ~3s.
+    steps.push(execStep('Invalidating CDN cache...', o.buildCwd, 'gcloud',
+      ['compute', 'url-maps', 'invalidate-cdn-cache', o.urlMap, '--path', `${o.basePath}*`, '--async']));
+  }
+  return steps;
+}
+
+/** The SSE status title for a failed build step. After a `publishes` step succeeded the build is
+ *  already LIVE, so a bare `FAILED:<label>` would read as "nothing shipped" — the #1588 report,
+ *  where a dead CDN setting failed a deploy that had in fact published both games. */
+export function buildStepFailureTitle(step: { label: string; publishes?: string }, publishedTo: string | undefined): string {
+  const name = step.label.replace(/\.\.\.$/, '');
+  if (publishedTo) return `Published to ${publishedTo} — but "${name}" failed afterwards`;
+  // The publishing step ITSELF failed: an rsync that dies midway has already replaced or deleted
+  // some objects, so "nothing shipped" is exactly as wrong here — a half-deployed build.
+  if (step.publishes) return `${name} failed — ${step.publishes} may be partially updated`;
+  return step.label;
+}
+
 /** Does `dir` (recursively) hold a file ending `.<ext>`? The run-time check behind the CDN step's
  *  per-extension `when` — it replaced a bash `find … | head -1` loop (#1537). A missing dir is "no". */
 export function distHasExtension(dir: string, ext: string): boolean {
@@ -2884,13 +2928,13 @@ export function assetScannerPlugin(): Plugin {
             // (which hangs via Python multiprocessing on macOS). Entry points get
             // no-cache so redeploys are picked up immediately.
             stepsByPlatform.web.push(
-              execStep(`Uploading to ${WEB_BUCKET}...`, webCwd, 'gcloud', ['storage', 'rsync', '--recursive', '--delete-unmatched-destination-objects', 'dist', WEB_BUCKET]),
+              execStep(`Uploading to ${WEB_BUCKET}...`, webCwd, 'gcloud', ['storage', 'rsync', '--recursive', '--delete-unmatched-destination-objects', 'dist', WEB_BUCKET], { publishes: WEB_BUCKET }),
               // No-cache the entry point AND every data JSON (scene/particle/mesh/
               // mat/prefab/shader + assets.manifest.json). These keep stable
               // filenames across redeploys, so without no-cache an authoring tweak
               // (e.g. a particle color) stays stale for up to max-age. Big binaries
-              // (glb/ktx2/webp) keep the default long cache — they rarely change and
-              // texture variants are content-hashed in their names.
+              // (glb/ktx2/webp) are marked immutable after this, by gcsCdnSteps — their
+              // names are stable, and a changed file is a changed `?v=<hash>`.
               execStep('Setting cache headers...', buildCwd, 'gcloud', ['storage', 'objects', 'update', `${WEB_BUCKET}/index.html`, `${WEB_BUCKET}/**.json`, '--cache-control=no-cache, max-age=0']),
               // Hashed build outputs under /assets/ (JS/CSS + content-hashed JSON
               // chunks) have content-addressed filenames that change every build, so
@@ -2905,38 +2949,13 @@ export function assetScannerPlugin(): Plugin {
             // resolveGcloudDir, but no step below depends on bash any more (#1537).
             stepsByPlatform.web.push({ kind: 'inproc', label: 'Revealing dist/...', run: () => openInOS(distDir) });
           }
-          // B1: the model/texture binaries (glb/ktx2/webp) keep STABLE filenames
-          // across edits but are fetched with a content-hash `?v=<hash>` query in
-          // prod (modelGlbUrl / resolveTextureVariantUrl). That only busts caches
-          // when the CDN keys on the query string — so mark them immutable ONLY
-          // when a backend-bucket is configured AND we've set its cache-key policy
-          // to include the query (next step). Only applies to the built-in gcloud
-          // path (a custom deploy command owns its own caching).
-          if (deployMode === 'gcs' && WEB_BUCKET && cfg.build.webCdnBackendBucket) {
-            stepsByPlatform.web.push(
-              // Idempotent: re-running just re-asserts the policy. Whitelist ONLY
-              // the `v` cache-bust param (our sole query) so a distinct
-              // `?v=<hash>` keys a distinct edge object (B1) without fragmenting
-              // the cache on incidental/unknown query params.
-              execStep('Enabling CDN query-string cache key (v only)...', buildCwd, 'gcloud',
-                ['compute', 'backend-buckets', 'update', cfg.build.webCdnBackendBucket, '--cache-key-query-string-whitelist=v']),
-              ...cdnBinaryCacheSteps(WEB_BUCKET, distDir, buildCwd),
-            );
-          }
-          // Cloud CDN fronts the bucket: re-upload + no-cache headers don't help
-          // until the edge is flushed (it had cached the old object and ignores
-          // query strings in its cache key). Invalidate the deploy path so a
-          // redeploy is visible immediately. Skipped when no url-map is configured
-          // or a custom deploy command owns the deploy.
-          if (deployMode === 'gcs' && WEB_BUCKET && cfg.build.webCdnUrlMap) {
-            // `--async`: submit the invalidation and return immediately instead of
-            // blocking on operation-polling. The synchronous form polls the op via
-            // extra gcloud API calls that can hang for minutes in the spawned build
-            // subprocess (observed: the dialog froze on this step while the op was
-            // never even created), even though the same command run interactively
-            // completes in ~3s. The edge flush still finishes server-side in seconds.
-            stepsByPlatform.web.push(execStep('Invalidating CDN cache...', buildCwd, 'gcloud',
-              ['compute', 'url-maps', 'invalidate-cdn-cache', cfg.build.webCdnUrlMap, '--path', `${cfg.build.webBasePath}*`, '--async']));
+          // The CDN/cache half, after the upload — gating documented on gcsCdnSteps. A custom deploy
+          // command owns its own caching.
+          if (deployMode === 'gcs' && WEB_BUCKET) {
+            stepsByPlatform.web.push(...gcsCdnSteps({
+              bucket: WEB_BUCKET, backendBucket: cfg.build.webCdnBackendBucket, urlMap: cfg.build.webCdnUrlMap,
+              basePath: cfg.build.webBasePath, distDir, buildCwd,
+            }));
           }
           const steps = stepsByPlatform[platform];
 
@@ -3334,6 +3353,7 @@ export function assetScannerPlugin(): Plugin {
               if (aborted) return;
             }
             const total = steps.length;
+            let publishedTo: string | undefined; // set once a `publishes` step succeeds (#1588)
             for (let i = 0; i < steps.length; i++) {
               if (aborted) return; // client gone — don't start the next step
               const step = steps[i];
@@ -3355,6 +3375,7 @@ export function assetScannerPlugin(): Plugin {
                 proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); keep(`ERROR: ${e.message}`); resolve(false); });
               });
               if (aborted) return; // disconnected during the step
+              if (ok && step.publishes) publishedTo = step.publishes;
               if (!ok) {
                 // Prefer lines that look like real errors; else fall back to the tail.
                 const errLines = recentOutput.filter((l) => /error|fail|cannot find|not found|exception/i.test(l));
@@ -3372,8 +3393,8 @@ export function assetScannerPlugin(): Plugin {
                     `  2. select the App target → Signing & Capabilities → tick “Automatically manage signing” and pick your Team\n` +
                     `  3. run Build → iOS again (it now reuses the profile Xcode created).`;
                 }
-                sendStatus(`FAILED:${step.label}\n${errorSummary}`);
-                send('Build failed.');
+                sendStatus(`FAILED:${buildStepFailureTitle(step, publishedTo)}\n${errorSummary}`);
+                send(publishedTo ? `Build published to ${publishedTo}, then a later step failed.` : 'Build failed.');
                 res.end();
                 return;
               }

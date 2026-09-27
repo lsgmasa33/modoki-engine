@@ -18,7 +18,7 @@ import {
   settleRelayReply, countLiveBridgeClients,
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot, absToAssetUrl, pathToClassifyForChange, isSiblingRaisedChange,
-  isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps, distHasExtension, cdnBinaryCacheSteps,
+  isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps, distHasExtension, cdnBinaryCacheSteps, gcsCdnSteps, buildStepFailureTitle,
   otaPublishTarget, otaSubgameProjectDir, otaResolveSubgameDir, otaPublishSteps, otaSigningKeyRefusal,
   otaPublishBuildStepEnv,
   type AssetRoot,
@@ -396,6 +396,60 @@ describe('isSseRoute (catch-all exclusion)', () => {
     expect(findNodes(gates[0]!.thenStatement, (n): n is ts.ContinueStatement => ts.isContinueStatement(n)).length,
       'a step whose when() is false must be SKIPPED (continue), not merely logged').toBe(1);
     expectInOrder(loop.getText(sf), [gates[0]!.getText(sf), 'spawnBuildStep('], 'the /api/build step loop');
+  });
+
+  describe('#1588: the gcs deploy after its upload', () => {
+    const base = { bucket: 'gs://b', basePath: '/g/', distDir: '/nonexistent-dist', buildCwd: '/repo' };
+    const verbs = (steps: { args: string[] }[]) => steps.map((s) => s.args.slice(0, 3).join(' '));
+
+    it('caches the ?v= binaries immutable with NO GCP backend bucket or url-map (the Worker keys on the query)', () => {
+      // The headers were gated on webCdnBackendBucket, so deleting the GCP LB silently dropped them.
+      expect(verbs(gcsCdnSteps({ ...base, backendBucket: '', urlMap: '' })))
+        .toEqual(['storage objects update', 'storage objects update', 'storage objects update']);
+    });
+
+    it('runs the GCP-only steps exactly when their resource is named, in the original order', () => {
+      const steps = gcsCdnSteps({ ...base, backendBucket: 'bb', urlMap: 'lb' });
+      expect(verbs(steps)).toEqual([
+        'compute backend-buckets update', 'storage objects update', 'storage objects update',
+        'storage objects update', 'compute url-maps invalidate-cdn-cache']);
+      expect(steps[0]!.args[3]).toBe('bb');
+      expect(steps[4]!.args.slice(3)).toEqual(['lb', '--path', '/g/*', '--async']);
+      expect(verbs(gcsCdnSteps({ ...base, backendBucket: 'bb', urlMap: '' }))[0]).toBe('compute backend-buckets update');
+      expect(verbs(gcsCdnSteps({ ...base, backendBucket: '', urlMap: 'lb' })).at(-1)).toBe('compute url-maps invalidate-cdn-cache');
+    });
+
+    it('a failure AFTER a publishing step says the build is live; before one it is the bare label', () => {
+      expect(buildStepFailureTitle({ label: 'Invalidating CDN cache...' }, 'gs://b'))
+        .toBe('Published to gs://b — but "Invalidating CDN cache" failed afterwards');
+      expect(buildStepFailureTitle({ label: 'Building web...' }, undefined)).toBe('Building web...');
+    });
+
+    it('the publishing step failing ITSELF says the destination may be partly updated (an rsync dies midway)', () => {
+      expect(buildStepFailureTitle({ label: 'Uploading to gs://b...', publishes: 'gs://b' }, undefined))
+        .toBe('Uploading to gs://b failed — gs://b may be partially updated');
+    });
+
+    it('the upload step publishes, and the step loop feeds that into the failure title', () => {
+      const sf = parseSource(readScannedSource(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts')).code, 'vite-asset-scanner.ts');
+      const uploads = findNodes(sf, ts.isCallExpression).filter((c) =>
+        c.expression.getText(sf) === 'execStep' && /^`Uploading to /.test(c.arguments[0]?.getText(sf) ?? ''));
+      expect(uploads.length, 'the gcs upload step').toBe(1);
+      expect(uploads[0]!.arguments[4]?.getText(sf) ?? '', 'the upload marks where it publishes').toMatch(/\bpublishes:\s*WEB_BUCKET\b/);
+      const loop = findNodes(sf, ts.isForStatement).filter((l) => /\bsteps\.length\b/.test(l.condition?.getText(sf) ?? ''))[0]!;
+      const body = loop.statement.getText(sf);
+      expect(body, 'a succeeded publishing step is remembered').toMatch(/if \(ok && step\.publishes\) publishedTo = step\.publishes;/);
+      expect(body, 'the failure status goes through the title helper').toMatch(/sendStatus\(`FAILED:\$\{buildStepFailureTitle\(step, publishedTo\)\}/);
+    });
+
+    it('the route plans gcsCdnSteps on every gcs deploy — gated on no webCdn* field (the #1588 regression)', () => {
+      const sf = parseSource(readScannedSource(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts')).code, 'vite-asset-scanner.ts');
+      const calls = findNodes(sf, ts.isCallExpression).filter((c) => c.expression.getText(sf) === 'gcsCdnSteps');
+      expect(calls.length, 'the route calls gcsCdnSteps once').toBe(1);
+      let gate: ts.Node | undefined = calls[0]!.parent;
+      while (gate && !ts.isIfStatement(gate)) gate = gate.parent;
+      expect(gate && (gate as ts.IfStatement).expression.getText(sf)).toBe("deployMode === 'gcs' && WEB_BUCKET");
+    });
   });
 
   it('does not match unrelated /api routes (they flow through the backend dispatch)', () => {

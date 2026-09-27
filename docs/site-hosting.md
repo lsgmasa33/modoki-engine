@@ -126,6 +126,13 @@ nothing purges Cloudflare on deploy. Staleness is bounded by the Worker's own ed
   to protect the request budget, short enough that a re-uploaded asset shows up without anyone
   hunting for a purge button.
 
+**The edge cache key includes the query string**: the Worker fetches `BUCKET + path + url.search`.
+Measured 2026-09-27 on a Weaveling texture: the bare URL, `?v=<manifest hash>` and a fresh
+`?v=<random>` were three separate edge objects (HIT at age 4 s, HIT at age 33,152 s, MISS). The game
+deploy's year-long `immutable` header on `?v=`-busted binaries rests on this
+([build.md](build.md) § Web deploy). Changing the Worker to strip or ignore the query would make
+those binaries stale for a year in returning browsers.
+
 Manual purge, if ever needed: Cloudflare dashboard → Caching → Purge Everything.
 
 404s are returned with `cache-control: no-store` **deliberately** — an earlier version cached

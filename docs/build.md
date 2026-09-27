@@ -2679,7 +2679,7 @@ Deferred as medium+delicate, not small — changing the algorithm re-pins every 
 
 #### Web deploy (`gcloud`)
 
-The web deploy step (`gsutil`/`gcloud storage` upload + CDN invalidation to `webBucket`) shells out
+The web deploy step (`gcloud storage` upload to `webBucket`, then the cache-header and CDN steps) shells out
 to `gcloud`, which is a **sanctioned system tool like `xcodebuild`** — it carries the user's cloud
 auth, so it can never be provisioned by the toolchain the way Node/JDK/Android SDK are (see
 [editor-toolchain.md](editor-toolchain.md)). A **Finder-launched** packaged editor gets a minimal
@@ -2700,6 +2700,37 @@ iOS/CocoaPods PATH block); if `gcloud` is genuinely absent, the step fails fast 
 hint instead of the mid-stream "command not found" a bare shell-out would produce. Verified on the
 packaged app under a minimal PATH (no `/opt/homebrew`): the deploy resolves `gcloud` via the
 well-known dirs and completes ("✅ deployed successfully").
+
+**After the upload** (`gcsCdnSteps`, #1588) — three steps with three independent gates:
+
+| Step | Runs when |
+|---|---|
+| `.glb`/`.ktx2`/`.webp` → `public, max-age=31536000, immutable` (`cdnBinaryCacheSteps`, one per extension present in `dist/`) | **every** gcs deploy |
+| GCP backend bucket: cache key whitelists `v` | `webCdnBackendBucket` is set |
+| GCP url-map: invalidate `<webBasePath>*` | `webCdnUrlMap` is set |
+
+A year's cache on a file that keeps its name is safe only because every runtime fetch of these
+binaries carries `?v=<content hash>` AND the CDN keys on the query. The headers used to be gated on
+`webCdnBackendBucket`, since the step that sets the GCP key policy was the only proof of the second
+half. So deleting the GCP load balancer silently dropped them. The Cloudflare Worker that replaced it
+keys on the full query string ([site-hosting.md](site-hosting.md) § Caching). ⚠️ **A new loader that
+fetches one of these extensions without `?v=` breaks that premise**: a returning browser keeps the
+old file for a year. The 2026-09-27 census of both published games found 0 of 34 binary requests
+unversioned.
+**GCS's own built-in cache keys on the query too** — it sits behind the Worker (which fetches
+`storage.googleapis.com/<bucket>/<path>?v=…`) and caches public objects with a cacheable
+`Cache-Control`; its documentation does not say how it keys. Measured 2026-09-27 with a throwaway
+object uploaded `public, max-age=31536000, immutable`, then overwritten: a NEW `?v=` returned the new
+generation at once, both direct and through the Worker, while the old `?v=` and the bare URL kept
+serving the old bytes from cache (`age` 6 s, then 37 s). So a changed `?v=` busts both layers — and
+the bare URL is exactly as stale as the premise above warns.
+
+**A failure after the upload is reported as a failure of a LIVE build.** The upload step carries
+`publishes`, and once it succeeds the build loop titles a later failure `Published to <bucket> — but
+"<step>" failed afterwards`. A bare `FAILED:<step>` read as "nothing shipped" (#1588: a dead CDN
+setting failed two deploys that had in fact published). The upload failing ITSELF is titled `<step> failed — <bucket> may be partially
+updated`: `rsync --delete-unmatched-destination-objects` dying midway has already replaced or
+deleted some objects.
 
 ### iOS Simulator
 ```bash
