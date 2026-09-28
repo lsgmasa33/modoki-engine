@@ -15,16 +15,27 @@ function statedGuids(value: unknown, out: Set<string>): Set<string> {
   return out;
 }
 
-/** The marker data for a COPY of a placeholder whose guid was `oldGuid` and is now `newGuid`. Every identity the record
- *  states is re-minted with `mint`, and the root's becomes `newGuid`, everywhere it appears in the record (a scene
+/** The guids a COPY of a placeholder mints for its record, where the placeholder's guid was `oldGuid` and is now
+ *  `newGuid`: every identity the record states gets a fresh one from `mint`, and the root's becomes `newGuid` (a scene
  *  entry names its own root in `PrefabInstance.rootInstanceId`), so the copy and the original never answer to one guid
- *  once the prefab resolves. A reference to anything OUTSIDE the record is left alone, as a copy leaves it. */
-export function copyUnresolvedRef(data: { source: string; kind: string; record: string }, oldGuid: string, newGuid: string, mint: () => string): { source: string; kind: string; record: string } {
-  let parsed: unknown;
-  try { parsed = JSON.parse(data.record); } catch { return { ...data }; }
+ *  once the prefab resolves. `copySnapshot` merges these into the copy's own remap BEFORE it rewrites anything, so a
+ *  copied entity's ref into a record member follows the copy's member too (#1763). */
+export function recordGuidMints(data: { record: string }, oldGuid: string, newGuid: string, mint: () => string): Map<string, string> {
   const remap = new Map<string, string>();
+  let parsed: unknown;
+  try { parsed = JSON.parse(data.record); } catch { return remap; }
   for (const g of statedGuids(parsed, new Set())) remap.set(g, g === oldGuid ? newGuid : mint());
   if (oldGuid && newGuid) remap.set(oldGuid, newGuid);
+  return remap;
+}
+
+/** The marker data for a COPY of a placeholder: its record with every guid in `remap` rewritten, as a value and as a
+ *  key. `remap` is the WHOLE copy's (`recordGuidMints` for every record in it, plus `planCopyGuids`' for every entity
+ *  copied), so a ref inside the record to an entity copied alongside the placeholder names the copy of it, not the
+ *  original (#1338's rule; #1763). A reference to anything outside the copy is left alone, as a copy leaves it. */
+export function copyUnresolvedRef(data: { source: string; kind: string; record: string }, remap: ReadonlyMap<string, string>): { source: string; kind: string; record: string } {
+  let parsed: unknown;
+  try { parsed = JSON.parse(data.record); } catch { return { ...data }; }
   const swap = (v: unknown): unknown => {
     if (typeof v === 'string') return remap.get(v) ?? v;
     if (Array.isArray(v)) return v.map(swap);

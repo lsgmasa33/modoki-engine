@@ -20,13 +20,14 @@ import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
-import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
+import { isStoredRoot, isOwnedRoot, durableGuid, type MemberPi } from '../../runtime/core/assetRefRules';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
 import {
   foldStructureLayers, foldPath as sharedFoldPath,
   type OverrideMap, type StructureLayer, type FoldDoc, type ForwardState as SharedForwardState,
 } from '../../runtime/loaders/prefabOverrides';
-import type { AddedEntity, NestedStructureDelta, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, NestedStructureDelta, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import { keptLegacyChannels, setKeptLegacyChannels, legacyPathReached } from '../../runtime/loaders/loadSceneFile';
 import { getCachedPrefabSync, recoverTemplateKey, type PrefabFile } from './prefab';
 
 /** A layer's structural lists, as the fold leaves them for the frame it reaches. `moved` only when an outer layer's
@@ -86,6 +87,15 @@ export function levelDoc(root: number, source: string): { doc: PrefabFile | null
   const rec = entity ? frameRootDoc(getCurrentWorld(), entity) : undefined;
   if (rec && rec.source === source) return { doc: rec.doc as PrefabFile, fromRecord: true };
   return { doc: getCachedPrefabSync(source), fromRecord: false };
+}
+
+/** The document a WRITER captures the live frame root `root` (an instance of `source`) against: the cache, else the
+ *  frame's own record (#1738). A prefab that stopped resolving mid-session (its caches evicted with no reload) is a
+ *  reference the writer cannot read, and I18 says it writes back the record it was loaded with: the frame record IS that
+ *  record, the document the frame was expanded from. Without it the writers flattened, dropped or truncated the
+ *  instance. The cache comes first, so a capture that works today reads the bytes it always read. */
+export function captureDoc(root: number, source: string): PrefabFile | null {
+  return getCachedPrefabSync(source) ?? levelDoc(root, source).doc;
 }
 
 /** What the layers above a frame FORWARD into its expansion — `instantiatePrefab`'s `_nestedOverrides`, `_layers` and
@@ -239,6 +249,65 @@ export function frameForward(frame: number, doc: PrefabFile): (ForwardState & { 
   if (!forward) return null;
   const stack = levels.slice(0, -1).map((l) => l.doc?.id ?? '').filter(Boolean);
   return { ...forward, stack };
+}
+
+/** What the load KEPT of the legacy path-keyed channels of the stored root above frame `frame` (R2's legacy half, #1780)
+ *  that reaches into `frame`'s expansion, re-keyed from `frame`, both of them — `nestedOverrides` and `nestedStructure`: the scene's statement about a frame no live
+ *  expansion had, which a rebuild that brings the frame in hands to it as the OUTERMOST layer, as a load of the same
+ *  scene would. Deliberately not part of {@link frameForward}: the nested capture subtracts that state as a PREFAB
+ *  layer's, and a scene statement subtracted would never be saved. Captured as the scene's own instead, the next save
+ *  writes it on a member row, which migrates the legacy channel. Null when nothing kept reaches the frame. */
+export function keptLegacyForward(frame: number): { rootGuid: string; source: string; prefix: string; nestedOverrides?: NestedOverridePaths; nestedStructure?: NestedStructurePaths } | null {
+  const climbed = climbFrame(frame, 0);
+  if (!climbed) return null;
+  const top = climbed.levels[0]!;
+  const eaMeta = getTraitByName('EntityAttributes');
+  const rootGuid = eaMeta ? durableGuid((readTraitData(top.root, eaMeta) as { guid?: string } | null)?.guid) : '';
+  const kept = rootGuid ? keptLegacyChannels(rootGuid) : undefined;
+  if (!kept) return null;
+  const prefix = climbed.chain.join('.');
+  const descend = <V,>(ch: Record<string, V> | undefined): Record<string, V> | undefined => {
+    const out: Record<string, V> = {};
+    for (const [key, v] of Object.entries(ch ?? {})) {
+      if (!prefix) out[key] = v;
+      else if (key.startsWith(`${prefix}.`)) out[key.slice(prefix.length + 1)] = v;
+    }
+    return Object.keys(out).length ? out : undefined;
+  };
+  const nestedOverrides = descend(kept.nestedOverrides);
+  const nestedStructure = descend(kept.nestedStructure);
+  return nestedOverrides || nestedStructure ? { rootGuid, source: top.source, prefix, nestedOverrides, nestedStructure } : null;
+}
+
+/** A stored root's captured channels with the LEGACY path-keyed ones the load kept for it put back (R2's legacy half,
+ *  #1780, #1738): a channel addressing a frame no live expansion reaches is regenerated by no capture, so the save
+ *  writes it as the file held it. A live capture wins each path key. */
+export function withKeptLegacy<C extends { nestedOverrides?: NestedOverridePaths; nestedStructure?: NestedStructurePaths }>(channels: C, rootGuid: string): C {
+  const kept = rootGuid ? keptLegacyChannels(rootGuid) : undefined;
+  if (!kept) return channels;
+  return {
+    ...channels,
+    ...(kept.nestedOverrides ? { nestedOverrides: { ...kept.nestedOverrides, ...channels.nestedOverrides } } : {}),
+    ...(kept.nestedStructure ? { nestedStructure: { ...kept.nestedStructure, ...channels.nestedStructure } } : {}),
+  };
+}
+
+/** After a rebuild handed `legacy` to its expansion: the kept channels whose frame the document now reaches were
+ *  applied, and the live world states them from here on, so they leave the store (a save would otherwise write them
+ *  beside the member rows the capture now writes, and a later live edit would be contradicted by the kept statement:
+ *  close-out F2). The rest stay. */
+export function settleKeptLegacy(legacy: { rootGuid: string; source: string; prefix: string }): void {
+  const kept = keptLegacyChannels(legacy.rootGuid);
+  if (!kept) return;
+  const settle = <V,>(ch: Record<string, V> | undefined): Record<string, V> => {
+    const next: Record<string, V> = {};
+    for (const [key, v] of Object.entries(ch ?? {})) {
+      const forwarded = !legacy.prefix || key.startsWith(`${legacy.prefix}.`);
+      if (!forwarded || !legacyPathReached(legacy.source, key, getCachedPrefabSync)) next[key] = v;
+    }
+    return next;
+  };
+  setKeptLegacyChannels(legacy.rootGuid, { nestedOverrides: settle(kept.nestedOverrides), nestedStructure: settle(kept.nestedStructure) });
 }
 
 /** Per member of `doc`, the traits `layer`'s field overrides put on it that `doc`'s own row lacks: what a removal on the

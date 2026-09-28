@@ -901,10 +901,19 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
     if (!ref) continue;
     // An added reference NODE whose prefab is missing: a template's own key node, or a pasted scene one. The template
     // capture leaves it out (`captureChild`), and the prefab-edit save has no baseline for a node, so writing on would
-    // drop it and its edits silently. Refused instead, until the prefab resolves (#1738 tracks writing it).
+    // drop it and its edits silently. REFUSED, until the prefab resolves (#1738, owner ruling: refuse with a reason
+    // rather than write a node the save cannot place). Writing it back would need the file's node matched in the same
+    // frame, wherever a template node can hang (a row's `added`, a member row's, a plain node's `children`, a
+    // `nestedStructure` slot) — the design fork #1738 member 2 left for later.
+    // The reason says which prefab is missing and what is safe: a node the FILE declares (it has a template key) is
+    // still on disk; a pasted one exists only in this edit.
     if (ref.kind === 'node') {
       const name = (ref.record.name as string | undefined) || 'a node';
-      return { error: `"${name}" is a reference to a missing prefab added inside this prefab, and it cannot be written into the template until that prefab resolves. Restore it, or delete the node` };
+      const missing = resolveRef(ref.source) ?? ref.source;
+      const onDisk = typeof ref.record.key === 'string' && !!ref.record.key;
+      return { error: onDisk
+        ? `"${name}" references the prefab ${missing}, which is missing or has no root, so this save cannot write it. The prefab file on disk still has it unchanged. Restore that prefab and save again, or delete "${name}" to save without it`
+        : `"${name}" is a pasted reference to the prefab ${missing}, which is missing or has no root, so this save cannot write it, and it exists only in this edit. Restore that prefab and save again, or delete "${name}" to save without it` };
     }
     const localId = preservedLocalIds.get(e.id());
     const row = localId === undefined ? undefined : previous.entities.find((r) => r.localId === localId && r.prefab === ref.source);

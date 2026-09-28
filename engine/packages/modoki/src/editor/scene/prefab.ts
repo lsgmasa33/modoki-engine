@@ -1,5 +1,6 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
+import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
 import { whyWorldNotAuthored, notAuthoredExit } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
@@ -44,7 +45,7 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, deriveMemberGuidsAfterPins, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
 import { translateLocalIds, docRows } from '../../runtime/loaders/memberTranslation';
 import { foldMemberRowChannels, mergeTraitRemovals, descendStructureLayers, foldStructureLayers, type StructureLayer as StructLayer } from '../../runtime/loaders/prefabOverrides';
-import { frameBase, frameForward, chainLayer, docChainLayer, layerAddedTraits, levelDoc, ownedRootAt, type FrameLayer, type FrameBase } from './prefabBase';
+import { frameBase, frameForward, chainLayer, docChainLayer, layerAddedTraits, levelDoc, captureDoc, keptLegacyForward, settleKeptLegacy, withKeptLegacy, ownedRootAt, type FrameLayer, type FrameBase } from './prefabBase';
 import { templateValueWriter, type TemplateValueWriter } from './prefabTemplateValue';
 import {
   chainSlots, memberKeyAt, writeStated, dropStated, writeRemoval, writeMemberRemoval, statedFields, traitInside, resolveKeyLevel, carrierOf,
@@ -297,15 +298,20 @@ function captureRowChannels(rootEcs: number, source: string, childPrefab: Prefab
   const eaMeta = getTraitByName('EntityAttributes');
   const rootGuid = eaMeta ? durableGuid((readTraitData(rootEcs, eaMeta) as { guid?: string } | null)?.guid) : '';
   const members: Record<string, SceneMemberRow> = { ...rowed.members };
-  const kept = keepsTemplateRows(rootEcs, rootGuid) ? keptMemberOrphans(rootGuid) ?? {} : {};
+  const ownRows = keepsTemplateRows(rootEcs, rootGuid);
+  const kept = ownRows ? keptMemberOrphans(rootGuid) ?? {} : {};
   for (const [key, row] of Object.entries(kept)) {
     if (members[key]) continue;
     const t = templateRowOf(row);
     if (t) members[key] = t;
   }
+  // …and its LEGACY path-keyed channels no live frame reaches (#1738 member 3, #1780): a pre-v5 template's row states a
+  // nested frame's edits there, with no `nodeGuid` for a member row to carry them. Under the same guard, for the same
+  // reason: under a scene root they are the scene's.
+  const legacy = withKeptLegacy({ nestedOverrides: channels.nestedOverrides, nestedStructure: rowed.channels.nestedStructure }, ownRows ? rootGuid : '');
   return {
-    channels, structureBaselines,
-    nestedStructure: rowed.channels.nestedStructure,
+    channels: { ...channels, nestedOverrides: legacy.nestedOverrides }, structureBaselines,
+    nestedStructure: legacy.nestedStructure,
     members: Object.keys(members).length ? members : undefined,
   };
 }
@@ -552,7 +558,7 @@ function planPrefabRows(
         console.error(`[Prefab] refusing to save — nesting "${source}" inside "${existingId}" creates a cycle`);
         return null;
       }
-      const childPrefab = getCachedPrefabSync(source);
+      const childPrefab = captureDoc(e.id, source);
       if (!childPrefab) {
         console.warn(`[Prefab] nested prefab "${source}" not cached; flattening instead of referencing`);
         continue;
@@ -1780,6 +1786,11 @@ export function instantiatePrefab(
   /** What each of `_layers` forwarded to this frame's nested roots when the caller folded it here. */
   _forwardRoots: readonly (ReadonlyMap<number, SceneMemberRow> | undefined)[] = [],
 ): number {
+  // The loader twin's rule (#1768): a document with no root to expand spawns nothing.
+  if (!expandsToRoot(prefab, getCachedPrefabSync, _stack)) {
+    console.warn(`[Prefab] prefab ${prefab.id ?? '(unnamed)'} expands to no root; nothing spawned`);
+    return 0;
+  }
   const segments = _segments ?? [];
   const layers = _layers ?? [{ slots: _nestedStructure }];
   // The loader twin's token scope: a tree holding no member token registers no frame (#1352 review).
@@ -3409,7 +3420,9 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   const nestedRowPresent = (pe: PrefabFile['entities'][number]): boolean => {
     const parentLocal = prefabParent.get(pe.localId) ?? 0;
     const parentMember = rowEcs(parentLocal);
-    if (!pe.localId || !parentMember || !getCachedPrefabSync(pe.prefab!)) return true;
+    // A child that loads but expands to no root expanded to nothing too (#1768): not a removal either.
+    const child = getCachedPrefabSync(pe.prefab!);
+    if (!pe.localId || !parentMember || !child || !expandsToRoot(child, getCachedPrefabSync)) return true;
     return claimedRows.has(pe.localId);
   };
   const removedSet = new Set<number>();
@@ -3476,7 +3489,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     const pi = readTraitData(ecsId, PrefabInstanceMeta);
     const source = pi?.source as string | undefined;
     if (!source) return null;
-    const childPrefab = getCachedPrefabSync(source);
+    const childPrefab = captureDoc(ecsId, source);
     if (!childPrefab) {
       console.warn(`[Prefab] user-added nested instance "${source}" not cached; exact placement not captured`);
       return null;
@@ -3498,8 +3511,12 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     // The node is the OUTERMOST layer for its own nested rows, so it carries their scene edits itself
     // — the same two channels a top-level entry carries (#1369). Without them an edit inside a row
     // expansion of a DRAGGED-IN prefab was captured by nothing and came back on reload.
-    const channels = captureNestedChannels(ecsId, source, ref.ownedNested, { template: opts.template, rows: opts.rows });
-    for (const c of channels.consumedEcsIds) consumedEcsIds.add(c);
+    const captured = captureNestedChannels(ecsId, source, ref.ownedNested, { template: opts.template, rows: opts.rows });
+    for (const c of captured.consumedEcsIds) consumedEcsIds.add(c);
+    // A SCENE node is a stored root: what the load kept of its legacy channels goes back out with it (#1780). A template
+    // capture of one writes its scene statements nowhere (I8).
+    const nodeGuid = opts.template ? '' : durableGuid((readTraitData(ecsId, getTraitByName('EntityAttributes')!) as { guid?: string } | null)?.guid);
+    const channels = withKeptLegacy(captured, nodeGuid);
     // A template reference node's own moves ride the scene form unchanged: they are the template's statement, and the
     // moves captured above are measured against them (`prefabMoveTargets`), so a respawn without them lost the move (#1543).
     const handle = findEntity(ecsId);
@@ -4193,8 +4210,9 @@ function editorStructureOps(): Parameters<typeof applyStructureCore>[0] {
       // the next capture re-detects it as user-added.
       spawnNestedInstance: (node, parentEcsId) => {
         const child = getCachedPrefabSync(node.prefab!);
-        if (!child) {
-          console.warn(`[Prefab] added nested instance "${node.prefab}" not cached`);
+        // One that loads but expands to no root is kept the same way (#1768).
+        if (!child || !expandsToRoot(child, getCachedPrefabSync)) {
+          console.warn(`[Prefab] added nested instance "${node.prefab}" not cached, or expands to no root`);
           // The loader's twin: a placeholder carrying the node, so a rebuild keeps what the save writes back (#1699).
           spawnUnresolvedReference(getCurrentWorld(), node, parentEcsId);
           return;
@@ -7590,6 +7608,12 @@ export function rebuildInstance(
 ): number {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return rootInstanceId;
+  // A document with no root to expand would tear the instance down and spawn nothing in its place (#1768): the live
+  // instance stays, as a failed fetch leaves it.
+  if (!expandsToRoot(prefab, getCachedPrefabSync)) {
+    console.warn(`[Prefab] rebuild of ${source} skipped: the prefab expands to no root`);
+    return rootInstanceId;
+  }
   if (remap.size) structure = remapGuidValues(structure, remap) as typeof structure;
   // A localId means something only together with the document it was read from (#1468 Phase 4). What
   // the caller captured is in `baseline`'s numbering, and the respawn below is in `prefab`'s; a template
@@ -7671,6 +7695,8 @@ export function rebuildInstance(
   // the new template gains, one a re-pointed row now expands), and the nested capture subtracts the same state. Null for
   // a stored root nothing encloses, which expands as the plain top call it always was.
   const forward = frameForward(rootInstanceId, prefab);
+  // …and what the scene's own legacy channels say about frames the stored root above never had (#1780), outermost.
+  const legacy = keptLegacyForward(rootInstanceId);
 
   const { toDestroy, parked } = rebuildTeardown(rootInstanceId, remap);
   // Every torn-down node's template key, by guid: the capture carries the guid alone, and only a key-derived guid could
@@ -7688,8 +7714,11 @@ export function rebuildInstance(
   const beforeSpawn = new Set(getAllEntities().map((e) => e.id));
   // Still a TOP call: its own token scope, resolved by the derive below once the member guids are restored, and the
   // forwarded state applied at its NESTED rows only. The root's own members take their layer from `overrides`/`structure`.
-  const newRootId = forward
-    ? instantiatePrefab(prefab, parentId, new Set(forward.stack), forward.nestedOverrides, undefined, undefined, forward.layers, forward.forwardRoots)
+  const forwardedOverrides = legacy?.nestedOverrides ? mergeNestedOverridePaths(forward?.nestedOverrides, legacy.nestedOverrides) : forward?.nestedOverrides;
+  // The kept structure slots are the OUTERMOST structural layer (layers run innermost first), as a load makes the entry's.
+  const forwardedLayers = legacy?.nestedStructure ? [...(forward?.layers ?? []), { slots: legacy.nestedStructure }] : forward?.layers;
+  const newRootId = forward || legacy
+    ? instantiatePrefab(prefab, parentId, new Set(forward?.stack ?? []), forwardedOverrides, undefined, undefined, forwardedLayers, forward?.forwardRoots ?? [])
     : instantiatePrefab(prefab, parentId);
   // Preserve the instance root's stable guid across the teardown+respawn so refs
   // into the instance (UI bindings, guid-based undo) survive the rebuild — the
@@ -7717,6 +7746,7 @@ export function rebuildInstance(
   // derive can drop one that collides with a derivation, exactly as the load does (#1777).
   const pinned = new Set<number>();
   settleKeptOrphans(newRootId, pinned);
+  if (legacy) settleKeptLegacy(legacy);
   // A rebuilt OWNED nested instance re-expands from its own document only: the moves the prefabs around it make
   // of its members are queued again, or an apply or revert on it undid them in every instance (#1437 review).
   // Only for members THIS rebuild respawned: any other member is where the scene's own moves left it, and a

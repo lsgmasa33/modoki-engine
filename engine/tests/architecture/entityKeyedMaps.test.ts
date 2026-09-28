@@ -1003,6 +1003,8 @@ const HELD_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'brief: the caller\'s options for one call, read once and never stored; runtime/core/actionRegistry.ts:185' },
   { item: 'engine/packages/modoki/src/runtime/core/ecs/transformPropagationSystem.ts::_allEntityIds',
     reason: 'scratch: cleared, then refilled from the live EntityAttributes query in the same pass that reads it; runtime/core/ecs/transformPropagationSystem.ts:204' },
+  { item: 'engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts::GuidParentMiss.entity',
+    reason: 'alive-checked: a pass-2 guid-parent miss local to one loadSceneFile call (#1738), held across its prefab awaits and used once by retryGuidParents, which checks it with isPackedAlive first; runtime/loaders/loadSceneFile.ts:3256' },
   { item: 'engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts::EntityIdRef.entity',
     reason: 'alive-checked: a record local to one loadSceneFile call (#1353), dropped when it returns; writeEntityIdRef skips a dead entity and a field that no longer holds the expected id before every write; runtime/loaders/loadSceneFile.ts:1464' },
   { item: 'engine/packages/modoki/src/runtime/input/pointerSource.ts::activeId',

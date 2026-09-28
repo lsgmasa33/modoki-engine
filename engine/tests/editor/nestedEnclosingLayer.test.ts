@@ -1009,6 +1009,80 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
       expect(xsOf('L')).toEqual([6]);
     });
 
+    /** A scene entry of O whose LEGACY path-keyed channel reaches L through a frame P does not have yet: row N (4) → C (3). */
+    const legacyScene = () => {
+      const sc = scene(O, [ROOT1]);
+      Object.assign((sc.entities as unknown as Array<Record<string, unknown>>)[1]!, { nestedOverrides: { '4.3': { 2: { Transform: { x: 7 } } } } });
+      return sc;
+    };
+
+    it('#1780: a scene\'s legacy channel into a frame the template does not have yet is written back by a no-edit save', async () => {
+      // The kept store holds it while no live frame reaches it (R2's legacy half). Mutation: skip the kept-channel merge
+      // in `serializeScene` — the channel is dropped, and a load onto P-with-C shows L at Q's bare 0.
+      install(qDoc(), pDoc(), oWith({}));
+      await load(legacyScene());
+      const { scene: s, entry } = await saved();
+      expect(entry.nestedOverrides).toEqual({ '4.3': { 2: { Transform: { x: 7 } } } });
+      install(pWithC());
+      await load(s);
+      expect(xsOf('L')).toEqual([7]);
+    });
+
+    it('#1780 with a ROOT-LESS child: a legacy channel through a row whose prefab loads but has no root is kept too', async () => {
+      // P has row C, but C's Q names no root row, so the frame '4.3' expands to nothing (#1768). Mutation: drop
+      // `expandsToRoot` from `legacyPathReached` — the channel is judged reached, is not kept, and the save drops it.
+      const rootless = { ...qDoc(), rootLocalId: 9 };
+      install(rootless, pWithC(), oWith({}));
+      await load(legacyScene());
+      expect(named('L')).toEqual([]); // precondition: nothing expanded for C
+      const { scene: s, entry } = await saved();
+      expect(entry.nestedOverrides).toEqual({ '4.3': { 2: { Transform: { x: 7 } } } });
+      install(qDoc());
+      await load(s);
+      expect(xsOf('L')).toEqual([7]);
+    });
+
+    it('#1780: a Refresh whose template GAINS that frame gives it the scene\'s value, and the save keeps it', async () => {
+      // Mutations: skip the kept channels in `rebuildInstance`'s expansion — L comes in at Q's bare 0, and the save drops
+      // it; skip `settleKeptLegacy` — the save states L twice, on its member row AND in the legacy channel.
+      install(qDoc(), pDoc(), oWith({}));
+      await load(legacyScene());
+      install(pWithC());
+      await rebaseStaleInstances();
+      expect(xsOf('L')).toEqual([7]);
+      const { scene: s, entry } = await saved();
+      // The first save after the frame is live migrates the legacy statement onto L's member row.
+      expect(entry.nestedOverrides).toBeUndefined();
+      expect(JSON.stringify(entry.members)).toContain('"x":7');
+      await load(s);
+      expect(xsOf('L')).toEqual([7]);
+    });
+
+    it('#1780 close-out F2: a legacy nestedStructure removal into a frame the Refresh gains applies there too, as a load does', async () => {
+      // Mutations: forward no kept `nestedStructure` in `rebuildInstance` — L is live after the Refresh, where a load of
+      // the same scene removes it; settle no `nestedStructure` in `settleKeptLegacy` — the save states the removal twice
+      // over, the kept slot on top of what the capture now writes.
+      const legacyRemoval = () => {
+        const sc = scene(O, [ROOT1]);
+        Object.assign((sc.entities as unknown as Array<Record<string, unknown>>)[1]!, { nestedStructure: { '4.3': { removed: [2] } } });
+        return sc;
+      };
+      install(qDoc(), pWithC(), oWith({}));
+      await load(legacyRemoval());
+      expect(named('L')).toEqual([]); // the control: a load onto P-with-C applies the removal
+      install(qDoc(), pDoc(), oWith({}));
+      await load(legacyRemoval());
+      install(pWithC());
+      await rebaseStaleInstances();
+      expect(named('QR')).toHaveLength(1); // precondition: the Refresh brought C in
+      expect(named('L')).toEqual([]);
+      const { scene: s, entry } = await saved();
+      expect((entry.nestedStructure as Record<string, unknown> | undefined)?.['4.3']).toBeUndefined();
+      await load(s);
+      expect(named('QR')).toHaveLength(1);
+      expect(named('L')).toEqual([]);
+    });
+
     it('the accept side: a CAPTURED frame keeps its own edit — nothing restates the layer over it', async () => {
       // A guard for #1737's fix: whatever gives an uncaptured frame its layer must leave a captured frame's own edit.
       install(qDoc(), pWithC(), oDeepRow());

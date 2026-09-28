@@ -28,6 +28,7 @@ import { beginWorldReplacement } from './authoringSettle';
 import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances, savedFrameDoc } from './prefab';
+import { levelDoc, withKeptLegacy } from './prefabBase';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefab';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
@@ -153,6 +154,7 @@ export interface SceneFile {
 // `@modoki/engine/editor` still surfaces it from this module.
 import { isTraitDefault, writtenTraitKeys } from './traitDefault';
 export { isTraitDefault };
+
 
 /** Whether a PRIMARY-scene save skips this entity: it or an ancestor is `Transient`, or it or an
  *  ancestor came from a base scene (`sourceScene` non-empty). The same two exclusions
@@ -338,7 +340,8 @@ async function serializeSceneScoped(opts?: {
   const nestedStructureByTop = new Map<number, NestedStructurePaths>();
   const nestedFramesByTop = new Map<number, Map<string, { root: number; path: number[] }>>();
   for (const [rootId, { source }] of prefabRootInfo) {
-    const current = await getPrefabSource(source);
+    // A prefab that stopped resolving mid-session is written from the document the instance was expanded from (#1738).
+    const current = (await getPrefabSource(source)) ?? levelDoc(rootId, source).doc;
     if (!current) continue;
     // Measured against the document the instance was EXPANDED from (#1685), translated onto `current` when written.
     const prefab = savedFrameDoc(rootId, source, current);
@@ -420,7 +423,7 @@ async function serializeSceneScoped(opts?: {
     // user-added traits, root or child) so the entry needs only PrefabInstance.
     if (rootInfo) {
       entry.prefab = rootInfo.source;
-      const current = await getPrefabSource(rootInfo.source);
+      const current = (await getPrefabSource(rootInfo.source)) ?? levelDoc(info.id, rootInfo.source).doc;
       if (current) {
         const prefab = savedFrameDoc(info.id, rootInfo.source, current);
         const struct = rootStructure.get(info.id);
@@ -438,7 +441,7 @@ async function serializeSceneScoped(opts?: {
           added: struct?.added, removed: struct?.removed, removedTraits: struct?.removedTraits,
           nestedOverrides: nestedOverridesByTop.get(info.id), nestedStructure: nestedStructureByTop.get(info.id),
         }, captureInstanceMembers(info.id, prefab), nestedFramesByTop.get(info.id));
-        const ch = moved.channels;
+        const ch = withKeptLegacy(moved.channels, guidForId(info.id));
         if (ch.overrides && Object.keys(ch.overrides).length) entry.overrides = ch.overrides;
         if (ch.added?.length) entry.added = ch.added;
         if (ch.removed?.length) entry.removed = ch.removed;

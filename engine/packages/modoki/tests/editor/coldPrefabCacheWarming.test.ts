@@ -166,9 +166,20 @@ async function coldWorldHoldingOneInstance() {
 }
 
 describe('serializePrefab over a COLD cache — the degraded branch this fix exists to prevent', () => {
-  it('flattens the held nested instance into copies, with no prefab row at all', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  it('reads a live instance\'s document from its FRAME RECORD, so a cold cache alone no longer flattens it (#1738)', async () => {
+    // Mutation: `captureDoc` reads the cache only — the instance is flattened into copies.
     const { mod, holderId } = await coldWorldHoldingOneInstance();
+    const out = mod.serializePrefab(holderId)!;
+    expect(out.entities.filter((e) => e.prefab).map((e) => e.prefab)).toEqual([INNER]);
+  });
+
+  it('flattens the held nested instance into copies, with no prefab row at all, when no frame record answers either', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { mod, holderId, innerRoot } = await coldWorldHoldingOneInstance();
+    // A record of ANOTHER source does not answer for this one (`levelDoc`), so nothing reads the document.
+    const { noteFrameRootDoc } = await import('../../src/runtime/core/ecs/identityParents');
+    const root = [...testWorld.entities].find((e) => e.id() === innerRoot)!;
+    noteFrameRootDoc(testWorld, root, { source: 'not-this-prefab', doc: { entities: [] } } as never);
 
     const out = mod.serializePrefab(holderId)!;
 

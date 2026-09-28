@@ -84,7 +84,7 @@ answer the same question for themselves. Each place in that column is a place th
 | I15 | A template's `version` is the writer's constant, and a build never overwrites a file written in a newer format. | `PREFAB_FORMAT_VERSION`, `engine/plugins/prefabWriteGuard.ts`, `classifyExistingDocumentId`. It answers `known` before it checks the version (#1678). |
 | I16 | A template never contains itself. | `wouldCreateCycle` / `expandedPrefabRefs` when writing; the loader's ancestor stack when loading. |
 | I17 | An editor write that changes an instance member's field leaves its override mark in the state the save needs, and its undo puts the mark back. | `editor/undo/overrideMarkWrites.ts`. See § "Editor writes and the override mark". |
-| I18 | A reference the load cannot expand is written back as the file held it, until an expansion replaces it. A reader never drops what it could not interpret. | The `UnresolvedPrefabRef` marker on the placeholder (`runtime/core/unresolvedPrefabRef.ts`) and its writers (`runtime/loaders/unresolvedPrefabRefs.ts`). See § "A missing prefab keeps its record". |
+| I18 | A reference the load cannot expand is written back as the file held it, until an expansion replaces it. A reader never drops what it could not interpret. | The `UnresolvedPrefabRef` marker on the placeholder (`runtime/core/unresolvedPrefabRef.ts`) and its writers (`runtime/loaders/unresolvedPrefabRefs.ts`); a live frame whose document stopped resolving, its frame record (`captureDoc`); a legacy path-keyed channel no live frame reaches, R2's kept store (`keptOrphanRows.ts`). See § "A missing prefab keeps its record". |
 
 ### Where the owners are missing
 
@@ -1098,8 +1098,17 @@ layers ENCLOSING that root forward into it (`frameForward`): an owned nested roo
 node's channels. That is the state a load hands the same root, so every nested frame the expansion brings in comes back
 with the whole layer, as it would on a load. A stored root that no prefab layer encloses gets nothing and expands as
 before. What the SCENE hands it on a load (a legacy `nestedOverrides` channel, a scene-added node's channels) is the
-scene's own statement, and it still comes back through the capture alone. A frame the capture cannot reach loses it
-(#1780). The scene's own edits
+scene's own statement, and it comes back through the capture. A frame the capture cannot reach, because the document
+did not expand it at load, keeps it through R2's LEGACY half (#1780): the load keeps each path-keyed channel whose frame
+the document does not expand (`legacyPathReached`, asked of the document as R2's row test is), every writer puts it back
+with a live capture winning each key (`withKeptLegacy`), and a rebuild that brings the frame in hands it to the
+expansion as the OUTERMOST layer (`keptLegacyForward`). It is deliberately not part of `frameForward`: the nested
+capture subtracts that state as a prefab layer's, and a scene statement subtracted would never be saved. Captured as
+the scene's own, it goes onto a member row at the next save, so **a legacy file's first save after the frame is live
+migrates the channel and changes the file's bytes**; a file with no such channel saves byte-identically. Both channels
+are forwarded: kept `nestedStructure` slots ride as the outermost STRUCTURAL layer, so a removal the scene states
+inside a frame the Refresh gains applies there as a load of the same scene would apply it (close-out F2: forwarded
+fields alone left the frame showing a member the file removes, and the save then wrote both). The scene's own edits
 reach it through the live capture (`captureNestedInstanceOverrides`, taken just before the teardown), which subtracts
 the chain folded from that SAME forward state. A frame whose right state is not what the live tree shows at that moment
 comes back wrong. There are three cases:
@@ -1241,6 +1250,8 @@ its folder, because those are what the Hierarchy can change. The name is the liv
 | An added reference node (on the entry, a member row, a plain node's children, another reference node) | `spawnUnresolvedReference`, under the node's parent. The loader's and the editor's `spawnNestedInstance` both call it, so a rebuild (Apply, Revert, Refresh) respawns it. The loader keeps no orphan rows for it: its record holds them, and kept ones outlived its re-expansion and overwrote a later edit. | `captureChild` writes the node (`asAddedNode`). |
 | A template's reference row inside a resolved instance | None: the frame is the template's. | The scene's edits to that frame ride member rows. `rowBackedTest` counts a row naming a reference row whose child cannot be read as unbacked, so the orphan store keeps it (the nested root's own row included, which it used to drop) and the save writes it back. |
 | A reference row in PREFAB EDIT | The row is a top-level entry of the edit world, so it takes the first path. | `serializePrefabEditWorld` writes the row from the baseline, because the edit world's entry went through `editWorldRefs`. |
+| A document that LOADS but expands to no root (#1768): its `rootLocalId` names no row, or a reference row whose prefab cannot be read, or one that nests itself | Where it is a scene entry or an added node: the same placeholder as a document that does not load. One predicate (`expandsToRoot`, `runtime/loaders/prefabRoot.ts`) gates the entry site before `onDeletePlaceholder`, both `spawnNestedInstance` twins, both expansions (which spawn NOTHING rather than a root-less scatter of rows) and `rebuildInstance` (the live instance stays). A template ROW whose child expands to no root has no placeholder, as a missing child has none: the document tests read that child as unreadable (`nestedRowPresent`, `rowBackedTest`'s reader and `templateNodeGuids`' unread set, `legacyPathReached`), so its row is not saved as removed, and the scene's edits to its frame are kept (close-out F1). | As the row it replaces; a template row's frame, as the row "A template's reference row inside a resolved instance" above. |
+| A LIVE frame whose document stops resolving mid-session (both caches evicted, no reload; #1738) | None: the frame is live. | The writers capture it against its frame record, the document it was expanded from (`captureDoc`, and `serializeScene`'s `levelDoc` fallback); the cache comes first, so a capture that works today writes the bytes it wrote. |
 
 **A placeholder is NOT an instance.** It is a plain entity carrying the marker and no `PrefabInstance`; the top-level
 one drops the `PrefabInstance` pass 1 gave it, and the marker holds the source. Carrying it, every piece of instance
@@ -1261,14 +1272,20 @@ one save later. Only an expansion clears the marker: a reload or a rebuild that 
 
 Lifecycle: delete → undo carries the marker (`carriedMarkers.ts`). A duplicate or a paste keeps the record, with every
 guid it states re-minted and the root's set to the copy's (`copyUnresolvedRef`), so the two never share an identity
-once the prefab resolves. Two open gaps (#1722): a duplicate or paste of a prefab MEMBER strips the markers along with
-`PrefabInstance`, so a placeholder under it loses its record (#1762), and a ref inside the record to an entity copied
-alongside it is not remapped to the copy (#1763). In prefab edit, a copy of a missing row has no baseline row. It is written from its record
+once the prefab resolves. The copy has ONE remap (#1763): `planCopyGuids`' new guids for every copied entity plus every
+record's re-minted identities (`recordGuidMints`), built before anything is rewritten and applied both to the records
+and to the copied traits. So a ref inside the record to an entity copied alongside it names the copy of that entity,
+and a copied entity's ref into a record's member names the copy's member. A member copied without its `PrefabInstance`
+keeps the records under it too (#1762). In prefab edit, a copy of a missing row has no baseline row. It is written from its record
 when nothing in the record was rewritten into the edit world's ids and it states no guid; the save refuses otherwise.
 The guid test is what refuses a SCENE placeholder pasted into prefab edit, whose member rows pin scene guids (#1293). The Hierarchy
 labels the placeholder **Missing Prefab** (`EntityInfo.missingPrefab`), so it does not read as an empty object to clean
-up. A duplicate re-mints the record's guids on its own, so a copied scene child's ref into a member of the record still
-names the original's member (the copy's remap, `planCopyGuids`, cannot see members that do not exist).
+up.
+
+A plain child the scene puts under a NODE placeholder is saved top-level, parented by the placeholder's guid, which is
+the guid the node's root is spawned with. Pass 2 resolves parents before any expansion runs, so the load records a
+guid `parentId` it cannot resolve and asks again once the expansions and the derive are done (`retryGuidParents`,
+#1738). One that still misses stays at the scene root, as before.
 
 The TEMPLATE writers refuse rather than write a scene record into a template (I8): Create Prefab of a tree holding a
 placeholder (the human path and the agent `prefab create` op, over the live tree they write), and an Apply that would
@@ -1278,19 +1295,28 @@ member moved into the node stays behind with the member). Apply of anything else
 instance goes ahead. A rebuild's preload fetches a placeholder's source (`preloadNestedPrefabsForSubtree`), so a
 prefab restored on disk re-expands on the next rebuild.
 
-Known gaps, filed as one class in #1738 (a writer meeting a reference it cannot read, with no record for it):
+**How a live frame's document stops resolving.** Not by an editor trash: `/api/delete-asset` marks the vanished paths as
+the editor's own writes, and nothing evicts either cache, so the deleted prefab stays readable until a reload, and the
+reload takes the load path above (the stale entry is #1751's). The caches are emptied only by `seatCaches(key, null)`
+(`prefabCommit.ts`), which runs on the undo of a Create Prefab, an Import Model or a rig prefab. A live instance of that
+prefab is reached there only past a dropped throwing undo, `worldLeft()` mid-commit, a carried `Persistent` tree, or a
+key the editor never warmed. Create Prefab over such an instance writes a REFERENCE row from the record rather than
+refusing: its refusal check runs before the nested warm, so a refusal would fire on a merely cold key.
+
+**A pre-v5 template** states a nested frame's edits in path-keyed `nestedOverrides` / `nestedStructure`, with no
+`nodeGuid` for a member row to carry them. One addressing a frame whose prefab is missing is kept by R2's legacy half
+(above, #1780), on the scene side and in the template's own prefab-edit save (`captureRowChannels`, under
+`keepsTemplateRows`).
+
+Still refused or open (#1738):
 - **A prefab-edit save of a template holding an added reference NODE whose prefab is missing** (the template's own
-  key node, or a pasted scene one) is refused, not written: the template capture leaves a placeholder out, and the
-  save has no baseline for a node the way it has one for a row. Safe, but the prefab cannot be saved until the child
-  resolves or the node is deleted.
+  key node, or a pasted scene one) is REFUSED, not written: the template capture leaves a placeholder out, and writing
+  it back needs the file's node matched in the same frame, wherever a template node can hang. The reason names the
+  missing prefab and says which case it is: a node the template declares is still in the file on disk, a pasted one
+  exists only in this edit. Restore the prefab, or delete the node. A node placeholder with children takes the same
+  refusal.
 - **A missing row moved under a member of a nested row, in prefab edit,** is written under its row parent: the save
-  keeps the record and drops the move.
-- **A pre-v5 template's** path-keyed `nestedOverrides` / `nestedStructure` for a missing nested frame are not kept:
-  with no `nodeGuid` there are no rows for the orphan store to hold.
-- **A prefab trashed inside the editor while an instance of it is expanded**, then saved with no reload: the instance
-  carries no marker, the trash evicts both caches, and the save falls back to the root's trait snapshot. Since #1702 an
-  editor trash no longer reloads the open scene, which would have routed it through the load path (by reading, not
-  driven).
+  keeps the record and drops the move. (A move, not a record: not this class.)
 
 Tests: `engine/tests/editor/missingPrefabPassThrough.test.ts`, one case per row and per lifecycle step, each red under
 the mutation it names.
@@ -1463,7 +1489,7 @@ cache:
 |---|---|---|
 | `/api/prefab-member-paths` (#1437) | the member refs of every OTHER scene and prefab using a prefab whose member paths moved | the route returns `written` (each file's new bytes and `prior`); `repairMemberPathsEverywhere` → `adoptServerPrefabRewrites` (`editor/scene/serverPrefabRewrites.ts`) |
 | `/api/move-file` | a prefab's PATH | `applyAssetPathMoves` re-keys both prefab caches (`rekeyCachedPrefab`, `rekeyEditorPrefabCache`) |
-| `/api/delete-asset` | a prefab is gone | open: #1738 |
+| `/api/delete-asset` | a prefab is gone | deliberately nobody: both caches keep the deleted document until a reload, which takes the missing-prefab load path; a writer that does lose it writes from the frame record (#1738, § "A missing prefab keeps its record") |
 
 **The member-path repair, end to end:**
 - **The route** asks the renderer which documents an asset view holds unsaved (`dirtyAsset`), and leaves those,

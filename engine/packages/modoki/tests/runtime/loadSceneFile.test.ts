@@ -370,7 +370,7 @@ describe('loadSceneFile', () => {
 
       await loadSceneFile(data, {
         fetchPrefab: async (path: string) => {
-          if (path === 'prefabs/tree.prefab.json') return { version: 5, entities: [] };
+          if (path === 'prefabs/tree.prefab.json') return { version: 5, entities: [{ localId: 1, traits: {} }] };
           return null;
         },
         onInstantiatePrefab,
@@ -402,7 +402,7 @@ describe('loadSceneFile', () => {
       };
 
       await loadSceneFile(data, {
-        fetchPrefab: async () => ({ version: 1, entities: [] }),
+        fetchPrefab: async () => ({ version: 1, entities: [{ localId: 1, traits: {} }] }),
         onInstantiatePrefab,
         loadModels: false,
       });
@@ -423,7 +423,7 @@ describe('loadSceneFile', () => {
         }],
       };
       await loadSceneFile(data, {
-        fetchPrefab: async () => ({ version: 2, entities: [] }),
+        fetchPrefab: async () => ({ version: 2, entities: [{ localId: 1, traits: {} }] }),
         onInstantiatePrefab,
         loadModels: false,
       });
@@ -442,7 +442,7 @@ describe('loadSceneFile', () => {
         ],
       };
       await loadSceneFile(data, {
-        fetchPrefab: async () => ({ version: 1, entities: [] }),
+        fetchPrefab: async () => ({ version: 1, entities: [{ localId: 1, traits: {} }] }),
         onInstantiatePrefab,
         loadModels: false,
       });
@@ -664,7 +664,7 @@ describe('loadSceneFile', () => {
         }],
       };
       await loadSceneFile(data, {
-        fetchPrefab: async () => ({ version: 1, entities: [] }),
+        fetchPrefab: async () => ({ version: 1, entities: [{ localId: 1, traits: {} }] }),
         onInstantiatePrefab,
         loadModels: false,
       });

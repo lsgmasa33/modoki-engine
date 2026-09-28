@@ -168,20 +168,24 @@ describe('loadSceneFile — a reference to a prefab instance names its root (#13
     expect(orphanParents()).toEqual([{ name: 'PRoot', guid: OTHER_GUID }]);
   });
 
-  // Nothing replaces the placeholder: its children belong at the scene root, not on the freed id's
-  // next owner. Mutation: drop the `idMap.delete(entry.id)` line (the numeric case), or make
-  // `detachEntityIdRefs` leave the field alone (the guid case).
-  it('a child of an instance that fails to instantiate lands at the scene root', async () => {
+  // A prefab that loads but expands to no root is a reference the load cannot expand (#1768, I18): its entry keeps its
+  // pass-1 placeholder, exactly as a MISSING prefab's does, so its children stay under it, on the production path
+  // (SceneManager). Before, its rows spawned root-less and the children fell to the scene root. Mutation: drop
+  // `fetchedExpandsToRoot` at the entry site — BMember spawns, and the children land at the root.
+  it('a child of an instance whose prefab expands to no root stays under its placeholder, as a missing prefab\'s does', async () => {
     const broken = (id: number, guid: string): Row => ({ ...inst(id, guid), prefab: BROKEN_PREFAB_GUID });
-    const { world, findEntityByGuid, ea } = await load([broken(7, INST_GUID), kid(INST_GUID), inst(8, OTHER_GUID, 7)]);
-    expect([...world.entities].some((e) => ea(e)?.name === 'BMember'), 'premise: the broken prefab spawned rows').toBe(true);
-    expect(ea(findEntityByGuid(KID_GUID, world))?.parentId, 'guid child').toBe(0);
-    expect(ea(findEntityByGuid(OTHER_GUID, world))?.parentId, 'numeric child instance').toBe(0);
+    const { world, findEntityByGuid, ea, parentOf } = await load([broken(7, INST_GUID), kid(INST_GUID), inst(8, OTHER_GUID, 7)]);
+    expect([...world.entities].some((e) => ea(e)?.name === 'BMember'), 'nothing of the root-less prefab spawns').toBe(false);
+    const placeholder = findEntityByGuid(INST_GUID, world);
+    expect(placeholder, 'the entry keeps its placeholder').toBeDefined();
+    expect(parentOf(KID_GUID).guid, 'guid child').toBe(INST_GUID);
+    expect(ea(findEntityByGuid(OTHER_GUID, world))?.parentId, 'numeric child instance').toBe(placeholder!.id());
   });
 
-  // A trait-form member of an instance that fails: `rootInstanceId` is `stripTrait`, and a PrefabInstance
-  // left at 0 would read as an instance ROOT on save. Mutation: make `dropDetachedEntityIdRefs` a no-op.
-  it('a legacy trait-form member of an instance that fails to instantiate loses its PrefabInstance', async () => {
+  // A trait-form member of an instance whose prefab expands to no root: the root entry keeps its placeholder (#1768), so
+  // the member keeps a PrefabInstance naming it, exactly as a member of a MISSING prefab's instance does. Mutation: drop
+  // `fetchedExpandsToRoot` at the entry site — the instantiation spawns nothing, and the member loses its PrefabInstance.
+  it('a legacy trait-form member of an instance whose prefab expands to no root is kept as a missing prefab\'s is', async () => {
     const MEMBER_GUID = '50000000-0000-4000-8000-0000000000f8';
     const { world, findEntityByGuid } = await load([
       { id: 7, traits: { Transform: { x: 7 }, EntityAttributes: { name: 'Inst7', parentId: 0, guid: INST_GUID }, PrefabInstance: { source: BROKEN_PREFAB_GUID, localId: 1, rootInstanceId: 7 } } },
@@ -189,6 +193,7 @@ describe('loadSceneFile — a reference to a prefab instance names its root (#13
     ]);
     const stray = findEntityByGuid(MEMBER_GUID, world);
     expect(stray, 'premise: the member row spawned').toBeDefined();
-    expect(stray!.has(PrefabInstanceLike)).toBe(false);
+    expect(stray!.has(PrefabInstanceLike)).toBe(true);
+    expect((stray!.get(PrefabInstanceLike) as { rootInstanceId: number }).rootInstanceId).toBe(findEntityByGuid(INST_GUID, world)!.id());
   });
 });

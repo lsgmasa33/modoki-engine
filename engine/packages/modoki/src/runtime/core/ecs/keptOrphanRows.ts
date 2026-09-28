@@ -21,10 +21,35 @@
  *  by ~150 bytes each time. Accepted for now — the alternative is dropping identity on a timer — but
  *  it is the reason a later phase may want a deliberate prune, and not something to discover then.
  *
+ *  ⚠️ **The LEGACY half (#1780, #1738).** A scene or template older than member rows states a nested frame's edits in
+ *  path-keyed channels (`nestedOverrides`, `nestedStructure`, keyed by row localIds). One addressing a frame the document
+ *  does not expand (the template does not have the row yet, or its prefab cannot be read) reaches no live frame, so no
+ *  capture regenerates it, and the next save dropped it. The load keeps those channels here under the same root guid,
+ *  the writers put them back (a live capture wins each key), and a rebuild that makes the frame live hands them to its
+ *  expansion. A legacy file's first save after that migrates what it applied onto member rows.
+ *
  *  Typed loosely here (L0 knows no scene row shape); `loadSceneFile.ts` owns the typed API over it. */
 import { remapGuidValues } from '../assetRefRules';
 
 const keptRows = new Map<string, Record<string, object>>();
+
+/** A root's kept legacy channels: each is path key → what the channel states at that path. */
+export type KeptLegacy = { nestedOverrides?: Record<string, object>; nestedStructure?: Record<string, object> };
+const keptLegacy = new Map<string, KeptLegacy>();
+
+export function keptLegacyOf(rootGuid: string): KeptLegacy | undefined {
+  return keptLegacy.get(rootGuid);
+}
+
+/** Replace the legacy channels kept for `rootGuid`; nothing left drops the entry. */
+export function setKeptLegacy(rootGuid: string, channels: KeptLegacy): void {
+  if (!rootGuid) return;
+  const out: KeptLegacy = {};
+  if (channels.nestedOverrides && Object.keys(channels.nestedOverrides).length) out.nestedOverrides = channels.nestedOverrides;
+  if (channels.nestedStructure && Object.keys(channels.nestedStructure).length) out.nestedStructure = channels.nestedStructure;
+  if (out.nestedOverrides || out.nestedStructure) keptLegacy.set(rootGuid, out);
+  else keptLegacy.delete(rootGuid);
+}
 
 export function keptOrphanRowsOf(rootGuid: string): Record<string, object> | undefined {
   return keptRows.get(rootGuid);
@@ -43,6 +68,7 @@ export function dropKeptOrphanRows(rootGuid: string): void {
 
 export function clearKeptOrphanRows(): void {
   keptRows.clear();
+  keptLegacy.clear();
 }
 
 /** Move every renamed root's kept rows to its new guid, and rename the guids the rows themselves name (a row's `parent`,
@@ -52,16 +78,28 @@ export function clearKeptOrphanRows(): void {
  *  holds rows keeps its own on a clash. */
 export function rekeyKeptOrphanRows(remap: ReadonlyMap<string, string>): void {
   if (!remap.size) return;
-  for (const [guid, rows] of keptRows) {
-    const next = remapGuidValues(rows, remap) as Record<string, object>;
-    if (next !== rows) keptRows.set(guid, next);
+  rekey(keptRows, remap, (a, b) => ({ ...a, ...b }));
+  // The legacy half follows the same rename (#1780): its channels name guids too, in a restated trait's refs.
+  rekey(keptLegacy, remap, (a, b) => ({
+    nestedOverrides: { ...a.nestedOverrides, ...b.nestedOverrides },
+    nestedStructure: { ...a.nestedStructure, ...b.nestedStructure },
+  }));
+}
+
+function rekey<V extends object>(store: Map<string, V>, remap: ReadonlyMap<string, string>, merge: (moved: V, own: V) => V): void {
+  for (const [guid, value] of store) {
+    const next = remapGuidValues(value, remap) as V;
+    if (next !== value) store.set(guid, next);
   }
-  const moving: Array<[string, Record<string, object>]> = [];
+  const moving: Array<[string, V]> = [];
   for (const [from, to] of remap) {
-    const rows = keptRows.get(from);
-    if (!rows || from === to) continue;
-    keptRows.delete(from);
-    moving.push([to, rows]);
+    const value = store.get(from);
+    if (!value || from === to) continue;
+    store.delete(from);
+    moving.push([to, value]);
   }
-  for (const [to, rows] of moving) keptRows.set(to, { ...rows, ...keptRows.get(to) });
+  for (const [to, value] of moving) {
+    const own = store.get(to);
+    store.set(to, own ? merge(value, own) : value);
+  }
 }

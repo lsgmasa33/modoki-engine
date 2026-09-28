@@ -38,12 +38,13 @@ import {
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo, undo, duplicateEntity,
 } from '@modoki/engine/editor';
-import { setPrefabCache, applyToPrefabSelective, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, applyToPrefabSelective, instantiatePrefab, rebuildInstance, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { expandsToRoot } from '../../packages/modoki/src/runtime/loaders/prefabRoot';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { snapshotEntity, respawnFromSnapshot, copySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
-import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
+import { registerAsset, resolveRef } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { asAddedNode } from '../../packages/modoki/src/runtime/loaders/unresolvedPrefabRefs';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -330,6 +331,64 @@ describe('the placeholder\'s lifecycle (#1699)', () => {
     expect(inside(copyGuid, 'A')).not.toBe(inside(INST, 'A'));
   });
 
+  it('a duplicate\'s refs between its record and the entities copied with it follow the copy, both ways (#1763)', async () => {
+    // Member A (in the record) targets Kid, a plain child of the placeholder; Kid targets A's pinned guid. Mutations:
+    // `copyUnresolvedRef` given only the record's own mints (the pre-fix remap) — the copy's A still drives the original
+    // Kid; the trait loop given `planCopyGuids`' `remap` — the copy's Kid still drives the original's A.
+    const KID = 'dddddddd-0000-4000-8000-000000001607';
+    const UIA = (target: string) => ({ bindings: [{ event: 'click', kind: 'call', action: 'noop', target }] });
+    const targetOf = (id: number) => (readTraitData(id, meta('UIAction')) as { bindings: { target: string }[] }).bindings[0]!.target;
+    install(pDoc());
+    await load(scene(P));
+    writeTraitFieldWithUndo(inside(INST, 'A'), meta('Transform'), 'x', 5);
+    const control = await save();
+    const entry = entryOf(control, INST)! as { members: Record<string, { guid: string; traits: Record<string, unknown> }> };
+    const pinA = Object.values(entry.members)[0]!;
+    pinA.traits.UIAction = UIA(KID);
+    (control.entities as unknown[]).push({ id: 99, traits: { EntityAttributes: { name: 'Kid', parentId: INST, guid: KID }, UIAction: UIA(pinA.guid) } });
+    uninstall(P);
+    await load(control);
+    clearHistory();
+    const copyId = duplicateEntity(rootOf(INST), () => {})!;
+    const copyGuid = getAllEntities().find((e) => e.id === copyId)!.guid!;
+    const saved = await save();
+
+    install(pDoc());
+    await load(saved);
+    const kids = getAllEntities().filter((e) => e.name === 'Kid');
+    const copyKid = kids.find((e) => e.guid !== KID)!;
+    expect(kids.map((e) => e.guid).sort()).toEqual([KID, copyKid.guid].sort());
+    expect(targetOf(inside(INST, 'A'))).toBe(KID);
+    expect(targetOf(inside(copyGuid, 'A'))).toBe(copyKid.guid);
+    expect(targetOf(rootOf(KID))).toBe(getAllEntities().find((e) => e.id === inside(INST, 'A'))!.guid);
+    expect(targetOf(copyKid.id)).toBe(getAllEntities().find((e) => e.id === inside(copyGuid, 'A'))!.guid);
+  });
+
+  it('a duplicate of a MEMBER holding a node placeholder keeps the placeholder\'s record (#1762)', async () => {
+    // The member copy is stripped of `PrefabInstance` (it becomes an added node); the placeholder under it must keep its
+    // record through that (#1756 removed the strip that dropped it). Mutation: in `copySnapshot.markersOf`, skip
+    // `UnresolvedPrefabRef` on a node under a 'strip'-linked one — the copy's QInst saves bare and only the original's QX
+    // comes back.
+    install(pDoc(), qDoc());
+    await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
+    reparentEntity(rootOf(QINST), inside(INST, 'A'));
+    writeTraitFieldWithUndo(inside(QINST, 'QX'), meta('Transform'), 'x', 7);
+    const control = await save();
+    uninstall(Q);
+    await load(control);
+    clearHistory();
+    const copyA = duplicateEntity(inside(INST, 'A'), () => {})!;
+    const copyKids = getAllEntities().filter((e) => e.parentId === copyA);
+    expect(copyKids.map((e) => e.missingPrefab)).toEqual([true]);
+    const saved = await save();
+
+    install(qDoc());
+    await load(saved);
+    const qx = getAllEntities().filter((e) => e.name === 'QX');
+    expect(qx.map((e) => x(e.id))).toEqual([7, 7]);
+    expect(new Set(qx.map((e) => e.guid)).size).toBe(2);
+  });
+
   it('a rename and a move are kept: identity and placement come from the live placeholder', async () => {
     // Mutation: write the record's `name` in `asSceneEntry` — the rename is lost.
     const entry = await loadWithPMissing();
@@ -603,6 +662,282 @@ describe('the template refusals ask what is promoted or written, not the live tr
     const editRoot = getAllEntities().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!;
     respawnFromSnapshot(copySnapshot(snap), editRoot.id);
     const out = serializePrefabEditWorld(P);
-    expect('error' in out && out.error).toMatch(/missing prefab/);
+    // The reason names the prefab and says the paste exists only in this edit (#1738 member 2's refusal, sharpened).
+    expect('error' in out && out.error).toContain(`pasted reference to the prefab ${resolveRef(Q) ?? Q}, which is missing or has no root, so this save cannot write it, and it exists only in this edit`);
+  });
+
+  it('the refusal of a node the TEMPLATE declares says the file still has it (#1738, 2)', async () => {
+    // PK = R → row 3 expanding P, whose `added` authors the keyed reference node QK (Q) under P's A. Q is missing.
+    // Mutation: test `onDisk` as false — the reason claims the node exists only in this edit, which would send the human
+    // to delete a node the file still holds.
+    const PK = 'cccccccc-0000-4000-8000-000000001740';
+    const pk = { id: PK, version: 5, name: 'PK', rootLocalId: 1, entities: [
+      row(1, 'KR', 0, 'eeeeeeee-0000-4000-8000-000000001741'),
+      { localId: 3, name: 'Prow', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001742', prefab: P,
+        added: [{ parentLocalId: 2, key: 'eeeeeeee-0000-4000-8000-000000001743', name: 'QK', prefab: Q, traits: {}, children: [] }],
+        traits: { EntityAttributes: { name: 'Prow', parentId: 1, guid: '' } } },
+    ] };
+    install(pDoc(), pk);
+    await load(buildPrefabEditScene(pk as unknown as PrefabFile) as SceneData);
+    expect(getAllEntities().find((e) => e.name === 'QK')?.missingPrefab).toBe(true); // precondition: the node placeholder
+    const out = serializePrefabEditWorld(PK);
+    expect('error' in out && out.error).toContain(`"QK" references the prefab ${resolveRef(Q) ?? Q}, which is missing or has no root, so this save cannot write it. The prefab file on disk still has it`);
+  });
+});
+
+// #1768: a document that LOADS but expands to no root is a reference the load cannot expand (I18), exactly as one that
+// does not load. V is variant-shaped: its root row 1 references L, and L is missing.
+const V = 'cccccccc-0000-4000-8000-000000001768';
+const L = 'cccccccc-0000-4000-8000-000000001767';
+const lDoc = () => ({ id: L, version: 5, name: 'L', rootLocalId: 1, entities: [row(1, 'LA', 0, 'eeeeeeee-0000-4000-8000-000000001761')] });
+const vDoc = () => ({ id: V, version: 5, name: 'V', rootLocalId: 1, entities: [
+  { localId: 1, name: 'LRow', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001762', prefab: L, traits: { EntityAttributes: { name: 'LRow', parentId: 0, guid: '' } } },
+  row(2, 'VExtra', 1, 'eeeeeeee-0000-4000-8000-000000001763'),
+] });
+
+describe('a scene entry whose prefab loads but expands to no root keeps its entry (#1768)', () => {
+  it('nothing is spawned for it, and every save writes the entry it read', async () => {
+    // Mutation: drop `fetchedExpandsToRoot` at the entry site in `loadSceneFile` — the placeholder is deleted and the
+    // expansion replaces it with nothing, so the save writes no entry at all (its guid, overrides and name gone).
+    install(vDoc());
+    const input = scene(V);
+    const entry = (input.entities as unknown as Array<Record<string, unknown>>)[1]!;
+    entry.overrides = { 2: { Transform: { x: 5 } } };
+    await load(input);
+    expect(getAllEntities().filter((e) => e.name === 'VExtra')).toEqual([]);
+    expect(getAllEntities().find((e) => e.guid === INST)?.missingPrefab).toBe(true);
+    const s1 = await save();
+    expect(entryOf(s1, INST)).toMatchObject({ prefab: V, overrides: { 2: { Transform: { x: 5 } } } });
+    await load(s1);
+    expectSameBytes(entryOf(await save(), INST), entryOf(s1, INST));
+  });
+
+  it('an added reference node to it keeps its node through a load and through a rebuild (both spawnNestedInstance twins)', async () => {
+    // Mutations: drop `expandsToRoot` from the LOADER's `spawnNestedInstance` — the node is dropped at load; from the
+    // EDITOR's — the Apply's rebuild drops it. (Each alone: the other twin still spawns the placeholder.)
+    install(pDoc(), qDoc());
+    await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
+    reparentEntity(rootOf(QINST), inside(INST, 'A'));
+    const control = JSON.parse(JSON.stringify(await save()).split(Q).join(V)) as SceneData;
+    const nodeOf = (sd: SceneData) => (entryOf(sd, INST)!.members as Record<string, { added?: unknown[] }>)[`/${gA}`]!.added;
+    expect(JSON.stringify(nodeOf(control))).toContain(V); // precondition: the node now references V
+    uninstall(Q);
+    install(vDoc());
+    await load(control);
+    expect(getAllEntities().find((e) => e.guid === QINST)?.missingPrefab).toBe(true);
+    expect(getAllEntities().filter((e) => e.name === 'VExtra')).toEqual([]);
+    expect(nodeOf(await save())).toEqual(nodeOf(control));
+    writeTraitFieldWithUndo(inside(INST, 'A'), meta('Transform'), 'z', 3);
+    const keys = collectInstanceOverrideKeys(rootOf(INST), prefabs.get(P) as PrefabFile);
+    expect((await applyToPrefabSelective(rootOf(INST), new Set(keys.fields))).applied).toBe(true);
+    expect(getAllEntities().find((e) => e.guid === QINST)?.missingPrefab).toBe(true);
+    expect(nodeOf(await save())).toEqual(nodeOf(control));
+  });
+
+  it('a rebuild onto a document with no root leaves the live instance standing', async () => {
+    // Mutation: drop the `expandsToRoot` guard in `rebuildInstance` — the teardown destroys R and A, and nothing is
+    // spawned in their place.
+    install(pDoc());
+    await load(scene(P));
+    const root = rootOf(INST);
+    expect(rebuildInstance(root, P, { ...pDoc(), rootLocalId: 9 } as never, {}, {})).toBe(root);
+    expect(getAllEntities().find((e) => e.guid === INST)?.id).toBe(root);
+    expect(x(inside(INST, 'A'))).toBe(0);
+  });
+
+  it('a template ROW whose child loads but expands to no root keeps the frame\'s scene edits, as a missing child does (close-out F1)', async () => {
+    // Mutations: drop `expandsToRoot` from `nestedRowPresent` — the save writes the row as REMOVED; from the reader
+    // `rowBackedTest` hands `resolveMemberChain` — QX's row reads as backed, is not kept, and is dropped.
+    install(pqDoc(), qDoc());
+    await load(scene(PQ));
+    writeTraitFieldWithUndo(inside(INST, 'QX'), meta('Transform'), 'x', 7);
+    const control = await save();
+    const rootless = { ...qDoc(), rootLocalId: 9 };
+    install(rootless);
+    await load(control);
+    expect(getAllEntities().filter((e) => e.name === 'QX')).toEqual([]); // precondition: nothing expanded
+    const saved = await save();
+    expectSameBytes(entryOf(saved, INST), entryOf(control, INST));
+    install(qDoc());
+    await load(saved);
+    expect(x(inside(INST, 'QX'))).toBe(7);
+  });
+
+  it('the predicate agrees with both expansions on every shape (the twin pin)', () => {
+    // `expandsToRoot` is a second spelling of the expansion's root rule; this holds the three together. Mutation: make
+    // it answer true for a reference root without reading the child — the "L missing" and "cycle" shapes disagree;
+    // drop either expansion's early return — "no root row" spawns P's A parentless, and its last column goes false.
+    const self = 'cccccccc-0000-4000-8000-000000001766';
+    const shapes: Array<[string, () => void, { id: string }]> = [
+      ['plain root', () => install(pDoc()), pDoc()],
+      ['no root row', () => {}, { ...pDoc(), rootLocalId: 9 } as never],
+      ['reference root, child present', () => install(lDoc(), vDoc()), vDoc()],
+      ['reference root, child missing', () => install(vDoc()), vDoc()],
+      ['reference root naming itself', () => {}, { id: self, version: 5, name: 'S', rootLocalId: 1, entities: [
+        { localId: 1, name: 'Me', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001764', prefab: self, traits: { EntityAttributes: { name: 'Me', parentId: 0, guid: '' } } }] } as never],
+    ];
+    const verdicts = shapes.map(([name, setup, doc]) => {
+      prefabs.clear();
+      for (const id of [P, L, V, self]) setPrefabCache(id, null);
+      setup();
+      if (doc.id === self) install(doc);
+      setCurrentWorld(createWorld());
+      // Each expansion either spawns a root or spawns NOTHING — never a root-less scatter of rows.
+      const count = () => getCurrentWorld().entities.length;
+      const b0 = count();
+      const runtime = instantiatePrefabIntoWorld(getCurrentWorld(), doc as never, 0, undefined, doc.id) > 0;
+      const b1 = count();
+      const editor = instantiatePrefab(doc as never, 0) > 0;
+      const clean = (runtime || b1 === b0) && (editor || count() === b1);
+      return [name, expandsToRoot(doc as never, (s) => prefabs.get(s) as never), runtime, editor, clean];
+    });
+    expect(verdicts).toEqual([
+      ['plain root', true, true, true, true],
+      ['no root row', false, false, false, true],
+      ['reference root, child present', true, true, true, true],
+      ['reference root, child missing', false, false, false, true],
+      ['reference root naming itself', false, false, false, true],
+    ]);
+  });
+});
+
+// #1738 member 1: an EXPANDED instance whose prefab stops resolving mid-session (both caches evicted, no reload) is a
+// reference its writers cannot read, and I18 says they write back the record it was loaded with — the frame record.
+describe('a live instance whose prefab vanished mid-session is written from its frame record (#1738, 1)', () => {
+  const HOLDER = 'dddddddd-0000-4000-8000-000000001600';
+  const loaded = async () => {
+    install(pDoc(), qDoc());
+    await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: HOLDER } } }]));
+    reparentEntity(rootOf(QINST), inside(INST, 'A'));
+    writeTraitFieldWithUndo(inside(INST, 'A'), meta('Transform'), 'x', 5);
+    writeTraitFieldWithUndo(inside(QINST, 'QX'), meta('Transform'), 'x', 7);
+    clearHistory();
+  };
+
+  it('the scene save writes the instance and its nested node byte for byte as it did before the eviction', async () => {
+    // Mutations: drop the entry-site `levelDoc` fallback in `serializeScene` — no instance entry is written at all; drop
+    // the pre-pass one — the nested node is lost from `A`'s row; make `captureDoc` read the cache only — the nested node is dropped from `A`'s row.
+    await loaded();
+    const control = await save();
+    uninstall(P); uninstall(Q);
+    expectSameBytes(entryOf(await save(), INST), entryOf(control, INST));
+  });
+
+  it('Create Prefab over a tree holding it writes a REFERENCE row, not a flattened copy', async () => {
+    // Mutation: `planPrefabRows` reads the cache only — the row is flattened into plain R and A rows.
+    await loaded();
+    uninstall(P); uninstall(Q);
+    const holder = getAllEntities().find((e) => e.guid === HOLDER)!.id;
+    const created = await createPrefabFromEntity(holder, 'prefabs/Held.prefab.json', 'Held', async () => true);
+    expect(created && typeof created === 'object' && 'refused' in created).toBe(false);
+    const doc = JSON.parse(writes.filter((w) => w.path.endsWith('Held.prefab.json')).pop()!.content) as PrefabFile;
+    expect(doc.entities.filter((e) => e.prefab).map((e) => e.prefab)).toEqual([P]);
+    expect(doc.entities.map((e) => e.name)).not.toContain('A');
+  });
+});
+
+// #1738 member 3: a PRE-v5 template (no `nodeGuid`, so no member rows) states a nested frame's edits in the legacy
+// path-keyed channels. One addressing a frame whose prefab is missing reaches no live frame, and R2's legacy half keeps
+// it (the #1780 store), on the scene side and in the template's own prefab-edit save.
+describe('a pre-v5 legacy channel into a missing nested frame is written back (#1738, 3)', () => {
+  const T = 'cccccccc-0000-4000-8000-000000001738';
+  const T2 = 'cccccccc-0000-4000-8000-000000001739';
+  const bare = (r: Record<string, unknown>) => { const { nodeGuid: _g, ...rest } = r; return rest; };
+  /** PQ's shape, pre-v5: R → A, and row 3 expanding Q. */
+  const tDoc = () => ({ ...pqDoc(), id: T, version: 4, name: 'T', entities: pqDoc().entities.map((e) => bare(e as Record<string, unknown>)) });
+  const channel = { 3: { 2: { Transform: { x: 7 } } } };
+
+  it('the scene side: the entry keeps it with Q missing, and it applies once Q is back', async () => {
+    // Mutation: skip `keepUnreachedLegacy` in the loader — the save drops the channel, and QX comes back at Q's 0.
+    install(tDoc());
+    const sc = scene(T);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.nestedOverrides = channel;
+    await load(sc);
+    const saved = await save();
+    expect(entryOf(saved, INST)!.nestedOverrides).toEqual(channel);
+    install(qDoc());
+    await load(saved);
+    expect(x(inside(INST, 'QX'))).toBe(7);
+  });
+
+  it('a scene-added reference NODE keeps its own legacy channel the same way', async () => {
+    // A node is a stored root of its own (`collectReferenceNodeRows`). Mutation: `captureNestedRef` merges nothing for a
+    // scene node (`nodeGuid` = '') — the node is written without its channel.
+    install(pDoc(), tDoc(), qDoc());
+    await load(scene(P, [{ id: 3, prefab: T, guid: QINST, traits: { EntityAttributes: { name: 'TInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
+    reparentEntity(rootOf(QINST), inside(INST, 'A'));
+    const control = await save();
+    const nodeOf = (sd: SceneData) => (entryOf(sd, INST)!.members as Record<string, { added?: Array<Record<string, unknown>> }>)[`/${gA}`]!.added![0]!;
+    nodeOf(control).nestedOverrides = channel;
+    uninstall(Q);
+    await load(control);
+    const saved = await save();
+    expect(nodeOf(saved).nestedOverrides).toEqual(channel);
+    install(qDoc());
+    await load(saved);
+    expect(x(inside(QINST, 'QX'))).toBe(7);
+  });
+
+  it('the template side: a keyed template reference NODE keeps its own channel through a prefab-edit save', async () => {
+    // T3 = R3 → row 2 expanding P, whose `added` authors the keyed node TK (T) under P's A; TK's channel reaches into
+    // T's row 3, whose Q is missing. Mutation: keep no legacy for a keyed node in `keepTemplateNodeOrphans` — the node is
+    // written without its channel. (Its writer is `captureRowChannels`, through `finishTemplateReferenceNode`.)
+    const T3 = 'cccccccc-0000-4000-8000-000000001741';
+    install(pDoc(), tDoc());
+    const t3 = { id: T3, version: 5, name: 'T3', rootLocalId: 1, entities: [
+      row(1, 'R3', 0, 'eeeeeeee-0000-4000-8000-000000001745'),
+      { localId: 2, name: 'Prow', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001746', prefab: P,
+        added: [{ parentLocalId: 2, key: 'eeeeeeee-0000-4000-8000-000000001747', name: 'TK', prefab: T, traits: {}, children: [], nestedOverrides: channel }],
+        traits: { EntityAttributes: { name: 'Prow', parentId: 1, guid: '' } } },
+    ] };
+    install(t3);
+    await load(buildPrefabEditScene(t3 as never) as SceneData);
+    const out = serializePrefabEditWorld(T3);
+    if ('error' in out) throw new Error(out.error);
+    const node = (out.prefab.entities.find((e) => e.localId === 2) as { added?: Array<Record<string, unknown>> }).added?.[0];
+    expect(node?.nestedOverrides).toEqual(channel);
+  });
+
+  it('the template side: a prefab-edit save of a template whose row reaches into it keeps the row\'s channel', async () => {
+    // T2 = R2 → row 2 expanding T, whose own row 3 expands the missing Q. Mutation: drop the kept-channel merge in
+    // `captureRowChannels` — the row is written without its `nestedOverrides`.
+    install(tDoc());
+    const t2 = { id: T2, version: 4, name: 'T2', rootLocalId: 1, entities: [
+      bare(row(1, 'R2', 0, 'x')),
+      { localId: 2, name: 'Trow', prefab: T, nestedOverrides: channel, traits: { EntityAttributes: { name: 'Trow', parentId: 1, guid: '' } } },
+    ] };
+    install(t2);
+    await load(buildPrefabEditScene(t2 as never) as SceneData);
+    const out = serializePrefabEditWorld(T2);
+    if ('error' in out) throw new Error(out.error);
+    expect(out.prefab.entities.find((e) => e.localId === 2)?.nestedOverrides).toEqual(channel);
+  });
+});
+
+// #1738 (comment member, #1722 lens 4): a child the scene puts under a missing prefab's NODE placeholder is written
+// top-level, parented by the placeholder's guid. That guid is the node root's, which only the node's expansion spawns —
+// after pass 2 resolves parents — so the load used to put the child at the scene root for good.
+describe('a child under a node placeholder keeps its parent across a reload (#1738)', () => {
+  it('the saved parent guid resolves once the expansion has spawned it, with the prefab missing and once it is back', async () => {
+    // Mutation: drop `retryGuidParents` from the loader — PhKid lands at the root, and the next save writes parentId ''.
+    const KID = 'dddddddd-0000-4000-8000-000000001609';
+    install(pDoc(), qDoc());
+    await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
+    reparentEntity(rootOf(QINST), inside(INST, 'A'));
+    const control = await save();
+    uninstall(Q);
+    (control.entities as unknown[]).push({ id: 99, traits: { EntityAttributes: { name: 'PhKid', parentId: QINST, guid: KID } } });
+    await load(control);
+    const kid = () => getAllEntities().find((e) => e.guid === KID)!;
+    expect(kid().parentId).toBe(rootOf(QINST));
+    const kidEntry = (sd: SceneData) => (sd.entities as unknown as Array<{ traits?: { EntityAttributes?: { guid?: string; parentId?: string } } }>).find((e) => e.traits?.EntityAttributes?.guid === KID);
+    const s3 = await save();
+    expect(kidEntry(s3)?.traits?.EntityAttributes?.parentId).toBe(QINST);
+    await load(s3);
+    expectSameBytes(kidEntry(await save()), kidEntry(s3)); // S3 == S4: the placement round-trips with the prefab missing
+    install(qDoc());
+    await load(s3);
+    expect(kid().parentId).toBe(rootOf(QINST));
+    expect(getAllEntities().find((e) => e.id === rootOf(QINST))!.missingPrefab).toBeUndefined();
   });
 });

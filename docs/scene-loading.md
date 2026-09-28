@@ -1079,6 +1079,15 @@ has children that legitimately hold it. Pinned by
 `packages/modoki/tests/runtime/sceneLoadInstanceParentRefs.test.ts`, whose prefab lists its root
 LAST so recycling cannot mask the bug.
 
+**Gotcha — a guid parent that only an EXPANSION creates (#1738).** Pass 2 runs before any prefab
+expands, so a plain entry whose `parentId` guid names an entity an expansion spawns misses there
+and takes the `'root'` policy. The case that reaches it: a child the scene put under a missing
+prefab's node placeholder, saved top-level with the placeholder's guid, which is the guid the
+node's root is spawned with. Pass 2 records each `EntityAttributes.parentId` guid miss, and
+`retryGuidParents` asks them again after the expansions and the member-guid derive. One that
+resolves goes under its parent, unless that would make a cycle. One that still misses stays at the
+root. No committed scene reaches it: none has a guid parent that pass 2 misses.
+
 ### Why it mattered, and the regression gate
 
 A scene saved after a base-scene **carry** (a level swap that keeps a shared base

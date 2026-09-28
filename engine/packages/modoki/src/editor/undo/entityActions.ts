@@ -22,7 +22,7 @@ import { endFrames, relinkDetachedMembers, captureRootLinks, restoreRootLinks, p
 import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader, frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../../runtime/core/ecs/identityParents';
 import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
-import { copyUnresolvedRef } from './unresolvedRefCopy';
+import { copyUnresolvedRef, recordGuidMints } from './unresolvedRefCopy';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { pushAction, type EditDetail } from './undoManager';
@@ -474,15 +474,26 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
   // A copy is a new identity, so it carries no unregistered markers (`carriedMarkers.ts`) — except
   // the template key of a node the plan derived through it, inside a copy of a whole instance (#1430),
   // and the record a missing prefab's placeholder carries, re-guided so the copy shares no identity (#1699).
+  type RefData = { source: string; kind: string; record: string };
+  const refOf = (s: EntitySnapshot): RefData | null => {
+    const ref = s.markers?.UnresolvedPrefabRef;
+    return ref && ref !== true ? ref as RefData : null;
+  };
+  // ONE remap for the whole copy, built before anything is rewritten: the entities' new guids and every record's
+  // re-minted identities. A record's ref to an entity copied with it, and a copied entity's ref into a record's member,
+  // both follow the copy (#1338's rule, #1763). A record's mints win on the guids it states.
+  const fullRemap = new Map(remap);
+  const collectMints = (s: EntitySnapshot): void => {
+    const ref = refOf(s);
+    if (ref) for (const [g, m] of recordGuidMints(ref, (dataOf(s, 'EntityAttributes')?.guid as string) ?? '', guidOf.get(s)!, newGuid)) fullRemap.set(g, m);
+    for (const c of s.children) collectMints(c);
+  };
+  collectMints(snapshot);
   const markersOf = (s: EntitySnapshot): EntitySnapshot['markers'] => {
     const out: NonNullable<EntitySnapshot['markers']> = {};
     if (keyed.has(s)) out.TemplateAddedKey = { key: keyOf(s) };
-    const ref = s.markers?.UnresolvedPrefabRef;
-    if (ref && ref !== true) {
-      out.UnresolvedPrefabRef = copyUnresolvedRef(
-        ref as { source: string; kind: string; record: string }, (dataOf(s, 'EntityAttributes')?.guid as string) ?? '', guidOf.get(s)!, newGuid,
-      );
-    }
+    const ref = refOf(s);
+    if (ref) out.UnresolvedPrefabRef = copyUnresolvedRef(ref, fullRemap);
     return Object.keys(out).length ? out : undefined;
   };
   const copy = (s: EntitySnapshot): EntitySnapshot => {
@@ -491,7 +502,7 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
     for (const t of s.traits) {
       if (t.data === true) { traits.push(t); continue; }
       if (t.meta.name === 'PrefabInstance' && link === 'strip') continue;
-      const data = remapGuidValues(t.data, remap) as Record<string, unknown>;
+      const data = remapGuidValues(t.data, fullRemap) as Record<string, unknown>;
       if (t.meta.name === 'EntityAttributes') traits.push({ meta: t.meta, data: { ...data, guid: guidOf.get(s)! } });
       // A stored root has no row, so no owner either (#1437/#1468). A new object: the snapshot is replayed on redo.
       else if (t.meta.name === 'PrefabInstance' && link === 'promote') traits.push({ meta: t.meta, data: { ...data, parentLocalId: 0, parentNodeGuid: '', ownerGuid: '' } });
