@@ -1663,6 +1663,13 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
 
 ## Tests, gates and timings
 
+- **A fixed wall-clock wait in a test is a Windows bug waiting to fire** (#1719). A test that
+  sleeps N ms to let a chain of fake-delayed calls finish depends on the timer resolution, and on
+  Windows a timer can fire ~15.6 ms late. `slimePlayLogSink`'s `settle()` slept 60 ms for seven
+  chained `setTimeout` hops, so it failed every Windows run while macOS passed. **Wait on the
+  condition instead:** fake timers plus `vi.runAllTimersAsync()` (drains every timer the chain
+  schedules, whatever the clock), a completion promise, or `vi.waitFor`. Never raise the number.
+  (A loop of N × `setTimeout(0)` is hop-counting, ordered by due time, and is not this bug.)
 - **Windows caps vitest workers at HALF `availableParallelism()`** — `perfCoreWorkers()`
   ([engine/testWorkers.ts](../engine/testWorkers.ts)) returns `{maxWorkers: ceil(n/2)}` on `win32`,
   because these boxes are SMT and vitest's `availableParallelism() - 1` counts hyperthreads as
