@@ -11,7 +11,7 @@ import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { makeSortOrderRenumberAction } from '../undo/overrideMarkWrites';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, copySnapshot, moveEntityToScene, planReparent, applyReparent, assignFreshSortOrder, type EntitySnapshot } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, type EntityClipboard } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
@@ -35,7 +35,7 @@ import { useExpandedSet } from './useExpandedSet';
 import { loadCollapsedGuids, saveCollapsedGuids, computeRestoredCollapse, needsCollapseRestore, shouldPersistCollapse, holdCollapsed, reconcileCollapsed, persistableCollapsedGuids, NO_COLLAPSE_HOLDS, type CollapseHolds, type CollapseOwner } from './hierarchyCollapse';
 import { remapPrefix } from '../utils/assetPaths';
 import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, isRevealRequest, type RevealKey, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
-import { isSceneDirty, adoptParentScene, resolveAffectedScenes } from '../scene/sceneDirty';
+import { isSceneDirty } from '../scene/sceneDirty';
 import { startDragGhost, endDragGhost, armGrabCursor, getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
 import { decideHierarchyAssetDrop } from './assetDropPolicy';
 import { PRIMITIVE_NAMES } from '../../runtime/loaders/primitives';
@@ -1008,19 +1008,19 @@ export default function Hierarchy() {
 
   // ── Copy / Cut / Paste ──
   // Copy holds a deep snapshot (re-spawnable any number of times); Cut remembers
-  // the source id and moves the original on paste (reparent, with its own undo).
-  const [entityClipboard, setEntityClipboard] = useState<{ snapshot: EntitySnapshot; op: 'copy' | 'cut'; sourceId: number } | null>(null);
+  // the source, held by guid AND world (`clipEntity`), and moves the original on paste (reparent, with its own undo).
+  const [entityClipboard, setEntityClipboard] = useState<EntityClipboard | null>(null);
 
   const handleCopy = useCallback((entity: EntityInfo) => {
     if (entity.id === 0 || entity.isResource) return;
-    const snapshot = snapshotEntity(entity.id);
-    if (snapshot) setEntityClipboard({ snapshot, op: 'copy', sourceId: entity.id });
+    const clip = clipEntity(entity.id, 'copy');
+    if (clip) setEntityClipboard(clip);
   }, []);
 
   const handleCut = useCallback((entity: EntityInfo) => {
     if (entity.id === 0 || entity.isResource) return;
-    const snapshot = snapshotEntity(entity.id);
-    if (snapshot) setEntityClipboard({ snapshot, op: 'cut', sourceId: entity.id });
+    const clip = clipEntity(entity.id, 'cut');
+    if (clip) setEntityClipboard(clip);
   }, []);
 
   /** Every Hierarchy reparent goes through here (#1429): the row drop and cut → paste. A parent from
@@ -1031,9 +1031,7 @@ export default function Hierarchy() {
     if (plan.kind === 'refused') {
       // Only the scene-move refusals toast. Self, cycle and resource refusals are refused silently,
       // as a same-scene drop always was.
-      if (plan.reason === 'instance-member') {
-        useEditorStore.getState().showToast('This would split a prefab instance across two scene files: part of it belongs to an instance that stays behind. Move the whole instance, or unpack it first.', 'warn');
-      }
+      if (plan.reason === 'instance-member') useEditorStore.getState().showToast(SCENE_MOVE_REFUSAL_TEXT[plan.reason], 'warn');
       return false;
     }
     if (plan.kind === 'scene-move') {
@@ -1071,38 +1069,21 @@ export default function Hierarchy() {
     if (!entityClipboard) return;
     // ⌘V with a resource row selected pastes at the root: nothing is parented under a resource (#1248).
     const parentId = parentOrRootFor(pasteParentId);
-    const { snapshot, op, sourceId } = entityClipboard;
-    if (op === 'cut') {
+    if (entityClipboard.op === 'cut') {
       // Move the original under the new parent. requestReparent carries its own undo, asks before a
       // move into another scene, and rejects illegal targets (self / descendant) by returning false.
       // The cut is spent only when the move happens: a Cancel at the scene-move prompt keeps it.
+      // A cut from a world that has since been replaced names nothing: it is dropped, never re-aimed.
+      const sourceId = cutSourceId(entityClipboard);
+      if (sourceId == null) {
+        setEntityClipboard(null);
+        useEditorStore.getState().showToast('Not moved: the cut entity is gone, or the scene changed since the cut. Cut it again.', 'warn');
+        return;
+      }
       void requestReparent(sourceId, parentId).then((moved) => { if (moved) setEntityClipboard(null); });
       return;
     }
-    // copy → spawn a fresh deep copy under the target parent, with a unique
-    // sortOrder at the end of that parent's children (so drag-reorder math stays
-    // distinct: `assignFreshSortOrder`, shared with duplicateEntity).
-    // Fresh guids for the pasted copy ONCE (stable across undo/redo, not colliding with the source, and a guid-based
-    // handle that survives a world rebuild), and each node's prefab link by the frame it is a row of (#1756) — the one
-    // function duplicateEntity uses too.
-    const pasteSnapshot = copySnapshot(snapshot);
-    const parentRef = parentId ? entityRef(parentId) : null;
-    const spawn = (p: number) => {
-      const id = respawnFromSnapshot(pasteSnapshot, p);
-      // The copy belongs to its new parent's scene, not the source's (#1429).
-      adoptParentScene(id);
-      assignFreshSortOrder(id, p);
-      return id;
-    };
-    let currentId = spawn(parentId);
-    let ref = entityRef(currentId);
-    selectEntity(currentId);
-    pushAction({
-      label: 'Paste Entity',
-      affectedScenes: resolveAffectedScenes([currentId]),
-      undo: () => { const id = ref.resolve(); if (id != null) deleteEntity(id); selectEntity(null); },
-      redo: () => { currentId = spawn(parentRef?.resolve() ?? parentId); ref = entityRef(currentId); selectEntity(currentId); },
-    });
+    pasteEntityCopy(entityClipboard.snapshot, parentId, selectEntity);
   }, [entityClipboard, selectEntity, requestReparent]);
 
   // ── Focus (frame in SceneView orbit camera — see SceneView F-key) ──
@@ -1575,11 +1556,22 @@ export default function Hierarchy() {
    *  `requestReparent` instead (#1429). `folderPath`
    *  additionally tags the moved root into that folder once landed (used when
    *  the drop target was one of the target scene's OWN folder rows). */
-  const handleMoveToScene = useCallback(async (entityId: number, targetScene: string, folderPath?: string) => {
-    const pre = await preflightSceneMove(entityId, targetScene);
+  const handleMoveToScene = useCallback(async (dropped: number, targetScene: string, folderPath?: string) => {
+    // Refused before the prompt, with the reason (#1757). `moveEntityToScene` asks the same question again when
+    // it runs, so an instance that changed under the prompt is still covered.
+    const toast = useEditorStore.getState().showToast;
+    const plan = planSceneDrop(dropped, targetScene);
+    if (plan.kind === 'same-scene') return;
+    if (plan.kind === 'refused') { toast(SCENE_MOVE_REFUSAL_TEXT[plan.reason], 'warn'); return; }
+    const pre = await preflightSceneMove(dropped, targetScene);
     if (!(await confirmInEditor('Move to another scene?', formatSceneMoveConfirm(pre, targetScene), 'Move'))) return;
+    const entityId = sceneDropTarget(plan);
+    if (entityId == null) { toast('Not moved: the scene changed while the prompt was open. Drag it again.', 'warn'); return; }
     const res = moveEntityToScene(entityId, targetScene);
-    if (!res.ok) return;
+    if (!res.ok) {
+      if (res.reason === 'instance-member') toast(SCENE_MOVE_REFUSAL_TEXT[res.reason], 'warn');
+      return;
+    }
     if (folderPath !== undefined) {
       const eaMeta = eaMetaFind();
       if (eaMeta) writeTraitFieldWithUndo(entityId, eaMeta, 'editorFolder', normalizeFolderPath(folderPath));

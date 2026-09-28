@@ -25,6 +25,7 @@ import {
   findEntity,
   reparentRefusal,
   traitWriteRefusal,
+  fieldWriteRefusal,
 } from '@modoki/engine/runtime';
 import { resolveEntityAddress } from './entityRef';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
@@ -303,6 +304,21 @@ function guardParentWrite(ids: number[], writes: ParsedWrite[]): LiveMutateFailu
   return null;
 }
 
+/** The per-field refusals every generic write path shares (`fieldWriteRefusal`, #1757): a write of
+ *  `EntityAttributes.sourceScene` is a scene move, which a field write cannot carry. Judged per target
+ *  against its own current value, so writing back what an entity already has still passes. */
+function guardFieldWrites(ids: number[], writes: ParsedWrite[]): LiveMutateFailure | null {
+  for (const w of writes) {
+    if (w.field === null) continue;
+    for (const id of ids) {
+      const current = (readTraitDataFull(id, w.meta) as Record<string, unknown> | null)?.[w.field];
+      const refused = fieldWriteRefusal(w.trait, w.field, w.value, current);
+      if (refused) return { ok: false, error: `set key "${w.trait}.${w.field}" on entity ${id}: ${refused} — nothing was applied.` };
+    }
+  }
+  return null;
+}
+
 /** Read the current values of the fields this call touches, for the before/after readback. A write
  *  must be verifiable (conventions §8), and verifying it in the SAME reply is one lease round trip
  *  instead of two. */
@@ -353,6 +369,8 @@ export function applyLiveMutate(
 
   const parentRefusal = guardParentWrite(ids, writes);
   if (parentRefusal) return parentRefusal;
+  const stampRefusal = guardFieldWrites(ids, writes);
+  if (stampRefusal) return stampRefusal;
 
   if (ids.length === 0) {
     // Conventions §8: a no-op is a FAILURE when the caller asked for a change. `{ok:true,

@@ -37,24 +37,30 @@ export function rawSourceScene(entityId: number): string {
   return data?.sourceScene || '';
 }
 
-/** Put a NEWLY CREATED subtree in its parent's scene (#1429, owner option A). Create, paste-copy and
- *  instantiate stamp nothing, so without this a child created under a base entity is primary-owned
- *  under a base parent, the state `planReparent` exists to prevent. Nothing moves, so nothing is
- *  prompted: the subtree is born where it was put. A root keeps its own stamp. Raw writes with no undo:
- *  call it BEFORE the caller snapshots or resolves `affectedScenes`, so redo respawns the stamped copy
- *  and the right scene is marked dirty. Returns the scene the subtree now belongs to. */
+/** The scene a subtree CREATED under `parentId` belongs to: its parent's, or the primary at the root (#1429, #1760). */
+export function createTargetScene(parentId: number): string {
+  return parentId ? rawSourceScene(parentId) : '';
+}
+
+/** Put a NEWLY CREATED subtree in its target's scene (#1429, owner option A): its parent's, or the primary at the
+ *  root. Nothing moves, so nothing is prompted: the subtree is born where it was put. Without this a child created
+ *  under a base entity is primary-owned under a base parent, the state `planReparent` exists to prevent. And a ROOT
+ *  kept whatever stamp it arrived with (#1760): a paste carries its SOURCE's stamp, so a copy of a base entity pasted
+ *  at the root of a level without that base was saved into no file, and lost on reload. A stamp that was AUTHORED
+ *  (an agent `addEntity`) is not re-targeted here: the agent op refuses one that disagrees with this target before
+ *  creating anything (`createTargetScene`; refuse, never re-target — scene-loading.md § Readers of the world).
+ *  Raw writes with no undo: call it BEFORE the caller snapshots or resolves `affectedScenes`, so redo respawns the
+ *  stamped copy and the right scene is marked dirty. Returns the scene the subtree now belongs to. */
 export function adoptParentScene(rootId: number): string {
   const attrMeta = getTraitByName('EntityAttributes');
   const attrs = attrMeta ? readTraitData(rootId, attrMeta) : null;
   if (!attrMeta || !attrs) return '';
-  const own = (attrs.sourceScene as string) || '';
-  const parentId = (attrs.parentId as number) || 0;
-  if (!parentId) return own;
-  const parentScene = rawSourceScene(parentId);
-  if (parentScene !== own) {
-    for (const id of subtreeIds(getAllEntities(), rootId)) writeTraitField(id, attrMeta, 'sourceScene', parentScene);
+  const target = createTargetScene((attrs.parentId as number) || 0);
+  const ids = subtreeIds(getAllEntities(), rootId);
+  for (const id of ids) {
+    if (rawSourceScene(id) !== target) writeTraitField(id, attrMeta, 'sourceScene', target);
   }
-  return parentScene;
+  return target;
 }
 
 /** Resolve the set of BASE scene guids a batch of LIVE entity ids belongs to, deduped

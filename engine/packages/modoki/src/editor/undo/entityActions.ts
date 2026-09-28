@@ -733,6 +733,62 @@ export function duplicateEntity(
   return currentId;
 }
 
+/** What the Hierarchy's Copy / Cut holds. A CUT names its source by `entityRef` AND by the world it was cut in:
+ *  runtime ids are reassigned on every reload, so a raw id held across a scene load, a hot reload or a prefab-edit
+ *  swap named whatever entity held that index afterwards, and ⌘V moved THAT one. */
+export interface EntityClipboard {
+  snapshot: EntitySnapshot;
+  op: 'copy' | 'cut';
+  source: EntityRef;
+  /** A cut's world only: a copy never re-finds its source, and holding a replaced world keeps it alive. */
+  world?: ReturnType<typeof getCurrentWorld>;
+}
+
+/** Take `entityId` onto the clipboard, or null when it has no snapshot. */
+export function clipEntity(entityId: number, op: 'copy' | 'cut'): EntityClipboard | null {
+  const snapshot = snapshotEntity(entityId);
+  // mint:false — cutting must not write a guid into the source; the world check below covers a guid-less one.
+  return snapshot ? { snapshot, op, source: entityRef(entityId, false), ...(op === 'cut' ? { world: getCurrentWorld() } : {}) } : null;
+}
+
+/** The live entity a CUT still names, or null when it names nothing: the world was replaced since the cut (the
+ *  same guid may now belong to another file's entity, #1293), or the entity is gone. Refuse, never re-target. */
+export function cutSourceId(clip: EntityClipboard): number | null {
+  if (clip.world !== getCurrentWorld()) return null;
+  return clip.source.resolve();
+}
+
+/** Paste a copied snapshot under `parentId` (0 = the root) as a fresh deep copy: the Hierarchy's ⌘V after a Copy.
+ *  Fresh guids ONCE and each node's prefab link by its frame (`copySnapshot`, #1756, shared with duplicate), a
+ *  unique sortOrder at the end of the parent's children, and the TARGET's scene (#1760): the parent's, or the
+ *  primary at the root, never the source's stamp — the clipboard outlives a scene load, so that stamp can name a
+ *  scene that is not loaded, and the copy was then saved into no file (`adoptParentScene`). One undo entry. */
+export function pasteEntityCopy(
+  snapshot: EntitySnapshot,
+  parentId: number,
+  selectEntity: (id: number | null) => void,
+): number {
+  const copy = copySnapshot(snapshot);
+  const guid = rootGuidOf(copy);
+  const parentRef = parentId ? entityRef(parentId) : null;
+  const spawn = (p: number): number => {
+    const id = respawnFromSnapshot(copy, p);
+    adoptParentScene(id);
+    assignFreshSortOrder(id, p);
+    return id;
+  };
+  let currentId = spawn(parentId);
+  const affectedScenes = resolveAffectedScenes([currentId]);
+  selectEntity(currentId);
+  _pushAction({
+    label: 'Paste Entity',
+    undo: () => { const id = findByRootGuid(guid) ?? (findEntity(currentId) ? currentId : null); if (id != null) deleteEntity(id); selectEntity(null); },
+    redo: () => { currentId = spawn(parentRef?.resolve() ?? 0); selectEntity(currentId); },
+    affectedScenes,
+  });
+  return currentId;
+}
+
 /** Delete many entities as a SINGLE coalesced undo entry.
  *  - Drops ids whose ancestor is also selected: the ancestor's snapshot already
  *    captures the whole subtree, so deleting both would double-handle it and
@@ -1315,7 +1371,7 @@ function rewriteEntityRefsForGuid(oldGuid: string, newGuid: string): RefRewrite[
 
 export interface SceneMoveResult {
   ok: boolean;
-  reason?: 'no-entity' | 'no-attrs' | 'same-scene' | 'trait-missing';
+  reason?: 'no-entity' | 'no-attrs' | 'same-scene' | 'trait-missing' | SceneMoveRefusal;
   /** Live ids of every entity re-stamped (the subtree, root first). */
   movedIds: number[];
   /** True when the root's parentId was cleared (landed at the target scene's
@@ -1363,6 +1419,10 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   if (!oldAttr) return { ...NULL_MOVE_RESULT, reason: 'no-attrs' };
   const fromScene = (oldAttr.sourceScene as string) || '';
   if (fromScene === targetScene) return { ...NULL_MOVE_RESULT, reason: 'same-scene' };
+  // Asked HERE, inside the move, so no entry point can reach the move without it (#1757): the Hierarchy's
+  // scene-group, scene-folder and empty-area drops called this directly and skipped `planReparent`'s check.
+  const refusal = sceneMoveRefusal(entityId);
+  if (refusal) return { ...NULL_MOVE_RESULT, reason: refusal };
 
   const flat = getAllEntities();
   const byId = new Map(flat.map((e) => [e.id, e]));
@@ -1557,7 +1617,7 @@ export function demoteEntityToScene(entityId: number, opts?: Omit<SceneMoveOptio
  *  A stored instance root dropped inside a base's instance is NOT refused: it becomes that instance's
  *  user-added nested instance, as it does in a same-scene reparent (#1436). */
 export type ReparentPlan =
-  | { kind: 'refused'; reason: ReparentRefusal | 'instance-member' }
+  | { kind: 'refused'; reason: ReparentRefusal | SceneMoveRefusal }
   | { kind: 'same-scene' }
   | { kind: 'scene-move'; from: string; to: string };
 
@@ -1569,13 +1629,56 @@ export function planReparent(entityId: number, newParentId: number): ReparentPla
   const from = rawSourceScene(entityId);
   const to = rawSourceScene(newParentId);
   if (from === to) return { kind: 'same-scene' };
-  const piMeta = getTraitByName('PrefabInstance');
-  const prefabRefusal = piMeta ? sceneMovePrefabRefusal(entityId, piMeta) : null;
-  if (prefabRefusal) return { kind: 'refused', reason: prefabRefusal };
+  // The same question `moveEntityToScene` asks, asked here too so a caller can refuse BEFORE its prompt.
+  const moveRefusal = sceneMoveRefusal(entityId);
+  if (moveRefusal) return { kind: 'refused', reason: moveRefusal };
   return { kind: 'scene-move', from, to };
 }
 
-/** The prefab half of `planReparent` (see its doc for the refusal). */
+/** Why a scene move refuses. */
+export type SceneMoveRefusal = 'instance-member';
+
+/** The editor's words for a refused scene move: the Hierarchy toasts this for every drop that asks. */
+export const SCENE_MOVE_REFUSAL_TEXT: Record<SceneMoveRefusal, string> = {
+  'instance-member': 'This would split a prefab instance across two scene files: part of it belongs to an instance that stays behind. Move the whole instance, or unpack it first.',
+};
+
+/** Why moving `entityId`'s subtree into another scene file is refused, or null when it may move (#1757). The ONE
+ *  scene-move refusal: `moveEntityToScene` asks it before it writes anything, so every move is covered however it
+ *  arrives (a Hierarchy row drop, a scene-group / scene-folder / empty-area drop, cut → paste, the agent
+ *  `reparent-entity`). `planReparent` and the Hierarchy's group drops ask it too, only to refuse before their
+ *  prompt. The target scene does not enter into it: the instance splits whichever file the subtree goes to. */
+/** What a Hierarchy drop that lands at a scene's ROOT means (a scene GROUP row, one of its folder rows, the empty
+ *  area): nothing when the entity is already that scene's, a refusal, or a move. A `move` carries the entity by guid
+ *  AND the world the person dropped it in, for `sceneDropTarget` after the prompt. */
+export type SceneDropPlan =
+  | { kind: 'same-scene' }
+  | { kind: 'refused'; reason: SceneMoveRefusal }
+  | { kind: 'move'; entity: EntityRef; world: ReturnType<typeof getCurrentWorld> };
+
+export function planSceneDrop(entityId: number, targetScene: string): SceneDropPlan {
+  // Before the refusal: it ignores the target, so a member dropped on its OWN scene's group would be told it splits
+  // an instance, for a drop that crosses no file.
+  if (rawSourceScene(entityId) === targetScene) return { kind: 'same-scene' };
+  const reason = sceneMoveRefusal(entityId);
+  if (reason) return { kind: 'refused', reason };
+  return { kind: 'move', entity: entityRef(entityId), world: getCurrentWorld() };
+}
+
+/** The live entity a confirmed drop may still move, or null: the world was replaced while the prompt was open (a
+ *  scene load or reload; the same guid may belong to another file's entity there, and the target scene may not be
+ *  loaded at all), or the entity is gone. Refuse, never re-target. `moveEntityToScene` re-asks the refusal itself. */
+export function sceneDropTarget(plan: Extract<SceneDropPlan, { kind: 'move' }>): number | null {
+  if (plan.world !== getCurrentWorld()) return null;
+  return plan.entity.resolve();
+}
+
+export function sceneMoveRefusal(entityId: number): SceneMoveRefusal | null {
+  const piMeta = getTraitByName('PrefabInstance');
+  return piMeta ? sceneMovePrefabRefusal(entityId, piMeta) : null;
+}
+
+/** The prefab half of `sceneMoveRefusal` (see `planReparent`'s doc for the refusal). */
 function sceneMovePrefabRefusal(entityId: number, piMeta: TraitMeta): 'instance-member' | null {
   const flat = getAllEntities();
   const byId = new Map(flat.map((e) => [e.id, e]));

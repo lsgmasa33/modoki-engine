@@ -29,3 +29,21 @@ export function traitRemoveRefusal(name: string): string | null {
 export function traitWriteRefusal(name: string): string | null {
   return name === PREFAB_LINK ? LINK_REFUSAL : null;
 }
+
+/** Why a generic write of `trait.field` to `value` is refused, or null when it is allowed (#1757).
+ *
+ *  `EntityAttributes.sourceScene` names the scene FILE that saves the entity. Changing it is a scene move, and a
+ *  scene move re-stamps the whole subtree, marks both files dirty and refuses to split a prefab instance across two
+ *  files (`moveEntityToScene`). A field write did none of that: it stamped one entity, left its children and
+ *  instance rows in the old file, and could name a scene that is not loaded, so the entity was saved into no file.
+ *  A write of the value the entity already has changes nothing and passes (`current`), so a read → write round
+ *  trip still works. The file-direct path passes `current` as the file's own value, which is always '' there:
+ *  a scene file never stores a stamp, the loader sets it from which file it read. */
+export function fieldWriteRefusal(trait: string, field: string, value: unknown, current: unknown): string | null {
+  if (trait !== 'EntityAttributes' || field !== 'sourceScene') return null;
+  // Only a STRING equal to the current stamp passes: `null`/`0`/`false` read as '' downstream but would be stored.
+  if (typeof value === 'string' && value === ((current as string) || '')) return null;
+  return 'EntityAttributes.sourceScene is which scene file saves the entity, and it changes only by a scene move, '
+    + 'which carries the whole subtree with it: reparent-entity with moveToScene: true under a parent in that scene '
+    + '(or, in the editor, drag the entity onto that scene\'s group in the Hierarchy)';
+}

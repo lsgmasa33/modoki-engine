@@ -25,6 +25,7 @@ export {
   planReparent, applyReparent, type ReparentPlan,
 } from './undo/entityActions';
 export { preflightSceneMove, formatSceneMoveConfirm } from './scene/sceneMoveScan';
+export { createTargetScene } from './scene/sceneDirty';
 export {
   emptySpecs, primitiveSpecs, shape2DSpecs, canvas2DSpecs, uiSpecs, cameraSpecs, lightSpecs, environmentSpecs, particleSpecs,
   buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type LightKind,

@@ -44,7 +44,7 @@ import {
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
   isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEditReport, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, ensureGuid, type TraitSpec,
-  planReparent, applyReparent, type ReparentPlan, preflightSceneMove, formatSceneMoveConfirm,
+  planReparent, applyReparent, type ReparentPlan, preflightSceneMove, formatSceneMoveConfirm, createTargetScene,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
@@ -82,7 +82,7 @@ import {
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid, resolveRef,
-  getAllTraits, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, type MutateOp, type MutateEntityRef,
+  getAllTraits, readTraitData, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
   sceneManager, assetUrl, type AssetSchemaType, collectHandles, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
@@ -944,6 +944,10 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             continue;
           }
           let fields = op.fields ?? {};
+          // A sourceScene write is a scene move, which a field write cannot carry (#1757) — the file path's refusal, live.
+          const current = readTraitData(id, meta);
+          const fieldRefused = Object.entries(fields).map(([f, v]) => fieldWriteRefusal(meta.name, f, v, current?.[f])).find((r) => r);
+          if (fieldRefused) { errors.push(`${where}: ${fieldRefused} — nothing was applied to entity ${id}`); continue; }
           if (op.space === 'world') {
             const converted = worldFieldsToLocalLive(id, fields);
             if ('error' in converted) { errors.push(`${where}: ${converted.error}`); continue; }
@@ -1059,6 +1063,15 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             // Same fallback as an unresolvable parent: the entity is still created, somewhere that is saved (#1248).
             warnings.push(`${where}: parent ${parentId} is a resource (Time, Input, a config singleton) and holds no children — parented to the scene root instead`);
             parentId = 0;
+          }
+          // A created entity is saved with its parent's scene, or the primary's at the root (#1760). An authored stamp
+          // naming another scene is an explicit request the create cannot honour, so it is refused rather than
+          // re-targeted into a file the caller did not ask for (scene-loading.md § Readers of the world).
+          const authoredStamp = authoredEa && typeof authoredEa === 'object' ? (authoredEa as { sourceScene?: unknown }).sourceScene : undefined;
+          const landsIn = createTargetScene(parentId);
+          if (authoredStamp !== undefined && authoredStamp !== landsIn) {
+            errors.push(`${where}: EntityAttributes.sourceScene names ${typeof authoredStamp === 'string' ? loadedSceneName(authoredStamp) : JSON.stringify(authoredStamp)}, but an entity created ${parentId ? `under ${parentId}` : 'at the root'} is saved in ${loadedSceneName(landsIn)}: a new entity belongs to its parent's scene, or the primary at the root. To create it in that scene, create it under a parent that belongs to it, or open that scene itself. Nothing was created`);
+            continue;
           }
           const specs: TraitSpec[] = Object.entries(op.traits ?? {}).map(([name, data]) => ({
             name, data: data === true ? undefined : data as Record<string, unknown>,

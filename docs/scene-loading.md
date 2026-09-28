@@ -1288,10 +1288,17 @@ Tests: `engine/tests/editor/rebuildKeepsSourceScene.test.ts`,
   | Entry point | How the move is confirmed |
   |---|---|
   | Hierarchy row drop, cut → paste | the editor's own modal (`confirmInEditor`), text from `formatSceneMoveConfirm` |
+  | Hierarchy drop on a scene GROUP row, on a scene's FOLDER row, or on the empty area (demote) | the same modal (`handleMoveToScene`). These land at the target scene's root, so they ask `planSceneDrop` rather than `planReparent`: a drop on the entity's OWN scene is a no-op, not a refusal. After the modal, `sceneDropTarget` refuses if the world was replaced while it was open (the guid may name another file's entity there), then `moveEntityToScene` |
   | agent `reparent-entity` / `modoki_reparent_entity` | refused with that same text until re-sent with `moveToScene: true` |
   | agent `apply-scene-ops` `setTrait parentId` | refused per op, naming `reparent-entity {moveToScene}`: a batch has no confirm step. A SAME-scene write is a full `reparentEntity` (unpack on move, world-pose compensation, folder clear), not a bare field write — the bare write left a moved member linked, and the save dropped it (#1434). A string parent is a guid; one matching no live entity is refused |
+  | a generic write of `EntityAttributes.sourceScene`: `apply-scene-ops` / `modoki_mutate_scene` `setTrait`, `set-traits` (eval `modoki.setTraits`), file-direct `scene-mutate` (setTrait and addEntity) | **refused**, naming the scene move (`fieldWriteRefusal`, `traitEditPolicy.ts`). A field write stamped one entity and not its subtree, and could name a scene that is not loaded (#1757). Writing back the value the entity already has passes |
 
-  One prefab case is **refused**, because a scene move cannot carry `reparentEntity`'s
+  One prefab case is **refused**, by `sceneMoveRefusal`, **which `moveEntityToScene` asks itself before it writes
+  anything** — so no entry point can reach a move without it. `planReparent` and the Hierarchy's group/folder/
+  empty-area drops ask the same function only to refuse BEFORE their prompt, with the reason in a toast
+  (`SCENE_MOVE_REFUSAL_TEXT`). It was once asked by `planReparent` alone, and the three Hierarchy drops that call
+  `moveEntityToScene` directly split instances across two files; a later edit to the moved member was never
+  saved (#1757). It exists because a scene move cannot carry `reparentEntity`'s
   "unpack on move": `instance-member`, where something in the moved subtree is linked to an
   instance that stays behind. That covers a member, an owned nested root whose outer instance is
   not moving, and a member held under a plain added child. Moving it would split the instance
@@ -1299,9 +1306,15 @@ Tests: `engine/tests/editor/rebuildKeepsSourceScene.test.ts`,
   under a base instance's member is NOT refused: it moves and becomes that instance's user-added
   nested instance, exactly as in a same-scene drop (#1436, below).
 
-  A subtree **created**
-  under a base entity (create, paste-copy, prefab instantiate) is stamped into the parent's
-  scene with no prompt, since nothing moves (`adoptParentScene`, owner option A).
+  A subtree **created** (create, paste-copy, prefab instantiate, agent `addEntity`) is stamped for
+  its TARGET with no prompt, since nothing moves (`adoptParentScene`, owner option A): its parent's
+  scene, or the primary at the root (`createTargetScene`). A root used to keep the stamp it arrived
+  with, and a paste arrives with its SOURCE's — the Hierarchy clipboard outlives a scene load, so a
+  base entity copied in one level and pasted at the root of another was stamped for a scene that was
+  not loaded and saved into no file (#1760). An AUTHORED stamp (agent `addEntity` with
+  `EntityAttributes.sourceScene`, `''` included) that disagrees with that target is **refused**, not re-targeted
+  (§ Readers of the world). A Cut holds its source by guid AND world (`clipEntity`/`cutSourceId`):
+  after a world swap it names nothing and ⌘V says so, where a raw id moved whatever held that index.
   `reparentEntity` still hard-rejects a cross-scene parent as the backstop for any direct
   caller, and `SceneManager` warns at load time when a FILE already holds one.
   Promote/demote *changes* `sourceScene`, so it satisfies the rule rather than relaxing it.

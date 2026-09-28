@@ -434,6 +434,7 @@
   "faultProvider",
   "fetchRelease",
   "fetchShaderManifest",
+  "fieldWriteRefusal",
   "fillMegapixelsPerMs",
   "findChromeEntity",
   "findEntity",
