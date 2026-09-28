@@ -50,11 +50,29 @@ export function chainSlots(base: FrameBase): LevelSlot[] {
   return out;
 }
 
+/** Where a template REFERENCE node above `base`'s chain states the frame's members (#1731): the rows below the node down to
+ *  the frame — its `nestedOverrides` path — and their `nodeGuid`s, as {@link chainSlots} builds a row slot's. The node's
+ *  member rows are keyed as a row's are, so {@link memberKeyAt} names a member in them. */
+export function nodeSlot(base: FrameBase): { path: number[]; pathGuids: string[] | null } {
+  const { levels } = base;
+  const path: number[] = [];
+  let guids: string[] | null = [];
+  for (let i = 1; i < levels.length; i++) {
+    const step = levels[i]!.step;
+    if (step.kind !== 'row') { guids = null; break; }
+    path.push(step.row);
+    const g = levels[i - 1]!.doc?.entities.find((e) => e.localId === step.row)?.nodeGuid;
+    if (g && guids) guids.push(g);
+    else guids = null;
+  }
+  return { path, pathGuids: guids };
+}
+
 /** The member-row key for member `lid` of the frame (document `frameDoc`) at `slot`, or null when none can name it: a
  *  row on the path or the member itself has no `nodeGuid`. The frame's own ROOT is named by the path alone — the row a
  *  level states about a nested root is forwarded to it (`foldMemberRowChannels`' `forwardRoot`) — and has none where the
  *  slot's row expands the frame (its statements are the row's own `overrides`). */
-export function memberKeyAt(slot: LevelSlot, frameDoc: PrefabFile, lid: number): string | null {
+export function memberKeyAt(slot: Pick<LevelSlot, 'pathGuids'>, frameDoc: PrefabFile, lid: number): string | null {
   if (!slot.pathGuids) return null;
   if (lid === (frameDoc.rootLocalId ?? 1)) return slot.pathGuids.length ? `/${slot.pathGuids.join('/')}` : null;
   const g = frameDoc.entities.find((e) => e.localId === lid)?.nodeGuid;

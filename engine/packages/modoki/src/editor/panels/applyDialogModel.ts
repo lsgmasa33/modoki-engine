@@ -1,14 +1,17 @@
-/** The Apply dialog's target DECISIONS (#1693, owner ruling C) — which prefab each checked override is written to, as
- *  plain data the `.tsx` renders (CLAUDE.md: a panel's decisions live beside it in a `.ts`, with the unit tests).
+/** The Apply dialog's DECISIONS (#1693, owner ruling C; #1736) — which prefab each checked override is written to, and
+ *  what the dialog says about it — as plain data the `.tsx` renders (CLAUDE.md: a panel's decisions live beside it in a
+ *  `.ts`, with the unit tests).
  *
- *  Each listed key arrives with its targets (`applyTargetOptions`: the prefabs on the instance's chain it can go to,
- *  each with a truthful label and the enclosing overrides it would revert, U13) and its default (ruling (a)). The dialog
- *  shows, per row, the label of the target it is set to, a picker when there is more than one, and a footer naming every
- *  file the checked rows will write. "Apply all to …" moves every row that CAN go there, and leaves the rest where
- *  they are. */
+ *  Each listed key arrives with its targets (`applyTargetOptions`: the prefabs on the instance's chain it can go to) and
+ *  its default (ruling (a)). What applying the checked keys at their chosen targets DOES is not worked out here: the
+ *  dialog asks the engine for a dry run of exactly that Apply (`previewApply`), and every row, the "Writes:" footer and
+ *  the conflict line RENDER its per-key effects (#1736). A row's words used to be computed key by key, so the dialog
+ *  could not see two frames writing one template field, or one frame's write hiding another's U13 revert. */
 
 import type { KeyTargets, ApplyTargetOption } from '../scene/prefabApplyOptions';
 import type { ApplyTargets } from '../scene/prefabApplyTargets';
+import type { ApplyPreview, ApplyResult } from '../scene/prefab';
+import { describeEffect } from '../scene/prefabApplyEffects';
 
 /** key → the chosen target (a prefab guid). */
 export type TargetChoice = Readonly<Record<string, string>>;
@@ -48,24 +51,64 @@ export function hasChoice(options: ReadonlyMap<string, KeyTargets>, key: string)
   return (options.get(key)?.options.length ?? 0) > 1;
 }
 
-/** The prefab files the CHECKED keys write, by display name, in first-seen order: each key's target, and every
- *  enclosing prefab whose override it reverts (U13). The dialog's footer. */
-export function filesWritten(choice: TargetChoice, options: ReadonlyMap<string, KeyTargets>, checked: Iterable<string>): string[] {
-  const out: string[] = [];
-  const add = (name: string) => { if (!out.includes(name)) out.push(name); };
-  for (const key of checked) {
-    const o = chosenOption(choice, options, key);
-    if (!o) continue;
-    add(o.name);
-    for (const r of o.alsoReverts) add(r.name);
-  }
-  return out;
-}
-
 /** The request for `applyToPrefabWithUndo`: each checked key's chosen target. A key without a target is left to the
  *  engine's default. */
 export function toApplyTargets(choice: TargetChoice, checked: Iterable<string>): ApplyTargets {
   const perKey: Record<string, string> = {};
   for (const key of checked) if (choice[key]) perKey[key] = choice[key]!;
   return { perKey };
+}
+
+/** What a preview was computed FOR — the instance, the checked keys and their targets — so a result that arrives after
+ *  the selection moved on is recognised as stale and never rendered or applied from. Order-free. The instance is part
+ *  of it: two instances of one prefab list the same keys, and reopened on the other, the first one's preview passed. */
+export function previewRequestKey(root: number | null, choice: TargetChoice, checked: Iterable<string>): string {
+  return `${root ?? ''}\n${[...checked].sort().map((k) => `${k}→${choice[k] ?? ''}`).join('\n')}`;
+}
+
+/** Does the dialog stay open after an Apply (#1736)? Only for a REFUSAL that carries the plan it refused — a conflict,
+ *  or a plan that changed since it was shown: the dialog re-reads it and shows why. An Apply that wrote nothing
+ *  because every key was passed over carries effects too, and closing with its notice is right there — kept open, every
+ *  click toasted and nothing changed. */
+export function staysOpen(result: Pick<ApplyResult, 'applied' | 'refused' | 'effects'>): boolean {
+  return !result.applied && !!result.refused && !!result.effects;
+}
+
+/** The prefab FILES the plan writes, by file name, each once (#1733): it printed the display name with `.prefab.json`
+ *  after it — "Wooden Door.prefab.json", which does not exist — and two prefabs sharing a name were listed as one. */
+export function filesWritten(preview: Pick<ApplyPreview, 'files'> | null): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const f of preview?.files ?? []) {
+    if (seen.has(f.source)) continue;
+    seen.add(f.source);
+    out.push(f.file);
+  }
+  return out;
+}
+
+/** How one row reads: its effect in a sentence, its tone, what U13 reverts with it, and a consequence the effect alone
+ *  does not say. Null for a key the preview has no effect for (unchecked, or a key the plan passes over quietly). */
+export interface RowView { label: string; tone: 'ok' | 'notApplied' | 'conflict'; reverts: string[]; note?: string }
+
+export function rowView(preview: Pick<ApplyPreview, 'effects'> | null, key: string): RowView | null {
+  const e = preview?.effects.find((x) => x.key === key);
+  if (!e) return null;
+  const tone = e.effect.op === 'conflict' ? 'conflict' : e.effect.op === 'notApplied' ? 'notApplied' : 'ok';
+  return {
+    label: describeEffect(e),
+    tone,
+    reverts: e.alsoReverts.flatMap((r) => r.what.map((w) => `also reverts Prefab '${r.name}': ${w} — Prefab '${r.name}' is written too`)),
+    ...(e.note ? { note: e.note } : {}),
+  };
+}
+
+/** Why Apply cannot run on this preview, or null when it can: a refusal, a conflict (#1736 — both rows say which), or a
+ *  preview that is not of the current selection (`current` ≠ the request it was computed for). */
+export function applyBlocked(preview: (Pick<ApplyPreview, 'conflicts' | 'refused'> & { request: string }) | null, current: string): string | null {
+  if (!preview || preview.request !== current) return 'Working out what this Apply writes…';
+  if (preview.refused) return `Cannot apply: ${preview.refused}`;
+  const n = preview.conflicts.length;
+  if (n) return `Cannot apply: ${n} conflict${n === 1 ? '' : 's'} — checked changes write the same field with different values (see the red lines)`;
+  return null;
 }

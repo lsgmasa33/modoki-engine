@@ -269,6 +269,16 @@ from `modoki_list_assets` in `engine/tools/modoki-mcp/src/tools/scene.ts`.
 one trait's full field schema. The usage pattern is: know what exists, then fetch one schema before
 a `setTrait`.
 
+### `modoki_prefab overrides` — per-key Apply effects (#1736, measured 2026-09-28)
+
+`overrides` answers each key's EFFECT at its default target (one dry run of that Apply) instead of a sentence per
+target option. Measured headlessly on one outer instance holding 20 nested frames with 5 edited Transform fields each
+(100 `keys.nested`): **53,638 chars before → 55,350 after (+1,712, +3.2%)**, under the 60,000 cap. The first cut,
+which repeated each effect's target guid and name, measured **61,550** and crossed the cap; the target is
+`targets[key].defaultTarget` already, so the effect map carries only `op`, `effect`, and `alsoReverts`/`note` when
+present. An instance past ~110 such keys was already near the cap before this change; `apply {dryRun}` is the per-target
+read.
+
 ## `modoki_batch` — the one place suppressing a payload is CORRECT
 
 Every other rule in this doc is about making a payload *smaller*. `modoki_batch` is the one place a

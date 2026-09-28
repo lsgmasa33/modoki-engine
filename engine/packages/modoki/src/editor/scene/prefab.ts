@@ -46,8 +46,11 @@ import { frameBase, chainLayer, docChainLayer, layerAddedTraits, levelDoc, owned
 import { templateValueWriter, type TemplateValueWriter } from './prefabTemplateValue';
 import {
   chainSlots, memberKeyAt, writeStated, dropStated, writeRemoval, writeMemberRemoval, statedFields, traitInside, resolveKeyLevel, carrierOf,
-  type ApplyTargets, type LevelSlot,
+  nodeSlot, type ApplyTargets, type LevelSlot,
 } from './prefabApplyTargets';
+import {
+  conflictRefusal, effectsFingerprint, prefabFileName, formatEffectValue, REMOVED_VALUE, type ApplyConflict, type EditEffect, type KeyEffect,
+} from './prefabApplyEffects';
 import { rebaseMemberTokens, isMemberToken, parseMemberToken, memberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
 
 /** Fields that persist in a SCENE but must never be baked into a prefab TEMPLATE,
@@ -4604,6 +4607,8 @@ function insertAddedSubtree(
   tokens?: {
     writer: TemplateValueWriter; pathOfRow: (lid: number) => MemberStep[] | undefined; rowPaths: Map<number, MemberStep[]>;
     promoted: { row: PrefabFile['entities'][number]; at: number }[];
+    /** A dry run (#1736): the re-capture below reads each node's template key and never stamps one on the live world. */
+    readOnly?: boolean;
   },
 ): void {
   const myLocalId = nextId.v++;
@@ -4626,8 +4631,8 @@ function insertAddedSubtree(
     const liveChild = liveEcs ? getCachedPrefabSync(node.prefab) : null;
     let recaptured: { added?: AddedEntity[]; nestedStructure?: NestedStructurePaths; members?: Record<string, SceneMemberRow> } | undefined;
     if (liveChild) {
-      const ref = captureInstanceReference(liveEcs, node.prefab, liveChild, { template: true });
-      const rc = captureRowChannels(liveEcs, node.prefab, liveChild, ref, false);
+      const ref = captureInstanceReference(liveEcs, node.prefab, liveChild, { template: true, readOnly: tokens?.readOnly });
+      const rc = captureRowChannels(liveEcs, node.prefab, liveChild, ref, false, !!tokens?.readOnly);
       recaptured = { added: ref.added, nestedStructure: rc.nestedStructure, members: rc.members };
     }
     const refRow: PrefabFile['entities'][number] = {
@@ -4840,6 +4845,8 @@ function movedRowsOf(prefab: PrefabFile, instanceMoved: Record<number, string>):
  *  own nested rows (#1480). */
 function promoteReferenceMoves(
   prefab: PrefabFile, node: AddedEntity, rowLid: number, localToEcs: Map<number, number>, instancePaths: Map<string, MemberStep[]>,
+  /** A dry run (#1736): the same carry, said nowhere. */
+  quiet = false,
 ): void {
   const refRoot = localToEcsGuid(node.guid);
   const eaMeta = getTraitByName('EntityAttributes');
@@ -4894,7 +4901,7 @@ function promoteReferenceMoves(
     const memberPath = inRef.get(guidForEntityId(ecsId));
     const targetPath = inRef.has(target) ? [...rowPath, ...inRef.get(target)!] : instancePaths.get(target);
     if (!memberPath || !targetPath) {
-      console.warn(`[Prefab] a move inside the promoted instance "${node.name}" names something outside this prefab; it was not carried`);
+      if (!quiet) console.warn(`[Prefab] a move inside the promoted instance "${node.name}" names something outside this prefab; it was not carried`);
       continue;
     }
     prefab.moved = { ...prefab.moved, [memberPathKey([...rowPath, ...memberPath])]: memberToken(0, targetPath) };
@@ -4934,6 +4941,10 @@ export interface ApplyResult {
   targets?: { key: string; target: string }[];
   /** U13: enclosing overrides this Apply reverted because the applied value would otherwise be shadowed, per prefab. */
   alsoReverted?: { source: string; keys: string[] }[];
+  /** What each selected key did, as the plan computed it and the commit wrote it (#1736): every surface renders these. */
+  effects?: KeyEffect[];
+  /** Keys that state one slot with different values (#1736). Present only on a refusal: a conflict applies nothing. */
+  conflicts?: ApplyConflict[];
   /** Every `validatePrefabData` warning `warnInertPrefabSizes` reported for the written template (an
    *  inert size is one kind, not the only one), present only when `applied`. The editor Console
    *  already shows them; this is for a caller whose reader is not the Console — the agent `apply` op
@@ -5075,6 +5086,39 @@ export interface ApplyPlan {
   applied: { key: string; target: string }[];
   /** U13: the enclosing overrides an Apply to an inner prefab reverted, per prefab (#1693). */
   alsoReverted: { source: string; keys: string[] }[];
+  /** What each selected key does (#1736), in the caller's spelling — the one statement every surface renders. */
+  effects: KeyEffect[];
+  /** Slots two keys write with different values (#1736). Non-empty → the Apply is refused whole. */
+  conflicts: ApplyConflict[];
+}
+
+/** What an Apply WOULD do, computed by the same plan the commit executes and written nowhere (#1736): the dialog's rows
+ *  and footer and the agent op's `dryRun`/`overrides` render it. `files` is every prefab file the plan writes, innermost
+ *  first. `fingerprint` is what the dialog hands back to `applyToPrefabSelective`, which refuses when the fresh plan
+ *  differs from the one shown. */
+export interface ApplyPreview {
+  refused?: string;
+  effects: KeyEffect[];
+  conflicts: ApplyConflict[];
+  skipped: { key: string; reason: string }[];
+  files: { source: string; name: string; file: string }[];
+  fingerprint: string;
+}
+
+export async function previewApply(rootInstanceId: number, selectedKeys: Set<string>, targets?: ApplyTargets): Promise<ApplyPreview> {
+  const plan = await planApply(rootInstanceId, new Set(selectedKeys), targets, { dryRun: true });
+  if ('result' in plan) {
+    const r = plan.result;
+    const effects = r.effects ?? [];
+    return { ...(r.refused ? { refused: r.refused } : {}), effects, conflicts: r.conflicts ?? [], skipped: r.skipped ?? [], files: [], fingerprint: effectsFingerprint(effects) };
+  }
+  // A plan with a conflict writes NOTHING (the commit refuses it), so it names no file: a "Writes:" footer beside
+  // "Cannot apply" said the opposite of what Apply does.
+  const files = plan.conflicts.length ? [] : plan.writes.map((w) => {
+    const path = isGuid(w.source) ? resolveRef(w.source) ?? w.source : w.source;
+    return { source: w.source, name: w.doc.name || w.source, file: prefabFileName(path) };
+  });
+  return { effects: plan.effects, conflicts: plan.conflicts, skipped: plan.skipped, files, fingerprint: effectsFingerprint(plan.effects) };
 }
 
 export async function applyToPrefabSelective(
@@ -5082,9 +5126,28 @@ export async function applyToPrefabSelective(
   selectedKeys: Set<string>,
   /** Where each key is written (#1693): a prefab on the instance's chain. Absent → each key's default. */
   targets?: ApplyTargets,
+  /** `ApplyPreview.fingerprint` of what the caller SHOWED (#1736): a fresh plan that differs is refused, not written. */
+  opts: { expect?: string } = {},
 ): Promise<ApplyResult> {
+  // Both refusals are decided on a DRY plan (#1736 review): the writing plan's promotion stamps template keys on the live
+  // nodes, a change no undo records, which a refused Apply left behind.
+  const dry = await planApply(rootInstanceId, new Set(selectedKeys), targets, { dryRun: true });
+  // A refusal or a no-op is answered from the DRY plan too: the writing plan could only reach it after promoting.
+  if ('result' in dry) {
+    const r = dry.result;
+    if (r.refused) console.warn(`[Prefab] apply refused: ${r.refused}`);
+    for (const { key, reason } of r.skipped ?? []) console.warn(`[Prefab] ${key} was not applied: ${reason}`);
+    return r;
+  }
+  // Two keys stating one slot with different values: no silent last-write-wins (#1727). Nothing is written.
+  if (dry.conflicts.length) return { ...NOOP_APPLY, refused: conflictRefusal(dry.conflicts), effects: dry.effects, conflicts: dry.conflicts };
+  if (opts.expect !== undefined && effectsFingerprint(dry.effects) !== opts.expect) {
+    return { ...NOOP_APPLY, refused: 'what this Apply would do changed since it was shown — review it again', effects: dry.effects };
+  }
   const plan = await planApply(rootInstanceId, selectedKeys, targets);
-  return 'result' in plan ? plan.result : commitApplyPlan(plan);
+  if ('result' in plan) return plan.result;
+  if (plan.conflicts.length) return { ...NOOP_APPLY, refused: conflictRefusal(plan.conflicts), effects: plan.effects, conflicts: plan.conflicts };
+  return commitApplyPlan(plan);
 }
 
 /** The computing half of Apply: reads the instance and the prefab, and returns the documents to write — or, for a
@@ -5093,6 +5156,8 @@ async function planApply(
   rootInstanceId: number,
   selectedKeys: Set<string>,
   targets?: ApplyTargets,
+  /** A dry run (#1736, `previewApply`): the same plan, and nothing stamped on the live world or logged. */
+  { dryRun = false }: { dryRun?: boolean } = {},
 ): Promise<ApplyPlan | { result: ApplyResult }> {
   // ⚠️ Read the instance's values only from an AUTHORED world (#1548). Apply copies live trait values
   // into the template, and a pose or a Play value on the instance shows up as an override the dialog
@@ -5121,19 +5186,19 @@ async function planApply(
   }
   const ctx = resolveInstanceContext(rootInstanceId);
   if (!ctx) {
-    console.warn('[Prefab] Selected entity is not a prefab instance');
+    if (!dryRun) console.warn('[Prefab] Selected entity is not a prefab instance');
     return { result: NOOP_APPLY };
   }
   const { source } = ctx;
 
   const oldPrefab = await getPrefabSource(source);
   if (!oldPrefab) {
-    console.warn(`[Prefab] Cannot apply: source prefab not in cache: ${source}`);
+    if (!dryRun) console.warn(`[Prefab] Cannot apply: source prefab not in cache: ${source}`);
     return { result: NOOP_APPLY };
   }
 
   if (selectedKeys.size === 0) {
-    console.log('[Prefab] Nothing selected; aborting apply.');
+    if (!dryRun) console.log('[Prefab] Nothing selected; aborting apply.');
     return { result: NOOP_APPLY };
   }
 
@@ -5146,7 +5211,7 @@ async function planApply(
   // before anything moves. Older documents are unaffected and still stamp forward: this is a
   // one-sided comparison, never `!==` — every authored prefab in the corpus is below the constant.
   if (typeof oldPrefab.version === 'number' && oldPrefab.version > PREFAB_FORMAT_VERSION) {
-    console.error(
+    if (!dryRun) console.error(
       `[Prefab] cannot apply to "${source}" — it was written by a newer build (prefab format ` +
       `${oldPrefab.version}; this build writes ${PREFAB_FORMAT_VERSION}). Applying would rewrite ` +
       'the document with this build\'s serializer and re-stamp it downwards, discarding whatever ' +
@@ -5165,7 +5230,7 @@ async function planApply(
   const staleFrames = framesBuiltFromOtherRows(rootInstanceId);
   if (staleFrames.length) {
     const why = staleFramesRefusal(staleFrames);
-    console.error(`[Prefab] cannot apply: ${why}`);
+    if (!dryRun) console.error(`[Prefab] cannot apply: ${why}`);
     return { result: { ...NOOP_APPLY, refused: why } };
   }
 
@@ -5229,6 +5294,7 @@ async function planApply(
     },
     rowPaths: promotedPaths,
     promoted: [] as { row: PrefabFile['entities'][number]; at: number }[],
+    readOnly: dryRun,
   };
 
   // Capture the live structural diff so `+added`/`-removed`/`-trait` keys can be
@@ -5246,8 +5312,10 @@ async function planApply(
   const nextLocalId = { v: Math.max(0, ...newPrefab.entities.map((e) => e.localId)) + 1 };
   let rowsReparented = false;
   const skipped: { key: string; reason: string }[] = [];
-  const innerTags: { lid: number; tag: string }[] = [];
-  const innerRemovals: { lid: number; trait: string }[] = [];
+  const innerTags: { key: string; lid: number; tag: string }[] = [];
+  const innerRemovals: { key: string; lid: number; trait: string }[] = [];
+  /** The frame's own field keys, each with the fields it took out of the instance (`appliedFields`): U13 per key. */
+  const innerFields: { key: string; lid: number; trait: string; fields: string[] }[] = [];
   const movedKeys: string[] = [];
   const promotedRows = new Map<string, number>(); // live guid of a promoted added node → its new row
   const promotedRefRows = new Map<string, number>(); // …and of a promoted reference node → its nested row (#1660)
@@ -5270,6 +5338,68 @@ async function planApply(
     if (!selectedKeys.delete(key)) continue;
     skipped.push({ key: canon.original.get(key) ?? key, reason: 'the prefab enclosing this instance authors it, not this instance' });
   }
+
+  // ── What each key does (#1736): recorded where it is written, so every surface renders this plan, never re-derives it ──
+  const ownName = oldPrefab.name || source;
+  const effectOf = new Map<string, KeyEffect>();
+  const setEffect = (key: string, target: string, targetName: string, asOverride: boolean, effect: EditEffect): void => {
+    effectOf.set(key, { key, target, targetName, asOverride, effect, alsoReverts: [] });
+  };
+  /** The live member's name, else its row's. */
+  function memberNameIn(frameRoot: number, frameDoc: PrefabFile, lid: number): string {
+    const ecs = memberOf(frameRoot, lid);
+    const live = ecs && eaMetaForApply ? (readTraitData(ecs, eaMetaForApply)?.name as string) : '';
+    return live || frameDoc.entities.find((e) => e.localId === lid)?.name || `member ${lid}`;
+  }
+  /** What a SLOT is (#1736, #1728): one field of one member, stated in one document at one place in it — the row
+   *  `rowLid` and the path below it for an override on an enclosing prefab, none for a template's own row. The pool
+   *  hands out one document object per prefab, so the object names the prefab. A statement is never keyed coarser
+   *  than this: keyed by document alone, one frame's write was taken for another frame's (#1728). */
+  const docIds = new WeakMap<PrefabFile, number>();
+  let nextDocId = 0;
+  const docId = (d: PrefabFile): number => {
+    let i = docIds.get(d);
+    if (i === undefined) docIds.set(d, (i = nextDocId++));
+    return i;
+  };
+  const slotOf = (d: PrefabFile, rowLid: number | '', path: readonly number[], lid: number, trait: string, field: string): string =>
+    `${docId(d)}|${rowLid}|${path.join('.')}|${lid}|${trait}|${field}`;
+  const REMOVED = REMOVED_VALUE;
+  /** Every key that states each slot, with its value — ALL of them, not the first: kept to the first, a third key equal
+   *  to the first was never compared, and a 5/5/9 slot named two of its three keys (#1736 review). */
+  const claims = new Map<string, { key: string; value: unknown; label: string; targetName: string }[]>();
+  const claim = (slot: string, value: unknown, key: string, label: string, targetName: string): void => {
+    const list = claims.get(slot) ?? [];
+    if (!list.some((c) => c.key === key)) list.push({ key, value, label, targetName });
+    claims.set(slot, list);
+  };
+  /** Once every key has claimed: a slot keys state with more than one value is a conflict naming EVERY key that states it
+   *  (#1727) — and so is a field of a trait another key removes whole. Equal values write once. */
+  const findConflicts = (): Map<string, ApplyConflict> => {
+    const out = new Map<string, ApplyConflict>();
+    for (const [slot, list] of claims) {
+      if (list.some((c) => !valuesEqual(c.value, list[0]!.value))) {
+        out.set(slot, { slot: list[0]!.label, targetName: list[0]!.targetName, keys: list.map((c) => ({ key: c.key, value: c.value })) });
+      }
+    }
+    for (const [slot, list] of claims) {
+      const removers = slot.endsWith('|*') ? list.filter((c) => c.value === REMOVED) : [];
+      if (!removers.length) continue;
+      const prefix = slot.slice(0, -1);
+      for (const [other, writers] of claims) {
+        if (other === slot || !other.startsWith(prefix)) continue;
+        const against = writers.filter((w) => removers.some((r) => r.key !== w.key));
+        if (!against.length) continue;
+        const c = out.get(slot) ?? { slot: removers[0]!.label, targetName: removers[0]!.targetName, keys: list.map((x) => ({ key: x.key, value: x.value })) };
+        for (const w of against) if (!c.keys.some((k) => k.key === w.key)) c.keys.push({ key: w.key, value: w.value });
+        out.set(slot, c);
+      }
+    }
+    return out;
+  };
+  /** The fields a whole component shows the reader: the LIVE values of what is written (the template holds tokens). */
+  const shown = (live: Record<string, unknown>, written: Record<string, unknown>): Record<string, unknown> =>
+    Object.fromEntries(Object.keys(written).map((k) => [k, live[k]]));
 
   // WHERE each key is written (#1693, owner ruling C / U12): the frame's own template (level n), or as an override on
   // the row an enclosing prefab on the chain holds for this frame (level < n) — Unity's "Apply as override in Prefab".
@@ -5301,7 +5431,8 @@ async function planApply(
       if (addedNestsPrefab(node, oldPrefab.id || source)) { skipped.push({ key, reason: 'it holds an instance of this prefab, and a prefab cannot contain itself' }); continue; }
       const rowLid = nextLocalId.v;
       insertAddedSubtree(newPrefab, node, node.parentLocalId, nextLocalId, promotedRows, promotedRefRows, promotion);
-      if (node.prefab) promoteReferenceMoves(newPrefab, node, rowLid, localToEcs, instancePaths);
+      if (node.prefab) promoteReferenceMoves(newPrefab, node, rowLid, localToEcs, instancePaths, dryRun);
+      setEffect(key, source, ownName, false, { op: 'addNode', name: node.name });
       const liveEcs = localToEcsGuid(guid);
       if (liveEcs) liveAddedRootsToDelete.push(liveEcs);
       writtenCount++;
@@ -5364,7 +5495,10 @@ async function planApply(
         row.traits.EntityAttributes = { ...(row.traits.EntityAttributes as Record<string, unknown>), parentId: up };
         rowsReparented = true;
       }
-      if (newPrefab.entities.length !== before) writtenCount++;
+      if (newPrefab.entities.length !== before) {
+        writtenCount++;
+        setEffect(key, source, ownName, false, { op: 'removeMember', member: oldPrefab.entities.find((e) => e.localId === localId)?.name || `member ${localId}` });
+      }
       continue;
     }
     // Structural: remove a component from a member.
@@ -5375,7 +5509,10 @@ async function planApply(
         delete prefabEntity.traits[traitName];
         writtenCount++;
         appliedTargets.push({ key, target: source });
-        innerRemovals.push({ lid: Number(localIdStr), trait: traitName! });
+        innerRemovals.push({ key, lid: Number(localIdStr), trait: traitName! });
+        const member = memberNameIn(rootInstanceId, oldPrefab, Number(localIdStr));
+        setEffect(key, source, ownName, false, { op: 'removeComponent', member, trait: traitName! });
+        claim(slotOf(newPrefab, '', [], Number(localIdStr), traitName!, '*'), REMOVED, key, `${member} · ${traitName}`, ownName);
       }
       continue;
     }
@@ -5392,8 +5529,11 @@ async function planApply(
         prefabEntity.traits[tagName] = true;
         writtenCount++;
       }
-      innerTags.push({ lid: Number(localIdStr), tag: tagName });
+      innerTags.push({ key, lid: Number(localIdStr), tag: tagName });
       appliedTargets.push({ key, target: source });
+      const tagMember = memberNameIn(rootInstanceId, oldPrefab, Number(localIdStr));
+      setEffect(key, source, ownName, false, { op: 'addTag', member: tagMember, tag: tagName });
+      claim(slotOf(newPrefab, '', [], Number(localIdStr), tagName, '*'), true, key, `${tagMember} · ${tagName}`, ownName);
       continue;
     }
 
@@ -5430,6 +5570,7 @@ async function planApply(
     if (!prefabEntity) continue;
     let traitBag = prefabEntity.traits[traitName];
     if (traitBag === true) continue; // already a tag in the prefab — nothing to set
+    const took: string[] = [];
     if (!traitBag) {
       // Added component: the prefab lacks this trait at this localId, so the user
       // added it on the instance. Seed the prefab with the WHOLE live trait so
@@ -5441,23 +5582,39 @@ async function planApply(
       traitBag = writer.bag(meta, liveData);
       // Every field of the component leaves the source (#1469) — a blank asset ref the writer leaves out of the template
       // too: the template's default IS blank, and a kept override of it pinned the instance against a later ref.
-      for (const k of Object.keys(liveData)) if (!isTemplateExcludedField(meta, k)) appliedFields.add(`${localId}.${traitName}.${k}`);
+      for (const k of Object.keys(liveData)) if (!isTemplateExcludedField(meta, k)) took.push(k);
       prefabEntity.traits[traitName] = traitBag;
     }
     (traitBag as Record<string, unknown>)[fieldName] = liveValue;
-    appliedFields.add(`${localId}.${traitName}.${fieldName}`);
+    if (!took.includes(fieldName)) took.push(fieldName);
+    for (const k of took) appliedFields.add(`${localId}.${traitName}.${k}`);
+    innerFields.push({ key, lid: localId, trait: traitName, fields: took });
     writtenCount++;
     appliedTargets.push({ key, target: source });
+    // Decided against the document as READ, not as this Apply has changed it so far (#1727: a second key of the same
+    // component found the first one's bag and said "set field" of a component it was adding).
+    const member = memberNameIn(rootInstanceId, oldPrefab, localId);
+    const adds = oldPrefab.entities.find((e) => e.localId === localId)?.traits[traitName] === undefined;
+    const bag = traitBag as Record<string, unknown>;
+    setEffect(key, source, ownName, false, adds
+      ? { op: 'addComponent', member, trait: traitName, fields: shown(liveData, bag) }
+      : { op: 'setField', member, trait: traitName, field: fieldName, to: liveData[fieldName] });
+    for (const f of adds ? Object.keys(bag) : [fieldName]) {
+      claim(slotOf(newPrefab, '', [], localId, traitName, f), bag[f], key, `${member} · ${traitName}.${f}`, ownName);
+    }
   }
 
   // ── Writes at a level of a frame's chain (#1693): the keys written as overrides on an enclosing prefab's row, a nested
   //    frame's own edits (U14), then U13 ──
   /** Every document an enclosing write touches, by prefab — the frame's OWN prefab is `newPrefab` itself, so a U14 write
    *  into it and the frame's own keys land in one document. `level` orders the files innermost first. */
-  const pool = new Map<string, { source: string; level: number; expected: PrefabFile; before: PrefabFile; doc: PrefabFile; dirty: boolean; appliedFrom: Map<number, Set<string>> }>();
+  const pool = new Map<string, { source: string; levels: number[]; expected: PrefabFile; before: PrefabFile; doc: PrefabFile; dirty: boolean; appliedFrom: Map<number, Set<string>> }>();
   let outerRefusal = '';
-  const docFor = async (src: string, level: number, root: number): Promise<{ doc: PrefabFile; mark: () => void; took: (frame: number, key: string) => void } | null> => {
-    if (sameSource(src, source)) return { doc: newPrefab, mark: () => { writtenCount++; }, took: () => {} };
+  /** A pooled document: `pristine` is it as read (what an effect is decided against, #1727), `doc` what this Apply
+   *  writes. `took`/`kept` add and take back a frame's own edit the refresh subtracts (U15; #1731 keeps one). */
+  interface PoolDoc { doc: PrefabFile; pristine: PrefabFile; mark: () => void; took: (frame: number, key: string) => void; kept: (frame: number, key: string) => void }
+  const docFor = async (src: string, level: number, root: number): Promise<PoolDoc | null> => {
+    if (sameSource(src, source)) return { doc: newPrefab, pristine: oldPrefab, mark: () => { writtenCount++; }, took: () => {}, kept: () => {} };
     let e = pool.get(src);
     if (!e) {
       const expected = await getPrefabSource(src);
@@ -5465,38 +5622,41 @@ async function planApply(
       if (!expected || stale.length) { outerRefusal ||= expected ? staleFramesRefusal(stale) : `Prefab "${src}" is not loaded`; return null; }
       const doc = JSON.parse(JSON.stringify(expected)) as PrefabFile;
       doc.version = PREFAB_FORMAT_VERSION;
-      e = { source: src, level, expected, before: JSON.parse(JSON.stringify(expected)) as PrefabFile, doc, dirty: false, appliedFrom: new Map() };
+      const before = JSON.parse(JSON.stringify(expected)) as PrefabFile;
+      // An id-less file gets its id HERE, on both sides, as the frame's own document does above (#1729): minted by the
+      // write alone, the undo put `before` back with no id, the next write minted another, and redo always refused.
+      if (!doc.id) before.id = doc.id = newGuid();
+      e = { source: src, levels: [], expected, before, doc, dirty: false, appliedFrom: new Map() };
       pool.set(src, e);
     }
+    // EVERY level this document is reached at (#1715): the refresh order reads the deepest, not the first.
+    e.levels.push(level);
     const entry = e;
     return {
-      doc: entry.doc, mark: () => { entry.dirty = true; },
+      doc: entry.doc, pristine: entry.expected, mark: () => { entry.dirty = true; },
       took: (frame, key) => { const set = entry.appliedFrom.get(frame) ?? new Set<string>(); set.add(key); entry.appliedFrom.set(frame, set); },
+      kept: (frame, key) => { entry.appliedFrom.get(frame)?.delete(key); },
     };
   };
   /** A frame's chain, for the writes made in it: the opened frame's own, or a nested frame's (U14). */
   interface ChainCtx { base: FrameBase; slots: LevelSlot[]; frameDoc: PrefabFile; frameRoot: number; n: number; chain: number[] }
   /** A frame-local key as THIS instance's listing spells it: through the row chain for a nested frame (U14). */
   const listedKey = (ctx: ChainCtx, inner: string): string => (ctx.chain.length ? nestedKeyRef(oldPrefab, ctx.chain, inner, getCachedPrefabSync) : inner);
-  /** What each level wrote, for U13: `fields` undefined = the whole trait (a tag, a removal). */
-  const written: { ctx: ChainCtx; level: number; lid: number; trait: string; fields?: string[] }[] = [];
-  /** `source|lid|trait|field` (`*` = the whole trait) this Apply itself wrote into an enclosing document: U13 never drops
-   *  those — one component's fields split across two targets would otherwise undo the outer half (review of P5–P6). */
+  /** What each key wrote at each level, for U13: `fields` undefined = the whole trait (a tag, a removal). `keep` puts a
+   *  field back into the frame's capture — its own edit stays (#1731) — where the key took it out (U15). */
+  const written: { key: string; ctx: ChainCtx; level: number; lid: number; trait: string; fields?: string[]; keep?: (localKey: string) => void }[] = [];
+  /** Every SLOT this Apply itself wrote into an enclosing document (`slotOf`, `*` = the whole trait): U13 never drops
+   *  those — one component's fields split across two targets would otherwise undo the outer half (review of P5–P6). By
+   *  slot, not by document: keyed `source|lid|trait|field`, one frame's write there hid ANOTHER frame's U13 drop (#1728). */
   const wroteAt = new Set<string>();
   const ownCtx: ChainCtx | null = frame ? { base: frame, slots, frameDoc: oldPrefab, frameRoot: rootInstanceId, n, chain: [] } : null;
-  const innerByTrait = new Map<string, { lid: number; trait: string; fields: string[] }>();
-  for (const k of appliedFields) {
-    const [lidStr, t, f] = k.split('.');
-    const id = `${lidStr}.${t}`;
-    if (!innerByTrait.has(id)) innerByTrait.set(id, { lid: Number(lidStr), trait: t!, fields: [] });
-    innerByTrait.get(id)!.fields.push(f!);
-  }
   if (ownCtx) {
-    for (const w of innerByTrait.values()) written.push({ ctx: ownCtx, level: n, ...w });
-    for (const t of innerTags) written.push({ ctx: ownCtx, level: n, lid: t.lid, trait: t.tag });
+    const keepOwn = (k: string) => { appliedFields.delete(k); };
+    for (const w of innerFields) written.push({ ctx: ownCtx, level: n, ...w, keep: keepOwn });
+    for (const t of innerTags) written.push({ key: t.key, ctx: ownCtx, level: n, lid: t.lid, trait: t.tag });
     // A REMOVED component too: an enclosing row that still sets a field of it would add it back — partly — on every other
     // instance of the enclosing prefab (a row override of a component the member lacks adds it: #1658's own mechanism).
-    for (const r of innerRemovals) written.push({ ctx: ownCtx, level: n, lid: r.lid, trait: r.trait });
+    for (const r of innerRemovals) written.push({ key: r.key, ctx: ownCtx, level: n, lid: r.lid, trait: r.trait });
   }
 
   /** Write `key` (a frame-local key: field, `+trait.`, `-trait.`) of frame `ctx` at enclosing level `level` < ctx.n, as
@@ -5508,6 +5668,8 @@ async function planApply(
     const carrier = at.doc.entities.find((x) => x.localId === slot.rowLid && x.prefab);
     if (!carrier) { skipped.push({ key: reportAs, reason: `its row is no longer in Prefab '${at.doc.name}'` }); return false; }
     const levelWriter = templateValueWriter(ctx.base.levels[level]!.root);
+    const tName = at.doc.name || slot.source;
+    const here = (lid: number, trait: string, field: string) => slotOf(at.doc, slot.rowLid, slot.path, lid, trait, field);
     if (key.startsWith('-removed.')) {
       // A member the scene deleted, removed by this level (U12): the row's own `removed`, or a member row deeper down.
       const lid = Number(key.slice('-removed.'.length));
@@ -5515,16 +5677,22 @@ async function planApply(
         skipped.push({ key: reportAs, reason: `Prefab '${at.doc.name}' cannot name that member (a row on the way has no identity) — re-save it once` });
         return false;
       }
+      setEffect(reportAs, slot.source, tName, true, { op: 'removeMember', member: ctx.frameDoc.entities.find((e) => e.localId === lid)?.name || `member ${lid}` });
     } else if (key.startsWith('+trait.')) {
       const [, lidStr, tag] = key.split('.');
       const lid = Number(lidStr);
       writeStated(carrier, slot.path, memberKeyAt(slot, ctx.frameDoc, lid), lid, tag!, {});
-      written.push({ ctx, level, lid, trait: tag! });
-      wroteAt.add(`${slot.source}|${lid}|${tag}|*`);
+      written.push({ key: reportAs, ctx, level, lid, trait: tag! });
+      wroteAt.add(here(lid, tag!, '*'));
+      const member = memberNameIn(ctx.frameRoot, ctx.frameDoc, lid);
+      setEffect(reportAs, slot.source, tName, true, { op: 'addTag', member, tag: tag! });
+      claim(here(lid, tag!, '*'), true, reportAs, `${member} · ${tag}`, tName);
     } else if (key.startsWith('-trait.')) {
       const [, lidStr, t] = key.split('.');
       const lid = Number(lidStr);
       const mk = memberKeyAt(slot, ctx.frameDoc, lid);
+      // Said against the chain as READ (the carrier above is this Apply's copy): this level is what adds it → it stops.
+      const stops = !!statedFields(carrierOf(ctx.base, slot) ?? carrier, slot.path, mk, lid, t!) && !traitInside(ctx.slots, ctx.base, ctx.frameDoc, level, lid, t!);
       // This level adds it: it stops adding it. Whatever still gives the member the component below this level is
       // removed by a statement here.
       if (statedFields(carrier, slot.path, mk, lid, t!)) dropStated(carrier, slot.path, mk, lid, t!);
@@ -5532,8 +5700,11 @@ async function planApply(
         skipped.push({ key: reportAs, reason: `Prefab '${at.doc.name}' cannot name that member (a row on the way has no identity) — re-save it once` });
         return false;
       }
-      written.push({ ctx, level, lid, trait: t! });
-      wroteAt.add(`${slot.source}|${lid}|${t}|*`);
+      written.push({ key: reportAs, ctx, level, lid, trait: t! });
+      wroteAt.add(here(lid, t!, '*'));
+      const member = memberNameIn(ctx.frameRoot, ctx.frameDoc, lid);
+      setEffect(reportAs, slot.source, tName, true, stops ? { op: 'stopAddingComponent', member, trait: t! } : { op: 'removeComponent', member, trait: t! });
+      claim(here(lid, t!, '*'), REMOVED, reportAs, `${member} · ${t}`, tName);
     } else {
       const [lidStr, t, f] = key.split('.');
       const lid = Number(lidStr);
@@ -5544,27 +5715,35 @@ async function planApply(
       if (!live) return false;
       // A component nothing inside this level gives the member is written WHOLE here (the truthful effect: this level
       // adds it); otherwise only the field, as an override.
-      const fields = traitInside(ctx.slots, ctx.base, ctx.frameDoc, level, lid, t!, true)
+      const edits = traitInside(ctx.slots, ctx.base, ctx.frameDoc, level, lid, t!, true);
+      const fields = edits
         ? { [f!]: levelWriter.value(live[f!], ctx.frameRoot) }
         : levelWriter.bag(meta, live, ctx.frameRoot);
       writeStated(carrier, slot.path, memberKeyAt(slot, ctx.frameDoc, lid), lid, t!, fields);
-      written.push({ ctx, level, lid, trait: t!, fields: Object.keys(fields) });
-      for (const k of Object.keys(fields)) wroteAt.add(`${slot.source}|${lid}|${t}|${k}`);
+      written.push({ key: reportAs, ctx, level, lid, trait: t!, fields: Object.keys(fields) });
+      const member = memberNameIn(ctx.frameRoot, ctx.frameDoc, lid);
+      setEffect(reportAs, slot.source, tName, true, edits
+        ? { op: 'setField', member, trait: t!, field: f!, to: live[f!] }
+        : { op: 'addComponent', member, trait: t!, fields: shown(live, fields) });
+      for (const k of Object.keys(fields)) {
+        wroteAt.add(here(lid, t!, k));
+        claim(here(lid, t!, k), fields[k], reportAs, `${member} · ${t}.${k}`, tName);
+      }
     }
     at.mark();
     appliedTargets.push({ key: reportAs, target: slot.source });
     return true;
   };
   /** The live member `lid` of frame `root` (its root for the root's own localId). */
-  const memberOf = (root: number, lid: number): number => {
+  function memberOf(root: number, lid: number): number {
     if (root === rootInstanceId) return localToEcs.get(lid) ?? 0;
     let found = 0;
-    getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
+    getCurrentWorld().query(PrefabInstanceMeta!.trait).updateEach(([pi], entity) => {
       const d = pi as { rootInstanceId?: number; localId?: number };
       if (!found && d.rootInstanceId === root && d.localId === lid) found = entity.id();
     });
     return found;
-  };
+  }
 
   for (const { key, slot } of outerKeys) {
     if (!ownCtx) break;
@@ -5600,6 +5779,9 @@ async function planApply(
     // The source frame's own edit leaves it (#1469, U15): the refresh of that prefab takes it out of the frame's capture.
     for (const k of templateTook) at.took(nested, k);
     templateTook.length = 0;
+    const took = at;
+    const last = written[written.length - 1];
+    if (last?.key === key) last.keep = (k) => took.kept(nested, k);
     at.mark();
     appliedTargets.push({ key, target: fb.levels[ctx.n]!.source });
   }
@@ -5607,9 +5789,11 @@ async function planApply(
 
   /** Write a frame-local `key` of nested frame `ctx` into its own template `at.doc` — a field (the whole component where
    *  the row lacks it), a tag, a removal — through the one template-value writer (#1659). */
-  function writeTemplate(key: string, reportAs: string, ctx: ChainCtx, at: { doc: PrefabFile }): boolean {
+  function writeTemplate(key: string, reportAs: string, ctx: ChainCtx, at: { doc: PrefabFile; pristine: PrefabFile }): boolean {
     const w = templateValueWriter(ctx.frameRoot);
     const parts = key.split('.');
+    const tName = at.doc.name || ctx.base.levels[ctx.n]!.source;
+    const here = (lid: number, trait: string, field: string) => slotOf(at.doc, '', [], lid, trait, field);
     if (key.startsWith('-removed.')) {
       skipped.push({ key: reportAs, reason: 'removing a member from the nested prefab itself is applied from the nested instance' });
       return false;
@@ -5621,7 +5805,11 @@ async function planApply(
       if (!row) { skipped.push({ key: reportAs, reason: 'its member is no longer in that prefab' }); return false; }
       if (key.startsWith('+trait.')) row.traits[t!] = true;
       else delete row.traits[t!];
-      written.push({ ctx, level: ctx.n, lid, trait: t! });
+      written.push({ key: reportAs, ctx, level: ctx.n, lid, trait: t! });
+      const member = memberNameIn(ctx.frameRoot, ctx.frameDoc, lid);
+      const tag = key.startsWith('+trait.');
+      setEffect(reportAs, ctx.base.levels[ctx.n]!.source, tName, false, tag ? { op: 'addTag', member, tag: t! } : { op: 'removeComponent', member, trait: t! });
+      claim(here(lid, t!, '*'), tag ? true : REMOVED, reportAs, `${member} · ${t}`, tName);
       return true;
     }
     const [lidStr, t, f] = parts;
@@ -5632,19 +5820,29 @@ async function planApply(
     if (!ecs || !meta || !row || meta.category === 'tag' || !isPersistentTraitField(meta, f!) || isTemplateExcludedField(meta, f!)) return false;
     const live = clonePersistable(readTraitDataFull(ecs, meta));
     if (!live) return false;
-    const bag = row.traits[t!];
-    if (bag === true) return false;
+    // Whether the component is ADDED is decided against the document as read (#1727): a second frame of the same
+    // prefab found the first one's bag already written, took its own write for a one-field edit, and said so.
+    const bag = at.pristine.entities.find((e) => e.localId === lid)?.traits[t!];
+    const cur = row.traits[t!];
+    if (bag === true || cur === true) return false;
     const fields = bag ? { [f!]: w.value(live[f!]) } : w.bag(meta, live);
-    row.traits[t!] = { ...(bag || {}), ...fields };
+    row.traits[t!] = { ...(cur || {}), ...fields };
     // Every field the template now holds leaves the frame — a whole component's blank asset refs included, as the seed's.
     for (const k of bag ? [f!] : Object.keys(live).filter((x) => !isTemplateExcludedField(meta, x))) templateTook.push(`${lid}.${t}.${k}`);
-    written.push({ ctx, level: ctx.n, lid, trait: t!, fields: Object.keys(fields) });
+    written.push({ key: reportAs, ctx, level: ctx.n, lid, trait: t!, fields: Object.keys(fields) });
+    const member = memberNameIn(ctx.frameRoot, ctx.frameDoc, lid);
+    setEffect(reportAs, ctx.base.levels[ctx.n]!.source, tName, false, bag
+      ? { op: 'setField', member, trait: t!, field: f!, to: live[f!] }
+      : { op: 'addComponent', member, trait: t!, fields: shown(live, fields) });
+    for (const k of Object.keys(fields)) claim(here(lid, t!, k), fields[k], reportAs, `${member} · ${t}.${k}`, tName);
     return true;
   }
 
   // U13 (owner, 2026-09-28): a value applied at one level REVERTS every enclosing override of it — they would shadow it,
   // and every instance of the outer prefabs shows the applied value. Supersedes #1492 ruling b.
   const alsoReverted = new Map<string, string[]>();
+  const revertsOf = new Map<string, Map<string, { name: string; keys: string[]; what: string[] }>>();
+  const notes = new Map<string, string>();
   for (const w of written) {
     for (const sl of w.ctx.slots) {
       if (sl.level >= w.level) continue;
@@ -5655,27 +5853,43 @@ async function planApply(
       if (!at) break;
       const carrier = at.doc.entities.find((x) => x.localId === sl.rowLid && x.prefab);
       if (!carrier) continue;
-      // Not what this same Apply wrote there itself.
-      const mine = (f: string) => wroteAt.has(`${sl.source}|${w.lid}|${w.trait}|${f}`) || wroteAt.has(`${sl.source}|${w.lid}|${w.trait}|*`);
+      // Not what this same Apply wrote there itself — at THIS slot: this row, this path (#1728).
+      const whole = slotOf(at.doc, sl.rowLid, sl.path, w.lid, w.trait, '*');
+      const mine = (f: string) => wroteAt.has(slotOf(at.doc, sl.rowLid, sl.path, w.lid, w.trait, f)) || wroteAt.has(whole);
       const stated = Object.keys(statedFields(carrier, sl.path, mk, w.lid, w.trait) ?? {});
-      const anyMine = stated.some(mine) || wroteAt.has(`${sl.source}|${w.lid}|${w.trait}|*`);
+      const anyMine = stated.some(mine) || wroteAt.has(whole);
       const fields = w.fields ? w.fields.filter((f) => !mine(f)) : anyMine ? stated.filter((f) => !mine(f)) : undefined;
       if (fields && !fields.length) continue;
       if (dropStated(carrier, sl.path, mk, w.lid, w.trait, fields)) {
         at.mark();
         // Named as the frame's own listing names them (its member refs).
         const ref = memberRef(w.ctx.frameDoc, w.lid);
+        const names = (fields ?? [undefined]).map((f) => listedKey(w.ctx, f ? `${ref}.${w.trait}.${f}` : `${ref}.${w.trait}`));
         const list = alsoReverted.get(sl.source) ?? [];
-        list.push(...(fields ?? [undefined]).map((f) => listedKey(w.ctx, f ? `${ref}.${w.trait}.${f}` : `${ref}.${w.trait}`)));
+        list.push(...names);
         alsoReverted.set(sl.source, list);
+        // …and per key: what THIS key's write reverts, for the row that shows it.
+        const per = revertsOf.get(w.key) ?? new Map<string, { name: string; keys: string[]; what: string[] }>();
+        const e = per.get(sl.source) ?? { name: at.doc.name || sl.source, keys: [], what: [] };
+        e.keys.push(...names);
+        const who = memberNameIn(w.ctx.frameRoot, w.ctx.frameDoc, w.lid);
+        e.what.push(...(fields ?? [undefined]).map((f) => `its override of ${w.trait}${f ? `.${f}` : ''} on ${who}`));
+        per.set(sl.source, e);
+        revertsOf.set(w.key, per);
       }
     }
-    // A template reference node above the chain states it too: it is not a document Apply writes, so it still wins here.
+    // A template reference node above the chain states it too (#1731). It is not a place an Apply writes, so U13 cannot
+    // drop its statement: the prefab IS written (every other instance takes the value), and THIS instance keeps the value
+    // as its own edit — taken back out of the refresh's subtraction — rather than flipping to the node's. Said on the key.
     const node = w.ctx.base.node;
     if (node) {
-      const path = w.ctx.base.levels.slice(1).map((l) => (l.step as { row: number }).row);
-      if (statedFields(node, path, null, w.lid, w.trait)) {
-        skipped.push({ key: listedKey(w.ctx, `${memberRef(w.ctx.frameDoc, w.lid)}.${w.trait}`), reason: 'the template node that holds this instance sets it too, and still wins on this instance — apply it from the instance that holds the node' });
+      const ns = nodeSlot(w.ctx.base);
+      const stated = statedFields(node, ns.path, memberKeyAt(ns, w.ctx.frameDoc, w.lid), w.lid, w.trait);
+      const shadowed = stated ? (w.fields ? w.fields.filter((f) => f in stated) : Object.keys(stated)) : [];
+      if (stated && (shadowed.length || !w.fields)) {
+        for (const f of shadowed) w.keep?.(`${w.lid}.${w.trait}.${f}`);
+        const what = shadowed.length ? shadowed.map((f) => `${w.trait}.${f} = ${formatEffectValue(stated[f])}`).join(', ') : w.trait;
+        notes.set(w.key, `the template node holding this instance sets ${what} on it, and an Apply cannot write that node: every other instance takes the applied value, and this one keeps its own as an edit (still listed) — apply it from the instance that holds the node to change the node`);
       }
     }
   }
@@ -5776,6 +5990,7 @@ async function planApply(
         }
       }
       writtenCount++;
+      setEffect(key, source, ownName, false, { op: 'move', member: (eaMetaForApply ? (readTraitData(m.memberEcs, eaMetaForApply)?.name as string) : '') || 'member' });
       continue;
     }
     const lid = Number(key.slice('~moved.'.length));
@@ -5827,15 +6042,66 @@ async function planApply(
       rowPoseWrite(row, bag); // a moved nested ROOT's row takes it where the expansion reads it (#1490)
     }
     writtenCount++;
+    setEffect(key, source, ownName, false, { op: 'move', member: memberNameIn(rootInstanceId, oldPrefab, lid) });
   }
 
+  // Every key's effect, in the caller's spelling (#1736): a key this Apply skipped says why; each conflict replaces the
+  // effect of every key in it — the Apply is then refused whole, so none of them is written.
+  const conflictsBySlot = findConflicts();
+  const spell = (k: string) => canon.original.get(k) ?? k;
+  for (const { key, reason } of skipped) if (!effectOf.has(key)) setEffect(key, '', '', false, { op: 'notApplied', reason });
+  for (const [k, per] of revertsOf) {
+    const e = effectOf.get(k);
+    if (e) e.alsoReverts = [...per].map(([src, v]) => ({ source: src, name: v.name, keys: v.keys, what: v.what }));
+  }
+  for (const [k, note] of notes) { const e = effectOf.get(k); if (e) e.note = note; }
+  const conflicts: ApplyConflict[] = [...conflictsBySlot.values()].map((c) => ({ ...c, keys: c.keys.map((x) => ({ key: spell(x.key), value: x.value })) }));
+  /** A key as a reader tells it apart: its member, and for a nested instance's key the row that instance hangs from. */
+  const whoOf = new Map<string, string>();
+  for (const c of conflictsBySlot.values()) {
+    for (const x of c.keys) {
+      const e = effectOf.get(x.key)?.effect;
+      const member = e && 'member' in e ? e.member : '';
+      // The WHOLE row path: its last row alone named two instances nested one level further apart identically.
+      const rows: string[] = [];
+      const parts = splitNestedKey(x.key);
+      let doc: PrefabFile | null | undefined = oldPrefab;
+      for (const lid of parts ? memberPathSteps(parts.chain) : []) {
+        const r: PrefabEntity | undefined = typeof lid === 'number' ? doc?.entities.find((en) => en.localId === lid) : undefined;
+        rows.push(r?.name ?? '?');
+        doc = r?.prefab ? getCachedPrefabSync(r.prefab) : null;
+      }
+      whoOf.set(x.key, rows.length ? `${member} under row '${rows.join(' › ')}'` : member || spell(x.key));
+    }
+  }
+  // A key can be in SEVERAL conflicts (a field write against another value AND against a removal): its row names every
+  // key it collides with, or resolving the one it showed only surfaced the next on the following preview.
+  const conflictsOf = new Map<string, ApplyConflict[]>();
+  for (const c of conflictsBySlot.values()) for (const x of c.keys) conflictsOf.set(x.key, [...(conflictsOf.get(x.key) ?? []), c]);
+  for (const [k, cs] of conflictsOf) {
+    const e = effectOf.get(k);
+    if (!e) continue;
+    const mine = cs[0]!.keys.find((x) => x.key === k)!;
+    const withAll: { key: string; value: unknown; who: string }[] = [];
+    for (const c of cs) {
+      const me = c.keys.find((x) => x.key === k)!;
+      // The keys that write ANOTHER value: an equal one beside this key is not what it collides with.
+      for (const x of c.keys) {
+        if (x.key === k || valuesEqual(x.value, me.value) || withAll.some((w) => w.key === spell(x.key))) continue;
+        withAll.push({ key: spell(x.key), value: x.value, who: whoOf.get(x.key)! });
+      }
+    }
+    e.effect = { op: 'conflict', slot: cs.map((c) => c.slot).join(', '), value: mine.value, with: withAll, wanted: e.effect };
+  }
+  const effects = [...effectOf.values()].map((e) => ({ ...e, key: spell(e.key) }));
+
   // Reported in the caller's own spelling, not the internal one it was turned into above.
-  for (const x of skipped) x.key = canon.original.get(x.key) ?? x.key;
-  for (const { key, reason } of skipped) console.warn(`[Prefab] ${key} was not applied: ${reason}`);
-  const outerWrites = [...pool.values()].filter((e) => e.dirty).sort((a, b) => b.level - a.level);
+  for (const x of skipped) x.key = spell(x.key);
+  if (!dryRun) for (const { key, reason } of skipped) console.warn(`[Prefab] ${key} was not applied: ${reason}`);
+  const outerWrites = [...pool.values()].filter((e) => e.dirty);
   if (writtenCount === 0 && !outerWrites.length) {
-    console.log('[Prefab] No applicable overrides to apply.');
-    return { result: skipped.length ? { ...NOOP_APPLY, skipped } : NOOP_APPLY };
+    if (!dryRun) console.log('[Prefab] No applicable overrides to apply.');
+    return { result: { ...NOOP_APPLY, ...(skipped.length ? { skipped } : {}), ...(effects.length ? { effects } : {}) } };
   }
 
   // A re-parented row moves the PATH of it and everything below it, which is what a template's member
@@ -5858,22 +6124,52 @@ async function planApply(
     if (!newPrefab.moved) delete newPrefab.moved;
   }
 
-  for (const x of appliedTargets) x.key = canon.original.get(x.key) ?? x.key;
+  for (const x of appliedTargets) x.key = spell(x.key);
   return {
-    // Innermost first — by level on the chain, the frame's own at `n` (a U14 write into a NESTED frame's prefab is deeper
-    // still) — and the commit refreshes in this order, so each capture reads frames already rebuilt inside it.
-    writes: [
+    // Innermost first, and the commit refreshes in this order, so each capture reads frames already rebuilt inside it.
+    writes: innermostFirst([
       ...(writtenCount ? [{ level: n, w: { source, expected: oldPrefab, before: prefabBefore, doc: newPrefab, role: 'frame' as const } }] : []),
-      ...outerWrites.map((e) => ({ level: e.level, w: {
+      ...outerWrites.map((e) => ({ level: Math.max(...e.levels), w: {
         source: e.source, expected: e.expected, before: e.before, doc: e.doc, role: 'outer' as const,
         ...(e.appliedFrom.size ? { appliedFrom: [...e.appliedFrom].map(([rootId, fields]) => ({ rootId, fields })) } : {}),
       } })),
-    ].sort((a, b) => b.level - a.level).map((x) => x.w),
+    ], sameSource).map((x) => x.w),
     rebuild: { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows, rowsReparented },
     skipped,
     applied: appliedTargets,
     alsoReverted: [...alsoReverted].map(([src, keys]) => ({ source: src, keys })),
+    effects,
+    conflicts,
   };
+}
+
+/** The written documents in refresh order (#1715): a document ANOTHER written document contains — at any depth, read
+ *  through the pending copies first — comes before it, since the outer one's refresh rebuilds the frames of the inner
+ *  one inside it and a capture must read those already rebuilt. The deepest level a document was reached at breaks
+ *  ties. Level alone is not enough: recorded at first use, P reached at depth 1 and at depth 2 tied with Q and Q went
+ *  first; even the maximum orders O→P beside O→R→S→Q→P wrong (Q's 4 over P's 2, and Q contains P). */
+export function innermostFirst<T extends { level: number; w: { source: string; doc: PrefabFile } }>(items: T[], same: (a: string, b: string) => boolean): T[] {
+  const is = (ref: string, x: T) => same(ref, x.w.source) || (!!x.w.doc.id && ref === x.w.doc.id);
+  const contains = (outer: T, inner: T): boolean => {
+    const seen = new Set<string>();
+    const walk = (doc: PrefabFile | null | undefined): boolean => {
+      for (const ref of expandedPrefabRefs(doc?.entities ?? [])) {
+        if (is(ref, inner)) return true;
+        if (seen.has(ref)) continue;
+        seen.add(ref);
+        if (walk(items.find((x) => is(ref, x))?.w.doc ?? getCachedPrefabSync(ref))) return true;
+      }
+      return false;
+    };
+    return walk(outer.w.doc);
+  };
+  const rest = [...items].sort((a, b) => b.level - a.level);
+  const out: T[] = [];
+  while (rest.length) {
+    const i = rest.findIndex((x) => !rest.some((y) => y !== x && contains(x, y)));
+    out.push(...rest.splice(i < 0 ? 0 : i, 1));
+  }
+  return out;
 }
 
 /** The writing half of Apply: writes the plan's documents, sets the caches, and rebuilds every live instance. */
@@ -5974,6 +6270,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
     // Every file, innermost first — an undo puts them all back (#1693: "Apply's undo restores the row as well").
     writes: plan.writes.map((w) => ({ source: w.source, before: w.before, after: JSON.parse(JSON.stringify(w.doc)) as PrefabFile })),
     targets: plan.applied,
+    effects: plan.effects,
     ...(plan.alsoReverted.length ? { alsoReverted: plan.alsoReverted } : {}),
     warnings,
     ...(rowsReparented ? { memberPathsChanged: true, fileRepair } : {}),

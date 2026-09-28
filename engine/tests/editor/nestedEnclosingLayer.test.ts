@@ -38,8 +38,10 @@ import {
 import { reparentEntity } from '../../packages/modoki/src/editor/undo/entityActions';
 import {
   setPrefabCache, rebaseStaleInstances, serializePrefab, applyToPrefabSelective, revertOverridesSelective, getCachedPrefabSync, instantiatePrefab, setPrefabSource,
-  type PrefabFile,
+  previewApply, type PrefabFile,
 } from '../../packages/modoki/src/editor/scene/prefab';
+import { describeEffect } from '../../packages/modoki/src/editor/scene/prefabApplyEffects';
+import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
@@ -432,15 +434,18 @@ describe('#1658 / owner ruling C: an edit on a nested instance can be applied to
   });
 
   it('the dialog and the agent op SAY it truthfully: at P it is a component ADD every P gains, and it reverts O\'s override', async () => {
-    // Mutation: in `applyTargetOptions`' describe, test `adds` at the inner level against the WHOLE chain
-    // (`traitInside(…, 0, …, true)`) — O's row gives A Rotate3D, so the P label reads as a one-field edit.
+    // Mutation: in `planApply`'s own-frame field branch, decide `adds` against the WHOLE chain (`traitInside(…, 0, …,
+    // true)`) — O's row gives A Rotate3D, so the P effect reads as a one-field `setField`. The words are the PLAN's
+    // effect (#1736), which the dialog and the agent op both render.
     await editSpeed();
     const t = applyTargetOptions(nestedRoot(), getCachedPrefabSync(P) as PrefabFile, [speedKey]).get(speedKey)!;
     expect(t.defaultTarget).toBe(O);
-    const [atO, atP] = [t.options.find((o) => o.target === O)!, t.options.find((o) => o.target === P)!];
-    expect(atP.label).toBe('add component Rotate3D (axis "x", speed 7) to A in Prefab \'P\' — every P gains it');
+    expect(t.options.map((o) => o.target).sort()).toEqual([O, P].sort());
+    const atP = (await previewApply(nestedRoot(), new Set([speedKey]), { default: 'frame' })).effects[0]!;
+    expect(describeEffect(atP)).toBe('add component Rotate3D (axis "x", speed 7) to A in Prefab \'P\' — every P gains it');
     expect(atP.alsoReverts.map((r) => r.name)).toEqual(['O']);
-    expect(atO.label).toBe('A · Rotate3D.speed → 7 as an override in Prefab \'O\'');
+    const atO = (await previewApply(nestedRoot(), new Set([speedKey]))).effects[0]!;
+    expect(describeEffect(atO)).toBe('A · Rotate3D.speed → 7 as an override in Prefab \'O\'');
     expect(atO.alsoReverts).toEqual([]);
   });
 
@@ -688,16 +693,19 @@ describe('#1693 final close-out review: the cases it drove', () => {
   });
 
   it('a removal says what U13 does: at P it also reverts O\'s field override; at O it is a removal, not "stops adding"', async () => {
-    // Mutation: \`reverted()\` returns [] for a \`-trait.\` key — the P option names no O, though Apply writes O too.
+    // Mutation: leave the frame's own removals out of U13 (\`innerRemovals\` not pushed into \`written\`) — the P effect
+    // names no O, and O's row keeps setting a field of the removed component.
+    //   And: in \`writeOuter\`, word every removal as \`stopAddingComponent\` — the O effect reads "stops adding".
     const p = pDoc();
     (p.entities[1]!.traits as Record<string, unknown>).Rotate3D = { axis: 'x', speed: 1 };
     install(p, oWith({ 2: { Rotate3D: { speed: 5 } } }));
     await load(scene(O, [ROOT1]));
     removeTraitFromEntitiesWithUndo([inInstance(ROOT1, 'A')], meta('Rotate3D'));
     const key = `-trait.${gA}`.concat('.Rotate3D');
-    const t = applyTargetOptions(inInstance(ROOT1, 'R'), getCachedPrefabSync(P) as PrefabFile, [key]).get(key)!;
-    expect(t.options.find((o) => o.target === P)!.alsoReverts.map((r) => r.name)).toEqual(['O']);
-    expect(t.options.find((o) => o.target === O)!.label).toMatch(/^remove Rotate3D from A/);
+    const atP = (await previewApply(inInstance(ROOT1, 'R'), new Set([key]), { default: 'frame' })).effects[0]!;
+    expect(atP.alsoReverts.map((r) => r.name)).toEqual(['O']);
+    const atO = (await previewApply(inInstance(ROOT1, 'R'), new Set([key]), { perKey: { [key]: O } })).effects[0]!;
+    expect(describeEffect(atO)).toMatch(/^remove Rotate3D from A/);
   });
 
   it('Revert refuses a U14 nested key instead of rebuilding for nothing', async () => {
@@ -897,5 +905,311 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     await redo();
     expect(a()).toEqual([[3, 3]]);
     expect(listed()).toEqual([]);
+  });
+});
+
+describe('#1736: an Apply is ONE plan of per-key effects, keyed by SLOT — the surfaces render it', () => {
+  const written = (id: string) => writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === id).pop();
+  const Q = 'cccccccc-0000-4000-8000-000000001736';
+  const gN2 = 'eeeeeeee-0000-4000-8000-000000001736';
+  const gQR = 'eeeeeeee-0000-4000-8000-000000001737';
+  const gQA = 'eeeeeeee-0000-4000-8000-000000001738';
+  const gQP = 'eeeeeeee-0000-4000-8000-000000001739';
+  const gNQ = 'eeeeeeee-0000-4000-8000-00000000173a';
+  const KQ = 'ffffffff-0000-4000-8000-000000001736';
+  const tfx = (id: number) => (readTraitData(id, meta('Transform')) as { x: number }).x;
+  const ref = (localId: number, name: string, parentId: number, nodeGuid: string, prefab: string, extra: Record<string, unknown> = {}) => ({
+    localId, name, nodeGuid, prefab, traits: { EntityAttributes: { name, parentId, guid: '' } }, ...extra,
+  });
+  /** O: OR → Slot → N (P), OR → Slot2 → `second` — a second reference row. */
+  const oWithSecond = (second: Record<string, unknown>, nExtra: Record<string, unknown> = {}) => {
+    const d = oDoc() as unknown as { entities: Array<Record<string, unknown>> } & ReturnType<typeof oDoc>;
+    Object.assign(d.entities[3]!, nExtra);
+    d.entities.push(second);
+    return d;
+  };
+  /** Q: QR → QA, and (with `withP`) QR → QP, a row expanding P. */
+  const qDoc = (withP = false) => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
+    row(1, 'QR', 0, gQR), row(2, 'QA', 1, gQA),
+    ...(withP ? [ref(3, 'QP', 1, gQP, P)] : []),
+  ] });
+  /** The entity `name` inside ROOT1 whose ancestors include one named `under` (the row's parent slot). */
+  const under = (parent: string, name: string): number => {
+    const all = getAllEntities();
+    const byId = new Map(all.map((e) => [e.id, e]));
+    const root = rootOf(ROOT1);
+    const hits = all.filter((e) => {
+      if (e.name !== name) return false;
+      let inRoot = false;
+      let inParent = false;
+      for (let c: typeof e | undefined = byId.get(e.parentId); c; c = byId.get(c.parentId)) {
+        if (c.name === parent) inParent = true;
+        if (c.id === root) inRoot = true;
+      }
+      return inRoot && inParent;
+    });
+    if (hits.length !== 1) throw new Error(`fixture: ${hits.length} ${name} under ${parent}`);
+    return hits[0]!.id;
+  };
+  const nestedKeys = () => collectInstanceOverrideKeys(rootOf(ROOT1), getCachedPrefabSync(O) as PrefabFile).nested;
+  const k1 = `${gN}:${gA}.Transform.x`;
+  const k2 = `${gN2}:${gA}.Transform.x`;
+  const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
+    const spies = (['log', 'warn', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation(() => {}));
+    try { return await fn(); } finally { for (const s of spies) s.mockRestore(); }
+  };
+
+  describe('#1727: two frames of ONE nested prefab written into that prefab', () => {
+    const twoFrames = async (x1: number, x2: number) => {
+      install(pDoc(), oWithSecond(ref(5, 'N2', 3, gN2, P)));
+      await load(scene(O, [ROOT1, ROOT2]));
+      writeTraitFieldWithUndo(under('Slot', 'A'), meta('Transform'), 'x', x1);
+      writeTraitFieldWithUndo(under('Slot2', 'A'), meta('Transform'), 'x', x2);
+      expect(nestedKeys().sort()).toEqual([k1, k2].sort()); // precondition
+    };
+
+    it('with different values is a CONFLICT: refused whole, both keys named, nothing written, both edits kept', async () => {
+      // Mutation: drop `clash(had)` in `planApply`'s `claim` — the Apply lands, P's A.x = 9, and N's 5 is gone.
+      await twoFrames(5, 9);
+      const preview = await previewApply(rootOf(ROOT1), new Set([k1, k2]), { default: 'frame' });
+      expect(preview.conflicts).toHaveLength(1);
+      expect(preview.conflicts[0]!.keys.map((k) => [k.key, k.value]).sort()).toEqual([[k1, 5], [k2, 9]]);
+      expect(preview.effects.map((e) => e.effect.op)).toEqual(['conflict', 'conflict']);
+      // Named for a reader (the member and its row), not by key — the keys are in `conflicts` and the refusal.
+      expect(describeEffect(preview.effects.find((e) => e.key === k1)!)).toBe(
+        `conflict: A · Transform.x in Prefab 'P' is also written by the change to A under row 'N2' (9), not 5 as here — uncheck one, or apply one of them as an override in an enclosing prefab`,
+      );
+      // …and nothing is named as written: a conflicting plan writes no file.
+      expect(preview.files).toEqual([]);
+      const res = await quietly(() => applyToPrefabSelective(rootOf(ROOT1), new Set([k1, k2]), { default: 'frame' }));
+      expect(res.applied).toBe(false);
+      expect(res.refused).toMatch(/^changes write one field or component with different values, so nothing was applied: A · Transform.x in Prefab 'P'/);
+      expect(writes).toHaveLength(0);
+      expect([tfx(under('Slot', 'A')), tfx(under('Slot2', 'A'))]).toEqual([5, 9]);
+    });
+
+    it('a conflict names EVERY key on the slot: 5, 5 and 9 — all three red, each against the OTHER value only', async () => {
+      // Mutation: keep only a slot's FIRST claimant in \`claim\` (\`if (!list.length)\`) — N2 (5, equal to N) is never
+      // compared, its row is not red, and unchecking N surfaces a new conflict on the next preview.
+      const gN3 = 'eeeeeeee-0000-4000-8000-00000000173b';
+      const o = oWithSecond(ref(5, 'N2', 3, gN2, P));
+      o.entities.push(row(6, 'Slot3', 1, 'eeeeeeee-0000-4000-8000-00000000173c'), ref(7, 'N3', 6, gN3, P));
+      install(pDoc(), o);
+      await load(scene(O, [ROOT1]));
+      writeTraitFieldWithUndo(under('Slot', 'A'), meta('Transform'), 'x', 5);
+      writeTraitFieldWithUndo(under('Slot2', 'A'), meta('Transform'), 'x', 5);
+      writeTraitFieldWithUndo(under('Slot3', 'A'), meta('Transform'), 'x', 9);
+      const k3 = `${gN3}:${gA}.Transform.x`;
+      const preview = await previewApply(rootOf(ROOT1), new Set([k1, k2, k3]), { default: 'frame' });
+      expect(preview.conflicts).toHaveLength(1);
+      expect(preview.conflicts[0]!.keys.map((k) => k.key).sort()).toEqual([k1, k2, k3].sort());
+      expect(preview.effects.map((e) => e.effect.op)).toEqual(['conflict', 'conflict', 'conflict']);
+      const withOf = (k: string) => { const e = preview.effects.find((x) => x.key === k)!.effect; return e.op === 'conflict' ? e.with.map((w) => w.key).sort() : []; };
+      expect(withOf(k2)).toEqual([k3]);
+      expect(withOf(k3)).toEqual([k1, k2].sort());
+    });
+
+    it('a field against another key\'s whole-component REMOVAL conflicts too, and a key in two conflicts names both', async () => {
+      // Mutation: skip \`findConflicts\`' removal pass (\`if (true) continue\`) — N's removal of Rotate3D is not in any
+      // conflict, and N2's row says nothing of it.
+      //   And: let a key's FIRST conflict set its effect (\`if (e.effect.op === 'conflict') continue\`) — N2 names N3 only,
+      // and unchecking N3 surfaces the removal on the next preview.
+      const p = pDoc();
+      (p.entities[1]!.traits as Record<string, unknown>).Rotate3D = { axis: 'x', speed: 1 };
+      const o = oWithSecond(ref(5, 'N2', 3, gN2, P));
+      o.entities.push(row(6, 'Slot3', 1, 'eeeeeeee-0000-4000-8000-00000000173c'), ref(7, 'N3', 6, 'eeeeeeee-0000-4000-8000-00000000173b', P));
+      install(p, o);
+      await load(scene(O, [ROOT1]));
+      removeTraitFromEntitiesWithUndo([under('Slot', 'A')], meta('Rotate3D'));
+      writeTraitFieldWithUndo(under('Slot2', 'A'), meta('Rotate3D'), 'speed', 5);
+      writeTraitFieldWithUndo(under('Slot3', 'A'), meta('Rotate3D'), 'speed', 9);
+      const keys = nestedKeys();
+      const kRm = keys.find((k) => k.startsWith('-trait.'))!;
+      const k2s = keys.find((k) => k.startsWith(`${gN2}:`))!;
+      expect(keys).toHaveLength(3); // precondition
+      const preview = await previewApply(rootOf(ROOT1), new Set(keys), { default: 'frame' });
+      expect(preview.conflicts.map((c) => c.slot).sort()).toEqual(['A · Rotate3D', 'A · Rotate3D.speed']);
+      expect(preview.effects.map((e) => e.effect.op)).toEqual(['conflict', 'conflict', 'conflict']);
+      const e2 = preview.effects.find((e) => e.key === k2s)!.effect;
+      expect(e2.op === 'conflict' ? e2.with.map((w) => w.key).sort() : []).toEqual(keys.filter((k) => k !== k2s).sort());
+      expect(e2.op === 'conflict' ? e2.with.find((w) => w.key === kRm)!.value : null).toBe('(removed)');
+    });
+
+    it('with EQUAL values writes once: P takes it, both frames and the other O instance show it, nothing stays listed', async () => {
+      // Mutation: compare claims by identity (`had.value !== value`) instead of `valuesEqual` — still equal here for a
+      // number, so this case guards the ACCEPT side of the conflict rule: refusing equal writes fails it.
+      await twoFrames(5, 5);
+      const res = await quietly(() => applyToPrefabSelective(rootOf(ROOT1), new Set([k1, k2]), { default: 'frame' }));
+      expect(res.applied).toBe(true);
+      expect(res.conflicts).toBeUndefined();
+      expect((written(P)!.entities.find((e) => e.localId === 2)!.traits.Transform as { x: number }).x).toBe(5);
+      expect(res.effects?.map((e) => e.effect.op)).toEqual(['setField', 'setField']);
+      expect(nestedKeys()).toEqual([]);
+    });
+
+    it('an added component from two frames is said as an ADD on both keys, and differing fields conflict', async () => {
+      // Mutation: decide the add in `writeTemplate` against the DOCUMENT BEING WRITTEN (`cur`) instead of the one read —
+      // the second key finds the first one's bag and is labelled a one-field `setField` of a component it adds.
+      install(pDoc(), oWithSecond(ref(5, 'N2', 3, gN2, P)));
+      await load(scene(O, [ROOT1]));
+      addTraitToEntitiesWithUndo([under('Slot', 'A')], meta('Rotate3D'), { axis: 'y', speed: 9 });
+      addTraitToEntitiesWithUndo([under('Slot2', 'A')], meta('Rotate3D'), { axis: 'y', speed: 9 });
+      const s1 = `${gN}:${gA}.Rotate3D.speed`;
+      const s2 = `${gN2}:${gA}.Rotate3D.speed`;
+      const same = await previewApply(rootOf(ROOT1), new Set([s1, s2]), { default: 'frame' });
+      expect(same.conflicts).toEqual([]);
+      expect(same.effects.map((e) => e.effect.op)).toEqual(['addComponent', 'addComponent']);
+      writeTraitFieldWithUndo(under('Slot2', 'A'), meta('Rotate3D'), 'speed', 2);
+      const differ = await previewApply(rootOf(ROOT1), new Set([s1, s2]), { default: 'frame' });
+      expect(differ.conflicts.map((c) => c.slot)).toEqual(['A · Rotate3D.speed']);
+    });
+  });
+
+  describe('#1728: U13\'s "this Apply wrote it here itself" is per SLOT (row, path), not per document', () => {
+    it('two prefabs: N → O and NQ → Q — O\'s NQ override is dropped, QA shows 7, and so does a reload', async () => {
+      // Mutation: key `wroteAt`/`mine` by `source|lid|trait|field` again (drop `rowLid` and `path` from `slotOf`'s use
+      // there) — N's write at O marks NQ's slot "mine", the drop is skipped, O's NQ keeps x = 3, and QA shows 3.
+      const x3 = { overrides: { 2: { Transform: { x: 3 } } } };
+      install(pDoc(), qDoc(), oWithSecond(ref(5, 'NQ', 3, gNQ, Q, x3), x3));
+      await load(scene(O, [ROOT1]));
+      writeTraitFieldWithUndo(under('Slot', 'A'), meta('Transform'), 'x', 5);
+      writeTraitFieldWithUndo(under('Slot2', 'QA'), meta('Transform'), 'x', 7);
+      const kq = `${gNQ}:${gQA}.Transform.x`;
+      const res = await quietly(() => applyToPrefabSelective(rootOf(ROOT1), new Set([k1, kq]), { perKey: { [kq]: Q } }));
+      expect(res.applied).toBe(true);
+      const o = written(O)!;
+      expect(o.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Transform).toEqual({ x: 5 });
+      expect(o.entities.find((e) => e.localId === 5)!.overrides?.[2]?.Transform).toBeUndefined();
+      expect(res.alsoReverted).toEqual([{ source: O, keys: [kq] }]);
+      expect(res.effects?.find((e) => e.key === kq)!.alsoReverts).toEqual([{ source: O, name: 'O', keys: [kq], what: ['its override of Transform.x on QA'] }]);
+      expect(tfx(under('Slot2', 'QA'))).toBe(7);
+      const { scene: s } = await saved();
+      install(written(Q)!, o);
+      await load(s);
+      expect([tfx(under('Slot', 'A')), tfx(under('Slot2', 'QA'))]).toEqual([5, 7]);
+    });
+
+    it('one prefab: N → O and N2 → P — O\'s N2 override is dropped', async () => {
+      // Mutation: as above — O's N2 keeps x = 3 and A under Slot2 shows 3.
+      const x3 = { overrides: { 2: { Transform: { x: 3 } } } };
+      install(pDoc(), oWithSecond(ref(5, 'N2', 3, gN2, P, x3), x3));
+      await load(scene(O, [ROOT1]));
+      writeTraitFieldWithUndo(under('Slot', 'A'), meta('Transform'), 'x', 5);
+      writeTraitFieldWithUndo(under('Slot2', 'A'), meta('Transform'), 'x', 7);
+      const res = await quietly(() => applyToPrefabSelective(rootOf(ROOT1), new Set([k1, k2]), { perKey: { [k2]: P } }));
+      expect(res.applied).toBe(true);
+      expect(written(O)!.entities.find((e) => e.localId === 5)!.overrides?.[2]?.Transform).toBeUndefined();
+      expect([tfx(under('Slot', 'A')), tfx(under('Slot2', 'A'))]).toEqual([5, 7]);
+    });
+  });
+
+  it('a conflict two nesting levels down names the WHOLE row path of the other change', async () => {
+    // Mutation: name only the chain's LAST row in \`whoOf\` — both instances hang from row 'N', and each row names the
+    // other exactly as itself: "the change to A under row 'N'".
+    const gS1 = 'eeeeeeee-0000-4000-8000-00000000173d';
+    const gS2 = 'eeeeeeee-0000-4000-8000-00000000173e';
+    const gM2 = 'eeeeeeee-0000-4000-8000-00000000173f';
+    const o2 = { id: O2, version: 5, name: 'O2', rootLocalId: 1, entities: [
+      row(1, 'O2R', 0, gO2R), row(2, 'S1', 1, gS1), row(3, 'S2', 1, gS2),
+      ref(4, 'M1', 2, gM, O), ref(5, 'M2', 3, gM2, O),
+    ] };
+    install(pDoc(), oDoc(), o2);
+    await load(scene(O2, [ROOT1]));
+    writeTraitFieldWithUndo(under('S1', 'A'), meta('Transform'), 'x', 5);
+    writeTraitFieldWithUndo(under('S2', 'A'), meta('Transform'), 'x', 9);
+    const keys = collectInstanceOverrideKeys(rootOf(ROOT1), getCachedPrefabSync(O2) as PrefabFile).nested;
+    expect(keys).toHaveLength(2); // precondition
+    const preview = await previewApply(rootOf(ROOT1), new Set(keys), { default: 'frame' });
+    const first = preview.effects.find((e) => e.key.startsWith(gM))!.effect;
+    expect(first.op === 'conflict' ? first.with[0]!.who : '').toBe("A under row 'M2 › N'");
+  });
+
+  it('#1715 (pool half): P reached at two depths refreshes BEFORE Q, which contains it — the deep frame follows a later P edit', async () => {
+    // Mutation (BOTH, since each alone orders this case right — a redundant property): record the pool level at first
+    // use (`levels[0]`) AND drop the containment test in `innermostFirst` — writes run [Q, P], the deep frame's applied
+    // 7 stays marked, the save pins it, and P's later 9 reaches the direct frame only (9, 7).
+    install(pDoc(), qDoc(true), oWithSecond(ref(5, 'NQ', 3, gNQ, Q)));
+    await load(scene(O, [ROOT1]));
+    writeTraitFieldWithUndo(under('Slot2', 'QA'), meta('Transform'), 'x', 4);
+    writeTraitFieldWithUndo(under('Slot', 'A'), meta('Transform'), 'x', 7);
+    writeTraitFieldWithUndo(under('QR', 'A'), meta('Transform'), 'x', 7);
+    const keys = nestedKeys();
+    const kq = keys.find((k) => k.includes(gQA))!;
+    const direct = keys.find((k) => k.startsWith(`${gN}:`))!;
+    const deep = keys.find((k) => k !== kq && k !== direct)!;
+    expect([kq, direct, deep].every(Boolean)).toBe(true); // precondition
+    // The caller's order, Q first — the agent op passes keys as given.
+    const res = await quietly(() => applyToPrefabSelective(rootOf(ROOT1), new Set([kq, direct, deep]), { perKey: { [kq]: Q, [direct]: P, [deep]: P } }));
+    expect(res.writes?.map((w) => w.source)).toEqual([P, Q]);
+    const { scene: s } = await saved();
+    const p9 = written(P)!;
+    (p9.entities.find((e) => e.localId === 2)!.traits.Transform as { x: number }).x = 9;
+    install(p9, written(Q)!);
+    await load(s);
+    expect([tfx(under('Slot', 'A')), tfx(under('QR', 'A')), tfx(under('Slot2', 'QA'))]).toEqual([9, 9, 4]);
+  });
+
+  describe('#1731: a template reference node that states the applied field', () => {
+    /** O's row N adds a keyed Q node under R, which states `stated` about QA; the scene sets QA.x = 7 on it. */
+    const nodeCase = async (stated: Record<string, unknown>) => {
+      const node = { parentLocalId: 1, key: KQ, guid: '', name: 'QN', prefab: Q, traits: {}, children: [], ...stated };
+      install(pDoc(), qDoc(), oWith({}) as never);
+      const o = oDoc() as unknown as { entities: Array<Record<string, unknown>> };
+      o.entities[3]!.added = [node];
+      install(o as never);
+      await load(scene(O, [ROOT1]));
+      const qa = under('QR', 'QA');
+      expect(tfx(qa)).toBe(3); // precondition: the node states it
+      writeTraitFieldWithUndo(qa, meta('Transform'), 'x', 7);
+      return { qa, nodeRoot: under('R', 'QR') };
+    };
+    const entityOf = (id: number) => getCurrentWorld().entities.find((e) => e.id() === id)!;
+
+    it('writes Q, says so truthfully (no "not applied"), and the instance keeps 7 as its own, marked edit', async () => {
+      // Mutation: drop the `w.keep?.(…)` call — the refresh subtracts the applied field, QA's 7 loses its override mark,
+      // and the listing (by value) and the mark disagree.
+      //   And: drop the note — the key's effect says nothing of the node that still states 3.
+      const { qa, nodeRoot } = await nodeCase({ overrides: { 2: { Transform: { x: 3 } } } });
+      const key = `${gQA}.Transform.x`;
+      const res = await quietly(() => applyToPrefabSelective(nodeRoot, new Set([key])));
+      expect(res.applied).toBe(true);
+      expect(res.skipped).toBeUndefined();
+      expect((written(Q)!.entities.find((e) => e.localId === 2)!.traits.Transform as { x: number }).x).toBe(7);
+      const e = res.effects!.find((x) => x.key === key)!;
+      expect(e.effect).toMatchObject({ op: 'setField', to: 7 });
+      expect(e.note).toMatch(/^the template node holding this instance sets Transform.x = 3 on it/);
+      expect(tfx(under('QR', 'QA'))).toBe(7);
+      expect(getOverrideMarkSet(entityOf(under('QR', 'QA')))?.has('Transform.x')).toBe(true);
+      expect(qa).toBeTruthy();
+      expect(collectInstanceOverrideKeys(under('R', 'QR'), getCachedPrefabSync(Q) as PrefabFile).fields).toContain(key);
+    });
+
+    it('a node stating it on a MEMBER ROW is seen too', async () => {
+      // Mutation: pass `null` as the member key to `statedFields(node, …)` (the pre-fix call) — no note.
+      const { nodeRoot } = await nodeCase({ members: { [`/${gQA}`]: { traits: { Transform: { x: 3 } } } } });
+      const key = `${gQA}.Transform.x`;
+      const res = await quietly(() => applyToPrefabSelective(nodeRoot, new Set([key])));
+      expect(res.effects!.find((x) => x.key === key)!.note).toMatch(/template node/);
+    });
+  });
+
+  describe('the preview IS the plan the commit runs (hub ask: never apply a stale preview)', () => {
+    it('a dry run writes nothing; its fingerprint applies; a changed world since the preview is refused, not written', async () => {
+      // Mutation: drop the `opts.expect` check in `applyToPrefabSelective` — the stale Apply writes P's A.x = 6.
+      install(pDoc(), oDoc());
+      await load(scene(O, [ROOT1]));
+      writeTraitFieldWithUndo(under('Slot', 'A'), meta('Transform'), 'x', 5);
+      const shown = await previewApply(rootOf(ROOT1), new Set([k1]), { default: 'frame' });
+      expect(writes).toHaveLength(0);
+      expect(shown.files.map((f) => f.file)).toEqual([`${P}`]);
+      writeTraitFieldWithUndo(under('Slot', 'A'), meta('Transform'), 'x', 6); // the world moves after the preview
+      const stale = await quietly(() => applyToPrefabSelective(rootOf(ROOT1), new Set([k1]), { default: 'frame' }, { expect: shown.fingerprint }));
+      expect(stale.refused).toMatch(/changed since it was shown/);
+      expect(writes).toHaveLength(0);
+      const fresh = await previewApply(rootOf(ROOT1), new Set([k1]), { default: 'frame' });
+      const ok = await quietly(() => applyToPrefabSelective(rootOf(ROOT1), new Set([k1]), { default: 'frame' }, { expect: fresh.fingerprint }));
+      expect(ok.applied).toBe(true);
+      expect((written(P)!.entities.find((e) => e.localId === 2)!.traits.Transform as { x: number }).x).toBe(6);
+    });
   });
 });

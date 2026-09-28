@@ -620,24 +620,50 @@ enclosing prefab holds for the frame, that prefab ("Apply as override in Prefab 
 names the chain's places (`chainSlots`, from `frameBase`) and reads, writes and drops a member's statement where a
 level states it: the row's `overrides`, its `nestedOverrides[path]`, or a member row (`members`, which folds over both,
 so a value written under a member row that states the field would not show — it is written there instead).
-- **What each target does is said truthfully** (`prefabApplyOptions.ts`, read by the dialog and the agent op): a field
-  of a component the enclosing row ADDED, applied to the inner prefab, writes the whole component — "add component
-  Rotate3D (axis x, speed 7) to A in Prefab 'P' — every P gains it" (#1658: it used to be listed as "speed 3 → 7" and
-  written whole anyway). A component written at an enclosing level where nothing inside it gives the member one is
-  written whole there too.
+- **An Apply is ONE plan, and every surface renders it (#1736).** `planApply` decides what each selected key writes,
+  where, and what else that write changes, and returns it as a `KeyEffect` per key (`prefabApplyEffects.ts`: `setField`,
+  `addComponent`, `removeComponent`, `stopAddingComponent`, `addTag`, `removeMember`, `addNode`, `move`, `notApplied`,
+  `conflict`, with U13's `alsoReverts` and a `note`). The commit executes exactly that plan. `previewApply` is the same
+  plan as a DRY RUN — nothing written, nothing stamped on the live world (the promotion's template captures run
+  `readOnly`) — and the dialog's rows, its "Writes:" footer (file names, from the plan's writes — #1733) and the agent
+  op's `overrides`/`apply`/`apply {dryRun}` all render it through ONE `describeEffect`. `prefabApplyOptions.ts` says only
+  which targets a key HAS. It used to word each target key by key, and so could not see an effect that exists only
+  across keys. The dialog hands the preview's fingerprint to the commit, which refuses a fresh plan that differs from
+  what the rows showed rather than writing it. Both of Apply's plan-level refusals (a conflict, a changed plan) are
+  decided on a DRY plan before the writing one runs: the writing plan's promotion stamps template keys on live nodes,
+  which a refused Apply otherwise left behind with no undo.
+- **What each target does is said truthfully**: a field of a component the enclosing row ADDED, applied to the inner
+  prefab, writes the whole component — "add component Rotate3D (axis x, speed 7) to A in Prefab 'P' — every P gains it"
+  (#1658: it used to be listed as "speed 3 → 7" and written whole anyway). A component written at an enclosing level
+  where nothing inside it gives the member one is written whole there too. Whether a write ADDS the component is decided
+  against the document as READ, not as this Apply has changed it so far (#1727: a second frame found the first one's
+  bag and was labelled a one-field edit).
+- **A statement is keyed by its SLOT** — `document | row | path | member | trait | field` (a template's own row has no
+  row or path; `*` is a whole-trait tag or removal) — never by document alone. Two keys that state one slot with
+  DIFFERENT values are a **conflict** (#1727: two nested instances of one prefab, both applied into it, and the last
+  write won silently): the plan marks EVERY key stating that slot `conflict` (an equal third value too — each row names
+  only the keys whose value differs from its own), the dialog shows those rows in red and disables Apply, and
+  `applyToPrefabSelective` refuses the whole Apply naming every key (the agent op: `REFUSED_BY_OP`, the keys in
+  `options`). A field against another key's whole-trait removal is one too. Equal values write once. Unity has
+  no rule here — its Apply All on an outer root sends each nested instance to a different slot, and its per-property
+  "Apply to Prefab '<inner>'" acts on one instance — so this refuses rather than picking one.
 - **Defaults (owner ruling (a))**: the frame's own template, except a field or removal of a component an enclosing row
   added, which goes back to the prefab that adds it (`defaultKeyLevel`). A removal has no inner target: the inner
   template never had the component.
 - **U13** runs for every write, removals included: each enclosing level that states the applied field, tag or removed
   component drops it (a row override of a component the member lacks ADDS it, so a removal left under one came back
-  half-built). Never what the same Apply wrote at that level itself (`wroteAt`).
+  half-built). Never what the same Apply wrote at that SLOT itself (`wroteAt`) — keyed by document, one frame's write at
+  an enclosing prefab suppressed ANOTHER frame's drop there, and the applied edit was lost (#1728).
 - **U14 (owner, 2026-09-28; supersedes the 2026-09-19 ruling)**: Apply on an OUTER instance lists its nested instances'
   own fields, added tags, removed components and removed members too (`keys.nested`, chain-qualified: `<row chain>:<key>`,
   `nestedKeyRef`), and writes them into the outer prefab by default, as overrides on the row it holds for that
   instance; the nested prefab only when picked. They are not in `keys.all`: Revert acts on the nested instance itself.
 - **The write is ONE step over every file** (#1692's `commitPrefabWrites`), and the instances of each written prefab are
-  refreshed innermost first by chain level — a U14 write into a nested instance's own prefab before the frame's own —
-  so each capture reads frames already rebuilt inside it. A file that took a frame's OWN edit (the frame's own keys, or
+  refreshed innermost first — a file another written file CONTAINS goes before it (`innermostFirst`), the deepest chain
+  level it was reached at breaking ties — so each capture reads frames already rebuilt inside it. A level recorded at a
+  file's FIRST use tied P (reached at depths 1 and 2) with Q, which contains it, and Q went first (#1715); the maximum
+  alone still misorders O→P beside O→R→S→Q→P. An id-less enclosing prefab gets its id on both sides of the write, as the
+  frame's own document does, or its undo re-minted it and redo always refused (#1729). A file that took a frame's OWN edit (the frame's own keys, or
   a nested instance's U14 key written into its own prefab) has its refresh take that edit out of the frame's capture
   (`appliedFrom`), or its mark would pin it (#1469). Apply's undo and redo put every file back the same way.
 - **Every live value goes into a template through one writer** (`prefabTemplateValue.ts`, #1659): the value overlay,
@@ -647,8 +673,12 @@ so a value written under a member row that states the field would not show — i
 - **Not yet (#1715)**: an ADDED node, and a move inside a nested instance, go to the frame's own prefab only (a move OUT
   of a nested frame goes to the outer one, `nestedFrameMoves`, #1437); the enclosing levels take fields, tags, removed
   components and removed members (`writeMemberRemoval`). An added node is a live entity whose guid other refs name, so
-  writing it into another prefab's row needs #1660's guid carry across that prefab's rebuild — a different fix shape. A template reference node above the chain is not a document Apply writes: where it states
-  the applied value, it still wins on this instance, and Apply says so.
+  writing it into another prefab's row needs #1660's guid carry across that prefab's rebuild — a different fix shape. A template reference node above the chain is not a place Apply writes, so U13 cannot drop its
+  statement (#1731; Unity would — that needs the node as a write target, #1715's family). Where it states the applied
+  field, the prefab IS written (every other instance takes the value), and THIS instance keeps the value it shows as
+  its own edit — left out of the refresh's subtraction, still marked and still listed, since it differs from its base —
+  rather than flipping to the node's. The key's effect says so in its `note`; nothing lands in `skipped`. (It used to
+  push "not applied, the node still wins" after writing, which neither the file nor the instance matched.)
 
 **The resolved base is the enclosing layer WHOLE (#1506).** `frameBase` (`prefabBase.ts`, #1693; `enclosingLayer` reads
 its layer) answers what the layers enclosing an instance author on it: field overrides AND structure lists. `enclosingRowOverrides` is its

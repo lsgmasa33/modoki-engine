@@ -297,3 +297,33 @@ describe('#1732: a multi-file Apply and its undo report each file\'s outcome, no
     expect(detail).not.toMatch(/left as they are/);
   });
 });
+
+describe('#1729: an id-less ENCLOSING prefab written by U13 round-trips through undo and redo', () => {
+  it('the Apply stamps O\'s id on both sides, the undo puts back that same id, and the redo is allowed', async () => {
+    // Mutation: drop the id stamp in `planApply`'s `docFor` (`if (!doc.id) before.id = doc.id = newGuid()`) — the commit
+    // mints O an id the undo's `before` does not carry, the undo writes O back id-less (another mint), and the redo is
+    // refused as "changed on disk", leaving P and O at their pre-Apply bytes.
+    const idless = () => { const d = oDoc() as Partial<ReturnType<typeof oDoc>>; delete d.id; return d; };
+    prefabs.set(O, idless());
+    setPrefabCache(O, idless() as never);
+    fs.disk.set(O, jsonFileBody(idless()));
+    writeTraitFieldWithUndo(byName('A'), getTraitByName('Transform')!, 'x', 5);
+    const nested = byName('R');
+    const key = collectInstanceOverrideKeys(nested, getCachedPrefabSync(P) as PrefabFile).fields.find((k) => k.endsWith('.Transform.x'))!;
+    const res = await quietly(() => applyToPrefabWithUndo(nested, new Set([key])));
+    expect(res.writes?.map((w) => w.source)).toEqual([P, O]);
+    const oWrite = res.writes!.find((w) => w.source === O)!;
+    expect(oWrite.after.id).toBeTruthy();
+    expect(oWrite.before.id).toBe(oWrite.after.id);
+    expect(disk(O).id).toBe(oWrite.after.id);
+
+    await quietly(() => undo());
+    expect(disk(O).id).toBe(oWrite.after.id);
+    expect(disk(O).entities[1]!.overrides?.[2]?.Transform).toEqual({ x: 3 });
+
+    await quietly(() => redo());
+    expect((disk(P).entities[1]!.traits.Transform as { x: number }).x).toBe(5);
+    expect(disk(O).entities[1]!.overrides?.[2]?.Transform).toBeUndefined();
+    expect(disk(O).id).toBe(oWrite.after.id);
+  });
+});

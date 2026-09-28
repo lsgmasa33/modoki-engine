@@ -85,9 +85,10 @@ export {
   warnInertPrefabSizes, classifyExistingPrefabId, parsedPrefabRows,
   tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance, reattachDetachedInstance,
-  captureInstanceStructure, resolveInstanceContext,
-  type PrefabFile, type RevertResult,
+  captureInstanceStructure, resolveInstanceContext, previewApply,
+  type PrefabFile, type RevertResult, type ApplyPreview,
 } from './scene/prefab';
+export { describeEffect, type KeyEffect, type EditEffect, type ApplyConflict } from './scene/prefabApplyEffects';
 export { commitPrefabWrite, commitPrefabWrites, type PrefabCommitResult, type PrefabCommitsResult, type PrefabWrite, type PrefabExpectation } from './scene/prefabCommit';
 // Shared override-key enumeration for the Apply-to-Prefab / Revert-Overrides surfaces —
 // the dialog (ApplyPrefabDialog.tsx) and the `modoki_prefab {prefabAction:'overrides'}`

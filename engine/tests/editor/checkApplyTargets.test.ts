@@ -7,7 +7,7 @@ import { checkApplyTargets, type KeyTargets } from '../../packages/modoki/src/ed
 
 const O = 'outer-guid';
 const P = 'inner-guid';
-const opt = (target: string, name: string) => ({ target, name, label: name, alsoReverts: [] });
+const opt = (target: string, name: string) => ({ target, name });
 /** A key of the opened instance O's own frame, and a U14 key of its nested P frame (`frameTarget` P). */
 const options = new Map<string, KeyTargets>([
   ['own.T.f', { options: [opt(O, 'O')], defaultTarget: O, frameTarget: O }],

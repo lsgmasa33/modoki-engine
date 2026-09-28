@@ -335,6 +335,8 @@ export async function applyToPrefabWithUndo(
   selectedKeys: Set<string>,
   /** Where each key is written (#1693) — see `applyToPrefabSelective`. */
   targets?: ApplyTargets,
+  /** `expect`: the fingerprint of the preview the caller showed (#1736) — see `applyToPrefabSelective`. */
+  opts: { expect?: string } = {},
 ): Promise<ApplyResult> {
   // ⚠️ Lands WHOLE, in the world it began in (I11, #1667). Its write, its refresh, its scene save and its undo entry
   // are separated by awaits, and a Play, a scene open or entering prefab edit in one of them ran the rest in the
@@ -346,13 +348,13 @@ export async function applyToPrefabWithUndo(
   }
   const release = beginWorldBoundOperation();
   try {
-    return await applyHeld(rootInstanceId, selectedKeys, targets);
+    return await applyHeld(rootInstanceId, selectedKeys, targets, opts);
   } finally {
     release();
   }
 }
 
-async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targets?: ApplyTargets): Promise<ApplyResult> {
+async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targets?: ApplyTargets, opts: { expect?: string } = {}): Promise<ApplyResult> {
   // …and not over a world an editor route is still adopting (#1698): its snapshot, its scene save and its undo entry
   // would describe a world whose history and path are about to change under them.
   const settling = adoptionsSettled();
@@ -384,7 +386,7 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   if (ctx) await preloadNestedPrefabsForSubtree(rootInstanceId);
   const prefabNow = ctx ? await getPrefabSource(ctx.source) : null;
   const baseBefore = ctx && prefabNow && rootGuid ? captureSide(rootInstanceId, rootGuid, ctx.source, prefabNow) : null;
-  const result = await applyToPrefabSelective(rootInstanceId, selectedKeys, targets);
+  const result = await applyToPrefabSelective(rootInstanceId, selectedKeys, targets, opts);
   if (!result.applied || !result.source || !result.prefabBefore || !result.prefabAfter) {
     return result; // no-op apply — nothing to undo
   }

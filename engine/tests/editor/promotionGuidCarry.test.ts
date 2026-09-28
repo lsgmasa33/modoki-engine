@@ -32,16 +32,18 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 }));
 
 import {
-  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
+  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData, writeTraitField,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
+import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, createEntityWithUndo, ensureGuid, reparentEntity } from '@modoki/engine/editor';
 import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import {
   setPrefabCache, applyToPrefabSelective, getCachedPrefabSync, instantiatePrefab, setPrefabSource, carryPromotedGuidsForTest,
-  type PrefabFile,
+  previewApply, type PrefabFile,
 } from '../../packages/modoki/src/editor/scene/prefab';
+import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
@@ -354,6 +356,69 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     carryPromotedGuidsForTest(ROOT1, { plain: new Map([[lidA, HOLDER]]), refs: new Map() });
     expect(guidOf(a)).toBe(aGuid);
     expect(duplicateGuids()).toEqual([]);
+  });
+
+  it('#1736: a DRY RUN of that promotion (the dialog\'s preview) stamps no template key on the live node and writes nothing', async () => {
+    // Mutation: pass `readOnly: false` for the promotion in `planApply` (drop `readOnly: dryRun`) — the preview's
+    // template capture of the reference node stamps a key on Inner, a live change no undo records.
+    install(pDoc(), qDoc());
+    await load(scene());
+    const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
+    setPrefabSource(qRoot, Q);
+    const qRootGuid = ensureGuid(qRoot);
+    await load(await serializeScene() as unknown as SceneData);
+    const inner = add('Add Inner', idOf(qRootGuid), [{ name: 'EntityAttributes', data: { name: 'Inner', parentId: idOf(qRootGuid) } }]);
+    const entityOf = (id: number) => getCurrentWorld().entities.find((e) => e.id() === id);
+    expect(templateKeyOf(entityOf(inner))).toBe(''); // precondition
+    const r1 = idOf(ROOT1);
+    const keys = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P) as PrefabFile);
+    const preview = await previewApply(r1, new Set(keys.added));
+    expect(preview.effects.map((e) => e.effect.op)).toEqual(['addNode']);
+    expect(templateKeyOf(entityOf(inner))).toBe('');
+    expect(writes).toHaveLength(0);
+    // A REFUSED Apply leaves no stamp either (#1736 review): the stale-preview refusal is decided on a dry plan before
+    // the writing plan runs. Mutation: decide it on the writing plan (drop the dry pass in `applyToPrefabSelective`) —
+    // refused, nothing written, and Inner carries a template key no undo records.
+    const refused = await applyToPrefabSelective(r1, new Set(keys.added), undefined, { expect: 'not what was shown' });
+    expect(refused.refused).toMatch(/changed since it was shown/);
+    expect(templateKeyOf(entityOf(inner))).toBe('');
+    expect(writes).toHaveLength(0);
+  });
+
+  it('#1736: a CONFLICT is refused on the dry plan — the promotion in the same Apply stamps nothing', async () => {
+    // Mutation: drop \`if (dry.conflicts.length) return …\` in \`applyToPrefabSelective\` — the writing plan's own check still
+    // refuses and writes nothing, but only after its promotion stamped a template key on Inner, which no undo records.
+    // P2: R2 → N1 (Q), R2 → N2 (Q). QA.x = 5 under N1 and 9 under N2, both applied into Q: a conflict.
+    const P2 = 'cccccccc-0000-4000-8000-000000017361';
+    const ref = (localId: number, name: string, nodeGuid: string) => ({ localId, name, nodeGuid, prefab: Q, traits: { EntityAttributes: { name, parentId: 1, guid: '' } } });
+    const p2 = { id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [
+      row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000017361'), ref(2, 'N1', 'eeeeeeee-0000-4000-8000-000000017362'), ref(3, 'N2', 'eeeeeeee-0000-4000-8000-000000017363'),
+    ] };
+    install(pDoc(), qDoc(), p2);
+    await load({ ...scene(), entities: [
+      { id: 1, traits: { EntityAttributes: { name: 'Holder', parentId: 0, guid: HOLDER } } },
+      { id: 2, prefab: P2, guid: ROOT1, traits: { EntityAttributes: { name: 'Inst1', parentId: HOLDER } } },
+    ] } as unknown as SceneData);
+    const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
+    setPrefabSource(qRoot, Q);
+    const qRootGuid = ensureGuid(qRoot);
+    await load(await serializeScene() as unknown as SceneData);
+    const inner = add('Add Inner', idOf(qRootGuid), [{ name: 'EntityAttributes', data: { name: 'Inner', parentId: idOf(qRootGuid) } }]);
+    const entityOf = (id: number) => getCurrentWorld().entities.find((e) => e.id() === id);
+    const added = under(qRootGuid, 'QA');
+    const [qa1, qa2] = getAllEntities().filter((e) => e.name === 'QA' && e.id !== added).map((e) => e.id);
+    writeTraitField(qa1!, meta('Transform'), 'x', 5);
+    markOverride(entityOf(qa1!)!, 'Transform', 'x');
+    writeTraitField(qa2!, meta('Transform'), 'x', 9);
+    markOverride(entityOf(qa2!)!, 'Transform', 'x');
+    const r1 = idOf(ROOT1);
+    const keys = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P2) as PrefabFile);
+    expect([keys.added.length, keys.nested.length]).toEqual([1, 2]); // precondition
+    expect(templateKeyOf(entityOf(inner))).toBe(''); // precondition
+    const res = await applyToPrefabSelective(r1, new Set([...keys.added, ...keys.nested]), { perKey: Object.fromEntries(keys.nested.map((k) => [k, Q])) });
+    expect(res.conflicts).toHaveLength(1);
+    expect(writes).toHaveLength(0);
+    expect(templateKeyOf(entityOf(inner))).toBe('');
   });
 
   it('a node the author added INSIDE the promoted nested instance becomes template-keyed: its guid re-derives and the refs follow it', async () => {

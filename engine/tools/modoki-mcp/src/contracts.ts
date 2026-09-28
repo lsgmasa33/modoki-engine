@@ -462,6 +462,11 @@ const DECLS: Record<string, Decl> = {
       + 'destructive reading. Not every override is applyable, either — a scene-only/runtime-only '
       + 'field (EntityAttributes.editorFolder) is revertable but is skipped by a template write, '
       + 'so apply refuses it when named and reports it as `skippedKeys` when not. '
+      + "What an apply DOES is the plan's per-key `effects` (#1736): `overrides` answers each key's effect at its "
+      + "default (one dry run of that Apply) plus any `conflicts`; `apply` answers the effects it wrote, and "
+      + "`apply {dryRun:true}` the ones it would write, writing nothing. Two keys writing one field of one prefab with "
+      + "different values (two nested instances of it, applied into it) are a CONFLICT: refused whole, REFUSED_BY_OP, "
+      + 'both keys in `options` — never last-write-wins. '
       + "The edit-* actions drive PREFAB-EDIT MODE: 'edit-open' swaps the world for a synthetic "
       + 'prefab scene (world-destructive, so it takes `discardUnsaved` like load-scene, and it saves the '
       + "current scene on the way in), 'edit-save' re-serializes the .prefab.json, 'edit-exit' "

@@ -54,7 +54,8 @@ import {
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo,
-  applyToPrefabWithUndo, revertOverridesWithUndo, staleInstanceRefusal, resolveInstanceContext,
+  applyToPrefabWithUndo, revertOverridesWithUndo, staleInstanceRefusal, resolveInstanceContext, previewApply, describeEffect,
+  type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
   pushAction, makePrefabInstantiateAction, entityRef, assetDocAction,
   getEditorViewportCamera, focusEntityInSceneView, setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit,
@@ -546,6 +547,18 @@ interface PrefabParams {
   target?: string;
   /** apply: per-key targets, over `target`. Every one must be a target of its key, and every key must be applied. */
   targets?: Record<string, string>;
+  /** apply: compute the Apply and answer what it WOULD do (per-key `effects`, `conflicts`, the files) — write nothing (#1736). */
+  dryRun?: boolean;
+}
+
+/** One key's Apply effect as the agent op answers it (#1736): the plan's statement, worded by the same `describeEffect`
+ *  the dialog renders — never re-derived here. */
+function effectOut(e: KeyEffect): { key: string; target: string; name: string; op: string; effect: string; alsoReverts?: { prefab: string; name: string; keys: string[] }[]; note?: string } {
+  return {
+    key: e.key, target: e.target, name: e.targetName, op: e.effect.op, effect: describeEffect(e),
+    ...(e.alsoReverts.length ? { alsoReverts: e.alsoReverts.map((r) => ({ prefab: r.source, name: r.name, keys: r.keys })) } : {}),
+    ...(e.note ? { note: e.note } : {}),
+  };
 }
 
 /** Raw selection write — no undo entry (the agent shouldn't pollute the human's
@@ -3136,11 +3149,23 @@ export function registerEditorAgentOps(): void {
       // (U13), and the default. What the dialog shows per row.
       const targets = Object.fromEntries([...applyTargetOptions(ctx.rootInstanceId, prefab, [...keys.all, ...keys.nested])].map(([k, t]) => [k, {
         defaultTarget: t.defaultTarget,
-        options: t.options.map((o) => ({ target: o.target, name: o.name, effect: o.label, alsoReverts: o.alsoReverts.map((r) => `Prefab '${r.name}': ${r.what}`) })),
+        options: t.options.map((o) => ({ target: o.target, name: o.name })),
       }]));
+      // What applying EVERY key at its default does (#1736): ONE dry run of that Apply, so an effect that exists only across
+      // keys (two frames writing one template field — a conflict; U13's reverts) is said here as the dialog says it. Another
+      // target's effect: `apply` with `dryRun: true`.
+      const plan = await previewApply(ctx.rootInstanceId, new Set([...keys.all, ...keys.nested]));
+      // Keyed by key, without the target: that is `targets[key].defaultTarget` already, and a guid per key crossed the
+      // response cap at 100 nested keys (#1736: 61.5k chars, against 53.6k before and a 60k cap).
+      const effects = Object.fromEntries(plan.effects.map((e) => {
+        const { op, effect, alsoReverts, note } = effectOut(e);
+        return [e.key, { op, effect, ...(alsoReverts ? { alsoReverts } : {}), ...(note ? { note } : {}) }];
+      }));
       return {
         ok: true, source: ctx.source, rootInstanceId: ctx.rootInstanceId, guid: ensureGuid(ctx.rootInstanceId),
-        keys, fields, targets,
+        keys, fields, targets, effects,
+        ...(plan.conflicts.length ? { conflicts: plan.conflicts } : {}),
+        ...(plan.refused ? { planRefused: plan.refused } : {}),
         // Say out loud what `keys` deliberately does NOT contain, so the omission is data rather
         // than a discrepancy the caller only notices by counting. `unaddressableAdded` are added
         // subtrees whose entity has no guid yet (minted lazily — save the scene and they become
@@ -3253,13 +3278,30 @@ export function registerEditorAgentOps(): void {
           }
           perKey = checked.perKey;
         }
+        const asked = p.target !== undefined || p.targets ? { default: p.target, perKey } : undefined;
+        // A dry run (#1736): the same plan the write would run, answered and not written.
+        if (p.dryRun) {
+          const plan = await previewApply(ctx.rootInstanceId, keySet, asked);
+          return {
+            ok: true, dryRun: true, source: ctx.source,
+            effects: plan.effects.map(effectOut),
+            ...(plan.conflicts.length ? { conflicts: plan.conflicts } : {}),
+            written: plan.files.map((f) => f.source),
+            ...(plan.skipped.length ? { notWritten: plan.skipped } : {}),
+            ...(plan.refused ? { refused: plan.refused } : {}),
+          };
+        }
         // applyToPrefabWithUndo pushes its OWN undo entry (before/after prefab + scene
         // snapshot — see applyPrefabUndo.ts) — do NOT push a second one here.
-        const result = await applyToPrefabWithUndo(ctx.rootInstanceId, keySet,
-          p.target !== undefined || p.targets ? { default: p.target, perKey } : undefined);
+        const result = await applyToPrefabWithUndo(ctx.rootInstanceId, keySet, asked);
         // A move the prefab cannot express (#1437) is named with its reason, not echoed back as applied.
         const notWritten = result.skipped ?? [];
         if (!result.applied) {
+          // Two keys stating one slot with different values (#1736): refused whole, both named — never last-write-wins.
+          if (result.conflicts?.length) {
+            throw new OpRefusal('REFUSED_BY_OP', `prefab apply refused: ${result.refused}. Pass \`dryRun: true\` to see each key's effect.`,
+              { options: [...new Set(result.conflicts.flatMap((c) => c.keys.map((k) => k.key)))] });
+          }
           // A REFUSAL states its own cause; leading with the "may have stopped being a prefab
           // instance" guess before appending the real reason sends the reader down the wrong path
           // (#1468 close-out review F4). That guess is right only when nothing else explains it.
@@ -3281,7 +3323,9 @@ export function registerEditorAgentOps(): void {
           ...(excluded.length > 0 ? { skippedReason: `fields ${excluded.join(', ')}: not representable in a prefab template (scene-only / runtime-only field)` } : {}),
           ...(notWritten.length > 0 ? { notWritten } : {}),
           promotedAdditions: result.promotedAdditions, saved: true,
-          // Where each key went, every file written (innermost first), and what U13 reverted with them (#1693).
+          // What each key did (#1736), where each key went, every file written (innermost first), and what U13 reverted
+          // with them (#1693).
+          effects: (result.effects ?? []).map(effectOut),
           ...(result.targets ? { targets: result.targets } : {}),
           written: (result.writes ?? []).map((w) => w.source),
           ...(result.alsoReverted?.length ? { alsoReverted: result.alsoReverted } : {}),

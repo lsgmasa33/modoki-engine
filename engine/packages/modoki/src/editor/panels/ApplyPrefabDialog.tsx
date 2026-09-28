@@ -13,7 +13,9 @@ import {
   preloadNestedPrefabsForSubtree,
   ownInstanceStructure,
   staleInstanceRefusal,
+  previewApply,
   type PrefabFile,
+  type ApplyPreview,
 } from '../scene/prefab';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
 import { revertOverridesWithUndo } from '../undo/revertPrefabUndo';
@@ -32,7 +34,8 @@ import {
 import { ModalShell } from '../components/ModalShell';
 import { applyTargetOptions, type KeyTargets } from '../scene/prefabApplyOptions';
 import {
-  initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, filesWritten, toApplyTargets, type TargetChoice,
+  initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, filesWritten, toApplyTargets, rowView, applyBlocked,
+  previewRequestKey, staysOpen, type TargetChoice,
 } from './applyDialogModel';
 
 // The dialog's tree node is the shared shape exactly — aliased locally so the rest
@@ -167,6 +170,10 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   // Where each key is written (#1693, owner ruling C): its targets, and the one chosen. Apply only.
   const [targetOpts, setTargetOpts] = useState<Map<string, KeyTargets>>(new Map());
   const [choice, setChoice] = useState<TargetChoice>({});
+  // What the checked keys at their targets DO (#1736): a dry run of exactly this Apply, which every row, the footer and
+  // the conflict line render. `request` is the selection it was computed for; a newer selection makes it stale.
+  const [preview, setPreview] = useState<(ApplyPreview & { request: string }) | null>(null);
+  const [previewEpoch, setPreviewEpoch] = useState(0);
 
   /** #868: when the instance root the dialog was opened for no longer exists, the dialog closes with a
    *  notice rather than acting on whatever entity now holds its index (see prefabDialogSubject.ts). */
@@ -230,6 +237,23 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     return () => { cancelled = true; };
   }, [active, subject]);
 
+  useEffect(() => {
+    if (!active || mode !== 'apply' || rootInstanceId === null || loadState.kind !== 'ready') return;
+    const request = previewRequestKey(rootInstanceId, choice, checked);
+    if (checked.size === 0) { setPreview({ effects: [], conflicts: [], skipped: [], files: [], fingerprint: '', request }); return; }
+    let cancelled = false;
+    // Debounced: a run of checkbox clicks asks once. A result for an older selection is dropped here, and the Apply
+    // button waits for one of THIS selection (`applyBlocked`).
+    const timer = setTimeout(() => {
+      previewApply(rootInstanceId, new Set(checked), toApplyTargets(choice, checked))
+        .then((p) => { if (!cancelled) setPreview({ ...p, request }); })
+        .catch((err: unknown) => {
+          if (!cancelled) setPreview({ refused: String((err as Error)?.message ?? err), effects: [], conflicts: [], skipped: [], files: [], fingerprint: '', request });
+        });
+    }, 120);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [active, mode, rootInstanceId, loadState.kind, checked, choice, previewEpoch]);
+
   const totals = useMemo(() => {
     if (loadState.kind !== 'ready') return { total: 0, checked: 0 };
     let total = 0;
@@ -287,9 +311,14 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
         act: async (liveId) => {
           // Applies the selected overrides to the prefab AND pushes one undo entry.
           // (Promotion-driven scene re-save now happens inside applyToPrefabWithUndo.)
-          const result = await applyToPrefabWithUndo(liveId, checked, toApplyTargets(choice, checked));
+          // The Apply commits a FRESH plan of the checked keys; handed the fingerprint of what the rows show, it refuses
+          // a plan that would do something else (#1736) — the dialog then re-reads and shows it rather than closing.
+          const result = await applyToPrefabWithUndo(liveId, checked, toApplyTargets(choice, checked), { expect: preview?.fingerprint ?? '' });
           const notice = applyOutcomeNotice(result);
           if (notice) useEditorStore.getState().showToast(notice, 'warn');
+          // Re-read, with the old preview dropped: it has the same request, and would let a second click send its stale
+          // fingerprint before the new one lands.
+          if (staysOpen(result)) { setPreview(null); setPreviewEpoch((e) => e + 1); return; }
           closeDialog();
         },
       });
@@ -324,6 +353,9 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   const targetCell = (key: string, indent: number): React.ReactElement | null => {
     const o = mode === 'apply' ? chosenOption(choice, targetOpts, key) : undefined;
     if (!o) return null;
+    // The plan's effect for a CHECKED row (#1736); an unchecked row writes nothing, so it names only where it would go.
+    const view = checked.has(key) ? rowView(preview, key) : null;
+    const tone = view?.tone === 'conflict' ? '#e0605a' : view?.tone === 'notApplied' ? '#c9a44a' : '#9ab';
     return (
       <div style={{ paddingLeft: indent, fontSize: 11, marginBottom: 2 }}>
         {hasChoice(targetOpts, key) && (
@@ -336,10 +368,11 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             {targetOpts.get(key)!.options.map((t) => <option key={t.target} value={t.target}>{t.name}</option>)}
           </select>
         )}
-        <span style={{ color: '#9ab' }}>{o.label}</span>
-        {o.alsoReverts.map((r) => (
-          <div key={r.prefab + r.what} style={{ color: '#c9a44a' }}>also reverts Prefab '{r.name}': {r.what} — {r.name} is written too</div>
-        ))}
+        {view
+          ? <span style={{ color: tone }} data-ui-id={`prefab.dialog.effect.${key}`}>{view.label}</span>
+          : <span style={{ color: '#667' }}>→ Prefab '{o.name}'{checked.has(key) ? '' : ' (not applied)'}</span>}
+        {view?.reverts.map((r) => <div key={r} style={{ color: '#c9a44a' }}>{r}</div>)}
+        {view?.note && <div style={{ color: '#c9a44a' }}>{view.note}</div>}
       </div>
     );
   };
@@ -348,7 +381,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     for (const t of targetOpts.values()) for (const o of t.options) if (!seen.has(o.target)) seen.set(o.target, o.name);
     return [...seen];
   })();
-  const writesFooter = mode === 'apply' ? filesWritten(choice, targetOpts, checked) : [];
+  const writesFooter = mode === 'apply' ? filesWritten(preview) : [];
+  const blocked = mode === 'apply' && checked.size > 0 ? applyBlocked(preview, previewRequestKey(rootInstanceId, choice, checked)) : null;
 
   const isRevert = mode === 'revert';
   const title = isRevert ? 'Revert Overrides' : 'Apply to Prefab';
@@ -592,7 +626,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <TriCheckbox
                 state={checked.has(k) ? 'on' : 'off'}
                 onChange={(next) => toggleKey(k, next)}
-                dataUiId={`prefab.dialog.item.${k}`} dataUiLabel={chosenOption(choice, targetOpts, k)?.label ?? k}
+                dataUiId={`prefab.dialog.item.${k}`} dataUiLabel={rowView(preview, k)?.label ?? k}
               />
               {targetCell(k, 0)}
             </div>
@@ -601,8 +635,11 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
 
         {writesFooter.length > 0 && (
           <div data-ui-id="prefab.dialog.writes" style={{ color: '#888', fontSize: 11, marginTop: 8 }}>
-            Writes: {writesFooter.map((n) => `${n}.prefab.json`).join(', ')}
+            Writes: {writesFooter.join(', ')}
           </div>
+        )}
+        {blocked && (
+          <div data-ui-id="prefab.dialog.blocked" style={{ color: blocked.startsWith('Cannot') ? '#e0605a' : '#888', fontSize: 11, marginTop: 4 }}>{blocked}</div>
         )}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
           <button
@@ -617,13 +654,13 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
           >Cancel</button>
           <button
             onClick={onConfirm}
-            disabled={applying || totals.checked === 0 || loadState.kind !== 'ready'}
+            disabled={applying || totals.checked === 0 || loadState.kind !== 'ready' || !!blocked}
             data-ui-id="prefab.dialog.confirm" data-ui-kind="button"
             style={{
               padding: '5px 16px', border: `1px solid ${confirmBorder}`, borderRadius: 3,
               background: confirmBg, color: '#fff', cursor: (applying || totals.checked === 0) ? 'default' : 'pointer',
               fontFamily: 'monospace', fontSize: 11,
-              opacity: (applying || totals.checked === 0 || loadState.kind !== 'ready') ? 0.5 : 1,
+              opacity: (applying || totals.checked === 0 || loadState.kind !== 'ready' || blocked) ? 0.5 : 1,
             }}
           >{confirmLabel}</button>
         </div>
