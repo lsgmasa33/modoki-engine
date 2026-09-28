@@ -244,6 +244,38 @@ export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World 
   for (const e of renamed) indexEntityGuid(e, world);
 }
 
+/** Every entity below the frame root `rootEcsId` whose guid a RELOAD derives, with the guid it derives from `anchor`
+ *  (the root's guid) — the loader's coverage (`deriveMemberGuidsOnly`), walked down the identity tree instead of up.
+ *  A member the next save writes a ROW for is left out: the reload pins the guid it already has (`memberRowsToWrite`,
+ *  v16), in every frame the walk enters.
+ *
+ *  It is {@link memberPathIndex}, with one difference at a stored root. An UNKEYED stored root (a scene instance, a
+ *  scene-added reference node) has its guid stored by the save, and anchors its own members: it is its own walk, so
+ *  nothing below it is here. A KEYED stored root is a template reference node — a node a prefab document adds — whose
+ *  guid the reload DERIVES through its key, whatever a scene says: the load merges a scene's record of it onto the
+ *  template node, and pins that record's member rows only once the node's guid is the derived one (#1758). So the walk
+ *  takes it, and continues into its frame from its derived guid: a member no row pins derives from THAT guid. */
+export function reloadDerivedGuids(world: World, rootEcsId: number, anchor: string, tree: IdentityTree = identityTree(world)): Map<Entity, string> {
+  const piMeta = getTraitByName('PrefabInstance');
+  const out = new Map<Entity, string>();
+  if (!piMeta || !anchor) return out;
+  const walk = (root: number, from: string, depth: number): void => {
+    // ⚠️ `memberRowsToWrite`, not `memberRowKeysIn`: a KEYED member with no durable guid gets no row, and leaving it out
+    // on the premise that a row covers it reopens #1461's window for it.
+    const rowed = memberRowsToWrite(root, world);
+    for (const [key, e] of memberPathIndex(world, root, tree)) {
+      if (!key || !e) continue; // the root itself, and a step two siblings share
+      const stored = isStoredRoot(e.has(piMeta.trait) ? (e.get(piMeta.trait) as MemberPi) : null, e.id());
+      if (stored && !templateKeyOf(e)) continue; // a stored guid: the save writes it
+      const guid = deriveMemberGuid(from, memberPathSteps(key));
+      if (!rowed.has(e.id())) out.set(e, guid);
+      if (stored && depth < 64) walk(e.id(), guid, depth + 1);
+    }
+  };
+  walk(rootEcsId, anchor, 0);
+  return out;
+}
+
 /** Give every member of the instance rooted at `rootEcsId` the guid a RELOAD will derive for it, and
  *  return the rename it took (old guid → new), already applied (#1461).
  *
@@ -259,7 +291,10 @@ export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World 
  *
  *  The root keeps its guid: it is the anchor, and both Create Prefab callers resolve the tagged subtree by
  *  it across a world rebuild. A STORED root below (a user-added nested instance) keeps its own for the same
- *  reason, exactly as {@link promoteOwnedRoots} skips one — this is that function run the other way.
+ *  reason, exactly as {@link promoteOwnedRoots} skips one — this is that function run the other way. A KEYED stored
+ *  root is the exception, and it is renamed, with each of its members no row pins ({@link reloadDerivedGuids}, #1758): a reference node the
+ *  scene added inside a held instance becomes template content when the write swallows that instance, so the scene
+ *  stores no guid for it any more and the reload derives one.
  *  Undo: {@link applyGuidRemap} with the map reversed, and BEFORE the prior links go back, because
  *  `detachPrefabInstance`'s snapshot addresses every member by the guid it had when it was taken.
  *
@@ -282,25 +317,18 @@ export function stampDerivedMemberGuids(rootEcsId: number, world: World = getCur
   const remap = new Map<string, string>();
   if (!piMeta || !eaMeta) return remap;
   const guidOf = (e: Entity) => (e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '');
-  const index = memberPathIndex(world, rootEcsId, identityTree(world));
-  const root = index.get('');
+  const tree = identityTree(world);
+  const root = memberPathIndex(world, rootEcsId, tree).get('');
   // ⚠️ DURABLE only. A runtime guid (#1210) dies with its world, so deriving members from one would
   // bake identities the next reload cannot reproduce — the very defect this closes, one level up.
   // Both Create Prefab callers mint a durable guid (`entityRef` → `ensureGuid`) before tagging, so in
   // production this is a floor, not a live branch.
   const anchor = root ? durableGuid(guidOf(root)) : '';
   if (!anchor) return remap; // unaddressable before, and after: nothing derives from it
-  // The members the next save will STATE a guid for, so no reload has to derive one (v16).
-  // ⚠️ `memberRowsToWrite`, not `memberRowKeysIn`: a KEYED member with no durable guid gets no row,
-  // and skipping it here on the premise that a row covers it reopens #1461's window for it.
-  const keyed = memberRowsToWrite(rootEcsId, world);
-  for (const [key, e] of index) {
-    if (!key || !e) continue; // the root itself, and a step two siblings share
-    if (isStoredRoot(e.has(piMeta.trait) ? (e.get(piMeta.trait) as MemberPi) : null, e.id())) continue; // a stored root keeps its stored guid
-    if (keyed.has(e.id())) continue; // a stored row states its guid — see the docblock
+  // A member a stored row states a guid for is not in the walk — see the docblock.
+  for (const [e, next] of reloadDerivedGuids(world, rootEcsId, anchor, tree)) {
     const old = guidOf(e);
     // A member with NO guid is left alone: nothing can reference it, and the load-time pass fills it.
-    const next = deriveMemberGuid(anchor, memberPathSteps(key));
     if (old && old !== next) remap.set(old, next);
   }
   applyGuidRemap(remap, world);
@@ -331,7 +359,13 @@ export function stampDerivedMemberGuids(rootEcsId: number, world: World = getCur
  *  ⚠️ It is sound only because a promoted root has somewhere to WRITE those rows wherever it lands:
  *  its own scene entry if it ends up top-level, and `AddedEntity.members` if it stays inside another
  *  instance as a reference node. The reference-node slot was added in the same change for this
- *  reason — without it this skip silently loses the identity it is trying to keep. */
+ *  reason — without it this skip silently loses the identity it is trying to keep.
+ *
+ *  ⚠️ **It stops at EVERY stored root, keyed ones included — unlike Create Prefab's stamp ({@link reloadDerivedGuids}).**
+ *  A keyed reference node under a promoted root was added by the OUTER template, whose frame this root has just left:
+ *  its key names nothing now, so the save writes it as an added node WITH its guid, and the reload pins that guid.
+ *  Measured for #1758 (`prefabTemplateIdentity.test.ts`, "…keeps every guid through save + reload"): walking into it
+ *  renamed the node and its members for no reader, and a ref to them in another file dangled. */
 export function promoteOwnedRoots(roots: Iterable<number>, world: World = getCurrentWorld()): Map<string, string> {
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');

@@ -258,7 +258,7 @@ describe('gesture: UNDO / REDO RESPAWN — delete an instance, put it back', () 
   });
 
   it('gives a DUPLICATE`s respawn fresh guids — the same primitive, the opposite requirement', async () => {
-    // `regenerateSnapshotGuids` is what separates the two uses of one snapshot: undo must reproduce
+    // `copySnapshot` is what separates the two uses of one snapshot: undo must reproduce
     // identity, a duplicate must not. Both go through `respawnFromSnapshot`, so the distinction lives
     // entirely in whether the snapshot was regenerated — worth pinning, because a future caller
     // reaching for the wrong one produces #1293 with no error.
@@ -267,8 +267,8 @@ describe('gesture: UNDO / REDO RESPAWN — delete an instance, put it back', () 
     const badgeGuid = guidOf('Badge');
     const badgeNode = rowOf(template, 'Badge').nodeGuid!;
 
-    const { snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids } = await import('../../packages/modoki/src/editor/undo/entityActions');
-    const fresh = regenerateSnapshotGuids(snapshotEntity(idOf('Root'))!);
+    const { snapshotEntity, respawnFromSnapshot, copySnapshot } = await import('../../packages/modoki/src/editor/undo/entityActions');
+    const fresh = copySnapshot(snapshotEntity(idOf('Root'))!);
     respawnFromSnapshot(fresh, 0);
 
     const saved = await serializeScene() as unknown as { entities: SceneEntityEntry[] };

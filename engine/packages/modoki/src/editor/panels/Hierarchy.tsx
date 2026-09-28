@@ -11,7 +11,7 @@ import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { makeSortOrderRenumberAction } from '../undo/overrideMarkWrites';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, clearOwnedNestedStampFromSnapshot, moveEntityToScene, planReparent, applyReparent, assignFreshSortOrder, type EntitySnapshot } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, copySnapshot, moveEntityToScene, planReparent, applyReparent, assignFreshSortOrder, type EntitySnapshot } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
@@ -1082,17 +1082,10 @@ export default function Hierarchy() {
     // copy → spawn a fresh deep copy under the target parent, with a unique
     // sortOrder at the end of that parent's children (so drag-reorder math stays
     // distinct: `assignFreshSortOrder`, shared with duplicateEntity).
-    // Prefab-instance handling, identical to duplicateEntity (prefab F1): pasting an
-    // instance ROOT → new linked instance; pasting a non-root MEMBER →
-    // plain ADDED child (strip PrefabInstance).
-    const prefabKind = classifyPrefabDuplicate(snapshot);
-    // Mint fresh guids for the pasted copy ONCE (stable across undo/redo, and not
-    // colliding with the source) — same as duplicateEntity. This also gives the
-    // paste a guid-based handle that survives a world rebuild (Play→Stop).
-    let pasteSnapshot = regenerateSnapshotGuids(snapshot);
-    if (prefabKind === 'member') pasteSnapshot = stripPrefabInstanceFromSnapshot(pasteSnapshot);
-    // A pasted owned nested instance root becomes an INDEPENDENT instance (#1354, owner ruling).
-    else if (prefabKind === 'root') pasteSnapshot = clearOwnedNestedStampFromSnapshot(pasteSnapshot);
+    // Fresh guids for the pasted copy ONCE (stable across undo/redo, not colliding with the source, and a guid-based
+    // handle that survives a world rebuild), and each node's prefab link by the frame it is a row of (#1756) — the one
+    // function duplicateEntity uses too.
+    const pasteSnapshot = copySnapshot(snapshot);
     const parentRef = parentId ? entityRef(parentId) : null;
     const spawn = (p: number) => {
       const id = respawnFromSnapshot(pasteSnapshot, p);

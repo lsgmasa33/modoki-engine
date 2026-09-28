@@ -1661,11 +1661,11 @@ describe('duplicate carries references INSIDE the copied subtree (#1338)', () =>
   });
 
   it('the paste path (a snapshot whose source is already gone) carries refs the same way', async () => {
-    const { snapshotEntity, regenerateSnapshotGuids, respawnFromSnapshot } = await getModule();
+    const { snapshotEntity, copySnapshot, respawnFromSnapshot } = await getModule();
     const panel = put(Transform(), EntityAttributes({ name: 'Panel', guid: 'g-panel' }), Link({ target: 'g-child', bindings: [] }));
     put(Transform(), EntityAttributes({ name: 'Child', parentId: panel.id(), guid: 'g-child' }));
     const snap = snapshotEntity(panel.id())!;
-    const pasted = regenerateSnapshotGuids(snap);
+    const pasted = copySnapshot(snap);
     const linkOf = (s: typeof snap) => s.traits.find((t) => t.meta.name === 'Link')!.data as { target: string };
     const eaOf = (s: typeof snap) => s.traits.find((t) => t.meta.name === 'EntityAttributes')!.data as { guid: string };
     expect(linkOf(pasted).target).toBe(eaOf(pasted.children[0]!).guid);

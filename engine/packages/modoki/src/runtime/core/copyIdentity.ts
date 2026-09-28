@@ -1,6 +1,9 @@
 /** The identities a COPY of an entity subtree gets — shared by every live duplicate: the editor's
- *  duplicate/paste (`regenerateSnapshotGuids`) and the runtime `duplicate-entity` op the device runs
+ *  duplicate/paste (`copySnapshot`) and the runtime `duplicate-entity` op the device runs
  *  (`engine/app/debug/liveLifecycle.ts`). Pure: the caller hands in its own tree shape.
+ *
+ *  **Which nodes stay prefab-linked** is decided per node, by the frame the node is a row of ({@link CopyLink}, #1756),
+ *  and every rule below reads that decision: only a node that stays a member derives its guid.
  *
  *  Two rules, and a copy that follows only the first silently drives the SOURCE (#1338):
  *  - **Every entity gets a new guid**, and `remap` maps each old guid to it, so the caller can carry
@@ -12,8 +15,8 @@
  *    it. Which guids a save stores is decided by STRUCTURE, not by the live value, so that is how a
  *    node is classified here: a `PrefabInstance` entity is DERIVED unless it is an instance root the
  *    serializer stores (`rootInstanceId` is itself and it did not expand from a prefab row, i.e.
- *    `parentLocalId` is 0). Members and owned nested roots are derived; a top-level or user-added
- *    instance root, and every plain entity, is an ANCHOR that gets `mint()`. The copy's root is
+ *    `parentLocalId` is 0). Members and owned nested roots the copy KEEPS are derived; a top-level or user-added
+ *    instance root, a promoted root, a stripped member, and every plain entity, is an ANCHOR that gets `mint()`. The copy's root is
  *    always an anchor. (Classifying by "the live guid equals its derivation" was wrong in both
  *    directions once a save had stored a derived guid — #1338 review.)
  *  - **A node the prefab TEMPLATE added keeps its template key and derives through it** (#1430). It
@@ -43,9 +46,23 @@ export interface CopyGuidPlan<N> {
   remap: Map<string, string>;
   /** The template-added nodes whose copy KEEPS its template key. Any other node's key is dropped. */
   keyed: Set<N>;
+  /** What the copy does with each `PrefabInstance` node's link (#1756) — absent for a node with none. */
+  links: Map<N, CopyLink>;
 }
 
-type Pi = { localId?: number; parentLocalId?: number; rootInstanceId?: number } | null;
+/** A copied node's prefab link, decided by the frame it is a ROW of (`IdentityParents.frameOf`, I6), never by the copy's
+ *  root: a copy is a new instance of exactly the frames whose roots it holds.
+ *  - `keep`: a stored root, or a member / owned nested root whose frame is in the copy. It stays linked, re-pointed at
+ *    the copy's root, and its guid derives as a reload derives it.
+ *  - `promote`: an OWNED nested root whose owner is not CONFIRMED in the copy — its owner link names a node outside it,
+ *    or the owner's document has no row that expanded it. It becomes an independent instance of its own prefab (#1354's
+ *    ruling, at any depth, #1756): its row stamp is cleared, and it anchors its members.
+ *  - `strip`: a member whose frame root is not in the copy. It becomes a plain added node with a fresh guid, as a member
+ *    leaving its instance does. Kept linked, it was a second claimant of its row: the save wrote the COPY's row and the
+ *    original was lost on reload (#1756). */
+export type CopyLink = 'keep' | 'promote' | 'strip';
+
+type Pi = { source?: string; localId?: number; parentLocalId?: number; parentNodeGuid?: string; rootInstanceId?: number; ownerGuid?: string } | null;
 
 /** Plan the copy's guids. `dataOf(node, 'EntityAttributes' | 'PrefabInstance')` returns that trait's
  *  data on the node, or null when it has none; `keyOf(node)` its template key (`TemplateAddedKey`),
@@ -82,6 +99,34 @@ export function planCopyGuids<N>(
     nodes.push({ id: idOf(node), parentId: lp === undefined ? 0 : idOf(lp), guid: typeof guid === 'string' ? guid : '', pi: dataOf(node, 'PrefabInstance') as IdentityPi });
   }
   const parents = resolveIdentityParents(nodes, readDoc ?? (() => undefined));
+  // The resolver sees the snapshot alone, so a frame outside the copy answers 0 or an id no node has — and for an OWNED
+  // root it can answer with a frame inside the copy that does not own it. Its owner link names a node outside, which the
+  // resolver cannot see and so ignores; and with no document confirming any candidate, the owner read off where the root
+  // hangs is a guess (`ownerByPlace`'s first candidate). Kept linked on either, the copy was a second claimant of the
+  // OUTER frame's row, and the save wrote the copy's member row over the original's (#1756 close-out review). So an owned
+  // root stays linked only when its owner is CONFIRMED in the copy: its link, when it has one, names a copied node, and
+  // the owner's document has the row that expanded it. Anything less is promoted, as a root whose owner stays behind is.
+  const guidsInCopy = new Set(nodes.map((n) => n.guid).filter(Boolean));
+  const ownerConfirmed = (id: number, pi: NonNullable<Pi>): boolean => {
+    if (pi.ownerGuid && !guidsInCopy.has(pi.ownerGuid)) return false;
+    const owner = parents.ownerOf(id);
+    const ownerNode = byId.get(owner);
+    if (!owner || ownerNode === undefined) return false;
+    const source = (dataOf(ownerNode, 'PrefabInstance') as Pi)?.source;
+    const doc = source && readDoc ? readDoc(source, owner) : undefined;
+    if (!doc) return true; // no document to ask: where it hangs is every walk's answer, and this one's too
+    const row = doc.entities?.find((e) => e.localId === pi.parentLocalId);
+    return !!row && row.prefab === pi.source && (!row.nodeGuid || !pi.parentNodeGuid || row.nodeGuid === pi.parentNodeGuid);
+  };
+  const links = new Map<N, CopyLink>();
+  for (const node of liveOrder) {
+    const pi = dataOf(node, 'PrefabInstance') as Pi;
+    if (!pi) continue;
+    const id = idOf(node);
+    if (isStoredRoot(pi, id)) links.set(node, 'keep');
+    else if (pi.rootInstanceId === id) links.set(node, ownerConfirmed(id, pi) ? 'keep' : 'promote');
+    else links.set(node, pi.rootInstanceId && byId.has(pi.rootInstanceId) ? 'keep' : 'strip');
+  }
   const identityChildren = new Map<N, N[]>();
   for (const node of liveOrder) {
     if (node === root) continue;
@@ -106,7 +151,8 @@ export function planCopyGuids<N>(
     const storedRoot = isStoredRoot(pi, idOf(node));
     const inInstance = (storedRoot && !keyOf(node)) || !!ctx?.inInstance;
     const path = ctx && [...ctx.path, ...parents.of(idOf(node)).extra, entityStep(pi, key)];
-    const derived = !!ctx && (!!key || (!!pi && !storedRoot));
+    // Derived only while it stays a member of a frame in the copy: a promoted root anchors, a stripped member is plain.
+    const derived = !!ctx && (!!key || (links.get(node) === 'keep' && !storedRoot));
     const guid = derived ? deriveMemberGuid(ctx!.anchor, path!) : mint();
     guidOf.set(node, guid);
     if (key) keyed.add(node);
@@ -117,5 +163,5 @@ export function planCopyGuids<N>(
   visit(root, null);
   // A node whose identity chain loops never hangs off the root; it keeps its live place.
   for (const node of liveOrder) if (!visited.has(node)) visit(node, null);
-  return { guidOf, remap, keyed };
+  return { guidOf, remap, keyed, links };
 }

@@ -29,8 +29,8 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, spawnEntity, Transform, EntityAttributes,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, Transient as TransientTrait, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo, duplicateEntity } from '@modoki/engine/editor';
-import { snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids } from '../../packages/modoki/src/editor/undo/entityActions';
+import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo, duplicateEntity, reparentEntity } from '@modoki/engine/editor';
+import { snapshotEntity, respawnFromSnapshot, copySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
 import {
   setPrefabCache, serializePrefab, applyToPrefabSelective, instantiatePrefabAsync, getOverrideValues, collectComparableTraits,
   baseTokenResolver, type PrefabFile,
@@ -691,7 +691,7 @@ describe('delete→undo carries unregistered markers, a duplicate does not (#142
 
   // A copy is a new identity: a duplicated template-added node keeping the key would give two
   // siblings one step, which names neither. Mutation: drop `markers: undefined` in
-  // `regenerateSnapshotGuids`.
+  // `copySnapshot`.
   it('a duplicate of a keyed node carries no key and no Transient', async () => {
     await load({ id: 'e', version: 14, name: 'E', resources: [], entities: [] } as unknown as SceneData);
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Src', guid: DURABLE }));
@@ -727,7 +727,7 @@ describe('a duplicated or pasted instance keeps its template-added nodes keyed a
 
   // Before the fix the copy's Extra had a random guid and no key: its Panel read as overridden, and
   // after the reload the Panel held the literal token. Mutation: pass `() => ''` as `keyOf` in
-  // `regenerateSnapshotGuids` (or drop the `+key` step in `planCopyGuids`).
+  // `copySnapshot` (or drop the `+key` step in `planCopyGuids`).
   it('a duplicate — live, and after a scene save + reload', async () => {
     const file = outerWithRef() as unknown as PrefabFile;
     install(file);
@@ -746,7 +746,7 @@ describe('a duplicated or pasted instance keeps its template-added nodes keyed a
     const src = getAllEntities().find((e) => e.guid === G1)!.id;
     const snap = snapshotEntity(src)!;
     deleteEntitiesWithUndo([src]);
-    respawnFromSnapshot(regenerateSnapshotGuids(snap), 0);
+    respawnFromSnapshot(copySnapshot(snap), 0);
     const root = getAllEntities().find((e) => e.name === 'OuterRoot' && e.guid !== G2)!.id;
     const rootGuid = getAllEntities().find((e) => e.id === root)!.guid!;
     expect(keyOn(extraUnder(root).id)).toBe(KEY);
@@ -827,6 +827,41 @@ describe('a duplicated or pasted instance keeps its template-added nodes keyed a
     expect(dropped).toEqual([]);
   });
 
+  // #1758's measurement, both ways a keyed reference node ends up under a root that is no longer owned: its key names a
+  // node of OUTER's frame, which this root has left, so the scene writes it as an added node WITH its guid — which the
+  // reload pins. So neither the copy nor `promoteOwnedRoots` may rename it the way Create Prefab's stamp renames a keyed
+  // root that stays inside its template (`reloadDerivedGuids`). Mutation: rename through `reloadDerivedGuids` in
+  // `promoteOwnedRoots` — the promote case goes red.
+  const droppedDoc = () => outerDoc({ added: [{ parentLocalId: 3, guid: '', key: REF_KEY, name: 'Dropped', prefab: INNER, traits: {}, children: [], added: [keyed('Extra', 1)] }] });
+  const guidsUnder = (rootId: number): string[] => {
+    const under = (id: number): boolean => {
+      for (let cur = getAllEntities().find((e) => e.id === id); cur; cur = getAllEntities().find((e) => e.id === cur!.parentId)) if (cur.id === rootId) return true;
+      return false;
+    };
+    return getAllEntities().filter((e) => under(e.id)).map((e) => `${e.name}:${e.guid}`).sort();
+  };
+  it.each([
+    ['promoted, when the root is moved out of its instance', true],
+    ['copied as an independent instance', false],
+  ])('a keyed reference node under an owned root that is %s keeps every guid through save + reload', async (_label, promote) => {
+    install(droppedDoc());
+    await load({ ...twoInstances(OUTER, 'OuterRoot'), entities: [twoInstances(OUTER, 'OuterRoot').entities[0]] } as unknown as SceneData);
+    const mid = getAllEntities().find((e) => e.name === 'MidRoot')!.id;
+    const dropped = getAllEntities().find((e) => e.name === 'InnerRoot' && keyOn(e.id) === REF_KEY)!.id;
+    const droppedBefore = guidsUnder(dropped);
+    const root = promote ? (expect(reparentEntity(mid, 0)).toBe(true), mid) : duplicateEntity(mid, () => {})!;
+    // A promotion moves no identity it has no reason to: the save states this subtree's guids, so a ref to one of them
+    // from another file must keep resolving.
+    if (promote) expect(guidsUnder(dropped)).toEqual(droppedBefore);
+    const rootGuid = getAllEntities().find((e) => e.id === root)!.guid;
+    const before = guidsUnder(root);
+    expect(before.filter((g) => g.startsWith('InnerRoot:'))).toHaveLength(2); // the row's expansion and the dropped node
+
+    await load(await serializeScene() as unknown as SceneData);
+
+    expect(guidsUnder(getAllEntities().find((e) => e.guid === rootGuid)!.id)).toEqual(before);
+  });
+
   // Accept side: a copy that is not a whole instance must not hand out the key — two siblings would
   // share one step, or a plain added node would claim a template frame. Mutation: `const key =
   // keyOf(node)` in `planCopyGuids` (the copy root has no ctx, so both conditions must go).
@@ -843,8 +878,8 @@ describe('a duplicated or pasted instance keeps its template-added nodes keyed a
   // Panel is a plain member (its copy is stripped to added nodes); MidRoot is an owned nested root
   // (its copy becomes an independent MID instance, #1354, which OUTER's key does not describe).
   // Mutation: let any instance root open the key scope in `planCopyGuids` (`inInstance` from
-  // `rootInstanceId === self`, ignoring `parentLocalId`) — the MidRoot case goes red. The Panel case is guarded twice here (`stripPrefabInstanceFromSnapshot` drops markers as
-  // well); the device op has no strip, so `liveLifecycleOps.test.ts` pins the instance scope alone.
+  // `rootInstanceId === self`, ignoring `parentLocalId`) — the MidRoot case goes red. The Panel case is guarded twice here (a stripped copy drops
+  // its link as well); `liveLifecycleOps.test.ts` pins the instance scope alone on the device op.
   it.each(['Panel', 'MidRoot'])('a duplicate of %s, holding a keyed node, carries no key', async (name) => {
     install(outerWithRef());
     await load(twoInstances(OUTER, 'OuterRoot'));

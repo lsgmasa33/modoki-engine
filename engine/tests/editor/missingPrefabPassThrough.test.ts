@@ -42,7 +42,7 @@ import { setPrefabCache, applyToPrefabSelective, type PrefabFile } from '../../p
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
-import { snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids } from '../../packages/modoki/src/editor/undo/entityActions';
+import { snapshotEntity, respawnFromSnapshot, copySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { asAddedNode } from '../../packages/modoki/src/runtime/loaders/unresolvedPrefabRefs';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
@@ -307,7 +307,7 @@ describe('the placeholder\'s lifecycle (#1699)', () => {
   });
 
   it('a duplicate keeps the record under identities of its own, and both come back with the prefab', async () => {
-    // Mutation: drop the `UnresolvedPrefabRef` carry in `regenerateSnapshotGuids` — the copy saves as a bare
+    // Mutation: drop the `UnresolvedPrefabRef` carry in `copySnapshot` — the copy saves as a bare
     // placeholder. Dropping only the re-guiding (`copyUnresolvedRef` returning the data as is) fails the guid checks.
     const entry = await loadWithPMissing();
     const copyId = duplicateEntity(rootOf(INST), () => {})!;
@@ -533,7 +533,7 @@ describe('the template writers refuse a missing reference wherever it sits (#169
     install(qDoc());
     await load(buildPrefabEditScene(qDoc() as unknown as PrefabFile) as SceneData);
     const editRoot = getAllEntities().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!;
-    respawnFromSnapshot(regenerateSnapshotGuids(snap), editRoot.id);
+    respawnFromSnapshot(copySnapshot(snap), editRoot.id);
     const out = serializePrefabEditWorld(Q);
     expect('error' in out && out.error).toMatch(/cannot hold/);
   });
@@ -601,7 +601,7 @@ describe('the template refusals ask what is promoted or written, not the live tr
     const snap = snapshotEntity(rootOf(QINST))!;
     await load(buildPrefabEditScene(pDoc() as unknown as PrefabFile) as SceneData);
     const editRoot = getAllEntities().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!;
-    respawnFromSnapshot(regenerateSnapshotGuids(snap), editRoot.id);
+    respawnFromSnapshot(copySnapshot(snap), editRoot.id);
     const out = serializePrefabEditWorld(P);
     expect('error' in out && out.error).toMatch(/missing prefab/);
   });

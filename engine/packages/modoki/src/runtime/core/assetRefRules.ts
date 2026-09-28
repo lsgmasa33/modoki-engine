@@ -213,7 +213,7 @@ export function deriveGuid(seed: string): string {
  *  guid-carrying ancestor, `path` the step ids from just below that ancestor down to the member
  *  ({@link memberStepId}; a keyed added node steps as `'+' + key` — `addedKeyStep`, #1387, which
  *  cannot collide with a numeric step, so every numeric path hashes exactly as it always did). The ONE spelling of the rule — `deriveInstanceMemberGuids` applies it on
- *  load, and both duplicate paths (`remintSceneEntityGuids` for a scene file, `regenerateSnapshotGuids`
+ *  load, and both duplicate paths (`remintSceneEntityGuids` for a scene file, `copySnapshot`
  *  for an editor subtree) predict it with it, so a copy's refs land where a reload puts the members. */
 export function deriveMemberGuid(anchor: string, path: readonly MemberStep[]): string {
   // ⚠️ `path.join('.')`, not `memberPathKey(path)`, though they render identically: `memberPathKey`

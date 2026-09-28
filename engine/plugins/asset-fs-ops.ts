@@ -360,7 +360,7 @@ export function moveToTrash(
 }
 
 /** Give every entity a scene file DEFINES a fresh guid, and carry every reference to it along
- *  (#1293). The file-level counterpart of `regenerateSnapshotGuids`, which mints fresh guids for a
+ *  (#1293). The file-level counterpart of `copySnapshot`, which mints fresh guids for a
  *  subtree duplicated inside one scene and carries the refs inside it the same way (#1338). A
  *  copied scene is its own content, so it gets its own identities.
  *

@@ -190,6 +190,32 @@ describe('agent prefab create — undo restores the links the tree already had (
     expect(targetOfX()).toBe('g-undo-a');
   });
 
+  /** The same undo over a member the create DOES rename (#1758's test gap): the test above uses a member a row covers,
+   *  so the create renames nothing and deleting `unstampMemberGuids` from the undo left it green. Bolt is a member of a
+   *  held instance of a pre-v5 prefab, which mints no `nodeGuid`, so no row can pin it: the create renames it to what
+   *  the reload derives through the new prefab, and the ref follows. The undo has to put both back.
+   *  Mutation: drop the undo's `unstampMemberGuids` call (`assetOps` / the agent op's undo) — this goes red. */
+  it('undo puts back a member guid the create really renamed, and the ref with it', async () => {
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-rn-r' }));
+    const hull = game!.spawn(Transform(), EntityAttributes({ name: 'Hull', parentId: r.id(), guid: 'g-rn-hull' }));
+    const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-rn-bolt' }));
+    hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
+    bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
+    const x = game!.spawn(Transform(), EntityAttributes({ name: 'X', guid: 'g-rn-x' }),
+      UIAction({ bindings: [{ event: 'click', kind: 'call' as const, action: 'noop', target: 'g-rn-bolt' }] }));
+    const targetOfX = () => ((x.get(UIAction) as { bindings: { target: string }[] }).bindings)[0].target;
+    const boltGuid = () => (bolt.get(EntityAttributes) as { guid: string }).guid;
+
+    await runAgentOp('prefab', { action: 'create', entityGuid: 'g-rn-r', path: NEW_PATH });
+    expect(boltGuid(), 'fixture: the create re-identifies the member').not.toBe('g-rn-bolt');
+    expect(targetOfX(), 'and the ref follows it').toBe(boltGuid());
+
+    await undo();
+
+    expect(boltGuid()).toBe('g-rn-bolt');
+    expect(targetOfX()).toBe('g-rn-bolt');
+  });
+
   /** The report must not fire on the flow the fix makes WORK (close-out review F1).
    *
    *  `priorLinks` is a `strip: false` snapshot, so it also holds the entities the scoped untag

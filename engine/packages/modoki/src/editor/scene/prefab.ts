@@ -40,7 +40,7 @@ import { adoptParentScene, resolveAffectedScenes } from './sceneDirty';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, NestedStructureDelta, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { spawnUnresolvedReference, asAddedNode } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
-import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
+import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, deriveMemberGuidsAfterPins, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
 import { translateLocalIds, docRows } from '../../runtime/loaders/memberTranslation';
 import { foldMemberRowChannels, mergeTraitRemovals, descendStructureLayers, foldStructureLayers, type StructureLayer as StructLayer } from '../../runtime/loaders/prefabOverrides';
 import { frameBase, chainLayer, docChainLayer, layerAddedTraits, levelDoc, ownedRootAt, type FrameLayer, type FrameBase } from './prefabBase';
@@ -2562,7 +2562,7 @@ function prefabMoveTargets(rootInstanceId: number, prefab: PrefabFile): (ecsId: 
  *  would really cost is `peekEntityByGuid`, which never rescans by design — a guid written without
  *  indexing is invisible to a caller running inside a structure change. No such caller is on this
  *  path today, which is exactly why this note exists instead of a test that cannot fail. */
-function restoreInstanceMembers(rootEcsId: number, rows: Record<string, SceneMemberRow>): void {
+function restoreInstanceMembers(rootEcsId: number, rows: Record<string, SceneMemberRow>, pinned?: Set<number>): void {
   const eaMeta = getTraitByName('EntityAttributes');
   if (!eaMeta || !Object.keys(rows).length) return;
   const remap = new Map<string, string>();
@@ -2579,6 +2579,7 @@ function restoreInstanceMembers(rootEcsId: number, rows: Record<string, SceneMem
       const e = findEntity(ecsId);
       if (e) indexEntityGuid(e);
     } else remap.set(had, want);
+    pinned?.add(ecsId); // the derive after it drops a pin that collides with a derivation (#1777)
   }
   applyGuidRemap(remap);
 }
@@ -3314,7 +3315,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   // ⚠️ There is NO pass for an UNSTAMPED instance, and there must not be (#1367). Every path that
   // expands a row stamps it — the loader (`instantiatePrefabIntoWorld`), the editor's
   // `instantiatePrefab`, and Create Prefab's tag — so a live unstamped instance is never a row's own
-  // expansion: it is one the user dragged in, a duplicate (`clearOwnedNestedStampFromSnapshot`), or
+  // expansion: it is one the user dragged in, a duplicate (`copySnapshot`'s `promote` link), or
   // an unlinked root. A second pass once let such an instance claim a free row; it took a user-added
   // instance to BE a deleted row's expansion, so a no-op save dropped the user's addition AND
   // resurrected the row. A root guid cannot discriminate either: a nested root's derived guid is
@@ -7158,7 +7159,7 @@ const rowFrameKey = (key: string): string => key.slice(0, Math.max(0, key.lastIn
  *  shielded anyway: the first rebuild already kept its row, and a kept row wins.) */
 function captureRowsForSettle(
   rootInstanceId: number, baseline: PrefabFile, prefab: PrefabFile, toDestroy: ReadonlySet<number>, remap: ReadonlyMap<string, string>,
-): (newRootId: number) => void {
+): (newRootId: number, pinned?: Set<number>) => void {
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
   const rowRoot = rowWritingRoot(rootInstanceId);
@@ -7185,7 +7186,7 @@ function captureRowsForSettle(
   const before = remapGuidValues(Object.fromEntries(Object.entries(rows).filter(([k]) => torn(k))), remap) as Record<string, SceneMemberRow>;
   // The row-writing root is the rebuilt root itself, respawned as `newRootId`, or a stored root ENCLOSING it, which
   // the teardown does not reach and whose id therefore stands.
-  return (newRootId) => {
+  return (newRootId, pinned) => {
     const root = rowRoot === rootInstanceId ? newRootId : rowRoot;
     if (!findEntity(root)) return;
     const { backed } = rowBackedTest(rowSource, getCachedPrefabSync);
@@ -7216,7 +7217,7 @@ function captureRowsForSettle(
     };
     for (const [k, row] of Object.entries(before)) if (!(k in kept) && !backed(k)) next[k] = unhomed(k, row);
     for (const [k, row] of Object.entries(kept)) (backed(k) ? replay : next)[k] = row;
-    for (const k of replayRowsLive(root, replay)) next[k] = replay[k]!;
+    for (const k of replayRowsLive(root, replay, pinned)) next[k] = replay[k]!;
     setKeptMemberOrphans(rowRootGuid, next);
   };
 }
@@ -7226,7 +7227,7 @@ function captureRowsForSettle(
  *  fold (`foldMemberRowChannels`), frame by frame from the outside in, then node rows (`applyNodeRowsLive`), then
  *  the rows' guids and moves, which the caller's member restore and derive complete. Returns the keys applied
  *  nowhere: a target that is not live, or a node the template does not add. */
-function replayRowsLive(rowRoot: number, rows: Record<string, SceneMemberRow>): Set<string> {
+function replayRowsLive(rowRoot: number, rows: Record<string, SceneMemberRow>, pinned?: Set<number>): Set<string> {
   const unapplied = new Set<string>();
   const piMeta = getTraitByName('PrefabInstance');
   if (!piMeta || !Object.keys(rows).length) return unapplied;
@@ -7305,7 +7306,7 @@ function replayRowsLive(rowRoot: number, rows: Record<string, SceneMemberRow>): 
     for (const k of missed) unapplied.add(byNode.get(k)!.key);
   }
   // Moves drain with the caller's derive, by guid, exactly as the loader's rows do; guids go back first.
-  restoreInstanceMembers(rowRoot, applied);
+  restoreInstanceMembers(rowRoot, applied, pinned);
   const moves = Object.fromEntries(Object.entries(applied).filter(([, r]) => r.parent).map(([k, r]) => [k, { parent: r.parent }]));
   const rowDoc = docOf(rowRoot);
   if (rowDoc && Object.keys(moves).length) applyStructureByRootInstance(rowRoot, rowDoc, { members: moves });
@@ -7626,7 +7627,10 @@ export function rebuildInstance(
   applyStructureByRootInstance(newRootId, prefab, structure);
   reapplyNestedInstanceOverrides(newRootId, nestedCaptures);
   // Before the member restore and the derive below: a replayed row's guid and move go through them like any other.
-  settleKeptOrphans(newRootId);
+  // Every guid this rebuild PINS — a kept row replayed here, the carried members and reference-node rows below — so the
+  // derive can drop one that collides with a derivation, exactly as the load does (#1777).
+  const pinned = new Set<number>();
+  settleKeptOrphans(newRootId, pinned);
   // A rebuilt OWNED nested instance re-expands from its own document only: the moves the prefabs around it make
   // of its members are queued again, or an apply or revert on it undid them in every instance (#1437 review).
   // Only for members THIS rebuild respawned: any other member is where the scene's own moves left it, and a
@@ -7651,7 +7655,7 @@ export function rebuildInstance(
   // a move inside a SECOND instance vanished whenever an Apply rebuilt them all. Restoring after the
   // derive was right while every member's guid was derived — there was nothing to restore that the
   // derive had not just computed — and it stopped being right the moment identity was stored.
-  restoreInstanceMembers(newRootId, carriedMembers);
+  restoreInstanceMembers(newRootId, carriedMembers, pinned);
   // …and the rows of every user-added REFERENCE node the re-apply respawned inside it (#1482), in the
   // same place and for the same reason. A reference node is its own row-writing root, so the carry
   // above never reaches its members, and they re-derived: a stored guid that differed from the
@@ -7662,14 +7666,15 @@ export function rebuildInstance(
   for (const cap of nestedCaptures) collectReferenceNodeRows(cap.structure.added, referenceRows);
   for (const [refGuid, rows] of referenceRows) {
     const refRoot = findEntityByGuid(refGuid);
-    if (refRoot) restoreInstanceMembers(refRoot.id(), rows);
+    if (refRoot) restoreInstanceMembers(refRoot.id(), rows, pinned);
   }
   // Each torn-down node's key marker, once every guid is back (the re-apply's, the settle's, the member restore's): unkeyed,
   // the next Refresh's settle gate (`keepsTemplateRows`) read a dropped reference node as no template node (#1567).
   restoreTemplateKeys(carriedKeys);
   // The respawned members and template-keyed added nodes are guid-less until derived (#1387). Only
-  // fills empty guids, so the root's carried guid above and every restored scene guid stand.
-  deriveInstanceMemberGuids(getCurrentWorld());
+  // fills empty guids, so the root's carried guid above and every restored scene guid stand — except a restored guid
+  // that a derivation under the NEW template also produces: that pin yields, as the load's does (#1777).
+  deriveMemberGuidsAfterPins(getCurrentWorld(), pinned);
   // Scene OWNERSHIP is identity too (#1431): every respawn — members, nested expansions, the restored
   // added nodes — comes back unstamped, i.e. primary-owned, so a BASE scene's instance left the base
   // file on the next Save All and vanished from every other level using that base. Read off the old

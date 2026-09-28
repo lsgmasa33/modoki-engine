@@ -206,10 +206,16 @@ export function duplicateEntityLive(params: unknown): unknown {
     // A copy must NOT inherit the original's guid — two entities answering to one address is the
     // addressing failure every Percept tool would then inherit — and a ref INSIDE the copy must
     // follow it, or the copy drives the source (#1338). One plan per copy: each gets its own guids.
-    const { guidOf, remap, keyed } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid, (node) => node.key, frameDocReader(getCurrentWorld()));
+    const { guidOf, remap, keyed, links } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid, (node) => node.key, frameDocReader(getCurrentWorld()));
     for (const src of snapshot) {
-      const specs = src.traits.map((t) => {
+      // Each node's prefab link by the frame it is a ROW of (#1756), as the editor's `copySnapshot` applies it: a member
+      // whose frame is not in the copy is copied as a plain node, and a nested root whose owner is not stands alone.
+      const link = links.get(src);
+      const specs = src.traits.filter((t) => !(t.name === 'PrefabInstance' && link === 'strip')).map((t) => {
         if (!t.data) return t;
+        if (t.name === 'PrefabInstance' && link === 'promote') {
+          return { name: t.name, data: { ...(remapGuidValues(t.data, remap) as Record<string, unknown>), parentLocalId: 0, parentNodeGuid: '', ownerGuid: '' } };
+        }
         // Cloned PER COPY: remapGuidValues hands back the same object where nothing changed, and koota
         // stores what it is given, so two copies would otherwise share one bindings array.
         const data = cloneTraitValues(remapGuidValues(t.data, remap) as Record<string, unknown>) as Record<string, unknown>;

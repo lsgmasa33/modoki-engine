@@ -1336,7 +1336,7 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   `added[]` node — and rewrites every in-file string value equal to one of them (`parentId`,
   `rootInstanceId`, every `entityRef` field, `UIAction.bindings[].target`). A ref to a guid the file
   does not define (its base scene) is kept. Owner ruling: always remint, no "duplicate as variant"
-  opt-out — the same rule `regenerateSnapshotGuids` applies to a subtree duplicated inside a scene
+  opt-out — the same rule `copySnapshot` applies to a subtree duplicated inside a scene
   (below). **The accepted cost:** a `Persistent` entity in the copy no longer matches its original, so
   swapping between the two files spawns it twice. Existing files were deliberately left as they are
   — `qa/cases/**`, `demos/postfx-demo` and Court's tests pin their guids (and postfx-demo's code
@@ -1388,12 +1388,19 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   A stale runtime guid (#1210) is not reminted (it is no identity), and a BOM-prefixed file is
   parsed past its BOM rather than copied verbatim under the original's asset id.
 - **Duplicating or pasting a live SUBTREE carries its internal refs the same way (#1338).**
-  `regenerateSnapshotGuids` (`editor/undo/entityActions.ts`) and the device's `duplicate-entity`
+  `copySnapshot` (`editor/undo/entityActions.ts`) and the device's `duplicate-entity`
   op (`engine/app/debug/liveLifecycle.ts`, which also deep-clones its snapshot now) plan the copy's
   guids with one shared function, `planCopyGuids` (`runtime/core/copyIdentity.ts`). They then run
   the same `remapGuidValues` over every trait, so a `UIAction` target or an
   `entityRef` aimed at the source's own child points at the copy's child. A ref to anything outside
   the subtree is kept. Before the fix the copy silently drove the SOURCE, with nothing erroring.
+  **Which copied nodes stay prefab-linked is decided per node, by identity (#1756).** `planCopyGuids` also returns
+  a `CopyLink` for each node, from the frame the node is a ROW of (`frameOf`): `keep` while that frame's root is in
+  the copy, `promote` for an owned nested root whose owner is not (it becomes an independent instance), and `strip`
+  for a member whose frame root is not (it becomes a plain added node). The copy used to take one verdict from its
+  root. A member moved into a copied group then stayed linked to the instance outside the copy. It became a second
+  claimant of its row, the save wrote the copy's row, and the original was lost on reload. As a result, no copied
+  `rootInstanceId` names an entity outside the copy.
   Two mechanisms make this survive save + reload:
   - **A prefab member in the copy gets the guid a reload will derive, not a random one.** A random
     member guid would be replaced on the next load, taking every carried ref with it. Which guids a
@@ -1719,7 +1726,7 @@ above reaches only an entry not yet migrated, of which the committed corpus now 
   override on a member reference into it). `runtime/core/carriedMarkers.ts` lists the markers; the
   carry captures them per old id beside the override marks and restores them in its
   `onEntitySpawned`. Delete→undo does the same through `snapshotEntity` / `respawnFromSnapshot`. A
-  COPY (every duplicate and paste goes through `regenerateSnapshotGuids`) drops them: it is a new
+  COPY (every duplicate and paste goes through `copySnapshot`) drops them: it is a new
   identity, and two siblings sharing a template key name neither. ⚠️ That is too blunt for a keyed
   node INSIDE a copied instance: `planCopyGuids` gives it a random guid, so no heal can recover its
   key and a member token into it is dead after a save + reload (#1430, open). The architecture guard

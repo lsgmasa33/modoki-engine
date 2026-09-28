@@ -1791,13 +1791,23 @@ function settleDerivedGuids(world: World): void {
   drainAfterDerive(world);
 }
 
-/** {@link deriveMemberGuidsOnly}, then {@link settleDerivedGuids} — for every caller that runs no `dropCollidingPins`
- *  (an instantiate, a rebuild). The load runs the two halves itself, around it. ⚠️ A rebuild DOES pin guids first
- *  (`restoreInstanceMembers`) and has no collision guard at all, so a pin colliding with a new derivation there is
- *  neither dropped nor reported (#1777, a sibling of #1761 filed from its close-out review, not fixed by it). */
-export function deriveInstanceMemberGuids(world: World): void {
+/** What follows a PIN of stored member guids, in the one order it can run (#1761, #1777): derive every member still
+ *  without a guid, drop a pin that collides with a derivation ({@link dropCollidingPins}, which re-derives the member),
+ *  and only then settle tokens and moves against the final guids. The load pins the scene's rows (`applyStoredMemberRows`)
+ *  and a rebuild the rows it carried across its teardown (`restoreInstanceMembers`); both call this, so the order has one
+ *  spelling. A rebuild used to derive and settle with no guard at all: a restored pin equal to a guid the NEW template's
+ *  derivation hands another member left two entities on one guid, unreported, and a template's `@member` token could
+ *  resolve to the wrong one (#1777). `pinned` is the set of entities the caller pinned; only those can be dropped. */
+export function deriveMemberGuidsAfterPins(world: World, pinned: ReadonlySet<number>): void {
   deriveMemberGuidsOnly(world);
+  if (pinned.size) dropCollidingPins(world, pinned);
+  // Tokens and moves only once every guid is final (#1761): a dropped pin re-derives its member.
   settleDerivedGuids(world);
+}
+
+/** {@link deriveMemberGuidsAfterPins} with nothing pinned — for every caller that pins no stored guid (an instantiate). */
+export function deriveInstanceMemberGuids(world: World): void {
+  deriveMemberGuidsAfterPins(world, new Set());
 }
 
 // ── Template member references (#1352) ──────────────────────────────────────
@@ -3166,9 +3176,6 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   // …then give every remaining member a stable, addressable GUID so entities can reference into
   // instances: a pre-v16 scene, a template that predates prefab v5, and every member a row did not
   // name all land here, deriving exactly what they always did.
-  deriveMemberGuidsOnly(world);
-  if (pinned.size) dropCollidingPins(world, pinned);
-  // Tokens and moves only once every guid is final (#1761): a dropped pin re-derives its member.
-  settleDerivedGuids(world);
+  deriveMemberGuidsAfterPins(world, pinned);
   for (const [entryRootId, keyed] of templateNodeRows) keepTemplateNodeOrphans(world, entryRootId, keyed);
 }

@@ -1,5 +1,5 @@
 /** A copy of a missing prefab's placeholder keeps its record, re-guided (#1699). The marker and the rule are in
- *  `runtime/core/unresolvedPrefabRef.ts`; this is the editor's half, beside its one caller (`regenerateSnapshotGuids`),
+ *  `runtime/core/unresolvedPrefabRef.ts`; this is the editor's half, beside its one caller (`copySnapshot`),
  *  because a copy is an authoring act and mints guids, which a runtime path must not (`determinismGuard`). */
 
 /** Every value of a `guid` key anywhere in `value`: the identities a record states (its root, its member rows' pins,

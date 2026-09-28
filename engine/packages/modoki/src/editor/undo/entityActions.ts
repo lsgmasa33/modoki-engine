@@ -403,7 +403,7 @@ export interface EntitySnapshot {
    *  packed entity (#868), so a respawn gets them only from here — see overrideMarks.ts. */
   marks?: string[];
   /** Its unregistered markers (`Transient`, `TemplateAddedKey`), which the registry walk above never
-   *  sees (#1427). Restored by an undo's respawn; a copy drops them (`regenerateSnapshotGuids`), all
+   *  sees (#1427). Restored by an undo's respawn; a copy drops them (`copySnapshot`), all
    *  but the template key of a node inside a copied whole instance (#1430). */
   markers?: CarriedMarkers;
   /** The document its frame was expanded from, when it is a prefab-instance root with a record of its own
@@ -442,19 +442,25 @@ export function snapshotEntity(entityId: number): EntitySnapshot | null {
   };
 }
 
-/** Deep-clone a snapshot as a COPY: a fresh `EntityAttributes.guid` for every entity in the subtree,
- *  and every reference inside the subtree carried to the copy (#1338). Used by duplicate and paste:
- *  respawnFromSnapshot copies traits verbatim, so without the first a duplicated entity shares the
- *  source's guid — colliding guids break selection restore, prefab structural-override keys (the
- *  duplicate-key React crash) and asset refs — and without the second a `UIAction` target or an
- *  `entityRef` field aimed at the source's own child keeps driving the SOURCE, silently. A ref to an
- *  entity outside the subtree is left alone. The clone is computed ONCE in duplicateEntity so
- *  undo→redo re-spawns the same identity.
+/** Deep-clone a snapshot as a COPY — the ONE function every live copy of a subtree goes through: duplicate (the
+ *  Hierarchy menu, the keyboard, the `modoki_duplicate_entity` agent op) and paste. The device's `duplicate-entity` op
+ *  applies the same plan to its own snapshot shape (`engine/app/debug/liveLifecycle.ts`).
  *
- *  **A prefab MEMBER's new guid is the one a reload will derive**, so a carried ref survives save +
- *  reload — the rule and its reasoning live in `runtime/core/copyIdentity.ts` (`planCopyGuids`),
- *  shared with the device's `duplicate-entity` op. */
-export function regenerateSnapshotGuids(snapshot: EntitySnapshot): EntitySnapshot {
+ *  - **A fresh `EntityAttributes.guid` for every entity, and every reference inside the subtree carried to the copy**
+ *    (#1338). respawnFromSnapshot copies traits verbatim, so without the first a duplicated entity shares the source's
+ *    guid — colliding guids break selection restore, prefab structural-override keys (the duplicate-key React crash)
+ *    and asset refs — and without the second a `UIAction` target or an `entityRef` field aimed at the source's own child
+ *    keeps driving the SOURCE, silently. A ref to an entity outside the subtree is left alone.
+ *  - **Each node's prefab link, decided per node by the frame it is a row of** (`CopyLink`, #1756): kept while that
+ *    frame is in the copy, a nested root whose owner is not becomes an independent instance (#1354), and a member whose
+ *    frame is not becomes a plain ADDED node. This used to be one verdict for the whole copy, read off its root, so a
+ *    member moved into a copied group was copied still linked — a second claimant of its row, and the original was lost
+ *    on reload. It also means no copied `rootInstanceId` names an entity outside the copy, which a paste into another
+ *    world would read as whatever holds that id there.
+ *  - **A kept member's new guid is the one a reload will derive**, so a carried ref survives save + reload.
+ *  The rules and their reasoning live in `runtime/core/copyIdentity.ts` (`planCopyGuids`). The clone is computed ONCE
+ *  per duplicate/paste, so undo→redo re-spawns the same identity. */
+export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
   const dataOf = (s: EntitySnapshot, name: string): Record<string, unknown> | null => {
     const t = s.traits.find((x) => x.meta.name === name);
     return t && t.data !== true ? t.data : null;
@@ -463,7 +469,7 @@ export function regenerateSnapshotGuids(snapshot: EntitySnapshot): EntitySnapsho
     const tk = s.markers?.TemplateAddedKey;
     return tk && tk !== true && typeof tk.key === 'string' ? tk.key : '';
   };
-  const { guidOf, remap, keyed } = planCopyGuids(snapshot, (s) => s.children, dataOf, (s) => s.id, newGuid, keyOf, frameDocReader(getCurrentWorld()));
+  const { guidOf, remap, keyed, links } = planCopyGuids(snapshot, (s) => s.children, dataOf, (s) => s.id, newGuid, keyOf, frameDocReader(getCurrentWorld()));
   // Once every new guid is known: a parent's ref can name a child and vice versa.
   // A copy is a new identity, so it carries no unregistered markers (`carriedMarkers.ts`) — except
   // the template key of a node the plan derived through it, inside a copy of a whole instance (#1430),
@@ -479,81 +485,29 @@ export function regenerateSnapshotGuids(snapshot: EntitySnapshot): EntitySnapsho
     }
     return Object.keys(out).length ? out : undefined;
   };
-  const copy = (s: EntitySnapshot): EntitySnapshot => ({
-    ...s,
-    markers: markersOf(s),
-    traits: s.traits.map((t) => {
-      if (t.data === true) return t;
+  const copy = (s: EntitySnapshot): EntitySnapshot => {
+    const link = links.get(s);
+    const traits: EntitySnapshot['traits'] = [];
+    for (const t of s.traits) {
+      if (t.data === true) { traits.push(t); continue; }
+      if (t.meta.name === 'PrefabInstance' && link === 'strip') continue;
       const data = remapGuidValues(t.data, remap) as Record<string, unknown>;
-      return { meta: t.meta, data: t.meta.name === 'EntityAttributes' ? { ...data, guid: guidOf.get(s)! } : data };
-    }),
-    children: s.children.map(copy),
-  });
+      if (t.meta.name === 'EntityAttributes') traits.push({ meta: t.meta, data: { ...data, guid: guidOf.get(s)! } });
+      // A stored root has no row, so no owner either (#1437/#1468). A new object: the snapshot is replayed on redo.
+      else if (t.meta.name === 'PrefabInstance' && link === 'promote') traits.push({ meta: t.meta, data: { ...data, parentLocalId: 0, parentNodeGuid: '', ownerGuid: '' } });
+      else traits.push({ meta: t.meta, data });
+    }
+    const { marks, ...rest } = s;
+    return {
+      ...rest,
+      // An override mark means something only on a member of an instance: a stripped node is an added node.
+      ...(marks && link !== 'strip' ? { marks } : {}),
+      markers: markersOf(s),
+      traits,
+      children: s.children.map(copy),
+    };
+  };
   return copy(snapshot);
-}
-
-/** How a duplicate/paste of a prefab-instance entity should be handled (prefab F1):
- *  - 'root'   — the entity is an instance ROOT (`PrefabInstance.rootInstanceId === itself`).
- *               The copy becomes a NEW linked instance: keep PrefabInstance; `respawnFromSnapshot`
- *               carries every `rootInstanceId` inside the subtree to the copy's ids, so its
- *               members (and any nested instance, to its own root) point into the copy.
- *  - 'member' — the entity is a non-root instance MEMBER (a child inside an instance). The
- *               copy becomes an ADDED child of the same instance — i.e. plain entities with
- *               NO PrefabInstance, exactly as if the user added a new child (captureInstance-
- *               Structure picks up non-member descendants of a member as `added`). Strip it.
- *  - 'none'   — not a prefab instance; ordinary duplicate.
- *  Classified from the captured SNAPSHOT (not the live entity) so paste works even
- *  after the source is gone: the snapshot root's `.id` is the original source ECS id,
- *  and an instance ROOT is the one whose `PrefabInstance.rootInstanceId` points at it. */
-export function classifyPrefabDuplicate(snapshot: EntitySnapshot): 'none' | 'root' | 'member' {
-  const pi = snapshot.traits.find((t) => t.data !== true && t.meta.name === 'PrefabInstance');
-  if (!pi || pi.data === true) return 'none';
-  const rootInstanceId = (pi.data as Record<string, unknown>).rootInstanceId as number;
-  return rootInstanceId === snapshot.id ? 'root' : 'member';
-}
-
-/** Deep-clone a snapshot with `PrefabInstance` stripped from every entity in the
- *  subtree. Used by duplicate/paste of a non-root instance MEMBER so the copy
- *  becomes a plain ADDED child of the instance (prefab F1, 'member' case). Must
- *  NOT touch the delete-undo restore path, which keeps instance linkage. */
-export function stripPrefabInstanceFromSnapshot(snapshot: EntitySnapshot): EntitySnapshot {
-  // No `marks` either: an override mark means something only on a PrefabInstance member.
-  return {
-    id: snapshot.id,
-    traits: snapshot.traits.filter((t) => t.meta.name !== 'PrefabInstance'),
-    children: snapshot.children.map(stripPrefabInstanceFromSnapshot),
-  };
-}
-
-/** Clear an OWNED nested instance root's row stamp on a COPY, so the copy is an independent
- *  nested instance rather than a second claimant of the same prefab row.
- *
- *  An owned nested instance is one that expanded from its outer prefab's nested-prefab ROW; the
- *  loader records which row by stamping `PrefabInstance.parentLocalId`. `respawnFromSnapshot` copies
- *  traits verbatim, so without this the copy carries the SAME stamp: `captureInstanceStructure`
- *  then had two nodes claiming one row, both serialized into that row's `nestedOverrides`, and the
- *  later one won — the source instance was gone after a reload (#1354).
- *
- *  The ruling (owner, 2026-09-18): duplicating a nested instance produces an independent instance
- *  that is saved separately — not a refused duplicate. Cleared to 0, the copy takes the `added[]`
- *  reference-node path, which already round-trips its overrides AND its structure.
- *
- *  Only the ROOT's stamp is cleared: `parentLocalId` is meaningless on a non-root member, and the
- *  copy's members keep their own linkage (`respawnFromSnapshot` re-points `rootInstanceId` at the
- *  copy). A no-op on anything that is not a stamped instance root, so both duplicate seams can call
- *  it unconditionally for the 'root' case. */
-export function clearOwnedNestedStampFromSnapshot(snapshot: EntitySnapshot): EntitySnapshot {
-  return {
-    ...snapshot,
-    traits: snapshot.traits.map((t) => {
-      if (t.meta.name !== 'PrefabInstance' || t.data === true) return t;
-      const data = t.data as Record<string, unknown>;
-      if (!((data.parentLocalId as number) || 0)) return t;
-      // New object rather than a mutation: the snapshot is retained by the undo entry and replayed
-      // on redo, so mutating it in place would edit the recorded action too.
-      return { ...t, data: { ...data, parentLocalId: 0, parentNodeGuid: '', ownerGuid: '' } }; // a stored root has no row, so no owner (#1437/#1468)
-    }),
-  };
 }
 
 /** Rebuild a snapshot's subtree under `newParentId`; returns the new root id. Every entity gets a
@@ -738,24 +692,16 @@ export function duplicateEntity(
 ): number | null {
   const captured = snapshotEntity(entityId);
   if (!captured) return null;
-  // Prefab-instance handling (prefab F1): duplicating an instance ROOT makes a new
-  // linked instance (its rootInstanceIds carried on respawn); duplicating a non-root MEMBER makes a
-  // plain ADDED child (strip PrefabInstance). Ordinary entities: 'none'.
-  const prefabKind = classifyPrefabDuplicate(captured);
-  // Mint fresh guids for the whole copied subtree ONCE (stable across undo/redo).
-  // Without this the copy inherits the source's guid → collisions that break
-  // guid-keyed logic (prefab "+added.<guid>" override keys, selection restore).
-  let snapshot = regenerateSnapshotGuids(captured);
-  if (prefabKind === 'member') snapshot = stripPrefabInstanceFromSnapshot(snapshot);
-  // A copy of an owned nested instance root becomes an INDEPENDENT instance (#1354, owner ruling).
-  else if (prefabKind === 'root') snapshot = clearOwnedNestedStampFromSnapshot(snapshot);
+  // Mint fresh guids for the whole copied subtree ONCE (stable across undo/redo), and decide each node's prefab link by
+  // the frame it is a row of (#1756) — `copySnapshot`, shared with paste.
+  const snapshot = copySnapshot(captured);
   // Duplicate into the same parent as the original.
   const attrMeta = getAllTraits().find(m => m.name === 'EntityAttributes');
   const attrData = attrMeta ? readTraitData(entityId, attrMeta) : null;
   const parentId = (attrData?.parentId as number) || 0;
 
 
-  // regenerateSnapshotGuids already minted a fresh root guid; use it as the
+  // copySnapshot already minted a fresh root guid; use it as the
   // stable handle so undo/redo survive a world rebuild. Parent resolved by ref.
   const guid = rootGuidOf(snapshot);
   const parentRef = parentId ? entityRef(parentId) : null;

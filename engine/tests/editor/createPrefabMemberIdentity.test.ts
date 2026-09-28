@@ -26,7 +26,7 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { setActionCallback, pushAction, clearHistory, serializeScene, reparentEntity, createEntityWithUndo } from '@modoki/engine/editor';
+import { setActionCallback, pushAction, clearHistory, serializeScene, reparentEntity, createEntityWithUndo, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache, serializePrefab, tagEntityTreeAsInstance, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { memberPathIndex } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
@@ -43,6 +43,9 @@ const INNER = 'dddddddd-0000-4000-8000-0000000000c1';
 const NESTED = 'dddddddd-0000-4000-8000-000000000006';
 const PREFAB = 'dddddddd-0000-4000-8000-00000000000f';
 const PREFAB2 = 'dddddddd-0000-4000-8000-00000000001f';
+const LEAFP = 'dddddddd-0000-4000-8000-0000000000c2';
+const REFNODE = 'dddddddd-0000-4000-8000-000000000007';
+const PLAIN = 'dddddddd-0000-4000-8000-000000000008';
 
 const row = (localId: number, name: string, parentId: number, extra: Record<string, unknown> = {}) => ({
   localId, ...extra,
@@ -50,6 +53,12 @@ const row = (localId: number, name: string, parentId: number, extra: Record<stri
 });
 /** The prefab the fixture's nested instance expands from — so the created tree holds an OWNED nested row. */
 const innerDoc = { id: INNER, rootLocalId: 1, entities: [row(1, 'Nested', 0), row(2, 'Leaf', 1)] };
+/** The prefab of a reference node dropped inside the nested instance: LRoot → LKid. v5 mints `nodeGuid`s, so the save
+ *  writes LKid a member row; a pre-v5 document mints none, so LKid has no row and the reload derives it. */
+const leafDoc = (v5: boolean) => ({ id: LEAFP, ...(v5 ? { version: 5 } : {}), rootLocalId: 1, entities: [
+  row(1, 'LRoot', 0, v5 ? { nodeGuid: 'eeeeeeee-0000-4000-8000-0000000017a1' } : {}),
+  row(2, 'LKid', 1, v5 ? { nodeGuid: 'eeeeeeee-0000-4000-8000-0000000017a2' } : {}),
+] });
 
 async function load(scene: SceneData): Promise<void> {
   const prev = getCurrentWorld();
@@ -149,7 +158,7 @@ beforeEach(() => {
   prefabs.set(INNER, innerDoc);
   setPrefabCache(INNER, innerDoc as never);
 });
-afterAll(() => { setPrefabCache(INNER, null); setPrefabCache(PREFAB, null); setPrefabCache(PREFAB2, null); getCurrentWorld()?.destroy(); });
+afterAll(() => { setPrefabCache(INNER, null); setPrefabCache(LEAFP, null); setPrefabCache(PREFAB, null); setPrefabCache(PREFAB2, null); getCurrentWorld()?.destroy(); });
 
 describe('a member moved inside an instance made by Create Prefab in the same session (#1461)', () => {
   /** The issue body's repro, step for step. Mutation: drop the stamp from tagEntityTreeAsInstance. */
@@ -264,5 +273,63 @@ describe('a member moved inside an instance made by Create Prefab in the same se
     await load(await saved() as unknown as SceneData);
 
     expect(targetsOf(idAt('Holder')).map(pathOf)).toEqual(['Holder/Root/Panel/Button']);
+  });
+});
+
+/** #1758: Create Prefab over a tree whose held instance has a REFERENCE node the scene added inside it. The prefab write
+ *  turns that node into template content (the Nested row's `added`, keyed), and the reload DERIVES a template node's guid
+ *  through its key; it pins the member rows the scene writes for it only once the node holds that derived guid. The stamp
+ *  stopped at every stored root, so the node kept a guid no reload reproduces, its members' rows were never found, and
+ *  every ref to the node or a member dangled after save + reopen, in this scene too. */
+describe.each([
+  ['a v5 child, whose member a row pins', true],
+  ['a pre-v5 child, whose member the reload derives', false],
+])('Create Prefab over a reference node added inside a held instance: %s (#1758)', (_label, v5) => {
+  const REF_PATH = 'Holder/Root/Panel/Nested/Leaf/LRoot';
+  const KID_PATH = `${REF_PATH}/LKid`;
+  const PLAIN_PATH = 'Holder/Root/Panel/Nested/Leaf/Plain';
+  const setup = async () => {
+    prefabs.set(LEAFP, leafDoc(v5));
+    setPrefabCache(LEAFP, leafDoc(v5) as never);
+    await load({
+      ...baseScene(),
+      entities: [
+        ...(baseScene().entities as unknown[]),
+        { id: 7, prefab: LEAFP, guid: REFNODE, traits: { EntityAttributes: { name: 'Ref', parentId: HOLDER }, Transform: { x: 0, y: 0, z: 0 } } },
+        { id: 8, traits: { EntityAttributes: { name: 'Plain', parentId: HOLDER, guid: PLAIN }, Transform: { x: 0, y: 0, z: 0 } } },
+      ],
+    } as unknown as SceneData);
+    const leaf = idAt('Holder/Root/Panel/Nested/Leaf');
+    expect(reparentEntity(getAllEntities().find((e) => e.guid === REFNODE)!.id, leaf)).toBe(true);
+    expect(reparentEntity(getAllEntities().find((e) => e.guid === PLAIN)!.id, leaf)).toBe(true);
+    // Holder aims at the reference node, a member of it, and the plain node: all three are swallowed by the prefab.
+    writeTraitFieldWithUndo(idAt('Holder'), getTraitByName('UIAction')!, 'bindings',
+      [REFNODE, guidAt(KID_PATH), PLAIN].map((target) => ({ event: 'click', action: 'noop', target })));
+  };
+
+  /** Mutations: let the walk stop at a keyed stored root (both shapes go red); stop it descending into one (the pre-v5
+   *  shape goes red); drop the per-frame row exclusion (the v5 shape goes red, on the unchanged-guid line). */
+  it('the reference node, its member and the plain node already hold the guids the reload gives them', async () => {
+    await setup();
+    const kidBefore = guidAt(KID_PATH);
+    createPrefabFrom('Holder/Root');
+    const paths = [REF_PATH, KID_PATH, PLAIN_PATH];
+    const before = paths.map(guidAt);
+    // Where a row states the guid, identity does not move: a ref to LKid in ANOTHER file keeps resolving.
+    if (v5) expect(before[1]).toBe(kidBefore);
+    else expect(before[1], 'fixture: with no row, LKid is re-derived under the renamed node').not.toBe(kidBefore);
+
+    await load(await saved() as unknown as SceneData);
+
+    expect(before.map(pathOf)).toEqual(paths);
+  });
+
+  it('a ref to each of them still resolves after save + reopen', async () => {
+    await setup();
+    createPrefabFrom('Holder/Root');
+
+    await load(await saved() as unknown as SceneData);
+
+    expect(targetsOf(idAt('Holder')).map(pathOf)).toEqual([REF_PATH, KID_PATH, PLAIN_PATH]);
   });
 });

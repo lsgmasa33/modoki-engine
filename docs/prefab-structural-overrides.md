@@ -675,8 +675,8 @@ built once per identity resolver (`worldRowIndex`). A save builds that resolver 
 version, so each instance costs its own size. Built per call, a 1200-entity save measured 70% slower.
 
 **Duplicating an owned nested root produces an independent instance, saved separately**
-(owner ruling, 2026-09-18). `clearOwnedNestedStampFromSnapshot` clears the copy's row stamp
-at both duplicate seams, so the copy is independent by intent rather than because the source
+(owner ruling, 2026-09-18). `copySnapshot` clears the copy's row stamp (the `promote` link of
+`planCopyGuids`, #1756: any owned root whose owner is not in the copy, at any depth), so the copy is independent by intent rather than because the source
 happened to claim the row first — and, because it cannot then form a same-stamp pair, the
 double-write that a non-claiming *stamped* candidate would otherwise produce stays
 unreachable.
