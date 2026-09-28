@@ -102,3 +102,20 @@ describe('validatePrefabData — inert UI size inside a .prefab.json', () => {
     expect(validatePrefabData(prefab({})).schemaApplied).toBe(false);
   });
 });
+
+/** #1774: the localId high-water mark (`nextLocalId`, v8) must be above every row. Mutation: compare `mark >= top`
+ *  instead of `mark > top` — the "equal to the highest row" case goes quiet: red. */
+describe('validatePrefabData — the localId high-water mark (#1774)', () => {
+  const rows = (...lids: number[]) => lids.map((localId) => ({ localId, name: `n${localId}`, traits: {} }));
+  it('a mark at or below the highest row is warned about, naming both numbers', () => {
+    expect(validatePrefabData({ nextLocalId: 3, entities: rows(1, 3) }).warnings).toEqual([expect.stringMatching(/nextLocalId is 3, not above the highest row's localId \(3\)/)]);
+    expect(validatePrefabData({ nextLocalId: 2, entities: rows(1, 3) }).warnings).toEqual([expect.stringMatching(/nextLocalId is 2/)]);
+  });
+  it('a mark that is not a positive integer is warned about', () => {
+    expect(validatePrefabData({ nextLocalId: '4', entities: rows(1) }).warnings).toEqual([expect.stringMatching(/not a positive integer/)]);
+  });
+  it('accept side: a mark above every row, and a file with no mark (before v8), are clean', () => {
+    expect(validatePrefabData({ nextLocalId: 9, entities: rows(1, 3) }).warnings).toEqual([]);
+    expect(validatePrefabData({ entities: rows(1, 3) }).warnings).toEqual([]);
+  });
+});

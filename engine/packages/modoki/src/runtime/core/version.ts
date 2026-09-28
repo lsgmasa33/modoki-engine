@@ -107,8 +107,15 @@ export const SCENE_FORMAT_VERSION = 17;
  *  v7: an optional `templateMoved` map on a template REFERENCE node (#1543) — the moves the node states inside its own
  *  frame, in the shape of the document-level `moved`. An older build opens a v7 file without applying them, and would
  *  save the node with the moves gone, so the write gate stops it. No migration: no committed prefab held a template
- *  reference node when this landed. */
-export const PREFAB_FORMAT_VERSION = 7;
+ *  reference node when this landed.
+ *
+ *  v8: a top-level `nextLocalId` (#1774, owner ruling B), the document's localId high-water mark. A new row is numbered
+ *  at or above it and it never goes down, so a number freed at the top of the numbering is never handed to a new node,
+ *  which would derive the deleted member's guid and take over every ref to it. An older build opens a v8 file (nothing on
+ *  the loading path reads the field) but its serializer rebuilds the document and would drop the mark, so the write gate
+ *  stops it saving. No migration: a file without the mark derives it from its highest row (`localIdCounter`), and its
+ *  next write states it. */
+export const PREFAB_FORMAT_VERSION = 8;
 
 // The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
 // docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time

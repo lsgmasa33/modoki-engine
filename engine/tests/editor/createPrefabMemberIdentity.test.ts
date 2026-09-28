@@ -27,9 +27,9 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory, serializeScene, reparentEntity, createEntityWithUndo, writeTraitFieldWithUndo } from '@modoki/engine/editor';
-import { setPrefabCache, serializePrefab, tagEntityTreeAsInstance, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { memberPathIndex } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { memberPathIndex, keptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -331,5 +331,66 @@ describe.each([
     await load(await saved() as unknown as SceneData);
 
     expect(targetsOf(idAt('Holder')).map(pathOf)).toEqual([REF_PATH, KID_PATH, PLAIN_PATH]);
+  });
+});
+
+/** #1778: a reference node the scene added inside a held instance carries a kept ORPHAN member row (R2: a row naming a
+ *  node LEAFP no longer declares, kept in case that template edit is undone). Create Prefab's stamp renames the node to
+ *  its derived guid (#1758), and the kept-orphan store is keyed by the root's guid — left under the old one, the next
+ *  save looked under the new one and dropped the row for good. The store now follows the rename (`applyGuidRemap`). */
+describe('Create Prefab keeps a swallowed reference node\'s kept orphan row (#1778)', () => {
+  const REF_PATH = 'Holder/Root/Panel/Nested/Leaf/LRoot';
+  const ORPHAN = 'ffffffff-0000-4000-8000-0000000017f9';
+  const setup = async () => {
+    prefabs.set(LEAFP, leafDoc(true));
+    setPrefabCache(LEAFP, leafDoc(true) as never);
+    await load({
+      ...baseScene(),
+      entities: [
+        ...(baseScene().entities as unknown[]),
+        { id: 7, prefab: LEAFP, guid: REFNODE, members: { '/eeeeeeee-0000-4000-8000-0000000017f0': { guid: ORPHAN, name: 'Gone' } },
+          traits: { EntityAttributes: { name: 'Ref', parentId: HOLDER }, Transform: { x: 0, y: 0, z: 0 } } },
+      ],
+    } as unknown as SceneData);
+    expect(reparentEntity(getAllEntities().find((e) => e.guid === REFNODE)!.id, idAt('Holder/Root/Panel/Nested/Leaf'))).toBe(true);
+    // Control: before Create Prefab, a plain save writes the orphan row.
+    expect(JSON.stringify(await saved()), 'fixture: the orphan is written before Create Prefab').toContain(ORPHAN);
+  };
+  /** Create Prefab as both callers do it, keeping the rename for the undo (`assetOps`: unstamp, then untag). */
+  const create = () => {
+    const rootId = idAt('Holder/Root');
+    const file = serializePrefab(rootId, PREFAB)!;
+    prefabs.set(PREFAB, file);
+    setPrefabCache(PREFAB, file as never);
+    return { rootId, file, remap: tagEntityTreeAsInstance(rootId, PREFAB, file) };
+  };
+
+  /** Mutation: drop the re-key in `applyGuidRemap` — both assertions go red (the row stays under REFNODE). */
+  it('the next save writes the orphan row, and it survives save + reopen + save', async () => {
+    await setup();
+    create();
+    expect(guidAt(REF_PATH), 'fixture: the stamp renamed the node').not.toBe(REFNODE);
+
+    expect(JSON.stringify(await saved())).toContain(ORPHAN);
+    await load(await saved() as unknown as SceneData);
+    expect(JSON.stringify(await saved())).toContain(ORPHAN);
+  });
+
+  /** Mutations: drop the re-key — the rows never left REFNODE, so the undo lines pass and the redo's save goes red;
+   *  COPY the rows to the new guid instead of moving them — the undo's "nothing left under the new guid" line goes red. */
+  it('undo puts the rows back under the node\'s old guid, and redo moves them to the new one again', async () => {
+    await setup();
+    const { rootId, file, remap } = create();
+    const renamed = guidAt(REF_PATH);
+
+    unstampMemberGuids(remap);
+    untagEntityTreeAsInstance(rootId, PREFAB);
+    expect(guidAt(REF_PATH)).toBe(REFNODE);
+    expect(keptMemberOrphans(REFNODE)?.['/eeeeeeee-0000-4000-8000-0000000017f0']?.guid).toBe(ORPHAN);
+    expect(keptMemberOrphans(renamed)).toBeUndefined();
+
+    tagEntityTreeAsInstance(rootId, PREFAB, file);
+    expect(guidAt(REF_PATH)).toBe(renamed);
+    expect(JSON.stringify(await saved())).toContain(ORPHAN);
   });
 });

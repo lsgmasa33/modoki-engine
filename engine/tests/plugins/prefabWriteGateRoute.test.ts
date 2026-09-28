@@ -101,3 +101,49 @@ describe('POST /api/write-file — the prefab format gate', () => {
     expect(res.body.reason).toBe('prefab-format-too-new');
   });
 });
+
+/** The localId high-water mark (#1774): no write through this route lowers it. The editor's own writes keep it
+ *  (`commitPrefabWrites`), so this is the line for a RAW write — an agent's eval, a game panel, a dropped file.
+ *  Mutation: return null from `classifyPrefabMarkWrite` — every refusal goes through: red. */
+describe('POST /api/write-file — the prefab localId high-water mark (#1774)', () => {
+  const rows = (...lids: number[]) => lids.map((localId) => ({ localId, name: `n${localId}`, traits: {} }));
+  const doc = (mark: number | undefined, ...lids: number[]) =>
+    ({ version: PREFAB_FORMAT_VERSION, name: 'm', rootLocalId: 1, ...(mark === undefined ? {} : { nextLocalId: mark }), entities: rows(...lids) });
+  const onDisk = (name: string) => JSON.parse(fs.readFileSync(path.join(projectRoot, name), 'utf8'));
+
+  it('REFUSES a document whose mark is lower than the one on disk, and leaves the file alone', async () => {
+    const p = seed('assets/m.prefab.json', doc(9, 1, 2, 3));
+    const res = await post('/api/write-file', body(p, doc(4, 1, 2, 3)));
+    expect(res.status).toBe(409);
+    expect(res.body.reason).toBe('prefab-mark-lowered');
+    expect(onDisk('assets/m.prefab.json').nextLocalId).toBe(9);
+  });
+
+  it('REFUSES a document with NO mark whose rows sit below the stored one — the shape an older writer produces', async () => {
+    const p = seed('assets/m.prefab.json', doc(9, 1, 2, 3));
+    expect((await post('/api/write-file', body(p, doc(undefined, 1, 2)))).body.reason).toBe('prefab-mark-lowered');
+  });
+
+  it('REFUSES the same through the base64 encoding', async () => {
+    const p = seed('assets/m.prefab.json', doc(9, 1, 2, 3));
+    const res = await post('/api/write-file', { path: p, content: Buffer.from(JSON.stringify(doc(4, 1))).toString('base64'), encoding: 'base64' });
+    expect(res.body.reason).toBe('prefab-mark-lowered');
+  });
+
+  it('a CREATE-only write over an existing prefab is refused for its real reason, not as a lower mark', async () => {
+    // Review sibling of finding 1. Mutation: run the mark check for `ifNoneMatch: '*'` too — the reason reads
+    // `prefab-mark-lowered`, and Create Prefab's redo reports a generic failure instead of "changed on disk since".
+    const p = seed('assets/m.prefab.json', doc(9, 1, 2, 3));
+    const res = await post('/api/write-file', { ...body(p, doc(undefined, 1)), ifNoneMatch: '*' });
+    expect(res.body.reason).toBe('if-none-match');
+  });
+
+  it('ACCEPTS a mark that holds or rises, a file with no mark whose rows derive it, and a first write', async () => {
+    const p = seed('assets/m.prefab.json', doc(9, 1, 2, 3));
+    expect((await post('/api/write-file', body(p, doc(9, 1)))).body.ok).toBe(true);
+    expect((await post('/api/write-file', body(p, doc(12, 1, 11)))).body.ok).toBe(true);
+    const q = seed('assets/old.prefab.json', doc(undefined, 1, 2, 3));
+    expect((await post('/api/write-file', body(q, doc(undefined, 1, 2, 3)))).body.ok, 'before v8: the rows derive the same mark').toBe(true);
+    expect((await post('/api/write-file', body('/assets/new.prefab.json', doc(undefined, 1)))).body.ok).toBe(true);
+  });
+});

@@ -1,0 +1,56 @@
+/** A prefab document's localId high-water mark (#1774, owner ruling B, prefab v8): `nextLocalId`, the lowest number a
+ *  NEW row may take. Every localId the document has ever used is below it, and it never goes down.
+ *
+ *  Why it exists: a member's derived guid is a hash of its localId path, so a number handed out a second time hands the
+ *  new node the guid of the member that last held it, and every ref still naming that member lands on the new node. A
+ *  number freed at the TOP of the numbering is invisible to a writer that numbers above the rows it can see, so a LATER
+ *  write handed it out again (#1774). Unity never reuses a fileID either; it never counts, it draws a random one. The
+ *  owner kept sequential numbers (they are used elsewhere too) and made the mark persistent.
+ *
+ *  Two halves, and they live in different places on purpose:
+ *  - **Read** ({@link localIdCounter}): every allocator seeds from it — prefab-edit's session floor, a Replace's
+ *    `replaceNumbering`, Apply's promotion, `mergeRiggedPrefab`. Guarded per writer by `localIdCounter.test.ts`.
+ *  - **Advance** ({@link advanceLocalIdCounter}): each writer states the mark on what it builds, and
+ *    `commitPrefabWrites` — which every editor prefab write goes through — raises it to the document it lands over if a
+ *    writer did not, so no write lowers it. Under both, `/api/write-file` refuses any write that would lower it
+ *    (`classifyPrefabMarkWrite`): the route is reachable raw (an agent's eval, a game panel, the Assets drop import).
+ *
+ *  A file without the field (every file before v8, a hand edit) derives it from its highest row: no migration pass.
+ *  Import-free and in L0, beside `version.ts`, because it is a FORMAT rule with three readers in three places: the
+ *  editor's writers, `prefabCommit.ts` (which may not import `editor/scene/prefab.ts`, a load-time cycle), and the
+ *  server's write gate (`plugins/prefabWriteGuard.ts`, which refuses a raw write that would lower the mark). */
+
+/** The part of a prefab document the mark reads. */
+export interface CountedDoc {
+  nextLocalId?: unknown;
+  rootLocalId?: unknown;
+  entities?: ReadonlyArray<{ localId?: unknown }> | unknown;
+}
+
+const positiveInt = (v: unknown): number => (typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : 0);
+
+/** The lowest localId a NEW row of `doc` may take: its stored mark, or above its highest row and its root, whichever is
+ *  higher — so a mark a hand edit left too low cannot hand out a number a row holds. 1 for no document. */
+export function localIdCounter(doc: CountedDoc | null | undefined): number {
+  if (!doc || typeof doc !== 'object') return 1;
+  let next = Math.max(1, positiveInt(doc.nextLocalId), positiveInt(doc.rootLocalId) + 1);
+  if (Array.isArray(doc.entities)) for (const e of doc.entities as ReadonlyArray<{ localId?: unknown }>) next = Math.max(next, positiveInt(e?.localId) + 1);
+  return next;
+}
+
+/** Set `doc.nextLocalId` to the highest of its own counter and each prior document's — `priors` being what this write
+ *  replaces or lands over — and return it. Mutates, so every holder of `doc` (an undo record, a cache) sees the mark
+ *  that is written. */
+export function advanceLocalIdCounter(doc: { nextLocalId?: number } & CountedDoc, ...priors: Array<CountedDoc | number | null | undefined>): number {
+  let next = localIdCounter(doc);
+  for (const p of priors) next = Math.max(next, typeof p === 'number' ? positiveInt(p) : p ? localIdCounter(p) : 0);
+  doc.nextLocalId = next;
+  return next;
+}
+
+/** {@link localIdCounter} of a document read as bytes (a writer's `readPriorDocument`), or 0 for none, or for bytes that
+ *  do not parse — a positional rebuild then states only its own mark. */
+export function priorLocalIdCounter(text: string | null | undefined): number {
+  if (!text) return 0;
+  try { return localIdCounter(JSON.parse(text.replace(/^\uFEFF/, '')) as CountedDoc); } catch { return 0; }
+}

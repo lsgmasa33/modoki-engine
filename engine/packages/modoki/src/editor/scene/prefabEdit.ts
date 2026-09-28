@@ -9,6 +9,7 @@
 
 import type { Entity, World } from 'koota';
 import type { PrefabFile, PrefabEntity } from './prefab';
+import { localIdCounter } from '../../runtime/core/localIdCounter';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { channelsOf } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
@@ -639,15 +640,17 @@ export function collectPreservedLocalIds(
  *  - `rows`: live guid → the localId and `nodeGuid` a save gave it — every row a save wrote, and every row of each
  *    document an edit world was built from (by its sentinel guid). It answers for a member the LAST save no longer
  *    had: deleted, then brought back by an undo, which respawns it under its guid.
- *  - `floor`: the highest localId any of those has used. A new member is numbered above it, so a number a delete freed
- *    is never handed to another member while the deleted one can still come back (Unity never reuses a fileID either).
- *    Without it an undone delete met its own number on a newcomer: two rows at one localId.
+ *  - `floor`: the highest localId any of those has used, including each document's persisted high-water mark (#1774,
+ *    `localIdCounter`). A new member is numbered above it, so a number a delete freed is never handed to another member
+ *    while the deleted one can still come back (Unity never reuses a fileID either). Without it an undone delete met its
+ *    own number on a newcomer: two rows at one localId. The record dies with the process; the mark in the file is what
+ *    keeps a LATER session from handing the freed number out again (#1774).
  *  ⚠️ Keyed by the PREFAB, not the edit world, because what an undo can bring back outlives the world: Stop rebuilds it
  *  from a snapshot, so an entity from an earlier world can be respawned into a later one. Per world, each rebuild forgot
  *  every number and identity (close-out review 2). It lives as long as the editor process. Leaving prefab edit drops the
  *  prefab's undo history (U27 in `docs/prefabs.md`, #1704), so what it keeps across visits costs only gaps in the
  *  numbering.
- *  ⚠️ A write made OUTSIDE prefab edit between two visits (an Apply appends at max+1, a Replace renumbers, a checkout)
+ *  ⚠️ A write made OUTSIDE prefab edit between two visits (a positional rebuild, #1782; a pre-v5 Replace; a checkout)
  *  can give a number this record remembers to another row. A remembered ADDED member then yields to the document
  *  (`collectPreservedLocalIds`' `current`). A SENTINEL cannot: `__prefab_edit_local__<n>` names row n of whichever
  *  document the entity came from. Only an undo from an earlier visit could bring such a row back, and that history is
@@ -656,7 +659,8 @@ interface SessionRows { rows: Map<string, { localId: number; nodeGuid: string }>
 const sessionRowsByPrefab = new Map<string, SessionRows>();
 /** The prefab each world has merged its opened rows into the record of. */
 const seededWorlds = new WeakMap<World, string>();
-const maxLocalId = (doc: PrefabFile): number => doc.entities.reduce((m, e) => Math.max(m, e.localId), 0);
+/** The highest localId `doc` has ever used: below its high-water mark (#1774), which a file before v8 derives from its rows. */
+const usedUpTo = (doc: PrefabFile): number => localIdCounter(doc) - 1;
 /** Prefab `guid`'s record, with the rows of `opened` — the document `world` was built from — merged in once per world. */
 function sessionRowsFor(world: World, guid: string, opened: PrefabFile): SessionRows {
   let rec = sessionRowsByPrefab.get(guid);
@@ -666,7 +670,7 @@ function sessionRowsFor(world: World, guid: string, opened: PrefabFile): Session
       if (e.localId === opened.rootLocalId || !e.nodeGuid) continue;
       rec.rows.set(`${PREFAB_EDIT_LOCAL_GUID_PREFIX}${e.localId}`, { localId: e.localId, nodeGuid: e.nodeGuid });
     }
-    rec.floor = Math.max(rec.floor, maxLocalId(opened));
+    rec.floor = Math.max(rec.floor, usedUpTo(opened));
     seededWorlds.set(world, guid);
   }
   return rec;
@@ -678,7 +682,7 @@ function noteSessionRows(guid: string, written: ReadonlyMap<string, number>, doc
   if (!rec) return;
   const nodeGuidAt = new Map(doc.entities.map((e) => [e.localId, e.nodeGuid ?? '']));
   for (const [g, localId] of written) rec.rows.set(g, { localId, nodeGuid: nodeGuidAt.get(localId) ?? '' });
-  rec.floor = Math.max(rec.floor, maxLocalId(doc));
+  rec.floor = Math.max(rec.floor, usedUpTo(doc));
 }
 /** Test-only: forget every prefab's record, and the open session's baseline, as a fresh editor process has none. */
 export function _resetPrefabEditSessionRows(): void { sessionRowsByPrefab.clear(); editBaseline = null; }

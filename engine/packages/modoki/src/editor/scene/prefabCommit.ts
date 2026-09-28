@@ -34,6 +34,8 @@ import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { beginWorldBoundOperation } from '../undo/undoManager';
 import { adoptionsSettledGate, pendingAdoptionCount, captureAdoptionGate } from './adoptionGate';
+import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
+import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 
 /** What the file must hold for the write to go ahead:
  *  - a `PrefabFile`: the document the caller READ. Matched against the editor's own serialization of it first, and —
@@ -188,7 +190,7 @@ export async function commitPrefabWrites(
           ...('error' in landed && landed.error ? { error: landed.error } : {}), ...(stranded.length ? { stranded } : {}) };
       }
       const path = landed.path ?? w.asked;
-      done.push({ path, wrote: w.doc ? (w.bytes ?? jsonFileBody(w.doc)) : null, prior: pre ? pre.prior : priorOf(w.expected) });
+      done.push({ path, wrote: 'content' in landed ? landed.content ?? null : null, prior: pre ? pre.prior : priorOf(w.expected) });
     }
     const paths = done.map((d) => d.path);
     // 3. Both caches for every file, one rebuild, one rebase.
@@ -212,9 +214,10 @@ async function precheck(path: string, expected: PrefabExpectation): Promise<{ if
   if (state === 'unreadable') return { refused: `${path} could not be read to check it before writing` };
   if (expected === null) return state === 'absent' ? { createOnly: true, prior: null } : { refused: 'conflict' };
   if (state === 'absent') return { refused: 'conflict' };
-  const same = typeof expected === 'string'
+  const expectedDoc = typeof expected === 'string' ? parsedOrNull(expected) : expected;
+  const same = (typeof expected === 'string'
     ? state.text.replace(/^\uFEFF/, '') === expected.replace(/^\uFEFF/, '')
-    : state.text.replace(/^\uFEFF/, '') === jsonFileBody(expected) || sameDocument(state.text, expected);
+    : state.text.replace(/^\uFEFF/, '') === jsonFileBody(expected)) || (!!expectedDoc && sameDocument(state.text, expectedDoc));
   if (!same) return { refused: 'conflict' };
   const ifMatch = await hashBytes(state.bytes);
   return typeof ifMatch === 'string' ? { ifMatch, prior: state.text } : { refused: ifMatch.ok ? 'hash' : (ifMatch.error ?? 'hash') };
@@ -231,9 +234,12 @@ async function rollBack(done: Array<{ path: string; wrote: string | null; prior:
   const stranded: string[] = [];
   for (const d of [...done].reverse()) {
     const expected = d.wrote;
-    const back = d.prior === null
+    // The prior bytes, with the mark this commit wrote kept (#1774): the route refuses a write that lowers it.
+    const priorDoc = d.prior === null ? null : parsedOrNull(d.prior);
+    const prior = d.prior === null || !priorDoc ? d.prior : contentFor(priorDoc, d.prior, parsedOrNull(d.wrote));
+    const back = prior === null
       ? await trashDoc(d.path, expected, undefined)
-      : await post(d.path, d.prior, expected === null ? { createOnly: true } : { ifMatch: await hashOrEmpty(expected) }, 'rollback');
+      : await post(d.path, prior, expected === null ? { createOnly: true } : { ifMatch: await hashOrEmpty(expected) }, 'rollback');
     if (!back.ok) stranded.push(d.path);
   }
   if (stranded.length) console.error(`[Prefab] a multi-file write failed part-way; these files keep the new content and could not be put back: ${stranded.join(', ')}`);
@@ -267,29 +273,121 @@ function seatCaches(path: string, source: string, guid: string | undefined, doc:
 }
 
 /** `path`: the route's own spelling of the file it wrote, when it names one — a create inside a folder typed in another
- *  case lands in the folder that exists (#1273), and the caches and the manifest must key on THAT. */
-type Landed = { ok: true; path?: string } | { ok: false; conflict?: boolean; error?: string };
+ *  case lands in the folder that exists (#1273), and the caches and the manifest must key on THAT. `content`: the bytes a
+ *  document write put down, which the high-water mark can make differ from the caller's (`contentFor`). */
+type Landed = { ok: true; path?: string; content?: string } | { ok: false; conflict?: boolean; error?: string };
+
+/** The bytes a write of `doc` puts down, with its localId high-water mark (#1774, `localIdCounter.ts`) at least every
+ *  prior's — `priors` being the documents it lands over: the one the caller read, or the file re-read when that is what
+ *  the precondition matched. So no write LOWERS the mark, whichever writer made it: each writer states the mark itself,
+ *  and this is the line under it. Mutates `doc`, so the caches and the caller's own record hold the mark written.
+ *
+ *  A write that lowers nothing is left exactly as built. `bytes` (an undo putting a file back verbatim, #1679) are kept
+ *  verbatim unless they would lower the mark — undoing a
+ *  write that minted a number must not free that number for the next write, or it derives the guid the undone node had
+ *  (Apply adds C at 4, Cmd+Z, the next Apply adds D at 4). Then the bytes are written with the mark raised and a format
+ *  version that claims it, spliced in so every other byte stays (`withTopLevelNumbers`); re-serialized only when the
+ *  splice cannot be shown exact. */
+function contentFor(doc: PrefabFile, bytes: string | undefined, ...priors: Array<PrefabFile | null | undefined>): string {
+  const need = Math.max(0, ...priors.map((p) => (p ? localIdCounter(p) : 0)));
+  // Nothing to raise: the document goes down exactly as the caller built it — a writer states its own mark, and a
+  // restore of a file from before v8 stays without one (it derives the same mark from its rows).
+  // Judged on what is WRITTEN: with `bytes`, the bytes — not `doc`, which an earlier call may already have raised (a redo
+  // hands the same document and the same recorded bytes every time; judged on the raised document, the lower bytes went
+  // out and were refused for good, close-out re-review).
+  const written = bytes === undefined ? doc : parsedOrNull(bytes) ?? doc;
+  if (need <= localIdCounter(written)) return bytes ?? jsonFileBody(doc);
+  const had = doc.nextLocalId !== undefined;
+  advanceLocalIdCounter(doc, need);
+  // A raised mark is v8 data, so what is written claims v8 (an older build then refuses to save over it and drop the mark).
+  const claims = !(written.version >= PREFAB_FORMAT_VERSION);
+  if (!(doc.version >= PREFAB_FORMAT_VERSION)) doc.version = PREFAB_FORMAT_VERSION;
+  if (bytes === undefined) {
+    if (!had) placeMarkAfterRoot(doc);
+    return jsonFileBody(doc);
+  }
+  return withTopLevelNumbers(bytes, { nextLocalId: doc.nextLocalId!, ...(claims ? { version: doc.version } : {}) }) ?? jsonFileBody(doc);
+}
+
+/** `bytes` with each of `fields` set as a top-level number and every other byte kept — formatting, key order, a BOM —
+ *  so a restore that has to raise the mark changes only the lines that say so. Null when that cannot be shown: bytes
+ *  that do not parse, a key spelled more than once in the text, or a result that does not parse to exactly the
+ *  document with those fields set (the caller then re-serializes). */
+function withTopLevelNumbers(bytes: string, fields: Record<string, number>): string | null {
+  const bom = bytes.charCodeAt(0) === 0xfeff ? bytes.slice(0, 1) : '';
+  let text = bytes.slice(bom.length);
+  let before: unknown;
+  try { before = JSON.parse(text); } catch { return null; }
+  if (!before || typeof before !== 'object' || Array.isArray(before)) return null;
+  const inserts: string[] = [];
+  for (const [key, value] of Object.entries(fields)) {
+    if (!(key in (before as object))) { inserts.push(key); continue; }
+    if (text.split(`"${key}"`).length !== 2) return null;
+    const at = new RegExp(`("${key}"\\s*:\\s*)-?\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?`);
+    if (!at.test(text)) return null;
+    text = text.replace(at, `$1${value}`);
+  }
+  if (inserts.length) {
+    const open = text.indexOf('{');
+    const ws = /^\s*/.exec(text.slice(open + 1))![0];
+    const multiline = ws.includes('\n');
+    const entries = inserts.map((k) => `"${k}"${multiline ? ': ' : ':'}${fields[k]},${multiline ? ws : ''}`).join('');
+    text = `${text.slice(0, open + 1)}${ws}${entries}${text.slice(open + 1 + ws.length)}`;
+  }
+  try {
+    if (canonical(JSON.parse(text)) !== canonical({ ...(before as object), ...fields })) return null;
+  } catch { return null; }
+  return bom + text;
+}
+
+/** Move `nextLocalId` to where the serializer writes it, right after `rootLocalId`, so the bytes of a document it was
+ *  newly added to read as the next ordinary save will write them. Key order only; nothing else changes. */
+function placeMarkAfterRoot(doc: PrefabFile): void {
+  const rec = doc as unknown as Record<string, unknown>;
+  const keys = Object.keys(rec);
+  const at = keys.indexOf('rootLocalId');
+  if (at < 0) return;
+  const after = keys.slice(at + 1).filter((k) => k !== 'nextLocalId').map((k) => [k, rec[k]] as const);
+  const mark = rec.nextLocalId;
+  for (const [k] of after) delete rec[k];
+  delete rec.nextLocalId;
+  rec.nextLocalId = mark;
+  for (const [k, v] of after) rec[k] = v;
+}
+
+/** A prior document from its bytes, parsed as every reader parses them; null when there are none or they do not parse. */
+function parsedOrNull(text: string | null | undefined): PrefabFile | null {
+  if (!text) return null;
+  try { return parsePrefabBytes(text); } catch { return null; }
+}
 
 async function writeDoc(
   path: string, doc: PrefabFile, w: { expected: PrefabExpectation; bytes?: string; overwrite?: boolean },
-  /** The precondition a multi-file pre-check already established, exactly. */
-  pre?: { ifMatch?: string; createOnly?: boolean },
+  /** The precondition a multi-file pre-check already established, exactly, and the bytes it read there. */
+  pre?: { ifMatch?: string; createOnly?: boolean; prior?: string | null },
 ): Promise<Landed> {
-  const content = w.bytes ?? jsonFileBody(doc);
-  if (w.overwrite) return post(path, content, {}, doc.name);
-  if (pre) return post(path, content, pre.createOnly ? { createOnly: true } : { ifMatch: pre.ifMatch }, doc.name);
+  const put = async (content: string, cond: { createOnly?: boolean; ifMatch?: string }): Promise<Landed> => {
+    const res = await post(path, content, cond, doc.name);
+    return res.ok ? { ...res, content } : res;
+  };
+  const expectedDoc = w.expected === null ? null : typeof w.expected === 'string' ? parsedOrNull(w.expected) : w.expected;
+  // An overwrite ignores what is there, but never the mark it holds.
+  if (w.overwrite) return put(contentFor(doc, w.bytes, expectedDoc, parsedOrNull((await readBytes(path))?.text)), {});
+  if (pre) return put(contentFor(doc, w.bytes, parsedOrNull(pre.prior)), pre.createOnly ? { createOnly: true } : { ifMatch: pre.ifMatch });
   const { expected } = w;
-  if (expected === null) return post(path, content, { createOnly: true }, doc.name);
+  if (expected === null) return put(contentFor(doc, w.bytes), { createOnly: true });
   const first = await hashOf(typeof expected === 'string' ? expected : jsonFileBody(expected));
   if (typeof first !== 'string') return first;
-  const res = await post(path, content, { ifMatch: first }, doc.name);
-  if (res.ok || !res.conflict || typeof expected === 'string') return res;
-  // Refused against the editor's own serialization. The file may still hold the document read, in other bytes.
+  const res = await put(contentFor(doc, w.bytes, expectedDoc), { ifMatch: first });
+  if (res.ok || !res.conflict || !expectedDoc) return res;
+  // Refused against the exact bytes. The file may still hold the document read: in other bytes, or with only its mark
+  // raised since (`sameDocument` — a write stamped the mark after the caller recorded the bytes it holds, #1774). The
+  // mark then comes from the file that is there.
   const onDisk = await readBytes(path);
-  if (!onDisk || !sameDocument(onDisk.text, expected)) return res;
+  if (!onDisk || !sameDocument(onDisk.text, expectedDoc)) return res;
   const again = await hashBytes(onDisk.bytes);
   if (typeof again !== 'string') return again;
-  return post(path, content, { ifMatch: again }, doc.name);
+  return put(contentFor(doc, w.bytes, expectedDoc, parsedOrNull(onDisk.text)), { ifMatch: again });
 }
 
 async function trashDoc(path: string, expected: PrefabExpectation, pre: { ifMatch?: string; createOnly?: boolean } | undefined): Promise<Landed> {
@@ -326,7 +424,9 @@ async function post(path: string, content: string, pre: { createOnly?: boolean; 
     // one thing only the human can act on. Only an if-match / if-none-match 409 is a conflict; the gate's is not.
     const body = await res.json().catch(() => null) as { error?: unknown; reason?: unknown } | null;
     const why = typeof body?.error === 'string' ? body.error : typeof body?.reason === 'string' ? body.reason : '';
-    const conflict = res.status === 409 && (body?.reason === 'if-match' || body?.reason === 'if-none-match');
+    // `prefab-mark-lowered` (#1774) is a conflict too: the file's localId high-water mark rose past what this write was
+    // raised to, so it is not the file the caller read — and the fallback below re-reads it and raises from it.
+    const conflict = res.status === 409 && (body?.reason === 'if-match' || body?.reason === 'if-none-match' || body?.reason === 'prefab-mark-lowered');
     // Not logged here: every caller reports its own failure, once, in its own words (an undo's #308 report, Apply's
     // refusal, the prefab-edit save's warnings) — a second line here doubled each one.
     return { ok: false, ...(conflict ? { conflict } : {}), ...(why && !conflict ? { error: why } : {}) };
@@ -375,13 +475,19 @@ async function readState(path: string): Promise<'absent' | 'unreadable' | { byte
 }
 
 /** Does `text` parse to `expected`, the way every prefab reader parses it (`fetchPrefabSource`: the zIndex migration
- *  on every entity)? An id-less file compares with the id the editor minted for it (#1664: Apply mints both sides'). */
+ *  on every entity)? An id-less file compares with the id the editor minted for it (#1664: Apply mints both sides').
+ *  The localId high-water mark and the format version are not compared (#1774): this commit owns both where it raises the
+ *  mark (`contentFor` stamps a restore with the version that claims it), and only ever raises them, so a file that
+ *  differs from what the caller read in those alone holds nobody's change to protect. An undo's redo is the case: it is
+ *  conditional on the bytes the undo recorded, which predate the mark the undo's own write had to keep. */
 function sameDocument(text: string, expected: PrefabFile): boolean {
   try {
-    const parsed = parsePrefabBytes(text);
+    const parsed = parsePrefabBytes(text) as PrefabFile & { nextLocalId?: unknown };
     if (!parsed || !Array.isArray(parsed.entities)) return false;
     if (!parsed.id && expected.id) parsed.id = expected.id;
-    return canonical(parsed) === canonical(JSON.parse(JSON.stringify(expected)));
+    const want = JSON.parse(JSON.stringify(expected)) as PrefabFile & { nextLocalId?: unknown };
+    for (const d of [parsed, want] as unknown as Array<Record<string, unknown>>) { delete d.nextLocalId; delete d.version; }
+    return canonical(parsed) === canonical(want);
   } catch { return false; }
 }
 

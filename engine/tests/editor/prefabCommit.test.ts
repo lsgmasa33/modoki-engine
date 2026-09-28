@@ -101,13 +101,14 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, registerAsset, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory, deleteEntityWithUndo, createEntityWithUndo } from '@modoki/engine/editor';
-import { setPrefabCache, getCachedPrefabSync, getPrefabSource, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync, getPrefabSource, PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { commitPrefabWrite, commitPrefabWrites } from '../../packages/modoki/src/editor/scene/prefabCommit';
+import { localIdCounter } from '../../packages/modoki/src/runtime/core/localIdCounter';
 import { withAdoption, _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
-import { undo, worldBoundOperationsHeld } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo, worldBoundOperationsHeld } from '../../packages/modoki/src/editor/undo/undoManager';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { writeTraitFieldWithUndo } from '@modoki/engine/editor';
@@ -236,6 +237,13 @@ async function replaceXFromI2(): Promise<void> {
   expect((JSON.parse(route.disk.get(X_PATH)!) as PrefabFile).id).toBe(X); // precondition: a Replace, the guid kept
 }
 
+/** X's bytes as an undo or a rollback puts them back over a write that raised X's localId high-water mark to `mark`: the
+ *  replaced bytes with that mark and the format version that claims it spliced in, every other byte kept (#1774). */
+const restoredOverMark = (mark: number | undefined) => {
+  expect(mark, 'precondition: the write minted rows above X\'s own').toBeGreaterThan(Math.max(...xDoc().entities.map((e) => e.localId)) + 1);
+  return jsonFileBody({ nextLocalId: mark, ...xDoc(), version: PREFAB_FORMAT_VERSION } as never);
+};
+
 describe('Create Prefab → Replace rebuilds every OTHER live instance (#1685)', () => {
   it('the other instance gains the new members, and its save records none of them as removed', async () => {
     await replaceXFromI2();
@@ -250,11 +258,26 @@ describe('Create Prefab → Replace rebuilds every OTHER live instance (#1685)',
 
   it("the Replace's undo brings the other instance back onto the restored document too", async () => {
     await replaceXFromI2();
+    const mark = (JSON.parse(route.disk.get(X_PATH)!) as PrefabFile).nextLocalId;
     await quietly(() => undo()); // the Create Prefab entry (the edits above are their own entries)
-    expect(route.disk.get(X_PATH)).toBe(jsonFileBody(xDoc())); // precondition: the replaced bytes are back
+    // Precondition: the replaced document is back — with the Replace's localId high-water mark kept (#1774).
+    expect(route.disk.get(X_PATH)).toBe(restoredOverMark(mark));
     expect(namesIn(I1)).toEqual(['XA', 'XB', 'XC']);
     const saved = await quietly(() => serializeScene()) as unknown as SceneData;
     expect(JSON.stringify(entryOf(saved, I1))).not.toContain('"removed":true');
+  });
+});
+
+describe('#1774 close-out review: the mark across undo and redo', () => {
+  /** Finding 2. The undo raised the mark into the replaced bytes, with the version that claims it; the redo is conditional
+   *  on the bytes it recorded before that. Mutation: compare `version` in `sameDocument` — the redo is refused. */
+  it('Create Prefab → Replace, undo, redo: the redo lands and the Replace\'s content is back', async () => {
+    await replaceXFromI2();
+    const written = route.disk.get(X_PATH)!;
+    await quietly(() => undo());
+    expect(route.disk.get(X_PATH)).not.toBe(written); // precondition: the undo ran
+    await quietly(() => redo());
+    expect(JSON.parse(route.disk.get(X_PATH)!)).toEqual(JSON.parse(written));
   });
 });
 
@@ -339,6 +362,7 @@ describe('holding the world cannot deadlock (#1667)', () => {
   it('no rebuild a prefab write runs starts a world switch, and each run lands and lets go', async () => {
     // Create Prefab → Replace: the tag, then the rebase of the other instance.
     await replaceXFromI2();
+    const mark = (JSON.parse(route.disk.get(X_PATH)!) as PrefabFile).nextLocalId;
     expect(worldBoundOperationsHeld()).toBe(0);
     // Apply: its refresh, the rebase, then the undo entry — all under the hold.
     writeTraitFieldWithUndo(inInstance(I1, 'XB'), getTraitByName('Transform')!, 'x', 4);
@@ -348,7 +372,7 @@ describe('holding the world cannot deadlock (#1667)', () => {
     expect(worldBoundOperationsHeld()).toBe(0);
     // …and an undo's rebuild: the Apply's world restore, the field edit, then the Replace's untag and rebase.
     for (let i = 0; i < 3; i++) await quietly(() => undo());
-    expect(route.disk.get(X_PATH)).toBe(jsonFileBody(xDoc())); // precondition: the Replace's undo ran
+    expect(route.disk.get(X_PATH)).toBe(restoredOverMark(mark)); // precondition: the Replace's undo ran
     expect(worldBoundOperationsHeld()).toBe(0);
     expect(holds.switchesWhileHeld).toBe(0);
   });
@@ -482,7 +506,8 @@ describe('several prefab files as ONE step (#1692, for #1693)', () => {
     route.beforeWrite = null;
     expect(res).toMatchObject({ ok: false, conflict: true });
     expect(res.stranded).toBeUndefined();
-    expect(route.disk.get(X_PATH)).toBe(jsonFileBody(xDoc()));
+    // X is put back — keeping the mark its write raised, which the route would refuse to lower (#1774).
+    expect(route.disk.get(X_PATH)).toBe(restoredOverMark(localIdCounter(xNext())));
     expect(route.disk.get(Y_PATH)).toBe(jsonFileBody(yDoc('raced in')));
     expect(getCachedPrefabSync(X)?.entities.some((e) => e.name === 'XD')).toBe(false);
   });

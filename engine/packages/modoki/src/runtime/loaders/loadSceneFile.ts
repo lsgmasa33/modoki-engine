@@ -37,6 +37,7 @@ import { rebaseMemberTokens, hasMemberToken, isMemberToken, parseMemberToken, me
 import { mapStringValues } from '../core/assetRefRules';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
+import { keptOrphanRowsOf, setKeptOrphanRows, dropKeptOrphanRows, clearKeptOrphanRows } from '../core/ecs/keptOrphanRows';
 import { memberPathIndex, identityTree } from '../core/ecs/memberHome';
 import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, noteNodeMoves, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
 export { memberPathIndex } from '../core/ecs/memberHome';
@@ -1352,28 +1353,12 @@ function templateFrameKeys(prefabRef: string, frame: readonly string[], read: Pr
   return keys;
 }
 
-/** Member rows this load could not match to any node the template still declares (R2), kept per
- *  instance-root guid so the next SAVE can write them back rather than dropping them.
- *
- *  ⚠️ **Retained, not repaired.** A row orphans when its template node is GONE — a member deleted
- *  from the prefab, or a rigged re-import that could not re-associate a renamed bone. Keeping it
- *  means an undone template edit, or a re-import that matches again, restores the scene's identity
- *  for that member instead of silently minting a new one. That is the containment the #1468 design record promises: a
- *  rename costs one orphaned row and a log line, never a re-pointed subtree.
- *
- *  ⚠️ A member the INSTANCE removed is NOT an orphan — its node is still in the template, so its row
- *  is retained silently and un-removing it gets its identity back. R2 says this explicitly, and the
- *  distinction is why this asks the DOCUMENT rather than the live world: every removed member is
- *  absent from the world and would otherwise be reported as a loss on every load.
- *
- *  ⚠️ Rows accumulate: nothing expires an orphan, so a template that churns members grows the map
- *  by ~150 bytes each time. Accepted for now — the alternative is dropping identity on a timer — but
- *  it is the reason a later phase may want a deliberate prune, and not something to discover then. */
-const orphanMemberRows = new Map<string, Record<string, SceneMemberRow>>();
+// The kept-orphan store (R2) itself lives in L0, `core/ecs/keptOrphanRows.ts`, with its rationale: a guid rename (core)
+// re-keys it (#1778). This is its typed API.
 
 /** The orphan rows kept for the instance root with this guid, for the writer to re-emit (R2). */
 export function keptMemberOrphans(rootGuid: string): Record<string, SceneMemberRow> | undefined {
-  return orphanMemberRows.get(rootGuid);
+  return keptOrphanRowsOf(rootGuid) as Record<string, SceneMemberRow> | undefined;
 }
 
 /** Replace the orphan rows kept for the instance root with guid `rootGuid` — the editor rebuild's write-back
@@ -1381,15 +1366,13 @@ export function keptMemberOrphans(rootGuid: string): Record<string, SceneMemberR
  *  must leave this store as a reload would: every row the NEW template no longer backs kept (fork 2), whatever
  *  frame it is in, and every one it backs again applied and gone. */
 export function setKeptMemberOrphans(rootGuid: string, rows: Record<string, SceneMemberRow>): void {
-  if (!rootGuid) return;
-  if (Object.keys(rows).length) orphanMemberRows.set(rootGuid, rows);
-  else orphanMemberRows.delete(rootGuid);
+  setKeptOrphanRows(rootGuid, rows);
 }
 
 /** Drop every kept orphan. For tests — production keeps them for the lifetime of the process,
  *  because the only reader is a save of the same instance root. */
 export function clearKeptMemberOrphans(): void {
-  orphanMemberRows.clear();
+  clearKeptOrphanRows();
 }
 
 /** One user-added REFERENCE node's stored member rows: its root's guid, the rows, the prefab it expands. */
@@ -1489,7 +1472,7 @@ function applyStoredMemberRows(
   if (!Object.keys(members).length) {
     const root = findEntityById(rootEcsId, world) as EntityHandle | undefined;
     const guid = durableGuid(root?.has(attrMeta.trait) ? (root.get(attrMeta.trait) as { guid?: string }).guid : '');
-    if (guid) orphanMemberRows.delete(guid);
+    if (guid) dropKeptOrphanRows(guid);
     return;
   }
   for (const [ecsId, key] of keepOnly ? [] : memberRowKeysIn(rootEcsId, world)) {
@@ -1525,9 +1508,9 @@ function applyStoredMemberRows(
     orphans[key] = row;
     count++;
   }
-  if (!count) { orphanMemberRows.delete(rootGuid); return; }
+  if (!count) { dropKeptOrphanRows(rootGuid); return; }
   // Keep them either way — what differs is whether we are entitled to SAY they are gone.
-  orphanMemberRows.set(rootGuid, orphans);
+  setKeptOrphanRows(rootGuid, orphans);
   if (!complete) return; // a prefab this walk could not read; see templateNodeGuids
   // Named, and once per instance. A count alone cannot be acted on, and the row is the ONE place the
   // member's name can still come from — its template node is gone, so nothing else knows it.

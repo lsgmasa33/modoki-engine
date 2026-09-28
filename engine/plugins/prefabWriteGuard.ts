@@ -88,6 +88,7 @@
 import fs from 'node:fs';
 import { PREFAB_FORMAT_VERSION } from '../packages/modoki/src/runtime/core/version';
 import { classifyJsonFormatVersion } from '../packages/modoki/src/runtime/core/formatVersion';
+import { localIdCounter, type CountedDoc } from '../packages/modoki/src/runtime/core/localIdCounter';
 
 /** Is this a prefab document, by path? The gate is keyed on the suffix because `/api/write-file` is
  *  byte-opaque by design and has no other way to know what it is writing. */
@@ -144,5 +145,47 @@ export function classifyPrefabWrite(absPath: string): PrefabWriteRefusal | null 
     current: PREFAB_FORMAT_VERSION,
     message: `${absPath} was written by a newer build (prefab format ${stored}; this build writes ${PREFAB_FORMAT_VERSION}). `
       + 'Refusing to overwrite it — saving would silently drop the fields this build does not know about. Update your build.',
+  };
+}
+
+export interface PrefabMarkRefusal {
+  /** The high-water mark the prefab on disk holds (`localIdCounter`: stored, or derived from its rows). */
+  stored: number;
+  /** The mark the incoming document would leave. */
+  incoming: number;
+  message: string;
+}
+
+/** A refusal when writing `incoming` over the prefab at `absPath` would LOWER its localId high-water mark (#1774, prefab
+ *  v8, `runtime/core/localIdCounter.ts`); `null` otherwise — no file there, not a prefab, or either side not a JSON
+ *  document (the other rules own those).
+ *
+ *  The mark is the lowest localId a new row may take, and it never goes down: a derived member guid is a hash of the
+ *  localId path, so a number handed out twice gives the new node a deleted member's guid and every ref to it. The
+ *  editor's own writes keep it (`commitPrefabWrites` raises it before writing), so this fires only on a raw write — an
+ *  agent's eval, a game panel, a dropped file over an existing one — and that is the point: the route is byte-opaque.
+ *
+ *  ⚠️ Synchronous, for the reason {@link classifyPrefabWrite} is: it runs before the `ifMatch` window. */
+export function classifyPrefabMarkWrite(absPath: string, incoming: string): PrefabMarkRefusal | null {
+  if (!isPrefabPath(absPath)) return null;
+  let onDisk: string;
+  try { onDisk = fs.readFileSync(absPath, 'utf8'); } catch { return null; }
+  const parse = (t: string): CountedDoc | null => {
+    try {
+      const v: unknown = JSON.parse(t.replace(/^\uFEFF/, ''));
+      return v && typeof v === 'object' && !Array.isArray(v) ? v as CountedDoc : null;
+    } catch { return null; }
+  };
+  const was = parse(onDisk);
+  const next = parse(incoming);
+  if (!was || !next) return null;
+  const stored = localIdCounter(was);
+  const lands = localIdCounter(next);
+  if (lands >= stored) return null;
+  return {
+    stored, incoming: lands,
+    message: `${absPath} holds a localId high-water mark of ${stored}, and this write would lower it to ${lands}. `
+      + 'Refusing — a number below the mark may have belonged to a deleted member, and a new row given it would take over '
+      + `every ref to that member (#1774). Write "nextLocalId": ${stored} (or higher) into the document.`,
   };
 }

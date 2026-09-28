@@ -14,6 +14,7 @@ import { getAllTraits, getTraitByName } from './traitRegistry';
 import { deriveMemberGuid, remapGuidValues, durableGuid, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, type MemberStep, type MemberPi } from '../assetRefRules';
 import { templateKeyOf } from '../templateIdentity';
 import { memberRowsToWrite } from './memberRows';
+import { rekeyKeptOrphanRows } from './keptOrphanRows';
 import { memberPathKey } from '../templateRefs';
 import { worldIdentityParents, type IdentityParents, type TemplateDocReader } from './identityParents';
 
@@ -241,6 +242,9 @@ export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World 
     renamed.push(e);
   }
   remapWorldGuidRefs(remap, world);
+  // The rows R2 keeps for a renamed instance root follow it (#1778): Create Prefab's stamp renames a swallowed reference
+  // node, and its orphan rows, left under the old guid, were never written again.
+  rekeyKeptOrphanRows(remap);
   for (const e of renamed) indexEntityGuid(e, world);
 }
 

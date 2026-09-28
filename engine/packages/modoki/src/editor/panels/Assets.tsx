@@ -16,6 +16,7 @@ import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { commitPrefabWrite } from '../scene/prefabCommit';
+import { priorLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 // Backend-IO wrappers + create-prefab flow shared with the Hierarchy panel
 // (editor-panels F6/F7) — single source of truth for the /api/* calls and the
@@ -267,7 +268,8 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     // Node identity is a separate question and mints here either way: a freshly imported GLB tree has
     // no correspondence to the old document's rows, so there is nothing to carry. What the file guid
     // buys is that the instances still point AT this prefab, rather than at nothing.
-    const prefab = serializePrefab(rootId, existing.kind === 'known' ? existing.id : undefined);
+    // Positional over the old file (#1782), but its high-water mark never goes down (#1774).
+    const prefab = serializePrefab(rootId, existing.kind === 'known' ? existing.id : undefined, { priorCounter: priorLocalIdCounter(previousContent) });
 
     // Remove temporary entities from scene
     const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');

@@ -24,6 +24,7 @@ import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { durableGuid, memberStepId, nodeRowComponent, nodeRowKey, mapStringValues, deriveMemberGuid, remapGuidValues, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, isDerivedMember, isFrameStep, FRAME_STEP, type MemberPi } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
+import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import { templateKeysOf, recoverTemplateKey as recoverKeyFrom, type KeyRecoveryNode } from '../../runtime/loaders/templateKeyRecovery';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
@@ -175,6 +176,10 @@ export interface PrefabFile {
   version: number;
   name: string;
   rootLocalId: number;
+  /** The localId high-water mark (v8, #1774): the lowest number a NEW row may take; every localId this document has
+   *  ever used is below it, and it never goes down. Absent on a file written before v8 — read through
+   *  `localIdCounter`, which derives it from the highest row. See `localIdCounter.ts`. */
+  nextLocalId?: number;
   entities: PrefabEntity[];
   /** Members the prefab places under a parent no row relation can express (#1437 P3-b/P3-c) — a member of
    *  one of its NESTED instances, or a nested instance's member placed in this prefab: the member's path →
@@ -1078,6 +1083,10 @@ export function serializePrefab(
      *  highest localId the session has opened or written, so a number freed by a delete is never handed to a new member
      *  while the deleted one can still come back by undo (#1662; Unity never reuses a fileID either). */
     localIdFloor?: number;
+    /** The high-water mark of the document this write lands over, for a writer that passes neither `replacing` nor a
+     *  preserve map — a rebuild over an existing file (Import Model, the skin-rig update). It numbers nothing; it keeps
+     *  the written mark from going down (#1774). */
+    priorCounter?: number;
     /** ecsId → the reference row a placeholder stands for, whose prefab the load could not expand (#1699, prefab-edit
      *  only). The row is written as given (its prefab, edits and traits), numbered, identified, named and parented like
      *  any other: the edit world holds nothing of that frame for a capture to find. */
@@ -1286,9 +1295,14 @@ export function serializePrefab(
     // file already used, and every `parentId: <root>` in the entity rows is remapped through
     // the same table, so the two can't disagree.
     rootLocalId: ecsToLocal.get(selectedEntityId) ?? 1,
+    nextLocalId: 0, // stated just below, in this key position
     entities: prefabEntities,
     ...(moved ? { moved } : {}),
   };
+  // The high-water mark (#1774): above every row written, and never below the document this write replaces or lands
+  // over — prefab-edit's session floor, a Replace's document, a rebuild's prior file. `commitPrefabWrites` holds the same
+  // line against the file on disk; stating it here keeps the bytes a caller records before the commit the bytes written.
+  advanceLocalIdCounter(file, opts?.replacing, opts?.preserveLocalIds && opts.localIdFloor ? opts.localIdFloor + 1 : 0, opts?.priorCounter);
   assertNoRuntimeGuids(file, 'a serialized prefab');
   opts?.onRows?.(ecsToLocal);
   writtenRows.set(file.entities, new Map(flatTree.filter((e) => e.guid).map((e) => [e.guid!, ecsToLocal.get(e.id)!])));
@@ -1317,7 +1331,9 @@ function replaceNumbering(
   for (const r of rows) if (r.nodeGuid && isGuid(r.nodeGuid) && r.localId) oldLocal.set(r.nodeGuid, r.localId);
   if (!oldLocal.size) return null;
   const rootLid = replacing.rootLocalId ?? 1;
-  let next = Math.max(rootLid, ...rows.map((r) => r.localId ?? 0));
+  // Above the replaced document's high-water mark, not just its rows: a number an EARLIER write freed at the top is
+  // below the mark and above every row (#1774).
+  let next = Math.max(rootLid, localIdCounter(replacing) - 1);
   const out = new Map<number, number>([[selectedEntityId, rootLid]]);
   const used = new Set<number>([rootLid]);
   for (const e of flatTree) {
@@ -1507,11 +1523,10 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
   );
 
   // Allocator for brand-new fresh skeleton entities (a bone added to the rig) — above
-  // every id used by either side so it can't collide with a preserved localId.
-  let nextId = 0;
-  for (const pe of fresh.entities) nextId = Math.max(nextId, pe.localId);
-  for (const pe of existing.entities) nextId = Math.max(nextId, pe.localId);
-  nextId += 1;
+  // every id used by either side so it can't collide with a preserved localId, and above the existing document's
+  // high-water mark, so a bone an EARLIER re-import dropped never lends its number to a new one (#1774).
+  let nextId = localIdCounter(existing);
+  for (const pe of fresh.entities) nextId = Math.max(nextId, pe.localId + 1);
 
   // fresh localId → merged localId (matched skeleton → existing id; new → allocation).
   const freshRemap = new Map<number, number>();
@@ -1587,8 +1602,11 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
     version: Math.max(PREFAB_FORMAT_VERSION, existing.version),
     name: fresh.name,
     rootLocalId: fresh.rootLocalId,
+    // Computed here, so the existing document's mark is not carried through as an unknown field (#1774).
+    nextLocalId: 0,
     entities: [...mergedSkeleton, ...mergedUser],
   } satisfies Partial<PrefabFile> & Record<string, unknown>;
+  advanceLocalIdCounter(known, existing, nextId);
   // Every OTHER top-level field of the on-disk document rides through untouched (#1468). Until this
   // change the return above WAS the whole function — a five-field object literal — so a rigged
   // re-import discarded every field it did not itself compute. `moved` is one of them, and `moved`
@@ -1624,6 +1642,8 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
 export type ReplacedRows = {
   entities?: ReadonlyArray<{ name?: string; nodeGuid?: string; prefab?: string; localId?: number }>;
   rootLocalId?: number;
+  /** The replaced document's high-water mark (#1774): a new row is numbered above it. */
+  nextLocalId?: number;
 };
 
 /** {@link ReplacedRows} from a replaced prefab's raw bytes — undefined for bytes that are not a prefab document. Read
@@ -1631,9 +1651,13 @@ export type ReplacedRows = {
 export function parsedPrefabRows(text: string | null): ReplacedRows | undefined {
   if (!text) return undefined;
   try {
-    const doc = JSON.parse(text) as { entities?: unknown; rootLocalId?: unknown };
+    const doc = JSON.parse(text) as { entities?: unknown; rootLocalId?: unknown; nextLocalId?: unknown };
     if (!Array.isArray(doc?.entities)) return undefined;
-    return { entities: doc.entities as ReplacedRows['entities'], ...(typeof doc.rootLocalId === 'number' ? { rootLocalId: doc.rootLocalId } : {}) };
+    return {
+      entities: doc.entities as ReplacedRows['entities'],
+      ...(typeof doc.rootLocalId === 'number' ? { rootLocalId: doc.rootLocalId } : {}),
+      ...(typeof doc.nextLocalId === 'number' ? { nextLocalId: doc.nextLocalId } : {}),
+    };
   } catch { return undefined; }
 }
 
@@ -5389,7 +5413,9 @@ async function planApply(
   // refresh below subtracts them from this instance's capture: they are the template now, not an override.
   const appliedFields = new Set<string>();
   const liveAddedRootsToDelete: number[] = []; // live ecs roots whose adds were applied
-  const nextLocalId = { v: Math.max(0, ...newPrefab.entities.map((e) => e.localId)) + 1 };
+  // Above the document's high-water mark, not its rows (#1774): a number an EARLIER write freed at the top is below the
+  // mark. Taken before this Apply's removals, so it never hands out a number it frees itself either.
+  const nextLocalId = { v: localIdCounter(newPrefab) };
   let rowsReparented = false;
   const skipped: { key: string; reason: string }[] = [];
   const innerTags: { key: string; lid: number; tag: string }[] = [];
@@ -6204,6 +6230,9 @@ async function planApply(
     if (!newPrefab.moved) delete newPrefab.moved;
   }
 
+  // The high-water mark (#1774): past every number this Apply handed out, and never below the document it lands over. An
+  // enclosing document only loses an override here and mints nothing; its mark rides in its clone.
+  advanceLocalIdCounter(newPrefab, oldPrefab, nextLocalId.v);
   for (const x of appliedTargets) x.key = spell(x.key);
   return {
     // Innermost first, and the commit refreshes in this order, so each capture reads frames already rebuilt inside it.

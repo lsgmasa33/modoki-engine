@@ -1285,7 +1285,7 @@ had. An untouched save of OUTER2 dropped it, while the same orphan on a prefab R
 inner prefab briefly deleted a node, any save of the outer prefab erased the outer prefab's edit to
 it for good.
 
-**The mechanism.** R2's store (`orphanMemberRows`, read through `keptMemberOrphans`) is keyed by an
+**The mechanism.** R2's store (`runtime/core/ecs/keptOrphanRows.ts`, read through `keptMemberOrphans`) is keyed by an
 instance root's guid, and the load found a reference node's rows by the guid the node STORES
 (`collectReferenceNodeRows`). A template reference node stores none: it has a `key`, and its root
 derives a guid. So its rows never reached `applyStoredMemberRows`. The fold skipped the unmatched row
@@ -1367,6 +1367,26 @@ without a word, and the writer's re-emit had nothing to read.
   hand-edited file) is not stamped on the member, just as the scene-side fold ignores it.
 
 Tests: `templateReferenceNodeRows.test.ts` § #1542, § #1567 and § #1568. Each one names its mutation.
+
+### R2's store follows a guid rename (#1778)
+
+The store is keyed by the root's guid, which is its identity, so a rename has to take the rows along.
+Before #1778 nothing did. Create Prefab's stamp (#1758, `stampDerivedMemberGuids`) renames a reference
+node the scene added inside a held instance to its derived guid, because the write swallows it into the
+template. The node's orphan rows stayed under the old guid. The next save's `captureInstanceMembers`
+looked under the new guid, found nothing, and dropped the rows.
+
+**The fix is in `applyGuidRemap`, the one rename.** It re-keys the store (`rekeyKeptOrphanRows`). It also
+renames the guids the rows themselves name (a moved member's `parent`, a ref inside a restated trait),
+because `remapWorldGuidRefs` reaches live trait values only.
+- Every entry is taken out before any goes back, so a swap keeps both sets.
+- Create Prefab's undo (the reversed remap), its redo (the re-tag's stamp) and a promotion's rename all
+  take their rows along through this one call.
+- The store lives in L0 because the rename does, and core may not import the loaders that fill it.
+
+The new prefab file still carries no row. #1293's gate keeps scene rows out of a template, and an
+identity-only orphan converts to nothing (`templateRowOf`), so the scene save is the carrier.
+Tests: `createPrefabMemberIdentity.test.ts` § #1778, `tests/ecs/keptOrphanRows.test.ts`.
 
 ### A move inside a template reference node (#1543, prefab v7)
 

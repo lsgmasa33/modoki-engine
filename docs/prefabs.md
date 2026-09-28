@@ -26,8 +26,8 @@ the live instances (**propagation**). The rules below are grouped by those three
 
 | Entity | What it is | Defined in |
 |---|---|---|
-| **Template** | A `.prefab.json` document (`PrefabFile`): rows, `rootLocalId`, an optional document-level `moved`. | `editor/scene/prefab.ts` |
-| **Row** | One node of a template. `localId` is its array key: positional, and reused once freed. `nodeGuid` (v5) is its minted identity, never reused. | `PrefabEntity`, same file |
+| **Template** | A `.prefab.json` document (`PrefabFile`): rows, `rootLocalId`, the localId high-water mark `nextLocalId` (v8), an optional document-level `moved`. | `editor/scene/prefab.ts` |
+| **Row** | One node of a template. `localId` is its array key; a number is never handed out twice, because a new row takes one at or above the document's `nextLocalId` (v8, #1774). `nodeGuid` (v5) is its minted identity, never reused. | `PrefabEntity`, same file |
 | **Reference row** | A row with `prefab` set: a nested instance of a child template. It holds edits to the child: `overrides`, `added`, `removed`, `removedTraits`, `members`, and the path-keyed `nestedOverrides` / `nestedStructure` that pass edits to frames deeper down. | same |
 | **Instance, frame** | One live expansion of one template: a root plus its members, each stamped with `PrefabInstance` (`source`, `localId`, `nodeGuid`, `rootInstanceId`). A nested instance is a frame inside a frame. | `runtime/traits/PrefabInstance.ts` |
 | **Stored root / owned root** | A stored root is a frame root a file stores: a scene's top-level instance, or a reference node something added. An owned root is one a reference row expanded. It carries `parentLocalId` and `parentNodeGuid`, plus `ownerGuid` once it is moved. | `isStoredRoot`, `isOwnedRoot` (`runtime/core/assetRefRules.ts`) |
@@ -60,7 +60,7 @@ answer the same question for themselves. Each place in that column is a place th
 
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
-| I4 | A `localId` means something only together with the document it was read from. Across documents a node is named by `nodeGuid`, and translated to the `localId` of the document the frame expands NOW, where it is used. A write never hands a node a number the document it replaces used for another node, except a Replace over a pre-v5 document, whose numbers are its only identity and stay positional. **A nested frame's overrides survive a rebuild only while the frame expands the same prefab** (Unity drops them the same way when a nested prefab asset is swapped). Across two prefabs, an edit carries only where both documents hold the same `nodeGuid`, and every link of the frame's chain is found by identity (#1767). One difference from a reload is the rebuild's standing rule, not a translation gap: a scene-ADDED node under a dropped member is re-anchored to the frame root (§ Reconcile in `prefab-structural-overrides.md`), where a reload keeps it in the orphan row. | Numbering: `planPrefabRows`, whose plan `serializePrefab` records against the file it writes. A Replace keeps every matched row's number (`replaceNumbering`, #1759), and `tagEntityTreeAsInstance` reads its numbering from that file, which `planMatchesFile` checks row by row. **Translation: `runtime/loaders/memberTranslation.ts` (#1771)**, with `docRows`, `resolveMemberChain` and `translateLocalIds`. The callers are `foldMemberRowChannels` on load, R2's `rowBackedTest` (a member-row key is chained frame by frame, #1766), the rebuild's outer carry and each nested capture's re-apply (#1767), and `toLocalIdKeys` for Apply's keys. | A number freed at the TOP of the numbering is reused by a later write, because the document stores no high-water mark (#1774, OBSERVED). Four readers still spell the chain walk themselves; each chains through the frame's current document, so it is duplication, not a defect: `templateFrameKeys` (`loadSceneFile.ts`), the member-path rewrite in `memberPaths.ts`, `byRowDepth` (`prefabEdit.ts`) and the member-row size check in `sceneValidation.ts`. |
+| I4 | A `localId` means something only together with the document it was read from. Across documents a node is named by `nodeGuid`, and translated to the `localId` of the document the frame expands NOW, where it is used. A write never hands a node a number the document it replaces used for another node, nor one an EARLIER write used and freed: a new row takes a number at or above the document's persisted high-water mark, `nextLocalId` (v8, #1774). The exceptions are a Replace over a pre-v5 document, whose numbers are its only identity and stay positional, and the two positional rebuilders (#1782). **A nested frame's overrides survive a rebuild only while the frame expands the same prefab** (Unity drops them the same way when a nested prefab asset is swapped). Across two prefabs, an edit carries only where both documents hold the same `nodeGuid`, and every link of the frame's chain is found by identity (#1767). One difference from a reload is the rebuild's standing rule, not a translation gap: a scene-ADDED node under a dropped member is re-anchored to the frame root (§ Reconcile in `prefab-structural-overrides.md`), where a reload keeps it in the orphan row. | Numbering: `planPrefabRows`, whose plan `serializePrefab` records against the file it writes. The mark: `runtime/core/localIdCounter.ts`, read by every allocator and kept from going down by `commitPrefabWrites` (§ "The localId high-water mark"). A Replace keeps every matched row's number (`replaceNumbering`, #1759), and `tagEntityTreeAsInstance` reads its numbering from that file, which `planMatchesFile` checks row by row. **Translation: `runtime/loaders/memberTranslation.ts` (#1771)**, with `docRows`, `resolveMemberChain` and `translateLocalIds`. The callers are `foldMemberRowChannels` on load, R2's `rowBackedTest` (a member-row key is chained frame by frame, #1766), the rebuild's outer carry and each nested capture's re-apply (#1767), and `toLocalIdKeys` for Apply's keys. | Import Model over an existing prefab and the 2D skin-rig update rebuild positionally with fresh `nodeGuid`s, so refs to old members retarget by position (#1782, READ-ONLY; their mark cannot go down). Four readers still spell the chain walk themselves; each chains through the frame's current document, so it is duplication, not a defect: `templateFrameKeys` (`loadSceneFile.ts`), the member-path rewrite in `memberPaths.ts`, `byRowDepth` (`prefabEdit.ts`) and the member-row size check in `sceneValidation.ts`. |
 | I5 | Only a write mints identity (a `nodeGuid`, a template `key`), and it carries the existing identity wherever a real correspondence exists. A reader never mints. | `nodeGuidsFor`, the one matcher (#1691): a prefab-edit save's preserved rows, then the live `nodeGuid`, then, on a Replace only, the one old row sharing a node's name (U22). Also `addedNodeIdentity`, whose `readOnly` mode never mints. | None known. Fixed at the owner: the prefab-edit save now remembers where each session-added member was written (#1662); Create Prefab's Replace serializes against the kept id (#1686); Apply's promotion carries the promoted guids (#1660, `carryPromotedGuids`). |
 | I6 | Which frame an entity belongs to, what a frame holds, and where a member sits are decided by IDENTITY, never by the live tree. Delete, promotion, a move, Detach and the save's partition all act on the identity subtree. | `worldIdentityParents` (`ownerOf`, `parentOf`, `moved`, and `frameOf`: the frame an entity is a row of), `identitySubtree` (#1691, both in `identityParents.ts`), `memberRowsIn`, `instanceRowDomain` (the row claims, a partition), `rebuildTeardown`, `endFrames`, `planMoveUnlinks`. Apply's promotion delete, Detach, the save's partition and the scene-move refusal ask them (#1682, #1687). So does a copy: each copied node keeps its link only while the frame it is a row of is in the copy, an owned root whose owner is not (or not CONFIRMED: its owner link, when it has one, must name a copied node, and the owner's document must hold the row that expanded it) becomes an independent instance, and a member whose frame is not becomes a plain added node (`planCopyGuids`' `CopyLink`, applied by `copySnapshot` and the device `duplicate-entity` op, #1756). | `templateReferenceNode` climbs live parents, on purpose, for speed. A user Delete takes the LIVE subtree on purpose: it removes what is shown under the node (Unity's hierarchy delete), and `endFrames` unlinks a member moved out. Duplicate and paste copy the live subtree for the same reason, so a member dragged out of a copied instance is not copied (the copy saves it as removed); which of the copied nodes stay linked is decided by identity (#1756). "The members of frame R" is read as a raw `rootInstanceId` scan at several sites; for a member that field IS identity (stamped at expansion), so those are not bypasses. |
 | I7 | A member's guid is the member row's pin, else the template's, else derived from its anchor through identity parents. Every place that predicts one derives it the same way. | `deriveInstanceMemberGuids` (after `applyStoredMemberRows`) walks up, over `deriveMemberGuid` and `entityStep`. `memberPathIndex` (`runtime/core/ecs/memberHome.ts`) walks the identity tree down, and `stampDerivedMemberGuids`, `promoteOwnedRoots`, `storedMemberGuids` and the loader's move drain share it. Create Prefab's stamp renames through `reloadDerivedGuids`, the loader's coverage walked down: it also continues into a KEYED stored root, a template reference node the reload derives (#1758). `promoteOwnedRoots` deliberately stops there, because such a node under a promoted root is saved with its guid (measured, #1758). **A pin is followed by one sequence**, `deriveMemberGuidsAfterPins` (derive, `dropCollidingPins`, then settle tokens and moves), which the load and every rebuild call (#1761, #1777). | Four sites predict guids with a walk of their own. The derivation's docblock names two: `derivedMemberPaths` (built on `memberPathRecords`, `runtime/loaders/memberPaths.ts`), and `planCopyGuids`, which since #1756 takes frame membership from the resolver's `frameOf` and duplicates only the walk loop. The other two are `liveMemberGuidRemap` and the prefab-edit world's `editGuidAt`. |
@@ -196,10 +196,12 @@ Defined by `PrefabFile` in `editor/scene/prefab.ts`:
 ```ts
 interface PrefabFile {
   id?: string;          // stable UUID, written once, survives renames/moves
-  version: 1 | 2;
+  version: number;      // PREFAB_FORMAT_VERSION of the writer (runtime/core/version.ts)
   name: string;
   rootLocalId: number;  // localId of the root entity (1)
+  nextLocalId?: number; // v8: the localId high-water mark — see "The localId high-water mark"
   entities: PrefabEntity[];
+  moved?: Record<string, string>;
 }
 
 interface PrefabEntity {
@@ -290,6 +292,73 @@ free:
   whereas an entity tagged with a localId the file has no row for is written to **neither** the
   scene entry (serialize drops it as a prefab child) **nor** the overrides — it is simply gone on
   the next load.
+
+### The localId high-water mark (#1774, prefab v8)
+
+**The defect.** A member's derived guid is a hash of its localId path. If a number is handed out twice, the
+new node gets the guid of the member that last held it, and every ref still naming that member lands on
+the new node, silently. Each writer numbered new rows above the rows it could SEE. That stopped reuse
+within one write (#1759, #1771) and within one prefab-edit session (#1662, #1704), but not across writes:
+delete the top row B(3) and save, then add C in a later session, and C took 3 and B's guid.
+
+**The fix (owner ruling B).** The document persists the mark, `nextLocalId`: the lowest number a new row
+may take. Every number the document has ever used is below it, and it never goes down. Unity avoids the
+problem with random fileIDs instead; the owner kept sequential numbers, which are used elsewhere too.
+`runtime/core/localIdCounter.ts` owns both halves:
+- **Read.** Every allocator seeds from `localIdCounter(doc)`: max(the stored mark, the highest row + 1,
+  the root + 1). A file with no mark (anything before v8, or a hand edit) derives it from its rows, so
+  there is no migration.
+  The allocators:
+  - prefab-edit's session floor (`usedUpTo`)
+  - a Replace's `replaceNumbering`, which also covers the agent `prefab create` over a path
+  - Apply's promotion (`planApply`)
+  - `mergeRiggedPrefab`
+
+  `serializePrefab` states the mark on what it writes: above its rows, its session floor, the document it
+  replaces, and `priorCounter` for a positional rebuild over a file.
+- **Advance.** `commitPrefabWrites` is the line under every writer, because every client prefab write
+  goes through it (I9). Its `contentFor` raises a document's mark to that of the file it lands over. That
+  file is `expected`, or the file re-read when that is what the precondition matched. A write that lowers
+  nothing goes down exactly as built.
+  - **A raised mark claims v8.** The document is stamped v8 so an older build refuses to save over it
+    and drop the mark. A document newly given the mark carries it right after `rootLocalId`, where the
+    serializer puts it.
+  - **An undo that restores bytes** (#1679) stays verbatim unless it would lower the mark. Undoing a write
+    that minted numbers must not free them: Apply adds C at 4, Cmd+Z, the next Apply adds D at 4, and D
+    takes C's guid. When the mark must rise, `withTopLevelNumbers` splices the mark and version into the
+    original bytes, keeping formatting, key order and a BOM. It re-serializes only when it cannot prove
+    the splice exact (for example, a key spelled twice).
+  - **Preconditions** (`sameDocument`) therefore compare neither the mark nor the version. The commit owns
+    both where it raises the mark, and only ever raises them. So a file that differs from what the caller
+    read in those alone holds nobody's change. The case this covers is an undo's redo: its expectation is
+    the bytes the undo recorded, which predate the mark the undo had to keep.
+  - **The route's refusal counts as a conflict.** `prefab-mark-lowered` from the route means the file's
+    mark rose past what the write was raised to (a later undo already kept it). The commit then re-reads
+    the file and raises from it, like any other precondition miss. Without this, undoing two minting Applies
+    in a row refused the second undo and dropped the history entry.
+  - **Known residual (close-out review, PLAUSIBLE, not reproduced).** Suppose another writer mints a
+    number and then gives it back (its row is removed, its mark stays) while a caller holds an older
+    read. That caller's write can land a node it minted at that number, because the document matches the
+    read apart from the mark. A check against it misfired on every redo: the numbers a redo restores are
+    ones its own forward write took and its undo kept. It needs two writers on one prefab inside one
+    read-to-write window.
+  - **A failed multi-file commit's rollback** puts the prior bytes back with the mark its write raised.
+- **The server gate** (`classifyPrefabMarkWrite`, `plugins/prefabWriteGuard.ts`) stops a raw write. It
+  skips a create-only write, which `if-none-match` refuses for its real reason. On
+  `/api/write-file` it refuses (409 `prefab-mark-lowered`) any prefab write that would lower the mark of
+  the file on disk. The route is byte-opaque and reachable without the editor's commit: an agent's eval,
+  a game panel's `writeAssetFile`, or the Assets panel's OS-drop import over an existing file. The
+  editor's own writes never trip it.
+
+Server-side rewriters, the member-path repair, duplicate, the GUID heal and the migration scripts all
+parse and spread the document, so they carry the mark. None of them mints. The one open path is
+`/api/prefab-member-paths`: it reads, waits on the renderer, then writes with no precondition. A commit that
+lands in that window has its content reverted, mark included (#1784).
+
+Tests:
+- `tests/editor/localIdCounter.test.ts` covers the #1774 repro, one case per minting writer, and the
+  chokepoint (including that an undo restore is byte-equal except the mark).
+- `tests/architecture/localIdAllocatorsReadTheMark.test.ts` checks that each allocator calls the mark.
 
 A nested row is not retagged onto the new prefab: it keeps its link to its own child prefab and
 receives only `parentLocalId`, exactly as `instantiatePrefabIntoWorld` does on reload, and its
@@ -1542,10 +1611,10 @@ is stored in the parent prefab file as a single *reference row* — one
 instance. The child's members are **not** listed; they expand from the child
 file at load.
 
-Every file this serializer writes carries `PREFAB_FORMAT_VERSION` (**6** since #1533, **5** from #1468; this
-paragraph said **2** until #1468, which is the drift a hardcoded number in prose always ends in —
-read `runtime/core/version.ts`, which is where the constant lives now and which lists what each
-version added). It used to be derived from
+Every file this serializer writes carries `PREFAB_FORMAT_VERSION`. Read the number in
+`runtime/core/version.ts`, which is where the constant lives and which lists what each version added.
+This paragraph once said **2** (until #1468) and later **6** (after v7 had landed): a hardcoded number in
+prose drifts. It used to be derived from
 the document's content (`nestedRefs.size > 0 ? 2 : 1`, so flat prefabs stayed at 1),
 and that rule was replaced in #379 because it could **decrease**: deleting a prefab's
 last nested instance rewrote `2` back to `1`, which is not something a format version

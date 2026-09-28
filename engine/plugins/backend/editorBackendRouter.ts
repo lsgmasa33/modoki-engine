@@ -56,7 +56,7 @@ import { EDITOR_DELETE_FINGERPRINT } from '../editorWriteGuard';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, planMemberPathRepair, type RepairFile } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
-import { classifyPrefabWrite } from '../prefabWriteGuard';
+import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
 import { classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
 
 /** A validate route's file, parsed — or the parse failure as a WARNING (#1212 A-4).
@@ -4813,6 +4813,15 @@ async function describeUnresolvedAgainstLiveWorld(
           ok: false, conflict: true, reason: 'prefab-format-too-new',
           stored: prefabRefusal.stored, current: prefabRefusal.current, error: prefabRefusal.message,
         }, 409);
+      }
+      // …and its localId high-water mark never goes down (#1774), whoever is writing: this route is reachable raw.
+      // Not for a create-only write: one over an existing file is refused just below as `if-none-match`, its real reason.
+      if (typeof content === 'string' && ifNoneMatch !== '*') {
+        const markRefusal = classifyPrefabMarkWrite(absPath, encoding === 'base64' ? Buffer.from(content, 'base64').toString('utf8') : content);
+        if (markRefusal) {
+          console.error(`[Prefab] ${markRefusal.message}`);
+          return json({ ok: false, conflict: true, reason: 'prefab-mark-lowered', stored: markRefusal.stored, incoming: markRefusal.incoming, error: markRefusal.message }, 409);
+        }
       }
       const refusal = ifMatchRefusal(absPath, ifMatch);
       if (refusal) return json(refusal, 409);

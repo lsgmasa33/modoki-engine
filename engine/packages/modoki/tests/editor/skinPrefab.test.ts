@@ -267,7 +267,7 @@ describe('makeRigPrefabAsset undo/redo — success paths', () => {
     // The mock returns `id: 'g-existing'` whatever it is given, so the id assertions below cannot
     // tell an update that KEPT the prefab's GUID from one that minted a new one. Pin the argument
     // the update actually passes (#1670).
-    expect(serializePrefabSpy).toHaveBeenCalledWith(expect.anything(), 'g-existing');
+    expect(serializePrefabSpy).toHaveBeenCalledWith(expect.anything(), 'g-existing', { priorCounter: expect.any(Number) });
     const action = pushActionSpy.mock.calls[0][0];
 
     writeAssetFileSpy.mockClear();

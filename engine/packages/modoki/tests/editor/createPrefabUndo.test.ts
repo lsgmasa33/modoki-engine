@@ -263,7 +263,10 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
   // the first Thing prefab. It used to replace it under a fresh guid — every placed instance
   // unlinked — and this function's undo then TRASHED the path, deleting the original too.
   const PATH = '/p/thing.prefab.json';
-  const OLD_TEXT = `{"id":"${OLD_ID}","name":"old thing","entities":[]}\n`;
+  // With its root row, as every prefab has: a replaced document with NO rows would hold a lower localId high-water mark
+  // than the one-row tree the mocked serialize writes, and the undo would then raise it into the bytes (#1774) — pinned
+  // in `tests/editor/localIdCounter.test.ts`. These cases are about the verbatim restore.
+  const OLD_TEXT = `{"id":"${OLD_ID}","name":"old thing","entities":[{"localId":1}]}\n`;
 
   // Close-out review of #1692: the tree is serialized AFTER the Replace question now, by the id it was asked for. A world
   // rebuilt while the question was up (a watcher reload, an agent's scene load) can hand that id to another entity.
@@ -432,6 +435,9 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
   });
 
   it('redo after a successful undo of a REPLACE re-snapshots too', async () => {
+    // The replaced document has no rows, so the undo has to RAISE its localId high-water mark into the restored bytes
+    // (#1774) — and the redo, conditional on the bytes it recorded before that, must still land. Mutation: compare
+    // `version` in `sameDocument` — the redo is refused as "changed on disk since".
     onDisk.set('/p/thing.prefab.json', `{"id":"${OLD_ID}","entities":[]}\n`);
     const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
     if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
@@ -505,9 +511,9 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
   });
 
   it('undo of a REPLACE refuses to overwrite a prefab saved since', async () => {
-    onDisk.set(P, '{"id":"g-old","before":true}\n');
+    onDisk.set(P, '{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
     const action = await makeAction();
-    onDisk.set(P, '{"id":"g-old","edited":true}\n');
+    onDisk.set(P, '{"id":"g-old","edited":true,"entities":[{"localId":1}]}\n');
     await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
     expect(onDisk.get(P)).toContain('edited');
   });
@@ -527,12 +533,12 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
     await created.redo(); expect(onDisk.get(P)).toBe(after);
     await created.undo(); expect(onDisk.has(P)).toBe(false);
 
-    onDisk.set(P, '{"id":"g-old","before":true}\n');
+    onDisk.set(P, '{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
     const replaced = await makeAction();
     const applied = onDisk.get(P);
-    await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true}\n');
+    await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
     await replaced.redo(); expect(onDisk.get(P)).toBe(applied);
-    await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true}\n');
+    await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
   });
 
   it('which bytes the FILE holds is its own flag: a redo that wrote but found no tree to tag, then a failed undo, does not refuse the next redo', async () => {

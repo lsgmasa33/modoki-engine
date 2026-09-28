@@ -1350,6 +1350,25 @@ function describe(value: unknown): string {
  * or unexpected shape yields no warnings rather than a complaint, because a prefab that fails to
  * PARSE is a different (and much louder) failure that the loader already reports.
  */
+/** A prefab's localId high-water mark (`nextLocalId`, v8, #1774) must be above every row: it is the lowest number a new
+ *  row may take. One at or below a row's localId comes from a hand edit (no writer states one), and it is harmless in
+ *  the editor — every writer reads the mark through `localIdCounter`, which takes the rows too, and the next write
+ *  states it right — but the file then says something false about its own numbering. A file with no mark is not
+ *  warned about: before v8 there was none, and its highest row stands for it. */
+function localIdMarkWarnings(doc: { nextLocalId?: unknown }, entities: readonly unknown[]): string[] {
+  if (doc.nextLocalId === undefined) return [];
+  const mark = doc.nextLocalId;
+  if (typeof mark !== 'number' || !Number.isInteger(mark) || mark < 1) {
+    return [`nextLocalId is ${JSON.stringify(mark)}, not a positive integer — the next write replaces it with one above the highest row`];
+  }
+  let top = 0;
+  for (const e of entities) {
+    const lid = (e as { localId?: unknown } | null)?.localId;
+    if (typeof lid === 'number' && lid > top) top = lid;
+  }
+  return mark > top ? [] : [`nextLocalId is ${mark}, not above the highest row's localId (${top}) — a new row is numbered from ${top + 1} regardless, and the next write corrects the mark`];
+}
+
 export function validatePrefabData(data: unknown): ValidationResult {
   const warnings: string[] = [];
   const entities = (data as { entities?: unknown })?.entities;
@@ -1377,6 +1396,7 @@ export function validatePrefabData(data: unknown): ValidationResult {
     warnings.push(...lineHeightUnitWarnings(e.traits, prefabLabel));
     warnings.push(...collapsedNewlineWarnings(e.traits, prefabLabel));
   }
+  warnings.push(...localIdMarkWarnings(data as { nextLocalId?: unknown }, entities));
   // schemaApplied stays false: no trait schema is consulted (see above), and claiming otherwise
   // would tell a caller its type checks ran when they did not.
   return { warnings, schemaApplied: false };
