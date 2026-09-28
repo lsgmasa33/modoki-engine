@@ -35,6 +35,7 @@ import {
   setActionCallback, pushAction, clearHistory, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo,
   addTraitToEntitiesWithUndo, createEntityWithUndo, writeTraitFieldWithUndo,
 } from '@modoki/engine/editor';
+import { reparentEntity } from '../../packages/modoki/src/editor/undo/entityActions';
 import {
   setPrefabCache, rebaseStaleInstances, serializePrefab, applyToPrefabSelective, revertOverridesSelective, getCachedPrefabSync, instantiatePrefab, setPrefabSource,
   type PrefabFile,
@@ -44,6 +45,8 @@ import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyTargetOptions } from '../../packages/modoki/src/editor/scene/prefabApplyOptions';
 import { isMemberToken } from '../../packages/modoki/src/runtime/core/templateRefs';
+import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';
+import { undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -732,5 +735,167 @@ describe('#1693 final close-out review: the cases it drove', () => {
     const row = written(O2)!.entities.find((e) => e.localId === 2)!;
     expect((row.members as Record<string, { traits?: { Transform?: { x: number } } }>)[`/${gN}`]?.traits?.Transform?.x).toBe(3);
     expect(tfx(r())).toBe(3);
+  });
+});
+
+describe('#1730: Revert of a member the scene REMOVED inside a nested instance brings it back WITH the enclosing layer', () => {
+  const nestedRoot = () => inInstance(ROOT1, 'R');
+  const listed = () => collectInstanceOverrideKeys(nestedRoot(), getCachedPrefabSync(P) as PrefabFile).all;
+  const rotate = (id: number) => readTraitData(id, meta('Rotate3D')) as { axis?: string; speed?: number } | null;
+  const gB = 'eeeeeeee-0000-4000-8000-000000001730';
+  /** P: R → A → {B, D}, B carrying Rotate3D in the template. */
+  const pDeep = () => {
+    const d = pDoc();
+    const b = row(3, 'B', 2, gB) as ReturnType<typeof row> & { traits: Record<string, unknown> };
+    b.traits.Rotate3D = { axis: 'y', speed: 1 };
+    return { ...d, entities: [...d.entities, b, row(4, 'D', 2, 'eeeeeeee-0000-4000-8000-000000001735')] };
+  };
+  /** O whose row N says, of A's subtree: A.x = 3 and A gains Rotate3D; B.x = 4 and B loses Rotate3D; D is removed; a
+   *  node is added under A. */
+  const oDeep = () => {
+    const d = oWith({ 2: { Transform: { x: 3 }, Rotate3D: { axis: 'x', speed: 3 } }, 3: { Transform: { x: 4 } } });
+    Object.assign(d.entities[3] as Record<string, unknown>, {
+      removedTraits: { 3: ['Rotate3D'] },
+      removed: [4],
+      added: [{ parentLocalId: 2, guid: '', key: 'k1730', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0 }, Transform: { x: 9, y: 0, z: 0 } }, children: [] }],
+    });
+    return d;
+  };
+  async function revertRemovedA(): Promise<void> {
+    deleteEntitiesWithUndo([inInstance(ROOT1, 'A')]);
+    const key = listed().find((k) => k.startsWith('-removed.'));
+    expect(key).toBeDefined(); // precondition: the deletion is the instance's own
+    await revertOverridesSelective(nestedRoot(), new Set([key!]));
+  }
+
+  it('the row\'s field and its added component come back, nothing phantom is listed, and a save + reload keeps both', async () => {
+    // Mutation: drop the put-back of the layer for a reverted `-removed.` (`layerForRestoredMembers` in
+    // `revertOverridesSelective`) — A comes back as P's bare member: x = 0, no Rotate3D, and the listing shows
+    // `A.Transform.x` and `-trait.A.Rotate3D`, which the save then writes as `traitRemovals`.
+    install(pDoc(), oWith({ 2: { Transform: { x: 3 }, Rotate3D: { axis: 'x', speed: 3 } } }));
+    await load(scene(O, [ROOT1]));
+    expect([x(inInstance(ROOT1, 'A')), rotate(inInstance(ROOT1, 'A'))?.speed]).toEqual([3, 3]); // precondition
+    await revertRemovedA();
+    expect(x(inInstance(ROOT1, 'A'))).toBe(3);
+    expect(rotate(inInstance(ROOT1, 'A'))).toMatchObject({ axis: 'x', speed: 3 });
+    expect(listed()).toEqual([]);
+    const { scene: s, entry } = await saved();
+    expect(JSON.stringify(entry)).not.toContain('traitRemovals');
+    await load(s);
+    expect(x(inInstance(ROOT1, 'A'))).toBe(3);
+    expect(rotate(inInstance(ROOT1, 'A'))).toMatchObject({ axis: 'x', speed: 3 });
+  });
+
+  it('what the row says of the restored member\'s DESCENDANTS comes back too: a field, a removed component, an added node', async () => {
+    // Mutation: seed only the reverted member's own localId, not its template subtree — B comes back at x = 0 with
+    // P's Rotate3D, and D comes back.
+    //   And: drop the layer's `removed` from the seed — D, which the row removes, comes back.
+    //   And: drop the layer's `removedTraits` from the seed — B keeps P's Rotate3D, listed as the instance's own add.
+    //   And: drop the layer's `added` nodes from the seed — Extra is gone after the Revert.
+    install(pDeep(), oDeep());
+    await load(scene(O, [ROOT1]));
+    const state = () => ({
+      bx: x(inInstance(ROOT1, 'B')), bRotate: !!rotate(inInstance(ROOT1, 'B')),
+      extra: getAllEntities().filter((e) => e.name === 'Extra').map((e) => x(e.id)),
+      d: getAllEntities().filter((e) => e.name === 'D').length,
+    });
+    expect(state()).toEqual({ bx: 4, bRotate: false, extra: [9], d: 0 }); // precondition: the row's statements hold
+    await revertRemovedA();
+    expect(state()).toEqual({ bx: 4, bRotate: false, extra: [9], d: 0 });
+    expect(x(inInstance(ROOT1, 'A'))).toBe(3);
+    expect(listed()).toEqual([]);
+    const { scene: s } = await saved();
+    await load(s);
+    expect(state()).toEqual({ bx: 4, bRotate: false, extra: [9], d: 0 });
+  });
+
+  it('a subtree member still LIVE (moved out before the delete) is not seeded again: the layer\'s node under it stays single', async () => {
+    // Close-out review: the seed covered the whole template subtree, and a live member's capture already carries the
+    // layer. Mutation: drop the `live` exclusion in `layerForRestoredMembers` — Extra comes back twice, and the save
+    // writes the copy as the scene's own added node.
+    const d = pDoc();
+    const pD = { ...d, entities: [...d.entities, row(3, 'D', 2, gB)] };
+    install(pD, (() => {
+      const o = oWith({ 3: { Transform: { x: 7 } } });
+      Object.assign(o.entities[3] as Record<string, unknown>, {
+        added: [{ parentLocalId: 3, guid: '', key: 'k1730b', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0 }, Transform: { x: 9, y: 0, z: 0 } }, children: [] }],
+      });
+      return o;
+    })());
+    await load(scene(O, [ROOT1]));
+    const extras = () => getAllEntities().filter((e) => e.name === 'Extra').length;
+    expect(extras()).toBe(1);
+    reparentEntity(inInstance(ROOT1, 'D'), nestedRoot());
+    await revertRemovedA();
+    expect(extras()).toBe(1);
+    expect(x(inInstance(ROOT1, 'D'))).toBe(7);
+    const { scene: s } = await saved();
+    await load(s);
+    expect(extras()).toBe(1);
+  });
+
+  it('a moved-out REFERENCE row (an owned nested root) under the restored member is live too: the layer\'s node under it stays single', async () => {
+    // Second close-out review: an owned nested root is its own `rootInstanceId`, so the live set missed it. Mutation:
+    // drop the owned-root branch of the `live` set in `layerForRestoredMembers` — Extra comes back twice and is saved so.
+    const Q = 'cccccccc-0000-4000-8000-000000001797';
+    const qDoc = { id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001797')] };
+    const d = pDoc();
+    const pWithNQ = { ...d, entities: [...d.entities, { localId: 3, name: 'NQ', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001798', prefab: Q, traits: { EntityAttributes: { name: 'NQ', parentId: 2, guid: '' } } }] };
+    const o = oWith({});
+    Object.assign(o.entities[3] as Record<string, unknown>, {
+      added: [{ parentLocalId: 3, guid: '', key: 'k1797', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0 }, Transform: { x: 9, y: 0, z: 0 } }, children: [] }],
+    });
+    install(qDoc, pWithNQ, o);
+    await load(scene(O, [ROOT1]));
+    const extras = () => getAllEntities().filter((e) => e.name === 'Extra').length;
+    expect(extras()).toBe(1); // precondition
+    reparentEntity(inInstance(ROOT1, 'QR'), nestedRoot());
+    await revertRemovedA();
+    expect(extras()).toBe(1);
+    const { scene: s } = await saved();
+    await load(s);
+    expect(extras()).toBe(1);
+  });
+
+  it('a descendant removed on its OWN key (moved out, then deleted) stays removed, and so does the layer\'s node under it', async () => {
+    // The seed does reach it (it is in the reverted member's template subtree and not live), and that is harmless only
+    // because the structure pass skips an addition anchored on a member it removes. Mutation: drop that skip in
+    // `applyStructureCore` (`loadSceneFile.ts`, `removedLocals`) — Extra comes back hanging off nothing.
+    const d = pDoc();
+    const pDE = { ...d, entities: [...d.entities, row(3, 'D', 2, gB), row(4, 'E', 3, 'eeeeeeee-0000-4000-8000-000000001799')] };
+    const o = oWith({ 4: { Transform: { x: 4 } } });
+    Object.assign(o.entities[3] as Record<string, unknown>, {
+      added: [{ parentLocalId: 4, guid: '', key: 'k1799', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0 }, Transform: { x: 9, y: 0, z: 0 } }, children: [] }],
+    });
+    install(pDE, o);
+    await load(scene(O, [ROOT1]));
+    const count = (name: string) => getAllEntities().filter((e) => e.name === name).length;
+    expect(count('Extra')).toBe(1); // precondition
+    reparentEntity(inInstance(ROOT1, 'D'), nestedRoot());
+    deleteEntitiesWithUndo([inInstance(ROOT1, 'E')]);
+    deleteEntitiesWithUndo([inInstance(ROOT1, 'A')]);
+    expect(listed().filter((k) => k.startsWith('-removed.'))).toHaveLength(2); // precondition: E is its own key
+    await revertOverridesSelective(nestedRoot(), new Set([`-removed.${gA}`]));
+    expect([count('A'), count('D'), count('E'), count('Extra')]).toEqual([1, 1, 0, 0]);
+    const { scene: s } = await saved();
+    await load(s);
+    expect([count('A'), count('D'), count('E'), count('Extra')]).toEqual([1, 1, 0, 0]);
+  });
+
+  it('the Revert\'s undo takes the member away again, and its redo brings it back with the layer', async () => {
+    // Mutation: seed the layer into a copy the undo entry does not hold (after `RevertResult` is built from
+    // `reducedOverrides`/`reducedStructure`) — the redo rebuilds A as the bare template's: x = 0, no Rotate3D.
+    install(pDoc(), oWith({ 2: { Transform: { x: 3 }, Rotate3D: { axis: 'x', speed: 3 } } }));
+    await load(scene(O, [ROOT1]));
+    deleteEntitiesWithUndo([inInstance(ROOT1, 'A')]);
+    const key = listed().find((k) => k.startsWith('-removed.'))!;
+    await revertOverridesWithUndo(nestedRoot(), new Set([key]));
+    const a = () => getAllEntities().filter((e) => e.name === 'A').map((e) => [x(e.id), rotate(e.id)?.speed ?? null]);
+    expect(a()).toEqual([[3, 3]]);
+    await undo();
+    expect(a()).toEqual([]);
+    await redo();
+    expect(a()).toEqual([[3, 3]]);
+    expect(listed()).toEqual([]);
   });
 });

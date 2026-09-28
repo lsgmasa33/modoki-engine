@@ -755,12 +755,12 @@ describe('a P instance dropped inside another P instance, through an Apply fan-o
     const gE = 'eeeeeeee-0000-4000-8000-000000000b0f';
     createEntityWithUndo('Create', inner, [{ name: 'EntityAttributes', data: { name: 'E', parentId: inner, guid: gE, sourceScene: BASE } }], () => {});
     const before = prefabs.get(P) as PrefabFile;
-    const side = captureSide(idOfGuid(ROOT2), ROOT2, before);
+    const side = captureSide(idOfGuid(ROOT2), ROOT2, P, before);
     const result = await applyToPrefabSelective(idOfGuid(ROOT2), new Set([`+added.${gE}`]));
     expect(getAllEntities().filter((e) => e.name === 'E')).toHaveLength(2);   // the premise: both expanded it
     stampAll();
     setPrefabCache(P, before as never);                     // the undo's prefab restore
-    await rederiveBaseInstances(P, result.prefabAfter!, before, side);
+    await rederiveBaseInstances([{ source: P, from: result.prefabAfter!, to: before }], side);
     expect(getAllEntities().filter((e) => e.name === 'E')).toHaveLength(1);   // back on the inner one only
     expect(framesBuiltFromOtherRows(idOfGuid(ROOT))).toEqual([]);
     expect(framesBuiltFromOtherRows(idOfGuid(ROOT2))).toEqual([]);

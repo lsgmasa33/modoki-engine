@@ -21,6 +21,8 @@ const fs = vi.hoisted(() => ({
   posts: [] as Array<{ path: string; content: string; ifMatch?: string }>,
   /** The next write fails as a backend error would (#1668). */
   fail: false,
+  /** Per write, in order: `true` fails it as `fail` does (#1732: a later file, then its rollback). */
+  failSeq: [] as boolean[],
   /** The next write is refused by the #1468 format gate, which runs BEFORE the if-match check. */
   tooNew: false,
   /** When set, every write waits for it — a write held in flight (#1667). */
@@ -34,7 +36,7 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
     if (fs.gate) { fs.waiting++; await fs.gate; fs.waiting--; }
     fs.posts.push({ path, content, ifMatch: opts?.ifMatch });
     const answer = (status: number, body: object) => ({ ok: status < 300, status, json: async () => body, text: async () => JSON.stringify(body) }) as Response;
-    if (fs.fail) { fs.fail = false; return answer(500, { error: 'the disk is full' }); }
+    if (fs.fail || fs.failSeq.shift()) { fs.fail = false; return answer(500, { error: 'the disk is full' }); }
     if (fs.tooNew) { fs.tooNew = false; return answer(409, { ok: false, conflict: true, reason: 'prefab-format-too-new', error: 'a newer build wrote this prefab' }); }
     if (opts?.ifMatch !== undefined) {
       const cur = fs.disk.get(path);
@@ -173,6 +175,7 @@ beforeEach(() => {
   fs.disk.set(P, jsonFileBody(pDoc()));
   fs.disk.set(O, jsonFileBody(oDoc()));
   fs.posts.length = 0;
+  fs.failSeq.length = 0;
   sm.path = 'scenes/Level.json';
   useEditorStore.setState({ showToast: vi.fn() } as never);
   setCurrentScenePath('scenes/Level.json');
@@ -225,5 +228,72 @@ describe('U13: a two-file Apply is undone and redone as one', () => {
     await quietly(() => undo());
     expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc()));
     expect(fs.disk.get(O)).toBe(jsonFileBody(oDoc()));
+  });
+});
+
+describe('#1732: a multi-file Apply and its undo report each file\'s outcome, not one', () => {
+  /** N's A.x = 5 over O's row, keyed for an Apply to P — U13 writes [P, O]. */
+  function editFive(): { nested: number; key: string } {
+    writeTraitFieldWithUndo(byName('A'), getTraitByName('Transform')!, 'x', 5);
+    const nested = byName('R');
+    const key = collectInstanceOverrideKeys(nested, getCachedPrefabSync(P) as PrefabFile).fields.find((k) => k.endsWith('.Transform.x'))!;
+    return { nested, key };
+  }
+
+  it('P written, O fails, P cannot be put back: the refusal names O and the stranded P, and does not say "nothing was applied"', async () => {
+    // Mutation: word the refusal without `committed.stranded` (the pre-fix text) — it reads "so nothing was applied"
+    // while P holds the Apply on disk.
+    //   And: drop `failed` from the commit's write-failure return — the refusal names no file, only "the prefab".
+    const { nested, key } = editFive();
+    fs.failSeq.push(false, true, true); // P lands, O fails, P's rollback fails
+    const res = await quietly(() => applyToPrefabWithUndo(nested, new Set([key])));
+    expect(fs.posts.map((p) => p.path)).toEqual([P, O, P]); // precondition: the write order the case needs
+    expect(res.applied).toBe(false);
+    expect((disk(P).entities[1]!.traits.Transform as { x: number }).x).toBe(5); // P really is stranded
+    expect(res.refused).toContain(`the prefab ${O} file could not be written (the disk is full)`);
+    expect(res.refused).toContain(`${P} was written and could not be put back`);
+    expect(res.refused).not.toMatch(/nothing was applied/);
+  });
+
+  it('O fails with P put back: "nothing was applied" still holds, and names O', async () => {
+    const { nested, key } = editFive();
+    fs.failSeq.push(false, true); // P lands, O fails, P's rollback lands
+    const res = await quietly(() => applyToPrefabWithUndo(nested, new Set([key])));
+    expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc()));
+    expect(res.refused).toBe(`the prefab ${O} file could not be written (the disk is full), so nothing was applied.`);
+  });
+
+  it('an undo refused because O changed outside names O, the file that changed — not P', async () => {
+    // Mutation: name `where` (the primary source, P) instead of `committed.failed` in the undo's refusal — the detail
+    // blames P, which is untouched.
+    const { nested, key } = editFive();
+    const res = await quietly(() => applyToPrefabWithUndo(nested, new Set([key])));
+    expect(res.writes?.map((w) => w.source)).toEqual([P, O]);
+    const outside = { ...disk(O), name: 'O edited outside' };
+    fs.disk.set(O, jsonFileBody(outside as never));
+    const pAfter = fs.disk.get(P);
+    const errors: string[] = [];
+    const spies = (['log', 'warn', 'info', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation((...a: unknown[]) => { errors.push(a.map(String).join(' ')); }));
+    try { await undo(); } finally { for (const s of spies) s.mockRestore(); }
+    expect(fs.disk.get(P)).toBe(pAfter); // refused whole: P untouched
+    const detail = errors.find((e) => e.includes('changed on disk since the Apply'));
+    expect(detail).toContain(`${O} changed on disk since the Apply`);
+    expect(detail).not.toContain(`${P} changed on disk`);
+  });
+
+  it('an undo whose second file fails and whose first cannot be put back names both, and says the undo did not land', async () => {
+    // Mutation: drop the stranded tail from the undo's refusal — the detail claims the prefab and scene were "left as
+    // they are" while P holds the undo's side on disk.
+    const { nested, key } = editFive();
+    await quietly(() => applyToPrefabWithUndo(nested, new Set([key])));
+    fs.failSeq.push(false, true, true); // P lands, O fails, P's rollback fails
+    const errors: string[] = [];
+    const spies = (['log', 'warn', 'info', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation((...a: unknown[]) => { errors.push(a.map(String).join(' ')); }));
+    try { await undo(); } finally { for (const s of spies) s.mockRestore(); }
+    expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc())); // P really is stranded on the undo's side
+    const detail = errors.find((e) => e.includes('could not be written'));
+    expect(detail).toContain(`${O} could not be written (the disk is full), so the undo did not land.`);
+    expect(detail).toContain(`${P} was written and could not be put back`);
+    expect(detail).not.toMatch(/left as they are/);
   });
 });

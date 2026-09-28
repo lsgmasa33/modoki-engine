@@ -70,7 +70,7 @@ answer the same question for themselves. Each place in that column is a place th
 
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
-| I9 | The caches hold the current template for everything that reads them. A synchronous reader never runs over a cold cache: a miss there reads as "not a prefab". A prefab write is one step: once it lands, both caches hold the written bytes under every key they use, and every live frame expanded from the old document is rebuilt or refused. | Warming: `installEditorPrefabCacheWarm` (before a scene swap) and `instantiatePrefabInstance`, with `preloadNestedPrefabs` / `preloadNestedPrefabsForSubtree` at the call sites. **The write step: `commitPrefabWrite(source, doc, { expected })`** (`editor/scene/prefabCommit.ts`, #1692). It is the only function that changes a `.prefab.json`. Once the write lands it seats the editor cache under the guid, the path and the caller's ref, and the runtime cache under the resolved path. Then it runs the caller's own `rebuild` (Apply's refresh, Create Prefab's tag), then `rebaseStaleInstances({ sources })` for every other frame of the source. Every writer goes through it: Apply and its undo, the prefab-edit save, Create Prefab (Replace and its undo), the agent `create`, the skin rig and its undo, the model regenerate, and the Assets model import and its undo. **Several files are one step too** (`commitPrefabWrites`, for an Apply that writes an inner prefab and its enclosing one, #1693/U13). Every file's precondition is checked before any is written. Each file is then written only over the bytes checked. A miss part-way puts back what was already written, and names any file it could not (`stranded`). Then both caches for each file, one rebuild and one rebase. | No writer. **An outside edit** reaches the editor as a watcher event: the hot reload evicts the runtime cache, refreshes the editor cache (except the prefab open in prefab edit, `refreshPrefabSourceForPath`), reloads, then rebases; leaving prefab edit refreshes that one and rebases (`repairLeftPrefabEdit`, #1666). ⚠️ The commit seats the open prefab's entry too: a first version skipped it so the edit's save kept its baseline, and its own rebase then put the instances an Apply had just refreshed back onto the old document (close-out review). The edit session keeps its OWN baseline (`editBaselineFor`, § Prefab edit mode). |
+| I9 | The caches hold the current template for everything that reads them. A synchronous reader never runs over a cold cache: a miss there reads as "not a prefab". A prefab write is one step: once it lands, both caches hold the written bytes under every key they use, and every live frame expanded from the old document is rebuilt or refused. | Warming: `installEditorPrefabCacheWarm` (before a scene swap) and `instantiatePrefabInstance`, with `preloadNestedPrefabs` / `preloadNestedPrefabsForSubtree` at the call sites. **The write step: `commitPrefabWrite(source, doc, { expected })`** (`editor/scene/prefabCommit.ts`, #1692). It is the only function that changes a `.prefab.json`. Once the write lands it seats the editor cache under the guid, the path and the caller's ref, and the runtime cache under the resolved path. Then it runs the caller's own `rebuild` (Apply's refresh, Create Prefab's tag), then `rebaseStaleInstances({ sources })` for every other frame of the source. Every writer goes through it: Apply and its undo, the prefab-edit save, Create Prefab (Replace and its undo), the agent `create`, the skin rig and its undo, the model regenerate, and the Assets model import and its undo. **Several files are one step too** (`commitPrefabWrites`, for an Apply that writes an inner prefab and its enclosing one, #1693/U13). Every file's precondition is checked before any is written. Each file is then written only over the bytes checked. A miss part-way puts back what was already written, and names the file that missed (`failed`) and any file it could not put back (`stranded`); both refusals word themselves from those (#1732, § Undoing an Apply). Then both caches for each file, one rebuild and one rebase. | No writer. **An outside edit** reaches the editor as a watcher event: the hot reload evicts the runtime cache, refreshes the editor cache (except the prefab open in prefab edit, `refreshPrefabSourceForPath`), reloads, then rebases; leaving prefab edit refreshes that one and rebases (`repairLeftPrefabEdit`, #1666). ⚠️ The commit seats the open prefab's entry too: a first version skipped it so the edit's save kept its baseline, and its own rebase then put the instances an Apply had just refreshed back onto the old document (close-out review). The edit session keeps its OWN baseline (`editBaselineFor`, § Prefab edit mode). |
 | I10 | A write over content the caller did not read is conditional, and a write that does not land changes nothing. A read that began before a write cannot put the older bytes back. | `commitPrefabWrite`'s `expected`, required on every write (#1692). It is one of three things. A document the caller READ is matched by the editor's serialization of it, and when that is refused, by the file re-read and parsed as every reader parses it, then written with `ifMatch` on those bytes; so a hand-formatted, CRLF or BOM file still counts as the document read. Raw bytes are matched as they are. `null` means nothing may be there (`createOnly`). A trash carries `ifMatch` on `/api/delete-asset` (#1679). The Apply undo's SCENE half saves only over what the editor itself last wrote to that file (`saveScene({ ifMatch })` over `lastWrittenSceneBytes`, #1695). `getPrefabSource` carries the runtime cache's revision token across its fetch (#1669). The runtime cache refuses a stale in-flight fetch (#863). | One deliberate unconditional write: the prefab-edit save's **Overwrite**, after the conflict was shown to the human (or an agent's explicit `overwrite:true`). |
 | I11 | An operation that awaits between its steps lands whole, in the world it began in. | `beginWorldSwitch` / `prepareWorldSwitch`, which wait for what holds the world: an undo step (#1579), and a world-bound operation (`beginWorldBoundOperation`, #1667). The forward Apply holds it from its first line to its undo entry and refuses to start during a switch. Every `commitPrefabWrite` holds it from its write to its rebase. Nothing reachable from a write's rebuild may start a switch, or the two would wait on each other (`prefabCommit.test.ts` counts it). | A world swap that bypasses `beginWorldSwitch` (a hot reload) is read from #1698's adoption record instead. A write starts only once `adoptionsSettled()`, as does the forward Apply. After the write, a route mid-adoption (`pendingAdoptions()`) or a replaced world means it seats the caches and rebuilds nothing, since the new world's load builds from them. |
 
@@ -597,7 +597,19 @@ not the instance's own edit:
   Against the bare template, a value the outer row sets was listed as the instance's own override;
 - **Revert** puts back the ROW's value for a field a row sets, not the template's. The rebuild re-expands from the
   template alone and carries the row's values only as captured (marked) overrides, and the one reverted is subtracted
-  from those. A reverted REMOVAL of a component the row adds puts the row's component back the same way;
+  from those. A reverted REMOVAL of a component the row adds puts the row's component back the same way. A reverted
+  REMOVED MEMBER (#1730) brings back everything the layer states of it and its template subtree
+  (`layerForRestoredMembers`): the rows' field bags and added components, the components and members they remove,
+  and the nodes they add under it. Only members the Revert brings back: a subtree member still live (moved out before the
+  delete) already carries the layer in its own capture, and seeding it again duplicated a layer-added node into the
+  save (close-out review). "Live" includes an owned nested ROOT, which is its own `rootInstanceId`, and so is found by
+  its row (`parentLocalId`) in the frame that owns it. A descendant the scene removed on its OWN key (moved out, then
+  deleted) is seeded too, harmlessly: the structure pass skips an addition anchored on a member it removes
+  (`applyStructureCore`). A member the scene deleted had nothing live to capture, so before #1730 it came
+  back as the bare template's, its row's values were listed as phantom overrides, and the save wrote the row's
+  component as a `traitRemovals`. Still open (#1737): a restored REFERENCE row's frame gets the layer's statements
+  about its own members only from the nested capture, which a frame that did not exist has none of. It shows the
+  inner template's values until a reload; nothing wrong is listed or saved;
 - **the save** compares a nested field with the row by value (#1498).
 
 ### Apply's targets (#1693, owner ruling C, U12–U15)
@@ -827,6 +839,15 @@ applied"*. It throws rather than using #308's report-and-return because that pat
 other stack as though it had applied. A refused entry would also refuse again on every retry, and so
 block every older undo behind it.
 
+**Several files: the refusal names the file that refused, and any file left stranded (#1732).**
+`commitPrefabWrites` reports `failed` (the file whose precondition or write refused) and `stranded` (the files a
+mid-way failure wrote and whose rollback also failed). The undo's detail names `failed`, not the Apply's primary
+file: after a [P, O] Apply, an outside edit of O was reported as "P changed on disk", naming the file that had not
+changed. The forward Apply says "nothing was applied" only when nothing was stranded, and the dialog's notice no longer
+frames every refusal that way (`applyOutcomeNotice`: "Apply to Prefab refused: <reason>"). Otherwise it names the stranded
+file, which holds the Apply on disk while the editor still holds the document it read, so the next Apply refuses it
+as changed on disk until the scene is reopened. Tests: `applyTwoFileUndo.test.ts` § #1732.
+
 Tests: `engine/tests/editor/untitledApplyUndo.test.ts` (each rule above mutation-checked),
 `prefabEditApplyUndo.test.ts`, `applyPrefabDirtiesBase.test.ts`, and `applyUndoIfMatch.test.ts` for the
 if-match, the failed write, the forward Apply's own precondition and its world hold (#1667). The scene half:
@@ -881,6 +902,19 @@ member's row: false overrides, and Apply wrote one member's value into another's
   the third review, the enclosing instance read it as a stale nested frame, was skipped, and kept the
   member the undo had taken away. The snapshot restore also rebases the `Persistent` roots its scene
   load carries flat, before it saves.
+  The capture is of the applied FRAME against its own prefab (`BaseInstanceSide.source`), taken whenever the
+  instance is base-owned, including when the Apply wrote only an ENCLOSING prefab ("override in Prefab 'O'", #1724).
+  That Apply moves the instance's own value into O's row (U15), so the refresh of O's instances from the restored row
+  cannot bring it back. Before #1724 the capture was dropped for it, and the undo showed the row's old value on the
+  dirty base, which Save All then wrote. The rebuild re-seeds the value as a MARKED override, and that mark is what
+  carries it through the enclosing refresh that follows (a second rebuild after the refresh was tried, and a mutation
+  proved it inert). It is rebuilt onto the CURRENT copy of its own prefab (`rebuildInstanceFromCapture`, as Revert's
+  undo does, #1665), not the copy captured: an enclosing-only Apply restores nothing of the frame's own, and a
+  prefab-edit save, another scene's Apply or a pull can have changed it since. Rebuilt from the captured copy, a member
+  it had gained vanished from this instance, and the frame then read as stale, so Apply and Revert refused it (close-out
+  review). Test: `applyBaseTwoFileUndo.test.ts`, on the real two-file path.
+  Still open (#1741): an Apply made from the OUTER root of a nested frame's own edit (U14). The side captures only the
+  outer root's own members, so the nested frame's edit, which the Apply took out, is not restored.
 - **Leaving prefab-edit mode re-reads the edited prefab, by EVERY route** (`settleLeaveDebts`,
   `sceneAdoption.ts`). `refreshPrefabSourceForPath` skips the prefab open in prefab-edit mode, so after an
   exit without saving, the editor's copy could be older than the file the scene had just loaded from.

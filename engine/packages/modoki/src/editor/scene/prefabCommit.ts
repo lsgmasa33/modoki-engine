@@ -97,6 +97,9 @@ export interface PrefabCommitsResult {
   /** A precondition refused: some file is not what its caller read. With `stranded` empty, nothing changed. */
   conflict?: boolean;
   error?: string;
+  /** The file whose precondition or write refused or failed (`conflict`/`error`) — the one a refusal names (#1732): with
+   *  several files it is not necessarily the first. */
+  failed?: string;
   /** Files a mid-way failure left written and could NOT put back (a multi-file commit's rollback lost a race too). */
   stranded?: string[];
   worldLeft?: boolean;
@@ -109,7 +112,7 @@ export async function commitPrefabWrite(source: string, doc: PrefabFile | null, 
     overwrite: opts.overwrite, rebase: opts.rebase,
     rebuild: opts.rebuild ? (landed) => opts.rebuild!({ path: landed.paths[0]! }) : undefined,
   });
-  const { paths, stranded: _stranded, ...rest } = res;
+  const { paths, stranded: _stranded, failed: _failed, ...rest } = res;
   return { ...rest, path: paths[0] ?? prefabPathOf(source) };
 }
 
@@ -161,7 +164,7 @@ export async function commitPrefabWrites(
     if (plan.length > 1 && !opts.overwrite) {
       for (const [i, w] of plan.entries()) {
         const pre = await precheck(w.asked, w.expected);
-        if ('refused' in pre) return { ok: false, paths: plan.map((x) => x.asked), ...(pre.refused === 'conflict' ? { conflict: true } : { error: pre.refused }) };
+        if ('refused' in pre) return { ok: false, paths: plan.map((x) => x.asked), failed: w.asked, ...(pre.refused === 'conflict' ? { conflict: true } : { error: pre.refused }) };
         exact.set(i, pre);
       }
     }
@@ -174,7 +177,7 @@ export async function commitPrefabWrites(
         : await trashDoc(w.asked, w.expected, pre);
       if (!landed.ok) {
         const stranded = await rollBack(done);
-        return { ok: false, paths: plan.map((x) => x.asked), ...('conflict' in landed && landed.conflict ? { conflict: true } : {}),
+        return { ok: false, paths: plan.map((x) => x.asked), failed: w.asked, ...('conflict' in landed && landed.conflict ? { conflict: true } : {}),
           ...('error' in landed && landed.error ? { error: landed.error } : {}), ...(stranded.length ? { stranded } : {}) };
       }
       const path = landed.path ?? w.asked;

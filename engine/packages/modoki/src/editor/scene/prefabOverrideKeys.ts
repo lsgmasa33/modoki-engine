@@ -306,10 +306,11 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
 /** What an Apply did NOT do, in a sentence for the person who asked (#1437), or null when it did everything:
  *  moves the prefab could not express, and other files whose refs to moved members were not repaired. */
 export function applyOutcomeNotice(result: Pick<ApplyResult, 'skipped' | 'memberPathsChanged' | 'fileRepair' | 'refused'>): string | null {
-  // A REFUSAL is not a partial outcome and must not be worded as one: nothing was applied, and the
-  // line below would call it a "move" or a "change" (#1468). Reported alone, and first, because there
-  // is nothing else to say.
-  if (result.refused) return `Apply to Prefab: nothing was applied — ${result.refused}.`;
+  // A REFUSAL is not a partial outcome and must not be worded as one: the line below would call it a "move" or a
+  // "change" (#1468). Reported alone, and first, because there is nothing else to say. The reason says what landed
+  // itself: a multi-file refusal can leave a file written that its rollback could not put back (#1732), so the frame
+  // around it no longer claims "nothing was applied" for every refusal.
+  if (result.refused) return `Apply to Prefab refused: ${result.refused.replace(/\.$/, '')}.`;
   const parts: string[] = [];
   const skipped = result.skipped ?? [];
   // "move" only when every skipped key IS one: a tag (#1491) or a key naming no member is not.

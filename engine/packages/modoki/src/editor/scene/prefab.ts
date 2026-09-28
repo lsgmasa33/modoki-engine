@@ -5939,9 +5939,16 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
     },
   });
   if (!committed.ok) {
+    // Several files (#1732): name the one that refused — not necessarily the first — and any the rollback could not put
+    // back, which hold the Apply on disk while the editor still holds the document it read. "Nothing was applied" is
+    // true only without those.
+    const which = plan.writes.length > 1 && committed.failed ? `the prefab ${committed.failed}` : 'the prefab';
+    const stranded = committed.stranded?.length
+      ? ` ${committed.stranded.join(' and ')} ${committed.stranded.length === 1 ? 'was' : 'were'} written and could not be put back, so it holds the Apply on disk while the editor still shows it as it was: reopen the scene to pick that up before applying again.`
+      : '';
     return committed.conflict
-      ? { ...NOOP_APPLY, refused: `the prefab changed on disk since the editor read it (a save elsewhere, an outside edit or a \`git pull\`), so it was left as it is. Reopen the scene to pick up the change, then apply again.` }
-      : { ...NOOP_APPLY, refused: `the prefab file could not be written${committed.error ? ` (${committed.error})` : ''}, so nothing was applied.` };
+      ? { ...NOOP_APPLY, refused: `${which} changed on disk since the editor read it (a save elsewhere, an outside edit or a \`git pull\`), so it was left as it is.${stranded || ' Reopen the scene to pick up the change, then apply again.'}` }
+      : { ...NOOP_APPLY, refused: `${which} file could not be written${committed.error ? ` (${committed.error})` : ''}, so ${stranded ? 'the Apply did not land.' + stranded : 'nothing was applied.'}` };
   }
   // The world the Apply began in was replaced while it wrote: the file holds the Apply, the new world was built from
   // it, and nothing here can be undone against that world. Said, not hidden (#1667).
@@ -7923,6 +7930,77 @@ function subtractFieldOverrides(
   return out;
 }
 
+/** What the layers enclosing instance `rootInstanceId` state about the members a Revert of `-removed.<lid>` brings back
+ *  (#1730): each reverted member and its template subtree in `prefab` — the field bags and components the rows set, the
+ *  components and members they remove, the nodes they add under them. The rebuild re-expands the frame from its template
+ *  alone and carries the layer only through what it captures live, and a member the scene DELETED had nothing live to
+ *  capture: it came back as the bare template's, and the next save wrote the difference as the instance's own
+ *  (`traitRemovals` of a component the row adds). Null when nothing encloses the instance or nothing is restored. */
+function layerForRestoredMembers(
+  rootInstanceId: number,
+  prefab: PrefabFile,
+  restored: readonly number[],
+): {
+  overrides: Record<number, Record<string, Record<string, unknown>>>;
+  structure: Pick<InstanceStructure, 'added' | 'removed' | 'removedTraits'>;
+} | null {
+  if (!restored.length) return null;
+  const layer = enclosingLayer(rootInstanceId);
+  if (!layer) return null;
+  const children = new Map<number, number[]>();
+  for (const e of prefab.entities) {
+    const parent = ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0;
+    if (parent && e.localId !== prefab.rootLocalId) (children.get(parent) ?? children.set(parent, []).get(parent)!).push(e.localId);
+  }
+  // ⚠️ Only what the Revert actually brings BACK: a subtree member still live (moved out of the deleted member before
+  // it went) is rebuilt from its own capture, which already carries the layer — seeded again, a node the layer adds
+  // under it came back twice, and the save wrote the copy as the scene's own (close-out review). A plain member is one
+  // of this frame's by `rootInstanceId`; an owned nested ROOT (a reference row's expansion) is its own root, and is
+  // this frame's row `parentLocalId` when this frame owns it (second close-out review).
+  const live = new Set<number>();
+  const piMeta = getTraitByName('PrefabInstance');
+  if (piMeta) {
+    const identity = worldIdentityParents(getCurrentWorld());
+    getCurrentWorld().query(piMeta.trait).updateEach(([pi], entity) => {
+      const d = pi as MemberPi & { localId?: number; parentLocalId?: number };
+      const id = entity.id();
+      if (id === rootInstanceId) return;
+      if (isOwnedRoot(d, id)) {
+        if (identity.ownerOf(id) === rootInstanceId) live.add(d.parentLocalId as number);
+      } else if (d.rootInstanceId === rootInstanceId && d.localId) live.add(d.localId);
+    });
+  }
+  // A subtree member the scene removed on its OWN key (moved out, then deleted) is seeded too, and harmlessly: the
+  // structure pass skips an addition anchored on a member it removes (`applyStructureCore`), and a field bag for an
+  // absent member applies to nothing. No guard for it — one was tried and could be driven by no test.
+  const lids = new Set<number>();
+  for (const stack = [...restored]; stack.length;) {
+    const lid = stack.pop()!;
+    if (lids.has(lid)) continue;
+    if (!live.has(lid)) lids.add(lid);
+    stack.push(...(children.get(lid) ?? []));
+  }
+  const resolve = baseTokenResolver(rootInstanceId);
+  const rows = resolve(layer.overrides) as Record<number, Record<string, Record<string, unknown>>>;
+  const overrides: Record<number, Record<string, Record<string, unknown>>> = {};
+  for (const lid of lids) {
+    for (const [trait, bag] of Object.entries(rows[lid] ?? {})) {
+      if (bag && typeof bag === 'object') (overrides[lid] ??= {})[trait] = { ...bag };
+    }
+  }
+  const { structure: st } = layer;
+  const removedTraits: Record<number, string[]> = {};
+  for (const lid of lids) if (st.removedTraits[lid]?.length) removedTraits[lid] = [...st.removedTraits[lid]!];
+  return {
+    overrides,
+    structure: {
+      added: resolveAddedNodeTokens(resolve, st.added.filter((n) => lids.has(n.parentLocalId))) ?? [],
+      removed: st.removed.filter((lid) => lids.has(lid)),
+      removedTraits,
+    },
+  };
+}
+
 /** Return a copy of `full` structure with the selected structural keys removed.
  *  Dropping an `+added` node stops it being re-spawned (its live ids are still in
  *  `consumedEcsIds`, so they are destroyed); dropping a `-removed`/`-trait` entry
@@ -8047,6 +8125,8 @@ export async function revertOverridesSelective(
   // the row's values only as captured (marked) overrides, so the one reverted here is put back from the row.
   const enclosing = enclosingRowOverrides(rootInstanceId);
   for (const key of enclosing ? selectedKeys : []) {
+    // A reverted member removal brings back the WHOLE of what the layer says of it: below, with the structure.
+    if (key.startsWith('-removed.')) continue;
     // A reverted removal of a component the ROW adds (#1676, #1693): the row's component comes back, as the row states it —
     // the rebuild re-expands from the template alone, which never had it.
     if (key.startsWith('-trait.')) {
@@ -8061,6 +8141,26 @@ export async function revertOverridesSelective(
     ((reducedOverrides[Number(lid)] ??= {})[trait!] ??= {})[field!] = row[field!];
   }
   let reducedStructure = subtractRevertedStructure(fullStructure, selectedKeys);
+  // A reverted member removal (#1730): the member comes back as the enclosing rows state it — fields, components and
+  // structure, for it and its template subtree — not as the bare template's. In `reduced*`, so the redo replays it.
+  const restoredLayer = layerForRestoredMembers(
+    rootInstanceId, prefab, [...selectedKeys].filter((k) => k.startsWith('-removed.')).map((k) => Number(k.slice('-removed.'.length))),
+  );
+  if (restoredLayer) {
+    for (const [lid, bags] of Object.entries(restoredLayer.overrides)) {
+      const into = (reducedOverrides[Number(lid)] ??= {});
+      for (const [trait, bag] of Object.entries(bags)) into[trait] = { ...bag, ...into[trait] };
+    }
+    const { added, removed, removedTraits } = restoredLayer.structure;
+    const traits = { ...reducedStructure.removedTraits };
+    for (const [lid, names] of Object.entries(removedTraits)) traits[Number(lid)] = [...new Set([...(traits[Number(lid)] ?? []), ...names])];
+    reducedStructure = {
+      ...reducedStructure,
+      added: [...reducedStructure.added, ...added],
+      removed: [...new Set([...reducedStructure.removed, ...removed])],
+      removedTraits: traits,
+    };
+  }
   // Moves inside nested instances live in what the rebuild captures of THEM (owner's B): dropped for the revert,
   // set back for its undo, which rebuilds from `fullStructure`.
   const revertedNested = nestedFrameMoves(rootInstanceId).filter((m) => selectedKeys.has(m.key));

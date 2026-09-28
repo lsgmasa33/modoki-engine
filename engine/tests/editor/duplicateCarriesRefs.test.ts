@@ -1912,13 +1912,22 @@ describe('applying a move inside the instance re-parents the row and every ref f
   // thing that has ever populated it — so a refusal riding that channel told the human "1 move was
   // not applied: prefab format 6 is newer than 5", which is wrong about the count, the noun and the
   // outcome. Mutation: delete the `result.refused` early return and this goes red.
-  it('a refusal says nothing was applied, and never calls itself a move', () => {
+  it('a refusal says it was refused, and never calls itself a move', () => {
     const notice = applyOutcomeNotice({ refused: '"x.prefab.json" was written by a newer build (prefab format 6; this build writes 5)' })!;
-    expect(notice).toBe('Apply to Prefab: nothing was applied — "x.prefab.json" was written by a newer build (prefab format 6; this build writes 5).');
+    expect(notice).toBe('Apply to Prefab refused: "x.prefab.json" was written by a newer build (prefab format 6; this build writes 5).');
     expect(notice).not.toContain('move');
     // …and it wins over anything else the result happens to carry, because nothing else happened.
     expect(applyOutcomeNotice({ refused: 'r', skipped: [{ key: 'k', reason: 'why' }], memberPathsChanged: true, fileRepair: null }))
-      .toBe('Apply to Prefab: nothing was applied — r.');
+      .toBe('Apply to Prefab refused: r.');
+  });
+
+  // #1732 close-out review: a multi-file refusal can leave a file written that its rollback could not put back, and the
+  // notice framed EVERY refusal as "nothing was applied" — contradicting the reason it carried. Mutation: put the
+  // "nothing was applied — " frame back.
+  it('a refusal that stranded a file is not framed as "nothing was applied", and ends in one period', () => {
+    const notice = applyOutcomeNotice({ refused: 'the prefab O file could not be written (the disk is full), so the Apply did not land. P was written and could not be put back, so it holds the Apply on disk.' })!;
+    expect(notice).not.toMatch(/nothing was applied/);
+    expect(notice).toBe('Apply to Prefab refused: the prefab O file could not be written (the disk is full), so the Apply did not land. P was written and could not be put back, so it holds the Apply on disk.');
   });
 
   // F2 (P3-a review): an ORPHAN row (parentId 0) hangs off the instance's parent and derives from ITS anchor, so
