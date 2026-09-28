@@ -62,7 +62,7 @@ export type DeleteResult = { asset: AssetEntry; snapshots: Snapshot[]; deletePat
 
 /** `sha256`: the copy's bytes as `/api/duplicate-asset` wrote them (#1679) — the undo trashes the copy only while it
  *  still holds them. Absent (a route that did not report one) → the undo REFUSES rather than trash unguarded. */
-export type DupResult = { asset: AssetEntry; toPath: string; sha256?: string };
+export type DupResult = { asset: AssetEntry; toPath: string; sha256?: string; sidecar?: Record<string, unknown> };
 
 /** Build a single coalesced undo/redo for one or more completed deletes. Undo
  *  restores the FULL snapshot set (not just the GLB) so generated mesh/mat/
@@ -216,8 +216,8 @@ export function makeDeleteUndo(
       // ⚠️ Each FILE only while it holds the snapshot's bytes — an edit made to a restored file since is the user's,
       // and one mismatch trashes nothing at all (`fileChangedRefusal`). A retried refusal has a snapshot too: taken
       // at the delete, so an edit made after the OS refused it is protected the same way. SIDECARS ride with their
-      // file and carry no hash of their own: the scanner rewrites `.meta.local.json` on its own, so a hash on it would
-      // refuse redo for nothing, and the file's hash already decides for the asset as a whole.
+      // file and carry no BYTE hash: the scanner and the bakes rewrite both halves on their own, so a hash would refuse
+      // redo for nothing. The committed half carries a SETTINGS precondition instead (#1696, below).
       const retried = Array.from(refused).filter((p) => snapshotOf.has(p) && !onDisk.has(p));
       // A retried file takes its sidecars along: the one on disk is the heal's (this entry's snapshot of it went to the
       // trash with the delete), and left behind it would be an orphan the next undo's restore collides with — dropping
@@ -226,7 +226,11 @@ export function makeDeleteUndo(
       const allPaths = [...new Set([...onDisk, ...retried, ...riders])];
       if (allPaths.length === 0) { refresh(); return; }
       const guarded = allPaths.map((p) => snapshotOf.get(p)).filter((s): s is Snapshot => s !== undefined && !isSidecarPath(s.path));
-      const res = await deleteAssetFiles(allPaths, { ifMatch: await ifMatchOf(guarded) });
+      // A committed sidecar the last undo restored carries its SETTINGS as a precondition (#1696): for a binary it is
+      // where the import settings live, so one edited since is the user's. Only one this entry wrote back (`onDisk`) —
+      // a retry's rider is the heal's, not ours, and rides unguarded.
+      const ifSettings = settingsExpectations([...onDisk].map((p) => [p, snapshotDoc(snapshotOf.get(p))] as const));
+      const res = await deleteAssetFiles(allPaths, { ifMatch: await ifMatchOf(guarded), ifSettings });
       if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
       // Same false-success shape on the other half: a failed re-delete left the files on
       // disk, refresh() re-listed them, and redo read as a no-op (#291).
@@ -261,7 +265,8 @@ export function makeDeleteUndo(
   };
 }
 
-/** A `.meta.json` / `.meta.local.json` sidecar — it travels with its asset and carries no precondition of its own. */
+/** A `.meta.json` / `.meta.local.json` sidecar — it travels with its asset and carries no byte hash of its own (the
+ *  committed half may carry a settings precondition, #1696 — `settingsExpectations`). */
 function isSidecarPath(p: string): boolean {
   return p.endsWith('.meta.json') || p.endsWith('.meta.local.json');
 }
@@ -269,6 +274,24 @@ function isSidecarPath(p: string): boolean {
 /** The file a sidecar belongs to. */
 function primaryOfSidecar(p: string): string {
   return p.replace(/\.meta(\.local)?\.json$/, '');
+}
+
+/** `/api/delete-asset`'s `ifSettings` (#1696) for committed sidecars this step expects to find: each `.meta.json`
+ *  paired with the document it should still hold. A pair with no document (none was reported or snapshotted) is
+ *  left out, and that sidecar rides unguarded as before. */
+function settingsExpectations(pairs: ReadonlyArray<readonly [string, Record<string, unknown> | undefined]>): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const [p, doc] of pairs) if (doc && p.endsWith('.meta.json')) out[p] = doc;
+  return out;
+}
+
+/** The sidecar document a text snapshot holds, or undefined when it is not a JSON object. */
+function snapshotDoc(s: Snapshot | undefined): Record<string, unknown> | undefined {
+  if (!s || s.encoding === 'base64') return undefined;
+  try {
+    const v: unknown = JSON.parse(s.content.replace(/^\uFEFF/, ''));
+    return v !== null && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
+  } catch { return undefined; }
 }
 
 /** `{path: sha256 of the bytes written}` for a set of snapshots this step wrote (#1679). */
@@ -293,11 +316,13 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
   const undone = new Set<string>();
   // The bytes each copy holds as this entry last wrote it — re-read from every redo, since a JSON copy is re-minted.
   const shaOf = new Map(results.map((r) => [r.toPath, r.sha256] as const));
+  // And the committed sidecar each binary copy got (#1696), for `trashCopies`' settings precondition.
+  const sidecarOf = new Map(results.map((r) => [r.toPath, r.sidecar] as const));
   return {
     label,
     undo: async () => {
       const copies = results.filter(({ toPath }) => !undone.has(toPath)).map(({ toPath }) => toPath);
-      const deleted = await trashCopies(copies, shaOf); // primary files actually trashed — safe to unbind
+      const deleted = await trashCopies(copies, shaOf, sidecarOf); // primary files actually trashed — safe to unbind
       const failed = copies.filter((p) => !deleted.includes(p));
       for (const p of deleted) undone.add(p);
       // The copy can be OPEN by now (duplicate → double-click the copy → ⌘Z), and a bound
@@ -318,7 +343,7 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
         // The route refuses a destination that is already occupied (409 "Destination exists"), so a redo never
         // lands on a file made at that path since — that half needed no new precondition.
         const r = await duplicateAssetFileReport(asset.path, toPath);
-        if (r.ok) { undone.delete(toPath); shaOf.set(toPath, r.sha256); } else failed.push(toPath);
+        if (r.ok) { undone.delete(toPath); shaOf.set(toPath, r.sha256); sidecarOf.set(toPath, r.sidecar); } else failed.push(toPath);
       }
       if (failed.length > 0) {
         reportUndoFailure({ direction: 'Redo', label, detail: `not re-copied: ${failed.join(', ')}` });
@@ -336,9 +361,16 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
  *  Drops BOTH halves of each copy's sidecar pair: the committed `.meta.json` (import settings + the GUID the copy
  *  created) and the gitignored machine-local `.meta.local.json` (byte stats) — dropping only the committed half left
  *  the local one on disk after every undone duplicate (QA-CTX-0005). They ride in the same request, so a refusal
- *  keeps them too: never an orphan sidecar, never a GUID-less copy. They carry no hash (the scanner rewrites the local
- *  one on its own), and the route skips one that is not there, so a missing sidecar is never reported as a failure. */
-async function trashCopies(copies: string[], shaOf: ReadonlyMap<string, string | undefined>): Promise<string[]> {
+ *  keeps them too: never an orphan sidecar, never a GUID-less copy. They carry no byte hash (the scanner rewrites both
+ *  on its own), and the route skips one that is not there, so a missing sidecar is never reported as a failure.
+ *
+ *  The committed `.meta.json` carries a SETTINGS precondition instead (#1696): it is where a binary's import settings
+ *  live, so an import-settings edit to the copy, saved since, refuses the step like an edit to the file does. The
+ *  expectation is the sidecar the route reported writing (`sidecarOf`); a copy with none reported rides as before. */
+async function trashCopies(
+  copies: string[], shaOf: ReadonlyMap<string, string | undefined>,
+  sidecarOf: ReadonlyMap<string, Record<string, unknown> | undefined>,
+): Promise<string[]> {
   if (copies.length === 0) return [];
   const unknown = copies.filter((p) => shaOf.get(p) === undefined);
   if (unknown.length > 0) {
@@ -349,7 +381,8 @@ async function trashCopies(copies: string[], shaOf: ReadonlyMap<string, string |
   }
   const paths = copies.flatMap((p) => (isTextAsset(p) ? [p] : [p, p + '.meta.json', p + '.meta.local.json']));
   const ifMatch = Object.fromEntries(copies.map((p) => [p, shaOf.get(p) as string]));
-  const res = await deleteAssetFiles(paths, { ifMatch });
+  const ifSettings = settingsExpectations(copies.filter((p) => !isTextAsset(p)).map((p) => [`${p}.meta.json`, sidecarOf.get(p)]));
+  const res = await deleteAssetFiles(paths, { ifMatch, ifSettings });
   if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
   if (!res.ok) return [];
   const failed = new Set(res.failed);
@@ -530,7 +563,7 @@ export function makeFolderRenameUndo(params: {
 /** One item a cut/copy paste moved or copied — the panel's own destination-collision
  *  planning already happened, so `from`/`to` are the exact paths that landed. */
 /** `sha256`: for a copy-paste, the copy's bytes as the route wrote them (`DupResult.sha256`, #1679). */
-export type PasteMove = { from: string; to: string; sha256?: string };
+export type PasteMove = { from: string; to: string; sha256?: string; sidecar?: Record<string, unknown> };
 
 /** Undo/redo for `pasteClipboard` (Assets.tsx, #308). The forward loop already skips any
  *  item whose move/copy failed (`done` only holds what actually landed) — this only needs to
@@ -550,6 +583,7 @@ export function makePasteUndo(params: {
   const undone = new Set<string>();
   // A copy-paste's copies, as makeDuplicateUndo's `shaOf` (#1679). Unused by a cut: a move destroys no bytes.
   const shaOf = new Map(done.map((m) => [m.to, m.sha256] as const));
+  const sidecarOf = new Map(done.map((m) => [m.to, m.sidecar] as const));
   return {
     label,
     undo: async () => {
@@ -574,7 +608,7 @@ export function makePasteUndo(params: {
       }
       // The copies go in ONE guarded request, sidecars included — `trashCopies`, shared with makeDuplicateUndo (#1679).
       if (copies.length > 0) {
-        const trashed = await trashCopies(copies, shaOf);
+        const trashed = await trashCopies(copies, shaOf, sidecarOf);
         for (const to of copies) {
           if (trashed.includes(to)) { undone.add(to); deletedCopies.push(to); } else failed.push(to);
         }
@@ -601,7 +635,7 @@ export function makePasteUndo(params: {
           else { failed.push(`${from} → ${to}`); if (status === COLLISION_STATUS) collision = true; }
         } else {
           const r = await duplicateAssetFileReport(from, to);
-          if (r.ok) { undone.delete(to); shaOf.set(to, r.sha256); } else failed.push(`${from} → ${to}`);
+          if (r.ok) { undone.delete(to); shaOf.set(to, r.sha256); sidecarOf.set(to, r.sidecar); } else failed.push(`${from} → ${to}`);
         }
       }
       if (op === 'cut') applyAssetPathMoves(fwd);

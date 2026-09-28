@@ -4118,6 +4118,7 @@ read-then-write, because that is not atomic (#469).
 | re-creates a file it removed | `createOnly` (`ifNoneMatch:'*'`) |
 | trashes a file it created or restored | `ifMatch` on `/api/delete-asset` (`deleteAssetFiles(paths, {ifMatch})`) |
 | trashes a folder it created | `ifEmpty` on `/api/delete-asset`: only OS litter (`.DS_Store`, `Thumbs.db`, `desktop.ini`) may be in it, and a stray sidecar counts as content |
+| trashes a binary's committed sidecar it created or restored | `ifSettings` on `/api/delete-asset`: its import settings must still be the expected ones (`sameImportSettings`, #1696, below) |
 
 `/api/delete-asset` checks every precondition before it trashes anything, and **one miss trashes
 nothing**: 409 `reason:'if-match'` with `conflicts`. A lone path that has a precondition but is gone is
@@ -4132,9 +4133,30 @@ every path is now**, so the next step acts only on what this step actually did. 
 only what its undo restored, so a file recreated at a deleted path survives the undo AND the redo after
 it. An import's undo trashes only what its redo wrote.
 
-**Sidecars travel with their asset, all-or-nothing, and carry no hash of their own.** The scanner
+**Sidecars travel with their asset, all-or-nothing, and carry no BYTE hash of their own.** The scanner
 rewrites `.meta.local.json`, and on a cache miss `.meta.json` too, without anyone editing anything. A
-hash on either would refuse for nothing, and the file's own hash already decides for the asset.
+hash on either would refuse for nothing.
+
+**But the committed `.meta.json` carries a SETTINGS precondition (#1696).** For a binary asset it is where
+the import settings live, so the file's hash does not decide for the asset: delete a texture, Cmd+Z, change
+its import settings, save (only the sidecar is written), Cmd+Shift+Z trashed the edited sidecar. Duplicate →
+edit the copy's settings → Cmd+Z did the same. So `/api/delete-asset` takes `ifSettings: {[sidecar]: doc}`,
+checked in the same synchronous span as `ifMatch`, with the same 409 that trashes nothing:
+- **What "the same settings" means** is `sameImportSettings` (`runtime/loaders/sidecarSettings.ts`, re-exported by `plugins/meta-sidecar.ts`), and it is not a
+  raw compare either. It ignores what writes itself (`id`, `version`, the `CACHE_BLOCKS`). ⚠️ **Every bake also
+  rewrites its SETTINGS block with resolved defaults** (`meta.texture = resolveTextureSettings(meta)` plus
+  `type`, and likewise `model`/`audio`/`video`/`font`/`environment`). So each of those blocks is compared
+  through the resolver its bake uses. Otherwise duplicating a never-baked texture and merely looking at the
+  copy would refuse its undo. Every other key (sprites, border, postprocessor, rig, generated) is compared
+  as a document, with key order ignored. `metaSidecarSettings.test.ts` reads every `reimport-*.ts`'s
+  `meta.<key> =` writes and fails on a key the comparison does not know, so a new bake cannot silently
+  reintroduce the false refusal.
+- **The expectation.** The delete redo sends each `.meta.json` its last undo restored, as that snapshot.
+  `/api/duplicate-asset` reports the committed sidecar a binary copy got (`sidecar`, read back, like
+  `sha256`), and the duplicate/paste-copy undo sends that. A retry's rider (the heal's sidecar) and a copy
+  with no reported sidecar ride unguarded, as before.
+- **A gone sidecar passes** (nothing is lost). **One that does not parse refuses** (somebody wrote something
+  there). The machine-local half is never compared, because it holds only cache stats.
 - The delete undo restores an asset's sidecars **first**, so the scanner never sees the file bare and
   mints it a sidecar of its own.
 - A collision part-way through an asset's restore puts back what that asset had already written. So does a
@@ -4195,7 +4217,8 @@ destroys no bytes), and a duplicate's redo (the route already refuses `Destinati
 Tests: `packages/modoki/tests/editor/undoFilePreconditions.test.ts` (every Assets-panel site, against
 `fakeAssetRoute.ts`, a disk that holds the bytes each write sent), the precondition cases in
 `createPrefabUndo.test.ts` and `skinPrefab.test.ts`, and `tests/plugins/deleteAssetPreconditions.test.ts`
-(the route itself, on a real scratch directory).
+(the route itself, on a real scratch directory), plus `tests/plugins/metaSidecarSettings.test.ts` for the settings
+comparison (#1696).
 
 ### An asset-DOCUMENT undo checks the asset still holds its side, and its save is conditional (#1710)
 
@@ -4298,6 +4321,39 @@ Tests:
 resolves `false` rather than throwing. It was fixed anyway because "just throw so the entry stays
 on the stack" is the obvious-looking design the next change will reach for, and it did not work
 until this landed.
+
+### A game panel's undo that writes its own file uses the same seam (#1697)
+
+A game's own editor panel writes asset files too (sling's Level and Wave editors write a `.level.json` /
+`.wave.json` on every edit). Its undo entries face the #1679 problem, plus one of their own: they used to read
+the path when they RAN, so paint level A, open B, Cmd+Z wrote A's old grid into B's file.
+
+**When to use which.** #1679's seam is public in `@modoki/engine/editor` for exactly this case:
+`writeAssetFileGuarded(path, bytes, { ifMatch })` for the write, `expectedHash(path, bytes)` for the
+`ifMatch` (a refusal rather than a throw when the bytes cannot be hashed), and `fileChangedRefusal([path])` to
+throw on a `'conflict'` (`UndoRefusedError` too, for a refusal in your own words). Reach for them from an undo
+that **writes a file directly**. An asset **document** that parks and saves on Cmd+S uses #1710's
+`assetDocAction` instead. A game must not grow its own guard shape beside these.
+
+The shape a game entry takes (`games/sling/editor/fileDocUndo.ts`, the reference):
+- **Bind the path when the entry is RECORDED.** Undo/redo write that file and no other. Nothing is cleared when
+  the panel opens another file. The history is the one global stack, shared with scene edits.
+- **`ifMatch` = the hash of the bytes the entry's other half wrote.** A file changed since refuses, and the
+  entry drops with the standard toast.
+- **Update the panel only while it still has that file open, and only after the write landed**, so a refused
+  step changes nothing on screen and an undo never shows one file's content under another's name.
+- **Mark it `_isFileDirect`.** It changes a file, not a serialized scene entity, so it must not mark the scene
+  unsaved, and it survives a history swap like the other asset entries. ⚠️ The flag has a SECOND role: it lets the
+  entry undo inside a scrub/preview envelope (#1148, `undoManager.ts`). So a panel whose undo also writes a
+  serialized scene entity must NOT set it, or that edit is lost on Exit. Sling's only touches a `Transient` field.
+- **Refuse an edit while an undo/redo step is running** (`isExecutingUndoRedo()`). The step is async (a hash and a
+  guarded write), and `pushAction` silently drops a push made during one. An edit landing in that window would be
+  saved with no undo entry, and the step's late panel update would then show a document the disk does not hold.
+- **A canvas stroke captures its file and document at pointerdown**, and is dropped if either changed by
+  pointerup (a slow open, or an undo's panel update, landing mid-drag). Otherwise it commits one file's `before`
+  into another's.
+
+Tests: `games/sling/tests/sling-fileDocUndo.test.ts`.
 
 ### A step that awaits across a scene switch drops its entry too (#1575)
 

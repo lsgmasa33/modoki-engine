@@ -6,10 +6,14 @@
 // was raw `backendFetch`, so `games/sling`'s Level and Wave editors each hand-spelled their
 // own body and neither appended the trailing newline — #835's defect, reproduced outside the
 // engine by an export list that offered no alternative.
-export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl, jsonFileBody, writeAssetFile } from './backend/editorBackend';
+// `writeAssetFileGuarded` + `expectedHash` + `fileChangedRefusal` are #1679's if-match seam, public for the same
+// reason: a game panel's undo that rewrites its own file must state what it expects there, and without the seam in
+// the barrel each game would grow its own guard shape (#1697, sling's Level/Wave editors).
+export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl, jsonFileBody, writeAssetFile, writeAssetFileGuarded } from './backend/editorBackend';
+export { expectedHash, fileChangedRefusal, UndoRefusedError } from './undo/undoFailure';
 export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {
-  pushAction, undo, redo, undoStep, undoStepPending, type UndoStepResult, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
+  pushAction, undo, redo, undoStep, undoStepPending, isExecutingUndoRedo, type UndoStepResult, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
   beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
 } from './undo/undoManager';
 export { assetDocAction, runAssetDocStep, captureAssetDocBaseline, type AssetDocBaseline, type AssetDocSide } from './undo/assetDocUndo';

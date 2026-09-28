@@ -68,6 +68,10 @@ import {
 } from '../packages/modoki/src/runtime/core/formatVersion';
 // The one GUID validator — not a third copy of the regex (CLAUDE.md § single source of truth).
 import { isGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
+// The cache-block list and the import-settings comparison live beside the resolvers they use, in the engine package, so
+// the client's test fakes can share them (#1696). Re-exported: this file stays where a sidecar's format is defined.
+import { CACHE_BLOCKS, type CacheBlock } from '../packages/modoki/src/runtime/loaders/sidecarSettings';
+export { CACHE_BLOCKS, type CacheBlock, sameImportSettings, BAKE_WRITABLE_KEYS } from '../packages/modoki/src/runtime/loaders/sidecarSettings';
 
 /** The FORMAT version of the `.meta.json` sidecar document — how the file is laid
  *  out (which top-level fields exist, how cache blocks are shaped), NOT a version
@@ -127,12 +131,6 @@ export const CORRUPT_SIDECAR_SUFFIX = '.corrupt';
 function localSidecarPath(absPath: string): string {
   return absPath + '.meta.local.json';
 }
-
-/** Content-cache blocks whose contents are split between the COMMITTED sidecar and this machine's
- *  gitignored one. Being listed here does NOT mean "peel everything" — what gets peeled is decided
- *  per block by {@link LOCAL_KEYS}. */
-export const CACHE_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache', 'videoCache'] as const;
-export type CacheBlock = (typeof CACHE_BLOCKS)[number];
 
 /** Machine-local, inspector-only size fields. Spread into most blocks below — but NOT all of them,
  *  which is why this is a named list rather than an unconditional prefix (#1300). */

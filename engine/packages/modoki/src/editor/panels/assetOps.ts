@@ -309,8 +309,10 @@ export async function deleteAssetFiles(
   paths: string[],
   /** Preconditions the ROUTE checks atomically with the trash (#1679) — an undo/redo trashing files it created or
    *  restored: `ifMatch` maps a path to the sha256 of the bytes it must still hold, `ifEmpty` lists folders that must
-   *  hold nothing. One failure trashes NOTHING and comes back as `conflicts`. Keys must be members of `paths`. */
-  opts?: { ifMatch?: Record<string, string>; ifEmpty?: string[] },
+   *  hold nothing, `ifSettings` maps a `.meta.json` to the sidecar document whose IMPORT SETTINGS it must still hold
+   *  (#1696 — compared through the bakes' resolvers, `sameImportSettings`, not by bytes). One failure trashes NOTHING
+   *  and comes back as `conflicts`. Keys must be members of `paths`. */
+  opts?: { ifMatch?: Record<string, string>; ifEmpty?: string[]; ifSettings?: Record<string, Record<string, unknown>> },
 ): Promise<DeleteFilesResult> {
   if (paths.length === 0) return { ok: true, trashed: 0, missing: [], failed: [] };
   try {
@@ -323,6 +325,7 @@ export async function deleteAssetFiles(
         paths, rendererWrite: true,
         ...(opts?.ifMatch && Object.keys(opts.ifMatch).length ? { ifMatch: opts.ifMatch } : {}),
         ...(opts?.ifEmpty?.length ? { ifEmpty: opts.ifEmpty } : {}),
+        ...(opts?.ifSettings && Object.keys(opts.ifSettings).length ? { ifSettings: opts.ifSettings } : {}),
       }),
     });
     if (res.status === 409) {
@@ -401,7 +404,7 @@ export async function duplicateAssetFile(from: string, to: string): Promise<bool
 /** `duplicateAssetFile`, plus the sha256 of the copy's bytes as the route wrote them (#1679) — what the undo of the
  *  duplicate hands `deleteAssetFiles` as its `ifMatch`, so it trashes the copy only while nobody has edited it. The
  *  route reports it because a JSON copy is re-minted server-side and its bytes are not knowable here. */
-export async function duplicateAssetFileReport(from: string, to: string): Promise<{ ok: boolean; sha256?: string }> {
+export async function duplicateAssetFileReport(from: string, to: string): Promise<{ ok: boolean; sha256?: string; sidecar?: Record<string, unknown> }> {
   try {
     await flushPendingMetaFor(from);
     const res = await backendFetch('/api/duplicate-asset', {
@@ -415,8 +418,14 @@ export async function duplicateAssetFileReport(from: string, to: string): Promis
       console.error(`[Assets] duplicate ${from} → ${to} failed: ${res.status} ${detail.slice(0, 400)}`);
       return { ok: false };
     }
-    const body = await res.json().catch(() => null) as { sha256?: unknown } | null;
-    return { ok: true, ...(typeof body?.sha256 === 'string' ? { sha256: body.sha256 } : {}) };
+    const body = await res.json().catch(() => null) as { sha256?: unknown; sidecar?: unknown } | null;
+    const sidecar = body?.sidecar;
+    return {
+      ok: true,
+      ...(typeof body?.sha256 === 'string' ? { sha256: body.sha256 } : {}),
+      // The copy's committed sidecar as the route wrote it (#1696) — its undo trashes it only while it holds these settings.
+      ...(sidecar !== null && typeof sidecar === 'object' && !Array.isArray(sidecar) ? { sidecar: sidecar as Record<string, unknown> } : {}),
+    };
   } catch { return { ok: false }; }
 }
 

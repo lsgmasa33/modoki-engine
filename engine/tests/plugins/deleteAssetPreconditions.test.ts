@@ -13,7 +13,14 @@
  *  - hash without stripping the BOM: "the BOM is not part of the hash".
  *  - drop `sha256` from the duplicate reply: "the duplicate reports the hash of the bytes it wrote".
  *  - drop the BOM strip from the CLIENT's `sha256OfBytes`: "a base64 write of bytes that start with a BOM".
- *  - move the precondition check above the awaited gates: "the check runs AFTER the gates that await". */
+ *  - move the precondition check above the awaited gates: "the check runs AFTER the gates that await".
+ *  #1696 (`ifSettings`), each red on its named cases only:
+ *  - skip `sidecarSettingsRefusal`: "a changed import setting refuses", "a non-resolved key", "an unparseable one".
+ *  - `sameImportSettings` compares raw (no resolver): "a bake's rewrite is not a change".
+ *  - `canonicalJson` without the key sort: "key order is not a change".
+ *  - a gone sidecar refuses: "a gone sidecar passes".
+ *  - drop the `.meta.json` check in `readDeleteExpectations`: "…not a .meta.json, is a caller bug".
+ *  - drop `sidecar` from the duplicate reply: "reports the committed sidecar a binary copy got". */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
@@ -34,6 +41,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { sha256OfWritten } from '../../packages/modoki/src/editor/utils/contentHash';
+import { resolveTextureSettings, resolveTextureType } from '../../packages/modoki/src/runtime/loaders/textureSettings';
 
 let dir: string;
 beforeEach(() => { dir = makeScratchDir('modoki-delete-preconditions-'); trashCalls.length = 0; });
@@ -144,7 +152,76 @@ describe('/api/delete-asset ifEmpty', () => {
   });
 });
 
+describe('/api/delete-asset ifSettings (#1696) — a sidecar is trashed only while it holds the import settings expected', () => {
+  // Typed as the resolvers take it (a sidecar document), not as the literal's narrower inferred shape.
+  const SIDE: { id: string; texture: Record<string, unknown> } = { id: 'aaaaaaaa-0000-4000-8000-000000000002', texture: { maxSize: 512 } };
+  const trash = (body: Record<string, unknown>) => post('/api/delete-asset', { paths: ['/t.png', '/t.png.meta.json'], rendererWrite: true, ...body });
+
+  it('a changed import setting refuses, and nothing is trashed — the file included', async () => {
+    put('t.png', 'PNG'); put('t.png.meta.json', JSON.stringify({ ...SIDE, texture: { maxSize: 256 } }));
+    const r = await trash({ ifMatch: { '/t.png': sha('PNG') }, ifSettings: { '/t.png.meta.json': SIDE } });
+    expect(r.status).toBe(409);
+    expect(r.body.conflicts).toEqual(['/t.png.meta.json']);
+    expect(trashCalls).toHaveLength(0);
+    expect(there('t.png') && there('t.png.meta.json')).toBe(true);
+  });
+
+  it('a bake\'s rewrite is not a change: resolved defaults, a stamped type, a cache block, a new version and id', async () => {
+    put('t.png', 'PNG');
+    put('t.png.meta.json', JSON.stringify({
+      version: 2, id: 'bbbbbbbb-0000-4000-8000-000000000003', type: resolveTextureType(SIDE),
+      texture: resolveTextureSettings(SIDE), textureCache: { hash: 'h', variants: [] },
+    }));
+    const r = await trash({ ifSettings: { '/t.png.meta.json': SIDE } });
+    expect(r.body.ok).toBe(true);
+    expect(there('t.png.meta.json')).toBe(false);
+  });
+
+  it('key order is not a change', async () => {
+    put('t.png.meta.json', '{"texture":{"maxSize":512},"sprites":[{"name":"a","x":0}],"id":"x"}');
+    const r = await trash({ ifSettings: { '/t.png.meta.json': { id: 'x', sprites: [{ x: 0, name: 'a' }], texture: { maxSize: 512 } } } });
+    expect(r.body.ok).toBe(true);
+  });
+
+  it('a non-resolved key (sprite slices) that changed refuses', async () => {
+    put('t.png.meta.json', '{"id":"x","sprites":[{"name":"b"}]}');
+    const r = await trash({ ifSettings: { '/t.png.meta.json': { id: 'x', sprites: [{ name: 'a' }] } } });
+    expect(r.status).toBe(409);
+  });
+
+  it('a gone sidecar passes — nothing to lose; an unparseable one refuses — somebody wrote something', async () => {
+    put('t.png', 'PNG');
+    expect((await trash({ ifSettings: { '/t.png.meta.json': SIDE } })).body.ok).toBe(true);
+    put('t.png', 'PNG'); put('t.png.meta.json', '{ not json');
+    expect((await trash({ ifSettings: { '/t.png.meta.json': SIDE } })).status).toBe(409);
+    expect(there('t.png.meta.json')).toBe(true);
+  });
+
+  it('the single-path form takes the document itself', async () => {
+    put('t.png.meta.json', JSON.stringify({ ...SIDE, texture: { maxSize: 64 } }));
+    expect((await post('/api/delete-asset', { path: '/t.png.meta.json', ifSettings: SIDE, rendererWrite: true })).status).toBe(409);
+    put('t.png.meta.json', JSON.stringify(SIDE));
+    expect((await post('/api/delete-asset', { path: '/t.png.meta.json', ifSettings: SIDE, rendererWrite: true })).body.ok).toBe(true);
+  });
+
+  it('a key outside paths, or one that is not a .meta.json, is a caller bug (400)', async () => {
+    put('t.png', 'PNG');
+    expect((await trash({ ifSettings: { '/other.png.meta.json': SIDE } })).status).toBe(400);
+    expect((await trash({ ifSettings: { '/t.png': SIDE } })).status).toBe(400);
+    expect(there('t.png')).toBe(true);
+  });
+});
+
 describe('/api/duplicate-asset', () => {
+  it('reports the committed sidecar a binary copy got (#1696): the source\'s, with a fresh id and no generated list', async () => {
+    put('t.png', 'PNG'); put('t.png.meta.json', JSON.stringify({ id: 'aaaaaaaa-0000-4000-8000-000000000004', texture: { maxSize: 128 }, generated: { meshes: [] } }));
+    const r = await post('/api/duplicate-asset', { from: '/t.png', to: '/t copy.png' });
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 't copy.png.meta.json'), 'utf8')) as Record<string, unknown>;
+    expect(r.body.sidecar).toEqual(onDisk);
+    expect(onDisk).toMatchObject({ texture: { maxSize: 128 } });
+    expect(onDisk.generated).toBeUndefined();
+  });
+
   it('reports the hash of the bytes it wrote, for the undo to trash the copy by', async () => {
     put('p.prefab.json', '{\n  "id": "aaaaaaaa-0000-4000-8000-000000000001",\n  "name": "P"\n}\n');
     const r = await post('/api/duplicate-asset', { from: '/p.prefab.json', to: '/p copy.prefab.json' });

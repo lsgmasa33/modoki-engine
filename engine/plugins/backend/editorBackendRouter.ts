@@ -48,7 +48,7 @@ import { fingerprintAssets } from '../takeAssets';
 import type { RenderOptions } from '../../packages/modoki/src/editor/recorder/renderOptions';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
 import { osascriptChooser, type NativeChooser } from './nativeChooser';
-import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
+import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION, sameImportSettings } from '../meta-sidecar';
 
 import { readFontAxes } from '../font-instance';
 // A leaf: the watcher's guard module imports nothing from the Vite plugin, so this router stays host-agnostic.
@@ -628,15 +628,18 @@ function ifMatchRefusal(absPath: string, expected: string | undefined): { ok: fa
 
 /** What a `/api/delete-asset` caller expects at each path (#1679), keyed by the request string. `sha256` is the
  *  hash of the bytes the file must hold (the `ifMatchRefusal` rule, BOM-stripped); `empty` is a folder that must
- *  hold nothing but OS litter. Single `path`: `ifMatch: string`, `ifEmpty: true`. Batch `paths`:
- *  `ifMatch: {[path]: sha}`, `ifEmpty: [path…]` — every key must be one of `paths`, or the request is refused,
- *  because a precondition on a path the request does not trash is a caller bug that would otherwise pass silently. */
-type DeleteExpectation = { sha256?: string; empty?: true };
+ *  hold nothing but OS litter; `settings` is the committed `.meta.json` document whose IMPORT SETTINGS the sidecar
+ *  must still hold (`sameImportSettings`, #1696 — a byte hash would refuse for nothing, since the scanner and every
+ *  bake rewrite a sidecar on their own). Single `path`: `ifMatch: string`, `ifEmpty: true`, `ifSettings: {…}`.
+ *  Batch `paths`: `ifMatch: {[path]: sha}`, `ifEmpty: [path…]`, `ifSettings: {[path]: {…}}` — every key must be one
+ *  of `paths`, or the request is refused, because a precondition on a path the request does not trash is a caller
+ *  bug that would otherwise pass silently. An `ifSettings` key must name a `.meta.json`. */
+type DeleteExpectation = { sha256?: string; empty?: true; settings?: { doc: Record<string, unknown> } };
 
 function readDeleteExpectations(
   body: unknown, inputs: readonly string[], batch: boolean,
 ): { map: Map<string, DeleteExpectation> } | { error: string } {
-  const { ifMatch, ifEmpty } = (body ?? {}) as { ifMatch?: unknown; ifEmpty?: unknown };
+  const { ifMatch, ifEmpty, ifSettings } = (body ?? {}) as { ifMatch?: unknown; ifEmpty?: unknown; ifSettings?: unknown };
   const map = new Map<string, DeleteExpectation>();
   const add = (p: string, e: DeleteExpectation) => map.set(p, { ...map.get(p), ...e });
   if (ifMatch !== undefined) {
@@ -664,6 +667,17 @@ function readDeleteExpectations(
       }
     }
   }
+  if (ifSettings !== undefined) {
+    const isDoc = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+    const entries: Array<[string, unknown]> = !batch ? [[inputs[0], ifSettings]] : isDoc(ifSettings) ? Object.entries(ifSettings) : [];
+    if (batch && !isDoc(ifSettings)) return { error: 'ifSettings must be a {path: sidecar document} map for paths' };
+    for (const [p, doc] of entries) {
+      if (!inputs.includes(p)) return { error: `ifSettings names ${p}, which is not in paths` };
+      if (!p.endsWith('.meta.json')) return { error: `ifSettings names ${p}, which is not a .meta.json sidecar` };
+      if (!isDoc(doc)) return { error: `ifSettings[${p}] must be a sidecar document (an object)` };
+      add(p, { settings: { doc } });
+    }
+  }
   return { map };
 }
 
@@ -672,6 +686,17 @@ function readDeleteExpectations(
  *  into. Anything else — a stray `.meta.json` included — is content somebody put there, and is not trashed. */
 const OS_LITTER = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
 
+/** Does the committed sidecar at `abs` no longer hold `expected`'s import settings (#1696)? A sidecar that is GONE
+ *  passes — nothing is lost, and the trash skips a missing path anyway. One that does not parse fails: somebody
+ *  wrote something there. Read raw, not through `readMetaSidecar`, which merges in the machine-local half. */
+function sidecarSettingsRefusal(abs: string, expected: Record<string, unknown>): boolean {
+  let bytes: Buffer;
+  try { bytes = fs.readFileSync(abs); } catch { return false; }
+  let onDisk: unknown;
+  try { onDisk = JSON.parse(stripUtf8Bom(bytes).toString('utf-8')); } catch { return true; }
+  return !sameImportSettings(expected, onDisk);
+}
+
 /** The request strings whose precondition fails, in request order. Synchronous on purpose — see the call site. */
 function deletePreconditionConflicts(expect: ReadonlyMap<string, DeleteExpectation>, absOf: ReadonlyMap<string, string>): string[] {
   const out: string[] = [];
@@ -679,6 +704,7 @@ function deletePreconditionConflicts(expect: ReadonlyMap<string, DeleteExpectati
     const abs = absOf.get(input);
     if (abs === undefined) { out.push(input); continue; }
     if (e.sha256 !== undefined && ifMatchRefusal(abs, e.sha256)) { out.push(input); continue; }
+    if (e.settings && sidecarSettingsRefusal(abs, e.settings.doc)) { out.push(input); continue; }
     if (e.empty) {
       let entries: string[] | null;
       try { entries = fs.statSync(abs).isDirectory() ? fs.readdirSync(abs) : null; } catch { entries = null; }
@@ -3494,7 +3520,7 @@ async function describeUnresolvedAgainstLiveWorld(
       if (conflicts.length > 0) {
         return json({
           ok: false, conflict: true, reason: 'if-match', conflicts,
-          error: `Nothing was trashed: ${conflicts.join(', ')} ${conflicts.length === 1 ? 'is' : 'are'} not what the caller expected (changed, gone, or a folder that is no longer empty).`,
+          error: `Nothing was trashed: ${conflicts.join(', ')} ${conflicts.length === 1 ? 'is' : 'are'} not what the caller expected (changed, gone, a folder that is no longer empty, or a sidecar whose import settings changed).`,
         }, 409);
       }
       // Listed before the trash, while a folder's children are still there to list (#1702).
@@ -4975,12 +5001,17 @@ async function describeUnresolvedAgainstLiveWorld(
       // trashes the copy only while it still holds them. Read back rather than predicted — a JSON copy gets a fresh id,
       // so the client cannot know its bytes, and a prediction here would be a second serializer to keep in step.
       const sha256 = crypto.createHash('sha256').update(stripUtf8Bom(fs.readFileSync(absTo))).digest('hex');
+      // And the committed sidecar a BINARY copy got (#1696), read back for the same reason: the undo trashes it only
+      // while its import settings are still these (`ifSettings`). Absent for a text asset, which has none.
+      let sidecar: unknown;
+      try { sidecar = JSON.parse(stripUtf8Bom(fs.readFileSync(`${absTo}.meta.json`)).toString('utf-8')); } catch { sidecar = undefined; }
       const manifestRebuilt = rebuildManifestInline(ctx);
       return json({
         ok: true,
         saved: true,
         guid: newGuid,
         sha256,
+        ...(sidecar !== null && typeof sidecar === 'object' && !Array.isArray(sidecar) ? { sidecar } : {}),
         manifestRebuilt,
         ...(dupGate.kind === 'held'
           ? {

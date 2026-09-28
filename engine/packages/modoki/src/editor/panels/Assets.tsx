@@ -1180,7 +1180,7 @@ export default function Assets() {
     taken.add(toPath);
     console.log(`[Assets] Duplicated ${asset.path} → ${toPath}`);
     // The copy's hash rides into the undo, which trashes the copy only while it still holds these bytes (#1679).
-    return { asset, toPath, sha256: dup.sha256 };
+    return { asset, toPath, sha256: dup.sha256, sidecar: dup.sidecar };
   }, []);
 
   // Build + push the coalesced duplicate undo (builder in assetUndo.ts — F6).
@@ -1365,7 +1365,7 @@ export default function Assets() {
       } else {
         // The copy's hash rides into the undo (`PasteMove.sha256`, #1679).
         const dup = await duplicateAsset(from, to);
-        if (dup.ok) done.push({ from, to, sha256: dup.sha256 });
+        if (dup.ok) done.push({ from, to, sha256: dup.sha256, sidecar: dup.sidecar });
       }
     }
     if (done.length === 0) return;

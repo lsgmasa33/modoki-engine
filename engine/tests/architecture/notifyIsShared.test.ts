@@ -184,6 +184,9 @@ const insideScanDirs = (rel: string): boolean =>
  *  Both were invisible to the text detector until #1241: the element is called inside a spread
  *  (`...p(set)`), and the regex refused a call preceded by `.` so as not to read `entity.id()`.
  *
+ *  - `runtime/loaders/sidecarSettings.ts` — `for (const { keys, resolve } of BAKE_RESOLVED)` in `sameImportSettings`
+ *    (#1696). A fixed module table of pure import-settings RESOLVERS whose return values are compared; no subscriber
+ *    set, no state mutated before the loop, nothing to starve.
  *  - `engine/plugins/load-project-config.ts` — `for (const [filename, read] of [[…, readRawProjectConfig],
  *    […, readRawProjectUserConfig]] as const)`. An inline two-element array of READERS whose return
  *    value is used; the header lists this shape as one the guard does not mean to match, and it is
@@ -239,6 +242,7 @@ const EXEMPT: Readonly<Record<string, ExemptKind>> = {
   'engine/packages/modoki/src/runtime/core/screenBounds.ts :: p': 'query',
   'engine/packages/modoki/src/editor/panels/assetEditorBindings.ts :: repair': 'query',
   'engine/plugins/load-project-config.ts :: read': 'query',
+  'engine/packages/modoki/src/runtime/loaders/sidecarSettings.ts :: resolve': 'query',
   'games/wordweave/runtime/stem.ts :: coValidate': 'query',
   'games/slime-shooter/runtime/stem.ts :: coValidate': 'query',
   'engine/packages/modoki/src/editor/scene/authoredWorld.ts :: isPosed': 'query',

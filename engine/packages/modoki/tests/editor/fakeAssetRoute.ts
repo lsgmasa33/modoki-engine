@@ -4,11 +4,14 @@
  *  preconditions the real routes apply, over those stored bytes:
  *  - `/api/write-file`: `ifMatch` → 409 `reason:'if-match'` unless sha256(stored bytes) equals it, or nothing is stored;
  *    `ifNoneMatch:'*'` → 409 `reason:'if-none-match'` when anything is stored.
- *  - `/api/delete-asset`: every `ifMatch`/`ifEmpty` checked first, and one miss trashes NOTHING (409 `reason:'if-match'`
- *    with `conflicts`); otherwise each present path (a folder with everything under it) is removed, absent ones are
- *    `missing`. A lone absent `path` with no precondition is a 404.
+ *  - `/api/delete-asset`: every `ifMatch`/`ifEmpty`/`ifSettings` checked first, and one miss trashes NOTHING (409
+ *    `reason:'if-match'` with `conflicts`); otherwise each present path (a folder with everything under it) is removed,
+ *    absent ones are `missing`. A lone absent `path` with no precondition is a 404. `ifSettings` (#1696) is judged by
+ *    the route's OWN `sameImportSettings`, so the two cannot disagree about what counts as a settings change; a gone
+ *    sidecar passes and an unparseable one refuses, as on the route.
  *  - `/api/duplicate-asset`: 409 on an occupied destination; a `.json` copy is RE-MINTED (a fresh `id`), a binary copy
- *    takes its `.meta.json` along; answers the sha256 of the copy's stored bytes.
+ *    takes its `.meta.json` along (the source's, with a fresh `id` and no `generated`, as `duplicateAssetFile` does);
+ *    answers the sha256 of the copy's stored bytes and, for a binary, the sidecar it wrote.
  *  - `/api/rescan-assets`: runs `onRescan` (a test's stand-in for the scanner's GUID heal).
  *  - any other GET: serves the stored bytes.
  *
@@ -17,6 +20,7 @@
  *  `engine/tests/plugins/deleteAssetPreconditions.test.ts`; this fake only has to agree with it. */
 
 import { createHash } from 'node:crypto';
+import { sameImportSettings } from '../../src/runtime/loaders/sidecarSettings';
 
 export interface FakeAssetRoute {
   disk: Map<string, Buffer>;
@@ -67,14 +71,25 @@ export function makeFakeAssetRoute(): FakeAssetRoute {
       }
 
       if (u.endsWith('/api/delete-asset')) {
-        const b = body as { path?: string; paths?: string[]; ifMatch?: string | Record<string, string>; ifEmpty?: boolean | string[] };
+        const b = body as { path?: string; paths?: string[]; ifMatch?: string | Record<string, string>; ifEmpty?: boolean | string[]; ifSettings?: Record<string, unknown> };
         const batch = Array.isArray(b.paths);
         const inputs = batch ? b.paths! : [b.path!];
         const expectSha = new Map<string, string>(
           typeof b.ifMatch === 'string' ? [[inputs[0], b.ifMatch]] : Object.entries(b.ifMatch ?? {}),
         );
         const expectEmpty = new Set<string>(b.ifEmpty === true ? [inputs[0]] : Array.isArray(b.ifEmpty) ? b.ifEmpty : []);
+        // The single-`path` form takes the document itself; the batch form a {path: document} map — as on the route.
+        const expectSettings = new Map<string, unknown>(b.ifSettings === undefined ? [] : batch ? Object.entries(b.ifSettings) : [[inputs[0], b.ifSettings]]);
+        // The route's caller-bug check (`readDeleteExpectations`): only a committed sidecar carries a settings expectation.
+        const notSidecar = [...expectSettings.keys()].find((p) => !p.endsWith('.meta.json'));
+        if (notSidecar) return reply(400, { error: `ifSettings names ${notSidecar}, which is not a .meta.json sidecar` });
+        const settingsChanged = (p: string) => {
+          const cur = disk.get(p);
+          if (cur === undefined) return false;
+          try { return !sameImportSettings(expectSettings.get(p), JSON.parse(cur.toString('utf8'))); } catch { return true; }
+        };
         const conflicts = inputs.filter((p) => {
+          if (expectSettings.has(p) && settingsChanged(p)) return true;
           if (expectSha.has(p)) { const cur = disk.get(p); if (cur === undefined || sha256(cur) !== expectSha.get(p)) return true; }
           if (expectEmpty.has(p)) return !folders.has(p) || under(p).some((k) => !k.endsWith('/.DS_Store'));
           return false;
@@ -82,7 +97,7 @@ export function makeFakeAssetRoute(): FakeAssetRoute {
         if (conflicts.length) return reply(409, { ok: false, conflict: true, reason: 'if-match', conflicts });
         const present = inputs.filter((p) => disk.has(p) || folders.has(p));
         const missing = inputs.filter((p) => !present.includes(p));
-        if (!batch && present.length === 0 && expectSha.size === 0 && expectEmpty.size === 0) return reply(404, { error: 'File not found' });
+        if (!batch && present.length === 0 && expectSha.size === 0 && expectEmpty.size === 0 && expectSettings.size === 0) return reply(404, { error: 'File not found' });
         for (const p of present) { disk.delete(p); folders.delete(p); for (const k of under(p)) { disk.delete(k); folders.delete(k); } }
         return reply(200, { ok: true, trashed: present.length, missing, failed: [] });
       }
@@ -93,10 +108,15 @@ export function makeFakeAssetRoute(): FakeAssetRoute {
         if (src === undefined) return reply(404, { error: 'Source not found' });
         if (disk.has(b.to)) return reply(409, { error: 'Destination exists' });
         let copy = src;
+        let sidecar: Record<string, unknown> | undefined;
         if (b.to.endsWith('.json')) copy = Buffer.from(`${JSON.stringify({ ...JSON.parse(src.toString('utf8')), id: `dup-${++dups}` }, null, 2)}\n`);
-        else if (disk.has(`${b.from}.meta.json`)) disk.set(`${b.to}.meta.json`, Buffer.from(`{"id":"dup-meta-${++dups}"}`));
+        else if (disk.has(`${b.from}.meta.json`)) {
+          const { generated: _generated, ...meta } = JSON.parse(disk.get(`${b.from}.meta.json`)!.toString('utf8')) as Record<string, unknown>;
+          sidecar = { ...meta, id: `dup-meta-${++dups}` };
+          disk.set(`${b.to}.meta.json`, Buffer.from(JSON.stringify(sidecar)));
+        }
         disk.set(b.to, copy);
-        return reply(200, { ok: true, saved: true, sha256: sha256(copy) });
+        return reply(200, { ok: true, saved: true, sha256: sha256(copy), ...(sidecar ? { sidecar } : {}) });
       }
 
       if (u.endsWith('/api/rescan-assets')) { route.onRescan(); return reply(200, {}); }

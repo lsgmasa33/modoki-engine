@@ -26,6 +26,12 @@
  *  - no settled baseline for a scanner-stamped JSON (`settledHashes` returns nothing, or skips the rescan, or the
  *    undo ignores `sha256`): "an import the scanner re-stamps".
  *  - folder trash sends no `ifEmpty`: both folder cases.
+ *  #1696 (the settings precondition on a binary's committed sidecar), each red on its named cases only:
+ *  - `trashCopies` sends no `ifSettings`: "duplicate → edit the copy's import settings" and "a pasted copy whose …".
+ *  - the delete redo sends no `ifSettings`: "delete → undo → edit the restored import settings".
+ *  - `sameImportSettings` compares raw (no resolver): "a NEVER-BAKED texture" and "a bake rewrites the restored".
+ *  - the duplicate redo keeps the first copy's sidecar: "the undo after a redo expects the redo's sidecar".
+ *  - `settingsExpectations` keeps `.meta.local.json`: "a restored machine-local half rides unguarded".
  *  Close-out review cases, each red alone: an OS-refused file's sidecar not overwritten ("…the original GUID comes
  *  back"); a failed write not stopping the asset ("a FAILED sidecar write…"); hashes taken after the writes ("…BEFORE
  *  the first write"); no BOM strip in `sha256OfBytes` ("…UTF-8 BOM…"); the settled read hashing decoded text ("…hashes
@@ -42,6 +48,7 @@ import { writeAssetFileGuarded } from '../../src/editor/backend/editorBackend';
 import { sha256OfWritten } from '../../src/editor/utils/contentHash';
 import { UndoRefusedError } from '../../src/editor/undo/undoFailure';
 import { useEditorStore } from '../../src/editor/store/editorStore';
+import { resolveTextureSettings, resolveTextureType } from '../../src/runtime/loaders/textureSettings';
 import type { AssetEntry } from '../../src/editor/utils/assetPaths';
 
 let route: FakeAssetRoute;
@@ -339,7 +346,7 @@ describe('makeDuplicateUndo / makePasteUndo (copy)', () => {
   async function duplicate(from: string, to: string) {
     const r = await duplicateAssetFileReport(from, to);
     expect(r.ok).toBe(true);
-    return { asset: A(from), toPath: to, sha256: r.sha256 };
+    return { asset: A(from), toPath: to, sha256: r.sha256, sidecar: r.sidecar };
   }
 
   it('accept side: undo trashes the copy with its sidecars', async () => {
@@ -383,6 +390,95 @@ describe('makeDuplicateUndo / makePasteUndo (copy)', () => {
     route.put('/assets/t copy.png', 'PNG');
     await expect(makeDuplicateUndo([{ asset: A('/assets/t.png'), toPath: '/assets/t copy.png' }], vi.fn()).undo()).rejects.toBeInstanceOf(UndoRefusedError);
     expect(route.disk.has('/assets/t copy.png')).toBe(true);
+  });
+});
+
+describe('a binary\'s committed sidecar carries its IMPORT SETTINGS as a precondition (#1696)', () => {
+  const PNG = '/assets/t.png';
+  const COPY = '/assets/t copy.png';
+  /** What a bake leaves in a sidecar with no user action: the resolved settings + type, a cache block, the stamp. */
+  const baked = (meta: Record<string, unknown>) => ({
+    ...meta, version: 2, type: resolveTextureType(meta), texture: resolveTextureSettings(meta),
+    textureCache: { hash: 'h', variants: [] },
+  });
+  const sidecarOf = (p: string) => JSON.parse(bytesOf(`${p}.meta.json`)!) as Record<string, unknown>;
+  async function duplicated() {
+    route.put(PNG, 'PNG'); route.put(`${PNG}.meta.json`, '{"id":"t","texture":{"maxSize":512}}'); // never baked
+    const r = await duplicateAssetFileReport(PNG, COPY);
+    return makeDuplicateUndo([{ asset: A(PNG), toPath: COPY, sha256: r.sha256, sidecar: r.sidecar }], vi.fn());
+  }
+
+  it('duplicate → edit the copy\'s import settings → save → undo: refused, and the copy and its sidecar survive', async () => {
+    const action = await duplicated();
+    route.put(`${COPY}.meta.json`, JSON.stringify({ ...sidecarOf(COPY), texture: { maxSize: 256 } }));
+    await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
+    expect(route.disk.has(COPY)).toBe(true);
+    expect(sidecarOf(COPY).texture).toEqual({ maxSize: 256 });
+  });
+
+  it('duplicate a NEVER-BAKED texture → view it (the bake fills in defaults) → undo: trashed, no refusal', async () => {
+    const action = await duplicated();
+    route.put(`${COPY}.meta.json`, JSON.stringify(baked(sidecarOf(COPY))));
+    await action.undo();
+    expect(route.disk.has(COPY)).toBe(false);
+    expect(route.disk.has(`${COPY}.meta.json`)).toBe(false);
+  });
+
+  it('the undo after a redo expects the REDO\'s sidecar, which copies the source as it is then', async () => {
+    const action = await duplicated();
+    await action.undo();
+    route.put(`${PNG}.meta.json`, '{"id":"t","texture":{"maxSize":64}}'); // the source's settings changed meanwhile
+    await action.redo();
+    expect(sidecarOf(COPY).texture).toEqual({ maxSize: 64 });
+    await action.undo();
+    expect(route.disk.has(`${COPY}.meta.json`)).toBe(false);
+  });
+
+  it('a pasted copy whose import settings were edited refuses the undo', async () => {
+    route.put(PNG, 'PNG'); route.put(`${PNG}.meta.json`, '{"id":"t"}');
+    const r = await duplicateAssetFileReport(PNG, '/b/t.png');
+    const action = makePasteUndo({ op: 'copy', done: [{ from: PNG, to: '/b/t.png', sha256: r.sha256, sidecar: r.sidecar }], refresh: vi.fn() });
+    route.put('/b/t.png.meta.json', JSON.stringify({ ...sidecarOf('/b/t.png'), texture: { srgb: false } }));
+    await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
+    expect(route.disk.has('/b/t.png.meta.json')).toBe(true);
+  });
+
+  it('delete → undo → edit the restored import settings → save → redo: refused, nothing trashed', async () => {
+    const a = binaryAsset('/assets/a.png', 'AAAA', '{"id":"ga","texture":{"maxSize":512}}');
+    const action = makeDeleteUndo([a], vi.fn());
+    await action.undo();
+    route.put('/assets/a.png.meta.json', '{"id":"ga","texture":{"maxSize":128}}');
+    await expect(action.redo()).rejects.toBeInstanceOf(UndoRefusedError);
+    expect(bytesOf('/assets/a.png')).toBe('AAAA');
+    expect(bytesOf('/assets/a.png.meta.json')).toBe('{"id":"ga","texture":{"maxSize":128}}');
+  });
+
+  it('delete → undo → a bake rewrites the restored sidecar → redo: trashed, no refusal', async () => {
+    const a = binaryAsset('/assets/a.png', 'AAAA', '{"id":"ga","texture":{"maxSize":512}}');
+    const action = makeDeleteUndo([a], vi.fn());
+    await action.undo();
+    route.put('/assets/a.png.meta.json', JSON.stringify(baked(sidecarOf('/assets/a.png'))));
+    await action.redo();
+    expect(route.disk.has('/assets/a.png')).toBe(false);
+    expect(route.disk.has('/assets/a.png.meta.json')).toBe(false);
+  });
+
+  it('a restored machine-local half rides unguarded: the redo still trashes the whole asset', async () => {
+    const a = binaryAsset('/assets/a.png', 'AAAA', '{"id":"ga"}');
+    a.snapshots.push({ path: '/assets/a.png.meta.local.json', content: '{"textureCache":{"bytes":4}}' });
+    const action = makeDeleteUndo([a], vi.fn());
+    await action.undo();
+    expect(route.disk.has('/assets/a.png.meta.local.json')).toBe(true);
+    await action.redo();
+    expect(route.disk.has('/assets/a.png')).toBe(false);
+    expect(route.disk.has('/assets/a.png.meta.local.json')).toBe(false);
+  });
+
+  it('the request names the committed sidecar in ifSettings, and never the machine-local half', async () => {
+    const action = await duplicated();
+    await action.undo();
+    const del = route.calls.filter((c) => c.url.endsWith('/api/delete-asset')).at(-1)!;
+    expect(Object.keys(del.body!.ifSettings as object)).toEqual([`${COPY}.meta.json`]);
   });
 });
 
