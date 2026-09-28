@@ -41,6 +41,7 @@
 import { isPointerBlocked, isOutsidePointerScope } from '../core/pointerBlockers';
 import type { GestureFrame, InputFrame } from '../core/inputActions';
 import type { InputSource } from './inputSources';
+import { provesEarlierPointersLifted } from './strandedPointers';
 
 /** How long a press may last and still count as a tap, in ms. */
 export const DEFAULT_TAP_MAX_MS = 250;
@@ -90,6 +91,8 @@ interface LivePointer {
   id: number;
   x: number;
   y: number;
+  /** The event's `pointerType`; `'emulated'` for the mouse emulation's two synthetic fingers. */
+  type: string;
 }
 
 /** Pointers currently down, in the order they arrived. The first two drive the pinch. */
@@ -147,8 +150,8 @@ const find = (id: number): LivePointer | undefined => live.find((p) => p.id === 
 // ⚠️ EVERY mutation of `live` goes through these three. `live.push` / `live.length = 0` written
 // inline would leave the version describing a set that has already changed, and nothing would
 // error — the consumer would simply stop seeing a discontinuity it needs. Keep it that way.
-function addPointer(id: number, x: number, y: number): void {
-  live.push({ id, x, y });
+function addPointer(id: number, x: number, y: number, type: string): void {
+  live.push({ id, x, y, type });
   pointerSetVersion++;
 }
 
@@ -285,8 +288,8 @@ function startEmulation(e: PointerEvent): void {
   // Both fingers begin ON the anchor. The pinch does not ARM until they separate — see
   // EMULATED_PINCH_SEED_PX for why a zero starting spread cannot be divided by.
   clearPointers();
-  addPointer(-1, e.clientX, e.clientY);
-  addPointer(-2, e.clientX, e.clientY);
+  addPointer(-1, e.clientX, e.clientY, 'emulated');
+  addPointer(-2, e.clientX, e.clientY, 'emulated');
   phase = 'idle';
   tapEligible = false;
   positionEmulated(e.clientX, e.clientY);
@@ -311,7 +314,20 @@ function handleEmulatedMove(e: PointerEvent): boolean {
   return true;
 }
 
+/** End every listed pointer of `type` whose up or cancel never came — for a real primary press, which
+ *  proves none of them is still down (`strandedPointers.ts`, #1706). Ends like a cancel: a gesture
+ *  that lost its release did not complete, so it makes no tap. */
+function dropStranded(type: string): void {
+  const stranded = live.filter((p) => p.type === type);
+  if (stranded.length === 0) return;
+  for (const p of stranded) removePointer(p.id);
+  endGesture();
+}
+
 function onPointerDown(e: PointerEvent): void {
+  // Before the scope and block checks, as in pointerSource: a real press anywhere proves the strand
+  // lifted, wherever the press itself lands.
+  if (provesEarlierPointersLifted(e)) dropStranded(e.pointerType);
   // Filter at INGESTION, the same discipline pointerSource follows: a press that starts on blocked
   // chrome must never enter the list, because filtering later would leave the gesture half-tracked.
   // The host's ingestion scope applies here for the same reason (#1182): outside it (editor chrome),
@@ -319,7 +335,7 @@ function onPointerDown(e: PointerEvent): void {
   if (isOutsidePointerScope(e.target) || isPointerBlocked(e.target)) return;
   if (isEmulationStart(e)) { startEmulation(e); return; }
   if (find(e.pointerId)) return;
-  addPointer(e.pointerId, e.clientX, e.clientY);
+  addPointer(e.pointerId, e.clientX, e.clientY, e.pointerType);
 
   if (live.length === 1) {
     phase = 'pending';

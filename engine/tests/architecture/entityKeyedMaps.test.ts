@@ -987,6 +987,8 @@ const HELD_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'alive-checked: a pool of sprites the presenter spawned; `pool` replaces any dead entry before it is drawn or hidden; games/slime-shooter/runtime/slime/presenter.ts:161' },
   { item: 'games/slime-shooter/runtime/slime/presenter.ts::State.dragCells',
     reason: 'alive-checked: a pool of sprites the presenter spawned; `pool` replaces any dead entry before it is drawn or hidden; games/slime-shooter/runtime/slime/presenter.ts:161' },
+  { item: 'games/slime-shooter/runtime/slime/presenter.ts::State.comboTexts',
+    reason: 'alive-checked: pools of combo-popup text entities the presenter spawned; `renderCombos` replaces any dead entry before it is drawn or hidden; games/slime-shooter/runtime/slime/presenter.ts:662' },
   { item: 'engine/packages/modoki/src/runtime/core/actionRegistry.ts::UIActionContext.target',
     reason: 'brief: built per dispatch and handed straight to the handler; runtime/core/actionRegistry.ts:185' },
   { item: 'engine/packages/modoki/src/runtime/core/actionRegistry.ts::DispatchOptions.target',

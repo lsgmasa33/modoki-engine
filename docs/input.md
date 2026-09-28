@@ -174,9 +174,11 @@ in a shipped game and fails open. The editor's policy is the Game panel's play a
 
 **A stranded synthetic press, and why a real finger reclaims it (#299).** The primary-touch rule —
 the first pointer down owns the gesture, later pointers are ignored until it lifts — assumes the
-owning press eventually lifts. (This section is about `pointerSource` specifically; `gestureSource`
-listens to the same events on an independent list and is not affected either way — see "Multi-touch
-gestures" below.) A press from the **device debug bridge** need not: `device_pointer
+owning press eventually lifts. (This section is about `pointerSource` specifically. `gestureSource`
+and `touchControlSource` keep their own per-pointer lists, which this takeover does not reach: a held
+`device_pointer` press, an untrusted mouse, stays in `gestureSource`'s list until its `up`, and a real
+touch meanwhile reads as a second finger. The stranded REAL press below is handled in all three.)
+A press from the **device debug bridge** need not: `device_pointer
 {action:'down'}` holds across calls BY DESIGN, so an agent that never sends the matching `up` leaves
 `activeId` latched with no live pointer behind it, and nothing recovers it (`blur`/`visibilitychange`
 /play-start resets do not fire in a running shipped game). From then on every `pointerdown` — the
@@ -200,6 +202,30 @@ hand-rolled the clear and skipped the velocity reset, and because the pointer-bl
 `pointerPredictedPos` extrapolates from. The bridge closes the other half: dropping the lease
 releases a press left held (`releaseHeldPointer`), because that is the moment the agent provably
 cannot send the `up` itself.
+
+**A stranded REAL press, and why the next primary press ends it (#1706).** A finger can strand the
+pointer too: the platform may never send its `pointerup` or `pointercancel`. Observed on the owner's
+iPhone Air (iOS 26.6) in Slime Shooter: after a drag the owner thinks ended off the screen edge, the
+game took no drag at all. `Input.pointer` read `down: true` at the old touch, and #299's takeover
+cannot help, because the owner of the gesture is trusted. What proves the old finger gone is the next
+real press being **primary**. Pointer Events define the primary pointer as the first of its type to
+go down while none of that type is active, and on the Air each new touch arrived `isPrimary: true`,
+alone in `TouchEvent.touches`. A real second finger during a held drag arrives `isPrimary: false` with
+both fingers listed, so the primary-touch rule still holds. iOS keeps it per pointer, as the spec
+says: once the first finger lifts, the second stays non-primary to its own `pointerup`, though it is
+then the only touch (3 of 3 on the same phone). That rules out "primary = first in the event's touch
+list", which WebKit's open-source GTK/WPE dispatch does and the close-out review suspected of iOS,
+whose dispatcher is closed source.
+
+The rule is `provesEarlierPointersLifted` (`runtime/input/strandedPointers.ts`): a trusted,
+primary press. Each of the three sources that track pointers applies it to its own strands:
+- `pointerSource` adopts the press, if its type matches the gesture's, through the same `endGesture()`
+  as #299;
+- `gestureSource` drops listed pointers of that type, and ends the gesture like a cancel, with no tap;
+- `touchControlSource` releases held controls of that type.
+
+A synthetic press never proves it, because the bridge's `isPrimary` is its own claim. What made iOS
+drop the release is not known: the probe went in after it happened.
 
 **…and a later `device_tap`/`device_drag` releases it too (#305).** The takeover above protects the
 HUMAN, whose finger is trusted. It does nothing for the AGENT: a synthetic tap is not `isTrusted`

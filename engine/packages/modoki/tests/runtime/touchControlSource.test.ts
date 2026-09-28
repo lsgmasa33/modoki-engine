@@ -30,6 +30,25 @@ function firePointer(type: string, x: number, y: number, pointerId = 1, target: 
   target.dispatchEvent(ev);
 }
 
+/** A REAL touch: `isTrusted` when the source sees it, with `isPrimary` and `pointerType` set — the
+ *  forge `pointerSource.test.ts`'s `fireRealPointer` documents (jsdom's impl object, re-set from a
+ *  CAPTURE listener on `window` because dispatch marks the event untrusted). Throws when this jsdom
+ *  cannot forge it, so the #1706 tests below cannot pass on an untrusted event. */
+function fireRealTouch(
+  type: string, x: number, y: number, pointerId: number, isPrimary: boolean,
+  target: EventTarget = document.body, pointerType = 'touch',
+): void {
+  const ev = new MouseEvent(type, { clientX: x, clientY: y, bubbles: true });
+  Object.assign(ev, { pointerId, isPrimary, pointerType });
+  const forge = (e: Event) => {
+    const impl = Object.getOwnPropertySymbols(e).find((sym) => sym.description === 'impl');
+    if (impl) (e as unknown as Record<symbol, { isTrusted: boolean }>)[impl].isTrusted = true;
+    if (!e.isTrusted) throw new Error('cannot forge a trusted event in this jsdom — the #1706 tests would be vacuous');
+  };
+  window.addEventListener(type, forge, { capture: true });
+  try { target.dispatchEvent(ev); } finally { window.removeEventListener(type, forge, { capture: true }); }
+}
+
 let root: HTMLElement;
 /** Coordinate → element, backing the `elementFromPoint` stub. */
 const atPoint = new Map<string, Element>();
@@ -311,5 +330,50 @@ describe('touchControlSource', () => {
     const f2 = createInputFrame(); pointerSource.sample(f2);
     expect(f2.pointer.down).toBe(true);
     expect(f2.pointer.dragX).toBe(40);
+  });
+});
+
+describe('a d-pad press whose release never came (#1706)', () => {
+  /** A touch's up/cancel can be lost (observed on the owner's iPhone Air, iOS 26.6). Here it would hold
+   *  its arrow forever — the character walks on with no finger on the pad. The next real PRIMARY touch
+   *  proves the stranded one lifted. */
+  it('THE REGRESSION: the next real primary touch, anywhere, releases the stranded arrow', () => {
+    const left = control(root, 'moveLeft', 10, 10);
+    fireRealTouch('pointerdown', 10, 10, 55, true, left); // its up never comes
+    expect(sample().axes.moveX).toBe(-1);
+
+    fireRealTouch('pointerdown', 300, 400, 56, true); // on the scene, not the pad
+    expect(sample().axes.moveX).toBe(0);
+  });
+
+  it('a real SECOND finger (not primary) leaves the held arrow alone — walk while you orbit', () => {
+    const left = control(root, 'moveLeft', 10, 10);
+    fireRealTouch('pointerdown', 10, 10, 58, true, left);
+    fireRealTouch('pointerdown', 300, 400, 59, false);
+    expect(sample().axes.moveX).toBe(-1);
+  });
+
+  it('a SYNTHETIC press claiming to be primary does not release a real one — only the browser can prove it', () => {
+    const left = control(root, 'moveLeft', 10, 10);
+    fireRealTouch('pointerdown', 10, 10, 58, true, left);
+    const ev = new MouseEvent('pointerdown', { clientX: 300, clientY: 400, bubbles: true });
+    Object.assign(ev, { pointerId: 9, isPrimary: true, pointerType: 'touch' });
+    window.dispatchEvent(ev);
+    expect(sample().axes.moveX).toBe(-1);
+  });
+
+  it('a real MOUSE press whose up was lost is released by the next real click', () => {
+    const left = control(root, 'moveLeft', 10, 10);
+    fireRealTouch('pointerdown', 10, 10, 1, true, left, 'mouse'); // its up never comes
+    expect(sample().axes.moveX).toBe(-1);
+    fireRealTouch('pointerdown', 300, 400, 1, true, document.body, 'mouse');
+    expect(sample().axes.moveX).toBe(0);
+  });
+
+  it('a primary press of ANOTHER pointer type does not release a touch', () => {
+    const left = control(root, 'moveLeft', 10, 10);
+    fireRealTouch('pointerdown', 10, 10, 58, true, left);
+    fireRealTouch('pointerdown', 300, 400, 1, true, document.body, 'mouse');
+    expect(sample().axes.moveX).toBe(-1);
   });
 });

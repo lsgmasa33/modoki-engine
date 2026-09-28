@@ -25,7 +25,27 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-interface SendOpts { on?: EventTarget; pointerType?: string; shiftKey?: boolean; button?: number }
+interface SendOpts {
+  on?: EventTarget; pointerType?: string; shiftKey?: boolean; button?: number;
+  /** Set `isPrimary` (left undefined otherwise, as every older test here sends it). */
+  isPrimary?: boolean;
+  /** Deliver it `isTrusted`, as a real finger — see `forgeTrusted`. */
+  real?: boolean;
+}
+
+/** Make the event `isTrusted` by the time the source's bubble-phase listener sees it — the forge
+ *  `pointerSource.test.ts`'s `fireRealPointer` documents: jsdom's internal impl object, re-set from a
+ *  CAPTURE listener because dispatch marks the event untrusted. Throws when this jsdom cannot, so a
+ *  test of a trusted-only rule cannot pass vacuously on an untrusted event. */
+function forgeTrusted(type: string): () => void {
+  const forge = (e: Event) => {
+    const impl = Object.getOwnPropertySymbols(e).find((sym) => sym.description === 'impl');
+    if (impl) (e as unknown as Record<symbol, { isTrusted: boolean }>)[impl].isTrusted = true;
+    if (!e.isTrusted) throw new Error('cannot forge a trusted event in this jsdom — the #1706 tests would be vacuous');
+  };
+  window.addEventListener(type, forge, { capture: true });
+  return () => window.removeEventListener(type, forge, { capture: true });
+}
 
 /** Dispatch one pointer event with a controlled id, position and timestamp. */
 function send(type: string, id: number, x: number, y: number, t: number, opts: SendOpts = {}): void {
@@ -38,8 +58,11 @@ function send(type: string, id: number, x: number, y: number, t: number, opts: S
   ev.shiftKey = opts.shiftKey ?? false;
   ev.ctrlKey = false;
   ev.altKey = false;
+  if (opts.isPrimary !== undefined) ev.isPrimary = opts.isPrimary;
   Object.defineProperty(ev, 'timeStamp', { value: t });
-  (opts.on ?? window).dispatchEvent(ev);
+  // A real event is dispatched below `window`, so the capture-phase forge runs before the source.
+  const unforge = opts.real ? forgeTrusted(type) : null;
+  try { (opts.on ?? (opts.real ? document.body : window)).dispatchEvent(ev); } finally { unforge?.(); }
 }
 
 /**
@@ -308,6 +331,72 @@ describe('pinch', () => {
     send('pointerup', 1, 100, 100, T0 + 40); // inside the tap window, never moved
 
     expect(sample().gesture.tapped).toBe(false);
+  });
+});
+
+describe('a touch whose release never came (#1706)', () => {
+  /** On the owner's iPhone Air a touch's up/cancel never arrived, so it stayed in the list and every
+   *  later touch read as a SECOND finger — a pinch, never a tap or a pan. Each later touch arrived
+   *  `isPrimary: true`, which proves the stranded one lifted. */
+  const real = (isPrimary: boolean): SendOpts => ({ real: true, isPrimary });
+
+  it('THE REGRESSION: the next real primary touch drops the strand, so it taps instead of pinching', () => {
+    send('pointerdown', 55, 209, 667, T0 + 0, real(true)); // its up never comes
+    sample();
+
+    send('pointerdown', 56, 212, 689, T0 + 5000, real(true));
+    let f = sample();
+    expect(f.gesture.pinchStarted).toBe(false);
+    expect(f.gesture.pointerCount).toBe(1);
+    send('pointerup', 56, 213, 690, T0 + 5100, real(true));
+    f = sample();
+    expect(f.gesture.tapped).toBe(true);
+    expect(f.gesture.pointerCount).toBe(0);
+  });
+
+  it('a real SECOND finger (not primary) still starts a pinch', () => {
+    send('pointerdown', 58, 215, 677, T0 + 0, real(true));
+    send('pointerdown', 59, 103, 677, T0 + 1000, real(false)); // as the Air sends it
+    const f = sample();
+    expect(f.gesture.pinchStarted).toBe(true);
+    expect(f.gesture.pointerCount).toBe(2);
+  });
+
+  it('a pinch whose two ups were both lost ENDS when the next real primary touch drops them — pinchEnded fires', () => {
+    // A consumer that commits its zoom on pinchEnded would otherwise never get one.
+    send('pointerdown', 58, 100, 300, T0 + 0, real(true));
+    send('pointerdown', 59, 300, 300, T0 + 5, real(false));
+    expect(sample().gesture.pinchStarted).toBe(true); // both ups never come
+    send('pointerdown', 60, 200, 500, T0 + 3000, real(true));
+    const f = sample();
+    expect(f.gesture.pinchEnded).toBe(true);
+    expect(f.gesture.pinching).toBe(false);
+    expect(f.gesture.pointerCount).toBe(1);
+  });
+
+  it('a real MOUSE whose up was lost is dropped by the next real click, which then taps where IT went down', () => {
+    // The mouse is pointer 1 every time, so without the drop the new click's down is ignored as a
+    // pointer already listed, and its up ends the OLD press — long past the tap window: no tap.
+    const click = { real: true, isPrimary: true, pointerType: 'mouse' };
+    send('pointerdown', 1, 100, 100, T0 + 0, click); // its up never comes
+    send('pointerdown', 1, 150, 120, T0 + 4000, click);
+    send('pointerup', 1, 150, 120, T0 + 4050, click);
+    const f = sample();
+    expect(f.gesture.tapped).toBe(true);
+    expect(f.gesture.tapX).toBe(150);
+    expect(f.gesture.tapY).toBe(120);
+  });
+
+  it('a SYNTHETIC press claiming to be primary does not drop a real touch — only the browser can prove it', () => {
+    send('pointerdown', 58, 215, 677, T0 + 0, real(true));
+    send('pointerdown', 9, 103, 677, T0 + 1000, { isPrimary: true });
+    expect(sample().gesture.pointerCount).toBe(2);
+  });
+
+  it('a primary press of ANOTHER pointer type does not drop a touch — it proves only its own type lifted', () => {
+    send('pointerdown', 58, 215, 677, T0 + 0, real(true));
+    send('pointerdown', 1, 103, 677, T0 + 1000, { real: true, isPrimary: true, pointerType: 'mouse' });
+    expect(sample().gesture.pointerCount).toBe(2);
   });
 });
 

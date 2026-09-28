@@ -58,9 +58,13 @@ function firePointerAtTime(type: string, x: number, y: number, pointerId: number
  *  listener: a jsdom that changes either throws there, rather than quietly delivering an untrusted
  *  event and turning every takeover assertion below into a tautology that passes for the wrong
  *  reason. */
-function fireRealPointer(type: string, x: number, y: number, pointerId = 1, target: EventTarget = document.body): void {
+function fireRealPointer(
+  type: string, x: number, y: number, pointerId = 1, target: EventTarget = document.body,
+  extra: { isPrimary?: boolean; pointerType?: string } = {},
+): void {
   const ev = new MouseEvent(type, { clientX: x, clientY: y, bubbles: true });
   (ev as unknown as { pointerId: number }).pointerId = pointerId;
+  Object.assign(ev, extra);
   const forge = (e: Event) => {
     const impl = Object.getOwnPropertySymbols(e).find((sym) => sym.description === 'impl');
     if (impl) (e as unknown as Record<symbol, { isTrusted: boolean }>)[impl].isTrusted = true;
@@ -791,5 +795,106 @@ describe('a stranded SYNTHETIC gesture yields to a real finger (#299)', () => {
     const f = sampleFrame(prev);
     expect(f.pointer.down).toBe(true);
     expect(f.pointer.x).toBe(50);
+  });
+});
+
+describe('a stranded REAL gesture yields to the next primary press (#1706)', () => {
+  /** THE FAILURE: on the owner's iPhone Air a drag's `pointerup`/`pointercancel` never arrived, so a
+   *  TRUSTED gesture owned `activeId` forever and #299's takeover (synthetic strands only) could not
+   *  end it — Slime Shooter took no drag at all. Each later touch arrived `isPrimary: true`: the
+   *  browser holding no other touch, which is the proof the old one lifted. */
+  const touch = (isPrimary: boolean) => ({ isPrimary, pointerType: 'touch' });
+
+  it('THE REGRESSION: a real primary touch after a real one whose release never came is NOT swallowed', () => {
+    pointerSource.attach();
+    const prev = { down: false };
+
+    fireRealPointer('pointerdown', 209, 667, 55, document.body, touch(true)); // its up never comes
+    sampleFrame(prev);
+
+    fireRealPointer('pointerdown', 212, 689, 56, document.body, touch(true));
+    // The lost gesture is released first, so the new press is its own pressed edge.
+    let f = sampleFrame(prev);
+    expect(f.pointer.down).toBe(false);
+    expect(f.pointer.released).toBe(true);
+    f = sampleFrame(prev);
+    expect(f.pointer.pressed).toBe(true);
+    expect(f.pointer.x).toBe(212);
+    expect(f.pointer.y).toBe(689);
+
+    // The new finger owns the gesture: its own move and up are tracked.
+    fireRealPointer('pointermove', 309, 479, 56, document.body, touch(true));
+    f = sampleFrame(prev);
+    expect(f.pointer.dragY).toBe(479 - 689);
+    fireRealPointer('pointerup', 309, 479, 56, document.body, touch(true));
+    f = sampleFrame(prev);
+    expect(f.pointer.released).toBe(true);
+  });
+
+  it('a real SECOND finger (not primary) still cannot take a held drag — the primary-touch rule holds', () => {
+    pointerSource.attach();
+    const prev = { down: false };
+
+    fireRealPointer('pointerdown', 215, 677, 58, document.body, touch(true));
+    sampleFrame(prev);
+    fireRealPointer('pointerdown', 103, 677, 59, document.body, touch(false)); // as the Air sends it
+    const f = sampleFrame(prev);
+    expect(f.pointer.x).toBe(215);
+    expect(f.pointer.down).toBe(true);
+    expect(f.pointer.released).toBe(false);
+  });
+
+  it('a primary press of ANOTHER pointer type does not end a touch gesture — it proves only its own type lifted', () => {
+    pointerSource.attach();
+    const prev = { down: false };
+
+    fireRealPointer('pointerdown', 215, 677, 58, document.body, touch(true));
+    sampleFrame(prev);
+    fireRealPointer('pointerdown', 40, 40, 1, document.body, { isPrimary: true, pointerType: 'mouse' });
+    const f = sampleFrame(prev);
+    expect(f.pointer.x).toBe(215);
+    expect(f.pointer.released).toBe(false);
+  });
+
+  it('a real MOUSE whose up was lost (released outside the window) yields to the next real click', () => {
+    // The desktop build and the Electron Game panel: the mouse is pointer 1 every time.
+    const mouse = { isPrimary: true, pointerType: 'mouse' };
+    pointerSource.attach();
+    const prev = { down: false };
+
+    fireRealPointer('pointerdown', 10, 10, 1, document.body, mouse); // its up never comes
+    sampleFrame(prev);
+    fireRealPointer('pointerdown', 50, 60, 1, document.body, mouse);
+    let f = sampleFrame(prev);
+    expect(f.pointer.released).toBe(true);
+    f = sampleFrame(prev);
+    expect(f.pointer.pressed).toBe(true);
+    expect(f.pointer.x).toBe(50);
+  });
+
+  it('a primary TOUCH does not end a stranded mouse gesture — the other direction of the type check', () => {
+    pointerSource.attach();
+    const prev = { down: false };
+
+    fireRealPointer('pointerdown', 10, 10, 1, document.body, { isPrimary: true, pointerType: 'mouse' });
+    sampleFrame(prev);
+    fireRealPointer('pointerdown', 300, 400, 56, document.body, touch(true));
+    const f = sampleFrame(prev);
+    expect(f.pointer.x).toBe(10);
+    expect(f.pointer.released).toBe(false);
+  });
+
+  it('a SYNTHETIC press claiming to be primary does not end a real gesture — only the browser can prove it', () => {
+    pointerSource.attach();
+    const prev = { down: false };
+
+    fireRealPointer('pointerdown', 215, 677, 58, document.body, touch(true));
+    sampleFrame(prev);
+    const ev = new MouseEvent('pointerdown', { clientX: 40, clientY: 40, bubbles: true });
+    Object.assign(ev, { pointerId: 9, isPrimary: true, pointerType: 'touch' });
+    window.dispatchEvent(ev);
+    const f = sampleFrame(prev);
+    expect(f.pointer.x).toBe(215);
+    expect(f.pointer.released).toBe(false);
   });
 });

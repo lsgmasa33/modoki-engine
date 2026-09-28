@@ -48,6 +48,7 @@
  *  control outside such a root is ignored. */
 
 import type { InputSource } from './inputSources';
+import { provesEarlierPointersLifted } from './strandedPointers';
 import type { InputFrame } from '../core/inputActions';
 import {
   TOUCH_ATTR, TOUCH_OPACITY_ATTR, UI_ROOT_ATTR, type TouchControlAction,
@@ -63,6 +64,8 @@ interface Press {
   /** The element currently under this finger — held so the press highlight can be lifted from
    *  the element it was applied to, even after the finger has slid onto another control. */
   el: HTMLElement | null;
+  /** The event's `pointerType` — a primary press proves only its own type lifted (#1706). */
+  type: string;
 }
 
 /** Live press highlights, keyed by ELEMENT and refcounted — NOT stored per `Press`.
@@ -146,12 +149,18 @@ function reset(): void {
 }
 
 function onPointerDown(e: PointerEvent): void {
+  // A real primary press anywhere proves every earlier press of its type lifted, so one whose up or
+  // cancel never came stops holding its control — a stranded d-pad arrow would walk the character
+  // forever (`strandedPointers.ts`, #1706).
+  if (provesEarlierPointersLifted(e)) {
+    for (const [id, p] of [...presses]) if (p.type === e.pointerType) endPress(id);
+  }
   const el = controlAt(e.target);
   if (!el) return; // not ours — leave it to pointerSource (or to nothing)
   const action = actionOf(el);
   if (!action) return;
   noteUserInput(rawNow()); // see core/userActivity.ts — tier calibration must not judge an idle device
-  const p: Press = { action, el };
+  const p: Press = { action, el, type: e.pointerType };
   presses.set(e.pointerId, p);
   applyHighlight(p);
   active = true;
