@@ -2187,7 +2187,7 @@ without a word, and since #1409 the undo stack went with them.
 |---|---|---|
 | Assets double-click on a scene, Inspector "Open Scene" | `openAssetInEditor` (both routes go through it) | world-swap |
 | Assets → Create Scene | `Assets.tsx` `runCreate`, before the path picker (any `create` override replaces the world) | world-swap |
-| Open a prefab for editing | `openPrefabForEditing`'s `confirmDiscard` option. It asks only about what is still dirty **after** the existing auto-save: an untitled scene or a failed save. The agent op passes no gate and refuses up front instead | world-swap |
+| Open a prefab for editing | `openPrefabForEditing`'s `confirmDiscard` option. It asks only about what is still dirty **after** the existing auto-save: an untitled scene or a failed save. The agent op passes no gate and refuses up front instead; its `discardUnsaved` skips the auto-save, so the discarded edits are not written into the scene file (#1745) | world-swap |
 | Prefab edit → "Back to scene" | `SceneView.tsx` `exitPrefabEdit` | world-swap |
 | View → Reset Layout / Load Layout | `EditorApp.tsx` (both reload the page) | page-unload |
 | AI panel → toggle renderer debugging (packaged: relaunches) | `AIPanel.tsx` `toggleCdp` | page-unload |

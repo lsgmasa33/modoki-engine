@@ -708,12 +708,13 @@ export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>
  *  handed the RELOAD, not its result, so the editor holds the whole world switch as one pending adoption (#1698) and
  *  adopts only the world that reload promoted. It rejects with the reload's own rejection.
  *  Installed the way the suppressor is; unset in the game runtime, which has no undo — the reload then just runs. */
-type WorldReloadedFromDisk = (scenePath: string, reload: () => Promise<SceneLoadResult>) => Promise<void>;
+type WorldReloadedFromDisk = (scenePath: string, reload: () => Promise<SceneLoadResult>, opts?: { sceneFileChanged?: boolean }) => Promise<void>;
 let _worldReloadedFromDisk: WorldReloadedFromDisk | null = null;
 
 /** Editor-only: install the after-reload hook. Called from `agentEditorOps.ts`. */
 export function setWorldReloadedFromDiskHook(fn: WorldReloadedFromDisk | null): void {
   _worldReloadedFromDisk = fn;
+  _owedSceneChanges.clear(); // a new hook starts with no scene change owed to it
 }
 
 /** Editor-only: the file the editor's next save writes (`getCurrentScenePath`), installed the way the hooks above are
@@ -3054,6 +3055,16 @@ type SceneChangedMsg = { urlPath: string; kind: SceneChangedKind; viaSibling?: b
  *  order of their latest write (#1164). Drained by {@link replaySuppressedSceneReloads}. */
 const _suppressedReloads = new Map<string, SceneChangedMsg>();
 
+/** Scene-FILE changes owed to the undo stack (#1744): per open scene path, the generation of the newest change to a file
+ *  in its loaded chain that no reload of that path has carried yet. Its reload drops the stack, clean or not.
+ *  - **Per path**, so a change raised for scene A and never reloaded (A was left meanwhile) cannot drop scene B's stack.
+ *  - **By generation**, so a reload clears only the change it CARRIED. A watcher batch starts one reload per changed file,
+ *    and they race: a prefab reload that read nothing owed, then finished after a scene change was raised, used to clear
+ *    it before the scene's own reload read it, and the stale stack survived.
+ *  Raised before the reload's first await, so a reload of the same path that starts alongside it carries it too. */
+let _sceneChangeSeq = 0;
+const _owedSceneChanges = new Map<string, number>();
+
 /** Replay every scene/prefab change that arrived while the hot reload was suppressed, through the
  *  same `handleSceneChanged` a live change takes, so a deferred change gets exactly the treatment
  *  it would have had one frame after Stop. That includes **disk winning over unsaved edits** the
@@ -3222,6 +3233,7 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
       break;
     }
     if (!matchedAny) return; // touches no scene in the currently-loaded chain (a scene change carries no prefabs)
+    _owedSceneChanges.set(normScenePath(current), ++_sceneChangeSeq);
   }
   try {
     // Fetch the fresh file once: validate it AND hand it to loadScene via
@@ -3271,8 +3283,14 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
     });
-    if (_worldReloadedFromDisk) await _worldReloadedFromDisk(current, reload);
+    // A SCENE file changed under the undo stack, so the editor drops it even over a clean world (#1744). A prefab
+    // change leaves the scene file alone, unless a scene change to this path is still owed (one it superseded).
+    const owedKey = normScenePath(current);
+    const owed = _owedSceneChanges.get(owedKey);
+    if (_worldReloadedFromDisk) await _worldReloadedFromDisk(current, reload, { sceneFileChanged: owed !== undefined });
     else await reload();
+    // Only the change this reload carried: a newer one raised during its load is still owed to that change's own reload.
+    if (owed !== undefined && _owedSceneChanges.get(owedKey) === owed) _owedSceneChanges.delete(owedKey);
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
     // A newer load superseding this one aborts the in-flight load

@@ -19,12 +19,13 @@ import { useEditorStore } from '../../packages/modoki/src/editor/store/editorSto
 
 const A = { path: '/assets/prefabs/A.prefab.json', guid: 'aaaaaaaa-0000-4000-8000-000000001700', name: 'A' };
 const B = { path: '/assets/prefabs/B.prefab.json', guid: 'bbbbbbbb-0000-4000-8000-000000001700', name: 'B' };
-const prefab = vi.hoisted(() => ({ opens: true }));
+const prefab = vi.hoisted(() => ({ opens: true, opts: [] as unknown[] }));
 vi.mock('../../packages/modoki/src/editor/scene/prefabEdit', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   isEditingPrefab: () => useEditorStore.getState().editingPrefab != null,
   // Stands in for the real one: it either enters the session for the path it was given, or returns early.
-  openPrefabForEditing: async (asset: { path: string; name: string }) => {
+  openPrefabForEditing: async (asset: { path: string; name: string }, opts?: unknown) => {
+    prefab.opts.push(opts);
     if (prefab.opens) useEditorStore.getState().openPrefabEditor({ path: asset.path, guid: B.guid, name: asset.name }, null);
   },
 }));
@@ -40,6 +41,7 @@ beforeEach(() => {
   clearDirtyAssets();
   markSceneSaved();
   prefab.opens = true;
+  prefab.opts.length = 0;
   useEditorStore.getState().openPrefabEditor(A, null); // already editing A
   vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
 });
@@ -60,5 +62,21 @@ describe('prefab edit-open reply names the prefab it was asked for', () => {
   it('ACCEPT SIDE: an edit-open of B that entered B succeeds', async () => {
     await expect(runAgentOp('prefab', { prefabAction: 'edit-open', path: B.path })).resolves.toBeDefined();
     expect(useEditorStore.getState().editingPrefab?.path).toBe(B.path);
+  });
+});
+
+// #1745: the op's guard lets `discardUnsaved` through, and the open's own auto-save then wrote the discarded work into the
+// scene file. The op must hand the discard to the open, which skips that save (prefabEditOpenDiscard.test.ts). Mutation
+// checked: pass `{}` instead of the discard → the first case goes red, the accept side stays green.
+describe('prefab edit-open hands the caller\'s discard to the open (#1745)', () => {
+  it('edit-open {discardUnsaved:true} opens with discardUnsaved, so its auto-save is skipped', async () => {
+    await runAgentOp('prefab', { prefabAction: 'edit-open', path: B.path, discardUnsaved: true });
+    expect(prefab.opts).toEqual([{ discardUnsaved: true }]);
+  });
+
+  it('ACCEPT SIDE: a plain edit-open does not ask to discard', async () => {
+    await runAgentOp('prefab', { prefabAction: 'edit-open', path: B.path });
+    expect(prefab.opts).toHaveLength(1);
+    expect((prefab.opts[0] as { discardUnsaved?: boolean } | undefined)?.discardUnsaved).not.toBe(true);
   });
 });

@@ -158,12 +158,15 @@ describe('#1712: a newScene() world saved to a file is bound to that file', () =
     expect(undoLabel()).toBe('Move Box');
   });
 
+  // A PREFAB reload proves the stacks moved: it adopts under the file's key and keeps a clean stack. A scene-file reload
+  // would drop the stack whichever key it sat under (#1744), so it cannot tell a moved stack from a stranded one.
   it("a human's first Cmd+S (the Save-As panel) moves the stacks to the file too", async () => {
+    instantiate();
     pushAction({ label: 'Move Box', undo: () => {}, redo: () => {} });
     const r = await saveScene();
     expect(r).toMatchObject({ saved: true, path: SCENE_PATH });
     expect(activeHistoryKey()).toBe(SCENE_PATH);
-    emit(SCENE_PATH, 'scene');
+    emit(PREFAB_PATH, 'prefab');
     await settle();
     expect(loadScene).toHaveBeenCalledTimes(1);
     expect(undoLabel()).toBe('Move Box');

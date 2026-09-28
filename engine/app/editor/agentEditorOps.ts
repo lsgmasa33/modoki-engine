@@ -3359,11 +3359,13 @@ export function registerEditorAgentOps(): void {
       // Opening SWAPS the world exactly as load-scene does, so it destroys unsaved live work the
       // same way and must refuse for the same reason. It additionally SAVES the current scene on
       // the way in (prefabEdit.ts does this deliberately, so the return trip's reload-from-disk
-      // is non-destructive) — which is a write the caller should not discover afterwards.
-      await guardUnsavedAfterUndo('prefab edit-open', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
+      // is non-destructive) — which is a write the caller should not discover afterwards. A caller that passed
+      // `discardUnsaved` gets no save: the work it said to throw away used to be written into the scene file (#1745).
+      const discard = ((p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force) === true;
+      await guardUnsavedAfterUndo('prefab edit-open', discard);
       const scenePathBefore = getCurrentScenePath();
       const name = p.path.split('/').pop()?.replace(/\.prefab\.json$/, '') ?? p.path;
-      await openPrefabForEditing({ path: p.path, name });
+      await openPrefabForEditing({ path: p.path, name }, discard ? { discardUnsaved: true } : {});
       // openPrefabForEditing reports failure by console.error + early return (it is a UI path).
       // An agent needs it to FAIL, not to report ok:true having done nothing — a bad path would
       // otherwise leave the editor in the previous scene and the next edit-save would write the
@@ -3381,9 +3383,9 @@ export function registerEditorAgentOps(): void {
       return {
         ok: true,
         editing: { path: editing.path, guid: editing.guid, name: editing.name },
-        /** The scene saved + remembered on the way in; 'edit-exit' reloads it. */
+        /** The scene remembered on the way in, and saved unless the caller discarded its edits; 'edit-exit' reloads it. */
         returnScene: scenePathBefore,
-        savedReturnScene: scenePathBefore != null,
+        savedReturnScene: scenePathBefore != null && !discard,
         ...editorStateFields('scenePath', 'prefabEditWorld', 'worldEntityTotal'),
       };
     }

@@ -82,6 +82,9 @@ export interface AdoptionRecord {
     readonly keptBaseGuids: ReadonlySet<string>;
     /** The incoming world is built from nothing (Create Scene), so no stack recorded under `key` matches it. */
     readonly freshIncoming?: boolean;
+    /** A scene FILE in the outgoing chain changed on disk (a hot reload of a scene change): the stack was recorded
+     *  against bytes that are gone, so it drops, clean or not (#1744). */
+    readonly fileChanged?: boolean;
   };
   /** The world is the edit world of this prefab. Absent: it is not an edit world, and the flag is cleared. */
   readonly prefabEdit?: { readonly prefab: EditedPrefab; readonly returnScene: string | null };
@@ -247,12 +250,21 @@ function adopt(record: AdoptionRecord, dirt: TaggedDirt): boolean {
     // re-open: an Apply between two visits refilled a number an undone delete then brought back. Read off the stack's
     // KEY, not the edit flag: Exit with no return scene clears the flag and leaves the edit world and its stack live.
     // A same-key swap (re-opening the prefab from inside its own edit world) drops it as well.
-    const { key, keptBaseGuids, freshIncoming } = record.history;
+    // ⚠️ So does a stack whose scene FILE changed on disk (#1744), the scene analogue of #1704. A hot reload of a clean
+    // world kept it: a `git checkout` restored a deleted entity, and undoing the delete then made a second one with the
+    // same guid. Unity reloads an externally changed scene and its undo ends. A PREFAB change leaves the scene file
+    // alone, so its reload does not set this, as Unity's prefab reimport keeps scene undo.
+    const { key, keptBaseGuids, freshIncoming, fileChanged } = record.history;
     const before = dirt.baselineSeq === baselineSeq ? dirt : null;
     const discarded = s.worldEdited() || hasDirtySceneOutside(keptBaseGuids)
       || (before !== null && (before.edited || [...before.scenes].some((g) => !keptBaseGuids.has(g))));
     const leavingPrefabEdit = activeHistoryKey().startsWith(PREFAB_EDIT_SCENE_PREFIX);
-    swapHistory(key, { discardOutgoing: discarded || leavingPrefabEdit, ...(freshIncoming ? { freshIncoming: true } : {}) });
+    // A changed file retires the stack PARKED under the incoming key too: a hot reload can overtake an adopted prefab
+    // edit-open, and the scene's clean stack parked by that open was recorded against the old bytes as well.
+    swapHistory(key, {
+      discardOutgoing: discarded || leavingPrefabEdit || fileChanged === true,
+      ...(freshIncoming || fileChanged ? { freshIncoming: true } : {}),
+    });
     s.markSaved();
     clearSceneDirtyExcept(keptBaseGuids);
     baselineSeq += 1;

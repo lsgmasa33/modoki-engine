@@ -33,8 +33,16 @@ const restores: (() => void)[] = [];
 const noop = () => {};
 const edit = (label: string) => pushAction({ label, undo: noop, redo: noop });
 
-async function hotReload(): Promise<void> {
-  for (const cb of handlers.get('scene-changed') ?? []) cb({ urlPath: SCENE_PATH, kind: 'scene' });
+const PREFAB_PATH = '/games/g/runtime/assets/Crate.prefab.json';
+
+/** `kind: 'scene'` rewrites the open scene's own file; `'prefab'` a prefab it uses (the fixture's loaded entry has no
+ *  `prefabRefs`, so the bridge counts every prefab as used and reloads). */
+async function hotReload(kind: 'scene' | 'prefab' | 'scene-none' = 'scene'): Promise<void> {
+  // 'scene-none' emits nothing: it only lets whatever is in flight settle.
+  if (kind !== 'scene-none') {
+    const urlPath = kind === 'scene' ? SCENE_PATH : PREFAB_PATH;
+    for (const cb of handlers.get('scene-changed') ?? []) cb({ urlPath, kind });
+  }
   for (let i = 0; i < 10; i++) await Promise.resolve();
   await new Promise((r) => setTimeout(r, 0));
 }
@@ -83,10 +91,40 @@ describe('a hot reload over a dirty world drops its undo history (#1409)', () =>
     expect(hasUnsavedChanges()).toBe(false);
   });
 
-  it('keeps a CLEAN world\'s history — the file it reloaded still matches it', async () => {
+  // #1744: this case used to KEEP the stack ("the file it reloaded still matches it"). It does not: the reload ran BECAUSE
+  // the file changed, so the stack was recorded against bytes that are gone. Live on anim-bug: delete Sphere, save, `git
+  // checkout` the scene (Sphere back), undo the delete → two Spheres with one guid.
+  it('a SCENE-file reload drops a CLEAN world\'s history too: its file changed under the stack (#1744)', async () => {
+    edit('Delete Entity');
+    markSceneSaved();
+    expect(hasUnsavedChanges(), 'fixture: the world is clean').toBe(false);
+    await hotReload('scene');
+    expect(loadScene, 'fixture: the reload ran').toHaveBeenCalledTimes(1);
+    expect(canUndo()).toBe(false);
+    expect(hasUnsavedChanges()).toBe(false);
+  });
+
+  it('a PREFAB-change reload keeps a CLEAN world\'s history: the scene file did not change (Unity keeps scene undo on a reimport)', async () => {
     edit('Move');
     markSceneSaved();
-    await hotReload();
+    await hotReload('prefab');
+    expect(loadScene, 'fixture: the reload ran').toHaveBeenCalledTimes(1);
+    expect(undoLabel()).toBe('Move');
+  });
+
+  it('a scene change whose reload a PREFAB reload superseded is still owed: the winner drops the stack (#1744)', async () => {
+    edit('Delete Entity');
+    markSceneSaved();
+    loadScene.mockRejectedValueOnce(new DOMException('superseded', 'AbortError'));
+    await hotReload('scene');
+    expect(undoLabel(), 'fixture: the aborted reload adopted nothing').toBe('Delete Entity');
+    await hotReload('prefab');
+    expect(loadScene, 'fixture: both reloads ran').toHaveBeenCalledTimes(2);
+    expect(canUndo()).toBe(false);
+    // …and it is paid once: a later prefab-only reload keeps the new stack.
+    edit('Move');
+    markSceneSaved();
+    await hotReload('prefab');
     expect(undoLabel()).toBe('Move');
   });
 
@@ -110,12 +148,110 @@ describe('a hot reload over a dirty world drops its undo history (#1409)', () =>
     expect(canUndo()).toBe(false);
   });
 
+  it('a scene change raised while a PREFAB reload is loading is still owed after that reload adopts (#1744 close-out review)', async () => {
+    edit('Delete Entity');
+    markSceneSaved();
+    // P: a prefab reload, held in its load, having read "nothing owed".
+    let releaseP!: () => void;
+    loadScene.mockImplementationOnce(async () => {
+      await new Promise<void>((r) => { releaseP = r; });
+      return { world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
+    });
+    await hotReload('prefab');
+    expect(loadScene, 'fixture: P is loading').toHaveBeenCalledTimes(1);
+    // S: the scene change arrives and raises its debt, then waits in its fetch.
+    let releaseS!: () => void;
+    const realFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    vi.mocked(globalThis.fetch).mockImplementationOnce(async (...args) => {
+      await new Promise<void>((r) => { releaseS = r; });
+      return realFetch(...args);
+    });
+    await hotReload('scene');
+    // P finishes first: it adopts, keeping the stack, since it carried no scene change…
+    releaseP();
+    await hotReload('scene-none');
+    expect(undoLabel(), 'fixture: P kept the clean stack').toBe('Delete Entity');
+    // …and S's reload still carries its own.
+    releaseS();
+    await hotReload('scene-none');
+    expect(loadScene, 'fixture: S reloaded').toHaveBeenCalledTimes(2);
+    expect(canUndo()).toBe(false);
+  });
+
+  it('a reload that carried an OLDER change does not clear a newer one raised during its load (#1744 close-out review)', async () => {
+    edit('Delete Entity');
+    markSceneSaved();
+    // S1 carries generation 1 into its held load.
+    let releaseS1!: () => void;
+    loadScene.mockImplementationOnce(async () => {
+      await new Promise<void>((r) => { releaseS1 = r; });
+      return { world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
+    });
+    await hotReload('scene');
+    // S2: a newer write to the same file raises generation 2, then waits in its fetch.
+    let releaseS2!: () => void;
+    const realFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    vi.mocked(globalThis.fetch).mockImplementationOnce(async (...args) => {
+      await new Promise<void>((r) => { releaseS2 = r; });
+      return realFetch(...args);
+    });
+    await hotReload('scene');
+    releaseS1();
+    await hotReload('scene-none');
+    expect(canUndo(), 'fixture: S1 dropped the stale stack').toBe(false);
+    // An edit made on S1's world — which predates S2's bytes.
+    edit('Move');
+    markSceneSaved();
+    releaseS2();
+    await hotReload('scene-none');
+    expect(loadScene, 'fixture: S2 reloaded').toHaveBeenCalledTimes(2);
+    expect(canUndo()).toBe(false);
+  });
+
+  it('a scene change owed to a scene that was LEFT does not drop the next scene\'s clean stack on a prefab reload', async () => {
+    loadScene.mockRejectedValueOnce(new DOMException('superseded', 'AbortError'));
+    await hotReload('scene'); // owed to Main, never carried: Main's reload was superseded
+    const OTHER = '/games/g/runtime/assets/Other.scene.json';
+    vi.mocked(sceneManager.getCurrent).mockReturnValue({ path: OTHER } as never);
+    vi.mocked(sceneManager.getLoadedScenes).mockReturnValue(new Map([['other', { path: OTHER, role: 'primary', guid: 'other' }]]) as never);
+    swapHistory(OTHER);
+    edit('Move');
+    markSceneSaved();
+    await hotReload('prefab');
+    expect(loadScene, 'fixture: the prefab reload ran').toHaveBeenCalledTimes(2);
+    expect(undoLabel()).toBe('Move');
+  });
+
+  it('a scene-file reload retires the stack PARKED under its key too (a reload overtaking a prefab edit-open)', async () => {
+    edit('Delete Entity');
+    markSceneSaved();
+    swapHistory('/__prefab-edit__/aaaaaaaa-0000-4000-8000-000000001744'); // the edit-open parked Main's clean stack
+    await hotReload('scene');
+    expect(loadScene, 'fixture: the reload ran').toHaveBeenCalledTimes(1);
+    expect(canUndo()).toBe(false);
+  });
+
+  it('a clean BASE scene file changing drops the stack too', async () => {
+    const BASE_PATH = '/games/g/runtime/assets/Base.scene.json';
+    vi.mocked(sceneManager.getLoadedScenes).mockReturnValue(new Map([
+      ['main', { path: SCENE_PATH, role: 'primary', guid: 'main' }],
+      ['base', { path: BASE_PATH, role: 'base', guid: 'base' }],
+    ]) as never);
+    edit('Move');
+    markSceneSaved();
+    for (const cb of handlers.get('scene-changed') ?? []) cb({ urlPath: BASE_PATH, kind: 'scene' });
+    await hotReload('scene-none');
+    expect(loadScene, 'fixture: the base change reloaded the scene').toHaveBeenCalledTimes(1);
+    expect(canUndo()).toBe(false);
+  });
+
+  // A PREFAB reload: a scene-file reload drops a clean stack anyway (#1744).
   it('a kept dirty base with a CLEAN edit version (a half-failed Save All) keeps the stack too', async () => {
     edit('Move base Camera');
     markSceneSaved();
     markSceneDirty(BASE);
     keeping(BASE);
-    await hotReload();
+    await hotReload('prefab');
     expect(isSceneDirty(BASE)).toBe(true);
     expect(undoLabel()).toBe('Move base Camera');
   });

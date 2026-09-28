@@ -2021,8 +2021,9 @@ Each invariant names the one function that owns it.
     run twice. A repair clears the debts it ran only if the world did not change under it, and a
     repair that throws is reported and stays owed.
 - **S8. The adopt decides discarded work against the OUTGOING world.** The dirt is read on both
-  sides of the swap's await. The undo stack drops iff work was discarded or the outgoing stack is a
-  prefab-edit world's (U27, #1704: § Per-scene undo history), and only a kept base keeps its dirty flag. **Owner:** the owner's `history` write, one rule for every route (#1409,
+  sides of the swap's await. The undo stack drops iff work was discarded, the outgoing stack is a
+  prefab-edit world's (U27, #1704: § Per-scene undo history), or a hot reload's scene FILE changed on disk
+  (`fileChanged`, #1744), and only a kept base keeps its dirty flag. **Owner:** the owner's `history` write, one rule for every route (#1409,
   #1417). The pre-swap read counts only while the baseline it was read against is still the current
   one — no adopt since (`baselineSeq`, bumped by each adopt's history write; a save does not bump it): a newer route's read that
   predates an older route's adopt describes a world that adopt already settled, and used anyway it
@@ -2298,13 +2299,36 @@ Every editor route shares ONE adopt rule, the adoption owner's history write (`s
 - **Only a kept base keeps its dirty flag** (`clearSceneDirtyExcept`). Before #1417 every load
   cleared all flags, so `saveAll`, which writes a base only if it is dirty, skipped the surviving
   edit, and the unsaved-work guard stopped asking. The edit stayed on screen, flagged clean.
-- **The stack drops iff work was discarded**: a world edit since the last save, or a dirty base
-  that was NOT kept. ⚠️ The edit version is one global counter and a base edit bumps it too, so
+- **The stack drops when work was discarded**: a world edit since the last save, or a dirty base
+  that was NOT kept. (It also drops on leaving prefab edit, U27, and when a scene file changed
+  on disk, #1744: both below.) ⚠️ The edit version is one global counter and a base edit bumps it too, so
   it cannot tell a primary edit from a base edit. In the common case a kept base's edit still
   drops the stack: the edit stays saveable, not undoable. That is the lesser loss next to a stack
   replaying discarded primary work, and filtering one mixed stack by scene would need per-entry
   scene tags nobody records. The stack survives when only the flag is dirty, e.g. after a Save
   All that wrote the primary and failed on the base.
+- **A hot reload of a changed SCENE file drops the stack, clean or not** (#1744). The reload runs
+  BECAUSE the file changed, so the stack describes bytes that are gone. Kept, it replayed onto the
+  new ones: delete Sphere, save, `git checkout` the scene (Sphere back), undo the delete, and the
+  world held two Spheres with one guid. Unity ends undo when it reloads an externally changed scene.
+  A reload for a PREFAB change keeps a clean stack: the scene file did not change, and Unity's
+  prefab reimport keeps scene undo. It also retires the stack PARKED under the reloaded key, since a
+  reload can overtake an adopted prefab edit-open that parked the scene's stale stack. `agentBridge`
+  records the debt per open scene path, by generation, and a reload clears only the change it
+  carried. A watcher batch starts one reload per changed file, and they race: a prefab reload that
+  read nothing owed and finished after a scene change was raised must not clear that change. A debt
+  raised for a scene that was left before its reload ran cannot drop another scene's stack.
+  ⚠️ **Open gap (#1750):** such a debt OUTLIVES the leave. A scene open that supersedes the reload
+  (its load waits for an undo step, not for a pending hot reload) parks the scene's now-stale stack,
+  and nothing but a hot reload of that path reads the debt. Reopening the scene restores the stale
+  stack, so undoing a delete can duplicate a guid again. A later prefab reload there reads the
+  stranded debt and drops a clean stack recorded since the reopen. It is the hot-reload-vs-route
+  interleaving the adoption-token study owns, so it is not patched here.
+  ⚠️ Two editor writes pay for it too, deliberately. A Save All that flushes a pending Base Scene
+  change rewrites the scene file through `/api/scene-mutate` unmarked, so that the reload loads the
+  new base, and the stack drops with that reload. Here the base's entities DO change under the stack.
+  A self-write-guard miss (the Windows path class, QA-WIN-0003) used to cost only a pointless reload,
+  and now costs the stack as well.
 - ⚠️ **A kept flag can over-report, deliberately.** SceneManager snapshots a kept base before its
   long resource-acquire awaits, so an edit to a CLEAN kept base made during that window is lost
   with the outgoing world, yet the base's flag survives: the next Save All rewrites a base that
@@ -2376,7 +2400,8 @@ Where it applies:
 "Dirty" over-reports, deliberately: undo and redo bump the edit version, so a scene undone back to
 its saved state still reads dirty and its history is dropped rather than parked. That loses
 history, never correctness. Not covered: a scene FILE that changes on disk while its CLEAN stack is
-parked under a scene that is not open (a git checkout, an agent `write_asset`).
+parked under a scene that is not open (a git checkout, an agent `write_asset`). The OPEN scene's
+file is covered: its hot reload drops the stack (#1744).
 
 ## Persistent entities
 

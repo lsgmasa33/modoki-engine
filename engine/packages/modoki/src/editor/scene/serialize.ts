@@ -880,13 +880,17 @@ export function worldHasUnsavedEdits(): boolean {
  *  instances are still the old document's expansion while the editor's copy is already the new one — rebuilt
  *  here from the document each was expanded from (#1483), or every capture would match its members with
  *  another member's rows. A reload whose world was replaced before it adopted rebuilds nothing: the route that
- *  replaced it adopts its own world. Rejects with the reload's own rejection (an AbortError when superseded). */
-export async function adoptWorldReloadedFromDisk(scenePath: string, reload: () => Promise<SceneLoadResult>): Promise<void> {
+ *  replaced it adopts its own world. Rejects with the reload's own rejection (an AbortError when superseded).
+ *  `sceneFileChanged`: the change was to a scene FILE in the loaded chain, not a prefab it uses, so the undo stack was
+ *  recorded against bytes that are gone and drops even when the world was clean (#1744). */
+export async function adoptWorldReloadedFromDisk(
+  scenePath: string, reload: () => Promise<SceneLoadResult>, { sceneFileChanged = false }: { sceneFileChanged?: boolean } = {},
+): Promise<void> {
   await withAdoption('hot-reload', async (adoption) => {
     const { world, keptBaseGuids } = await reload();
     // The path and base too: a reload that overtakes an adopted prefab edit-open (which takes no replacement token)
     // replaces an edit world, whose path is null (close-out review of #1698).
-    if (!adoption.offer({ world, path: scenePath, baseScene: 'loaded', history: { key: scenePath, keptBaseGuids } })) return;
+    if (!adoption.offer({ world, path: scenePath, baseScene: 'loaded', history: { key: scenePath, keptBaseGuids, ...(sceneFileChanged ? { fileChanged: true } : {}) } })) return;
     // Not only kept bases: a `Persistent` root is carried too, whatever scene owns it (review of 4f0b839d0).
     // Everything the reload re-expanded from disk compares equal and is left alone.
     const rebuilt = await rebaseStaleInstances();

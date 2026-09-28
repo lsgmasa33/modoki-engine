@@ -407,6 +407,10 @@ export async function openPrefabForEditing(
      *  or a save that failed) — resolve false to abort before the swap discards them. The HUMAN
      *  route passes the unsaved-work gate (#1419); the agent op refuses up front instead. */
     confirmDiscard?: (action: string) => Promise<boolean>;
+    /** The caller already chose to DISCARD the world's unsaved edits (the agent's `discardUnsaved`): the auto-save below
+     *  is skipped and the swap discards them, as `loadScene` does. Saving them wrote into the file the very work the
+     *  caller said to throw away (#1745). */
+    discardUnsaved?: boolean;
   } = {},
 ): Promise<void> {
   // Taken before the first await: a scene load, Create Scene or another edit-open requested after this one wins (#1700).
@@ -426,7 +430,7 @@ export async function openPrefabForEditing(
 
 async function openPrefabForEditingSwitching(
   asset: { path: string; name: string },
-  opts: { confirmDiscard?: (action: string) => Promise<boolean> },
+  opts: { confirmDiscard?: (action: string) => Promise<boolean>; discardUnsaved?: boolean },
   switchReady: () => Promise<void> | null,
   stillNewest: () => boolean,
 ): Promise<void> {
@@ -473,7 +477,14 @@ async function openPrefabForEditingSwitching(
   // writes and this swap replaces.
   const ready = switchReady();
   if (ready) await ready;
-  if (getCurrentScenePath()) await saveScene();
+  // ⚠️ Both decisions come BEFORE the save, which is this route's one side effect on disk (#1745). A request superseded
+  // while it waited does nothing: the newer one owns the world, and one that discarded it would find this older
+  // request's save had written the discarded work into the file. A caller that asked to discard gets no save at all.
+  if (!stillNewest()) {
+    console.warn(`[PrefabEdit] "${asset.name}" was not entered: a newer scene request was made while it waited`);
+    return;
+  }
+  if (getCurrentScenePath() && !opts.discardUnsaved) await saveScene();
   if (opts.confirmDiscard && worldHasUnsavedEdits() && !(await opts.confirmDiscard(`edit prefab ${asset.name}`))) return;
   // The REQUEST-order check `loadScene` makes after its `ready()` (#1700), here after the last await before the swap: a
   // newer request made while this one waited — the human's dialog above can stay open indefinitely — owns the world, and

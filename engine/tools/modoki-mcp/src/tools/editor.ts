@@ -499,7 +499,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'Address the entity/parent by guid (PREFER — stable) or id. ' +
       'PREFAB-EDIT MODE (edit-open / edit-save / edit-exit) is how you edit the TEMPLATE itself: ' +
       'edit-open swaps the world for a synthetic scene holding the prefab in isolation (so it ' +
-      'refuses on unsaved work like load_scene does, and SAVES the current scene on the way in), ' +
+      'refuses on unsaved work like load_scene does, and SAVES the current scene on the way in — unless discardUnsaved:true, which skips that save so the discarded work never reaches the file), ' +
       'you edit its entities with modoki_mutate_scene / modoki_set_transform (omit `path` — it targets the prefab-edit world, reported as `prefabEditWorld` by modoki_get_editor_state) or the create/duplicate/delete/reparent entity tools, edit-save re-serializes the .prefab.json, ' +
       'and edit-exit reloads the scene you came from so its instances re-expand from the new file (it refuses on unsaved prefab edits — edit-save first, or discardUnsaved:true to drop them). ' +
       'While in that mode modoki_save_all REFUSES — edit-save is the save. In that world parent new entities UNDER the ' +
