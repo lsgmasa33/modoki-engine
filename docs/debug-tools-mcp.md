@@ -354,6 +354,12 @@ with **no go-ios tunnel**, and the iPhone 8 was probed directly:
 - **The device is picked from go-ios's list, never devicectl's.** usbmuxd can lose a wired device that
   CoreDevice still reports `available (paired)` — the hub saw exactly that, and replugging fixed it —
   so a UDID usbmuxd does not see is refused with "replug it" rather than forwarded to nothing.
+  **Without replugging, reach it over the CoreDevice tunnel instead.** `xcrun devicectl device info
+  details --device <udid>` prints `tunnelIPAddress` (an `fd…::1` IPv6 address) while `tunnelState` is
+  `connected`, and `device_connect ip:"<that address>"` reaches the app's debug server on 9095.
+  Measured 2026-09-28 on the iPhone Air: `transportType: wired`, go-ios did not list it, and the
+  tunnel address connected on the first try. ⚠️ The address is per tunnel, not per device: after a
+  reinstall the old one answered `EHOSTUNREACH`, and a fresh `info details` gave a new one.
 - **"start listening" is NOT proof of a bind, and the child's bind is not proof of the tunnel.**
   go-ios v1.3.2's `forward.Forward` logs that line BEFORE `net.Listen`, and exits 1 when the listen
   fails. But on macOS its `0.0.0.0` listen is an IPv6 wildcard, which COEXISTS with another process's

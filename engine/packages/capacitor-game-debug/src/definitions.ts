@@ -22,6 +22,15 @@ import type { PluginListenerHandle } from '@capacitor/core';
  *  which is a different subsystem, not a probe. */
 export type FaultKind = 'crash' | 'anr' | 'uncaught';
 
+/** One file of the debug-files folder, as {@link GameDebugPlugin.listDebugFiles} lists it. */
+export interface DebugFileInfo {
+  name: string;
+  /** Bytes. */
+  size: number;
+  /** Last modified, ms since the epoch. */
+  modified: number;
+}
+
 export interface GameDebugPlugin {
   /** Start the TCP server + UDP beacon */
   /** Start the TCP bridge. Binds the default port (9095), retrying briefly while another Modoki
@@ -86,6 +95,31 @@ export interface GameDebugPlugin {
    *  resumed, so the call neither resolves nor rejects; treat a settled promise as "the fault was
    *  ACCEPTED", never as "the fault happened". The oracle is the crash console, not this return. */
   triggerFault(options: { kind: FaultKind; blockMs?: number }): Promise<{ ok: boolean }>;
+
+  /** Write a text file for the developer to pull off the device afterwards — a game's play log, say.
+   *
+   *  `path` is relative to the app's DEBUG-FILES folder and may not leave it (no leading `/`, no empty,
+   *  `.` or `..` segment — rejected otherwise):
+   *  - iOS: `Documents/modoki-debug/` in the app's data container, pulled with
+   *    `xcrun devicectl device copy from --domain-type appDataContainer --domain-identifier <bundle id>
+   *    --source Documents/modoki-debug …` (iOS 17+, a development-signed build).
+   *  - Android: `<external files dir>/modoki-debug/`, i.e. `/sdcard/Android/data/<package>/files/modoki-debug/`,
+   *    pulled with `adb pull`.
+   *
+   *  Missing folders are created. `append` adds `data` to the end of the file (creating it); otherwise
+   *  the file is replaced. Calls are applied one at a time, in the order they arrive.
+   *
+   *  Gated on `build.debugBuild` like {@link triggerFault}: a release build rejects, so nothing it
+   *  does can fill a player's phone. */
+  writeDebugFile(options: { path: string; data: string; append?: boolean }): Promise<{ ok: boolean }>;
+
+  /** The files directly inside `dir` of the debug-files folder (`''` = the folder itself), for pruning
+   *  old ones; empty when the folder does not exist. Same gate as {@link writeDebugFile}. */
+  listDebugFiles(options: { dir: string }): Promise<{ files: DebugFileInfo[] }>;
+
+  /** Delete one file of the debug-files folder. A file that is not there is not an error. Same gate
+   *  as {@link writeDebugFile}. */
+  deleteDebugFile(options: { path: string }): Promise<{ ok: boolean }>;
 
   /** Listen for incoming requests from MCP */
   addListener(

@@ -13,7 +13,7 @@ import pathMod from 'node:path';
 import path from 'path';
 import fs from 'fs';
 import {
-  findAssetRoots, resolveAssetPath, readAssetGuid, buildManifest, writeAssetGuid, detectType,
+  findAssetRoots, resolveAssetPath, readAssetGuid, buildManifest, manifestProjectOf, writeAssetGuid, detectType,
   classifySceneChange, isSseRoute, createEditorWriteGuard, normalizeWriteGuardKey, createBrowserRequestRegistry,
   settleRelayReply, countLiveBridgeClients,
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
@@ -1239,6 +1239,53 @@ describe('buildManifest auto-heal', () => {
     expect(m.assets[0].guid).not.toBe(m.assets[1].guid);
     expect(spy.mock.calls.some(c => String(c[0]).includes('GUID collision healed'))).toBe(true);
     spy.mockRestore();
+  });
+
+  it('never heals a collision ACROSS projects — the original sorting later must not be re-minted (#1584)', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const guid = 'a1b2c3d4-e5f6-4789-9abc-def012345678';
+    const copyPath = path.join(tmpDir, 'copy.mat.json');
+    const origPath = path.join(tmpDir, 'orig.mat.json');
+    fs.writeFileSync(copyPath, JSON.stringify({ id: guid, version: 1 }));
+    fs.writeFileSync(origPath, JSON.stringify({ id: guid, version: 1 }));
+
+    buildManifest([
+      // The COPY sorts first, so a path-ordered heal would have re-minted the ORIGINAL.
+      { guid, path: '/games/slime-shooter/assets/m.mat.json', name: 'M', type: 'material', absPath: copyPath },
+      { guid, path: '/games/wordweave/assets/m.mat.json', name: 'M', type: 'material', absPath: origPath },
+    ], true);
+
+    expect(JSON.parse(fs.readFileSync(origPath, 'utf-8')).id).toBe(guid);
+    expect(JSON.parse(fs.readFileSync(copyPath, 'utf-8')).id).toBe(guid);
+    expect(err.mock.calls.some(c => String(c[0]).includes('defined in two projects'))).toBe(true);
+    err.mockRestore();
+    warn.mockRestore();
+  });
+
+  it('still heals a collision inside ONE project (accept side of the cross-project refusal)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const guid = 'a1b2c3d4-e5f6-4789-9abc-def012345678';
+    const aPath = path.join(tmpDir, 'a.mat.json');
+    const bPath = path.join(tmpDir, 'b.mat.json');
+    fs.writeFileSync(aPath, JSON.stringify({ id: guid, version: 1 }));
+    fs.writeFileSync(bPath, JSON.stringify({ id: guid, version: 1 }));
+
+    buildManifest([
+      { guid, path: '/games/wordweave/assets/a.mat.json', name: 'A', type: 'material', absPath: aPath },
+      { guid, path: '/games/wordweave/assets/b.mat.json', name: 'B', type: 'material', absPath: bPath },
+    ], true);
+
+    expect(JSON.parse(fs.readFileSync(aPath, 'utf-8')).id).toBe(guid);
+    expect(JSON.parse(fs.readFileSync(bPath, 'utf-8')).id).not.toBe(guid);
+    warn.mockRestore();
+  });
+
+  it('manifestProjectOf names the project of a monorepo path and nothing else', () => {
+    expect(manifestProjectOf('/games/court/assets/x.png')).toBe('/games/court');
+    expect(manifestProjectOf('/demos/sling/assets/x.png')).toBe('/demos/sling');
+    expect(manifestProjectOf('/modoki/assets/fonts/a.ttf')).toBe('');
+    expect(manifestProjectOf('/assets/x.png')).toBe('');
   });
 
   it('only warns (does not rewrite) when heal=false', () => {

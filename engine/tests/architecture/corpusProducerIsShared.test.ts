@@ -269,6 +269,11 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
    * it could never stand in for any of these even after a hypothetical Phase 5 — the corpus these
    * walk simply isn't the kind repoCorpus.mjs produces. */
   {
+    file: 'games/slime-shooter/tests/playLogReplay.ts', rule: 'walker', walker: 'walk',
+    reason: 'Walks the folder of play logs PULLED FROM A PHONE (#1584) — a path the report is given '
+      + '(SLIME_PLAY_LOGS), outside the repo, nested however devicectl copied it. Not repo content.',
+  },
+  {
     file: 'engine/scripts/assertBundleUnchanged.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks a packaged app BUNDLE dir (a CLI arg, e.g. a signed .app) to diff its file list '
       + 'before/after a run — not repo content.',
@@ -355,6 +360,18 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
   },
   {
     file: 'games/wordweave/tests/sceneChrome.test.ts', rule: 'walker', walker: 'collectFontGuids',
+    reason: 'Walks Weaveling\'s (and the engine\'s) font sidecars to prove UISettings.fontFamily '
+      + 'names a font something ships — the twin of Court\'s uiFontRoots walker, added by #1280 '
+      + 'when Weaveling adopted the same scene-wide UI font default. Same #29 bar: a game test '
+      + 'cannot import engine/scripts/repoCorpus.mjs, which is why this is a second walker rather '
+      + 'than a second caller. It exists because the check it performs is NOT inherited from '
+      + 'anywhere: assetRefIntegrity\'s dangling-GUID scan runs off a key allowlist carrying '
+      + 'neither UIElement.fontFamily nor UISettings.fontFamily (disproved by experiment in '
+      + '#1280\'s review — repointing the font sidecar\'s id left that guard green), and a '
+      + 'dangling default renders every UI root in the system font.',
+  },
+  {
+    file: 'games/slime-shooter/tests/sceneChrome.test.ts', rule: 'walker', walker: 'collectFontGuids',
     reason: 'Walks Weaveling\'s (and the engine\'s) font sidecars to prove UISettings.fontFamily '
       + 'names a font something ships — the twin of Court\'s uiFontRoots walker, added by #1280 '
       + 'when Weaveling adopted the same scene-wide UI font default. Same #29 bar: a game test '

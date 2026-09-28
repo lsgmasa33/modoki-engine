@@ -18,6 +18,9 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getDeviceIp", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getDeviceHardware", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "triggerFault", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "writeDebugFile", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "listDebugFiles", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "deleteDebugFile", returnType: CAPPluginReturnPromise),
     ]
 
     private var listener: NWListener?
@@ -798,6 +801,99 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                         + "report hangs — MetricKit MXHangDiagnostic is the oracle for those. Use \"crash\".")
         default:
             call.reject("Unknown fault kind \"\(kind)\" — iOS supports: crash.")
+        }
+    }
+
+    // MARK: - Debug files
+
+    /// The folder under the app's Documents directory the debug-file methods are confined to — what a
+    /// developer pulls off the phone with `xcrun devicectl device copy from --domain-type
+    /// appDataContainer --source Documents/modoki-debug`. definitions.ts documents the contract.
+    private static let debugFilesDir = "modoki-debug"
+
+    /// One serial queue for every debug-file call, so appends land in the order they arrived.
+    private let debugFileQueue = DispatchQueue(label: "com.modokiengine.gamedebug.files")
+
+    private static let debugFilesOff = "Debug files disabled: build.debugBuild is off for this project "
+        + "(Project Settings → Developer → \"Debug build\"). Rebuild after enabling it."
+
+    /// `relative` inside the debug-files folder, or nil when it would leave it (a leading `/`, an empty,
+    /// `.` or `..` segment) — `""` names the folder itself only when `allowRoot`.
+    private static func debugFileURL(_ relative: String, allowRoot: Bool = false) -> URL? {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let root = docs.appendingPathComponent(debugFilesDir, isDirectory: true).standardizedFileURL
+        if relative.isEmpty { return allowRoot ? root : nil }
+        if relative.hasPrefix("/") { return nil }
+        let segments = relative.split(separator: "/", omittingEmptySubsequences: false)
+        guard segments.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { return nil }
+        let url = root.appendingPathComponent(relative).standardizedFileURL
+        return url.path.hasPrefix(root.path + "/") ? url : nil
+    }
+
+    @objc func writeDebugFile(_ call: CAPPluginCall) {
+        guard isDebugBuildEnabled() else { call.reject(GameDebugPlugin.debugFilesOff); return }
+        let path = call.getString("path") ?? ""
+        guard let url = GameDebugPlugin.debugFileURL(path) else {
+            call.reject("writeDebugFile: \"\(path)\" is not a path inside the debug-files folder")
+            return
+        }
+        let data = Data((call.getString("data") ?? "").utf8)
+        let append = call.getBool("append") ?? false
+        debugFileQueue.async {
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if append, FileManager.default.fileExists(atPath: url.path) {
+                    let handle = try FileHandle(forWritingTo: url)
+                    defer { try? handle.close() }
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: data)
+                } else {
+                    try data.write(to: url, options: .atomic)
+                }
+                call.resolve(["ok": true])
+            } catch {
+                call.reject("writeDebugFile \(path): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    @objc func listDebugFiles(_ call: CAPPluginCall) {
+        guard isDebugBuildEnabled() else { call.reject(GameDebugPlugin.debugFilesOff); return }
+        let dir = call.getString("dir") ?? ""
+        guard let url = GameDebugPlugin.debugFileURL(dir, allowRoot: true) else {
+            call.reject("listDebugFiles: \"\(dir)\" is not a folder inside the debug-files folder")
+            return
+        }
+        debugFileQueue.async {
+            let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+            let items = (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: keys)) ?? []
+            var files: [[String: Any]] = []
+            for item in items {
+                guard let v = try? item.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
+                files.append([
+                    "name": item.lastPathComponent,
+                    "size": v.fileSize ?? 0,
+                    "modified": ((v.contentModificationDate ?? Date(timeIntervalSince1970: 0)).timeIntervalSince1970 * 1000).rounded(),
+                ])
+            }
+            call.resolve(["files": files])
+        }
+    }
+
+    @objc func deleteDebugFile(_ call: CAPPluginCall) {
+        guard isDebugBuildEnabled() else { call.reject(GameDebugPlugin.debugFilesOff); return }
+        let path = call.getString("path") ?? ""
+        guard let url = GameDebugPlugin.debugFileURL(path) else {
+            call.reject("deleteDebugFile: \"\(path)\" is not a path inside the debug-files folder")
+            return
+        }
+        debugFileQueue.async {
+            do {
+                if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+                call.resolve(["ok": true])
+            } catch {
+                call.reject("deleteDebugFile \(path): \(error.localizedDescription)")
+            }
         }
     }
 

@@ -399,6 +399,31 @@ await GameDebug.startServer({ port: 9095 });
 const { running, connected } = await GameDebug.getStatus();
 ```
 
+**Debug files** (`writeDebugFile` / `listDebugFiles` / `deleteDebugFile`, 2026-09-27): a Debug build
+writes text files the developer pulls off the device afterwards — Slime Shooter's per-game play log
+is the first user (docs/plans/slime-shooter.md § Play logs). Paths are confined to a debug-files
+folder — iOS `Documents/modoki-debug/` (pulled with `xcrun devicectl device copy from --domain-type
+appDataContainer`), Android `<external files>/modoki-debug/` (`adb pull`) — and a path that would
+leave it is rejected. One serial queue per platform keeps appends in arrival order. `deleteDebugFile`
+is for files: handed a folder, iOS removes it with its contents and Android refuses a non-empty one
+(noted here rather than in `definitions.ts`, whose every byte re-vendors 21 projects). Gated on
+`build.debugBuild` like `triggerFault`; the web build rejects them as unavailable. The contract is in
+`definitions.ts`. Verified on the iOS simulator (write, append order, list, delete, a `../` path
+refused) and on an iPhone Air (a write, then pulled with `devicectl … copy from`); Android is
+compiled but not yet run on a device.
+
+### ⚠️ A Capacitor plugin is a thenable — never resolve a promise WITH it
+
+`registerPlugin` returns a Proxy that answers **every** property with a method stub, `then`
+included. So a promise resolved with a plugin — `import('x').then((m) => m.Plugin)`, `return plugin`
+from an `async` function, `Promise.resolve(plugin)` — takes it for a promise, calls its `then`, and
+waits **forever**, with no error anywhere. Measured on the iOS simulator (2026-09-27):
+`Promise.resolve(Capacitor.Plugins.GameDebug)` never settles; `Promise.resolve({ api: plugin })`
+resolves at once. It cost Slime Shooter's play log a build that wrote nothing. Destructure the module
+namespace (`const { GameDebug } = await import(…)`, as the engine's bridge does), or carry the plugin
+in a box (`{ api }`, as `games/slime-shooter/runtime/slime/playLogSink.ts` does). A test fake that is
+a plain object cannot catch this — make it a Proxy with a `then` that never settles.
+
 ## Every parked call must settle — on EVERY path (#1507, #1514)
 
 A plugin method that settles its `PluginCall` only from an async callback — an SDK completion, a

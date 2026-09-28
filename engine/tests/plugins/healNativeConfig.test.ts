@@ -473,6 +473,45 @@ describe('healNativeConfig — iOS Crashlytics dSYMs', () => {
     expect((readPbx().match(/Upload Crashlytics dSYMs/g) || []).length).toBe(3);
   });
 
+  /** Run the healed phase's script the way Xcode would: the pbxproj string unescaped, under /bin/sh,
+   *  with SRCROOT pointing at a real directory. Nothing is mocked — the guard is a file test. */
+  function runPhaseScript(srcroot: string): { status: number | null; out: string } {
+    const line = readPbx().split('\n').find((l) => l.trimStart().startsWith('shellScript = '))!;
+    const body = line.trimStart().slice('shellScript = "'.length, -'";'.length)
+      .replace(/\\n/g, '\n').replace(/\\"/g, '"');
+    const r = spawnSync('/bin/sh', ['-c', body], {
+      env: { PATH: process.env.PATH, SRCROOT: srcroot, BUILD_DIR: path.join(srcroot, 'DerivedData', 'Build', 'Products'),
+        DEBUG_INFORMATION_FORMAT: 'dwarf-with-dsym' },
+      encoding: 'utf8',
+    });
+    return { status: r.status, out: r.stdout + r.stderr };
+  }
+
+  // Runs the phase under /bin/sh, which a Windows runner (the public CI's windows-latest leg) has not;
+  // Xcode only ever runs this script on a Mac anyway.
+  it.skipIf(process.platform === 'win32')('skips the upload, and says so, when the project has no Firebase config yet', () => {
+    // A new game before its Firebase app exists (Slime Shooter, #1584): Crashlytics' own run script
+    // fails the whole archive without a GOOGLE_APP_ID, so the phase must stand down first.
+    writeDsymPbx();
+    writeConfig('');
+    writeCrashlyticsDep();
+    healNativeConfig(root);
+    const srcroot = path.join(root, 'ios', 'App');
+    fs.mkdirSync(path.join(srcroot, 'App'), { recursive: true });
+
+    const without = runPhaseScript(srcroot);
+    expect(without.status).toBe(0);
+    expect(without.out).toContain('GoogleService-Info.plist is missing');
+
+    // With the config present the guard lets the phase through, to its next check (no run script
+    // exists in this fixture) — so the skip above was the plist guard, not a general early exit.
+    fs.writeFileSync(path.join(srcroot, 'App', 'GoogleService-Info.plist'), '<plist/>');
+    const withPlist = runPhaseScript(srcroot);
+    expect(withPlist.status).toBe(0);
+    expect(withPlist.out).not.toContain('GoogleService-Info.plist is missing');
+    expect(withPlist.out).toContain('no run script found');
+  });
+
   it('does nothing for a project without Crashlytics', () => {
     writeDsymPbx();
     writeConfig('');

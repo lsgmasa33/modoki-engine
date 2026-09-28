@@ -124,6 +124,7 @@ const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [
   'games/3d-test/packages/app-services/src/ads.ts :: initEpoch',
   // REAL — an IAP epoch guarding an awaited purchase flow.
   'games/wordweave/runtime/systems.ts :: iapEpoch',
+  'games/slime-shooter/runtime/systems.ts :: iapEpoch',
   // ⚠️ FALSE POSITIVE, kept so the set is exact rather than silently filtered. `k` is a binary-heap
   // LOOP INDEX (`let k = hi.length - 1` and `let k = 0` in `nav.ts`'s `buildNavField`) that happens to be
   // zero-initialised and compared, which is all the detector can see. Do NOT "migrate" it. If the

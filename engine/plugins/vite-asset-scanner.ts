@@ -1459,6 +1459,13 @@ export function filterKeptAssets(assets: AssetEntry[], keepNfc: Set<string>): As
   });
 }
 
+/** The project a monorepo manifest path belongs to (`/games/<id>` or `/demos/<id>`), or `''` for
+ *  everything else — engine built-ins and a flat single-project scan, which is one project. */
+export function manifestProjectOf(manifestPath: string): string {
+  const m = /^\/([^/]+)\/([^/]+)\//.exec(manifestPath);
+  return m && PROJECT_ROOT_DIRS.includes(m[1]) ? `/${m[1]}/${m[2]}` : '';
+}
+
 /** Build a serializable manifest from a scan. Detects GUID collisions (two
  *  files sharing an id — usually a raw `cp` that bypassed the editor's Duplicate
  *  flow). When `heal` is true (dev scans), the collision is resolved by keeping
@@ -1529,6 +1536,18 @@ export function buildManifest(assets: AssetEntry[], heal = false): { version: 2;
     const original = distinct[0];
     for (let i = 1; i < distinct.length; i++) {
       const copy = distinct[i];
+      // ⚠️ Never heal ACROSS projects (#1584). The keeper is chosen by path, not by which file is
+      // the copy, so a project copied verbatim to a name that sorts FIRST (games/slime-shooter from
+      // games/wordweave) had the ORIGINAL re-minted — while the original's scenes kept the old ids,
+      // which then resolved only to the copy. And this runs in `configResolved`, i.e. on every
+      // vitest start and build too, not just the editor. A cross-project duplicate is always an
+      // un-re-minted copy; leave both files alone and let
+      // `engine/tests/assets/crossProjectGuidUniqueness.test.ts` fail on it.
+      const crossProject = manifestProjectOf(copy.entry.path) !== manifestProjectOf(original.entry.path);
+      if (crossProject) {
+        console.error(`[asset-scanner] GUID ${guid} is defined in two projects — NOT healed (re-mint the copy's GUIDs):\n  ${original.entry.path}\n  ${copy.entry.path}`);
+        continue;
+      }
       if (heal && copy.absPath && fs.existsSync(copy.absPath)) {
         const fresh = randomUUID();
         if (writeAssetGuid(copy.absPath, copy.entry.type, fresh)) {

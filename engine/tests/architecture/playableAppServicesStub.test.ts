@@ -410,7 +410,17 @@ const HANDED_ON_REVIEWED = [
       + 'name fallback happens to read; a renamed receiver would not be.',
   },
   {
+    item: "games/slime-shooter/runtime/cloudSyncWiring.ts::auth in startCloudSync > `auth`",
+    reason: 'Weaveling\'s port of the same default (#679). Its calls go through `services.auth.<member>(…)`, which the '
+      + 'name fallback happens to read; a renamed receiver would not be.',
+  },
+  {
     item: "games/wordweave/runtime/cloudSyncWiring.ts::cloudSave in startCloudSync > `cloudSave`",
+    reason: 'the same default. `makeTransport(services.cloudSave)` calls it through a parameter spelled `cloudSave`, '
+      + 'which the name fallback happens to read; a renamed parameter would not be.',
+  },
+  {
+    item: "games/slime-shooter/runtime/cloudSyncWiring.ts::cloudSave in startCloudSync > `cloudSave`",
     reason: 'the same default. `makeTransport(services.cloudSave)` calls it through a parameter spelled `cloudSave`, '
       + 'which the name fallback happens to read; a renamed parameter would not be.',
   },
@@ -423,6 +433,10 @@ const HANDED_ON_REVIEWED = [
   },
   {
     item: "games/wordweave/runtime/debugTab.tsx::ads in <module> > `export const WordweaveAdsTab = createAdsDebugTab(ads.adsDebug);`",
+    reason: 'Weaveling\'s copy of the same tab (#1474, shared since #1501) — the same handoff into the engine, safe for the same reason.',
+  },
+  {
+    item: "games/slime-shooter/runtime/debugTab.tsx::ads in <module> > `export const SlimeShooterAdsTab = createAdsDebugTab(ads.adsDebug);`",
     reason: 'Weaveling\'s copy of the same tab (#1474, shared since #1501) — the same handoff into the engine, safe for the same reason.',
   },
 ] as const;

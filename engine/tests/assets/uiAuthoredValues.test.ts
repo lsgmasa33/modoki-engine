@@ -419,6 +419,8 @@ describe('shippable code does not fake spacing with whitespace (#841)', () => {
       fix: FIX,
       exempt: [
         { item: 'games/wordweave/runtime/dictionary.ts ×1', reason: "'\\n' is the delimiter of the word list it indexes — parsing data, never displayed" },
+        { item: 'games/slime-shooter/runtime/dictionary.ts ×1', reason: "'\\n' is the delimiter of the word list it indexes — parsing data, never displayed" },
+        { item: 'games/slime-shooter/runtime/slime/playLogSink.ts ×1', reason: "'\\n' ends each JSONL line of the play-log FILE (#1584) — a data format written to disk, never displayed" },
       ],
     });
   });

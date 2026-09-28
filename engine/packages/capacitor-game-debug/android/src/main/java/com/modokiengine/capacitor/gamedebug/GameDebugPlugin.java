@@ -716,6 +716,110 @@ public class GameDebugPlugin extends Plugin {
         }
     }
 
+    // --- Debug files ---
+
+    /** The folder under the app's external files dir the debug-file methods are confined to —
+     *  {@code /sdcard/Android/data/<package>/files/modoki-debug/}, pulled with {@code adb pull}.
+     *  definitions.ts documents the contract. */
+    private static final String DEBUG_FILES_DIR = "modoki-debug";
+
+    private static final String DEBUG_FILES_OFF = "Debug files disabled: build.debugBuild is off for this project "
+            + "(Project Settings → Developer → \"Debug build\"). Rebuild after enabling it.";
+
+    /** One thread for every debug-file call, so appends land in the order they arrived. */
+    private final java.util.concurrent.ExecutorService debugFileExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    private java.io.File debugFilesRoot() {
+        java.io.File base = getContext().getExternalFilesDir(null);
+        if (base == null) base = getContext().getFilesDir();
+        return new java.io.File(base, DEBUG_FILES_DIR);
+    }
+
+    /** {@code relative} inside the debug-files folder, or null when it would leave it (a leading
+     *  {@code /}, an empty, {@code .} or {@code ..} segment) — {@code ""} names the folder itself only
+     *  when {@code allowRoot}. */
+    private java.io.File debugFile(String relative, boolean allowRoot) {
+        java.io.File root = debugFilesRoot();
+        if (relative == null || relative.isEmpty()) return allowRoot ? root : null;
+        if (relative.startsWith("/")) return null;
+        for (String seg : relative.split("/", -1)) {
+            if (seg.isEmpty() || seg.equals(".") || seg.equals("..")) return null;
+        }
+        try {
+            java.io.File f = new java.io.File(root, relative).getCanonicalFile();
+            return f.getPath().startsWith(root.getCanonicalPath() + java.io.File.separator) ? f : null;
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    @PluginMethod
+    public void writeDebugFile(PluginCall call) {
+        if (!isDebugBuildEnabled()) { call.reject(DEBUG_FILES_OFF); return; }
+        final String path = call.getString("path", "");
+        final java.io.File f = debugFile(path, false);
+        if (f == null) { call.reject("writeDebugFile: \"" + path + "\" is not a path inside the debug-files folder"); return; }
+        final byte[] data = call.getString("data", "").getBytes(StandardCharsets.UTF_8);
+        final boolean append = Boolean.TRUE.equals(call.getBoolean("append", false));
+        debugFileExecutor.execute(() -> {
+            java.io.File parent = f.getParentFile();
+            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+                call.reject("writeDebugFile " + path + ": could not create " + parent);
+                return;
+            }
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(f, append)) {
+                out.write(data);
+                JSObject ok = new JSObject();
+                ok.put("ok", true);
+                call.resolve(ok);
+            } catch (java.io.IOException e) {
+                call.reject("writeDebugFile " + path + ": " + e.getMessage());
+            }
+        });
+    }
+
+    @PluginMethod
+    public void listDebugFiles(PluginCall call) {
+        if (!isDebugBuildEnabled()) { call.reject(DEBUG_FILES_OFF); return; }
+        final String dir = call.getString("dir", "");
+        final java.io.File d = debugFile(dir, true);
+        if (d == null) { call.reject("listDebugFiles: \"" + dir + "\" is not a folder inside the debug-files folder"); return; }
+        debugFileExecutor.execute(() -> {
+            com.getcapacitor.JSArray files = new com.getcapacitor.JSArray();
+            java.io.File[] items = d.listFiles();
+            if (items != null) {
+                for (java.io.File item : items) {
+                    if (!item.isFile()) continue;
+                    JSObject o = new JSObject();
+                    o.put("name", item.getName());
+                    o.put("size", item.length());
+                    o.put("modified", item.lastModified());
+                    files.put(o);
+                }
+            }
+            JSObject result = new JSObject();
+            result.put("files", files);
+            call.resolve(result);
+        });
+    }
+
+    @PluginMethod
+    public void deleteDebugFile(PluginCall call) {
+        if (!isDebugBuildEnabled()) { call.reject(DEBUG_FILES_OFF); return; }
+        final String path = call.getString("path", "");
+        final java.io.File f = debugFile(path, false);
+        if (f == null) { call.reject("deleteDebugFile: \"" + path + "\" is not a path inside the debug-files folder"); return; }
+        debugFileExecutor.execute(() -> {
+            if (f.exists() && !f.delete()) {
+                call.reject("deleteDebugFile " + path + ": could not delete it");
+                return;
+            }
+            JSObject ok = new JSObject();
+            ok.put("ok", true);
+            call.resolve(ok);
+        });
+    }
+
     // --- Cleanup ---
 
     private void stopAll() {

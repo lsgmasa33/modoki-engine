@@ -1,5 +1,5 @@
 import { WebPlugin } from '@capacitor/core';
-import type { GameDebugPlugin } from './definitions';
+import type { DebugFileInfo, GameDebugPlugin } from './definitions';
 
 export class GameDebugWeb extends WebPlugin implements GameDebugPlugin {
   async startServer(): Promise<{ port: number }> {
@@ -19,6 +19,17 @@ export class GameDebugWeb extends WebPlugin implements GameDebugPlugin {
    *  the fault triggers exist to avoid. */
   async triggerFault(): Promise<{ ok: boolean }> {
     throw this.unavailable('triggerFault is native-only — there is no native runtime to fault on the web.');
+  }
+  /** No device folder to write into — a web build has nothing to pull files from. Rejects rather than
+   *  resolving, so a caller cannot mistake "accepted" for "written". */
+  async writeDebugFile(): Promise<{ ok: boolean }> {
+    throw this.unavailable('writeDebugFile is native-only — a web build has no debug-files folder.');
+  }
+  async listDebugFiles(): Promise<{ files: DebugFileInfo[] }> {
+    throw this.unavailable('listDebugFiles is native-only — a web build has no debug-files folder.');
+  }
+  async deleteDebugFile(): Promise<{ ok: boolean }> {
+    throw this.unavailable('deleteDebugFile is native-only — a web build has no debug-files folder.');
   }
   async getNativeLogs(): Promise<{ logs: string[] }> { return { logs: [] }; }
   async getDeviceIp(): Promise<{ ip: string }> { return { ip: '' }; }
