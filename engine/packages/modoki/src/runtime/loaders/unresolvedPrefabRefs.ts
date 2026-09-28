@@ -116,7 +116,11 @@ export function asAddedNode(
   live: { name: string; parentLocalId: number; identity: Record<string, unknown> },
 ): Record<string, unknown> {
   const base: Record<string, unknown> = kind === 'node' ? { ...record } : { traits: {}, children: [], ...channelsOf(record) };
-  delete base.guid;
-  delete base.key;
-  return { ...base, parentLocalId: live.parentLocalId, ...live.identity, name: live.name, prefab: source };
+  // In the order `captureNestedRef` writes a reference node, so a save with no edit writes the bytes it read (#1722):
+  // the node's own record came from that writer, and deleting its identity then re-spreading it moved `guid` to the end.
+  const { parentLocalId: _p, guid: _g, key: _k, name: _n, traits, children, prefab: _s, ...channels } = base;
+  return {
+    parentLocalId: live.parentLocalId, ...live.identity, name: live.name, traits: traits ?? {}, children: children ?? [],
+    prefab: source, ...channels,
+  };
 }

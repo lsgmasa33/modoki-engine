@@ -1097,7 +1097,9 @@ Without the trait, none of them can see it.
 
 A placeholder dragged from one kind of place to the other is written in the shape of where it now is. `asAddedNode`
 drops an entry's legacy root traits (`rootExtraTraits`), and `asSceneEntry` drops a template node's `templateMoved`;
-neither is written by a current scene save.
+neither is written by a current scene save. `asAddedNode` writes the node in `captureNestedRef`'s key order, so a
+save with no edit writes the bytes it read (#1722: it used to move `guid` to the end, and every no-edit save churned the
+file).
 
 **The writers key on the marker, not on whether the prefab resolves now.** A prefab restored mid-session (a checkout,
 no reload) resolves while the live entity is still the empty placeholder, and a capture of it would drop the record
@@ -1105,7 +1107,9 @@ one save later. Only an expansion clears the marker: a reload or a rebuild that 
 
 Lifecycle: delete → undo carries the marker (`carriedMarkers.ts`). A duplicate or a paste keeps the record, with every
 guid it states re-minted and the root's set to the copy's (`copyUnresolvedRef`), so the two never share an identity
-once the prefab resolves. In prefab edit, a copy of a missing row has no baseline row. It is written from its record
+once the prefab resolves. Two open gaps (#1722): a duplicate or paste of a prefab MEMBER strips the markers along with
+`PrefabInstance`, so a placeholder under it loses its record (#1762), and a ref inside the record to an entity copied
+alongside it is not remapped to the copy (#1763). In prefab edit, a copy of a missing row has no baseline row. It is written from its record
 when nothing in the record was rewritten into the edit world's ids and it states no guid; the save refuses otherwise.
 The guid test is what refuses a SCENE placeholder pasted into prefab edit, whose member rows pin scene guids (#1293). The Hierarchy
 labels the placeholder **Missing Prefab** (`EntityInfo.missingPrefab`), so it does not read as an empty object to clean

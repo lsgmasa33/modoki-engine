@@ -34,6 +34,15 @@ describe('writtenTraitKeys', () => {
     expect(isFieldWritten(99, schema, 'elapsed', fields.elapsed)).toBe(false);
   });
 
+  // JSON has no -0: a written -0 reads back as 0, the default, so the NEXT save omitted what this one wrote, and the
+  // file the editor had just written failed the canonical-scene guard. A reparent's pose decompose makes -0 (#1722).
+  it('omits a signed zero at a zero default, as it omits 0 (JSON cannot carry the sign), and still matches NaN', () => {
+    expect(writtenTraitKeys(schema, { x: -0, parent: 5, elapsed: 0, name: '', tags: [] }, fields)).toEqual(['parent', 'tags']);
+    expect(isFieldWritten(-0, schema, 'x', undefined)).toBe(false);
+    expect(isFieldWritten(NaN, { x: NaN }, 'x', undefined)).toBe(false);
+    expect(isFieldWritten(1, schema, 'x', undefined)).toBe(true);
+  });
+
   it('an AoS trait (no schema) keeps every live key, in the live order — nothing to compare against', () => {
     const data = { b: 0, a: '', c: [] };
     expect(writtenTraitKeys(null, data, {})).toEqual(['b', 'a', 'c']);

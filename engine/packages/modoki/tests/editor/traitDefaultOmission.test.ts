@@ -106,10 +106,14 @@ describe('isTraitDefault — the scalar-only safety boundary', () => {
     expect(isTraitDefault(false, true)).toBe(false);
   });
 
-  it('never omits a signed zero against a plain zero — a different authored value in a direction field', async () => {
+  // This used to assert the opposite ("a different authored value in a direction field"). Writing -0 never kept the
+  // sign: JSON.stringify(-0) is "0", so the file got a 0 that read back as the default, and the NEXT save omitted it —
+  // a save the following one undid, and a fresh file that failed the canonical-scene guard (#1722).
+  it('omits a signed zero against a plain zero, as it omits 0 — the file cannot carry the sign', async () => {
     const { isTraitDefault } = await import('../../src/editor/scene/serialize');
-    expect(isTraitDefault(-0, 0)).toBe(false);
-    expect(isTraitDefault(0, -0)).toBe(false);
+    expect(isTraitDefault(-0, 0)).toBe(true);
+    expect(isTraitDefault(0, -0)).toBe(true);
+    expect(isTraitDefault(NaN, NaN)).toBe(true);
   });
 
   it('never omits a non-scalar, on EITHER side — a shared default array/object cannot be compared safely', async () => {

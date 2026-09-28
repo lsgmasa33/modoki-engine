@@ -1,7 +1,7 @@
 /** Is a trait field still holding its schema default? — the single predicate deciding whether a
  *  field is WRITTEN to disk or omitted.
  *
- *  A LEAF module on purpose. It is pure (`Object.is` plus two typeof checks, no imports), and TWO
+ *  A LEAF module on purpose. It is pure (an equality plus two typeof checks, no imports), and TWO
  *  serializers have to agree on it: `serialize.ts` for a top-level entity, and `prefab.ts`'s
  *  `snapshotAddedTraits` for a prefab-instance `added` child. Importing it from `serialize.ts`
  *  dragged that module's whole graph (`onWorldSwap` and friends) into `prefab.ts` and broke seven
@@ -21,14 +21,16 @@
  *  obvious. Same reasoning excludes AoS traits wholesale at the call site: their schema
  *  is a *function*, so there is no default to compare against at all.
  *
- *  `Object.is` (not `===`) so `NaN` matches its own default and `-0` does NOT collapse
- *  into `0` — a signed zero is a different authored value in a direction/velocity field.
+ *  `NaN` matches its own default. `-0` matches `0`: JSON has no signed zero (`JSON.stringify(-0)` is
+ *  `"0"`), so a written `-0` read back as the default and the NEXT save omitted it — a save that the
+ *  following one undid, and a freshly written file that failed the canonical-scene guard. A reparent's
+ *  pose decompose is what makes one (#1722).
  *
  *  Exported for unit testing. */
 export function isTraitDefault(value: unknown, def: unknown): boolean {
   if (def !== null && (typeof def === 'object' || typeof def === 'function')) return false;
   if (value !== null && (typeof value === 'object' || typeof value === 'function')) return false;
-  return Object.is(value, def);
+  return value === def || (Number.isNaN(value) && Number.isNaN(def));
 }
 
 /** The two Inspector hints the write rule reads — structural, so this module stays import-free.

@@ -44,6 +44,7 @@ import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID }
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
+import { asAddedNode } from '../../packages/modoki/src/runtime/loaders/unresolvedPrefabRefs';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
@@ -127,6 +128,9 @@ const inside = (guid: string, name: string): number => {
 };
 const x = (id: number) => (readTraitData(id, meta('Transform')) as { x: number }).x;
 const save = async () => JSON.parse(JSON.stringify(await serializeScene())) as SceneData;
+/** The record a missing-prefab save writes, compared BYTE for byte with the control's: `toEqual` ignores key order, and a
+ *  re-emit that reorders a node's keys churned every no-edit save of the file (#1722). */
+const expectSameBytes = (got: unknown, want: unknown) => expect(JSON.stringify(got)).toBe(JSON.stringify(want));
 const entryOf = (s: SceneData, guid: string) => (s.entities as unknown as Array<Record<string, unknown>>).find((e) => e.guid === guid);
 
 /** Holder → a scene instance of `prefab` (guid INST). */
@@ -162,7 +166,7 @@ describe('a top-level instance whose prefab is missing keeps its entry (#1699, 1
     uninstall(P);
     await load(control);
     const missing = await save();
-    expect(entryOf(missing, INST)).toEqual(entry);
+    expectSameBytes(entryOf(missing, INST), entry);
 
     install(pDoc());
     await load(missing);
@@ -183,7 +187,7 @@ describe('a nested row whose child prefab is missing keeps the frame\'s scene ed
     uninstall(Q);
     await load(control);
     const missing = await save();
-    expect(entryOf(missing, INST)).toEqual(entry);
+    expectSameBytes(entryOf(missing, INST), entry);
 
     install(qDoc());
     await load(missing);
@@ -205,11 +209,23 @@ describe('a scene-added reference node whose prefab is missing keeps its node (#
     uninstall(Q);
     await load(control);
     const missing = await save();
-    expect(entryOf(missing, INST)).toEqual(entry);
+    expectSameBytes(entryOf(missing, INST), entry);
 
     install(qDoc());
     await load(missing);
     expect(x(inside(QINST, 'QX'))).toBe(7);
+  });
+});
+
+// Both branches of the re-emit write `captureNestedRef`'s key order, so a no-edit save writes the bytes it read (#1722).
+// Case 3 above drives the NODE branch through the save; this pins the ENTRY branch (a top-level placeholder dragged
+// under a member), whose record is a scene entry. Mutation: the old `{ ...base, parentLocalId, ...identity, name, prefab }`.
+describe('a missing-prefab reference node is re-emitted in the writer\'s key order (#1722)', () => {
+  it('an entry record dragged under a member: identity first, then the channels in their own order', () => {
+    const entry = { name: 'Old', traits: { EntityAttributes: { name: 'Old' } }, prefab: Q, overrides: { 1: { Transform: { x: 2 } } }, members: { '/g': { name: 'QX' } }, guid: QINST };
+    const node = asAddedNode('entry', entry, Q, { name: 'QInst', parentLocalId: 2, identity: { guid: QINST } });
+    expect(Object.keys(node)).toEqual(['parentLocalId', 'guid', 'name', 'traits', 'children', 'prefab', 'overrides', 'members']);
+    expect(node.traits).toEqual({}); // an entry's root traits are not a node's (docs/prefabs.md § A missing prefab keeps its record)
   });
 });
 
