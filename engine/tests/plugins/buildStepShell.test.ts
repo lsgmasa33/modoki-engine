@@ -175,19 +175,26 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
   // `sleep 30` would have no grandchild at all and both cases below would trivially pass.
   const COMPOUND = 'X=$(echo hi) && { sleep 30 || true; }'
   const settle = () => new Promise((r) => setTimeout(r, 350))
-  const childrenOf = (pid: number): number[] => {
-    try { return execSync(`pgrep -P ${pid} || true`, { encoding: 'utf8' }).trim().split('\n').filter(Boolean).map(Number) } catch { return [] }
+  /** The shell's `sleep 30` children. Matched by command, not "any child": a poll can land while the `$(echo hi)`
+   *  subshell is the only child, and that one exits by itself. */
+  const sleepersOf = (pid: number): number[] => {
+    try { return execSync(`pgrep -P ${pid} -f '^sleep 30$' || true`, { encoding: 'utf8' }).trim().split('\n').filter(Boolean).map(Number) } catch { return [] }
+  }
+  /** Bash forking the grandchild is an EVENT: poll for it, never sleep a guess (#1742's sweep). A 350 ms sleep here bet the
+   *  fork landed inside it, which a loaded box does not promise. */
+  const forked = async (pid: number): Promise<number[]> => {
+    let kids: number[] = []
+    await vi.waitFor(() => { kids = sleepersOf(pid); expect(kids.length, 'bash should have forked a grandchild for a compound command').toBeGreaterThan(0) }, { timeout: 5000, interval: 25 })
+    return kids
   }
   const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
 
   it('CONTROL: a plain proc.kill() signals only the shell, orphaning the real child', async () => {
     const proc = spawnShell(COMPOUND)
-    await settle()
-    const kids = childrenOf(proc.pid!)
-    expect(kids.length, 'bash should have forked a grandchild for a compound command').toBeGreaterThan(0)
+    const kids = await forked(proc.pid!)
 
     proc.kill('SIGTERM') // the pre-#176 abort: one pid
-    await settle()
+    await settle() // a SURVIVAL window, so a fixed wait is the point: a longer one only strengthens it
     expect(kids.some(alive), 'the orphan this bug is about').toBe(true)
 
     for (const k of kids) { try { process.kill(k, 'SIGKILL') } catch { /* gone */ } }
@@ -195,13 +202,15 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
 
   it('killBuildProcess reaches the grandchild via the process group', async () => {
     const proc = spawnShell(COMPOUND)
-    await settle()
-    const kids = childrenOf(proc.pid!)
-    expect(kids.length).toBeGreaterThan(0)
+    const kids = await forked(proc.pid!)
 
-    killBuildProcess(proc)
-    await settle()
-    expect(kids.filter(alive), 'no survivors of the group kill').toEqual([])
+    // A grace longer than the poll, so only the group SIGTERM can kill inside it. A kill that misses only the grandchild
+    // still kills the shell, and the escalation is skipped for an exited shell; but one that misses the shell too (no
+    // SIGTERM sent at all) would let the default 5 s escalation race this 5 s poll. The timer is cleared on the close.
+    killBuildProcess(proc, { graceMs: 60_000 })
+    // The deaths are an event too: poll. The CONTROL above proves a plain kill leaves the grandchild alive, so a kill that
+    // misses it leaves `sleep 30` running past the deadline.
+    await vi.waitFor(() => expect(kids.filter(alive), 'no survivors of the group kill').toEqual([]), { timeout: 5000, interval: 25 })
   })
 
   it('escalates to SIGKILL when the tree IGNORES SIGTERM', async () => {
@@ -217,9 +226,7 @@ describe.skipIf(process.platform === 'win32')('buildStepShell — killBuildProce
     // which is why this was green on every Mac and red on `ci/main` only. A TERM trap does not
     // suppress the optimization — only EXIT/ERR traps do.
     const proc = spawnShell(`trap "" TERM; ${COMPOUND}`)
-    await settle()
-    const kids = childrenOf(proc.pid!)
-    expect(kids.length).toBeGreaterThan(0)
+    const kids = await forked(proc.pid!)
 
     killBuildProcess(proc, { graceMs: 400 })
     // Mid-grace: SIGTERM has been sent and IGNORED. Asserting survival here is what proves the

@@ -1670,6 +1670,13 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
   condition instead:** fake timers plus `vi.runAllTimersAsync()` (drains every timer the chain
   schedules, whatever the clock), a completion promise, or `vi.waitFor`. Never raise the number.
   (A loop of N × `setTimeout(0)` is hop-counting, ordered by due time, and is not this bug.)
+  **It fires on a loaded Mac too** (#1772, #1742). Node reads a fresh clock for every timer it inserts, so two timers
+  of DIFFERENT durations inserted microseconds apart can swap order: a worker preempted for more than 4 ms between a
+  test's 5 ms sleep and a stub's 0 ms load let the sleep fire first (`riggedModelCache`, red at load 35). Timers of the
+  SAME duration fire in insertion order, so a `setTimeout(r, 0)` flush behind a 0 ms stub is safe. A watcher's
+  readiness is an event as well: with `ignoreInitial`, a file written before chokidar's scan ends is never reported, so
+  wait for a probe file to be reported, not for N ms. And assert WHICH files were reported, not the exact event list:
+  FSEvents under load reports a create-then-write as `add` + `change`.
 - **A process holds its cwd until it has EXITED, and a kill returns before that** (#1735). So a
   teardown that kills a child whose cwd is a scratch dir (or merely does not wait for it), then removes the dir,
   fails `EPERM` on Windows while macOS and Linux delete it happily. Measured: SIGKILL a

@@ -519,16 +519,21 @@ describe('riggedModelCache', () => {
 describe('riggedModelCache — a failed load is classified before it is remembered (#1397)', () => {
   const VARIANT = '/models/alien.glb.processed.glb';
   const httpError = (status: number) => Object.assign(new Error(`responded with ${status}`), { response: { status } });
-  const settle = () => new Promise((r) => setTimeout(r, 5));
+  /** One 5 ms lap of FAKE time (#1772). It was a real 5 ms `setTimeout`, raced against the stub's 0 ms load timer. Node
+   *  reads a fresh clock for each timer it inserts, and the two are inserted microseconds apart, so a worker preempted
+   *  for more than 4 ms between them let the sleep fire first. The lap then ended before the load landed, and verify went
+   *  red at load 35 with "expected undefined to be defined". On fake time the order is by due time alone. */
+  const settle = () => vi.advanceTimersByTimeAsync(5);
   /** Ask the way the render sync does: once per "frame", letting each lap settle. */
   const frames = async (n: number) => { for (let i = 0; i < n; i++) { ensureRiggedModelLoadedFor(1, REF); await settle(); } };
 
   beforeEach(() => {
     setManualNow(0);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     manifest.entry = { modelCache: {} }; // two candidates: the variant, then the raw source
   });
-  afterEach(() => { restoreRealClock(); vi.restoreAllMocks(); });
+  afterEach(() => { vi.useRealTimers(); restoreRealClock(); vi.restoreAllMocks(); });
 
   it('a 404 on both candidates is requested ONCE across many frames, until invalidateRiggedModel', async () => {
     cfg.failWith = () => httpError(404);
