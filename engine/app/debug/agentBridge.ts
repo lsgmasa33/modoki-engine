@@ -649,7 +649,7 @@ export function dumpSceneState(params: SceneStateParams = {}) {
         })
         : undefined;
   return {
-    scenePath: sceneManager.getCurrent()?.path ?? null,
+    scenePath: openScenePath(),
     // §2 (#1217, #1223 D3): `returnedCount` is the rows below, `totalCount` every entity the query
     // matched before the limit — both always, so a total never exists only when truncation happened.
     // Never `entityCount`: it meant these rows here and the whole world in the editor state.
@@ -714,6 +714,28 @@ let _worldReloadedFromDisk: WorldReloadedFromDisk | null = null;
 /** Editor-only: install the after-reload hook. Called from `agentEditorOps.ts`. */
 export function setWorldReloadedFromDiskHook(fn: WorldReloadedFromDisk | null): void {
   _worldReloadedFromDisk = fn;
+}
+
+/** Editor-only: the file the editor's next save writes (`getCurrentScenePath`), installed the way the hooks above are
+ *  (#1712). Unset in the game runtime, where `SceneManager` is the only answer. */
+let _editorScenePath: (() => string | null) | null = null;
+
+/** Editor-only: install the editor's scene-path reader. Called from `agentEditorOps.ts`. */
+export function setEditorScenePathReader(fn: (() => string | null) | null): void {
+  _editorScenePath = fn;
+}
+
+/** The scene FILE the open world is bound to: `SceneManager`'s primary when it has one, else the file the editor
+ *  saves it to (#1712).
+ *
+ *  ⚠️ Not `sceneManager.getCurrent()?.path` alone. A world made by `newScene()` goes through
+ *  `replaceWorldContent`, which leaves `getCurrent()` null by design, and a save that later gives it a file
+ *  (`save_all {path}`, a first Cmd+S, Assets → Create Scene) tells only the editor. Asking `SceneManager` alone
+ *  dropped every outside change to that scene, or to a prefab it uses, with no reload and no log, until it was
+ *  reopened. `SceneManager` still wins whenever it answers, so the prefab-edit world keeps its synthetic path (the
+ *  editor's is null there) and a loaded scene reads exactly as before. */
+function openScenePath(): string | null {
+  return sceneManager.getCurrent()?.path ?? _editorScenePath?.() ?? null;
 }
 
 /** Why scene hot-reload is currently suppressed (editor Play mode), or null when
@@ -3164,7 +3186,9 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
     const refresh = _prefabSourceRefresher;
     if (refresh) await Promise.all(prefabPaths.map((urlPath) => refresh(urlPath).catch(() => {})));
   };
-  const current = sceneManager.getCurrent()?.path;
+  // `openScenePath`, not `getCurrent()` alone (#1712): a scene made by `newScene()` and then saved has a file but no
+  // `SceneManager` entry, and returning here dropped every change to it silently.
+  const current = openScenePath();
   if (!current) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
   // In prefab-edit mode the active "scene" is a synthetic in-memory scene
   // (`/__prefab-edit__/<guid>`) with no file on disk — leave it alone. The editor's prefab copy is
@@ -3189,7 +3213,8 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   let changedBaseGuid: string | undefined;
   if (msg.kind === 'scene') {
     const normChanged = normScenePath(msg.urlPath);
-    let matchedAny = false;
+    // The open scene itself, also when `SceneManager` has no entry for it (#1712: a `newScene()` world saved to a file).
+    let matchedAny = normScenePath(current) === normChanged;
     for (const entry of sceneManager.getLoadedScenes().values()) {
       if (normScenePath(entry.path) !== normChanged) continue;
       matchedAny = true;

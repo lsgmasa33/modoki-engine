@@ -848,6 +848,20 @@ export function swapHistory(
 /** The key the live stacks belong to: the last {@link swapHistory}'s. */
 export function activeHistoryKey(): string { return _activeKey; }
 
+/** The UNTITLED world just got a file (#1712): its live stacks now belong to `key`. Not a swap: the world and its
+ *  stacks are unchanged, only their name moves, so nothing is parked or invalidated. A stack parked under `key`
+ *  named that file's OLD content, which the save just replaced, so it is dropped (as {@link forgetHistory} does).
+ *
+ *  Without this the stacks stayed under '' while the world was bound to `key`, and the first hot reload of that
+ *  file (which adopts under `key`) swapped them out for `key`'s empty stack: Cmd+Z emptied by an outside write,
+ *  where a loaded scene keeps its stack through the same reload. Only from '' — no other context is untitled. */
+export function rekeyUntitledHistory(key: string): void {
+  if (_activeKey !== '' || key === '') return;
+  _histories.delete(key);
+  _histories.delete('');
+  _activeKey = key;
+}
+
 /** Park only the entries that outlive a discarded world: `_isFileDirect` ones (material, clip,
  *  particle, skin, timeline… edits), whose target is a file the swap does not touch. Dropping them
  *  with the world's entries would strand an asset edit with no undo (#1409 review). Relative order

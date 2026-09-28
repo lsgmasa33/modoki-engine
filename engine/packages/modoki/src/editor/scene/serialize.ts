@@ -24,7 +24,7 @@ import { useEditorStore } from '../store/editorStore';
 import { setPlayState } from '../../runtime/core/playState';
 import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
-import { forgetHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
+import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances, savedFrameDoc } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
@@ -1215,7 +1215,12 @@ export function lastWrittenSceneBytes(path: string): string | undefined {
   return lastWrittenScene.get(path);
 }
 
-async function writePrimaryScene(path: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number, ifMatch?: string): Promise<SaveResult> {
+async function writePrimaryScene(
+  path: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number, ifMatch?: string,
+  /** The world `content` was serialized from — see `saveScene`. Defaults to the one live now, for a caller that did
+   *  not serialize across an await of its own. */
+  worldSerialized = getCurrentWorld(),
+): Promise<SaveResult> {
   const openBefore = _currentScenePath;
   // `ifMatch` (#1695): only over the bytes the caller expects there, checked by the route atomically with the write.
   const guarded = ifMatch === undefined ? null : await writeAssetFileGuarded(path, content, { ifMatch });
@@ -1236,7 +1241,13 @@ async function writePrimaryScene(path: string, content: string, sceneId: string,
   // stamping its world as saved, would make the next save write THAT world over this file (#1414
   // close-out review). The bytes above are the old scene's, written to its own file — still true.
   if (_currentScenePath !== openBefore) return { saved: true, path, reason: 'ok', content };
+  // …and for an UNTITLED world that check cannot see it: a Create Scene landing meanwhile leaves the path null → null.
+  // Binding `path` to that new world would name a file holding the OLD one's bytes, mark it saved, and hand it the
+  // file's undo key (#1712 close-out re-review). The world, not the path, is what the bytes are.
+  if (openBefore === null && getCurrentWorld() !== worldSerialized) return { saved: true, path, reason: 'ok', content };
   if (path !== _currentScenePath) setCurrentScenePath(path);
+  // An untitled world's first file (#1712): its undo stacks move to the file's key, which a hot reload of it adopts.
+  if (openBefore === null) rekeyUntitledHistory(path);
   markSceneSaved(savedAtEditVersion);
   return { saved: true, path, reason: 'ok', content };
 }
@@ -1298,6 +1309,10 @@ export async function saveScene(opts: {
     console.warn(`[Editor] Save refused — ${notAuthored}. Stop preview/play (and let it finish reverting) before saving so preview mutations don't reach disk.`);
     return { saved: false, path: explicitPath || _currentScenePath, reason: 'playing' };
   }
+  // The world these bytes are, captured BEFORE serializing: `serializeScene` itself awaits (prefab sources), and a first
+  // save binds its file only to this world (#1712 close-out reviews — read after, a Create Scene landing inside the
+  // serialize was taken for the world the bytes came from).
+  const worldSerialized = getCurrentWorld();
   // Saving is the authored write that persists identity — commit minted guids
   // to the live world so subsequent refs resolve and the next save is stable.
   const scene = await serializeScene({ assignGuids: true });
@@ -1321,7 +1336,7 @@ export async function saveScene(opts: {
   // case-variant `path` names the same file, and adopting it would give the manifest a second key.
   const knownPath = kind === 'same' ? _currentScenePath! : explicitPath || _currentScenePath;
   // scene.id is always populated by serializeScene (required field).
-  if (knownPath) return writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAtEditVersion, ifMatch);
+  if (knownPath) return writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAtEditVersion, ifMatch, worldSerialized);
 
   // No path, and no dialog allowed (an agent) — say so instead of opening a modal panel
   // only a human can close.
@@ -1360,7 +1375,11 @@ export async function saveScene(opts: {
     // and the current scene path persists — a second spelling would be what every later save writes.
     const saved = written.path;
     registerAsset(written.guid, saved, 'scene');
+    // A world switch during the panel or the write (a Create Scene, a scene open) owns the editor now: the file holds
+    // the world that was serialized, not this one, so nothing binds to it (#1712 close-out re-review).
+    if (getCurrentWorld() !== worldSerialized) return { saved: true, path: saved, reason: 'ok' };
     setCurrentScenePath(saved); // persists, so the next Save All goes straight to it
+    rekeyUntitledHistory(saved); // its undo stacks now belong to the file (#1712 close-out review) — see writePrimaryScene
     editorEmit('!save', { path: saved, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${saved}`);
     markSceneSaved(savedAtEditVersion);

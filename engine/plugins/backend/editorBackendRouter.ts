@@ -53,7 +53,7 @@ import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, 
 import { readFontAxes } from '../font-instance';
 // A leaf: the watcher's guard module imports nothing from the Vite plugin, so this router stays host-agnostic.
 import { EDITOR_DELETE_FINGERPRINT } from '../editorWriteGuard';
-import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash, remintSceneEntityGuids, planMemberPathRepair, type RepairFile } from '../asset-fs-ops';
+import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, planMemberPathRepair, type RepairFile } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite } from '../prefabWriteGuard';
@@ -1032,6 +1032,17 @@ function filesUnder(dir: string, rel = ''): string[] {
   return entries.flatMap((e) => {
     const childRel = rel ? `${rel}/${e.name}` : e.name;
     return e.isDirectory() ? filesUnder(dir, childRel) : [childRel];
+  });
+}
+
+/** What an import writes at `destUrl` (#1713): `importedAssetBytes` against THIS project's manifest and prefabs — the
+ *  one decision both imports make (`/api/import-file`, and the Assets panel's through `/api/import-identity`). */
+function importIdentity(ctx: BackendContext, destUrl: string, bytes: Buffer, claimed: readonly string[] = []): { bytes: Buffer; guid?: string; id?: string } {
+  const also = new Set(claimed.map((g) => g.toLowerCase()));
+  return importedAssetBytes(bytes, destUrl, {
+    guidTaken: (g) => also.has(g.toLowerCase())
+      || ctx.getManifest().assets.some((a) => typeof a.guid === 'string' && a.guid.toLowerCase() === g.toLowerCase()),
+    readPrefab: makePrefabResolver(ctx),
   });
 }
 
@@ -6096,11 +6107,35 @@ async function describeUnresolvedAgainstLiveWorld(
     return json({ ok: true });
   }
 
+  // ── POST /api/import-identity {path, content} (M) ── the Assets panel's half of an import (#1713): the bytes a
+  // file dropped from the OS becomes at `path` — a JSON asset keeps its own id unless the project already holds it,
+  // exactly as /api/import-file decides (`importIdentity`). Writes nothing — the panel writes the answer through
+  // /api/write-file and keeps it as its redo bytes. ⚠️ `claimed`: the ids this panel batch has already decided on. Its
+  // writes go through /api/write-file, which does not rebuild the manifest, so without them a batch of two files carrying
+  // one unused id kept it twice and left the pair to the scanner's heal (#1713 close-out re-review). Answers `id`, the
+  // id the bytes carry, for the panel to claim.
+  // `content` is base64 in and out, as the panel reads a dropped File.
+  if (urlPath === '/api/import-identity' && method === 'POST') {
+    try {
+      const { path: destUrl, content, claimed } = (body ?? {}) as { path?: unknown; content?: unknown; claimed?: unknown };
+      if (typeof destUrl !== 'string' || typeof content !== 'string') return json({ error: 'import-identity requires { path, content }' }, 400);
+      const claimedIds = Array.isArray(claimed) ? claimed.filter((g): g is string => typeof g === 'string') : [];
+      const abs = resolveWritableFilePath(ctx, destUrl);
+      if (!abs) return outsideAssetRoots('path outside allowed directories');
+      const out = importIdentity(ctx, scannerUrlOf(ctx, abs) ?? destUrl, Buffer.from(content, 'base64'), claimedIds);
+      return json({ ok: true, content: out.bytes.toString('base64'), ...(out.guid ? { guid: out.guid } : {}), ...(out.id ? { id: out.id } : {}) });
+    } catch (e) {
+      return json({ error: String(e) }, 500);
+    }
+  }
+
   // ── POST /api/import-file {srcPath, destFolder, reimport?} (M, exec) ── import
-  // a NEW file from anywhere on disk into the project (the human "drag from
-  // Finder" path): copy it under destFolder, let the manifest rescan heal a fresh
-  // GUID, then run the asset-type's import handler (texture→KTX2/WebP, model→GLB)
-  // unless reimport:false. Returns the new asset's url path + guid.
+  // a NEW file from anywhere on disk into the project: copy it under destFolder —
+  // a JSON asset under its own id unless the project already holds it (`importIdentity`,
+  // #1713), a binary as is, for the scan to mint its sidecar — then run the asset-type's import handler
+  // (texture→KTX2/WebP, model→GLB) unless reimport:false. Returns the new asset's
+  // url path + guid. (The Assets panel's OS drop writes through /api/write-file and
+  // takes its identity from /api/import-identity — the same `importIdentity`.)
   if (urlPath === '/api/import-file' && method === 'POST') {
     try {
       const { srcPath, destFolder, reimport = true } = (body ?? {}) as { srcPath?: string; destFolder?: string; reimport?: boolean };
@@ -6112,8 +6147,17 @@ async function describeUnresolvedAgainstLiveWorld(
       const base = path.basename(srcPath);
       const destAbs = path.join(destDirAbs, base);
       if (fs.existsSync(destAbs)) return json({ error: `destination exists: ${base}` }, 409);
-      fs.copyFileSync(srcPath, destAbs);
-      // Rescan heals a fresh GUID for the new file (scanner writeAssetGuid path).
+      // The identity is decided BEFORE the bytes reach disk (#1713): a colliding copy written with its source's id would
+      // meet the scanner's collision heal, which keeps the id for the path that sorts first — the ORIGINAL re-minted, whenever
+      // the import sorts first. A binary is copied as is; the rescan mints its sidecar.
+      // Classified by the url the SCAN will index it under (`scannerUrlOf`), so a legacy `/scenes/` folder typed in
+      // another case still reads as one.
+      // Only a file whose identity the import decides is read into memory; everything else is copied as before, so a
+      // multi-GB video still imports (`readFileSync` refuses past 2 GiB) and stays an APFS clone (close-out review).
+      const scanUrl = scannerUrlOf(ctx, destAbs);
+      if (!scanUrl) return outsideAssetRoots('destFolder outside allowed directories');
+      if (importDecidesIdentity(scanUrl)) fs.writeFileSync(destAbs, importIdentity(ctx, scanUrl, fs.readFileSync(srcPath)).bytes, { flag: 'wx' });
+      else fs.copyFileSync(srcPath, destAbs);
       ctx.rebuildManifest();
       // The editor's own write (#1702), after the rebuild: its GUID heal may rewrite the copy, and the mark must
       // fingerprint the bytes that stay. Nothing between the copy and here awaits — see `markWrittenFile`.

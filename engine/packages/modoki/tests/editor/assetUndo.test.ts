@@ -943,6 +943,44 @@ describe('makeFileImportUndo (#308 follow-up B)', () => {
     expect(writes[0].body).toEqual({ path: '/assets/a.png', content: 'AA==', encoding: 'base64', ifNoneMatch: '*' });
   });
 
+  // #1713 close-out re-review: the id a JSON import kept can be taken while it is undone (an agent import elsewhere pushes
+  // no undo). The redo asks again, as the forward import did, and writes what it is answered.
+  // Mutation: write `f.content` as before, skipping the re-decision — this and the next case go red; drop the
+  // `bytesOf` update — only this one goes red.
+  it('redo re-decides a JSON asset\'s id and writes the answer', async () => {
+    const refresh = vi.fn();
+    const kept = Buffer.from('{"id":"kept"}').toString('base64');
+    const fresh = Buffer.from('{"id":"fresh"}\n').toString('base64');
+    const action = makeFileImportUndo({ imported: [{ path: '/assets/a.prefab.json', content: kept }, { path: '/assets/b.png', content: 'AA==' }], refresh });
+    await action.undo();
+    calls = [];
+    statusOverrides.push({ url: '/api/import-identity', status: 200, ok: true, body: { ok: true, content: fresh, id: 'fresh' } });
+    await action.redo();
+    const asked = calls.filter((c) => c.url === '/api/import-identity');
+    expect(asked.map((c) => c.body)).toEqual([{ path: '/assets/a.prefab.json', content: kept, claimed: [] }]); // the PNG is not asked
+    const writes = calls.filter((c) => c.url === '/api/write-file').map((c) => c.body);
+    expect(writes).toEqual([
+      { path: '/assets/a.prefab.json', content: fresh, encoding: 'base64', ifNoneMatch: '*' },
+      { path: '/assets/b.png', content: 'AA==', encoding: 'base64', ifNoneMatch: '*' },
+    ]);
+    // The next undo guards the bytes the redo WROTE (the settle read fails in this harness, so the entry's own bytes
+    // are the baseline): guarded by the old ones, it would refuse an untouched file as changed.
+    calls = [];
+    await action.undo();
+    const del = calls.find((c) => c.url === '/api/delete-asset')!.body;
+    expect(del.ifMatch['/assets/a.prefab.json']).toBe(createHash('sha256').update(Buffer.from(fresh, 'base64')).digest('hex'));
+  });
+
+  it('redo does not write a JSON file whose id the backend could not decide — never the old bytes', async () => {
+    const action = makeFileImportUndo({ imported: [{ path: '/assets/a.prefab.json', content: 'e30=' }], refresh: vi.fn() });
+    await action.undo();
+    calls = [];
+    statusOverrides.push({ url: '/api/import-identity', status: 500, ok: false, body: { error: 'boom' } });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try { await action.redo(); } finally { err.mockRestore(); }
+    expect(calls.filter((c) => c.url === '/api/write-file')).toEqual([]);
+  });
+
   // #308: redo's re-write loop was entirely unchecked.
   it('redo batch-reports every path whose re-write fails', async () => {
     const error = spyConsole('error');

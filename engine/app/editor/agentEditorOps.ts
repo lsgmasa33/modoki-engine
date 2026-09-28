@@ -26,7 +26,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setEditorScenePathReader, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
 import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
@@ -1196,6 +1196,8 @@ export function registerEditorAgentOps(): void {
   // #1409: a hot reload replaces the world from disk outside `loadScene`, so it owes the same
   // undo-history and clean-baseline rules — see `adoptWorldReloadedFromDisk`.
   setWorldReloadedFromDiskHook(adoptWorldReloadedFromDisk);
+  // #1712: a `newScene()` world saved to a file has no `SceneManager` entry — the bridge asks the editor which file it is.
+  setEditorScenePathReader(getCurrentScenePath);
   setSceneReloadSuppressor(() => {
     // Stopped, but a snapshot restore, a scene open or a save cycle is still swapping the world
     // (#1164 review): a reload now supersedes that load — a scene open silently fails, or a Stop's

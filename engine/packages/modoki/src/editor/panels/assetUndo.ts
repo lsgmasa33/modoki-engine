@@ -21,7 +21,7 @@ import {
   writeAssetFile, deleteAssetFiles, duplicateAssetFileReport,
   createFolderApi, moveFileToStatus,
 } from './assetOps';
-import { writeAssetFileGuarded, backendFetch } from '../backend/editorBackend';
+import { writeAssetFileGuarded, backendFetch, importedFileContent } from '../backend/editorBackend';
 import { sha256OfBytes } from '../utils/contentHash';
 import type { AssetEntry } from '../utils/assetPaths';
 import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
@@ -775,6 +775,8 @@ export function makeFileImportUndo(params: {
   const label = imported.length > 1 ? `Import ${imported.length} files` : `Import "${imported[0].path.split('/').pop()}"`;
   // path → the hash its current bytes are expected to have; present = on disk as this entry left it.
   const onDisk = new Map<string, string | undefined>(imported.map((f) => [f.path, f.sha256]));
+  // path → the bytes (base64) this entry last wrote there: a redo re-decides a JSON asset's id (#1713), so they can move.
+  const bytesOf = new Map<string, string>(imported.map((f) => [f.path, f.content]));
   return {
     label,
     // Undoing an import DELETES the files, and you can have opened one in the meantime
@@ -783,7 +785,7 @@ export function makeFileImportUndo(params: {
       const files = imported.filter((f) => onDisk.has(f.path));
       if (files.length === 0) { refresh(); return; }
       const ifMatch: Record<string, string> = {};
-      for (const f of files) ifMatch[f.path] = onDisk.get(f.path) ?? await expectedHash(f.path, f.content, 'base64');
+      for (const f of files) ifMatch[f.path] = onDisk.get(f.path) ?? await expectedHash(f.path, bytesOf.get(f.path)!, 'base64');
       const res = await deleteAssetFiles(files.map((f) => f.path), { ifMatch });
       if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
       const failed = res.ok ? new Set(res.failed) : new Set(files.map((f) => f.path));
@@ -799,14 +801,21 @@ export function makeFileImportUndo(params: {
       const failed: string[] = [];
       const taken: string[] = [];
       const wrote: string[] = [];
+      // The id is decided AGAIN, as the forward import decided it (#1713 close-out re-review): the one this entry kept
+      // can have been taken since the undo freed it (an agent import elsewhere pushes no undo, so redo stays offered),
+      // and re-writing it as it was would leave two files on one id to the scanner's heal. Unchanged when still free.
+      const claimed = new Set<string>();
       for (const f of imported) {
         if (onDisk.has(f.path)) continue; // still on disk from before — nothing to redo
-        const w = await writeAssetFileGuarded(f.path, f.content, { encoding: 'base64', createOnly: true });
+        const content = await importedFileContent(f.path, bytesOf.get(f.path)!, claimed);
+        if (content === null) { failed.push(f.path); continue; }
+        bytesOf.set(f.path, content);
+        const w = await writeAssetFileGuarded(f.path, content, { encoding: 'base64', createOnly: true });
         if (w === 'ok') wrote.push(f.path);
         else if (w === 'conflict') taken.push(f.path);
         else failed.push(f.path);
       }
-      // Re-take the settled baseline: the scanner heals a re-written JSON again, and mints it a fresh id this time.
+      // Re-take the settled baseline, for a re-written JSON the scanner may still re-stamp (one with no GUID-shaped id).
       const settled = await settledHashes(wrote);
       for (const p of wrote) onDisk.set(p, settled.get(p));
       if (taken.length > 0) {

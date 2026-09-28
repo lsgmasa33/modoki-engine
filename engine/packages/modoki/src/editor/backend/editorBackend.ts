@@ -135,6 +135,32 @@ export async function writeSceneCopy(filePath: string, content: string, openPath
   } catch { return null; }
 }
 
+/** The bytes (base64) a file dropped into the Assets panel is written as at `dest` (#1713): a JSON asset with an
+ *  identity of its own, decided by the backend exactly as `modoki_import_file` decides it (`/api/import-identity`
+ *  → `importedAssetBytes`); anything else unchanged, without a round trip. Null when the backend could not answer — the
+ *  caller must NOT fall back to the dropped bytes, which carry the source's id: written as they are, a copy of an asset
+ *  already in the project claims its guid, and the scanner's heal keeps it for whichever path sorts first.
+ *
+ *  `claimed` is ONE batch's decided ids, shared across its calls and grown by each (#1713 close-out re-review): the
+ *  batch writes through `/api/write-file`, which rebuilds no manifest, so the backend cannot see the batch's earlier
+ *  files — two carrying one unused id would otherwise both keep it. */
+export async function importedFileContent(dest: string, content: string, claimed: Set<string> = new Set()): Promise<string | null> {
+  if (!dest.toLowerCase().endsWith('.json')) return content;
+  try {
+    const res = await backendPostJson('/api/import-identity', { path: dest, content, claimed: [...claimed] });
+    const j = await res.json().catch(() => ({})) as { content?: unknown; id?: unknown; error?: unknown };
+    if (!res.ok || typeof j.content !== 'string') {
+      console.error(`[Assets] ${dest} was not imported: no identity from the backend (${String(j.error ?? res.status)})`);
+      return null;
+    }
+    if (typeof j.id === 'string') claimed.add(j.id);
+    return j.content;
+  } catch (e) {
+    console.error(`[Assets] ${dest} was not imported: no identity from the backend`, e);
+    return null;
+  }
+}
+
 /** After a prefab changed from `before` in a way that moved member PATHS (#1437: an applied move),
  *  re-point the member refs stored in every OTHER scene and prefab file that uses it
  *  (`/api/prefab-member-paths`). Resolves to what was rewritten and what was left because an asset view

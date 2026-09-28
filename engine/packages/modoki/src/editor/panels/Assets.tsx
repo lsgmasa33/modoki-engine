@@ -1,7 +1,7 @@
 /** Assets — browse project assets by category or folder structure */
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { backendFetch, jsonFileBody } from '../backend/editorBackend';
+import { backendFetch, jsonFileBody, importedFileContent } from '../backend/editorBackend';
 import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
@@ -1552,7 +1552,7 @@ export default function Assets() {
   const [dropHighlight, setDropHighlight] = useState<string | null>(null); // folder path being hovered
 
   // Import files from the OS (file picker or drag-in from Finder) into a folder.
-  // Bytes are read as base64 and written via /api/write-file; freshly-imported
+  // Bytes are read as base64 (a JSON asset keeps its id unless the project holds it, #1713) and written via /api/write-file; freshly-imported
   // textures/models are run through the conversion pipeline. Collisions get a
   // " copy" suffix (never silently overwrite). One batch = one undo entry.
   const importFiles = useCallback(async (files: FileList | File[], targetFolder: string) => {
@@ -1566,13 +1566,17 @@ export default function Assets() {
     const taken = new Set(assets.map((a) => a.path));
     const plan = planImports(list.map((f) => f.name), target, taken);
     const imported: { path: string; content: string; convert: boolean }[] = [];
+    const claimed = new Set<string>(); // the ids this batch decided on — see importedFileContent
     setImportStatus(true, `Importing ${list.length} file(s)…`, 0, list.length);
     try {
       for (let i = 0; i < list.length; i++) {
         const file = list[i];
         const { dest, convert } = plan[i];
         setImportStatus(true, file.name, i, list.length);
-        const content = await fileToBase64(file);
+        // A JSON asset's identity is decided BEFORE the write (#1713), as modoki_import_file decides it — and these
+        // are the bytes the redo re-writes, so it never brings the source's id back.
+        const content = await importedFileContent(dest, await fileToBase64(file), claimed);
+        if (content === null) continue; // said by importedFileContent
         const ok = await writeFile(dest, content, 'base64');
         if (!ok) { console.error(`[Assets] Failed to import ${file.name}`); continue; }
         imported.push({ path: dest, content, convert });

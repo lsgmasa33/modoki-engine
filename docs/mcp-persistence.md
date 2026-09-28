@@ -904,6 +904,21 @@ referenced a scene replaced by Save As no longer resolves. It is not drift from 
   close-out reviews). A
   scene with no path yet (`new_scene`) already has a fresh id. A base loaded under the open scene is
   refused as a target. The human Save As is unaffected: it is offered only for an untitled scene.
+- **An IMPORT keeps its id unless the project already holds it (#1713, owner ruling 2026-09-28: copy
+  Unity).** `modoki_import_file` (`/api/import-file`) and the Assets panel's OS-file drop decide an
+  imported JSON asset's identity through ONE function, `importedAssetBytes`
+  (`engine/plugins/asset-fs-ops.ts`). A file whose `id` no asset in the project holds lands byte for byte,
+  so an asset moved in from another project keeps every ref to it. On a collision it gets a fresh id,
+  with a scene's entity guids reminted, through `withFreshJsonIdentity`, which it shares with Duplicate. A
+  file with no id gets one. The panel writes through `/api/write-file`, so it first asks
+  `/api/import-identity` (pure, writes nothing) for the bytes. ⚠️ It passes the ids this drop has
+  already decided on as `claimed`, because `/api/write-file` rebuilds no manifest. Without them, a file
+  and its Finder duplicate carrying one unused id both kept it (found in review, observed). A redo asks
+  again, since the id it kept can have been taken while undone, and it writes nothing it could not get
+  an answer for. ⚠️ Both decide BEFORE the bytes reach disk, against the route's own manifest. Left to the scanner, a colliding copy meets the heal
+  described above, which re-mints the ORIGINAL whenever the import sorts first. Before #1713 both imports
+  copied byte for byte and left the collision to that heal. A binary, a `.layout.json`, a JSON file the
+  scanner types as no asset, and unparseable JSON are written as they came.
 - **The reply names every file in the asset-root form (#1562).** The renderer builds the reply from
   its own paths, and the open scene's path is whatever spelling it was opened under. That is Vite's
   `/@fs/<abs>` for a boot candidate or an explicit `/@fs/` load. So a Save As answered

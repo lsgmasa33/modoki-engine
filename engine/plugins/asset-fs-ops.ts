@@ -23,6 +23,7 @@ export { derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, type
 // only by the Linux `rmSync` fallback in `moveToTrash`; the darwin/win32 paths hand the delete to
 // the OS trash, which moves rather than unlinks and so cannot orphan a link's payload.
 import { findDeleteBoundaries } from '../scripts/deleteBoundary.mjs';
+import { classifyJsonAssetPath, ID_BEARING_TYPES } from './assetTypes';
 
 /** The sidecars an asset carries, as SUFFIXES. Spelled once: `moveAssetFile` renames them and
  *  `moveToTrash`'s refusal predicate must hold them back, and a second hand-kept copy of the list
@@ -526,6 +527,68 @@ export function planMemberPathRepair(
   return out;
 }
 
+/** A JSON asset's document with its own identity replaced: `id` set to `guid`, and for a scene every entity guid
+ *  reminted too (`remintSceneEntityGuids`). Null when `text` is not a JSON object — the caller then copies verbatim.
+ *
+ *  THE way a copy of a JSON asset gets an identity of its own — Duplicate (`duplicateAssetFile`) and both imports on a
+ *  collision (`importedAssetBytes`) go through it, so a copy is never born sharing its original's guid by one path and not
+ *  another. (`/api/scene-save-as` stamps the same identity on a serialized scene that never was a file.)
+ *
+ *  A UTF-8 BOM makes JSON.parse throw, and the verbatim fallback then leaves the copy with the ORIGINAL's asset id —
+ *  two assets claiming one guid (#1293 review). Parsed past it. */
+export function withFreshJsonIdentity(
+  text: string,
+  guid: string,
+  isScene: boolean,
+  genGuid: () => string = randomUUID,
+  readPrefab?: PrefabReader,
+): Record<string, unknown> | null {
+  let json: unknown;
+  try { json = JSON.parse(text.replace(/^\uFEFF/, '')); } catch { return null; }
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
+  const doc = { ...(json as Record<string, unknown>), id: guid };
+  return isScene ? remintSceneEntityGuids(doc, genGuid, readPrefab) : doc;
+}
+
+/** Whether an import at `destUrl` decides the file's identity (`importedAssetBytes`), i.e. whether its bytes need
+ *  reading at all: the scanner's own classification, and only the kinds whose guid lives IN the file
+ *  (`ID_BEARING_TYPES`) — a `.layout.json` carries none, a plain `.json` the scanner indexes as nothing is no asset,
+ *  and a binary's guid is in a sidecar the scan mints. */
+export function importDecidesIdentity(destUrl: string): boolean {
+  const type = classifyJsonAssetPath(destUrl);
+  return !!type && ID_BEARING_TYPES.has(type);
+}
+
+/** The bytes an import writes to `destUrl` (#1713). **A JSON asset keeps its own id unless the project already has an
+ *  asset under it** (owner ruling, 2026-09-28: copy Unity — an asset moved between projects with its GUID keeps every
+ *  ref to it); only on a collision does it get a fresh one, with a scene's entity guids reminted too
+ *  (`withFreshJsonIdentity`, as Duplicate does). A file with no id gets one. `guidTaken` answers whether the project
+ *  already has an asset under a guid.
+ *
+ *  ⚠️ Decided HERE, before the bytes reach disk, never left to the scanner: a colliding copy written as it came meets
+ *  the scanner's heal, which keeps the id for whichever path sorts FIRST — re-minting the ORIGINAL when the import
+ *  sorts first, and re-pointing every ref to it at the import.
+ *
+ *  Anything else — a binary (the scan mints its sidecar), a JSON file the scanner types as no asset or as a kind whose
+ *  guid is not in the file, JSON that does not parse — is written exactly as it came. Returns the guid it stamped,
+ *  when it stamped one, and `id`: the id the written file carries, kept or stamped (absent when it decided nothing). */
+export function importedAssetBytes(
+  bytes: Buffer,
+  destUrl: string,
+  opts: { guidTaken: (guid: string) => boolean; genGuid?: () => string; readPrefab?: PrefabReader },
+): { bytes: Buffer; guid?: string; id?: string } {
+  if (!importDecidesIdentity(destUrl)) return { bytes };
+  const type = classifyJsonAssetPath(destUrl);
+  const { guidTaken, genGuid = randomUUID, readPrefab } = opts;
+  const text = bytes.toString('utf-8');
+  let own: unknown;
+  try { own = (JSON.parse(text.replace(/^\uFEFF/, '')) as { id?: unknown } | null)?.id; } catch { return { bytes }; }
+  if (typeof own === 'string' && own && !guidTaken(own)) return { bytes, id: own };
+  const guid = genGuid();
+  const json = withFreshJsonIdentity(text, guid, type === 'scene', genGuid, readPrefab);
+  return json ? { bytes: assetJsonBytes(json), guid, id: guid } : { bytes };
+}
+
 /** Copy an asset to a new path with a freshly-generated GUID so the duplicate
  *  doesn't collide with the original in the manifest. JSON assets carry their
  *  id inline (rewritten); binary assets get a copied `.meta.json` sidecar with
@@ -546,14 +609,9 @@ export function duplicateAssetFile(
   const newGuid = genGuid();
   const ext = path.extname(absFrom).toLowerCase();
   if (ext === '.json') {
-    // JSON asset: copy + rewrite top-level id
-    // A UTF-8 BOM makes JSON.parse throw, and the verbatim fallback below then leaves the copy with
-    // the ORIGINAL's asset id — two assets claiming one guid (#1293 review). Parse past it.
-    const txt = fs.readFileSync(absFrom, 'utf-8').replace(/^\uFEFF/, '');
-    let json: Record<string, unknown>;
-    try { json = JSON.parse(txt); } catch { fs.copyFileSync(absFrom, absTo); return null; }
-    json.id = newGuid;
-    if (absFrom.toLowerCase().endsWith('.scene.json')) json = remintSceneEntityGuids(json, genGuid, readPrefab);
+    // JSON asset: copy + rewrite top-level id (`withFreshJsonIdentity`, shared with import — #1713).
+    const json = withFreshJsonIdentity(fs.readFileSync(absFrom, 'utf-8'), newGuid, absFrom.toLowerCase().endsWith('.scene.json'), genGuid, readPrefab);
+    if (!json) { fs.copyFileSync(absFrom, absTo); return null; }
     // Bytes from the one definition (#831) — a copied asset must not be born without the trailing
     // newline every committed asset doc has, or its first edit shows a spurious
     // `\ No newline at end of file` on a line nobody touched.

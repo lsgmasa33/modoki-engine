@@ -218,8 +218,11 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_import_file',
     'Import a NEW file from anywhere on disk into the project (the human "drag from Finder" ' +
-      'path): copies it under destFolder, assigns a fresh GUID, and runs the asset-type import ' +
+      'path): copies it under destFolder and runs the asset-type import ' +
       'pipeline (texture→KTX2/WebP, model→GLB) unless reimport=false. Returns {path, guid, type}.\n\n' +
+      'GUID: a JSON asset (prefab, scene, particle, …) KEEPS its own id unless an asset in the project already holds ' +
+      'it — then it gets a fresh one (a scene also gets fresh entity guids), so the original keeps its refs. A binary ' +
+      'gets a fresh GUID (its source sidecar is not copied).\n\n' +
       'FAILS (422) if the file copied but the import PIPELINE did not run — the response still ' +
       'carries the path + guid, so retry the pipeline with modoki_reimport_asset rather than ' +
       'importing again. It is not reported as a success: an unconverted texture has no runtime ' +

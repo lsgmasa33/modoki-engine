@@ -102,6 +102,26 @@ Camera moved to y=42 came back at 2.417 with `canUndo:false`, the console naming
    - **An entry that does not know** (built without a load) counts as using everything: the old
      behavior, not a skipped reload.
 
+**Which scene is "the open scene" (#1712).** The handler, and `get_scene_state.scenePath`, ask
+`openScenePath()` in `engine/app/debug/agentBridge.ts`: `SceneManager`'s primary when it has one, else
+the file the editor's next save writes (`getCurrentScenePath`, through a reader `agentEditorOps`
+installs). ⚠️ `sceneManager.getCurrent()` alone is not enough. A world made by `newScene()` (Assets →
+Create Scene, `modoki_new_scene`) goes through `replaceWorldContent`, which leaves it null by design, and
+a save that later gives the world a file (`save_all {path}`, a first Cmd+S, Create Scene's own save)
+tells only the editor. The handler used to return at `if (!current)` there, and every outside change to
+that scene or a prefab it used was dropped with no reload and no log until the scene was reopened
+(observed on `win`). That dates from #853, not from #1698's adoption owner. The reload then loads the
+file like any other, after which `SceneManager` knows it. ⚠️ **The untitled world's undo stacks
+move to the file at that first save** (`rekeyUntitledHistory`, from `writePrimaryScene` and from the
+Save-As panel). They were keyed `''`, and the first reload, which adopts under the file's key, swapped
+in that key's empty stack. Cmd+Z was emptied by an outside write, where a loaded scene keeps its stack
+(found in the close-out review). Both first-save sites bind nothing if the world changed during their
+awaits, because a Create Scene landing there leaves the path null → null. The other readers of
+`getCurrent()?.path` (the take recorder's "no scene is open" refusal, the SceneView label, capture status, `load_scene`'s
+`previous`) still see null for such a scene: #1718. They were deliberately NOT given a `SceneManager`
+entry for a content world, because its id would become `getCurrentSceneId()`, and that moves font and
+texture ownership in the renderers for every untitled scene.
+
 **`mesh` (`.mesh.json`, #1380) needs more than an eviction, and it is the one kind here that is not an
 `ASSET_SCHEMA_TYPE`.** Nothing agent-side writes one and it is never parked, so the only external
 writer is a plain file edit — which is why #842's "schema type ⊆ live-reload kind" check could not
