@@ -4,10 +4,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { findEntity, entityDisplayName, guidOfEntityId } from '../../runtime/core/ecs/entityUtils';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
-import { markUIDirty, onEditorDirty, useUITreeStore } from '../../runtime/ui/uiTreeStore';
-import { pushAction } from '../undo/undoManager';
-import { entityRef } from '../undo/entityRef';
-import { notifyFieldEdited } from '../animation/recording';
+import { onEditorDirty, useUITreeStore } from '../../runtime/ui/uiTreeStore';
+import { writeUIHandleValues, commitUIHandleDrag } from '../scene/uiHandleCommit';
 import { useEditorStore } from '../store/editorStore';
 import { anchorRefPoint, anchorDragAxes, accumulateAncestorScale, computeMoveOffsets, computeResize, containingBlockSize, frameToLogicalRect, paddingBoxRect } from '../scene/uiResizeMath';
 import { resolveLengthPx } from '../../runtime/ui/anchorLayout';
@@ -119,13 +117,7 @@ function readUIElement(entityId: number): {
 
 /** Write UIElement width/height to ECS */
 function writeUIElement(entityId: number, values: { width?: number; height?: number; widthUnit?: string; heightUnit?: string }) {
-  const uiElMeta = traitMeta('UIElement');
-  if (!uiElMeta) return;
-  const entity = findEntity(entityId);
-  if (!entity || !entity.has(uiElMeta.trait)) return;
-  const current = entity.get(uiElMeta.trait) as any;
-  entity.set(uiElMeta.trait, { ...current, ...values });
-  markUIDirty();
+  writeUIHandleValues(entityId, 'UIElement', values);
 }
 
 /** Read UIAnchor data from ECS */
@@ -148,13 +140,7 @@ function readUIAnchor(entityId: number): {
 
 /** Write UIAnchor offset fields to ECS */
 function writeUIAnchor(entityId: number, values: { top?: number; left?: number; right?: number; bottom?: number }) {
-  const anchorMeta = traitMeta('UIAnchor');
-  if (!anchorMeta) return;
-  const entity = findEntity(entityId);
-  if (!entity || !entity.has(anchorMeta.trait)) return;
-  const current = entity.get(anchorMeta.trait) as any;
-  entity.set(anchorMeta.trait, { ...current, ...values });
-  markUIDirty();
+  writeUIHandleValues(entityId, 'UIAnchor', values);
 }
 
 /** Read parent entity ID from EntityAttributes */
@@ -509,8 +495,9 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
     writeUIElement(eid, computeResize(handle, startValues, computedSize, parentComputedSize, dx, dy, viewport, ancestorScaleX, ancestorScaleY));
   }, [toLogicalDelta, gameViewSize]);
 
-  // Finalize the drag: push the undo entry + bridge to the animation record hook. Called
-  // from the window pointerup (so it runs even if the handle div unmounted mid-drag).
+  // Finalize the drag: one undo entry, the prefab-instance override marks, and the animation
+  // record hook, all in `commitUIHandleDrag`. Called from the window pointerup (so it runs even
+  // if the handle div unmounted mid-drag).
   const finishDrag = useCallback(() => {
     const dr = dragRef.current;
     if (!dr) return;
@@ -522,40 +509,11 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
       if (currentAnchor) {
         const before = { top: startAnchor.top, left: startAnchor.left, right: startAnchor.right, bottom: startAnchor.bottom };
         const after = { top: currentAnchor.top, left: currentAnchor.left, right: currentAnchor.right, bottom: currentAnchor.bottom };
-        const name = entityDisplayName(entityId);
-        const ref = entityRef(entityId);
-        pushAction({
-          label: `Move UI "${name}"`,
-          undo: () => { const id = ref.resolve(); if (id != null) writeUIAnchor(id, before); },
-          redo: () => { const id = ref.resolve(); if (id != null) writeUIAnchor(id, after); },
-        });
-        // Record mode: the drag writes UIAnchor via direct entity.set, which
-        // bypasses writeTraitField → the animation record hook never sees it.
-        // Notify it for the offset fields that actually moved (no-op when not
-        // recording) so dragging keys the clip at the playhead.
-        for (const k of Object.keys(after) as (keyof typeof after)[]) {
-          if (!Object.is(before[k], after[k])) notifyFieldEdited(entityId, 'UIAnchor', k, after[k]);
-        }
+        commitUIHandleDrag(entityId, 'UIAnchor', before, after, `Move UI "${entityDisplayName(entityId)}"`);
       }
     } else {
-      // Undo for resize
       const current = readUIElement(entityId);
-      if (current) {
-        const before = { ...startValues };
-        const after = { ...current };
-        const name = entityDisplayName(entityId);
-        const ref = entityRef(entityId);
-        pushAction({
-          label: `Resize UI "${name}"`,
-          undo: () => { const id = ref.resolve(); if (id != null) writeUIElement(id, before); },
-          redo: () => { const id = ref.resolve(); if (id != null) writeUIElement(id, after); },
-        });
-        // Record mode: bridge the resize to the animation record hook for the
-        // dimensions that changed (see the move branch above).
-        for (const k of ['width', 'height'] as const) {
-          if (!Object.is(before[k], after[k])) notifyFieldEdited(entityId, 'UIElement', k, after[k]);
-        }
-      }
+      if (current) commitUIHandleDrag(entityId, 'UIElement', { ...startValues }, { ...current }, `Resize UI "${entityDisplayName(entityId)}"`);
     }
     dragRef.current = null;
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -83,6 +83,7 @@ answer the same question for themselves. Each place in that column is a place th
 | I14 | An entity is saved into exactly one scene file, the one its `sourceScene` names, and a rebuild keeps that. | `serializeScene`'s scene filter, `planReparent`, and `rebuildInstance`, which carries the stamp. |
 | I15 | A template's `version` is the writer's constant, and a build never overwrites a file written in a newer format. | `PREFAB_FORMAT_VERSION`, `engine/plugins/prefabWriteGuard.ts`, `classifyExistingDocumentId`. It answers `known` before it checks the version (#1678). |
 | I16 | A template never contains itself. | `wouldCreateCycle` / `expandedPrefabRefs` when writing; the loader's ancestor stack when loading. |
+| I17 | An editor write that changes an instance member's field leaves its override mark in the state the save needs, and its undo puts the mark back. | `editor/undo/overrideMarkWrites.ts`. See § "Editor writes and the override mark". |
 
 ### Where the owners are missing
 
@@ -118,7 +119,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | U4 | Property override | Bold, with a blue bar in the margin. [M22 `EditingPrefabViaInstance`] | Presence-based `overrides`, on member rows since scene v16. The Inspector marks the field with a blue left accent (`overrideStyle`). | match |
 | U5 | Added / removed component | Both are overrides, badged + / −. [M22 `EditingPrefabViaInstance`] | An added trait is a whole-trait override, and `removedTraits` records a removed one. [prefab-structural-overrides.md](./prefab-structural-overrides.md) | match (badges: see U8) |
 | U6 | Added / removed GameObject | Added children are overrides. A removed child is a "removed GameObject" override. [M6 `PrefabInstanceOverrides`, M22 `UpgradeGuide2022LTS`; the `PrefabUtility.GetRemovedGameObjects` API page first exists for 2022.2] | `added` (plain or reference nodes) and `removed` (the top-most member only). | match |
-| U7 | Reparenting a member inside an instance | Not allowed: "you cannot reparent a GameObject that is part of a Prefab". [M22 `PrefabInstanceOverrides`. The same sentence's ban on removal is out of date (U6), and the Unity 6 page says nothing, so this citation is weak.] Since 2022.3 Unity even drops child REORDER overrides, and its suggested way to move a nested child is duplicate plus delete. [M22 `UpgradeGuide2022LTS`] | Allowed and stays linked: the member row records `parent`, and Apply re-parents the row (#1437). Dragging a plain member out of its instance unpacks it; an owned nested root dragged out becomes a standalone instance (`planMoveUnlinks`). | **diverges**, deliberate: a Modoki extension. The owner rules on whether it stays. |
+| U7 | Reparenting a member inside an instance | Not allowed: "you cannot reparent a GameObject that is part of a Prefab". [M22 `PrefabInstanceOverrides`. The same sentence's ban on removal is out of date (U6), and the Unity 6 page says nothing, so this citation is weak.] Since 2022.3 Unity even drops child REORDER overrides, and its suggested way to move a nested child is duplicate plus delete. [M22 `UpgradeGuide2022LTS`] | Allowed and stays linked: the member row records `parent`, and Apply re-parents the row (#1437). Dragging a plain member out of its instance unpacks it; an owned nested root dragged out becomes a standalone instance (`planMoveUnlinks`). A reorder inside an instance is saved as a `sortOrder` override, by value (#1709). | **diverges**, deliberate: a Modoki extension. The owner rules on whether it stays. |
 | U8 | Override indicators | Instance names in blue; a blue margin line in the Hierarchy on an instance that has overrides; + on added GameObjects; +/− on components; an **Overrides** drop-down on the outermost root, with an asset-vs-instance comparison per component. [M22 `EditingPrefabViaInstance`, `PrefabInstanceOverrides`] | The Hierarchy tints and badges every `PrefabInstance` entity ("P"), and the Inspector accents overridden fields. There is no Hierarchy mark on an edited instance, no + on an added node, no marker for a removed member or component, and no Overrides drop-down: the full list exists only inside the Apply / Revert dialog. | **missing**: badges S, drop-down with comparison M |
 | U9 | Missing prefab asset | The instance stays in the scene (`PrefabInstanceStatus.MissingAsset`), and its `PrefabInstance` data stays in the scene file. [S6 `PrefabAssetType.MissingAsset`, M6 `yaml-prefab-serialization`] | The loader warns and keeps a bare placeholder. The next scene save writes only that placeholder, so every override, added node and the name are lost for good (#1699, observed). | **diverges**, bug #1699 (serious) |
 
@@ -444,6 +445,51 @@ scene uniquely changed on top of what the nested row already overrides. On load,
 `instantiatePrefabIntoWorld` re-expands the children and re-applies these deltas via
 `applyOverridesByLocalToEcs`; the round-trip is covered in
 [prefab-structural-overrides.md](./prefab-structural-overrides.md).
+
+### Editor writes and the override mark (#1709)
+
+In the FILE an override is presence-based, as above. In the LIVE world it is a runtime mark
+(`runtime/loaders/overrideMarks.ts`), and the save keeps a member field that differs from the
+template only when it is marked (`captureInstanceOverrides`' mark gate). The gate exists so that a
+re-imported template does not freeze an unedited instance's stale values. It also means an editor
+write that changes a member field without marking it is dropped by the next save. #1709 found that
+in the UI resize/move handles, in every `EntityAttributes.sortOrder` rewrite (reorder, sibling
+renumber, reparent, duplicate, paste, scene move) and in re-adding a trait the template defines
+(#1677). Undo had the opposite gap: it restored the value but kept the mark, so an undone edit was
+saved as an override pinned at the old value, and later template edits stopped reaching it.
+
+Every editor mark write now goes through `editor/undo/overrideMarkWrites.ts`, under three rules:
+
+- **A deliberate field edit marks unconditionally** (`markOverrideIfInstance`): the Inspector, a
+  gizmo commit, agent `setTrait`. The user typed that value, so it stays an override even when it
+  equals the base.
+- **A write the user did not aim at that field follows the save's by-value rule**
+  (`reconcileOverrideMarks`, and `writeTraitFieldMarked` for `sortOrder`). It marks where the live
+  value differs from `instanceBase` and unmarks where it equals it. A renumber rewrites every
+  sibling's `sortOrder`, and marking them all would pin the instance's whole child order against
+  the template. The UI handle commit and a re-added trait use the same rule.
+- **Every undo puts back the marks it found** (`markStateOf` / `putMarkState`; a move's undo
+  restores the whole set with `putBackMarks`; a renumber's undo is built by `makeSortOrderRenumberAction`). The
+  snapshot must be taken before the edit's FIRST write: `reparentEntity` once took it after its own
+  marked `sortOrder` write, and its undo put the new mark back. The gizmos' marks belong to their one undo builder,
+  `buildTransformUndoAction`'s `markFields` (`editor/scene/gizmoUndo.ts`).
+
+⚠️ **By value cannot keep a reorder local when the template's siblings TIE.** 651 of the 843
+sibling groups across the repo's 325 templates carry equal `sortOrder`s, mostly all 0
+(measured 2026-09-28). No value sorts between two tied siblings, so the Hierarchy renumbers
+the group. Every child from the drop point on then differs from its base, is marked, and stops
+following template reorders. That is correct by value, because it is the order on screen. Writing
+distinct `sortOrder`s into templates is #1714.
+
+**Not marked, deliberately:** `set-traits` through `modoki_eval` (`app/debug/liveMutate.ts`) is a
+raw live write with no undo that also runs in play mode and on the device. A mark there would outlive
+Stop. Agent authoring goes through `setTrait`, which marks. Pose, timeline and preview writes, guid
+mints, `parentId` and `sourceScene` are not mark-gated.
+
+A general "unmarked write fails" tripwire was measured at the gate over 3,503 tests: it tripped 28,
+and 17 of those were the gate's legitimate drops. So the guard is the narrow one,
+`engine/tests/architecture/instanceSortOrderWrites.test.ts` (no raw `sortOrder` write in editor
+code), and each writer has a save-and-reload test in `engine/tests/editor/instanceWriteMarks.test.ts`.
 
 **Which fields an override may carry is decided by the trait's koota SCHEMA, never by
 `meta.fields`** (`runtime/core/ecs/traitSchema.ts` — `isPersistentTraitField`).

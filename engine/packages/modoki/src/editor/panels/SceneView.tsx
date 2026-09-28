@@ -18,7 +18,7 @@ import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds, entityDisplayName, guidOfEntityId } from '../../runtime/core/ecs/entityUtils';
-import { markOverrideIfInstance } from '../undo/entityActions';
+import { markOverrideIfInstance, markStateOf, putMarkState } from '../undo/overrideMarkWrites';
 import { Transform, EntityAttributes, Collider2D, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
 import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
 import {
@@ -1224,13 +1224,14 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     function commitPoints(entityId: number, colMeta: { trait: unknown }, beforeStr: string, afterPts: Pt[]) {
       const afterStr = serializeColliderPoints(afterPts);
       if (afterStr === beforeStr) { setPointsLive(entityId, colMeta, beforeStr); return; }
+      const oldMarks = markStateOf(entityId, 'Collider2D', ['points']); // put back by the undo (#1709)
       setPointsLive(entityId, colMeta, afterStr);
       markOverrideIfInstance(entityId, 'Collider2D', 'points');
       notifyFieldEdited(entityId, 'Collider2D', 'points', afterStr);
       const ref = entityRef(entityId);
       pushAction({
         label: 'Edit Collider2D.points',
-        undo: () => { const id = ref.resolve(); if (id != null) setPointsLive(id, colMeta, beforeStr); },
+        undo: () => { const id = ref.resolve(); if (id != null) { setPointsLive(id, colMeta, beforeStr); putMarkState(id, 'Collider2D', oldMarks); } },
         redo: () => { const id = ref.resolve(); if (id != null) { setPointsLive(id, colMeta, afterStr); markOverrideIfInstance(id, 'Collider2D', 'points'); } },
       });
     }
@@ -1710,11 +1711,11 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           if (!tf) return null;
           const after = { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy };
           const ref = entityRef(m.id);
-          for (const k of recFields) { notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]); markOverrideIfInstance(m.id, 'Transform', k); }
+          for (const k of recFields) notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]);
           return buildTransformUndoAction({
             label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: { ...m.local }, after,
-            entityGuid: journalRefOf(ref.guid, m.id),
+            entityGuid: journalRefOf(ref.guid, m.id), markFields: recFields,
           });
         }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
         if (actions.length) pushAction(buildGroupTransformUndoAction(`Transform ${actions.length} entities`, actions));
@@ -1734,23 +1735,19 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         // koota handle (or raw id) goes stale if the entity is deleted/restored or
         // the world is rebuilt (Play→Stop). The ref tolerates all three.
         const ref = entityRef(eid);
+        const moved = (Object.keys(after) as (keyof typeof after)[]).filter((k) => !Object.is(before[k], after[k]));
+        // `markFields`: a deliberate override on a prefab-instance member, same as an inspector edit —
+        // otherwise override capture can't tell this gizmo edit from a stale-inherited field and drops it
+        // on save. The builder also takes the marks back on undo (#1709).
         pushAction(buildTransformUndoAction({
           label: `Transform "${entityDisplayName(eid)}"`,
           trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
-          entityGuid: journalRefOf(ref.guid, eid),
+          entityGuid: journalRefOf(ref.guid, eid), markFields: moved,
         }));
         // Record mode: a gizmo drag writes Transform via direct entity.set (above),
         // which bypasses writeTraitField → the animation record hook never sees it.
         // Notify it for the fields that actually moved (no-op when not recording).
-        for (const k of Object.keys(after) as (keyof typeof after)[]) {
-          if (!Object.is(before[k], after[k])) {
-            notifyFieldEdited(eid, 'Transform', k, after[k]);
-            // Record a deliberate override on a prefab-instance member, same as an
-            // inspector edit — otherwise override capture can't tell this gizmo edit
-            // from a stale-inherited field and (post-fix) would drop it on save.
-            markOverrideIfInstance(eid, 'Transform', k);
-          }
-        }
+        for (const k of moved) notifyFieldEdited(eid, 'Transform', k, after[k]);
       }
       dragRef.current = null;
     }
@@ -3301,14 +3298,11 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           const after = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
           const ref = entityRef(m.id);
           // Record-mode + prefab-override hooks per member (mirrors the single-entity path).
-          for (const k of recFields) {
-            notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]);
-            markOverrideIfInstance(m.id, 'Transform', k);
-          }
+          for (const k of recFields) notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]);
           return buildTransformUndoAction({
             label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: m.before, after,
-            entityGuid: journalRefOf(ref.guid, m.id),
+            entityGuid: journalRefOf(ref.guid, m.id), markFields: recFields,
           });
         }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
         if (actions.length) {
@@ -3327,23 +3321,20 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // Capture a guid-based ref and re-resolve inside the closures — a captured
       // handle/raw id goes stale on delete/restore or a world rebuild (Play→Stop).
       const ref = entityRef(eid);
-      pushAction(buildTransformUndoAction({
-        label: `Transform "${entityDisplayName(eid)}"`,
-        trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
-        entityGuid: journalRefOf(ref.guid, eid),
-      }));
       // Record mode: the gizmo writes Transform via direct entity.set, bypassing
       // writeTraitField → the animation record hook never sees it. Notify it for
       // the fields this drag mode affects (no-op when not recording). Mode-gated
       // rather than diffed so decompose float-noise doesn't spawn spurious tracks.
+      // The same fields are marked as a deliberate override on a prefab-instance member (e.g.
+      // hand-posing a bone), so override capture keeps this edit and doesn't confuse it with a
+      // stale-inherited field (rigged-reimport bug); the builder takes the marks back on undo (#1709).
       const recFields = mode === 'translate' ? ['x', 'y', 'z'] : mode === 'rotate' ? ['rx', 'ry', 'rz'] : ['sx', 'sy', 'sz'];
-      for (const k of recFields) {
-        notifyFieldEdited(eid, 'Transform', k, (after as Record<string, number>)[k]);
-        // Record a deliberate override on a prefab-instance member (e.g. hand-posing
-        // a bone), same as an inspector edit — so override capture keeps this edit
-        // and doesn't confuse it with a stale-inherited field (rigged-reimport bug).
-        markOverrideIfInstance(eid, 'Transform', k);
-      }
+      pushAction(buildTransformUndoAction({
+        label: `Transform "${entityDisplayName(eid)}"`,
+        trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
+        entityGuid: journalRefOf(ref.guid, eid), markFields: recFields,
+      }));
+      for (const k of recFields) notifyFieldEdited(eid, 'Transform', k, (after as Record<string, number>)[k]);
       gizmoDragStart = null;
       gizmoProxyScaleStart = null;
     };

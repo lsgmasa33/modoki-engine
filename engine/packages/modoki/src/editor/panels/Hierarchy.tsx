@@ -5,12 +5,13 @@ import { onWorldSwap, getCurrentWorld } from '../../runtime/core/ecs/world';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
 import { parentOrRootFor } from '../../runtime/core/ecs/hierarchy';
-import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, readTraitData, subtreeIds, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { pinEntityAt, livePinnedId, type EntityPin } from '../../runtime/core/ecs/entityPin';
 import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, clearOwnedNestedStampFromSnapshot, moveEntityToScene, planReparent, applyReparent, type EntitySnapshot } from '../undo/entityActions';
+import { makeSortOrderRenumberAction } from '../undo/overrideMarkWrites';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, clearOwnedNestedStampFromSnapshot, moveEntityToScene, planReparent, applyReparent, assignFreshSortOrder, type EntitySnapshot } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
@@ -26,7 +27,7 @@ import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
-import { makeReorderSiblingsAction, diffSiblingSorts } from '../undo/reorderSiblingsUndo';
+import { diffSiblingSorts } from '../undo/reorderSiblingsUndo';
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
 import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
@@ -388,12 +389,9 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
                 const changes = diffSiblingSorts(
                   siblings.map((s, i) => ({ id: s.id, oldSort: s.sortOrder, newSort: i * 10 })),
                 );
-                if (changes.length) {
-                  const action = makeReorderSiblingsAction(
-                    changes,
-                    (eid, sort) => writeTraitField(eid, eaMeta, 'sortOrder', sort),
-                    'Renumber siblings',
-                  );
+                // The override marks it writes and puts back are `makeSortOrderRenumberAction`'s (#1709).
+                const action = changes.length ? makeSortOrderRenumberAction(changes) : null;
+                if (action) {
                   action.redo(); // apply the renumber now
                   pushAction(action); // make it undoable
                 }
@@ -1082,8 +1080,7 @@ export default function Hierarchy() {
     }
     // copy → spawn a fresh deep copy under the target parent, with a unique
     // sortOrder at the end of that parent's children (so drag-reorder math stays
-    // distinct, mirroring duplicateEntity).
-    const eaMeta = getAllTraits().find(t => t.name === 'EntityAttributes');
+    // distinct: `assignFreshSortOrder`, shared with duplicateEntity).
     // Prefab-instance handling, identical to duplicateEntity (prefab F1): pasting an
     // instance ROOT → new linked instance; pasting a non-root MEMBER →
     // plain ADDED child (strip PrefabInstance).
@@ -1100,11 +1097,7 @@ export default function Hierarchy() {
       const id = respawnFromSnapshot(pasteSnapshot, p);
       // The copy belongs to its new parent's scene, not the source's (#1429).
       adoptParentScene(id);
-      if (eaMeta) {
-        const siblings = getAllEntities().filter(e => e.parentId === p && e.id !== id);
-        const nextSort = siblings.length ? Math.max(...siblings.map(s => s.sortOrder)) + 1 : 0;
-        writeTraitField(id, eaMeta, 'sortOrder', nextSort);
-      }
+      assignFreshSortOrder(id, p);
       return id;
     };
     let currentId = spawn(parentId);

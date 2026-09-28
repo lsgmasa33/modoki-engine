@@ -32,7 +32,9 @@ const Link = trait(() => ({ target: '' as string, bindings: [] as { event: strin
 let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', async (importOriginal) => ({
+  // The real module underneath: a new import that reaches another export must not break this mock (#1709).
+  ...(await importOriginal<Record<string, unknown>>()),
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   registerEntity: (entity: any) => entityIndex.set(entity.id(), entity),
@@ -1586,7 +1588,10 @@ describe('override marks across respawn (#868)', () => {
     const newId = duplicateEntity(root.id(), vi.fn())!;
     expect(newId).not.toBe(root.id());
 
-    expect([...(getOverrideMarkSet(entityIndex.get(newId)) ?? [])]).toEqual(['Transform.x']);
+    // The source's mark is carried. The copy's own sortOrder is marked too: Duplicate places it last among its
+    // siblings, and a copied instance root saves that only when marked (#1709; the template is not cached here, so
+    // the by-value check cannot read a base and keeps the mark).
+    expect([...(getOverrideMarkSet(entityIndex.get(newId)) ?? [])].sort()).toEqual(['EntityAttributes.sortOrder', 'Transform.x']);
   });
 
   it('delete + undo restores a member\'s marks even when another spawn took its index meanwhile', async () => {

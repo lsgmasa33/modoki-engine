@@ -332,6 +332,33 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
     } finally { setPrefabCache(COIN, null); worldTransforms.clear(); }
   });
 
+  // #1709: an instance root saves its sortOrder only when it is override-marked, and every sortOrder rewrite used to
+  // write raw. The coin lands at 7 among the Slot's children; without the mark the base saves no sortOrder and the
+  // coin reloads at the template's 0. Mutation: make moveEntityToScene's applyStamps write sortOrder with raw
+  // `writeTraitField` (the reparent case: the same in reparentEntity).
+  it('a scene move and an agent reparent both save the sortOrder they wrote on an instance root', async () => {
+    const { slot } = await baseInstance();
+    const COIN = '/p1709coin.prefab.json';
+    setPrefabCache(COIN, {
+      id: 'c1709000-0000-4000-8000-000000000001', version: 2, name: 'Coin', rootLocalId: 1,
+      entities: [{ localId: 1, name: 'Coin', traits: { EntityAttributes: { name: 'Coin', parentId: 0 }, Transform: {} } }],
+    } as never);
+    type Entry = { name?: string; guid?: string; overrides?: Record<string, { EntityAttributes?: { sortOrder?: number } }>; added?: Entry[] };
+    try {
+      const { rootId: moved } = await runAgentOp('prefab', { action: 'instantiate', path: COIN }) as { rootId: number };
+      await runAgentOp('reparent-entity', { guid: attrs(moved).guid, parentGuid: attrs(slot).guid, sortOrder: 7, moveToScene: true });
+      const base = (await serializeScene({ scene: BASE_FILE })).entities as Entry[];
+      const kitAdded = base.find((e) => e.name === 'Kit')?.added ?? [];
+      expect(kitAdded.find((n) => n.guid === attrs(moved).guid)?.overrides?.['1']?.EntityAttributes?.sortOrder).toBe(7);
+
+      const holder = spawn('Holder');
+      const { rootId: kept } = await runAgentOp('prefab', { action: 'instantiate', path: COIN }) as { rootId: number };
+      await runAgentOp('reparent-entity', { guid: attrs(kept).guid, parentGuid: guidOf(holder), sortOrder: 7 });
+      const primary = (await serializeScene()).entities as Entry[];
+      expect(primary.find((e) => e.guid === attrs(kept).guid)?.overrides?.['1']?.EntityAttributes?.sortOrder).toBe(7);
+    } finally { setPrefabCache(COIN, null); }
+  });
+
   // Mutation: drop `adoptParentScene(currentId)` from entityActions.ts's createEntityWithUndo. This is
   // the issue's own shape: a primary child under a base prefab member, which the base's `added` would bake.
   it('create-entity under a base prefab MEMBER stamps the new entity into the base and dirties it', async () => {

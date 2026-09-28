@@ -31,7 +31,9 @@ const UIAction = trait(() => ({ bindings: [] as Array<{ event: string; target?: 
 let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', async (importOriginal) => ({
+  // The real module underneath: a new import that reaches another export must not break this mock (#1709).
+  ...(await importOriginal<Record<string, unknown>>()),
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   registerEntity: (entity: any) => entityIndex.set(entity.id(), entity),

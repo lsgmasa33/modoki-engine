@@ -6,6 +6,7 @@
 
 import type { UndoAction } from '../undo/undoManager';
 import { fireDirtyListeners } from '../../runtime/core/renderDirty';
+import { markOverrideIfInstance, markStateOf, putMarkState, type MarkState } from '../undo/overrideMarkWrites';
 
 /** Minimal entity surface the undo closures touch. `get` is `| undefined` because a koota handle's
  *  is — declaring it never-undefined only compiled while `findEntity` returned `any` (#1151). */
@@ -32,24 +33,36 @@ export interface TransformUndoOptions {
    *  perceives the spatial edit — the changed field subset, old→new. Omit to skip
    *  journalling (the action then falls back to a bare `!edit`). */
   entityGuid?: string;
+  /** The Transform fields this drag marks as prefab-instance overrides: a deliberate edit, like the Inspector's. The
+   *  builder marks them when it is built, and its undo and redo put back each side's marks, so an undone drag is not
+   *  saved as an override pinned at the old pose (#1709). Omit to mark nothing. */
+  markFields?: readonly string[];
 }
 
 /** Build the undo action. `undo`/`redo` MERGE their field set onto the LIVE transform
  *  (not replace it) so an unrelated field changed between the drag and the undo isn't
  *  clobbered; both re-resolve the entity and no-op if it's gone. */
 export function buildTransformUndoAction(opts: TransformUndoOptions): UndoAction {
-  const { label, trait, resolve, findEntity, before, after, entityGuid } = opts;
-  const apply = (fields: Record<string, number>) => {
+  const { label, trait, resolve, findEntity, before, after, entityGuid, markFields } = opts;
+  let marks: { before: MarkState; after: MarkState } | undefined;
+  const markId = markFields?.length ? resolve() : null;
+  if (markId != null && markFields) {
+    const was = markStateOf(markId, 'Transform', markFields);
+    for (const f of markFields) markOverrideIfInstance(markId, 'Transform', f);
+    marks = { before: was, after: markStateOf(markId, 'Transform', markFields) };
+  }
+  const apply = (fields: Record<string, number>, markState?: MarkState) => {
     const id = resolve();
     if (id == null) return;
     const en = findEntity(id);
     if (!en?.has(trait)) return;
     en.set(trait, { ...en.get(trait), ...fields });
+    if (markState) putMarkState(id, 'Transform', markState);
     // A direct ECS write fires no dirty broadcast, and undo/redo has none of its own — so without
     // this the Game view (and anything else listening) kept the pre-undo position (#1141 sibling).
     fireDirtyListeners();
   };
-  const action: UndoAction = { label, undo: () => apply(before), redo: () => apply(after) };
+  const action: UndoAction = { label, undo: () => apply(before, marks?.before), redo: () => apply(after, marks?.after) };
   if (entityGuid) {
     action.kind = '!transform';
     // Only the fields this gizmo mode changed — a translate reports {x,y,z}, a

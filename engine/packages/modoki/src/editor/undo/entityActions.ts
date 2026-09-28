@@ -15,6 +15,7 @@ import { newGuid } from '../../runtime/loaders/assetManifest';
 import { remapGuidValues } from '../../runtime/core/assetRefRules';
 import { planCopyGuids } from '../../runtime/core/copyIdentity';
 import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
+import { markOverrideIfInstance, reconcileOverrideMarks, writeTraitFieldMarked, markStateOf, putMarkState } from './overrideMarkWrites';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
 import { endFrames, relinkDetachedMembers, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
@@ -29,23 +30,24 @@ import { entityRef, ensureGuid, buildGuidIndex, resolveWith, journalRefOf, type 
 import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
 
-/** Record a deliberate per-instance override when the user edits a field on a
- *  prefab-instance member, so the change survives serialize even if the prefab
- *  base is later edited to coincide with it — AND so override capture can tell a
- *  real edit from a field that merely diverged from the base when the prefab was
- *  re-imported under an un-edited instance (the rigged-reimport root-bone bug).
- *  No-op for non-instance entities and for the PrefabInstance trait itself.
- *  See overrideMarks.ts + getOverrideValues/captureInstanceOverrides. */
-export function markOverrideIfInstance(entityId: number, traitName: string, field: string): void {
-  if (traitName === 'PrefabInstance') return;
-  const piMeta = getTraitByName('PrefabInstance');
-  const entity = findEntity(entityId);
-  if (!piMeta || !entity || !entity.has(piMeta.trait)) return;
-  markOverride(entity, traitName, field);
-}
+// The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
+export { markOverrideIfInstance };
 
 function markFieldOverrideIfInstance(entityId: number, meta: TraitMeta, field: string): void {
   markOverrideIfInstance(entityId, meta.name, field);
+}
+
+/** Put a freshly spawned copy (Duplicate, Paste Entity) last among `parentId`'s children: max sibling sortOrder + 1.
+ *  `respawnFromSnapshot` copies the source's EntityAttributes verbatim, sortOrder included, so the copy would
+ *  collide with its source and break drag-to-reorder's distinct-position math. Excludes the copy itself from the max
+ *  so the copied value can't inflate the result. Written marked: a copied instance ROOT saves its sortOrder only
+ *  when marked (#1709). */
+export function assignFreshSortOrder(newId: number, parentId: number): void {
+  const attrMeta = getTraitByName('EntityAttributes');
+  if (!attrMeta) return;
+  const siblings = getAllEntities().filter((e) => e.parentId === parentId && e.id !== newId);
+  const nextSort = siblings.length > 0 ? Math.max(...siblings.map((e) => e.sortOrder)) + 1 : 0;
+  writeTraitFieldMarked(newId, attrMeta, 'sortOrder', nextSort);
 }
 
 /** Write a field with undo tracking */
@@ -65,13 +67,15 @@ export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field
   // the uniform "resolve before mutation" convention (Phase 12, M2) every affected-
   // scene call in this file follows.
   const affectedScenes = resolveAffectedScenes([entityId]);
+  // The undo puts the mark back as it was, or an undone edit is saved as an override at the old value (#1709).
+  const oldMarks = markStateOf(entityId, meta.name, [field]);
   writeTraitField(entityId, meta, field, value);
   markFieldOverrideIfInstance(entityId, meta, field);
   // Capture a guid-based ref so undo/redo survive a world rebuild (Play→Stop).
   const ref = entityRef(entityId);
   _pushAction({
     label: `Edit ${meta.name}.${field || 'toggle'}`,
-    undo: () => { const id = ref.resolve(); if (id == null) return; writeTraitField(id, meta, field, oldValue); },
+    undo: () => { const id = ref.resolve(); if (id == null) return; writeTraitField(id, meta, field, oldValue); putMarkState(id, meta.name, oldMarks); },
     redo: () => { const id = ref.resolve(); if (id == null) return; writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); },
     coalesceKey: fieldCoalesceKey(meta, field, [entityId]),
     detail: editDetail([ref], meta, field, [oldValue], [value]),
@@ -97,13 +101,14 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
     return data ? data[field] : undefined;
   });
   const affectedScenes = resolveAffectedScenes(entityIds);
+  const oldMarks = entityIds.map((id) => markStateOf(id, meta.name, [field])); // put back by the undo (#1709)
   entityIds.forEach((id) => { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); });
   // Guid refs (positionally aligned with oldValues) so undo/redo survive a rebuild.
   const refs = entityIds.map((id) => entityRef(id));
   const suffix = entityIds.length > 1 ? ` (${entityIds.length})` : '';
   _pushAction({
     label: `Edit ${meta.name}.${field || 'toggle'}${suffix}`,
-    undo: () => { const idx = buildGuidIndex(); refs.forEach((r, i) => { const id = resolveWith(r, idx); if (id != null) writeTraitField(id, meta, field, oldValues[i]); }); },
+    undo: () => { const idx = buildGuidIndex(); refs.forEach((r, i) => { const id = resolveWith(r, idx); if (id != null) { writeTraitField(id, meta, field, oldValues[i]); putMarkState(id, meta.name, oldMarks[i]!); } }); },
     redo: () => { const idx = buildGuidIndex(); refs.forEach((r) => { const id = resolveWith(r, idx); if (id != null) { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); } }); },
     coalesceKey: fieldCoalesceKey(meta, field, entityIds),
     detail: editDetail(refs, meta, field, oldValues, refs.map(() => value)),
@@ -132,7 +137,7 @@ export function writeTraitFieldPerEntityWithUndo(
     // rename wiped the whole clips list).
     const data = readTraitDataFull(id, meta);
     const oldValue = data ? data[field] : undefined;
-    return { id, ref: entityRef(id), oldValue, newValue: compute(oldValue, id) };
+    return { id, ref: entityRef(id), oldValue, newValue: compute(oldValue, id), oldMarks: markStateOf(id, meta.name, [field]) };
   }).filter((e) => !Object.is(e.oldValue, e.newValue));
   if (entries.length === 0) return;
   const affectedScenes = resolveAffectedScenes(entries.map((e) => e.id));
@@ -145,7 +150,7 @@ export function writeTraitFieldPerEntityWithUndo(
   const suffix = entries.length > 1 ? ` (${entries.length})` : '';
   _pushAction({
     label: `${label}${suffix}`,
-    undo: () => { const idx = buildGuidIndex(); entries.forEach(({ ref, oldValue }) => { const id = resolveWith(ref, idx); if (id != null) writeTraitField(id, meta, field, oldValue); }); },
+    undo: () => { const idx = buildGuidIndex(); entries.forEach(({ ref, oldValue, oldMarks }) => { const id = resolveWith(ref, idx); if (id != null) { writeTraitField(id, meta, field, oldValue); putMarkState(id, meta.name, oldMarks); } }); },
     redo: applyAll,
     coalesceKey: fieldCoalesceKey(meta, field, entityIds),
     detail: editDetail(entries.map((e) => e.ref), meta, field, entries.map((e) => e.oldValue), entries.map((e) => e.newValue)),
@@ -175,7 +180,7 @@ export function writeTraitFieldsPerEntityWithUndo(
     const patch = compute(full, id);
     const oldValues: Record<string, unknown> = {};
     for (const k of Object.keys(patch)) oldValues[k] = full ? full[k] : undefined;
-    return { id, ref: entityRef(id), oldValues, patch };
+    return { id, ref: entityRef(id), oldValues, patch, oldMarks: markStateOf(id, meta.name, Object.keys(patch)) };
   }).filter((e) => Object.keys(e.patch).length > 0);
   if (entries.length === 0) return;
   const affectedScenes = resolveAffectedScenes(entries.map((e) => e.id));
@@ -190,7 +195,15 @@ export function writeTraitFieldsPerEntityWithUndo(
   const suffix = entries.length > 1 ? ` (${entries.length})` : '';
   _pushAction({
     label: `${label}${suffix}`,
-    undo: () => { const idx = buildGuidIndex(); entries.forEach(({ ref, oldValues }) => { const id = resolveWith(ref, idx); if (id != null) writeMany(id, oldValues); }); },
+    // Raw writes plus the old marks: `writeMany` would MARK the old values, saving an undone edit as an override (#1709).
+    undo: () => {
+      const idx = buildGuidIndex();
+      entries.forEach(({ ref, oldValues, oldMarks }) => {
+        const id = resolveWith(ref, idx); if (id == null) return;
+        for (const [field, value] of Object.entries(oldValues)) writeTraitField(id, meta, field, value);
+        putMarkState(id, meta.name, oldMarks);
+      });
+    },
     redo: applyAll,
     affectedScenes,
   });
@@ -233,19 +246,25 @@ export function addTraitToEntitiesWithUndo(
   const affectedScenes = resolveAffectedScenes(targets);
   const initial = values ? filterToTraitSchema(meta, values) : undefined;
   const refs = targets.map((id) => entityRef(id));
+  const oldMarks = targets.map((id) => marksOf(id));
   const apply = () => {
     const idx = buildGuidIndex();
     refs.forEach((r) => {
       const id = resolveWith(r, idx);
+      if (id == null) return;
       // Clone per entity AND per apply: without it, redo would re-seat the same
       // object on every target and they'd share one array.
-      if (id != null) findEntity(id)?.add(initial ? meta.trait(cloneTraitValues(initial)) : meta.trait());
+      findEntity(id)?.add(initial ? meta.trait(cloneTraitValues(initial)) : meta.trait());
+      // A trait the TEMPLATE defines here, added back after the instance removed it, is value-diffed by the save,
+      // which keeps only marked fields: unmarked, the re-added values were dropped and the reload showed the
+      // template's (#1677). Every field that differs from the base is the instance's own now.
+      reconcileOverrideMarks(id, meta);
     });
     markUIDirty(); markStructureDirty();
   };
   const revert = () => {
     const idx = buildGuidIndex();
-    refs.forEach((r) => { const id = resolveWith(r, idx); if (id != null) findEntity(id)?.remove(meta.trait); });
+    refs.forEach((r, i) => { const id = resolveWith(r, idx); if (id != null) { findEntity(id)?.remove(meta.trait); putBackMarks(id, oldMarks[i]!); } });
     markUIDirty(); markStructureDirty();
   };
   apply();
@@ -722,18 +741,6 @@ export function duplicateEntity(
   const attrData = attrMeta ? readTraitData(entityId, attrMeta) : null;
   const parentId = (attrData?.parentId as number) || 0;
 
-  // respawnFromSnapshot copies the source's EntityAttributes — including its
-  // sortOrder — verbatim, so the fresh copy would collide with the source's
-  // sortOrder among the same parent's children, breaking drag-to-reorder's
-  // distinct-position math. Reassign (max sibling sortOrder + 1) post-spawn,
-  // mirroring createEntityWithUndo's auto-assignment. Excludes the duplicate
-  // itself from the max so the copied value can't inflate the result.
-  const assignFreshSortOrder = (newId: number, resolvedParentId: number) => {
-    if (!attrMeta) return;
-    const siblings = getAllEntities().filter(e => e.parentId === resolvedParentId && e.id !== newId);
-    const nextSort = siblings.length > 0 ? Math.max(...siblings.map(s => s.sortOrder)) + 1 : 0;
-    writeTraitField(newId, attrMeta, 'sortOrder', nextSort);
-  };
 
   // regenerateSnapshotGuids already minted a fresh root guid; use it as the
   // stable handle so undo/redo survive a world rebuild. Parent resolved by ref.
@@ -1143,9 +1150,12 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // An OWNED nested root records which instance's row it is BEFORE it leaves: after the write its live parent
   // no longer says (`identityParents.ts`). Kept across the undo — back at its row, the link and the live parent
   // agree. (A plain member records nothing: its template parent is read from the document.)
+  // The marks an undo puts back: taken before ANY write here, since the sortOrder write below marks (#1709), and a
+  // snapshot after it made the undo restore that mark, pinning the old order as an override.
+  const oldMarks = marksOf(entityId);
   if (parentChanged) linkOwnerBeforeMove(getCurrentWorld(), entityId);
   if (parentChanged) writeTraitField(entityId, attrMeta, 'parentId', newParentId);
-  if (newSortOrder !== undefined) writeTraitField(entityId, attrMeta, 'sortOrder', newSortOrder);
+  if (newSortOrder !== undefined) writeTraitFieldMarked(entityId, attrMeta, 'sortOrder', newSortOrder);
   if (clearFolder) writeTraitField(entityId, attrMeta, 'editorFolder', '');
 
   // Leaving the OUTERMOST instance cuts exactly the links the move splits (#1447): a member carried away from its
@@ -1209,7 +1219,6 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     }
   };
   const detaching = detachTargets.length > 0 || promoteTargets.length > 0;
-  const oldMarks = marksOf(entityId); // before the detach: an undo puts back what the entity had
   // Guid refs so undo/redo survive a world rebuild. Root (0) stays literal 0. Taken BEFORE the detach: a
   // promotion renames members (#1447), and the old parent can be one of them — undo reverses the rename first,
   // so a ref taken after it named nothing and the mover went to the scene root (close-out review).
@@ -1224,7 +1233,6 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
 
   const savedOldLocal = oldLocal ? { ...oldLocal } : null;
   const savedNewParentId = newParentId;
-  const savedNewSortOrder = newSortOrder ?? oldSortOrder;
   const savedNewLocal = newLocal;
 
   const entityName = getAllEntities().find(e => e.id === entityId)?.name || `Entity ${entityId}`;
@@ -1251,7 +1259,9 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     redo: () => {
       const id = ref.resolve(); if (id == null) return;
       writeTraitField(id, attrMeta!, 'parentId', newParentRef?.resolve() ?? 0);
-      writeTraitField(id, attrMeta!, 'sortOrder', savedNewSortOrder);
+      // As the original action: only a move that SET a sortOrder writes it. Re-writing the unchanged value marked
+      // would re-reconcile a mark the move never touched and drop a stored override equal to the base.
+      if (newSortOrder !== undefined) writeTraitFieldMarked(id, attrMeta!, 'sortOrder', newSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', '');
       if (savedNewLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedNewLocal[f]); }
       if (detaching) applyDetach(); // re-strip after the move
@@ -1469,7 +1479,7 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     }
     const rid = resolveWith(rootRef, idx); if (rid == null) return;
     if (parentChanged) writeTraitField(rid, attrMeta, 'parentId', newParentRef?.resolve() ?? 0);
-    writeTraitField(rid, attrMeta, 'sortOrder', newSortOrder);
+    writeTraitFieldMarked(rid, attrMeta, 'sortOrder', newSortOrder);
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', '');
     if (newLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, newLocal[f]);
     if (oldLocal && newLocal) markCompensatedTransform(rid, oldLocal, newLocal);

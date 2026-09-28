@@ -55,6 +55,12 @@ export function markOverride(entity: Entity, trait: string, field: string): void
   setFor(entity).add(keyOf(trait, field));
 }
 
+/** Take back the mark on `field` of `trait`: an editor write that put the field back at its base, or the undo of
+ *  the write that marked it (#1709). */
+export function unmarkOverride(entity: Entity, trait: string, field: string): void {
+  marks.get(packedOf(entity))?.delete(keyOf(trait, field));
+}
+
 /** Re-apply "Trait.field" keys read off another entity with {@link getOverrideMarkSet} — a respawn
  *  of the same logical member (undo, a carried entity) or a copy of it. */
 export function restoreOverrideMarks(entity: Entity, keys: Iterable<string>): void {

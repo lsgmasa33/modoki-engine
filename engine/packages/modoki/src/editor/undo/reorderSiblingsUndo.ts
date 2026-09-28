@@ -32,13 +32,16 @@ export function makeReorderSiblingsAction(
   changes: SiblingSortChange[],
   apply: (id: number, sort: number) => void,
   label = 'Reorder siblings',
+  /** The undo's write, when it is not `apply`'s mirror: the Hierarchy's renumber marks by value going forward and
+   *  must put back the marks it found coming back (#1709). Defaults to `apply`. */
+  revert: (id: number, sort: number) => void = apply,
 ): UndoAction {
   // Snapshot defensively so later mutation of the caller's array can't corrupt
   // the captured values.
   const snapshot = changes.map((c) => ({ id: c.id, oldSort: c.oldSort, newSort: c.newSort }));
   return {
     label,
-    undo: () => { for (const c of snapshot) apply(c.id, c.oldSort); },
+    undo: () => { for (const c of snapshot) revert(c.id, c.oldSort); },
     redo: () => { for (const c of snapshot) apply(c.id, c.newSort); },
   };
 }
