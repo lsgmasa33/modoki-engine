@@ -788,6 +788,14 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: keyed by a prefab member\'s serialized localId in the frame\'s own document (#1468 Phase 4); loaders/prefabOverrides.ts:158' },
   { item: 'loaders/prefabOverrides.ts::EffectiveMemberOptions.removedTraits',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; loaders/prefabOverrides.ts:142' },
+  // The shared path fold (#1707): the document shapes it reads and the state it threads, all localId-keyed.
+  ...[['SlotLists.removedTraits', 440], ['SlotLists.moved', 441], ['FoldRow.overrides', 449], ['FoldRow.nestedOverrides', 450],
+    ['FoldRow.removedTraits', 453], ['ForwardState.nestedOverrides', 468], ['ForwardState.forwardRoots', 470]].map(([f, line]) => ({
+    item: `loaders/prefabOverrides.ts::${f}`,
+    reason: `not-entity: keyed by a prefab member's row localId in the frame's own document — the path fold (foldRowStep/foldPath, #1707), computed per call and never held across one; loaders/prefabOverrides.ts:${line}` })),
+  ...[['FrameFold.overrides', 606], ['FrameFold.removedTraits', 607]].map(([f, line]) => ({
+    item: `loaders/prefabOverrides.ts::${f}`,
+    reason: `not-entity: keyed by a prefab member's row localId — what the layers around a frame put on its own members while effectivePrefab*Traits composes one member (#1707); loaders/prefabOverrides.ts:${line}` })),
   { item: 'loaders/riggedModelCache.ts::owners',
     reason: 'not-entity: asset key → Set of owning SceneIds (`type SceneId = number`), the per-scene refcount; loaders/riggedModelCache.ts:64' },
   { item: 'loaders/uiAnchorZIndexMigration.ts::MigratableEntry.overrides',
@@ -817,7 +825,7 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id — the written twin of loaders/loadSceneFile.ts SceneEntityEntry; editor/scene/serialize.ts:41' })),
   { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::StructureCaptureOpts.layerTraits',
     reason: 'not-entity: keyed by a prefab member\'s row localId (the frame document\'s own id space), valued by trait names the enclosing layer adds to it; built for one capture (#1676); editor/scene/prefab.ts StructureCaptureOpts' },
-  ...['LayerStructure.removedTraits', 'LayerStructure.moved', 'FrameLayer.overrides', 'LayerLists.removedTraits', 'ForwardState.nestedOverrides', 'ForwardState.forwardRoots'].map((f) => ({
+  ...['LayerStructure.removedTraits', 'LayerStructure.moved', 'FrameLayer.overrides', 'LayerLists.removedTraits'].map((f) => ({
     item: `engine/packages/modoki/src/editor/scene/prefabBase.ts::${f}`,
     reason: 'not-entity: keyed by a prefab member\'s row localId (the frame document\'s own id space) — the fold of the prefab layers enclosing a frame (#1693), computed per call and never held across one; editor/scene/prefabBase.ts:30' })),
   ...['PromotedGuids.plain', 'PromotedGuids.refs'].map((f) => ({

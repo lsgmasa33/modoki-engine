@@ -433,6 +433,105 @@ export function foldStructureLayers<A extends { parentLocalId: number }>(
   return { channels, forwardRoots };
 }
 
+/** The lists a whole-frame slot (`nestedStructure[path]`) states — the part the fold reads. */
+export interface SlotLists<A> {
+  added?: A[];
+  removed?: number[];
+  removedTraits?: Record<number, string[]>;
+  moved?: Record<number, string>;
+}
+
+/** A document ROW, as the path fold reads it: a plain member, or a nested row with its channels. */
+export interface FoldRow<A, D, R> {
+  localId?: number;
+  nodeGuid?: string;
+  prefab?: string;
+  overrides?: OverrideMap;
+  nestedOverrides?: NestedOverridePaths;
+  added?: A[];
+  removed?: number[];
+  removedTraits?: Record<number, string[]>;
+  nestedStructure?: Record<string, D>;
+  members?: Record<string, R>;
+}
+
+/** A prefab document, as the path fold reads it. */
+export interface FoldDoc<A, D, R> {
+  entities: readonly FoldRow<A, D, R>[];
+  rootLocalId?: number;
+}
+
+/** What the layers above a frame FORWARD into its expansion: the pending path-keyed field overrides, the structural
+ *  layers reaching it, and what each of them forwarded to its nested roots. Applied at the frame's NESTED rows only:
+ *  what the layers say of the frame's own members is the `channels` part {@link foldRowStep} returns beside it. */
+export interface ForwardState<D, R> {
+  nestedOverrides?: NestedOverridePaths;
+  layers: StructureLayer<D, R>[];
+  forwardRoots: readonly (ReadonlyMap<number, R> | undefined)[];
+}
+
+/** ONE nested row expanded (#1707, I1's expansion side): what the layers above a frame (`state`) and the nested row
+ *  `row` itself put on the row's child frame, whose document is `child`. The spawner's order: the row's `overrides` under
+ *  the outer layer's forwarded direct ones, the row's lists unless an outer slot owns the frame (then the slot's, an
+ *  absent list read as empty, and the slot's `moved`), and then every layer's member rows folded over both, inner first.
+ *  `forward` is what the child frame hands ITS nested rows; null without a child document.
+ *
+ *  The one statement of that step the pure readers share: the editor's effective base (`prefabBase.ts` `foldPath`), the
+ *  validator and the UIEntries pool (`effectivePrefabMemberTraits`). The two spawners still state it themselves
+ *  (`instantiatePrefabIntoWorld`, the editor's `instantiatePrefab`); a test pins the three against each other. */
+export function foldRowStep<A extends { parentLocalId: number }, D extends SlotLists<A>, R extends MemberRowChannels<A>>(
+  row: FoldRow<A, D, R>,
+  state: ForwardState<D, R>,
+  child: FoldDoc<A, D, R> | null,
+): { channels: FrameChannels<A>; moved?: Record<number, string>; forward: ForwardState<D, R> | null } {
+  const lid = row.localId ?? 0;
+  const { direct, forward } = descendNestedOverrides(state.nestedOverrides, lid);
+  const overrides = direct ? mergeOverrideMaps(row.overrides, direct) : row.overrides;
+  const pending = mergeNestedOverridePaths(row.nestedOverrides, forward);
+  const d = descendStructureLayers(state.layers, row, state.forwardRoots);
+  // An outer layer addressing this path OWNS the interior — all three lists, absent read as empty (`structDirect`).
+  const lower: FrameChannels<A> = d.direct
+    ? { overrides, added: d.direct.added ?? [], removed: d.direct.removed ?? [], removedTraits: d.direct.removedTraits ?? {} }
+    : { overrides, added: row.added, removed: row.removed, removedTraits: row.removedTraits };
+  if (!child) return { channels: lower, ...(d.direct ? { moved: d.direct.moved ?? {} } : {}), forward: null };
+  const folded = foldStructureLayers(child, d.layers as StructureLayer<unknown, MemberRowChannels<A>>[], d.foldFrom, lower);
+  return {
+    channels: folded.channels,
+    ...(d.direct ? { moved: d.direct.moved ?? {} } : {}),
+    forward: { nestedOverrides: pending, layers: d.layers, forwardRoots: folded.forwardRoots as ForwardState<D, R>['forwardRoots'] },
+  };
+}
+
+/** {@link foldRowStep} down `path` (nested-row localIds, outermost first), from a first level whose document is
+ *  `docs[0]`; `docs[i + 1]` is the document of the frame row `path[i]` expands. `seed` is what a layer above the first
+ *  level forwards into it. Returns what the chain puts on the LAST frame: its members' field overrides, its structural
+ *  lists (with `moved` when an outer slot owns it), and what it forwards to its own nested rows — null when a level is
+ *  missing, and then the overrides and lists are empty. */
+export function foldPath<A extends { parentLocalId: number }, D extends SlotLists<A>, R extends MemberRowChannels<A>>(
+  docs: readonly (FoldDoc<A, D, R> | null)[],
+  path: readonly number[],
+  seed?: ForwardState<D, R>,
+): { overrides: OverrideMap; structure: SlotLists<A>; forward: ForwardState<D, R> | null } {
+  let state: ForwardState<D, R> = seed ?? { layers: [{}], forwardRoots: [] };
+  if (!path.length) return { overrides: {}, structure: {}, forward: state };
+  for (let i = 0; i < path.length; i++) {
+    const row = docs[i]?.entities.find((e) => e.localId === path[i] && e.prefab);
+    if (!row) break;
+    const step = foldRowStep(row, state, docs[i + 1] ?? null);
+    if (i === path.length - 1) {
+      const { added, removed, removedTraits } = step.channels;
+      return {
+        overrides: step.channels.overrides ?? {},
+        structure: { added, removed, removedTraits, ...(step.moved ? { moved: step.moved } : {}) },
+        forward: step.forward,
+      };
+    }
+    if (!step.forward) break;
+    state = step.forward;
+  }
+  return { overrides: {}, structure: {}, forward: null };
+}
+
 /** Fold ONE trait's override fields onto its current values — the per-trait rule the spawner
  *  applies (`applyOverridesByLocalToEcs`) and `effectivePrefabMemberTraits` models, kept in one place
  *  so the two cannot disagree about precedence or about which fields count.
@@ -477,6 +576,12 @@ export interface EffectiveMemberOptions {
   nestedOverrides?: NestedOverridePaths;
   /** Per-localId component removals an outer layer applies to this instance. */
   removedTraits?: Record<number, string[]>;
+  /** The outer layer's MEMBER ROWS, keyed from this instance's frame (`members`, #1468 / #1533): a direct row folds on
+   *  its member here, a deeper one descends into the nested frame it names — as the spawner folds them (#1707). */
+  members?: Record<string, unknown>;
+  /** The outer layer's whole-frame slots for this instance's nested frames (`nestedStructure`): a slot OWNS its frame's
+   *  structural lists, the row's own included (#1707). */
+  nestedStructure?: Record<string, unknown>;
 }
 
 /** @deprecated-alias kept for the first caller's name; identical to `EffectiveMemberOptions`. */
@@ -486,12 +591,54 @@ export type EffectiveRootOptions = EffectiveMemberOptions;
  *  keys on `prefab.id`, which a hand-written or test prefab may lack. */
 const MAX_NEST_DEPTH = 64;
 
-type PrefabRowLike = {
-  localId?: unknown; traits?: unknown; prefab?: unknown;
-  overrides?: unknown; nestedOverrides?: unknown; removedTraits?: unknown;
-};
-
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+
+// The fold's types, instantiated for a document read off disk: nothing here knows the concrete node or row types.
+type AnyNode = { parentLocalId: number };
+type AnySlot = SlotLists<AnyNode>;
+type AnyRow = MemberRowChannels<AnyNode>;
+type AnyFoldRow = FoldRow<AnyNode, AnySlot, AnyRow>;
+type AnyFoldDoc = FoldDoc<AnyNode, AnySlot, AnyRow>;
+
+/** What the layers around a frame put on it: its own members' field overrides and component removals, and what they
+ *  forward to its nested rows. */
+interface FrameFold {
+  overrides?: OverrideMap;
+  removedTraits?: Record<number, string[]>;
+  forward: ForwardState<AnySlot, AnyRow>;
+}
+
+/** A row read off disk, keeping only the channels in the shape the fold reads — a malformed one is dropped, as the
+ *  spawner would fail to read it, so a hand-written file resolves to less rather than throwing. */
+function foldRowOf(e: Record<string, unknown>): AnyFoldRow {
+  const rec = <T>(v: unknown): T | undefined => (isRecord(v) ? v as T : undefined);
+  const arr = <T>(v: unknown): T | undefined => (Array.isArray(v) ? v as T : undefined);
+  return {
+    localId: typeof e.localId === 'number' ? e.localId : undefined,
+    nodeGuid: typeof e.nodeGuid === 'string' ? e.nodeGuid : undefined,
+    prefab: typeof e.prefab === 'string' ? e.prefab : undefined,
+    overrides: rec(e.overrides), nestedOverrides: rec(e.nestedOverrides), removedTraits: rec(e.removedTraits),
+    added: arr(e.added), removed: arr(e.removed), nestedStructure: rec(e.nestedStructure), members: rec(e.members),
+  };
+}
+
+/** The document the fold reads: its well-formed rows, in order. */
+function foldDocOf(prefab: Record<string, unknown>): AnyFoldDoc {
+  const entities = (prefab.entities as unknown[]).filter(isRecord).map(foldRowOf);
+  return { entities, rootLocalId: typeof prefab.rootLocalId === 'number' ? prefab.rootLocalId : undefined };
+}
+
+/** The frame an instance of `doc` is, under the outer layer `opts` describes: the layer's direct member rows folded over
+ *  its localId channels (a whole-frame slot is for the frames BELOW this one), and the layer forwarded to the nested rows
+ *  — the spawner's top call (`instantiatePrefabIntoWorld`) and a reference node's (`spawnNestedInstance`). */
+function topFrame(doc: AnyFoldDoc, opts: EffectiveMemberOptions): FrameFold {
+  const slots = isRecord(opts.nestedStructure) ? opts.nestedStructure as Record<string, AnySlot> : undefined;
+  const rows = isRecord(opts.members) ? opts.members as Record<string, AnyRow> : undefined;
+  const layers: StructureLayer<AnySlot, AnyRow>[] = [{ slots, rows }];
+  const lower = { overrides: opts.overrides, removedTraits: opts.removedTraits };
+  const { channels, forwardRoots } = rows ? foldStructureLayers(doc, layers, 0, lower) : { channels: lower, forwardRoots: [] };
+  return { overrides: channels.overrides, removedTraits: channels.removedTraits, forward: { nestedOverrides: opts.nestedOverrides, layers, forwardRoots } };
+}
 
 /** The trait bag an instance of `prefab` would carry on its ROOT entity — or `null` when no root
  *  entity would be produced at all. The root is `rootLocalId ?? 1`, the spawner's rule (NOT "the first
@@ -502,7 +649,7 @@ export function effectivePrefabRootTraits(
   opts: EffectiveMemberOptions = {},
 ): Record<string, unknown> | null {
   if (!isRecord(prefab)) return null;
-  return resolveMember(prefab, (prefab.rootLocalId as number | undefined) ?? 1, getPrefab, opts, new Set<string>(), 0);
+  return effectivePrefabMemberTraitsAt(prefab, [], (prefab.rootLocalId as number | undefined) ?? 1, getPrefab, opts);
 }
 
 /** The trait bag the member at `localId` of an instance of `prefab` would carry — composed from the
@@ -512,45 +659,123 @@ export function effectivePrefabRootTraits(
  *  Mirrors the spawner, step for step:
  *  1. **Which row:** the LAST row carrying `localId` (the spawner's `localToEcs.set` overwrites). No
  *     such row, or localId 0 → `null`.
- *  2. **A nested-instance row** (`prefab: <guid>`) produces the CHILD prefab's ROOT, with the row's
- *     own `overrides` merged under whatever an outer layer addresses at this row (outer wins), the
- *     row's `nestedOverrides` threaded on, and the row's `removedTraits` applied in the child. The
- *     row's own `traits` are NOT part of the result — the spawner reads only `parentId` there. A child
- *     that does not resolve (uncached, a cycle, too deep) → `null`, because the spawner maps no entity
- *     for the row either.
+ *  2. **A nested-instance row** (`prefab: <guid>`) produces the CHILD prefab's ROOT, composed under
+ *     what the row and the layers around it put on the child frame — {@link foldRowStep}, the step the
+ *     editor's effective base folds with (#1707): the row's `overrides` under the outer layer's forwarded
+ *     ones, the row's `removedTraits` unless an outer whole-frame slot owns the frame, then every layer's
+ *     member rows (`members`) over both. The row's own `traits` are NOT part of the result — the spawner
+ *     reads only `parentId` there. A child that does not resolve (uncached, a cycle, too deep) → `null`,
+ *     because the spawner maps no entity for the row either.
  *  3. **A plain row** starts from its own `traits`, minus any baked-in `PrefabInstance` (the spawner
  *     replaces it).
- *  4. `opts.overrides[localId]` is folded on AFTER the row is resolved — adding a known trait the
- *     member lacks, skipping an unknown one (see `traitKind`) — then `opts.removedTraits[localId]` is
- *     deleted LAST: the spawner's order (overrides, then structure).
+ *  4. The frame's overrides on `localId` are folded on AFTER the row is resolved — adding a known trait
+ *     the member lacks, skipping an unknown one (see `traitKind`) — then its removed traits are deleted
+ *     LAST: the spawner's order (overrides, then structure). At the top frame those are `opts.overrides`
+ *     and `opts.removedTraits` with the direct rows of `opts.members` folded over them.
  *
  *  ⚠️ Values are returned by REFERENCE where nothing overrode them, as the plain-row read always
  *  did — the result may alias the prefab CACHE, so never mutate it.
  *
- *  **Not modelled:** a structural `removed` of the member itself (the spawner returns a dead id). */
+ *  **Not modelled:** a structural `removed` of the member itself (the spawner returns a dead id), and a member a
+ *  structural `added` list spawns (it has no localId to be asked for). A malformed shape anywhere reads as `null`. */
 export function effectivePrefabMemberTraits(
   prefab: unknown,
   localId: number,
   getPrefab: (ref: string) => unknown,
   opts: EffectiveMemberOptions = {},
 ): Record<string, unknown> | null {
-  return resolveMember(prefab, localId, getPrefab, opts, new Set<string>(), 0);
+  return effectivePrefabMemberTraitsAt(prefab, [], localId, getPrefab, opts);
+}
+
+/** {@link effectivePrefabMemberTraits} for a member of a NESTED frame of the instance: `path` is the nested rows'
+ *  localIds from `prefab` down (outermost first), and `localId` is the member's in the last frame's document (#1707).
+ *  `[]` is the instance's own frame. Null when a path step is not a nested row, or a document does not resolve. */
+export function effectivePrefabMemberTraitsAt(
+  prefab: unknown,
+  path: readonly number[],
+  localId: number,
+  getPrefab: (ref: string) => unknown,
+  opts: EffectiveMemberOptions = {},
+): Record<string, unknown> | null {
+  if (!isRecord(prefab) || !Array.isArray(prefab.entities)) return null;
+  try {
+    const at = asOuterMember(prefab, path, localId, getPrefab);
+    return resolveMember(prefab, at.path, at.localId, getPrefab, topFrame(foldDocOf(prefab), opts), opts, new Set<string>(), 0);
+  } catch {
+    return null; // a shape the fold cannot read; the spawner could not either
+  }
+}
+
+/** The ROOT of a nested frame is the nested row's own member in the frame ABOVE: what that frame puts on the row (its
+ *  overrides and removed traits at the row's localId) lands on the same entity, and composing it from inside the child
+ *  frame misses that (#1707 close-out review). So while the member asked for is its frame's root, the last path step
+ *  becomes the member — repeatedly, because a frame's root can itself be a nested row (the #1031 shape). The member-row
+ *  writer names such an entity by the outermost row alone; a hand-written key can spell it any of the ways. An address
+ *  whose documents do not resolve is left as it is: the walk then answers null for it, as before. */
+function asOuterMember(
+  prefab: Record<string, unknown>, path: readonly number[], localId: number, getPrefab: (ref: string) => unknown,
+): { path: number[]; localId: number } {
+  if (!path.length) return { path: [], localId };
+  const docs: Record<string, unknown>[] = [prefab];
+  for (const step of path) {
+    const entities = docs[docs.length - 1]!.entities;
+    if (!Array.isArray(entities) || docs.length > MAX_NEST_DEPTH) return { path: [...path], localId };
+    const row = [...entities].reverse().find((e) => isRecord(e) && ((e.localId as number | undefined) ?? 0) === step) as Record<string, unknown> | undefined;
+    if (!row || typeof row.prefab !== 'string' || !row.prefab) return { path: [...path], localId };
+    let child: unknown;
+    try { child = getPrefab(row.prefab); } catch { child = undefined; }
+    if (!isRecord(child)) return { path: [...path], localId };
+    docs.push(child);
+  }
+  const out = [...path];
+  let lid = localId;
+  while (out.length && lid === ((docs[out.length]!.rootLocalId as number | undefined) ?? 1)) lid = out.pop()!;
+  return { path: out, localId: lid };
+}
+
+/** The member a member-row KEY names (`/<nodeGuid>/…`, one component per frame — `SceneMemberRow`), as the address
+ *  {@link effectivePrefabMemberTraitsAt} takes: the nested rows' localIds down to its frame, and its localId there. Each
+ *  component is resolved against its frame's document by `nodeGuid` (`docRows`). Null for a node row (`a+<key>`: an
+ *  added node has no localId), or a component that names no row, or a frame whose document does not resolve. */
+export function memberAddressOfRowKey(
+  prefab: unknown,
+  key: string,
+  getPrefab: (ref: string) => unknown,
+): { path: number[]; localId: number } | null {
+  if (!key.startsWith('/') || !isRecord(prefab) || !Array.isArray(prefab.entities)) return null;
+  const components = key.slice(1).split('/');
+  let doc: Record<string, unknown> = prefab;
+  const path: number[] = [];
+  for (let i = 0; i < components.length; i++) {
+    const component = components[i]!;
+    if (!component || nodeRowKey(component)) return null;
+    const at = docRows(foldDocOf(doc)).get(component);
+    if (!at) return null;
+    if (i === components.length - 1) return { path, localId: at.localId };
+    if (!at.prefab || path.length >= MAX_NEST_DEPTH) return null;
+    let child: unknown;
+    try { child = getPrefab(at.prefab); } catch { child = undefined; }
+    if (!isRecord(child) || !Array.isArray(child.entities)) return null;
+    path.push(at.localId);
+    doc = child;
+  }
+  return null;
 }
 
 function resolveMember(
-  prefab: unknown,
+  prefab: Record<string, unknown>,
+  path: readonly number[],
   localId: number,
   getPrefab: (ref: string) => unknown,
+  frame: FrameFold,
   opts: EffectiveMemberOptions,
   stack: Set<string>,
   depth: number,
   /** The ref this prefab was reached BY (absent at the top level). */
   selfRef?: string,
 ): Record<string, unknown> | null {
-  if (!isRecord(prefab)) return null;
   const entities = prefab.entities;
   if (!Array.isArray(entities) || entities.length === 0) return null;
-
   // An ANCESTOR stack, like the spawner's — which keys on `prefab.id` alone. This level registers
   // under its `id` AND the ref it was reached by, ONCE, on entry: a real prefab's `id` IS the ref
   // that names it, so registering the ref in the parent before recursing (the first draft) made
@@ -560,32 +785,38 @@ function resolveMember(
   if (keys.some((k) => stack.has(k))) return null;
   for (const k of keys) stack.add(k);
   try {
-    let row: PrefabRowLike | undefined;
-    for (let i = entities.length - 1; i >= 0; i--) {
-      const e = entities[i] as PrefabRowLike | null;
-      if (isRecord(e) && ((e.localId as number | undefined) ?? 0) === localId) { row = e; break; }
+    const rowAt = (lid: number): Record<string, unknown> | undefined => {
+      for (let i = entities.length - 1; i >= 0; i--) {
+        const e = entities[i] as unknown;
+        if (isRecord(e) && ((e.localId as number | undefined) ?? 0) === lid) return e;
+      }
+      return undefined;
+    };
+    /** Resolve `lid` at `rest` inside the frame nested row `row` expands, under what this frame puts on it. */
+    const into = (row: Record<string, unknown>, rest: readonly number[], lid?: number): Record<string, unknown> | null => {
+      const ref = row.prefab as string;
+      if (depth >= MAX_NEST_DEPTH) return null;
+      let child: unknown;
+      try { child = getPrefab(ref); } catch { child = undefined; }
+      if (!isRecord(child) || !Array.isArray(child.entities)) return null;
+      const step = foldRowStep(foldRowOf(row), frame.forward, foldDocOf(child));
+      const childFrame: FrameFold = { overrides: step.channels.overrides, removedTraits: step.channels.removedTraits, forward: step.forward! };
+      // The child registers itself (under its id and `ref`) on entry — see the stack note above.
+      return resolveMember(child, rest, lid ?? ((child.rootLocalId as number | undefined) ?? 1), getPrefab, childFrame, opts, stack, depth + 1, ref);
+    };
+
+    if (path.length) {
+      const row = rowAt(path[0]!);
+      if (!row || typeof row.prefab !== 'string' || !row.prefab) return null;
+      return into(row, path.slice(1), localId);
     }
+
+    const row = rowAt(localId);
     if (!row || !localId) return null;
 
     let traits: Record<string, unknown>;
     if (typeof row.prefab === 'string' && row.prefab) {
-      const ref = row.prefab;
-      if (depth >= MAX_NEST_DEPTH) return null;
-      let child: unknown;
-      try { child = getPrefab(ref); } catch { child = undefined; }
-      if (!isRecord(child)) return null;
-      const { direct, forward } = descendNestedOverrides(opts.nestedOverrides, localId);
-      const rowOverrides = isRecord(row.overrides) ? row.overrides as OverrideMap : undefined;
-      const childOverrides = direct ? mergeOverrideMaps(rowOverrides, direct) : rowOverrides;
-      const rowNested = isRecord(row.nestedOverrides) ? row.nestedOverrides as NestedOverridePaths : undefined;
-      // The child registers itself (under its id and `ref`) on entry — see the stack note above.
-      const composed = resolveMember(child, (child.rootLocalId as number | undefined) ?? 1, getPrefab, {
-        acceptField: opts.acceptField,
-        traitKind: opts.traitKind,
-        overrides: childOverrides,
-        nestedOverrides: mergeNestedOverridePaths(rowNested, forward),
-        removedTraits: isRecord(row.removedTraits) ? row.removedTraits as Record<number, string[]> : undefined,
-      }, stack, depth + 1, ref);
+      const composed = into(row, []);
       if (!composed) return null;
       traits = composed;
     } else {
@@ -597,7 +828,7 @@ function resolveMember(
       }
     }
 
-    const own = opts.overrides?.[localId];
+    const own = frame.overrides?.[localId];
     if (isRecord(own)) {
       for (const [traitName, fields] of Object.entries(own)) {
         if (!isRecord(fields)) continue;
@@ -614,7 +845,7 @@ function resolveMember(
       }
     }
 
-    const removed = opts.removedTraits?.[localId];
+    const removed = frame.removedTraits?.[localId];
     if (Array.isArray(removed)) {
       for (const name of removed) if (typeof name === 'string') delete traits[name];
     }

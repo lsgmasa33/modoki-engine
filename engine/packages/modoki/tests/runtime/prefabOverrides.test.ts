@@ -56,7 +56,12 @@ const getLoader = () => import('../../src/runtime/loaders/loadSceneFile');
 const getPure = () => import('../../src/runtime/loaders/prefabOverrides');
 
 type OverrideMap = Record<number, Record<string, Record<string, unknown>>>;
-type Opts = { overrides?: OverrideMap; nestedOverrides?: Record<string, OverrideMap>; removedTraits?: Record<number, string[]> };
+type Opts = {
+  overrides?: OverrideMap; nestedOverrides?: Record<string, OverrideMap>; removedTraits?: Record<number, string[]>;
+  members?: Record<string, unknown>; nestedStructure?: Record<string, unknown>;
+};
+/** A member of a NESTED frame: the nested rows' localIds down to it, its localId there, and the source it spawns under. */
+type At = { path: number[]; localId: number; source: string };
 
 /** The provider's two rules, built from the SAME registry double the spawner reads. */
 async function spawnerRules() {
@@ -90,19 +95,23 @@ function spawnedMember(localId: number) {
  *  one resolves iff the other produced the entity; every field the pure answer carries is on it; and
  *  every spawned field that differs from the trait default is in the pure answer. `member` omitted
  *  compares the ROOT. */
-async function expectParity(prefab: unknown, opts: Opts = {}, member?: number) {
+async function expectParity(prefab: unknown, opts: Opts = {}, member?: number | At) {
   const { instantiatePrefabIntoWorld } = await getLoader();
-  const { effectivePrefabRootTraits, effectivePrefabMemberTraits } = await getPure();
+  const { effectivePrefabRootTraits, effectivePrefabMemberTraits, effectivePrefabMemberTraitsAt } = await getPure();
   const get = (ref: string) => cachedPrefabs.get(ref) ?? null;
   const all = { ...opts, ...(await spawnerRules()) };
   const pure = member === undefined
     ? effectivePrefabRootTraits(prefab, get, all)
-    : effectivePrefabMemberTraits(prefab, member, get, all);
+    : typeof member === 'number'
+      ? effectivePrefabMemberTraits(prefab, member, get, all)
+      : effectivePrefabMemberTraitsAt(prefab, member.path, member.localId, get, all);
+  const structure = opts.removedTraits || opts.members ? { removedTraits: opts.removedTraits, members: opts.members } : undefined;
   const rootId = instantiatePrefabIntoWorld(
     testWorld, prefab as never, 0, undefined, 'P', opts.overrides,
-    opts.removedTraits ? { removedTraits: opts.removedTraits } : undefined, undefined, opts.nestedOverrides,
+    structure as never, undefined, opts.nestedOverrides, opts.nestedStructure as never,
   );
-  const entity = member === undefined ? (rootId ? idIndex.get(rootId) : undefined) : spawnedMember(member);
+  const entity = member === undefined ? (rootId ? idIndex.get(rootId) : undefined)
+    : typeof member === 'number' ? spawnedMember(member) : spawnedAt(member);
   expect(pure === null, `pure resolves iff the spawner produced the entity (root id: ${rootId})`).toBe(entity === undefined);
   if (!entity || !pure) return { pure };
   const live = entity.has(UIElement) ? { ...(entity.get(UIElement) as Record<string, unknown>) } : undefined;
@@ -116,6 +125,16 @@ async function expectParity(prefab: unknown, opts: Opts = {}, member?: number) {
     }
   }
   return { pure };
+}
+
+/** The spawned member `at.localId` of a frame expanded from `at.source` (fixtures give each source one frame). */
+function spawnedAt(at: At) {
+  let found: any;
+  testWorld.query(PrefabInstance).updateEach(([pi], e) => {
+    const p = pi as Record<string, unknown>;
+    if (!found && p.source === at.source && p.localId === at.localId) found = idIndex.get(e.id());
+  });
+  return found;
 }
 
 const leaf = (id: string, ui: Record<string, unknown>) => ({
@@ -198,6 +217,134 @@ describe('effectivePrefabRootTraits agrees with the spawner (#1031)', () => {
     await expectParity(nestingRoot('Parent', 'Missing'));
     // No `rootLocalId`: the spawner's rule is `?? 1`, NOT "the first row" — this prefab spawns no root.
     await expectParity({ id: 'Seven', entities: [{ localId: 7, traits: { Transform: { x: 0 }, UIElement: { width: 9 } } }] });
+  });
+});
+
+/** #1707 — a nested row is composed with the fold the editor's effective base uses (`foldRowStep`), so the pure answer
+ *  follows the spawner on the channels it used to skip: a row's member ROWS (prefab v6), an outer whole-frame slot owning
+ *  the row's lists, and an outer layer's DEEP member rows. Each was red before #1707 (the old composition took the row's
+ *  `overrides`/`removedTraits` and nothing else). */
+describe('#1707: a nested row composes its member rows and an outer slot, as the spawner does', () => {
+  const G = (n: number) => `a1707000-0000-4000-8000-0000000000${String(n).padStart(2, '0')}`;
+  const [gRoot, gKid, gRow] = [G(1), G(2), G(9)];
+  /** Child: Root (UIElement `rootUi`) → Kid (UIElement width 5), both with minted identities. */
+  const child = (rootUi: Record<string, unknown>) => ({ id: 'Child', rootLocalId: 1, entities: [
+    { localId: 1, nodeGuid: gRoot, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'ChildRoot', parentId: 0 }, UIElement: rootUi } },
+    { localId: 2, nodeGuid: gKid, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'ChildKid', parentId: 1 }, UIElement: { width: 5, widthUnit: 'px' } } },
+  ] });
+  /** Host: HostRoot → row 2 (nodeGuid gRow) expanding Child, with `row` merged onto the reference row. */
+  const host = (row: Record<string, unknown> = {}) => ({ id: 'Host', rootLocalId: 1, entities: [
+    { localId: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'HostRoot', parentId: 0 } } },
+    { localId: 2, nodeGuid: gRow, prefab: 'Child', traits: { EntityAttributes: { name: 'Ref', parentId: 1 } }, ...row },
+  ] });
+  const KID: At = { path: [2], localId: 2, source: 'Child' };
+
+  it('a nested ROOT row\'s member row on the child root folds into the root', async () => {
+    // Mutation: `foldRowStep` returns `lower` without folding the layers — height stays 10.
+    cachedPrefabs.set('Child', child({ height: 10, heightUnit: 'px' }));
+    const { pure } = await expectParity(nestingRoot('Parent', 'Child', { members: { [`/${gRoot}`]: { traits: { UIElement: { height: 44 } } } } }));
+    expect(pure?.UIElement).toMatchObject({ height: 44 });
+  });
+
+  it('a member of a nested frame, by path: the row\'s member row on it applies', async () => {
+    cachedPrefabs.set('Child', child({}));
+    const { pure } = await expectParity(host({ members: { [`/${gKid}`]: { traits: { UIElement: { width: 12 } } } } }), {}, KID);
+    expect(pure?.UIElement).toEqual({ width: 12, widthUnit: 'px' });
+  });
+
+  it('a member of a nested frame, by path, with no row on it is the child document\'s own', async () => {
+    cachedPrefabs.set('Child', child({}));
+    expect((await expectParity(host(), {}, KID)).pure?.UIElement).toEqual({ width: 5, widthUnit: 'px' });
+  });
+
+  it('an outer whole-frame slot OWNS the row\'s removedTraits: the slot\'s empty list puts the trait back', async () => {
+    // Mutation: in `foldRowStep` take `row.removedTraits` even under a slot — UIElement stays removed.
+    cachedPrefabs.set('Child', child({ height: 10, heightUnit: 'px' }));
+    const parent = nestingRoot('Parent', 'Child', { removedTraits: { 1: ['UIElement'] } });
+    expect((await expectParity(parent)).pure).not.toHaveProperty('UIElement');
+    const { pure } = await expectParity(parent, { nestedStructure: { 1: { added: [], removed: [], removedTraits: {} } } });
+    expect(pure?.UIElement).toMatchObject({ height: 10 });
+  });
+
+  it('an outer layer\'s DEEP member row reaches the member of the nested frame it names', async () => {
+    // Mutation: `topFrame` forwards no rows (`layers: [{ slots }]`) — the width stays 5.
+    cachedPrefabs.set('Child', child({}));
+    const { pure } = await expectParity(host(), { members: { [`/${gRow}/${gKid}`]: { traits: { UIElement: { width: 33 } } } } }, KID);
+    expect(pure?.UIElement).toMatchObject({ width: 33 });
+  });
+
+  /** Mid: MidRoot → row 3 expanding Leaf2, removing UIElement from Leaf2's member 2; Leaf2: root → Kid (width 5). */
+  const leaf2 = () => ({ id: 'Leaf2', rootLocalId: 1, entities: [
+    { localId: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Leaf2Root', parentId: 0 }, UIElement: { width: 1, widthUnit: 'px' } } },
+    { localId: 2, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Leaf2Kid', parentId: 1 }, UIElement: { width: 5, widthUnit: 'px' } } },
+  ] });
+  const mid = (row: Record<string, unknown> = {}) => ({ id: 'Mid', rootLocalId: 1, entities: [
+    { localId: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'MidRoot', parentId: 0 } } },
+    { localId: 3, prefab: 'Leaf2', traits: { EntityAttributes: { name: 'Leaf2Ref', parentId: 1 } }, ...row },
+  ] });
+  const top = (row: Record<string, unknown>) => ({ id: 'Top', rootLocalId: 1, entities: [
+    { localId: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'TopRoot', parentId: 0 } } },
+    { localId: 2, prefab: 'Mid', traits: { EntityAttributes: { name: 'MidRef', parentId: 1 } }, ...row },
+  ] });
+
+  it('a whole-frame slot a prefab ROW carries owns the frame below it, as one passed in does (close-out review)', async () => {
+    // Mutation: `foldRowOf` drops the row's `nestedStructure` — Mid's removal stands and UIElement is gone.
+    cachedPrefabs.set('Leaf2', leaf2());
+    cachedPrefabs.set('Mid', mid({ removedTraits: { 2: ['UIElement'] } }));
+    const at: At = { path: [2, 3], localId: 2, source: 'Leaf2' };
+    const { pure } = await expectParity(top({ nestedStructure: { 3: { added: [], removed: [], removedTraits: {} } } }), {}, at);
+    expect(pure?.UIElement).toEqual({ width: 5, widthUnit: 'px' });
+  });
+
+  it('the ROOT of the last nested frame, asked by path, carries what the frame above puts on it (close-out review)', async () => {
+    // Top's row 2 overrides Mid's member 3 — Leaf2's root. `[2, 3]` + Leaf2's root is that same entity.
+    // Mutation: make `asOuterMember` return its input — width reads Leaf2's own 1.
+    cachedPrefabs.set('Leaf2', leaf2());
+    cachedPrefabs.set('Mid', mid());
+    const { pure } = await expectParity(top({ overrides: { 3: { UIElement: { width: 77 } } } }), {}, { path: [2, 3], localId: 1, source: 'Leaf2' });
+    expect(pure?.UIElement).toMatchObject({ width: 77 });
+  });
+
+  it('…at every depth: a frame whose ROOT row is itself a nested row climbs until the member is no frame\'s root', async () => {
+    // Close-out re-review: the first normalisation collapsed one level. Top and Mid are both the #1031 shape (a nested
+    // root row); `[1, 1]` + Leaf's root is Top's own root, where the outer layer's override lands.
+    // Mutation: `while` → `if` in `asOuterMember` — width reads Leaf's own 1.
+    cachedPrefabs.set('Leaf', leaf('Leaf', { width: 1, widthUnit: 'px' }));
+    cachedPrefabs.set('Mid', nestingRoot('Mid', 'Leaf'));
+    const opts = { overrides: { 1: { UIElement: { width: 90 } } } };
+    const { pure } = await expectParity(nestingRoot('Top', 'Mid'), opts, { path: [1, 1], localId: 1, source: 'Leaf' });
+    expect(pure?.UIElement).toMatchObject({ width: 90 });
+  });
+
+  it('…and through a frame whose root localId is not 1', async () => {
+    // Mid's root is row 3, expanding Leaf2: `[2, 3]` + Leaf2's root is Mid's root, which is Top's member 2.
+    cachedPrefabs.set('Leaf2', leaf2());
+    cachedPrefabs.set('Mid', { id: 'Mid', rootLocalId: 3, entities: [
+      { localId: 3, prefab: 'Leaf2', traits: { EntityAttributes: { name: 'Leaf2Ref', parentId: 0 } } },
+    ] });
+    const { pure } = await expectParity(top({ overrides: {} }), { overrides: { 2: { UIElement: { width: 77 } } } }, { path: [2, 3], localId: 1, source: 'Leaf2' });
+    expect(pure?.UIElement).toMatchObject({ width: 77 });
+  });
+
+  it('a malformed file reads as unresolved, never a throw — the pool calls this with no try of its own', async () => {
+    // `overrides: {1: null}` throws inside `mergeOverrideMaps` once a member row merges over it.
+    // Mutation: remove the try/catch in `effectivePrefabMemberTraitsAt` — this throws.
+    const { effectivePrefabRootTraits } = await getPure();
+    cachedPrefabs.set('Child', child({}));
+    const bad = nestingRoot('Parent', 'Child', { overrides: { 1: null }, members: { [`/${gRoot}`]: { traits: { UIElement: { height: 1 } } } } });
+    expect(effectivePrefabRootTraits(bad, (ref) => cachedPrefabs.get(ref) ?? null)).toBeNull();
+  });
+
+  it('memberAddressOfRowKey resolves a key frame by frame, and refuses what names no member', async () => {
+    const { memberAddressOfRowKey } = await getPure();
+    cachedPrefabs.set('Child', child({}));
+    const get = (ref: string) => cachedPrefabs.get(ref) ?? null;
+    expect(memberAddressOfRowKey(host(), `/${gRow}`, get)).toEqual({ path: [], localId: 2 });
+    expect(memberAddressOfRowKey(host(), `/${gRow}/${gKid}`, get)).toEqual({ path: [2], localId: 2 });
+    expect(memberAddressOfRowKey(host(), `/${gRow}/a+somekey`, get)).toBeNull(); // a node row: no localId
+    expect(memberAddressOfRowKey(host(), `/${G(7)}`, get)).toBeNull();           // names no row
+    expect(memberAddressOfRowKey(host(), `/${gKid}/${gKid}`, get)).toBeNull();   // not a row of Host
+    expect(memberAddressOfRowKey(host(), `/${gRow}/${gKid}`, () => null)).toBeNull(); // the frame does not resolve
   });
 });
 

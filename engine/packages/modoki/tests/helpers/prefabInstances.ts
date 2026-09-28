@@ -26,8 +26,7 @@
 // ⚠️ Relative and narrow, like `tapTargetFloor.ts`: `prefabOverrides` imports nothing but `docKeys`,
 // which is what lets this run in a plain Node test with no trait registry.
 import {
-  descendNestedOverrides, effectivePrefabMemberTraits, mergeNestedOverridePaths, mergeOverrideMaps,
-  type EffectiveMemberOptions, type NestedOverridePaths, type OverrideMap,
+  effectivePrefabMemberTraitsAt, type EffectiveMemberOptions, type NestedOverridePaths, type OverrideMap,
 } from '../../src/runtime/loaders/prefabOverrides';
 
 /** Resolve a `prefab:` ref (the child prefab's `id`) to its parsed document, or `undefined`. */
@@ -87,33 +86,25 @@ export interface PrefabInstance {
   members: InstanceMember[];
 }
 
-/** The options a placement row applies to the child it names. */
+/** The layer a placement row applies to the child it names — every channel the spawner reads off it, member rows and
+ *  whole-frame slots included (#1707). */
 function rowOptions(row: Rec): EffectiveMemberOptions {
   return {
     overrides: isRecord(row.overrides) ? row.overrides as OverrideMap : undefined,
     nestedOverrides: isRecord(row.nestedOverrides) ? row.nestedOverrides as NestedOverridePaths : undefined,
     removedTraits: isRecord(row.removedTraits) ? row.removedTraits as Record<number, string[]> : undefined,
-  };
-}
-
-/** The options the spawner threads into the instance at `row` (localId `lid`) when an OUTER layer
- *  applies `outer` — `resolveMember` step 2, line for line: the row's overrides with the outer layer's
- *  direct map merged over them, the outer deep paths forwarded under the row's own, and the ROW's
- *  removals (outer removals are not forwarded). */
-function threadInto(row: Rec, lid: number, outer: EffectiveMemberOptions): EffectiveMemberOptions {
-  const own = rowOptions(row);
-  const { direct, forward } = descendNestedOverrides(outer.nestedOverrides, lid);
-  return {
-    overrides: direct ? mergeOverrideMaps(own.overrides, direct) : own.overrides,
-    nestedOverrides: mergeNestedOverridePaths(own.nestedOverrides, forward),
-    removedTraits: own.removedTraits,
+    members: isRecord(row.members) ? row.members : undefined,
+    nestedStructure: isRecord(row.nestedStructure) ? row.nestedStructure : undefined,
   };
 }
 
 const MAX_DEPTH = 64;
 
+/** Every member of the frame `prefab` is, at `path` inside the placed child `top`. Each is composed by the engine's own
+ *  path fold from the TOP (`effectivePrefabMemberTraitsAt`), so what a nested row threads into its child is the
+ *  spawner's step and not a copy of it — the copy this used to carry (`threadInto`) forwarded no member rows (#1707). */
 function collect(
-  prefab: unknown, opts: EffectiveMemberOptions, base: EffectiveMemberOptions, getPrefab: PrefabLookup,
+  top: unknown, prefab: unknown, placement: EffectiveMemberOptions, getPrefab: PrefabLookup,
   path: readonly number[], stack: Set<string>, out: InstanceMember[],
 ): void {
   if (!isRecord(prefab) || !Array.isArray(prefab.entities) || path.length > MAX_DEPTH) return;
@@ -144,8 +135,8 @@ function collect(
           localId: lid,
           path,
           parent,
-          effective: effectivePrefabMemberTraits(prefab, lid, getPrefab, opts),
-          standalone: effectivePrefabMemberTraits(prefab, lid, getPrefab, base),
+          effective: effectivePrefabMemberTraitsAt(top, path, lid, getPrefab, placement),
+          standalone: effectivePrefabMemberTraitsAt(top, path, lid, getPrefab, {}),
         });
       }
       // A member that is itself an instance: its OTHER members are reached with the options the
@@ -153,7 +144,7 @@ function collect(
       if (typeof row.prefab === 'string' && row.prefab) {
         let child: unknown;
         try { child = getPrefab(row.prefab); } catch { child = undefined; }
-        collect(child, threadInto(row, lid, opts), threadInto(row, lid, base), getPrefab, [...path, lid], stack, out);
+        collect(top, child, placement, getPrefab, [...path, lid], stack, out);
       }
     }
   } finally {
@@ -175,7 +166,7 @@ export function prefabInstances(doc: unknown, getPrefab: PrefabLookup): PrefabIn
     const members: InstanceMember[] = [];
     // The placed child is composed with the row's options; its `standalone` twin with none, which is
     // exactly the child prefab file read on its own.
-    collect(child, rowOptions(row), {}, getPrefab, [], new Set(), members);
+    collect(child, child, rowOptions(row), getPrefab, [], new Set(), members);
     const root = members[0];
     if (!root) continue;
     const attrs = isRecord(row.traits) && isRecord(row.traits.EntityAttributes) ? row.traits.EntityAttributes : {};

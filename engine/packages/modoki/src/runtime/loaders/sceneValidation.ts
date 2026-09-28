@@ -29,7 +29,7 @@ import { parseColliderPoints } from '../core/colliderPoints';
 import { hasDocKey } from '../core/docKeys';
 import { readUILength, type UIElementLengthField } from '../traits/uiLength';
 import {
-  effectivePrefabRootTraits, effectivePrefabMemberTraits, type EffectiveMemberOptions,
+  effectivePrefabRootTraits, effectivePrefabMemberTraitsAt, memberAddressOfRowKey, type EffectiveMemberOptions,
 } from './prefabOverrides';
 
 /** Asset-reference fields, keyed by the trait they live on. A value in one of
@@ -941,48 +941,47 @@ export function validateSceneData(
         // nested-instance reference carries little more than `EntityAttributes`; the entity it
         // produces is the child prefab's root plus the row's overrides, and reading the row made this
         // pass blind to that child's `UIAnchor`, so a scene override sizing a stretched nested member
-        // warned nothing. Any malformed shape reads as "unresolved" (no throw). Memoised per localId,
-        // because several override groups can address one member.
+        // warned nothing. Any malformed shape reads as "unresolved" (no throw). Memoised per member,
+        // because several override groups can address one. A member of a NESTED frame is addressed by
+        // `path` (the nested rows' localIds down to it) and composed through each row on the way (#1707).
         const memberOpts = schemaMemberOptions(schema);
-        const memberTraits = new Map<number, Record<string, unknown> | undefined>();
-        const prefabTraitsOf = (localId: number): Record<string, unknown> | undefined => {
-          if (!memberTraits.has(localId)) {
+        const memberTraits = new Map<string, Record<string, unknown> | undefined>();
+        const prefabTraitsOf = (path: readonly number[], localId: number): Record<string, unknown> | undefined => {
+          const key = [...path, localId].join('.');
+          if (!memberTraits.has(key)) {
             let traits: Record<string, unknown> | undefined;
             try {
               traits = prefab && getPrefab
-                ? effectivePrefabMemberTraits(prefab, localId, getPrefab, memberOpts) ?? undefined
+                ? effectivePrefabMemberTraitsAt(prefab, path, localId, getPrefab, memberOpts) ?? undefined
                 : undefined;
             } catch { traits = undefined; }
-            memberTraits.set(localId, traits);
+            memberTraits.set(key, traits);
           }
-          return memberTraits.get(localId);
+          return memberTraits.get(key);
         };
 
         // Every override group, whichever channel holds it: the legacy `overrides[localId]`, and since
-        // Phase 4 (#1468) a member ROW's `traits`, keyed by identity. A direct row (`/<nodeGuid>`) is
-        // resolved to its localId through the prefab so the size checks below can compose the member;
-        // a deeper one (a nested member) gets the ref check only — its member is not in THIS prefab.
-        const groups: { where: string; localId: number; raw: unknown }[] = [];
+        // Phase 4 (#1468) a member ROW's `traits`, keyed by identity. A row's key is resolved to its
+        // member through the documents, one component per frame, as the spawner resolves it (`docRows`):
+        // a direct row (`/<nodeGuid>`) names a member of this prefab, a deeper one a member of a nested
+        // frame, composed through the nested rows on the way (#1707 — before that it got the ref check
+        // only). A node row (`a+<key>`) names an added node, which has no member to compose.
+        const groups: { where: string; path: readonly number[]; localId: number; raw: unknown }[] = [];
         for (const [k, raw] of Object.entries((overrides ?? {}) as Record<string, unknown>)) {
-          groups.push({ where: `overrides[${k}]`, localId: Number(k), raw });
-        }
-        const byNode = new Map<string, number>();
-        const rows = (prefab as { entities?: unknown } | undefined)?.entities;
-        if (Array.isArray(rows)) {
-          for (const r of rows as { nodeGuid?: unknown; localId?: unknown }[]) {
-            if (r && typeof r.nodeGuid === 'string' && typeof r.localId === 'number') byNode.set(r.nodeGuid, r.localId);
-          }
+          groups.push({ where: `overrides[${k}]`, path: [], localId: Number(k), raw });
         }
         for (const [key, row] of Object.entries((members ?? {}) as Record<string, { traits?: unknown } | null>)) {
           if (!row?.traits) continue;
-          const direct = key.length > 1 && key[0] === '/' && key.indexOf('/', 1) < 0;
-          groups.push({ where: `members[${key}].traits`, localId: direct ? byNode.get(key.slice(1)) ?? NaN : NaN, raw: row.traits });
+          const at = ((): { path: number[]; localId: number } | null => {
+            try { return prefab && getPrefab ? memberAddressOfRowKey(prefab, key, getPrefab) : null; } catch { return null; }
+          })();
+          groups.push({ where: `members[${key}].traits`, path: at?.path ?? [], localId: at ? at.localId : NaN, raw: row.traits });
         }
 
-        for (const { where, localId: groupLocalId, raw: traitOverridesRaw } of groups) {
+        for (const { where, path: groupPath, localId: groupLocalId, raw: traitOverridesRaw } of groups) {
           if (!traitOverridesRaw || typeof traitOverridesRaw !== 'object') continue;
           const traitOverrides = traitOverridesRaw as Record<string, unknown>;
-          const localIdKey = String(groupLocalId);
+          const localIdKey = groupPath.length ? `${groupLocalId} of the nested frame at row path ${groupPath.join('.')}` : String(groupLocalId);
 
           // #292 — an override group has the same `{trait: {field: value}}` shape as
           // `traits`, and 56 ref fields across `games/` + `demos/` are authored in one, so
@@ -997,7 +996,7 @@ export function validateSceneData(
           const ovUan = traitOverrides.UIAnchor;
           const ovUanObj = ovUan && typeof ovUan === 'object' ? (ovUan as Record<string, unknown>) : undefined;
 
-          const prefabTraits = Number.isFinite(groupLocalId) ? prefabTraitsOf(groupLocalId) : undefined;
+          const prefabTraits = Number.isFinite(groupLocalId) ? prefabTraitsOf(groupPath, groupLocalId) : undefined;
           const prefabUel = prefabTraits?.UIElement as Record<string, unknown> | undefined;
           const prefabUan = prefabTraits?.UIAnchor as Record<string, unknown> | undefined;
 

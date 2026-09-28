@@ -23,10 +23,10 @@ import { readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
 import {
-  mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, descendStructureLayers, foldStructureLayers,
-  type OverrideMap, type StructureLayer,
+  foldStructureLayers, foldPath as sharedFoldPath,
+  type OverrideMap, type StructureLayer, type FoldDoc, type ForwardState as SharedForwardState,
 } from '../../runtime/loaders/prefabOverrides';
-import type { AddedEntity, NestedOverridePaths, NestedStructureDelta, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import type { AddedEntity, NestedStructureDelta, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { getCachedPrefabSync, recoverTemplateKey, type PrefabFile } from './prefab';
 
 /** A layer's structural lists, as the fold leaves them for the frame it reaches. `moved` only when an outer layer's
@@ -88,15 +88,9 @@ export function levelDoc(root: number, source: string): { doc: PrefabFile | null
   return { doc: getCachedPrefabSync(source), fromRecord: false };
 }
 
-/** What the layers above a frame FORWARD into its expansion: the pending path-keyed field overrides, the structural
- *  layers reaching it and what each of them forwarded to its nested roots — `instantiatePrefab`'s `_nestedOverrides`,
- *  `_layers` and `_forwardRoots`, as the expansion of the row above hands them to it. Applied at the frame's NESTED rows
- *  only: what the layers say of the frame's own members is the `direct` part, which the fold returns beside it. */
-export interface ForwardState {
-  nestedOverrides?: NestedOverridePaths;
-  layers: StructureLayer<NestedStructureDelta, SceneMemberRow>[];
-  forwardRoots: readonly (ReadonlyMap<number, SceneMemberRow> | undefined)[];
-}
+/** What the layers above a frame FORWARD into its expansion — `instantiatePrefab`'s `_nestedOverrides`, `_layers` and
+ *  `_forwardRoots`, as the expansion of the row above hands them to it. The shared fold's (`prefabOverrides.ts`, #1707). */
+export type ForwardState = SharedForwardState<NestedStructureDelta, SceneMemberRow>;
 
 /** The forward state a template REFERENCE node hands the expansion of its frame, whose document is `doc`: its path-keyed
  *  channels and its member rows, as the editor's spawner hands them (`spawnNestedInstance`) and the loader's twin. */
@@ -109,52 +103,16 @@ function nodeForward(node: AddedEntity, doc: PrefabFile | null): ForwardState {
   };
 }
 
-/** The fold ITSELF: everything the layers above a frame state about it, walking `path` (row localIds, outermost first)
- *  down from a first level whose document is `docs[0]`. `docs[i + 1]` is the document of the frame row `path[i]`
- *  expands. `seed` is what a layer above the first level forwards into it: a template reference node's channels
- *  ({@link nodeForward}), or the whole state above a nested frame a rebuild re-expands ({@link frameForward}). The
- *  editor expansion's order (`instantiatePrefab`): per step, the row's `overrides` under the outer layer's forwarded
- *  direct ones, the row's lists unless an outer slot owns the frame, and then every layer's member rows folded over
- *  both, inner first. `forward` is what the last step hands the frame's own expansion; null when a level is missing. */
+/** The fold ITSELF (`prefabOverrides.ts` `foldPath`, #1707 — the step the validator and the UIEntries pool share): everything
+ *  the layers above a frame state about it, walking `path` (row localIds, outermost first) down from a first level whose
+ *  document is `docs[0]`. `seed` is what a layer above the first level forwards into it: a template reference node's
+ *  channels ({@link nodeForward}), or the whole state above a nested frame a rebuild re-expands ({@link frameForward}). */
 function foldPath(
   docs: readonly (PrefabFile | null)[],
   path: readonly number[],
   seed?: ForwardState,
 ): { overrides: OverrideMap; structure: LayerStructure; forward: ForwardState | null } {
-  let prefab = docs[0] ?? null;
-  let pending: NestedOverridePaths | undefined = seed?.nestedOverrides;
-  let layers: StructureLayer<NestedStructureDelta, SceneMemberRow>[] = seed?.layers ?? [{}];
-  let forwardRoots: readonly (ReadonlyMap<number, SceneMemberRow> | undefined)[] = seed?.forwardRoots ?? [];
-  let out: { overrides: OverrideMap; structure: LayerStructure; forward: ForwardState | null } = {
-    overrides: {}, structure: {}, forward: path.length ? null : { nestedOverrides: pending, layers, forwardRoots },
-  };
-  for (let i = 0; i < path.length; i++) {
-    if (!prefab) return out;
-    const row = prefab.entities.find((e) => e.localId === path[i] && e.prefab);
-    if (!row) return out;
-    const { direct, forward } = descendNestedOverrides(pending, row.localId);
-    const overrides = direct ? mergeOverrideMaps(row.overrides, direct) : (row.overrides ?? {});
-    pending = mergeNestedOverridePaths(row.nestedOverrides, forward);
-    const d = descendStructureLayers(layers, row, forwardRoots);
-    // An outer layer addressing this path OWNS the interior — all three lists, absent read as empty (`structDirect`).
-    const lower = d.direct
-      ? { overrides, added: d.direct.added ?? [], removed: d.direct.removed ?? [], removedTraits: d.direct.removedTraits ?? {} }
-      : { overrides, added: row.added, removed: row.removed, removedTraits: row.removedTraits };
-    const child = docs[i + 1] ?? null;
-    const folded = child ? foldStructureLayers(child, d.layers, d.foldFrom, lower) : { channels: lower, forwardRoots: [] };
-    if (i === path.length - 1) {
-      const { added, removed, removedTraits } = folded.channels;
-      out = {
-        overrides: folded.channels.overrides ?? {},
-        structure: { added, removed, removedTraits, ...(d.direct ? { moved: d.direct.moved ?? {} } : {}) },
-        forward: child ? { nestedOverrides: pending, layers: d.layers, forwardRoots: folded.forwardRoots } : null,
-      };
-    }
-    layers = d.layers;
-    forwardRoots = folded.forwardRoots;
-    prefab = child;
-  }
-  return out;
+  return sharedFoldPath<AddedEntity, NestedStructureDelta, SceneMemberRow>(docs as readonly (FoldDoc<AddedEntity, NestedStructureDelta, SceneMemberRow> | null)[], path, seed);
 }
 
 /** {@link foldPath} from the frame `top` down `path`: the layer the prefab chain puts on the nested frame `path`

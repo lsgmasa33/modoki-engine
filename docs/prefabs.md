@@ -52,7 +52,7 @@ answer the same question for themselves. Each place in that column is a place th
 
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
-| I1 | A frame's effective base is its template folded with every enclosing layer, from the outside in, the same way at every depth. A layer can carry every edit an instance can. | Runtime: the walk in `instantiatePrefabIntoWorld`, built from the shared folds. **Editor, comparison side: `frameBase` / `chainLayer` (`editor/scene/prefabBase.ts`, #1693)** — one fold (`foldPath`) with the same folds, in the editor expansion's order: a row's fields under the outer layer's forwarded ones, then every layer's member rows over both. It climbs by `ownerOf` and through a template reference node (#1506), and reads every level's document from its frame record (I3). | The expansion side is still twinned (#1707): `instantiatePrefab`, the editor's copy of the spawner (#1683 said it drops a nested row's moves and member rows; it threads member rows since #1533, so re-check before relying on either). `effectivePrefabRootTraits` / `effectivePrefabMemberTraits` (the UIEntries pool and the validator) predate member rows, `nestedStructure` and `added` (#1707). The pose base of an applied nested move (`docChainLayer`), and `referenceRootPose`, fold one level. |
+| I1 | A frame's effective base is its template folded with every enclosing layer, from the outside in, the same way at every depth. A layer can carry every edit an instance can. | Runtime: the walk in `instantiatePrefabIntoWorld`, built from the shared folds. **Editor, comparison side: `frameBase` / `chainLayer` (`editor/scene/prefabBase.ts`, #1693)** — one fold (`foldPath`) with the same folds, in the editor expansion's order: a row's fields under the outer layer's forwarded ones, then every layer's member rows over both. **The step itself is shared since #1707** (`foldRowStep` / `foldPath`, `runtime/loaders/prefabOverrides.ts`): the validator and the UIEntries pool (`effectivePrefab*Traits`) compose each nested row with it too. It climbs by `ownerOf` and through a template reference node (#1506), and reads every level's document from its frame record (I3). | The expansion side is still twinned: `instantiatePrefab`, the editor's copy of the spawner. #1707 re-checked #1683's claim and pinned the two walks against each other (`engine/tests/editor/expansionTwinParity.test.ts`). The editor's nested-row apply, which is where a frame's removals run, was handed neither of the frame's moves. A slot's `moved` was lost outright: a pre-v5 member moved inside a scene-added reference node went back to its row on every rebuild of the instance around it. A member row's `parent` was recovered by `spawnNestedInstance`'s top-level apply, except where the same frame removes the member's old ancestor. That removal cascade stops only at a member it is told has moved, so the moved member was deleted with it. Both are fixed, and the apply now gets the runtime's `moved` and `members`. Making the editor call the runtime walk is #1783, with that harness as its pin and its blind spots listed. `effectivePrefab*Traits` still model neither a structural `removed` of the member nor an `added` node. The pose base of an applied nested move (`docChainLayer`), and `referenceRootPose`, fold one level. |
 | I2 | Every "is this the instance's own edit?" question compares the live frame with its effective base. That covers the override list, the Inspector highlight, the save, the rebuild's capture, Apply's keys and write, and Revert. Every own edit found has one key, and the listing, Apply and Revert all handle it. | `frameBase`'s layer: through `instanceBase` / `enclosingRowOverrides` (fields) and `ownInstanceStructure` / `layerAuthoredStructureKeys` (structure) for the override list, the Inspector, Apply's structure refusal, and Revert; through `chainSlots` for Apply's targets and U13 (#1693); through `chainLayer` for the save (`captureNestedChannels`) and the rebuild (`captureNestedInstanceOverrides`), whose removed-components pass also measures a member against the traits the layer adds (`layerAddedTraits`, #1676). | `applyToPrefab` builds its keys from `captureInstanceOverrides` against the bare child. `instanceBase` folds the layer's fields but not its `removedTraits` or `added`. A layer's values arrive override-marked, so every bare-child diff has to subtract them by value. The listing and the Inspector diff by value, with no mark gate; the save has one. Gating the listing the same way is #1717 (unblocked by #1709, which made every editor write mark). |
 | I3 | A frame is compared against the document it was EXPANDED from. No capture runs on a frame whose recorded rows differ from the cached ones. | The frame record, read through `levelDoc` (`prefabBase.ts`) by every level of `frameBase` / `chainLayer`, the scene save's top-level capture (`savedFrameDoc`, #1685) and its nested captures, the rebuild's readers (`expandedDocOf`) and the settle's save capture (#1693 retired the scoped `expandedFrom` map and the settle's cache swap onto it). `framesBuiltFromOtherRows` refuses a frame whose record holds other rows, and `rebaseStaleInstances` repairs it. `rebuildInstanceFromCapture` puts a capture taken against an older document back onto the current one (Revert's undo, #1665). | The two staleness tests differ: `rowsMeanTheSame` for the refusal, `sameDocument` for the rebase. A frame with no record falls back to the current cache (`setFrameDocFallback`), and the refusal cannot judge it; every expansion path writes one (`instantiatePrefab`, Create Prefab's tag, a reattach, the loader, a carry across a world swap, an undo respawn). |
 
@@ -92,7 +92,7 @@ answer the same question for themselves. Each place in that column is a place th
 needed a new rule. The table and the counts are on the issue, not here, because they go stale.
 
 The bugs cluster where the table above shows no owner, or an owner that operations go around:
-- **Effective base** (I1–I3). Since #1693, `frameBase` (`prefabBase.ts`) is the one answer on the comparison side: the override list, Apply's refusals, Revert, the save and the rebuild's capture all take the layer from it, every level read from its frame record. Before it, the fixes landed one surface at a time: #1386, #1401, #1498, #1492, #1506, and #1676 (the capture's removed-components pass). Apply's write followed with #1693's two-target Apply (#1658), and the expansion side is #1707.
+- **Effective base** (I1–I3). Since #1693, `frameBase` (`prefabBase.ts`) is the one answer on the comparison side: the override list, Apply's refusals, Revert, the save and the rebuild's capture all take the layer from it, every level read from its frame record. Before it, the fixes landed one surface at a time: #1386, #1401, #1498, #1492, #1506, and #1676 (the capture's removed-components pass). Apply's write followed with #1693's two-target Apply (#1658), and the expansion side is #1707 (the pure readers onto the shared step, and the twin pinned) and #1783 (the unification).
 - **Propagation** (I9–I11). Owned since #1692 by `commitPrefabWrite`. Before, each writer put together write, cache and rebuild itself, and the writers that skipped a step were the bugs it absorbed: #1667, #1669, #1685, #1695 (and #1666, fixed at `loadScene`'s leave repair).
 - **Identity** (I4–I8). It has real owners (`worldIdentityParents`, `memberRowsIn`, the row-claim partition), and since #1691 one identity subtree (`identitySubtree`, `frameOf`) that the sites which walked the live tree now ask (#1682, #1687). Member guids are still predicted by four walks of their own (#1324, #1339, #1430, #1461, #1660); why none moved onto the shared walk is on the follow-up issue #1691 links. Translating a saved member reference against the frame's current document has one owner since #1771 (`memberTranslation.ts`); its three copies were each handed a document the frame no longer expanded (#1766, #1767).
 
@@ -690,7 +690,8 @@ so a value written under a member row that states the field would not show — i
 **The resolved base is the enclosing layer WHOLE (#1506).** `frameBase` (`prefabBase.ts`, #1693; `enclosingLayer` reads
 its layer) answers what the layers enclosing an instance author on it: field overrides AND structure lists. `enclosingRowOverrides` is its
 field half, with tokens resolved. The layer can be one of two things:
-- **a row frame**: every row from the top down, fields and structure in ONE fold (`foldPath`), each level's
+- **a row frame**: every row from the top down, fields and structure in ONE fold (`foldPath`, whose per-row step
+  `foldRowStep` lives in `prefabOverrides.ts` and is shared with the validator and the pool since #1707), each level's
   document read from its frame record;
 - **a reference node that a prefab TEMPLATE authored** (a keyed `added` node with `prefab`, in a row of the
   frame it hangs in): the node's own channels (`overrides`, `added`, `removed`, `removedTraits`, `moved`,
@@ -1746,11 +1747,14 @@ the file.**
   entry-prefab pass. It mirrors `instantiatePrefabIntoWorld` step for step:
   - the root is `rootLocalId ?? 1` — **not** "the first row", which the provider and
     the validator used to fall back to and the spawner never did;
-  - a **nested-instance root row** resolves to the CHILD prefab's root, with the row's
+  - a **nested-instance root row** resolves to the CHILD prefab's root, composed by
+    `foldRowStep` (#1707), the step the editor's effective base folds with: the row's
     `overrides` merged UNDER whatever an outer layer addresses at that row (outer
-    wins), its `nestedOverrides` threaded on, and its `removedTraits` applied in the
-    child. The row's own `traits` are not part of the answer — the spawner reads
-    only `parentId` there;
+    wins), its `nestedOverrides` threaded on, its `removedTraits` unless an outer
+    whole-frame slot (`nestedStructure`) owns the child frame (then the slot's lists,
+    an absent one read as empty), and then every layer's member rows (`members`) over
+    both. Before #1707 the member rows and the slot were skipped. The row's own
+    `traits` are not part of the answer — the spawner reads only `parentId` there;
   - the outer layer's `overrides` for the root fold on after that, then its
     `removedTraits` — the spawner's order (overrides, then structure);
   - no root would spawn (an uncached child, no row at the root localId, a cycle)
@@ -1762,6 +1766,21 @@ the file.**
   instance-override pass uses it to read the base `UIElement`/`UIAnchor` a scene
   override lands on — a nested member's base is its child prefab's root, which the
   pass could not see while it read raw rows.
+
+  **A member of a nested frame** (#1707): `effectivePrefabMemberTraitsAt(prefab, path,
+  localId, …)` takes the nested rows' localIds down to the member's frame, and
+  `memberAddressOfRowKey` turns a member-row key (`/<row>/<member>`) into that address,
+  frame by frame through each document's `nodeGuid`s (`docRows`, the spawner's rule). The
+  validator uses both, so a scene's DEEP member row sizing a stretched nested member now
+  warns (it got the ref check only before). An address naming the ROOT of a nested frame
+  is the nested row's member in the frame above, and is composed there (`asOuterMember`,
+  at every depth): what that frame puts on the row lands on the same entity. The outer layer's `members` and
+  `nestedStructure` are options, as a placement row states them. The test helper
+  `prefabInstances` composes every member from the top along its path, and no longer
+  carries its own copy of the step. Measured on the corpus when it landed: 72 validator
+  warnings before and after, and all 125 prefab roots and 1953 members composed
+  identically. No committed prefab row carries `members` or `nestedStructure`, and no
+  scene deep member row carries `traits`.
 
   ⚠️ **Why a separate module rather than a helper in `loadSceneFile.ts`:** the
   validator runs in the Node Vite plugin with no trait registry, imports nothing that
@@ -1775,7 +1794,8 @@ the file.**
   name it does not know). The provider passes the registry's answers; the validator
   rebuilds both from its `SceneSchema`, which is stricter than the spawner for AoS
   traits (it lists their factory fields, the spawner accepts any) — neither pass reads
-  one. The merge ORDER is control flow in the spawner and cannot be shared, so
+  one. The merge ORDER is control flow in the spawner and is not shared with it (the pure
+  readers share `foldRowStep` among themselves, #1707), so
   `tests/runtime/prefabOverrides.test.ts` spawns every fixture through the real
   spawner and requires field-by-field agreement.
 

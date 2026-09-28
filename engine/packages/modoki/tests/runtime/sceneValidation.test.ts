@@ -768,6 +768,49 @@ describe('validateSceneData — UIElement size inert under a stretched UIAnchor,
     expect(res.warnings.join('\n')).toMatch(/overrides\[3\]\.UIElement\.width is inert.*bottom-stretch.*from its prefab, localId 3/s);
   });
 
+  /** #1707 — a DEEP member row (`/<row>/<member>`, a member of a nested frame) got the ref check only: its member is
+   *  not in the instance's own prefab, and the pass resolved direct keys alone. It is now resolved frame by frame
+   *  (`memberAddressOfRowKey`) and composed through the nested row (`effectivePrefabMemberTraitsAt`). */
+  describe('a DEEP member row, sizing a member of a nested frame (#1707)', () => {
+    const CHILD_GUID = 'c3d4e5f6-1111-2222-3333-444455556666';
+    const gRef = 'a1707000-0000-4000-8000-000000000031';
+    const gKid = 'a1707000-0000-4000-8000-000000000032';
+    const host = (row: Record<string, unknown> = {}) => ({
+      id: PREFAB_GUID, version: 5, name: 'Host', rootLocalId: 1,
+      entities: [
+        { localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } },
+        { localId: 3, name: 'Ref', nodeGuid: gRef, prefab: CHILD_GUID, traits: { EntityAttributes: { name: 'Ref', parentId: 1 } }, ...row },
+      ],
+    });
+    const child = (kidAnchor: string) => ({
+      id: CHILD_GUID, version: 5, name: 'Child', rootLocalId: 1,
+      entities: [
+        { localId: 1, name: 'ChildRoot', traits: { EntityAttributes: { name: 'ChildRoot', parentId: 0 } } },
+        { localId: 2, name: 'Kid', nodeGuid: gKid, traits: { EntityAttributes: { name: 'Kid', parentId: 1 }, UIAnchor: { anchor: kidAnchor } } },
+      ],
+    });
+    const deepRow = scene([{
+      id: 1, name: 'Instance',
+      traits: { PrefabInstance: { source: PREFAB_GUID, localId: 1, rootInstanceId: 1 } },
+      members: { [`/${gRef}/${gKid}`]: { guid: 'a1707000-0000-4000-8000-000000000033', traits: { UIElement: { width: 90, widthUnit: '%' } } } },
+    }]);
+
+    it('warns: the anchor is the nested member\'s own, the size the scene\'s deep row', () => {
+      // Mutation: give a deeper key no address (`localId: NaN`) — the pass goes silent, as it was before #1707.
+      const getPrefab: PrefabResolver = (ref) => (ref === PREFAB_GUID ? host() : ref === CHILD_GUID ? child('bottom-stretch') : undefined);
+      const res = validateSceneData(deepRow, undefined, getPrefab);
+      expect(res.warnings.join('\n')).toMatch(/members\[\/[^\]]+\]\.traits\.UIElement\.width is inert.*bottom-stretch.*from its prefab, localId 2 of the nested frame at row path 3\)/s);
+    });
+
+    it('reads the anchor the NESTED ROW puts on the member, not the child document\'s', () => {
+      // The row re-anchors Kid to a plain anchor through its own member row: the deep row's size is live, so no warning.
+      // Mutation: compose the member from the child document alone (skip `foldRowStep`'s layers) — it warns.
+      const reanchored = host({ members: { [`/${gKid}`]: { traits: { UIAnchor: { anchor: 'top-left' } } } } });
+      const getPrefab: PrefabResolver = (ref) => (ref === PREFAB_GUID ? reanchored : ref === CHILD_GUID ? child('bottom-stretch') : undefined);
+      expect(validateSceneData(deepRow, undefined, getPrefab).warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+    });
+  });
+
   it('warns with NO resolver at all when anchor AND size are both in the same override group', () => {
     const res = validateSceneData(instance({
       1: { UIAnchor: { anchor: 'bottom-stretch' }, UIElement: { width: 90, widthUnit: '%' } },

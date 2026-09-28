@@ -67,6 +67,36 @@ describe('composing one placement', () => {
   });
 });
 
+describe('member rows (#1707): a placement\'s, and a nested row\'s', () => {
+  const gFace = 'a1707000-0000-4000-8000-000000000041';
+  const gInner = 'a1707000-0000-4000-8000-000000000042';
+  // TILE with minted identities, which is what a member row names.
+  const TILE_V5 = { ...TILE, id: 'tile5', entities: TILE.entities.map((e) => (e.localId === 2 ? { ...e, nodeGuid: gFace } : e)) };
+
+  it('a placement row\'s member row sizes the member it names', () => {
+    // Mutation: drop `members` from `rowOptions` — Face keeps its 80.
+    const page = pageOf({ ...placeTile(2, { members: { [`/${gFace}`]: { traits: { UIElement: { width: 30 } } } } }), prefab: 'tile5' });
+    const [inst] = prefabInstances(page, prefabLookup([page, TILE_V5]));
+    expect(at(inst.members, '', 2)!.effective!.UIElement).toEqual({ width: 30, height: 80 });
+    expect(at(inst.members, '', 2)!.standalone!.UIElement).toEqual({ width: 80, height: 80 });
+  });
+
+  it('a NESTED row\'s own member row reaches the member of its frame — in `effective` and `standalone` alike', () => {
+    // The row prefab places tile5 at its row 2 and sizes Face through the row's member rows (prefab v6). The copy of
+    // the step this helper used to carry forwarded no member rows, so both answers read Face at 80.
+    const ROW_V6 = { id: 'row6', rootLocalId: 1, entities: [
+      { localId: 1, traits: { EntityAttributes: { name: 'Row', parentId: 0 }, UIElement: {} } },
+      { localId: 2, nodeGuid: gInner, prefab: 'tile5', traits: { EntityAttributes: { name: 'Inner', parentId: 1 } },
+        members: { [`/${gFace}`]: { traits: { UIElement: { width: 25 } } } } },
+    ] };
+    const page = pageOf({ localId: 2, prefab: 'row6', traits: { EntityAttributes: { name: 'Placed', parentId: 1 } } });
+    const [inst] = prefabInstances(page, prefabLookup([page, ROW_V6, TILE_V5]));
+    const face = at(inst.members, '2', 2)!;
+    expect(face.effective!.UIElement).toEqual({ width: 25, height: 80 });
+    expect(face.standalone!.UIElement).toEqual({ width: 25, height: 80 });
+  });
+});
+
 describe('a nested placement', () => {
   // `row` places the tile at its row 2; the page places `row` and reaches the tile's Face THROUGH it.
   const ROW = {

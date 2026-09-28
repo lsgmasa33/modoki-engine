@@ -1843,9 +1843,17 @@ export function instantiatePrefab(
       // A row's `traits` fold into the overrides as the loader folds them.
       const folded = childStructure.overrides;
       if (folded) applyOverridesByRootInstance(childRoot, rebaseMemberTokens(folded, childSegments) as typeof folded);
-      if (structDirect || childStructure !== base || pe.added?.length || pe.removed?.length || pe.removedTraits) {
+      // The frame's MOVES too, as the loader hands them to its child (#1707): a slot owning the frame states them by localId
+      // (a pre-v5 member no row can key), and the OUTERMOST layer's member rows by `parent`. This apply is where the frame's
+      // removals run, and its cascade stops at a member it is told has moved. Without them a pre-v5 member moved inside a
+      // scene-added reference node went back to its row on every rebuild of the instance around it, and a member moved OUT
+      // from under a member the same frame removes was deleted with it (close-out review 2). The move a row states is
+      // queued here and again by the caller's top frame, whose `memberRowsIn` reaches this frame; the drain keeps one.
+      const members = childLayers[childLayers.length - 1]!.rows;
+      if (structDirect || childStructure !== base || pe.added?.length || pe.removed?.length || pe.removedTraits || members) {
         applyStructureByRootInstance(childRoot, child, {
           added: rebaseAddedMemberTokens(childStructure.added, childSegments), removed: childStructure.removed, removedTraits: childStructure.removedTraits,
+          moved: structDirect?.moved, members,
         });
       }
       localToEcs.set(pe.localId, childRoot);
