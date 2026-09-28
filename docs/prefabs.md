@@ -613,9 +613,9 @@ not the instance's own edit:
   deleted) is seeded too, harmlessly: the structure pass skips an addition anchored on a member it removes
   (`applyStructureCore`). A member the scene deleted had nothing live to capture, so before #1730 it came
   back as the bare template's, its row's values were listed as phantom overrides, and the save wrote the row's
-  component as a `traitRemovals`. Still open (#1737): a restored REFERENCE row's frame gets the layer's statements
-  about its own members only from the nested capture, which a frame that did not exist has none of. It shows the
-  inner template's values until a reload; nothing wrong is listed or saved;
+  component as a `traitRemovals`. A restored REFERENCE row's frame, and every frame inside it, gets what the layer
+  says of its INSIDE only through the nested capture, which a frame that did not exist has none of: it shows the inner
+  template's values until a reload, and nothing wrong is listed or saved (#1737, § "A rebuild's nested frames");
 - **the save** compares a nested field with the row by value (#1498).
 
 ### Apply's targets (#1693, owner ruling C, U12–U15)
@@ -949,8 +949,10 @@ member's row: false overrides, and Apply wrote one member's value into another's
   prefab-edit save, another scene's Apply or a pull can have changed it since. Rebuilt from the captured copy, a member
   it had gained vanished from this instance, and the frame then read as stale, so Apply and Revert refused it (close-out
   review). Test: `applyBaseTwoFileUndo.test.ts`, on the real two-file path.
-  Still open (#1741): an Apply made from the OUTER root of a nested frame's own edit (U14). The side captures only the
-  outer root's own members, so the nested frame's edit, which the Apply took out, is not restored.
+  The side also carries every frame NESTED in the applied instance (`BaseInstanceSide.nested`, #1741), captured with it
+  and handed to the rebuild in place of the live frames. An Apply from the OUTER root of a nested frame's own edit
+  (U14) takes that edit out of the frame, so at undo time the live frame shows the other side, and the rebuild's own
+  capture read nothing of it: the undo showed O's row value on the dirty base. See § "A rebuild's nested frames".
 - **Leaving prefab-edit mode re-reads the edited prefab, by EVERY route** (`settleLeaveDebts`,
   `sceneAdoption.ts`). `refreshPrefabSourceForPath` skips the prefab open in prefab-edit mode, so after an
   exit without saving, the editor's copy could be older than the file the scene had just loaded from.
@@ -1016,6 +1018,28 @@ not needed. Before this, a nested frame was only detected. The rebase skipped it
 was carried stale through every reload until it was saved. The save then wrote its edits onto other
 members: a nested member the scene had deleted came back on reload, and the member now holding its old
 number was deleted instead (OBSERVED, the "…so the SAVE" test below).
+
+**A rebuild's nested frames come from ONE source, the live capture, unless the caller names the side (#1741).** A
+rebuild re-expands its root from the template, so each nested frame inside comes back with only what the rebuilt
+prefab's own rows say of it. Everything else reaches it through the live capture (`captureNestedInstanceOverrides`,
+taken just before the teardown), and a frame whose right state is not what the live tree shows at that moment comes
+back wrong. There are two cases:
+- **The caller names the side.** An undo rebuilding an instance to one side of a step hands in the frames it captured
+  with that side (`nested`, from `captureNestedFrames`), and they REPLACE the live capture. They are re-applied exactly as
+  a live capture is: each link is found by `nodeGuid`, and each capture is translated from the document it was read against
+  (I4). A prefab file that changed between the step and its undo therefore takes the edit by identity, never by number.
+  Apply's undo does this (`BaseInstanceSide.nested`). Revert's does not need to: Revert refuses a U14 nested key, so
+  the live nested frames at its undo are the side's own.
+- **Still open (#1737): a frame no capture reached.** A reference row under a member a Revert restores, one the
+  template gained under a Refresh, or a row that a re-pointed frame's new prefab holds (#1767) has nothing live to
+  capture, so it comes back with only what the rebuilt prefab's own rows say of it. It shows the inner template's values
+  until a reload; nothing wrong is listed or saved. Two fixes that seeded such frames AFTER the expansion (a nested
+  `rebuildInstance`, then a respawn) were backed out in review. A rebuild's tail is world-wide, and the respawn's teardown
+  destroyed enclosing rows hung under the frame, so any after-the-fact seed fights the shared world. The design on #1737
+  expands the rebuilt root under its enclosing layer's forwarded state, as a load does, and subtracts that same state in
+  the nested capture. `nestedEnclosingLayer.test.ts` § #1737 pins the gap with `it.fails` cases, and guards the moves and
+  kept rows the seeds broke.
+Tests: `applyBaseTwoFileUndo.test.ts` (#1741).
 
 **A rebuild carries what its teardown reaches OUTSIDE its live subtree (#1499).** The teardown
 (`rebuildTeardown`) reaches by identity, so it also destroys things outside the rebuilt root's live

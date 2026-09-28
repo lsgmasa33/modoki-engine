@@ -252,3 +252,59 @@ describe('#1724: undo of an Apply on a base scene\'s nested instance keeps the i
     expect(xs()).toEqual([5, 5]);
   });
 });
+
+describe('#1741: undo of a U14 Apply made from the OUTER root keeps the nested frame\'s own edit', () => {
+  /** The applied O instance's root. */
+  const outer = () => all().find((e) => e.guid === ROOT)!.id;
+  const nestedKeys = () => collectInstanceOverrideKeys(outer(), getCachedPrefabSync(O) as PrefabFile).nested;
+  /** N1's A.x = 5 over O's row (3), applied from the OUTER root as its chain-qualified key, to `target`. */
+  async function applyFiveFromOuter(target: string) {
+    expect(xs()).toEqual([3, 3]); // precondition: O's row sets it in both
+    writeTraitFieldWithUndo(inO(ROOT, 'A'), getTraitByName('Transform')!, 'x', 5);
+    const [key] = nestedKeys();
+    expect(key).toBeDefined(); // precondition: U14 lists the nested frame's edit on the outer root
+    const res = await quietly(() => applyToPrefabWithUndo(outer(), new Set([key!]), { perKey: { [key!]: target } }));
+    expect(res.applied).toBe(true);
+    return res;
+  }
+
+  for (const [target, files] of [[O, [O]], [P, [P, O]]] as const) {
+    it(`target ${target === O ? 'O' : 'P'}: undo restores 5 on the applied instance and 3 on the other, listed again; redo applies it again`, async () => {
+      // Mutation: rebuild the side with the LIVE nested capture (drop `side.nested` in `restoreBaseInstance`) — the
+      // Apply's `took` already moved N1's 5 out, so the undo re-derives it from O's restored row: [3, 3].
+      const res = await applyFiveFromOuter(target);
+      expect(res.writes?.map((w) => w.source)).toEqual(files);
+      expect(xs()).toEqual([5, 5]);
+      expect(nestedKeys()).toEqual([]);
+
+      await quietly(() => undo());
+      expect(fs.disk.get(O)).toBe(jsonFileBody(oDoc()));
+      expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc()));
+      expect(xs()).toEqual([5, 3]);
+      expect(nestedKeys()).toHaveLength(1); // the frame's own edit again, so the dirty base's save writes it
+      expect(ownKeys()).toHaveLength(1);
+      expect(isSceneDirty(BASE)).toBe(true);
+
+      await quietly(() => redo());
+      expect(xs()).toEqual([5, 5]);
+      expect(nestedKeys()).toEqual([]);
+    });
+  }
+
+  it('P is RENUMBERED on disk between the Apply and its undo: the captured frame is translated by nodeGuid, not by number', async () => {
+    // The side's nested capture is keyed in the P it was read against; the frame expands the renumbered P by then (A is
+    // row 7, and nothing is row 2). Mutation: skip the capture's translation in the re-apply (`translateLocalIds` in
+    // `reapplyNestedInstanceOverrides`) — the 5 is written to row 2, which names nothing, and A reads 0.
+    await applyFiveFromOuter(O);
+    const renumbered = pDoc();
+    (renumbered.entities[1] as { localId: number }).localId = 7;
+    install(renumbered);
+    fs.disk.set(P, jsonFileBody(renumbered));
+    await quietly(() => rebaseStaleInstances());
+    await quietly(() => undo());
+    // Only the applied instance is asserted. The hand renumber leaves O's row keyed by P's OLD numbers (the editor never
+    // renumbers: localIds are kept like Unity fileIDs, #1759), so the other instance's value is the renumber's own hazard.
+    expect(tfX(inO(ROOT, 'A'))).toBe(5);
+    expect(framesBuiltFromOtherRows(n1())).toEqual([]);
+  });
+});

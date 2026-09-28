@@ -6608,7 +6608,7 @@ export async function applyToPrefab(selectedEntityId: number): Promise<void> {
  *  rebuild so it can be re-applied after re-expansion. `chain` is the sequence of
  *  `parentLocalId`s from the outer root down to this nested root — a stable
  *  address that survives the id churn (the prefab structure is deterministic). */
-interface NestedInstanceCapture {
+export interface NestedInstanceCapture {
   chain: number[];
   /** Each link of `chain` by identity: the row's `nodeGuid` in the frame above (`parentNodeGuid`), '' for a pre-v5 row.
    *  The re-apply finds each link in the document that frame expands NOW (#1771 close-out review F3): a link read by
@@ -7056,6 +7056,13 @@ function reapplyNestedInstanceOverrides(newOuterRootId: number, captures: Nested
   }
 }
 
+/** Every nested frame of instance `rootInstanceId`, as a rebuild would capture it now (#1741): the state an undo hands
+ *  back to {@link rebuildInstance} (`nested`) when the live frames will show another side by the time it runs. Measured
+ *  against the document the instance was expanded from (I3), which `rebuildInstanceFromCapture` translates it out of. */
+export function captureNestedFrames(rootInstanceId: number, source: string, fallback: PrefabFile): NestedInstanceCapture[] {
+  return captureNestedInstanceOverrides(rootInstanceId, levelDoc(rootInstanceId, source).doc ?? fallback);
+}
+
 /** Patch v17 node rows (#1516) onto the template-added nodes of the live frame rooted at `frameRoot` — the live-world
  *  twin of the loader's `applyNodeRows`, for a rebuild whose fresh expansion just spawned the NEW template's nodes.
  *  A node is found by its template key among the entities hanging below the frame's members, through plain nodes
@@ -7498,6 +7505,11 @@ export function rebuildInstance(
   /** Old → new member guid, when the rebuild changes member paths (#1437): a move's target and a parked
    *  member's parent are looked up by guid AFTER the rebuild, so they are translated first. */
   remap: ReadonlyMap<string, string> = new Map(),
+  /** The state of every nested frame, in place of the LIVE capture (#1741): an undo rebuilding an instance to one side of
+   *  a step whose live nested frames already show the other side. Captured by {@link captureNestedFrames}, in `baseline`'s
+   *  numbering, and re-applied exactly as a live capture is — each link found by identity, each capture translated from
+   *  the document it was read against (I4). */
+  nested?: readonly NestedInstanceCapture[],
 ): number {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return rootInstanceId;
@@ -7526,7 +7538,7 @@ export function rebuildInstance(
   // Snapshot live per-copy overrides on nested children BEFORE the teardown
   // (they get cascade-destroyed with the outer members and re-expanded fresh).
   // The documents stay out of the remap: they hold no instance guid, and a copy of each per rebuild is waste.
-  const rawCaptures = captureNestedInstanceOverrides(rootInstanceId, baseline);
+  const rawCaptures = nested ?? captureNestedInstanceOverrides(rootInstanceId, baseline);
   const nestedCaptures = (remapGuidValues(rawCaptures.map(({ doc: _doc, ...cap }) => cap), remap) as Omit<NestedInstanceCapture, 'doc'>[])
     .map((cap, i) => ({ ...cap, doc: rawCaptures[i]!.doc }));
   // Only a chain's FIRST link is a row of `baseline`. ⚠️ The re-apply does NOT address by this number where the link has
@@ -7720,6 +7732,10 @@ export function rebuildInstanceFromCapture(
   capturedFrom: PrefabFile,
   overrides: Record<number, Record<string, Record<string, unknown>>>,
   structure: Parameters<typeof rebuildInstance>[4],
+  /** Its nested frames as captured with it ({@link captureNestedFrames}), in place of the live ones (#1741). Each chain's
+   *  first link is a row of `capturedFrom` and goes to `live` with the rest; each capture's own members are translated
+   *  by the re-apply, from the document it holds. */
+  nested?: readonly NestedInstanceCapture[],
 ): number | null {
   if (framesBuiltFromOtherRows(rootInstanceId, { nestedOnly: true }).length) return null;
   const now = prefabCache.get(source) ?? capturedFrom;
@@ -7728,9 +7744,10 @@ export function rebuildInstanceFromCapture(
   const live = rec && rec.source === source ? rec.doc as PrefabFile : now;
   const toLive = translateLocalIds(capturedFrom, live);
   if (toLive) ({ overrides, structure } = translateCarried(toLive, overrides, structure));
+  if (toLive && nested) nested = nested.map((c) => (c.chain.length ? { ...c, chain: [toLive(c.chain[0]!), ...c.chain.slice(1)] } : c));
   const toNow = translateLocalIds(capturedFrom, now);
   if (toNow && structure.nestedMoves) structure = { ...structure, nestedMoves: translateNestedMoveKeys(structure.nestedMoves, toNow) };
-  return rebuildInstance(rootInstanceId, source, now, overrides, structure, live);
+  return rebuildInstance(rootInstanceId, source, now, overrides, structure, live, new Map(), nested);
 }
 
 /** `nestedMoves` keys (`~moved.<chain>:<lid>`) with their chain's FIRST link — a row of the outer document — put through

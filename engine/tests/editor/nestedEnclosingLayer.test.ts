@@ -890,6 +890,224 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     expect([count('A'), count('D'), count('E'), count('Extra')]).toEqual([1, 1, 0, 0]);
   });
 
+  /** #1737 (OPEN): a frame the rebuild spawns with nothing live to capture should get its WHOLE enclosing layer, as a
+   *  load builds it. A rebuild re-expands its root from the template, and what a layer ENCLOSING the rebuilt root says of
+   *  a nested frame's inside reaches that frame only through the frame's live capture, which such a frame has none of.
+   *  The cases marked `it.fails` pin that gap: each one FAILS today, and the forward-state fix (#1737: expand under the
+   *  enclosing layer's forwarded state, subtract the same state in the nested capture) flips it, which fails the run
+   *  until the mark is removed. The two seeding attempts and why they were backed out are on #1737. */
+  describe('#1737: a frame the rebuild spawns with nothing live to capture gets its WHOLE enclosing layer', () => {
+    const Q = 'cccccccc-0000-4000-8000-000000001737';
+    const Q2 = 'cccccccc-0000-4000-8000-000000001738';
+    const S = 'cccccccc-0000-4000-8000-000000001739';
+    const gC = 'eeeeeeee-0000-4000-8000-000000001739';
+    const gB = 'eeeeeeee-0000-4000-8000-000000001740';
+    /** Q: QR → L. */
+    const qDoc = () => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
+      row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001737'), row(2, 'L', 1, 'eeeeeeee-0000-4000-8000-000000001738'),
+    ] });
+    /** S: SR → K. */
+    const sDoc = () => ({ id: S, version: 5, name: 'S', rootLocalId: 1, entities: [
+      row(1, 'SR', 0, 'eeeeeeee-0000-4000-8000-000000001741'), row(2, 'K', 1, 'eeeeeeee-0000-4000-8000-000000001742'),
+    ] });
+    const ref = (localId: number, name: string, parentId: number, nodeGuid: string, prefab: string) =>
+      ({ localId, name, nodeGuid, prefab, traits: { EntityAttributes: { name, parentId, guid: '' } } });
+    /** Q2: Q2R → D, a reference row expanding S. */
+    const q2Doc = () => ({ id: Q2, version: 5, name: 'Q2', rootLocalId: 1, entities: [
+      row(1, 'Q2R', 0, 'eeeeeeee-0000-4000-8000-000000001743'), ref(2, 'D', 1, 'eeeeeeee-0000-4000-8000-000000001744', S),
+    ] });
+    /** Q: QR → M → D, a reference row expanding S. */
+    const qDeepDoc = () => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
+      row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001737'), row(2, 'M', 1, 'eeeeeeee-0000-4000-8000-000000001745'),
+      ref(3, 'D', 2, 'eeeeeeee-0000-4000-8000-000000001744', S),
+    ] });
+    /** P: R → A → C, a reference row expanding `child`; R → B. */
+    const pWithC = (child = Q) => {
+      const d = pDoc();
+      return { ...d, entities: [...d.entities, ref(3, 'C', 2, gC, child), row(4, 'B', 1, gB)] };
+    };
+    /** O whose row N reaches into the frames under row 3 of P (C): `nestedOverrides`, path-keyed (`"3.3"` is row 3 of C). */
+    const oDeepRow = (nested: Record<string, unknown> = { 3: { 2: { Transform: { x: 6 } } } }) => {
+      const o = oWith({});
+      Object.assign(o.entities[3] as Record<string, unknown>, { nestedOverrides: nested });
+      return o;
+    };
+    const named = (name: string) => getAllEntities().filter((e) => e.name === name);
+    const xsOf = (name: string) => named(name).map((e) => x(e.id));
+    const guidsOf = (name: string) => named(name).map((e) => e.guid);
+    /** C's frame root QR, and its own listed keys against Q. */
+    const cListed = () => collectInstanceOverrideKeys(named('QR')[0]!.id, getCachedPrefabSync(Q) as PrefabFile).all;
+
+    it.fails('#1737: the Revert brings L back at the row\'s 6, listed nowhere, with the guids a load derives; save + reload keep it', async () => {
+      // Today: L comes back at Q's bare 0 until a reload.
+      install(qDoc(), pWithC(), oDeepRow());
+      await load(scene(O, [ROOT1]));
+      expect(xsOf('L')).toEqual([6]); // precondition: the row's deep statement holds
+      const loaded = [...guidsOf('QR'), ...guidsOf('L')];
+      await revertRemovedA();
+      expect(xsOf('L')).toEqual([6]);
+      expect(listed()).toEqual([]);
+      expect(cListed()).toEqual([]);
+      // I7: the seeded frame's members take the guids a load derives, never minted ones.
+      expect([...guidsOf('QR'), ...guidsOf('L')]).toEqual(loaded);
+      const { scene: s, entry } = await saved();
+      expect(JSON.stringify(entry)).not.toContain('"x":6');
+      expect(JSON.stringify(entry)).not.toContain('"x":0');
+      await load(s);
+      expect(xsOf('L')).toEqual([6]);
+      expect([...guidsOf('QR'), ...guidsOf('L')]).toEqual(loaded);
+    });
+
+    it.fails('#1737: the Revert\'s undo takes the frame away again, and its redo brings it back with the row\'s 6', async () => {
+      // The redo is a rebuild from the captured reduced state (`rebuildInstanceFromCapture`), which holds nothing of C, so
+      // the fix has to live inside the rebuild. Today: L is 0 after the Revert and after the redo.
+      install(qDoc(), pWithC(), oDeepRow());
+      await load(scene(O, [ROOT1]));
+      deleteEntitiesWithUndo([inInstance(ROOT1, 'A')]);
+      await revertOverridesWithUndo(nestedRoot(), new Set([listed().find((k) => k.startsWith('-removed.'))!]));
+      expect(xsOf('L')).toEqual([6]);
+      await undo();
+      expect(xsOf('L')).toEqual([]);
+      await redo();
+      expect(xsOf('L')).toEqual([6]);
+    });
+
+    it.fails('#1737 depth 2: a reference row inside the restored frame gets the layer too — its K takes the row\'s 8', async () => {
+      // Today: K comes back at S's 0.
+      install(sDoc(), qDeepDoc(), pWithC(), oDeepRow({ '3.3': { 2: { Transform: { x: 8 } } } }));
+      await load(scene(O, [ROOT1]));
+      expect(xsOf('K')).toEqual([8]); // precondition
+      const loaded = guidsOf('K');
+      await revertRemovedA();
+      expect(xsOf('K')).toEqual([8]);
+      expect(guidsOf('K')).toEqual(loaded);
+      const { scene: s } = await saved();
+      await load(s);
+      expect(xsOf('K')).toEqual([8]);
+    });
+
+    it.fails('#1737 under a CAPTURED frame: a row C now expands another prefab (#1767), and the new D inside it gets the layer', async () => {
+      // The frame C is live and captured; the Refresh re-points its row at Q2, whose row D no capture names. Today: K is 0.
+      install(qDoc(), sDoc(), q2Doc(), pWithC(), oDeepRow({ '3.2': { 2: { Transform: { x: 8 } } } }));
+      await load(scene(O, [ROOT1]));
+      expect(xsOf('K')).toEqual([]); // precondition: C expands Q, which has no D
+      install(pWithC(Q2));
+      await rebaseStaleInstances();
+      expect(named('Q2R')).toHaveLength(1); // the Refresh did re-point C
+      expect(xsOf('K')).toEqual([8]);
+      const { scene: s } = await saved();
+      await load(s);
+      expect(xsOf('K')).toEqual([8]);
+    });
+
+    it.fails('#1737: a Refresh whose template GAINS the reference row the row already reaches into gives it the layer', async () => {
+      // Today: L comes in at Q's bare 0 until a reload.
+      install(qDoc(), pDoc(), oDeepRow());
+      await load(scene(O, [ROOT1]));
+      expect(xsOf('L')).toEqual([]); // precondition
+      install(pWithC());
+      await rebaseStaleInstances();
+      expect(xsOf('L')).toEqual([6]);
+    });
+
+    it('the accept side: a CAPTURED frame keeps its own edit — nothing restates the layer over it', async () => {
+      // A guard for #1737's fix: whatever gives an uncaptured frame its layer must leave a captured frame's own edit.
+      install(qDoc(), pWithC(), oDeepRow());
+      await load(scene(O, [ROOT1]));
+      writeTraitFieldWithUndo(named('L')[0]!.id, meta('Transform'), 'x', 9);
+      deleteEntitiesWithUndo([inInstance(ROOT1, 'B')]);
+      await revertOverridesSelective(nestedRoot(), new Set([listed().find((k) => k.startsWith('-removed.'))!]));
+      expect(named('B')).toHaveLength(1); // precondition: the Revert rebuilt N
+      expect(xsOf('L')).toEqual([9]);
+    });
+
+    describe('guards for #1737\'s fix: a rebuild that brings in a new frame keeps the scene\'s moves and kept rows', () => {
+      // Each passes today and FAILED under #1737's first seed, a nested `rebuildInstance` whose world-wide tail (the
+      // kept-orphan settle, the guid derive that drains the move queue) ran inside the outer rebuild's (close-out review).
+      const gX = 'eeeeeeee-0000-4000-8000-000000009001';
+      const STORED_B = 'ffffffff-0000-4000-8000-000000009002';
+      /** P: R → A (→ C, a reference row expanding Q, when `withC`); R → B; R → X. */
+      const pBX = (withC: boolean, bx = 0) => {
+        const d = pDoc();
+        return { ...d, entities: [...d.entities, ...(withC ? [ref(3, 'C', 2, gC, Q)] : []), row(4, 'B', 1, gB, bx), row(5, 'X', 1, gX)] };
+      };
+      /** The scene's rows on N: B keeps a STORED guid that is not its derived one, and X is moved under it. */
+      const sceneWithRows = (): SceneData => {
+        const sc = scene(O, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+        sc.entities[1]!.members = { [`/${gN}/${gB}`]: { guid: STORED_B, name: 'B' }, [`/${gN}/${gX}`]: { parent: STORED_B, name: 'X' } };
+        return sc as unknown as SceneData;
+      };
+      const parentName = (name: string) => {
+        const all = getAllEntities();
+        const e = all.find((n) => n.name === name)!;
+        return all.find((n) => n.id === e.parentId)?.name;
+      };
+
+      it('a Revert keeps a scene move under a STORED-guid member: the move drains after the outer restores the guid', async () => {
+        install(qDoc(), pBX(true), oDeepRow());
+        await load(sceneWithRows());
+        expect([named('B')[0]!.guid, parentName('X')]).toEqual([STORED_B, 'B']); // precondition
+        await revertRemovedA();
+        expect([named('B')[0]!.guid, parentName('X')]).toEqual([STORED_B, 'B']);
+      });
+
+      it('a Refresh that GAINS the reference row keeps the same move', async () => {
+        install(qDoc(), pBX(false), oWith({}));
+        await load(sceneWithRows());
+        expect(parentName('X')).toBe('B'); // precondition
+        install(pBX(true));
+        await rebaseStaleInstances();
+        expect(named('QR')).toHaveLength(1); // the Refresh did bring C in
+        expect(parentName('X')).toBe('B');
+      });
+
+      it('the scene\'s OWN move still beats the enclosing prefab\'s move across a Revert', async () => {
+        const o = oWith({}) as Record<string, unknown>;
+        o.moved = { '2.4.5': '@member:3' }; // O moves N's X under Slot2
+        install(qDoc(), pBX(true), o);
+        await load(scene(O, [ROOT1]));
+        expect(parentName('X')).toBe('Slot2'); // precondition: O's move holds
+        reparentEntity(inInstance(ROOT1, 'X'), inInstance(ROOT1, 'B'));
+        await revertRemovedA();
+        expect(parentName('X')).toBe('B');
+      });
+
+      it('a kept orphan row reaches its frame when a SIBLING frame is seeded in the same rebuild', async () => {
+        const gC1 = 'eeeeeeee-0000-4000-8000-000000009101';
+        const gC2 = 'eeeeeeee-0000-4000-8000-000000009102';
+        const gL = 'eeeeeeee-0000-4000-8000-000000001738';
+        const pWith = (both: boolean) => {
+          const d = pDoc();
+          return { ...d, entities: [...d.entities, ...(both ? [ref(3, 'C1', 1, gC1, Q), ref(6, 'C2', 1, gC2, Q)] : [])] };
+        };
+        const sc = scene(O, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+        sc.entities[1]!.members = { [`/${gN}/${gC2}/${gL}`]: { name: 'L', traits: { Transform: { x: 9 } } } };
+        install(qDoc(), pWith(false), oWith({}));
+        await load(sc as unknown as SceneData);
+        install(pWith(true));
+        await rebaseStaleInstances();
+        expect(xsOf('L').sort()).toEqual([0, 9]);
+        const { scene: saved1 } = await saved();
+        expect(JSON.stringify(saved1)).toContain('"x":9');
+      });
+    });
+
+    it('a MISSING prefab: the Revert expands nothing, and the row\'s statement is there once Q resolves (I18)', async () => {
+      // A guard for #1737's fix: a row whose child does not resolve must stay unexpanded, its enclosing row's statement kept.
+      setPrefabCache(Q, null);
+      install(pWithC(), oDeepRow());
+      await load(scene(O, [ROOT1]));
+      expect(named('QR')).toHaveLength(0); // precondition: Q does not resolve
+      await revertRemovedA();
+      expect(named('A')).toHaveLength(1);
+      expect(named('QR')).toHaveLength(0);
+      const { scene: s } = await saved();
+      install(qDoc());
+      await load(s);
+      expect(xsOf('L')).toEqual([6]);
+    });
+  });
+
   it('the Revert\'s undo takes the member away again, and its redo brings it back with the layer', async () => {
     // Mutation: seed the layer into a copy the undo entry does not hold (after `RevertResult` is built from
     // `reducedOverrides`/`reducedStructure`) — the redo rebuilds A as the bare template's: x = 0, no Rotate3D.
