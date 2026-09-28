@@ -49,7 +49,7 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
-  getPrefabSource, instantiatePrefabInstance, serializePrefab, writePrefabFile, warnInertPrefabSizes,
+  getPrefabSource, instantiatePrefabInstance, serializePrefab, writePrefabFile, warnInertPrefabSizes, replacedPrefabRows,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
@@ -666,7 +666,7 @@ function loadedSceneName(sceneGuid: string): string {
 function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>['reason'], id: number, parentId: number): string {
   switch (reason) {
     case 'resource': return `reparent-entity: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
-    case 'instance-member': return `reparent-entity: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and something in ${id}'s subtree (${id} itself, or an entity under it) belongs to a prefab instance that would stay behind, splitting it across two scene files. Move that instance's root instead, or unpack that instance first.`;
+    case 'instance-member': return `reparent-entity: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and a prefab instance would be split across two scene files: something in ${id}'s subtree (${id} itself, or an entity under it) belongs to an instance that would stay behind, or a member of an instance in it lives outside the subtree. Move that instance's root instead, or unpack that instance first.`;
     default: return `reparent-entity: refused to move ${id} under ${parentId} — the move is illegal (${reason === 'self-parent' ? 'an entity cannot be its own parent' : `${parentId} is a descendant of ${id}`}).`;
   }
 }
@@ -2986,8 +2986,15 @@ export function registerEditorAgentOps(): void {
       // Same cold-cache flatten as the human path (#1284) — classifyExistingPrefabId fetches
       // raw and never touches the editor prefab cache, so nothing here warms it.
       await preloadNestedPrefabsForSubtree(entityId);
+      // Over an existing prefab this is a Replace: the rows it overwrites are what a node with no live identity is
+      // matched against by name — the same matcher as Create Prefab's Replace (#1686, `nodeGuidsFor`).
+      const replacing = existingId ? await replacedPrefabRows(path) : undefined;
+      // …and after those awaits the world is asked again, as Create Prefab's Replace asks after its dialog: a Play
+      // started meanwhile would write its played pose (close-out review of #1686).
+      const late = whyWorldNotAuthored();
+      if (late) throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${late} — stop Play first, or the played pose is written into the prefab.`);
       let runtimeExcluded = 0;
-      const prefab = serializePrefab(entityId, existingId, { onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
+      const prefab = serializePrefab(entityId, existingId, { replacing, onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
       if (!prefab) throw new Error(`could not serialize prefab from entity ${entityId}`);
       // An authoring write (it can overwrite an existing template), so it reports an inert size like
       // the human Save-as-Prefab does (#42, #1251) — in THIS response too, because the agent that

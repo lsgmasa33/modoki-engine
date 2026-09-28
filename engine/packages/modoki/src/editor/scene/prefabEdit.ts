@@ -7,7 +7,7 @@
  *  plus throwaway lights + an HDR environment so the prefab is visible. On save we
  *  serialize the prefab subtree back out, excluding the scaffold entities. */
 
-import type { Entity } from 'koota';
+import type { Entity, World } from 'koota';
 import type { PrefabFile } from './prefab';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
@@ -27,7 +27,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
-import { deriveMemberGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
+import { deriveMemberGuid, durableGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
 import { isMemberToken, parseMemberToken, type MemberStep } from '../../runtime/core/templateRefs';
 
 /** Guid prefix stamped on EVERY member of the synthetic edit scene, carrying that member's
@@ -529,19 +529,94 @@ function findPrefabEditRoot(): number {
  *  Exported for tests: this is the half of the localId-preservation fix that only a LIVE
  *  editor round-trip would otherwise exercise (buildPrefabEditScene writes the sentinels, a
  *  real scene load reassigns the ecs ids, and only then does this read them back). */
-export function collectPreservedLocalIds(rootLocalId: number, rootEcsId: number): Map<number, number> {
+export function collectPreservedLocalIds(
+  rootLocalId: number, rootEcsId: number,
+  /** The prefab being edited: its saves' record (#1662) answers for a member the user added. */
+  prefabGuid?: string,
+  /** The document the save is written over. A remembered number is trusted only where this document has no row at it,
+   *  or has that same row: a write OUTSIDE prefab edit (an Apply appends at max+1, a Replace renumbers, a checkout) can
+   *  have given the number to another row since, and the member would take that row's identity (close-out review 3). */
+  current?: PrefabFile,
+): Map<number, number> {
   const map = new Map<number, number>();
   const eaMeta = getTraitByName('EntityAttributes');
   if (!eaMeta) return map;
   if (rootEcsId) map.set(rootEcsId, rootLocalId);
-  getCurrentWorld().query(eaMeta.trait).updateEach(([ea], entity) => {
+  const world = getCurrentWorld();
+  const saved = prefabGuid ? sessionRowsByPrefab.get(prefabGuid)?.rows : undefined;
+  const added: [number, number][] = [];
+  world.query(eaMeta.trait).updateEach(([ea], entity) => {
     const guid = (ea as Record<string, unknown>).guid;
-    if (typeof guid !== 'string' || !guid.startsWith(PREFAB_EDIT_LOCAL_GUID_PREFIX)) return;
+    if (typeof guid !== 'string') return;
+    if (!guid.startsWith(PREFAB_EDIT_LOCAL_GUID_PREFIX)) {
+      // A member ADDED in this session that an earlier save already wrote: the row it was written at (#1662).
+      const at = saved?.get(guid);
+      const there = at ? current?.entities.find((e) => e.localId === at.localId) : undefined;
+      if (at && entity.id() !== rootEcsId && (!there || there.nodeGuid === at.nodeGuid)) added.push([entity.id(), at.localId]);
+      return;
+    }
     const localId = Number(guid.slice(PREFAB_EDIT_LOCAL_GUID_PREFIX.length));
     if (Number.isInteger(localId) && localId > 0) map.set(entity.id(), localId);
   });
+  // An opened row's sentinel wins a number over a remembered one, and a number two remembered members claim goes to
+  // neither — `localIdFloor` keeps both from happening, so this is the floor under it, never a guess.
+  const held = new Set(map.values());
+  const claims = new Map<number, number>();
+  for (const [, lid] of added) claims.set(lid, (claims.get(lid) ?? 0) + 1);
+  for (const [id, lid] of added) if (!held.has(lid) && claims.get(lid) === 1) map.set(id, lid);
   return map;
 }
+
+/** Per PREFAB, what its prefab-edit saves have written (#1662). An opened row carries its localId in its sentinel guid; a
+ *  member the user ADDED has an ordinary guid, so without this every later save renumbered it above the preserved ids
+ *  and minted it a fresh `nodeGuid`.
+ *  - `rows`: live guid → the localId and `nodeGuid` a save gave it — every row a save wrote, and every row of each
+ *    document an edit world was built from (by its sentinel guid). It answers for a member the LAST save no longer
+ *    had: deleted, then brought back by an undo, which respawns it under its guid.
+ *  - `floor`: the highest localId any of those has used. A new member is numbered above it, so a number a delete freed
+ *    is never handed to another member while the deleted one can still come back (Unity never reuses a fileID either).
+ *    Without it an undone delete met its own number on a newcomer: two rows at one localId.
+ *  ⚠️ Keyed by the PREFAB, not the edit world, because what an undo can bring back outlives the world: Stop rebuilds it
+ *  from a snapshot, and leaving + re-opening keeps the prefab's undo history (`swapHistory`, U27 in `docs/prefabs.md`),
+ *  so an entity from an earlier world can be respawned into a later one. Per world, each rebuild forgot every number
+ *  and identity (close-out review 2). It lives as long as the editor process, which is at least as long as any undo
+ *  history that could need it; what it costs past that is gaps in the numbering.
+ *  ⚠️ A write made OUTSIDE prefab edit between two visits (an Apply appends at max+1, a Replace renumbers, a checkout)
+ *  can give a number this record remembers to another row. A remembered ADDED member then yields to the document
+ *  (`collectPreservedLocalIds`' `current`). A SENTINEL cannot: `__prefab_edit_local__<n>` names row n of whichever
+ *  document the entity came from, so an undo from the kept history can bring back an opened row whose number an
+ *  outside write refilled, and the save then refuses the duplicate. That is U27's kept history outliving the document
+ *  it was recorded against (Unity drops it on leaving Prefab Mode): the owner's ruling, not this record's. */
+interface SessionRows { rows: Map<string, { localId: number; nodeGuid: string }>; floor: number }
+const sessionRowsByPrefab = new Map<string, SessionRows>();
+/** The prefab each world has merged its opened rows into the record of. */
+const seededWorlds = new WeakMap<World, string>();
+const maxLocalId = (doc: PrefabFile): number => doc.entities.reduce((m, e) => Math.max(m, e.localId), 0);
+/** Prefab `guid`'s record, with the rows of `opened` — the document `world` was built from — merged in once per world. */
+function sessionRowsFor(world: World, guid: string, opened: PrefabFile): SessionRows {
+  let rec = sessionRowsByPrefab.get(guid);
+  if (!rec) { rec = { rows: new Map(), floor: 0 }; sessionRowsByPrefab.set(guid, rec); }
+  if (seededWorlds.get(world) !== guid) {
+    for (const e of opened.entities) {
+      if (e.localId === opened.rootLocalId || !e.nodeGuid) continue;
+      rec.rows.set(`${PREFAB_EDIT_LOCAL_GUID_PREFIX}${e.localId}`, { localId: e.localId, nodeGuid: e.nodeGuid });
+    }
+    rec.floor = Math.max(rec.floor, maxLocalId(opened));
+    seededWorlds.set(world, guid);
+  }
+  return rec;
+}
+/** Record, after a save LANDED, where it wrote each member: `written` guid → localId, read at SERIALIZE time (an id read
+ *  after the write's await could name an entity created in the meantime). */
+function noteSessionRows(guid: string, written: ReadonlyMap<string, number>, doc: PrefabFile): void {
+  const rec = sessionRowsByPrefab.get(guid);
+  if (!rec) return;
+  const nodeGuidAt = new Map(doc.entities.map((e) => [e.localId, e.nodeGuid ?? '']));
+  for (const [g, localId] of written) rec.rows.set(g, { localId, nodeGuid: nodeGuidAt.get(localId) ?? '' });
+  rec.floor = Math.max(rec.floor, maxLocalId(doc));
+}
+/** Test-only: forget every prefab's record, as a fresh editor process has none. */
+export function _resetPrefabEditSessionRows(): void { sessionRowsByPrefab.clear(); }
 
 /** What a prefab edit-mode save did: whether the file was written, and every prefab validation warning
  *  `warnInertPrefabSizes` reported for it (empty unless `saved`). */
@@ -593,7 +668,7 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   }
   const serialized = serializePrefabEditWorld(editingPrefab.guid);
   if ('error' in serialized) { console.error(`[PrefabEdit] cannot save "${editingPrefab.name}" — ${serialized.error}`); return NOT_SAVED; }
-  const { prefab, runtimeExcluded } = serialized;
+  const { prefab, runtimeExcluded, rows } = serialized;
   // The version `prefab` represents, captured BEFORE the write. `writePrefabFile` is a real fetch
   // to the dev server, and the human keeps working during it — a bone drag or an agent op lands as
   // an ordinary `pushAction`. Re-reading the version after the await would fold that edit into the
@@ -614,6 +689,8 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   // Refresh the editor's prefab cache to the just-saved version AND invalidate the
   // runtime refcount cache, so reopening the return scene re-expands from the new file.
   setPrefabCache(editingPrefab.guid, prefab);
+  // …and where it put each member added this session, so the next save keeps that row and its identity (#1662).
+  noteSessionRows(editingPrefab.guid, rows, prefab);
   // ⚠️ Re-baseline the dirty tracker. Without this the prefab-edit world stayed "unsaved" FOREVER
   // after a successful save: `hasUnsavedChanges()` compares the live edit version against
   // `_savedAtEditVersion`, and every other write path (`saveScene`, `loadScene`, `newScene`) moves
@@ -632,8 +709,9 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
 
 /** The live prefab-edit world as the document of the prefab `guid` — what Save writes. `runtimeExcluded` counts
  *  the runtime-spawned entities it left out. An `error` says why there is no document, phrased to follow
- *  "cannot save …". Pure: it writes nothing. */
-export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; runtimeExcluded: number } | { error: string } {
+ *  "cannot save …". It writes no file and changes no entity; it does merge the rows this world was built from into the
+ *  prefab's save record (#1662), which a save then extends. */
+export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; runtimeExcluded: number; rows: ReadonlyMap<string, number> } | { error: string } {
   const rootId = findPrefabEditRoot();
   if (!rootId) return { error: 'prefab root not found' };
 
@@ -655,7 +733,10 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
   // runs while stopped), so this save legitimately drops them — and says so, because this path
   // already has a `warnings` array the agent op surfaces and a console nobody reads (review F4).
   let runtimeExcluded = 0;
-  const preservedLocalIds = collectPreservedLocalIds(previous.rootLocalId, rootId);
+  let rowsById: ReadonlyMap<number, number> = new Map();
+  const world = getCurrentWorld();
+  const session = sessionRowsFor(world, guid, previous);
+  const preservedLocalIds = collectPreservedLocalIds(previous.rootLocalId, rootId, guid, previous);
   // …and the node identity each of those rows already had (#1468). The edit world holds the document
   // as PLAIN entities with no prefab link, so the baseline file is the only thing that still knows
   // which row a given live entity is; without this every node would be re-minted on every Cmd+S, and
@@ -664,8 +745,17 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
   // (#1468 design record: on next save, never on load).
   const nodeGuidByLocalId = new Map(previous.entities.map((e) => [e.localId, e.nodeGuid ?? '']));
   const preserveNodeGuids = new Map<number, string>();
+  const eaMeta = getTraitByName('EntityAttributes');
+  const guidOf = new Map<number, string>();
+  if (eaMeta) world.query(eaMeta.trait).updateEach(([ea], e) => { guidOf.set(e.id(), ((ea as { guid?: string }).guid) ?? ''); });
   for (const [ecsId, localId] of preservedLocalIds) {
-    const g = nodeGuidByLocalId.get(localId);
+    // The last save's row at that number; for a row that save no longer had (deleted since, and back by an undo), the
+    // identity an earlier save of this session wrote it with (#1662).
+    let g = nodeGuidByLocalId.get(localId);
+    if (!g) {
+      const row = session.rows.get(guidOf.get(ecsId) ?? '');
+      if (row?.localId === localId) g = row.nodeGuid;
+    }
     if (g) preserveNodeGuids.set(ecsId, g);
   }
   const prefab = serializePrefab(rootId, guid, {
@@ -675,8 +765,22 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
     // A row the prefab's own move placed under a nested member keeps its original row parent (#1437).
     rowParents: new Map(previous.entities.map((e) => [e.localId, ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0])),
     onRuntimeExcluded: (n) => { runtimeExcluded = n; },
+    onRows: (r) => { rowsById = r; },
+    localIdFloor: session.floor,
   });
-  return prefab ? { prefab, runtimeExcluded } : { error: 'serialize produced no prefab' };
+  // By guid, read NOW: the save records it only after its write's await, when an ecs id may name another entity.
+  const rows = new Map<string, number>();
+  for (const [ecsId, localId] of rowsById) {
+    const g = durableGuid(guidOf.get(ecsId));
+    if (g && g !== PREFAB_EDIT_ROOT_GUID) rows.set(g, localId);
+  }
+  if (!prefab) return { error: 'serialize produced no prefab' };
+  // The last line under the numbering above: a document with two rows at one localId is refused, never written. Every
+  // scene key naming that number would silently pick one of them.
+  const seen = new Set<number>();
+  const twice = prefab.entities.find((e) => (seen.has(e.localId) ? true : (seen.add(e.localId), false)));
+  if (twice) return { error: `two rows would share localId ${twice.localId} ("${twice.name}"), so a scene override keyed to it could land on either` };
+  return { prefab, runtimeExcluded, rows };
 }
 
 /** Leave prefab-edit mode: reload the scene the prefab was opened from — that

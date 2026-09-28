@@ -14,7 +14,7 @@
 
 import { whyWorldNotAuthored } from '../scene/authoredWorld';
 import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody } from '../backend/editorBackend';
-import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, type PrefabFile } from '../scene/prefab';
+import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, parsedPrefabRows, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
 import { reportUndoFailure, fileChangedRefusal, expectedHash } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
@@ -590,26 +590,41 @@ export async function createPrefabFromEntity(
   const draft = serializePrefab(entityId, undefined, { onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
   if (!draft) return null;
   warnInertPrefabSizes(draft, requestedPath);
-  const written = await writeNewAssetDocument(requestedPath, (guid, kept) => {
-    // ⚠️ A Replace keeps the replaced prefab's id, and `serializePrefab`'s cycle guard only runs
-    // for an `existingId` — which the draft had none of. So check it here: an entity holding an
-    // instance of the very prefab it is replacing would otherwise write a prefab that contains
-    // itself. Same test the serializer applies, over the same reference rows.
+  // The document the file ends up holding: the draft, or — over a Replace that kept the old id — the same tree
+  // serialized against the document it replaces.
+  let doc: PrefabFile = draft;
+  let refusedLate = '';
+  const written = await writeNewAssetDocument(requestedPath, (guid, kept, previous) => {
+    doc = draft;
+    // ⚠️ A Replace builds AFTER the confirm dialog, an unbounded wait: the authored-world gate above (#1548) is asked
+    // again, or a Play started meanwhile would write its played pose (close-out review of #1686) — and tag the played
+    // tree. Said the way the gate above says it, so the caller shows it rather than a silent failure.
+    const notNow = whyWorldNotAuthored();
+    if (notNow) { refusedLate = notNow; return null; }
     if (kept) {
-      const cyclic = draft.entities.find((e) => e.prefab && wouldCreateCycle(guid, e.prefab));
-      if (cyclic) {
-        console.error(`[Prefab] refusing to replace ${requestedPath} — it would nest "${cyclic.prefab}" inside itself`);
+      // ⚠️ The replaced prefab's id is known only here, so the draft (serialized with none) minted every row's
+      // `nodeGuid` — and every other instance's edits and pinned member guids are keyed by the old ones (#1686).
+      // Serialized again against it: the live `nodeGuid` carries where the tree is an instance of it, then a
+      // unique name matches (Unity's Replace, `nodeGuidsFor`). And the cycle guard, which the draft (serialized with
+      // no id) skipped: an entity holding an instance of the very prefab it replaces would otherwise write a prefab
+      // that contains itself.
+      const again = serializePrefab(entityId, guid, { replacing: parsedPrefabRows(previous) });
+      const cyclic = (again ?? draft).entities.find((e) => e.prefab && wouldCreateCycle(guid, e.prefab));
+      if (!again || cyclic) {
+        console.error(`[Prefab] refusing to replace ${requestedPath} — it would nest "${cyclic?.prefab ?? guid}" inside itself`);
         return null;
       }
+      doc = again;
     }
-    return jsonFileBody({ ...draft, id: guid });
+    return jsonFileBody({ ...doc, id: guid });
   }, { confirmReplace, keepPrevious: true, guid: draft.id });
   if (written.outcome === 'declined') return 'declined';
+  if (refusedLate) return { refused: `Create Prefab refused — ${refusedLate}. Exit the preview / stop Play first.` };
   if (written.outcome !== 'created' && written.outcome !== 'replaced') return null;
   // The path the prefab really landed on — the existing file's on-disk spelling after a Replace
   // (#1273). Registration, the instance tags and both undo directions all key on it.
   const savePath = written.path;
-  const prefab: PrefabFile = { ...draft, id: written.guid };
+  const prefab: PrefabFile = { ...doc, id: written.guid };
   const content = jsonFileBody(prefab);
   const previousContent = written.outcome === 'replaced' ? written.previousContent : null;
   const replaced = written.outcome === 'replaced';

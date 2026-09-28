@@ -367,6 +367,7 @@ const GENERATED_PREFAB_WRITERS = [
  *  is the caller's, which the write census above holds to it. */
 const SERIALIZE_FOR_A_CALLER = [
   { item: 'packages/modoki/src/editor/scene/prefabEdit.ts::serializePrefabEditWorld', reason: 'the prefab-edit world as a document: savePrefabEditReport warns what it writes (the write census row for it), and the tests read it as what a Save would write' },
+  { item: 'packages/modoki/src/editor/panels/assetOps.ts::createPrefabFromEntity', reason: 'a Replace serializes the SAME tree again against the kept prefab id, to carry its rows\' nodeGuids (#1686): the sizes are the draft\'s, which is warned before the write, and warning twice would print every warning twice' },
 ];
 
 /** Whether `e` calls THE engine `warnInertPrefabSizes` — by its bare name, resolving to an import or to its own

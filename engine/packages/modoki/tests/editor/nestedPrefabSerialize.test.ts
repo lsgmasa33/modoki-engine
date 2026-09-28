@@ -378,8 +378,8 @@ describe('tagEntityTreeAsInstance mirrors the rows serializePrefab wrote (#1278)
     };
     const r = mk('R', 0, 'g-r5');
     // Create Prefab directly ON an owned nested instance: it becomes row 1 of the NEW prefab,
-    // so its parentLocalId must be cleared. Left at 3, serialize.ts's `parentIsMember &&
-    // parentLocalId` writes no scene entry for it and the new link vanishes on reload.
+    // so its parentLocalId must be cleared. Left at 3, serialize.ts reads it as an OWNED nested root
+    // (`IdentityParents.frameOf` finds an owner), writes no scene entry for it, and the new link vanishes on reload.
     r.add(PrefabInstance({ source: INNER, localId: 1, rootInstanceId: r.id(), parentLocalId: 3 }));
 
     serializePrefab(r.id());

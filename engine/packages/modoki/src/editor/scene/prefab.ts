@@ -4,7 +4,7 @@ import { whyWorldNotAuthored } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, identityTree, type DetachedMember, type IdentityTree } from '../../runtime/core/ecs/memberHome';
-import { worldIdentityParents, setFrameDocFallback, noteFrameDoc, noteNodeMoves, frameRootDoc, noteFrameRootDoc, templateFrameClimber, rewriteNodeMoves } from '../../runtime/core/ecs/identityParents';
+import { worldIdentityParents, identitySubtree, linkOwnerBeforeMove, setFrameDocFallback, noteFrameDoc, noteNodeMoves, frameRootDoc, noteFrameRootDoc, templateFrameClimber, rewriteNodeMoves } from '../../runtime/core/ecs/identityParents';
 import { memberRowKeysIn, memberRowsIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
 import { isPrefabEditRowGuid, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { nestedMoveRef, toLocalIdKeys } from './overrideKeyGrammar';
@@ -511,6 +511,8 @@ function planPrefabRows(
   selectedEntityId: number,
   existingId?: string,
   preserveLocalIds?: Map<number, number>,
+  /** New members are numbered above this too (prefab-edit: the highest localId the session has opened or written). */
+  localIdFloor = 0,
 ): { nestedRefs: Map<number, PlannedNestedRow>; flatTree: EntityInfo[]; ecsToLocal: Map<number, number> } | null {
   const piMeta = getTraitByName('PrefabInstance');
 
@@ -573,7 +575,7 @@ function planPrefabRows(
   const flatTree = tree.filter((e) => !skip.has(e.id));
   const ecsToLocal = new Map<number, number>();
   if (preserveLocalIds) {
-    let next = 0;
+    let next = localIdFloor;
     for (const e of flatTree) next = Math.max(next, preserveLocalIds.get(e.id) ?? 0);
     for (const e of flatTree) {
       const kept = preserveLocalIds.get(e.id);
@@ -938,6 +940,9 @@ function nodeGuidsFor(
   preserved: Map<number, string> | undefined,
   selectedEntityId: number,
   nestedRowIds: ReadonlySet<number>,
+  /** The document this write REPLACES (#1686), when it is a Replace: Create Prefab over an existing file, or the
+   *  agent `create` op over an existing path. Never a prefab-edit save, whose rows are named by `preserved`. */
+  replacing?: ReplacedRows,
 ): (ecsId: number) => string {
   const piMeta = getTraitByName('PrefabInstance');
   const carried = new Map<number, string>();
@@ -973,6 +978,33 @@ function nodeGuidsFor(
       continue;
     }
     if (pi?.source === existingId && pi.nodeGuid) take(e.id, pi.nodeGuid);
+  }
+  // A Replace then matches BY NAME what no live identity answered for (#1686, Unity parity U22): "Unity tries to
+  // preserve references to the prefab and the individual parts… it matches the names of GameObjects between the new
+  // prefab and the existing prefab" (Manual, CreatingPrefabs). Unity's match ignores the hierarchy and says a duplicate
+  // name makes it "unpredictable"; here a duplicate name — on either side — matches nothing and mints, because a guess
+  // hands one node's stored edits to another. A nested row matches only a nested row of the same child prefab, and a
+  // plain node only a plain row. The live `nodeGuid` above wins wherever it exists: it is the exact correspondence.
+  if (replacing?.entities?.length) {
+    const kindOf = (e: EntityInfo): string => (nestedRowIds.has(e.id)
+      ? `ref:${(piMeta ? (readTraitData(e.id, piMeta) as { source?: string } | null)?.source : '') ?? ''}` : 'plain');
+    const count = <T,>(xs: Iterable<T>, key: (x: T) => string) => {
+      const n = new Map<string, number>();
+      for (const x of xs) n.set(key(x), (n.get(key(x)) ?? 0) + 1);
+      return n;
+    };
+    const liveKey = (e: EntityInfo) => `${kindOf(e)}\0${e.name ?? ''}`;
+    const rowKey = (r: { name?: string; prefab?: string }) => `${r.prefab ? `ref:${r.prefab}` : 'plain'}\0${r.name ?? ''}`;
+    const liveNames = count(flatTree, liveKey);
+    const rowNames = count(replacing.entities, rowKey);
+    const rowByKey = new Map(replacing.entities.map((r) => [rowKey(r), r]));
+    for (const e of flatTree) {
+      if (carried.has(e.id) || !e.name) continue;
+      const k = liveKey(e);
+      const r = rowByKey.get(k);
+      if (!r?.nodeGuid || liveNames.get(k) !== 1 || rowNames.get(k) !== 1 || claimed.has(r.nodeGuid)) continue;
+      take(e.id, r.nodeGuid);
+    }
   }
   return (ecsId) => carried.get(ecsId) ?? newGuid();
 }
@@ -1015,6 +1047,17 @@ export function serializePrefab(
      *  parent is no row — the prefab's own move put it under a nested member (#1437) — is written back under
      *  it, with the move kept in `moved`, instead of losing its parent. */
     rowParents?: Map<number, number>;
+    /** The document this write REPLACES, read before the write destroys it — a Replace (Create Prefab over an
+     *  existing file, the agent `create` over an existing path). A node no live identity names takes the `nodeGuid`
+     *  of the one row sharing its name (#1686, `nodeGuidsFor`). */
+    replacing?: ReplacedRows;
+    /** Told, once the document is built, the localId each live entity of the tree was written at — for a caller that
+     *  must name the same rows on its next save (prefab-edit, #1662). */
+    onRows?: (ecsToLocal: ReadonlyMap<number, number>) => void;
+    /** With `preserveLocalIds`: a new member is numbered above this as well as above every preserved id — prefab-edit's
+     *  highest localId the session has opened or written, so a number freed by a delete is never handed to a new member
+     *  while the deleted one can still come back by undo (#1662; Unity never reuses a fileID either). */
+    localIdFloor?: number;
   },
 ): PrefabFile | null {
   const rawEntities = getAllEntities();
@@ -1041,14 +1084,14 @@ export function serializePrefab(
   const outerExits = nodeExits;
   nodeExits = exits;
   let plan: ReturnType<typeof planPrefabRows>;
-  try { plan = planPrefabRows(tree, selectedEntityId, existingId, opts?.preserveLocalIds); } finally { nodeExits = outerExits; }
+  try { plan = planPrefabRows(tree, selectedEntityId, existingId, opts?.preserveLocalIds, opts?.localIdFloor); } finally { nodeExits = outerExits; }
   if (!plan) return null; // cycle — planPrefabRows already reported it
   const { nestedRefs, flatTree, ecsToLocal } = plan;
 
   const allTraits = getAllTraits();
   const prefabEntities: PrefabEntity[] = [];
   const nestedRowIds = new Set(nestedRefs.keys());
-  const nodeGuidOf = nodeGuidsFor(flatTree, existingId, opts?.preserveNodeGuids, selectedEntityId, nestedRowIds);
+  const nodeGuidOf = nodeGuidsFor(flatTree, existingId, opts?.preserveNodeGuids, selectedEntityId, nestedRowIds, opts?.replacing);
   const rowParent = rowParentsFor(selectedEntityId, flatTree, allEntities, ecsToLocal, opts?.rowParents, nestedRowIds);
   // A ref from one member of the written tree to another becomes a member TOKEN (#1352): the file is a
   // template, and the live guid it held names the SOURCE entity in every instance.
@@ -1204,6 +1247,7 @@ export function serializePrefab(
     ...(moved ? { moved } : {}),
   };
   assertNoRuntimeGuids(file, 'a serialized prefab');
+  opts?.onRows?.(ecsToLocal);
   return file;
 }
 
@@ -1486,6 +1530,30 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
   // `fresh` contributes nothing — it is this importer's own output, from a GLB tree with no nested
   // instances, so it has neither unknown fields nor a `moved` map.
   return mergeUnknownFields(known, collectUnknownFields(existing, Object.keys(known))) as unknown as PrefabFile;
+}
+
+/** The rows a Replace matches identity against (#1686): only each row's name, `nodeGuid` and nested `prefab`. */
+export type ReplacedRows = { entities?: ReadonlyArray<{ name?: string; nodeGuid?: string; prefab?: string }> };
+
+/** {@link ReplacedRows} from a replaced prefab's raw bytes — undefined for bytes that are not a prefab document. Read
+ *  raw, unmigrated: a document too old to carry `nodeGuid` has nothing to carry anyway. */
+export function parsedPrefabRows(text: string | null): ReplacedRows | undefined {
+  if (!text) return undefined;
+  try {
+    const doc = JSON.parse(text) as { entities?: unknown };
+    return Array.isArray(doc?.entities) ? { entities: doc.entities as ReplacedRows['entities'] } : undefined;
+  } catch { return undefined; }
+}
+
+/** {@link ReplacedRows} of the prefab file at `path` that a write is about to replace — the FILE's bytes, read raw and
+ *  NOT cached: the write destroys those rows, whatever the editor cache holds (it can be stale, #1692), and caching them
+ *  left the editor cache holding the old document after the replacing write (close-out review of #1686). Create
+ *  Prefab's Replace matches against the same thing: the bytes it is replacing. */
+export async function replacedPrefabRows(path: string): Promise<ReplacedRows | undefined> {
+  try {
+    const res = await fetch(assetUrl(path), ASSET_FETCH_INIT);
+    return res.ok ? parsedPrefabRows(await res.text()) : undefined;
+  } catch { return undefined; }
 }
 
 /** Resolve the stable id a (re)written prefab at `prefabPath` must keep, so a
@@ -4136,7 +4204,7 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
    *  merge (`if ('k' in value) store.k[i] = value.k`), so an omitted field keeps its old value —
    *  and this used to be masked by Create Prefab stripping the trait first. A surviving
    *  `parentLocalId` makes serialize classify the row as an OWNED nested instance of the prefab
-   *  it used to belong to (`serialize.ts` `parentIsMember && parentLocalId`), which writes no
+   *  it used to belong to (`serialize.ts`: `IdentityParents.frameOf` finds an owner), which writes no
    *  scene entry for it at all and loses the new link on the next reload. */
   const applyTag = (ecsId: number, localId: number) => {
     const entity = findEntity(ecsId);
@@ -4288,7 +4356,7 @@ export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: En
 export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; }
 
 /** Detach a prefab instance — strip the `PrefabInstance` trait off the instance
- *  root and EVERY descendant in its subtree (nested instances included), turning
+ *  root and EVERY descendant in its identity subtree (nested instances included), turning
  *  the live tree into ordinary, unlinked entities. Mirrors Unity's "Unpack
  *  Prefab Completely". The entities, their transforms, and their other traits are
  *  untouched — only the prefab link is severed, so later edits to the source
@@ -4305,7 +4373,7 @@ export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: Detac
  *  ⚠️ LIMIT — a guid only helps while the entity KEEPS it. A detach leaves plain entities whose guids
  *  are saved, so Hierarchy/agent Detach undo survives Play→Stop. **Create Prefab's snapshot does
  *  not**: a held nested instance ends up INSIDE the new prefab, and `serialize.ts` writes no scene
- *  entry for an owned nested instance (`parentIsMember && parentLocalId`) — only a `nestedOverrides`
+ *  entry for an owned nested instance (`IdentityParents.frameOf` finds an owner) — only a `nestedOverrides`
  *  delta against the outer row. Its guid never reaches disk, so `deriveInstanceMemberGuids` re-mints
  *  it from the new root on reload and these refs miss.
  *
@@ -4329,7 +4397,13 @@ export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return { links: [], orphans: [] };
   const strip = opts?.strip !== false;
-  const tree = collectTree(rootEcsId, getAllEntities());
+  // What a Detach ends is the instance's IDENTITY subtree (I6, #1691): a member of ANOTHER frame dragged under it
+  // (#1437) is that frame's, and stripping it unlinked it from an instance nothing detached. The walk only answers
+  // which entities; that every nested frame among them is stripped too is this function's policy (Unpack Completely,
+  // U17), not the walk's. A snapshot-only caller keeps the live tree: it is about to overwrite every link in it.
+  const live = collectTree(rootEcsId, getAllEntities());
+  const own = strip ? new Set(identitySubtree(getCurrentWorld(), [rootEcsId])) : null;
+  const tree = own ? live.filter((e) => own.has(e.id)) : live;
   const snapshot: DetachedInstanceTrait[] = [];
   for (const info of tree) {
     const entity = findEntity(info.id);
@@ -4747,36 +4821,58 @@ function insertAddedSubtree(
   for (const child of node.children) insertAddedSubtree(prefab, child, myLocalId, nextId, rows, refRows);
 }
 
-/** The members of the instance rooted at `rootId` — its own, and its owned nested instances' — that were moved
- *  OUT of its subtree (#1437), with everything under them. A delete of the subtree leaves them standing, but
- *  whatever respawns the instance respawns them, moved: a promotion must take them too. */
-function membersLivingOutside(rootId: number): number[] {
-  const piMeta = getTraitByName('PrefabInstance');
-  if (!piMeta) return [];
+/** A live entity a promotion's delete must NOT take, and where it hung: a member of a frame outside the promoted nodes
+ *  that was dragged under one of them (#1682). */
+interface PromotionSurvivor { id: number; guid: string; parentGuid: string }
+
+/** Delete the live entities of the promoted `+added` nodes `roots` before the refresh re-expands their rows — their
+ *  IDENTITY subtree (`identitySubtree`, I6), not the live one (#1682):
+ *  - a member of a frame OUTSIDE them dragged under one of them is not theirs: the delete took it, and the refresh's
+ *    capture (against the old document) saved it as REMOVED. It is parked at the scene root instead, where the capture
+ *    reads it as moved and keeps its pose as values, and {@link rehangPromotionSurvivors} puts it back.
+ *  - a member of a frame INSIDE them dragged out of them is theirs, at any depth: the refresh re-expands it, and a
+ *    live delete left the original beside its twin. (Only a top-level reference node's own frames were consulted
+ *    before — `membersLivingOutside`.)
+ *  Returns the survivors, read before anything is deleted. */
+function deletePromotedNodes(roots: readonly number[]): PromotionSurvivor[] {
+  if (!roots.length) return [];
+  const eaMeta = getTraitByName('EntityAttributes');
+  const world = getCurrentWorld();
+  const doomed = new Set(identitySubtree(world, roots));
   const all = getAllEntities();
-  const links = all.map((e) => [e.id, e.parentId] as const);
-  const inside = new Set(collectSubtreeIds(links, [rootId]));
-  const identity = worldIdentityParents(getCurrentWorld());
-  const frames = new Set([rootId]);
-  const out: number[] = [];
-  const frameOf = (id: number, pi: Record<string, unknown>): number => {
-    if (pi.rootInstanceId !== id) return (pi.rootInstanceId as number) || 0;
-    if (!pi.parentLocalId) return 0;
-    return identity.ownerOf(id);
-  };
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const e of all) {
-      const pi = e.traits.includes('PrefabInstance') ? readTraitData(e.id, piMeta) : null;
-      if (!pi) continue;
-      if (isOwnedRoot(pi, e.id) && frames.has(frameOf(e.id, pi)) && !frames.has(e.id)) { frames.add(e.id); grew = true; }
-      if (inside.has(e.id) || !frames.has(frameOf(e.id, pi)) || e.id === rootId) continue;
-      for (const id of collectSubtreeIds(links, [e.id])) inside.add(id);
-      out.push(e.id);
-      grew = true;
-    }
+  const guidOf = new Map(all.map((e) => [e.id, e.guid ?? '']));
+  const survivors: PromotionSurvivor[] = [];
+  for (const e of all) {
+    if (doomed.has(e.id) || !doomed.has(e.parentId)) continue;
+    survivors.push({ id: e.id, guid: guidOf.get(e.id) ?? '', parentGuid: guidOf.get(e.parentId) ?? '' });
+    if (eaMeta) writeTraitField(e.id, eaMeta, 'parentId', 0);
   }
-  return out;
+  if (survivors.length) markStructureDirty();
+  deleteEntities([...doomed]);
+  return survivors;
+}
+
+/** Hang each {@link PromotionSurvivor} back under the node it was dragged under — now the member the promotion made of
+ *  it, found by the guid the carry gave back, or the one the refs followed to (`follow`, old → derived). A survivor the
+ *  refresh rebuilt is found by its guid; one whose parent is gone for good stays where the refresh put it, which is
+ *  inside its own instance (its template parent), never the scene root it was parked at. Already there — its move was
+ *  applied with the addition, so the template now puts it there — it is left alone. */
+function rehangPromotionSurvivors(survivors: readonly PromotionSurvivor[], follow: ReadonlyMap<string, string>): void {
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!survivors.length || !eaMeta) return;
+  const live = new Map(getAllEntities().filter((e) => e.guid).map((e) => [e.guid!, e]));
+  const identity = worldIdentityParents(getCurrentWorld());
+  let moved = false;
+  for (const s of survivors) {
+    const self = s.guid ? live.get(s.guid) : undefined;
+    if (!self) continue;
+    const to = live.get(follow.get(s.parentGuid) ?? s.parentGuid)?.id ?? (self.parentId ? 0 : identity.parentOf(self.id));
+    if (!to || to === self.id || to === self.parentId) continue;
+    linkOwnerBeforeMove(getCurrentWorld(), self.id);
+    writeTraitField(self.id, eaMeta, 'parentId', to);
+    moved = true;
+  }
+  if (moved) markStructureDirty();
 }
 
 /** A move made inside an owned NESTED instance of the instance at `rootInstanceId` to a parent outside that
@@ -5222,7 +5318,7 @@ export async function applyToPrefabSelective(
       insertAddedSubtree(newPrefab, node, node.parentLocalId, nextLocalId, promotedRows, promotedRefRows);
       if (node.prefab) promoteReferenceMoves(newPrefab, node, rowLid, localToEcs, instancePaths);
       const liveEcs = localToEcsGuid(guid);
-      if (liveEcs) liveAddedRootsToDelete.push(liveEcs, ...(node.prefab ? membersLivingOutside(liveEcs) : []));
+      if (liveEcs) liveAddedRootsToDelete.push(liveEcs);
       writtenCount++;
       continue;
     }
@@ -5530,7 +5626,7 @@ export async function applyToPrefabSelective(
   // Delete the live plain entities for applied additions BEFORE refresh, so the
   // re-instantiated prefab member replaces them instead of duplicating. Non-applied
   // additions stay live and are re-captured + re-spawned by the refresh.
-  if (liveAddedRootsToDelete.length) deleteEntities(liveAddedRootsToDelete);
+  const survivors = deletePromotedNodes(liveAddedRootsToDelete);
 
   prefabCache.set(source, newPrefab);
   // Every instance of this source, with NO exclusion — the clicked one goes through
@@ -5555,7 +5651,7 @@ export async function applyToPrefabSelective(
   if (rowsReparented && prefabId) rewriteNodeMoves(getCurrentWorld(), (moved, src) => rewriteFrameMoves(moved, src, readOld, readNew));
   refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap, { rootId: rootInstanceId, fields: appliedFields });
   if (remap.size) remapWorldGuidRefs(remap);
-  carryPromotedGuids(rootGuid, promotedGuids);
+  rehangPromotionSurvivors(survivors, carryPromotedGuids(rootGuid, promotedGuids));
   // …and every other file that uses the prefab. The open scene's own file too: its live world is already
   // repaired, and the next save writes that.
   const fileRepair = rowsReparented && prefabId ? await repairPrefabMemberPaths(prefabId, oldPrefab) : undefined;
@@ -5641,11 +5737,12 @@ function snapshotPromotedGuids(plain: ReadonlyMap<string, number>, refs: Readonl
  *  - **anything else keeps its derived guid, and the live refs follow it** — a template-keyed node or a member of a
  *    pre-v5 document, which no row can pin. A ref in another file to one of those still dangles; nothing short of a
  *    row can hold that identity, and the reload would re-derive whatever this wrote live. */
-function carryPromotedGuids(rootGuid: string, promoted: PromotedGuids): void {
-  if (!promoted.plain.size && !promoted.refs.size) return;
+function carryPromotedGuids(rootGuid: string, promoted: PromotedGuids): Map<string, string> {
+  const none = new Map<string, string>();
+  if (!promoted.plain.size && !promoted.refs.size) return none;
   const piMeta = getTraitByName('PrefabInstance');
   const root = rootGuid ? localToEcsGuid(rootGuid) : 0;
-  if (!piMeta || !root) return;
+  if (!piMeta || !root) return none;
   const world = getCurrentWorld();
   const tree = identityTree(world);
   const all = getAllEntities();
@@ -5673,8 +5770,9 @@ function carryPromotedGuids(rootGuid: string, promoted: PromotedGuids): void {
   const follow = new Map<string, string>(); // old → derived: the refs move to the member
   // Never guess. An original two entities answer to, or an entity two originals answer to, is left as the refresh
   // made it: a guid carried onto the wrong one is worse than a derived one, and carried onto both is two entities
-  // with one guid. Nor is a guid taken from an entity still holding it — which DOES happen while #1682 stands: an
-  // original the delete above missed (a nested member moved out of a promoted plain node) survives beside its twin.
+  // with one guid. Nor is a guid taken from an entity still holding it: two entities would share it. Apply's delete takes
+  // the promoted nodes' identity subtree (#1682), so no original survives beside its twin through Apply; the clause is
+  // the backstop for a caller that deletes less.
   const claims = new Map<string | number, number>();
   for (const [old, id] of pairs) for (const k of [old, id]) claims.set(k, (claims.get(k) ?? 0) + 1);
   for (const [old, id] of pairs) {
@@ -5686,6 +5784,7 @@ function carryPromotedGuids(rootGuid: string, promoted: PromotedGuids): void {
   }
   applyGuidRemap(carry);
   remapWorldGuidRefs(follow);
+  return follow;
 }
 
 /** {@link carryPromotedGuids}, exported for the guard that it never guesses — a pairing that is not unique cannot

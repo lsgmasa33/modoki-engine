@@ -48,6 +48,8 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   preloadNestedPrefabsForSubtree: async () => {},
   // The real guard, reduced to its direct case: the child IS the parent.
   wouldCreateCycle: (parent: string, child: string) => parent === child,
+  // A Replace hands the replaced bytes to the matcher (#1686); what they parse to does not matter to this mocked serialize.
+  parsedPrefabRows: () => undefined,
   classifyExistingDocumentId: async () => ({ kind: 'known', id: OLD_ID }),
   setPrefabCache: (...a: unknown[]) => setPrefabCacheSpy(...a),
   tagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return new Map([['g-old', 'g-derived']]); },

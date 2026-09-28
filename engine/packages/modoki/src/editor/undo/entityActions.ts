@@ -1581,8 +1581,10 @@ export function demoteEntityToScene(entityId: number, opts?: Omit<SceneMoveOptio
  *
  *  One prefab refusal, `instance-member`: the scene-move twin of `reparentEntity`'s "unpack on move",
  *  which a scene move cannot carry. Something in the moved subtree is linked to an instance that stays
- *  behind. That is a member, an OWNED nested root (`parentLocalId` > 0) whose outer instance is not
- *  moving, or a member held under a plain added child. The instance would be split across two files.
+ *  behind — a member, an OWNED nested root whose outer instance is not moving, or a member held under a
+ *  plain added child — or a row of an instance that IS moving lives outside the subtree (a member dragged
+ *  out of it, #1437). Either way the instance would be split across two files. Frames are read by identity
+ *  (`IdentityParents.frameOf`), never by live parent.
  *  A stored instance root dropped inside a base's instance is NOT refused: it becomes that instance's
  *  user-added nested instance, as it does in a same-scene reparent (#1436). */
 export type ReparentPlan =
@@ -1609,15 +1611,21 @@ function sceneMovePrefabRefusal(entityId: number, piMeta: TraitMeta): 'instance-
   const flat = getAllEntities();
   const byId = new Map(flat.map((e) => [e.id, e]));
   const moving = new Set(subtreeIds(flat, entityId));
-  for (const id of moving) {
-    const en = findEntity(id);
-    if (!en?.has(piMeta.trait)) continue;
-    const pd = en.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number };
-    const owner = pd.rootInstanceId as number;
-    if (!moving.has(owner)) return 'instance-member';
-    // An owned nested root is owned by the instance its PARENT belongs to; that one has to move too.
-    const ownedNested = isOwnedRoot(pd, id);
-    if (ownedNested && !moving.has(byId.get(id)?.parentId ?? 0)) return 'instance-member';
+  // Which frame an entity is a row of is IDENTITY (I6, #1691): a member's `rootInstanceId`, an owned nested root's
+  // owner — not the instance its live parent belongs to. And the check runs BOTH ways: a moving entity's frame must
+  // move with it, and so must every row of a moving frame, including a member dragged OUT of the moved subtree (#1437),
+  // which a subtree walk never saw — it stayed behind in the old scene file, split from its instance.
+  const identity = worldIdentityParents(getCurrentWorld());
+  for (const e of flat) {
+    if (!e.traits.includes('PrefabInstance')) continue;
+    const frame = identity.frameOf(e.id);
+    if (frame) {
+      if (moving.has(e.id) !== moving.has(frame)) return 'instance-member';
+      continue;
+    }
+    // An owned nested root whose owner cannot be told: the instance its parent belongs to has to move too.
+    const pd = findEntity(e.id)?.get(piMeta.trait) as { rootInstanceId?: number; parentLocalId?: number } | undefined;
+    if (moving.has(e.id) && pd && isOwnedRoot(pd, e.id) && !moving.has(byId.get(e.id)?.parentId ?? 0)) return 'instance-member';
   }
   return null;
 }

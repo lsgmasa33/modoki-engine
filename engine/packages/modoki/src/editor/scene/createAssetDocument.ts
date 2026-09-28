@@ -45,8 +45,10 @@ export async function writeNewAssetDocument(
   path: string,
   /** The document's bytes for `guid`. `kept` is true when `guid` is the REPLACED asset's id — a
    *  builder that would otherwise prefer an id of its own must use this one, or every ref to the
-   *  replaced asset dangles. Null aborts (e.g. a prefab that would nest itself). */
-  build: (guid: string, kept: boolean) => string | null,
+   *  replaced asset dangles. `previous` is the replaced document's bytes, read before the write (`keepPrevious`
+   *  only; null otherwise): what a builder matching identity against the old content reads (#1686). Null
+   *  aborts (e.g. a prefab that would nest itself). */
+  build: (guid: string, kept: boolean, previous: string | null) => string | null,
   opts: {
     confirmReplace?: (path: string) => Promise<boolean>;
     /** The guid a fresh create uses. Default: a new one. */
@@ -58,7 +60,7 @@ export async function writeNewAssetDocument(
   } = {},
 ): Promise<NewAssetDocumentResult> {
   const fresh = opts.guid ?? newGuid();
-  const firstBody = build(fresh, false);
+  const firstBody = build(fresh, false, null);
   if (firstBody == null) return { outcome: 'failed', path };
   const first = await post(path, firstBody, true);
   if (first?.ok) {
@@ -95,7 +97,7 @@ export async function writeNewAssetDocument(
   const keptId = existing.kind === 'known' ? existing.id : undefined;
   const previousContent = opts.keepPrevious ? await readText(at) : null;
   const guid = keptId ?? fresh;
-  const body = build(guid, keptId != null);
+  const body = build(guid, keptId != null, previousContent);
   if (body == null) return { outcome: 'failed', path: at };
   const second = await post(at, body, false);
   if (!second?.ok) return { outcome: 'failed', path: at, status: second?.status };

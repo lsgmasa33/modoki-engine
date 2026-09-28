@@ -36,7 +36,7 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
-import { setActionCallback, pushAction, clearHistory, createEntityWithUndo, ensureGuid } from '@modoki/engine/editor';
+import { setActionCallback, pushAction, clearHistory, createEntityWithUndo, ensureGuid, reparentEntity } from '@modoki/engine/editor';
 import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import {
   setPrefabCache, applyToPrefabSelective, getCachedPrefabSync, instantiatePrefab, setPrefabSource, carryPromotedGuidsForTest,
@@ -475,5 +475,107 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     takeWritten();
     expect(guidOf(under(ROOT1, 'QR'))).toBe(qRootGuid); // the durable root is carried
     expect(isRuntimeGuid(guidOf(under(ROOT1, 'QB')))).toBe(false);
+  });
+});
+
+describe('#1682: Apply deletes the promoted node\'s IDENTITY subtree, not its live one', () => {
+  /** P: R → A → B, and instance 1 moves member A under a node it added. */
+  const moveIntoAdded = async () => {
+    const p3 = { id: P, version: 5, name: 'P', rootLocalId: 1, entities: [
+      row(1, 'R', 0, 'eeeeeeee-0000-4000-8000-000000016611'), row(2, 'A', 1, 'eeeeeeee-0000-4000-8000-000000016612'),
+      row(3, 'B', 2, 'eeeeeeee-0000-4000-8000-000000016613'),
+    ] };
+    install(p3);
+    await load(scene());
+    const r1 = idOf(ROOT1);
+    const extra = add('Add Extra', r1, [{ name: 'EntityAttributes', data: { name: 'Extra', parentId: r1 } }]);
+    const aGuid = guidOf(under(ROOT1, 'A'));
+    reparentEntity(under(ROOT1, 'A'), extra);
+    const holder = idOf(HOLDER);
+    add('Add Outside', holder, [
+      { name: 'EntityAttributes', data: { name: 'Outside', parentId: holder } },
+      { name: 'UIFocusable', data: { navDown: aGuid } },
+    ]);
+    const keys = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P) as PrefabFile);
+    expect(keys.all).toEqual(expect.arrayContaining([expect.stringMatching(/^\+added\./), expect.stringMatching(/^~moved\./)])); // precondition
+    return { r1, keys, aGuid };
+  };
+  const parentName = (id: number) => getAllEntities().find((e) => e.id === getAllEntities().find((x) => x.id === id)?.parentId)?.name;
+
+  it('a member dragged INTO the promoted node survives the Apply and the reload (the move applied with it)', async () => {
+    // Mutation: delete the promoted nodes' LIVE subtree again (`deleteEntities` over the live descendants) — A and B go
+    // with Extra, and the refresh's capture saves A as removed: "0 entities named A".
+    const { r1, keys } = await moveIntoAdded();
+    await applyToPrefabSelective(r1, new Set([...keys.added, ...keys.moved]));
+    takeWritten();
+    for (const phase of ['after Apply', 'after reload']) {
+      if (phase === 'after reload') await load(await serializeScene() as unknown as SceneData);
+      expect(under(ROOT1, 'A')).toBeTruthy();
+      expect(under(ROOT1, 'B')).toBeTruthy();
+      expect(parentName(under(ROOT1, 'A'))).toBe('Extra');
+      expect(idOf(nav(under(HOLDER, 'Outside')).navDown!)).toBe(under(ROOT1, 'A'));
+      expect(duplicateGuids()).toEqual([]);
+    }
+  });
+
+  it('…and when only the addition is applied, the member keeps its (still unapplied) move under the promoted node', async () => {
+    // Mutation: drop the step that hangs a survivor back under its recorded live parent after the refresh — A survives
+    // but falls back to its template parent R, losing the move the user made and did not apply.
+    const { r1, keys } = await moveIntoAdded();
+    await applyToPrefabSelective(r1, new Set(keys.added));
+    takeWritten();
+    for (const phase of ['after Apply', 'after reload']) {
+      if (phase === 'after reload') await load(await serializeScene() as unknown as SceneData);
+      expect(parentName(under(ROOT1, 'A'))).toBe('Extra');
+      expect(under(ROOT1, 'B')).toBeTruthy();
+      expect(idOf(nav(under(HOLDER, 'Outside')).navDown!)).toBe(under(ROOT1, 'A'));
+      expect(duplicateGuids()).toEqual([]);
+    }
+  });
+
+  it('a member dragged under a MEMBER of a promoted reference node is hung back under it', async () => {
+    // The survivor's parent is inside the promoted node's nested frame, re-expanded as the nested row's member.
+    // Mutation: drop `rehangPromotionSurvivors` — A stays at its template parent R.
+    install(pDoc(), qDoc());
+    await load(scene());
+    const r1 = idOf(ROOT1);
+    const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, r1);
+    setPrefabSource(qRoot, Q);
+    const qRootGuid = ensureGuid(qRoot);
+    reparentEntity(under(ROOT1, 'A'), under(qRootGuid, 'QA'));
+    const keys = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P) as PrefabFile);
+    await applyToPrefabSelective(r1, new Set(keys.added));
+    takeWritten();
+    expect(parentName(under(ROOT1, 'A'))).toBe('QA');
+    expect(duplicateGuids()).toEqual([]);
+  });
+
+  it('a nested member moved OUT of a promoted plain node is not left behind as a duplicate', async () => {
+    // A plain Extra holds a dropped Q, and Q's member QB was moved out under R1.
+    // Mutation: consult the members living outside only for a top-level REFERENCE node (the old `membersLivingOutside`
+    // gate) — the original QB survives beside its re-expansion: 3 QBs across the two instances.
+    install(pDoc(), qDoc());
+    await load(scene());
+    const extra = add('Add Extra', idOf(ROOT1), [{ name: 'EntityAttributes', data: { name: 'Extra', parentId: idOf(ROOT1) } }]);
+    const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, extra);
+    setPrefabSource(qRoot, Q);
+    const qRootGuid = ensureGuid(qRoot);
+    await load(await serializeScene() as unknown as SceneData);
+    const qbGuid = guidOf(under(qRootGuid, 'QB'));
+    reparentEntity(idOf(qbGuid), idOf(ROOT1));
+    const holder = idOf(HOLDER);
+    add('Add Outside', holder, [
+      { name: 'EntityAttributes', data: { name: 'Outside', parentId: holder } },
+      { name: 'UIFocusable', data: { navDown: qbGuid } },
+    ]);
+    const keys = collectInstanceOverrideKeys(idOf(ROOT1), getCachedPrefabSync(P) as PrefabFile);
+    await applyToPrefabSelective(idOf(ROOT1), new Set(keys.added));
+    takeWritten();
+    for (const phase of ['after Apply', 'after reload']) {
+      if (phase === 'after reload') await load(await serializeScene() as unknown as SceneData);
+      expect(getAllEntities().filter((e) => e.name === 'QB')).toHaveLength(2);
+      expect(duplicateGuids()).toEqual([]);
+      expect(idOf(nav(under(HOLDER, 'Outside')).navDown!)).toBe(under(ROOT1, 'QB')); // `under` throws on 2
+    }
   });
 });

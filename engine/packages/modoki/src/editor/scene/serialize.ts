@@ -2,12 +2,12 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
-import { openIdentityScope, closeIdentityScope } from '../../runtime/core/ecs/identityParents';
+import { openIdentityScope, closeIdentityScope, worldIdentityParents } from '../../runtime/core/ecs/identityParents';
 import { collectTransientSubtreeIds } from './authoringScope';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
-import { spawnEntity, findEntityByGuid } from '../../runtime/core/ecs/world';
+import { spawnEntity, findEntityByGuid, getCurrentWorld } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
@@ -283,6 +283,9 @@ async function serializeSceneScoped(opts?: {
   const prefabRootInfo = new Map<number, { source: string; localId: number }>();
   const byId = new Map(entityInfos.map((e) => [e.id, e] as const));
   if (piMeta) {
+    // Which frame a root belongs to is IDENTITY (I6, #1687), asked of the same resolver the captures below claim rows
+    // with (`instanceRowDomain`) — never of where the root hangs live.
+    const identity = worldIdentityParents(getCurrentWorld());
     for (const info of entityInfos) {
       if (!info.traits.includes('PrefabInstance')) continue;
       const piData = readTraitData(info.id, piMeta);
@@ -292,29 +295,20 @@ async function serializeSceneScoped(opts?: {
       if (rootId !== info.id && rootId !== 0) {
         prefabChildIds.add(info.id);
       } else if (source) {
-        // Instance root. If its parent entity is itself part of a prefab instance,
-        // this is a NESTED instance owned by that parent prefab (e.g. the
-        // spaceship's engine flames). It expands from the parent prefab — writing
-        // it as a standalone scene entity would orphan it at scene root on the next
-        // load AND make captureInstanceStructure flag it removed from the parent.
-        // Only genuinely top-level instances become their own scene entries; the
-        // nested ones' scene edits ride on the owner's nestedOverrides.
-        const parentInfo = byId.get(info.parentId);
-        const parentLocalId = (piData['parentLocalId'] as number) || 0;
-        const parentIsMember = parentInfo?.traits.includes('PrefabInstance');
-        if (parentIsMember && parentLocalId) {
-          // Owned nested instance (expanded from the parent prefab, so it carries a
-          // parentLocalId): its scene-level edits ride on the owner's nested channels
-          // (`captureNestedChannels`) — it is NOT written as its own scene entry.
+        if (identity.frameOf(info.id)) {
+          // An OWNED nested instance: a row of the frame that expanded it (e.g. the spaceship's engine flames). Its
+          // scene-level edits ride on the owner's nested channels (`captureNestedChannels`), and its owner records a
+          // move of it — so it is never its own scene entry, wherever it hangs. Partitioned by its live parent, one
+          // moved under a plain node added inside its own instance was written twice, and grew a copy every save
+          // and reload (#1687). Its source is preloaded for the delta capture.
           prefabChildIds.add(info.id);
-          prefabSources.add(source); // preload child prefab for delta capture
-        } else if (parentIsMember) {
-          // User-added nested instance dragged under a prefab member (parentLocalId
-          // === 0 — it did NOT come from the parent prefab's definition). It is
-          // captured as an `added` REFERENCE node on the owning top-level instance
-          // (captureInstanceStructure handles this), so it round-trips under its
-          // EXACT parent member. Skip the standalone write; preload its source so
-          // the structural capture can read the child prefab.
+          prefabSources.add(source);
+        } else if (byId.get(info.parentId)?.traits.includes('PrefabInstance')) {
+          // A user-added (STORED) instance dragged under a prefab member. A stored root steps from its live parent in
+          // identity too, so this IS the identity test: it is captured as an `added` REFERENCE node on the instance
+          // that owns that member (captureInstanceStructure), under its EXACT parent member. Skip the standalone
+          // write; preload its source so the structural capture can read the child prefab. (One under a plain node
+          // added inside an instance is claimed by that capture's `consumedEcsIds` instead.)
           prefabChildIds.add(info.id);
           prefabSources.add(source);
         } else {

@@ -73,8 +73,8 @@ describe('planReparent — the one decision every reparent entry point asks (#14
     expect(planReparent(root.id(), baseParent.id())).toMatchObject({ kind: 'scene-move', to: BASE });
   });
 
-  // Mutation: drop the `ownedNested` check in sceneMovePrefabRefusal. (Review finding: an owned nested
-  // root has rootInstanceId === itself, so a member-only check let it leave its outer instance.)
+  // Mutation: read the frame from `rootInstanceId` instead of `identity.frameOf` in sceneMovePrefabRefusal. (Review
+  // finding: an owned nested root has rootInstanceId === itself, so a member-only check let it leave its outer instance.)
   it('an OWNED nested instance root cannot leave its outer instance, but moves with it', () => {
     const outer = spawn('Ship');
     const engine = spawn('Engine', { parentId: outer.id() });
@@ -96,6 +96,34 @@ describe('planReparent — the one decision every reparent entry point asks (#14
     link(member, 2, root.id());
     const baseParent = spawn('BaseParent', { sourceScene: BASE });
     expect(planReparent(added.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'instance-member' });
+  });
+
+  // #1691 (I6): the check runs both ways. A member dragged OUT of the subtree (#1437) is still a row of the instance
+  // being moved, and a subtree walk never saw it: the move left it behind in the old file. Mutation: check only the
+  // moving entities' frames (drop the `moving.has(frame)` half of the two-way test).
+  it('an instance whose member was dragged out of its subtree cannot move without it', () => {
+    const outer = spawn('Outer');
+    const slot = spawn('Slot', { parentId: outer.id() });
+    const q = spawn('Q', { parentId: slot.id() });
+    const qb = spawn('QB', { parentId: outer.id() }); // Q's member, dragged out under the outer root
+    link(outer, 1, outer.id());
+    link(slot, 2, outer.id());
+    link(q, 1, q.id()); // a user-added (stored) instance: parentLocalId 0
+    link(qb, 2, q.id());
+    const baseParent = spawn('BaseParent', { sourceScene: BASE });
+    expect(planReparent(q.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'instance-member' });
+    expect(planReparent(outer.id(), baseParent.id())).toMatchObject({ kind: 'scene-move' });
+  });
+
+  // An owned nested root whose owner cannot be told (no member parent, no owner link): the instance its parent belongs to
+  // moves with it, as before #1691. Mutation: drop that fallback in sceneMovePrefabRefusal — the root leaves alone.
+  it('an owned nested root with no known owner cannot leave without its parent', () => {
+    const holder = spawn('PlainHolder');
+    const nested = spawn('Nested', { parentId: holder.id() });
+    link(nested, 1, nested.id(), 2); // expanded from row 2 of some outer prefab, but nothing here says which frame
+    const baseParent = spawn('BaseParent', { sourceScene: BASE });
+    expect(planReparent(nested.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'instance-member' });
+    expect(planReparent(holder.id(), baseParent.id())).toMatchObject({ kind: 'scene-move' });
   });
 
   // #1436 (owner): a stored instance root dropped inside a base's instance is a scene move, not a

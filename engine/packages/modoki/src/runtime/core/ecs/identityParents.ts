@@ -65,6 +65,9 @@ export interface IdentityParents {
   moved(id: number): boolean;
   /** The frame an OWNED nested root belongs to (the instance whose row expanded it); 0 when unknown. */
   ownerOf(id: number): number;
+  /** The frame whose ROW `id` is (I6): a member's `rootInstanceId`, an owned nested root's {@link ownerOf}. 0 for a
+   *  stored root, a scene-added node, a plain entity, and an owned root whose owner is unknown. */
+  frameOf(id: number): number;
 }
 
 // ── The per-world document registry ─────────────────────────────────────────────────────────────
@@ -332,7 +335,51 @@ export function resolveIdentityParents(nodes: Iterable<IdentityNode>, readDoc: T
     parentOf: (id) => of(id).parentId,
     moved: (id) => { const r = of(id); return r.extra.some((s) => !isFrameStep(s)) || r.parentId !== (byId.get(id)?.parentId ?? 0); },
     ownerOf,
+    frameOf: (id) => {
+      const n = byId.get(id);
+      if (!n?.pi?.rootInstanceId) return 0;
+      if (!isRoot(n)) return n.pi.rootInstanceId;
+      return n.pi.parentLocalId ? ownerOf(id) : 0;
+    },
   };
+}
+
+// ── The identity subtree (#1691, owner 2 of #1683) ───────────────────────────────────────────────
+
+/** Every entity `world` holds under `roots` in the IDENTITY tree — each entity under its identity parent
+ *  ({@link IdentityParents.of}), not where it hangs live — `roots` first, then depth-first. This is I6's answer to
+ *  "what goes when these nodes go" (`docs/prefabs.md` § Model and invariants), and every operation that ends or
+ *  replaces a subtree asks it instead of walking `EntityAttributes.parentId`:
+ *  - **a member of a frame OUTSIDE the subtree that was dragged into it is not part of it** — its identity parent is
+ *    its template parent, outside. Deleting the live subtree took it along, and the refresh saved it as removed (#1682).
+ *  - **a member of a frame INSIDE the subtree that was dragged out of it is part of it**, at any depth — its identity
+ *    parent is still inside. A live walk left it standing beside its re-expansion (#1682).
+ *  - a stored root, a scene-added node and a plain entity step from their live parent, so for a tree nobody moved
+ *    anything in, this IS the live subtree.
+ *  It only answers which entities; what to do with the nested frames among them (Detach strips them today, a one-level
+ *  Unpack would keep them) is the caller's. A parent loop terminates: an entity is visited once. */
+export function identitySubtree(world: World, roots: Iterable<number>, parents: IdentityParents = worldIdentityParents(world)): number[] {
+  const children = new Map<number, number[]>();
+  for (const e of world.entities as Iterable<Entity>) {
+    const p = parents.parentOf(e.id());
+    const list = children.get(p);
+    if (list) list.push(e.id());
+    else children.set(p, [e.id()]);
+  }
+  const alive = new Set<number>();
+  for (const e of world.entities as Iterable<Entity>) alive.add(e.id());
+  const out: number[] = [];
+  const seen = new Set<number>();
+  const stack = [...roots].filter((id) => alive.has(id)).reverse();
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    const kids = children.get(id);
+    if (kids) for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]!);
+  }
+  return out;
 }
 
 /** A save asks for the world's identity parents once per instance and per capture step, over a world that
