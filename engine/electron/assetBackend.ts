@@ -4,14 +4,13 @@
  * watcher the Vite plugin owns, so the *same* editorBackendRouter can run in
  * main with no Vite server. The pure machinery (findAssetRoots / scanAllAssets /
  * buildManifest / resolveAssetPath / absToAssetUrl / detectType) is reused from
- * the scanner; only the transport-specific glue (a standalone chokidar watcher +
+ * the scanner; only the transport-specific glue (the shared asset-tree watcher +
  * broadcast callbacks) lives here.
  */
 
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import chokidar, { type FSWatcher } from 'chokidar';
 import {
   findAssetRoots, defaultSaveRootDir, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
   isUnderAssetRoot, pathToClassifyForChange, isSiblingRaisedChange,
@@ -19,6 +18,7 @@ import {
   type LiveReloadKind,
 } from '../plugins/vite-asset-scanner';
 import { createEditorWriteGuard } from '../plugins/editorWriteGuard';
+import { createAssetTreeWatcher, type AssetTreeWatcher } from '../plugins/assetTreeWatcher';
 import { computeKeptAssets, enumerateRefEdges, type TreeShakeResult, type RefEdgeEnumeration } from '../plugins/asset-tree-shaker';
 
 export interface ElectronAssetManifest { version: 2; assets: Array<{ path: string; type: string; guid?: string }> }
@@ -73,9 +73,10 @@ export function createAssetBackend(opts: {
     return cachedManifest;
   };
 
-  // ── Watcher (chokidar). Debounced rebuild + scene/prefab classification —
+  // ── Watcher (`createAssetTreeWatcher`: chokidar on macOS/Linux, one recursive fs.watch per root on Windows so a
+  //    folder with subfolders can still be recycled, #1708). Debounced rebuild + scene/prefab classification —
   //    same logic as the Vite plugin's onChange/flushPending. ──
-  let watcher: FSWatcher | null = null;
+  let watcher: AssetTreeWatcher | null = null;
   let pendingRebuild: NodeJS.Timeout | null = null;
   // `viaSibling` = this urlPath's OWN file did not change; a SIBLING did (today: a
   // `.glsl`/`.wgsl` body remapped to its `.shader.json` descriptor, #857). The consumer needs
@@ -102,7 +103,7 @@ export function createAssetBackend(opts: {
     // has no separator boundary and so also matches a sibling root sharing the prefix
     // (`<root>-evil`, `…/assets-extra`) — the same shape as the traversal bug fixed in
     // asset-tree-shaker. Benign here (an extra manifest rebuild, not an escape) because
-    // chokidar is seeded from these very roots, but there's no reason to keep a fourth
+    // the watcher is seeded from these very roots, but there's no reason to keep a fourth
     // hand-rolled copy of containment logic when a tested one is already exported.
     if (!isUnderAssetRoot(file, assetRoots)) return;
     // CALL the shared classifier — do NOT re-implement it. This block used to duplicate
@@ -150,11 +151,7 @@ export function createAssetBackend(opts: {
     markEditorWrite,
     start() {
       if (watcher) return;
-      watcher = chokidar.watch(assetRoots.map((r) => r.absDir), {
-        ignoreInitial: true,
-        ignored: (p) => p.split(path.sep).some((seg) => seg.startsWith('.')),
-      });
-      watcher.on('add', onChange).on('change', onChange).on('unlink', onChange);
+      watcher = createAssetTreeWatcher({ roots: assetRoots.map((r) => r.absDir), onEvent: (_kind, file) => onChange(file) });
     },
     async stop() {
       if (pendingRebuild) clearTimeout(pendingRebuild);

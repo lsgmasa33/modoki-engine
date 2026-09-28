@@ -1563,6 +1563,76 @@ Match on `Get-CimInstance Win32_Process` `CommandLine` instead, and:
   comment already explaining why `-like` is wrong. **A scope restriction is a claim.**
 - Killing a process does not kill its children — stopping Vite must take its build tree with it.
 
+## Recycling a folder while the editor watches it (#1708)
+
+**Windows refuses to MOVE a directory while any DESCENDANT directory has an open handle, and the
+Recycle Bin is a move.** A folder's OWN handle does not block its move, so a flat folder recycled
+fine and a folder with subfolders failed with `DeleteDirectory: "This function is not supported on
+this system"`, only while the editor ran. `rm -rf` works, because a delete is not a move. macOS and
+Linux let a directory with open handles under it be moved, so this is Windows-only.
+
+Measured on `win` (Node 24.18, the Node Electron 43 runs), recycling `nest/sub/deeper/` under a
+temp root, one watcher at a time:
+
+| watcher on the root | recycle `nest` |
+|---|---|
+| none | ✓ |
+| ONE `fs.watch(root, {recursive:true})` | ✓ |
+| `fs.watch` on every directory | FAILED |
+| chokidar 5 (the old Electron watcher) | FAILED |
+| Vite 8's watcher (chokidar 3, the asset scanner used to `server.watcher.add` the roots) | FAILED |
+| `fs.watch` on ONE FILE inside `sub/` | FAILED: libuv watches a file by opening its PARENT directory |
+
+**What does NOT work: unwatch before the move.** chokidar's `unwatch()` does not close the
+handles, in any order, after any wait (`getWatched()` still lists every directory). Closing the
+whole watcher is not an option in dev either, because Vite's watcher is Vite's HMR.
+
+**The fix: nothing but the root holds a handle.**
+- **One shared watcher** (`engine/plugins/assetTreeWatcher.ts`) serves both live-reload consumers,
+  Electron main (`assetBackend.ts`) and the Vite asset scanner. On win32 it is ONE recursive
+  `fs.watch` per asset root; on macOS/Linux it is chokidar, unchanged.
+- **The recursive watch reports coarsely**, so the pure index in `engine/plugins/assetTreeIndex.ts`
+  turns it back into the per-file `add`/`change`/`unlink` the consumers and #1702's delete marks
+  were written against:
+  - a recycled folder arrives as one `rename:nest`, so the index unlinks every known file under it;
+  - a folder moved in (a restore, the editor's undo) arrives as one `rename`, so it is walked and
+    every file added;
+  - a case-only rename is decided by the parent's listing, not `stat`, because `stat('Foo')` still
+    succeeds after `Foo` → `foo`. A case-only FOLDER rename can arrive as the OLD name alone, late,
+    with the new-name half never sent (observed in review), so a gone path whose parent lists
+    another spelling of it reconciles that spelling too;
+  - an overflow arrives as a `null` filename (3000 fast writes gave 2 events), and triggers a
+    rescan diffed by `mtimeMs` + `size`, so a `git checkout` that MODIFIES files still reloads a
+    changed prefab.
+- **Vite's own watchers are told to ignore the project asset roots**, through the public
+  `server.watch.ignored` (`projectAssetRootsWatchIgnore`). That covers the dev server, the Electron
+  SSR loader and the Stage-A bake server. Removing the `server.watcher.add` alone was not enough:
+  every game imports its scene with `?url`, and Vite then watches that FILE. The ignore loses
+  nothing, because `handleHotUpdate` already returns `[]` for asset-root files.
+
+⚠️ **Losing the ROOT raises no error on Windows.** Deleting the watched root makes the handle
+spin, reporting `rename` with the root's own absolute `\\?\` path (~150k events a second,
+measured), and renaming the root away reports nothing at all. `assetTreeWatcher.ts` detects both:
+an absolute filename, or a changed root identity on a 2 s check. Either way it closes the handle,
+rescans (unlinking what went) and re-watches once the root is back. The identity is `dev:ino`
+read as a **bigint**: on this box's ReFS volume two directories' 64-bit ids differed by 1 and were
+the same `Number`. The limit of a 2 s poll: a root renamed away AND back inside one check keeps its
+identity, so a write made inside it while it was away is not reported.
+
+⚠️ **Any new watcher on an asset root brings #1708 back** — a per-directory library, or a single
+FILE watch. Route it through `createAssetTreeWatcher`, or add the ignore.
+
+⚠️ **Residual, by design: the engine's OWN built-in asset root, in the dev editor.**
+`engine/packages/modoki/src/runtime/assets` sits inside Vite's root (`engine/`) and holds real TS
+modules (`assetSchemas.ts`, `builtinAssets.ts`, …) whose transform cache Vite must invalidate on
+edit, so Vite keeps watching it. There, a folder with subfolders still cannot be recycled while the
+dev editor runs. The packaged editor has no Vite and is fixed there too. Moving those `.ts` files out
+of the asset root would close it.
+
+Tests: `assetTreeIndex.test.ts` + `assetTreeWatcher.test.ts` (every platform) and
+`assetTreeWatcherLive.test.ts` (win32: the real watcher, a real Vite server and the real
+`moveToTrash`, each with a control built the old way that must fail to recycle).
+
 ## Shell dependence
 
 **11 of 49 root npm scripts shell out to bash** (`editor*`, `dev:stop`, `editor:stop`,

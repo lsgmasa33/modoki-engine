@@ -58,7 +58,7 @@ function armedPlugin(): Hooked {
     // Only `send` is asserted on; `on` exists because configureServer subscribes to the
     // agent-bridge channels (modoki:schema / modoki:response) on the same socket.
     ws: { send: (m: WsMessage) => { sent.push(m); }, on: () => {} },
-    watcher: { add: () => {}, on: () => {} },
+    config: { server: { watch: null } }, // watching off: these tests start no asset watcher (#1708)
     middlewares: { use: () => {} },
     httpServer: null,
   });

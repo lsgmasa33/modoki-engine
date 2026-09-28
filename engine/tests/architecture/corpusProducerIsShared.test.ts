@@ -470,6 +470,12 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
       + 'dir, not repo corpus.',
   },
   {
+    file: 'engine/plugins/assetTreeIndex.ts', rule: 'walker', walker: 'walk',
+    reason: 'The Windows asset WATCHER\'s view of the open project\'s asset roots (#1708): it walks a folder that '
+      + 'arrived, or the root on an overflow rescan, through an INJECTED listing, to rebuild per-file events. '
+      + 'Project dir at runtime, not repo corpus — same class as scanDir() above.',
+  },
+  {
     file: 'scripts/scan-publish-safety.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks the assembled SNAPSHOT STAGE, not the repo — publish-engine-oss.sh:568 invokes '
       + 'it as `scan-publish-safety.mjs "$STAGE"`, and $STAGE is rsynced (:167) from that script\'s '

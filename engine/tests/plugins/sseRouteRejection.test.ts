@@ -207,7 +207,7 @@ beforeEach(() => {
   let captured: Middleware | undefined;
   p.configureServer({
     ws: { send: () => {}, on: () => {} },
-    watcher: { add: () => {}, on: () => {} },
+    config: { server: { watch: null } }, // watching off: these tests start no asset watcher (#1708)
     middlewares: { use: (fn: Middleware) => { captured ??= fn; } },
     httpServer: null,
   });

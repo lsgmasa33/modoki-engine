@@ -65,7 +65,10 @@ Camera moved to y=42 came back at 2.417 with `canUndo:false`, the console naming
    watched file appear or vanish calls `ctx.markEditorWrite` for it, and the watcher skips the event
    (`engine/plugins/editorWriteGuard.ts`, the ONE guard both watchers use; the Electron main process
    kept a hand-copied twin until #1702). `/api/delete-asset` was the gap: it marked nothing, and a
-   folder delete needs every FILE under it marked, because chokidar reports an `unlink` per child.
+   folder delete needs every FILE under it marked, because the watcher reports an `unlink` per child.
+   (On Windows the recursive watch reports only the folder, and `assetTreeIndex.ts` expands it into
+   those per-file unlinks; a rescan after an overflow emits the same shape. Pinned against the real
+   marks in `editorOwnFileChangesMarked.test.ts`, #1708.)
    `/api/duplicate-asset` and `/api/import-file` were unmarked too.
    - **Mark right AFTER the synchronous fs op, with no await in between.** The watcher runs on the
      same event loop, so none of its events can be handled first. Marking BEFORE can expire unread:
@@ -224,7 +227,11 @@ descriptor's `kind:'shader'`. Three consequences worth knowing:
 
 ⚠️ **There are TWO watchers, and they must not drift.** The Vite dev server has one and the Electron
 main process has an independent twin (`engine/electron/assetBackend.ts`) — the default editor
-surface, and what the `modoki` MCP drives. They have now drifted four times, each time through
+surface, and what the `modoki` MCP drives. Both get their events from ONE shared
+`createAssetTreeWatcher` (`engine/plugins/assetTreeWatcher.ts`, #1708), not from Vite's own watcher,
+which ignores the project asset roots. On Windows that is one recursive `fs.watch` per root, so a
+folder with subfolders can be recycled while the editor runs; see
+[windows.md § Recycling a folder while the editor watches it](windows.md#recycling-a-folder-while-the-editor-watches-it-1708). They have now drifted four times, each time through
 whatever line the previous fix left duplicated: the classifier, then the extension gate itself. Both
 route through one shared `pathToClassifyForChange`, and
 `engine/tests/architecture/liveReloadKinds.test.ts` enumerates watcher implementations and fails any

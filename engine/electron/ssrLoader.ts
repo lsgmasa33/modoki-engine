@@ -21,6 +21,7 @@
  */
 
 import path from 'node:path';
+import { findAssetRoots, projectAssetRootsWatchIgnore } from '../plugins/vite-asset-scanner';
 
 let server: { ssrLoadModule: (url: string) => Promise<Record<string, unknown>>; close: () => Promise<void> } | null = null;
 let creating: Promise<void> | null = null;
@@ -46,6 +47,7 @@ export async function getSsrLoadModule(projectRoot: string, repoRoot: string): P
         const enginePkgSrc = path.join(repoRoot, 'engine', 'packages', 'modoki', 'src');
         const aliasFor = (sub: string, file: string) =>
           ({ find: new RegExp(`^@modoki/engine${sub}$`), replacement: path.join(enginePkgSrc, file) });
+        const projectAssetRootList = findAssetRoots(projectRoot);
         const inner = await createServer({
           configFile: false,
           // Root at the EDITOR's vite root (<repo>/engine) — the SAME root the
@@ -83,6 +85,9 @@ export async function getSsrLoadModule(projectRoot: string, repoRoot: string): P
             middlewareMode: true,
             hmr: false,
             fs: { allow: [repoRoot, projectRoot] },
+            // Nobody listens to this server's watcher, but it still holds directory handles, and on Windows one under
+            // a project asset root stops that folder from being recycled (#1708).
+            watch: { ignored: [projectAssetRootsWatchIgnore(() => projectAssetRootList)] },
           },
           appType: 'custom',
           logLevel: 'warn',

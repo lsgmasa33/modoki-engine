@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import crypto, { randomUUID } from 'crypto';
 import { createEditorWriteGuard } from './editorWriteGuard';
+import { createAssetTreeWatcher, type AssetTreeWatcher } from './assetTreeWatcher';
 import { normalizePath, type Plugin } from 'vite';
 import { resolveModuleUrl } from './backend/moduleUrl';
 import { computeKeptAssets, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
@@ -1622,6 +1623,24 @@ export function isUnderAssetRoot(file: string, roots: readonly Pick<AssetRoot, '
   });
 }
 
+/** A `server.watch.ignored` entry that keeps a Vite server's OWN watcher off the PROJECT asset roots (#1708).
+ *
+ *  On Windows a folder cannot be recycled while any directory under it has an open watch handle, and Vite's watcher
+ *  (chokidar 3, one handle per directory) would hold one even without `server.watcher.add`: every game imports its
+ *  scene with `?url`, and Vite then watches that FILE, which libuv does by opening its parent directory. The scanner
+ *  gets its events from `createAssetTreeWatcher` instead, and nothing is lost by the ignore — `handleHotUpdate` returns
+ *  `[]` for every asset-root file anyway, and a `?url` module is only the URL string, so it cannot go stale.
+ *
+ *  ⚠️ **Not the engine's built-in root** (`ENGINE_ASSETS_URL_PREFIX`): it sits inside Vite's root and holds real TS
+ *  modules (`assetSchemas.ts`, …) whose transform cache Vite must invalidate on edit. So in the DEV editor a folder
+ *  with subfolders under the engine's own built-in assets still cannot be recycled — a documented residual
+ *  (docs/windows.md § "Recycling a folder while the editor watches it").
+ *
+ *  `getRoots` is read per call, so a plugin can hand in its live `assetRoots`. */
+export function projectAssetRootsWatchIgnore(getRoots: () => readonly AssetRoot[]): (p: string) => boolean {
+  return (p) => isUnderAssetRoot(p, getRoots().filter((r) => r.urlPrefix !== ENGINE_ASSETS_URL_PREFIX));
+}
+
 /** True when `file` is the open project's GAME CODE — the .ts/.tsx that Vite compiles
  *  but the running editor never re-imports (see the handleHotUpdate comment below).
  *
@@ -1705,6 +1724,8 @@ export function assetScannerPlugin(): Plugin {
   // built on. A shared alias makes that impossible rather than tidy.
   type ViteServerRef = { ws: { send: (m: object) => void; clients?: { size: number; has?: (c: unknown) => boolean } } };
   let viteServer: ViteServerRef | null = null;
+  /** The scanner's own asset-root watcher (#1708) — closed in `closeBundle`, which a dev server's close runs. */
+  let assetWatcher: AssetTreeWatcher | null = null;
 
   // ── Agent bridge state (dev-only AI/tooling helpers) ──
   // The live trait-registry schema, pushed by the browser over the HMR socket
@@ -1862,6 +1883,20 @@ export function assetScannerPlugin(): Plugin {
       return undefined;
     },
 
+    // #1708: keep Vite's own watcher off the project asset roots — see projectAssetRootsWatchIgnore. Public config,
+    // merged after Vite's default ignores; nothing reaches into the watcher. The predicate reads `assetRoots` per
+    // call, and Vite creates its watcher after configResolved has filled it. A `watch: null` (watcher off) is left
+    // alone: merging an object into it would turn the watcher back ON.
+    config(userConfig) {
+      if (userConfig.server?.watch === null) return;
+      return { server: { watch: { ignored: [projectAssetRootsWatchIgnore(() => assetRoots)] } } };
+    },
+
+    async closeBundle() {
+      await assetWatcher?.close();
+      assetWatcher = null;
+    },
+
     configResolved(config) {
       // The vite root is engine/ (C3), but the open PROJECT (games/, project
       // assets, project.config.json) is the repo root — engine/'s parent — or an
@@ -1961,8 +1996,9 @@ export function assetScannerPlugin(): Plugin {
         ssrLoadModule: (id) => (server as unknown as { ssrLoadModule: (id: string) => Promise<Record<string, unknown>> }).ssrLoadModule(id),
       }).catch(() => { /* validation is best-effort */ });
 
-      // Watch asset roots for changes. Vite's chokidar instance already runs;
-      // we just add our directories. add/unlink/change all trigger a rebuild,
+      // Watch asset roots for changes — with the scanner's OWN watcher, not Vite's (#1708): Vite's opens a handle per
+      // directory, which on Windows stops a folder with subfolders from being recycled, so the `config` hook above
+      // keeps Vite's off the project asset roots entirely. add/unlink/change all trigger a rebuild,
       // since changes to .id or sidecar files affect the manifest. Debounce
       // with a short timer so a bulk write (e.g. importer) only fires one update.
       let pendingRebuild: NodeJS.Timeout | null = null;
@@ -1993,7 +2029,6 @@ export function assetScannerPlugin(): Plugin {
         if (pendingRebuild) clearTimeout(pendingRebuild);
         pendingRebuild = setTimeout(flushPending, 150);
       };
-      for (const root of assetRoots) server.watcher.add(root.absDir);
       const onChange = (file: string) => {
         if (!isUnderAssetRoot(file, assetRoots)) return;
         // Classify via the same detector the scanner uses — new scenes are
@@ -2025,9 +2060,12 @@ export function assetScannerPlugin(): Plugin {
         }
         scheduleRebuild();
       };
-      server.watcher.on('add', onChange);
-      server.watcher.on('unlink', onChange);
-      server.watcher.on('change', onChange);
+      // `watch: null` turns Vite's watcher off (vitest does, in a run); the scanner's follows it, as it did while it
+      // rode on Vite's.
+      if (server.config.server.watch !== null) {
+        void assetWatcher?.close();
+        assetWatcher = createAssetTreeWatcher({ roots: assetRoots.map((r) => r.absDir), onEvent: (_kind, file) => onChange(file) });
+      }
 
       // Minimal ctx for the shared static-asset server. `autoConvert` opts the dev/
       // editor server into on-demand variant baking: a model/texture whose
@@ -4164,6 +4202,7 @@ export function assetScannerPlugin(): Plugin {
           // via the importer's upward node_modules walk for an in-repo project.)
           const aliasFor = (sub: string, file: string) =>
             ({ find: new RegExp(`^@modoki/engine${sub}$`), replacement: path.join(enginePkgSrcAbs, file) });
+          const bakeAssetRoots = findAssetRoots(projectRoot);
           const inner = await createServer({
             configFile: false,
             root: projectRoot,
@@ -4192,7 +4231,11 @@ export function assetScannerPlugin(): Plugin {
               ],
               dedupe: ['three'],
             },
-            server: { middlewareMode: true, hmr: false, fs: { allow: [repoRootAbs, projectRoot].filter(Boolean) } },
+            // The watcher nobody listens to still holds handles — keep it off the asset roots (#1708).
+            server: {
+              middlewareMode: true, hmr: false, fs: { allow: [repoRootAbs, projectRoot].filter(Boolean) },
+              watch: { ignored: [projectAssetRootsWatchIgnore(() => bakeAssetRoots)] },
+            },
             appType: 'custom',
             logLevel: 'warn',
           });

@@ -34,6 +34,9 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
 import { createEditorWriteGuard } from '../../plugins/editorWriteGuard';
+import { createAssetTreeIndex, type TreeEventKind } from '../../plugins/assetTreeIndex';
+import { nodeTreeFs } from '../../plugins/assetTreeWatcher';
+import { classifySceneChange, pathToClassifyForChange } from '../../plugins/vite-asset-scanner';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let dir: string;
@@ -136,5 +139,59 @@ describe('#1702 siblings: the other routes that create a watched file', () => {
     expect(r.body.ok, JSON.stringify(r.body)).toBe(true);
     now = 60_000; // past the TTL: only the landing's content hash can still recognise it
     expect(watcherSkips('crate.prefab.json'), 'the source`s TTL-only mark replaced the landing`s hash').toBe(true);
+  });
+});
+
+/** #1708 — on Windows the watcher is ONE recursive `fs.watch` per root, which reports a recycled folder as a single
+ *  event. `assetTreeIndex` expands it into the per-file unlinks the marks were written against, and a rescan after an
+ *  overflow emits its own. Those SYNTHETIC events must still be recognised as the editor's own, or the delete of a
+ *  folder with subfolders reloads the open scene again. The real index over the real scratch dir, the real router, the
+ *  real guard — so a spelling the index invents that `normalizeWriteGuardKey` does not fold to the mark fails here.
+ *
+ *  Mutations, each red here: the index emits the RELATIVE path instead of `join(root, rel)`; the folder expansion
+ *  unlinks only the folder itself; drop the delete route's mark loop. */
+describe('#1708: the Windows watcher`s synthetic events still meet the marks', () => {
+  function watched() {
+    const events: Array<[TreeEventKind, string]> = [];
+    const index = createAssetTreeIndex({ root: dir, fs: nodeTreeFs, emit: (k, a) => events.push([k, a]) });
+    index.seed();
+    return { index, events };
+  }
+  const isOwn = (absPath: string) => guard.isWrite(absPath, () => {
+    try { return createHash('sha1').update(fs.readFileSync(absPath)).digest('hex'); } catch { return null; }
+  });
+  const nested = ['kit/a.prefab.json', 'kit/sub é/b.prefab.json', 'kit/sub é/deeper/c.mat.json'];
+
+  it('the folder expansion of a delete with nested subfolders (one non-ASCII): every unlink is the editor`s own', async () => {
+    for (const f of nested) put(f, PREFAB);
+    const w = watched();
+    const r = await post('/api/delete-asset', { paths: ['/kit'], rendererWrite: true });
+    expect(r.body.ok).toBe(true);
+    w.index.note({ rel: 'kit', kind: 'rename' }); // what the recursive watch reports for the whole tree
+    w.index.flush();
+    expect(w.events.map(([k, p]) => [k, p]).sort()).toEqual(nested.map((f) => ['unlink', abs(f)]).sort());
+    for (const [, p] of w.events) expect(isOwn(p), p).toBe(true);
+  });
+
+  it('the rescan after an overflow: its unlinks are the editor`s own too', async () => {
+    for (const f of nested) put(f, PREFAB);
+    const w = watched();
+    await post('/api/delete-asset', { paths: ['/kit'], rendererWrite: true });
+    w.index.note({ overflow: true });
+    w.index.flush();
+    expect(w.events).toHaveLength(nested.length);
+    for (const [, p] of w.events) expect(isOwn(p), p).toBe(true);
+  });
+
+  it('an OUTSIDE edit to a prefab still arrives as external and classifies as a prefab change (it must reload)', () => {
+    put('prefabs/used.prefab.json', PREFAB);
+    const w = watched();
+    fs.writeFileSync(abs('prefabs/used.prefab.json'), `${PREFAB}\n`); // an outside tool, no mark
+    w.index.note({ rel: path.join('prefabs', 'used.prefab.json'), kind: 'change' });
+    w.index.flush();
+    expect(w.events).toEqual([['change', abs('prefabs/used.prefab.json')]]);
+    const p = w.events[0][1];
+    expect(isOwn(p)).toBe(false);
+    expect(classifySceneChange(pathToClassifyForChange(p)!.split(path.sep).join('/'))).toBe('prefab');
   });
 });

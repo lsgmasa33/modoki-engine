@@ -49,7 +49,7 @@ function armPlugin(clients: Set<unknown>) {
       on: (event: string, cb: WsHandler) => { on.set(event, [...(on.get(event) ?? []), cb]); },
       clients,
     },
-    watcher: { add: () => {}, on: () => {} },
+    config: { server: { watch: null } }, // watching off: these tests start no asset watcher (#1708)
     middlewares: {
       use: (fn: typeof middleware) => {
         // Loud rather than last-wins: the plugin registers exactly one middleware today, and a

@@ -338,7 +338,7 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
  *
  * `findWatcherClassifierFiles` below is a genuine ENUMERATION, not a hardcoded pair: it walks the
  * tracked corpus (`repoCorpus.mjs`, git-sourced) for any `.ts`/`.tsx` file that both registers a
- * watcher (`chokidar.watch(` or the Vite dev server's `server.watcher.on(`) AND classifies via
+ * watcher (`createAssetTreeWatcher(` since #1708, or a raw `chokidar.watch(` / `server.watcher.on(`) AND classifies via
  * `classifySceneChange` — the two independent signals that together mean "this is one of the
  * producer's own watcher implementations", not merely a file that mentions either concept in
  * passing (`agentBridge.ts` and `dirtyAssets.ts` reference `classifySceneChange` too, as the
@@ -356,7 +356,11 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
     const aliases = findNodes(sf, ts.isImportSpecifier)
       .filter((sp) => (sp.propertyName ?? sp.name).text === 'classifySceneChange').map((sp) => sp.name);
     const classifies = callsTo(sf, 'classifySceneChange').length > 0 || aliases.some((id) => readsOf(id).length > 0);
-    return (callsToPath(sf, 'chokidar.watch').length > 0 || callsToPath(sf, 'watcher.on').length > 0) && classifies;
+    // `createAssetTreeWatcher(…)` is how both producers register since #1708 (the shared module itself only watches;
+    // it never classifies, so it is not swept in as a third).
+    const registers = callsToPath(sf, 'chokidar.watch').length > 0 || callsToPath(sf, 'watcher.on').length > 0
+      || callsTo(sf, 'createAssetTreeWatcher').length > 0;
+    return registers && classifies;
   }
 
   function findWatcherClassifierFiles(): string[] {
@@ -371,7 +375,7 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
       // Cheap RAW pre-filter first — narrows the whole repo down to a handful of candidates before
       // paying for a parse of each. It only ever ADDS candidates relative to the authoritative check
       // next: every call the parser can find spells both names somewhere in the raw text.
-      if (!raw.includes('classifySceneChange') || !/\bwatch\b|\bwatcher\b/.test(raw)) continue;
+      if (!raw.includes('classifySceneChange') || !/\bwatch\b|\bwatcher\b|\bcreateAssetTreeWatcher\b/.test(raw)) continue;
       if (isWatcherClassifier(parseSource(readScannedSource(abs).code, rel))) out.push(abs);
     }
     return out;
@@ -475,5 +479,7 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
     expect(isWatcherClassifier(parseSource("import { classifySceneChange as classify } from './s';\nchokidar.watch(d).on('all', (f) => classify(f));", 'e.ts'))).toBe(true);
     expect(isWatcherClassifier(parseSource("import { classifySceneChange as classify } from './s';\nchokidar.watch(d).on('all', (f) => route(f, classify));", 'f.ts'))).toBe(true);
     expect(isWatcherClassifier(parseSource("import { classifySceneChange as classify } from './s';\nchokidar.watch(d);", 'g.ts'))).toBe(false);
+    expect(isWatcherClassifier(parseSource('createAssetTreeWatcher({ roots, onEvent: (_k, f) => classifySceneChange(f) });', 'h.ts'))).toBe(true);
+    expect(isWatcherClassifier(parseSource("const doc = 'createAssetTreeWatcher('; classifySceneChange(x);", 'i.ts'))).toBe(false);
   });
 });
