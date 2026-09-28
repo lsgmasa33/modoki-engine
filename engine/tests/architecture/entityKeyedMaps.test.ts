@@ -817,7 +817,7 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id — the written twin of loaders/loadSceneFile.ts SceneEntityEntry; editor/scene/serialize.ts:41' })),
   { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::StructureCaptureOpts.layerTraits',
     reason: 'not-entity: keyed by a prefab member\'s row localId (the frame document\'s own id space), valued by trait names the enclosing layer adds to it; built for one capture (#1676); editor/scene/prefab.ts StructureCaptureOpts' },
-  ...['LayerStructure.removedTraits', 'LayerStructure.moved', 'FrameLayer.overrides', 'LayerLists.removedTraits'].map((f) => ({
+  ...['LayerStructure.removedTraits', 'LayerStructure.moved', 'FrameLayer.overrides', 'LayerLists.removedTraits', 'ForwardState.nestedOverrides', 'ForwardState.forwardRoots'].map((f) => ({
     item: `engine/packages/modoki/src/editor/scene/prefabBase.ts::${f}`,
     reason: 'not-entity: keyed by a prefab member\'s row localId (the frame document\'s own id space) — the fold of the prefab layers enclosing a frame (#1693), computed per call and never held across one; editor/scene/prefabBase.ts:30' })),
   ...['PromotedGuids.plain', 'PromotedGuids.refs'].map((f) => ({

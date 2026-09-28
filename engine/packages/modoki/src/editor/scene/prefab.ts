@@ -43,7 +43,7 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, deriveMemberGuidsAfterPins, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
 import { translateLocalIds, docRows } from '../../runtime/loaders/memberTranslation';
 import { foldMemberRowChannels, mergeTraitRemovals, descendStructureLayers, foldStructureLayers, type StructureLayer as StructLayer } from '../../runtime/loaders/prefabOverrides';
-import { frameBase, chainLayer, docChainLayer, layerAddedTraits, levelDoc, ownedRootAt, type FrameLayer, type FrameBase } from './prefabBase';
+import { frameBase, frameForward, chainLayer, docChainLayer, layerAddedTraits, levelDoc, ownedRootAt, type FrameLayer, type FrameBase } from './prefabBase';
 import { templateValueWriter, type TemplateValueWriter } from './prefabTemplateValue';
 import {
   chainSlots, memberKeyAt, writeStated, dropStated, writeRemoval, writeMemberRemoval, statedFields, traitInside, resolveKeyLevel, carrierOf,
@@ -1760,7 +1760,9 @@ export function instantiatePrefab(
   const layers = _layers ?? [{ slots: _nestedStructure }];
   // The loader twin's token scope: a tree holding no member token registers no frame (#1352 review).
   const outerScope = _segments ? null : openTokenScope();
-  noteTokens(prefab.entities, _nestedOverrides, _nestedStructure);
+  // A top call notes every value it is handed, as the loader's twin does. `_layers` from outside is a rebuild's forwarded
+  // state (#1737) or a reference node's own slots and rows; a nested call's layers are the top call's, descended.
+  noteTokens(prefab.entities, _nestedOverrides, _nestedStructure, _segments ? undefined : _layers);
   const stack = _stack ?? new Set<string>();
   if (prefab.id) {
     if (stack.has(prefab.id)) {
@@ -6692,6 +6694,12 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
   // value or node read as a scene edit and froze the old template (#1386 review) — `resolveAddedNodeTokens`.
 
   const captures: NestedInstanceCapture[] = [];
+  // What the layers ENCLOSING the outer root forward into its expansion (#1737). The rebuild expands under that state
+  // (`rebuildInstance`), so a nested frame's statements from it come back with the expansion, and the capture subtracts
+  // them with the chain's own: restated, a node that layer adds came back twice, and a value it sets pinned the frame
+  // against a later template edit. Folded against `baseline`, the document the live tree was built from.
+  const outerSource = (piOf(outerRootId)?.source as string) || '';
+  const enclosing = frameForward(outerRootId, baseline) ?? undefined;
   // Every nested frame the rebuild's TEARDOWN destroys — asked of the teardown itself, not of the live subtree
   // (#1499). A frame owned here but moved out of that subtree (#1437) is destroyed by the teardown's reverse case
   // and re-expanded at its row; walking live children never reached it, so its edits were lost. Shallowest first,
@@ -6712,7 +6720,7 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
       const childPrefab = levelDoc(id, source).doc; // its own record, as the chain below is read (I3)
       if (childPrefab) {
         const resolve = baseTokenResolver(id);
-        const chainLayerHere = chainLayer(outerRootId, (piOf(outerRootId)?.source as string) || '', chain, baseline);
+        const chainLayerHere = chainLayer(outerRootId, outerSource, chain, baseline, enclosing);
         const chainStructure = chainLayerHere.structure;
         const full = captureInstanceStructure(id, childPrefab, { layerTraits: layerAddedTraits(chainLayerHere, childPrefab) });
         // The template's nodes node by node (v17, #1516), as the save states them; a member whose list cannot be
@@ -7589,6 +7597,12 @@ export function rebuildInstance(
   // fresh frame with none, and no spawner runs for this root, so the next save lost them (close-out review).
   const oldRoot = findEntity(rootInstanceId);
   const nodeMoved = oldRoot ? frameRootDoc(getCurrentWorld(), oldRoot)?.nodeMoved : undefined;
+  // What the layers ENCLOSING this root forward into its expansion, as a load hands it (#1737): an owned nested root's
+  // chain, a template reference node's channels. Read before the teardown, which the climb needs live. Every nested frame
+  // the expansion brings in then gets its whole layer, whether a capture reaches it or not (one the Revert restores, one
+  // the new template gains, one a re-pointed row now expands), and the nested capture subtracts the same state. Null for
+  // a stored root nothing encloses, which expands as the plain top call it always was.
+  const forward = frameForward(rootInstanceId, prefab);
 
   const { toDestroy, parked } = rebuildTeardown(rootInstanceId, remap);
   // Every torn-down node's template key, by guid: the capture carries the guid alone, and only a key-derived guid could
@@ -7604,7 +7618,11 @@ export function rebuildInstance(
   deleteEntities([...toDestroy]);
 
   const beforeSpawn = new Set(getAllEntities().map((e) => e.id));
-  const newRootId = instantiatePrefab(prefab, parentId);
+  // Still a TOP call: its own token scope, resolved by the derive below once the member guids are restored, and the
+  // forwarded state applied at its NESTED rows only. The root's own members take their layer from `overrides`/`structure`.
+  const newRootId = forward
+    ? instantiatePrefab(prefab, parentId, new Set(forward.stack), forward.nestedOverrides, undefined, undefined, forward.layers, forward.forwardRoots)
+    : instantiatePrefab(prefab, parentId);
   // Preserve the instance root's stable guid across the teardown+respawn so refs
   // into the instance (UI bindings, guid-based undo) survive the rebuild — the
   // re-instantiated root would otherwise mint a fresh guid. Same identity, so

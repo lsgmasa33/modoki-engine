@@ -615,8 +615,8 @@ not the instance's own edit:
   (`applyStructureCore`). A member the scene deleted had nothing live to capture, so before #1730 it came
   back as the bare template's, its row's values were listed as phantom overrides, and the save wrote the row's
   component as a `traitRemovals`. A restored REFERENCE row's frame, and every frame inside it, gets what the layer
-  says of its INSIDE only through the nested capture, which a frame that did not exist has none of: it shows the inner
-  template's values until a reload, and nothing wrong is listed or saved (#1737, § "A rebuild's nested frames");
+  says of its INSIDE from the expansion itself, which runs under the layer's forwarded state (#1737, § "A rebuild's
+  nested frames"). The seed above covers only the restored members' own localIds;
 - **the save** compares a nested field with the row by value (#1498).
 
 ### Apply's targets (#1693, owner ruling C, U12–U15)
@@ -1020,27 +1020,48 @@ was carried stale through every reload until it was saved. The save then wrote i
 members: a nested member the scene had deleted came back on reload, and the member now holding its old
 number was deleted instead (OBSERVED, the "…so the SAVE" test below).
 
-**A rebuild's nested frames come from ONE source, the live capture, unless the caller names the side (#1741).** A
-rebuild re-expands its root from the template, so each nested frame inside comes back with only what the rebuilt
-prefab's own rows say of it. Everything else reaches it through the live capture (`captureNestedInstanceOverrides`,
-taken just before the teardown), and a frame whose right state is not what the live tree shows at that moment comes
-back wrong. There are two cases:
+**A rebuild's nested frames get their LAYER from the expansion and their EDITS from one source, the live capture,
+unless the caller names the side (#1737, #1741).** A rebuild re-expands its root from the template, under the state the
+layers ENCLOSING that root forward into it (`frameForward`): an owned nested root's chain, or a template reference
+node's channels. That is the state a load hands the same root, so every nested frame the expansion brings in comes back
+with the whole layer, as it would on a load. A stored root that no prefab layer encloses gets nothing and expands as
+before. What the SCENE hands it on a load (a legacy `nestedOverrides` channel, a scene-added node's channels) is the
+scene's own statement, and it still comes back through the capture alone. A frame the capture cannot reach loses it
+(#1780). The scene's own edits
+reach it through the live capture (`captureNestedInstanceOverrides`, taken just before the teardown), which subtracts
+the chain folded from that SAME forward state. A frame whose right state is not what the live tree shows at that moment
+comes back wrong. There are three cases:
 - **The caller names the side.** An undo rebuilding an instance to one side of a step hands in the frames it captured
   with that side (`nested`, from `captureNestedFrames`), and they REPLACE the live capture. They are re-applied exactly as
   a live capture is: each link is found by `nodeGuid`, and each capture is translated from the document it was read against
   (I4). A prefab file that changed between the step and its undo therefore takes the edit by identity, never by number.
   Apply's undo does this (`BaseInstanceSide.nested`). Revert's does not need to: Revert refuses a U14 nested key, so
   the live nested frames at its undo are the side's own.
-- **Still open (#1737): a frame no capture reached.** A reference row under a member a Revert restores, one the
-  template gained under a Refresh, or a row that a re-pointed frame's new prefab holds (#1767) has nothing live to
-  capture, so it comes back with only what the rebuilt prefab's own rows say of it. It shows the inner template's values
-  until a reload; nothing wrong is listed or saved. Two fixes that seeded such frames AFTER the expansion (a nested
-  `rebuildInstance`, then a respawn) were backed out in review. A rebuild's tail is world-wide, and the respawn's teardown
-  destroyed enclosing rows hung under the frame, so any after-the-fact seed fights the shared world. The design on #1737
-  expands the rebuilt root under its enclosing layer's forwarded state, as a load does, and subtracts that same state in
-  the nested capture. `nestedEnclosingLayer.test.ts` § #1737 pins the gap with `it.fails` cases, and guards the moves and
-  kept rows the seeds broke.
-Tests: `applyBaseTwoFileUndo.test.ts` (#1741).
+- **A frame no capture reached (#1737).** A reference row under a member a Revert restores, one the template gained
+  under a Refresh, or a row that a re-pointed frame's new prefab holds (#1767) has nothing live to capture. It gets its
+  layer from the forwarded expansion like every other frame. Before #1737 the expansion was a bare top call, so the
+  layer reached a nested frame only through its capture, and such a frame showed the inner template's values until a
+  reload.
+  - The two halves hold only TOGETHER. Without the capture's subtraction, a node the layer adds comes back twice (once
+    expanded, once re-applied as the scene's own), and a restated layer value pins the frame against a later template
+    edit. Without the expansion, nothing brings the subtracted layer back. Both halves match an added node by template
+    key or durable guid, so a hand-written node with neither is matched by nothing and comes back twice (#1779; a
+    prefab's own rows had this before #1737).
+  - The forward state is folded against the document each side is FROM, because what a layer forwards to a frame's
+    nested roots depends on that document's rows. The expansion uses the new `prefab`, the capture uses `baseline`.
+  - The expansion stays a TOP call, with its own token scope, resolved by the rebuild's own derive once the member
+    guids are restored. Its cycle stack holds the documents of the levels above, from the stored root down. The
+    forwarded state is applied at the root's NESTED rows only: the root's own members take their layer from the
+    caller's `overrides`/`structure`.
+  - **Why not seed the frame afterwards:** two fixes that did (a nested `rebuildInstance`, then a respawn) were backed
+    out in review. A rebuild's tail is world-wide: the kept-orphan settle, the derive that drains the move queue, the
+    token scope and the cycle stack all run on the shared world. So the inner tail ran inside the outer one, and the
+    respawn's teardown destroyed enclosing rows hung under the frame. Every after-the-fact seed fights the shared
+    world. Doing what a load does avoids that, because the rebuild's single tail runs once over a tree that is
+    already complete.
+Tests: `applyBaseTwoFileUndo.test.ts` (#1741); `nestedEnclosingLayer.test.ts` § #1737, which also guards the moves and
+kept rows the seeds broke, a Refresh from another version of the prefab, a forwarded member token, and a stored root's
+unchanged save.
 
 **A rebuild carries what its teardown reaches OUTSIDE its live subtree (#1499).** The teardown
 (`rebuildTeardown`) reaches by identity, so it also destroys things outside the rebuilt root's live
