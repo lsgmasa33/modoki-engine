@@ -20,18 +20,31 @@
 import { canEdit, getRunMode } from '../../runtime/core/playState';
 
 const _sources = new Map<string, () => boolean>();
+const _fallbacks = new Map<string, () => boolean>();
+/** What to do about a reason, for a source whose way out is not "stop Play / exit the preview" ({@link notAuthoredExit}). */
+const _exits = new Map<string, string>();
 
 /** Register a source that can say "the live world may be posed right now". `label` is the whole
  *  reason clause the refusal text quotes ("a preview session is open"). Re-registering a label
- *  replaces it (a hot-reloaded module re-registers). */
-export function registerPosedWorldSource(label: string, isPosed: () => boolean): void {
-  _sources.set(label, isPosed);
+ *  replaces it (a hot-reloaded module re-registers). A `fallback` source is asked only after every
+ *  other one: its reason is broader, so a more specific one that is also true names the exit instead
+ *  (#1750: "a scene is still loading" is true during a Stop's restore too, which says "retry"). */
+export function registerPosedWorldSource(label: string, isPosed: () => boolean, opts: { fallback?: boolean; exit?: string } = {}): void {
+  (opts.fallback ? _fallbacks : _sources).set(label, isPosed);
+  if (opts.exit) _exits.set(label, opts.exit); else _exits.delete(label);
+}
+
+/** The way out of `reason` (a {@link whyWorldNotAuthored} answer) when its source registered one — "try again once it's
+ *  open" for a landing scene switch (#1750) — else undefined, and the writer names its own (stop Play, exit the preview).
+ *  So a refusal never tells a user waiting for a scene to open to stop a Play that is not running. */
+export function notAuthoredExit(reason: string | null): string | undefined {
+  return reason === null ? undefined : _exits.get(reason);
 }
 
 /** Why the live world is NOT authored, or null when it is. The text is for a refusal message. */
 export function whyWorldNotAuthored(): string | null {
   if (!canEdit()) return `run-mode is '${getRunMode()}', not 'stopped'`;
-  for (const [label, isPosed] of _sources) {
+  for (const [label, isPosed] of [..._sources, ..._fallbacks]) {
     // FAIL CLOSED: this gates a disk write, so a source that cannot answer counts as posed — the cost
     // is a refused save with a reason, where skipping it could write a pose.
     let posed = true;

@@ -44,7 +44,7 @@ import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult 
 import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes } from './pendingBaseScene';
 import { hasPendingMeta, getPendingMetaPaths, flushPendingMeta, type MetaFlushResult } from './pendingMeta';
 import { createSupersessionToken } from '../../runtime/core/liveness';
-import { withAdoption, settleLeaveDebts, bindEditorSceneState, adoptedWorld, beginWorldRequest } from './sceneAdoption';
+import { withAdoption, settleLeaveDebts, bindEditorSceneState, adoptedWorld, beginWorldRequest, SCENE_SWITCH_LANDING } from './sceneAdoption';
 import type { World } from 'koota';
 import type { SceneLoadResult } from '../../runtime/scene/SceneManager';
 
@@ -881,16 +881,14 @@ export function worldHasUnsavedEdits(): boolean {
  *  here from the document each was expanded from (#1483), or every capture would match its members with
  *  another member's rows. A reload whose world was replaced before it adopted rebuilds nothing: the route that
  *  replaced it adopts its own world. Rejects with the reload's own rejection (an AbortError when superseded).
- *  `sceneFileChanged`: the change was to a scene FILE in the loaded chain, not a prefab it uses, so the undo stack was
- *  recorded against bytes that are gone and drops even when the world was clean (#1744). */
-export async function adoptWorldReloadedFromDisk(
-  scenePath: string, reload: () => Promise<SceneLoadResult>, { sceneFileChanged = false }: { sceneFileChanged?: boolean } = {},
-): Promise<void> {
+ *  A scene FILE change is not an argument here: the bridge records it with the owner (`recordSceneFileChanged`) before
+ *  the reload starts, and whichever route adopts that key next pays it (#1744, #1750 S7). */
+export async function adoptWorldReloadedFromDisk(scenePath: string, reload: () => Promise<SceneLoadResult>): Promise<void> {
   await withAdoption('hot-reload', async (adoption) => {
     const { world, keptBaseGuids } = await reload();
     // The path and base too: a reload that overtakes an adopted prefab edit-open (which takes no replacement token)
     // replaces an edit world, whose path is null (close-out review of #1698).
-    if (!adoption.offer({ world, path: scenePath, baseScene: 'loaded', history: { key: scenePath, keptBaseGuids, ...(sceneFileChanged ? { fileChanged: true } : {}) } })) return;
+    if (!adoption.offer({ world, path: scenePath, baseScene: 'loaded', history: { key: scenePath, keptBaseGuids } })) return;
     // Not only kept bases: a `Persistent` root is carried too, whatever scene owns it (review of 4f0b839d0).
     // Everything the reload re-expanded from disk compares equal and is left alone.
     const rebuilt = await rebaseStaleInstances();
@@ -1103,7 +1101,9 @@ export function causeSpecs(): Readonly<Record<keyof UnsavedCauses, CauseSpec>> {
 export interface SaveResult {
   saved: boolean;
   path: string | null;
-  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'prefab-edit' | 'target-loaded' | 'superseded' | 'conflict';
+  /** `'switching'`: a scene switch is still landing, so the editor's path does not describe the world on screen yet
+   *  (#1750) — refused, never waited for; saving again once the scene is open works. */
+  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'switching' | 'prefab-edit' | 'target-loaded' | 'superseded' | 'conflict';
   /** The primary scene's bytes as written, when it was (#1695): what a later conditional save (`ifMatch`) of the same
    *  file expects — Apply's undo and redo save the scene only over what the other half saved. */
   content?: string;
@@ -1327,6 +1327,13 @@ export async function saveScene(opts: {
   // restore has swapped the posed world out, and the agent `save-all` in that window wrote the pose
   // and replied ok:true. Only the human Cmd+S waited for the restore; every caller inherits this.
   const notAuthored = whyWorldNotAuthored();
+  // #1750 R1: a route's world is on screen and not adopted yet (or Create Scene wrote its path ahead of its swap), so the
+  // path names the OTHER scene — the save wrote the incoming world into the outgoing scene's file (#1746). Refused:
+  // nothing is lost, the outgoing scene was already saved or discarded when the switch was chosen (owner, 2026-09-28).
+  if (notAuthored === SCENE_SWITCH_LANDING) {
+    console.warn(`[Editor] Save refused — ${SCENE_SWITCH_LANDING}; save again once it's open.`);
+    return { saved: false, path: explicitPath || _currentScenePath, reason: 'switching' };
+  }
   if (notAuthored) {
     console.warn(`[Editor] Save refused — ${notAuthored}. Stop preview/play (and let it finish reverting) before saving so preview mutations don't reach disk.`);
     return { saved: false, path: explicitPath || _currentScenePath, reason: 'playing' };
@@ -1968,6 +1975,8 @@ export async function newScene(path: string | null = null): Promise<void> {
     // here, BEFORE the await, for the Hierarchy ordering above. The owner reads the outgoing dirt at registration —
     // both sides of the await, as in `loadScene` (#1409) — so it registers before the path moves.
     await withAdoption('new-scene', async (adoption) => {
+      // The path now runs AHEAD of the world until the offer (#1750 R1): a save in between wrote the outgoing world here.
+      adoption.writingAhead();
       setCurrentScenePath(path);
       setCurrentBaseScene(undefined);
       // Replace the world CONTENT through SceneManager rather than deleting and respawning in

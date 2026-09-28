@@ -36,6 +36,8 @@ import { useEditorStore } from '../store/editorStore';
 import { editorEmit } from '../editorJournal';
 import { clearSceneDirtyExcept, dirtySceneGuidsSnapshot, hasDirtySceneOutside } from './sceneDirty';
 import { refreshPrefabSourceForPath, rebaseStaleInstances } from './prefab';
+import { registerPosedWorldSource } from './authoredWorld';
+import { normScenePath } from '../../runtime/scene/scenePathKey';
 
 /** The editor scene state `serialize.ts` owns, bound at its module load. */
 export interface EditorSceneStateBinding {
@@ -82,9 +84,6 @@ export interface AdoptionRecord {
     readonly keptBaseGuids: ReadonlySet<string>;
     /** The incoming world is built from nothing (Create Scene), so no stack recorded under `key` matches it. */
     readonly freshIncoming?: boolean;
-    /** A scene FILE in the outgoing chain changed on disk (a hot reload of a scene change): the stack was recorded
-     *  against bytes that are gone, so it drops, clean or not (#1744). */
-    readonly fileChanged?: boolean;
   };
   /** The world is the edit world of this prefab. Absent: it is not an edit world, and the flag is cleared. */
   readonly prefabEdit?: { readonly prefab: EditedPrefab; readonly returnScene: string | null };
@@ -101,6 +100,9 @@ export interface RestoreTicket {
 /** One route's world switch, between the moment it is about to replace the world and its adopt ({@link withAdoption}). */
 export interface AdoptionTicket extends RestoreTicket {
   readonly route: AdoptionRoute;
+  /** The route is about to write editor state AHEAD of its swap (Create Scene's path, #887): until its offer or its end,
+   *  that state describes a world that is not on screen yet, so {@link editorStateCurrent} is false (#1750 R1). */
+  writingAhead(): void;
   /** Adopt `record` iff its world is current. Synchronous: every write lands in one run, so nothing can observe half an
    *  adoption. At most once per ticket — a second offer (or `restored`) throws. */
   offer(record: AdoptionRecord): boolean;
@@ -116,6 +118,24 @@ let baselineSeq = 0;
 const owed = new Set<string | null>();
 const pending = new Set<object>();
 const pendingRoutes = new Map<object, AdoptionRoute>();
+/** The routes that wrote editor state ahead of their swap and have not offered yet ({@link AdoptionTicket.writingAhead}). */
+const ahead = new Set<object>();
+/** The world each pending route registered in: once the world on screen differs, that route (or a newer one) has
+ *  swapped, and until an adopt the editor state still describes the world it left ({@link editorStateCurrent}). */
+const registeredIn = new Map<object, World>();
+/** Invalidated by every adoption that writes — what {@link captureAdoption}'s check compares. */
+const adoptionEpoch = createTeardownToken();
+/** Scene FILES that changed on disk under a recorded undo stack (#1744's debt, moved here by #1750 S7): by
+ *  {@link normScenePath} key, each change with its sequence number. Paid by the next adopt whose history swap goes TO
+ *  that key, from any route — so a scene open that supersedes the hot reload still pays it, and a reload whose offer LOST
+ *  pays nothing — and only by a route registered AFTER the change was raised: a route already loading read bytes older
+ *  than it (a newer write raised during its load stays owed to that write's own reload). */
+const sceneFileDebts = new Map<string, number[]>();
+let sceneChangeSeq = 0;
+/** The change sequence each pending route registered at. */
+const registeredAtChange = new Map<object, number>();
+/** Called whenever {@link adoptionsSettled} would resolve — the hot reload's deferred replays (#1750 R3). */
+const settledListeners = new Set<() => void>();
 let repairing: Promise<void> | null = null;
 /** Settles queued behind the running repair: its world can change under it, keeping its debts for them to re-run, so a
  *  waiter released between the two would resume into the re-run (close-out re-review of #1698). */
@@ -168,18 +188,94 @@ export function adoptionsSettled(): Promise<void> | null {
  *  adopted, and while a world replaced by no editor route (a runtime navigation during Play) is live. */
 export function isWorldAdopted(): boolean { return lastAdopted.world !== null && lastAdopted.world === getCurrentWorld(); }
 
+/** Do the editor's scene state (the path, the prefab-edit flag, the history key) and the world on screen describe each
+ *  other? The question every reader that PAIRS them asks (#1750 R1): a disk writer pairs the path or the edit flag with
+ *  the world's bytes. False in a route's States 4 to 6 — a pending route registered in another world than the one on
+ *  screen, which is not the one adopted last: swapped, not yet adopted — and while a route has written its state AHEAD
+ *  of its swap (Create Scene: the new path, the old world). `isWorldAdopted()` alone misses the second, because the OLD
+ *  world is still the adopted one there.
+ *
+ *  ⚠️ Keyed on a PENDING route's swap, not on `isWorldAdopted()`. Before a route swaps, the state still describes the
+ *  world it will leave, so a save of that pair is right (it is the outgoing scene, to its own file). And a world no route
+ *  replaced (a runtime navigation during Play, a harness, a boot that never adopted) is not this question — the run mode
+ *  and the restore sources answer for Play — while failing closed on it would refuse every save until some later
+ *  adopt, with a "still loading" reason that is false: nothing is loading. */
+export function editorStateCurrent(): boolean {
+  if (ahead.size > 0) return false;
+  const world = getCurrentWorld();
+  if (world === lastAdopted.world) return true;
+  for (const leftWorld of registeredIn.values()) if (leftWorld !== world) return false;
+  return true;
+}
+
+/** A reader that CARRIES something across an await (a world, an entity id, a target path, a snapshot) captures here
+ *  before it, and asks the check after its LAST await, before it acts (#1750 R2): still the same world, no adoption
+ *  since, and the editor state still describes it. Null when the state is not current now: a capture taken in State 4
+ *  would pass a same-world check all the way to that world's adopt (#1747), so the caller refuses instead.
+ *
+ *  ⚠️ The WORLD, not the reader's own entities: a prefab frame rebuilt in place (`refreshInstances` — a leave repair,
+ *  another Apply's fan-out) re-mints entity ids inside the same world. A reader that carries an entity id re-checks THAT
+ *  id against its guid as well (`entityRef(id).resolve() === id`). A global "frames rebuilt" epoch was tried and
+ *  reverted in the close-out reviews: any Apply of an unrelated prefab then invalidated every capture, half-landing a
+ *  concurrent Apply and dropping an undo step. */
+export function captureAdoption(): LivenessCheck | null {
+  if (!editorStateCurrent()) return null;
+  const world = getCurrentWorld();
+  const noAdoptionSince = adoptionEpoch.capture();
+  return () => getCurrentWorld() === world && noAdoptionSince() && editorStateCurrent();
+}
+
+/** The refusal every disk writer quotes while {@link editorStateCurrent} is false — `saveScene` maps it to its own
+ *  `'switching'` reason, so the human reads "save again once it's open" rather than Play's advice. */
+export const SCENE_SWITCH_LANDING = 'a scene is still loading';
+
 /** The world the owner adopted last (a restore's included), or null before the first. A caller that loaded a world asks
  *  whether it is still THE adopted one — `serialize.loadSceneReporting`'s `adopted`. */
 export function adoptedWorld(): World | null { return lastAdopted.world; }
+
+/** A scene FILE changed on disk (#1744, #1750 S7): the undo stack recorded against it — open, or parked because the
+ *  scene is not — is stale, so the next adopt that swaps history under this file's key drops it (owner fork 4: a
+ *  parked clean stack too). Keyed by {@link normScenePath}, so any path form reaches it. */
+export function recordSceneFileChanged(path: string): void {
+  const key = normScenePath(path);
+  sceneFileDebts.set(key, [...(sceneFileDebts.get(key) ?? []), ++sceneChangeSeq]);
+}
+
+/** The scene-file debts still owed — for tests and diagnostics. */
+export function owedSceneFileChanges(): readonly string[] { return [...sceneFileDebts.keys()]; }
+
+/** Pay `key`'s changes raised at or before `through`. True when one was paid. */
+function paySceneFileDebt(key: string, through: number): boolean {
+  const k = normScenePath(key);
+  const seqs = sceneFileDebts.get(k);
+  if (!seqs) return false;
+  const left = seqs.filter((s) => s > through);
+  if (left.length === seqs.length) return false;
+  if (left.length) sceneFileDebts.set(k, left); else sceneFileDebts.delete(k);
+  return true;
+}
+
+/** Call `fn` whenever no route is pending and no leave repair runs ({@link adoptionsSettled}'s condition). Persistent:
+ *  a caller registers once, at startup; the returned function unsubscribes. */
+export function onAdoptionsSettled(fn: () => void): () => void {
+  settledListeners.add(fn);
+  return () => { settledListeners.delete(fn); };
+}
+
+/** How many {@link onAdoptionsSettled} listeners are registered — a test's check that deferrals do not add any. */
+export function adoptionsSettledListenerCount(): number { return settledListeners.size; }
 
 /** How many adoptions have written so far — Exit captures it before its load ({@link endPrefabEditInPlace}). */
 export function adoptionCount(): number { return adoptions; }
 
 function notifySettled(): void {
-  if (settledWaiters.length === 0 || !isSettled()) return;
-  const waiters = settledWaiters;
-  settledWaiters = [];
-  notifyListeners(waiters, 'adoptionsSettled', []);
+  if (!isSettled()) return;
+  if (settledWaiters.length > 0) {
+    const waiters = settledWaiters;
+    settledWaiters = [];
+    notifyListeners(waiters, 'adoptionsSettled', []);
+  }
+  if (settledListeners.size > 0) notifyListeners([...settledListeners], 'onAdoptionsSettled', []);
 }
 
 /** Run `body` as one route's world switch: registered as pending for exactly its duration, however it ends — the
@@ -205,6 +301,8 @@ async function runSwitch<T>(route: AdoptionRoute, readDirt: boolean, body: (tick
   const key = {};
   pending.add(key);
   pendingRoutes.set(key, route);
+  registeredIn.set(key, getCurrentWorld());
+  registeredAtChange.set(key, sceneChangeSeq);
   try {
     const dirt: TaggedDirt | null = readDirt ? { edited: state().worldEdited(), scenes: dirtySceneGuidsSnapshot(), baselineSeq } : null;
     let spent = false;
@@ -214,13 +312,16 @@ async function runSwitch<T>(route: AdoptionRoute, readDirt: boolean, body: (tick
     };
     return await body({
       route,
+      writingAhead: () => { if (!spent) ahead.add(key); },
       offer: (record) => {
         spend();
+        ahead.delete(key);
         if (!dirt) throw new Error(`[sceneAdoption] a '${route}' restore cannot adopt a record`);
-        return adopt(record, dirt);
+        return adopt(record, dirt, registeredAtChange.get(key) ?? sceneChangeSeq);
       },
       restored: (world) => {
         spend();
+        ahead.delete(key);
         if (world !== getCurrentWorld()) return false;
         lastAdopted = { world, edit: lastAdopted.edit };
         return true;
@@ -229,13 +330,16 @@ async function runSwitch<T>(route: AdoptionRoute, readDirt: boolean, body: (tick
   } finally {
     pending.delete(key);
     pendingRoutes.delete(key);
+    registeredIn.delete(key);
+    registeredAtChange.delete(key);
+    ahead.delete(key);
     // The settle STARTS (marking the repair running) before any waiter is told: told first, a waiter resumed into the
     // repair it was waiting for (close-out review of #1698). It notifies itself when there is nothing to run.
     await settleLeaveDebts();
   }
 }
 
-function adopt(record: AdoptionRecord, dirt: TaggedDirt): boolean {
+function adopt(record: AdoptionRecord, dirt: TaggedDirt, changesSeen: number): boolean {
   if (record.world !== getCurrentWorld()) return false;
   const s = state();
   if (record.path !== undefined) s.setScenePath(record.path);
@@ -253,17 +357,22 @@ function adopt(record: AdoptionRecord, dirt: TaggedDirt): boolean {
     // ⚠️ So does a stack whose scene FILE changed on disk (#1744), the scene analogue of #1704. A hot reload of a clean
     // world kept it: a `git checkout` restored a deleted entity, and undoing the delete then made a second one with the
     // same guid. Unity reloads an externally changed scene and its undo ends. A PREFAB change leaves the scene file
-    // alone, so its reload does not set this, as Unity's prefab reimport keeps scene undo.
-    const { key, keptBaseGuids, freshIncoming, fileChanged } = record.history;
+    // alone, so it records no debt, as Unity's prefab reimport keeps scene undo. The debt is the owner's (#1750 S7), so
+    // WHICHEVER route adopts next pays it — a scene open that superseded the reload included.
+    // Paid by the swap TO that scene's key: its stack — live (a reload: the same key) or parked (the scene was left, or
+    // never open) — comes back through `freshIncoming`. Leaving the scene pays nothing; its stack parks and drops on return.
+    const { key, keptBaseGuids, freshIncoming } = record.history;
+    const incomingChanged = paySceneFileDebt(key, changesSeen);
     const before = dirt.baselineSeq === baselineSeq ? dirt : null;
     const discarded = s.worldEdited() || hasDirtySceneOutside(keptBaseGuids)
       || (before !== null && (before.edited || [...before.scenes].some((g) => !keptBaseGuids.has(g))));
     const leavingPrefabEdit = activeHistoryKey().startsWith(PREFAB_EDIT_SCENE_PREFIX);
     // A changed file retires the stack PARKED under the incoming key too: a hot reload can overtake an adopted prefab
-    // edit-open, and the scene's clean stack parked by that open was recorded against the old bytes as well.
+    // edit-open, and the scene's clean stack parked by that open was recorded against the old bytes as well — and a
+    // scene that changed while it was not open at all comes back with no history (owner fork 4, #1750).
     swapHistory(key, {
-      discardOutgoing: discarded || leavingPrefabEdit || fileChanged === true,
-      ...(freshIncoming || fileChanged ? { freshIncoming: true } : {}),
+      discardOutgoing: discarded || leavingPrefabEdit,
+      ...(freshIncoming || incomingChanged ? { freshIncoming: true } : {}),
     });
     s.markSaved();
     clearSceneDirtyExcept(keptBaseGuids);
@@ -277,6 +386,7 @@ function adopt(record: AdoptionRecord, dirt: TaggedDirt): boolean {
   else useEditorStore.getState().closePrefabEditor();
   lastAdopted = { world: record.world, edit: record.prefabEdit?.prefab ?? null };
   adoptions += 1;
+  adoptionEpoch.invalidateAll();
   // Editor Percept (V2): correlate later game/edit events to the scene opened. `worldEntityTotal`, the editor state's
   // name for the same count (§2, #1223 D3). Read here, in the adopt's own run, so it counts the adopted world.
   if (record.journal) editorEmit('!scene-load', { path: record.journal.path, worldEntityTotal: getAllEntities().length });
@@ -345,6 +455,12 @@ export function _resetSceneAdoptionForTests(): void {
   owed.clear();
   pending.clear();
   pendingRoutes.clear();
+  ahead.clear();
+  registeredIn.clear();
+  registeredAtChange.clear();
+  sceneFileDebts.clear();
+  sceneChangeSeq = 0;
+  adoptionEpoch.invalidateAll();
   repairing = null;
   chainedSettles = 0;
   chainReset.invalidateAll();
@@ -353,4 +469,8 @@ export function _resetSceneAdoptionForTests(): void {
 
 // The two answers a prefab write needs, installed where it can read them without importing this module (#1692,
 // `adoptionGate.ts`: a direct import closes a load-time cycle through `./prefab`).
-installAdoptionGate({ settled: adoptionsSettled, pending: () => pendingRoutes.size });
+installAdoptionGate({ settled: adoptionsSettled, pending: () => pendingRoutes.size, capture: captureAdoption });
+// Every writer that asks `whyWorldNotAuthored` refuses while the editor state does not describe the world (#1750 R1;
+// owner, 2026-09-28: when the world is not savable, REFUSE — never wait, never re-target).
+// A FALLBACK: a Stop or preview restore in flight is also a pending route, and its own source says what to do there.
+registerPosedWorldSource(SCENE_SWITCH_LANDING, () => !editorStateCurrent(), { fallback: true, exit: "try again once it's open" });

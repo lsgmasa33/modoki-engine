@@ -26,7 +26,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setEditorScenePathReader, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, setEditorScenePathReader, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
 import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
@@ -71,12 +71,13 @@ import {
   describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
   type DevicePreset, type Orientation,
   type PrefabFile,
-  causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath, whyWorldNotAuthored,
+  causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath, whyWorldNotAuthored, notAuthoredExit,
   dirtyAssetEditorHolds,
+  editorStateCurrent, captureAdoption, recordSceneFileChanged, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
-  getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, deleteEntity, findUnrenderable2D,
+  getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, captureEntityIdentity, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, deleteEntity, findUnrenderable2D,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, currentCaptureSeq, resolveCapCursor, journalDroppedThroughCap, journalGapNote, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
@@ -1165,6 +1166,9 @@ function refuseEditOfPosedWorld(op: string, consequence?: string): void {
   if (getRunMode() === 'playing') return;
   const why = whyWorldNotAuthored();
   if (!why) return;
+  // A source with its own way out (#1750: a scene still loading) says that, not a Play/preview exit it has nothing to do with.
+  const exit = notAuthoredExit(why);
+  if (exit) throw new OpRefusal('REFUSED_BY_OP', `${op} refused: ${why} — the edit would land in a world the editor has not adopted yet, so it could be lost. Nothing was changed. ${exit[0]!.toUpperCase()}${exit.slice(1)}.`, { options: [exit] });
   const { options, hint, owner } = posedWorldExits();
   const envelope = getRunMode() === 'scrub' || getRunMode() === 'preview';
   const lost = consequence ?? (envelope
@@ -1216,9 +1220,15 @@ export function registerEditorAgentOps(): void {
     // (#1164 review): a reload now supersedes that load — a scene open silently fails, or a Stop's
     // restore is cut short. Defer it; the token's release settles and replays it.
     if (canEdit()) {
-      return isWorldReplacementInFlight()
-        ? 'a scene load or restore is still landing — the reload replays once it has'
-        : null;
+      if (isWorldReplacementInFlight()) return 'a scene load or restore is still landing — the reload replays once it has';
+      // #1750: a route's world is on screen and not adopted yet (a prefab edit-open takes no replacement token): the
+      // path the reload would read names the scene that world is leaving.
+      if (!editorStateCurrent()) return 'a scene switch is still landing — the reload replays once it has';
+      // #1750 R3, Unity's `DisallowAutoRefresh`: an operation that must land whole in the world it began in (an Apply, a
+      // prefab write and its rebuild, an undo step) holds the world, and a reload nobody asked for does not start under
+      // it. It renumbered the world under an Apply, whose carried id then named another instance (H1).
+      if (undoStepPending() !== null) return 'an undo step or a prefab write is still landing — the reload replays once it has';
+      return null;
     }
     const mode = getRunMode();
     return mode === 'playing'
@@ -1229,6 +1239,11 @@ export function registerEditorAgentOps(): void {
   // restore or scene open still loading. Not `onRunModeChange` — Stop flips the mode BEFORE its
   // restore loads, so a replay there races the restore and is lost again (`authoringSettle.ts`).
   onAuthoringSettled(() => { void replaySuppressedSceneReloads(); });
+  // …and once each of the gate's newer reasons clears (#1750): the world holds drain, a scene switch settles. Registered
+  // ONCE here (`registered` guards this function), so a deferral adds no listener of its own.
+  onWorldHoldsSettled(() => { void replaySuppressedSceneReloads(); });
+  onAdoptionsSettled(() => { void replaySuppressedSceneReloads(); });
+  setSceneAdoptionHooks({ capture: captureAdoption, settled: () => adoptionsSettled() === null, sceneFileChanged: recordSceneFileChanged });
   // The editor's own prefab copy (the override diff base) is re-read with the runtime cache on an
   // external prefab write (#1169 review) — see `refreshPrefabSourceForPath`.
   setPrefabSourceRefresher(refreshPrefabSourceForPath);
@@ -2627,6 +2642,10 @@ export function registerEditorAgentOps(): void {
         + landedNote,
       );
     }
+    if (r.reason === 'switching') {
+      // #1750: refused, not queued — the world on screen is not the one the editor's path names yet.
+      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — a scene is still loading, so the editor's scene path does not describe the world on screen yet. Save again once it's open.${landed.length ? ` The ${landed.length} parked item(s) WERE written (${landed.join(', ')}).` : ''}`);
+    }
     if (r.reason === 'playing') {
       // The SCENE half only. Parked asset docs already flushed above (#259) — say so, or an agent
       // reads this as "nothing was saved" and re-parks work that is already on disk.
@@ -2994,6 +3013,14 @@ export function registerEditorAgentOps(): void {
           { options: ['restore the missing prefab (the scene reload re-expands the reference), then retry', 'create the prefab from a subtree that does not hold it'] });
       }
       refuseEditOfPosedWorld('prefab create', 'the subtree may carry a pose, which would be written into the prefab file');
+      // `entityId` is a bare index carried across the three fetches below, with no world hold taken until the commit: a hot
+      // reload landing in one renumbers the world, and the id then names another instance of the same prefab (#1750 H1's
+      // class — measured on this op: IB's value written, `ok:true`). Captured here, in the adopted world (a landing switch
+      // was refused just above), and asked after the last await.
+      const adopted = captureAdoption()!;
+      // …and the root itself: a frame rebuilt in place re-mints ids in the same world (close-out reviews). Asked again
+      // inside the commit's rebuild, which acts on the raw id after the commit's own awaits.
+      const sameRoot = captureEntityIdentity(entityId);
       const existing = await classifyExistingPrefabId(path);
       // ⚠️ Refuse rather than mint a fresh file guid over a prefab that is THERE and unreadable — a
       // 500, corrupt bytes, or one a newer build wrote (#1468, #896's class). The agent asked to
@@ -3020,7 +3047,10 @@ export function registerEditorAgentOps(): void {
       // …and after those awaits the world is asked again, as Create Prefab's Replace asks after its dialog: a Play
       // started meanwhile would write its played pose (close-out review of #1686).
       const late = whyWorldNotAuthored();
-      if (late) throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${late} — stop Play first, or the played pose is written into the prefab.`);
+      if (late) throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${late} — ${notAuthoredExit(late) ?? 'stop Play first, or the played pose is written into the prefab'}.`);
+      if (!adopted() || !sameRoot()) {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${adopted() ? 'the entity was rebuilt in place (a prefab instance refreshed)' : 'the scene was reloaded'} while the prefab was being prepared, so entity ${entityId} may name another entity now. Nothing was written. Address it again (by guid) and retry.`);
+      }
       let runtimeExcluded = 0;
       const prefab = serializePrefab(entityId, keptId, { replacing, onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
       if (!prefab) throw new Error(`could not serialize prefab from entity ${entityId}`);
@@ -3041,6 +3071,9 @@ export function registerEditorAgentOps(): void {
       const committed = await commitPrefabWrite(path, prefab, {
         expected: prior ?? null,
         rebuild: () => {
+          // The tree was rebuilt in place during the write (fourth close-out review): the id names another entity now, so
+          // nothing is tagged, and the reply says the file landed unlinked.
+          if (!sameRoot()) return;
           // Snapshot the links the tree already had, so undo can put them back (#1278). Tagging
           // deliberately leaves a held nested instance linked to its OWN prefab, but the untag
           // below strips the WHOLE tree — without this the agent path's undo left that instance
@@ -3061,6 +3094,7 @@ export function registerEditorAgentOps(): void {
       }
       const ok = committed.ok;
       if (committed.worldLeft) warnings.push('the scene changed while the prefab was written: the file landed, but the entity was not linked to it');
+      else if (ok && !tagged) warnings.push('the entity was rebuilt in place while the prefab was written: the file landed, but the entity was not linked to it');
       if (tagged) {
         const { ref, priorLinks } = tagged;
         let { guidRemap } = tagged;
@@ -3365,7 +3399,9 @@ export function registerEditorAgentOps(): void {
       await guardUnsavedAfterUndo('prefab edit-open', discard);
       const scenePathBefore = getCurrentScenePath();
       const name = p.path.split('/').pop()?.replace(/\.prefab\.json$/, '') ?? p.path;
-      await openPrefabForEditing({ path: p.path, name }, discard ? { discardUnsaved: true } : {});
+      const refusal = await openPrefabForEditing({ path: p.path, name }, discard ? { discardUnsaved: true } : {});
+      // Refused because the world was not in a state to leave (#1750): its own reason, not the generic failure below.
+      if (refusal) throw new OpRefusal('REFUSED_BY_OP', `prefab edit-open refused: ${refusal.refused}. Nothing was saved or swapped.`);
       // openPrefabForEditing reports failure by console.error + early return (it is a UI path).
       // An agent needs it to FAIL, not to report ok:true having done nothing — a bad path would
       // otherwise leave the editor in the previous scene and the next edit-save would write the

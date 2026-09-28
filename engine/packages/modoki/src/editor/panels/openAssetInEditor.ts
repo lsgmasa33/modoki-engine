@@ -68,7 +68,9 @@ export async function openAssetInEditor(asset: SelectedAsset): Promise<void> {
       // The human route asks before its swap discards anything the auto-save could not write
       // (#1419); the agent op has its own `guardUnsaved` and passes no gate.
       const { confirmDiscardUnsaved } = await import('../scene/unsavedGate');
-      openPrefabForEditing({ path, name }, { confirmDiscard: (action) => confirmDiscardUnsaved(action, 'world-swap') });
+      // A refusal says why (#1750: a scene still loading), as the save it stands in for does.
+      void openPrefabForEditing({ path, name }, { confirmDiscard: (action) => confirmDiscardUnsaved(action, 'world-swap') })
+        .then((r) => { if (r) useEditorStore.getState().showToast(`Prefab not opened: ${r.refused}.`, 'warn'); });
       return;
     }
     case 'scene': {

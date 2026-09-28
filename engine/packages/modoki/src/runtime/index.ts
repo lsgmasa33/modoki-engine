@@ -273,7 +273,7 @@ export { suggestBones, type SuggestBonesOptions } from './skinning/rig2dAutoBone
 export { buildRig2D, autoRig2D, type BuildRig2DOptions, type AutoRig2DOptions } from './skinning/rig2dBuild';
 export { paintWeights, boneWeightField, dominantBoneField, type PaintWeightsOptions, type PaintWeightsResult } from './skinning/rig2dWeightPaint';
 export {
-  findEntity, guidOfEntityId, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField, carryEntityIdFields, cloneTraitValues,
+  findEntity, captureEntityIdentity, guidOfEntityId, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField, carryEntityIdFields, cloneTraitValues,
   getAllEntities, entityDisplayName, buildEntityTree, deleteEntity, deleteEntities, deriveLayer,
   onStructureDirty, markStructureDirty, getStructureVersion,
   type EntityInfo,
@@ -492,6 +492,7 @@ export { loadSceneFile, collectResourceRefsFromEntities, instantiatePrefabIntoWo
 export { markOverride, getOverrideMarkSet, clearOverrideMarks, clearAllOverrideMarks } from './loaders/overrideMarks';
 export { resolveCanvas2DHost, type ResolveCanvas2DHostOptions } from './scene/canvas2DHost';
 export { loadedScenePath } from './core/ecs/sceneLoaded';
+export { normScenePath } from './scene/scenePathKey';
 export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneLoadResult, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
 export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult, type AssetRefVerdict, type AssetRefResolver, makeAssetRefResolver } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';

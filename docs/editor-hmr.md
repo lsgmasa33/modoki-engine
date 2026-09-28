@@ -157,7 +157,10 @@ During Play/Pause and inside a scrub/preview envelope, `sceneReloadSuppressedRea
 scene/prefab hot reload — a reload there rebuilds the world the run's snapshot belongs to, and inside
 an envelope it tears the preview down mid-pose. It also blocks while the editor is stopped but a
 world-replacement token is held (below): a reload then would supersede the scene open, restore or
-save cycle that holds it. Until #1164 the blocked change was simply **dropped**:
+save cycle that holds it. And since #1750 it blocks while an operation HOLDS the world (an undo step, an Apply, a
+prefab write and its rebuild — Unity's `DisallowAutoRefresh`) and while a scene switch is still landing (a route's
+world on screen, not adopted yet): [scene-loading.md § Readers of the world](scene-loading.md#readers-of-the-world-what-they-may-assume-1750),
+R3. Until #1164 the blocked change was simply **dropped**:
 Stop/Exit restored the pre-write snapshot, the world sat behind the file on disk with nothing saying
 so, and the next Cmd+S wrote that stale world over the external change (a hand edit, a `git checkout`).
 
@@ -177,9 +180,13 @@ Three things about the replay are load-bearing:
   suspend → save → resume cycle inside an envelope (`saveCommand.ts`) each hold a world-replacement
   token, taken synchronously before any mode change, and settle fires only once the count is zero
   while `canEdit()` holds. A new path that swaps the world after flipping the mode needs a token too.
+  The #1750 reasons replay on their own edges — `onWorldHoldsSettled` (the last hold or undo step ends) and
+  `onAdoptionsSettled` — each registered ONCE at startup, so a deferral adds no listener.
 - **It checks suppression twice** — before the handler's `fetch` of the scene file and again after
   it, because a Play press, an envelope or a scene open can begin inside that await. A change that
-  finds itself suppressed late is deferred again, with the prefabs it was carrying.
+  finds itself suppressed late is deferred again, with the prefabs it was carrying. After the fetch it also
+  re-asks its TARGET (#1749): the adopted world it read `current` in is captured with it, and a prefab
+  edit-open that adopted inside the fetch defers the reload instead of being replaced by the scene it left.
 - **It runs its reloads one at a time.** Fired together they supersede each other, and the winner does
   not carry the loser's options: a base-scene reload needs `forceReloadBases`, a prefab reload does
   not, so a prefab reload winning leaves the base stale. Measured live on the first, fired-together
@@ -192,8 +199,9 @@ Three things about the replay are load-bearing:
 Known gaps, left on purpose (found in the #1164 close-out review, none reproduced):
 
 - **World swaps that take no token** — `openPrefabForEditing`, `applyPrefabUndo` and the runtime
-  `load-scene` op call `sceneManager.loadScene` directly, so a live reload can still supersede them.
-  That race predates #1164; the tokens cover the paths that flip the run mode.
+  `load-scene` op call `sceneManager.loadScene` directly, so a live reload can still supersede one BEFORE it
+  swaps. Once one has swapped, #1750 defers the reload until it adopts, and the undo restore runs inside an undo
+  step, which defers it too; the pre-swap window predates #1164.
 - **A token that is never released** (a load that hangs past every abort checkpoint) now defers every
   live hot reload while stopped, and the pending set has no editor or MCP surface — only the warning in
   the console says so.

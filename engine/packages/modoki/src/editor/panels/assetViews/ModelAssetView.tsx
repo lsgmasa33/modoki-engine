@@ -316,12 +316,13 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
                 // reload, while the next save captured them against the old rows. ⚠️ Nothing is cached unless the
                 // write landed: a scene load short-circuits on a runtime cache hit, so seating bytes that never
                 // reached disk would keep serving them for as long as a scene owns the prefab.
-                const wrote = (await commitPrefabWrite(prefabPath, prefab, { expected: prior ?? null })).ok;
+                const committed = await commitPrefabWrite(prefabPath, prefab, { expected: prior ?? null });
+                const wrote = committed.ok;
                 if (wrote) {
                   const verb = !prefabExists ? 'Created' : isRigged ? 'Merged' : 'Regenerated';
                   console.log(`[Inspector] ${verb} prefab: ${prefabPath}${existingId ? ` (preserved id ${existingId})` : ''}`);
                 } else {
-                  console.error(`[Inspector] Could not write prefab: ${prefabPath}`);
+                  console.error(`[Inspector] Could not write prefab: ${prefabPath}${committed.error ? ` — ${committed.error}` : ''}`);
                 }
               }
             }

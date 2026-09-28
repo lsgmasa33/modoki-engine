@@ -19,7 +19,7 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad, bootSceneWalkPending } from './serialize';
 import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
 import { beginWorldReplacement } from './authoringSettle';
-import { adoptionsSettled } from './sceneAdoption';
+import { adoptionsSettled, captureAdoption } from './sceneAdoption';
 import { undoDepth, truncateUndoTo, beginWorldSwitch } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
@@ -190,6 +190,14 @@ export async function enterPlay(): Promise<PlayOutcome> {
     // does not go on posing into the Play world (#1546).
     const envelopeDown = takeDownPreviewEnvelope();
     if (envelopeDown) await envelopeDown;
+    // The world the snapshot is OF, captured in the adopted world just before it (#1750 R2, #1748). The generation below
+    // counts only `serialize.loadScene`; a hot reload, a prefab edit-open or an undo restore landing in the awaits after
+    // this bumps none of it, and Play then armed with a snapshot of the world they replaced (Stop restored it over the
+    // reload), or inside the edit world holding the scene's snapshot. Not taken at entry: the undo step and the envelope
+    // takedown above replace the world on purpose, and Play snapshots what they leave (#1579).
+    // Null: a switch still landing here (one that waited for the same undo step, or swapped during the envelope's restore).
+    const adopted = captureAdoption();
+    if (!adopted) return refusePlay('scene-swap', 'Play refused — a scene is still loading. Try again once it is open.');
     // Snapshot only — NO `assignGuids` (see captureAuthoredSnapshot). Bases included (A5).
     _snapshot = await captureAuthoredSnapshot();
     // The undo barrier belongs to the SNAPSHOT, not to the moment Play flips: an edit made during the
@@ -212,7 +220,7 @@ export async function enterPlay(): Promise<PlayOutcome> {
     // Bail BEFORE `setPlayState('playing')` — past that point Play is externally visible and the
     // snapshot is already load-bearing. The `finally` clears `_entering` and any queued Stop.
     // `adoptionsSettled()` too (#1703): a repair can START inside the awaits above — an Exit in place pressed meanwhile.
-    if (sceneLoadGeneration() !== enteredLoadGeneration || aSceneSwapIsHappening() || adoptionsSettled() !== null) {
+    if (sceneLoadGeneration() !== enteredLoadGeneration || aSceneSwapIsHappening() || adoptionsSettled() !== null || !adopted()) {
       _snapshot = null;
       return refusePlay('load-landed', 'Play cancelled — a scene load landed while the snapshot was being taken.');
     }

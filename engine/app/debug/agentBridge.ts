@@ -144,6 +144,7 @@ import { layoutSettleReport } from './layoutSettle';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
 import { coveredCarriers } from './carrierCover';
 import { readConsoleSource } from './consoleSource';
+import { normScenePath } from '@modoki/engine/runtime';
 import { getConsoleRingEntries, getConsoleRingDropped, getConsoleRingEpoch, installConsoleRing } from '@modoki/engine/runtime/core/consoleRing';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
@@ -346,23 +347,9 @@ function dumpConsoleLogs(p: ConsoleLogsParams = {}): { logs: ConsoleEntry[]; tot
   return { logs, total };
 }
 
-/** Normalize a scene URL for comparison by the hot-reload equality gate.
- *
- *  The same scene can be referenced through several forms:
- *   - game app import: `/games/<id>/runtime/assets/scenes/x.json?url`
- *   - dev-server watcher broadcast: `/games/<id>/assets/…` or (editor) `/assets/…`
- *     (`findAssetRoots` strips `runtime/`; the editor watcher also strips the project)
- *   - editor "open scene": Vite's absolute `/@fs/<abspath>/…/runtime/assets/scenes/x.json`
- *
- *  Collapse `runtime/assets` → `assets`, drop the query, THEN reduce to the suffix
- *  from the last `/assets/` — so an absolute `/@fs/…` current path and a clean
- *  `/assets/…` broadcast resolve to the same key. Only one project is open at a time,
- *  so the `/assets/…` suffix uniquely identifies a scene (no cross-project collision). */
-export function normScenePath(p: string): string {
-  const s = p.split('?')[0].replace('/runtime/assets/', '/assets/');
-  const i = s.lastIndexOf('/assets/');
-  return i >= 0 ? s.slice(i) : s;
-}
+/** A scene path's comparison KEY — moved to the runtime (`scenePathKey.ts`, #1750) so the editor's adoption owner keys
+ *  its scene-file debts by the same function; re-exported for this module's existing importers. */
+export { normScenePath };
 
 /** Which transport drives scene hot-reloads in the current environment.
  *
@@ -708,13 +695,31 @@ export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>
  *  handed the RELOAD, not its result, so the editor holds the whole world switch as one pending adoption (#1698) and
  *  adopts only the world that reload promoted. It rejects with the reload's own rejection.
  *  Installed the way the suppressor is; unset in the game runtime, which has no undo — the reload then just runs. */
-type WorldReloadedFromDisk = (scenePath: string, reload: () => Promise<SceneLoadResult>, opts?: { sceneFileChanged?: boolean }) => Promise<void>;
+type WorldReloadedFromDisk = (scenePath: string, reload: () => Promise<SceneLoadResult>) => Promise<void>;
 let _worldReloadedFromDisk: WorldReloadedFromDisk | null = null;
 
 /** Editor-only: install the after-reload hook. Called from `agentEditorOps.ts`. */
 export function setWorldReloadedFromDiskHook(fn: WorldReloadedFromDisk | null): void {
   _worldReloadedFromDisk = fn;
-  _owedSceneChanges.clear(); // a new hook starts with no scene change owed to it
+}
+
+/** Editor-only (#1750): what the reload asks the editor's adoption owner, installed the way the hooks above are.
+ *  - `capture`: `captureAdoption` — a check on the adopted world, or null while a scene switch is landing. The reload
+ *    reads its target once and acts on it after its fetch, so it re-asks before it acts (R2, #1749).
+ *  - `settled`: no route pending and no leave repair running (`adoptionsSettled() === null`).
+ *  - `sceneFileChanged`: `recordSceneFileChanged` — a scene FILE changed on disk, so the undo stack recorded against it
+ *    is stale; the owner holds the debt and whichever adopt names that scene next pays it (#1744, S7).
+ *  Unset in the game runtime, which has no undo and no adoption: the reload then just runs. */
+export interface SceneAdoptionHooks {
+  capture(): (() => boolean) | null;
+  settled(): boolean;
+  sceneFileChanged(path: string): void;
+}
+let _adoptionHooks: SceneAdoptionHooks | null = null;
+
+/** Editor-only: install the adoption hooks. Called from `agentEditorOps.ts`. */
+export function setSceneAdoptionHooks(hooks: SceneAdoptionHooks | null): void {
+  _adoptionHooks = hooks;
 }
 
 /** Editor-only: the file the editor's next save writes (`getCurrentScenePath`), installed the way the hooks above are
@@ -3055,15 +3060,6 @@ type SceneChangedMsg = { urlPath: string; kind: SceneChangedKind; viaSibling?: b
  *  order of their latest write (#1164). Drained by {@link replaySuppressedSceneReloads}. */
 const _suppressedReloads = new Map<string, SceneChangedMsg>();
 
-/** Scene-FILE changes owed to the undo stack (#1744): per open scene path, the generation of the newest change to a file
- *  in its loaded chain that no reload of that path has carried yet. Its reload drops the stack, clean or not.
- *  - **Per path**, so a change raised for scene A and never reloaded (A was left meanwhile) cannot drop scene B's stack.
- *  - **By generation**, so a reload clears only the change it CARRIED. A watcher batch starts one reload per changed file,
- *    and they race: a prefab reload that read nothing owed, then finished after a scene change was raised, used to clear
- *    it before the scene's own reload read it, and the stale stack survived.
- *  Raised before the reload's first await, so a reload of the same path that starts alongside it carries it too. */
-let _sceneChangeSeq = 0;
-const _owedSceneChanges = new Map<string, number>();
 
 /** Replay every scene/prefab change that arrived while the hot reload was suppressed, through the
  *  same `handleSceneChanged` a live change takes, so a deferred change gets exactly the treatment
@@ -3181,6 +3177,14 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   };
   const suppressed = sceneReloadSuppressedReason();
   if (suppressed) { defer(suppressed); return; }
+  // #1750 R2: the target (`current`, below) is read once and acted on after the fetch, so the adopted world it belongs to
+  // is captured with it and re-asked before the load. Null only if a switch landed since the suppressor's own check.
+  const adopted = _adoptionHooks ? _adoptionHooks.capture() : () => true;
+  if (!adopted) { defer('a scene switch is still landing — the reload replays once it has'); return; }
+  // A scene FILE changed: its undo stack is stale wherever it is — open, or parked because the scene is not (owner fork 4,
+  // #1750) — so the debt is raised for the file itself, before anything below can return, and the next adopt that names
+  // that scene pays it. A prefab change leaves every scene file alone and raises none (#1744).
+  if (msg.kind === 'scene') _adoptionHooks?.sceneFileChanged(msg.urlPath);
   // #1169: a prefab change must evict the cached prefab BEFORE the scene reload below, or the reload
   // re-instantiates the OLD prefab: a load acquires before it releases, so the new scene id finds the
   // entry still owned and `fetchPrefab` returns on the cache hit. BOTH copies: the runtime cache
@@ -3233,7 +3237,8 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
       break;
     }
     if (!matchedAny) return; // touches no scene in the currently-loaded chain (a scene change carries no prefabs)
-    _owedSceneChanges.set(normScenePath(current), ++_sceneChangeSeq);
+    // A changed BASE leaves the primary's own file alone, but its stack was recorded over the base's old bytes too.
+    if (changedBaseGuid) _adoptionHooks?.sceneFileChanged(current);
   }
   try {
     // Fetch the fresh file once: validate it AND hand it to loadScene via
@@ -3277,20 +3282,25 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
     // change would be gone from the pending list — so defer it again instead.
     const lateReason = sceneReloadSuppressedReason();
     if (lateReason) { defer(lateReason); return; }
+    // …and the target itself (#1749): a prefab edit-open (it takes no replacement token) that adopted inside the awaits
+    // above made `current` a scene that is no longer open, and reloading it now replaced the edit world — its session
+    // and its undo stack with it. Deferred like any held change; it replays when that switch has settled — at once when
+    // it already has, since no later settle would come to replay it.
+    if (!adopted()) {
+      defer('a scene switch landed while the reload read the file — it replays once that has settled');
+      if (_adoptionHooks?.settled()) void Promise.resolve().then(() => replaySuppressedSceneReloads());
+      return;
+    }
     evictRuntimePrefabs();
     // The kept bases carried their unsaved edits across, so the editor keeps their dirty flags (#1417).
     const reload = () => sceneManager.loadScene(current, {
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
     });
-    // A SCENE file changed under the undo stack, so the editor drops it even over a clean world (#1744). A prefab
-    // change leaves the scene file alone, unless a scene change to this path is still owed (one it superseded).
-    const owedKey = normScenePath(current);
-    const owed = _owedSceneChanges.get(owedKey);
-    if (_worldReloadedFromDisk) await _worldReloadedFromDisk(current, reload, { sceneFileChanged: owed !== undefined });
+    // A SCENE file changed under the undo stack, so the editor drops it even over a clean world (#1744): the debt raised
+    // above is the owner's, paid by the adopt that names this scene — this reload's, or a scene open's that superseded it.
+    if (_worldReloadedFromDisk) await _worldReloadedFromDisk(current, reload);
     else await reload();
-    // Only the change this reload carried: a newer one raised during its load is still owed to that change's own reload.
-    if (owed !== undefined && _owedSceneChanges.get(owedKey) === owed) _owedSceneChanges.delete(owedKey);
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
     // A newer load superseding this one aborts the in-flight load

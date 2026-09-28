@@ -32,11 +32,14 @@ export {
 export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode, getModeOwner, onModeOwnerChange } from './scene/playMode';
 export type { PlayOutcome, StopOutcome } from './scene/playMode';
-export { isWorldAuthored, whyWorldNotAuthored } from './scene/authoredWorld';
+export { isWorldAuthored, whyWorldNotAuthored, notAuthoredExit } from './scene/authoredWorld';
 export { envelopeExitOptions } from './scene/envelopeExits';
 export { lastRestoreFailed } from './scene/authoredSnapshot';
 export { hasTimelinePreviewSession } from './scene/timelinePreview';
 export { onAuthoringSettled, isWorldReplacementInFlight } from './scene/authoringSettle';
+// #1750: what the hot reload asks the adoption owner — through hooks the bridge installs, since the bridge cannot import it.
+export { editorStateCurrent, captureAdoption, recordSceneFileChanged, onAdoptionsSettled, adoptionsSettled } from './scene/sceneAdoption';
+export { onWorldHoldsSettled } from './undo/undoManager';
 // GameView device simulation. Exported for the agent ops behind `modoki_set_game_view_device` /
 // `modoki_game_view_devices` (#367) — the catalog is the single source of truth for what screens
 // exist, so an op that hardcoded a table would go stale on the next device added.

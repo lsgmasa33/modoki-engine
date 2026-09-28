@@ -18,13 +18,14 @@ import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { getEditVersion } from '../undo/undoManager';
 import { sceneManager, type SceneLoadResult } from '../../runtime/scene/SceneManager';
-import { withAdoption, adoptionCount, endPrefabEditInPlace, beginWorldRequest } from './sceneAdoption';
+import { withAdoption, adoptionCount, endPrefabEditInPlace, beginWorldRequest, editorStateCurrent, SCENE_SWITCH_LANDING } from './sceneAdoption';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
 import type { SceneData, SceneEntityEntry, AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { linkOwnerBeforeMove } from '../../runtime/core/ecs/identityParents';
 import { whyWorldNotAuthored } from './authoredWorld';
+import { canEdit } from '../../runtime/core/playState';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
@@ -412,7 +413,7 @@ export async function openPrefabForEditing(
      *  caller said to throw away (#1745). */
     discardUnsaved?: boolean;
   } = {},
-): Promise<void> {
+): Promise<EditOpenRefusal | undefined> {
   // Taken before the first await: a scene load, Create Scene or another edit-open requested after this one wins (#1700).
   const stillNewest = beginWorldRequest();
   // Refuses new undo steps for the whole switch, fetch included, and names the one in flight (#1579).
@@ -422,7 +423,7 @@ export async function openPrefabForEditing(
     // file, so a fetch during its write read the applied file and `setPrefabCache` overwrote the undo's restored copy —
     // the edit world was built from the applied document, and saving it put the Apply back on disk.
     if (worldSwitch.idle) await worldSwitch.idle;
-    await openPrefabForEditingSwitching(asset, opts, worldSwitch.ready, stillNewest);
+    return await openPrefabForEditingSwitching(asset, opts, worldSwitch.ready, stillNewest);
   } finally {
     worldSwitch.release();
   }
@@ -433,7 +434,7 @@ async function openPrefabForEditingSwitching(
   opts: { confirmDiscard?: (action: string) => Promise<boolean>; discardUnsaved?: boolean },
   switchReady: () => Promise<void> | null,
   stillNewest: () => boolean,
-): Promise<void> {
+): Promise<EditOpenRefusal | undefined> {
   let prefab: PrefabFile;
   try {
     const res = await fetch(asset.path);
@@ -484,6 +485,12 @@ async function openPrefabForEditingSwitching(
     console.warn(`[PrefabEdit] "${asset.name}" was not entered: a newer scene request was made while it waited`);
     return;
   }
+  // …and not over a world that is not savable (#1750; owner, 2026-09-28: refuse, never wait). Checked BEFORE the save:
+  // in another route's tail the save wrote the incoming world into the outgoing scene's file (#1746 A2), and a refused
+  // save used to be ignored, so the swap below then discarded the work it had failed to keep. Play armed while this
+  // fetched is the same answer (the run mode), and swapping would put this edit world inside the Play world.
+  const refused = refuseUnsavable(asset.name, opts);
+  if (refused) return refused;
   if (getCurrentScenePath() && !opts.discardUnsaved) await saveScene();
   if (opts.confirmDiscard && worldHasUnsavedEdits() && !(await opts.confirmDiscard(`edit prefab ${asset.name}`))) return;
   // The REQUEST-order check `loadScene` makes after its `ready()` (#1700), here after the last await before the swap: a
@@ -494,6 +501,10 @@ async function openPrefabForEditingSwitching(
     console.warn(`[PrefabEdit] "${asset.name}" was not entered: a newer scene request was made while it waited`);
     return;
   }
+  // Again after the save and the human's dialog, which can stay open indefinitely: Play pressed meanwhile, or another
+  // route's swap, is found here, with nothing from here to the swap that awaits.
+  const late = refuseUnsavable(asset.name, opts);
+  if (late) return late;
 
   const returnScene = resolveReturnScene(
     sceneManager.getCurrent()?.path ?? null,
@@ -534,6 +545,27 @@ async function openPrefabForEditingSwitching(
     editBaseline = { guid, doc: opened };
     console.log(`[PrefabEdit] editing "${prefab.name}"`);
   });
+}
+
+/** An edit-open refused because the world was not in a state to leave (#1750): `refused` is the reason, for a toast or an
+ *  agent refusal. Nothing was written and nothing was swapped. */
+export interface EditOpenRefusal { readonly refused: string }
+
+/** Why an edit-open must not leave the world now, or null. A switch still landing (any route — a Stop's or a preview's
+ *  restore included, whose own reason outranks the switch reason in `whyWorldNotAuthored`) and a run mode other than
+ *  stopped refuse ALWAYS: this swap would supersede that switch, or land inside the Play world. Asked of the owner and the
+ *  run mode directly, not by comparing the reason string, for that reason (close-out review). Any other posed-world
+ *  reason refuses only when the edits would be kept, since the save that keeps them would be refused and the swap would
+ *  then discard them; a caller that asked to discard them gets its swap. */
+function refuseUnsavable(name: string, opts: { discardUnsaved?: boolean }): EditOpenRefusal | undefined {
+  const landing = !editorStateCurrent();
+  const why = whyWorldNotAuthored();
+  if (!landing && (!why || (opts.discardUnsaved && canEdit()))) return undefined;
+  const refused = landing
+    ? `${SCENE_SWITCH_LANDING} — open the prefab again once it's open`
+    : `the world is not in a state to leave (${why})`;
+  console.warn(`[PrefabEdit] "${name}" was not entered: ${refused}`);
+  return { refused };
 }
 
 /** Build the prefab-edit world for `prefab` (the document of the prefab `guid`) in place of the live world — the
@@ -711,6 +743,13 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
   // during preview) removed the human's too. One guard, both paths. `isWorldAuthored`, not the run
   // mode, for the same reason as `saveScene` (#1548): an exit reads 'stopped' before its restore lands.
   const notAuthored = whyWorldNotAuthored();
+  // #1750 R1: another prefab's edit-open is in its tail — its edit world is on screen while the flag above still names
+  // THIS prefab, so the save wrote that prefab's world into this one's file (#1747). Refused, with the reason in the
+  // report so Cmd+S and the agent both say it.
+  if (notAuthored === SCENE_SWITCH_LANDING) {
+    console.warn(`[PrefabEdit] "${editingPrefab.name}" was not saved — ${SCENE_SWITCH_LANDING}`);
+    return { saved: false, warnings: [`${SCENE_SWITCH_LANDING} — save again once it's open`] };
+  }
   if (notAuthored) {
     console.error(
       `[PrefabEdit] cannot save "${editingPrefab.name}" — ${notAuthored}. ` +

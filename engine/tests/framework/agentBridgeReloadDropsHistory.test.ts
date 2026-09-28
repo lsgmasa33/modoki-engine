@@ -24,8 +24,10 @@ type Win = typeof window & { __modokiElectron?: { bridge?: unknown } };
 vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
 const SCENE_PATH = '/games/g/runtime/assets/Main.scene.json';
 
-const { initAgentBridge, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads } =
+const { initAgentBridge, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, replaySuppressedSceneReloads } =
   await import('../../app/debug/agentBridge');
+const { captureAdoption, adoptionsSettled, recordSceneFileChanged, _resetSceneAdoptionForTests } =
+  await import('../../packages/modoki/src/editor/scene/sceneAdoption');
 
 let handlers: Map<string, Handler[]>;
 let loadScene: ReturnType<typeof vi.spyOn>;
@@ -57,7 +59,10 @@ beforeEach(() => {
     },
   };
   initAgentBridge();
+  _resetSceneAdoptionForTests();
   setWorldReloadedFromDiskHook(adoptWorldReloadedFromDisk);
+  // The scene-file debt is the adoption owner's since #1750 (S7): the bridge raises it through these, as the editor installs them.
+  setSceneAdoptionHooks({ capture: captureAdoption, settled: () => adoptionsSettled() === null, sceneFileChanged: recordSceneFileChanged });
   const getCurrent = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: SCENE_PATH } as never);
   const getLoaded = vi.spyOn(sceneManager, 'getLoadedScenes')
     .mockReturnValue(new Map([['main', { path: SCENE_PATH, role: 'primary', guid: 'main' }]]) as never);
@@ -77,6 +82,7 @@ afterEach(async () => {
   setSceneReloadSuppressor(null);
   await replaySuppressedSceneReloads();
   setWorldReloadedFromDiskHook(null);
+  setSceneAdoptionHooks(null);
   for (const r of restores.splice(0)) r();
   delete (window as Win).__modokiElectron;
 });

@@ -1,6 +1,6 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
-import { whyWorldNotAuthored } from './authoredWorld';
+import { whyWorldNotAuthored, notAuthoredExit } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, identityTree, type DetachedMember, type IdentityTree } from '../../runtime/core/ecs/memberHome';
@@ -5245,7 +5245,7 @@ async function planApply(
   // can revert. Refused here, the one function both the dialog and the agent `prefab apply` reach.
   const notAuthored = whyWorldNotAuthored();
   if (notAuthored) {
-    return { result: { ...NOOP_APPLY, refused: `the live world is not authored (${notAuthored}) — exit the preview / stop Play first, or a pose would be written into the prefab` } };
+    return { result: { ...NOOP_APPLY, refused: `the live world is not authored (${notAuthored}) — ${notAuthoredExit(notAuthored) ?? 'exit the preview / stop Play first, or a pose would be written into the prefab'}` } };
   }
   // A reference to a missing prefab inside the instance (#1699) holds its edits as a scene record, which a template
   // cannot take (I8): promoting it wrote an empty reference row into the prefab and took the node out of the instance.

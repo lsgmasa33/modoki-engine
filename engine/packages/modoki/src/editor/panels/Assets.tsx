@@ -280,9 +280,11 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       // the resulting Cmd+Z trash a file that isn't there.
       // ONE step (#1692): only over what was read at the path, then both caches — so the instances placed from a
       // re-imported prefab are rebuilt from it now, not at the next reload.
-      const wrote = (await commitPrefabWrite(prefabPath, prefab, { expected: previousContent ?? null })).ok;
+      const committed = await commitPrefabWrite(prefabPath, prefab, { expected: previousContent ?? null });
+      const wrote = committed.ok;
       if (!wrote) {
-        console.error(`[Assets] Failed to create prefab ${prefabPath}`);
+        // The commit's own reason when it has one (#1750: "a scene is still loading" refuses a write, and says so).
+        console.error(`[Assets] Failed to create prefab ${prefabPath}${committed.error ? ` — ${committed.error}` : ''}`);
       } else {
         console.log(`[Assets] Created prefab: ${prefabPath}`);
         // Builder in assetUndo.ts (#308) — both directions now check the write/delete

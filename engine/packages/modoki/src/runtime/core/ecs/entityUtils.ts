@@ -91,6 +91,17 @@ function warnFallbackCapped(entityId: number) {
 
 /** Find an entity by ID. O(1) via entity index, with fallback scan for
  *  entities not registered via registerEntity (e.g. in tests). */
+/** The entity `entityId` names NOW, captured as a check: true while the id still names that SAME entity — not destroyed,
+ *  and not a newer entity recycled into its index (koota bumps a recycled index's generation, so the handle differs).
+ *  What a reader carrying a bare entity id across an await asks before it acts (#1750 R2): a prefab frame rebuilt in
+ *  place re-mints its entities in the same world, which no world check can see. By HANDLE, not by guid: a guid can be
+ *  re-stamped on the same entity (Create Prefab's member stamp) or shared by two (a hand-edited file), and either made a
+ *  guid check refuse an entity that had not changed. An id naming nothing at capture stays a no-op check. */
+export function captureEntityIdentity(entityId: number): () => boolean {
+  const handle = findEntity(entityId);
+  return () => findEntity(entityId) === handle;
+}
+
 export function findEntity(entityId: number): Entity | null {
   const fromIndex = findEntityById(entityId);
   if (fromIndex) return fromIndex;

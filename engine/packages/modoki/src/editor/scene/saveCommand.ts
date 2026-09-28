@@ -388,6 +388,11 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
       : whyBlocked(o.mode);
     return { text: `${savedPart || 'The scene was not saved: '}${why}${failSuffix}`, kind: 'warn' };
   }
+  if (r.reason === 'switching') {
+    // Refused, not queued (#1750; owner, 2026-09-28): the outgoing scene was already saved or discarded when the switch
+    // was chosen, so nothing is lost by pressing it again.
+    return { text: `${savedPart || 'The scene was not saved: '}a scene is still loading — save again once it's open.${failSuffix}`, kind: 'warn' };
+  }
   if (r.reason === 'prefab-edit') {
     return { text: `${savedPart}this is a prefab-edit world — re-open the prefab to save it${failSuffix}`, kind: 'warn' };
   }

@@ -28,17 +28,26 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 }));
 
 // Apply writes the prefab through postWriteFile — captured instead of hitting a dev server.
-vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
+vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => {
+  const real = await importOriginal<Record<string, unknown>>();
+  return {
+  ...real,
+  // `duringRepair` runs inside the undo's member-path repair — its rebuild's one await before the restore (#1750 T3).
+  repairPrefabMemberPaths: async (...args: unknown[]) => {
+    const out = await (real.repairPrefabMemberPaths as (...a: unknown[]) => Promise<unknown>)(...args);
+    const f = sm.duringRepair; sm.duringRepair = null; f?.();
+    return out;
+  },
   // `duringWrite` runs inside the write's await — where an undo's file install waits, and an Exit can land.
   postWriteFile: async () => {
     const f = sm.duringWrite; sm.duringWrite = null; f?.();
     return { ok: true, json: async () => ({}), text: async () => '' } as Response;
   },
-}));
+  };
+});
 
 /** The live world's synthetic path, and the loader the stubbed swap runs. */
-const sm = vi.hoisted(() => ({ path: '', load: null as null | ((data: unknown) => Promise<void>), duringWrite: null as null | (() => void) }));
+const sm = vi.hoisted(() => ({ path: '', load: null as null | ((data: unknown) => Promise<void>), duringWrite: null as null | (() => void), duringRepair: null as null | (() => void) }));
 vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
   return {
@@ -251,6 +260,21 @@ describe('undoing an Apply made in the prefab editor rebuilds that world (#1573)
     expect(parentOf(inRow('B', 'Box'))).toBe(rootOf('B'));
     expect(nameOf(parentOf(inRow('A', 'Box')))).toBe('Slot');
     expect(saved()).toEqual(before);
+  });
+});
+
+describe('the restore`s own world check (#1750 T3: the stub swaps a world of its own)', () => {
+  // The commit skips its rebuild for any swap during the WRITE, so the restore's `getCurrentWorld() !== world` is reached
+  // only by one landing inside the rebuild's member-path repair, under the SAME key — a switch through `SceneManager`
+  // that is not an editor route (the key check cannot see it). Mutation: drop that clause → this goes red.
+  it('a world swapped in under the same key during the member-path repair is not overwritten by the snapshot', async () => {
+    reparentEntity(inRow('A', 'Box'), inRow('A', 'Slot'));
+    await applyFromA((k) => k.moved);
+    let swapped: ReturnType<typeof createWorld> | null = null;
+    sm.duringRepair = () => { swapped = createWorld(); setCurrentWorld(swapped); };
+    await quietly(() => undo());
+    expect(swapped, 'premise: the repair ran inside the undo').not.toBeNull();
+    expect(getCurrentWorld() === swapped, 'the snapshot was loaded over the world that replaced it').toBe(true);
   });
 });
 

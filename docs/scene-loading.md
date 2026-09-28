@@ -2029,8 +2029,8 @@ Each invariant names the one function that owns it.
     repair that throws is reported and stays owed.
 - **S8. The adopt decides discarded work against the OUTGOING world.** The dirt is read on both
   sides of the swap's await. The undo stack drops iff work was discarded, the outgoing stack is a
-  prefab-edit world's (U27, #1704: § Per-scene undo history), or a hot reload's scene FILE changed on disk
-  (`fileChanged`, #1744), and only a kept base keeps its dirty flag. **Owner:** the owner's `history` write, one rule for every route (#1409,
+  prefab-edit world's (U27, #1704: § Per-scene undo history), or the incoming scene's FILE changed on disk
+  (the owner's scene-file debt, #1744 / #1750 S7 below), and only a kept base keeps its dirty flag. **Owner:** the owner's `history` write, one rule for every route (#1409,
   #1417). The pre-swap read counts only while the baseline it was read against is still the current
   one — no adopt since (`baselineSeq`, bumped by each adopt's history write; a save does not bump it): a newer route's read that
   predates an older route's adopt describes a world that adopt already settled, and used anyway it
@@ -2071,8 +2071,8 @@ Each invariant names the one function that owns it.
 S1 to S11 govern the routes that REPLACE the world. This part covers the code that READS it: a disk writer
 (a scene save, a prefab-edit save, a prefab commit), and any operation that captures something before an
 await and acts on it afterwards (Play's startup, the hot reload, an Apply). It came from the #1750 design
-study (2026-09-28). ⚠️ **R1 to R3 are the model, not yet the code.** The status line under each one says what
-enforces it today, and the fix is tracked on #1750.
+study (2026-09-28), and the #1750 fix enforces R1 to R3 and S7 through the adoption owner (`sceneAdoption.ts`). The
+status line under each one says where.
 
 **The rule: when the world is not in a savable state, REFUSE. Don't wait, and don't guess** (owner,
 2026-09-28). A save, a prefab write or an Apply that finds the world mid-switch, mid-reload or otherwise
@@ -2108,52 +2108,82 @@ Two measured facts make a wrong answer expensive:
   A disk writer pairs the scene path, or the prefab-edit flag, with the world's bytes. The pair is broken in
   States 4 to 6 of any route, and while `newScene`'s path runs ahead of its swap. **The question is
   "adopted", not "same world".** `isWorldAdopted()` alone misses the `newScene` window, because the OLD world
-  is still adopted there. **Status: not enforced.** `isWorldAdopted()` has no production reader.
-  `whyWorldNotAuthored` (`authoredWorld.ts`), the one check every writer already asks, knows only Play, the
-  previews and a restore landing. Broken by #1746 (a save writes the incoming world into the outgoing scene's
+  is still adopted there. **Status: enforced** by `editorStateCurrent()`: false while a PENDING route registered
+  in another world than the one on screen and that world is not the adopted one (swapped, not adopted), or while
+  a route has called its ticket's `writingAhead()` (`newScene`, before it writes its path). It is a FALLBACK
+  source of `whyWorldNotAuthored` ("a scene is still loading"), asked after the specific ones, so a Stop's restore
+  still says "retry". `saveScene` returns `reason: 'switching'` (Cmd+S and `save-all` say "save again once it's
+  open"), the prefab-edit save puts the reason in its report, and the edit-open refuses before its auto-save and
+  again at its last check before its swap — asking `editorStateCurrent()` and the run mode directly, so its
+  `discardUnsaved` exemption (which waives only a posed-world reason) never reaches a Stop's restore tail, where the
+  restore's own label is the reason string. The source registers its own way out ("try again once it's open",
+  `notAuthoredExit`), which the other refusals quote instead of Play/preview advice. ⚠️ Keyed on a pending route's SWAP, not on `isWorldAdopted()`: before a
+  route swaps, the state still describes the world it leaves, so that pair saves; and a world no route replaced (a
+  harness, a boot that never adopted) is not this question — failing closed there refused every save with a
+  "still loading" that was false. Was broken by #1746 (a save writes the incoming world into the outgoing scene's
   file), #1747 (a prefab-edit save writes another prefab's edit world into the open prefab's file) and the
   `newScene` window (a save writes the outgoing world to the new path).
 - **R2. A reader that CARRIES a capture across an await re-establishes, after its last await and before it
   acts, that it is still in the same ADOPTED world.** A capture is a world, an entity id, a target path, or a
   snapshot. The check is "same world AND adopted", and the capture itself must be taken in an adopted world. A
   capture taken in State 4 passes a same-world check forever: that is how `commitPrefabWrites` takes an
-  unadopted edit world for the open prefab's (#1747). **Status: each site answers its own question.** Play
-  compares a request generation that a hot reload and an edit-open never bump (#1748). The hot reload reads
-  its target once (#1749). The forward Apply re-checks nothing across its awaits (H1).
+  unadopted edit world for the open prefab's (#1747). **Status: enforced** through `captureAdoption()` — null when
+  the state is not current, else a check (same world, no adoption since, still current). ⚠️ The world is not the
+  reader's ENTITIES: `refreshInstances` re-mints a prefab frame's entities in the same world (a leave repair an Apply
+  waited for, another Apply's fan-out), so a reader that carries an entity id also re-checks THAT entity
+  (`captureEntityIdentity(id)` before its first await, asked after its last — and the agent `prefab create` again
+  inside its commit's rebuild, which acts on the raw id after the commit's own awaits) and refuses with "the instance
+  was rebuilt meanwhile". By koota HANDLE, not by guid: a recycled index gets a bumped generation, while a guid can be
+  re-stamped on the same entity or shared by two, and a guid check refused entities that had not changed. A global "frames rebuilt" epoch was tried and reverted in the close-out reviews: any Apply of
+  an unrelated prefab then invalidated every capture, half-landing a concurrent Apply and dropping an Apply undo whose
+  write it overlapped (pinned in `applyAcrossReload.test.ts`). Its readers:
+  `commitPrefabWrites` (through `adoptionGate.ts`, taken before its wait as #1698's review requires), Play (just
+  before its snapshot — not at entry, since the undo step and envelope takedown before it replace the world on
+  purpose; #1748), the forward Apply (one check after its last await before it plans; H1), Create Prefab and the agent
+  `prefab create` (the same, after their fetches — found by the fix's own sweep and close-out review), and the hot
+  reload (its target re-asked after its fetch; #1749, which then defers).
 - **R3. A world switch that nobody requested does not start while an operation holds the world.** This is
   Unity's `AssetDatabase.DisallowAutoRefresh`: a tool holds off the refresh that would reload assets under it.
   Here the unrequested switch is the hot reload, and the operation is anything that took a world hold (an
-  Apply, a prefab commit, an undo step). **Status: not enforced.** The suppressor consults only the replacement
-  token, and neither the Apply nor the commit takes one. So a reload can land inside an Apply's awaits (H1,
-  measured at its scene snapshot, `applyPrefabUndo.ts` `sceneBefore`) and, by reading, inside the commit's
-  rebuild (F5).
+  Apply, a prefab commit, an undo step). **Status: enforced** by the suppressor (`agentEditorOps.ts`): it defers
+  while `undoStepPending()` (an undo step or a world hold) and while a switch is landing, and the deferred change
+  replays on `onWorldHoldsSettled` and `onAdoptionsSettled` as well as on authoring settling — each listener
+  registered once, at startup. The replay re-reads the file, and several changes to one file are one reload. Was
+  open to H1 (a reload inside an Apply's `sceneBefore` snapshot) and, by reading, F5.
 - **R4. A question about a REQUEST stays with the request order (S11).** "Did a newer request supersede mine?"
   is not a world question, and no world token answers it. The edit-open's `stillNewest()` (#1700, #1745) and
   Play's generation check are this kind. Neither S6 nor R2 retires them.
 - **S7, extended: a scene-file debt must survive supersession too.** #1744's "this scene file changed on disk,
-  so its undo stack is stale" debt lives in `agentBridge` (`_owedSceneChanges`), keyed by the open scene's path.
-  Only a hot reload of that same path that runs to completion clears it. **Status: not the S7 shape.** A scene
-  open that aborts or out-adopts the reload strands it, and the scene's clean stack is parked without the drop.
-  A reload whose offer LOST still clears it (`agentBridge.ts` deletes the debt once the hook resolves, and
-  `adoptWorldReloadedFromDisk` resolves normally when `offer()` returns false), so nothing applied it.
-  `pendingForcedBases` (#1422) is the precedent that does it right: owned by the manager, cleared only by a
-  committed swap.
+  so its undo stack is stale" debt is the adoption owner's (`recordSceneFileChanged`), as `pendingForcedBases`
+  (#1422) is the manager's. **Status: enforced.** The bridge raises it for every scene-FILE change — the open
+  scene's, a changed base's (for the primary too), and a scene that is not open at all (owner fork 4: its parked
+  clean stack is as stale). It is paid by the next adopt whose history swap goes TO that scene's key, from ANY
+  route — a scene open that superseded the reload included — and only by a route registered after the change was
+  raised (a route already loading read older bytes; the newer change stays owed to its own reload). A lost offer
+  pays nothing. Leaving the scene pays nothing either: its stack parks, and the swap back drops it. Keys are
+  `normScenePath` (`runtime/scene/scenePathKey.ts`), which normalises separators first, so a Windows `C:\…` path,
+  either drive-letter case under `/@fs/` and the `/assets/…` broadcast are one key. Was stranded by a scene open
+  that aborted or out-adopted the reload, and cleared by a reload whose offer lost.
 
 #### The #1750 members, classified
 
+Tests: `sceneAdoptionReaders.test.ts` (R1, #1748, the Play item), `applyAcrossReload.test.ts` (H1),
+`agentBridgeReloadHoldsWorld.test.ts` (R3, #1749, S7, the keys), `prefabEditApplyUndo.test.ts` (the undo restore's
+own world check, which only a same-key swap inside its member-path repair reaches).
+
 | Member | Route and reader | Invariant | Verdict |
 |---|---|---|---|
-| #1746 A1 | a scene load's State 4 · Cmd+S / agent `save-all` | R1 | observed headless (#1723) |
-| #1746 A2 | an edit-open's State 4 · a second edit-open's auto-save | R1 | observed headless (#1723) |
-| #1747 | an edit-open's State 4 · prefab-edit save → `commitPrefabWrites` | R1, R2 (its capture is taken in State 4) | observed headless (#1723) |
-| #1748 | a hot reload or edit-open inside Play's startup awaits | R2 | observed headless (#1723) |
-| #1749 | an edit-open adopted inside the hot reload's fetch | R2 | observed headless (#1723) |
-| H1 | an Apply that waited in `adoptionsSettled()`, or whose `sceneBefore` snapshot awaited a prefab fetch, while a hot reload landed | R2, R3 | **reproduced** (scratch test, #1750 comment): the wrong instance's value applied |
-| F5 | a hot reload inside `commitApplyPlan`'s rebuild | R3 | **not reproduced in that window**. The rebuild's only await is `preloadNestedPrefabsForSubtree`, and the Apply's `sceneBefore` serialize has already fetched every prefab the scene uses, so that await is warm (microtasks). A reload that needs a real fetch lands one step earlier, which is H1. The mechanism is still open: `isLiveInstanceRoot` ignores `source`, and nothing re-checks the world before `refreshInstances` |
+| #1746 A1 | a scene load's State 4 · Cmd+S / agent `save-all` | R1 | observed headless (#1723); **refused** (`'switching'`) |
+| #1746 A2 | an edit-open's State 4 · a second edit-open's auto-save | R1 | observed headless (#1723); **the second open refuses**, nothing written or swapped |
+| #1747 | an edit-open's State 4 · prefab-edit save → `commitPrefabWrites` | R1, R2 (its capture is taken in State 4) | observed headless (#1723); **both refuse** |
+| #1748 | a hot reload or edit-open inside Play's startup awaits | R2 | observed headless (#1723); **Play refuses** (`load-landed`) |
+| #1749 | an edit-open adopted inside the hot reload's fetch | R2 | observed headless (#1723); **the reload defers**, the edit world stays |
+| H1 | an Apply that waited in `adoptionsSettled()`, or whose `sceneBefore` snapshot awaited a prefab fetch, while a hot reload landed | R2, R3 | **reproduced**, both windows, both file orders (`applyAcrossReload.test.ts`, red before the fix); **refused**: "the scene reloaded — open Apply again" (owner fork 2) |
+| F5 | a hot reload inside `commitApplyPlan`'s rebuild | R3 | **not reproduced in that window**. The rebuild's only await is `preloadNestedPrefabsForSubtree`, and the Apply's `sceneBefore` serialize has already fetched every prefab the scene uses, so that await is warm (microtasks). A reload that needs a real fetch lands one step earlier, which is H1. `isLiveInstanceRoot` still ignores `source`, but **R3 closes the window**: a reload now defers while the Apply or the commit holds the world |
 | #1745 E2 residual | a save's own awaits, then a newer `load_scene {discardUnsaved}` | R4, not a world question | not a defect under serial order: the save began before the discard was asked for, and in Unity it would have finished first. An owner fork on #1750 |
-| #1744 stranded debt | a scene open aborting or out-adopting the hot reload | S7 | read from the code, plus the lost-offer case above |
-| `newScene` early path | Cmd+S in Create Scene's manager awaits | R1 | read from the code (`serialize.ts` `newScene`, `SceneManager.replaceWorldContent`) |
-| Play and a waiting edit-open | an edit-open still in its fetch when Play arms, which then swaps during Play | R3 or R4 | hypothesis, READ-ONLY. `enterPlay` never reads `isWorldSwitchInProgress()`, and the edit-open's `stillNewest()` cannot see Play. Decided by pressing Play while an edit-open's prefab fetch is held |
+| #1744 stranded debt | a scene open aborting or out-adopting the hot reload | S7 | read from the code, plus the lost-offer case; **both fixed** (the debt is the owner's) |
+| `newScene` early path | Cmd+S in Create Scene's manager awaits | R1 | read from the code; **refused** (`writingAhead()`) |
+| Play and a waiting edit-open | an edit-open still in its fetch when Play arms, which then swaps during Play | R1 (run mode) | **reachable**: Play arms during the fetch (tested). **The edit-open refuses** at its checks ("run-mode is 'playing'") instead of swapping into the Play world; Play pressed during its discard dialog is caught by the last check |
 
 #### Designs compared
 
@@ -2176,8 +2206,8 @@ Two measured facts make a wrong answer expensive:
   External file changes are picked up only by an `AssetDatabase` refresh between operations, never inside
   one. A tool can hold refresh off with `DisallowAutoRefresh` (a counter) or batch its imports with
   `StartAssetEditing`. An externally modified open scene prompts a reload.
-- **Recommended: A for R1 and R2, plus B's reload-honours-holds for R3, plus the S7 debt moved into the
-  adoption owner.** Modoki's loads cannot be synchronous, so this is the closest copy of Unity (#1694): R1 and
+- **Chosen (owner, 2026-09-28, fork 5): A for R1 and R2, plus B's reload-honours-holds for R3, plus the S7 debt
+  moved into the adoption owner.** Modoki's loads cannot be synchronous, so this is the closest copy of Unity (#1694): R1 and
   R2 make the async windows visible and refuse them, and R3 is `DisallowAutoRefresh`. C stays the fallback if
   the class keeps producing members after that. The fix plan and the owner forks are on #1750.
 

@@ -31,6 +31,7 @@ const PRIOR_LINKS = { links: [{ id: 7, data: { source: 'g-prior', localId: 1, ro
 const detachSpy = vi.fn(() => PRIOR_LINKS);
 const reattachSpy = vi.fn();
 const calls: string[] = [];
+const preload = vi.hoisted(() => ({ during: null as null | (() => Promise<void> | void) }));
 const OLD_ID = 'g-old';
 let runtimeExcludedFixture = 0;
 vi.mock('../../src/editor/scene/prefab', () => ({
@@ -50,7 +51,8 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   // precisely because this file asserts the undo/redo closures and mocks serializePrefab
   // anyway — and since #1295 the cache is populated by construction, so the warm is
   // belt-and-braces rather than the thing under test (prefabCacheWarm.test.ts covers that).
-  preloadNestedPrefabsForSubtree: async () => {},
+  // #1750: `duringPreload` runs inside it — a cold warm is a real fetch, where a hot reload can renumber the world.
+  preloadNestedPrefabsForSubtree: async () => { const f = preload.during; preload.during = null; await f?.(); },
   // The real guard, reduced to its direct case: the child IS the parent.
   wouldCreateCycle: (parent: string, child: string) => parent === child,
   // A Replace hands the replaced bytes to the matcher (#1686); what they parse to does not matter to this mocked serialize.
@@ -277,6 +279,35 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
       expect(onDisk.get(PATH)).toBe(OLD_TEXT);
       expect(written).toHaveLength(0);
     } finally { setCurrentWorld(before); }
+  });
+
+  it('a world rebuilt while the nested prefabs were warmed refuses, and writes nothing (#1750: H1`s class)', async () => {
+    const { createWorld } = await import('koota');
+    const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const before = getCurrentWorld();
+    preload.during = () => { setCurrentWorld(createWorld()); };
+    try {
+      const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
+      expect(res).toMatchObject({ refused: expect.stringMatching(/reloaded while the prefab was being prepared/) });
+      expect(written).toHaveLength(0);
+      expect(tagSpy).not.toHaveBeenCalled();
+    } finally { setCurrentWorld(before); preload.during = null; }
+  });
+
+  it('the entity rebuilt IN PLACE while the nested prefabs were warmed (same world, its index recycled) refuses, and writes nothing (#1750)', async () => {
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const world = getCurrentWorld();
+    const e = world.spawn();
+    const id = e.id();
+    // Destroyed and re-minted into the SAME index, as a frame rebuilt in place is: koota hands the freed index back with a
+    // bumped generation, so the id is equal and the entity is not.
+    preload.during = () => { e.destroy(); const again = world.spawn(); expect(again.id(), 'premise: the index was recycled').toBe(id); };
+    try {
+      const res = await createPrefabFromEntity(id, PATH, 'Create Prefab "Thing"', async () => true);
+      expect(res).toMatchObject({ refused: expect.stringMatching(/was rebuilt while the prefab was being prepared/) });
+      expect(written).toHaveLength(0);
+      expect(tagSpy).not.toHaveBeenCalled();
+    } finally { preload.during = null; for (const x of [...world.entities]) if (x.id() === id) x.destroy(); }
   });
 
   it('asks, naming the path, and a NO writes nothing', async () => {

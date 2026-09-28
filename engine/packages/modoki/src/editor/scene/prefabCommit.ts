@@ -33,7 +33,7 @@ import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { beginWorldBoundOperation } from '../undo/undoManager';
-import { adoptionsSettledGate, pendingAdoptionCount } from './adoptionGate';
+import { adoptionsSettledGate, pendingAdoptionCount, captureAdoptionGate } from './adoptionGate';
 
 /** What the file must hold for the write to go ahead:
  *  - a `PrefabFile`: the document the caller READ. Matched against the editor's own serialization of it first, and —
@@ -140,13 +140,20 @@ export async function commitPrefabWrites(
     // world, and taken after it the commit adopted that new world as its own — its caller's rebuild (Apply's refresh,
     // Create Prefab's and the agent's tag) then ran there, with ids and captures from the world it began in. A world
     // replaced while waiting refuses the whole write instead: what the caller computed describes a world that is gone.
+    // …and taken only in an ADOPTED world (#1750 R2): called in a route's State 4 (another prefab's edit-open tail), the
+    // world is already the incoming one and stays "the same" all the way to its adopt, so the commit wrote that world as
+    // the open prefab (#1747). Refused, not waited for (owner, 2026-09-28: a world that is not savable refuses).
+    const live = captureAdoptionGate();
+    if (!live) {
+      return { ok: false, paths: writes.map((w) => prefabPathOf(w.source)), worldLeft: true, error: 'a scene is still loading, so nothing was written — try again once it is open' };
+    }
     const world = getCurrentWorld();
     const settling = adoptionsSettledGate();
     if (settling) await settling;
-    if (getCurrentWorld() !== world) {
+    if (!live()) {
       return { ok: false, paths: writes.map((w) => prefabPathOf(w.source)), worldLeft: true, error: 'the scene was replaced before the write could start, so nothing was written' };
     }
-    const worldLeft = () => getCurrentWorld() !== world || pendingAdoptionCount() > 0;
+    const worldLeft = () => !live() || pendingAdoptionCount() > 0;
 
     // `overwrite` skips every precondition, so a multi-file rollback would have nothing true to put back (the caller's
     // `expected` is exactly what an overwrite ignores): one file only — the prefab-edit save's Overwrite.

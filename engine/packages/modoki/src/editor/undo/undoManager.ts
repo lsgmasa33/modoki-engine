@@ -212,6 +212,21 @@ export function undoStepPending(): Promise<void> | null {
  *  await of the barrier from inside one shows there as a timeout). */
 let _worldHolds = 0;
 let _holdsDrained: { promise: Promise<void>; resolve: () => void } | null = null;
+/** Told each time {@link undoStepPending} goes back to null: the last undo step ended, or the last world hold was
+ *  released, with the other already idle (#1750 R3 — the hot reload's deferred replays). */
+const _idleListeners = new Set<() => void>();
+function notifyIdleIfSo(): void {
+  if (_stepsPending > 0 || _worldHolds > 0 || _idleListeners.size === 0) return;
+  notifyListeners([..._idleListeners], 'onWorldHoldsSettled', []);
+}
+/** Call `fn` whenever no undo step runs and no world-bound operation holds the world — {@link undoStepPending} is null
+ *  again. Persistent: register once, at startup; the returned function unsubscribes. */
+export function onWorldHoldsSettled(fn: () => void): () => void {
+  _idleListeners.add(fn);
+  return () => { _idleListeners.delete(fn); };
+}
+/** How many {@link onWorldHoldsSettled} listeners are registered — a test's check that deferrals do not add any. */
+export function worldHoldsSettledListenerCount(): number { return _idleListeners.size; }
 function worldHoldsSettled(): Promise<void> | null {
   if (_worldHolds === 0) return null;
   if (!_holdsDrained) {
@@ -234,6 +249,7 @@ export function beginWorldBoundOperation(): () => void {
       _holdsDrained = null;
       resolve();
     }
+    notifyIdleIfSo();
   };
 }
 /** A world switch is in progress (#1579) — a forward operation that must land in one world refuses to start then. */
@@ -394,7 +410,7 @@ function serialize<T>(op: () => Promise<T>): Promise<T> {
   _stepsPending += 1;
   const run = _inFlight.then(op, op);
   // A side branch, not a `.finally` on `run`: that would delay every caller and the chain by a tick.
-  const settled = () => { _stepsPending -= 1; };
+  const settled = () => { _stepsPending -= 1; notifyIdleIfSo(); };
   run.then(settled, settled);
   _inFlight = run.catch(() => {});
   return run;

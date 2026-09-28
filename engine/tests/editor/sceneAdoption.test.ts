@@ -307,42 +307,38 @@ describe('#1690: leave debts', () => {
     expect(owedLeaveRepairs()).toEqual([]);
   });
 
-  it('a prefab edit-open landing in a scene load`s tail: the prefab left first is repaired once, and the new session stands', async () => {
+  // An edit-open that reaches a scene load's post-swap tail REFUSES since #1750 (the world is not savable there: its save
+  // wrote the incoming world into the outgoing scene's file), so it can no longer out-adopt that load. These two pin that
+  // the load it left alone then pays E1's debt once, with no second session in between.
+  it('a prefab edit-open reaching a scene load`s tail refuses; the load lands and repairs the prefab left, once', async () => {
     await editingPrefab(E1);
     const tail = gate();
     sm.holdTail.set(SCENE, tail.promise);
     const load = loadScene(SCENE);
     await until(() => sm.path === SCENE);
-    await openPrefabForEditing({ path: E2.path, name: E2.name }); // P2 lands inside the scene load's tail
-    expect(editing()).toBe(E2.path);
+    expect((await openPrefabForEditing({ path: E2.path, name: E2.name }))?.refused).toMatch(/a scene is still loading/);
     tail.open();
 
-    expect(await load).toBe('superseded');
-    expect(editing(), 'the scene load must not adopt over the edit world that replaced it').toBe(E2.path);
-    expect(isPrefabEditWorld()).toBe(true);
-    expect(refreshed(E1.path), 'E1 was left: its repair runs, once, with the flag naming E2').toEqual([
-      { call: 'refresh', path: E1.path, editing: E2.path },
-    ]);
-
-    // Leaving E2 owes E2's repair — and E1's is not run again.
-    await exitPrefabEditing();
-    expect(refreshed(E2.path)).toHaveLength(1);
-    expect(refreshed(E1.path)).toHaveLength(1);
+    expect(await load).toBe('loaded');
+    expect(editing()).toBeNull();
+    expect(isPrefabEditWorld()).toBe(false);
+    expect(refreshed(E1.path), 'E1 was left: its repair runs, once').toEqual([{ call: 'refresh', path: E1.path, editing: null }]);
+    expect(refreshed(E2.path)).toEqual([]);
   });
 
-  it('Exit variant: an edit-open landing in Exit`s load tail keeps its session — Exit does not clear its flag', async () => {
+  it('Exit variant: an edit-open reaching Exit`s load tail refuses; Exit lands, ends E1`s session and repairs it once', async () => {
     await editingPrefab(E1);
     useEditorStore.getState().openPrefabEditor({ path: E1.path, guid: E1.doc.id!, name: E1.name }, SCENE);
     const tail = gate();
     sm.holdTail.set(SCENE, tail.promise);
     const exit = exitPrefabEditing();
     await until(() => sm.path === SCENE);
-    await openPrefabForEditing({ path: E2.path, name: E2.name });
+    expect((await openPrefabForEditing({ path: E2.path, name: E2.name }))?.refused).toMatch(/a scene is still loading/);
     tail.open();
     expect(await exit).toBe(SCENE);
 
-    expect(editing(), 'Exit resumed after E2 was adopted, and must leave E2`s session alone').toBe(E2.path);
-    expect(isPrefabEditWorld()).toBe(true);
+    expect(editing()).toBeNull();
+    expect(isPrefabEditWorld()).toBe(false);
     expect(refreshed(E1.path)).toHaveLength(1);
   });
 });

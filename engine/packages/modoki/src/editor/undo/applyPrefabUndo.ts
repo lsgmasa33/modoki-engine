@@ -29,7 +29,7 @@ import { isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
 import { serializeScene, saveScene, lastWrittenSceneBytes, getCurrentScenePath, isSceneLoadSwapping } from '../scene/serialize';
-import { withAdoption, adoptionsSettled } from '../scene/sceneAdoption';
+import { withAdoption, adoptionsSettled, captureAdoption } from '../scene/sceneAdoption';
 import {
   applyToPrefabSelective, guidForEntityId, entityIdForGuid,
   resolveInstanceContext, getPrefabSource, captureInstanceOverrides, captureInstanceStructure,
@@ -44,6 +44,7 @@ import { useEditorStore } from '../store/editorStore';
 import { repairPrefabMemberPaths } from '../backend/editorBackend';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { ensureGuid } from './entityRef';
+import { captureEntityIdentity } from '../../runtime/core/ecs/entityUtils';
 import { PREFAB_EDIT_SCENE_PREFIX } from '../scene/prefabEditWorld';
 import { currentSceneKey } from '../scene/authoredSnapshot';
 
@@ -332,6 +333,8 @@ function makeApplyPrefabAction(opts: {
   };
 }
 
+const NOT_APPLIED = { promotedAdditions: 0, applied: false } as const;
+
 /** Apply the selected overrides to the prefab AND record one undo entry.
  *  Captures the scene snapshot before the mutation, applies, persists the scene when a
  *  promotion restructured it, captures the after snapshot, and pushes the action. */
@@ -349,7 +352,7 @@ export async function applyToPrefabWithUndo(
   // open took the undo entry onto ITS stack. So every world switch waits for this, as for an undo step (#1579), and
   // an Apply does not start while one is under way. Taken synchronously, before the first await.
   if (isWorldSwitchInProgress()) {
-    return { promotedAdditions: 0, applied: false, refused: 'a scene switch is in progress — apply again once it has landed.' };
+    return { ...NOT_APPLIED, refused: 'a scene switch is in progress — apply again once it has landed.' };
   }
   const release = beginWorldBoundOperation();
   try {
@@ -362,6 +365,16 @@ export async function applyToPrefabWithUndo(
 async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targets?: ApplyTargets, opts: { expect?: string } = {}): Promise<ApplyResult> {
   // …and not over a world an editor route is still adopting (#1698): its snapshot, its scene save and its undo entry
   // would describe a world whose history and path are about to change under them.
+  // ⚠️ `rootInstanceId` is a bare entity index, and a reloaded world numbers its entities from zero in FILE order, so
+  // after a switch it names whatever entity holds that index — often ANOTHER instance of the same prefab (#1750 H1:
+  // measured, IB's value written as IA's with `applied: true`). So the Apply captures the adopted world first and, after
+  // its last await before it plans (below — it covers this wait too), refuses if that world is gone. Never re-found by
+  // guid: the write would no longer be the preview the user confirmed (owner, 2026-09-28).
+  const adopted = captureAdoption();
+  if (!adopted) return { ...NOT_APPLIED, refused: 'a scene is still loading — apply again once it is open.' };
+  // …and the instance itself: a frame rebuilt in place (a leave repair this waits for below, another Apply's fan-out)
+  // re-mints its entities in the SAME world, so the world check cannot see it (close-out reviews).
+  const sameInstance = captureEntityIdentity(rootInstanceId);
   const settling = adoptionsSettled();
   if (settling) await settling;
   const scenePath = getCurrentScenePath();
@@ -391,6 +404,10 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   if (ctx) await preloadNestedPrefabsForSubtree(rootInstanceId);
   const prefabNow = ctx ? await getPrefabSource(ctx.source) : null;
   const baseBefore = ctx && prefabNow && rootGuid ? captureSide(rootInstanceId, rootGuid, ctx.source, prefabNow) : null;
+  // The last await before the plan reads the instance by that id: a reload the wait above let land, or one landing in
+  // `sceneBefore`'s serialize (it fetches a cold prefab) or the preloads, renumbered the world (#1750 H1, both windows).
+  if (!adopted()) return { ...NOT_APPLIED, refused: 'the scene reloaded — open Apply again.' };
+  if (!sameInstance()) return { ...NOT_APPLIED, refused: 'the instance was rebuilt meanwhile — open Apply again.' };
   const result = await applyToPrefabSelective(rootInstanceId, selectedKeys, targets, opts);
   if (!result.applied || !result.source || !result.prefabBefore || !result.prefabAfter) {
     return result; // no-op apply — nothing to undo

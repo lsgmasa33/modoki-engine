@@ -12,7 +12,7 @@
  *  `${targetFolder}/…`). They now live here so a fix lands in ONE place, and
  *  the logic is unit-testable without rendering a React panel. */
 
-import { whyWorldNotAuthored } from '../scene/authoredWorld';
+import { whyWorldNotAuthored, notAuthoredExit } from '../scene/authoredWorld';
 import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, warnInertPrefabSizes, classifyExistingDocumentId, parsedPrefabRows, missingPrefabPlaceholders, type PrefabFile } from '../scene/prefab';
 import { commitPrefabWrite, parsePrefabBytes } from '../scene/prefabCommit';
@@ -22,7 +22,8 @@ import { reportUndoFailure, fileChangedRefusal } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
 import { dirtyAssetEditorHolds } from '../store/editorStore';
 import { newGuid } from '../../runtime/loaders/assetManifest';
-import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { captureAdoptionGate } from '../scene/adoptionGate';
+import { captureEntityIdentity } from '../../runtime/core/ecs/entityUtils';
 import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
 import { firstAssetRoot } from './assetRoots';
 import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
@@ -568,6 +569,9 @@ function idOf(text: string): string | undefined {
   try { const id = (JSON.parse(text.replace(/^\uFEFF/, '')) as { id?: unknown }).id; return typeof id === 'string' && id ? id : undefined; } catch { return undefined; }
 }
 
+/** A clause as a sentence: its first letter capitalised. */
+const sentence = (clause: string): string => clause.charAt(0).toUpperCase() + clause.slice(1);
+
 export async function createPrefabFromEntity(
   entityId: number,
   /** Where to write. Over an existing file of another casing the prefab lands on THAT file's on-disk
@@ -584,7 +588,7 @@ export async function createPrefabFromEntity(
   // The live subtree is what gets written, so it must be authored (#1548) — a posed or played
   // entity saved as a prefab carries the pose into every future instance.
   const notAuthored = whyWorldNotAuthored();
-  if (notAuthored) return { refused: `Create Prefab refused — ${notAuthored}. Exit the preview / stop Play first.` };
+  if (notAuthored) return { refused: `Create Prefab refused — ${notAuthored}. ${sentence(notAuthoredExit(notAuthored) ?? 'exit the preview / stop Play first')}.` };
   // A reference to a missing prefab holds its edits as a scene record, which a template cannot take (#1699, I8).
   const missing = missingPrefabPlaceholders(entityId)[0];
   if (missing) return { refused: `Create Prefab refused — "${missing.name}" is a reference to a missing prefab, so its edits cannot be written into a template until that prefab resolves. Restore it first, or leave it out of the selection.` };
@@ -593,8 +597,17 @@ export async function createPrefabFromEntity(
   // serialized, so what is written is the tree as it stands once the question is answered.
   // The world the tree lives in. The question below is a modal, and a world rebuilt while it is up (a watcher reload, an
   // agent's scene load) can hand `entityId` to another entity — which would then be written over the prefab the human
-  // said yes to (close-out review).
-  const world = getCurrentWorld();
+  // said yes to (close-out review). Captured as the ADOPTED world (#1750 R2): a same-world check also passes a world a
+  // route installed and has not adopted, and misses an adopt that kept the world.
+  // Non-null: a landing switch made `whyWorldNotAuthored` refuse above, and nothing has awaited since. The tree's root
+  // itself too: a frame rebuilt in place (a leave repair, an Apply's fan-out) re-mints ids in the same world.
+  const adopted = captureAdoptionGate()!;
+  const sameRoot = captureEntityIdentity(entityId);
+  const gone = (when: string) => (!adopted()
+    ? { refused: `Create Prefab refused — the scene was reloaded ${when}, so the entity it was asked for is gone. Select it and try again.` }
+    : !sameRoot()
+      ? { refused: `Create Prefab refused — the entity it was asked for was rebuilt ${when} (a prefab instance refreshed in place). Select it and try again.` }
+      : null);
   const at = await existingAssetPath(requestedPath);
   let savePath = requestedPath;
   let keptId: string | undefined;
@@ -620,12 +633,18 @@ export async function createPrefabFromEntity(
   }
   // The question above is a modal: the world can have gone into Play or a preview while it was up.
   const stillNotAuthored = whyWorldNotAuthored();
-  if (stillNotAuthored) return { refused: `Create Prefab refused — ${stillNotAuthored}. Exit the preview / stop Play first.` };
-  if (getCurrentWorld() !== world) return { refused: 'Create Prefab refused — the scene was reloaded while the question was open, so the entity it was asked for is gone. Select it and try again.' };
+  if (stillNotAuthored) return { refused: `Create Prefab refused — ${stillNotAuthored}. ${sentence(notAuthoredExit(stillNotAuthored) ?? 'exit the preview / stop Play first')}.` };
+  const goneAtQuestion = gone('while the question was open');
+  if (goneAtQuestion) return goneAtQuestion;
   // serializePrefab reads nested children from the editor prefab cache SYNCHRONOUSLY, and
   // nothing else on this path warms it — after an ordinary scene load it is empty, so a held
   // nested instance was flattened into copies with only a console.warn (#1284).
   await preloadNestedPrefabsForSubtree(entityId);
+  // …and that warm is a real fetch when cold, with no world hold taken yet (the commit's is later): a hot reload landing
+  // in it renumbers the world, and `entityId` then names another entity — H1's class (#1750). The last await before the
+  // serialize, so the last check.
+  const goneAtWarm = gone('while the prefab was being prepared');
+  if (goneAtWarm) return goneAtWarm;
   let runtimeExcluded = 0;
   // ⚠️ A Replace that keeps the replaced prefab's id serializes AGAINST the document it replaces (#1686): with no id, every
   // row's `nodeGuid` was minted fresh, and every other instance's edits and pinned member guids are keyed by the old ones.
