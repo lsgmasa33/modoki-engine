@@ -31,6 +31,8 @@ import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStruct
 export { captureNestedSceneDelta } from './prefab';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
+import { asSceneEntry } from '../../runtime/loaders/unresolvedPrefabRefs';
+import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
@@ -389,6 +391,22 @@ async function serializeSceneScoped(opts?: {
     // No `id` (Phase 3, scene-loading.md) — the loader synthesizes its
     // own per-load key (array index) now that nothing on disk references the old
     // live-ecs-id-derived value (that's exactly what made it churn on every save).
+    // A placeholder for a reference the load could not expand (#1699): the entry it carries goes back verbatim, with
+    // identity and placement from the live placeholder. Checked before the prefab is fetched, and whatever the fetch
+    // would answer: a prefab restored mid-session resolves while this entity is still the empty placeholder, and a
+    // capture of it would drop the record one save later. Only an expansion (a reload, a rebuild) replaces it.
+    const unresolved = unresolvedRefOf(findEntity(info.id));
+    if (unresolved) {
+      const placement: Record<string, unknown> = {};
+      const parentGuid = guidForId(info.parentId);
+      if (parentGuid) placement.parentId = parentGuid;
+      if (info.editorFolder) placement.editorFolder = info.editorFolder;
+      const live = eaMeta ? findEntity(info.id)?.get(eaMeta.trait) as { guid?: string } | undefined : undefined;
+      const guid = durableGuid(live?.guid) || mintedGuids.get(info.id);
+      entities.push(asSceneEntry(unresolved.kind, unresolved.record, unresolved.source, { name: info.name, guid, placement }) as unknown as SerializedEntity);
+      continue;
+    }
+
     const entry: SerializedEntity = { name: info.name, traits: {} };
     const rootInfo = prefabRootInfo.get(info.id);
     // True once we've successfully captured overrides for a prefab root — then the

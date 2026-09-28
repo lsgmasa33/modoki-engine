@@ -9,8 +9,11 @@
  *     `Persistent` root or a kept base's prefab member was written into the scene file after a carry.
  *   - `TemplateAddedKey` — how a template-added node is named. Without it the Inspector showed a
  *     false override on a member reference into the node.
+ *   - `UnresolvedPrefabRef` — the record a missing prefab's placeholder carries (#1699). Without it an undone delete
+ *     brought the placeholder back empty, and the next save wrote the bare placeholder over the instance's edits.
  *
- *  A copy does not carry them. That is right for `Transient` (a pasted copy of a runtime node should
+ *  A copy does not carry them — except `UnresolvedPrefabRef`, which a copy keeps re-guided (`copyUnresolvedRef`), because
+ *  Unity keeps a missing-prefab instance's data on a duplicate. That is right for `Transient` (a pasted copy of a runtime node should
  *  be savable) and for a copied KEYED node itself (two siblings sharing one key name neither), but
  *  wrong for a keyed node INSIDE a copied instance, which lands in a different frame and loses its
  *  name for good — #1430. A new unregistered marker goes on this list
@@ -18,11 +21,12 @@
 
 import { Transient } from './traits/Transient';
 import { TemplateAddedKey } from './templateIdentity';
+import { UnresolvedPrefabRef } from './unresolvedPrefabRef';
 
 type Handle = { has(t: unknown): boolean; get(t: unknown): unknown; add(...t: unknown[]): void };
 
 /** Every carried marker, by a stable name — the name is what a snapshot stores. */
-export const CARRIED_MARKER_TRAITS = { Transient, TemplateAddedKey } as const;
+export const CARRIED_MARKER_TRAITS = { Transient, TemplateAddedKey, UnresolvedPrefabRef } as const;
 type MarkerName = keyof typeof CARRIED_MARKER_TRAITS;
 
 /** What one entity carried: marker name → its data (`true` for a tag). Absent markers are omitted. */

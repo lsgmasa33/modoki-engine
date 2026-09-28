@@ -22,6 +22,7 @@ import { endFrames, relinkDetachedMembers, captureRootLinks, restoreRootLinks, p
 import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader, frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../../runtime/core/ecs/identityParents';
 import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
+import { copyUnresolvedRef } from './unresolvedRefCopy';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { pushAction, type EditDetail } from './undoManager';
@@ -465,10 +466,22 @@ export function regenerateSnapshotGuids(snapshot: EntitySnapshot): EntitySnapsho
   const { guidOf, remap, keyed } = planCopyGuids(snapshot, (s) => s.children, dataOf, (s) => s.id, newGuid, keyOf, frameDocReader(getCurrentWorld()));
   // Once every new guid is known: a parent's ref can name a child and vice versa.
   // A copy is a new identity, so it carries no unregistered markers (`carriedMarkers.ts`) — except
-  // the template key of a node the plan derived through it, inside a copy of a whole instance (#1430).
+  // the template key of a node the plan derived through it, inside a copy of a whole instance (#1430),
+  // and the record a missing prefab's placeholder carries, re-guided so the copy shares no identity (#1699).
+  const markersOf = (s: EntitySnapshot): EntitySnapshot['markers'] => {
+    const out: NonNullable<EntitySnapshot['markers']> = {};
+    if (keyed.has(s)) out.TemplateAddedKey = { key: keyOf(s) };
+    const ref = s.markers?.UnresolvedPrefabRef;
+    if (ref && ref !== true) {
+      out.UnresolvedPrefabRef = copyUnresolvedRef(
+        ref as { source: string; kind: string; record: string }, (dataOf(s, 'EntityAttributes')?.guid as string) ?? '', guidOf.get(s)!, newGuid,
+      );
+    }
+    return Object.keys(out).length ? out : undefined;
+  };
   const copy = (s: EntitySnapshot): EntitySnapshot => ({
     ...s,
-    markers: keyed.has(s) ? { TemplateAddedKey: { key: keyOf(s) } } : undefined,
+    markers: markersOf(s),
     traits: s.traits.map((t) => {
       if (t.data === true) return t;
       const data = remapGuidValues(t.data, remap) as Record<string, unknown>;

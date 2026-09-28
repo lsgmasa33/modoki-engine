@@ -74,7 +74,7 @@ export {
 export { installEditorPrefabCacheWarm, warmEditorPrefabCacheFor } from './scene/prefabCacheWarm';
 export {
   PREFAB_FORMAT_VERSION,
-  serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource,
+  serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource, missingPrefabPlaceholders,
   instantiatePrefabInstance,
   primeEditorPrefabCache, isEditorPrefabCached,
   getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, getOverrides, getOverrideValues,

@@ -16,7 +16,7 @@ import { collectUnknownFields, mergeUnknownFields } from '../../runtime/core/for
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { repairPrefabMemberPaths } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './authoringScope';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
@@ -38,6 +38,8 @@ import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/e
 import { writtenTraitKeys } from './traitDefault';
 import { adoptParentScene, resolveAffectedScenes } from './sceneDirty';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, NestedStructureDelta, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import { spawnUnresolvedReference, asAddedNode } from '../../runtime/loaders/unresolvedPrefabRefs';
+import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
 import { foldMemberRowChannels, mergeTraitRemovals, descendStructureLayers, foldStructureLayers, type StructureLayer as StructLayer } from '../../runtime/loaders/prefabOverrides';
 import { frameBase, chainLayer, docChainLayer, layerAddedTraits, levelDoc, ownedRootAt, type FrameLayer, type FrameBase } from './prefabBase';
@@ -1063,6 +1065,10 @@ export function serializePrefab(
      *  highest localId the session has opened or written, so a number freed by a delete is never handed to a new member
      *  while the deleted one can still come back by undo (#1662; Unity never reuses a fileID either). */
     localIdFloor?: number;
+    /** ecsId → the reference row a placeholder stands for, whose prefab the load could not expand (#1699, prefab-edit
+     *  only). The row is written as given (its prefab, edits and traits), numbered, identified, named and parented like
+     *  any other: the edit world holds nothing of that frame for a capture to find. */
+    unresolvedRows?: ReadonlyMap<number, PrefabEntity>;
   },
 ): PrefabFile | null {
   const rawEntities = getAllEntities();
@@ -1109,6 +1115,20 @@ export function serializePrefab(
     // Nested-instance root → reference row (child prefab + captured diffs). Only
     // EntityAttributes (name + remapped parentId) is written inline; the child's
     // own traits come from the child file, edits ride in `overrides`.
+    const unresolvedRow = opts?.unresolvedRows?.get(entityInfo.id);
+    if (unresolvedRow) {
+      const parentLocal = ecsToLocal.get(rowParent.get(entityInfo.id) ?? 0) || 0;
+      const ea = unresolvedRow.traits.EntityAttributes;
+      prefabEntities.push({
+        ...unresolvedRow,
+        localId,
+        nodeGuid: nodeGuidOf(entityInfo.id),
+        name: entityInfo.name,
+        traits: { ...unresolvedRow.traits, EntityAttributes: { ...(ea && ea !== true ? ea : {}), name: entityInfo.name, parentId: parentLocal, guid: '' } },
+      });
+      continue;
+    }
+
     const nested = nestedRefs.get(entityInfo.id);
     if (nested) {
       const parentLocal = ecsToLocal.get(rowParent.get(entityInfo.id) ?? 0) || 0;
@@ -2054,6 +2074,10 @@ export async function preloadNestedPrefabsForSubtree(selectedEntityId: number): 
   // so parallelising cannot reintroduce a double fetch for two instances of one source.
   const seen = new Set<string>();
   for (const e of collectTree(selectedEntityId, getAllEntities())) {
+    // A placeholder for a missing prefab (#1699) names its source on its marker, and a rebuild that finds that prefab
+    // restored re-expands it only if this fetched it.
+    const marked = e.missingPrefab ? unresolvedRefOf(findEntity(e.id))?.source : undefined;
+    if (marked) { seen.add(marked); continue; }
     if (!e.traits.includes('PrefabInstance')) continue;
     const source = readTraitData(e.id, piMeta)?.source as string | undefined;
     if (source) seen.add(source);
@@ -3392,6 +3416,19 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   // Capture one non-member child as an AddedEntity (plain subtree OR nested-instance
   // reference), or null if it should be skipped (owned nested instance).
   const captureChild = (childEcsId: number, parentLocalId: number): AddedEntity | null => {
+    // A placeholder for a reference the load could not expand writes back the node it carries (#1699), whether or not
+    // the prefab resolves by now: until an expansion replaces it, the placeholder is all the world holds of it. Found
+    // by its marker, since it carries no `PrefabInstance`.
+    // ⚠️ Scene form only. A TEMPLATE capture would write the record's scene guids into a template (I8), so it is left
+    // out, and the two template writers refuse a tree holding one up front (Create Prefab; Apply of its key).
+    const unresolved = unresolvedRefOf(findEntity(childEcsId));
+    if (unresolved) {
+      if (opts.template) return null;
+      consumedEcsIds.add(childEcsId);
+      return asAddedNode(unresolved.kind, unresolved.record, unresolved.source, {
+        name: byId.get(childEcsId)?.name || '', parentLocalId, identity: addedNodeIdentity(childEcsId, false, opts.readOnly),
+      }) as unknown as AddedEntity;
+    }
     const kind = nestedRootKind(childEcsId);
     if (kind === 'owned') return null;                  // round-trips via the prefab/nestedOverrides
     if (kind === 'userAdded') return captureNestedRef(childEcsId, parentLocalId);
@@ -4038,7 +4075,12 @@ function editorStructureOps(): Parameters<typeof applyStructureCore>[0] {
       // the next capture re-detects it as user-added.
       spawnNestedInstance: (node, parentEcsId) => {
         const child = getCachedPrefabSync(node.prefab!);
-        if (!child) { console.warn(`[Prefab] added nested instance "${node.prefab}" not cached`); return; }
+        if (!child) {
+          console.warn(`[Prefab] added nested instance "${node.prefab}" not cached`);
+          // The loader's twin: a placeholder carrying the node, so a rebuild keeps what the save writes back (#1699).
+          spawnUnresolvedReference(getCurrentWorld(), node, parentEcsId);
+          return;
+        }
         // The node's own `overrides`/`added` are applied AFTER the expansion below closes its token scope,
         // so this scope wraps the whole node: the loader's twin hands them INTO its top call, which notes
         // them there (#1352 close-out review).
@@ -5059,6 +5101,23 @@ async function planApply(
   const notAuthored = whyWorldNotAuthored();
   if (notAuthored) {
     return { result: { ...NOOP_APPLY, refused: `the live world is not authored (${notAuthored}) — exit the preview / stop Play first, or a pose would be written into the prefab` } };
+  }
+  // A reference to a missing prefab inside the instance (#1699) holds its edits as a scene record, which a template
+  // cannot take (I8): promoting it wrote an empty reference row into the prefab and took the node out of the instance.
+  // What an `+added` key promotes is the node's IDENTITY subtree (I6), so that is what is asked, not the key's text (a
+  // placeholder under a plain added node is named by no key of its own) and not the live tree (a placeholder under a
+  // member moved into the node is that member's, and stays behind when the node is promoted).
+  const idParents = worldIdentityParents(getCurrentWorld());
+  const byName = new Map(getAllEntities().map((e) => [e.id, e.name] as const));
+  let missing: { name: string; node: string } | undefined;
+  for (const g of addedKeyGuids(selectedKeys)) {
+    const node = (findEntityByGuid(g) as { id(): number } | undefined)?.id();
+    const hit = node ? identitySubtree(getCurrentWorld(), [node], idParents).find((id) => !!unresolvedRefOf(findEntity(id))) : undefined;
+    if (node && hit) { missing = { name: byName.get(hit) ?? '', node: byName.get(node) ?? '' }; break; }
+  }
+  if (missing) {
+    const where = missing.node && missing.node !== missing.name ? ` (inside "${missing.node}")` : '';
+    return { result: { ...NOOP_APPLY, refused: `"${missing.name}"${where} is a reference to a missing prefab, so it cannot be written into a template until that prefab resolves. Leave "${missing.node || missing.name}" unchecked, or restore the prefab first` } };
   }
   const ctx = resolveInstanceContext(rootInstanceId);
   if (!ctx) {
@@ -8015,3 +8074,25 @@ export async function revertOverridesSelective(
   return { newRootId, source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, affectedScenes: resolveAffectedScenes([newRootId]) };
 }
 
+
+/** The placeholders for missing prefabs (#1699) in the live subtree of `rootId`, the root included: what Create Prefab
+ *  (the human path and the agent op) refuses over, since it writes the whole live tree. Apply asks the identity subtree
+ *  of each node it promotes instead (`planApply`). */
+export function missingPrefabPlaceholders(rootId: number): { id: number; name: string; guid: string }[] {
+  const all = getAllEntities();
+  const byId = new Map(all.map((e) => [e.id, e] as const));
+  return subtreeIds(all, rootId)
+    .filter((id) => !!unresolvedRefOf(findEntity(id)))
+    .map((id) => ({ id, name: byId.get(id)?.name ?? '', guid: byId.get(id)?.guid ?? '' }));
+}
+
+/** The guids an Apply key selection promotes as added nodes: `+added.<guid>`, bare or behind a nested chain
+ *  (`<chain>:+added.<guid>`), the only key form that names an added node (`prefabOverrideKeys.ts`). */
+function addedKeyGuids(keys: Iterable<string>): string[] {
+  const out: string[] = [];
+  for (const k of keys) {
+    const m = /(?:^|:)\+added\.([^:]+)$/.exec(k);
+    if (m) out.push(m[1]!);
+  }
+  return out;
+}

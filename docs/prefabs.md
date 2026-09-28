@@ -84,6 +84,7 @@ answer the same question for themselves. Each place in that column is a place th
 | I15 | A template's `version` is the writer's constant, and a build never overwrites a file written in a newer format. | `PREFAB_FORMAT_VERSION`, `engine/plugins/prefabWriteGuard.ts`, `classifyExistingDocumentId`. It answers `known` before it checks the version (#1678). |
 | I16 | A template never contains itself. | `wouldCreateCycle` / `expandedPrefabRefs` when writing; the loader's ancestor stack when loading. |
 | I17 | An editor write that changes an instance member's field leaves its override mark in the state the save needs, and its undo puts the mark back. | `editor/undo/overrideMarkWrites.ts`. See § "Editor writes and the override mark". |
+| I18 | A reference the load cannot expand is written back as the file held it, until an expansion replaces it. A reader never drops what it could not interpret. | The `UnresolvedPrefabRef` marker on the placeholder (`runtime/core/unresolvedPrefabRef.ts`) and its writers (`runtime/loaders/unresolvedPrefabRefs.ts`). See § "A missing prefab keeps its record". |
 
 ### Where the owners are missing
 
@@ -121,7 +122,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | U6 | Added / removed GameObject | Added children are overrides. A removed child is a "removed GameObject" override. [M6 `PrefabInstanceOverrides`, M22 `UpgradeGuide2022LTS`; the `PrefabUtility.GetRemovedGameObjects` API page first exists for 2022.2] | `added` (plain or reference nodes) and `removed` (the top-most member only). | match |
 | U7 | Reparenting a member inside an instance | Not allowed: "you cannot reparent a GameObject that is part of a Prefab". [M22 `PrefabInstanceOverrides`. The same sentence's ban on removal is out of date (U6), and the Unity 6 page says nothing, so this citation is weak.] Since 2022.3 Unity even drops child REORDER overrides, and its suggested way to move a nested child is duplicate plus delete. [M22 `UpgradeGuide2022LTS`] | Allowed and stays linked: the member row records `parent`, and Apply re-parents the row (#1437). Dragging a plain member out of its instance unpacks it; an owned nested root dragged out becomes a standalone instance (`planMoveUnlinks`). A reorder inside an instance is saved as a `sortOrder` override, by value (#1709). | **diverges**, deliberate: a Modoki extension. The owner rules on whether it stays. |
 | U8 | Override indicators | Instance names in blue; a blue margin line in the Hierarchy on an instance that has overrides; + on added GameObjects; +/− on components; an **Overrides** drop-down on the outermost root, with an asset-vs-instance comparison per component. [M22 `EditingPrefabViaInstance`, `PrefabInstanceOverrides`] | The Hierarchy tints and badges every `PrefabInstance` entity ("P"), and the Inspector accents overridden fields. There is no Hierarchy mark on an edited instance, no + on an added node, no marker for a removed member or component, and no Overrides drop-down: the full list exists only inside the Apply / Revert dialog. | **missing**: badges S, drop-down with comparison M |
-| U9 | Missing prefab asset | The instance stays in the scene (`PrefabInstanceStatus.MissingAsset`), and its `PrefabInstance` data stays in the scene file. [S6 `PrefabAssetType.MissingAsset`, M6 `yaml-prefab-serialization`] | The loader warns and keeps a bare placeholder. The next scene save writes only that placeholder, so every override, added node and the name are lost for good (#1699, observed). | **diverges**, bug #1699 (serious) |
+| U9 | Missing prefab asset | The instance stays in the scene (`PrefabInstanceStatus.MissingAsset`), and its `PrefabInstance` data stays in the scene file. [S6 `PrefabAssetType.MissingAsset`, M6 `yaml-prefab-serialization`] | The same since #1699: a placeholder, labelled **Missing Prefab** in the Hierarchy, carries the record the file held, and every save writes it back until the prefab is back and re-expands it. A duplicate keeps the data too. § "A missing prefab keeps its record". | match (template-form captures of one are the gap named there) |
 
 ### Apply, Revert and their targets
 
@@ -1033,6 +1034,74 @@ implementation spawns from the refcounted prefab cache into the staging world,
 re-applies the root's extra traits, and replays the `overrides` map per localId.
 Override tracking is per-localId, so edits to a sub-entity (not just the root)
 survive a reload.
+
+### A missing prefab keeps its record (#1699, I18)
+
+A prefab reference whose document does not resolve at load (deleted, renamed without its sidecar, or not pulled yet)
+cannot be expanded. Before #1699 the loader skipped it and kept its data nowhere, and the next save wrote only what the
+world held: every override, added node and the name were lost for good, and did not come back with the prefab. Unity
+keeps a missing-asset instance's `PrefabInstance` data in the scene untouched (U9). So does Modoki now:
+
+**The reference leaves a placeholder that carries its identity, and the record the file held for it rides on the
+placeholder as the unregistered `UnresolvedPrefabRef` marker. Every writer that meets the placeholder writes that
+record back verbatim.** Only identity and placement come from the live placeholder: its guid, its name, its parent and
+its folder, because those are what the Hierarchy can change. The name is the live one on purpose, so a rename is kept.
+
+| Reference | Placeholder | Writer |
+|---|---|---|
+| A top-level scene entry | The loader's pass-1 placeholder stays (`keepUnresolvedEntry`) and takes the entry's name. | `serializeScene` writes the entry (`asSceneEntry`). |
+| An added reference node (on the entry, a member row, a plain node's children, another reference node) | `spawnUnresolvedReference`, under the node's parent. The loader's and the editor's `spawnNestedInstance` both call it, so a rebuild (Apply, Revert, Refresh) respawns it. The loader keeps no orphan rows for it: its record holds them, and kept ones outlived its re-expansion and overwrote a later edit. | `captureChild` writes the node (`asAddedNode`). |
+| A template's reference row inside a resolved instance | None: the frame is the template's. | The scene's edits to that frame ride member rows. `rowBackedTest` counts a row naming a reference row whose child cannot be read as unbacked, so the orphan store keeps it (the nested root's own row included, which it used to drop) and the save writes it back. |
+| A reference row in PREFAB EDIT | The row is a top-level entry of the edit world, so it takes the first path. | `serializePrefabEditWorld` writes the row from the baseline, because the edit world's entry went through `editWorldRefs`. |
+
+**A placeholder is NOT an instance.** It is a plain entity carrying the marker and no `PrefabInstance`; the top-level
+one drops the `PrefabInstance` pass 1 gave it, and the marker holds the source. Carrying it, every piece of instance
+machinery (the Apply fan-out to every instance of a source, the override list, the rebuild settle) treated the
+placeholder as a live, empty instance the moment its prefab resolved: it rebuilt it and destroyed the record, and the
+override list offered "removed" for every member, which Apply then wrote into the prefab (close-out review, observed).
+Without the trait, none of them can see it.
+
+A placeholder dragged from one kind of place to the other is written in the shape of where it now is. `asAddedNode`
+drops an entry's legacy root traits (`rootExtraTraits`), and `asSceneEntry` drops a template node's `templateMoved`;
+neither is written by a current scene save.
+
+**The writers key on the marker, not on whether the prefab resolves now.** A prefab restored mid-session (a checkout,
+no reload) resolves while the live entity is still the empty placeholder, and a capture of it would drop the record
+one save later. Only an expansion clears the marker: a reload or a rebuild that finds the prefab spawns new entities.
+
+Lifecycle: delete → undo carries the marker (`carriedMarkers.ts`). A duplicate or a paste keeps the record, with every
+guid it states re-minted and the root's set to the copy's (`copyUnresolvedRef`), so the two never share an identity
+once the prefab resolves. In prefab edit, a copy of a missing row has no baseline row. It is written from its record
+when nothing in the record was rewritten into the edit world's ids and it states no guid; the save refuses otherwise.
+The guid test is what refuses a SCENE placeholder pasted into prefab edit, whose member rows pin scene guids (#1293). The Hierarchy
+labels the placeholder **Missing Prefab** (`EntityInfo.missingPrefab`), so it does not read as an empty object to clean
+up. A duplicate re-mints the record's guids on its own, so a copied scene child's ref into a member of the record still
+names the original's member (the copy's remap, `planCopyGuids`, cannot see members that do not exist).
+
+The TEMPLATE writers refuse rather than write a scene record into a template (I8): Create Prefab of a tree holding a
+placeholder (the human path and the agent `prefab create` op, over the live tree they write), and an Apply that would
+promote one. What an `+added` key promotes is the node's IDENTITY subtree (I6), so Apply asks that, not the key's text
+(a placeholder under a plain added node is named by no key of its own) and not the live tree (a placeholder under a
+member moved into the node stays behind with the member). Apply of anything else on the
+instance goes ahead. A rebuild's preload fetches a placeholder's source (`preloadNestedPrefabsForSubtree`), so a
+prefab restored on disk re-expands on the next rebuild.
+
+Known gaps, filed as one class in #1738 (a writer meeting a reference it cannot read, with no record for it):
+- **A prefab-edit save of a template holding an added reference NODE whose prefab is missing** (the template's own
+  key node, or a pasted scene one) is refused, not written: the template capture leaves a placeholder out, and the
+  save has no baseline for a node the way it has one for a row. Safe, but the prefab cannot be saved until the child
+  resolves or the node is deleted.
+- **A missing row moved under a member of a nested row, in prefab edit,** is written under its row parent: the save
+  keeps the record and drops the move.
+- **A pre-v5 template's** path-keyed `nestedOverrides` / `nestedStructure` for a missing nested frame are not kept:
+  with no `nodeGuid` there are no rows for the orphan store to hold.
+- **A prefab trashed inside the editor while an instance of it is expanded**, then saved with no reload: the instance
+  carries no marker, the trash evicts both caches, and the save falls back to the root's trait snapshot. Since #1702 an
+  editor trash no longer reloads the open scene, which would have routed it through the load path (by reading, not
+  driven).
+
+Tests: `engine/tests/editor/missingPrefabPassThrough.test.ts`, one case per row and per lifecycle step, each red under
+the mutation it names.
 
 ## ⚠️ A prefab EDIT replaces the runtime cache entry — it used to empty it (#1308)
 

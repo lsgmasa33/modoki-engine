@@ -8,7 +8,9 @@
  *  serialize the prefab subtree back out, excluding the scaffold entities. */
 
 import type { Entity, World } from 'koota';
-import type { PrefabFile } from './prefab';
+import type { PrefabFile, PrefabEntity } from './prefab';
+import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { channelsOf } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { serializePrefab, warnInertPrefabSizes, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
 import { commitPrefabWrite } from './prefabCommit';
@@ -821,7 +823,39 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
     }
     if (g) preserveNodeGuids.set(ecsId, g);
   }
+  // A placeholder for a reference ROW whose prefab the load could not expand (#1699): the edit world holds nothing of
+  // its frame, so the row is written from the file as read, the baseline, where only a capture could otherwise have
+  // stood. The edit world's own entry for it went through `editWorldRefs`, so it is not the file's form.
+  const unresolvedRows = new Map<number, PrefabEntity>();
+  for (const e of world.entities as Iterable<Parameters<typeof unresolvedRefOf>[0] & { id(): number }>) {
+    const ref = unresolvedRefOf(e);
+    if (!ref) continue;
+    // An added reference NODE whose prefab is missing: a template's own key node, or a pasted scene one. The template
+    // capture leaves it out (`captureChild`), and the prefab-edit save has no baseline for a node, so writing on would
+    // drop it and its edits silently. Refused instead, until the prefab resolves (#1738 tracks writing it).
+    if (ref.kind === 'node') {
+      const name = (ref.record.name as string | undefined) || 'a node';
+      return { error: `"${name}" is a reference to a missing prefab added inside this prefab, and it cannot be written into the template until that prefab resolves. Restore it, or delete the node` };
+    }
+    const localId = preservedLocalIds.get(e.id());
+    const row = localId === undefined ? undefined : previous.entities.find((r) => r.localId === localId && r.prefab === ref.source);
+    if (row) { unresolvedRows.set(e.id(), structuredClone(row)); continue; }
+    // A COPY (a duplicate or a paste) has no row of its own in the file. Its record is the edit world's entry, which
+    // names a member of this prefab by this edit's ids, not by a member token, wherever `editWorldRefs` rewrote one. So
+    // it is written as the row only when nothing in it was rewritten; otherwise the save refuses, as it does over any
+    // row it cannot write truthfully.
+    // A record copied from a SCENE (a paste of a scene placeholder) states member guids, which a template never holds
+    // (I8, #1293: every instance would stamp one guid on its member), so any stated guid is refused as well.
+    const channels = channelsOf(ref.record);
+    const text = JSON.stringify(channels);
+    if (text.includes(PREFAB_EDIT_LOCAL_GUID_PREFIX) || text.includes(PREFAB_EDIT_ROOT_GUID) || /"guid":"[^"]/.test(text)) {
+      const name = (ref.record.name as string | undefined) || 'a copy';
+      return { error: `"${name}" is a copy of a reference to a missing prefab whose edits carry identities a template cannot hold, and they cannot be written until that prefab resolves. Restore it, or delete the copy` };
+    }
+    unresolvedRows.set(e.id(), { localId: 0, name: '', prefab: ref.source, traits: {}, ...channels } as PrefabEntity);
+  }
   const prefab = serializePrefab(rootId, guid, {
+    unresolvedRows,
     preserveLocalIds: preservedLocalIds,
     preserveNodeGuids,
     name: previous.name,

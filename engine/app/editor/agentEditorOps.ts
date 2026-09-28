@@ -49,7 +49,7 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
-  getPrefabSource, instantiatePrefabInstance, serializePrefab, commitPrefabWrite, readPriorDocument, warnInertPrefabSizes, parsedPrefabRows,
+  getPrefabSource, instantiatePrefabInstance, serializePrefab, missingPrefabPlaceholders, commitPrefabWrite, readPriorDocument, warnInertPrefabSizes, parsedPrefabRows,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
@@ -2972,6 +2972,13 @@ export function registerEditorAgentOps(): void {
       if (getRunMode() === 'playing') {
         throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${whyWorldNotAuthored()} — stop Play first, or the played pose is written into the prefab.`,
           { options: ["modoki_play_control {action:'stop'} — returns to the authored world, then retry"] });
+      }
+      // A reference to a missing prefab holds its edits as a scene record, which a template cannot take (#1699, I8) — the
+      // human path refuses the same tree (`createPrefabFromEntity`).
+      const missing = missingPrefabPlaceholders(entityId)[0];
+      if (missing) {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: "${missing.name}" is a reference to a missing prefab, so its edits cannot be written into a template until that prefab resolves.`,
+          { options: ['restore the missing prefab (the scene reload re-expands the reference), then retry', 'create the prefab from a subtree that does not hold it'] });
       }
       refuseEditOfPosedWorld('prefab create', 'the subtree may carry a pose, which would be written into the prefab file');
       const existing = await classifyExistingPrefabId(path);

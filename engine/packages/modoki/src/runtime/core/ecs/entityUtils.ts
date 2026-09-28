@@ -6,6 +6,7 @@ import { getCurrentWorld, findEntityById, destroyEntity, setStructureCallback } 
 import { getAllTraits, getTraitByName, transformName, type TraitMeta } from './traitRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { Transient } from '../traits/Transient';
+import { UnresolvedPrefabRef } from '../unresolvedPrefabRef';
 import { isSimRunning } from '../playState';
 import { inSystemTick } from '../systemTick';
 import { noteAuthoredWriteWhileStopped } from './authoredWrites';
@@ -379,6 +380,9 @@ export interface EntityInfo {
    *  rather than inheriting from an ancestor. Drives the Hierarchy's scene-group
    *  ghosting (base-scene plan Phase 9). */
   sourceScene?: string;
+  /** A placeholder for a prefab reference the load could not expand (#1699): the Hierarchy marks it "Missing Prefab",
+   *  as Unity does, so it does not read as an empty object to clean up. Its edits ride on it until the prefab is back. */
+  missingPrefab?: boolean;
   children?: EntityInfo[];
 }
 
@@ -452,7 +456,8 @@ export function getAllEntities(): EntityInfo[] {
     layer = deriveLayer(traitNames, layer);
 
     const name = pickEntityName(attrName, scan) ?? `Entity ${id}`;
-    entities.push({ id, name: transformName(name), traits: traitNames, parentId, sortOrder, layer, guid, isResource, editorFolder, sourceScene });
+    const missingPrefab = entityHas(UnresolvedPrefabRef);
+    entities.push({ id, name: transformName(name), traits: traitNames, parentId, sortOrder, layer, guid, isResource, editorFolder, sourceScene, ...(missingPrefab ? { missingPrefab } : {}) });
   }
   return dropParkedEntries(entities);
 }

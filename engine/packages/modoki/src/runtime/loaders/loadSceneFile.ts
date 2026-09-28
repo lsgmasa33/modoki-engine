@@ -20,6 +20,8 @@ import {
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 import { memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
+import { keepUnresolvedEntry, spawnUnresolvedReference } from './unresolvedPrefabRefs';
+import { unresolvedRefOf } from '../core/unresolvedPrefabRef';
 import { parseMemberRowKey, parseNodeRowKey, memberRowNodes } from '../core/assetRefRules';
 import { classifyFormatVersion } from '../core/formatVersion';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
@@ -1188,7 +1190,12 @@ export function applyStructureByLocalToEcs(
       },
       spawnNestedInstance: (node, parentEcsId) => {
         const child = getCachedPrefab(node.prefab!) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null;
-        if (!child) { console.warn(`[loadSceneFile] added nested instance not cached: ${node.prefab}`); return; }
+        if (!child) {
+          console.warn(`[loadSceneFile] added nested instance not cached: ${node.prefab}`);
+          // A placeholder carrying the node, so the next save writes it back verbatim (#1699).
+          spawnUnresolvedReference(world, node, parentEcsId);
+          return;
+        }
         const rootEcsId = instantiatePrefabIntoWorld(
           world, child, parentEcsId, undefined, node.prefab, node.overrides,
           { added: node.added, removed: node.removed, removedTraits: node.removedTraits, moved: node.moved, members: node.members }, undefined, node.nestedOverrides,
@@ -1278,6 +1285,7 @@ export function rowBackedTest(source: string, read: PrefabDocReader = getCachedP
 function templateNodeGuids(prefabRef: string, read: PrefabDocReader = getCachedPrefab): { guids: Set<string>; complete: boolean } {
   const guids = new Set<string>();
   const seen = new Set<string>();
+  const unread = new Set<string>();
   let complete = true;
   const walk = (ref: string): void => {
     if (!ref || seen.has(ref)) return;
@@ -1286,10 +1294,14 @@ function templateNodeGuids(prefabRef: string, read: PrefabDocReader = getCachedP
     // ⚠️ A nested prefab that is not cached is "I cannot tell", NOT "those nodes are gone". Without
     // this the caller reports every member of an uncached nested instance as a lost row — a loud,
     // wrong claim caused by a cache miss, on exactly the documents least able to afford one.
-    if (!doc?.entities) { complete = false; return; }
+    if (!doc?.entities) { complete = false; unread.add(ref); return; }
     for (const row of doc.entities) {
-      if (row.nodeGuid) guids.add(row.nodeGuid);
-      if (row.prefab) walk(row.prefab);
+      if (!row.prefab) { if (row.nodeGuid) guids.add(row.nodeGuid); continue; }
+      walk(row.prefab);
+      // A reference row whose child cannot be read expanded into NOTHING (#1699), so a row naming it (the nested
+      // root's own row, or its removal) has no member to land on and no capture to regenerate it. It is not
+      // backed: the orphan store keeps it, and the save writes it back, as it does the rows below it.
+      if (row.nodeGuid && !unread.has(row.prefab)) guids.add(row.nodeGuid);
     }
   };
   walk(prefabRef);
@@ -3022,6 +3034,8 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       const prefab = await fetchPrefab(source);
       if (!prefab) {
         console.warn(`[loadSceneFile] Could not find prefab "${source}"`);
+        // The placeholder stays and carries the entry, so the next save writes it back verbatim (#1699).
+        keepUnresolvedEntry(world, newEntityId, source, entry);
         continue;
       }
 
@@ -3118,7 +3132,9 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   // it on the spawned root, so it resolves here.
   for (const [rootGuid, members, source] of addedInstanceRows) {
     const root = findEntityByGuid(rootGuid, world) as EntityHandle | undefined;
-    if (root) applyStoredMemberRows(world, root.id(), members, source, pinned);
+    // A placeholder for a node whose prefab is missing (#1699) carries its rows in its record. Kept here as orphans too,
+    // they outlived the node's re-expansion and overwrote a later edit of its members (close-out review).
+    if (root && !unresolvedRefOf(root)) applyStoredMemberRows(world, root.id(), members, source, pinned);
   }
   // …then give every remaining member a stable, addressable GUID so entities can reference into
   // instances: a pre-v16 scene, a template that predates prefab v5, and every member a row did not
