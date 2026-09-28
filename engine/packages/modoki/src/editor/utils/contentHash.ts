@@ -2,7 +2,7 @@
  *
  *  This is the CLIENT half of the `ifMatch` precondition on `POST /api/asset-write`
  *  (`editorBackendRouter.ts`), threaded by `atlasPersist.ts`, and on `POST /api/write-file`,
- *  threaded by Apply-to-Prefab's undo/redo (`installPrefabSnapshot`, #1664). The server hashes the raw file bytes with Node's
+ *  threaded by every prefab write (`commitPrefabWrite`, #1664/#1692). The server hashes the raw file bytes with Node's
  *  `crypto.createHash('sha256')`, and both sides must agree on the same bytes for the
  *  same content, or every conditional write reports a spurious conflict. Kept here —
  *  not inlined in one panel — so any future conditional-write caller hashes the same

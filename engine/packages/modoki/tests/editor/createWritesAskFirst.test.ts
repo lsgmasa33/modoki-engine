@@ -66,20 +66,17 @@ describe('an editor create writes through writeNewAssetDocument, never mint-then
       const key = rel.slice(EDITOR_REL.length + 1);
       return mintedPlainWrites(parseSource(readScannedSource(abs).code, key), key);
     });
-    expect(writes.length, 'the reader must see the editor\'s plain writes, or the ledger below is vacuous').toBeGreaterThanOrEqual(10);
+    // 9 since #1692: the prefab writers' plain writes (skin rig, model regenerate, model import) moved into
+    // `commitPrefabWrite`, which writes only conditionally — create-only for a new file, `ifMatch` over the bytes read
+    // for a replace — and whose one heal-mint (`if (!doc.id) doc.id = newGuid()`, an id-less EXISTING template) sits in
+    // a different function from its write. The prefab.ts row this ledger pardoned went with `writePrefabFileReport`.
+    expect(writes.length, 'the reader must see the editor\'s plain writes, or the ledger below is vacuous').toBeGreaterThanOrEqual(9);
     assertExemptionLedger({
       label: 'editor functions that mint a guid and write it with a plain write (#1264)',
       population: writes.filter((w) => w.mints).map(({ item, site }) => ({ item, site })),
-      exempt: [{
-        item: 'scene/prefab.ts::writePrefabFileReport',
-        reason: 'the SAVE choke point for an existing template (Apply-to-Prefab, prefab edit mode, undo restore, the agent create op) — '
-          + '`if (!prefab.id) prefab.id = newGuid()` heals a document with no id; it is not minting an identity for a new file. '
-          + 'Every caller hands it a prefab whose id was resolved from the existing file (classifyExistingPrefabId / the edited guid). '
-          + 'Named `writePrefabFileReport` since #1468: the choke point gained a report-returning form so a refusal\'s REASON '
-          + 'survives the call, and `writePrefabFile` is now a thin boolean wrapper over it that mints nothing itself.',
-      }],
+      exempt: [],
       scanned: writes.length,
-      floor: 10,
+      floor: 9,
       fix: 'create the document with writeNewAssetDocument (scene/createAssetDocument.ts): it writes create-only, asks before replacing, and keeps the replaced asset\'s guid',
     });
   });

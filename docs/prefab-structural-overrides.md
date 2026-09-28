@@ -321,7 +321,7 @@ before refresh (so the re-instantiated prefab member replaces them rather than
 duplicating); non-applied additions are re-captured and re-spawned by the
 refresh, so nothing is lost. See [Refresh reconciliation](#refresh-reconciliation).
 
-Then `writePrefabFile` + `refreshAllInstances`. After refresh, applied additions
+Then `commitPrefabWrite` (#1692: the write, both caches, the refresh as its rebuild, a rebase of every other frame). After refresh, applied additions
 are now base members (re-detected as members, not adds) and applied removals are
 gone from the base, so both drop out of the instance's structural override set on
 the next capture — the same self-clearing behavior the value-diff path already

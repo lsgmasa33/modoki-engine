@@ -13,7 +13,7 @@ import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
 import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
-import { writeAssetFile, writeSceneCopy, jsonFileBody } from '../backend/editorBackend';
+import { writeAssetFile, writeAssetFileGuarded, writeSceneCopy, jsonFileBody } from '../backend/editorBackend';
 import { chooseNewAssetPath } from '../utils/saveDialog';
 import { SCENE_EXT, classifyExplicitSceneSave } from './sceneFileName';
 import { writeNewAssetDocument } from './createAssetDocument';
@@ -1078,7 +1078,10 @@ export function causeSpecs(): Readonly<Record<keyof UnsavedCauses, CauseSpec>> {
 export interface SaveResult {
   saved: boolean;
   path: string | null;
-  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'prefab-edit' | 'target-loaded' | 'superseded';
+  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'prefab-edit' | 'target-loaded' | 'superseded' | 'conflict';
+  /** The primary scene's bytes as written, when it was (#1695): what a later conditional save (`ifMatch`) of the same
+   *  file expects — Apply's undo and redo save the scene only over what the other half saved. */
+  content?: string;
   /** Set when an explicit `path` wrote the open scene to ANOTHER file (#1414): the copy got a fresh
    *  scene id and reminted entity guids, and the editor then reopened it from disk so the live world
    *  carries the identities the file does. `reopened:false` means the copy IS on disk but the editor
@@ -1193,23 +1196,46 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
 }
 
 /** Write the serialized primary scene to `path` under its own id, and make `path` the open scene's. */
-async function writePrimaryScene(path: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number): Promise<SaveResult> {
+/** The bytes the editor itself last wrote to each scene file, by the path it wrote (#1692 close-out review of #1695).
+ *  A save that must not overwrite a change made from OUTSIDE (Apply's undo, `saveScene({ ifMatch })`) is conditional on
+ *  these, so the user's Cmd+S between an Apply and its undo is not mistaken for an outside edit. Session-scoped, like
+ *  the undo history that reads it.
+ *
+ *  ⚠️ Recorded by `writePrimaryScene` ONLY — the open scene saved to its own file. A base scene written through the
+ *  scene that loads it (`saveOtherLoadedScenes`) and a first save / Save As (`writeNewAssetDocument`,
+ *  `writeSceneCopy`) are not, deliberately: the undo of an Apply in that base, run later from the base itself, must
+ *  REFUSE rather than write its snapshot over an edit made through the other scene. Its report calls that an outside
+ *  change, which from the base's own history it is. Do not "complete" this map without that case in mind. */
+const lastWrittenScene = new Map<string, string>();
+/** {@link lastWrittenScene} for `path`: what the editor last wrote there, or undefined if it has not this session. */
+export function lastWrittenSceneBytes(path: string): string | undefined {
+  return lastWrittenScene.get(path);
+}
+
+async function writePrimaryScene(path: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number, ifMatch?: string): Promise<SaveResult> {
   const openBefore = _currentScenePath;
-  const ok = await writeAssetFile(path, content);
+  // `ifMatch` (#1695): only over the bytes the caller expects there, checked by the route atomically with the write.
+  const guarded = ifMatch === undefined ? null : await writeAssetFileGuarded(path, content, { ifMatch });
+  if (guarded === 'conflict') {
+    console.warn(`[Editor] ${path} changed on disk since it was last saved here, so it was not overwritten`);
+    return { saved: false, path, reason: 'conflict' };
+  }
+  const ok = guarded === null ? await writeAssetFile(path, content) : guarded === 'ok';
   if (!ok) {
     console.error(`[Editor] Failed to save scene to ${path}`);
     return { saved: false, path, reason: 'write-failed' };
   }
   registerAsset(sceneId, path, 'scene');
+  lastWrittenScene.set(path, content);
   editorEmit('!save', { path, entities: entityCount }); // Editor Percept (V2)
   console.log(`[Editor] Saved scene: ${entityCount} entities → ${path}`);
   // A scene load that landed during the write owns the editor now. Pointing it back at `path`, or
   // stamping its world as saved, would make the next save write THAT world over this file (#1414
   // close-out review). The bytes above are the old scene's, written to its own file — still true.
-  if (_currentScenePath !== openBefore) return { saved: true, path, reason: 'ok' };
+  if (_currentScenePath !== openBefore) return { saved: true, path, reason: 'ok', content };
   if (path !== _currentScenePath) setCurrentScenePath(path);
   markSceneSaved(savedAtEditVersion);
-  return { saved: true, path, reason: 'ok' };
+  return { saved: true, path, reason: 'ok', content };
 }
 
 export async function saveScene(opts: {
@@ -1220,8 +1246,12 @@ export async function saveScene(opts: {
    *  an agent-triggered dialog hangs the call ~60s AND blocks every later renderer-bound
    *  call until someone clicks Cancel. Default true to keep the human callers unchanged. */
   allowDialog?: boolean;
+  /** Write the open scene's own file only while it holds the bytes with this sha256 (#1695) — Apply's undo and redo,
+   *  over what the other half saved. Refused → `reason: 'conflict'`, nothing written. Only for a save to the scene's
+   *  known path; a Save As ignores it. */
+  ifMatch?: string;
 } = {}): Promise<SaveResult> {
-  const { path: explicitPath, allowDialog = true } = opts;
+  const { path: explicitPath, allowDialog = true, ifMatch } = opts;
   // ⚠️ NEVER serialize the prefab-edit world. Its entities are the prefab PLUS throwaway scaffolding
   // (key light, ambient, HDR, and the 2D `Canvas2D` host + centring stage), and its scene path is
   // deliberately null so a normal save cannot target a real file. But "no path" then fell into the
@@ -1288,7 +1318,7 @@ export async function saveScene(opts: {
   // case-variant `path` names the same file, and adopting it would give the manifest a second key.
   const knownPath = kind === 'same' ? _currentScenePath! : explicitPath || _currentScenePath;
   // scene.id is always populated by serializeScene (required field).
-  if (knownPath) return writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAtEditVersion);
+  if (knownPath) return writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAtEditVersion, ifMatch);
 
   // No path, and no dialog allowed (an agent) — say so instead of opening a modal panel
   // only a human can close.

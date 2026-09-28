@@ -7,14 +7,14 @@
  *  before the write and ignored the result (#1668), so a failed write rebuilt the world against a document the disk
  *  did not hold.
  *
- *  Driven through the real Apply, undo manager, `installPrefabSnapshot` and `writePrefabFileReport`. Only the route is
+ *  Driven through the real Apply, undo manager and `commitPrefabWrite` (#1692). Only the route is
  *  a fake: a disk keyed by the path `postWriteFile` received, holding exactly the bytes it received, with
  *  `/api/write-file`'s own if-match rule (`ifMatchRefusal`, editorBackendRouter.ts): refuse with 409
  *  `reason:'if-match'` unless the sha256 of the stored bytes equals `ifMatch`. The accept side therefore compares the
  *  hash the undo sent against the bytes the Apply really wrote, not against a recomputation of them.
  *
  *  Mutations, each checked:
- *  - drop the `ifMatch` from `installPrefabSnapshot`'s write: the #1664 case goes red.
+ *  - drop the `ifMatch` from `commitPrefabWrite`'s write: the #1664 case goes red.
  *  - ignore the write result (do not throw) there: the #1668 case goes red.
  *  - serialize the Apply's write differently from the undo's hash (one path only): the accept cases go red.
  *  - treat every 409 as the if-match refusal: the format-gate case goes red.
@@ -43,10 +43,15 @@ const fs = vi.hoisted(() => ({
   fail: false,
   /** The next write is refused by the #1468 format gate, which runs BEFORE the if-match check. */
   tooNew: false,
+  /** When set, every write waits for it — a write held in flight (#1667). */
+  gate: null as Promise<void> | null,
+  /** Writes waiting on `gate`. */
+  waiting: 0,
 }));
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   postWriteFile: async (path: string, content: string, _enc?: string, opts?: { ifMatch?: string }) => {
+    if (fs.gate) { fs.waiting++; await fs.gate; fs.waiting--; }
     fs.posts.push({ path, content, ifMatch: opts?.ifMatch });
     const answer = (status: number, body: object) => ({ ok: status < 300, status, json: async () => body, text: async () => JSON.stringify(body) }) as Response;
     if (fs.fail) { fs.fail = false; return answer(500, { error: 'the disk is full' }); }
@@ -97,13 +102,15 @@ import {
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
-import { setPrefabCache, getCachedPrefabSync, writePrefabFileReport, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
+import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
 import { setCurrentScenePath } from '../../packages/modoki/src/editor/scene/serialize';
 import { dirtySceneGuidsSnapshot, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
-import { undo, redo, canRedo, swapHistory, _resetHistoryContexts, getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo, peekUndo, canRedo, swapHistory, _resetHistoryContexts, getEditVersion, beginWorldSwitch } from '../../packages/modoki/src/editor/undo/undoManager';
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -156,7 +163,8 @@ const box = () => {
   return all().find((e) => e.name === 'Box' && parentOf(e.id) === root)!.id;
 };
 const boxInCache = () => (getCachedPrefabSync(P) as PrefabFile).entities.find((e) => e.name === 'Box')!.traits.Transform as { x: number; y: number };
-/** The ONE path the fake disk holds for P — whatever `writePrefabFileReport` resolved the guid to. */
+/** The ONE path the fake disk holds for P — whatever `commitPrefabWrite` resolved the guid to (P itself: it is not in
+ *  the manifest). */
 const onDisk = () => {
   const paths = [...new Set(fs.posts.map((p) => p.path))];
   expect(paths).toHaveLength(1); // precondition: every write went to one file
@@ -164,6 +172,8 @@ const onDisk = () => {
 };
 const boxOnDisk = () => (JSON.parse(onDisk()) as PrefabFile).entities.find((e) => e.name === 'Box')!.traits.Transform as { x: number; y: number };
 const toast = vi.fn();
+/** A later write of the template from somewhere else — a prefab-edit save goes through the same step. */
+const laterSave = (doc: PrefabFile) => commitPrefabWrite(P, doc, { expected: getCachedPrefabSync(P) as PrefabFile, rebase: false });
 
 const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
   const spies = (['log', 'warn', 'info', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation(() => {}));
@@ -185,9 +195,14 @@ beforeEach(() => {
   prefabs.clear();
   install(pDoc());
   fs.disk.clear();
+  // The prefab is ON DISK before anything runs, as it is in the editor: the forward Apply is conditional on the document
+  // it read (#1692, I10), and a file that is not there is not what it read.
+  fs.disk.set(P, jsonFileBody(pDoc()));
   fs.posts.length = 0;
   fs.fail = false;
   fs.tooNew = false;
+  fs.gate = null;
+  fs.waiting = 0;
   sm.path = 'scenes/Level.json';
   sm.loads = 0;
   sm.saves = 0;
@@ -245,7 +260,7 @@ describe('Apply undo/redo writes the prefab only over the other side of the Appl
     // `savePrefabEdit`), then seeds the cache as that save does.
     const later = JSON.parse(JSON.stringify(getCachedPrefabSync(P))) as PrefabFile;
     later.entities.push({ ...row(3, G(3), 'Extra', 1) } as never);
-    expect((await quietly(() => writePrefabFileReport(P, later))).ok).toBe(true); // precondition
+    expect((await quietly(() => laterSave(later))).ok).toBe(true); // precondition
     setPrefabCache(P, later);
     const laterBytes = onDisk();
     const loads = sm.loads;
@@ -274,7 +289,7 @@ describe('Apply undo/redo writes the prefab only over the other side of the Appl
     expect(boxOnDisk().x).toBe(0); // precondition
     const later = JSON.parse(JSON.stringify(getCachedPrefabSync(P))) as PrefabFile;
     later.name = 'Renamed by a later save';
-    await quietly(() => writePrefabFileReport(P, later));
+    await quietly(() => laterSave(later));
     setPrefabCache(P, later);
     const laterBytes = onDisk();
 
@@ -341,7 +356,7 @@ describe('a refusal on a BASE scene\'s instance dirties no scene (close-out re-r
     clearAllSceneDirty();
     const later = JSON.parse(JSON.stringify(getCachedPrefabSync(P))) as PrefabFile;
     later.name = 'Saved in prefab edit';
-    await quietly(() => writePrefabFileReport(P, later));
+    await quietly(() => laterSave(later));
     setPrefabCache(P, later);
 
     await quietly(() => undo());
@@ -354,7 +369,7 @@ describe('a refusal on a BASE scene\'s instance dirties no scene (close-out re-r
 describe('a prefab file with no id (close-out review)', () => {
   // The id-less document stays keyed by P in the caches (as a GUID source is), so the Apply's write is what mints its id.
   const idless = () => { const { id: _id, ...rest } = pDoc(); return rest; };
-  const install2 = () => { prefabs.set(P, idless()); setPrefabCache(P, idless() as never); };
+  const install2 = () => { prefabs.set(P, idless()); setPrefabCache(P, idless() as never); fs.disk.set(P, jsonFileBody(idless())); };
 
   it('undo and redo both land, and the file keeps the one id the Apply gave it', async () => {
     install2();
@@ -377,3 +392,66 @@ function xOf(id: number): number {
   for (const e of getCurrentWorld().entities) if (e.id() === id) return (e.get(Transform) as { x: number }).x;
   return NaN;
 }
+
+/** #1692 (I10): the FORWARD Apply writes only over the document it read. The editor's copy can be behind the file — a
+ *  save from elsewhere, an outside edit the watcher has not refreshed yet — and the Apply rewrites the whole document
+ *  from that copy, so an unconditional write silently threw the other change away.
+ *  Mutation: write with no precondition in `commitPrefabWrite` (`overwrite: true` for the Apply) — this goes red. */
+describe('a forward Apply writes only over the document it read (#1692)', () => {
+  it('a file changed since the editor read it refuses the Apply, and nothing moves', async () => {
+    const elsewhere = { ...pDoc(), name: 'saved elsewhere' };
+    fs.disk.set(P, jsonFileBody(elsewhere));
+    writeTraitFieldWithUndo(box(), getTraitByName('Transform')!, 'x', 5);
+    const keys = collectInstanceOverrideKeys(rootId(), getCachedPrefabSync(P) as PrefabFile);
+    const edits = getEditVersion();
+    const res = await quietly(() => applyToPrefabWithUndo(rootId(), new Set(keys.fields)));
+    expect(res.applied).toBe(false);
+    expect(res.refused).toMatch(/changed on disk/);
+    expect(fs.disk.get(P)).toBe(jsonFileBody(elsewhere));
+    expect(xOf(box())).toBe(5); // the instance keeps its edit…
+    expect(boxInCache().x).toBe(0); // …and the template was not moved
+    expect(getEditVersion()).toBe(edits); // no undo entry
+  });
+});
+
+/** #1667 (I11): a forward Apply lands WHOLE in the world it began in. Its write, refresh, scene save and undo entry are
+ *  separated by awaits; a Play, a scene open or entering prefab edit in one of them ran the rest in the incoming world.
+ *  Every world switch now waits for it, as for an undo step (#1579), and an Apply does not start during a switch.
+ *  Mutation: drop the hold in `applyToPrefabWithUndo` — the first case goes red (the switch lands after the write but
+ *  BEFORE the undo entry, since the commit's own hold ends with the write step); drop the refusal — the second. */
+describe('a forward Apply is serialized against world switches (#1667)', () => {
+  it('a switch begun while the Apply writes waits until the Apply has landed, undo entry included', async () => {
+    let open!: () => void;
+    fs.gate = new Promise<void>((r) => { open = r; });
+    writeTraitFieldWithUndo(box(), getTraitByName('Transform')!, 'x', 5);
+    const keys = collectInstanceOverrideKeys(rootId(), getCachedPrefabSync(P) as PrefabFile);
+    const applying = quietly(() => applyToPrefabWithUndo(rootId(), new Set(keys.fields)));
+    await vi.waitFor(() => expect(fs.waiting).toBe(1)); // the Apply's write is in flight
+    const sw = beginWorldSwitch();
+    expect(sw.idle).not.toBeNull();
+    // What the top of THIS scene's undo stack says when the switch is let through (the field edit is under it).
+    let landedWith: string | null = null;
+    void sw.idle!.then(() => { landedWith = peekUndo()?.label ?? ''; });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(landedWith).toBeNull(); // still waiting on the write
+    fs.gate = null;
+    open();
+    expect((await applying).applied).toBe(true);
+    await sw.idle;
+    sw.release();
+    // The switch was let through only once the Apply had finished — its undo entry already on this scene's stack.
+    expect(landedWith).toBe('Apply to Prefab');
+  });
+
+  it('an Apply does not start while a world switch is under way', async () => {
+    writeTraitFieldWithUndo(box(), getTraitByName('Transform')!, 'x', 5);
+    const keys = collectInstanceOverrideKeys(rootId(), getCachedPrefabSync(P) as PrefabFile);
+    const sw = beginWorldSwitch();
+    try {
+      const res = await quietly(() => applyToPrefabWithUndo(rootId(), new Set(keys.fields)));
+      expect(res.applied).toBe(false);
+      expect(res.refused).toMatch(/scene switch is in progress/);
+      expect(fs.posts).toHaveLength(0);
+    } finally { sw.release(); }
+  });
+});

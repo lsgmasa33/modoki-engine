@@ -77,12 +77,13 @@ export {
   captureInstanceOverrides, applyOverridesByRootInstance,
   applyToPrefab, applyToPrefabSelective, staleInstanceRefusal,
   revertOverridesSelective, rebuildInstance, rebuildInstanceFromCapture,
-  writePrefabFile, warnInertPrefabSizes, classifyExistingPrefabId, replacedPrefabRows,
+  warnInertPrefabSizes, classifyExistingPrefabId, parsedPrefabRows,
   tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance, reattachDetachedInstance,
   captureInstanceStructure, resolveInstanceContext,
   type PrefabFile, type RevertResult,
 } from './scene/prefab';
+export { commitPrefabWrite, commitPrefabWrites, type PrefabCommitResult, type PrefabCommitsResult, type PrefabWrite, type PrefabExpectation } from './scene/prefabCommit';
 // Shared override-key enumeration for the Apply-to-Prefab / Revert-Overrides surfaces —
 // the dialog (ApplyPrefabDialog.tsx) and the `modoki_prefab {prefabAction:'overrides'}`
 // agent op both build their checkbox/discovery list from this ONE walk, so they cannot
@@ -178,13 +179,13 @@ export {
 // #889 — the Clean Up dialog's staleness DECISION, exported for its unit test. The dialog itself
 // is .tsx; the decision is a plain module so it is assertable without a jsdom mount
 // (docs/editor.md § Panels).
-export { readUnusedStaleness, type UnusedStaleness } from './panels/assetOps';
+export { readUnusedStaleness, readPriorDocument, type UnusedStaleness } from './panels/assetOps';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.
 // #125: prefab-edit is also the only round-trip that re-serializes a .prefab.json, so the
 // bulk re-save sweep (engine/scripts/resave-prefabs.sh) drives these three as agent ops.
-export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, savePrefabEditReport, type PrefabEditSaveReport, exitPrefabEditing } from './scene/prefabEdit';
+export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, savePrefabEditReport, type PrefabEditSaveReport, type PrefabEditSaveOptions, exitPrefabEditing } from './scene/prefabEdit';
 // The PURE predicate, and the ground truth `isEditingPrefab`'s store flag only approximates.
 // Exported because a PROBE must not use the self-healing one — see its docblock (#889 close-out).
 export { isPrefabEditWorld, prefabEditWorldPath, prefabSessionWorldPath, PREFAB_EDIT_SCENE_PREFIX } from './scene/prefabEditWorld';

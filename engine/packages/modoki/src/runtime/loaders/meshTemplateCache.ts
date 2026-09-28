@@ -2446,7 +2446,7 @@ export function getPrefabRevision(prefabRef: string): number {
 
 /** The cache key a prefab ref names: a GUID resolves through the manifest; anything else is taken
  *  as the resolved path already. ⚠️ Not `refToPath` for the path form — `resolveRef` rejects an
- *  internal asset path with a console.error and returns undefined, and `writePrefabFile`'s agent
+ *  internal asset path with a console.error and returns undefined, and the agent
  *  `create` caller hands a PATH: that turned a replace into an eviction plus a false error (#1308
  *  close-out). `invalidatePrefab` carves the same exception out for the same reason. */
 function prefabCacheKey(prefabRef: string): string | undefined {

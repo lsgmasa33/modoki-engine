@@ -119,7 +119,7 @@ describe('the base-scene flush runs LAST, and that rule is DATA (#831, #972)', (
     // cannot carry the format gate's refusal REASON out to the toast — and an exact match on the old
     // name made `found()` fire, which is this guard working: the ordering rule below is unchanged,
     // but its subject moved. Matching both means a later flip back does not silently break it either.
-    const prefabSave = found(branch.search(/await savePrefabEdit(?:Report)?\(\)/), "the prefab-edit branch's savePrefabEdit call");
+    const prefabSave = found(branch.search(/await savePrefabEdit(?:Report)?\(/), "the prefab-edit branch's savePrefabEdit call");
     const after = found(branch.indexOf("await flushParked('after-scene')"), "the prefab-edit branch's after-scene flush "
       + '(without it Cmd+S there leaves the edit pending and says nothing)');
     expect(before).toBeLessThan(prefabSave);

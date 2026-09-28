@@ -225,7 +225,16 @@ async function runSaveTargets(): Promise<SaveOutcome> {
     // and the boolean throws it away, leaving a toast that says to check a console the reason may
     // not even be in (the server logs it to the DEV-SERVER terminal). `savePrefabEditReport` returns
     // it in `warnings` on a failure; the notice below names it.
-    const prefabReport = await savePrefabEditReport();
+    // A file changed on disk under the open edit is replaced only when the human says so (#1692) — Cancel leaves it,
+    // and the edit stays open and unsaved, so Exit's Save leaves nothing behind to discard.
+    const prefabReport = await savePrefabEditReport({
+      // Dynamic, like the unsaved gate's own import of this module: the modal is DOM, and this module is not.
+      confirmOverwrite: async (name, path) => (await import('../utils/saveDialog')).confirmInEditor(
+        `"${name}" changed on disk`,
+        `${path} changed on disk since you opened it here (a save from somewhere else, an outside edit or a git pull). Overwrite it with this edit, or cancel and keep the file as it is? Your edit stays open either way.`,
+        'Overwrite',
+      ),
+    });
     const prefabSaved = prefabReport.saved;
     // …and the pending base-scene refs, for the same #259 reason this branch already flushes
     // parked asset docs: a `baseScene` set on a scene the editor never loaded has nothing to do

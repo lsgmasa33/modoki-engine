@@ -2657,14 +2657,13 @@ Findings come from four passes:
    same check so an agent editing prefab JSON can verify its own edit. All four share the one
    `inertLayoutWarnings` predicate, so the rule and its noise budget cannot drift between them.
 
-   The write-time hook deliberately does NOT live in `writePrefabFile`: that is also the undo/redo
-   restore path (`installPrefabSnapshot`), and warning there would fire while someone *reverts*
+   The write-time hook deliberately does NOT live in `commitPrefabWrite` (#1692): that is also every undo/redo
+   restore path (Apply's, Create Prefab's, the skin rig's), and warning there would fire while someone *reverts*
    the value. The price is that each authoring write has to remember the call — and two did not:
    edit mode's save predated #42 and the agent `create` op was never listed (#1251). So the guard
    (`warnInertPrefabSizes.test.ts`) takes **two censuses** over the package's `src/editor` and the
-   app's `app/editor`, each through `assertExemptionLedger`: every `writePrefabFile` call must warn
-   first or be a named restore, and every function that calls `serializePrefab` — which reaches the
-   writers that bypass `writePrefabFile`, like Save-as-Prefab's `writeAssetFile` — must call
+   app's `app/editor`, each through `assertExemptionLedger`: every `commitPrefabWrite` call must warn
+   first or be a named restore or GENERATED writer, and every function that calls `serializePrefab` must call
    `warnInertPrefabSizes` or be a named GENERATED writer (model import, model re-import, 2D rig
    prefab). A new writer of either shape fails by file and function instead of being skipped.
 

@@ -302,7 +302,7 @@ describe('undoing an Apply made in an untitled scene rebuilds that world (#1575)
 });
 
 describe('undoing an untitled scene\'s Apply after the world changed under it (#1575)', () => {
-  it('after a Save As, the undo restores the scene at its new path and saves it there', async () => {
+  it('after a Save As, the undo restores the scene at its new path, and leaves it unsaved as the Apply did', async () => {
     writeTraitFieldWithUndo(inInst('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     const before = await saved();
     await applyFromA((k) => k.fields);
@@ -315,7 +315,8 @@ describe('undoing an untitled scene\'s Apply after the world changed under it (#
     expect(await saved()).toEqual(before);
     expect(sm.path).toBe(SAVED);
     expect(getCurrentScenePath()).toBe(SAVED);
-    expect(sm.saves).toBe(1);
+    // A field Apply saves no scene, so neither does its undo (#1695): the restore is dirty, as any undo leaves it.
+    expect(sm.saves).toBe(0);
   });
 
   it('a Create Scene landing during the undo\'s file install is not overwritten by the untitled snapshot', async () => {
@@ -426,7 +427,7 @@ describe('a world switch during an Apply undo waits for it (#1579)', () => {
 
   // Members 2 and 3's door: the load swapped the world under the step, which skipped its reload and its rederive of
   // the base instances (member 2's lost override) and dirtied the outgoing scene after the load read it (member 3).
-  it('a scene load: the undo restores the world, rederives and saves the scene, and only then does the load land', async () => {
+  it('a scene load: the undo restores the world and rederives, and only then does the load land', async () => {
     titled();
     writeTraitFieldWithUndo(inInst('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     await applyFromA((k) => k.fields);
@@ -435,7 +436,7 @@ describe('a world switch during an Apply undo waits for it (#1579)', () => {
     expect(did).toBe(true);
     expect(result).toBe('loaded');
     expect(refreshes.n).toBe(1); // the rederive ran — over A's world, before the swap
-    expect(sm.saves).toBe(1); // the restored A was saved before it was left
+    expect(sm.saves).toBe(0); // a field Apply saved no scene, so its undo saves none either (#1695)
     expect(boxOnDisk()).toMatchObject({ x: 0 });
     expect(getCurrentScenePath()).toBe('/scenes/B.json');
   });

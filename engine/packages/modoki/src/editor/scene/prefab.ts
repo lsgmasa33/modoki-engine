@@ -14,8 +14,7 @@ import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, rewrit
 import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { collectUnknownFields, mergeUnknownFields } from '../../runtime/core/formatVersion';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
-import { postWriteFile, jsonFileBody, repairPrefabMemberPaths } from '../backend/editorBackend';
-import { sha256Hex } from '../utils/contentHash';
+import { repairPrefabMemberPaths } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './authoringScope';
@@ -29,10 +28,10 @@ import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdenti
 import { templateKeysOf, recoverTemplateKey as recoverKeyFrom, type KeyRecoveryNode } from '../../runtime/loaders/templateKeyRecovery';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { entityRef, type EntityRef } from '../undo/entityRef';
-import { UndoRefusedError } from '../undo/undoFailure';
+import { commitPrefabWrite } from './prefabCommit';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { assetIsAbsent, parseAssetJson, ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
-import { invalidatePrefab, replaceCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
+import { invalidatePrefab, replaceCachedPrefab, getPrefabRevision } from '../../runtime/loaders/meshTemplateCache';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
@@ -1545,17 +1544,6 @@ export function parsedPrefabRows(text: string | null): ReplacedRows | undefined 
   } catch { return undefined; }
 }
 
-/** {@link ReplacedRows} of the prefab file at `path` that a write is about to replace — the FILE's bytes, read raw and
- *  NOT cached: the write destroys those rows, whatever the editor cache holds (it can be stale, #1692), and caching them
- *  left the editor cache holding the old document after the replacing write (close-out review of #1686). Create
- *  Prefab's Replace matches against the same thing: the bytes it is replacing. */
-export async function replacedPrefabRows(path: string): Promise<ReplacedRows | undefined> {
-  try {
-    const res = await fetch(assetUrl(path), ASSET_FETCH_INIT);
-    return res.ok ? parsedPrefabRows(await res.text()) : undefined;
-  } catch { return undefined; }
-}
-
 /** Resolve the stable id a (re)written prefab at `prefabPath` must keep, so a
  *  model re-import never mints a fresh guid that orphans scenes whose
  *  PrefabInstance.source points at the old one (the tropical-island bug).
@@ -1903,9 +1891,22 @@ setFrameDocFallback((source) => prefabCache.get(source) ?? null);
  *  manifest) or a legacy path like "/models/.../island.prefab.json". Cached by
  *  the original ref so guid + path callers don't fetch twice. */
 export async function getPrefabSource(source: string): Promise<PrefabFile | null> {
-  if (prefabCache.has(source)) return prefabCache.get(source)!;
-  const prefab = await fetchPrefabSource(source);
-  if (prefab) prefabCache.set(source, prefab);
+  // ⚠️ A cold read is not allowed to put older bytes back (#1669, the editor twin of #863). A write can land while the
+  // fetch is in flight — Create Prefab → Replace, a rig update, an agent `create`, from the Apply dialog opening or a
+  // nested preload racing it — and the fetch then resolves with the bytes from before it, over the document the write
+  // just seated. So the read carries the runtime cache's revision token, which every prefab write and eviction bumps
+  // (`replaceCachedPrefab`/`invalidatePrefab`), and is discarded when the token moved or a writer filled the key
+  // meanwhile. One re-read, then the last fetch is returned uncached rather than looping on a file that keeps changing.
+  let prefab: PrefabFile | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (prefabCache.has(source)) return prefabCache.get(source)!;
+    const revision = getPrefabRevision(source);
+    prefab = await fetchPrefabSource(source);
+    if (prefabCache.has(source)) return prefabCache.get(source)!;
+    if (getPrefabRevision(source) !== revision) continue;
+    if (prefab) prefabCache.set(source, prefab);
+    return prefab;
+  }
   return prefab;
 }
 
@@ -1950,9 +1951,13 @@ async function fetchPrefabSource(source: string, init?: RequestInit): Promise<Pr
  *
  *  Swapped only if nobody replaced the entry during the fetch: an Apply-to-Prefab landing then has
  *  already put the newer content in (its own write never reaches the watcher), and two external
- *  writes can race their refreshes. And the prefab OPEN in prefab-edit mode keeps its copy: the edit
- *  world still holds the old content, so the save it diffs against must stay the one it opened —
- *  refreshing it changes what that save does without the world ever showing the external version.
+ *  writes can race their refreshes. And the prefab OPEN in prefab-edit mode keeps its copy until the session
+ *  ends, when the leaving repair refreshes it and rebases (#1666). ⚠️ The reason this skip was written — the edit's
+ *  save diffed against this entry — no longer holds: since #1692 the save is conditional on the session's own
+ *  baseline (`prefabEdit.ts` `editBaselineFor`), and every editor WRITE re-seats this entry anyway. What the skip still
+ *  does is leave the entry behind an outside edit for the rest of the session, so an in-editor writer that reads it as
+ *  what it read (an Apply from a carried instance) is refused as a conflict until the edit ends — the safe direction.
+ *  Kept rather than removed with #1692, because the leaving repair is built on it and is being reworked by #1698.
  *
  *  Keyed by whatever ref the caller used, a GUID normally and a path for a not-yet-normalized
  *  instance, so both keys are refreshed. Does NOT touch the runtime cache: the watcher path evicts
@@ -2091,6 +2096,13 @@ export async function instantiatePrefabInstance(
  *  every scene swap. */
 export function primeEditorPrefabCache(source: string, prefab: PrefabFile): void {
   prefabCache.set(source, prefab);
+}
+
+/** The editor cache's half of a prefab write, for `commitPrefabWrite` (prefabCommit.ts) alone: set `source` to the
+ *  document just written, or evict it after a trash. The runtime cache is the commit's to update. */
+export function seatEditorPrefabCache(source: string, prefab: PrefabFile | null): void {
+  if (prefab) prefabCache.set(source, prefab);
+  else prefabCache.delete(source);
 }
 
 /** Is this source already in the editor cache? (`getCachedPrefabSync` answers the same
@@ -4493,16 +4505,15 @@ export async function reattachDetachedInstance(detached: DetachSnapshot): Promis
   return unresolved;
 }
 
-/** Seed (or evict) the in-memory prefab cache. Used by save/import flows so
- *  the Inspector's override detection picks up newly-written prefabs without
- *  a re-fetch. */
+/** Seed (or evict) both prefab caches with a document READ from disk — `openPrefabForEditing`'s raw fetch.
+ *  ⚠️ NOT for a write: a prefab write is `commitPrefabWrite` (prefabCommit.ts, #1692), which seats both caches under
+ *  every key only once the write has landed, and then rebuilds the live frames. Every writer used to call this after
+ *  its own write, and each one that stopped there left other instances expanded from the old document (#1685). */
 export function setPrefabCache(source: string, prefab: PrefabFile | null): void {
   if (prefab) prefabCache.set(source, prefab);
   else prefabCache.delete(source);
-  // Keep the runtime refcounted prefab cache in sync — every setPrefabCache call follows a prefab
-  // file write (save-as-prefab, overwrite, delete/undo). A write REPLACES the runtime entry rather
-  // than evicting it: an eviction strands every synchronous runtime reader until the next scene
-  // load (#1308). A delete still evicts.
+  // Keep the runtime refcounted prefab cache in sync. REPLACE rather than evict: an eviction strands every synchronous
+  // runtime reader until the next scene load (#1308). A delete still evicts.
   if (prefab) replaceCachedPrefab(source, prefab);
   else invalidatePrefab(source);
 }
@@ -4531,8 +4542,6 @@ export function resolveInstanceContext(entityId: number): { source: string; root
   return { source, rootInstanceId };
 }
 
-/** Write the new prefab JSON to its source path. Tries the dev-server API
- *  first (we know the path); falls back to a save-file picker. */
 /** Warn about the inert-size trap at prefab WRITE time (#42) — a `UIElement` size authored on an
  *  axis the anchor stretches is stored and shown in the Inspector, but never applied.
  *
@@ -4541,12 +4550,12 @@ export function resolveInstanceContext(entityId: number): { source: string; root
  *
  *  The one thing that must stay HERE, because it is invisible in the code and looks like an
  *  obvious cleanup: call this from EVERY AUTHORING write (Apply-to-Prefab, Save-as-Prefab, prefab edit
- *  mode save, the agent `create` op — #1251), never from `writePrefabFile`. That is the single choke point for prefab writes AND the
- *  undo/redo restore path (`installPrefabSnapshot`), so hooking it warns while someone REVERTS the
+ *  mode save, the agent `create` op — #1251), never from `commitPrefabWrite`. That is the single choke point for prefab writes AND the
+ *  undo/redo restore path (Apply's undo), so hooking it warns while someone REVERTS the
  *  value. Guarded by tests/editor/warnInertPrefabSizes.test.ts. */
 export function warnInertPrefabSizes(prefab: unknown, source: string): string[] {
   // Name the FILE even when the caller holds the GUID (PrefabInstance.source and prefab edit mode both
-  // do) — the same resolution writePrefabFile applies before it writes.
+  // do) — the same resolution `commitPrefabWrite` applies before it writes.
   const where = isGuid(source) ? (resolveRef(source) || source) : source;
   const { warnings } = validatePrefabData(prefab);
   for (const w of warnings) {
@@ -4554,123 +4563,6 @@ export function warnInertPrefabSizes(prefab: unknown, source: string): string[] 
   }
   // Returned for a caller whose reader is not the editor Console — the agent op answers in its response.
   return warnings;
-}
-
-export async function writePrefabFile(source: string, prefab: PrefabFile): Promise<boolean> {
-  return (await writePrefabFileReport(source, prefab)).ok;
-}
-
-/** The same write, with the backend's REASON kept (#1468). A boolean cannot carry why a save
- *  failed, and under the format gate the most likely why — "a newer build wrote this file" — is
- *  something only the human can act on.
- *
- *  ⚠️ Deliberately a sibling rather than a widened return, for the reason `savePrefabEditReport`
- *  records about its own split: `{ ok: false, … }` is an always-truthy object, so a caller still
- *  written `if (!(await writePrefabFile(…)))` would compile and never see a failure again. */
-export async function writePrefabFileReport(
-  source: string, prefab: PrefabFile,
-  /** `ifMatch`: the sha256 of the bytes the file must hold now, or the route refuses the write (#1664). */
-  opts?: { ifMatch?: string },
-): Promise<{ ok: boolean; error?: string; /** The `ifMatch` precondition refused it: the file is not what the caller expected. */ conflict?: boolean }> {
-  if (!prefab.id) prefab.id = newGuid();
-  // `source` may be a GUID — resolve to the real file path before writing,
-  // otherwise the dev-server API would create a file literally named by the guid.
-  // A path source (live instance, pre-normalization) is used as-is — routing it
-  // through resolveRef would trip its internal-path rejection.
-  const path = isGuid(source) ? (resolveRef(source) || source) : source;
-  registerAsset(prefab.id, path, 'prefab');
-  const content = jsonFileBody(prefab);
-  try {
-    const res = await postWriteFile(path, content, undefined, opts?.ifMatch !== undefined ? { ifMatch: opts.ifMatch } : undefined);
-    if (res.ok) {
-      // Put the bytes just written into the runtime refcounted prefab cache. Without
-      // this, opening another scene that uses this prefab re-instantiates from the
-      // stale cached copy (e.g. missing flames/ShipShake the user just applied).
-      // REPLACE, not evict (#1308): an eviction left every synchronous runtime reader
-      // — a pooled scroll view, a timeline spawn — reading nothing until the next
-      // scene load, which blanked a UIEntries view on Apply. (An unowned prefab is
-      // still just evicted — see replaceCachedPrefab.) The editor's own prefabCache
-      // is updated by the caller. `source` may be a GUID or a path (the agent `create`
-      // op hands the path); replaceCachedPrefab keys either form correctly.
-      // ⚠️ The bytes are ON DISK from here. Anything below that throws must NOT be reported as a
-      // failed write (close-out review R4): the catch would answer `{ ok: false, error: <that
-      // message> }`, `savePrefabEditReport` would skip `markSceneSaved`, and the editor would stay
-      // permanently dirty against a file that saved — now with a confident, wrong reason attached.
-      // Its own try/catch, so a cache or logging fault is reported as what it is.
-      try {
-        replaceCachedPrefab(source, prefab);
-        console.log(`[Prefab] Wrote "${prefab.name}" → ${path}`);
-      } catch (e) {
-        console.error(`[Prefab] wrote "${prefab.name}" → ${path}, but the post-write cache update failed:`, e);
-      }
-      return { ok: true };
-    }
-    // ⚠️ READ THE BODY (#1468 close-out review F5). The owner's ruling is refuse-to-SAVE-never-to-
-    // LOAD, so a build WILL open a prefab a newer build wrote, edit it, and press Cmd+S — that is
-    // the designed-for case, not an edge. The gate answers 409 with the reason in `error`, and this
-    // line used to log the status alone and throw the body away, so the save failed silently: the
-    // server's own console.error goes to the DEV-SERVER TERMINAL, not the editor console, and
-    // `savePrefabEditReport` returns `{saved:false}` with no warning to raise.
-    const body = await res.json().catch(() => null) as { error?: unknown; reason?: unknown } | null;
-    const why = typeof body?.error === 'string' ? body.error : typeof body?.reason === 'string' ? body.reason : '';
-    // The if-match refusal, and only that one: the #1468 format gate also answers 409 `conflict:true`, runs first, and
-    // carries its own reason, which is a different thing to tell the user.
-    const conflict = res.status === 409 && body?.reason === 'if-match';
-    console.error(`[Prefab] Could not write "${prefab.name}" → ${path} (HTTP ${res.status})${why ? ` — ${why}` : ''}`);
-    return { ok: false, ...(why ? { error: why } : {}), ...(conflict ? { conflict } : {}) };
-  } catch (e) {
-    console.error('[Prefab] Write failed:', e);
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
-  // No local file-picker fallback: showSaveFilePicker writes to the user's LOCAL
-  // disk, not the project working copy (so the prefab would never reach the repo).
-  // A prefab always has a real target path here (resolved above), so a failure
-  // means a genuine backend error — report it rather than silently misdirecting.
-}
-
-/** Install a prefab snapshot as the live source: persist the file (which replaces the runtime refcounted cache
- *  entry), then update the editor cache and preload nested children. Does NOT touch live instances — the caller
- *  rebuilds the scene, which re-instantiates every instance from this cache. Used by Apply-to-Prefab undo/redo to
- *  restore the prefab base before replaying the scene snapshot.
- *
- *  **Only over `expected`** (#1664): the file is written with the hash of `expected`'s bytes as `ifMatch`, so it is
- *  replaced only while it still holds the other side of the Apply — undo expects the Apply's written document, redo the
- *  one the undo wrote, and both were serialized by `jsonFileBody` in `writePrefabFileReport`. The prefab file is
- *  global and an Apply's entry outlives edits made elsewhere (a prefab-edit save, another scene's Apply, a `git pull`),
- *  so without it an undo silently wrote the pre-Apply document over them, and redo could not bring them back.
- *
- *  **THROWS when the write does not land** — refused by that precondition, or failed (#1668) — and nothing is changed
- *  then: the cache is set only after the write. The Apply undo's step then throws, and `runStep` drops the entry with a
- *  toast saying why (`UndoRefusedError`, #310). Not the #308 report-and-return: that moves the entry to the other stack as though it had applied,
- *  and a refused entry refuses again on every retry, so it would also wall off every older undo behind it. */
-export async function installPrefabSnapshot(source: string, prefab: PrefabFile, expected: PrefabFile): Promise<void> {
-  const snap: PrefabFile = JSON.parse(JSON.stringify(prefab));
-  const where = isGuid(source) ? (resolveRef(source) || source) : source;
-  let ifMatch: string;
-  try {
-    ifMatch = await sha256Hex(jsonFileBody(expected));
-  } catch (e) {
-    // `crypto.subtle` exists only in a secure context — every origin the editor ships on is one, a dev URL on a LAN IP
-    // is not. Nothing has been written, so it is a refusal, not the generic "part of it may have applied".
-    throw new UndoRefusedError(
-      `${where} was not written: its expected contents could not be hashed (${e instanceof Error ? e.message : String(e)}), so the prefab and the scene were left as they are.`,
-      `the prefab file could not be written (see console)`,
-    );
-  }
-  const res = await writePrefabFileReport(source, snap, { ifMatch });
-  if (!res.ok) {
-    throw res.conflict
-      ? new UndoRefusedError(
-        `${where} changed on disk since the Apply (a later save of the prefab, another Apply, or an outside edit), so it was left as it is rather than overwritten.`,
-        `the prefab changed on disk since the Apply, and was left as it is`,
-      )
-      : new UndoRefusedError(
-        `${where} could not be written${res.error ? ` (${res.error})` : ''}, so the prefab and the scene were left as they are.`,
-        `the prefab file could not be written (see console)`,
-      );
-  }
-  prefabCache.set(source, snap);
-  await preloadNestedPrefabs(snap);
 }
 
 /** Scene-form added nodes rewritten into TEMPLATE form (#1387), recursively through `children`, a
@@ -5233,7 +5125,7 @@ export async function applyToPrefabSelective(
   // caught that the sweep for writers grepped for the token `version` and so could not see
   // a writer whose defect is that it never mentions it.
   newPrefab.version = PREFAB_FORMAT_VERSION;
-  // NOT stamped on the undo snapshot: `installPrefabSnapshot` replays the BEFORE bytes, and
+  // NOT stamped on the undo snapshot: Apply's undo replays the BEFORE bytes, and
   // those must be what was actually on disk, version included.
   const prefabBefore: PrefabFile = JSON.parse(JSON.stringify(oldPrefab));
   // A file with no id gets one HERE, on both sides, rather than from the write (which would stamp `newPrefab` alone).
@@ -5616,42 +5508,53 @@ export async function applyToPrefabSelective(
   }
 
   const warnings = warnInertPrefabSizes(newPrefab, source);
-  const ok = await writePrefabFile(source, newPrefab);
-  if (!ok) return NOOP_APPLY;
 
   // Who the promoted entities are, read while they still exist: the refresh re-expands each as a member with a
   // DERIVED guid, and `carryPromotedGuids` below gives it back the one every ref names (#1660).
   const promotedGuids = snapshotPromotedGuids(promotedRows, promotedRefRows);
   const rootGuid = guidForEntityId(rootInstanceId);
-  // Delete the live plain entities for applied additions BEFORE refresh, so the
-  // re-instantiated prefab member replaces them instead of duplicating. Non-applied
-  // additions stay live and are re-captured + re-spawned by the refresh.
-  const survivors = deletePromotedNodes(liveAddedRootsToDelete);
-
-  prefabCache.set(source, newPrefab);
-  // Every instance of this source, with NO exclusion — the clicked one goes through
-  // capture/restore too. ⚠️ Matching the new base is NOT what takes an applied field out of its
-  // override set (#1469): the field is still override-MARKED, the capture against the old document
-  // keeps it, and the rebuild re-seeds the mark — so it was saved as an override nobody could see
-  // (the listing diffs by value) and it pinned this instance against later template edits. The
-  // refresh subtracts `appliedFields` from THIS instance's capture instead; other instances keep
-  // their own overrides of the same field.
-  const rootsToRefresh = collectInstanceRoots(source);
-  // refreshInstances re-instantiates synchronously, so warm both halves first: the new
-  // file's own reference rows...
-  await preloadNestedPrefabs(newPrefab);
-  // ...and the LIVE tree of each instance. A user-added nested instance is not a row of
-  // newPrefab, so the file walk above never reaches it, and captureNestedInstanceOverrides
-  // would then drop its per-copy overrides with no warning at all (#1284).
-  for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
-  const remap = rowsReparented && prefabId ? liveMemberGuidRemap(prefabId, readOld, readNew, rootsToRefresh) : new Map<string, string>();
-  // …and each template reference node's live moves, path-keyed in its frame (#1564): the rebuilds below re-queue them — a
-  // rebuilt root's carry, and the moves of the frames around a rebuilt instance — and a stale path names nothing, so the
-  // member went back to its template home and the next save dropped the node's move.
-  if (rowsReparented && prefabId) rewriteNodeMoves(getCurrentWorld(), (moved, src) => rewriteFrameMoves(moved, src, readOld, readNew));
-  refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap, { rootId: rootInstanceId, fields: appliedFields });
-  if (remap.size) remapWorldGuidRefs(remap);
-  rehangPromotionSurvivors(survivors, carryPromotedGuids(rootGuid, promotedGuids));
+  // ONE step (#1692): the write only over the document this Apply read (I10), both caches, this refresh, then a rebase
+  // of every other frame of the source still built from the old document — all in the world the Apply began in (I11).
+  const committed = await commitPrefabWrite(source, newPrefab, {
+    expected: oldPrefab,
+    rebuild: async () => {
+      // Delete the live plain entities for applied additions BEFORE refresh, so the
+      // re-instantiated prefab member replaces them instead of duplicating. Non-applied
+      // additions stay live and are re-captured + re-spawned by the refresh.
+      const survivors = deletePromotedNodes(liveAddedRootsToDelete);
+      // Every instance of this source, with NO exclusion — the clicked one goes through
+      // capture/restore too. ⚠️ Matching the new base is NOT what takes an applied field out of its
+      // override set (#1469): the field is still override-MARKED, the capture against the old document
+      // keeps it, and the rebuild re-seeds the mark — so it was saved as an override nobody could see
+      // (the listing diffs by value) and it pinned this instance against later template edits. The
+      // refresh subtracts `appliedFields` from THIS instance's capture instead; other instances keep
+      // their own overrides of the same field.
+      const rootsToRefresh = collectInstanceRoots(source);
+      // refreshInstances re-instantiates synchronously, so warm the LIVE tree of each instance (the commit already
+      // warmed the new file's own reference rows). A user-added nested instance is not a row of newPrefab, so the file
+      // walk never reaches it, and captureNestedInstanceOverrides would then drop its per-copy overrides with no
+      // warning at all (#1284).
+      for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
+      const remap = rowsReparented && prefabId ? liveMemberGuidRemap(prefabId, readOld, readNew, rootsToRefresh) : new Map<string, string>();
+      // …and each template reference node's live moves, path-keyed in its frame (#1564): the rebuilds below re-queue them — a
+      // rebuilt root's carry, and the moves of the frames around a rebuilt instance — and a stale path names nothing, so the
+      // member went back to its template home and the next save dropped the node's move.
+      if (rowsReparented && prefabId) rewriteNodeMoves(getCurrentWorld(), (moved, src) => rewriteFrameMoves(moved, src, readOld, readNew));
+      refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap, { rootId: rootInstanceId, fields: appliedFields });
+      if (remap.size) remapWorldGuidRefs(remap);
+      rehangPromotionSurvivors(survivors, carryPromotedGuids(rootGuid, promotedGuids));
+    },
+  });
+  if (!committed.ok) {
+    return committed.conflict
+      ? { ...NOOP_APPLY, refused: `the prefab changed on disk since the editor read it (a save elsewhere, an outside edit or a \`git pull\`), so it was left as it is. Reopen the scene to pick up the change, then apply again.` }
+      : { ...NOOP_APPLY, refused: `the prefab file could not be written${committed.error ? ` (${committed.error})` : ''}, so nothing was applied.` };
+  }
+  // The world the Apply began in was replaced while it wrote: the file holds the Apply, the new world was built from
+  // it, and nothing here can be undone against that world. Said, not hidden (#1667).
+  if (committed.worldLeft) {
+    return { ...NOOP_APPLY, refused: 'the scene changed while the Apply wrote the prefab: the prefab was written, but the instances and the undo history of the scene it began in were not updated.' };
+  }
   // …and every other file that uses the prefab. The open scene's own file too: its live world is already
   // repaired, and the next save writes that.
   const fileRepair = rowsReparented && prefabId ? await repairPrefabMemberPaths(prefabId, oldPrefab) : undefined;
@@ -5665,7 +5568,9 @@ export async function applyToPrefabSelective(
     applied: true,
     source,
     prefabBefore,
-    prefabAfter: newPrefab,
+    // A copy of the bytes just written: the editor cache holds `newPrefab` itself, and an in-place change to it would
+    // move the undo's expected hash off the disk (#1664).
+    prefabAfter: JSON.parse(JSON.stringify(newPrefab)) as PrefabFile,
     warnings,
     ...(rowsReparented ? { memberPathsChanged: true, fileRepair } : {}),
     ...(skipped.length ? { skipped } : {}),
@@ -7226,7 +7131,10 @@ export function staleInstanceRefusal(rootInstanceId: number): string | null {
  *  author dropped inside another) only ever captures nested frames that are current. If the world is replaced
  *  while the nested prefabs load, nothing is rebuilt — the ids were collected in the world that is gone, and
  *  the new world's load recorded its own documents. */
-export async function rebaseStaleInstances(): Promise<number> {
+export async function rebaseStaleInstances(
+  /** Only frames of these refs (a prefab write rebuilds what IT changed, not every other prefab's stale frames). */
+  opts: { sources?: ReadonlySet<string> } = {},
+): Promise<number> {
   const pi = getTraitByName('PrefabInstance');
   if (!pi) return 0;
   const world = getCurrentWorld();
@@ -7237,6 +7145,7 @@ export async function rebaseStaleInstances(): Promise<number> {
     const d = data as { source?: string; rootInstanceId?: number };
     // Every frame root — stored or owned (#1493) — not only the stored ones.
     if (!d.source || d.rootInstanceId !== entity.id() || runtimeIds.has(entity.id())) return;
+    if (opts.sources && !opts.sources.has(d.source)) return;
     const rec = frameRootDoc(world, entity);
     const cached = prefabCache.get(d.source);
     if (!rec || rec.source !== d.source || !cached || sameDocument(rec.doc, cached)) return;

@@ -37,8 +37,11 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   // Reports whatever the current test asked for, so the propagation through
   // createPrefabFromEntity -> CreatePrefabResult.runtimeExcluded is asserted at the seam that
   // actually carries it (review F3: nothing downstream of the callback had a test).
-  serializePrefab: (_id: number, _existing: unknown, opts?: { onRuntimeExcluded?: (n: number) => void }) => {
+  serializePrefab: (_id: number, existing: unknown, opts?: { onRuntimeExcluded?: (n: number) => void }) => {
     if (runtimeExcludedFixture > 0) opts?.onRuntimeExcluded?.(runtimeExcludedFixture);
+    // The real serializer's cycle guard (`planPrefabRows`), reduced to its direct case: serialized FOR the prefab a row
+    // nests, it refuses — logged, and null.
+    if (existing === 'g-child') { console.error('[Prefab] refusing: it would nest "g-child" inside itself'); return null; }
     return { id: 'g-new', root: {}, entities: [{ localId: 1, prefab: 'g-child' }] };
   },
   // createPrefabFromEntity awaits this before serializing (#1284). A no-op here is safe
@@ -51,7 +54,10 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   // A Replace hands the replaced bytes to the matcher (#1686); what they parse to does not matter to this mocked serialize.
   parsedPrefabRows: () => undefined,
   classifyExistingDocumentId: async () => ({ kind: 'known', id: OLD_ID }),
-  setPrefabCache: (...a: unknown[]) => setPrefabCacheSpy(...a),
+  // The editor-cache half of `commitPrefabWrite` (#1692), which every write here now goes through.
+  seatEditorPrefabCache: (...a: unknown[]) => setPrefabCacheSpy(...a),
+  preloadNestedPrefabs: async () => {},
+  rebaseStaleInstances: async () => 0,
   tagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return new Map([['g-old', 'g-derived']]); },
   // #1461: the tag stamps the members with the guid the reload derives, and undo reverses it. Recorded
   // here because this file is the only place the undo's call ORDER is asserted — see the sequences below.
@@ -63,11 +69,17 @@ vi.mock('../../src/editor/scene/prefab', () => ({
 }));
 
 const registerAssetSpy = vi.fn();
-vi.mock('../../src/runtime/loaders/assetManifest', () => ({
+// The real module under the spies: the write step's imports (the adoption owner, #1698) reach exports this file never
+// names, and an explicit-list mock breaks on each new one.
+vi.mock('../../src/runtime/loaders/assetManifest', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   registerAsset: (...a: unknown[]) => registerAssetSpy(...a),
   getGuidForPath: () => undefined,
   newGuid: () => 'g-minted',
+  isGuid: (s: string) => s.startsWith('g-'),
+  resolveRef: () => undefined,
 }));
+vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ replaceCachedPrefab: vi.fn(), invalidatePrefab: vi.fn(), getPrefabRevision: () => 0 }));
 
 /** Set to make the tree unresolvable (a world rebuild with the subtree gone), for the #1679 flag case. */
 const refState = vi.hoisted(() => ({ gone: false }));
@@ -84,7 +96,8 @@ let failing = new Set<string>();
 /** Files already on disk, path → text. `/api/write-file` honours `ifNoneMatch:'*'` against it the
  *  way the real route does (409, nothing written), and a plain GET of the asset serves the text. */
 let onDisk = new Map<string, string>();
-const sha = (t: string) => createHash('sha256').update(t).digest('hex');
+// Over the bytes with a leading BOM stripped, as the route's `ifMatchRefusal` hashes them.
+const sha = (t: string) => createHash('sha256').update(t.replace(/^\uFEFF/, '')).digest('hex');
 let written: Array<{ path: string; content: string; createOnly: boolean }> = [];
 const mockFetch = vi.fn(async (url: string, init?: { body?: string }) => {
   const bad = Array.from(failing).some((r) => String(url).includes(r));
@@ -98,6 +111,12 @@ const mockFetch = vi.fn(async (url: string, init?: { body?: string }) => {
     written.push({ path: b.path, content: b.content, createOnly: b.ifNoneMatch === '*' });
     onDisk.set(existing ?? b.path, b.content);
   }
+  if (!bad && String(url).includes('/api/exists')) {
+    // Case-insensitive, answered with the stored spelling, as the real route does (#1273).
+    const asked = decodeURIComponent(String(url).split('path=')[1] ?? '');
+    const existing = [...onDisk.keys()].find((k) => k.toLowerCase() === asked.toLowerCase());
+    return { ok: true, status: 200, json: async () => ({ exists: !!existing, ...(existing ? { path: existing } : {}) }) } as any;
+  }
   if (!bad && String(url).includes('/api/delete-asset')) {
     const b = JSON.parse(init?.body ?? '{}') as { paths: string[]; ifMatch?: Record<string, string> };
     const conflicts = Object.entries(b.ifMatch ?? {}).filter(([p, h]) => !onDisk.has(p) || sha(onDisk.get(p)!) !== h).map(([p]) => p);
@@ -106,7 +125,9 @@ const mockFetch = vi.fn(async (url: string, init?: { body?: string }) => {
     return { ok: true, status: 200, json: async () => ({ ok: true, trashed: b.paths.length, missing: [], failed: [] }) } as any;
   }
   const served = !String(url).includes('/api/') && [...onDisk.entries()].find(([p]) => String(url).endsWith(p));
-  if (served) return { ok: true, status: 200, text: async () => served[1], json: async () => JSON.parse(served[1]) } as any;
+  // A REAL Response over the stored bytes: its `text()` strips a leading BOM, as a browser's does — which is the #1684
+  // note's whole point, and a fake `text()` that kept it would hide the defect.
+  if (served) return new Response(new TextEncoder().encode(served[1]), { status: 200 });
   return { ok: !bad, status: bad ? 500 : 200, json: async () => ({}) } as any;
 });
 
@@ -226,7 +247,8 @@ describe('createPrefabFromEntity — redo', () => {
 
     await action.redo();
 
-    expect(setPrefabCacheSpy).toHaveBeenCalledTimes(1);
+    // Under every key it is read by (#1692) — the guid among them.
+    expect(setPrefabCacheSpy).toHaveBeenCalledWith('g-new', expect.objectContaining({ id: 'g-new' }));
     expect(registerAssetSpy).toHaveBeenCalledTimes(1);
     expect(tagSpy).toHaveBeenCalledTimes(1);
   });
@@ -238,6 +260,22 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
   // unlinked — and this function's undo then TRASHED the path, deleting the original too.
   const PATH = '/p/thing.prefab.json';
   const OLD_TEXT = `{"id":"${OLD_ID}","name":"old thing","entities":[]}\n`;
+
+  // Close-out review of #1692: the tree is serialized AFTER the Replace question now, by the id it was asked for. A world
+  // rebuilt while the question was up (a watcher reload, an agent's scene load) can hand that id to another entity.
+  // Mutation: drop the world check after the question in `createPrefabFromEntity`.
+  it('a world rebuilt while the Replace question was up refuses, and writes nothing', async () => {
+    onDisk.set(PATH, OLD_TEXT);
+    const { createWorld } = await import('koota');
+    const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const before = getCurrentWorld();
+    try {
+      const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => { setCurrentWorld(createWorld()); return true; });
+      expect(res).toMatchObject({ refused: expect.stringMatching(/reloaded while the question was open/) });
+      expect(onDisk.get(PATH)).toBe(OLD_TEXT);
+      expect(written).toHaveLength(0);
+    } finally { setCurrentWorld(before); }
+  });
 
   it('asks, naming the path, and a NO writes nothing', async () => {
     onDisk.set(PATH, OLD_TEXT);
@@ -292,6 +330,17 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     expect(onDisk.get(ON_DISK)).toBe(OLD_TEXT);
   });
 
+  // #1684's note on #1692: a Windows tool's leading BOM used to be dropped by the restore, because the prior bytes were
+  // read with `Response.text()`, which strips it. Mutation: read them with `res.text()` again in `readPriorDocument`.
+  it('UNDO of a replace puts a BOM-prefixed file back byte for byte', async () => {
+    const withBom = `\uFEFF${OLD_TEXT}`;
+    onDisk.set(PATH, withBom);
+    const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
+    await res.action.undo();
+    expect(onDisk.get(PATH)).toBe(withBom);
+  });
+
   it('UNDO of a replace RESTORES the replaced bytes and never trashes the file', async () => {
     onDisk.set(PATH, OLD_TEXT);
     const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
@@ -306,18 +355,16 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
 
   it('a replace that would nest the prefab inside itself is refused, and the old file survives', async () => {
     // The draft carries a reference row to 'g-child'. Replacing the prefab whose id IS 'g-child'
-    // with it would make that prefab contain itself.
-    onDisk.set(PATH, OLD_TEXT);
+    // with it would make that prefab contain itself. A Replace serializes WITH the kept id (#1686), so the serializer's
+    // own guard refuses it — the id taken from the replaced bytes themselves.
+    const childText = `{"id":"g-child","name":"child","entities":[]}\n`;
+    onDisk.set(PATH, childText);
     const err = spyError();
-    const prefabMod = await import('../../src/editor/scene/prefab');
-    const spy = vi.spyOn(prefabMod, 'classifyExistingDocumentId').mockResolvedValue({ kind: 'known', id: 'g-child' });
-    try {
-      const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
-      expect(res).toBeNull();
-      expect(written).toEqual([]);
-      expect(onDisk.get(PATH)).toBe(OLD_TEXT);
-      expect(String(err.mock.calls[0]?.[0])).toMatch(/inside itself/);
-    } finally { spy.mockRestore(); }
+    const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
+    expect(res).toBeNull();
+    expect(written).toEqual([]);
+    expect(onDisk.get(PATH)).toBe(childText);
+    expect(String(err.mock.calls[0]?.[0])).toMatch(/inside itself/);
   });
 });
 

@@ -830,7 +830,7 @@ describe('makeFilesDropUndo — partial-failure state tracking (#308 close-out)'
 
 describe('makeModelImportUndo (#308 follow-up A)', () => {
   const build = (onDone = vi.fn()) => makeModelImportUndo({
-    assetName: 'Rig', prefabPath: '/assets/models/rig.prefab.json', content: '{"id":"p1"}', onDone,
+    assetName: 'Rig', prefabPath: '/assets/models/rig.prefab.json', content: '{"id":"p1","entities":[]}', onDone,
   });
 
   it('undo trashes the prefab and calls onDone on success', async () => {
@@ -840,7 +840,7 @@ describe('makeModelImportUndo (#308 follow-up A)', () => {
     expect(deletes).toHaveLength(1);
     expect(deletes[0].body.paths).toEqual(['/assets/models/rig.prefab.json']);
     // Only while it holds the imported bytes (#1679) — the hash of exactly `content`.
-    expect(deletes[0].body.ifMatch).toEqual({ '/assets/models/rig.prefab.json': createHash('sha256').update('{"id":"p1"}').digest('hex') });
+    expect(deletes[0].body.ifMatch).toEqual({ '/assets/models/rig.prefab.json': createHash('sha256').update('{"id":"p1","entities":[]}').digest('hex') });
     expect(onDone).toHaveBeenCalledTimes(1);
   });
 
@@ -865,7 +865,7 @@ describe('makeModelImportUndo (#308 follow-up A)', () => {
     const writes = calls.filter((c) => c.url === '/api/write-file');
     expect(writes).toHaveLength(1);
     // Only into the path the undo emptied (#1679).
-    expect(writes[0].body).toEqual({ path: '/assets/models/rig.prefab.json', content: '{"id":"p1"}', ifNoneMatch: '*' });
+    expect(writes[0].body).toEqual({ path: '/assets/models/rig.prefab.json', content: '{"id":"p1","entities":[]}', ifNoneMatch: '*' });
     expect(onDone).toHaveBeenCalledTimes(1);
   });
 

@@ -90,8 +90,8 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
   // function` line to the first `'\n}'`, and each write site matched by a regex over two adjacent lines:
   // a template literal holding a column-0 `}` ended the body early, a warning reached through a local
   // helper was invisible, and a blank line between the warning and the write turned a pass into a fail.
-  const prefabSf = parseSource(read('editor/scene/prefab.ts'), 'prefab.ts');
   const assetOpsSf = parseSource(read('editor/panels/assetOps.ts'), 'assetOps.ts');
+  const commitSf = parseSource(read('editor/scene/prefabCommit.ts'), 'prefabCommit.ts');
 
   it('every writePrefabFile call in the editor warns first, unless it is a restore (#1251)', () => {
     // A CENSUS, not a list of the writes somebody remembered: #42 named Apply-to-Prefab and Save-as-Prefab,
@@ -101,8 +101,9 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     // The reader must SEE the authoring writes, or an empty census would pass everything below.
     expect(census).toEqual(expect.arrayContaining([
       { file: 'packages/modoki/src/editor/scene/prefab.ts', in: 'applyToPrefabSelective', warned: true },
-      { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true }, // via writePrefabFileReport
+      { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true },
       { file: 'app/editor/agentEditorOps.ts', in: 'registerEditorAgentOps', warned: true }, // prefabAction:'create'
+      { file: 'packages/modoki/src/editor/panels/assetOps.ts', in: 'createPrefabFromEntity', warned: true }, // Save-as-Prefab
     ]));
     // An unwarned write is an offender unless it is a restore. Keyed `file::function` and SPENT per call, so a second
     // unwarned write inside a pardoned function is an offender too, and a restore that starts warning (or goes away)
@@ -110,12 +111,17 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     assertExemptionLedger({
       label: 'unwarned writePrefabFile calls in warnInertPrefabSizes (#1251)',
       population: census.filter((w) => !w.warned).map((w) => ({ item: `${w.file}::${w.in}`, site: w.file })),
-      exempt: [{
-        item: 'packages/modoki/src/editor/scene/prefab.ts::installPrefabSnapshot',
-        reason: 'the undo/redo restore: a warning there blames someone for the value they are reverting',
-      }],
+      exempt: [
+        ...(['applyPrefabUndo.ts::restoreSnapshot', 'assetOps.ts::undo', 'assetOps.ts::redo', 'assetUndo.ts::undo', 'assetUndo.ts::redo',
+          'skinPrefab.ts::undo', 'skinPrefab.ts::redo'].map((at) => ({
+          item: `packages/modoki/src/editor/${at.startsWith('applyPrefabUndo') ? 'undo' : at.startsWith('skinPrefab') ? 'scene' : 'panels'}/${at}`,
+          reason: 'an undo/redo restore: a warning there blames someone for the value they are reverting',
+        }))),
+        // The generated prefabs: a model or rig, not an authored UI — the serializer census holds the same three.
+        ...GENERATED_PREFAB_WRITERS,
+      ],
       scanned: census.length,
-      floor: 4,
+      floor: 12,
       fix: 'call warnInertPrefabSizes(<the prefab>, <the same source>) before the write — it is an authoring write',
     });
   });
@@ -169,15 +175,11 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
   });
 
   it('createPrefabFromEntity (Save-as-Prefab) warns before writing', () => {
-    // The create goes through writeNewAssetDocument since #1264 (create-only, ask, keep the guid), so the
-    // authoring write is THAT call, and the warned binding feeds its builder.
-    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'writeNewAssetDocument').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
+    // Every write is one `commitPrefabWrite` since #1692: the forward one is the authoring write and warns; UNDO of a
+    // Replace writes the REPLACED bytes back and REDO writes the same file again, and those must stay quiet for the
+    // reason above.
+    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'commitPrefabWrite').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
       { in: 'createPrefabFromEntity', warned: true },
-    ]);
-    // The plain writes left are the action's restores, and must stay quiet for the reason above: UNDO of a Replace
-    // writes the REPLACED bytes back, REDO writes the same file again. Each carries a precondition since #1679, through
-    // the one call each half makes, `replaceFileIfMatch`.
-    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'replaceFileIfMatch').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
       { in: 'undo', warned: false },
       { in: 'redo', warned: false },
     ]);
@@ -245,14 +247,10 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     expect(probe('pushAction({ redo: () => { return { warnings: w }; } });\n  return { ok: true };')).toBe(0);
   });
 
-  it('writePrefabFile itself does NOT warn, so undo/redo stays quiet', () => {
+  it('commitPrefabWrite itself does NOT warn, so undo/redo stays quiet', () => {
     // Asserted on the function specifically — asserting on the whole file would pass merely because
-    // the helper is DEFINED there.
-    expect(warnChain(prefabSf, 'writePrefabFile')).toBeUndefined();
-  });
-
-  it('installPrefabSnapshot (the undo/redo path) does NOT warn', () => {
-    expect(warnChain(prefabSf, 'installPrefabSnapshot')).toBeUndefined();
+    // the helper is DEFINED there. It is the one write every restore makes too (#1692).
+    expect(warnChain(commitSf, 'commitPrefabWrite')).toBeUndefined();
   });
 
   it('the two readers see a warning the text slices could not, and only a real one (#1195)', () => {
@@ -367,7 +365,6 @@ const GENERATED_PREFAB_WRITERS = [
  *  is the caller's, which the write census above holds to it. */
 const SERIALIZE_FOR_A_CALLER = [
   { item: 'packages/modoki/src/editor/scene/prefabEdit.ts::serializePrefabEditWorld', reason: 'the prefab-edit world as a document: savePrefabEditReport warns what it writes (the write census row for it), and the tests read it as what a Save would write' },
-  { item: 'packages/modoki/src/editor/panels/assetOps.ts::createPrefabFromEntity', reason: 'a Replace serializes the SAME tree again against the kept prefab id, to carry its rows\' nodeGuids (#1686): the sizes are the draft\'s, which is warned before the write, and warning twice would print every warning twice' },
 ];
 
 /** Whether `e` calls THE engine `warnInertPrefabSizes` — by its bare name, resolving to an import or to its own
@@ -464,21 +461,17 @@ function prefabWriteCensus(): Array<{ file: string; in: string | undefined; warn
     .filter((f) => /\.tsx?$/.test(f)).map((f) => path.join(root, f)));
   return files.sort().flatMap((abs) => {
     const code = readScannedSource(abs).code;
-    if (!code.includes('writePrefabFile')) return [];
+    if (!code.includes('commitPrefabWrite')) return [];
     const sf = parseSource(code, path.basename(abs));
-    // ⚠️ BOTH names (#1468). The save choke point gained a report-returning sibling —
-    // `writePrefabFileReport` carries the backend's refusal reason out, which a boolean cannot — and
-    // `writePrefabFile` is now a thin wrapper over it. A census that knows only the old name stops
-    // seeing every caller that moves to the new one, which is this guard going quiet rather than
-    // green: `savePrefabEditReport` dropped straight out of it.
-    return [...callsTo(sf, 'writePrefabFile'), ...callsTo(sf, 'writePrefabFileReport')]
+    // Every prefab write is ONE `commitPrefabWrite` since #1692 — the census reads that one name. (It read
+    // `writePrefabFile` and `writePrefabFileReport` before, and #1468 showed why a census must follow a rename: a caller
+    // that moved to the other name dropped straight out of it.)
+    return callsTo(sf, 'commitPrefabWrite')
       .map((call) => ({
         file: path.relative(ENGINE, abs).split(path.sep).join('/'),
         in: enclosingNamedFunction(call)?.name,
         warned: warnedFirst(call),
-      }))
-      // The wrapper's own delegation is not a write SITE — it is the same write, named twice.
-      .filter((w) => w.in !== 'writePrefabFile');
+      }));
   });
 }
 

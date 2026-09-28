@@ -81,6 +81,7 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
   // below guards "the warm never touches the runtime cache", whichever call that touch would be.
   replaceCachedPrefab: (...a: unknown[]) => invalidateSpy(...a),
   getCachedPrefab: (ref: string) => runtimeCache.get(ref),
+  getPrefabRevision: () => 0,
 }));
 
 const registerSpy = vi.fn();

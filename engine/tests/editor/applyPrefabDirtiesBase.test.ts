@@ -33,6 +33,16 @@ vi.mock('../../packages/modoki/src/editor/scene/serialize', async (importOrigina
   setCurrentScenePath: () => {},
   setCurrentBaseScene: () => {},
 }));
+// The undo's prefab half is ONE `commitPrefabWrite` (#1692): installed here with no disk, then its rebuild (the world
+// restore) runs, as the real step runs it once the write lands.
+vi.mock('../../packages/modoki/src/editor/scene/prefabCommit', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  commitPrefabWrite: async (src: string, doc: { id?: string }, opts: { rebuild?: (l: { path: string }) => unknown }) => {
+    install(doc);
+    await opts.rebuild?.({ path: src });
+    return { ok: true, path: src };
+  },
+}));
 // The restore's path write goes through the adoption owner (#1698), which writes through `serialize.ts`'s own setter —
 // not the mocked export above — and that persists the path.
 vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
@@ -45,7 +55,6 @@ vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) 
     // primary built from the prefab being undone, and a real rebase would rebuild it — masking the
     // `refreshBaseInstances` filter this file pins. No root here is carried, so the stub loses nothing.
     rebaseStaleInstances: async () => 0,
-    installPrefabSnapshot: async (_src: string, doc: { id?: string }) => { install(doc); },
     // The real apply promotes `Mine` into the prefab (here: member `Promoted`), deletes the live node,
     // installs the new prefab and REFRESHES every instance of it from the old one. Modelled so.
     applyToPrefabSelective: async () => {

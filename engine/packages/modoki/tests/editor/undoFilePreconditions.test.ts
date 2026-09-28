@@ -387,7 +387,8 @@ describe('makeDuplicateUndo / makePasteUndo (copy)', () => {
 });
 
 describe('makeModelImportUndo', () => {
-  const content = '{"id":"rig","name":"Rig"}\n';
+  // A real prefab document: the undo is a `commitPrefabWrite` now (#1692), which parses what it restores.
+  const content = '{"id":"rig","name":"Rig","entities":[]}\n';
   const setup = () => { route.put('/assets/rig.prefab.json', content); return makeModelImportUndo({ assetName: 'rig.glb', prefabPath: '/assets/rig.prefab.json', content }); };
 
   it('accept side: undo trashes the prefab, redo writes it back', async () => {
@@ -415,9 +416,9 @@ describe('makeModelImportUndo', () => {
 });
 
 describe('makeModelImportUndo — a RE-import over an existing prefab (close-out sweep, #1264 shape)', () => {
-  const before = '{"id":"rig","name":"Before"}\n';
-  const after = '{"id":"rig","name":"After"}\n';
-  const setup = (previousContent: string | null) => {
+  const before = '{"id":"rig","name":"Before","entities":[]}\n';
+  const after = '{"id":"rig","name":"After","entities":[]}\n';
+  const setup = (previousContent: string) => {
     route.put('/assets/rig.prefab.json', after);
     return makeModelImportUndo({ assetName: 'rig.glb', prefabPath: '/assets/rig.prefab.json', content: after, previousContent });
   };
@@ -432,12 +433,8 @@ describe('makeModelImportUndo — a RE-import over an existing prefab (close-out
     expect(bytesOf('/assets/rig.prefab.json')).toBe(before);
   });
 
-  it('a replaced prefab that could not be read is left as it is, with a report — not trashed', async () => {
-    const action = setup(null);
-    await action.undo();
-    expect(bytesOf('/assets/rig.prefab.json')).toBe(after);
-    expect(route.calls.some((c) => c.url.endsWith('/api/delete-asset'))).toBe(false);
-  });
+  // (A replaced prefab that could not be read no longer reaches this undo: the import itself refuses to overwrite it
+  // blind (#1692, Assets.tsx), so there is no third `previousContent` case to restore.)
 
   it('an edit to the re-imported prefab refuses the restore', async () => {
     const action = setup(before);

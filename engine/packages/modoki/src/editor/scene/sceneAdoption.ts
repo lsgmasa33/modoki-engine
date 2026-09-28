@@ -23,6 +23,7 @@
  *  ({@link bindEditorSceneState}) instead of this module importing it back — the same reason `prefabEditWorld.ts` is
  *  a leaf. */
 
+import { installAdoptionGate } from './adoptionGate';
 import type { World } from 'koota';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
@@ -330,3 +331,7 @@ export function _resetSceneAdoptionForTests(): void {
   chainReset.invalidateAll();
   settledWaiters = [];
 }
+
+// The two answers a prefab write needs, installed where it can read them without importing this module (#1692,
+// `adoptionGate.ts`: a direct import closes a load-time cycle through `./prefab`).
+installAdoptionGate({ settled: adoptionsSettled, pending: () => pendingRoutes.size });

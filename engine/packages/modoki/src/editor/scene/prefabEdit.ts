@@ -10,7 +10,8 @@
 import type { Entity, World } from 'koota';
 import type { PrefabFile } from './prefab';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
-import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
+import { serializePrefab, warnInertPrefabSizes, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
+import { commitPrefabWrite } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { getEditVersion } from '../undo/undoManager';
@@ -447,6 +448,11 @@ async function openPrefabForEditingSwitching(
   // sync nested-instance detection reads it, so without this a nested instance would
   // flatten on save instead of round-tripping as a reference row.
   setPrefabCache(guid, prefab);
+  // …and the session's OWN copy of what it opened (#1692): the save's precondition and its row numbering. Not the
+  // cache entry — every prefab write re-seats that — and a COPY: the edit scene is built from `prefab`'s trait bags, and
+  // the loader edits them in place (a legacy `CameraFrame.showGizmo` is stripped), which would make every save of such a
+  // prefab look like a file changed on disk. Taken now, SEATED only once the swap has landed (below).
+  const opened = JSON.parse(JSON.stringify(prefab)) as PrefabFile;
   await preloadNestedPrefabs(prefab);
 
   // Entering prefab-edit SWAPS the live world, and exitPrefabEdit reloads the return
@@ -509,6 +515,10 @@ async function openPrefabForEditingSwitching(
       console.warn(`[PrefabEdit] "${prefab.name}" was not entered: another scene replaced its edit world while it loaded`);
       return;
     }
+    // ⚠️ Seated here, once the session IS this prefab's, not at the fetch (#1692 close-out re-review): the gate above can
+    // cancel this open and the swap can fail or be replaced — and the session still open (another prefab's) would be left
+    // with no baseline, refusing every save, including the gate's own Save of it.
+    editBaseline = { guid, doc: opened };
     console.log(`[PrefabEdit] editing "${prefab.name}"`);
   });
 }
@@ -626,8 +636,17 @@ function noteSessionRows(guid: string, written: ReadonlyMap<string, number>, doc
   for (const [g, localId] of written) rec.rows.set(g, { localId, nodeGuid: nodeGuidAt.get(localId) ?? '' });
   rec.floor = Math.max(rec.floor, maxLocalId(doc));
 }
-/** Test-only: forget every prefab's record, as a fresh editor process has none. */
-export function _resetPrefabEditSessionRows(): void { sessionRowsByPrefab.clear(); }
+/** Test-only: forget every prefab's record, and the open session's baseline, as a fresh editor process has none. */
+export function _resetPrefabEditSessionRows(): void { sessionRowsByPrefab.clear(); editBaseline = null; }
+
+/** The document the open prefab-edit session was expanded from, or last saved as (#1692) — what its save is conditional
+ *  on, and what it numbers rows from. Set by `openPrefabForEditing` and by each save that lands; never by another
+ *  writer, which is the point: the editor cache follows every write, so it cannot answer "what did THIS edit open". */
+let editBaseline: { guid: string; doc: PrefabFile } | null = null;
+/** {@link editBaseline} for `guid`, or null when the session open is another prefab's (or none). */
+export function editBaselineFor(guid: string): PrefabFile | null {
+  return editBaseline?.guid === guid ? editBaseline.doc : null;
+}
 
 /** What a prefab edit-mode save did: whether the file was written, and every prefab validation warning
  *  `warnInertPrefabSizes` reported for it (empty unless `saved`). */
@@ -637,6 +656,17 @@ export interface PrefabEditSaveReport {
    *  backend refused (#1468). It used to be documented as "empty unless `saved`"; the format gate
    *  made a failed save something a human can act on, so the failure now has somewhere to say why. */
   warnings: string[];
+  /** The file changed on disk since this edit opened it (or last saved it), and was left as it is (#1692): nothing
+   *  was written, and the edit is still open and unsaved. Saving again with `overwrite` replaces what is there. */
+  conflict?: boolean;
+}
+
+/** How a prefab-edit save treats a file that changed on disk under the open edit (#1692). */
+export interface PrefabEditSaveOptions {
+  /** Replace what is on disk without asking — the deliberate choice after being told (the agent's `overwrite`). */
+  overwrite?: boolean;
+  /** Ask whether to replace it (the human's Cmd+S and Exit's Save). Absent and not `overwrite`: refuse. */
+  confirmOverwrite?: (name: string, path: string) => Promise<boolean>;
 }
 
 /** Save the in-progress prefab edit back to its `.prefab.json`. Returns true on success — the
@@ -652,7 +682,7 @@ export async function savePrefabEdit(): Promise<boolean> {
 /** Save the in-progress prefab edit back to its `.prefab.json`. Serializes the
  *  prefab subtree (scaffold lights/HDR are excluded — they aren't descendants of
  *  the root). */
-export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
+export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Promise<PrefabEditSaveReport> {
   const NOT_SAVED: PrefabEditSaveReport = { saved: false, warnings: [] };
   const { editingPrefab } = useEditorStore.getState();
   if (!editingPrefab) return NOT_SAVED;
@@ -680,26 +710,46 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   const serialized = serializePrefabEditWorld(editingPrefab.guid);
   if ('error' in serialized) { console.error(`[PrefabEdit] cannot save "${editingPrefab.name}" — ${serialized.error}`); return NOT_SAVED; }
   const { prefab, runtimeExcluded, rows } = serialized;
-  // The version `prefab` represents, captured BEFORE the write. `writePrefabFile` is a real fetch
+  // The version `prefab` represents, captured BEFORE the write. `commitPrefabWrite` is a real fetch
   // to the dev server, and the human keeps working during it — a bone drag or an agent op lands as
   // an ordinary `pushAction`. Re-reading the version after the await would fold that edit into the
   // saved baseline without it ever being written; see markSceneSaved's doc comment for why that is
   // data loss and not a cosmetic flag (#573).
   const savedAtEditVersion = getEditVersion();
   // An authoring write, so it reports an inert size (#42, #1251) — warnInertPrefabSizes says why
-  // the call sits here and not in writePrefabFile.
+  // the call sits here and not in commitPrefabWrite.
   const warnings = warnInertPrefabSizes(prefab, editingPrefab.guid);
   if (runtimeExcluded > 0) warnings.push(runtimeExcludedMessage(runtimeExcluded));
-  const wrote = await writePrefabFileReport(editingPrefab.guid, prefab);
+  // ONE step (#1692): written only over the document this edit was opened from — or last saved as — which is the session's
+  // own baseline (`editBaselineFor`): it moves only with this save's own writes. A file changed under the edit (an Apply
+  // from a carried instance, an outside edit, a `git pull`) is not overwritten unasked: silently, that lost the other
+  // change for good.
+  // No baseline: in the editor it is seated in the same run as the open's adoption, so this is a test harness's edit world
+  // built without `openPrefabForEditing` (and HMR of this module reloads the page, so its state cannot be lost under a
+  // live session). The editor cache is then the last record there is — conditional on it, rather than refusing a save
+  // no session could ever make.
+  const expected = editBaselineFor(editingPrefab.guid) ?? getCachedPrefabSync(editingPrefab.guid);
+  if (!expected) return { saved: false, warnings: ['this edit has no record of the prefab it opened — re-open it and try again'] };
+  let wrote = await commitPrefabWrite(editingPrefab.guid, prefab, { expected, overwrite: opts.overwrite });
+  if (!wrote.ok && wrote.conflict && !opts.overwrite && opts.confirmOverwrite
+    && await opts.confirmOverwrite(editingPrefab.name, editingPrefab.path)) {
+    wrote = await commitPrefabWrite(editingPrefab.guid, prefab, { expected, overwrite: true });
+  }
+  if (!wrote.ok && wrote.conflict) {
+    return {
+      saved: false, conflict: true,
+      warnings: [`${editingPrefab.path} changed on disk since this edit opened it, so it was not overwritten — the edit is still open and unsaved`],
+    };
+  }
   // ⚠️ Carry the backend's REASON out (#1468). The owner's ruling is refuse-to-SAVE-never-to-LOAD,
   // so a build will open a prefab a newer build wrote, edit it and press Cmd+S — the gate answers
   // 409 and, until this, the human got a `{saved:false}` with nothing on it: the server's own error
   // goes to the dev-server terminal, not the editor console. Reported through `warnings`, which the
   // agent `edit-save` op already surfaces and the human paths already read.
   if (!wrote.ok) return { saved: false, warnings: wrote.error ? [wrote.error] : [] };
-  // Refresh the editor's prefab cache to the just-saved version AND invalidate the
-  // runtime refcount cache, so reopening the return scene re-expands from the new file.
-  setPrefabCache(editingPrefab.guid, prefab);
+  // The file holds this edit now: the next save is conditional on it, and numbers its rows from it. (Both caches were
+  // seated by the commit itself.)
+  editBaseline = { guid: editingPrefab.guid, doc: JSON.parse(JSON.stringify(prefab)) as PrefabFile };
   // …and where it put each member added this session, so the next save keeps that row and its identity (#1662).
   noteSessionRows(editingPrefab.guid, rows, prefab);
   // ⚠️ Re-baseline the dirty tracker. Without this the prefab-edit world stayed "unsaved" FOREVER
@@ -726,16 +776,19 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
   const rootId = findPrefabEditRoot();
   if (!rootId) return { error: 'prefab root not found' };
 
-  // The file as it was when we opened it (openPrefabForEditing seeds this cache). It supplies
+  // The file as it was when we opened it — or last saved it (`editBaselineFor`; the editor cache follows every
+  // writer, #1692, so it can hold a document this world was never expanded from). It supplies
   // the two things a re-save must NOT re-derive from the live world: the existing localId
   // numbering, and the asset's own name. Refuse rather than fall back to renumbering — a
   // silent renumber drops every localId-keyed override in every scene that instantiates this
   // prefab, which is precisely the damage this path exists to avoid.
-  const previous = getCachedPrefabSync(guid);
+  // Outside a session (a harness serializing an edit world it built itself — see the save's same fallback), the editor
+  // cache is the only record.
+  const previous = editBaselineFor(guid) ?? getCachedPrefabSync(guid);
   if (!previous) {
     return {
-      error: 'the opened prefab is no longer in the ' +
-        'editor cache, so its localId numbering cannot be preserved. Saving now would renumber ' +
+      error: 'this edit has no record of the prefab it ' +
+        'opened, so its localId numbering cannot be preserved. Saving now would renumber ' +
         'members and break every scene override keyed to them. Re-open the prefab and try again.',
     };
   }

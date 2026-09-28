@@ -195,7 +195,54 @@ export function whenUndoIdle(): Promise<void> {
  *  conservative dirty mark (#310) lands at its END, so a gate read during the step answered "clean", and the switch
  *  that then waited for the step discarded the history it had just dirtied without asking. */
 export function undoStepPending(): Promise<void> | null {
-  return _stepsPending > 0 ? whenUndoIdle() : null;
+  const step = _stepsPending > 0 ? whenUndoIdle() : null;
+  const held = worldHoldsSettled();
+  return step && held ? Promise.all([step, held]).then(() => undefined) : step ?? held;
+}
+
+/** Forward operations in flight that must land whole in the world they began in (#1667): a prefab write and the
+ *  rebuild and undo entry that follow it (`commitPrefabWrite`, `applyToPrefabWithUndo`). A world switch waits for them
+ *  exactly as it waits for an undo step — `undoStepPending` reports both — so a Play, a scene open or entering prefab
+ *  edit that lands mid-write no longer runs the refresh and pushes the undo entry into the incoming world. A COUNT:
+ *  an Apply holds across its whole run and its commit holds again inside it.
+ *
+ *  ⚠️ Never start a world switch, and never await `undoStepPending` / `whenUndoIdle`, while holding one: the switch
+ *  would wait for the hold, and the hold for the switch. Nothing a prefab rebuild reaches does either
+ *  (`tests/editor/prefabCommit.test.ts` § "holding the world cannot deadlock" counts a switch begun under a hold; an
+ *  await of the barrier from inside one shows there as a timeout). */
+let _worldHolds = 0;
+let _holdsDrained: { promise: Promise<void>; resolve: () => void } | null = null;
+function worldHoldsSettled(): Promise<void> | null {
+  if (_worldHolds === 0) return null;
+  if (!_holdsDrained) {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => { resolve = r; });
+    _holdsDrained = { promise, resolve };
+  }
+  return _holdsDrained.promise;
+}
+/** Hold every world switch until the returned release is called — see {@link worldHoldsSettled}. Idempotent release. */
+export function beginWorldBoundOperation(): () => void {
+  _worldHolds += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    _worldHolds -= 1;
+    if (_worldHolds === 0 && _holdsDrained) {
+      const { resolve } = _holdsDrained;
+      _holdsDrained = null;
+      resolve();
+    }
+  };
+}
+/** A world switch is in progress (#1579) — a forward operation that must land in one world refuses to start then. */
+export function isWorldSwitchInProgress(): boolean {
+  return _worldSwitches > 0;
+}
+/** How many world-bound operations are held now — for a test that must prove a rebuild started no switch. */
+export function worldBoundOperationsHeld(): number {
+  return _worldHolds;
 }
 
 /** How long a world switch waits for an undo step before `beginWorldSwitch` warns. An Apply undo is one prefab file
@@ -247,8 +294,8 @@ export function beginWorldSwitch(): { idle: Promise<void> | null; release: () =>
   // A step that never settles now holds every switch with it — scene opens hang, Play refuses, every undo is refused —
   // and nothing else says why. Warn once, so the hang names its cause (#1579 close-out review).
   const stall = idle ? setTimeout(() => {
-    console.warn(`[undo] a scene switch has waited ${WORLD_SWITCH_STALL_WARN_MS / 1000}s for the undo/redo step in flight — `
-      + 'until that step settles, no scene can be opened or created and Play cannot start');
+    console.warn(`[undo] a scene switch has waited ${WORLD_SWITCH_STALL_WARN_MS / 1000}s for the undo/redo step or prefab write in flight — `
+      + 'until it settles, no scene can be opened or created and Play cannot start');
   }, WORLD_SWITCH_STALL_WARN_MS) : null;
   const clearStall = () => { if (stall !== null) clearTimeout(stall); };
   void idle?.then(clearStall);

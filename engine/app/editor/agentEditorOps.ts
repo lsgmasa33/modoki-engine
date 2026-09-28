@@ -49,7 +49,7 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
-  getPrefabSource, instantiatePrefabInstance, serializePrefab, writePrefabFile, warnInertPrefabSizes, replacedPrefabRows,
+  getPrefabSource, instantiatePrefabInstance, serializePrefab, commitPrefabWrite, readPriorDocument, warnInertPrefabSizes, parsedPrefabRows,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
@@ -520,6 +520,9 @@ interface PrefabParams {
   path?: string;
   /** edit-open: discard unsaved live work instead of refusing (mirrors load-scene). */
   force?: boolean;
+  /** edit-save: the prefab changed on disk since the edit opened it, and the save refused (#1692) — `true` replaces
+   *  what is on disk with this edit. Never implied: without it that save refuses and says so. */
+  overwrite?: boolean;
   /** instantiate: parent entity id (default root). */
   parentId?: number;
   /** instantiate: parent entity guid. Given with ANY `parentId` (0 included), the call is refused (#1223 D1). */
@@ -2986,15 +2989,24 @@ export function registerEditorAgentOps(): void {
       // Same cold-cache flatten as the human path (#1284) — classifyExistingPrefabId fetches
       // raw and never touches the editor prefab cache, so nothing here warms it.
       await preloadNestedPrefabsForSubtree(entityId);
-      // Over an existing prefab this is a Replace: the rows it overwrites are what a node with no live identity is
-      // matched against by name — the same matcher as Create Prefab's Replace (#1686, `nodeGuidsFor`).
-      const replacing = existingId ? await replacedPrefabRows(path) : undefined;
+      // What is at `path` now, read ONCE (#1692): the bytes the write below is conditional on (I10), and — over an existing
+      // prefab, a Replace — the rows it overwrites, which a node with no live identity is matched against by name, the
+      // same matcher as Create Prefab's Replace (#1686, `nodeGuidsFor`). One read, so the rows matched are the rows the
+      // write replaces.
+      const prior = await readPriorDocument(path);
+      if (prior === null) {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: the file at ${path} could not be read, so it was not overwritten blind.`);
+      }
+      // …and the id kept is the one THAT read carries (close-out review): the classify above read the file separately.
+      const priorId = prior ? (() => { try { return (JSON.parse(prior.replace(/^\uFEFF/, '')) as { id?: unknown }).id; } catch { return undefined; } })() : undefined;
+      const keptId = typeof priorId === 'string' && priorId ? priorId : existingId;
+      const replacing = keptId && prior ? parsedPrefabRows(prior.replace(/^\uFEFF/, '')) : undefined;
       // …and after those awaits the world is asked again, as Create Prefab's Replace asks after its dialog: a Play
       // started meanwhile would write its played pose (close-out review of #1686).
       const late = whyWorldNotAuthored();
       if (late) throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${late} — stop Play first, or the played pose is written into the prefab.`);
       let runtimeExcluded = 0;
-      const prefab = serializePrefab(entityId, existingId, { replacing, onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
+      const prefab = serializePrefab(entityId, keptId, { replacing, onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
       if (!prefab) throw new Error(`could not serialize prefab from entity ${entityId}`);
       // An authoring write (it can overwrite an existing template), so it reports an inert size like
       // the human Save-as-Prefab does (#42, #1251) — in THIS response too, because the agent that
@@ -3004,20 +3016,38 @@ export function registerEditorAgentOps(): void {
       // are excluded from the file (#1306) — and the agent does not read the renderer console, so it
       // is told here or not at all. Same reasoning as the inert-size warnings above (#1258).
       if (runtimeExcluded > 0) warnings.push(runtimeExcludedMessage(runtimeExcluded));
-      const ok = await writePrefabFile(path, prefab);
-      if (ok) {
-        // Snapshot the links the tree already had, so undo can put them back (#1278). Tagging
-        // deliberately leaves a held nested instance linked to its OWN prefab, but the untag
-        // below strips the WHOLE tree — without this the agent path's undo left that instance
-        // permanently unlinked, with nothing recorded to restore it. Mirrors the human flow.
-        // ⚠️ Mint the root's guid BEFORE the tag: it is the ANCHOR every member's derived guid comes
-        // from (#1461), and `entityRef` is what mints it. Taken after, the stamp has nothing to derive
-        // from and leaves the create window open. (Its other job — resolving the subtree across a world
-        // rebuild — is unchanged.)
-        const ref = entityRef(entityId);
-        const priorLinks = detachPrefabInstance(entityId, { strip: false });
-        // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
-        let guidRemap = tagEntityTreeAsInstance(entityId, path, prefab);
+      // ONE step (#1692): written only over what was at `path` when it was read above — nothing, or those bytes (I10) —
+      // then both caches, the tag of this tree, and a rebuild of every OTHER live instance of the prefab this overwrites
+      // (#1685's sibling: it used to seat the runtime cache alone, so the editor cache kept the old document under the guid).
+      type TaggedTree = { ref: ReturnType<typeof entityRef>; priorLinks: ReturnType<typeof detachPrefabInstance>; guidRemap: ReturnType<typeof tagEntityTreeAsInstance> };
+      // Set inside the commit's rebuild; `as` so the closure's assignment is not narrowed away.
+      let tagged = null as TaggedTree | null;
+      const committed = await commitPrefabWrite(path, prefab, {
+        expected: prior ?? null,
+        rebuild: () => {
+          // Snapshot the links the tree already had, so undo can put them back (#1278). Tagging
+          // deliberately leaves a held nested instance linked to its OWN prefab, but the untag
+          // below strips the WHOLE tree — without this the agent path's undo left that instance
+          // permanently unlinked, with nothing recorded to restore it. Mirrors the human flow.
+          // ⚠️ Mint the root's guid BEFORE the tag: it is the ANCHOR every member's derived guid comes
+          // from (#1461), and `entityRef` is what mints it. Taken after, the stamp has nothing to derive
+          // from and leaves the create window open. (Its other job — resolving the subtree across a world
+          // rebuild — is unchanged.) Inside the commit, BEFORE its rebase: the tagged tree is recorded as
+          // expanded from the new document, so the rebase leaves it alone and rebuilds only the others.
+          const ref = entityRef(entityId);
+          const priorLinks = detachPrefabInstance(entityId, { strip: false });
+          // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
+          tagged = { ref, priorLinks, guidRemap: tagEntityTreeAsInstance(entityId, path, prefab) };
+        },
+      });
+      if (!committed.ok && committed.conflict) {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${path} changed on disk while this create was writing it, so it was left as it is. Retry to write over the new content.`);
+      }
+      const ok = committed.ok;
+      if (committed.worldLeft) warnings.push('the scene changed while the prefab was written: the file landed, but the entity was not linked to it');
+      if (tagged) {
+        const { ref, priorLinks } = tagged;
+        let { guidRemap } = tagged;
         // Undo reverts the LIVE tagging only — deliberately NOT the file write. Deleting the
         // .prefab.json on undo (as the human path does for a brand-new prefab) is wrong here:
         // this op also OVERWRITES an existing prefab (`existingId` preserves its GUID), and
@@ -3052,7 +3082,7 @@ export function registerEditorAgentOps(): void {
       // `saved` describes the .prefab.json FILE write (ok). The live-world PrefabInstance
       // TAG on the source entity is separate and unsaved until modoki_save_all — reported so
       // an agent doesn't conflate "the asset file landed" with "the scene linkage did too".
-      return { ok, source: path, saved: ok, sceneLinkageSaved: false, ...(warnings.length ? { warnings } : {}) };
+      return { ok, source: path, saved: ok, sceneLinkageSaved: false, ...(committed.error ? { error: committed.error } : {}), ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'detach') {
       refuseEditOfPosedWorld('prefab detach');
@@ -3286,7 +3316,15 @@ export function registerEditorAgentOps(): void {
         );
       }
       const editing = useEditorStore.getState().editingPrefab!;
-      const { saved, warnings } = await savePrefabEditReport();
+      const { saved, warnings, conflict } = await savePrefabEditReport({ overwrite: p.overwrite === true });
+      if (!saved && conflict) {
+        throw new OpRefusal('REFUSED_BY_OP',
+          `prefab edit-save refused: ${editing.path} changed on disk since this edit opened it (a save elsewhere, an outside edit or a git pull), so NOTHING was written and the edit is still open and unsaved.`,
+          { options: [
+            "modoki_prefab {action:'edit-save', overwrite:true} — replace what is on disk with this edit",
+            "modoki_prefab {action:'edit-exit', discardUnsaved:true} — discard this edit and keep the file",
+          ] });
+      }
       if (!saved) {
         // ⚠️ `warnings` carries the backend's own REASON on a failure now (#1468) — the format gate
         // answers 409 with why, and without this the agent got three guesses and a pointer to a

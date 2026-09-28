@@ -16,8 +16,9 @@
  *  stays framework-free. */
 
 import type { UndoAction } from '../undo/undoManager';
+import { commitPrefabWrite, parsePrefabBytes } from '../scene/prefabCommit';
 import {
-  writeAssetFile, deleteAssetFiles, duplicateAssetFileReport, replaceFileIfMatch,
+  writeAssetFile, deleteAssetFiles, duplicateAssetFileReport,
   createFolderApi, moveFileToStatus,
 } from './assetOps';
 import { writeAssetFileGuarded, backendFetch } from '../backend/editorBackend';
@@ -684,10 +685,10 @@ export function makeModelImportUndo(params: {
   prefabPath: string;
   content: string;
   /** What the prefab path held BEFORE the import: absent for a fresh create; the bytes for a RE-import over an
-   *  existing prefab (it keeps that prefab's id, #1468); `null` when one was there but could not be read. A re-import's
-   *  undo RESTORES those bytes rather than trashing the file — trashing it is how #1264 lost a replaced prefab, and
-   *  the same shape was left standing here (#1679 close-out sweep). */
-  previousContent?: string | null;
+   *  existing prefab (it keeps that prefab's id, #1468). A re-import's undo RESTORES those bytes rather than trashing
+   *  the file — trashing it is how #1264 lost a replaced prefab, and the same shape was left standing here (#1679
+   *  close-out sweep). An unreadable prior refuses the import itself now (#1692), so there is no third case. */
+  previousContent?: string;
   onDone?: () => void;
 }): UndoAction {
   const { assetName, prefabPath, content, previousContent, onDone } = params;
@@ -701,22 +702,23 @@ export function makeModelImportUndo(params: {
     // ⚠️ Both halves carry a PRECONDITION (#1679): undo changes the prefab only while it holds the imported bytes
     // (import → open the prefab → edit → Cmd+S → Cmd+Z used to trash that save), redo only while it holds what the undo
     // left. Either miss REFUSES before anything moved (`fileChangedRefusal`). Same call as Create Prefab's.
+    // Each half is ONE `commitPrefabWrite` (#1692): both caches follow the file, and the instances placed from the
+    // prefab are rebuilt from whatever it holds now.
     undo: async () => {
-      if (previousContent === null) {
-        reportUndoFailure({ direction: 'Undo', label, detail: `the prefab this import replaced could not be read before the import, so it cannot be restored: "${prefabPath}" was left as it is` });
-        onDone?.();
-        return;
-      }
-      const w = await replaceFileIfMatch(prefabPath, replaced ? previousContent! : null, content);
-      if (w === 'conflict') throw fileChangedRefusal([prefabPath]);
-      if (w === 'ok') onDisk = false;
+      const w = await commitPrefabWrite(prefabPath, replaced ? parsePrefabBytes(previousContent!) : null, {
+        expected: content, ...(replaced ? { bytes: previousContent! } : {}),
+      });
+      if (w.conflict) throw fileChangedRefusal([prefabPath]);
+      if (w.ok) onDisk = false;
       else reportUndoFailure({ direction: 'Undo', label, detail: `prefab "${prefabPath}" was not ${replaced ? 'restored' : 'trashed'}` });
       onDone?.();
     },
     redo: async () => {
-      const w = await replaceFileIfMatch(prefabPath, content, onDisk ? content : replaced ? previousContent! : null);
-      if (w === 'conflict') throw fileChangedRefusal([prefabPath]);
-      if (w === 'ok') onDisk = true;
+      const w = await commitPrefabWrite(prefabPath, parsePrefabBytes(content), {
+        expected: onDisk ? content : replaced ? previousContent! : null, bytes: content,
+      });
+      if (w.conflict) throw fileChangedRefusal([prefabPath]);
+      if (w.ok) onDisk = true;
       else reportUndoFailure({ direction: 'Redo', label, detail: `prefab "${prefabPath}" was not recreated` });
       onDone?.();
     },

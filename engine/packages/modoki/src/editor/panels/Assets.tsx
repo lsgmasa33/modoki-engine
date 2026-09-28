@@ -15,6 +15,7 @@ import { readMetaPreferringPark } from '../scene/pendingMeta';
 import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
+import { commitPrefabWrite } from '../scene/prefabCommit';
 import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 // Backend-IO wrappers + create-prefab flow shared with the Hierarchy panel
 // (editor-panels F6/F7) — single source of truth for the /api/* calls and the
@@ -226,6 +227,12 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     // (#1264's shape, found by #1679's sweep). Read now, before anything is written, and decided by the FILE: a
     // manifest-`known` id can outlive it, and a `no-id` file is there all the same (`readPriorDocument`).
     const previousContent = await readPriorDocument(prefabPath);
+    // …and the write is conditional on it (#1692, I10), so a prefab that is there and cannot be read is not overwritten
+    // blind. Refused before anything is spawned or written.
+    if (previousContent === null) {
+      setImportError(`Import of "${assetName}" was aborted — ${prefabPath} is there but could not be read, so it was not overwritten.`);
+      return;
+    }
 
     // Temporarily spawn entities to serialize as prefab, then clean up
     const rootId = await importModel(assetPath, prefix, postprocessorId, rootTransform);
@@ -271,7 +278,9 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       // #308 follow-up A: the forward write was unchecked too (not just undo/redo) —
       // pushing an undo entry for a prefab that was never actually written would make
       // the resulting Cmd+Z trash a file that isn't there.
-      const wrote = await writeFile(prefabPath, content);
+      // ONE step (#1692): only over what was read at the path, then both caches — so the instances placed from a
+      // re-imported prefab are rebuilt from it now, not at the next reload.
+      const wrote = (await commitPrefabWrite(prefabPath, prefab, { expected: previousContent ?? null })).ok;
       if (!wrote) {
         console.error(`[Assets] Failed to create prefab ${prefabPath}`);
       } else {

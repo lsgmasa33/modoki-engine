@@ -116,8 +116,14 @@ beforeEach(() => {
   _resetPrefabEditSessionRows();
   onDisk.clear();
   vi.stubGlobal('fetch', async (url: string) => {
+    // Create Prefab asks the route what is at the path before it asks the human (#1692).
+    if (String(url).includes('/api/exists')) {
+      const asked = decodeURIComponent(String(url).split('path=')[1] ?? '');
+      return { ok: true, status: 200, json: async () => (onDisk.has(asked) ? { exists: true, path: asked } : { exists: false }) };
+    }
     const hit = [...onDisk].find(([p]) => String(url).endsWith(p));
-    if (hit) return { ok: true, status: 200, json: async () => JSON.parse(hit[1]), text: async () => hit[1] };
+    // A real Response: the prior-bytes read takes `arrayBuffer()` (#1692, a BOM is kept for the verbatim undo).
+    if (hit) return new Response(hit[1], { status: 200 });
     return { ok: true, json: async () => ({ files: [] }), text: async () => '' };
   });
 });
@@ -283,7 +289,8 @@ describe('#1686 close-out: the Replace\'s second serialize, and the agent create
   });
 
   it('the agent create op matches against the FILE it replaces, not a stale editor-cache copy', async () => {
-    // Mutation: prefer the editor cache in `replacedPrefabRows` — "Keep" matches the stale copy's row.
+    // Mutation: build the agent op's `replacing` from the editor cache instead of the `prior` bytes it read — "Keep"
+    // matches the stale copy's row.
     const { registerEditorAgentOps } = await import('../../app/editor/agentEditorOps');
     const { runAgentOp } = await import('../../app/debug/agentBridge');
     registerEditorAgentOps();

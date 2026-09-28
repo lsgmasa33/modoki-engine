@@ -443,7 +443,7 @@ const DECLS: Record<string, Decl> = {
     minimalArgs: { action: 'instantiate', path: '/assets/prefabs/probe.prefab.json' },
     notes: 'Sends `prefabAction` on the wire: the relay STRIPS a param named `action`. '
       + "persists:'both' because action:'create' and 'apply' WRITE the .prefab.json "
-      + "(writePrefabFile / applyToPrefabWithUndo) while instantiate/detach/overrides/revert are "
+      + "(commitPrefabWrite, conditional on what was read — #1692) while instantiate/detach/overrides/revert are "
       + "live-only; the undo entry covers the live tagging/rebuild only, never a file write "
       + '(undoing an overwrite would destroy an asset the agent never created — apply is the one '
       + "exception: its undo DOES restore the pre-apply .prefab.json, because that write IS the op). "

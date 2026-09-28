@@ -516,6 +516,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred). Not together with parentId.'),
       entityId: z.number().optional().describe('create/detach/overrides/apply/revert: the entity id. Only for an entity with no guid — use entityGuid.'),
       entityGuid: z.string().optional().describe('create/detach/overrides/apply/revert: the entity guid (preferred). Not together with entityId.'),
+      overwrite: z.boolean().optional().describe("edit-save: the prefab changed on disk since this edit opened it (a save elsewhere, an outside edit, a git pull), and the save was REFUSED — true replaces what is on disk with this edit. Never implied; without it that save refuses and nothing is written."),
       keys: z.array(z.string()).optional().describe("apply/revert: the override keys to act on — exact strings from a prior `overrides` call's `keys.all`. ALL-or-nothing: one unrecognized key refuses the whole call rather than quietly acting on the rest. OMIT to act on ALL current overrides; an explicit empty array is REFUSED, because a filter that matched nothing means 'act on nothing' and must not fall through to 'act on everything'."),
     },
     // `prefabAction`, NOT `action`: /api/editor-action spends `action` on the op name and strips it

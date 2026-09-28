@@ -12,6 +12,7 @@
  *  test exercises only the undo wiring. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import type { UndoAction } from '../../src/editor/undo/undoManager';
 
 const SRC = 'aaaaaaaa-0000-4000-8000-000000000002';
@@ -23,8 +24,12 @@ const sceneAfter = { id: 'scene-1', entities: [{ id: 1, name: 'Ship', traits: { 
 // serializeScene returns sceneBefore on the first call (pre-apply snapshot), then
 // sceneAfter on the second (post-apply snapshot) — mirroring real ordering.
 const serializeScene = vi.fn();
-const saveScene = vi.fn<(...args: any[]) => Promise<void>>(async () => {});
-const installPrefabSnapshot = vi.fn<(...args: any[]) => Promise<void>>(async () => {});
+const saveScene = vi.fn<(...args: any[]) => Promise<unknown>>(async () => { lastWritten.bytes = 'scene-bytes'; return { saved: true, reason: 'ok', content: 'scene-bytes' }; });
+/** The prefab half is ONE `commitPrefabWrite` (#1692): it lands, then runs its rebuild (the world restore). */
+const commitPrefabWrite = vi.fn<(...args: any[]) => Promise<unknown>>(async (src: string, _doc: unknown, opts: { rebuild?: (l: { path: string }) => unknown }) => {
+  await opts.rebuild?.({ path: src });
+  return { ok: true, path: src };
+});
 const loadScene = vi.fn<(...args: any[]) => Promise<unknown>>(async () => ({ world: (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }));
 const selectEntity = vi.fn();
 let pushed: UndoAction | null = null;
@@ -38,11 +43,17 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   setCurrentScenePath: vi.fn(),
   setCurrentBaseScene: (...a: any[]) => setCurrentBaseScene(...a),
   isSceneLoadSwapping: () => false,
+  // What the editor last wrote to the scene file, from ANY save (#1695): the undo's scene save is conditional on it.
+  lastWrittenSceneBytes: () => lastWritten.bytes,
+}));
+const lastWritten = vi.hoisted(() => ({ bytes: undefined as string | undefined }));
+
+vi.mock('../../src/editor/scene/prefabCommit', () => ({
+  commitPrefabWrite: (...a: any[]) => commitPrefabWrite(...a),
 }));
 
 vi.mock('../../src/editor/scene/prefab', () => ({
   applyToPrefabSelective: vi.fn(async () => applyResult),
-  installPrefabSnapshot: (...a: any[]) => installPrefabSnapshot(...a),
   guidForEntityId: (id: number) => (id === 1 ? 'g-root' : ''),
   entityIdForGuid: (guid: string) => (guid === 'g-root' ? 1 : 0),
   // #1431: undo/redo re-derive carried BASE instances; this suite's instance is primary, and its
@@ -59,13 +70,17 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 }));
 
 vi.mock('../../src/editor/store/editorStore', () => ({
-  useEditorStore: { getState: () => ({ selectEntity, selectedEntityId: 1, closePrefabEditor: () => {} }) },
+  // `showToast`: a refused scene save is one the user can fix, so its report toasts (#1695).
+  useEditorStore: { getState: () => ({ selectEntity, selectedEntityId: 1, closePrefabEditor: () => {}, showToast: () => {} }) },
 }));
 
 vi.mock('../../src/editor/undo/undoManager', () => ({
   pushAction: (a: UndoAction) => { pushed = a; },
   // The restore reads its target from `currentSceneKey` (#1575), whose module registers a barrier on import.
   registerUndoRestoreBarrier: () => {},
+  // A forward Apply holds world switches for its whole run (#1667).
+  isWorldSwitchInProgress: () => false,
+  beginWorldBoundOperation: () => () => {},
 }));
 
 async function getModule() {
@@ -84,7 +99,7 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     serializeScene.mockReset();
     serializeScene.mockResolvedValueOnce(sceneBefore).mockResolvedValueOnce(sceneAfter);
     saveScene.mockClear();
-    installPrefabSnapshot.mockClear();
+    commitPrefabWrite.mockClear();
     loadScene.mockClear();
     selectEntity.mockClear();
     setCurrentBaseScene.mockClear();
@@ -109,17 +124,19 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     expect(saveScene).toHaveBeenCalled();
 
     // ── undo: BEFORE prefab + BEFORE scene ──
-    installPrefabSnapshot.mockClear(); loadScene.mockClear();
+    commitPrefabWrite.mockClear(); loadScene.mockClear(); saveScene.mockClear();
     await pushed!.undo();
-    expect(installPrefabSnapshot).toHaveBeenCalledWith(SRC, prefabBefore, prefabAfter);
+    expect(commitPrefabWrite).toHaveBeenCalledWith(SRC, prefabBefore, expect.objectContaining({ expected: prefabAfter }));
+    // …and the scene half only over the bytes the forward Apply saved (#1695).
+    expect(saveScene).toHaveBeenCalledWith(expect.objectContaining({ ifMatch: expect.stringMatching(/^[0-9a-f]{64}$/) }));
     expect(loadScene).toHaveBeenCalledWith('scenes/test.json', { preloaded: sceneBefore });
     // selection re-anchored to the applied instance root by guid (id 1).
     expect(selectEntity).toHaveBeenLastCalledWith(1);
 
     // ── redo: AFTER prefab + AFTER scene ──
-    installPrefabSnapshot.mockClear(); loadScene.mockClear();
+    commitPrefabWrite.mockClear(); loadScene.mockClear();
     await pushed!.redo();
-    expect(installPrefabSnapshot).toHaveBeenCalledWith(SRC, prefabAfter, prefabBefore);
+    expect(commitPrefabWrite).toHaveBeenCalledWith(SRC, prefabAfter, expect.objectContaining({ expected: prefabBefore }));
     expect(loadScene).toHaveBeenCalledWith('scenes/test.json', { preloaded: sceneAfter });
   });
 
@@ -153,5 +170,81 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     const { applyToPrefabWithUndo } = await getModule();
     await applyToPrefabWithUndo(1, new Set());
     expect(pushed).toBeNull();
+  });
+});
+
+/** #1695: the SCENE half of an Apply's undo and redo. The forward Apply saves the scene only when a promotion
+ *  restructured it; the undo and redo then save it only over the bytes the other half saved, and without a promotion
+ *  they save nothing — the restore is left unsaved, as any undo leaves it.
+ *  Mutations: drop the `ifMatch` in `saveSceneOverOtherHalf` — the changed-file case goes red; save on every undo/redo
+ *  whatever the forward did (the old rule) — the no-promotion case goes red; key the precondition on the other half's
+ *  save instead of the editor's last write (the first version) — the own-Cmd+S case goes red. */
+describe('Apply undo/redo saves the scene only over what the editor last wrote there (#1695)', () => {
+  const sha = (t: string) => createHash('sha256').update(t).digest('hex');
+  /** The scene file: `saveScene` writes it only while it holds the bytes `ifMatch` hashes, as `/api/write-file` does. */
+  let sceneDisk = '';
+  let n = 0;
+  beforeEach(() => {
+    serializeScene.mockReset();
+    serializeScene.mockResolvedValueOnce(sceneBefore).mockResolvedValueOnce(sceneAfter);
+    pushed = null;
+    sceneDisk = 'as last saved by hand';
+    n = 0;
+    saveScene.mockReset();
+    lastWritten.bytes = undefined;
+    saveScene.mockImplementation(async (opts?: { ifMatch?: string }) => {
+      if (opts?.ifMatch !== undefined && sha(sceneDisk) !== opts.ifMatch) return { saved: false, reason: 'conflict', path: 'scenes/test.json' };
+      sceneDisk = `saved #${++n}`;
+      lastWritten.bytes = sceneDisk; // as `writePrimaryScene` records every save of the editor's own
+      return { saved: true, reason: 'ok', content: sceneDisk };
+    });
+  });
+
+  it('a scene file changed since the Apply saved it is left as it is, and the undo says so', async () => {
+    applyResult = { applied: true, source: SRC, prefabBefore, prefabAfter, promotedAdditions: 1 };
+    const { applyToPrefabWithUndo } = await getModule();
+    await applyToPrefabWithUndo(1, new Set(['+added.x']));
+    expect(sceneDisk).toBe('saved #1'); // precondition: the promotion saved the scene
+    sceneDisk = 'changed on disk while the scene was closed';
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await pushed!.undo();
+      expect(sceneDisk).toBe('changed on disk while the scene was closed');
+      expect(error.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/changed on disk since the editor last saved it/);
+    } finally { error.mockRestore(); }
+  });
+
+  it('accept side: undo and redo each save over the other half, round trip', async () => {
+    applyResult = { applied: true, source: SRC, prefabBefore, prefabAfter, promotedAdditions: 1 };
+    const { applyToPrefabWithUndo } = await getModule();
+    await applyToPrefabWithUndo(1, new Set(['+added.x']));
+    await pushed!.undo();
+    expect(sceneDisk).toBe('saved #2');
+    await pushed!.redo();
+    expect(sceneDisk).toBe('saved #3');
+  });
+
+  it('a field Apply saves no scene, and neither do its undo and redo', async () => {
+    applyResult = { applied: true, source: SRC, prefabBefore, prefabAfter, promotedAdditions: 0 };
+    const { applyToPrefabWithUndo } = await getModule();
+    await applyToPrefabWithUndo(1, new Set(['1.Transform.x']));
+    await pushed!.undo();
+    await pushed!.redo();
+    expect(saveScene).not.toHaveBeenCalled();
+    expect(sceneDisk).toBe('as last saved by hand');
+  });
+
+  it("the user's own Cmd+S between the Apply and its undo is not an outside change: the undo saves", async () => {
+    applyResult = { applied: true, source: SRC, prefabBefore, prefabAfter, promotedAdditions: 1 };
+    const { applyToPrefabWithUndo } = await getModule();
+    await applyToPrefabWithUndo(1, new Set(['+added.x']));
+    await saveScene(); // Cmd+S: an ordinary save of the editor's own
+    expect(sceneDisk).toBe('saved #2'); // precondition
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await pushed!.undo();
+      expect(sceneDisk).toBe('saved #3');
+      expect(error).not.toHaveBeenCalled();
+    } finally { error.mockRestore(); }
   });
 });

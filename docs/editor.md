@@ -4179,15 +4179,15 @@ hashes the same on both sides.
 that is already there replaces it and keeps its id (#1468), and the import's undo used to trash the file,
 losing the replaced prefab. That is #1264's shape. `importModelWithMeta` now reads the prior bytes from the
 FILE before writing (a manifest-`known` id can outlive the file, and a `no-id` file is there all the same),
-and the undo restores them through `replaceFileIfMatch`. If the prior bytes could not be read, or were not
-a readable document (a corrupt file is never an absent one), the undo reports that and leaves the file
-alone (`readPriorDocument`). The skin prefab's update undo reads its prior bytes the same way.
+and the undo restores them VERBATIM (a leading BOM included, #1684's note) through `commitPrefabWrite`. If the prior
+bytes could not be read, or were not a readable document (a corrupt file is never an absent one), the import itself is
+refused now (#1692): a write conditional on what it read cannot go over what it could not read (`readPriorDocument`).
+The skin prefab's update reads its prior bytes the same way.
 
-**Create Prefab's and the skin prefab's undo/redo change the file through ONE call each,
-`replaceFileIfMatch(path, next, expected)`** (`assetOps.ts`: `next` null trashes, `expected` null means
-nothing may be there). That is the seam a single prefab-write owner takes over. #1683 proposes one,
-`commitPrefabWrite`, for the propagation rules (I9–I11) in [prefabs.md](prefabs.md) § Model and invariants. These undos add no cache or
-instance handling of their own beyond what they already did.
+**Every prefab write, these undos included, is ONE `commitPrefabWrite(path, doc | null, { expected })`**
+(`scene/prefabCommit.ts`, #1692; `doc` null trashes, `expected` null means nothing may be there). It took over
+`replaceFileIfMatch`, the one call each undo made, and adds the rest of the step: both caches under every key and a
+rebuild of the prefab's other live instances ([prefabs.md](prefabs.md) § Model and invariants, I9–I11).
 
 **Not affected:** a rename or move (`/api/move-file` already 409s on an occupied destination, and a move
 destroys no bytes), and a duplicate's redo (the route already refuses `Destination exists`).

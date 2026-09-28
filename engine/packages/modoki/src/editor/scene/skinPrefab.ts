@@ -7,14 +7,14 @@
  *  The rig (`.rig2d.json`) is the low-level asset (mesh/bones/weights, like a
  *  mesh/material); the prefab is the placeable thing (mirrors mesh ↔ prefab in 3D). */
 
-import { registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
+import { getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { spawnEntitySubtree, type SubtreeSpec } from '../undo/entityActions';
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
-import { serializePrefab, setPrefabCache, classifyExistingPrefabId, type PrefabFile } from './prefab';
-import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
-import { writeAssetFile, replaceFileIfMatch, readPriorDocument } from '../panels/assetOps';
+import { serializePrefab, classifyExistingPrefabId, type PrefabFile } from './prefab';
+import { commitPrefabWrite, parsePrefabBytes } from './prefabCommit';
+import { readPriorDocument } from '../panels/assetOps';
 import { jsonFileBody } from '../backend/editorBackend';
 import { pushAction, type UndoAction } from '../undo/undoManager';
 import { reportUndoFailure, fileChangedRefusal } from '../undo/undoFailure';
@@ -77,11 +77,13 @@ export async function makeRigPrefabAsset(
   // must not delete a prefab that predated it). Absent ⇒ this was a fresh create.
   //
   // ⚠️ Read from the FILE (`readPriorDocument`), and an unreadable one is not a create (#1679 close-out review): it
-  // used to fall through to "create", so the undo TRASHED the prefab this update had replaced — #1264's shape. It now
-  // reports and leaves the file. A manifest id whose file is gone (a 404, or the SPA fallback's HTML) is a create.
+  // used to fall through to "create", so the undo TRASHED the prefab this update had replaced — #1264's shape. It is
+  // not a free overwrite either (#1692, I10): the update is conditional on what it read, so an unreadable prefab
+  // REFUSES the update and is left as it is. A manifest id whose file is gone (a 404, or the SPA fallback's HTML) is a
+  // create.
   const prior = await readPriorDocument(savePath);
-  const prevContent: string | null = typeof prior === 'string' ? prior : null;
-  const prevUnreadable = prior === null;
+  if (prior === null) { console.error(`[skinPrefab] not updating ${savePath} — it could not be read, so it would be overwritten blind`); return null; }
+  const prevContent: string | null = prior ?? null;
 
   // Spawn → serialize → delete: reuse the exact prefab serialization without leaving
   // a scene instance. All synchronous, so the temp entities never render.
@@ -92,58 +94,47 @@ export async function makeRigPrefabAsset(
   if (!prefab) return null;
 
   const content = jsonFileBody(prefab);
-  if (!(await writeAssetFile(savePath, content))) return null;
-  const cacheKey = prefab.id ?? savePath;
-  if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
-  setPrefabCache(cacheKey, prefab);
+  // ONE step (#1692): over what was read at the path (I10), then both caches, then a rebuild of every placed instance
+  // — an update keeps the guid precisely so they pick it up, and they used to stay expanded from the old bind pose
+  // until a reload, with the next save capturing them against the wrong rows (#1685's sibling).
+  const written = await commitPrefabWrite(savePath, prefab, { expected: prevContent });
+  if (!written.ok) {
+    console.error(`[skinPrefab] ${savePath} was not written — ${written.conflict ? 'it changed on disk since it was read, and was left as it is' : written.error ?? 'the write failed'}`);
+    return null;
+  }
+  /** `prevContent` as every reader parses it — what the undo's caches hold. */
+  const restored = (): PrefabFile => parsePrefabBytes(prevContent!);
 
-  const updated = prevContent != null || prevUnreadable; // an unreadable prefab was still there: an update, not a create
+  const updated = prevContent != null;
   const label = `${updated ? 'Update' : 'Make'} prefab "${rootName}"`;
   // ⚠️ Every half carries a PRECONDITION (#1679), the same four as Create Prefab's (assetOps.ts): the prefab file is
   // global, and this entry outlives a later save of it (open the skin prefab, edit, Cmd+S, then Cmd+Z here). Each
   // half changes the file only while it holds what the other half left there, and otherwise REFUSES before anything
   // moved (`fileChangedRefusal`, the #1664 shape). `applied` tracks which half last landed: an undo that reported a
-  // failed write left `content` on disk, so the redo after it must expect `content`, not the restored bytes.
+  // failed write left `content` on disk, so the redo after it must expect `content`, not the restored bytes. Each half
+  // is one `commitPrefabWrite`, so the placed instances follow it both ways.
   let applied = true;
   const action: UndoAction = {
     label,
     undo: async () => {
-      if (prevUnreadable) {
-        reportUndoFailure({ direction: 'Undo', label, detail: `the prefab this update replaced could not be read before it, so it cannot be restored: "${savePath}" was left as it is` });
-        return;
-      }
-      // Restore the prior prefab content, or delete a fresh create. Only update the cache if the
-      // file change actually landed — a failed write must not leave the in-memory cache reverted
-      // while the file on disk still holds the newer version (#308).
-      const wrote = await replaceFileIfMatch(savePath, prevContent, content);
-      if (wrote === 'conflict') throw fileChangedRefusal([savePath]);
-      if (wrote !== 'ok') {
+      // Restore the prior prefab verbatim, or delete a fresh create.
+      const wrote = await commitPrefabWrite(savePath, prevContent != null ? restored() : null, {
+        expected: content, ...(prevContent != null ? { bytes: prevContent } : {}),
+      });
+      if (wrote.conflict) throw fileChangedRefusal([savePath]);
+      if (!wrote.ok) {
         reportUndoFailure({ direction: 'Undo', label, detail: `"${savePath}" was not ${prevContent != null ? 'restored' : 'deleted'}` });
         return;
-      }
-      if (prevContent != null) {
-        // Migrate before seeding the cache — getPrefabSource returns early on a cache hit, so an
-        // un-migrated object here poisons override detection for the rest of the session (the
-        // same raw-JSON-cache-seed defect fixed in prefabEdit.ts's openPrefabForEditing).
-        try {
-          const restored = JSON.parse(prevContent) as PrefabFile;
-          for (const entry of restored.entities ?? []) migrateUIAnchorZIndexStructured(entry);
-          setPrefabCache(cacheKey, restored);
-        } catch { setPrefabCache(cacheKey, null); }
-      } else {
-        setPrefabCache(cacheKey, null);
       }
       applied = false;
     },
     redo: async () => {
-      const wrote = await replaceFileIfMatch(savePath, content, applied ? content : prevContent);
-      if (wrote === 'conflict') throw fileChangedRefusal([savePath]);
-      if (wrote !== 'ok') {
+      const wrote = await commitPrefabWrite(savePath, prefab, { expected: applied ? content : prevContent, bytes: content });
+      if (wrote.conflict) throw fileChangedRefusal([savePath]);
+      if (!wrote.ok) {
         reportUndoFailure({ direction: 'Redo', label, detail: `"${savePath}" was not written` });
         return;
       }
-      if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
-      setPrefabCache(cacheKey, prefab);
       applied = true;
     },
   };
