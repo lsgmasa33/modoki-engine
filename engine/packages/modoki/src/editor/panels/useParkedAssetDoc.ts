@@ -64,7 +64,13 @@ export function useParkedAssetDoc<T>(
       //
       // Only ours: compared by identity against what we parked, so an agent's park for the same
       // path — which we did not make and cannot judge — survives.
-      if (parkedRef.current !== null && peekDirtyAsset(path)?.data === parkedRef.current) {
+      //
+      // …or a park of THIS very doc, whoever made it: it would write back the bytes the file already holds. Since
+      // #1710 that is the undo step's own park — `assetDocUndo` parks its target itself (an undo must not depend on
+      // this panel being open), so an undo back to the saved doc arrives here already parked, and without this the
+      // indicator said Unsaved over a file nothing had changed.
+      const parked = peekDirtyAsset(path)?.data;
+      if (parked !== undefined && (parked === value || (parkedRef.current !== null && parked === parkedRef.current))) {
         discardDirtyAssets([path]);
       }
       parkedRef.current = null;

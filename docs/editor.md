@@ -4197,6 +4197,102 @@ Tests: `packages/modoki/tests/editor/undoFilePreconditions.test.ts` (every Asset
 `createPrefabUndo.test.ts` and `skinPrefab.test.ts`, and `tests/plugins/deleteAssetPreconditions.test.ts`
 (the route itself, on a real scratch directory).
 
+### An asset-DOCUMENT undo checks the asset still holds its side, and its save is conditional (#1710)
+
+**The mechanism.** #1679's rule for the other class of asset undo. A material, clip, particle effect, sprite animation,
+timeline, rig, shader or animset edit, from its panel or an agent op, is an `_isFileDirect` entry. `parkSurvivors` keeps
+these across every discarding history swap (#1409), and since #1704 that includes leaving prefab edit
+([prefabs.md](prefabs.md) U27). So the asset can have been edited, saved or rewritten from outside by the time the entry
+runs. The step re-parked its whole old document regardless. Tint M in S1 and save, change M's roughness in S2 and save,
+then Cmd+Z in S1: the roughness went too, and the next save wrote it.
+
+**These steps PARK and do not write (#831)**, so there is no write for a route precondition to guard at step time. The
+check runs in the step (`undo/assetDocUndo.ts`), against what the next save would leave on disk:
+
+| The asset is… | It holds the step's expected side when… |
+|---|---|
+| parked | the parked doc equals it (`sameAssetDoc`: JSON equality, key order ignored) |
+| not parked | the file's CURRENT bytes hash to one of two records of bytes known to encode it: the route's own hash of this session's last flush of that doc (`getLastFlushedWrite`), or the file's hash when the entry was recorded while nothing was parked, when the expected side is the entry's `before` (`captureAssetDocBaseline`) |
+
+One more acceptance: when nothing is parked and the file ALREADY holds the step's TARGET, the step moves nothing on
+disk, only the live cache back to the file. An undo of an edit that was discarded is this case: `discardDirtyAssets`
+leaves the cache on the edit, and a refusal there stranded the cache on a doc no save writes.
+
+An absent or unreadable file holds nothing. A mismatch on any side throws `assetChangedRefusal`, which is #1664's
+`UndoRefusedError`: nothing is applied, the entry is dropped, and the toast reads "*m.mat.json* changed since, and was
+left as it is". A multi-asset step (the material batch view) checks every side before applying any. Between the reads
+and the last apply there is no `await`, so no edit can land between "holds" and "moved".
+
+⚠️ **Not "the file parses to the expected doc".** A loader can migrate what it reads (a legacy particle `gravity: 6`
+loads as `[0,-6,0]`), so the doc a panel holds need not be the one its file parses to. A parse comparison would refuse
+every step on such an asset. Only bytes the route wrote or the editor read are compared.
+
+⚠️ **The baseline is taken BEFORE the forward edit parks**, or it describes the edit itself. Every site builds its entry
+(`assetDocAction`) before parking. The rig canvas's drags park the live rig on every pointer move and push at
+pointer-up, so they take the baseline at pointer-down (`skinGestureBaseline`). No baseline is taken in three cases,
+because in each the file does not hold `before`:
+- **Something is parked.** An undo of the second of two unsaved edits would otherwise discard the first as already
+  saved.
+- **An agent discard left the live cache on an edit the file does not hold** (`assetCacheDiverged`). A flush that
+  writes the path, a cache reload from disk (the watcher), or any discard that leaves cache and file agreeing ends the
+  divergence. A move carries it to the new path.
+- **The read is overtaken by a save of that path.** A flush that STARTS before the read resolves voids it
+  (`getAssetWriteEpoch`, bumped before the request goes out), since the read may have hashed the saved bytes.
+
+⚠️ **The step's own read never overlaps a save of the same path.** Read mid-flight, the pre-save bytes let the step
+discard its park as "the file holds the target", and the flush then landed the other doc: the editor showed one, disk
+held another, and it reported clean. The step waits for every flush writing its paths to end (`assetWritesSettled`, a
+set per path, because an agent `save_all` and a Cmd+S can overlap). It then reads, and reads again if a flush started
+or was still writing meanwhile. After three tries it refuses. The wait has no timeout of its own, so a hung
+`/api/asset-write` holds the undo queue until the fetch fails.
+
+**The save after it.** An accepted step over the FILE parks its target with `ifMatch` = the hash it just checked. The
+flush sends that as `/api/asset-write`'s precondition (`DirtyAsset.ifMatch`), so an outside write between the undo and
+Cmd+S is refused at the route. The park stays and the save toast names the file. A step over an existing PARK leaves
+that park's own `ifMatch` alone, because replacing it would erase a conflict it already carries.
+
+**The step parks its target itself.** It does not leave that to the panel. The hook editors (`useParkedAssetDoc`) park
+reactively, and only while open on that path. So an undo with the editor closed moved the cache and left the undone
+doc parked, and the next save wrote it back. When the file already holds the target (an edit undone back to the saved
+doc), the step discards the park instead, so that reads as clean. The hook discards a park of its saved doc, whoever
+made it, for the same reason.
+
+**Sites**, held to it by `tests/architecture/assetUndoIsFileDirect.test.ts` ("every asset-doc undo entry is GUARDED"):
+- Material, AnimSet and Shader views.
+- MaterialBatchView (`runAssetDocStep` over N sides).
+- The particle, animation, timeline and spriteanim editors. The coalesced `_after` is read at step time.
+- SkinEditor, SkinCanvas and SkinBoneList (`skinDocAction`).
+- The agent ops' `pushAssetUndo`: `particle-set`, `anim-set-clip`, `anim-add-key`, `timeline-set`,
+  `timeline-add-clip`. A refusal there is REFUSED_BY_OP.
+
+The base-scene set/clear (`makeBaseSceneUndo`) is the same mechanism on one field. It refuses unless the scene holds
+its side now (`baseSceneHeldBy`: a park, else the open scene's live value, else the file).
+
+**Not covered, or covered only by refusing:**
+- The base-scene field's own flush is not conditional: `/api/scene-mutate` has no field precondition.
+- A conflict on a flush the undo made conditional has no "Discard & reload" button outside the Atlas view. The save
+  toast names the file and the park stays, so the exits are `modoki_discard_asset_edits` or re-opening the project.
+  Material, shader and animset have no watcher drop either (#842), so a `git checkout` under such a park keeps the save
+  refusing until one of those.
+- An asset renamed since the entry was recorded refuses. The entry names the old path, which now 404s. The old step
+  re-parked there, and the save created a ghost file.
+- The step is async now, so an edit made during its file read (one localhost round trip) applies with no undo entry,
+  because `pushAction` ignores pushes while a step executes. The step then refuses, because the park moved.
+- A composite of asset-doc steps (`evalApi.composite`) wraps a refusal in an `AggregateError`, so the other subs still
+  apply. All-or-nothing holds within ONE step (the material batch), not across a composite.
+- A panel opened on a MISSING file (the particle editor's default-effect fallback) refuses a redo after an undo,
+  because an absent file holds nothing.
+- A `.meta.json` import-settings park is #1696's.
+- The sling Level/Wave editors write files directly: #1697.
+
+Tests:
+- `packages/modoki/tests/editor/assetDocUndo.test.ts`: every kind's undo and redo against a fake backend that holds
+  the real written bytes and applies the route's `ifMatch` rule.
+- `baseSceneUndo.test.ts`.
+- `agentPersistence.test.ts`'s agent refusal.
+- `useParkedAssetDoc.test.tsx`'s saved-doc discard.
+- The site guard in `assetUndoIsFileDirect.test.ts`, which requires both halves to be guarded.
+
 ⚠️ **This was LATENT when fixed** — #308 closed the last live route (the base-scene field's
 `mutateScene` let a network-level rejection escape; it catches now), and every filesystem helper
 resolves `false` rather than throwing. It was fixed anyway because "just throw so the entry stays

@@ -40,6 +40,7 @@ import {
 } from '../../runtime/timeline/types';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
+import { assetDocAction } from '../undo/assetDocUndo';
 import { shouldCoalesce } from '../animation/undoCoalesce';
 import { DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import TrackLaneList from './timeline/TrackLaneList';
@@ -345,20 +346,16 @@ export default function TimelineEditor() {
       act._after = next;
     } else {
       const before = cur;
-      const a: TLAction = {
-        _after: next,
+      const a: TLAction = Object.assign(assetDocAction<TimelineDef>({
         label: `timeline ${group.split(':')[0]}`,
-        // Asset-document edit: it changes a .timeline.json file, NOT any scene entity, so it must not
-        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
-        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
-        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
-        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
-        // twins have set this since S2.27; the panels never did.
-        _isFileDirect: true,
+        // `assetDocAction` (#1710): `_isFileDirect` — an asset-document edit, not scene state, so no scene edit-version
+        // bump (a falsely-dirty scene self-blocks the file-direct agent routes and modoki_build). Its undo/redo check the
+        // file still holds their side before moving it, park the result themselves (so an undo with this editor closed
+        // is not written back by the next save), and read `_after` at step time, after any coalescing.
+        path, type: 'timeline', before, after: () => a._after,
         // Re-pose only into our own held session — a pose OPENS the envelope (#1550; `undoMayRepose`).
-        undo: () => { useEditorStore.getState().applyTimelineDoc(path, before); if (undoMayRepose('timeline')) poseLatestRef.current(before); },
-        redo: () => { useEditorStore.getState().applyTimelineDoc(path, a._after); if (undoMayRepose('timeline')) poseLatestRef.current(a._after); },
-      };
+        apply: (d) => { useEditorStore.getState().applyTimelineDoc(path, d); if (undoMayRepose('timeline')) poseLatestRef.current(d); },
+      }), { _after: next });
       pushAction(a);
       lastAction.current = a;
     }

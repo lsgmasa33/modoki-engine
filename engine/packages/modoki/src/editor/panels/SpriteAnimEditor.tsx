@@ -28,6 +28,7 @@ import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
+import { assetDocAction } from '../undo/assetDocUndo';
 import { runUndoCommand } from '../undo/undoCommand';
 import { BufferedNumberInput, inputStyle } from './fields';
 import { FrameThumb, TrackNameField, iconBtn, labelStyle } from './SpriteAnimatorSection';
@@ -197,19 +198,15 @@ export default function SpriteAnimEditor() {
       act._after = next;
     } else {
       const before = cur;
-      const a: SpriteAnimAction = {
-        _after: next,
+      const a: SpriteAnimAction = Object.assign(assetDocAction<SpriteAnimDef>({
         label: `spriteanim ${group.split(':')[0]}`,
-        // Asset-document edit: it changes a .spriteanim.json file, NOT any scene entity, so it must not
-        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
-        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
-        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
-        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
-        // twins have set this since S2.27; the panels never did.
-        _isFileDirect: true,
-        undo: () => useEditorStore.getState().applySpriteAnimDef(path, before),
-        redo: () => useEditorStore.getState().applySpriteAnimDef(path, a._after),
-      };
+        // `assetDocAction` (#1710): `_isFileDirect` — an asset-document edit, not scene state, so no scene edit-version
+        // bump (a falsely-dirty scene self-blocks the file-direct agent routes and modoki_build). Its undo/redo check the
+        // file still holds their side before moving it, park the result themselves (so an undo with this editor closed
+        // is not written back by the next save), and read `_after` at step time, after any coalescing.
+        path, type: 'spriteanim', before, after: () => a._after,
+        apply: (d) => useEditorStore.getState().applySpriteAnimDef(path, d),
+      }), { _after: next });
       pushAction(a);
       lastAction.current = a;
     }

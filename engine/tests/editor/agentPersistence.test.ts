@@ -22,7 +22,7 @@ import {
 } from '@modoki/engine/runtime';
 import {
   getEditVersion, hasUnsavedChanges, markSceneSaved, clearHistory, canUndo, undoLabel, undo, redo,
-  getDirtyAssetPaths, peekDirtyAsset,
+  getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, undoStep, assetCacheDiverged,
 } from '@modoki/engine/editor';
 
 /** The PARKED doc for a path — what `save_all` would write — narrowed to the field these
@@ -43,6 +43,8 @@ function registerTestAssets() {
   registerAsset(`00000000-0000-4000-8000-000000000000`.slice(0,36), '/assets/fx/phase0.particle.json', 'particle');
   registerAsset('00000000-0000-4000-8000-000000000001', '/assets/fx/parked-undo.particle.json', 'particle');
   registerAsset('00000000-0000-4000-8000-000000000002', '/assets/fx/clean-then-undone.particle.json', 'particle');
+  registerAsset('00000000-0000-4000-8000-000000000003', '/assets/fx/edited-elsewhere.particle.json', 'particle');
+  registerAsset('00000000-0000-4000-8000-000000000004', '/assets/fx/discarded.particle.json', 'particle');
 }
 
 
@@ -256,18 +258,54 @@ describe('Path A — particle/anim/timeline ops: apply live AND always persist, 
     expect(dirtyAssetSnapshot(p)?.particle?.lifetime).toBe(9);
   });
 
+  /** #1710: the agent ops' entry is `assetDocUndo`'s, so it outlives a scene switch AND checks the asset
+   *  before moving it. Another history's edit to the same asset since must not be reverted by it. */
+  it('an agent asset undo REFUSES when the asset was edited elsewhere since — the later park survives', async () => {
+    const p = '/assets/fx/edited-elsewhere.particle.json';
+    await runAgentOp('particle-set', { path: p, def: { emitter: { shape: 'point' }, particle: { lifetime: 1 } } });
+    await runAgentOp('particle-set', { path: p, def: { emitter: { shape: 'point' }, particle: { lifetime: 9 } } });
+    // Another scene's panel edits the same effect (its entry lives in THAT history, not this one).
+    markAssetDirty(p, 'particle', { emitter: { shape: 'point' }, particle: { lifetime: 42 } }, 'panel');
+    const r = await undoStep('undo');
+    expect(r.did).toBe(false);
+    expect(r.failed?.refused).toBe(true);
+    expect(dirtyAssetSnapshot(p)?.particle?.lifetime).toBe(42);
+  });
+
+  /** #1710: `discard-asset-edits` keeps the applied def LIVE, so the cache now differs from the file, and the registry
+   *  must know it — an asset-doc baseline taken next would otherwise name the file's bytes as the cache's doc. */
+  it('discard-asset-edits marks the cache as diverged from the file', async () => {
+    const p = '/assets/fx/discarded.particle.json';
+    await runAgentOp('particle-set', { path: p, def: { emitter: { shape: 'point' }, particle: { lifetime: 3 } } });
+    expect(assetCacheDiverged(p)).toBe(false);
+    await runAgentOp('discard-asset-edits', { paths: [p] });
+    expect(assetCacheDiverged(p)).toBe(true);
+  });
+
   it('undoing the only edit to a CLEAN asset discards the parked write instead of re-parking it', async () => {
     // Nothing was pending before, so disk already holds the pre-edit def: leaving a parked write
     // would keep the asset dirty forever after an undo and self-block the file-direct routes.
     const p = '/assets/fx/clean-then-undone.particle.json';
-    // A committed asset: a def in the live cache (so undo has something to revert TO) and
-    // nothing parked — i.e. disk and cache agree.
-    setParticleEffect(p, { emitter: { shape: 'point' }, particle: { lifetime: 2 } } as never);
-    expect(getDirtyAssetPaths()).not.toContain(p);
-    await runAgentOp('particle-set', { path: p, def: { emitter: { shape: 'point' }, particle: { lifetime: 7 } } });
-    expect(getDirtyAssetPaths()).toContain(p);
-    await undo();
-    expect(getDirtyAssetPaths()).not.toContain(p);
+    // A committed asset: a def in the live cache (so undo has something to revert TO), the same doc
+    // in the FILE, and nothing parked. Since #1710 the step decides "the file already holds it" from
+    // the file's real bytes (hashed when the entry was recorded, and again at undo), so the file has
+    // to exist here — without it the undo parks, which is the safe answer for a file it cannot see.
+    const committed = { emitter: { shape: 'point' }, particle: { lifetime: 2 } };
+    const bytes = new TextEncoder().encode(JSON.stringify(committed, null, 2) + '\n');
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => (String(url).endsWith(p)
+      ? new Response(bytes.slice().buffer as ArrayBuffer, { status: 200 })
+      : new Response('', { status: 404 }))) as typeof fetch;
+    try {
+      setParticleEffect(p, committed as never);
+      expect(getDirtyAssetPaths()).not.toContain(p);
+      await runAgentOp('particle-set', { path: p, def: { emitter: { shape: 'point' }, particle: { lifetime: 7 } } });
+      expect(getDirtyAssetPaths()).toContain(p);
+      await undo();
+      expect(getDirtyAssetPaths()).not.toContain(p);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   it('the FIRST write to an asset pushes NO entry — there is nothing to revert to', async () => {

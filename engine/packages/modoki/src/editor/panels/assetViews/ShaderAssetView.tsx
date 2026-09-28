@@ -8,6 +8,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { pushAction } from '../../undo/undoManager';
+import { assetDocAction } from '../../undo/assetDocUndo';
 import type { ShaderParam, ShaderParamType } from '../../../runtime/loaders/shaderSchema';
 import { BufferedTextInput, inputStyle } from '../fields';
 import { NumberField } from './widgets';
@@ -51,13 +52,13 @@ export function ShaderAssetView({ path }: { path: string }) {
   const writeData = useCallback((updated: Record<string, unknown>, label: string) => {
     const old = dataRef.current;
     if (!old) return;
-    persistAssetEdit(path, 'shader', updated, invalidateShaderFile);
-    pushAction({
-      _isFileDirect: true, // parked, not scene state (persistAssetEdit) — see MaterialAssetView for why
-      label,
-      undo: () => persistAssetEdit(path, 'shader', old, invalidateShaderFile),
-      redo: () => persistAssetEdit(path, 'shader', updated, invalidateShaderFile),
+    // Built BEFORE the park, and its undo/redo check the asset still holds their side (#1710) — see MaterialAssetView.
+    const action = assetDocAction({
+      label, path, type: 'shader', before: old, after: () => updated,
+      apply: (doc) => persistAssetEdit(path, 'shader', doc, invalidateShaderFile),
     });
+    persistAssetEdit(path, 'shader', updated, invalidateShaderFile);
+    pushAction(action); // _isFileDirect: parked, not scene state (persistAssetEdit)
   }, [path]);
 
   // Patch one metadata field of one param (default / min / max / step / label).

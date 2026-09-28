@@ -12,6 +12,7 @@ export {
   pushAction, undo, redo, undoStep, undoStepPending, type UndoStepResult, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
   beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
 } from './undo/undoManager';
+export { assetDocAction, runAssetDocStep, captureAssetDocBaseline, type AssetDocBaseline, type AssetDocSide } from './undo/assetDocUndo';
 export { runAsCompositeAction, composeUndoActions, type CompositeActionOptions } from './undo/compositeAction';
 export {
   writeTraitFieldWithUndo, deleteEntityWithUndo, deleteEntitiesWithUndo, duplicateEntity,
@@ -108,7 +109,7 @@ export {
 } from './scene/serialize';
 export { SCENE_EXT, correctedScenePath, isAcceptableScenePath } from './scene/sceneFileName';
 export {
-  markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,
+  markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets, assetCacheDiverged, assetCacheMatchesFile,
   discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,
   subscribeDirtyAssets, getDirtyAssetsVersion, isAssetDirty, getLastFlushedAsset,
   getLastFlushedAssetHash, getAssetFlushError, clearAssetIfMatch, forgetFlushedAssetHash,

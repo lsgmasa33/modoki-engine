@@ -65,10 +65,30 @@ function pushedAction(call: ts.CallExpression): ts.Expression | undefined {
   return decl && ts.isVariableDeclaration(decl) && decl.initializer ? unwrapValue(decl.initializer) : arg;
 }
 
-/** Is this action an ASSET-DOC undo entry? A mutator NAMED inside it (called, or handed on), or — in a file
- *  that touches a mutator at all — an own `undo` member. */
+/** The factories that build a WHOLE asset-doc entry and set the flag themselves (#1710): `assetDocAction`
+ *  (undo/assetDocUndo.ts) and `skinDocAction` (panels/skinDocAction.ts), which returns the first. That each really
+ *  does is checked below — a name on this list vouches for nothing on its own. */
+const FLAGGING_FACTORIES = ['assetDocAction', 'skinDocAction'];
+
+/** Is this action a factory's entry — the call itself, or `Object.assign(<the call>, { _after })` (a coalescing
+ *  editor's shape)? */
+function factoryBuilt(action: ts.Expression): boolean {
+  let e: ts.Expression = action;
+  if (ts.isCallExpression(e) && ts.isPropertyAccessExpression(e.expression) && e.expression.getText() === 'Object.assign' && e.arguments[0]) {
+    // The extras may add fields (`_after`), never replace the factory's guarded steps.
+    // A spread (`'...'`) or computed key (`'[k]'`) could be undo/redo too, so it counts as one.
+    const overrides = e.arguments.slice(1).some((x) => (objectLiteralKeys(unwrapValue(x)) ?? ['?'])
+      .some((k) => k === 'undo' || k === 'redo' || k === '?' || k === '...' || k.startsWith('[')));
+    if (overrides) return false;
+    e = unwrapValue(e.arguments[0]);
+  }
+  return ts.isCallExpression(e) && ts.isIdentifier(e.expression) && FLAGGING_FACTORIES.includes(e.expression.text);
+}
+
+/** Is this action an ASSET-DOC undo entry? A factory's entry, a mutator NAMED inside it (called, or handed on), or —
+ *  in a file that touches a mutator at all — an own `undo` member. */
 function isAssetDocEntry(action: ts.Expression, mutators: readonly string[], fileTouchesAssets: boolean): boolean {
-  const direct = findNodes(action, ts.isIdentifier).some((id) => mutators.includes(id.text));
+  const direct = factoryBuilt(action) || findNodes(action, ts.isIdentifier).some((id) => mutators.includes(id.text));
   return direct || (fileTouchesAssets && (objectLiteralKeys(action) ?? []).includes('undo'));
 }
 
@@ -77,7 +97,37 @@ function isAssetDocEntry(action: ts.Expression, mutators: readonly string[], fil
  *  guard accepted both that and a comment saying the word, which is the failure its own docstring names;
  *  a flag inside a nested literal does not flag the action either. */
 function isFlagged(action: ts.Expression): boolean {
-  return propertyValue(action, '_isFileDirect')?.kind === ts.SyntaxKind.TrueKeyword;
+  return factoryBuilt(action) || propertyValue(action, '_isFileDirect')?.kind === ts.SyntaxKind.TrueKeyword;
+}
+
+/** Is this entry's undo/redo GUARDED (#1710) — does each check the asset still holds its side before moving it? A
+ *  factory's entry, or a literal whose `undo` AND `redo` each run `runAssetDocStep` — directly, or through a local
+ *  const resolved by scope (MaterialBatchView's `undo: step(next, prev)`). One guarded half does not vouch for the
+ *  other: a raw `persistAssetEdit(old)` / `apply*Def(before)` step re-parks the whole old doc over whatever the asset
+ *  holds now. */
+function isGuarded(action: ts.Expression): boolean {
+  if (factoryBuilt(action)) return true;
+  if (!ts.isObjectLiteralExpression(action)) return false;
+  // A spread can replace either step at runtime, whatever the literal names.
+  if (action.properties.some(ts.isSpreadAssignment)) return false;
+  // CALLED, not merely named — and called by the step ITSELF: `() => { void step; persistAssetEdit(old); }` names the
+  // helper, and `() => { const never = () => runAssetDocStep(…); persistAssetEdit(old); }` calls it in a closure
+  // nothing runs. Only calls whose nearest enclosing function is the step's own count.
+  const ownerFn = (n: ts.Node): ts.Node | undefined => { for (let p = n.parent; p; p = p.parent) if (ts.isFunctionLike(p)) return p; return undefined; };
+  const callees = (n: ts.Node) => {
+    const own = ts.isArrowFunction(n) || ts.isFunctionExpression(n) ? n : ownerFn(n);
+    return findNodes(n, ts.isCallExpression).filter((c) => ownerFn(c) === own).map((c) => c.expression).filter(ts.isIdentifier);
+  };
+  const runsStep = (n: ts.Node) => callees(n).some((id) => id.text === 'runAssetDocStep');
+  // A local step FACTORY (`const step = (a, b) => () => runAssetDocStep(…)`) calls it in the function it RETURNS — that
+  // inner function is the step the literal installs, so the factory's body counts at any depth.
+  const factoryRunsStep = (n: ts.Node) => findNodes(n, ts.isCallExpression)
+    .some((c) => ts.isIdentifier(c.expression) && c.expression.text === 'runAssetDocStep');
+  const guardedStep = (value: ts.Node | undefined) => !!value && (runsStep(value) || callees(value).some((id) => {
+    const decl = declarationOf(id);
+    return !!decl && ts.isVariableDeclaration(decl) && !!decl.initializer && factoryRunsStep(decl.initializer);
+  }));
+  return guardedStep(propertyValue(action, 'undo')) && guardedStep(propertyValue(action, 'redo'));
 }
 
 /** Every asset-doc undo entry that does not carry the flag, set to TRUE — plus how many asset-doc
@@ -105,7 +155,51 @@ function unflagged(): { hits: string[]; examined: number } {
   return { hits, examined };
 }
 
+/** Every asset-doc undo entry whose steps are NOT guarded (#1710), and how many were examined. */
+function unguarded(): { hits: string[]; examined: number } {
+  const mutators = assetDocMutators();
+  const hits: string[] = [];
+  let examined = 0;
+  for (const file of editorSources()) {
+    const code = readScannedSource(file).code;
+    const fileTouchesAssets = mutators.some((mut) => new RegExp(`\\b${mut}\\b`).test(code));
+    const sf = parseSource(code, file);
+    for (const call of callsTo(sf, 'pushAction')) {
+      const action = pushedAction(call);
+      if (!action || !isAssetDocEntry(action, mutators, fileTouchesAssets)) continue;
+      examined++;
+      if (!isGuarded(action)) hits.push(`${path.relative(EDITOR, file)}:${lineOf(call)}`);
+    }
+  }
+  return { hits, examined };
+}
+
 describe('asset-document undo entries do not dirty the scene', () => {
+  it('every asset-doc undo entry is GUARDED — it checks the asset still holds its side (#1710)', () => {
+    const { hits, examined } = unguarded();
+    // Material, animset, shader, the batch, particle, animation, timeline, spriteanim and 7 rig sites — a scan that
+    // finds far fewer has stopped seeing them, and would pass vacuously.
+    expect(examined, 'the scan found almost no asset-doc entries — it has gone blind').toBeGreaterThanOrEqual(15);
+    expect(hits, `these asset-doc undo entries re-park a whole old document with no check that the asset still holds
+this step's side, so an edit made to that asset elsewhere since is reverted (#1710). Build them with
+assetDocAction (undo/assetDocUndo.ts), or run the step through runAssetDocStep:\n\n${hits.join('\n')}\n`).toEqual([]);
+  });
+
+  it('the flagging factories really set it: assetDocAction returns `_isFileDirect: true`, skinDocAction returns assetDocAction(...)', () => {
+    const src = (rel: string) => parseSource(readScannedSource(path.join(EDITOR, rel)).code, rel);
+    const returned = (sf: ts.SourceFile, fn: string) => {
+      const decl = findNodes(sf, ts.isFunctionDeclaration).find((d) => d.name?.text === fn);
+      expect(decl, `${fn} not found — FLAGGING_FACTORIES names a function that no longer exists`).toBeDefined();
+      return findNodes(decl!, ts.isReturnStatement).map((r) => r.expression && unwrapValue(r.expression)).filter((e): e is ts.Expression => !!e);
+    };
+    const own = returned(src('undo/assetDocUndo.ts'), 'assetDocAction');
+    expect(own.length).toBeGreaterThan(0);
+    for (const e of own) expect(propertyValue(e, '_isFileDirect')?.kind).toBe(ts.SyntaxKind.TrueKeyword);
+    const skin = returned(src('panels/skinDocAction.ts'), 'skinDocAction');
+    expect(skin.length).toBe(1);
+    expect(skin.every((e) => ts.isCallExpression(e) && ts.isIdentifier(e.expression) && e.expression.text === 'assetDocAction')).toBe(true);
+  });
+
   it('derives the mutator list from the store rather than restating it', () => {
     const m = assetDocMutators();
     // If this shrinks, the derivation broke and the guard below would pass vacuously.
@@ -122,6 +216,25 @@ describe('asset-document undo entries do not dirty the scene', () => {
       const raw = fs.readFileSync(file, 'utf8');
       assertScanIsSane(raw, stripComments(raw), path.relative(EDITOR, file));
     }
+  });
+
+  it('a guarded HALF does not vouch for the other, and an Object.assign cannot replace the factory\'s steps (#1710)', () => {
+    const sf = parseSource([
+      "function f() {",
+      "  const step = () => () => runAssetDocStep([], () => {}, 'panel');",
+      "  pushAction({ _isFileDirect: true, label: 'a', undo: step(), redo: step() });",
+      "  pushAction({ _isFileDirect: true, label: 'b', undo: () => persistAssetEdit(p, 'material', old, inv), redo: step() });",
+      "  pushAction(Object.assign(assetDocAction({}), { _after: next }));",
+      "  pushAction(Object.assign(assetDocAction({}), { undo: () => persistAssetEdit(p, 'material', old, inv) }));",
+      "  pushAction(Object.assign(assetDocAction({}), { ...raw }));",
+      "  pushAction(Object.assign(assetDocAction({}), { [k]: rawUndo }));",
+      "  pushAction({ _isFileDirect: true, undo: step(), redo: step(), ...raw });",
+      "  pushAction({ _isFileDirect: true, undo: () => { void step; persistAssetEdit(p, 'material', old, inv); }, redo: step() });",
+      "  pushAction({ _isFileDirect: true, undo: () => { const never = () => runAssetDocStep([], f, 'panel'); persistAssetEdit(p, 'material', old, inv); }, redo: step() });",
+      "  pushAction({ _isFileDirect: true, undo: () => runAssetDocStep([], f, 'panel'), redo: async () => { await runAssetDocStep([], f, 'panel'); } });",
+      "}",
+    ].join('\n'), 'probe.ts');
+    expect(callsTo(sf, 'pushAction').map((c) => isGuarded(pushedAction(c)!))).toEqual([true, false, true, false, false, false, false, false, false, true]);
   });
 
   it('reads the pushed action as a node — a string\'s bracket, a nested flag and a same-named const elsewhere do not vouch (#1195)', () => {

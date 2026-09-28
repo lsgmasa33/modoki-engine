@@ -6,6 +6,7 @@ import { useCallback } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { reparentBone } from '../../runtime/skinning/rig2dEdit';
 import { pushAction } from '../undo/undoManager';
+import { skinDocAction } from './skinDocAction';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 
 type Bone = { name: string; parent: number };
@@ -22,10 +23,7 @@ export default function SkinBoneList({ selBone, setSelBone }: { selBone: number;
     const before = store.editingSkinDef;
     const path = store.editingSkinAsset?.path;
     if (!before || !path || next === before) return;
-    // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
-    // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
-    // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
-    pushAction({ _isFileDirect: true, label: `rig2d ${label}`, undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, next) });
+    pushAction(skinDocAction(`rig2d ${label}`, path, before, next)); // an asset-doc edit, #1710 — see skinDocAction
     store.applySkinDef(path, next);
   }, []);
 

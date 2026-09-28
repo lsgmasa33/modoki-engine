@@ -19,6 +19,8 @@ import { paintWeights } from '../../runtime/skinning/rig2dWeightPaint';
 import { addBone } from '../../runtime/skinning/rig2dEdit';
 import { drawGizmo2D, hitTestGizmo2D, applyGizmoDrag2D, type GizmoHandle } from './Gizmo2D';
 import { pushAction } from '../undo/undoManager';
+import { skinDocAction, skinGestureBaseline } from './skinDocAction';
+import type { AssetDocBaseline } from '../undo/assetDocUndo';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 
 const HEIGHT = 300;
@@ -174,12 +176,13 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
   const panDragRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null);
   // Move-part drag: offset the active part's WHOLE mesh (reposition the sprite). Holds
   // the pre-drag snapshot (one undo) + the original verts (absolute-delta, no drift).
-  const movePartRef = useRef<{ startX: number; startY: number; origVerts: number[][]; before: Rig2DFile } | null>(null);
+  // `baseline` (#1710): taken at the gesture's start, since the live rig is parked long before pointer-up — skinGestureBaseline.
+  const movePartRef = useRef<{ startX: number; startY: number; origVerts: number[][]; before: Rig2DFile; baseline: AssetDocBaseline | null } | null>(null);
   useEffect(() => { viewUserRef.current = { zoom: 1, panX: 0, panY: 0 }; }, [nonce]);
   // active weight-paint stroke: pre-stroke snapshot for a single undo, plus the stroke's own
   // sweep state (#392's interpolation, so a fast stroke doesn't tunnel between stamps) —
   // advanced ONLY through `advancePaintStroke` so all three open/move sites stay in sync.
-  const paintRef = useRef<{ before: Rig2DFile; stroke: PaintStrokeState } | null>(null);
+  const paintRef = useRef<{ before: Rig2DFile; baseline: AssetDocBaseline | null; stroke: PaintStrokeState } | null>(null);
   const cursorRef = useRef<{ x: number; y: number } | null>(null);
   // A pointer-down on a JOINT while the brush is active is ambiguous: it could be a click
   // (switch which bone you're painting) or the head of a stroke that happens to start over
@@ -221,11 +224,11 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
     return offBindings;
   }, [paintMode, hmrEpoch]);
   // Active gizmo drag (translate/rotate a bone — bind pose in bone edit, test pose in paint).
-  const gizmoRef = useRef<{ handle: GizmoHandle; startPx: number; startPy: number; centerPx: [number, number]; worldRz: number; parentWorldRz: number; before: Rig2DFile | null } | null>(null);
+  const gizmoRef = useRef<{ handle: GizmoHandle; startPx: number; startPy: number; centerPx: [number, number]; worldRz: number; parentWorldRz: number; before: Rig2DFile | null; baseline: AssetDocBaseline | null } | null>(null);
   // Parts-mode translate gizmo drag: axis-constrained move of the active part's whole mesh
   // (origVerts + origCenter snapshot → absolute delta, no drift). Free-drag on the mesh is
   // the movePartRef path; this is the handle-constrained path.
-  const partGizmoRef = useRef<{ handle: GizmoHandle; startPx: number; startPy: number; centerPx: [number, number]; origVerts: number[][]; origCenter: { x: number; y: number }; before: Rig2DFile } | null>(null);
+  const partGizmoRef = useRef<{ handle: GizmoHandle; startPx: number; startPy: number; centerPx: [number, number]; origVerts: number[][]; origCenter: { x: number; y: number }; before: Rig2DFile; baseline: AssetDocBaseline | null } | null>(null);
   const hoverHandleRef = useRef<GizmoHandle | null>(null);
   const showGizmo = selBone >= 0 && ((skinMode === 'rig' && tool === 'select') || (paintMode && paintSubTool === 'transform'));
   // Parts mode draws a translate gizmo at the active part's center (mesh present). None when
@@ -599,10 +602,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
     const before = store.editingSkinDef;
     const path = store.editingSkinAsset?.path;
     if (!before || !path) return;
-    // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
-    // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
-    // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
-    pushAction({ _isFileDirect: true, label: `rig2d ${label}`, undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, next) });
+    pushAction(skinDocAction(`rig2d ${label}`, path, before, next)); // an asset-doc edit, #1710 — see skinDocAction
     store.applySkinDef(path, next);
   }, []);
 
@@ -686,7 +686,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       if (c && handle) {
         const av = activePartOf(cur, active).mesh?.verts;
         if (cur && av?.length) {
-          partGizmoRef.current = { handle, startPx: px, startPy: py, centerPx: toCanvas(c.x, c.y), origVerts: av.map((v) => [v[0], v[1]]), origCenter: c, before: cur };
+          partGizmoRef.current = { handle, startPx: px, startPy: py, centerPx: toCanvas(c.x, c.y), origVerts: av.map((v) => [v[0], v[1]]), origCenter: c, before: cur, baseline: skinGestureBaseline(cur) };
           frozenFitRef.current = { fitScale: fitRef.current.fitScale, centerX: fitRef.current.centerX, centerY: fitRef.current.centerY };
           (e.target as Element).setPointerCapture?.(e.pointerId);
         }
@@ -699,7 +699,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       if (picked !== active) store.setActiveSkinPart(picked);
       const verts = activePartOf(cur, picked).mesh?.verts;
       if (cur && verts?.length) {
-        movePartRef.current = { startX: x, startY: y, origVerts: verts.map((v) => [v[0], v[1]]), before: cur };
+        movePartRef.current = { startX: x, startY: y, origVerts: verts.map((v) => [v[0], v[1]]), before: cur, baseline: skinGestureBaseline(cur) };
         // Freeze the current fit so the view stays put as the part's verts move.
         frozenFitRef.current = { fitScale: fitRef.current.fitScale, centerX: fitRef.current.centerX, centerY: fitRef.current.centerY };
         (e.target as Element).setPointerCapture?.(e.pointerId);
@@ -714,7 +714,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
         ?? hitTestGizmo2D(px, py, cx, cy, wrz, 1, 1, 0, 0, 'translate', 'local', 1);
       if (h) {
         const parent = coerceBones(useEditorStore.getState().editingSkinDef?.bones)[selBone]?.parent ?? -1;
-        gizmoRef.current = { handle: h, startPx: px, startPy: py, centerPx: [cx, cy], worldRz: wrz, parentWorldRz: parent >= 0 ? worldRz(parent) : 0, before: paintMode ? null : (useEditorStore.getState().editingSkinDef ?? null) };
+        gizmoRef.current = { handle: h, startPx: px, startPy: py, centerPx: [cx, cy], worldRz: wrz, parentWorldRz: parent >= 0 ? worldRz(parent) : 0, before: paintMode ? null : (useEditorStore.getState().editingSkinDef ?? null), baseline: paintMode ? null : skinGestureBaseline(useEditorStore.getState().editingSkinDef ?? null) };
         (e.target as Element).setPointerCapture?.(e.pointerId);
         return;
       }
@@ -738,7 +738,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       const before = useEditorStore.getState().editingSkinDef;
       if (before) {
         const { centers, state } = advancePaintStroke(null, { x, y }, useEditorStore.getState().skinPaint.radius);
-        paintRef.current = { before, stroke: state };
+        paintRef.current = { before, baseline: skinGestureBaseline(before), stroke: state };
         (e.target as Element).setPointerCapture?.(e.pointerId); cursorRef.current = { x, y }; paintAt(centers, e.altKey);
       }
       return;
@@ -859,7 +859,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
         // stroke actually started, not from this first post-promotion sample.
         if (before) {
           const { centers, state } = advancePaintStroke(null, { x: pend.tx, y: pend.ty }, useEditorStore.getState().skinPaint.radius);
-          paintRef.current = { before, stroke: state };
+          paintRef.current = { before, baseline: skinGestureBaseline(before), stroke: state };
           paintAt(centers, e.altKey);
         }
       }
@@ -885,10 +885,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       const store = useEditorStore.getState();
       const path = store.editingSkinAsset?.path, after = store.editingSkinDef, before = mp.before;
       if (path && after && after !== before) {
-        // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
-        // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
-        // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
-        pushAction({ _isFileDirect: true, label: 'rig2d move part', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
+        pushAction(skinDocAction('rig2d move part', path, before, after, mp.baseline)); // asset-doc edit — see skinDocAction
       }
       return;
     }
@@ -901,10 +898,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       const path = store.editingSkinAsset?.path, after = store.editingSkinDef, before = pg.before;
       if (path && after && after !== before) {
         const label = pg.handle === 'rotate' ? 'rig2d rotate part' : 'rig2d move part';
-        // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
-        // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
-        // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
-        pushAction({ _isFileDirect: true, label, undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
+        pushAction(skinDocAction(label, path, before, after, pg.baseline)); // asset-doc edit — see skinDocAction
       }
       return;
     }
@@ -915,10 +909,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
         const store = useEditorStore.getState();
         const path = store.editingSkinAsset?.path, after = store.editingSkinDef, before = g.before;
         if (path && after && after !== before) {
-          // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
-          // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
-          // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
-          pushAction({ _isFileDirect: true, label: 'rig2d transform bone', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
+          pushAction(skinDocAction('rig2d transform bone', path, before, after, g.baseline)); // asset-doc edit — see skinDocAction
         }
       }
       return;
@@ -928,15 +919,12 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
     const pend = paintPendingRef.current;
     if (pend) { paintPendingRef.current = null; setSelBone(pend.joint); return; }
     if (paintRef.current) {
-      const before = paintRef.current.before;
+      const { before, baseline } = paintRef.current;
       paintRef.current = null;
       const store = useEditorStore.getState();
       const path = store.editingSkinAsset?.path, after = store.editingSkinDef;
       if (path && after && after !== before) {
-        // Asset-doc edit (.rig2d.json): parked in the dirty-asset registry, so it must NOT bump the
-        // scene edit-version — a falsely-dirty scene self-blocks the file-direct routes, makes
-        // modoki_build refuse, and makes Cmd+S interrupt a preview to save a scene nothing changed.
-        pushAction({ _isFileDirect: true, label: 'rig2d paint weights', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
+        pushAction(skinDocAction('rig2d paint weights', path, before, after, baseline)); // asset-doc edit — see skinDocAction
       }
     }
   }, [draw, setSelBone]);

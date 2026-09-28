@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { pushAction } from '../../undo/undoManager';
+import { assetDocAction } from '../../undo/assetDocUndo';
 import type { AnimSetClipDef } from '../../../runtime/loaders/animSetCache';
 import { NumberField } from './widgets';
 import { persistAssetEdit, useAssetViewRefresher, invalidateAnimSetFile } from './persist';
@@ -40,13 +41,13 @@ export function AnimSetAssetView({ path }: { path: string }) {
   const writeData = useCallback((updated: typeof data, label: string) => {
     const old = dataRef.current;
     if (!old || !updated) return;
-    persistAssetEdit(path, 'animset', updated, invalidateAnimSetFile);
-    pushAction({
-      _isFileDirect: true, // parked, not scene state (persistAssetEdit) — see MaterialAssetView for why
-      label,
-      undo: () => persistAssetEdit(path, 'animset', old, invalidateAnimSetFile),
-      redo: () => persistAssetEdit(path, 'animset', updated, invalidateAnimSetFile),
+    // Built BEFORE the park, and its undo/redo check the asset still holds their side (#1710) — see MaterialAssetView.
+    const action = assetDocAction({
+      label, path, type: 'animset', before: old, after: () => updated,
+      apply: (doc) => persistAssetEdit(path, 'animset', doc, invalidateAnimSetFile),
     });
+    persistAssetEdit(path, 'animset', updated, invalidateAnimSetFile);
+    pushAction(action); // _isFileDirect: parked, not scene state (persistAssetEdit)
   }, [path]);
 
   const writeClipField = useCallback((index: number, field: keyof AnimSetClipDef, value: unknown) => {

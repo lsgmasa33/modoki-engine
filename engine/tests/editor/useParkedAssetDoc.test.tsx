@@ -310,4 +310,19 @@ describe('an agent park is not ours to discard (EhE6JQkHRYttDGeGmtPK)', () => {
     expect(getDirtyAssetPaths()).toEqual([]);
     expect(result.current.dirty).toBe(false);
   });
+
+  it('discards a park of the SAVED doc itself — #1710\'s undo step parks its target before the panel sees it', () => {
+    // `assetDocUndo` parks the undo's target synchronously (an undo must not depend on this panel being open), so
+    // an undo back to the saved doc reaches this hook already parked, with `parkedRef` still naming the edit.
+    // Without the `parked === value` arm the indicator said Unsaved over a file nothing had changed.
+    const { rerender, result } = setup();
+    const loaded = { n: 1 };
+    act(() => { result.current.markSaved(loaded); });
+    rerender({ v: loaded });
+    rerender({ v: { n: 2 } });                        // edit → the panel parks it
+    markAssetDirty(PATH, 'particle', loaded, 'panel'); // the undo step parks its target itself…
+    rerender({ v: loaded });                          // …then the store change reaches the panel
+    expect(getDirtyAssetPaths()).toEqual([]);
+    expect(result.current.dirty).toBe(false);
+  });
 });

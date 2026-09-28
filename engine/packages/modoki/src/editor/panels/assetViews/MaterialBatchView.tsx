@@ -6,6 +6,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { pushAction } from '../../undo/undoManager';
+import { captureAssetDocBaseline, runAssetDocStep, type AssetDocSide } from '../../undo/assetDocUndo';
 import { listShaderOptions, optionValueForMaterial, resolveShaderSchema, type ShaderKind } from '../../shaderCatalog';
 import type { ShaderParamSchema } from '../../../runtime/loaders/shaderSchema';
 import { NumberField, ColorField, DropdownField, MixedCheckbox, DEFAULT_COLOR } from './widgets';
@@ -111,10 +112,20 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
     // read while its siblings park normally. Extracted so that guarantee is testable.
     const { prev, next } = planBatchWrite(paths, mats, mutate);
     const apply = (map: MatMap) => { for (const p of Object.keys(map)) persistAssetEdit(p, 'material', map[p], invalidateMaterialFile); };
+    // Baselines BEFORE the park (#1710, assetDocUndo.ts). Each step checks EVERY member still holds its side before
+    // moving any: one changed since refuses the whole step, so a batch edit is never half-undone.
+    const baselines = Object.fromEntries(Object.keys(prev).map((p) => [p, captureAssetDocBaseline(p, prev[p])]));
+    const sides = (from: MatMap, to: MatMap): AssetDocSide[] => Object.keys(prev).map((p) => ({
+      path: p, type: 'material', baseline: baselines[p], expected: () => from[p], target: () => to[p],
+    }));
+    const step = (from: MatMap, to: MatMap) => () => runAssetDocStep(sides(from, to), (p, doc) => {
+      setMats((m) => ({ ...m, [p]: doc as MatMap[string] }));
+      persistAssetEdit(p, 'material', doc, invalidateMaterialFile);
+    }, 'panel');
     setMats((m) => ({ ...m, ...next }));
     apply(next);
     // Asset-FILE edits, PARKED by persistAssetEdit (#831), so pending against the registry, not the scene — see MaterialAssetView.
-    pushAction({ _isFileDirect: true, label, undo: () => { setMats((m) => ({ ...m, ...prev })); apply(prev); }, redo: () => { setMats((m) => ({ ...m, ...next })); apply(next); } });
+    pushAction({ _isFileDirect: true, label, undo: step(next, prev), redo: step(prev, next) });
   }, [paths, mats]);
 
   const writeFieldAll = useCallback((field: string, value: unknown) => {

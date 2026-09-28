@@ -3014,7 +3014,9 @@ const ASSET_CACHE_INVALIDATORS: Partial<Record<SceneChangedKind, (urlPath: strin
  *  Loud, never silent — this discards pending work, so it says exactly what it dropped. */
 async function dropParkedWriteFor(urlPath: string): Promise<void> {
   try {
-    const { peekDirtyAsset, discardDirtyAssets } = await import('@modoki/engine/editor');
+    const { peekDirtyAsset, discardDirtyAssets, assetCacheMatchesFile } = await import('@modoki/engine/editor');
+    // The watcher reloads the cache from this file, so cache and file agree again even with nothing parked (#1710).
+    assetCacheMatchesFile(urlPath);
     if (!peekDirtyAsset(urlPath)) return;
     discardDirtyAssets([urlPath]);
     console.warn(

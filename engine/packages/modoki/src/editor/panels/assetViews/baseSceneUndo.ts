@@ -17,6 +17,26 @@
 
 import type { UndoAction } from '../../undo/undoManager';
 import { reportUndoFailure } from '../../undo/undoFailure';
+import { assetChangedRefusal } from '../../undo/assetDocUndo';
+import { peekBaseSceneEdit } from '../../scene/pendingBaseScene';
+
+/** The base ref `path` holds NOW, as the next save will leave it — '' for none, null when it cannot be read (#1710).
+ *  A park wins (the flush mutates it in after the scene write); else the OPEN scene's live value; else the file. The
+ *  live getters and the read are injected: `serialize.ts` imports the park registry, so this cannot import it back. */
+export async function baseSceneHeldBy(path: string, deps: {
+  currentScenePath: () => string | null;
+  liveBaseScene: () => string | undefined;
+  readScene: (path: string) => Promise<unknown>;
+}): Promise<string | null> {
+  const parked = peekBaseSceneEdit(path);
+  if (parked !== undefined) return parked ?? '';
+  if (deps.currentScenePath() === path) return deps.liveBaseScene() ?? '';
+  try {
+    const doc = await deps.readScene(path) as { baseScene?: unknown } | null;
+    if (!doc || typeof doc !== 'object') return null;
+    return typeof doc.baseScene === 'string' ? doc.baseScene : '';
+  } catch { return null; }
+}
 
 export function makeBaseSceneUndo(params: {
   /** The scene asset being edited — named in the failure message. */
@@ -40,9 +60,14 @@ export function makeBaseSceneUndo(params: {
    *  state that only a scene save persists — so the bump is exactly right, and without it Cmd+S
    *  would have nothing telling it the scene changed. */
   fileDirect: boolean;
+  /** The base ref the scene holds now (`baseSceneHeldBy`). Each step refuses unless it is the value on this step's
+   *  own side (#1710): a parked entry outlives scene switches (`parkSurvivors`), so the base can have been changed
+   *  from the open scene or saved since, and the step used to revert that change. */
+  current: () => Promise<string | null>;
 }): UndoAction {
-  const { path, old, next, write, fileDirect } = params;
+  const { path, old, next, write, fileDirect, current } = params;
   const label = next ? 'Set base scene' : 'Clear base scene';
+  const requireHeld = async (expected: string) => { if ((await current()) !== expected) throw assetChangedRefusal([path]); };
   return {
     label,
     // `write` already logs the backend error naming the path, so this is NOT a second
@@ -50,9 +75,11 @@ export function makeBaseSceneUndo(params: {
     // a message about the UNDO specifically. No toast — a rejected scene mutation is a
     // backend failure, which is not something the user can act on.
     undo: async () => {
+      await requireHeld(next);
       if (!await write(old)) reportUndoFailure({ direction: 'Undo', label, detail: `"${path}" was not reverted` });
     },
     redo: async () => {
+      await requireHeld(old);
       if (!await write(next)) reportUndoFailure({ direction: 'Redo', label, detail: `"${path}" was not updated` });
     },
     _isFileDirect: fileDirect,

@@ -4,6 +4,7 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { pushAction } from '../../undo/undoManager';
+import { assetDocAction } from '../../undo/assetDocUndo';
 import { listShaderOptions, optionValueForMaterial, materialFieldsForOption, resolveShaderSchema, type ShaderKind } from '../../shaderCatalog';
 import { mergeParamDefaults, type ShaderParam, type ShaderParamSchema } from '../../../runtime/loaders/shaderSchema';
 import { inputStyle, BufferedNumberInput } from '../fields';
@@ -99,25 +100,27 @@ export function MaterialAssetView({ path }: { path: string }) {
   const writeData = useCallback((updated: Record<string, unknown>, label: string) => {
     const old = dataRef.current;
     if (!old) return;
-    persistAssetEdit(path, 'material', updated, invalidateMaterialFile);
-    pushAction({
-      // Asset-FILE edit: it changes a `.mat.json`, never a scene entity, so there is nothing for
-      // the SCENE's edit-version to represent — the literal case this flag names. Without it,
-      // editing a material marked the scene dirty, which is a different and wrong claim.
-      // ⚠️ It no longer stops the file-direct agent routes REFUSING, though: `hasUnsavedChanges()`
-      // folds in `hasDirtyAssets()`, so a parked material edit blocks `mutate_scene`/`modoki_build`
-      // whatever this flag says. Correct in itself (the edit IS unsaved) — and the refusal now
-      // names the real cause too (#844): `unsavedChangeCauses()` reports `dirtyAssetPaths`
-      // separately from `sceneDirty`, so a parked material edit is no longer blamed on the wrong one.
-      // ⚠️ The flag is still right; its old REASON is not. It used to read "persistAssetEdit
-      // already wrote it to disk", which stopped being true in #831 — the edit is now PARKED in
-      // the dirty-asset registry, not written. So this edit is genuinely pending, just not against
-      // the scene: `hasDirtyAssets()` is what represents it, and Cmd+S is what writes it.
-      _isFileDirect: true,
-      label,
-      undo: () => persistAssetEdit(path, 'material', old, invalidateMaterialFile),
-      redo: () => persistAssetEdit(path, 'material', updated, invalidateMaterialFile),
+    // `assetDocAction` sets `_isFileDirect`. Asset-FILE edit: it changes a `.mat.json`, never a scene entity, so
+    // there is nothing for the SCENE's edit-version to represent — the literal case this flag names. Without it,
+    // editing a material marked the scene dirty, which is a different and wrong claim.
+    // ⚠️ It no longer stops the file-direct agent routes REFUSING, though: `hasUnsavedChanges()`
+    // folds in `hasDirtyAssets()`, so a parked material edit blocks `mutate_scene`/`modoki_build`
+    // whatever this flag says. Correct in itself (the edit IS unsaved) — and the refusal now
+    // names the real cause too (#844): `unsavedChangeCauses()` reports `dirtyAssetPaths`
+    // separately from `sceneDirty`, so a parked material edit is no longer blamed on the wrong one.
+    // ⚠️ The flag is still right; its old REASON is not. It used to read "persistAssetEdit
+    // already wrote it to disk", which stopped being true in #831 — the edit is now PARKED in
+    // the dirty-asset registry, not written. So this edit is genuinely pending, just not against
+    // the scene: `hasDirtyAssets()` is what represents it, and Cmd+S is what writes it.
+    //
+    // Built BEFORE the park — its baseline is the file as it holds `old` — and its undo/redo check the material still
+    // holds their side before moving it (#1710, assetDocUndo.ts).
+    const action = assetDocAction({
+      label, path, type: 'material', before: old, after: () => updated,
+      apply: (doc) => persistAssetEdit(path, 'material', doc, invalidateMaterialFile),
     });
+    persistAssetEdit(path, 'material', updated, invalidateMaterialFile);
+    pushAction(action);
   }, [path]);
 
   const writeField = useCallback((field: string, value: unknown) => {

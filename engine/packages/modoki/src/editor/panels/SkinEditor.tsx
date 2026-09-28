@@ -39,7 +39,8 @@ import { useEditorStore } from '../store/editorStore';
 import { makeRigPrefabAsset } from '../scene/skinPrefab';
 import { removeBone } from '../../runtime/skinning/rig2dEdit';
 import { activePartOf, withActivePart, partsOf, partCount, addPart, removePart, reorderPart, reorderActiveIndex, renamePart, uvToPosAffine, partAngle, bboxCenter } from './skinParts';
-import { pushAction, type UndoAction } from '../undo/undoManager';
+import { pushAction } from '../undo/undoManager';
+import { skinDocAction } from './skinDocAction';
 import { runUndoCommand } from '../undo/undoCommand';
 import { BufferedNumberInput, inputStyle } from './fields';
 import { getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
@@ -400,18 +401,7 @@ export default function SkinEditor() {
     const path = store.editingSkinAsset?.path;
     if (!before || !path) return;
     setStaleOpMsg(''); // an edit that DID apply supersedes the notice — after the guards, so a no-op commit does not
-    const a: UndoAction = {
-      label: `rig2d ${label}`,
-      // Asset-document edit: it changes a .rig2d.json file, NOT any scene entity, so it must not
-      // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
-      // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
-      // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
-      // interrupt a preview and rewrite the scene file on every save while authoring. The agent
-      // twins have set this since S2.27; the panels never did.
-      _isFileDirect: true,
-      undo: () => useEditorStore.getState().applySkinDef(path, before),
-      redo: () => useEditorStore.getState().applySkinDef(path, next),
-    };
+    const a = skinDocAction(`rig2d ${label}`, path, before, next); // an asset-doc edit, #1710 — see skinDocAction
     pushAction(a);
     store.applySkinDef(path, next);
   }, []);

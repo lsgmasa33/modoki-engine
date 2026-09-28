@@ -56,7 +56,7 @@ import {
   detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo,
   applyToPrefabWithUndo, revertOverridesWithUndo, staleInstanceRefusal, resolveInstanceContext,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey,
-  pushAction, makePrefabInstantiateAction, entityRef,
+  pushAction, makePrefabInstantiateAction, entityRef, assetDocAction,
   getEditorViewportCamera, focusEntityInSceneView, setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit,
   upsertKey, findTrack, encodeValue,
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
@@ -726,12 +726,12 @@ function refuseResourceParent(parentId: number, op: string): void {
  *  registry still held the new one — so the next `save_all` wrote to disk exactly the value the
  *  caller had just undone, and the undo silently un-did itself at save time.
  *
- *  Which way undo moves the registry depends on whether a write was ALREADY parked for this path
- *  before this edit (captured here, before the op's own `persistOrMarkDirty` runs):
- *   - already pending → the parked doc WAS `before`, so re-park `before`: state restored exactly.
- *   - not pending → disk already holds `before`, so DISCARD the parked write instead of re-parking.
- *     Re-parking would leave the asset dirty forever after an undo, and `hasUnsavedChanges()` would
- *     then block the file-direct routes over an edit that no longer exists. */
+ *  Which way undo moves the registry is `assetDocUndo`'s (#1710), the same step every panel's asset-doc entry runs: it
+ *  parks the target, or DISCARDS the park when the file already holds it — the old `wasPending` rule made exact (it
+ *  re-parked `before` whenever something had been pending at push time, whatever the file held by the time undo ran).
+ *  And before moving anything it checks the asset still holds this step's side: these entries outlive scene switches
+ *  (`parkSurvivors`), so the asset can have been edited or saved from elsewhere since, and the old step reverted that
+ *  too. A refusal throws `UndoRefusedError`, which the `undo` op reports as REFUSED_BY_OP. */
 function pushAssetUndo<T>(
   label: string, before: T | null | undefined, after: T, apply: (def: T) => void,
   path: string, type: AssetSchemaType,
@@ -744,21 +744,7 @@ function pushAssetUndo<T>(
   // never fired and we pushed an entry whose `undo()` applied `null` — restoring nothing while
   // consuming the human's Cmd-Z, which is worse than the missing entry it was meant to prevent.
   if (before == null) return;
-  const wasPending = getDirtyAssetPaths().includes(path);
-  pushAction({
-    label,
-    undo: () => {
-      apply(before);
-      if (wasPending) markAssetDirty(path, type, before);
-      else discardDirtyAssets([path]);
-    },
-    redo: () => {
-      apply(after);
-      markAssetDirty(path, type, after);
-    },
-    kind: '!asset-edit',
-    _isFileDirect: true,
-  });
+  pushAction(assetDocAction({ label, path, type, before, after: () => after, apply, origin: 'agent', kind: '!asset-edit' }));
 }
 
 /** Refuse an asset-editing op whose `path` names no asset that exists.
@@ -2696,7 +2682,8 @@ export function registerEditorAgentOps(): void {
         + `Pending now (${pending.length}): ${pending.join(', ')}. Paths match exactly (asset-root URLs, e.g. /assets/fx/a.particle.json).`,
         { options: choices });
     }
-    const r = discardDirtyAssets(p.all ? undefined : p.paths);
+    // The applied def stays LIVE (this op's documented scope), so the cache now differs from the file (#1710).
+    const r = discardDirtyAssets(p.all ? undefined : p.paths, { cacheKeepsEdit: true });
     // ⚠️ This op owns the DIRTY-ASSET registry and not the sidecar one, and `all:true` reads as if
     // it owned both. A parked `.meta.json` import-settings edit survives it untouched, so an agent
     // that discards "everything" and then re-imports still bakes against the human's unsaved
@@ -4087,7 +4074,7 @@ export function registerEditorAgentOps(): void {
    *  absent because it is not discardable at all (see the op header), and its absence from
    *  `DiscardableRegistry` is what makes that a type error rather than a runtime surprise. */
   const DISCARDERS = {
-    dirtyAsset: (paths: string[]) => discardDirtyAssets(paths),
+    dirtyAsset: (paths: string[]) => discardDirtyAssets(paths, { cacheKeepsEdit: true }),
     pendingMeta: (paths: string[]) => discardPendingMeta(paths),
     pendingBaseScene: (paths: string[]) => discardPendingBaseScenes(paths),
   } as const satisfies Record<DiscardableRegistry, (paths: string[]) => { discarded: string[] }>;

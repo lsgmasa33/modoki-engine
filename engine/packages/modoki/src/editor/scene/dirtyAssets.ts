@@ -54,7 +54,9 @@ interface DirtyAsset {
    *  them. When set, the flush sends it as `/api/asset-write`'s `ifMatch` precondition and the
    *  write is REFUSED (409) if the file changed underneath in the meantime.
    *
-   *  Only `AtlasAssetView` sets it today. It needs it (#439): that panel serializes the WHOLE
+   *  Two setters. An accepted asset-document undo/redo over the FILE sets it to the bytes it checked
+   *  (#1710, `assetDocUndo.ts`), so an outside write between the step and Cmd+S is refused, not
+   *  overwritten. And `AtlasAssetView` sets it for its own reason (#439): that panel serializes the WHOLE
    *  document, and nothing notifies it of a same-path content change — `assetsVersion` is keyed on
    *  the asset PATH SET, and `atlas` is not a `SceneChangedKind`, so neither the manifest signal
    *  nor `dropParkedWriteFor` fires for it. A `git checkout` under a live editor (CLAUDE.md's
@@ -106,6 +108,57 @@ const lastFlushed = new Map<string, unknown>();
  *  save re-baseline another's unsaved edit. */
 export function getLastFlushedAsset(path: string | undefined): unknown | null {
   return path ? lastFlushed.get(path) ?? null : null;
+}
+
+/** The sha256 the route reported for the bytes it wrote with `lastFlushed`'s doc — a pair with it, kept, moved and
+ *  cleared with it. **Not `lastFlushedHash`**, which a discard or a panel's own write forgets because a CAS panel must
+ *  not re-seed its baseline from it. This one is only ever compared against the file's CURRENT bytes (#1710's asset-doc
+ *  undo, `assetDocUndo.ts`), so a record that has gone stale can only fail that comparison — a refusal, never a write
+ *  over something newer — and forgetting it on a discard would refuse the ordinary "save, edit, undo, undo" instead. */
+const lastFlushedSha = new Map<string, string>();
+
+/** How many flush WRITES of each path have STARTED this session. A baseline read that resolves after this moved
+ *  cannot say which side of the write it read, so `captureAssetDocBaseline` drops it (#1710 close-out review): a save
+ *  racing the read would otherwise hash the SAVED bytes under the claim "the file holds `before`". Bumped before the
+ *  request goes out, so a read the write overtakes is always caught — at worst a read that finished first is dropped
+ *  too, which costs a refusal, never a false "holds". */
+const writeEpoch = new Map<string, number>();
+export function getAssetWriteEpoch(path: string): number { return writeEpoch.get(path) ?? 0; }
+
+/** The flushes writing each path right now, settled when that FLUSH ends (its bookkeeping included — the park is
+ *  dropped and `lastFlushed` recorded only after the whole loop). An asset-doc undo waits on these before reading the
+ *  file (#1710 close-out review): a step that read the pre-save bytes while the save was in flight discarded its park
+ *  as "the file holds the target", and the save then landed the other doc — editor showing one, disk holding another,
+ *  reported clean. */
+const writesInFlight = new Map<string, Set<Promise<void>>>();
+/** Every flush writing any of `paths` has ended — including one that STARTED while an earlier one was being awaited.
+ *  A SET per path, not one promise: two flushes can overlap (an agent `save_all` does not take the Cmd+S latch), and a
+ *  single slot let the first flush's settle clear it while the second's write was still in flight (#1710 review 3). */
+export async function assetWritesSettled(paths: readonly string[]): Promise<void> {
+  for (;;) {
+    const pending = paths.flatMap((p) => [...(writesInFlight.get(p) ?? [])]);
+    if (!pending.length) return;
+    await Promise.all(pending);
+  }
+}
+/** Is a flush writing `path` right now? */
+export function assetWriteInFlight(path: string): boolean { return (writesInFlight.get(path)?.size ?? 0) > 0; }
+
+/** Paths whose live cache holds a doc the file does not, with nothing parked: an agent discard drops the pending write
+ *  and deliberately KEEPS the applied def live (`discardDirtyAssets`' `cacheKeepsEdit`). While a path is here, the file
+ *  is not the doc the panel shows, so an asset-doc baseline taken now would name the file's bytes as the wrong doc
+ *  (#1710 close-out review) — `captureAssetDocBaseline` takes none. Cleared when a flush writes the path. */
+const cacheDiverged = new Set<string>();
+export function assetCacheDiverged(path: string): boolean { return cacheDiverged.has(path); }
+/** The live cache for `path` now agrees with the file again — it was reloaded from disk (the watcher), or the file was
+ *  written from it. Ends a divergence `discardDirtyAssets`' `cacheKeepsEdit` began. */
+export function assetCacheMatchesFile(path: string): void { cacheDiverged.delete(path); }
+
+/** What the last flush of `path` wrote — the doc and the route's hash of its bytes — or null if this session has never
+ *  written it or the route did not report a hash. Whether the file STILL holds it is the caller's to check. */
+export function getLastFlushedWrite(path: string): { data: unknown; sha256: string } | null {
+  const sha256 = lastFlushedSha.get(path);
+  return sha256 !== undefined && lastFlushed.has(path) ? { data: lastFlushed.get(path), sha256 } : null;
 }
 /** Why the LAST flush of each path failed, if it did. Cleared when the path is parked again,
  *  discarded, or flushed successfully.
@@ -170,6 +223,13 @@ const forgetFlushedHash = forgetFlushedAssetHash;
  *  against, so it gets the same guarantee. */
 export function remapFlushedAssetRecords(remap: (path: string) => string | null | undefined): void {
   remapOneFlushedMap(lastFlushed, remap);
+  remapOneFlushedMap(lastFlushedSha, remap);
+  // The divergence flag names a FILE too: left on the old path it would miss the moved asset (a baseline taken there
+  // names the file's bytes as the cache's doc) and wrongly bind whatever is created at the old path next.
+  const moved = new Map([...cacheDiverged].map((p) => [p, true] as const));
+  remapOneFlushedMap(moved, remap);
+  cacheDiverged.clear();
+  for (const p of moved.keys()) cacheDiverged.add(p);
   remapOneFlushedMap(lastFlushedHash, remap);
 }
 
@@ -293,6 +353,7 @@ export function peekDirtyAsset(
  *
  *  Loud, never silent, for the same reason as `dropParkedWriteFor`: this discards pending work. */
 export function assetWrittenToDisk(path: string): boolean {
+  cacheDiverged.delete(path); // the file was just written from the editor's own doc
   if (!dirty.delete(path)) return false;
   // The panel wrote the file itself, so what THIS module last flushed is no longer what is on
   // disk — see `forgetFlushedHash`.
@@ -307,7 +368,7 @@ export function assetWrittenToDisk(path: string): boolean {
 }
 
 /** Test-only: drop every pending entry without writing it. */
-export function clearDirtyAssets(): void { dirty.clear(); lastFlushed.clear(); lastFlushedHash.clear(); flushErrors.clear(); bump(); }
+export function clearDirtyAssets(): void { dirty.clear(); cacheDiverged.clear(); lastFlushed.clear(); lastFlushedSha.clear(); lastFlushedHash.clear(); flushErrors.clear(); bump(); }
 
 /** Drop pending asset writes WITHOUT writing them — the missing counterpart to `flushDirtyAssets`.
  *
@@ -330,9 +391,19 @@ export function clearDirtyAssets(): void { dirty.clear(); lastFlushed.clear(); l
  *  bare — see the `discard-asset-edits` op, which refuses a bare call and makes the caller say
  *  `all:true`. Same lesson as `set_selection`, where a bare call clearing everything is what made a
  *  misspelled argument key destructive. */
-export function discardDirtyAssets(paths?: readonly string[]): { discarded: string[]; notPending: string[] } {
+export function discardDirtyAssets(
+  paths?: readonly string[],
+  /** The caller leaves the live cache on the discarded edit (the agent `discard-asset-edits` op, by design) rather
+   *  than moving it back to the file — see `assetCacheDiverged`. A panel's own discard, an undo back to the file's
+   *  doc and a Discard & reload all leave cache and file agreeing, and do not pass it. */
+  opts?: { cacheKeepsEdit?: boolean },
+): { discarded: string[]; notPending: string[] } {
+  // Without the flag the caller says cache and file AGREE after this (an undo back to the file's doc, a Discard & reload,
+  // the watcher's reload, a panel back at its saved doc) — which ends any divergence an earlier agent discard began.
+  const diverge = (ps: readonly string[]) => { for (const p of ps) { if (opts?.cacheKeepsEdit) cacheDiverged.add(p); else cacheDiverged.delete(p); } };
   if (!paths) {
     const discarded = [...dirty.keys()];
+    diverge(discarded);
     dirty.clear();
     for (const p of discarded) { flushErrors.delete(p); forgetFlushedHash(p); }
     if (discarded.length) bump();
@@ -346,6 +417,7 @@ export function discardDirtyAssets(paths?: readonly string[]): { discarded: stri
     // as the first one.
     if (dirty.delete(p)) { discarded.push(p); flushErrors.delete(p); forgetFlushedHash(p); } else notPending.push(p);
   }
+  diverge(opts?.cacheKeepsEdit ? discarded : paths);
   if (discarded.length) bump();
   return { discarded, notPending };
 }
@@ -374,68 +446,90 @@ export async function flushDirtyAssets(): Promise<FlushResult> {
   /** path → the exact entry object we wrote, so the cleanup below can tell it apart from one that
    *  superseded it mid-flush. */
   const written = new Map<string, DirtyAsset>();
-  /** Recorded per path as the loop runs, then swapped in wholesale below — writing straight into
-   *  `flushErrors` here would clear an error for a path this flush never reached. */
-  const errorsByPath = new Map<string, { error: string; conflict: boolean }>();
-  for (const [path, entry] of dirty) {
-    const { type, data, origin, ifMatch } = entry;
-    try {
-      const res = await backendFetch('/api/asset-write', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          path, type, data,
-          ...(origin === 'panel' ? { replace: true } : {}),
-          ...(ifMatch !== undefined ? { ifMatch } : {}),
-          selfWrite: true,
-        }),
-      });
-      let body: { ok?: unknown; error?: unknown; errors?: unknown; conflict?: unknown; sha256?: unknown } | null = null;
-      try { body = await res.json(); } catch { /* non-JSON body */ }
-      const errors = Array.isArray(body?.errors) ? (body.errors as unknown[]).join('; ') : '';
-      if (!res.ok || body?.ok === false || errors) {
-        const error = errors || (typeof body?.error === 'string' ? body.error : `HTTP ${res.status}`);
+  /** path → the route's hash of what it wrote, paired with `lastFlushed` below (`lastFlushedSha`). */
+  const writtenSha = new Map<string, string>();
+  // ONE promise for this flush, entered in the in-flight set of every path it writes and settled when it ends.
+  let flushEnded!: () => void;
+  const thisFlush = new Promise<void>((r) => { flushEnded = r; });
+  const writing: Array<{ path: string; set: Set<Promise<void>> }> = [];
+  try {
+    /** Recorded per path as the loop runs, then swapped in wholesale below — writing straight into
+     *  `flushErrors` here would clear an error for a path this flush never reached. */
+    const errorsByPath = new Map<string, { error: string; conflict: boolean }>();
+    for (const [path, entry] of dirty) {
+      const { type, data, origin, ifMatch } = entry;
+      writeEpoch.set(path, getAssetWriteEpoch(path) + 1);
+      const set = writesInFlight.get(path) ?? new Set<Promise<void>>();
+      set.add(thisFlush);
+      writesInFlight.set(path, set);
+      writing.push({ path, set });
+      try {
+        const res = await backendFetch('/api/asset-write', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            path, type, data,
+            ...(origin === 'panel' ? { replace: true } : {}),
+            ...(ifMatch !== undefined ? { ifMatch } : {}),
+            selfWrite: true,
+          }),
+        });
+        let body: { ok?: unknown; error?: unknown; errors?: unknown; conflict?: unknown; sha256?: unknown } | null = null;
+        try { body = await res.json(); } catch { /* non-JSON body */ }
+        const errors = Array.isArray(body?.errors) ? (body.errors as unknown[]).join('; ') : '';
+        if (!res.ok || body?.ok === false || errors) {
+          const error = errors || (typeof body?.error === 'string' ? body.error : `HTTP ${res.status}`);
+          failed.push({ path, error });
+          errorsByPath.set(path, { error, conflict: body?.conflict === true });
+          continue;
+        }
+        saved.push(path);
+        written.set(path, entry);
+        // The server's own hash of what it wrote — see `getLastFlushedAssetHash`. Absent from an
+        // older backend's reply, in which case a CAS panel keeps its previous baseline and its next
+        // save conflicts LOUDLY rather than writing against a baseline nobody vouched for.
+        if (typeof body?.sha256 === 'string') { lastFlushedHash.set(path, body.sha256); writtenSha.set(path, body.sha256); }
+      } catch (e) {
+        const error = e instanceof Error ? e.message : String(e);
         failed.push({ path, error });
-        errorsByPath.set(path, { error, conflict: body?.conflict === true });
-        continue;
+        errorsByPath.set(path, { error, conflict: false });
       }
-      saved.push(path);
-      written.set(path, entry);
-      // The server's own hash of what it wrote — see `getLastFlushedAssetHash`. Absent from an
-      // older backend's reply, in which case a CAS panel keeps its previous baseline and its next
-      // save conflicts LOUDLY rather than writing against a baseline nobody vouched for.
-      if (typeof body?.sha256 === 'string') lastFlushedHash.set(path, body.sha256);
-    } catch (e) {
-      const error = e instanceof Error ? e.message : String(e);
-      failed.push({ path, error });
-      errorsByPath.set(path, { error, conflict: false });
     }
-  }
-  for (const [path, entry] of written) {
-    // ⚠️ Delete ONLY the entry we actually wrote. Each write above is an `await`, and an edit
-    // landing in that window REPLACES the entry — a blind `dirty.delete(path)` then drops the
-    // human's newer doc, which is on screen, is not on disk, and no longer counts as unsaved. The
-    // window is short (one HTTP round trip) and it is exactly the "keep dragging after Cmd+S" case.
-    const current = dirty.get(path);
-    if (current === entry) dirty.delete(path);
-    else if (current && current.ifMatch !== undefined) {
-      // ⚠️ …and that superseding entry's BASELINE is now stale, which is the same case one level
-      // down. It captured the hash of the file as it was BEFORE this flush; the flush then wrote
-      // our own bytes over it, so the precondition it carries can no longer match and the next
-      // save 409s under a banner claiming the file "changed on disk" — when nothing external
-      // touched it. Advance it to what the writer says it actually wrote. Only for an entry that
-      // HAS a baseline: an entry with none is deliberately unconditional and must stay so.
-      const advanced = lastFlushedHash.get(path);
-      if (advanced) dirty.set(path, { ...current, ifMatch: advanced });
+    for (const [path, entry] of written) {
+      // ⚠️ Delete ONLY the entry we actually wrote. Each write above is an `await`, and an edit
+      // landing in that window REPLACES the entry — a blind `dirty.delete(path)` then drops the
+      // human's newer doc, which is on screen, is not on disk, and no longer counts as unsaved. The
+      // window is short (one HTTP round trip) and it is exactly the "keep dragging after Cmd+S" case.
+      const current = dirty.get(path);
+      if (current === entry) dirty.delete(path);
+      else if (current && current.ifMatch !== undefined) {
+        // ⚠️ …and that superseding entry's BASELINE is now stale, which is the same case one level
+        // down. It captured the hash of the file as it was BEFORE this flush; the flush then wrote
+        // our own bytes over it, so the precondition it carries can no longer match and the next
+        // save 409s under a banner claiming the file "changed on disk" — when nothing external
+        // touched it. Advance it to what the writer says it actually wrote. Only for an entry that
+        // HAS a baseline: an entry with none is deliberately unconditional and must stay so.
+        const advanced = lastFlushedHash.get(path);
+        if (advanced) dirty.set(path, { ...current, ifMatch: advanced });
+      }
+      // Record what the FILE now holds — `entry.data`, not whatever is parked now, for the same
+      // reason. See `lastFlushed`.
+      lastFlushed.set(path, entry.data);
+      const sha = writtenSha.get(path);
+      if (sha !== undefined) lastFlushedSha.set(path, sha); else lastFlushedSha.delete(path);
+      cacheDiverged.delete(path); // the file now holds a doc the editor wrote from its own state
     }
-    // Record what the FILE now holds — `entry.data`, not whatever is parked now, for the same
-    // reason. See `lastFlushed`.
-    lastFlushed.set(path, entry.data);
+    for (const path of saved) flushErrors.delete(path);
+    for (const [path, err] of errorsByPath) flushErrors.set(path, err);
+    // Bump on a FAILURE too, not just a success: the panel that needs to show "changed on disk"
+    // learns about it through this subscription, and a flush where every entry failed used to move
+    // nothing at all.
+    if (written.size || errorsByPath.size) bump();
+    return { saved, failed };
+  } finally {
+    for (const { path, set } of writing) {
+      set.delete(thisFlush);
+      if (!set.size && writesInFlight.get(path) === set) writesInFlight.delete(path);
+    }
+    flushEnded();
   }
-  for (const path of saved) flushErrors.delete(path);
-  for (const [path, err] of errorsByPath) flushErrors.set(path, err);
-  // Bump on a FAILURE too, not just a success: the panel that needs to show "changed on disk"
-  // learns about it through this subscription, and a flush where every entry failed used to move
-  // nothing at all.
-  if (written.size || errorsByPath.size) bump();
-  return { saved, failed };
 }

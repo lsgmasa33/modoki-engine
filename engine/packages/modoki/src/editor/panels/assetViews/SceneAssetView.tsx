@@ -41,12 +41,12 @@
 
 import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from 'react';
 import { pushAction } from '../../undo/undoManager';
-import { getCurrentScenePath, setCurrentBaseScene } from '../../scene/serialize';
+import { getCurrentScenePath, setCurrentBaseScene, getCurrentBaseScene } from '../../scene/serialize';
 import {
   applyBaseSceneEdit, peekBaseSceneEdit, isBaseSceneDirty,
   subscribePendingBaseScenes, getPendingBaseScenesVersion,
 } from '../../scene/pendingBaseScene';
-import { makeBaseSceneUndo } from './baseSceneUndo';
+import { makeBaseSceneUndo, baseSceneHeldBy } from './baseSceneUndo';
 import { AssetRefField, assetDisplayName } from '../AssetRefField';
 import { isGuid, resolveGuidToPath } from '../../../runtime/loaders/assetManifest';
 import { resolveSceneChain, type FetchSceneMeta } from '../../../runtime/scene/sceneChain';
@@ -172,7 +172,13 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
     if (!await write(next)) return;
     // Builder in baseSceneUndo.ts (#308) — a framework-free factory so the undo/redo
     // closures are unit-testable without mounting this panel.
-    pushAction(makeBaseSceneUndo({ path, old, next, write, fileDirect: lastRoute.current === 'parked' }));
+    pushAction(makeBaseSceneUndo({
+      path, old, next, write, fileDirect: lastRoute.current === 'parked',
+      current: () => baseSceneHeldBy(path, {
+        currentScenePath: getCurrentScenePath, liveBaseScene: getCurrentBaseScene,
+        readScene: (p) => fetch(p, { cache: 'no-store' }).then((r) => parseAssetJson(r, p)),
+      }),
+    }));
   }, [write, path]);
 
   const handleChange = useCallback(async (v: string) => {

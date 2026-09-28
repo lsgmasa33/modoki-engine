@@ -36,6 +36,7 @@ import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fiel
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
+import { assetDocAction } from '../undo/assetDocUndo';
 import { runUndoCommand } from '../undo/undoCommand';
 import CurveEditor from './particle/CurveEditor';
 import { loadParticleEditorShowFloor, saveParticleEditorShowFloor } from './particleEditorPrefs';
@@ -453,19 +454,15 @@ export default function ParticleEditor() {
       act._after = next; // redo() reads act._after; undo() still restores the original `before`
     } else {
       const before = cur;
-      const a: ParticleAction = {
-        _after: next,
+      const a: ParticleAction = Object.assign(assetDocAction<ParticleEffectDef>({
         label: `particle ${group.split(':')[0]}`,
-        // Asset-document edit: it changes a .particle.json file, NOT any scene entity, so it must not
-        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
-        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
-        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
-        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
-        // twins have set this since S2.27; the panels never did.
-        _isFileDirect: true,
-        undo: () => useEditorStore.getState().applyParticleDef(path, before),
-        redo: () => useEditorStore.getState().applyParticleDef(path, a._after),
-      };
+        // `assetDocAction` (#1710): `_isFileDirect` — an asset-document edit, not scene state, so no scene edit-version
+        // bump (a falsely-dirty scene self-blocks the file-direct agent routes and modoki_build). Its undo/redo check the
+        // file still holds their side before moving it, park the result themselves (so an undo with this editor closed
+        // is not written back by the next save), and read `_after` at step time, after any coalescing.
+        path, type: 'particle', before, after: () => a._after,
+        apply: (d) => useEditorStore.getState().applyParticleDef(path, d),
+      }), { _after: next });
       pushAction(a);
       lastAction.current = a;
     }
