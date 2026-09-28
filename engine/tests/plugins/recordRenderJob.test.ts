@@ -14,7 +14,16 @@ vi.mock('../../plugins/backend/osOpen', async (orig) => ({
   ...(await orig<typeof import('../../plugins/backend/osOpen')>()),
   revealInOS: async (p: string) => { revealed.push(p); },
 }));
+// Every CLI this file starts, through ANY runner — the backend's own `renderJobs` too, whose spawn a
+// test cannot pass in. `afterEach` waits for each one to exit (#1735).
+const clis = vi.hoisted(() => [] as import('child_process').ChildProcess[]);
+vi.mock('child_process', async (orig) => {
+  const cp = await orig<typeof import('child_process')>();
+  const spawn = ((...args: Parameters<typeof cp.spawn>) => { const p = cp.spawn(...args); clis.push(p); return p; }) as typeof cp.spawn;
+  return { ...cp, spawn };
+});
 import fs from 'fs';
+import type { ChildProcess } from 'child_process';
 import path from 'path';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import {
@@ -25,7 +34,14 @@ import { handleBackendRequest, type BackendContext } from '../../plugins/backend
 const OPTIONS = { fps: 30, scale: 1, format: 'mp4' as const, outDir: null, keepFrames: false };
 
 /** The fake CLI. Its behaviour is chosen by the take's file name; it writes the grandchild's pid
- *  beside the take so the test can check it is gone. */
+ *  beside the take so the test can check it is gone.
+ *
+ *  `ok` outlives its `done` line, as the real CLI does (it flushes, then exits): the job ends on the
+ *  LINE, so a test that waited for `done` has not waited for the exit — which is what the teardown
+ *  must wait for (#1735). The linger is far longer than any test, so the last `ok` CLI is still
+ *  alive at teardown however the file grows, and dropping the wait fails every Windows run. The
+ *  grandchild runs outside `dir`: the test holds only its pid, which gives no `exit` event (only a
+ *  poll that races PID reuse), and a process holds its cwd on Windows until it has exited. */
 const FAKE_CLI = `
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -39,10 +55,11 @@ if (mode === 'ok') {
   process.stdout.write('not json\\n');
   out({ stage: 'done', video: take + '.mp4', reportFile: 'r.json', size: { width: 2, height: 2 }, frames: 3, fps: 30,
     renderSeconds: 1, undispatchedEvents: 0, unsettled: [], pageErrors: 0, pageErrorSample: [], replay: { status: 'matched', events: 0 } });
-  process.exit(0);
+  setTimeout(() => process.exit(0), 60000);
+  return;
 }
 if (mode === 'crash') { console.error('boom: something broke'); process.exit(3); }
-const gc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+const gc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore', cwd: require('os').tmpdir() });
 fs.writeFileSync(take + '.pid', String(gc.pid));
 out({ stage: 'frames', frame: 1, total: 3 });
 if (mode === 'deaf') {
@@ -69,7 +86,18 @@ beforeAll(() => {
   script = path.join(dir, 'fake-cli.cjs');
   fs.writeFileSync(script, FAKE_CLI);
 });
-afterEach(() => { for (const pid of leftovers.splice(0)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } } });
+/** Resolves once `p` has exited — the `exit` event, not a kill's return. */
+const exited = (p: ChildProcess) => new Promise<void>((resolve) => {
+  if (p.exitCode !== null || p.signalCode !== null) resolve();
+  else p.once('exit', () => resolve());
+});
+afterEach(async () => {
+  for (const pid of leftovers.splice(0)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+  // Every CLI runs in `dir`, and on Windows a process holds its cwd until it has EXITED — after its
+  // closing line (which is all a test waits for) and after a kill returns. So `afterAll`'s rmSync
+  // fails EPERM unless each CLI is waited out here (#1735).
+  await Promise.all(clis.splice(0).map((p) => { const done = exited(p); p.kill('SIGKILL'); return done; }));
+});
 afterAll(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
 const start = (runner: RenderJobRunner, mode: string) => runner.start({ repoRoot: dir, scriptPath: script, take: take(mode), options: OPTIONS });

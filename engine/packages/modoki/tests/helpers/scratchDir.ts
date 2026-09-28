@@ -98,7 +98,8 @@ export function removeScratchDirs(): string[] {
 /** Remove one dir; the failure line for the report, or `undefined` when it is gone. */
 function removeOne(dir: string): string | undefined {
   try {
-    // Retries cover a Windows handle a just-exited child process has not released yet.
+    // Retries cover a Windows handle held by a child that was killed but not yet awaited: a process
+    // keeps its cwd until it has exited (docs/windows.md § Tests, gates and timings, #1735).
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     return undefined;
   } catch (err) {

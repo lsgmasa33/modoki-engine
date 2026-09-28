@@ -1670,6 +1670,22 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
   condition instead:** fake timers plus `vi.runAllTimersAsync()` (drains every timer the chain
   schedules, whatever the clock), a completion promise, or `vi.waitFor`. Never raise the number.
   (A loop of N × `setTimeout(0)` is hop-counting, ordered by due time, and is not this bug.)
+- **A process holds its cwd until it has EXITED, and a kill returns before that** (#1735). So a
+  teardown that kills a child whose cwd is a scratch dir (or merely does not wait for it), then removes the dir,
+  fails `EPERM` on Windows while macOS and Linux delete it happily. Measured: SIGKILL a
+  `node` child whose cwd is a temp dir, then `rmSync` → `EPERM` 20/20; await its `exit` event first
+  → 20/20 clean. **Wait for the `exit` event** (the process has exited once it fires, and its
+  handles are closed), not for the kill to return, and not for the child's last line of output:
+  `recordRenderJob.test.ts` waited for the fake CLI's `done` LINE, which the real CLI prints just
+  before it exits. Its `afterAll` was seen failing once (09-28), but `%TEMP%` held a second
+  leftover `modoki-render-job-*` dir from 09-24, with every take file written, including the last
+  CLI test's output. That is consistent with the same teardown failing unnoticed (it would also
+  fit a run killed just before `afterAll`). A process you hold only a PID for gives you no `exit`
+  event: you can only poll `process.kill(pid, 0)`, and that races PID reuse. So don't start it
+  inside the dir. `makeScratchDir`'s file-end cleanup does retry and only warns,
+  but that's a backstop against leaks, not a substitute for the wait. Retries guess how long the
+  holder will take, and a teardown that removes the dir itself should know the holder has already
+  exited.
 - **Windows caps vitest workers at HALF `availableParallelism()`** — `perfCoreWorkers()`
   ([engine/testWorkers.ts](../engine/testWorkers.ts)) returns `{maxWorkers: ceil(n/2)}` on `win32`,
   because these boxes are SMT and vitest's `availableParallelism() - 1` counts hyperthreads as
