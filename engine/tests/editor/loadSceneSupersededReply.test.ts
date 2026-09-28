@@ -3,14 +3,19 @@
  *  When a later load wins the swap, the editor's tracked path is written by that load's own tail, so
  *  at the moment this op replies it can still hold the pre-swap value. The error text already read
  *  `sceneManager.getCurrent()` for that reason; #1553's reply briefly paired it with a `scenePath`
- *  read from the tracked path, so one reply named two different scenes. `loadScene` is stubbed to
- *  report `superseded` — the only way to reach that branch without racing two real loads. */
+ *  read from the tracked path, so one reply named two different scenes. `loadSceneReporting` is stubbed to
+ *  report `superseded` — the only way to reach that branch without racing two real loads.
+ *
+ *  And the other side (#1698): a superseded REQUEST whose world the editor ADOPTED — the later request installed
+ *  nothing — must not be told another scene won. Mutation: drop the op's `superseded && adopted` branch. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const h = vi.hoisted(() => ({ adopted: false }));
+
 vi.mock('@modoki/engine/editor', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  loadScene: vi.fn(async () => 'superseded'),
+  loadSceneReporting: vi.fn(async () => ({ outcome: 'superseded', adopted: h.adopted })),
 }));
 
 import { createTestWorld, type TestWorld, setPlayState, sceneManager } from '@modoki/engine/runtime';
@@ -23,7 +28,7 @@ registerAllTraits();
 registerEditorAgentOps();
 
 let game: TestWorld;
-beforeEach(() => { game = createTestWorld({}); setPlayState('stopped'); clearHistory(); markSceneSaved(); });
+beforeEach(() => { h.adopted = false; game = createTestWorld({}); setPlayState('stopped'); clearHistory(); markSceneSaved(); });
 afterEach(() => { vi.restoreAllMocks(); game.dispose(); });
 
 describe('superseded load-scene reply', () => {
@@ -34,5 +39,13 @@ describe('superseded load-scene reply', () => {
     const reply = await runAgentOp('load-scene', { path: '/assets/scenes/Mine.scene.json' }) as { ok: boolean; superseded?: boolean; scenePath?: string; error?: string };
     expect(reply).toMatchObject({ ok: false, superseded: true, scenePath: '/assets/scenes/Winner.scene.json' });
     expect(reply.error).toContain('"/assets/scenes/Winner.scene.json" is now the active scene');
+  });
+
+  it('a superseded request whose own scene the editor ADOPTED answers ok — it is the open scene (#1698)', async () => {
+    h.adopted = true;
+    const reply = await runAgentOp('load-scene', { path: '/assets/scenes/Mine.scene.json' }) as { ok: boolean; superseded?: boolean; error?: string; warnings?: string[] };
+    expect(reply).toMatchObject({ ok: true, superseded: true });
+    expect(reply.error).toBeUndefined();
+    expect(reply.warnings?.[0]).toContain('"/assets/scenes/Mine.scene.json" is the open scene');
   });
 });

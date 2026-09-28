@@ -594,13 +594,12 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 });
 
 // #1422: a base hot reload (`forceReloadBases`) overtaken by a newer load in its POST-swap tail.
-// The editor adopts each load's outcome after it resolves (serialize.ts `adoptReplacedWorld`, and
-// agentBridge's hot reload through `adoptWorldReloadedFromDisk`), and adopting the hot reload
-// LAST would rebind the undo stack and rebaseline over the newer load's world. That cannot
-// happen, and this pins why: the post-swap tail's only yielding await is the scene managers'
+// This pins SceneManager's order: the post-swap tail's only yielding await is the scene managers'
 // `init()`, and the overtaking load's own post-swap `disposeActiveSceneManagers` waits for those
 // same inits. So the hot reload always RESOLVES (a newer load is not a teardown, so no
-// AbortError), and resolves FIRST.
+// AbortError), and resolves FIRST. The editor used to rely on that order to adopt the hot reload
+// before the newer load; since #1698 it adopts a world only while it is current
+// (`sceneAdoption.ts`), so a hot reload resolving last would adopt nothing either way.
 describe('a base hot reload overtaken in its post-swap tail (#1422)', () => {
   it('resolves, and resolves BEFORE the load that overtook it, even though that load kept the fresh base', async () => {
     const { sceneManager } = await getSceneManager();

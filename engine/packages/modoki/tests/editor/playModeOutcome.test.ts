@@ -37,7 +37,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     loadScene: async () => {
       if (h.failLoad) throw new Error('reload failed');
-      return { keptBaseGuids: new Set<string>() };
+      return { world: (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
     },
     getNext: () => null,
     getLoadedScenes: () => new Map(),

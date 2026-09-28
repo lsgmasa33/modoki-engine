@@ -10,17 +10,17 @@
  *  swap is a stub that reports the path the editor's own `isPrefabEditWorld()` reads, and the two repair calls are
  *  recorded with the edit flag they saw. What they DO is covered where they are defined (#1483, #1493).
  *
- *  Mutations (each goes red here):
- *  - drop the owed-repair run after a landed load → every route that lands; drop it from the failure branch → the Exit
- *    superseded by a FAILING load; from the refusal branch → the one superseded by a REFUSED load.
- *  - clear the owed repair whatever world it finished in → the load that swapped in during the repair.
- *  - `settleLeaveRepair` leaves the owed repair in place → the failed Exit, then a load out, runs it twice.
- *  - run the owed repair while the world is still a prefab-edit world → the failed load out of it.
- *  - `exitPrefabEditing` repairs whatever happened (not only in place) → the landed and superseded Exits run it twice;
- *    never repairs in place → the failed Exit and the no-return-scene Exit.
- *  - drop `&& editingBefore` from the trigger → the no-return-scene Exit, then a load out, runs it twice.
- *  - drop the repair in `openPrefabForEditingSwitching` → the A → B case.
- *  - clear the flag AFTER the repair → the refresh sees the flag still naming A. */
+ *  Since #1698 the debt is the adoption owner's (`sceneAdoption.ts`): recorded by the adopt that replaces an edit world,
+ *  paid by `settleLeaveDebts` at the end of the last world switch to end. These cases are unchanged; the owner's own
+ *  cases are in sceneAdoption.test.ts.
+ *
+ *  Mutations (each goes red here, checked against the owner, 2026-09-28):
+ *  - drop `settleLeaveDebts()` from `loadScene`'s `finally` → every load route that lands, and the Exits superseded by
+ *    a load that lands, FAILS or is REFUSED.
+ *  - clear the debts whatever world the repair finished in → the load that swapped in during the repair.
+ *  - `endPrefabEditInPlace` records no debt → the failed Exit and the no-return-scene Exit.
+ *  - record no debt when the incoming world is itself an edit world → the A → B case.
+ *  - drop the adopt's flag write → the refresh sees the flag still naming A. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -56,14 +56,15 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', () => ({
       // A real swap replaces the ECS world: the repair's "completed in the world it started in" is judged by it.
       const { setCurrentWorld, getCurrentWorld } = await import('../../packages/modoki/src/runtime/core/ecs/world');
       const prev = getCurrentWorld();
-      setCurrentWorld((await import('koota')).createWorld());
+      const promoted = (await import('koota')).createWorld();
+      setCurrentWorld(promoted);
       prev?.destroy(); // koota allows 16 live worlds
       sm.path = path;
       const s = sm.swapped; sm.swapped = null; s?.();
       if (sm.slowTail) await new Promise((r) => setTimeout(r, 0));
       const f = sm.afterSwap; sm.afterSwap = null; f?.();
       await Promise.resolve();
-      return { keptBaseGuids: new Set<string>() };
+      return { world: promoted, keptBaseGuids: new Set<string>() };
     },
   },
 }));
@@ -97,6 +98,7 @@ import { loadScene, setCurrentScenePath, markSceneSaved } from '../../packages/m
 import { openAssetInEditor } from '../../packages/modoki/src/editor/panels/openAssetInEditor';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
+import { _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 
 registerAllTraits();
 
@@ -149,6 +151,7 @@ beforeEach(() => {
   setCurrentScenePath(null);
   markSceneSaved();
   useEditorStore.getState().closePrefabEditor();
+  _resetSceneAdoptionForTests(); // the owner's own record of what it adopted last (#1698), as a fresh editor starts
   sm.path = ''; sm.fail = false; sm.failPath = ''; sm.refusePath = ''; sm.afterSwap = null; sm.duringRefresh = null; sm.swapped = null; sm.slowTail = false;
   calls.length = 0;
   rebaseWorlds.length = 0;

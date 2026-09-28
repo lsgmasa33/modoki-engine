@@ -8,9 +8,10 @@
  *  including a case-variant spelling (#1273) — must stay a plain save that keeps its id. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createTestWorld, type TestWorld, setPlayState, registerAsset, getGuidForPath, resolveGuidToPath } from '@modoki/engine/runtime';
+import { createTestWorld, type TestWorld, setPlayState, registerAsset, getGuidForPath, resolveGuidToPath, getCurrentWorld } from '@modoki/engine/runtime';
 import {
   clearHistory, clearDirtyAssets, saveScene, saveAll, setCurrentScenePath, markSceneSaved, getCurrentScenePath, hasUnsavedChanges,
+  loadScene,
 } from '@modoki/engine/editor';
 import { classifyExplicitSceneSave } from '../../packages/modoki/src/editor/scene/sceneFileName';
 import { markSceneDirty, clearAllSceneDirty, isSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
@@ -156,6 +157,20 @@ describe('saveScene — Save As, the review findings (#1414 close-out)', () => {
   it('with no edit during the write, the copy IS reopened (the control for the next test)', async () => {
     await saveScene({ path: COPY_PATH, allowDialog: false });
     expect(reopenFetches().length).toBeGreaterThan(0);
+  });
+
+  // #1698: a later load REQUEST that begins during the reopen and installs nothing leaves the copy open and adopted,
+  // though the reopen's outcome reads 'superseded'. Reporting "not reopened" then named the wrong open scene.
+  // Mutation: Save As reads the outcome alone (`if (outcome === 'superseded')`).
+  it('a reopen superseded by a request that then FAILS still reopened the copy — it is the open scene', async () => {
+    vi.spyOn(sceneManager, 'loadScene').mockImplementation(async (p: string) => {
+      if (p !== COPY_PATH) throw new Error(`404 ${p}`);
+      expect(await loadScene('/assets/scenes/missing.scene.json')).toBe('failed'); // begins after the copy's
+      return { world: getCurrentWorld(), keptBaseGuids: new Set<string>() };
+    });
+    const r = await saveScene({ path: COPY_PATH, allowDialog: false });
+    expect(r.savedAs).toMatchObject({ from: OPEN_PATH, reopened: true });
+    expect(getCurrentScenePath()).toBe(COPY_PATH);
   });
 
   it('an edit landing during the copy write keeps the editor on the original — no reopen, and the note says why', async () => {

@@ -76,11 +76,12 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOri
         if (opts?.preloaded) await sm.load!(opts.preloaded);
         else sm.loadPath!(path);
         sm.path = path;
-        return { keptBaseGuids: new Set<string>() };
+        return { world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
       },
       replaceWorldContent: async (populate: (world: unknown) => void) => {
         sm.replace!(populate);
         sm.path = null;
+        return (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld();
       },
     },
   };

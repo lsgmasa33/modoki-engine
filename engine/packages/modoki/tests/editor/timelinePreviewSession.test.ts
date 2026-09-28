@@ -45,7 +45,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
       if (h.loadGate) await h.loadGate;
       const gate = h.loadGates.shift();
       if (gate) await gate;
-      return { keptBaseGuids: new Set<string>() };
+      return { world: (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
     },
     getNext: () => null,
     getLoadedScenes: () => new Map(),

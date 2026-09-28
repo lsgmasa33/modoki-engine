@@ -985,7 +985,7 @@ describe('a manager that fails to start does not un-load a loaded scene (#1425)'
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const populate = vi.fn();
-      await expect(sceneManager.replaceWorldContent(populate)).resolves.toBeUndefined();
+      expect(await sceneManager.replaceWorldContent(populate)).toBe((await import('../../src/runtime/core/ecs/world')).getCurrentWorld());
       expect(populate).toHaveBeenCalledOnce();
       expect(errSpy.mock.calls.some((c) => String(c[0]).includes('manager "anyScene" failed to start:'))).toBe(true);
     } finally {

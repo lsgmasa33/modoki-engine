@@ -21,7 +21,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 let currentPath: string | null = null;
-const loadScene = vi.fn(async (path: string, _opts?: unknown) => { currentPath = path; });
+const loadScene = vi.fn(async (path: string, _opts?: unknown) => {
+  currentPath = path;
+  return { world: (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
+});
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     getCurrent: () => (currentPath === null ? null : { path: currentPath }),

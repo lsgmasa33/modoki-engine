@@ -24,6 +24,7 @@ let stallLoad = false;
 const loadScene = vi.fn(async (path: string, _opts?: unknown) => {
   currentPath = path;
   if (stallLoad) await new Promise<void>((resolve) => { resolveLoad = resolve; });
+  return { world: (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
 });
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {

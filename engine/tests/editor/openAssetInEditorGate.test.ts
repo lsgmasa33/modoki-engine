@@ -5,9 +5,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const gate = vi.fn<(action: string, scope: string) => Promise<boolean>>();
-const loadScene = vi.fn(async () => 'loaded');
+// The opener loads through `loadSceneReporting` (#1698), which also says whether its scene is the open one.
+const loadScene = vi.fn(async (_path: string) => ({ outcome: 'loaded', adopted: true }));
 vi.mock('../../packages/modoki/src/editor/scene/unsavedGate', () => ({ confirmDiscardUnsaved: gate }));
-vi.mock('../../packages/modoki/src/editor/scene/serialize', () => ({ loadScene }));
+vi.mock('../../packages/modoki/src/editor/scene/serialize', () => ({ loadSceneReporting: loadScene }));
 const openPrefabForEditing = vi.fn(async (_a: unknown, _o?: { confirmDiscard?: (action: string) => Promise<boolean> }) => {});
 vi.mock('../../packages/modoki/src/editor/scene/prefabEdit', () => ({ openPrefabForEditing }));
 

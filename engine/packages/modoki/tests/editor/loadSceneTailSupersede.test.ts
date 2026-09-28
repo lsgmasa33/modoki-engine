@@ -19,6 +19,8 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 interface LoadCall {
   path: string;
   opts: { onProgress?: (loaded: number, total: number) => void; gameId?: string | null };
+  /** Promote this load's own world, as SceneManager's swap does (a resolve swaps first if this did not run). */
+  swap: () => void;
   resolve: () => void;
   reject: (e: unknown) => void;
 }
@@ -27,13 +29,17 @@ const h = vi.hoisted(() => ({
   loadCalls: [] as LoadCall[],
   swapHistoryCalls: [] as string[],
   emitCalls: [] as Array<{ event: string; payload: unknown }>,
+  /** Mints a world and makes it current — a real swap, which the adoption owner judges by (#1698). */
+  promote: null as null | (() => unknown),
 }));
 
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     loadScene: (path: string, opts: LoadCall['opts']) =>
-      new Promise<{ keptBaseGuids: Set<string> }>((resolve, reject) => {
-        h.loadCalls.push({ path, opts, resolve: () => resolve({ keptBaseGuids: new Set() }), reject });
+      new Promise<{ world: unknown; keptBaseGuids: Set<string> }>((resolve, reject) => {
+        let world: unknown = null;
+        const swap = () => { world ??= h.promote!(); };
+        h.loadCalls.push({ path, opts, swap, resolve: () => { swap(); resolve({ world, keptBaseGuids: new Set() }); }, reject });
       }),
     getCurrentBaseScene: () => undefined,
     // `loadScene` asks whether the outgoing world is a prefab-edit world (#1666): none is.
@@ -57,6 +63,12 @@ vi.mock('../../src/editor/editorJournal', () => ({
 }));
 
 import { loadScene, getCurrentScenePath } from '../../src/editor/scene/serialize';
+import { createWorld, type World } from 'koota';
+import { getCurrentWorld, setCurrentWorld } from '../../src/runtime/core/ecs/world';
+
+const home = getCurrentWorld();
+const minted: World[] = [];
+h.promote = () => { const w = createWorld(); minted.push(w); setCurrentWorld(w); return w; };
 
 // serialize.ts persists the last-scene path to localStorage on a successful load; this
 // package's jsdom env doesn't provide one (see newScene.test.ts / loadSceneEpochGuard.test.ts).
@@ -73,6 +85,8 @@ if (typeof globalThis.localStorage === 'undefined') {
 }
 
 afterEach(() => {
+  setCurrentWorld(home);
+  for (const w of minted.splice(0)) w.destroy(); // koota allows 16 live worlds
   h.loadCalls.length = 0;
   h.swapHistoryCalls.length = 0;
   h.emitCalls.length = 0;
@@ -89,6 +103,8 @@ describe('loadScene: a load superseded in the WINNER\'S TAIL (#495)', () => {
     expect(h.loadCalls).toHaveLength(2);
     const [call1, call2] = h.loadCalls;
 
+    // The loser swapped FIRST and is in its post-swap tail; the winner's swap replaces its world.
+    call1.swap();
     // The winner's own SceneManager.loadScene resolves; the winner runs its full success path.
     call2.resolve();
     await expect(p2).resolves.toBe('loaded');

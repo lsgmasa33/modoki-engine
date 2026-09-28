@@ -24,7 +24,8 @@ import { getCurrentWorld, spawnEntity } from '../runtime/core/ecs/world';
 import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
 import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
-import { setCurrentScenePath, getCurrentScenePath, setScenePersistenceProject, lastSceneKey, beginBootSceneWalk, type SceneLoadOutcome } from './scene/serialize';
+import { getCurrentScenePath, setScenePersistenceProject, lastSceneKey, beginBootSceneWalk, type SceneLoadOutcome } from './scene/serialize';
+import { withAdoption } from './scene/sceneAdoption';
 import { sceneManager } from '../runtime/scene/SceneManager';
 import { registerSelectionRestore } from './store/selectionRestore';
 import { registerEditorRefLiveness } from './store/editorRefLiveness';
@@ -280,11 +281,13 @@ export async function loadFirstScene(
   // fail after it (#1598 close-out reviews). So settle first, then decide:
   // - a FOREIGN scene won (`settle` answers overtaken) → report it; the caller yields to it.
   // - the editor ADOPTED `p` → it is loaded. A foreign open of the same scene the walk was loading lands here, and
-  //   answering null would run `initWorld` into it and name the last candidate. Asks the editor's path, not
-  //   `getCurrent()`: a load superseded in its post-swap tail leaves `p` current in SceneManager but never adopted
-  //   (no scene path, no history swap), and calling that "loaded" boots an untitled world showing `p`.
-  // - otherwise the superseding switch installed nothing → retry `p` ONCE, then move on to the next candidate.
-  //   Stopping here ran the fallback, naming a candidate that was never tried, although this one would have loaded.
+  //   answering null would run `initWorld` into it and name the last candidate. So does the walk's own load when it
+  //   was superseded by a request that then installed nothing: its world stayed on screen, so it adopted it and still
+  //   reported 'superseded' (#1698 — the outcome is request-scoped, the adopt follows the world).
+  // - otherwise `p` was never INSTALLED: the switch that superseded it before its swap installed nothing either →
+  //   retry `p` ONCE, then move on to the next candidate. Stopping here ran the fallback, naming a candidate that was
+  //   never tried, although this one would have loaded. (Before #1698 this also retried a `p` that WAS installed but
+  //   never adopted — the #1688 gap, which the adoption owner closed.)
   const attempt = async (p: string): Promise<string | null | undefined> => {
     for (let retried = false; ; retried = true) {
       const outcome = await tryLoad(p);
@@ -848,20 +851,26 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     }
     const scenePath = candidates[candidates.length - 1] ?? null;
 
-    // Try initWorld (game-provided setup)
-    if (options.config.initWorld) {
-      options.config.initWorld();
-      if (scenePath) setCurrentScenePath(scenePath);
-      return;
-    }
+    // Nothing loaded: the fallback populates the world already on screen, in place, and adopts it through the one owner
+    // (#1698) — the path it names is the last candidate's, as before. No await runs between the populate and the adopt,
+    // so no other switch can land in between.
+    await withAdoption('boot-fallback', async (adoption) => {
+      // Try initWorld (game-provided setup)
+      if (options.config.initWorld) {
+        options.config.initWorld();
+        adoption.offer({ world: getCurrentWorld(), ...(scenePath ? { path: scenePath } : {}) });
+        return;
+      }
 
-    // Empty scene: just a camera
-    spawnEntity(getCurrentWorld(),
-      Transform({ x: 0, y: 5, z: 10 }),
-      Camera({ fov: 60 }),
-      EntityAttributes({ name: 'Camera', sortOrder: 0 }),
-    );
-    console.log('[Editor] Created empty scene with default camera');
+      // Empty scene: just a camera
+      spawnEntity(getCurrentWorld(),
+        Transform({ x: 0, y: 5, z: 10 }),
+        Camera({ fov: 60 }),
+        EntityAttributes({ name: 'Camera', sortOrder: 0 }),
+      );
+      adoption.offer({ world: getCurrentWorld() });
+      console.log('[Editor] Created empty scene with default camera');
+    });
   })().finally(bootWalk.release);
 
   // Lazy-import EditorApp. sceneReady no longer depends on it mounting (that dependency was

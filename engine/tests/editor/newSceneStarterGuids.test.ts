@@ -16,9 +16,9 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async () => {
   return {
     sceneManager: {
       getCurrent: () => null,
-      loadScene: async () => ({ keptBaseGuids: new Set<string>() }),
+      loadScene: async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }),
       getLoadedScenes: () => new Map(),
-      replaceWorldContent: async (populate: (w: unknown) => void) => { populate(getCurrentWorld()); },
+      replaceWorldContent: async (populate: (w: unknown) => void) => { populate(getCurrentWorld()); return getCurrentWorld(); },
     },
   };
 });

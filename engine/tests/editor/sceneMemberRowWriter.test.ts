@@ -126,7 +126,10 @@ const entryOf = async (): Promise<SceneEntityEntry> => {
 const addChild = (parent: string, name: string) =>
   createEntityWithUndo('Create', one(parent).id, [{ name: 'EntityAttributes', data: { name, parentId: one(parent).id } }], () => {});
 
-beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans(); });
+// The hot reload's adopt persists the scene path (#1698 close-out review: a reload over an edit world must name it).
+// Per test: some describes below unstub every global after they run.
+const localStorageStub = { setItem: () => {}, getItem: () => null, removeItem: () => {} };
+beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans(); vi.stubGlobal('localStorage', localStorageStub); });
 afterAll(() => { getCurrentWorld()?.destroy(); });
 
 describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
@@ -590,7 +593,7 @@ describe('a live frame built from another version of its template (#1483)', () =
     await load(scene(P));
     writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
     install(renumbered());
-    await adoptWorldReloadedFromDisk('/scenes/level.json', new Set());
+    await adoptWorldReloadedFromDisk('/scenes/level.json', async () => ({ world: getCurrentWorld(), keptBaseGuids: new Set<string>() }));
     expect(framesBuiltFromOtherRows(one('R').id)).toEqual([]);
     expect([tf('A')?.x, tf('B')?.x, tf('C')?.x]).toEqual([5, 0, 0]);
   });
@@ -828,7 +831,7 @@ describe('a carried instance whose NESTED frame was built from another version o
     await edited();
     install(valued([4, 2, 3]));                              // an external write renumbered P; O did not change
     expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([P]);
-    await adoptWorldReloadedFromDisk('/scenes/level.json', new Set());
+    await adoptWorldReloadedFromDisk('/scenes/level.json', async () => ({ world: getCurrentWorld(), keptBaseGuids: new Set<string>() }));
     expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([]);
     expect([count('A'), count('B'), count('C')]).toEqual([1, 1, 0]);
     expect([tf('A')?.x, tf('B')?.x]).toEqual([5, 2]);
@@ -839,7 +842,7 @@ describe('a carried instance whose NESTED frame was built from another version o
     // nodeGuid of the member now holding C's old number (A), so the reload deleted A and brought C back.
     await edited();
     install(valued([4, 2, 3]));
-    await adoptWorldReloadedFromDisk('/scenes/level.json', new Set());
+    await adoptWorldReloadedFromDisk('/scenes/level.json', async () => ({ world: getCurrentWorld(), keptBaseGuids: new Set<string>() }));
     const entry = await entryOf();
     await load(scene(O, entry as never));
     expect([count('A'), count('B'), count('C')]).toEqual([1, 1, 0]);
@@ -860,7 +863,7 @@ describe('a carried instance whose NESTED frame was built from another version o
     await edited();
     install(valued([4, 2, 3]));
     expect(staleInstanceRefusal(one('OR').id)).toMatch(/different version/);
-    await adoptWorldReloadedFromDisk('/scenes/level.json', new Set());
+    await adoptWorldReloadedFromDisk('/scenes/level.json', async () => ({ world: getCurrentWorld(), keptBaseGuids: new Set<string>() }));
     expect(staleInstanceRefusal(one('OR').id)).toBeNull();
     writeTraitFieldWithUndo(one('Slot').id, meta('Transform'), 'x', 3);
     const result = await applyToPrefabSelective(one('OR').id, new Set([`${gSlot}.Transform.x`]));

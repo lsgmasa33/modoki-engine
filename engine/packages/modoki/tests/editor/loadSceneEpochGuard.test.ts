@@ -28,13 +28,15 @@ interface LoadCall {
 
 const h = vi.hoisted(() => ({
   loadCalls: [] as LoadCall[],
+  /** The world on screen — what each stubbed load reports as promoted: this file swaps no world. */
+  currentWorld: null as null | (() => unknown),
 }));
 
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     loadScene: (path: string, opts: LoadCall['opts']) =>
       new Promise<{ keptBaseGuids: Set<string> }>((resolve, reject) => {
-        h.loadCalls.push({ path, opts, resolve: () => resolve({ keptBaseGuids: new Set() }), reject });
+        h.loadCalls.push({ path, opts, resolve: () => resolve({ world: h.currentWorld!(), keptBaseGuids: new Set() } as never), reject });
       }),
     getCurrentBaseScene: () => undefined,
     // `loadScene` asks whether the outgoing world is a prefab-edit world (#1666): none is.
@@ -44,6 +46,8 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 
 import { loadScene } from '../../src/editor/scene/serialize';
 import { useEditorStore } from '../../src/editor/store/editorStore';
+import { getCurrentWorld } from '../../src/runtime/core/ecs/world';
+h.currentWorld = getCurrentWorld;
 
 // serialize.ts persists the last-scene path to localStorage on a successful load; this
 // package's jsdom env doesn't provide one (see newScene.test.ts), so back it with a tiny

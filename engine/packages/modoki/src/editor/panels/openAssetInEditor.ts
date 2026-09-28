@@ -76,9 +76,11 @@ export async function openAssetInEditor(asset: SelectedAsset): Promise<void> {
       // Assets double-click and the Inspector's Open Scene button — come through here.
       const { confirmDiscardUnsaved } = await import('../scene/unsavedGate');
       if (!(await confirmDiscardUnsaved(`open scene ${name}`, 'world-swap'))) return;
-      const { loadScene } = await import('../scene/serialize');
-      const outcome = await loadScene(path);
-      if (outcome === 'loaded') console.log(`[openAssetInEditor] Opened scene: ${path}`);
+      const { loadSceneReporting } = await import('../scene/serialize');
+      const { outcome, adopted } = await loadSceneReporting(path);
+      // `adopted`, not the outcome: a later request that installed nothing leaves this scene open under a
+      // 'superseded' outcome (#1698).
+      if (outcome === 'loaded' || adopted) console.log(`[openAssetInEditor] Opened scene: ${path}`);
       // 'superseded' is not a failure to the user — another load (an agent op, a rapid
       // second click) already won the swap, so this open simply did nothing.
       else if (outcome === 'superseded') console.log(`[openAssetInEditor] Scene open for ${path} was superseded by another load.`);

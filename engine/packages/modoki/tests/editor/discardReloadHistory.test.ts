@@ -21,8 +21,9 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     // Which bases the load KEPT (#1417): SceneManager's own answer, pinned against the real
     // SceneManager in sceneManagerBaseSceneChain.test.ts's A7 cases.
-    loadScene: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); return { keptBaseGuids: h.kept, startupErrors: h.startupErrors }; },
-    replaceWorldContent: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); },
+    // The world is not swapped: the one on screen is what each call resolves as promoted.
+    loadScene: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); return { world: (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: h.kept, startupErrors: h.startupErrors }; },
+    replaceWorldContent: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); return (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(); },
     getCurrentBaseScene: () => undefined,
     getCurrent: () => null, // not a prefab-edit world, so Create Scene is allowed
   },

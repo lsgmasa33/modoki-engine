@@ -20,6 +20,8 @@ import { markSceneDirty, isSceneDirty, clearAllSceneDirty } from '../../packages
 type Handler = (data: unknown) => void;
 type Win = typeof window & { __modokiElectron?: { bridge?: unknown } };
 
+// The hot reload's adopt persists the scene path (#1698 close-out review: a reload over an edit world must name it).
+vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
 const SCENE_PATH = '/games/g/runtime/assets/Main.scene.json';
 
 const { initAgentBridge, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, replaySuppressedSceneReloads } =
@@ -51,7 +53,7 @@ beforeEach(() => {
   const getCurrent = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: SCENE_PATH } as never);
   const getLoaded = vi.spyOn(sceneManager, 'getLoadedScenes')
     .mockReturnValue(new Map([['main', { path: SCENE_PATH, role: 'primary', guid: 'main' }]]) as never);
-  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
+  loadScene = vi.spyOn(sceneManager, 'loadScene').mockImplementation(async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }));
   const fetchStub = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
     new Response(JSON.stringify({ version: 7, entities: [] }), { status: 200, headers: { 'content-type': 'application/json' } }));
   restores.push(() => { getCurrent.mockRestore(); getLoaded.mockRestore(); loadScene.mockRestore(); fetchStub.mockRestore(); });
@@ -93,7 +95,7 @@ describe('a hot reload over a dirty world drops its undo history (#1409)', () =>
   // edits outlive a primary/prefab reload (A7 case, sceneManagerBaseSceneChain.test.ts), and it
   // now REPORTS which bases it kept.
   const BASE = 'bbbbbbbb-0000-4000-8000-00000000ba5e';
-  const keeping = (...guids: string[]) => loadScene.mockResolvedValueOnce({ keptBaseGuids: new Set(guids) });
+  const keeping = (...guids: string[]) => loadScene.mockImplementationOnce(async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set(guids) }));
 
   it('a KEPT dirty base keeps its flag: its edit survived the reload, so saveAll must still write it', async () => {
     edit('Move base Camera');
@@ -104,7 +106,7 @@ describe('a hot reload over a dirty world drops its undo history (#1409)', () =>
     expect(isSceneDirty(BASE)).toBe(true);
     expect(hasUnsavedChanges()).toBe(true);
     // The edit version is one global counter, so it cannot tell this base edit from a primary one:
-    // the stack drops (the edit stays saveable, not undoable). See adoptReplacedWorld.
+    // the stack drops (the edit stays saveable, not undoable). See the S8 rule in sceneAdoption.ts.
     expect(canUndo()).toBe(false);
   });
 

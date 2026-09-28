@@ -1840,32 +1840,72 @@ above reaches only an entry not yet migrated, of which the committed corpus now 
 
 A scene load takes a while, and a second one can start before the first ends. This section is the
 model the code implements for that race. It was recovered from the code by the #1689 design study
-(2026-09-28). The incident notes further down are tagged with the invariant each one illustrates,
-as **[S1]** to **[S11]**.
+(2026-09-28), and #1698 built the one owner that study found missing. The incident notes further
+down are tagged with the invariant each one illustrates, as **[S1]** to **[S11]**.
 
 There are **two layers, and each has its own idea of who won**:
 - **The world** belongs to `SceneManager`. The winner is the load whose swap committed last.
   `primaryId` names it, and `getCurrentWorld()` is the world itself.
-- **The editor's scene state** is adopted after the swap by whichever editor route asked for the
-  load. That state is the current scene path (also persisted as the last-scene key), the current
-  base scene, the active undo-history key, the dirty baseline, the prefab-edit flag and the
-  `!scene-load` journal entry. `serialize.loadScene` decides who adopts by **request order**
-  (`loadEpoch`): the newest call wins, whether or not its world ever arrives.
+- **The editor's scene state** is adopted after the swap. That state is the current scene path
+  (also persisted as the last-scene key), the current base scene, the active undo-history key, the
+  dirty baseline, the prefab-edit flag and the `!scene-load` journal entry. **One function writes
+  it: the adoption owner, `editor/scene/sceneAdoption.ts`** (#1698). A route offers the world
+  `SceneManager` PROMOTED for it, and the owner adopts it **iff that world is still the one on
+  screen**. So both layers now judge by the world, and they agree.
 
-The two agree whenever the newest request swaps. The one open defect on this mechanism (#1688) is
-the case where it does not.
+Before #1698, `serialize.loadScene` decided who adopts by REQUEST order (`loadEpoch`, #495): the
+newest call won whether or not its world ever arrived, so a newer request that then failed silenced
+the load whose world was on screen (#1688). That signal survives only for what is about a request
+(S11).
+
+### The owner (`sceneAdoption.ts`)
+
+- **`withAdoption(route, body)`** runs one route's world switch as a pending adoption. It registers
+  the route, reads the outgoing world's dirt (tagged with the current baseline, S8), and hands the
+  body a ticket. Its `finally` drops the entry, so a route that throws, even synchronously, cannot
+  strand one. A route registers only around its own world call, never across a prefab write of its
+  own, because #1692's writes wait on the pending set.
+- **`ticket.offer(record)`** adopts `record.world` iff it is current, synchronously, writing only the
+  fields the route owns (a route's record leaves the rest alone). It returns false, and writes
+  nothing, for a world that was replaced.
+- **`withRestore(body)` / `ticket.restored(world)`**: a Stop, a preview exit, or an undo restore
+  under the SAME key. It writes nothing; the restored world becomes the adopted one, so an older
+  pending route whose world it replaced adopts nothing (hub decision: **the restore is the
+  adopter**).
+- **`lastAdopted`**: the world adopted last, and the prefab-edit session if it was an edit world.
+  Leave debts are derived from it, not from the edit flag (S7).
+- **`settleLeaveDebts()`**: runs every owed leave repair, unless a world switch is still coming
+  (another route pending, or a `serialize.loadScene` that has not yet reached its `finally`,
+  waiting included). The last switch to END pays, whatever its outcome. A scene load settles FIRST
+  in its `finally`, while it still counts as in flight and holds its world switch, so Play and an
+  undo step stay refused for the repair (close-out review). A load in its `finally` no longer
+  counts as coming, so two loads ending together cannot each wait for the other.
+- **`endPrefabEditInPlace(since)`**: Exit's flag write. It ends the session only if no adoption
+  happened since Exit began (`adoptionCount()`).
+- **For #1692** (prefab writes serialized against world switches): `pendingAdoptions()`,
+  `adoptionsSettled(): Promise<void> | null`, and `isWorldAdopted()`. `adoptionsSettled` is null
+  when no route is pending, no leave repair is running or queued to re-run, and no owed repair
+  waits on a scene load past its wait. A debt alone does not count: one whose repair threw stays
+  owed until the next switch ends, and counting it would hang every writer. Nor does a load still
+  WAITING for the undo step in flight: a writer inside that step would wait for the load that waits
+  for it. So a writer may await it from inside an undo step, and no route holds a pending entry
+  across its own prefab write.
+
+`serialize.ts` owns the state these writes land in and imports the owner, so it BINDS its writers
+into it (`bindEditorSceneState`) instead of the owner importing it back. There is no cycle.
 
 ### The routes that replace the world
 
-| Route | Enters via | Supersession signal | Writes editor scene state |
-|---|---|---|---|
-| Scene open (Assets, Inspector, agent `load-scene`, Exit, boot walk) | `serialize.loadScene` | `loadEpoch` (request order), plus `prepareWorldSwitch` and a replacement token | yes: path, base, `adoptReplacedWorld`, journal, owed leave repair |
-| Scene hot reload (external write) | `agentBridge`'s scene reload → `adoptWorldReloadedFromDisk` | none on the adopt. Defers while a replacement token is held | yes: `adoptReplacedWorld` |
-| Prefab edit-open | `openPrefabForEditing` → `loadPrefabEditWorld` | none after the swap (the world-switch registry only) | yes: its own path, history and baseline writes |
-| Prefab undo restore | `applyPrefabUndo`'s `restoreSnapshot` | world and key identity, checked **before** its load | scene-file branch only: path, base, `saveScene`. The untitled and prefab-edit branches write none |
-| Stop / preview exit | `restoreAuthoredSnapshot` | `_restoring` count, and the timeline preview's own restore count (`isPreviewRestoreInFlight`) | no (same path) |
-| Create Scene | `newScene` → `SceneManager.replaceWorldContent` | a lock (`_newSceneInFlight`). A teardown, to `SceneManager` | yes: path written **before** the await, history and baseline after |
-| Runtime boot, `NavigationManager`, runtime `load-scene` op | `sceneManager.loadScene` directly | the swap itself (`onWorldSwap`, `getCurrent()`) | none (no editor) |
+| Route | Enters via | Adopts through the owner |
+|---|---|---|
+| Scene open (Assets, Inspector, agent `load-scene`, Exit, boot walk) | `serialize.loadScene` | path + key, base, history + baseline, flag, journal |
+| Scene hot reload (external write) | `agentBridge` hands the reload to `adoptWorldReloadedFromDisk` | path + key, base, history + baseline, flag (it can replace an adopted edit world, whose path is null). Defers while a replacement token is held |
+| Prefab edit-open | `openPrefabForEditing` → `loadPrefabEditWorld` | path (null), base (none), history + baseline, flag (the session) |
+| Prefab undo restore | `applyPrefabUndo`'s `restoreSnapshot` | scene-file branch: path + base. The untitled and prefab-edit branches are restores |
+| Stop / preview exit | `restoreAuthoredSnapshot` | a restore: nothing |
+| Create Scene | `newScene` → `SceneManager.replaceWorldContent` | history + baseline only. The path is written **before** the await (#887) |
+| Boot fallback (`initWorld`, empty camera) | `createEditor`'s walk tail | path (the last candidate) |
+| Runtime boot, `NavigationManager`, runtime `load-scene` op | `sceneManager.loadScene` directly | none (no editor) |
 
 ### States of one load
 
@@ -1873,9 +1913,9 @@ the case where it does not.
    replacement token (`beginWorldReplacement`) are held.
 2. **Waiting.** An undo step in flight, or a preview envelope, is being taken down (`ready()`). If it
    is superseded here, it answers `'superseded'` without ever calling `SceneManager`.
-3. **Preloading.** It is `SceneManager`'s `nextLoad`: fetch, chain, acquire, spawn into the staging
-   world. A newer load or a teardown aborts it (AbortError). It installs nothing and releases what
-   it acquired.
+3. **Preloading.** The load is now a pending adoption. It is `SceneManager`'s `nextLoad`: fetch,
+   chain, acquire, spawn into the staging world. A newer load or a teardown aborts it (AbortError).
+   It installs nothing and releases what it acquired.
 4. **Swapped.** `loadedScenes`, `primaryId` and `currentBaseScene` are rebuilt, `nextLoad` is
    cleared, and the forced bases are marked applied. Then `setCurrentWorld` runs. **The world on
    screen is now this load's, but the editor's scene state still describes the OUTGOING world.**
@@ -1883,32 +1923,34 @@ the case where it does not.
    destroy, and re-activates managers only if it is still primary. A newer load now runs
    **concurrently**, because there is nothing left to abort. A teardown latches
    `postSwapSuperseded`.
-6. **Resolved.** `SceneManager` returns `{ keptBaseGuids, startupErrors? }`. If a teardown won in
-   the tail, it throws an AbortError instead.
-7. **Adopted.** The editor writes its scene state (the `loadScene` tail).
-8. **Ended.** `finally` runs: the counters, the token, and the progress modal (newest request only).
+6. **Resolved.** `SceneManager` returns `{ world, keptBaseGuids, startupErrors? }`, where `world`
+   is the world it promoted. If a teardown won in the tail, it throws an AbortError instead.
+7. **Offered.** The owner adopts `world` iff it is still current. That happens even when a newer
+   request has begun, as long as that request has not replaced the world.
+8. **Ended.** `finally` runs: the counters, the token, the progress modal (newest request only),
+   and `settleLeaveDebts()`.
 
-Terminal outcomes:
+Terminal outcomes. The outcome is request-scoped (S11): a newer request that began before the call
+ENDED makes it `'superseded'`, even when its world was adopted.
 - `'superseded'` at state 2 or 3: nothing was installed.
-- `'superseded'` at state 6: **a world WAS installed**, and the adopt was skipped.
-- `'superseded'` after the adopt: the check after `await runOwedLeaveRepair()`. The world was
-  installed AND adopted; only the journal entry and the startup-error report are skipped.
+- `'superseded'` at state 7: a world WAS installed. It was adopted iff it was still current, and an
+  adopted one still reports its managers that failed to start (#1425).
+  `loadSceneReporting` says which (`adopted`): **`'superseded'` alone does not mean "the world on
+  screen is not mine"**. The agent `load-scene` reply, Save As's reopen and `openAssetInEditor` read
+  `adopted`; the boot walk asks the adopted path, and Exit asks `adoptionCount`.
 - `'failed'` or `'refused'` before the swap: nothing was installed.
-- `'failed'` after the adopt: a throw from the success path's `runOwedLeaveRepair` (not the quiet
-  variant the failure branches use). The world was installed and adopted. Whether the repair can
-  throw there was not checked.
 
 ### Who may supersede whom
 
-Rows are the OLDER operation, and columns are what overtakes it. The cells describe what the code does. The
-notes below the table say which races production can actually reach.
+Rows are the OLDER operation, and columns are what overtakes it. The cells describe what the code
+does. The notes below the table say which races production can actually reach.
 
 | The older one is | A newer editor load | A newer prefab edit-open | A newer teardown (`unloadAll`, `replaceWorldContent`) |
 |---|---|---|---|
 | an editor load, Requested / Waiting | the older one returns `'superseded'` at the check after `ready()`, and never calls `SceneManager` | the older one is not told. Whichever reaches `SceneManager` second aborts the other's preload | the older one's `SceneManager` call rejects at entry |
-| an editor load, Preloading | aborts it. The newer load owes the adopt. If the newer one installs nothing, the world is still the outgoing one and still matches the editor | aborts it. The edit-open adopts through its own writes | aborts it |
-| an editor load, Swapped / Tail | **runs concurrently.** The older load skips re-activation once the newer one swaps (S4), and skips the adopt once the newer one BEGINS (S6). If the newer one then installs nothing, nobody adopts the older one's world (**#1688**) | runs concurrently. The older load's epoch is still live, so it adopts even when the edit world is already on screen. The edit-open resolves later (S6's ordering argument) and writes over it | the older load finishes its tail's release work, then rejects (S3) |
-| a hot reload, Swapped / Tail | runs concurrently. The hot reload adopts first, by S6's ordering argument, which `sceneManagerBaseSceneChain.test.ts` § #1422 pins | runs concurrently. The same ordering argument, not pinned | as for an editor load |
+| an editor load, Preloading | aborts it. The newer load owes the adopt. If the newer one installs nothing, the world is still the outgoing one and still matches the editor | aborts it. The edit-open adopts its own world | aborts it |
+| an editor load, Swapped / Tail | **runs concurrently.** The older load skips re-activation once the newer one swaps (S4). At its offer it adopts iff its world is still current: not if the newer one has swapped, and yes if the newer one installed nothing (#1688) | runs concurrently. Whichever world is on screen when each offers decides: the loser's offer is dropped | the older load finishes its tail's release work, then rejects (S3) |
+| a hot reload, Swapped / Tail | runs concurrently, by the same rule. No ordering argument is needed | the same | as for an editor load |
 
 Reachable today:
 - **A hot reload never overtakes an editor load.** `loadScene` holds a replacement token from
@@ -1919,10 +1961,14 @@ Reachable today:
   step in flight. An editor load requested during that wait resumes after `replaceWorldContent`
   has raised `teardownInFlight`, rejects at entry and returns `'superseded'`. `newScene` does not
   refuse during a hot reload's tail either. Both outcomes are benign.
+- **An edit-open still has its own REQUEST-order gap** (not absorbed by #1698): it can wait on a
+  human `confirmDiscard` and then call `SceneManager` after a newer load did, superseding the winner
+  with the loser. World identity cannot catch that (the edit world IS current after its own swap);
+  it needs the request-order check `loadScene` has after `ready()`. Filed as #1700.
 
 ### Invariants
 
-Each invariant names the one function that owns it today, or the sites that each re-derive it.
+Each invariant names the one function that owns it.
 
 - **S1. One world, one swap point.** The world on screen belongs to the latest committed swap, and
   `primaryId` names it. Only three entry points mutate it: `SceneManager.loadScene` (its atomic
@@ -1943,53 +1989,39 @@ Each invariant names the one function that owns it today, or the sites that each
   The residual is deliberate: a game-scoped manager keeps a world that is no longer current.
 - **S5. Editor adoption follows the world.** Once world switches settle, the editor's scene state
   describes the world on screen. It was written by the route that installed that world, from that
-  route's own record (path, kept bases, dirt before the swap). **Owner: none.** It is re-derived at
-  five sites:
-  - `serialize.loadScene`'s tail;
-  - `adoptWorldReloadedFromDisk`;
-  - `openPrefabForEditing`;
-  - `applyPrefabUndo`'s `restoreSnapshot`;
-  - `newScene`.
-
-  Outside those five:
-  - the boot walk's tail in `createEditor.tsx` writes the path itself: the `initWorld` fallback
-    names the last candidate, and the persisted last-scene key is written or restored directly;
-  - the boot walk's `attempt` works around the gap by retrying a candidate whose world
-    `SceneManager` installed but the editor never adopted;
-  - the prefab-edit flag is also cleared by `isEditingPrefab`'s self-heal on any swap, by
-    `runOwedLeaveRepair`, and by `exitPrefabEditing` after its load (`closePrefabEditor`, plus
-    `settleLeaveRepair` when it judges the session ended in place). So the flag cannot say which
-    world was last adopted, and an edit-open landing in an Exit load's tail can have its flag
-    cleared by that Exit (#1690).
-
-  Only the first two of the five sites share a rule (`adoptReplacedWorld`).
-- **S6. A superseded operation writes no editor scene state.** **Owner:** `loadEpoch` / `stillLive`,
-  in `serialize.loadScene` only. There, "superseded" means that a newer REQUEST began, not that a
-  newer world arrived. The other routes rely on an **ordering argument** instead: every
-  overtaking load's `disposeActiveSceneManagers` waits for the inits that the overtaken tail is
-  awaiting, so the overtaken route adopts first. A test pins that argument only for the hot reload
-  (`sceneManagerBaseSceneChain.test.ts` § #1422). `openPrefabForEditing` relies on it without a
-  test. `restoreSnapshot` relies on S9 instead. `newScene` refuses a second call rather than
-  superseding it (#887).
-  ⚠️ **S5 and S6 conflict when supersession is measured by request order.** S6 makes the older
-  load skip its adopt. If the newer request then installs nothing, S5 has no writer: that is
-  #1688. Two sites have already met this conflict and moved off request order:
-  - the boot walk's `BootSceneWalk.overtaken` asks the world, not the epoch (#1593 close-out);
-  - `NavigationManager` records history from `onWorldSwap`, not from its continuation (#808).
-- **S7. A debt that is true whoever wins survives supersession.** The next load that commits (or
-  ends) pays it. **Owners:** two hand-rolled records with the same shape:
+  route's own record. **Owner:** `sceneAdoption.ts`'s `offer`, for every editor route in the table
+  above. The prefab-edit flag is written by it too, and by `endPrefabEditInPlace` for an Exit in
+  place. Two self-heals still clear a stale flag in a non-edit world (`isEditingPrefab`, the Scene
+  view); they cannot clear a live session's flag.
+- **S6. A superseded operation writes no editor scene state.** "Superseded" means **its world was
+  replaced**, not that a newer request began. **Owner:** the owner's world check, `record.world
+  === getCurrentWorld()`, against the world `SceneManager` returned (`SceneLoadResult.world`,
+  `replaceWorldContent`'s result), never `getCurrentWorld()` read after the await, which names the
+  newer world. This retired #495's request-order guard and the ordering arguments the other routes
+  relied on (the hot reload's #1422 note, `disposeActiveSceneManagers`' "load-bearing for the
+  editor" comment). `newScene` still refuses a second call rather than superseding it (#887),
+  because its path is written before its await.
+- **S7. A debt that is true whoever wins survives supersession.** The next switch that ends pays
+  it. **Owners:**
   - `SceneManager`'s `pendingForcedBases`: a changed base file. Only a committed swap clears it
-    (#1422).
-  - `serialize`'s `owedLeaveRepair`: leaving a prefab-edit world (#1666). It is recorded when a
-    load starts from an edit world. It is run at the end of a load that adopted, or that failed
-    or was refused, but not by one that returned `'superseded'`. A repair clears it only if it
-    completed in the world it started in, and `settleLeaveRepair` clears it outright. ⚠️ It is
-    ONE slot, so a second debt recorded while the first is still owed replaces it (#1690).
+    (#1422). Left as it is (hub decision).
+  - The owner's leave debts: leaving a prefab-edit world (#1666). An adopt RECORDS one when the
+    world it replaces was an edit world whose session is still open, whatever the new world is
+    (another edit world included). Kept as a **set** (#1690: one slot let a second debt replace the
+    first). `settleLeaveDebts` pays them at the end of the last switch to end, **whatever its
+    outcome**. Running earlier, the older load's repair would be cut in half by the newer swap and
+    run twice. A repair clears the debts it ran only if the world did not change under it, and a
+    repair that throws is reported and stays owed.
 - **S8. The adopt decides discarded work against the OUTGOING world.** The dirt is read on both
   sides of the swap's await. The undo stack drops iff work was discarded, and only a kept base
-  keeps its dirty flag. **Owner:** `adoptReplacedWorld`, for the scene open and the hot reload.
-  It is re-derived in `openPrefabForEditing` and in `newScene`
-  (`discardOutgoing: dirtyBeforeSwap || worldHasUnsavedEdits()`) (#1409, #1417).
+  keeps its dirty flag. **Owner:** the owner's `history` write, one rule for every route (#1409,
+  #1417). The pre-swap read counts only while the baseline it was read against is still the current
+  one — the same number of adopts AND the same saved edit version: a newer route's read that
+  predates an older route's adopt describes a world that adopt already settled, and used anyway it
+  dropped the older scene's CLEAN parked stack (#1689 review). ⚠️ A SAVE between the read and the
+  adopt does NOT make the read stale, deliberately: dirt cleared mid-load still counts as discarded
+  (#1409, `discardReloadHistory.test.ts` "cleared mid-load"). The #1698 close-out review proposed
+  tagging saves too, and that reverses this ruling, so it was not taken.
 - **S9. No world switch lands inside an undo step.** **Owner:** `beginWorldSwitch`
   (`prepareWorldSwitch` for the editor routes, #1579). A closure that must replace the world from
   inside an undo step calls `SceneManager` directly.
@@ -1997,23 +2029,22 @@ Each invariant names the one function that owns it today, or the sites that each
   world, and checks again after its own awaits.** **Owners, one per operation:**
   - the hot reload: `sceneReloadSuppressedReason` over the `authoringSettle` replacement token
     (#1164);
-  - the boot walk: `settle` / `overtaken` over `worldSwitchesSettled` (#1593, #1598);
+  - the boot walk: `settle` / `overtaken` over `worldSwitchesSettled` (#1593, #1598). Its retry of
+    a candidate that was installed but never adopted is retired by S6 (the load adopts it itself);
+    the retry of a candidate that was never INSTALLED stays;
   - Play: `aSceneSwapIsHappening`.
 
   "Is the world being replaced?" is answered by at least nine separate records, each with a
   comment on why the others do not fit: `_loadsInFlight`, `_loadsSwapping`, `_worldSwitches`,
   `_replacing`, `_restoring`, the timeline preview's `_restoresInFlight`, `_bootWalk`,
-  `sceneManager.getNext()` and `SceneManager`'s private `teardownInFlight`.
+  `sceneManager.getNext()` and `SceneManager`'s private `teardownInFlight`. The owner's pending
+  set is a tenth, for a different question: "is a world installed but not yet adopted?".
 - **S11. Output about a REQUEST belongs to that request, and the progress modal belongs to the
   newest one.** A call's outcome describes its own request: a superseded request is never
   reported as `'failed'` (#486, #495). Only the newest epoch drives the modal and `onProgress`.
-  **Owner:** `loadEpoch`, and this is the use it is right for. `_lastLoadFailureMessage` is
-  last-writer-wins and documented as "read immediately after".
-
-**Where the gap is.** S1 to S4 are owned inside `SceneManager`, and each of their bugs was fixed at
-that owner. S5 has no owner, and S6 is owned with the wrong signal. The #1689 study's verdict,
-its classification of the bug history, and a proposed owner are in #1689's closing comment. #1688
-waits on that decision.
+  **Owner:** `loadEpoch`, which keeps two jobs: this, and the check after `ready()` that stops an
+  older request from calling `SceneManager` after a newer one did (#1548). `_lastLoadFailureMessage`
+  is last-writer-wins and documented as "read immediately after".
 
 ## SceneManager API
 
@@ -2248,10 +2279,10 @@ exists. When the swap DISCARDED world work, the outgoing stack is **dropped** in
 
 **But not every base reloads from disk** (#1417). `SceneManager.loadScene` KEEPS a base whose guid
 is unchanged across the swap and snapshots its entities from the live world, so a kept base's
-unsaved edits SURVIVE the load. `loadScene` resolves to `{ keptBaseGuids }` so the editor can tell
-the two apart; nothing in the world records it. A base in `forceReloadBases` is never kept. The
-editor's `loadScene` tail and the hot reload share ONE adopt rule, `adoptReplacedWorld` in
-`serialize.ts`:
+unsaved edits SURVIVE the load. `loadScene` resolves to `{ world, keptBaseGuids }` so the editor can
+tell the two apart; nothing in the world records it. A base in `forceReloadBases` is never kept.
+Every editor route shares ONE adopt rule, the adoption owner's history write (`sceneAdoption.ts`,
+§ Load supersession S8):
 - **Only a kept base keeps its dirty flag** (`clearSceneDirtyExcept`). Before #1417 every load
   cleared all flags, so `saveAll`, which writes a base only if it is dirty, skipped the surviving
   edit, and the unsaved-work guard stopped asking. The edit stayed on screen, flagged clean.
@@ -2303,19 +2334,17 @@ Where it applies:
     re-queued the change, so the external write was lost and a later save wrote the stale base over
     it (reproduced in review). Now the base is not kept, so the editor's adopt treats its edits as
     discarded: disk wins, as it does for any hot reload (#1164).
-  - **[S6] After the swap** the hot reload is not rejected: a newer load is not a teardown, so it resolves
-    and adopts. Its adopt has no supersede guard and needs none, because it always runs FIRST. The
-    tail's only yielding await is the scene managers' `init()`, and every overtaking load's own
-    `disposeActiveSceneManagers` waits for those same inits. The newer load then keeps the freshly
-    reloaded base, whose flag is already cleared. If the newer load adopted first, the late
-    hot-reload adopt would rebind the undo stack to a scene that is not open and rebaseline the
-    winner's world. If the dispose's wait ever goes, this adopt needs the `stillLive` guard the
-    editor's `loadScene` has.
+  - **[S6] After the swap** the hot reload is not rejected: a newer load is not a teardown, so it
+    resolves. It adopts only while its world is still current (`sceneAdoption.ts`, #1698). In
+    practice it resolves FIRST, because the tail's only yielding await is the scene managers'
+    `init()` and every overtaking load's own `disposeActiveSceneManagers` waits for those same inits,
+    so it adopts and the newer load then keeps the freshly reloaded base, whose flag is already
+    cleared. Before #1698 that ORDER was what kept a late hot-reload adopt from rebinding the undo
+    stack over the winner's world; the world check now does, whichever resolves last.
   Both halves are pinned in `sceneManagerBaseSceneChain.test.ts` § #1422. ⚠️ A token-holding editor
   load (a scene open, a Play restore) cannot be overtaken BY a hot reload, because the reload defers
   while the token is held (#1164). Prefab-edit entry and the prefab-undo restore take no token, so
-  a hot reload can overtake them. The ordering above still holds, since every load goes through
-  `disposeActiveSceneManagers`.
+  a hot reload can overtake them; the world check covers those too.
 - **Asset-document edits survive the drop.** `_isFileDirect` entries (material, clip, particle,
   skin, timeline…) target a file the swap does not touch, so `parkSurvivors` keeps them, in order.
 - **`newScene` starts its key empty** (`freshIncoming`), apart from those asset entries, because a

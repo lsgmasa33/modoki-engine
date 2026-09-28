@@ -15,7 +15,7 @@ const h = vi.hoisted(() => ({ duringLoad: null as null | (() => void) }));
 vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     getCurrent: () => null,
-    loadScene: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); return { keptBaseGuids: new Set<string>() }; },
+    loadScene: async () => { const f = h.duringLoad; h.duringLoad = null; f?.(); return { world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }; },
     getLoadedScenes: () => new Map(),
   },
 }));

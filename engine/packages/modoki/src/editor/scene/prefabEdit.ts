@@ -12,11 +12,11 @@ import type { PrefabFile } from './prefab';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { serializePrefab, warnInertPrefabSizes, writePrefabFileReport, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
 import { runtimeExcludedMessage } from './authoringScope';
-import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, settleLeaveRepair, type SerializedEntity } from './serialize';
-import { swapHistory, getEditVersion } from '../undo/undoManager';
-import { sceneManager } from '../../runtime/scene/SceneManager';
+import { collectResourceRefs, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
+import { getEditVersion } from '../undo/undoManager';
+import { sceneManager, type SceneLoadResult } from '../../runtime/scene/SceneManager';
+import { withAdoption, adoptionCount, endPrefabEditInPlace } from './sceneAdoption';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
-import { clearAllSceneDirty } from './sceneDirty';
 import type { SceneData, SceneEntityEntry, AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
@@ -470,41 +470,44 @@ async function openPrefabForEditingSwitching(
     useEditorStore.getState().prefabReturnScenePath ?? null,
   );
   const sceneData = buildPrefabEditScene(prefab);
-  // Opening a prefab from INSIDE another's edit world leaves that one as a scene load would, and owes the same repair
-  // (#1666). Read before the swap and before the flag is re-pointed at this prefab.
-  const editingBefore = useEditorStore.getState().editingPrefab;
-  const leftPrefabEdit = isPrefabEditWorld() && editingBefore ? { prefab: editingBefore } : null;
-  // Still dirty after the save above (an untitled scene, or a save that failed) → that work is
-  // discarded by this swap, and so is its undo stack (#1409). Read on both sides of the await.
-  const dirtyBeforeSwap = worldHasUnsavedEdits();
-  try {
-    await loadPrefabEditWorld(guid, prefab, sceneData);
-  } catch (e) {
-    console.error('[PrefabEdit] failed to load edit scene:', e);
-    return;
-  }
-  setCurrentScenePath(null); // normal scene-save must not target a real file
-  setCurrentBaseScene(undefined); // the prefab-edit scene never carries a baseScene
-  // Swap to this prefab-edit context's OWN undo stack (keyed by the synthetic
-  // prefab-edit path). The main scene's stack is saved and restored when
-  // exitPrefabEdit reloads the return scene (via the serialize.loadScene wrapper).
-  swapHistory(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { discardOutgoing: dirtyBeforeSwap || worldHasUnsavedEdits() });
-  // The prefab world IS its file — a clean baseline, like a load (#1409 review). Without it a dirty
-  // flag from an untitled scene rode into the prefab world, and leaving it then dropped a valid stack.
-  markSceneSaved();
-  clearAllSceneDirty();
-  useEditorStore.getState().openPrefabEditor({ path: asset.path, guid, name: prefab.name }, returnScene);
-  // After the flag names THIS prefab: the refresh skips the one it names. Re-opening the same prefab refreshes nothing
-  // — it was just fetched above.
-  if (leftPrefabEdit) await settleLeaveRepair(leftPrefabEdit.prefab?.path ?? null);
-  console.log(`[PrefabEdit] editing "${prefab.name}"`);
+  // One pending adoption around the swap (#1698). The owner reads the dirt still here after the save above (an untitled
+  // scene, or a save that failed) — that work is discarded by this swap, and so is its undo stack (#1409) — and it
+  // records the repair owed for leaving an edit world this one replaces (#1666): opening a prefab from INSIDE another's
+  // edit world leaves that one as a scene load would.
+  await withAdoption('prefab-edit-open', async (adoption) => {
+    let loaded: SceneLoadResult;
+    try {
+      loaded = await loadPrefabEditWorld(guid, prefab, sceneData);
+    } catch (e) {
+      console.error('[PrefabEdit] failed to load edit scene:', e);
+      return;
+    }
+    // Adopted only while this edit world is still the one on screen: a switch that replaced it during the swap's tail
+    // adopts its own world, and entering this session over it would name a prefab that is not loaded. The path is
+    // null so a scene save cannot target a real file; the edit world never carries a base; its undo stack is its OWN,
+    // keyed by the synthetic path (the scene's is parked and restored when Exit reloads it through `loadScene`); and
+    // the world IS its file — a clean baseline, like a load (#1409 review): without it a dirty flag from an untitled
+    // scene rode into the prefab world, and leaving it then dropped a valid stack. The flag goes up before the owed
+    // repair runs, since the refresh skips the prefab it names — re-opening the same prefab refreshes nothing, it was
+    // just fetched above.
+    if (!adoption.offer({
+      world: loaded.world, path: null, baseScene: 'none',
+      history: { key: `${PREFAB_EDIT_SCENE_PREFIX}${guid}`, keptBaseGuids: loaded.keptBaseGuids },
+      prefabEdit: { prefab: { path: asset.path, guid, name: prefab.name }, returnScene },
+    })) {
+      console.warn(`[PrefabEdit] "${prefab.name}" was not entered: another scene replaced its edit world while it loaded`);
+      return;
+    }
+    console.log(`[PrefabEdit] editing "${prefab.name}"`);
+  });
 }
 
 /** Build the prefab-edit world for `prefab` (the document of the prefab `guid`) in place of the live world — the
  *  world half of `openPrefabForEditing`, which owns entering the session (history, dirty baseline, the store). */
-export async function loadPrefabEditWorld(guid: string, prefab: PrefabFile, sceneData: SceneData = buildPrefabEditScene(prefab)): Promise<void> {
-  await sceneManager.loadScene(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { preloaded: sceneData });
+export async function loadPrefabEditWorld(guid: string, prefab: PrefabFile, sceneData: SceneData = buildPrefabEditScene(prefab)): Promise<SceneLoadResult> {
+  const loaded = await sceneManager.loadScene(`${PREFAB_EDIT_SCENE_PREFIX}${guid}`, { preloaded: sceneData });
   applyEditWorldMoves(prefab);
+  return loaded;
 }
 
 /** Locate the live ECS id of the prefab root in the edit world (by sentinel guid). */
@@ -685,7 +688,7 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
  *  back to (the store flag is cleared either way, so the editor is never left
  *  stuck in a prefab-edit mode with no prefab world). */
 export async function exitPrefabEditing(): Promise<string | null> {
-  const { prefabReturnScenePath, closePrefabEditor } = useEditorStore.getState();
+  const { prefabReturnScenePath } = useEditorStore.getState();
   // #478: was the UNSCOPED `modoki-last-scene` key — global across every project sharing this
   // origin, so a boot with no scene loaded still held the PREVIOUS project's path and this would
   // try to load it (a cross-project path that resolves to nothing). Read the same per-project key
@@ -699,15 +702,14 @@ export async function exitPrefabEditing(): Promise<string | null> {
   // candidate carries it, so the fallback can never reintroduce the same dead end.
   const target = [prefabReturnScenePath, stored]
     .find((p): p is string => !!p && !p.startsWith(PREFAB_EDIT_SCENE_PREFIX)) ?? null;
-  const edited = useEditorStore.getState().editingPrefab;
+  const since = adoptionCount();
   if (target) await loadScene(target);
-  // A load that swapped out of this world ran the leaving repair itself, or handed it to the load that superseded it
-  // (`runOwedLeaveRepair`, #1666). Still in it — no return scene, or the load failed before its swap — the session
-  // ends in place, and the repair is this function's. Judged by the world, not the outcome: a load superseded by one
-  // that then failed reads 'superseded' either way.
-  const inPlace = isPrefabEditWorld();
-  closePrefabEditor();
-  if (inPlace) await settleLeaveRepair(edited?.path ?? null);
+  // The flag is the adoption owner's to write (#1690, Exit variant). A world adopted since Exit began — the scene its
+  // load landed, or an edit world another route opened in that load's tail — already owns it: the first cleared it and
+  // recorded this prefab's repair, and the second must keep its own session. With no adoption since — no return scene,
+  // or a load that installed nothing — the session ends here, in place, and owes its repair here. Judged by adoption,
+  // not by the outcome: a load superseded by one that then failed reads 'superseded' and still adopted.
+  await endPrefabEditInPlace(since);
   return target;
 }
 

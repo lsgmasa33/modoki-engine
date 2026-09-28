@@ -33,6 +33,9 @@ vi.mock('../../packages/modoki/src/editor/scene/serialize', async (importOrigina
   setCurrentScenePath: () => {},
   setCurrentBaseScene: () => {},
 }));
+// The restore's path write goes through the adoption owner (#1698), which writes through `serialize.ts`'s own setter —
+// not the mocked export above — and that persists the path.
+vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
 vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefab')>();
   return {
@@ -160,7 +163,7 @@ beforeEach(async () => {
   await load(sceneWith());
   const slot = slotOf(ROOT);
   getCurrentWorld().spawn(eaMeta().trait({ name: 'Mine', parentId: slot, guid: ADDED }), getTraitByName('Transform')!.trait());
-  vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+  vi.spyOn(sceneManager, 'loadScene').mockImplementation(async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }) as never);
   vi.spyOn(sceneManager, 'getCurrentBaseScene').mockReturnValue(null as never);
 });
 afterAll(() => { for (const id of [INNER, KIT]) setPrefabCache(id, null); getCurrentWorld()?.destroy(); vi.restoreAllMocks(); });

@@ -37,6 +37,7 @@ import { conditionError, surfaceError, waitForCondition, clampWaitTimeout, type 
 import {
   hasDocKey,
   sceneManager,
+  type SceneLoadResult,
   getAllEntities,
   rawNow,
   getAllTraits,
@@ -701,11 +702,12 @@ export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>
   _prefabSourceRefresher = fn;
 }
 
-/** Editor-only: told when a hot reload has REPLACED the current world from disk (#1409), and which
- *  bases it kept (#1417), so the editor can drop discarded work's undo entries and rebaseline —
- *  `adoptWorldReloadedFromDisk`.
- *  Installed the way the suppressor is; unset in the game runtime, which has no undo. */
-type WorldReloadedFromDisk = (scenePath: string, keptBaseGuids: ReadonlySet<string>) => void | Promise<void>;
+/** Editor-only: runs a hot reload that REPLACES the current world from disk, and adopts it — drops discarded work's undo
+ *  entries (#1409), keeps the bases the reload kept dirty (#1417), rebaselines: `adoptWorldReloadedFromDisk`. It is
+ *  handed the RELOAD, not its result, so the editor holds the whole world switch as one pending adoption (#1698) and
+ *  adopts only the world that reload promoted. It rejects with the reload's own rejection.
+ *  Installed the way the suppressor is; unset in the game runtime, which has no undo — the reload then just runs. */
+type WorldReloadedFromDisk = (scenePath: string, reload: () => Promise<SceneLoadResult>) => Promise<void>;
 let _worldReloadedFromDisk: WorldReloadedFromDisk | null = null;
 
 /** Editor-only: install the after-reload hook. Called from `agentEditorOps.ts`. */
@@ -3201,11 +3203,12 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
     if (lateReason) { defer(lateReason); return; }
     evictRuntimePrefabs();
     // The kept bases carried their unsaved edits across, so the editor keeps their dirty flags (#1417).
-    const { keptBaseGuids } = await sceneManager.loadScene(current, {
+    const reload = () => sceneManager.loadScene(current, {
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
     });
-    await _worldReloadedFromDisk?.(current, keptBaseGuids);
+    if (_worldReloadedFromDisk) await _worldReloadedFromDisk(current, reload);
+    else await reload();
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
     // A newer load superseding this one aborts the in-flight load

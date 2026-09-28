@@ -37,7 +37,7 @@ let currentScene: { path: string } | null = null;
 vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     getCurrent: () => currentScene,
-    loadScene: async () => ({ keptBaseGuids: new Set<string>() }),
+    loadScene: async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }),
     getLoadedScenes: () => new Map(),
   },
 }));

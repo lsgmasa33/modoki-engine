@@ -7,7 +7,7 @@ import { collectTransientSubtreeIds } from './authoringScope';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
-import { spawnEntity, findEntityByGuid, getCurrentWorld } from '../../runtime/core/ecs/world';
+import { spawnEntity, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
@@ -24,9 +24,9 @@ import { useEditorStore } from '../store/editorStore';
 import { setPlayState } from '../../runtime/core/playState';
 import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
-import { swapHistory, forgetHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
+import { forgetHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances, refreshPrefabSourceForPath } from './prefab';
+import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefab';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
@@ -34,7 +34,7 @@ import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
-import { clearAllSceneDirty, clearSceneDirty, clearSceneDirtyExcept, dirtySceneGuidsSnapshot, hasDirtyScenes, hasDirtySceneOutside, isSceneDirty } from './sceneDirty';
+import { clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
@@ -42,6 +42,9 @@ import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult 
 import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes } from './pendingBaseScene';
 import { hasPendingMeta, getPendingMetaPaths, flushPendingMeta, type MetaFlushResult } from './pendingMeta';
 import { createSupersessionToken } from '../../runtime/core/liveness';
+import { withAdoption, settleLeaveDebts, bindEditorSceneState, adoptedWorld } from './sceneAdoption';
+import type { World } from 'koota';
+import type { SceneLoadResult } from '../../runtime/scene/SceneManager';
 
 // ── Types ───────────────────────────────────────────────
 
@@ -848,110 +851,32 @@ export function worldHasUnsavedEdits(): boolean {
   return CAUSE_SPECS.sceneDirty.has() || CAUSE_SPECS.dirtyScenes.has();
 }
 
-/** The world-shaped unsaved work, read BEFORE a world replacement's await (#1409): the outgoing
- *  world stays live and editable while the new one loads, so the adopt step reads it again after
- *  and takes the union. */
-export interface WorldDirt {
-  readonly edited: boolean;
-  readonly scenes: ReadonlySet<string>;
-}
-
-export function readWorldDirt(): WorldDirt {
-  return { edited: CAUSE_SPECS.sceneDirty.has(), scenes: dirtySceneGuidsSnapshot() };
-}
-
-/** Adopt a world that `SceneManager.loadScene` just built: the ONE rule for `loadScene`'s tail and
- *  a hot reload, so the two cannot drift (#1409, #1417).
- *
- *  - **The undo stack drops iff work was DISCARDED.** That is a world edit since the last save, or
- *    a dirty base the swap did not keep. A kept base's edits survive the swap live, so they are not
- *    discarded work. ⚠️ The edit version is ONE global counter, and a base edit bumps it too, so
- *    it cannot tell a primary edit from a base edit. In the common case a kept base edit still
- *    drops the stack: the edit stays on screen and flagged dirty (saveable), but not undoable,
- *    which is the lesser loss next to a stack replaying discarded primary work (#1409). The stack
- *    survives only when the counter is clean, e.g. after a Save All that wrote the primary and
- *    failed on the base.
- *  - **Only a kept base keeps its dirty flag** (#1417). Clearing it made `saveAll` skip the base
- *    and the unsaved-work guard stop asking, which lost the surviving edit silently.
- *  - The reloaded world is the new clean baseline (`markSceneSaved`). */
-function adoptReplacedWorld(scenePath: string, keptBaseGuids: ReadonlySet<string>, before?: WorldDirt): void {
-  const discarded = CAUSE_SPECS.sceneDirty.has() || hasDirtySceneOutside(keptBaseGuids)
-    || (before !== undefined && (before.edited || [...before.scenes].some((g) => !keptBaseGuids.has(g))));
-  swapHistory(scenePath, { discardOutgoing: discarded });
-  markSceneSaved();
-  clearSceneDirtyExcept(keptBaseGuids);
-}
-
 /** The editor's half of a scene HOT-RELOAD: an external write to the open scene or a prefab it
- *  uses, where disk wins over unsaved edits (owner, 2026-09-13, #1164). The runtime replaced the
- *  world from disk without going through `loadScene`, so it owes `loadScene`'s rules, which
- *  `adoptReplacedWorld` holds. Before #1409, `unsavedChanges` stayed true after the reload over a
- *  world that matched disk, and the stack still offered to undo a reparent the file never had.
+ *  uses, where disk wins over unsaved edits (owner, 2026-09-13, #1164). The runtime replaces the
+ *  world from disk without going through `loadScene`, so it owes `loadScene`'s adopt, and goes through
+ *  the same owner (`sceneAdoption.ts`, #1698): the S8 history and baseline rule, adopted only while the
+ *  reloaded world is still the one on screen. Before #1409, `unsavedChanges` stayed true after the reload
+ *  over a world that matched disk, and the stack still offered to undo a reparent the file never had.
  *  A changed BASE reloads through `forceReloadBases`, so it is not in `keptBaseGuids` and its
- *  edits are discarded with its flag. Installed via `setWorldReloadedFromDiskHook`.
+ *  edits are discarded with its flag. Installed via `setWorldReloadedFromDiskHook`, which hands over the
+ *  RELOAD itself, so the whole world switch is one pending adoption (#1692 reads that).
  *
  *  A kept base (and any `Persistent` root) is CARRIED flat, so when the reload was a PREFAB change its
  *  instances are still the old document's expansion while the editor's copy is already the new one — rebuilt
  *  here from the document each was expanded from (#1483), or every capture would match its members with
- *  another member's rows. */
-export async function adoptWorldReloadedFromDisk(scenePath: string, keptBaseGuids: ReadonlySet<string>): Promise<void> {
-  adoptReplacedWorld(scenePath, keptBaseGuids);
-  // Not only kept bases: a `Persistent` root is carried too, whatever scene owns it (review of 4f0b839d0).
-  // Everything the reload re-expanded from disk compares equal and is left alone.
-  const rebuilt = await rebaseStaleInstances();
-  if (rebuilt) console.log(`[Prefab] rebuilt ${rebuilt} carried instance(s) from the prefab that changed`);
-}
-
-/** The repair a world swap OUT of a prefab-edit world owes, whichever route made it (#1666) — a scene load (Exit, the
- *  Assets double-click, the Inspector's Open Scene, agent `load-scene`) or opening another prefab for editing. Call
- *  it once the swap has landed and the edit flag no longer names `leftPath`'s prefab (a scene load calls it through
- *  {@link runOwedLeaveRepair}):
- *  - `leftPath`: the editor's copy of the prefab that was open skipped every external-write refresh while it was open
- *    (`refreshPrefabSourceForPath`), so it can be older than the file. Left so, Apply/Revert refused every instance
- *    of it, and saves captured against the old rows (#1483 review).
- *  - A `Persistent` root is carried into the edit world and out again, so a SAVED edit reaches it only here — the
- *    load re-expands everything else from disk. Rebuilds nothing that is current.
- *  Refresh FIRST: the rebase rebuilds each stale frame to the editor's copy, so that copy must be the file's. */
-export async function repairLeftPrefabEdit(leftPath: string | null): Promise<void> {
-  if (leftPath) await refreshPrefabSourceForPath(leftPath);
-  await rebaseStaleInstances();
-}
-
-/** The repair a scene load out of a prefab-edit world owes, once the world has actually been left (#1666 close-out
- *  review). Recorded when such a load STARTS and run by the newest load at its end, whatever that load's outcome —
- *  so a load superseded after its swap hands it to the one that won, and that one runs it even when it FAILS before
- *  its own swap. Inferring it from the edit flag missed both: the flag is cleared by the breadcrumb's re-render on the
- *  swap, and a load that fails never reaches its repair. Recorded at the start, not after the swap, because a newer
- *  load can fail and finish before the older one's swap resolves.
- *  Settled by {@link settleLeaveRepair} when the session ends without a load leaving the world (Exit in place, or
- *  opening another prefab from inside it). */
-let owedLeaveRepair: { path: string | null } | null = null;
-
-/** Run the owed repair if the world is no longer a prefab-edit world; while it still is, nothing was left and it
- *  stays owed. Cleared only by a repair that completed in the world it started in: a load swapping in during its
- *  awaits makes the rebase rebuild nothing (it collected ids in the world that is gone), and the newer load runs it
- *  again at its own end. At worst the refresh runs twice; it is idempotent. */
-async function runOwedLeaveRepair(): Promise<void> {
-  const owed = owedLeaveRepair;
-  if (!owed || isPrefabEditWorld()) return;
-  // The flag goes first: the refresh skips the prefab it names, and the session it names is over.
-  useEditorStore.getState().closePrefabEditor();
-  const world = getCurrentWorld();
-  await repairLeftPrefabEdit(owed.path);
-  if (getCurrentWorld() === world && owedLeaveRepair === owed) owedLeaveRepair = null;
-}
-
-/** {@link runOwedLeaveRepair} from a load's FAILURE branch: a repair that throws there is reported, not let out —
- *  `loadScene` resolves an outcome and never rejects, and every caller relies on that. It stays owed. */
-async function runOwedLeaveRepairQuietly(): Promise<void> {
-  try { await runOwedLeaveRepair(); } catch (e) { console.error('[Editor] the repair owed for leaving prefab edit failed:', e); }
-}
-
-/** The session ends WITHOUT a scene load leaving its world — Exit with nowhere to go or a load that failed, or opening
- *  another prefab from inside it: run the repair for `leftPath` here, and forget any a load recorded for it. */
-export async function settleLeaveRepair(leftPath: string | null): Promise<void> {
-  owedLeaveRepair = null;
-  await repairLeftPrefabEdit(leftPath);
+ *  another member's rows. A reload whose world was replaced before it adopted rebuilds nothing: the route that
+ *  replaced it adopts its own world. Rejects with the reload's own rejection (an AbortError when superseded). */
+export async function adoptWorldReloadedFromDisk(scenePath: string, reload: () => Promise<SceneLoadResult>): Promise<void> {
+  await withAdoption('hot-reload', async (adoption) => {
+    const { world, keptBaseGuids } = await reload();
+    // The path and base too: a reload that overtakes an adopted prefab edit-open (which takes no replacement token)
+    // replaces an edit world, whose path is null (close-out review of #1698).
+    if (!adoption.offer({ world, path: scenePath, baseScene: 'loaded', history: { key: scenePath, keptBaseGuids } })) return;
+    // Not only kept bases: a `Persistent` root is carried too, whatever scene owns it (review of 4f0b839d0).
+    // Everything the reload re-expanded from disk compares equal and is left alone.
+    const rebuilt = await rebaseStaleInstances();
+    if (rebuilt) console.log(`[Prefab] rebuilt ${rebuilt} carried instance(s) from the prefab that changed`);
+  });
 }
 
 /** WHICH kinds of unsaved work exist, told apart. The causes themselves — what each one is, what
@@ -1261,11 +1186,13 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
   // The reopen swaps the world, and `SceneManager` clears the #124 records on a load — so warn now,
   // or the copy is the one save that bakes a system-rewritten field in silently.
   warnAuthoredWritesWhileStopped();
-  const outcome = await loadScene(written.path);
-  if (outcome === 'superseded') {
+  const { outcome, adopted } = await loadSceneReporting(written.path);
+  // A newer request that installed nothing leaves the copy open and adopted, though the outcome reads 'superseded'
+  // (#1698): that IS the reopen.
+  if (outcome === 'superseded' && !adopted) {
     return stay(`another scene load started meanwhile and won, so the editor is on whatever that load opened; ${from} was not written`);
   }
-  if (outcome !== 'loaded') {
+  if (outcome !== 'loaded' && !adopted) {
     return stay(`the copy could not be reopened (${outcome}${_lastLoadFailureMessage ? `: ${_lastLoadFailureMessage}` : ''}); the editor stays on ${from} with its edits unsaved`);
   }
   return { saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: true }, ...othersReport };
@@ -1449,6 +1376,10 @@ export function sceneLoadGeneration(): number { return loadEpoch.current; }
  *  worked example. */
 let _loadsInFlight = 0;
 export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
+/** How many of those loads are in their `finally`, settling the owed leave repairs (#1698); and how many of THOSE were
+ *  past their wait (`_loadsSwapping`). */
+let _loadsEnding = 0;
+let _loadsSwappingEnding = 0;
 
 /** How many of those loads are past their wait for the undo in flight (#1579) — the ones that may be swapping the
  *  world now. `isSceneLoadInFlight` also counts a load still WAITING for an undo to finish, and an undo that skipped
@@ -1660,12 +1591,49 @@ export async function loadScene(
   gameId?: string,
   opts?: { probing?: boolean },
 ): Promise<SceneLoadOutcome> {
+  return (await loadSceneReporting(scenePath, gameId, opts)).outcome;
+}
+
+/** `loadScene`'s outcome, and whether THIS call's world is the one the editor has adopted when the call ends. */
+export interface SceneLoadReport {
+  readonly outcome: SceneLoadOutcome;
+  /** The world this call loaded is the adopted one now (#1698). It can be true with `'superseded'`: a newer REQUEST
+   *  began, so the outcome is request-scoped `'superseded'` (S11), but that request installed nothing, so this call's
+   *  scene is the one open. A caller that answers "which scene is open" or "did the reopen happen" must read this,
+   *  not the outcome — `'superseded'` alone does not mean "the world on screen is not mine". */
+  readonly adopted: boolean;
+}
+
+/** {@link loadScene} with {@link SceneLoadReport.adopted}. A separate entry point rather than a wider outcome: every
+ *  existing caller compares the outcome string with `===`. */
+export async function loadSceneReporting(
+  scenePath: string,
+  gameId?: string,
+  opts?: { probing?: boolean },
+): Promise<SceneLoadReport> {
   // Epoch guard: SceneManager cancels an in-flight load when a newer one starts
   // (boot autoload vs an agent/menu open, or rapid scene switches). The aborted
   // load's `finally` must NOT clear the progress modal the WINNING load is
   // driving, and its late onProgress must not write stale counts — so only the
   // latest epoch touches sceneLoadStatus.
   const stillLive = loadEpoch.begin();
+  let adoptedHere: World | null = null;
+  const outcome = await loadSceneRequest(scenePath, gameId, opts, stillLive, (w) => { adoptedHere = w; });
+  return {
+    // The OUTCOME is request-scoped (S11): a newer request that began before this call ENDED — its leave repair
+    // included, which runs in the `finally` — makes it 'superseded', even though its world was adopted (#1698).
+    outcome: outcome === 'loaded' && !stillLive() ? 'superseded' : outcome,
+    adopted: adoptedHere !== null && adoptedWorld() === adoptedHere,
+  };
+}
+
+async function loadSceneRequest(
+  scenePath: string,
+  gameId: string | undefined,
+  opts: { probing?: boolean } | undefined,
+  stillLive: () => boolean,
+  onAdopted: (world: World) => void,
+): Promise<SceneLoadOutcome> {
   const setSceneLoadStatus = useEditorStore.getState().setSceneLoadStatus;
   // Inside nothing yet, but immediately before the `try` whose `finally` decrements it — so the
   // pairing holds however the body exits. (Kept below the store read deliberately: an increment
@@ -1701,64 +1669,47 @@ export async function loadScene(
     swapping = true;
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
-    // Read on BOTH sides of the await (#1409): the outgoing world stays live and editable while the
-    // new one loads, so an edit made mid-load is discarded too. Nothing resets the dirty state until
-    // `adoptReplacedWorld` below; the swap itself does not.
-    const dirtBeforeLoad = readWorldDirt();
-    // Leaving a prefab-edit world by ANY route owes its repair (#1666). Read before the swap: after it the world is
-    // the incoming one, and the flag is what names the prefab that was open. A cleared flag in an edit world is an
-    // Exit that already repaired in place (no return scene, or a failed load): nothing more is owed.
-    const editingBefore = useEditorStore.getState().editingPrefab;
-    if (isPrefabEditWorld() && editingBefore) owedLeaveRepair = { path: editingBefore.path };
-    const { keptBaseGuids, startupErrors = [] } = await sceneManager.loadScene(scenePath, {
-      ...(gameId !== undefined ? { gameId } : {}),
-      // Resources acquire in parallel; each completion (on a cold cache, a finished
-      // bake) advances the bar. The SceneLoadModal only shows past a ~400ms delay.
-      onProgress: (loaded, total) => {
-        if (stillLive()) setSceneLoadStatus({ active: true, loaded, total });
-      },
+    // One pending adoption from here to the adopt (#1698): the owner reads the outgoing world's dirt now, before the
+    // await (#1409) — the outgoing world stays live and editable while the new one loads.
+    return await withAdoption('scene-load', async (adoption) => {
+      const { world, keptBaseGuids, startupErrors = [] } = await sceneManager.loadScene(scenePath, {
+        ...(gameId !== undefined ? { gameId } : {}),
+        // Resources acquire in parallel; each completion (on a cold cache, a finished
+        // bake) advances the bar. The SceneLoadModal only shows past a ~400ms delay.
+        onProgress: (loaded, total) => {
+          if (stillLive()) setSceneLoadStatus({ active: true, loaded, total });
+        },
+      });
+      // Adopted iff THIS load's world is still the one on screen (#1698) — not iff this is still the newest REQUEST. A
+      // newer request that then installs nothing (fails, is refused, is cancelled) leaves this world on screen, and
+      // skipping the adopt left it under the outgoing world's path, undo stack and baseline (#1688). A newer world that
+      // DID land makes this a no-op, so a loser never stomps the winner (#495): not its path (persisted, so the next
+      // launch would reopen the wrong scene), not its history (the stale-id hazard per-scene keying prevents), not the
+      // journal. The history keeps THIS scene's own stack (empty on first visit) instead of dropping undo globally,
+      // unless the outgoing world held work this load discarded (#1409); a kept base keeps its dirty flag (#1417). Both
+      // rules live in the owner. (Play→Stop does not come through here — it restores via `sceneManager` directly.)
+      const adopted = adoption.offer({
+        world, path: scenePath, baseScene: 'loaded', history: { key: scenePath, keptBaseGuids }, journal: { path: scenePath },
+      });
+      if (!adopted) return 'superseded';
+      onAdopted(world);
+      // Reported for the scene the editor adopted, even when a newer request began (#1425 — close-out review of #1698):
+      // that request installed nothing, so these managers are the ones running on screen.
+      _lastLoadStartupErrors = startupErrors.map(({ manager, error }) => `${manager}: ${(error as Error)?.message ?? String(error)}`);
+      if (_lastLoadStartupErrors.length) {
+        // The scene IS loaded, so this is not a failure toast; SceneManager already console.error'd each.
+        useEditorStore.getState().showToast(
+          `Scene loaded, but ${startupErrors.length} manager(s) failed to start: ${startupErrors.map((f) => f.manager).join(', ')} (see the console)`,
+          'warn',
+        );
+      }
+      // The OUTCOME stays request-scoped (S11): a newer request began, so this call reports 'superseded' even when its
+      // world was adopted. The leave repair is not run here but by the last world switch to end (`settleLeaveDebts`,
+      // this load's `finally` included).
+      if (!stillLive()) return 'superseded';
+      console.log(`[Editor] Loaded scene: ${getAllEntities().length} entities from ${scenePath}`);
+      return 'loaded';
     });
-    if (!stillLive()) {
-      // Superseded in the WINNER'S TAIL (SceneManager.loadScene's step-11 tail guard): our own `sceneManager.loadScene`
-      // resolved successfully — nothing threw, so the `catch` below never sees this case — but a
-      // newer `loadScene` call already won. Running the writes below now would stomp the winner:
-      // `setCurrentScenePath` would persist OUR path over the winner's (localStorage too, so the
-      // next editor launch would reopen the wrong scene), `swapHistory` would rebind the undo
-      // stack to OUR scene while the winner's world is live (the exact stale-id hazard per-scene
-      // history keying exists to prevent), and `editorEmit('!scene-load', …)` would journal our
-      // path against the winner's live entity count — corrupting the record `modoki_editor_journal`
-      // answers "who changed this" from. So: none of it runs.
-      return 'superseded';
-    }
-    setCurrentScenePath(scenePath); // persists to localStorage for next editor launch
-    setCurrentBaseScene(sceneManager.getCurrentBaseScene());
-    // Swap to THIS scene's own undo history (empty on first visit) instead of
-    // dropping undo globally — returning to a previously-open scene restores its
-    // stack. Per-scene keying also keeps another scene's actions (stale ids) from
-    // ever applying here. (Play→Stop does NOT come through here — it reloads via
-    // sceneManager directly — so its same-scene history is preserved.)
-    //
-    // ⚠️ Unless the outgoing world held work this load DISCARDED (#1409): then its stack
-    // describes that work, and parking it (or, on a same-path discard-reload, keeping it live) let
-    // one undo replay it onto the fresh world. A kept base's dirty flag survives (#1417). Both
-    // rules: `adoptReplacedWorld`.
-    adoptReplacedWorld(scenePath, keptBaseGuids, dirtBeforeLoad);
-    await runOwedLeaveRepair();
-    if (!stillLive()) return 'superseded';
-    _lastLoadStartupErrors = startupErrors.map(({ manager, error }) => `${manager}: ${(error as Error)?.message ?? String(error)}`);
-    if (_lastLoadStartupErrors.length) {
-      // The scene IS loaded, so this is not a failure toast; SceneManager already console.error'd each.
-      useEditorStore.getState().showToast(
-        `Scene loaded, but ${startupErrors.length} manager(s) failed to start: ${startupErrors.map((f) => f.manager).join(', ')} (see the console)`,
-        'warn',
-      );
-    }
-    const worldEntityTotal = getAllEntities().length;
-    // Editor Percept (V2): the human opened a scene — correlate later game/edit events to it.
-    // `worldEntityTotal`, the editor state's name for the same count (§2, #1223 D3).
-    editorEmit('!scene-load', { path: scenePath, worldEntityTotal });
-    console.log(`[Editor] Loaded scene: ${worldEntityTotal} entities from ${scenePath}`);
-    return 'loaded';
   } catch (e) {
     // An AbortError means a newer load superseded this one — CANCELLED early, by design (see
     // the epoch guard above); it's expected, not a failure worth a red console error, and it's
@@ -1784,7 +1735,6 @@ export async function loadScene(
       const msg = `[Editor] Refused to load scene "${scenePath}": ${e.message}`;
       console.error(msg);
       useEditorStore.getState().showToast(`Scene not loaded: ${e.message}`, 'warn');
-      await runOwedLeaveRepairQuietly(); // an earlier load may have swapped out of a prefab-edit world and handed it here
       return 'refused';
     }
     // `probing`: the caller is walking a CANDIDATE LIST (editor boot) and a miss here is a
@@ -1798,20 +1748,32 @@ export async function loadScene(
     const msg = `[Editor] Failed to load scene: ${e}`;
     if (opts?.probing) console.warn(`${msg} (trying the next boot candidate…)`);
     else console.error(msg);
-    await runOwedLeaveRepairQuietly(); // as the refusal above
     return 'failed';
   } finally {
-    // Load-bearing: if anything above throws, this must still return to zero, or every later
-    // reader of `isSceneLoadInFlight()` would believe a load is running forever.
-    _loadsInFlight -= 1;
-    if (swapping) _loadsSwapping -= 1;
-    worldSwitch.release();
-    // Beside the count it mirrors, and above the store call, so a throw there cannot leak the token
-    // (a leaked token means no deferred reload ever replays again).
-    releaseReplacement();
-    // Only the latest load owns the modal — a superseded load must not hide the
-    // winner's progress bar (its `finally` can run after the winner set active).
-    if (stillLive()) useEditorStore.getState().setSceneLoadStatus({ active: false });
+    // A leave repair an earlier load recorded and handed on is paid by the last world switch to END, whatever this
+    // one's outcome (#1690): landed, failed, refused, cancelled or superseded. No-op while another is still coming.
+    // FIRST, while this load still counts as in flight and still holds its world switch and replacement token: run
+    // after them, Play could start inside the repair and snapshot the world before its rebase (close-out review of
+    // #1698). It no longer counts as COMING, so two loads ending together do not each wait for the other; the
+    // owner runs one repair at a time. Never rejects, so the releases below still run.
+    _loadsEnding += 1;
+    if (swapping) _loadsSwappingEnding += 1;
+    try {
+      await settleLeaveDebts();
+    } finally {
+      // Load-bearing: if anything above throws, this must still return to zero, or every later
+      // reader of `isSceneLoadInFlight()` would believe a load is running forever.
+      _loadsInFlight -= 1;
+      _loadsEnding -= 1;
+      if (swapping) { _loadsSwapping -= 1; _loadsSwappingEnding -= 1; }
+      worldSwitch.release();
+      // Beside the count it mirrors, and above the store call, so a throw there cannot leak the token
+      // (a leaked token means no deferred reload ever replays again).
+      releaseReplacement();
+      // Only the latest load owns the modal — a superseded load must not hide the
+      // winner's progress bar (its `finally` can run after the winner set active).
+      if (stillLive()) useEditorStore.getState().setSceneLoadStatus({ active: false });
+    }
   }
 }
 
@@ -1929,47 +1891,50 @@ export async function newScene(path: string | null = null): Promise<void> {
     // from a path that is still the OUTGOING scene's. Setting it first removes the ordering
     // dependency instead of racing it. ⚠️ This is also what makes the refusal above a LOCK
     // rather than a supersession token — see there.
-    // Read on both sides of the await, for the same reason as in `loadScene` (#1409).
-    const dirtyBeforeSwap = worldHasUnsavedEdits();
-    setCurrentScenePath(path);
-    setCurrentBaseScene(undefined);
-    // Replace the world CONTENT through SceneManager rather than deleting and respawning in
-    // place (#853). The in-place version was the one path in the repo that replaced every
-    // entity without emitting a world swap, so every id-keyed teardown keyed on `onWorldSwap`
-    // was skipped — and koota recycles ids LIFO and totally, so the outgoing scene's state
-    // aliased exactly onto the incoming scene's entities.
-    // Each starter gets its guid AT SPAWN (#1199). Without one it was unaddressable until the first
-    // save or undoable edit minted it: Assets → Create Scene saves straight away so a human never
-    // saw that, but the agent `new-scene` op does not save, and every guid-addressed op refused
-    // the starters. Minted before `markSceneSaved()` below, so it is part of the clean baseline.
-    await sceneManager.replaceWorldContent((world) => {
-      spawnEntity(world,
-        Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }),
-        EntityAttributes({ name: 'Camera', sortOrder: 0, guid: newGuid() }),
-      );
-      spawnEntity(world,
-        Environment({ hdrPath: WHITE_HDR_GUID }),
-        EntityAttributes({ name: 'HDR Environment', sortOrder: 1, guid: newGuid() }),
-      );
-      spawnEntity(world,
-        Transform({ x: 5, y: 10, z: 7 }),
-        Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
-        EntityAttributes({ name: 'Directional Light', sortOrder: 2, guid: newGuid() }),
-      );
-      spawnEntity(world,
-        Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
-        EntityAttributes({ name: 'Ambient Light', sortOrder: 3, guid: newGuid() }),
-      );
+    // Joins the adoption owner for the history and the baseline only (#1698, hub): the path and base stay written
+    // here, BEFORE the await, for the Hierarchy ordering above. The owner reads the outgoing dirt at registration —
+    // both sides of the await, as in `loadScene` (#1409) — so it registers before the path moves.
+    await withAdoption('new-scene', async (adoption) => {
+      setCurrentScenePath(path);
+      setCurrentBaseScene(undefined);
+      // Replace the world CONTENT through SceneManager rather than deleting and respawning in
+      // place (#853). The in-place version was the one path in the repo that replaced every
+      // entity without emitting a world swap, so every id-keyed teardown keyed on `onWorldSwap`
+      // was skipped — and koota recycles ids LIFO and totally, so the outgoing scene's state
+      // aliased exactly onto the incoming scene's entities.
+      // Each starter gets its guid AT SPAWN (#1199). Without one it was unaddressable until the first
+      // save or undoable edit minted it: Assets → Create Scene saves straight away so a human never
+      // saw that, but the agent `new-scene` op does not save, and every guid-addressed op refused
+      // the starters. Minted before `markSceneSaved()` below, so it is part of the clean baseline.
+      const world = await sceneManager.replaceWorldContent((world) => {
+        spawnEntity(world,
+          Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }),
+          EntityAttributes({ name: 'Camera', sortOrder: 0, guid: newGuid() }),
+        );
+        spawnEntity(world,
+          Environment({ hdrPath: WHITE_HDR_GUID }),
+          EntityAttributes({ name: 'HDR Environment', sortOrder: 1, guid: newGuid() }),
+        );
+        spawnEntity(world,
+          Transform({ x: 5, y: 10, z: 7 }),
+          Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
+          EntityAttributes({ name: 'Directional Light', sortOrder: 2, guid: newGuid() }),
+        );
+        spawnEntity(world,
+          Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
+          EntityAttributes({ name: 'Ambient Light', sortOrder: 3, guid: newGuid() }),
+        );
     });
     // Keyed by the new scene's own path when it has one, so its undo stack is its own and the
     // outgoing scene's is preserved under ITS key when clean rather than dropped. '' is the untitled
     // bootstrap context, which is what the agent `new-scene` op (no path) still gets.
     // `freshIncoming`: a starter world matches no stack ever recorded under this key — '' above all,
-    // which every untitled scene shares (#1409).
-    swapHistory(path ?? '', { discardOutgoing: dirtyBeforeSwap || worldHasUnsavedEdits(), freshIncoming: true });
-    markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
-    clearAllSceneDirty();
-    console.log('[Editor] New scene created');
+    // which every untitled scene shares (#1409). The starter is the new clean baseline (C7), and no base is kept.
+    // Only while the starter is still the world on screen: a world that replaced it adopts its own.
+    if (adoption.offer({ world, history: { key: path ?? '', keptBaseGuids: new Set(), freshIncoming: true } })) {
+      console.log('[Editor] New scene created');
+    }
+    });
   } finally {
     worldSwitch?.release();
     _newSceneInFlight = false;
@@ -2112,3 +2077,14 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
     ...(await withBaseScenes()),
   });
 }
+
+// The adoption owner writes the editor scene state this module holds (#1698). Bound rather than imported by
+// `sceneAdoption.ts`, which this module imports: no cycle.
+bindEditorSceneState({
+  setScenePath: setCurrentScenePath,
+  setBaseScene: setCurrentBaseScene,
+  markSaved: () => markSceneSaved(),
+  worldEdited: () => CAUSE_SPECS.sceneDirty.has(),
+  sceneLoadsComing: () => _loadsInFlight - _loadsEnding,
+  sceneLoadsSwappingComing: () => _loadsSwapping - _loadsSwappingEnding,
+});

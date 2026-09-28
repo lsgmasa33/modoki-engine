@@ -4263,7 +4263,7 @@ not undo serialization; see async-lifetime.md § An operation made of SEVERAL lo
   count, `isSceneLoadSwapping()` (loads past their wait), and the undo reads that one. Play and the
   Hierarchy keep `isSceneLoadInFlight`, the conservative answer for them.
 - **The unsaved-work gates wait too** — for a step already running when they are asked. A step's conservative dirty mark (#310) lands at its END. A gate
-  read during it answered "clean", the switch then waited for the step, and `adoptReplacedWorld`
+  read during it answered "clean", the switch then waited for the step, and the adopt (`sceneAdoption.ts`)
   discarded the history the step had just dirtied with no prompt. `confirmDiscardUnsaved` (world-swap
   scope only; a page unload must not hang on a step) and the agent ops' `guardUnsavedAfterUndo`
   (load-scene, new-scene, prefab edit-open and edit-exit) await `undoStepPending()` before they read.

@@ -46,12 +46,13 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async () => {
         if (path.includes('missing')) throw new Error(`404 ${path}`);
         sm.order.push(`load ${path}`);
         sm.current = { path };
-        return { keptBaseGuids: new Set<string>() };
+        return { world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
       },
       replaceWorldContent: async (populate: (w: unknown) => void) => {
         populate(getCurrentWorld());
         sm.order.push('new-scene');
         sm.current = null; // replaceWorldContent clears loadedScenes
+        return getCurrentWorld();
       },
     },
   };
@@ -365,7 +366,11 @@ describe('loadFirstScene over the walk: a cancelled candidate settles before it 
     expect(sm.order).toEqual(['load /user']);
   });
 
-  it('superseded in its POST-SWAP tail by a foreign load that then fails: the swapped-but-unadopted candidate is re-loaded, not reported as loaded', async () => {
+  // #1698 retired the retry this case used to take: the walk's load swapped, and the request that superseded it then
+  // installed nothing, so its world is still the one on screen — the adoption owner adopts it (by the world, not the
+  // request order) and the walk answers it without loading it a second time. Mutation: adopt by request order again
+  // (`offer` → only while the newest request) → the candidate is not adopted, and the walk re-loads it.
+  it('superseded in its POST-SWAP tail by a foreign load that then fails: the candidate on screen is ADOPTED, and not loaded again (#1698)', async () => {
     game = createTestWorld({});
     walk = beginBootSceneWalk();
     let unhold!: () => void;
@@ -381,7 +386,7 @@ describe('loadFirstScene over the walk: a cancelled candidate settles before it 
     expect(await user).toBe('failed');
     expect(await booted).toBe('/a');
     expect(getCurrentScenePath(), 'the editor must have ADOPTED the scene it reports as loaded').toBe('/a');
-    expect(sm.order).toEqual(['load /a', 'load /a']);
+    expect(sm.order).toEqual(['load /a']);
   });
 
   it('a retry cancelled AGAIN by a second failing load: the walk moves on to the next candidate, not the fallback', async () => {

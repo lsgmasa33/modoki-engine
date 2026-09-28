@@ -1287,7 +1287,7 @@ describe('#1564: an Apply that renumbers member paths re-points every carrier', 
   // explicitly: this world has no scene loaded, which the undo now reloads under '' like any untitled one (#1575).
   // Mutation: in `restoreSnapshot`, skip `rewriteNodeMoves`.
   it('its undo puts the live move record back on the restored paths', async () => {
-    const swap = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() } as never);
+    const swap = vi.spyOn(sceneManager, 'loadScene').mockImplementation(async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }) as never);
     onTestFinished(() => swap.mockRestore());
     install(midDoc());
     const first = await openInEditor(outer2());

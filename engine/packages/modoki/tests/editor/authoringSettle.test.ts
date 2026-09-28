@@ -18,6 +18,7 @@ const loadScene = vi.fn(async (path: string) => {
   currentPath = path;
   await new Promise<void>((resolve) => { releaseLoad = resolve; });
   loadsResolved += 1;
+  return { world: (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
 });
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {

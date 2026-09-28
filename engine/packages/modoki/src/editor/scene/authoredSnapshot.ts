@@ -28,6 +28,7 @@ import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { soaSchema, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { registerPosedWorldSource } from './authoredWorld';
 import { registerUndoRestoreBarrier } from '../undo/undoManager';
+import { withRestore } from './sceneAdoption';
 
 export interface AuthoredSnapshot {
   /** The primary scene's serialization — what the restore reloads. */
@@ -211,7 +212,12 @@ export async function restoreAuthoredSnapshot(snap: AuthoredSnapshot): Promise<v
   // so the Play world is still live for the whole reload with the mode already reading 'stopped'.
   _restoring++;
   try {
-    await sceneManager.loadScene(snap.key ?? '', { preloaded: snap.primary as unknown as SceneData });
+    // The restore is the ADOPTER (#1698, hub): it reloads under the SAME key, so it writes no editor scene state, and an
+    // older route whose world it replaced — a load still in its tail — adopts nothing.
+    await withRestore(async (adoption) => {
+      const { world } = await sceneManager.loadScene(snap.key ?? '', { preloaded: snap.primary as unknown as SceneData });
+      adoption.restored(world);
+    });
     for (const base of snap.bases.values()) restoreAuthoredEntities(base.entities);
     restoreAuthoredEntities(persistentSubtreeEntries(snap.primary.entities));
     _restoreFailed = false;

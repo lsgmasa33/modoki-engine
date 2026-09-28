@@ -58,7 +58,7 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', () => ({
         const handle = [...getCurrentWorld().entities].find((x) => x.id() === ecsId);
         if (handle) handle.set(eaMeta.trait, { ...(handle.get(eaMeta.trait) as object), parentId: localToEcs.get(parentLocal) ?? 0 });
       }
-      return { keptBaseGuids: new Set<string>() };
+      return { world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };
     },
     getLoadedScenes: () => new Map(),
   },

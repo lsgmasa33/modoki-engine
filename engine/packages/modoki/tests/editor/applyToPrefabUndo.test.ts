@@ -25,7 +25,7 @@ const sceneAfter = { id: 'scene-1', entities: [{ id: 1, name: 'Ship', traits: { 
 const serializeScene = vi.fn();
 const saveScene = vi.fn<(...args: any[]) => Promise<void>>(async () => {});
 const installPrefabSnapshot = vi.fn<(...args: any[]) => Promise<void>>(async () => {});
-const loadScene = vi.fn<(...args: any[]) => Promise<void>>(async () => {});
+const loadScene = vi.fn<(...args: any[]) => Promise<unknown>>(async () => ({ world: (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }));
 const selectEntity = vi.fn();
 let pushed: UndoAction | null = null;
 let applyResult: any;
@@ -59,7 +59,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 }));
 
 vi.mock('../../src/editor/store/editorStore', () => ({
-  useEditorStore: { getState: () => ({ selectEntity, selectedEntityId: 1 }) },
+  useEditorStore: { getState: () => ({ selectEntity, selectedEntityId: 1, closePrefabEditor: () => {} }) },
 }));
 
 vi.mock('../../src/editor/undo/undoManager', () => ({
@@ -68,7 +68,16 @@ vi.mock('../../src/editor/undo/undoManager', () => ({
   registerUndoRestoreBarrier: () => {},
 }));
 
-async function getModule() { return import('../../src/editor/undo/applyPrefabUndo'); }
+async function getModule() {
+  // `serialize.ts` is mocked whole, so it never binds the adoption owner's writers (#1698): bound here, with the base
+  // write routed to the spy the A3 case asserts on — the restore's base write now goes through the owner.
+  const { bindEditorSceneState } = await import('../../src/editor/scene/sceneAdoption');
+  bindEditorSceneState({
+    setScenePath: () => {}, setBaseScene: (b) => setCurrentBaseScene(b), markSaved: () => {},
+    worldEdited: () => false, sceneLoadsComing: () => 0, sceneLoadsSwappingComing: () => 0,
+  });
+  return import('../../src/editor/undo/applyPrefabUndo');
+}
 
 describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + scene', () => {
   beforeEach(() => {

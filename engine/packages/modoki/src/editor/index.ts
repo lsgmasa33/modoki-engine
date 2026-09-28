@@ -101,7 +101,7 @@ export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 export { revertOverridesWithUndo } from './undo/revertPrefabUndo';
 export { detachPrefabInstanceWithUndo } from './undo/detachPrefabUndo';
 export {
-  saveScene, saveAll, serializeScene, loadScene, newScene, NewSceneRefusedError,
+  saveScene, saveAll, serializeScene, loadScene, loadSceneReporting, type SceneLoadReport, newScene, NewSceneRefusedError,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors, type SceneLoadOutcome,
 } from './scene/serialize';

@@ -753,27 +753,24 @@ member's row: false overrides, and Apply wrote one member's value into another's
   the third review, the enclosing instance read it as a stale nested frame, was skipped, and kept the
   member the undo had taken away. The snapshot restore also rebases the `Persistent` roots its scene
   load carries flat, before it saves.
-- **Leaving prefab-edit mode re-reads the edited prefab, by EVERY route** (`repairLeftPrefabEdit`,
-  `serialize.ts`). `refreshPrefabSourceForPath` skips the prefab open in prefab-edit mode, so after an
+- **Leaving prefab-edit mode re-reads the edited prefab, by EVERY route** (`settleLeaveDebts`,
+  `sceneAdoption.ts`). `refreshPrefabSourceForPath` skips the prefab open in prefab-edit mode, so after an
   exit without saving, the editor's copy could be older than the file the scene had just loaded from.
   Every instance of it was then refused, and a later rebase rebuilt carried ones back to the old
-  template. The repair re-reads it once the edit flag is cleared, then rebases, because a `Persistent`
-  root is carried through prefab-edit mode and back, so a SAVED edit reaches it only there. Until
-  #1666 it ran only in `exitPrefabEditing`, so the Assets double-click, the Inspector's Open Scene and
-  agent `load-scene` (all `serialize.loadScene`) left the carried instance built from the old template
-  and the prefab's copy stale for the session. It is now RECORDED as owed when any `loadScene` starts
-  out of a prefab-edit world (with the edit flag set), and run by the newest load at its end, whatever
-  that load's outcome, once the world is no longer an edit world (`runOwedLeaveRepair`). It is cleared
-  only by a repair that completed in the world it started in. Two things make inferring it wrong,
-  both found by the close-out review: the breadcrumb's re-render clears the edit flag on the swap, and a
-  load superseded after its swap by one that then FAILS left the world with no load reaching a repair.
-  It is recorded at the load's START because the newer load can fail and finish before the older one's
-  swap resolves. A load that fails before its swap leaves the edit world live and the flag set: nothing
-  was left, and it stays owed. The session ending WITHOUT a load leaving the world settles it
-  (`settleLeaveRepair`): `exitPrefabEditing` in place (no return scene, or its load failed), judged by
-  the world rather than the outcome, and opening another prefab from inside the edit world, once the
-  flag names the new one (that swap goes through `sceneManager` directly). A flag already cleared in an
-  edit world is an Exit that repaired in place, so a later load out owes nothing.
+  template. The repair re-reads it once the edit flag no longer names it, then rebases, because a
+  `Persistent` root is carried through prefab-edit mode and back, so a SAVED edit reaches it only there.
+  Until #1666 it ran only in `exitPrefabEditing`, so the Assets double-click, the Inspector's Open Scene
+  and agent `load-scene` (all `serialize.loadScene`) left the carried instance built from the old
+  template and the prefab's copy stale for the session. Since #1698 the adoption owner RECORDS the
+  debt: adopting any world (another edit world included) over an edit world whose session is still
+  open owes that prefab's repair. The debt comes from the owner's own `lastAdopted`, not the edit flag,
+  which the breadcrumb's re-render clears on the swap. Debts are a SET: #1690's one slot lost the first
+  debt when an edit-open landed in a scene load's tail. They are paid by the last world switch to END,
+  whatever its outcome, and cleared only by a repair that completed in the world it started in. The
+  session ending WITHOUT a load leaving the world (Exit with no return scene, or whose load installed
+  nothing) is `endPrefabEditInPlace`, which acts only if no adoption happened since Exit began: an
+  edit-open adopted in Exit's tail keeps its session. The full model: `docs/scene-loading.md`
+  § "Load supersession: states and invariants", S7.
 - **An undo that puts an instance back from an older capture lands it on the CURRENT template**
   (#1665). Revert's undo and redo rebuilt from the document the Revert read, and Detach's undo re-adds
   links naming the pre-detach document. When the template changed in between (a prefab-edit save, an

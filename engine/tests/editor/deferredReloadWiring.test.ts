@@ -40,6 +40,8 @@ async function settle(): Promise<void> {
 }
 
 beforeEach(() => {
+  // The hot reload's adopt persists the scene path (#1698 close-out review: a reload over an edit world must name it).
+  vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
   setRunMode('stopped');
   handlers = new Map();
   (window as Win).__modokiElectron = {
@@ -52,7 +54,7 @@ beforeEach(() => {
   const getCurrent = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: SCENE_PATH } as never);
   const getLoaded = vi.spyOn(sceneManager, 'getLoadedScenes')
     .mockReturnValue(new Map([['main', { path: SCENE_PATH, role: 'primary', guid: 'main' }]]) as never);
-  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
+  loadScene = vi.spyOn(sceneManager, 'loadScene').mockImplementation(async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }));
   prefabFetch = null;
   const fetchStub = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     if (String(input).includes('.prefab.json') && prefabFetch) return prefabFetch();

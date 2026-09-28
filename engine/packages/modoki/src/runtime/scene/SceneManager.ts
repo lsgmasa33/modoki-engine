@@ -182,6 +182,11 @@ export interface Scene {
 
 /** What a successful `loadScene` did that its caller cannot see from the world alone. */
 export interface SceneLoadResult {
+  /** The world this load PROMOTED. By the time the call resolves it may no longer be current — a newer load or a
+   *  teardown can swap during the post-swap tail — so a caller that adopts the load (the editor's
+   *  `sceneAdoption.ts`, #1698) compares THIS against `getCurrentWorld()`, never reads `getCurrentWorld()` in its
+   *  place: that would name the NEWER world and let a superseded load adopt over it. */
+  readonly world: World;
   /** Guids of the base scenes this swap KEPT rather than reloaded: their entities were
    *  snapshotted from the LIVE world and carried across, so any unsaved edit to them survived
    *  the load (#1417). Every other scene in the new chain, the primary included, was loaded from
@@ -279,8 +284,9 @@ export interface SceneManager {
   /** Replace every entity in the live world with freshly-spawned content, through the
    *  normal mint → populate → promote → release → destroy contract, so `onWorldSwap`
    *  fires (#853). `populate` spawns into the world it is handed. Not a scene load:
-   *  `loadedScenes` ends empty and `getCurrent()` returns null. */
-  replaceWorldContent(populate: (world: World) => void): Promise<void>;
+   *  `loadedScenes` ends empty and `getCurrent()` returns null. Resolves to the world it promoted — the same reason
+   *  as `SceneLoadResult.world`. */
+  replaceWorldContent(populate: (world: World) => void): Promise<World>;
   /** For tests + shutdown. Releases everything and resets the manager. */
   unloadAll(): Promise<void>;
   /** For tests: reset the sceneId counter so test runs are deterministic. */
@@ -1253,7 +1259,7 @@ class SceneManagerImpl implements SceneManager {
       reportStartupErrors(path, startupErrors);
       // Only when there are some: "absent means none" (SceneLoadResult), which keeps the clean
       // result the exact shape it always was.
-      return startupErrors.length ? { keptBaseGuids, startupErrors } : { keptBaseGuids };
+      return startupErrors.length ? { world: promotedWorld, keptBaseGuids, startupErrors } : { world: promotedWorld, keptBaseGuids };
     } catch (err) {
       // Failure or abort — clean up every sceneId allocated THIS attempt (the
       // primary plus any base newly entering the chain). Skip once the swap has
@@ -1421,7 +1427,7 @@ class SceneManagerImpl implements SceneManager {
    *  fresh world without freeing the old one — that half is fixed, and both now share
    *  `destroyWorldWhenSafe`, so the koota-cap argument this warning used to rest on no
    *  longer applies. The rest of it still does.) */
-  async replaceWorldContent(populate: (world: World) => void): Promise<void> {
+  async replaceWorldContent(populate: (world: World) => void): Promise<World> {
     // Unload-wins (#535), same head as `unloadAll()` and for the same reason: this drops
     // every loaded scene, so a `loadScene()` racing it must not win. `teardownInFlight`
     // rejects a load that STARTS during the awaits below; the token invalidation is what a
@@ -1549,6 +1555,7 @@ class SceneManagerImpl implements SceneManager {
       // whatever path it is about to show.
       if (oldPath) emit('@scene-swapped', { from: oldPath, to: '' }, staging);
       else emit('@scene-loaded', { path: '' }, staging);
+      return staging;
     } finally {
       this.teardownInFlight--;
     }

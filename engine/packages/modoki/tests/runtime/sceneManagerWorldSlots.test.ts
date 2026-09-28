@@ -84,7 +84,8 @@ describe('#888: a throwing onWorldSwap listener must not abort the promoter', ()
     // test dies of pool exhaustion instead of reporting its own verdict.
     onTestFinished(() => { unsub(); getCurrentWorld().destroy(); vi.restoreAllMocks(); });
 
-    await expect(sceneManager.replaceWorldContent(() => {})).resolves.toBeUndefined();
+    // Resolves to the world it promoted (#1698) — the one on screen now.
+    expect(await sceneManager.replaceWorldContent(() => {})).toBe(getCurrentWorld());
 
     expect(destroySpy).toHaveBeenCalledTimes(1);
     expect(getCurrentWorld()).not.toBe(outgoing);
@@ -247,7 +248,7 @@ describe('#877: unloadAll frees the world slot it replaces', () => {
       await expect(sceneManager.unloadAll()).resolves.toBeUndefined();
     }
     for (let i = 0; i < headroom + 5; i++) {
-      await expect(sceneManager.replaceWorldContent(() => {})).resolves.toBeUndefined();
+      await expect(sceneManager.replaceWorldContent(() => {})).resolves.toBeDefined();
     }
   });
 });

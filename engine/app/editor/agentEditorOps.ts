@@ -38,7 +38,7 @@ import {
   type AssetEditorKind, type AssetEditorMount, colliderEditBlocker,
   enterPlay, stopPlay, pausePlay, type PlayOutcome, type StopOutcome,
   undoStep, undoStepPending, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
-  loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk,
+  loadSceneReporting, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk,
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
@@ -2384,7 +2384,7 @@ export function registerEditorAgentOps(): void {
     // #486 finding A) lets the message say whether the PREVIOUS scene is still what's loaded,
     // rather than assuming it.
     const before = getCurrentScenePath();
-    const outcome = await loadScene(path);
+    const { outcome, adopted } = await loadSceneReporting(path);
     if (outcome === 'refused' || outcome === 'failed') {
       // Carry the ACTUAL reason (docs/format-versioning.md § 2b-bis / #784 phase C3) instead of
       // guessing one — a too-new/unreadable scene is a REFUSAL, not a missing path, and the old
@@ -2400,6 +2400,20 @@ export function registerEditorAgentOps(): void {
           ? `The previous scene is still loaded.`
           : `The active scene is now "${cur ?? 'null'}" — the previous scene is NOT what is loaded, because another load swapped it in while this one was failing.`),
       );
+    }
+    if (outcome === 'superseded' && adopted) {
+      // A later load REQUEST began while ours ran, but installed nothing: our scene is the one open, and the editor
+      // adopted it (#1698). The reply must not say another scene won — the caller asked for this one and has it.
+      const startupErrors = getLastSceneLoadStartupErrors();
+      return {
+        ok: true,
+        superseded: true,
+        warnings: [
+          `a later scene load started while this one ran and did not replace it; "${path}" is the open scene`,
+          ...startupErrors.map((e) => `manager failed to start (the scene is still loaded): ${e}`),
+        ],
+        ...editorStateFields('scenePath', 'worldEntityTotal', 'unsavedChanges'),
+      };
     }
     if (outcome === 'superseded') {
       // A LATER load won the swap while ours was in flight (SceneManager.loadScene's step-11 tail guard) — our own
