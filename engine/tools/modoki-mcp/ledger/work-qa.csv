@@ -194,3 +194,4 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-27,work-qa,modoki_focus_entity,350,1658,171375,eb024afc9
 2026-09-27,work-qa,modoki_get_editor_state,187,2484,171375,eb024afc9
 2026-09-27,work-qa,modoki_set_view_camera,773,773,171375,eb024afc9
+2026-09-28,work-qa,modoki_prefab,485,5724,172478,79835250a

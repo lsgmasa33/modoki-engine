@@ -291,7 +291,7 @@ Operate on the deep-cloned `newPrefab`:
   row's own root pose, and a nested member moved out of its instance (`~moved.<rows>:<member>`, into
   `overrides` or `nestedOverrides`). The layer holds only what differs from its BASE, the pose the
   documents below give the member: the member's own row, under whatever the rows in between set
-  (`resolveEffectivePrefabOverride`). A field that now equals the base is dropped. Writing the full
+  (`docChainLayer`, `prefabBase.ts`). A field that now equals the base is dropped. Writing the full
   TRS froze the lower documents' later edits in the row. It also lost scene edits while the save still
   subtracted every field a row's override holds by KEY (#1498, since fixed): a scene edit to any of
   those fields was dropped.
@@ -537,8 +537,8 @@ a document with no `resources[]` an unqueued ref reaches `vite-asset-scanner`'s 
 ⚠️ **Three carriers — a scene entry, a reference node, and a prefab ROW (#1381).** Each is the
 outermost layer for its own paths *within its document*, and a path steps only through nested ROWS.
 Where two meet during expansion the outer one wins **per path, whole** — never element-wise, for the
-same un-delete reason as above — and `resolveEffectivePrefabStructure` descends the rows' slots
-path-keyed exactly as `resolveEffectivePrefabOverride` does, so a scene's baseline includes what an
+same un-delete reason as above — and the chain fold (`foldPath`, `prefabBase.ts`) descends the rows' slots
+path-keyed exactly as it descends their `nestedOverrides`, so a scene's baseline includes what an
 intermediate row already did to the interior. Since prefab v6 (#1533) each carrier is a separate
 LAYER that also holds member rows, and the loaders fold the layers one after another — see "A prefab
 row states its nested frames per member" below.
@@ -588,7 +588,7 @@ it), so a bump now does protect a new field. v6 (#1533) takes one for `members`.
 predates the gate and was never bumped for.
 
 History: the row slot was declared during #1358 and removed because nothing wrote it, and the
-descend in `resolveEffectivePrefabStructure` was removed as dead for the same reason. Both came back
+descend in `resolveEffectivePrefabStructure` (now `prefabBase.ts`'s `foldPath`) was removed as dead for the same reason. Both came back
 in #1381 with their producers; before that, promotion dropped the slot and a prefab-edit save lost a
 row's file-authored `nestedOverrides` too.
 
@@ -1015,7 +1015,7 @@ say it, and always takes the member's live Transform with it (its pose relative 
   instance is not offered outward — its own prefab records it. Revert rebuilds without it (`nestedMoves.drop`
   on what the rebuild captures of the nested instance) and its undo sets it back. While a rebuild captures
   nested instances, an enclosing instance's move base is read from the document it was EXPANDED from
-  (`expandedFrom`): read from the cache's newer copy during a refresh, a member not yet moved looked moved
+  (its frame record, `expandedDocOf`; a scoped `expandedFrom` map before #1693): read from the cache's newer copy during a refresh, a member not yet moved looked moved
   back, and the capture cancelled the move being applied. The Apply dialog toasts every skip and every file left unrepaired
   (`applyOutcomeNotice`).
 
@@ -1107,7 +1107,7 @@ all, and every untouched sibling was pinned: a later template change to it never
   and node rows alike — see R2 below. The Refresh finds a template REFERENCE node's root by its key too, so a scene deletion of one survives
   it (re-review R3b).
 - **A scene-deleted template node stays deleted** even if the template later edits it (fork 3).
-- **Refresh.** The rebuild runs the same diff against the baseline (`captureNestedInstanceOverridesIn`,
+- **Refresh.** The rebuild runs the same diff against the baseline (`captureNestedInstanceOverrides`,
   shared deps `nodeDiffDeps`), lets the fresh expansion spawn the NEW template's nodes, and patches each
   node row onto its fresh node (`applyNodeRowsLive`). So a Refresh delivers a template change to the
   unedited fields of an edited node, and honours a deletion — both gaps before v17. Only a fallback
@@ -1170,7 +1170,7 @@ it, and after MID restores `Leaf`, OUTER still hides it.
     prefab row's additions under a nested root whenever a scene slot sat one frame up (review F1). Once there are two
     row layers, a merged slot map cannot say which layer a slot came from, and without that the loader
     would re-apply a row's deletion over a scene slot that un-deleted the member.
-- **The scene over a row.** `resolveEffectivePrefabStructure` folds the row layers along the path, so
+- **The scene over a row.** `chainLayer` (`prefabBase.ts`) folds the row layers along the path, so
   a scene's baseline includes what the prefab rows state and an untouched scene writes nothing for them.
   A scene row that un-deletes what a prefab row deleted is folded after it, and wins.
 - **The prefab-edit world** forwards a row's `members` onto the scene entry it builds, rebasing member
@@ -1761,8 +1761,11 @@ members vanished on reload.
 would split an instance (`instance-member`, docs/scene-loading.md), an owned nested root included, where the
 same drag inside one scene keeps it linked. Extending promotion to scene moves is not done.
 
-An edit inside a nested instance is applied to the nested prefab's own file, so every instance of it everywhere
-updates (owner, 2026-09-19). The outer instance's Apply offers nothing for it.
+An edit inside a nested instance, applied from the nested instance, goes to the nested prefab's own file by default,
+so every instance of it everywhere updates. Applied from the OUTER instance (U14, owner 2026-09-28, superseding the
+2026-09-19 ruling that the outer Apply offers nothing for it), a nested instance's own fields, tags and removed
+components are listed there too and go into the OUTER prefab by default, as overrides on the row it holds for the
+nested instance; the nested prefab only when picked. docs/prefabs.md § "Apply's targets" has the rules.
 
 ## Edge cases
 

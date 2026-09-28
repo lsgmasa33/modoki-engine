@@ -32,7 +32,8 @@ import {
   collectComparableTraits, getOverrideValues, ownInstanceStructure, baseTokenResolver, instanceBase,
   isTemplateExcludedField, nestedFrameMoves, getCachedPrefabSync, type PrefabFile, type ApplyResult,
 } from './prefab';
-import { memberRef, toLocalIdKey } from './overrideKeyGrammar';
+import { memberRef, toLocalIdKey, nestedKeyRef } from './overrideKeyGrammar';
+import { ownedFrames, levelDoc } from './prefabBase';
 
 // ── Key-format helpers — the ONE place these four string shapes are written ──
 
@@ -208,6 +209,11 @@ export interface InstanceOverrideKeys {
   /** All of the above, concatenated — what `applyToPrefabSelective`/
    *  `revertOverridesSelective` accept as `selectedKeys`. */
   all: string[];
+  /** U14 (#1693): each NESTED instance's own edits — its fields, added tags and removed components — keyed from this
+   *  instance: `<nested row chain>:<the nested instance's key>` (`nestedKeyRef`). Apply writes them into THIS
+   *  instance's prefab by default, as overrides on the row it holds for that instance; Revert does not take them (it
+   *  reverts on the nested instance itself), so they are not in `all`. */
+  nested: string[];
   /** The subset of `fields` that REVERT can act on but APPLY cannot, because the field is
    *  deliberately kept out of a written template (`isTemplateExcludedField` — a runtime
    *  read-back, or the scene-only `EntityAttributes.editorFolder`).
@@ -267,9 +273,32 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
     ...nestedFrameMoves(rootInstanceId).map((m) => m.ref),
   ];
 
+  // U14: what each nested instance changed of its own, measured against its own base (the rows enclosing it included).
+  const nested: string[] = [];
+  const piMeta = getTraitByName('PrefabInstance');
+  for (const { frame, chain } of piMeta ? ownedFrames(rootInstanceId) : []) {
+    const src = (readTraitData(frame, piMeta!)?.source as string) || '';
+    const doc = src ? levelDoc(frame, src).doc : null;
+    if (!doc) continue;
+    const inner = collectInstanceOverrideTree(frame, doc);
+    const own: string[] = [];
+    for (const e of inner.entities) for (const t of e.traits) for (const f of t.fields) {
+      if (!isTemplateExcludedField(getTraitByName(t.trait)!, f.field)) own.push(f.key);
+    }
+    for (const t of inner.addedTags) own.push(t.key);
+    const ref = documentMemberRefs(doc);
+    const st = ownInstanceStructure(frame, doc);
+    for (const [lidStr, names] of Object.entries(st.removedTraits)) {
+      for (const t of names) own.push(removedTraitKey(ref(Number(lidStr)), t));
+    }
+    for (const lid of st.removed) own.push(removedEntityKey(ref(lid)));
+    for (const k of own) nested.push(nestedKeyRef(prefab, chain, k, getCachedPrefabSync));
+  }
+
   return {
     fields, added, removedEntities, removedTraits, addedTags, moved,
     all: [...fields, ...added, ...removedEntities, ...removedTraits, ...addedTags, ...moved],
+    nested,
     applyExcluded, unaddressableAdded,
   };
 }

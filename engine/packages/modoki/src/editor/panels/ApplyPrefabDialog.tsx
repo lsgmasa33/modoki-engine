@@ -26,10 +26,14 @@ import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
 import { MixedCheckbox } from './assetViews/widgets';
 import {
-  collectInstanceOverrideTree, addedKey, removedEntityKey, removedTraitKey, movedKey, applyOutcomeNotice, nestedFrameMoves, documentMemberRefs,
+  collectInstanceOverrideTree, collectInstanceOverrideKeys, addedKey, removedEntityKey, removedTraitKey, movedKey, applyOutcomeNotice, nestedFrameMoves, documentMemberRefs,
   type EntityOverrideNode, type AddedTagNode,
 } from '../scene/prefabOverrideKeys';
 import { ModalShell } from '../components/ModalShell';
+import { applyTargetOptions, type KeyTargets } from '../scene/prefabApplyOptions';
+import {
+  initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, filesWritten, toApplyTargets, type TargetChoice,
+} from './applyDialogModel';
 
 // The dialog's tree node is the shared shape exactly — aliased locally so the rest
 // of this file (predating the extraction) doesn't need a wholesale rename.
@@ -49,7 +53,7 @@ interface Structural {
 type LoadState =
   | { kind: 'loading' }
   | { kind: 'error'; message: string }
-  | { kind: 'ready'; entities: EntityNode[]; addedTags: AddedTagNode[]; structural: Structural };
+  | { kind: 'ready'; entities: EntityNode[]; addedTags: AddedTagNode[]; structural: Structural; nested: string[] };
 
 function stringifyValue(v: unknown): string {
   if (typeof v === 'number') {
@@ -160,6 +164,9 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [applying, setApplying] = useState(false);
+  // Where each key is written (#1693, owner ruling C): its targets, and the one chosen. Apply only.
+  const [targetOpts, setTargetOpts] = useState<Map<string, KeyTargets>>(new Map());
+  const [choice, setChoice] = useState<TargetChoice>({});
 
   /** #868: when the instance root the dialog was opened for no longer exists, the dialog closes with a
    *  notice rather than acting on whatever entity now holds its index (see prefabDialogSubject.ts). */
@@ -210,9 +217,15 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       for (const r of structural.removedEntities) allKeys.add(r.key);
       for (const r of structural.removedTraits) allKeys.add(r.key);
       for (const r of structural.moved) allKeys.add(r.key);
+      // U14 (#1693): the nested instances' own edits, which Apply on this OUTER instance writes into its prefab by default.
+      const nested = mode === 'apply' ? collectInstanceOverrideKeys(rootInstanceId, prefab).nested : [];
+      for (const k of nested) allKeys.add(k);
       setChecked(allKeys);
+      const opts = mode === 'apply' ? applyTargetOptions(rootInstanceId, prefab, [...allKeys]) : new Map<string, KeyTargets>();
+      setTargetOpts(opts);
+      setChoice(initialTargets(opts));
       setCollapsed(new Set());
-      setLoadState({ kind: 'ready', entities, addedTags, structural });
+      setLoadState({ kind: 'ready', entities, addedTags, structural, nested });
     })();
     return () => { cancelled = true; };
   }, [active, subject]);
@@ -228,6 +241,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     for (const r of loadState.structural.removedEntities) tally(r.key);
     for (const r of loadState.structural.removedTraits) tally(r.key);
     for (const r of loadState.structural.moved) tally(r.key);
+    for (const k of loadState.nested) tally(k);
     return { total, checked: checkedCount };
   }, [loadState, checked]);
 
@@ -273,7 +287,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
         act: async (liveId) => {
           // Applies the selected overrides to the prefab AND pushes one undo entry.
           // (Promotion-driven scene re-save now happens inside applyToPrefabWithUndo.)
-          const result = await applyToPrefabWithUndo(liveId, checked);
+          const result = await applyToPrefabWithUndo(liveId, checked, toApplyTargets(choice, checked));
           const notice = applyOutcomeNotice(result);
           if (notice) useEditorStore.getState().showToast(notice, 'warn');
           closeDialog();
@@ -304,6 +318,37 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   };
 
   const baseRow: React.CSSProperties = { display: 'flex', alignItems: 'center', minHeight: 22, fontFamily: 'monospace', fontSize: 12 };
+
+  /** A row's target (#1693): what applying it does at the chosen prefab — a picker when there is more than one — and,
+   *  under it, the enclosing overrides that choice also reverts (U13). Null in Revert, and for a key with no target. */
+  const targetCell = (key: string, indent: number): React.ReactElement | null => {
+    const o = mode === 'apply' ? chosenOption(choice, targetOpts, key) : undefined;
+    if (!o) return null;
+    return (
+      <div style={{ paddingLeft: indent, fontSize: 11, marginBottom: 2 }}>
+        {hasChoice(targetOpts, key) && (
+          <select
+            value={o.target}
+            onChange={(e) => setChoice((c) => setTarget(c, targetOpts, key, e.target.value))}
+            data-ui-id={`prefab.dialog.target.${key}`} data-ui-kind="select" data-ui-label={`target of ${key}`}
+            style={{ background: '#22223a', color: '#ddd', border: '1px solid #444', fontFamily: 'monospace', fontSize: 11, marginRight: 6 }}
+          >
+            {targetOpts.get(key)!.options.map((t) => <option key={t.target} value={t.target}>{t.name}</option>)}
+          </select>
+        )}
+        <span style={{ color: '#9ab' }}>{o.label}</span>
+        {o.alsoReverts.map((r) => (
+          <div key={r.prefab + r.what} style={{ color: '#c9a44a' }}>also reverts Prefab '{r.name}': {r.what} — {r.name} is written too</div>
+        ))}
+      </div>
+    );
+  };
+  const chainTargets = (() => {
+    const seen = new Map<string, string>();
+    for (const t of targetOpts.values()) for (const o of t.options) if (!seen.has(o.target)) seen.set(o.target, o.name);
+    return [...seen];
+  })();
+  const writesFooter = mode === 'apply' ? filesWritten(choice, targetOpts, checked) : [];
 
   const isRevert = mode === 'revert';
   const title = isRevert ? 'Revert Overrides' : 'Apply to Prefab';
@@ -372,7 +417,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                     </>
                   )}
                 </div>
-              ))}
+              )).flatMap((row, i) => [row, <div key={`${t.fields[i]!.key}:target`}>{targetCell(t.fields[i]!.key, 84 + d * INDENT)}</div>])}
             </div>
           );
         })}
@@ -392,6 +437,21 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
           <span style={{ color: '#fff', fontSize: 13, fontWeight: 'bold' }}>{title}</span>
           <span style={{ color: '#888', fontSize: 11 }}>{totals.checked} / {totals.total} selected</span>
         </div>
+        {mode === 'apply' && chainTargets.length > 1 && (
+          <div style={{ color: '#aaa', fontSize: 11, marginBottom: 8 }}>
+            Apply all to{' '}
+            <select
+              value=""
+              onChange={(e) => { if (e.target.value) setChoice((c) => setAllTargets(c, targetOpts, targetOpts.keys(), e.target.value)); }}
+              data-ui-id="prefab.dialog.target.all" data-ui-kind="select" data-ui-label="apply all to"
+              style={{ background: '#22223a', color: '#ddd', border: '1px solid #444', fontFamily: 'monospace', fontSize: 11 }}
+            >
+              <option value="">—</option>
+              {chainTargets.map(([target, name]) => <option key={target} value={target}>Prefab '{name}'</option>)}
+            </select>
+            <span style={{ color: '#666', marginLeft: 6 }}>(each row that can go there)</span>
+          </div>
+        )}
 
         <div style={{ flex: 1, overflowY: 'auto', border: '1px solid #333', borderRadius: 4, padding: 8, background: '#15151f' }}>
           {loadState.kind === 'loading' && (
@@ -405,7 +465,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             && loadState.structural.added.length === 0
             && loadState.structural.removedEntities.length === 0
             && loadState.structural.removedTraits.length === 0
-            && loadState.structural.moved.length === 0 && (
+            && loadState.structural.moved.length === 0
+            && loadState.nested.length === 0 && (
             <div style={{ color: '#888', fontSize: 12, padding: 8 }}>{emptyMsg}</div>
           )}
           {loadState.kind === 'ready'
@@ -458,7 +519,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <span style={{ color: '#ddd', fontWeight: 'bold' }}>{r.name}</span>
               <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId}{isRevert ? '' : ' · affects all instances'}</span>
             </div>
-          ))}
+          )).flatMap((row, i) => [row, <div key={`${loadState.structural.removedEntities[i]!.key}:target`}>{targetCell(loadState.structural.removedEntities[i]!.key, 40)}</div>])}
 
           {loadState.kind === 'ready' && loadState.structural.removedTraits.map((r) => (
             <div key={r.key} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2 }}>
@@ -479,7 +540,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <span style={{ color: '#ddd' }}>{r.entityName}</span>
               <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId}</span>
             </div>
-          ))}
+          )).flatMap((row, i) => [row, <div key={`${loadState.structural.removedTraits[i]!.key}:target`}>{targetCell(loadState.structural.removedTraits[i]!.key, 40)}</div>])}
 
           {loadState.kind === 'ready' && loadState.addedTags.map((r) => (
             <div key={r.key} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2 }}>
@@ -500,7 +561,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <span style={{ color: '#ddd' }}>{r.entityName}</span>
               <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId} · tag</span>
             </div>
-          ))}
+          )).flatMap((row, i) => [row, <div key={`${loadState.addedTags[i]!.key}:target`}>{targetCell(loadState.addedTags[i]!.key, 40)}</div>])}
 
           {loadState.kind === 'ready' && loadState.structural.moved.map((r) => (
             <div key={r.key} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2 }}>
@@ -522,8 +583,27 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId}{isRevert ? '' : ' · affects all instances'}</span>
             </div>
           ))}
+          {loadState.kind === 'ready' && loadState.nested.length > 0 && (
+            <div style={{ color: '#888', fontSize: 11, margin: '8px 0 2px' }}>Inside nested instances</div>
+          )}
+          {loadState.kind === 'ready' && loadState.nested.map((k) => (
+            <div key={k} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2, alignItems: 'flex-start' }}>
+              <span style={{ width: 14 }} />
+              <TriCheckbox
+                state={checked.has(k) ? 'on' : 'off'}
+                onChange={(next) => toggleKey(k, next)}
+                dataUiId={`prefab.dialog.item.${k}`} dataUiLabel={chosenOption(choice, targetOpts, k)?.label ?? k}
+              />
+              {targetCell(k, 0)}
+            </div>
+          ))}
         </div>
 
+        {writesFooter.length > 0 && (
+          <div data-ui-id="prefab.dialog.writes" style={{ color: '#888', fontSize: 11, marginTop: 8 }}>
+            Writes: {writesFooter.map((n) => `${n}.prefab.json`).join(', ')}
+          </div>
+        )}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
           <button
             onClick={closeDialog}

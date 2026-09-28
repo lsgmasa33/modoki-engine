@@ -55,7 +55,7 @@ import {
   classifyExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo,
   applyToPrefabWithUndo, revertOverridesWithUndo, staleInstanceRefusal, resolveInstanceContext,
-  collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey,
+  collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
   pushAction, makePrefabInstantiateAction, entityRef, assetDocAction,
   getEditorViewportCamera, focusEntityInSceneView, setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit,
   upsertKey, findTrack, encodeValue,
@@ -79,7 +79,7 @@ import {
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, currentCaptureSeq, resolveCapCursor, journalDroppedThroughCap, journalGapNote, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
-  getAnimSet, getSpriteMaterialProgram, isGuid,
+  getAnimSet, getSpriteMaterialProgram, isGuid, resolveRef,
   getAllTraits, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
@@ -539,6 +539,13 @@ interface PrefabParams {
    *  `"-trait.<member>.<name>"` / `"+trait.<member>.<tag>"` / `"~moved.<member>"`, `<member>` a nodeGuid or, for a pre-v5
    *  template, a localId; `prefabOverrideKeys.ts`). Omitted ⇒ ALL current overrides on the instance. */
   keys?: string[];
+  /** apply: where EVERY key is written (#1693, owner ruling C) — a prefab on the instance's chain (its guid or path;
+   *  `overrides` lists each key's `targets`), or `'instance'` (the prefab of the instance this op is called on) or
+   *  `'frame'` (the prefab of the frame the key belongs to: the same for its own keys, the NESTED instance's for a
+   *  `keys.nested` key). Omitted ⇒ each key's own default (`targets[key].defaultTarget`). */
+  target?: string;
+  /** apply: per-key targets, over `target`. Every one must be a target of its key, and every key must be applied. */
+  targets?: Record<string, string>;
 }
 
 /** Raw selection write — no undo entry (the agent shouldn't pollute the human's
@@ -3115,9 +3122,16 @@ export function registerEditorAgentOps(): void {
         localId: e.localId, entityName: e.name, trait: t.trait, field: f.field,
         current: f.current, base: f.base, key: f.key,
       }))));
+      // Where each key can be applied (#1693, owner ruling C): the prefabs on the instance's chain, what applying it
+      // there does (stated truthfully — a component ADD is said as one), the enclosing overrides it also reverts
+      // (U13), and the default. What the dialog shows per row.
+      const targets = Object.fromEntries([...applyTargetOptions(ctx.rootInstanceId, prefab, [...keys.all, ...keys.nested])].map(([k, t]) => [k, {
+        defaultTarget: t.defaultTarget,
+        options: t.options.map((o) => ({ target: o.target, name: o.name, effect: o.label, alsoReverts: o.alsoReverts.map((r) => `Prefab '${r.name}': ${r.what}`) })),
+      }]));
       return {
         ok: true, source: ctx.source, rootInstanceId: ctx.rootInstanceId, guid: ensureGuid(ctx.rootInstanceId),
-        keys, fields,
+        keys, fields, targets,
         // Say out loud what `keys` deliberately does NOT contain, so the omission is data rather
         // than a discrepancy the caller only notices by counting. `unaddressableAdded` are added
         // subtrees whose entity has no guid yet (minted lazily — save the scene and they become
@@ -3144,7 +3158,10 @@ export function registerEditorAgentOps(): void {
       // `keys` list is validated against, so a cold miss turns a legitimate key into a refusal.
       await preloadNestedPrefabsForSubtree(ctx.rootInstanceId);
       const available = collectInstanceOverrideKeys(ctx.rootInstanceId, prefab);
-      if (available.all.length === 0) {
+      // U14 (#1693): Apply on an outer instance also takes its nested instances' own edits (`keys.nested`); Revert acts
+      // on the nested instance itself, so it does not.
+      const actOn = verb === 'apply' ? [...available.all, ...available.nested] : available.all;
+      if (actOn.length === 0) {
         throw new Error(`prefab ${verb}: instance rooted at entity ${ctx.rootInstanceId} has no overrides — nothing to ${verb}.`);
       }
       let keySet: Set<string>;
@@ -3157,7 +3174,7 @@ export function registerEditorAgentOps(): void {
         throw new OpRefusal(
           'AMBIGUOUS',
           `prefab ${verb}: \`keys\` was given as an EMPTY array, which is ambiguous — omit \`keys\` ` +
-          `entirely to ${verb} ALL ${available.all.length} override(s), or pass the ones you mean. ` +
+          `entirely to ${verb} ALL ${actOn.length} override(s), or pass the ones you mean. ` +
           'Refusing rather than guessing: an empty selection computed by a filter means "nothing", ' +
           'while the omitted-keys default means "everything", and acting on the wrong one here is ' +
           `${verb === 'apply' ? 'a write to the shared prefab every other instance inherits' : 'a teardown of every override on this instance'}.`,
@@ -3172,23 +3189,23 @@ export function registerEditorAgentOps(): void {
         // apply is flaky rather than that they mistyped a key.
         // Compared in ONE spelling (#1468 Phase 4): a key names its member by `nodeGuid` where it can, and
         // a caller holding the localId spelling of the same key is asking for the same thing.
-        const listed = new Set(available.all.map((k) => canonicalOverrideKey(k, prefab)));
+        const listed = new Set(actOn.map((k) => canonicalOverrideKey(k, prefab)));
         const unknown = new Set(p.keys.filter((k) => !listed.has(canonicalOverrideKey(k, prefab))));
         if (unknown.size > 0) {
-          const sample = available.all.slice(0, 5).join(', ');
+          const sample = actOn.slice(0, 5).join(', ');
           throw new OpRefusal(
             'NOT_FOUND',
             `prefab ${verb}: ${unknown.size} of the ${p.keys.length} given key(s) match no override on this ` +
             `instance — ${[...unknown].slice(0, 5).join(', ')}${unknown.size > 5 ? ', …' : ''}. NOTHING was ` +
             `${verb === 'apply' ? 'applied' : 'reverted'} (a partial ${verb} would look like a success). Valid ` +
-            `keys (${available.all.length} total) include: ${sample}${available.all.length > 5 ? ', …' : ''}. ` +
+            `keys (${actOn.length} total) include: ${sample}${actOn.length > 5 ? ', …' : ''}. ` +
             "Call prefabAction:'overrides' for the exact set.",
-            { options: available.all },
+            { options: actOn },
           );
         }
         keySet = new Set(p.keys);
       } else {
-        keySet = new Set(available.all); // omitted ⇒ act on everything
+        keySet = new Set(actOn); // omitted ⇒ act on everything
       }
 
       if (which === 'apply') {
@@ -3210,9 +3227,27 @@ export function registerEditorAgentOps(): void {
             'from `keys` to apply the rest.',
           );
         }
+        // Targets (#1693): ALL-or-nothing, like `keys` — `checkApplyTargets` decides, as `planApply` reads them.
+        let perKey: Record<string, string> = {};
+        if (p.target !== undefined || p.targets) {
+          const opts = applyTargetOptions(ctx.rootInstanceId, prefab, [...keySet]);
+          const checked = checkApplyTargets(keySet, opts, ctx.source, { default: p.target, perKey: p.targets },
+            (k) => canonicalOverrideKey(k, prefab), (g) => (isGuid(g) ? resolveRef(g) : undefined));
+          if (checked.stray.length) {
+            throw new OpRefusal('NOT_FOUND', `prefab apply: \`targets\` names ${checked.stray.length} key(s) this apply does not act on — ${checked.stray.slice(0, 5).join(', ')}. NOTHING was applied.`);
+          }
+          if (checked.bad.length) {
+            throw new OpRefusal('NOT_FOUND',
+              `prefab apply: ${checked.bad.length} key(s) cannot be applied where asked — ${checked.bad.slice(0, 5).join('; ')}${checked.bad.length > 5 ? '; …' : ''}. ` +
+              "NOTHING was applied. prefabAction:'overrides' lists each key's `targets`.",
+              { options: [...new Set([...opts.values()].flatMap((t) => t.options.map((x) => x.target)))] });
+          }
+          perKey = checked.perKey;
+        }
         // applyToPrefabWithUndo pushes its OWN undo entry (before/after prefab + scene
         // snapshot — see applyPrefabUndo.ts) — do NOT push a second one here.
-        const result = await applyToPrefabWithUndo(ctx.rootInstanceId, keySet);
+        const result = await applyToPrefabWithUndo(ctx.rootInstanceId, keySet,
+          p.target !== undefined || p.targets ? { default: p.target, perKey } : undefined);
         // A move the prefab cannot express (#1437) is named with its reason, not echoed back as applied.
         const notWritten = result.skipped ?? [];
         if (!result.applied) {
@@ -3237,6 +3272,10 @@ export function registerEditorAgentOps(): void {
           ...(excluded.length > 0 ? { skippedReason: `fields ${excluded.join(', ')}: not representable in a prefab template (scene-only / runtime-only field)` } : {}),
           ...(notWritten.length > 0 ? { notWritten } : {}),
           promotedAdditions: result.promotedAdditions, saved: true,
+          // Where each key went, every file written (innermost first), and what U13 reverted with them (#1693).
+          ...(result.targets ? { targets: result.targets } : {}),
+          written: (result.writes ?? []).map((w) => w.source),
+          ...(result.alsoReverted?.length ? { alsoReverted: result.alsoReverted } : {}),
           // An applied move changed member paths (#1437): which other files had their refs repaired, and which not.
           ...(result.memberPathsChanged ? { fileRepair: result.fileRepair ?? { failed: true } } : {}),
           ...(result.warnings?.length ? { warnings: result.warnings } : {}),

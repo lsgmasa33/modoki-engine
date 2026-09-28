@@ -815,6 +815,11 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
   ...['SerializedEntity.overrides', 'SerializedEntity.removedTraits', 'SerializedEntity.moved', 'SerializedEntity.nestedOverrides'].map((f) => ({
     item: `engine/packages/modoki/src/editor/scene/serialize.ts::${f}`,
     reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id — the written twin of loaders/loadSceneFile.ts SceneEntityEntry; editor/scene/serialize.ts:41' })),
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::StructureCaptureOpts.layerTraits',
+    reason: 'not-entity: keyed by a prefab member\'s row localId (the frame document\'s own id space), valued by trait names the enclosing layer adds to it; built for one capture (#1676); editor/scene/prefab.ts StructureCaptureOpts' },
+  ...['LayerStructure.removedTraits', 'LayerStructure.moved', 'FrameLayer.overrides', 'LayerLists.removedTraits'].map((f) => ({
+    item: `engine/packages/modoki/src/editor/scene/prefabBase.ts::${f}`,
+    reason: 'not-entity: keyed by a prefab member\'s row localId (the frame document\'s own id space) — the fold of the prefab layers enclosing a frame (#1693), computed per call and never held across one; editor/scene/prefabBase.ts:30' })),
   ...['PromotedGuids.plain', 'PromotedGuids.refs'].map((f) => ({
     item: `engine/packages/modoki/src/editor/scene/prefab.ts::${f}`,
     reason: 'not-entity: keyed by the row localId Apply\'s promotion just wrote into the prefab (the file\'s own id space); the values are guids, and the record lives only across one Apply\'s delete + refresh (#1660)' })),
@@ -880,8 +885,6 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'per-world-index: rebuilt from the live world once per identity resolver and cached on that resolver OBJECT (WeakMap). A resolver is reused only while the world\'s structure version stands still (openIdentityScope), and a despawn bumps it, so no recycled id can reach an index built before its entity died; outside a scope every resolver, and so every index, is fresh (#1484); editor/scene/prefab.ts:2506' },
   { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::worldRowIndexMemo',
     reason: 'per-world-index: rebuilt from the live world once per identity resolver and cached on that resolver OBJECT (WeakMap). A resolver is reused only while the world\'s structure version stands still (openIdentityScope), and a despawn bumps it, so no recycled id can reach an index built before its entity died; outside a scope every resolver, and so every index, is fresh (#1484); editor/scene/prefab.ts:2506' },
-  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::expandedFrom',
-    reason: 'scratch: set and cleared (try/finally) around ONE synchronous captureNestedInstanceOverrides call — a read-only capture that spawns and destroys nothing, so no instance-root id it holds can be recycled while it is read; null outside that call (#1437); editor/scene/prefab.ts:1620' },
   { item: 'engine/packages/modoki/src/editor/scene/sceneViewBus.ts::ecsObjectsRegistry',
     reason: 'owner-checked: a reference to SceneView\'s live RenderState.ecsObjects, registered with its ecsOwners stamp map; the one reader, isEcsObjectVisible, refuses an entry whose packed owner is no longer alive before reading it (#1198 review), pinned by sceneViewBus.test.ts; editor/scene/sceneViewBus.ts' },
   { item: 'engine/packages/modoki/src/editor/scene/sceneViewBus.ts::ecsOwnersRegistry',

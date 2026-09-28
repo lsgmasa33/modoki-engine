@@ -94,6 +94,8 @@ export {
   collectInstanceOverrideFields, collectInstanceOverrideKeys,
   type FieldNode, type TraitNode, type EntityOverrideNode, type InstanceOverrideKeys,
 } from './scene/prefabOverrideKeys';
+export { applyTargetOptions, checkApplyTargets, type ApplyTargetOption, type KeyTargets } from './scene/prefabApplyOptions';
+export type { ApplyTargets } from './scene/prefabApplyTargets';
 // `applyToPrefabWithUndo` is the ONLY way to apply overrides that also records undo —
 // `applyToPrefabSelective` above is the raw mutation the dialog/agent-op undo wrapper
 // calls into, kept exported too for callers that manage their own undo entry.

@@ -40,6 +40,7 @@ import {
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { noteFrameRootDoc } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -302,14 +303,37 @@ describe('the prefab editor shows and saves a row\'s nested channels (#1381, #13
     warn.mockRestore();
   });
 
-  // Review finding 2. Uncached, the owned instance still re-expands from the MID row, so neither it
-  // nor anything under it may become a row — the loss is reported instead. Mutation: in
-  // `captureNestedChannels`' uncached branch, `continue` without adding the subtree.
-  it('with the inner prefab uncached, nothing inside the owned instance falls out as a root row', async () => {
+  // #1693: a live frame's document is its FRAME RECORD (`levelDoc`), so a cold cache no longer loses what the scene added
+  // inside it. Mutation: read `captureNestedChannels`' child document from the cache (`getCachedPrefabSync`) — X is lost.
+  it('with the inner prefab uncached, the frame record still captures what was added inside the owned instance', async () => {
     const root = await openInEditor(outerDoc({}) as PrefabFile);
     const { spawnEntity, Transform, EntityAttributes } = await import('@modoki/engine/runtime');
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'X', parentId: leafUnderMid() }));
     setPrefabCache(INNER, null);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const saved = serializePrefab(root, OUTER)!;
+    const parentOf = (e: PrefabFile['entities'][number]) => (e.traits.EntityAttributes as { parentId: number }).parentId;
+    expect(saved.entities.filter((e) => parentOf(e) === 0).map((e) => e.name)).toEqual(['OuterRoot']);
+    expect(saved.entities.map((e) => e.name)).not.toContain('X'); // not a root row…
+    expect(JSON.stringify(saved)).toContain('"X"'); // …but kept, on the row that re-expands it
+    expect(warn.mock.calls.some(([m]) => /not captured/.test(String(m)))).toBe(false);
+    warn.mockRestore();
+  });
+
+  // Review finding 2. With neither a record nor the cache, the owned instance still re-expands from the MID row, so
+  // neither it nor anything under it may become a row — the loss is reported instead. Mutation: in
+  // `captureNestedChannels`' uncached branch, `continue` without adding the subtree.
+  it('with no document at all for the inner frame, nothing inside the owned instance falls out as a root row', async () => {
+    const root = await openInEditor(outerDoc({}) as PrefabFile);
+    const { spawnEntity, Transform, EntityAttributes } = await import('@modoki/engine/runtime');
+    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'X', parentId: leafUnderMid() }));
+    setPrefabCache(INNER, null);
+    // A frame with no record of its own: every INNER root's record names another source, which `levelDoc` ignores.
+    const piMeta = getTraitByName('PrefabInstance')!;
+    for (const e of getCurrentWorld().query(piMeta.trait)) {
+      const pi = e.get(piMeta.trait) as { source?: string; rootInstanceId?: number };
+      if (pi.source === INNER && pi.rootInstanceId === e.id()) noteFrameRootDoc(getCurrentWorld(), e, { source: 'none', doc: {} });
+    }
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const saved = serializePrefab(root, OUTER)!;
     const parentOf = (e: PrefabFile['entities'][number]) => (e.traits.EntityAttributes as { parentId: number }).parentId;

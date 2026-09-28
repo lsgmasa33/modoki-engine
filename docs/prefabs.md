@@ -7,7 +7,7 @@ updates every instance.
 
 See also: [Architecture](./architecture.md) · [Scene Loading](./scene-loading.md) · [Visual Editor](./editor.md)
 
-> **Design reference: Unity (owner, 2026-09-28).** When a prefab behaviour is a design choice (which prefab an Apply targets, what Revert or Replace keeps, how a nested override reads), copy Unity's prefab semantics. Example: Apply on a nested instance, of a component an enclosing row added, offers both "Apply to Prefab '<nested>'" (stated truthfully as a component addition) and "Apply as override in Prefab '<enclosing>'" (#1658).
+> **Design reference: Unity (owner, 2026-09-28).** When a prefab behaviour is a design choice (which prefab an Apply targets, what Revert or Replace keeps, how a nested override reads), copy Unity's prefab semantics. Example: Apply on a nested instance, of a component an enclosing row added, offers both "Apply to Prefab '<nested>'" (stated truthfully as a component addition) and "Apply as override in Prefab '<enclosing>'", the default (#1658, § "Apply's targets").
 
 ## Model and invariants
 
@@ -52,9 +52,9 @@ answer the same question for themselves. Each place in that column is a place th
 
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
-| I1 | A frame's effective base is its template folded with every enclosing layer, from the outside in, the same way at every depth. A layer can carry every edit an instance can. | Runtime: the walk in `instantiatePrefabIntoWorld`, built from the shared folds. **Editor: no single owner.** Each editor site composes the same folds itself. `enclosingLayer` answers the comparison side (I2), not the expansion. | The fold is re-composed in several places. `instantiatePrefab`, the editor's twin of the spawner, drops the rows' moves and member rows when it expands a nested row, and the runtime passes both. `resolveEffectivePrefabOverride` and `resolveEffectivePrefabStructure` re-walk it top-down. `enclosingLayer` climbs bottom-up and adds the template reference node's edits. `effectivePrefabRootTraits` / `effectivePrefabMemberTraits` (the UIEntries pool and the validator) predate member rows, `nestedStructure` and `added`. The pose base of an applied nested move, and `referenceRootPose`, fold one level. |
-| I2 | Every "is this the instance's own edit?" question compares the live frame with its effective base. That covers the override list, the Inspector highlight, the save, the rebuild's capture, Apply's keys and write, and Revert. Every own edit found has one key, and the listing, Apply and Revert all handle it. | `enclosingLayer`, through `instanceBase` / `enclosingRowOverrides` (fields) and `ownInstanceStructure` / `layerAuthoredStructureKeys` (structure). Used by the override list, the Inspector, Apply's drop rule and structure refusal, and Revert. | The save (`captureNestedChannels`) and the rebuild (`captureNestedInstanceOverridesIn`) diff against the bare child template, then subtract the rows' edits by value, from a walk that leaves out the template reference node's edits. Apply's field branch writes into the bare child's row, and seeds a whole component the child does not have. `applyToPrefab` builds its keys from `captureInstanceOverrides` against the bare child. `instanceBase` folds the rows' fields but not their `removedTraits` or `added`. A layer's values arrive override-marked, so every bare-child diff has to subtract them by value. |
-| I3 | A frame is compared against the document it was EXPANDED from. No capture runs on a frame whose recorded rows differ from the cached ones. | The frame record. `framesBuiltFromOtherRows` refuses such a frame, and `rebaseStaleInstances` repairs it. `rebuildInstanceFromCapture` puts a capture taken against an older document back onto the current one (Revert's undo, #1665). | The scene save reads the cache and checks nothing. `enclosingLayer` reads the cache, and so does every level below the top of the `resolveEffective…` walks, even when the caller pins the top document. "The document it was expanded from" is spelled two more ways: the scoped `expandedFrom` map, and `captureRowsForSettle` swapping the cache entry for the duration of a call. The two staleness tests differ: `rowsMeanTheSame` for the refusal, `sameDocument` for the rebase. A frame with no record falls back to the current cache (`setFrameDocFallback`), and the refusal cannot judge it. |
+| I1 | A frame's effective base is its template folded with every enclosing layer, from the outside in, the same way at every depth. A layer can carry every edit an instance can. | Runtime: the walk in `instantiatePrefabIntoWorld`, built from the shared folds. **Editor, comparison side: `frameBase` / `chainLayer` (`editor/scene/prefabBase.ts`, #1693)** — one fold (`foldPath`) with the same folds, in the editor expansion's order: a row's fields under the outer layer's forwarded ones, then every layer's member rows over both. It climbs by `ownerOf` and through a template reference node (#1506), and reads every level's document from its frame record (I3). | The expansion side is still twinned (#1707): `instantiatePrefab`, the editor's copy of the spawner (#1683 said it drops a nested row's moves and member rows; it threads member rows since #1533, so re-check before relying on either). `effectivePrefabRootTraits` / `effectivePrefabMemberTraits` (the UIEntries pool and the validator) predate member rows, `nestedStructure` and `added` (#1707). The pose base of an applied nested move (`docChainLayer`), and `referenceRootPose`, fold one level. |
+| I2 | Every "is this the instance's own edit?" question compares the live frame with its effective base. That covers the override list, the Inspector highlight, the save, the rebuild's capture, Apply's keys and write, and Revert. Every own edit found has one key, and the listing, Apply and Revert all handle it. | `frameBase`'s layer: through `instanceBase` / `enclosingRowOverrides` (fields) and `ownInstanceStructure` / `layerAuthoredStructureKeys` (structure) for the override list, the Inspector, Apply's structure refusal, and Revert; through `chainSlots` for Apply's targets and U13 (#1693); through `chainLayer` for the save (`captureNestedChannels`) and the rebuild (`captureNestedInstanceOverrides`), whose removed-components pass also measures a member against the traits the layer adds (`layerAddedTraits`, #1676). | `applyToPrefab` builds its keys from `captureInstanceOverrides` against the bare child. `instanceBase` folds the layer's fields but not its `removedTraits` or `added`. A layer's values arrive override-marked, so every bare-child diff has to subtract them by value. The listing and the Inspector diff by value, with no mark gate; the save has one. Gating the listing the same way is #1717 (unblocked by #1709, which made every editor write mark). |
+| I3 | A frame is compared against the document it was EXPANDED from. No capture runs on a frame whose recorded rows differ from the cached ones. | The frame record, read through `levelDoc` (`prefabBase.ts`) by every level of `frameBase` / `chainLayer`, the scene save's top-level capture (`savedFrameDoc`, #1685) and its nested captures, the rebuild's readers (`expandedDocOf`) and the settle's save capture (#1693 retired the scoped `expandedFrom` map and the settle's cache swap onto it). `framesBuiltFromOtherRows` refuses a frame whose record holds other rows, and `rebaseStaleInstances` repairs it. `rebuildInstanceFromCapture` puts a capture taken against an older document back onto the current one (Revert's undo, #1665). | The two staleness tests differ: `rowsMeanTheSame` for the refusal, `sameDocument` for the rebase. A frame with no record falls back to the current cache (`setFrameDocFallback`), and the refusal cannot judge it; every expansion path writes one (`instantiatePrefab`, Create Prefab's tag, a reattach, the loader, a carry across a world swap, an undo respawn). |
 
 #### Identity
 
@@ -64,7 +64,7 @@ answer the same question for themselves. Each place in that column is a place th
 | I5 | Only a write mints identity (a `nodeGuid`, a template `key`), and it carries the existing identity wherever a real correspondence exists. A reader never mints. | `nodeGuidsFor`, the one matcher (#1691): a prefab-edit save's preserved rows, then the live `nodeGuid`, then, on a Replace only, the one old row sharing a node's name (U22). Also `addedNodeIdentity`, whose `readOnly` mode never mints. | None known. Fixed at the owner: the prefab-edit save now remembers where each session-added member was written (#1662); Create Prefab's Replace serializes against the kept id (#1686); Apply's promotion carries the promoted guids (#1660, `carryPromotedGuids`). |
 | I6 | Which frame an entity belongs to, what a frame holds, and where a member sits are decided by IDENTITY, never by the live tree. Delete, promotion, a move, Detach and the save's partition all act on the identity subtree. | `worldIdentityParents` (`ownerOf`, `parentOf`, `moved`, and `frameOf`: the frame an entity is a row of), `identitySubtree` (#1691, both in `identityParents.ts`), `memberRowsIn`, `instanceRowDomain` (the row claims, a partition), `rebuildTeardown`, `endFrames`, `planMoveUnlinks`. Apply's promotion delete, Detach, the save's partition and the scene-move refusal ask them (#1682, #1687). | `templateReferenceNode` climbs live parents, on purpose, for speed. A user Delete takes the LIVE subtree on purpose: it removes what is shown under the node (Unity's hierarchy delete), and `endFrames` unlinks a member moved out. "The members of frame R" is read as a raw `rootInstanceId` scan at several sites; for a member that field IS identity (stamped at expansion), so those are not bypasses. |
 | I7 | A member's guid is the member row's pin, else the template's, else derived from its anchor through identity parents. Every place that predicts one derives it the same way. | `deriveInstanceMemberGuids` (after `applyStoredMemberRows`) walks up, over `deriveMemberGuid` and `entityStep`. `memberPathIndex` (`runtime/core/ecs/memberHome.ts`) walks the identity tree down, and `stampDerivedMemberGuids`, `promoteOwnedRoots`, `storedMemberGuids` and the loader's move drain share it. | Four sites predict guids with a walk of their own. The derivation's docblock names two: `derivedMemberPaths` (built on `memberPathRecords`, `runtime/loaders/memberPaths.ts`), and `planCopyGuids`. The other two are `liveMemberGuidRemap` and the prefab-edit world's `editGuidAt`. |
-| I8 | A template holds no identity of one instance: no guids, no member rows or moves, and a ref from one member to another is written as a member token. | `serializePrefab` with `templateTokenizer` and `assertNoRuntimeGuids`; `toTemplateNodes` for a promotion; `tokenizeForInstance` in Apply. | Apply's other write paths copy live values without tokenizing them (#1659). |
+| I8 | A template holds no identity of one instance: no guids, no member rows or moves, and a ref from one member to another is written as a member token. | `serializePrefab` with `templateTokenizer` and `assertNoRuntimeGuids`; `toTemplateNodes` for a promotion; `templateValueWriter` (`prefabTemplateValue.ts`, #1659) for every value Apply writes. | None known in Apply. `serializePrefab`'s `templateTokenizer` and prefab edit's `editWorldRefs` are further copies of the idea for other carriers. |
 
 #### Change propagation
 
@@ -91,7 +91,7 @@ answer the same question for themselves. Each place in that column is a place th
 needed a new rule. The table and the counts are on the issue, not here, because they go stale.
 
 The bugs cluster where the table above shows no owner, or an owner that operations go around:
-- **Effective base** (I1–I3). `enclosingLayer` answers it for the override list, Apply and Revert. The save, the rebuild's capture and Apply's field write each compose their own base. So the fixes landed one surface at a time: #1386, #1401, #1498, #1492, #1506. #1658 and #1676 are the surfaces still left.
+- **Effective base** (I1–I3). Since #1693, `frameBase` (`prefabBase.ts`) is the one answer on the comparison side: the override list, Apply's refusals, Revert, the save and the rebuild's capture all take the layer from it, every level read from its frame record. Before it, the fixes landed one surface at a time: #1386, #1401, #1498, #1492, #1506, and #1676 (the capture's removed-components pass). Apply's write followed with #1693's two-target Apply (#1658), and the expansion side is #1707.
 - **Propagation** (I9–I11). Owned since #1692 by `commitPrefabWrite`. Before, each writer put together write, cache and rebuild itself, and the writers that skipped a step were the bugs it absorbed: #1667, #1669, #1685, #1695 (and #1666, fixed at `loadScene`'s leave repair).
 - **Identity** (I4–I8). It has real owners (`worldIdentityParents`, `memberRowsIn`, the row-claim partition), and since #1691 one identity subtree (`identitySubtree`, `frameOf`) that the sites which walked the live tree now ask (#1682, #1687). Member guids are still predicted by four walks of their own (#1324, #1339, #1430, #1461, #1660); why none moved onto the shared walk is on the follow-up issue #1691 links.
 
@@ -129,10 +129,10 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 |---|---|---|---|---|
 | U10 | Apply / Revert granularity | Per property (right-click), per component (cog menu), per added GameObject (Hierarchy menu), and All / Selected from the Overrides drop-down. [M22 `EditingPrefabViaInstance`] | One dialog (`PrefabOverridesDialog`), opened from the Inspector's "Apply to Prefab…" / "Revert Overrides…". It is a tri-state tree of entity → component → field, plus one row per structural edit, all checked to start. No right-click Apply / Revert on a field or component. | match in what can be selected; the context-menu shortcuts are **missing**, S |
 | U11 | What Revert does per kind | Removes an added component or GameObject (with its children); restores a removed component or GameObject. [S6 `PrefabUtility.RevertAddedGameObject`, `RevertRemovedGameObject`; M22 `EditingPrefabViaInstance`] | The same, and "move back" for a moved member. `revertOverridesSelective` tears down and re-expands minus the reverted keys. | match |
-| U12 | Apply target, per item on a nested instance | Offers every prefab on the chain: "Apply to Prefab 'Vase'" (the inner asset) or "Apply as Override in Prefab 'Table'" (an override on the nested instance inside the outer asset). [M22 `PrefabOverridesMultiLevel`] | One target per kind of edit. For almost every edit, the dialog opens on the innermost frame root and Apply writes the child prefab. **The exception runs the other way:** a member moved out of its nested frame is offered only to the OUTER instance, which records the move and the member's pose on its nested row and leaves the nested prefab alone (`nestedFrameMoves`, #1437). That is Unity's "as Override" target, already built for one kind of edit. #1658's ruling C (2026-09-28, still open) will add the second target, but only for a component or field an enclosing row authored. | **diverges**: Unity offers both targets for **every** nested override. Owner: #1693. |
-| U13 | Applying to the inner asset clears the outer's override | "If Apply to Prefab 'Vase' is chosen and the 'Table' Prefab has an override of the value, this override in the 'Table' Prefab is reverted at the same time." [M22 `PrefabOverridesMultiLevel`] | The opposite (#1492, owner ruling b, 2026-09-24). The enclosing row keeps its override, and the source instance keeps its own override so that it shows the applied value (`appliedFieldsToDrop`). Every other instance of the outer prefab still shows the row's value. | **diverges**: ruling b predates "copy Unity". Owner fork, relayed on #1693. |
-| U14 | Apply All on the outermost root | Targets the outer prefab only. Nested edits become overrides on the nested instance inside it. [M22 `PrefabOverridesMultiLevel`] | The outer instance's Apply offers nothing for an edit inside a nested instance. That edit goes to the child's own file (owner, 2026-09-19; [prefab-structural-overrides.md](./prefab-structural-overrides.md)). The one exception is U12's move out of a nested frame. | **diverges**: the 2026-09-19 ruling predates "copy Unity". Owner fork, relayed on #1693. |
-| U15 | The instance after an Apply | The applied value now comes from the asset, so the override disappears. | The same: Apply takes what it applied out of the source instance's overrides (#1469). The exception is U13's case: a field an enclosing row sets keeps the instance's override. | match, except U13 |
+| U12 | Apply target, per item on a nested instance | Offers every prefab on the chain: "Apply to Prefab 'Vase'" (the inner asset) or "Apply as Override in Prefab 'Table'" (an override on the nested instance inside the outer asset). [M22 `PrefabOverridesMultiLevel`] | Every field, added tag and removed component takes a target per key over the whole chain (#1693, § "Apply's targets"), in the dialog and the agent `apply` op. An ADDED node, and a move inside a nested frame, still take only the frame's own prefab; a move OUT of a nested frame only the outer one (#1437). | match for fields, components and removed members; **diverges** for added nodes and moves (#1715) |
+| U13 | Applying to the inner asset clears the outer's override | "If Apply to Prefab 'Vase' is chosen and the 'Table' Prefab has an override of the value, this override in the 'Table' Prefab is reverted at the same time." [M22 `PrefabOverridesMultiLevel`] | The same (#1693, owner 2026-09-28, superseding #1492 ruling b): every enclosing level's statement of the applied field, tag or removed component is dropped, its file written in the same step, and Apply's undo restores it. | match |
+| U14 | Apply All on the outermost root | Targets the outer prefab only. Nested edits become overrides on the nested instance inside it. [M22 `PrefabOverridesMultiLevel`] | The same for fields, added tags, removed components and removed members (#1693, owner 2026-09-28, superseding the 2026-09-19 ruling): the outer instance lists them (`keys.nested`) and writes them into the outer prefab by default; the nested prefab only when picked. A nested frame's added nodes and inner moves are still applied from the nested instance. | match for fields, components and removed members; **diverges** for added nodes and inner moves (#1715) |
+| U15 | The instance after an Apply | The applied value now comes from the asset, so the override disappears. | The same: Apply takes what it applied out of the source instance's overrides (#1469), and nothing shadows it any more (U13). | match |
 
 ### Unpack, Prefab Mode, Replace, Create
 
@@ -583,33 +583,70 @@ writes. `refreshInstances` subtracts that set from **that one instance's** captu
 rebuild (`subtractFieldOverrides`, which Revert uses for the fields it reverts). Other instances keep
 their own overrides of the same field. Tests: `engine/tests/editor/applyLeavesNoSourceOverride.test.ts`.
 
-**…except a field an ENCLOSING row shadows (#1492, owner ruling b, 2026-09-24).** The rule is one
-predicate (`appliedFieldsToDrop`): **an applied field keeps its override only if dropping it would change
-the value the instance resolves to.** A nested instance resolves to its template UNDER the rows enclosing
-it (`enclosingRowOverrides`: every row from the stored root down, resolved outside-in, tokens resolved).
-So when the outer prefab's row sets the applied field to another value, the source keeps it. Dropped, the
-instance would show the row's value, not the one the author just applied. Every other applied field is
-subtracted as above, including on a nested instance whose rows do not set it. It is not a second #1469:
-it changes what the instance shows, and it adds no pinning, because the row had pinned the field already.
-It must be an ordinary override, and three surfaces make it one by reading the same resolved base:
-- **the override list** (`collectInstanceOverrideTree`) diffs a nested instance against its template
-  under its rows. Against the bare template, the kept value (equal to it now) was not listed, and a value
-  the outer row sets was listed as the instance's own override;
-- **Revert** puts back the ROW's value for a field a row sets, not the template's. The rebuild re-expands
-  from the template alone and carries the row's values only as captured (marked) overrides, and the one
-  reverted is subtracted from those;
-- **the save** keeps it, since #1498 compares a nested field with the row by value.
+**On a nested instance, the enclosing override goes too (U13, #1693; supersedes #1492's ruling b).** Unity's rule
+(owner, 2026-09-28): "if Apply to Prefab 'Vase' is chosen and the 'Table' Prefab has an override of the value, this
+override in the 'Table' Prefab is reverted at the same time". So an Apply of a field an enclosing prefab's row also
+sets DROPS that row's statement of it, and the enclosing prefab's file is written too: every instance of the outer
+prefab then shows the applied value, and nothing is left shadowing it, so every applied field leaves the source
+(`appliedFieldsToDrop`, ruling b's keep rule, is gone). Before, the row kept its override and the source kept its own
+(ruling b, 2026-09-24): every OTHER instance of the outer prefab still showed the row's value. Three surfaces still
+read a nested instance against its template UNDER the rows (`enclosingRowOverrides`), because a field the row sets is
+not the instance's own edit:
+- **the override list** (`collectInstanceOverrideTree`) diffs a nested instance against its template under its rows.
+  Against the bare template, a value the outer row sets was listed as the instance's own override;
+- **Revert** puts back the ROW's value for a field a row sets, not the template's. The rebuild re-expands from the
+  template alone and carries the row's values only as captured (marked) overrides, and the one reverted is subtracted
+  from those. A reverted REMOVAL of a component the row adds puts the row's component back the same way;
+- **the save** compares a nested field with the row by value (#1498).
 
-**The resolved base is the enclosing layer WHOLE (#1506).** `enclosingLayer` answers what the layers
-enclosing an instance author on it: field overrides AND structure lists. `enclosingRowOverrides` is its
+### Apply's targets (#1693, owner ruling C, U12–U15)
+
+Apply writes each key to a prefab ON THE INSTANCE'S CHAIN (`applyToPrefabSelective(root, keys, targets)`, Unity's
+`PrefabOverridesMultiLevel`): the frame's own template ("Apply to Prefab '<inner>'"), or, as an override on the row an
+enclosing prefab holds for the frame, that prefab ("Apply as override in Prefab '<outer>'"). `prefabApplyTargets.ts`
+names the chain's places (`chainSlots`, from `frameBase`) and reads, writes and drops a member's statement where a
+level states it: the row's `overrides`, its `nestedOverrides[path]`, or a member row (`members`, which folds over both,
+so a value written under a member row that states the field would not show — it is written there instead).
+- **What each target does is said truthfully** (`prefabApplyOptions.ts`, read by the dialog and the agent op): a field
+  of a component the enclosing row ADDED, applied to the inner prefab, writes the whole component — "add component
+  Rotate3D (axis x, speed 7) to A in Prefab 'P' — every P gains it" (#1658: it used to be listed as "speed 3 → 7" and
+  written whole anyway). A component written at an enclosing level where nothing inside it gives the member one is
+  written whole there too.
+- **Defaults (owner ruling (a))**: the frame's own template, except a field or removal of a component an enclosing row
+  added, which goes back to the prefab that adds it (`defaultKeyLevel`). A removal has no inner target: the inner
+  template never had the component.
+- **U13** runs for every write, removals included: each enclosing level that states the applied field, tag or removed
+  component drops it (a row override of a component the member lacks ADDS it, so a removal left under one came back
+  half-built). Never what the same Apply wrote at that level itself (`wroteAt`).
+- **U14 (owner, 2026-09-28; supersedes the 2026-09-19 ruling)**: Apply on an OUTER instance lists its nested instances'
+  own fields, added tags, removed components and removed members too (`keys.nested`, chain-qualified: `<row chain>:<key>`,
+  `nestedKeyRef`), and writes them into the outer prefab by default, as overrides on the row it holds for that
+  instance; the nested prefab only when picked. They are not in `keys.all`: Revert acts on the nested instance itself.
+- **The write is ONE step over every file** (#1692's `commitPrefabWrites`), and the instances of each written prefab are
+  refreshed innermost first by chain level — a U14 write into a nested instance's own prefab before the frame's own —
+  so each capture reads frames already rebuilt inside it. A file that took a frame's OWN edit (the frame's own keys, or
+  a nested instance's U14 key written into its own prefab) has its refresh take that edit out of the frame's capture
+  (`appliedFrom`), or its mark would pin it (#1469). Apply's undo and redo put every file back the same way.
+- **Every live value goes into a template through one writer** (`prefabTemplateValue.ts`, #1659): the value overlay,
+  the added-component seed, both promotion branches (a promoted node's refs, and a promoted reference node's overrides
+  in its own frame) and the move pose. It tokenizes a ref to a member (or to a node the same Apply promotes) and drops
+  a template-excluded field and a blank asset ref.
+- **Not yet (#1715)**: an ADDED node, and a move inside a nested instance, go to the frame's own prefab only (a move OUT
+  of a nested frame goes to the outer one, `nestedFrameMoves`, #1437); the enclosing levels take fields, tags, removed
+  components and removed members (`writeMemberRemoval`). An added node is a live entity whose guid other refs name, so
+  writing it into another prefab's row needs #1660's guid carry across that prefab's rebuild — a different fix shape. A template reference node above the chain is not a document Apply writes: where it states
+  the applied value, it still wins on this instance, and Apply says so.
+
+**The resolved base is the enclosing layer WHOLE (#1506).** `frameBase` (`prefabBase.ts`, #1693; `enclosingLayer` reads
+its layer) answers what the layers enclosing an instance author on it: field overrides AND structure lists. `enclosingRowOverrides` is its
 field half, with tokens resolved. The layer can be one of two things:
-- **a row frame**: every row from the top down, as above, plus `resolveEffectivePrefabStructure` of the
-  same chain;
+- **a row frame**: every row from the top down, fields and structure in ONE fold (`foldPath`), each level's
+  document read from its frame record;
 - **a reference node that a prefab TEMPLATE authored** (a keyed `added` node with `prefab`, in a row of the
   frame it hangs in): the node's own channels (`overrides`, `added`, `removed`, `removedTraits`, `moved`,
   with its `members` folded as the loader folds them — a template node carries template-form rows since
   #1538). A chain of rows UNDER such a node starts from the node's `nestedOverrides`/`nestedStructure`
-  and its `members` (the seed arguments of the `resolveEffective…` walkers).
+  and its `members` (`foldPath`'s seed).
   The node is found by template key (`templateReferenceNode`), using the marker first and the
   guid-derived recovery if the marker was lost. A node the SCENE added has no enclosing layer: the scene
   writes it as that instance's own.
@@ -880,7 +917,7 @@ member's row: false overrides, and Apply wrote one member's value into another's
   `rebuildInstanceFromCapture` translates the carried state into the frame's recorded document and
   passes THAT as the baseline, which is the rule `refreshInstances` follows. It only picks the
   document; the effective base is still computed in one place (`captureNestedInstanceOverrides` →
-  `resolveEffectivePrefabOverride`/`Structure`). A stale NESTED frame refuses the step before anything
+  `chainLayer`). A stale NESTED frame refuses the step before anything
   is rebuilt, with `UndoRefusedError` as Apply's undo refuses (#1664): `runStep` drops it (#310), marks
   nothing edited, and toasts the reason.
 - **Apply and Revert refuse whatever is left** (`framesBuiltFromOtherRows`): any frame of the
@@ -896,9 +933,9 @@ member's row: false overrides, and Apply wrote one member's value into another's
   content would block Apply over any byte difference between two copies of one file.
 
 **A stale NESTED frame is rebuilt by ITSELF (#1493), never through its outer instance.** The nested
-captures read the cached CHILD document: a rebuild's (`captureNestedInstanceOverridesIn`) and a save's
-(`captureNestedChannels`). So rebuilding the OUTER instance would carry a stale nested frame's edits
-onto the wrong rows. Rebuilding the nested root on its own does not have that problem, because its own
+captures (a rebuild's `captureNestedInstanceOverrides`, a save's `captureNestedChannels`) read each nested
+frame's record since #1693, but the outer rebuild RE-APPLIES them onto a fresh expansion of the CURRENT
+document. So rebuilding the OUTER instance would carry a stale nested frame's edits onto the wrong rows. Rebuilding the nested root on its own does not have that problem, because its own
 capture reads its own record, like any other root's. That is also what Apply's fan-out already did to a
 nested root of the source it applied. The rebase lists every frame root and rebuilds a frame only once
 no other stale frame is left in what its teardown destroys (#1499), so by the time an outer frame is
@@ -914,7 +951,7 @@ number was deleted instead (OBSERVED, the "…so the SAVE" test below).
 subtree: whatever the frame owns that was moved elsewhere in the instance (#1437), a member of a
 user-added reference node moved out of that node, and every frame under those. Before #1499 the capture
 and the respawn did not match it, and each mismatch was a defect:
-- **The nested capture walked LIVE children** (`captureNestedInstanceOverridesIn`). A frame owned here but
+- **The nested capture walked LIVE children** (`captureNestedInstanceOverrides`). A frame owned here but
   moved out was destroyed and re-expanded at its row with its edits lost. The capture now takes its frames
   from the teardown's own set, so the two cannot disagree.
 - **The respawn restored two of an owned root's three identity fields.** `parentLocalId` and

@@ -60,7 +60,48 @@ export function nestedMoveRef(doc: KeyDoc, chain: readonly number[], lid: number
  *  NOTHING rather than whatever now holds a number — and so is a member part that is neither a guid nor
  *  a number. `+added.<guid>` names a live node, not a member, and passes through; so does a string with
  *  no separator at all, which no shape produces and every consumer already ignores. */
+/** A NESTED frame's own edit, keyed from the instance Apply is opened on (#1693, U14): the rows naming the nested frame
+ *  from `doc`, frame by frame, then `:` and the key as the nested frame spells it (`inner`, `<member>.T.f`,
+ *  `+trait.<member>.<tag>` or `-trait.<member>.<name>`). The kind prefix stays in front, as `~moved.<chain>:<lid>` has it:
+ *  `4:<gA>.Rotate3D.speed`, `-trait.<gN>:<gA>.Rotate3D`. */
+export function nestedKeyRef(doc: KeyDoc, chain: readonly number[], inner: string, readDoc: KeyDocReader): string {
+  const refs: string[] = [];
+  let cur: KeyDoc | null | undefined = doc;
+  for (const row of chain) {
+    refs.push(cur ? memberRef(cur, row) : String(row));
+    const ref: string | undefined = cur?.entities.find((e) => e.localId === row)?.prefab;
+    cur = ref ? readDoc(ref) : null;
+  }
+  const prefix = NESTED_KINDS.find((k) => inner.startsWith(k)) ?? '';
+  return `${prefix}${refs.join('.')}:${inner.slice(prefix.length)}`;
+}
+const NESTED_KINDS = ['-trait.', '+trait.', '-removed.'] as const;
+
+/** A chain-qualified key's parts (#1693, U14) — `null` for any other key (a `~moved.` key keeps its own grammar). */
+export function splitNestedKey(key: string): { prefix: string; chain: string; inner: string } | null {
+  if (key.startsWith('~moved.') || key.startsWith('+added.')) return null;
+  const prefix = NESTED_KINDS.find((k) => key.startsWith(k)) ?? '';
+  const body = key.slice(prefix.length);
+  const colon = body.indexOf(':');
+  return colon < 0 ? null : { prefix, chain: body.slice(0, colon), inner: `${prefix}${body.slice(colon + 1)}` };
+}
+
 export function toLocalIdKey(key: string, doc: KeyDoc, readDoc: KeyDocReader): string | null {
+  const nested = splitNestedKey(key);
+  if (nested) {
+    // The chain in row localIds, then the nested frame's key in ITS document's localIds.
+    const lids: number[] = [];
+    let cur: KeyDoc | null | undefined = doc;
+    for (const ref of nested.chain.split('.')) {
+      const lid: number | null = cur ? localIdOfRef(cur, ref) : null;
+      if (lid === null) return null;
+      lids.push(lid);
+      const prefab: string | undefined = cur!.entities.find((e) => e.localId === lid)?.prefab;
+      cur = prefab ? readDoc(prefab) : null;
+    }
+    const inner = cur ? toLocalIdKey(nested.inner, cur, readDoc) : null;
+    return inner === null ? null : `${nested.prefix}${lids.join('.')}:${inner.slice(nested.prefix.length)}`;
+  }
   const one = (prefix: string, rest: string, tail = ''): string | null => {
     const lid = localIdOfRef(doc, rest);
     return lid === null ? null : `${prefix}${lid}${tail}`;

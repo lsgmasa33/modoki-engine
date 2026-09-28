@@ -100,7 +100,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     const census = prefabWriteCensus();
     // The reader must SEE the authoring writes, or an empty census would pass everything below.
     expect(census).toEqual(expect.arrayContaining([
-      { file: 'packages/modoki/src/editor/scene/prefab.ts', in: 'applyToPrefabSelective', warned: true },
+      { file: 'packages/modoki/src/editor/scene/prefab.ts', in: 'commitApplyPlan', warned: true }, // Apply's writing half (#1693)
       { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true },
       { file: 'app/editor/agentEditorOps.ts', in: 'registerEditorAgentOps', warned: true }, // prefabAction:'create'
       { file: 'packages/modoki/src/editor/panels/assetOps.ts', in: 'createPrefabFromEntity', warned: true }, // Save-as-Prefab
@@ -112,7 +112,13 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
       label: 'unwarned writePrefabFile calls in warnInertPrefabSizes (#1251)',
       population: census.filter((w) => !w.warned).map((w) => ({ item: `${w.file}::${w.in}`, site: w.file })),
       exempt: [
-        ...(['applyPrefabUndo.ts::restoreSnapshot', 'assetOps.ts::undo', 'assetOps.ts::redo', 'assetUndo.ts::undo', 'assetUndo.ts::redo',
+        // Two restores: one file, or every file a two-file Apply wrote as one step (#1693) — a restore either way.
+        { item: 'packages/modoki/src/editor/undo/applyPrefabUndo.ts::restoreSnapshot', count: 2,
+          reason: 'an undo/redo restore (one file, or all of a multi-file Apply\'s as one step, #1693): a warning there blames someone for the value they are reverting' },
+        // The one-file commit is the several-file one with one file: its CALLERS are this census's rows.
+        { item: 'packages/modoki/src/editor/scene/prefabCommit.ts::commitPrefabWrite',
+          reason: 'not a writer: the one-file commit hands its one file to commitPrefabWrites — every caller of it is in this census and warns (or is a restore) itself' },
+        ...(['assetOps.ts::undo', 'assetOps.ts::redo', 'assetUndo.ts::undo', 'assetUndo.ts::redo',
           'skinPrefab.ts::undo', 'skinPrefab.ts::redo'].map((at) => ({
           item: `packages/modoki/src/editor/${at.startsWith('applyPrefabUndo') ? 'undo' : at.startsWith('skinPrefab') ? 'scene' : 'panels'}/${at}`,
           reason: 'an undo/redo restore: a warning there blames someone for the value they are reverting',
@@ -340,6 +346,7 @@ function writesWarnedFirst(sf: ts.SourceFile, fnName: string, writer: string): A
 }
 
 function warnedFirst(call: ts.CallExpression): boolean {
+  if (ts.isIdentifier(call.expression) && call.expression.text === 'commitPrefabWrites') return warnedEvery(call);
   const path = call.arguments[0] && printedText(call.arguments[0]);
   return precedingStatements(call).some((s) => {
     // A bare call, or its result kept (`const warnings = warnInertPrefabSizes(…)` — the agent op returns them).
@@ -348,6 +355,30 @@ function warnedFirst(call: ts.CallExpression): boolean {
     const e = ts.isExpressionStatement(s) ? unwrapValue(s.expression) : kept && unwrapValue(kept);
     return isWarnCall(e)
       && !!e.arguments[1] && printedText(e.arguments[1]) === path && warnsTheWrittenPrefab(e, call);
+  });
+}
+
+/** The plural commit (#1693's two-file Apply): its first argument is the files written — `X.map((w) => …)`, or `X`
+ *  itself. Warned when an EARLIER statement warns every element of the same `X` — `X.flatMap((w) =>
+ *  warnInertPrefabSizes(w.doc, w.source))` (or `.map` / `.forEach`) — both of the warn's arguments read from the
+ *  callback's element, so one file's document is not warned under another's path. */
+function warnedEvery(call: ts.CallExpression): boolean {
+  const arg = call.arguments[0] && unwrapValue(call.arguments[0]);
+  const base = arg && ts.isCallExpression(arg) && ts.isPropertyAccessExpression(arg.expression) && arg.expression.name.text === 'map'
+    ? arg.expression.expression : arg;
+  if (!base) return false;
+  const baseText = printedText(base);
+  return precedingStatements(call).some((s) => {
+    const kept = ts.isVariableStatement(s) && s.declarationList.declarations.length === 1
+      ? s.declarationList.declarations[0]!.initializer : undefined;
+    const e = ts.isExpressionStatement(s) ? unwrapValue(s.expression) : kept && unwrapValue(kept);
+    if (!e || !ts.isCallExpression(e) || !ts.isPropertyAccessExpression(e.expression)) return false;
+    if (!['flatMap', 'map', 'forEach'].includes(e.expression.name.text) || printedText(e.expression.expression) !== baseText) return false;
+    const cb = e.arguments[0];
+    if (!cb || !(ts.isArrowFunction(cb) || ts.isFunctionExpression(cb)) || !cb.parameters[0] || !ts.isIdentifier(cb.parameters[0].name)) return false;
+    const el = cb.parameters[0].name.text;
+    return findNodes(cb.body, (n): n is ts.CallExpression => ts.isCallExpression(n) && isWarnCall(n)).some((w) =>
+      w.arguments.length >= 2 && printedText(w.arguments[0]!).startsWith(`${el}.`) && printedText(w.arguments[1]!).startsWith(`${el}.`));
   });
 }
 
@@ -463,10 +494,11 @@ function prefabWriteCensus(): Array<{ file: string; in: string | undefined; warn
     const code = readScannedSource(abs).code;
     if (!code.includes('commitPrefabWrite')) return [];
     const sf = parseSource(code, path.basename(abs));
-    // Every prefab write is ONE `commitPrefabWrite` since #1692 — the census reads that one name. (It read
-    // `writePrefabFile` and `writePrefabFileReport` before, and #1468 showed why a census must follow a rename: a caller
-    // that moved to the other name dropped straight out of it.)
-    return callsTo(sf, 'commitPrefabWrite')
+    // Every prefab write is ONE `commitPrefabWrite` since #1692 — or, for several files as one step, `commitPrefabWrites`
+    // (#1693's two-file Apply). The census reads both names. (It read `writePrefabFile` and `writePrefabFileReport`
+    // before, and #1468 showed why a census must follow a rename: a caller that moved to the other name dropped straight
+    // out of it — which is exactly what Apply did when it moved to the plural.)
+    return [...callsTo(sf, 'commitPrefabWrite'), ...callsTo(sf, 'commitPrefabWrites')]
       .map((call) => ({
         file: path.relative(ENGINE, abs).split(path.sep).join('/'),
         in: enclosingNamedFunction(call)?.name,

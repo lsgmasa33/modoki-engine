@@ -3,10 +3,10 @@
  *  #1498 — the save subtracted what the row sets by KEY, so a scene edit to a row-set field read as the row's own
  *  and was dropped. Both captures now subtract by VALUE (`subtractChainOverrides`), rotation as one orientation.
  *
- *  #1492 — Apply from the NESTED instance of a field the row also sets. Owner ruling (b): the source keeps the
- *  applied value as an ordinary override — listed, revertable to the ROW's value, durable. One predicate decides
- *  (`appliedFieldsToDrop`): keep an applied field only if dropping it would change what the instance resolves to,
- *  its template under the enclosing rows (`enclosingRowOverrides`), which the listing and Revert read too.
+ *  #1492 — Apply from the NESTED instance of a field the row also sets. Since #1693 (U13, superseding owner ruling
+ *  (b)): the row's override of it is REVERTED with the Apply, so every instance of the outer prefab shows the applied
+ *  value and the source keeps nothing. The listing and Revert still read the instance against its template under the
+ *  enclosing rows (`enclosingRowOverrides`).
  *
  *  #1506 — that base is the enclosing layer WHOLE (`enclosingLayer`): a row's STRUCTURE is not the instance's own
  *  either (listed, Apply stripped a row's removed trait from every instance of P), and a reference node a template
@@ -148,7 +148,16 @@ beforeEach(() => {
   prefabs.clear();
   clearKeptMemberOrphans(); // R2's kept rows are process state; one case's orphans must not reach the next
   // Apply repairs refs in other files after a re-parent; nothing else is on disk here.
-  vi.stubGlobal('fetch', async () => ({ ok: true, json: async () => ({ files: [] }), text: async () => '' }));
+  // The prefab "disk" for a multi-file Apply's pre-read (#1692 `commitPrefabWrites`, #1693 U13): a prefab's last written
+  // bytes, else the document installed for it — as a real Response, whose bytes the precondition hashes.
+  vi.stubGlobal('fetch', async (url: string) => {
+    const id = [...prefabs.keys()].find((k) => String(url).includes(k));
+    if (id) {
+      const last = writes.filter((w) => (JSON.parse(w.content) as { id?: string }).id === id).pop();
+      return new Response(last ? last.content : JSON.stringify(prefabs.get(id)), { status: 200 });
+    }
+    return { ok: true, json: async () => ({ files: [] }), text: async () => '' };
+  });
 });
 afterAll(() => { for (const id of [P, O]) setPrefabCache(id, null); vi.unstubAllGlobals(); getCurrentWorld()?.destroy(); });
 
@@ -268,14 +277,17 @@ describe('a refresh under a user-added reference node (#1498 design)', () => {
   });
 });
 
-describe('Apply from a nested instance whose field the outer row also sets (#1492, owner ruling b)', () => {
+describe('Apply from a nested instance whose field the outer row also sets (#1492; U13 supersedes ruling b, #1693)', () => {
   const nestedRoot = () => inInstance(ROOT1, 'R');
   const keysOf = (root: number) => collectInstanceOverrideKeys(root, getCachedPrefabSync(P) as PrefabFile).fields;
   const xKey = `${gA}.Transform.x`;
-  /** Reload the saved scene over the P the Apply WROTE. */
+  /** Reload the saved scene over the P and O the Apply WROTE. */
   const reload = async () => {
     const { scene: sc } = await saved();
-    install(writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === P).pop()!);
+    for (const id of [P, O]) {
+      const last = writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === id).pop();
+      if (last) install(last);
+    }
     await load(sc);
   };
   /** O's row sets A.x = 3; the nested instance in ROOT1 sets A.x = 5 and A.y = 7, and applies both to P. */
@@ -288,15 +300,18 @@ describe('Apply from a nested instance whose field the outer row also sets (#149
     expect((await applyToPrefabSelective(nestedRoot(), new Set(keysOf(nestedRoot())))).applied).toBe(true);
   };
 
-  it('SHADOWED: the source keeps 5, listed, through a save and a reload; the other instance keeps the row\'s 3', async () => {
-    // Mutation: make `appliedFieldsToDrop` drop every applied field (#1469 alone) — the source loses its override,
-    // the listing is empty, and the reload reads the row's 3.
+  it('U13: the row\'s override of the applied x is REVERTED too — every instance of O shows 5, and the source keeps nothing', async () => {
+    // Unity: "if Apply to Prefab 'Vase' is chosen and the 'Table' Prefab has an override of the value, this override in
+    // the 'Table' Prefab is reverted at the same time" (owner, 2026-09-28; supersedes #1492 ruling b). Mutation: skip
+    // U13's drop in `planApply` — O keeps its row's 3, ROOT2 still shows 3, and O is not written.
     await applyBoth();
-    expect([x(inInstance(ROOT1, 'A')), x(inInstance(ROOT2, 'A'))]).toEqual([5, 3]);
-    expect(keysOf(nestedRoot())).toEqual([xKey]);
+    const oWritten = writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === O).pop();
+    expect(oWritten?.entities.find((e) => e.localId === 4)?.overrides?.[2]?.Transform).toBeUndefined();
+    expect([x(inInstance(ROOT1, 'A')), x(inInstance(ROOT2, 'A'))]).toEqual([5, 5]);
+    expect(keysOf(nestedRoot())).toEqual([]);
     await reload();
-    expect([x(inInstance(ROOT1, 'A')), x(inInstance(ROOT2, 'A'))]).toEqual([5, 3]);
-    expect(keysOf(nestedRoot())).toEqual([xKey]);
+    expect([x(inInstance(ROOT1, 'A')), x(inInstance(ROOT2, 'A'))]).toEqual([5, 5]);
+    expect(keysOf(nestedRoot())).toEqual([]);
   });
 
   it('NOT shadowed: the applied y is subtracted (#1469) — not listed, nothing in the file', async () => {
@@ -308,13 +323,15 @@ describe('Apply from a nested instance whose field the outer row also sets (#149
     expect(row[`/${gN}/${gA}`]?.traits?.Transform ?? {}).not.toHaveProperty('y');
   });
 
-  it('Revert of the kept override gives the ROW\'s value, not the template\'s', async () => {
-    // Mutation: drop the enclosing-row put-back in `revertOverridesSelective` — A reverts to P's 5.
-    await applyBoth();
+  it('Revert of a scene override of a field the row sets gives the ROW\'s value, not the template\'s', async () => {
+    // Mutation: drop the enclosing-row put-back in `revertOverridesSelective` — A reverts to P's 0.
+    install(pDoc(), oWith({ 2: { Transform: { x: 3 } } }));
+    await load(scene(O, [ROOT1]));
+    setTf(inInstance(ROOT1, 'A'), 'x', 5);
     await revertOverridesSelective(nestedRoot(), new Set([xKey]));
     expect(x(inInstance(ROOT1, 'A'))).toBe(3);
     expect(keysOf(nestedRoot())).toEqual([]);
-    await reload();
+    await load((await saved()).scene);
     expect(x(inInstance(ROOT1, 'A'))).toBe(3);
   });
 

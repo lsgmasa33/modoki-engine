@@ -23,7 +23,7 @@
 
 import { pushAction, beginWorldBoundOperation, isWorldSwitchInProgress, type UndoAction } from './undoManager';
 import { UndoRefusedError, reportUndoFailure } from './undoFailure';
-import { commitPrefabWrite } from '../scene/prefabCommit';
+import { commitPrefabWrite, commitPrefabWrites } from '../scene/prefabCommit';
 import { sha256OfWritten } from '../utils/contentHash';
 import { isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -37,6 +37,7 @@ import {
   type ApplyResult, type PrefabFile,
 } from '../scene/prefab';
 import { rewriteNodeMoves } from '../../runtime/core/ecs/identityParents';
+import type { ApplyTargets } from '../scene/prefabApplyTargets';
 import { rewriteFrameMoves } from '../../runtime/loaders/memberPaths';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { useEditorStore } from '../store/editorStore';
@@ -81,6 +82,9 @@ async function restoreSnapshot(
   direction: 'Undo' | 'Redo',
   /** The Apply saved the scene, so this side saves it too (#1695). */
   sceneWasSaved: boolean,
+  /** The OTHER prefab files the Apply wrote (#1693: an enclosing prefab's row — an override applied there, or U13's
+   *  revert of one), each put back with this one as ONE step: all of them over what the other side wrote, or none. */
+  others: readonly { source: string; doc: PrefabFile; expected: PrefabFile }[] = [],
 ): Promise<boolean> {
   // Read before the first await: the file write and the member-path repair below are a window a scene load, an
   // Exit or a Create Scene can land in, and the snapshot must not be loaded over whatever world that put in.
@@ -89,8 +93,7 @@ async function restoreSnapshot(
   let restored = false;
   const where = isGuid(source) ? (resolveRef(source) || source) : source;
   // A copy: the editor cache keeps what it is handed, and this entry replays `prefab` again on the next redo/undo.
-  const committed = await commitPrefabWrite(source, clone(prefab), {
-    expected,
+  const rebuildOpts = {
     // The reload below rebases what it carries itself.
     rebase: false,
     rebuild: async () => {
@@ -157,7 +160,13 @@ async function restoreSnapshot(
       // A scene file, when the Apply saved it: only over what the editor last wrote there (#1695).
       if (sceneWasSaved && key !== null && !key.startsWith(PREFAB_EDIT_SCENE_PREFIX)) await saveSceneOverOtherHalf(key, label, direction);
     },
-  });
+  };
+  const committed = others.length
+    ? await commitPrefabWrites([
+      { source, doc: clone(prefab), expected },
+      ...others.map((o) => ({ source: o.source, doc: clone(o.doc), expected: o.expected })),
+    ], rebuildOpts)
+    : await commitPrefabWrite(source, clone(prefab), { expected, ...rebuildOpts });
   if (!committed.ok) {
     throw committed.conflict
       ? new UndoRefusedError(
@@ -260,6 +269,8 @@ function makeApplyPrefabAction(opts: {
   baseAfter: BaseInstanceSide | null;
   /** The forward Apply saved the scene (a promotion) — see {@link saveSceneOverOtherHalf}. */
   sceneSaved: boolean;
+  /** Every OTHER prefab file the Apply wrote, with its two sides (#1693). */
+  others: readonly { source: string; before: PrefabFile; after: PrefabFile }[];
 }): UndoAction {
   const paths = opts.memberPathsChanged;
   const label = 'Apply to Prefab';
@@ -273,12 +284,16 @@ function makeApplyPrefabAction(opts: {
     // then, because it applied only half — the file, not the world. `runStep` drops a throwing step with a loud report
     // (#310), rather than pushing it to the other stack as if the world had followed.
     undo: async () => {
-      if (!await restoreSnapshot(opts.source, opts.prefabBefore, opts.prefabAfter, opts.sceneBefore, opts.selGuid, paths ? opts.prefabAfter : undefined, label, 'Undo', opts.sceneSaved)) throw worldLeft();
+      const others = opts.others.map((o) => ({ source: o.source, doc: o.before, expected: o.after }));
+      if (!await restoreSnapshot(opts.source, opts.prefabBefore, opts.prefabAfter, opts.sceneBefore, opts.selGuid, paths ? opts.prefabAfter : undefined, label, 'Undo', opts.sceneSaved, others)) throw worldLeft();
       await rederiveBaseInstances(opts.source, opts.prefabAfter, opts.prefabBefore, opts.baseBefore);
+      for (const o of opts.others) await rederiveBaseInstances(o.source, o.after, o.before, null);
     },
     redo: async () => {
-      if (!await restoreSnapshot(opts.source, opts.prefabAfter, opts.prefabBefore, opts.sceneAfter, opts.selGuid, paths ? opts.prefabBefore : undefined, label, 'Redo', opts.sceneSaved)) throw worldLeft();
+      const others = opts.others.map((o) => ({ source: o.source, doc: o.after, expected: o.before }));
+      if (!await restoreSnapshot(opts.source, opts.prefabAfter, opts.prefabBefore, opts.sceneAfter, opts.selGuid, paths ? opts.prefabBefore : undefined, label, 'Redo', opts.sceneSaved, others)) throw worldLeft();
       await rederiveBaseInstances(opts.source, opts.prefabBefore, opts.prefabAfter, opts.baseAfter);
+      for (const o of opts.others) await rederiveBaseInstances(o.source, o.before, o.after, null);
     },
   };
 }
@@ -289,6 +304,8 @@ function makeApplyPrefabAction(opts: {
 export async function applyToPrefabWithUndo(
   rootInstanceId: number,
   selectedKeys: Set<string>,
+  /** Where each key is written (#1693) — see `applyToPrefabSelective`. */
+  targets?: ApplyTargets,
 ): Promise<ApplyResult> {
   // ⚠️ Lands WHOLE, in the world it began in (I11, #1667). Its write, its refresh, its scene save and its undo entry
   // are separated by awaits, and a Play, a scene open or entering prefab edit in one of them ran the rest in the
@@ -300,13 +317,13 @@ export async function applyToPrefabWithUndo(
   }
   const release = beginWorldBoundOperation();
   try {
-    return await applyHeld(rootInstanceId, selectedKeys);
+    return await applyHeld(rootInstanceId, selectedKeys, targets);
   } finally {
     release();
   }
 }
 
-async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>): Promise<ApplyResult> {
+async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targets?: ApplyTargets): Promise<ApplyResult> {
   // …and not over a world an editor route is still adopting (#1698): its snapshot, its scene save and its undo entry
   // would describe a world whose history and path are about to change under them.
   const settling = adoptionsSettled();
@@ -338,7 +355,7 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>): Pro
   if (ctx) await preloadNestedPrefabsForSubtree(rootInstanceId);
   const prefabNow = ctx ? await getPrefabSource(ctx.source) : null;
   const baseBefore = prefabNow && rootGuid ? captureSide(rootInstanceId, rootGuid, prefabNow) : null;
-  const result = await applyToPrefabSelective(rootInstanceId, selectedKeys);
+  const result = await applyToPrefabSelective(rootInstanceId, selectedKeys, targets);
   if (!result.applied || !result.source || !result.prefabBefore || !result.prefabAfter) {
     return result; // no-op apply — nothing to undo
   }
@@ -348,7 +365,10 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>): Pro
   const sceneSaved = result.promotedAdditions > 0 && scenePath ? await saveScene() : null;
 
   const sceneAfter = (await serializeScene({ assignGuids: true })) as unknown as SceneData;
-  const liveAfter = baseBefore && rootGuid ? entityIdForGuid(rootGuid) : 0;
+  // The base instance's side is the frame's OWN prefab's; an Apply that wrote only enclosing prefabs (#1693) re-derives
+  // their instances instead, through `others` — its first write is not this instance's prefab.
+  const ownWritten = !ctx || result.source === ctx.source;
+  const liveAfter = baseBefore && rootGuid && ownWritten ? entityIdForGuid(rootGuid) : 0;
   const baseAfter = liveAfter ? captureSide(liveAfter, rootGuid, result.prefabAfter) : null;
   pushAction(makeApplyPrefabAction({
     source: result.source,
@@ -362,6 +382,8 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>): Pro
     baseBefore: baseBefore && liveAfter ? { ...baseBefore, prefab: result.prefabBefore } : null,
     baseAfter,
     sceneSaved: !!sceneSaved?.saved,
+    // Every file but the one `result.source` names (writes are innermost first, and a U14 Apply's frame file is not).
+    others: (result.writes ?? []).filter((w) => w.source !== result.source),
   }));
   return result;
 }

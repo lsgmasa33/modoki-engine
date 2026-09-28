@@ -26,7 +26,7 @@ import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
 import { forgetHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances } from './prefab';
+import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances, savedFrameDoc } from './prefab';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefab';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
@@ -335,15 +335,17 @@ async function serializeSceneScoped(opts?: {
   const nestedStructureByTop = new Map<number, NestedStructurePaths>();
   const nestedFramesByTop = new Map<number, Map<string, { root: number; path: number[] }>>();
   for (const [rootId, { source }] of prefabRootInfo) {
-    const prefab = await getPrefabSource(source);
-    if (!prefab) continue;
+    const current = await getPrefabSource(source);
+    if (!current) continue;
+    // Measured against the document the instance was EXPANDED from (#1685), translated onto `current` when written.
+    const prefab = savedFrameDoc(rootId, source, current);
     // A nested row whose instance is gone is recorded as removed only when its prefab is cached
     // (#1355), and a deleted instance's source is not among the live ones preloaded above.
     await preloadNestedPrefabs(prefab);
     // Scene FILE form (#1468 Phase 4): a reference node inside writes its edits on its own rows.
     const s = captureInstanceStructure(rootId, prefab, { rows: true });
     for (const ecsId of s.consumedEcsIds) prefabChildIds.add(ecsId);
-    const channels = captureNestedChannels(source, s.ownedNested, { rows: true });
+    const channels = captureNestedChannels(rootId, source, s.ownedNested, { rows: true });
     for (const ecsId of channels.consumedEcsIds) prefabChildIds.add(ecsId);
     if (channels.nestedOverrides) nestedOverridesByTop.set(rootId, channels.nestedOverrides);
     if (channels.nestedStructure) nestedStructureByTop.set(rootId, channels.nestedStructure);
@@ -399,8 +401,9 @@ async function serializeSceneScoped(opts?: {
     // user-added traits, root or child) so the entry needs only PrefabInstance.
     if (rootInfo) {
       entry.prefab = rootInfo.source;
-      const prefab = await getPrefabSource(rootInfo.source);
-      if (prefab) {
+      const current = await getPrefabSource(rootInfo.source);
+      if (current) {
+        const prefab = savedFrameDoc(info.id, rootInfo.source, current);
         const struct = rootStructure.get(info.id);
         // v16 (#1468): each member's guid, STORED under its minted identity instead of re-derived
         // from its position on the next load — plus, since Phase 3, `parent` for a member that has
