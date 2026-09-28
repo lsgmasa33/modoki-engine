@@ -19,6 +19,7 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad, bootSceneWalkPending } from './serialize';
 import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
 import { beginWorldReplacement } from './authoringSettle';
+import { adoptionsSettled } from './sceneAdoption';
 import { undoDepth, truncateUndoTo, beginWorldSwitch } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
@@ -149,6 +150,13 @@ export async function enterPlay(): Promise<PlayOutcome> {
   if (aSceneSwapIsHappening() || bootSceneWalkPending() !== null) {
     return refusePlay('scene-swap', 'Play refused — a scene load is still in flight. Try again once it lands.');
   }
+  // A leave repair (#1666) is not a swap, so nothing above sees it unless a scene load is paying it (#1703). Exit in
+  // place, an edit-open and a hot reload run theirs with no load in flight: Play then snapshotted the world before the
+  // rebase, the rebase ran in the Play world and cleared the debt, and Stop replayed the stale instance. Checked HERE,
+  // not in `aSceneSwapIsHappening()`: the Hierarchy's collapse restore reads that, and a repair moves no scene path.
+  if (adoptionsSettled() !== null) {
+    return refusePlay('scene-swap', 'Play refused — the editor is still finishing a scene switch (repairing prefab instances after prefab edit). Try again in a moment.');
+  }
   // A failed restore may have left the posed (or previous Play) world live; Play's snapshot would take
   // it as authored, and Stop's successful restore would clear the flag that is guarding it (#1548).
   if (lastRestoreFailed()) {
@@ -203,7 +211,8 @@ export async function enterPlay(): Promise<PlayOutcome> {
     // that is gone. Refuse to enter Play rather than arm a Stop that would restore the wrong scene.
     // Bail BEFORE `setPlayState('playing')` — past that point Play is externally visible and the
     // snapshot is already load-bearing. The `finally` clears `_entering` and any queued Stop.
-    if (sceneLoadGeneration() !== enteredLoadGeneration || aSceneSwapIsHappening()) {
+    // `adoptionsSettled()` too (#1703): a repair can START inside the awaits above — an Exit in place pressed meanwhile.
+    if (sceneLoadGeneration() !== enteredLoadGeneration || aSceneSwapIsHappening() || adoptionsSettled() !== null) {
       _snapshot = null;
       return refusePlay('load-landed', 'Play cancelled — a scene load landed while the snapshot was being taken.');
     }

@@ -14,10 +14,11 @@ import crypto from 'crypto';
 import chokidar, { type FSWatcher } from 'chokidar';
 import {
   findAssetRoots, defaultSaveRootDir, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
-  normalizeWriteGuardKey, isUnderAssetRoot, pathToClassifyForChange, isSiblingRaisedChange,
+  isUnderAssetRoot, pathToClassifyForChange, isSiblingRaisedChange,
   type AssetRoot,
   type LiveReloadKind,
 } from '../plugins/vite-asset-scanner';
+import { createEditorWriteGuard } from '../plugins/editorWriteGuard';
 import { computeKeptAssets, enumerateRefEdges, type TreeShakeResult, type RefEdgeEnumeration } from '../plugins/asset-tree-shaker';
 
 export interface ElectronAssetManifest { version: 2; assets: Array<{ path: string; type: string; guid?: string }> }
@@ -53,42 +54,16 @@ export function createAssetBackend(opts: {
   let assetRoots: AssetRoot[] = findAssetRoots(projectRoot);
   let cachedManifest = buildManifest(scanAllAssets(assetRoots), true) as ElectronAssetManifest;
 
-  // ── Editor-own-write suppression (mirrors the Vite plugin) ──
-  // A write via /api/write-file marks the file so the watcher skips the
-  // hot-reload broadcast — an editor Cmd+S must not bounce the live scene. The
-  // 1500ms TTL covers chokidar's add+change burst; the content fingerprint closes
-  // the F9 late-rename gap (a rename event past the TTL is still a self-write while
-  // the on-disk bytes equal what we wrote). Kept inline (not the Vite plugin's
-  // createEditorWriteGuard) to avoid importing a Vite-plugin module into the
-  // Electron main process; the logic is identical. (editor-core F9)
-  // Keyed on a canonicalized path (drive-letter case + separators folded via
-  // normalizeWriteGuardKey) so the editor's own save — whose /@fs-derived absPath may
-  // spell the drive differently than chokidar's absDir — is recognized as a self-write
-  // on Windows instead of bouncing the live scene (Ctrl+S full-reload bug).
-  const recentEditorWrites = new Map<string, { exp: number; hash: string | null }>();
-  const markEditorWrite = (absPathRaw: string, hash: string | null = null) => {
-    const absPath = normalizeWriteGuardKey(absPathRaw);
-    recentEditorWrites.set(absPath, { exp: Date.now() + 1500, hash });
-    setTimeout(() => {
-      const e = recentEditorWrites.get(absPath);
-      if (e && e.exp <= Date.now() && e.hash == null) recentEditorWrites.delete(absPath);
-    }, 1600);
-  };
+  // ── Editor-own-write suppression — the SAME guard the Vite plugin's watcher uses ──
+  // A route that changes a watched file marks it (`markEditorWrite`) so the watcher skips the hot-reload broadcast — an
+  // editor Cmd+S must not bounce the live scene, and an editor delete must not reload it (#1702). TTL, content
+  // fingerprint (the F9 late-rename gap), delete fingerprint and drive-letter keying all live in `createEditorWriteGuard`.
+  // This used to be an inline copy, "the logic is identical", kept apart to keep a Vite-plugin module out of the main
+  // process — which already imported the scanner for everything else, and #1702 then had to change both copies.
+  const { mark: markEditorWrite, isWrite: isEditorWrite } = createEditorWriteGuard();
   const hashFileSync = (file: string): string | null => {
     try { return crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex'); }
     catch { return null; }
-  };
-  const isEditorWrite = (absPathRaw: string, currentHash?: () => string | null) => {
-    const absPath = normalizeWriteGuardKey(absPathRaw);
-    const e = recentEditorWrites.get(absPath);
-    if (!e) return false;
-    if (e.exp > Date.now()) return true;
-    if (e.hash != null && currentHash) {
-      const cur = currentHash();
-      if (cur != null && cur === e.hash) return true;
-      recentEditorWrites.delete(absPath);
-    }
-    return false;
   };
 
   const rebuildManifest = (): ElectronAssetManifest => {

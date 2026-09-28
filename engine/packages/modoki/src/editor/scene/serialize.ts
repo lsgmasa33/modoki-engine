@@ -42,7 +42,7 @@ import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult 
 import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes } from './pendingBaseScene';
 import { hasPendingMeta, getPendingMetaPaths, flushPendingMeta, type MetaFlushResult } from './pendingMeta';
 import { createSupersessionToken } from '../../runtime/core/liveness';
-import { withAdoption, settleLeaveDebts, bindEditorSceneState, adoptedWorld } from './sceneAdoption';
+import { withAdoption, settleLeaveDebts, bindEditorSceneState, adoptedWorld, beginWorldRequest } from './sceneAdoption';
 import type { World } from 'koota';
 import type { SceneLoadResult } from '../../runtime/scene/SceneManager';
 
@@ -1611,6 +1611,8 @@ export async function loadSceneReporting(
   // driving, and its late onProgress must not write stale counts — so only the
   // latest epoch touches sceneLoadStatus.
   const stillLive = loadEpoch.begin();
+  // A newer request than any edit-open still waiting to swap (#1700).
+  beginWorldRequest();
   let adoptedHere: World | null = null;
   const outcome = await loadSceneRequest(scenePath, gameId, opts, stillLive, (w) => { adoptedHere = w; });
   return {
@@ -1874,6 +1876,9 @@ export async function newScene(path: string | null = null): Promise<void> {
       );
     }
     // No envelope takedown: Create Scene never took one (unchanged here).
+    // A newer request than any edit-open still waiting to swap (#1700) — only once past every refusal above: a Create
+    // Scene that is refused replaces nothing, and must not cancel the edit-open (#1700 close-out review).
+    beginWorldRequest();
     worldSwitch = prepareWorldSwitch({ takeDownEnvelope: false });
     // The undo in flight finishes before the path is written (#1579): it restores under the CURRENT scene's key,
     // and reading this scene's path there would skip it — the prefab file restored, the world not.

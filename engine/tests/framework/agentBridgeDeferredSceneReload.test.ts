@@ -60,7 +60,8 @@ beforeEach(async () => {
 
   const getCurrent = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: SCENE_PATH } as never);
   const getLoaded = vi.spyOn(sceneManager, 'getLoadedScenes')
-    .mockReturnValue(new Map([['main', { path: SCENE_PATH, role: 'primary', guid: 'main' }]]) as never);
+    // `prefabRefs` as a real load records it (#1702): Main.scene uses the Crate prefab, so a Crate change reloads it.
+    .mockReturnValue(new Map([['main', { path: SCENE_PATH, role: 'primary', guid: 'main', prefabRefs: new Set([PREFAB_GUID, PREFAB_PATH]) }]]) as never);
   loadScene = vi.spyOn(sceneManager, 'loadScene').mockImplementation(async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }));
   const fetchStub = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     if (fetchSuppressesOnScene && String(input).includes('.scene.json')) setSceneReloadSuppressor(() => 'game is playing');

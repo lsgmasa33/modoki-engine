@@ -3259,12 +3259,14 @@ export function registerEditorAgentOps(): void {
       // An agent needs it to FAIL, not to report ok:true having done nothing — a bad path would
       // otherwise leave the editor in the previous scene and the next edit-save would write the
       // WRONG prefab, or nothing at all.
+      // ⚠️ THIS prefab, not merely "some prefab" (#1702 close-out review): opened from inside A's edit world, an edit-open
+      // of B that returned early leaves A open, and "is editing" answered ok:true naming A.
       const editing = useEditorStore.getState().editingPrefab;
-      if (!editing || !isEditingPrefab()) {
+      if (!editing || !isEditingPrefab() || editing.path !== p.path) {
         throw new Error(
-          `prefab edit-open FAILED for ${p.path} — the editor is not in prefab-edit mode. The file was ` +
-          'not fetched or not parseable as a prefab (check the served path exists and is a .prefab.json). ' +
-          'See the editor console for the [PrefabEdit] error.',
+          `prefab edit-open FAILED for ${p.path} — the editor is not editing it${editing ? ` (still editing ${editing.path})` : ''}. ` +
+          'The file was not fetched or not parseable as a prefab (check the served path exists and is a .prefab.json), ' +
+          'or a newer scene request replaced the world while it waited (#1700). See the editor console for the [PrefabEdit] line.',
         );
       }
       return {

@@ -1231,10 +1231,11 @@ limits, each deliberate:
   canonical form, so it still gets the disk's spelling under its own `urlPrefix`.
 - **A missing path keeps the caller's spelling** — there is no on-disk name to prefer. That is why
   `/api/move-file` takes the SOURCE url before `moveAssetFile`: afterwards the source is gone.
-- **Not fixed: the write guard key.** `/api/write-file` still fingerprints the request's spelling
-  (`markEditorWrite`), and so does `/api/move-file` for its source and landings. The create flows now
-  write to the on-disk spelling, so they are unaffected; an agent write, or a move INTO a folder named
-  in another case, may reach the watcher as a foreign change and drop a parked edit — unverified.
+- **The write guard key folds case on macOS and Windows (#1702).** `/api/write-file` and `/api/move-file` still
+  mark the request's spelling, but `normalizeWriteGuardKey` now lowercases both that and chokidar's on the
+  platforms whose default filesystem is case-insensitive (plus NFC and a trailing separator), so a case-only
+  difference no longer reaches the watcher as a foreign change. Not folded on Linux, where it would name two
+  files. Rules: [editor-hmr.md § Which changes reload the scene at all](editor-hmr.md#which-changes-reload-the-scene-at-all-1702).
 
 Cover: `engine/tests/plugins/assetUrlDiskCasing.test.ts`, against the real resolver on a scratch dir,
 skipped on a case-sensitive filesystem where the defect cannot occur.

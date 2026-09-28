@@ -14,7 +14,7 @@ import path from 'path';
 import fs from 'fs';
 import {
   findAssetRoots, resolveAssetPath, readAssetGuid, buildManifest, manifestProjectOf, writeAssetGuid, detectType,
-  classifySceneChange, isSseRoute, createEditorWriteGuard, normalizeWriteGuardKey, createBrowserRequestRegistry,
+  classifySceneChange, isSseRoute, createEditorWriteGuard, normalizeWriteGuardKey, EDITOR_DELETE_FINGERPRINT, createBrowserRequestRegistry,
   settleRelayReply, countLiveBridgeClients,
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot, absToAssetUrl, pathToClassifyForChange, isSiblingRaisedChange,
@@ -551,6 +551,27 @@ describe('normalizeWriteGuardKey (Windows path canonicalization)', () => {
   });
   it('is a no-op on POSIX paths (no drive letter, no backslashes)', () => {
     expect(normalizeWriteGuardKey('/home/user/game/main.json')).toBe('/home/user/game/main.json');
+  });
+  // #1702 — the route's spelling against chokidar's, each pair ONE file. Mutations checked, each red on its own case
+  // (the end-to-end case also goes red under the NFC and fold-nowhere ones): drop `.normalize('NFC')`, drop the
+  // trailing-separator strip, fold case on every platform, fold it on none.
+  it('#1702: NFC and NFD spellings of one name are one key', () => {
+    expect(normalizeWriteGuardKey('/p/sub \u00e9/a.prefab.json', 'linux')).toBe(normalizeWriteGuardKey('/p/sub e\u0301/a.prefab.json', 'linux'));
+  });
+  it('#1702: a folder path with and without its trailing separator is one key — the root keeps its own', () => {
+    expect(normalizeWriteGuardKey('/p/kit/', 'linux')).toBe('/p/kit');
+    expect(normalizeWriteGuardKey('C:\\p\\kit\\', 'win32')).toBe('c:/p/kit');
+    expect(normalizeWriteGuardKey('/', 'linux')).toBe('/');
+  });
+  it('#1702: letter case folds on macOS and Windows (case-insensitive by default), not on Linux', () => {
+    expect(normalizeWriteGuardKey('/p/Kit/Crate.prefab.json', 'darwin')).toBe(normalizeWriteGuardKey('/p/kit/crate.prefab.json', 'darwin'));
+    expect(normalizeWriteGuardKey('E:\\P\\Crate.json', 'win32')).toBe(normalizeWriteGuardKey('e:/p/crate.json', 'win32'));
+    expect(normalizeWriteGuardKey('/p/Crate.json', 'linux')).not.toBe(normalizeWriteGuardKey('/p/crate.json', 'linux'));
+  });
+  it('#1702: end to end — a delete marked in one spelling is recognised on the watcher`s', () => {
+    const { mark, isWrite } = createEditorWriteGuard(1500, () => 0, 'darwin');
+    mark('/p/Sub \u00e9/Crate.prefab.json', EDITOR_DELETE_FINGERPRINT);
+    expect(isWrite('/p/sub e\u0301/crate.prefab.json', () => null)).toBe(true);
   });
 });
 

@@ -51,6 +51,8 @@ import { osascriptChooser, type NativeChooser } from './nativeChooser';
 import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
 
 import { readFontAxes } from '../font-instance';
+// A leaf: the watcher's guard module imports nothing from the Vite plugin, so this router stays host-agnostic.
+import { EDITOR_DELETE_FINGERPRINT } from '../editorWriteGuard';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash, remintSceneEntityGuids, planMemberPathRepair, type RepairFile } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
@@ -1023,6 +1025,33 @@ async function probeInputDeliverability(method: string, deadlineMs?: number): Pr
  *  worth the read. A FOLDER move lands every descendant; those are marked TTL-only rather than
  *  hashed, because reading a whole subtree to guard a 1500ms window is the wrong trade — and
  *  before #867 they were not marked at all, which is strictly worse than either. */
+/** Every file under `dir`, as paths relative to it (`/`-joined), depth first. Unreadable subtrees are skipped. */
+function filesUnder(dir: string, rel = ''): string[] {
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(rel ? path.join(dir, rel) : dir, { withFileTypes: true }); } catch { return []; }
+  return entries.flatMap((e) => {
+    const childRel = rel ? `${rel}/${e.name}` : e.name;
+    return e.isDirectory() ? filesUnder(dir, childRel) : [childRel];
+  });
+}
+
+/** Mark a file this route just WROTE as the editor's own, fingerprinted by the bytes now on disk (#1702). Called right
+ *  after a SYNCHRONOUS write, with no await between: the watcher runs on this same event loop, so its event for the
+ *  write cannot be handled before the mark. */
+function markWrittenFile(ctx: BackendContext, abs: string): void {
+  let hash: string | null = null;
+  try { hash = crypto.createHash('sha1').update(fs.readFileSync(abs)).digest('hex'); } catch { /* TTL-only */ }
+  ctx.markEditorWrite(abs, hash);
+}
+
+/** Every path a delete of `abs` makes VANISH — the file, or a folder and every file under it, since chokidar reports an
+ *  `unlink` per child. Listed BEFORE the delete, while the tree is still there to walk (#1702). */
+function plannedDeleteVanishings(abs: string): string[] {
+  let isDir = false;
+  try { isDir = fs.statSync(abs).isDirectory(); } catch { /* raced away */ }
+  return isDir ? [abs, ...filesUnder(abs).map((rel) => path.join(abs, rel))] : [abs];
+}
+
 function plannedMoveLandings(absFrom: string, absTo: string, isDir: boolean): Array<[string, string | null]> {
   if (!isDir) {
     try {
@@ -1034,24 +1063,15 @@ function plannedMoveLandings(absFrom: string, absTo: string, isDir: boolean): Ar
     }
   }
   const out: Array<[string, string | null]> = [];
-  const walk = (dir: string, rel: string) => {
-    let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      const childRel = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory()) walk(path.join(dir, e.name), childRel);
-      else {
-        out.push([path.join(absTo, childRel), null]);
-        // ⚠️ And the child's OLD path. chokidar emits a per-CHILD `unlink` for a directory
-        // rename, not one event for the directory — so marking only the directory's own path
-        // leaves every child's unlink looking like a foreign change, `classifySceneChange`
-        // recognizes it, and `dropParkedWriteFor(oldChildPath)` discards a human's unsaved edit.
-        // The repair normally wins that race by ~150ms, which is not a reason to leave it open.
-        out.push([path.join(absFrom, childRel), null]);
-      }
-    }
-  };
-  walk(absFrom, '');
+  for (const childRel of filesUnder(absFrom)) {
+    out.push([path.join(absTo, childRel), null]);
+    // ⚠️ And the child's OLD path. chokidar emits a per-CHILD `unlink` for a directory
+    // rename, not one event for the directory — so marking only the directory's own path
+    // leaves every child's unlink looking like a foreign change, `classifySceneChange`
+    // recognizes it, and `dropParkedWriteFor(oldChildPath)` discards a human's unsaved edit.
+    // The repair normally wins that race by ~150ms, which is not a reason to leave it open.
+    out.push([path.join(absFrom, childRel), null]);
+  }
   return out;
 }
 
@@ -3466,6 +3486,8 @@ async function describeUnresolvedAgainstLiveWorld(
           error: `Nothing was trashed: ${conflicts.join(', ')} ${conflicts.length === 1 ? 'is' : 'are'} not what the caller expected (changed, gone, or a folder that is no longer empty).`,
         }, 409);
       }
+      // Listed before the trash, while a folder's children are still there to list (#1702).
+      const vanishing = new Map(resolved.map((r) => [r.abs, plannedDeleteVanishings(r.abs)]));
       const trashResult = resolved.length > 0 ? moveToTrash(resolved.map((r) => r.abs)) : { failed: [] as string[] };
       const trashFailed = trashResult.failed;
       // ⚠️ `samePath`, not `includes`/`===` (#881's shared helper, adopted here when main landed
@@ -3481,6 +3503,13 @@ async function describeUnresolvedAgainstLiveWorld(
         : resolved.filter((r) => !wasRefused(r.abs));
       // Repair the renderer for the paths that GENUINELY went. Unbinding an editor from a file
       // that is still on disk would be the wrong direction: the binding is still live and valid.
+      // The editor's OWN delete (#1702): without a mark the watcher reads each `unlink` as an external change, and an
+      // external prefab change reloaded the open scene from disk — its unsaved edits and whole undo stack gone, this
+      // delete's own undo entry included, for a prefab the scene never used. Marked AFTER the trash, which is
+      // synchronous, with no await before this line: the watcher shares this event loop, so none of its events can be
+      // handled first — and a Finder trash can outlast the guard's TTL, so marking BEFORE could expire unread. The
+      // fingerprint is "gone", so an `unlink` landing past the TTL is recognised too. Only what actually went.
+      for (const { abs } of wentToTrash) for (const gone of vanishing.get(abs) ?? []) ctx.markEditorWrite(gone, EDITOR_DELETE_FINGERPRINT);
       const deleted = trashFailed.length === 0
         ? candidates.map((c) => c.move)
         : candidates.filter((c) => !wasRefused(c.abs)).map((c) => c.move);
@@ -4929,6 +4958,8 @@ async function describeUnresolvedAgainstLiveWorld(
       if (dupRefused) return json(dupRefused.body, dupRefused.status);
       // The prefab reader lets a copied scene's refs to prefab MEMBERS follow the reminted root (#1324).
       const newGuid = duplicateAssetFile(absFrom, absTo, undefined, makePrefabResolver(ctx));
+      // The editor's own write (#1702) — see `markWrittenFile`. The sidecars it may write never broadcast.
+      markWrittenFile(ctx, absTo);
       // The hash of the copy's bytes as written (#1679), in `ifMatchRefusal`'s own terms: the undo of this duplicate
       // trashes the copy only while it still holds them. Read back rather than predicted — a JSON copy gets a fresh id,
       // so the client cannot know its bytes, and a prediction here would be a second serializer to keep in step.
@@ -5016,9 +5047,6 @@ async function describeUnresolvedAgainstLiveWorld(
       // the watcher as a foreign write and had its parked edit discarded, which is precisely the
       // bug the guard exists to prevent, on the path where the most edits are at risk. Mark every
       // file that will land.
-      for (const [absDest, hash] of plannedMoveLandings(absFrom, absTo, isDir)) {
-        ctx.markEditorWrite(absDest, hash);
-      }
       // And mark the SOURCE, whose `unlink` is otherwise a foreign change: `handleSceneChanged`
       // routes it to `dropParkedWriteFor(from)`, which discards the human's unsaved edit with a
       // console.warn. Marking it makes the watcher skip the event entirely, which also removes the
@@ -5033,6 +5061,12 @@ async function describeUnresolvedAgainstLiveWorld(
       // property since the fingerprint was first added, so this is not new behaviour, only newly
       // symmetrical.
       ctx.markEditorWrite(absFrom, null);
+      // The landings AFTER the source (#1702 close-out review): a case-only rename (`Crate` → `crate`) is ONE guard key
+      // since `normalizeWriteGuardKey` folds case on macOS/Windows, and the source's TTL-only mark written second
+      // replaced the landing's hash — so a rename event past the TTL read as foreign again (the F9 gap, reopened).
+      for (const [absDest, hash] of plannedMoveLandings(absFrom, absTo, isDir)) {
+        ctx.markEditorWrite(absDest, hash);
+      }
 
       // The SOURCE's url is taken HERE, before the move: `onDisk` spells an existing path the way the
       // disk does (#1261), and after the move `absFrom` exists no longer, so it would echo the
@@ -6081,6 +6115,9 @@ async function describeUnresolvedAgainstLiveWorld(
       fs.copyFileSync(srcPath, destAbs);
       // Rescan heals a fresh GUID for the new file (scanner writeAssetGuid path).
       ctx.rebuildManifest();
+      // The editor's own write (#1702), after the rebuild: its GUID heal may rewrite the copy, and the mark must
+      // fingerprint the bytes that stay. Nothing between the copy and here awaits — see `markWrittenFile`.
+      markWrittenFile(ctx, destAbs);
       // `onDisk`: the manifest keys the copy by the disk's spelling, and `destFolder` may name its folder
       // in another case — looked up lexically, a successful import 422'd as an unrecognized type (#1261).
       const destUrl = ctx.absToAssetUrl(destAbs, { onDisk: true });

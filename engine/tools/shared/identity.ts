@@ -42,8 +42,9 @@ export interface BackendIdentity {
  *  Windows spells the SAME directory several ways (`E:\p\m`, `e:/p/m`), so a raw string
  *  compare misses a real containment — which made `identityMismatch` cry wolf on every
  *  Windows session run from a subdirectory (the MCP's own `npm --prefix` smoke was
- *  mis-logged as a benign "cwd artifact" for months). Same normalisation, and the same
- *  reason, as `normalizeWriteGuardKey` (engine/plugins/vite-asset-scanner.ts). ⚠️ It was also
+ *  mis-logged as a benign "cwd artifact" for months). The same reason as `normalizeWriteGuardKey`
+ *  (engine/plugins/editorWriteGuard.ts), but NOT the same normalisation since #1702: that one also applies NFC and
+ *  folds the whole path's case on macOS/Windows, which is right for a guard KEY and wrong here (next paragraph). ⚠️ It was also
  *  cited as the same as `instanceToken.rootKey`, and #899 made that FALSE: `rootKey` now realpaths
  *  and folds the WHOLE path via `pathIdentity.mjs`. The next paragraph already explains why this
  *  one must not — keeping the stale equation would have invited exactly the sweep it warns off. No-op on POSIX paths.

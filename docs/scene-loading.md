@@ -1961,10 +1961,18 @@ Reachable today:
   step in flight. An editor load requested during that wait resumes after `replaceWorldContent`
   has raised `teardownInFlight`, rejects at entry and returns `'superseded'`. `newScene` does not
   refuse during a hot reload's tail either. Both outcomes are benign.
-- **An edit-open still has its own REQUEST-order gap** (not absorbed by #1698): it can wait on a
-  human `confirmDiscard` and then call `SceneManager` after a newer load did, superseding the winner
-  with the loser. World identity cannot catch that (the edit world IS current after its own swap);
-  it needs the request-order check `loadScene` has after `ready()`. Filed as #1700.
+- **An edit-open checks REQUEST order before it swaps** (#1700). It can wait on a human
+  `confirmDiscard` (or its fetches) while a newer load lands, and swapping after that superseded the
+  winner with the loser. World identity cannot catch it, since the edit world IS current after its
+  own swap. So the owner keeps a request order, `beginWorldRequest()`. It is bumped by
+  `serialize.loadScene`, `newScene` and the edit-open, and only the edit-open reads it: right before
+  its swap, after its last await, it drops out if a newer request was made. `loadScene` keeps
+  `loadEpoch` for itself. The edit-open does not bump that epoch, because `loadEpoch` also decides
+  which load owns the progress modal, and an older load's `finally` would then never clear it.
+  `newScene` records its request only past its refusals: one that is refused replaces nothing. A newer
+  `loadScene` that then FAILS still cancels a waiting edit-open. That is the load's own request-scoped
+  rule (S11), accepted: the edit-open logs why, and the agent `edit-open` reply fails with the prefab
+  it was asked for, not whichever one is still open.
 
 ### Invariants
 
@@ -2032,7 +2040,11 @@ Each invariant names the one function that owns it.
   - the boot walk: `settle` / `overtaken` over `worldSwitchesSettled` (#1593, #1598). Its retry of
     a candidate that was installed but never adopted is retired by S6 (the load adopts it itself);
     the retry of a candidate that was never INSTALLED stays;
-  - Play: `aSceneSwapIsHappening`.
+  - Play: `aSceneSwapIsHappening`, plus `adoptionsSettled() !== null` for a leave repair (#1703). A
+    repair is not a swap, so the first sees it only while a scene load pays it; Exit in place, an
+    edit-open and a hot reload run theirs with no load in flight. Checked in `enterPlay` up front and
+    at its post-await re-check, not inside `aSceneSwapIsHappening` (the Hierarchy's collapse restore
+    reads that, and a repair moves no scene path).
 
   "Is the world being replaced?" is answered by at least nine separate records, each with a
   comment on why the others do not fit: `_loadsInFlight`, `_loadsSwapping`, `_worldSwitches`,

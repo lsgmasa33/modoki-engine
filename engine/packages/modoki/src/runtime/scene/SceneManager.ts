@@ -250,7 +250,28 @@ export type BeforeSwapHook = (stagingWorld: World) => Promise<void>;
  *  minting a fresh one. Absent for a scene with no prior stamp (e.g. one authored
  *  before this field existed) — `serializeScene` mints a fresh one only in that
  *  case. */
-export type LoadedSceneEntry = { path: string; guid: string; role: 'primary' | 'base'; baseScene?: string; createdAt?: string };
+export type LoadedSceneEntry = {
+  path: string; guid: string; role: 'primary' | 'base'; baseScene?: string; createdAt?: string;
+  /** Every prefab this scene FILE uses, as loaded (#1702) — DERIVED from the refs `collectSceneResourceRefs` collected to
+   *  acquire the scene, the one walker that decides a scene's resources (an entity's instance rows, a game trait's GUID
+   *  field via its sweep, UIEntries, timeline control tracks, and the transitive walk through each prefab), filtered to
+   *  `type: 'prefab'` — never a list of its own. Each by its ref AND by the path that ref resolved to at load time. Both, because the question is asked from a watcher event that
+   *  names a PATH: after a delete the manifest may no longer map that path to a guid, and a prefab MISSING at load has
+   *  no path yet but is named by its guid when it comes back. Absent on an entry built without a load (unknown). */
+  prefabRefs?: ReadonlySet<string>;
+};
+
+/** {@link LoadedSceneEntry.prefabRefs} from a scene's collected refs: each prefab ref, and the path it resolves to now. */
+function prefabRefsOf(refs: readonly SceneResourceRef[]): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const r of refs) {
+    if (r.type !== 'prefab') continue;
+    out.add(r.path);
+    const resolved = isGuid(r.path) ? resolveGuidToPath(r.path) : undefined;
+    if (resolved) out.add(resolved);
+  }
+  return out;
+}
 
 /** Public surface of the {@link sceneManager} singleton. See the module doc above. */
 export interface SceneManager {
@@ -1122,7 +1143,7 @@ class SceneManagerImpl implements SceneManager {
         const createdAt = (sceneData as { createdAt?: string } | undefined)?.createdAt;
         this.loadedScenes.set(sid, {
           path: ref.path, guid: ref.guid, role: ref === primaryRef ? 'primary' : 'base',
-          baseScene: sceneData?.baseScene, createdAt,
+          baseScene: sceneData?.baseScene, createdAt, prefabRefs: prefabRefsOf(perSceneRefs.get(ref.path) ?? []),
         });
       }
       this.primaryId = id;

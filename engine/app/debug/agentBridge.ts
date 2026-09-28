@@ -41,6 +41,7 @@ import {
   getAllEntities,
   rawNow,
   getAllTraits,
+  getTraitByName,
   readTraitData,
   readTraitDataFull,
   buildSceneSchema,
@@ -3068,7 +3069,33 @@ export function peekSuppressedSceneReloads(): string[] {
   return [..._suppressedReloads.keys()];
 }
 
-/** Hot-reload the active scene when its file (or any prefab) changes on disk.
+/** Does the open scene use the prefab at `urlPath` — any loaded scene FILE (`LoadedSceneEntry.prefabRefs`, as the scene
+ *  was loaded: by ref or by its load-time path), or any LIVE instance? By its guid too, which is what names a prefab that
+ *  was MISSING when the scene loaded and has just come back. An entry that does not know (built without a load) counts
+ *  as using it.
+ *
+ *  ⚠️ The live half is load-bearing (#1702 close-out review): `prefabRefs` is fixed at load, and an instance added
+ *  since — dragged in, saved or not, a carried `Persistent` root, a Create Prefab — is in no file ref. Skipped, the reload
+ *  left that instance built from the OLD prefab while the editor copy was re-read to the new one, and the next save diffed
+ *  the one against the other and wrote the old values back as overrides. */
+function openSceneUsesPrefab(urlPath: string): boolean {
+  const want = normScenePath(urlPath);
+  const guid = getGuidForPath(urlPath);
+  const names = (ref: string): boolean => (guid !== undefined && ref === guid) || normScenePath(ref) === want;
+  for (const entry of sceneManager.getLoadedScenes().values()) {
+    if (!entry.prefabRefs) return true;
+    for (const ref of entry.prefabRefs) if (names(ref)) return true;
+  }
+  const meta = getTraitByName('PrefabInstance');
+  if (!meta) return false;
+  for (const e of getCurrentWorld().query(meta.trait)) {
+    const source = (e.get(meta.trait) as { source?: unknown } | undefined)?.source;
+    if (typeof source === 'string' && source && names(source)) return true;
+  }
+  return false;
+}
+
+/** Hot-reload the active scene when its file (or a prefab it uses) changes on disk.
  *  Shared by the Vite HMR path and the Electron IPC path. */
 async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly string[] = []): Promise<void> {
   // An asset-def change (.anim/.timeline/.particle/.spriteanim/.rig2d) invalidates just that
@@ -3141,6 +3168,16 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   // (`/__prefab-edit__/<guid>`) with no file on disk — leave it alone. The editor's prefab copy is
   // still re-read: the prefab-edit save reads it synchronously for the edited and nested prefabs.
   if (current.startsWith('/__prefab-edit__/')) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
+  // #1702: a prefab no loaded scene FILE uses changes nothing a reload from disk would rebuild — the reload only threw
+  // away the open scene's unsaved edits and its undo stack. The owner's disk-wins ruling (#1164) is for "the open scene
+  // or a prefab it uses", so a prefab change reloads only when the open scene uses one of the changed prefabs — a loaded
+  // scene file or a live instance (`openSceneUsesPrefab`). Both caches are still brought up to date, as above.
+  if (msg.kind === 'prefab' && !prefabPaths.some(openSceneUsesPrefab)) {
+    evictRuntimePrefabs();
+    await refreshEditorPrefabs();
+    console.log(`[agentBridge] prefab change not used by the open scene — no reload (${msg.urlPath})`);
+    return;
+  }
   // A7 (scene-loading.md): the changed file may be a BASE in the
   // loaded chain, not the primary — match against EVERY loaded scene, not just the
   // primary's path. Without this, editing Base.json on disk (an agent's

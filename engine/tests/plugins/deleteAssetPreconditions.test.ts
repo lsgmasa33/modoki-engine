@@ -52,6 +52,7 @@ function ctx(): BackendContext {
     getSchema: () => undefined,
     firstRootDir: () => null,
     invalidateProjectConfig: () => {},
+    markEditorWrite: () => {},
   } as unknown as BackendContext;
 }
 const post = (urlPath: string, body: unknown) =>

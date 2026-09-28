@@ -432,13 +432,16 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
       + 'may live outside this repo (a game copied out, #29), where repoFiles() sees nothing.',
   },
   {
-    file: 'engine/plugins/backend/editorBackendRouter.ts', rule: 'walker', walker: 'walk', count: 2,
-    reason: 'TWO walkers, both named walk, both at editor RUNTIME. (1) walkScripts() serves the '
-      + 'open project\'s dir — possibly outside this repo; a git enumeration is the wrong instrument '
-      + 'for "what is on disk right now" in a live editor. (2) plannedMoveLandings() walks the FOLDER '
-      + 'a move is relocating, to mark each child\'s old and new path against the watcher (#867) — '
-      + 'a subtree the human just picked, mid-move, not a corpus. (Count measured 2026-09-13 by '
-      + '#1128; the row named only the first until then.)',
+    file: 'engine/plugins/backend/editorBackendRouter.ts', rule: 'walker', walker: 'walk',
+    reason: 'walkScripts() at editor RUNTIME serves the open project\'s dir — possibly outside this '
+      + 'repo; a git enumeration is the wrong instrument for "what is on disk right now" in a live '
+      + 'editor. (Was count 2 until #1702 moved the move-landing walk into filesUnder, below.)',
+  },
+  {
+    file: 'engine/plugins/backend/editorBackendRouter.ts', rule: 'walker', walker: 'filesUnder',
+    reason: 'The FOLDER a move is relocating or a delete is trashing, at editor RUNTIME: each child\'s '
+      + 'path is marked against the watcher (#867 move, #1702 delete) — a subtree the human just '
+      + 'picked, listed while it is still on disk, not a corpus. One walker for both since #1702.',
   },
   {
     file: 'engine/plugins/detect-modules.ts', rule: 'walker', walker: 'collectSceneFiles',

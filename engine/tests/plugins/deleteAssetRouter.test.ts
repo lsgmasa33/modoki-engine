@@ -68,6 +68,7 @@ function makeCtx(
     getSchema: () => undefined,
     firstRootDir: () => null,
     invalidateProjectConfig: () => {},
+    markEditorWrite: () => {},   // the delete marks what it trashed (#1702) — covered in editorOwnFileChangesMarked.test.ts
   } as unknown as BackendContext;
 }
 

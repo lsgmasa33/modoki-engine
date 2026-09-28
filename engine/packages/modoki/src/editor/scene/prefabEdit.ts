@@ -15,7 +15,7 @@ import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { getEditVersion } from '../undo/undoManager';
 import { sceneManager, type SceneLoadResult } from '../../runtime/scene/SceneManager';
-import { withAdoption, adoptionCount, endPrefabEditInPlace } from './sceneAdoption';
+import { withAdoption, adoptionCount, endPrefabEditInPlace, beginWorldRequest } from './sceneAdoption';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
 import type { SceneData, SceneEntityEntry, AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { useEditorStore } from '../store/editorStore';
@@ -406,6 +406,8 @@ export async function openPrefabForEditing(
     confirmDiscard?: (action: string) => Promise<boolean>;
   } = {},
 ): Promise<void> {
+  // Taken before the first await: a scene load, Create Scene or another edit-open requested after this one wins (#1700).
+  const stillNewest = beginWorldRequest();
   // Refuses new undo steps for the whole switch, fetch included, and names the one in flight (#1579).
   const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: true });
   try {
@@ -413,7 +415,7 @@ export async function openPrefabForEditing(
     // file, so a fetch during its write read the applied file and `setPrefabCache` overwrote the undo's restored copy —
     // the edit world was built from the applied document, and saving it put the Apply back on disk.
     if (worldSwitch.idle) await worldSwitch.idle;
-    await openPrefabForEditingSwitching(asset, opts, worldSwitch.ready);
+    await openPrefabForEditingSwitching(asset, opts, worldSwitch.ready, stillNewest);
   } finally {
     worldSwitch.release();
   }
@@ -423,6 +425,7 @@ async function openPrefabForEditingSwitching(
   asset: { path: string; name: string },
   opts: { confirmDiscard?: (action: string) => Promise<boolean> },
   switchReady: () => Promise<void> | null,
+  stillNewest: () => boolean,
 ): Promise<void> {
   let prefab: PrefabFile;
   try {
@@ -464,6 +467,14 @@ async function openPrefabForEditingSwitching(
   if (ready) await ready;
   if (getCurrentScenePath()) await saveScene();
   if (opts.confirmDiscard && worldHasUnsavedEdits() && !(await opts.confirmDiscard(`edit prefab ${asset.name}`))) return;
+  // The REQUEST-order check `loadScene` makes after its `ready()` (#1700), here after the last await before the swap: a
+  // newer request made while this one waited — the human's dialog above can stay open indefinitely — owns the world, and
+  // swapping now would replace the newer scene with this older request's edit world. The world rule cannot see it: after
+  // this swap the edit world IS current. Synchronous from here to `SceneManager`'s call inside `loadPrefabEditWorld`.
+  if (!stillNewest()) {
+    console.warn(`[PrefabEdit] "${asset.name}" was not entered: a newer scene request was made while it waited`);
+    return;
+  }
 
   const returnScene = resolveReturnScene(
     sceneManager.getCurrent()?.path ?? null,

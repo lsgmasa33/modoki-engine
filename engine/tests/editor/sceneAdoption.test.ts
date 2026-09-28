@@ -134,6 +134,14 @@ vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) 
   };
 });
 
+/** Holds Play's settings fetch — its last await before the re-check (#1703). */
+const ai = vi.hoisted(() => ({ gate: null as Promise<void> | null }));
+vi.mock('../../packages/modoki/src/editor/panels/aiSettingsModel', async (importOriginal) => ({
+  ...await importOriginal<Record<string, unknown>>(),
+  getCachedAiSettings: () => (ai.gate ? null : { captureContactOnLaunch: false }),
+  fetchAiSettings: async () => { if (ai.gate) await ai.gate; return { captureContactOnLaunch: false }; },
+}));
+
 import { setRunMode } from '@modoki/engine/runtime';
 import type { PrefabFile } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -149,6 +157,9 @@ import {
 } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
+import { enterPlay, stopPlay, type PlayOutcome } from '../../packages/modoki/src/editor/scene/playMode';
+import { getPlayState } from '../../packages/modoki/src/runtime/core/playState';
+import { worldHasUnsavedEdits } from '../../packages/modoki/src/editor/scene/serialize';
 import { pushAction, canUndo, undoLabel, swapHistory, undo, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 
 registerAllTraits();
@@ -205,6 +216,7 @@ beforeEach(() => {
   sm.path = ''; sm.failPaths.clear(); sm.refusePaths.clear(); sm.throwSyncPath = '';
   sm.holdBefore.clear(); sm.holdTail.clear(); sm.holdReplaceTail = null; sm.preSwap.clear();
   sm.duringRefresh = null; sm.refreshThrows.clear(); sm.startupErrors.clear();
+  ai.gate = null;
   calls.length = 0;
   rebaseWorlds.length = 0;
   // @ts-expect-error test stub
@@ -215,6 +227,8 @@ beforeEach(() => {
 });
 afterEach(async () => {
   for (const open of gates.splice(0)) open();
+  ai.gate = null;
+  if (getPlayState() !== 'stopped') await stopPlay().catch(() => {});
   registerBeforeSceneLoad(() => null);
   for (let i = 0; i < 50 && (isSceneLoadInFlight() || pendingAdoptions().length > 0); i++) await tick();
   await tick();
@@ -656,5 +670,168 @@ describe('close-out review findings', () => {
     expect(await load).toBe('loaded');
     expect(owedLeaveRepairs(), 'precondition: the repair threw again').toEqual([E1.path]);
     await until(() => released);
+  });
+});
+
+describe('#1700: an edit-open that waited does not swap over a NEWER request', () => {
+  /** The prefab fetch for `p`, held until the returned gate opens. */
+  function holdFetchOf(p: typeof E1) {
+    const g = gate();
+    const real = globalThis.fetch;
+    let reached = false;
+    // @ts-expect-error test stub
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url) === p.path) { reached = true; await g.promise; }
+      return real(url);
+    });
+    return { ...g, reached: () => reached };
+  }
+
+  it('a scene load requested and landed during its fetch stays on screen', async () => {
+    await loadScene(SCENE);
+    const held = holdFetchOf(E1);
+    const open = openPrefabForEditing({ path: E1.path, name: E1.name });
+    await until(held.reached);
+    expect(await loadScene(OTHER)).toBe('loaded');
+    held.open();
+    await open;
+    expect(sm.path, 'the older edit-open swapped over the newer load').toBe(OTHER);
+    expect(isPrefabEditWorld()).toBe(false);
+    expect(editing()).toBeNull();
+    expect(getCurrentScenePath()).toBe(OTHER);
+    expect(isWorldAdopted()).toBe(true);
+  });
+
+  it('the human route: a load landing while the unsaved-work dialog is open stays on screen after "Discard"', async () => {
+    await newScene();                            // untitled: nothing to auto-save, so the dialog is asked
+    pushAction(action('an unsaved edit'));
+    expect(worldHasUnsavedEdits(), 'premise: the dialog is asked').toBe(true);
+    const dialog = gate();
+    let asked = false;
+    const open = openPrefabForEditing({ path: E1.path, name: E1.name }, {
+      confirmDiscard: async () => { asked = true; await dialog.promise; return true; },
+    });
+    await until(() => asked);
+    expect(await loadScene(OTHER)).toBe('loaded');
+    dialog.open();
+    await open;
+    expect(sm.path).toBe(OTHER);
+    expect(isPrefabEditWorld()).toBe(false);
+    expect(getCurrentScenePath()).toBe(OTHER);
+  });
+
+  it('Create Scene requested during its fetch stays on screen', async () => {
+    await loadScene(SCENE);
+    const held = holdFetchOf(E1);
+    const open = openPrefabForEditing({ path: E1.path, name: E1.name });
+    await until(held.reached);
+    await newScene();
+    const starter = getCurrentWorld();
+    held.open();
+    await open;
+    expect(getCurrentWorld(), 'the edit-open replaced the new scene').toBe(starter);
+    expect(isPrefabEditWorld()).toBe(false);
+  });
+
+  it('a newer edit-open wins over an older one still fetching', async () => {
+    await loadScene(SCENE);
+    const held = holdFetchOf(E1);
+    const older = openPrefabForEditing({ path: E1.path, name: E1.name });
+    await until(held.reached);
+    await openPrefabForEditing({ path: E2.path, name: E2.name });
+    expect(editing()).toBe(E2.path);
+    held.open();
+    await older;
+    expect(sm.path).toBe(editWorldOf(E2));
+    expect(editing(), 'the older edit-open replaced the newer one').toBe(E2.path);
+  });
+
+  it('ACCEPT SIDE: a Create Scene that is REFUSED does not cancel it — it replaced nothing (close-out review)', async () => {
+    await loadScene(SCENE);
+    const tail = gate();
+    sm.holdTail.set(OTHER, tail.promise);
+    const load = loadScene(OTHER);                // older than the edit-open, still in flight
+    await until(() => sm.path === OTHER);
+    const held = holdFetchOf(E1);
+    const open = openPrefabForEditing({ path: E1.path, name: E1.name });
+    await until(held.reached);
+    await expect(newScene(), 'premise: refused while a load is in flight').rejects.toThrow(/still loading/);
+    tail.open();
+    await load;
+    held.open();
+    await open;
+    expect(editing(), 'the refused Create Scene cancelled the edit-open').toBe(E1.path);
+  });
+
+  it('ACCEPT SIDE: an OLDER load landing during its fetch does not stop it — the edit-open is the newer request', async () => {
+    const tail = gate();
+    sm.holdTail.set(OTHER, tail.promise);
+    const load = loadScene(OTHER);
+    await until(() => sm.path === OTHER);
+    const held = holdFetchOf(E1);
+    const open = openPrefabForEditing({ path: E1.path, name: E1.name });
+    await until(held.reached);
+    tail.open();
+    await load;
+    expect(getCurrentScenePath(), 'premise: the older load adopted its scene first').toBe(OTHER);
+    held.open();
+    await open;
+    expect(sm.path).toBe(editWorldOf(E1));
+    expect(editing()).toBe(E1.path);
+  });
+});
+
+describe('#1703: Play is refused while a leave repair runs, whichever route runs it', () => {
+  /** In `E1`'s edit world with no scene to return to, so Exit ends the session in place. */
+  async function editingWithNoReturnScene() {
+    await openPrefabForEditing({ path: E1.path, name: E1.name });
+    expect(isPrefabEditWorld()).toBe(true);
+    expect(useEditorStore.getState().prefabReturnScenePath ?? null, 'premise: Exit has no scene to load').toBeNull();
+    calls.length = 0;
+  }
+
+  it('Exit in place: a Play pressed during its repair is refused — no scene load is in flight to refuse it', async () => {
+    await editingWithNoReturnScene();
+    let during: { outcome: PlayOutcome; loadInFlight: boolean } | null = null;
+    sm.duringRefresh = async () => { during = { outcome: await enterPlay(), loadInFlight: isSceneLoadInFlight() }; };
+    expect(await exitPrefabEditing()).toBeNull();
+    expect(refreshed(E1.path), 'premise: the repair ran').toHaveLength(1);
+    expect(during!.loadInFlight, 'premise: the old gate could not see it').toBe(false);
+    expect(during!.outcome).toMatchObject({ kind: 'refused', reason: 'scene-swap' });
+    expect(getPlayState()).toBe('stopped');
+  });
+
+  it('an edit-open from inside another edit world: a Play pressed during the repair it runs is refused', async () => {
+    await editingWithNoReturnScene();
+    let during: PlayOutcome | null = null;
+    sm.duringRefresh = async () => { during = await enterPlay(); };
+    await openPrefabForEditing({ path: E2.path, name: E2.name });
+    expect(refreshed(E1.path)).toHaveLength(1);
+    expect(during).toMatchObject({ kind: 'refused', reason: 'scene-swap' });
+  });
+
+  it('a repair that STARTS inside Play`s awaits cancels it at the re-check', async () => {
+    await editingWithNoReturnScene();
+    const settings = gate();
+    ai.gate = settings.promise;
+    const play = enterPlay();
+    await tick();
+    const repair = gate();
+    sm.duringRefresh = async () => { await repair.promise; };
+    const exit = exitPrefabEditing();
+    await until(() => refreshed(E1.path).length === 1);
+    settings.open();
+    const outcome = await play;
+    repair.open();
+    await exit;
+    expect(outcome).toMatchObject({ kind: 'refused', reason: 'load-landed' });
+    expect(getPlayState()).toBe('stopped');
+  });
+
+  it('ACCEPT SIDE: with the repair done, Play starts', async () => {
+    await editingWithNoReturnScene();
+    await exitPrefabEditing();
+    expect(adoptionsSettled()).toBeNull();
+    expect((await enterPlay()).kind).toBe('started');
   });
 });

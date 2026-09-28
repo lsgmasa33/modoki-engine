@@ -52,6 +52,56 @@ makes the reloaded world the clean baseline (#1409). The exception is a base sce
 its edits survive live and so does its dirty flag (#1417). The rule and why:
 [scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history).
 
+### Which changes reload the scene at all (#1702)
+
+Because that reload costs the human their unsaved work, **only two kinds of change may trigger it: an
+EXTERNAL write to a loaded scene file, or to a prefab a loaded scene uses.** Two mechanisms enforce the
+two halves, and each was missing before #1702. Trashing ANY prefab from the Assets panel reloaded the
+open scene, even one that never used it, and discarded its unsaved edits and the whole undo stack,
+the delete's own entry included (observed live on Windows, `win`, #1684 run; reproduced on macOS: a
+Camera moved to y=42 came back at 2.417 with `canUndo:false`, the console naming the prefab).
+
+1. **The editor's own file changes are marked, so they are never "external".** A route that makes a
+   watched file appear or vanish calls `ctx.markEditorWrite` for it, and the watcher skips the event
+   (`engine/plugins/editorWriteGuard.ts`, the ONE guard both watchers use; the Electron main process
+   kept a hand-copied twin until #1702). `/api/delete-asset` was the gap: it marked nothing, and a
+   folder delete needs every FILE under it marked, because chokidar reports an `unlink` per child.
+   `/api/duplicate-asset` and `/api/import-file` were unmarked too.
+   - **Mark right AFTER the synchronous fs op, with no await in between.** The watcher runs on the
+     same event loop, so none of its events can be handled first. Marking BEFORE can expire unread:
+     the TTL is 1500ms, and a Finder trash over AppleScript can take longer.
+   - **A delete's fingerprint is "gone"** (`EDITOR_DELETE_FINGERPRINT`). An `unlink` past the TTL
+     is still recognized, and the file coming back evicts the mark.
+   - **One key function, `normalizeWriteGuardKey`, spells both sides.** It folds separators and the
+     drive letter, applies Unicode NFC, strips a trailing separator, and folds letter case on
+     macOS/Windows (not on Linux). ⚠️ It over-folds on a case-SENSITIVE volume on those platforms.
+   - **A case-only rename is ONE key** since the case fold, so `/api/move-file` marks the source BEFORE
+     the landings: marked second, the source's TTL-only mark replaced the landing's content hash.
+   - **Not covered:** a Finder AppleEvent timeout (`-1712`) makes `moveToTrash` throw before the marks.
+     If Finder then finishes, its unlinks arrive unmarked. Half 2 below still stops a reload for a
+     prefab the scene does not use.
+   - Deliberately still unmarked, because they ARE external: `/api/scene-mutate`'s file branch and a
+     file-direct `/api/asset-write`. Also unmarked: the scanner's GUID heal (`writeAssetGuid`). It
+     rewrites only a file that has no id, which an external add already is.
+2. **A prefab change reloads only a scene that uses the prefab** (`openSceneUsesPrefab`), in either of
+   two ways, and otherwise still evicts and re-reads both prefab caches.
+   - **A loaded scene FILE names it.** `SceneManager` records each loaded scene's `prefabRefs`. It is
+     derived from the refs `collectSceneResourceRefs` collected to acquire the scene, never from a
+     list of its own, and holds each ref plus the path it resolved to at load.
+   - **A LIVE instance uses it** (`PrefabInstance.source`). ⚠️ Load-bearing, found in #1702's
+     close-out review: `prefabRefs` is fixed at load, so an instance gained since (dragged in, saved
+     or not; a carried `Persistent` root; a Create Prefab) is in no file ref. Skipping the reload
+     left it built from the OLD prefab while the editor copy was re-read to the new one, and the
+     next save diffed one against the other and wrote the old values back as overrides.
+   - **Residual, one host:** after an EXTERNAL delete in browser dev, the Vite manifest update prunes
+     the prefab first, so a LIVE-only instance (source = its guid) no longer matches and the scene is
+     not reloaded. Electron's manifest update is additive, so there it reloads. Not a data loss: the
+     editor copy under the guid is kept, so the next save writes the same dangling ref a reload would.
+   - **Why ref AND path.** After a delete, the Vite manifest no longer maps the path to a guid. A
+     prefab that was missing at load has no path, but comes back named by its guid.
+   - **An entry that does not know** (built without a load) counts as using everything: the old
+     behavior, not a skipped reload.
+
 **`mesh` (`.mesh.json`, #1380) needs more than an eviction, and it is the one kind here that is not an
 `ASSET_SCHEMA_TYPE`.** Nothing agent-side writes one and it is never parked, so the only external
 writer is a plain file edit — which is why #842's "schema type ⊆ live-reload kind" check could not

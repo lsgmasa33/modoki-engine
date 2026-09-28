@@ -26,7 +26,7 @@
 import type { World } from 'koota';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
-import { createTeardownToken } from '../../runtime/core/liveness';
+import { createTeardownToken, createSupersessionToken, type LivenessCheck } from '../../runtime/core/liveness';
 import { getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { swapHistory } from '../undo/undoManager';
@@ -118,6 +118,18 @@ let chainedSettles = 0;
 /** Invalidated by the test reset, so a continuation queued before it cannot drive the counter below zero. */
 const chainReset = createTeardownToken();
 let settledWaiters: (() => void)[] = [];
+
+/** The REQUEST order of the world switches a user or agent asks for — a scene load, Create Scene, a prefab edit-open
+ *  (#1700). Not the adopt rule: that one is by world (S5), and it cannot see this race, because an edit-open's world IS
+ *  current after its own swap. What it cannot see is an edit-open that waited — on the human `confirmDiscard` dialog, or
+ *  its fetches — while a NEWER request landed, and then swapped over it: the older request won. A hot reload and a
+ *  restore are not requests (they follow the disk and the undo stack), so they do not bump it. */
+const worldRequests = createSupersessionToken();
+
+/** Record a new world-switch request; the check goes false once a newer one is made. Only the edit-open consults it, right
+ *  before its swap — `serialize.loadScene` keeps its own `loadEpoch`, which also owns the progress modal, and `newScene`
+ *  refuses while a load is in flight. */
+export function beginWorldRequest(): LivenessCheck { return worldRequests.begin(); }
 
 /** A pre-swap dirt read, tagged with the adopts so far. ⚠️ Deliberately NOT with the saved edit version: dirt a save
  *  clears between the read and the adopt still counts as discarded (#1409's "cleared mid-load" case), so a save must
