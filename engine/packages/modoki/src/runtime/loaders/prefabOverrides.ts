@@ -19,6 +19,7 @@
  *  (`editor/scene/prefab.ts`, `editor/scene/serialize.ts`) are unchanged. */
 import { emptyDocMap } from '../core/docKeys';
 import { nodeRowKey } from '../core/assetRefRules';
+import { docRows } from './memberTranslation';
 
 /** localId → trait name → field → value. */
 export type OverrideMap = Record<number, Record<string, Record<string, unknown>>>;
@@ -281,10 +282,8 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
   if (!direct.length && !rootRow && !nodeRows.size) return lower;
 
   const rootLocalId = doc.rootLocalId ?? 1;
-  const byGuid = new Map<string, { localId: number; nested: boolean }>();
-  for (const pe of doc.entities ?? []) {
-    if (pe.nodeGuid && pe.localId) byGuid.set(pe.nodeGuid, { localId: pe.localId, nested: !!pe.prefab && pe.localId !== rootLocalId });
-  }
+  // The frame's CURRENT document answers which row each component names (#1771, `memberTranslation.ts`).
+  const byGuid = docRows(doc);
 
   let overrides = lower.overrides;
   let added = lower.added;

@@ -60,6 +60,20 @@ describe('prefab localId numbering — one procedure, one set of inputs (#1278)'
     expect(both, `these modules do both, which lets the file numbering and the live tagging diverge:\n  ${both.join('\n  ')}`).toEqual([]);
   });
 
+  it('ACCEPT: the Replace callers keep a preserved numbering through ONE plan — `replacing` in, the written file to the tag', () => {
+    // The remedy this guard names, taken (#1759, owner option 1): a Replace now keeps every matched row's localId, and
+    // the modules that do it are TAGGERS that never touch a preserve map. `serializePrefab({ replacing })` plans the
+    // kept numbering and records it against the file it returns; `tagEntityTreeAsInstance(…, file)` reads the
+    // numbering from that file and refuses when the tree no longer matches it (`planMatchesFile`). So preservation is
+    // not what this guard forbids — two numberings are. Pinned so a future edit cannot "fix" a Replace by moving
+    // `preserveLocalIds` into these modules, which the test above would then fail for the right reason.
+    const taggers = new Set(filesMentioning(TAG));
+    const preservers = new Set(filesMentioning(PRESERVE));
+    const replacers = filesMentioning('replacing').filter((f) => taggers.has(f));
+    expect(replacers.map((f) => f.replace(/\\/g, '/').split('/').pop()).sort()).toEqual(['agentEditorOps.ts', 'assetOps.ts']);
+    for (const f of replacers) expect(preservers.has(f), `${f} preserves AND tags`).toBe(false);
+  });
+
   it('the scan actually sees both symbols — otherwise the assertion above is vacuous', () => {
     // A guard that matches nothing passes forever. Pin that each side has real callers, so a
     // rename that silently empties one set fails here instead of going quiet.

@@ -800,7 +800,7 @@ handed every edit to whichever member inherited the number, with nothing to say 
   from.** The editor's in-memory maps stay localId-keyed — within one document that is a perfectly good
   address, and the capture functions also write prefab TEMPLATES, whose format is frozen. What changed
   is every place a localId used to cross from one document to another: the scene file (rows), a rebuild
-  handed a different `baseline` (`localIdTranslation` in `rebuildInstance`), and the Apply/Revert keys
+  handed a different `baseline` (`translateLocalIds` in `rebuildInstance`, `memberTranslation.ts`), and the Apply/Revert keys
   (below).
 - **The loader translates, the writer moves.** `foldMemberRowChannels` turns a frame's direct rows into
   that frame's localIds against its CURRENT document and folds them over the legacy channels before

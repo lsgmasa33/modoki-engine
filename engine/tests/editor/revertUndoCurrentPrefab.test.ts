@@ -13,7 +13,7 @@
  *  - `rebuildInstanceFromCapture` with `live = capturedFrom` (the shape the design rejects: the Revert's document as
  *    the baseline) → the nested-addition case, which spawns the row's node twice.
  *  - drop `translateNestedMoveKeys` → the nested-move case.
- *  - `localIdTranslation`: map a keyed row to 0 when the other document holds its number unkeyed → the pre-v5 case.
+ *  - `translateLocalIds` (`memberTranslation.ts`): map a keyed row to 0 when the other document holds its number unkeyed → the pre-v5 case.
  *  - `reattachDetachedInstance`: drop its rebase → both Detach cases; drop the reattach's frame-record put-back →
  *    the reload case, and keep a record of the same source → the Create Prefab Replace case; redo replays the first
  *    snapshot → the undo-redo-undo case. */

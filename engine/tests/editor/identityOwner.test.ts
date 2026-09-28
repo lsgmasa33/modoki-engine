@@ -259,6 +259,176 @@ describe('#1686: Create Prefab → Replace carries each row\'s nodeGuid — by l
 });
 const idOfGuid = (guid: string) => getAllEntities().find((e) => e.guid === guid)?.id ?? 0;
 
+describe('#1761: a template\'s member token resolves AFTER the pins are final — a dropped pin does not take the token with it', () => {
+  const T = 'cccccccc-0000-4000-8000-000000176101';
+  const INST_T = 'dddddddd-0000-4000-8000-000000176101';
+  const gA = 'eeeeeeee-0000-4000-8000-000000176102';
+  /** T: R → A (2), B (3); B's UIAction targets A by token. */
+  const tDoc = () => {
+    const d = { id: T, version: 5, name: 'T', rootLocalId: 1, entities: [
+      row(1, 'R', 0, 'eeeeeeee-0000-4000-8000-000000176101'), row(2, 'A', 1, gA), row(3, 'B', 1, 'eeeeeeee-0000-4000-8000-000000176103'),
+    ] };
+    (d.entities[2]!.traits as Record<string, unknown>).UIAction = { bindings: [{ event: 'click', action: 'noop', target: '@member:2' }] };
+    return d;
+  };
+  const sceneWith = (members?: Record<string, unknown>) => ({ id: 't1761', version: 16, name: 'S', resources: [], entities: [
+    { id: 1, prefab: T, guid: INST_T, traits: { EntityAttributes: { name: 'I', parentId: 0 } }, ...(members ? { members } : {}) },
+  ] } as unknown as SceneData);
+  const target = () => (readTraitData(one('B'), getTraitByName('UIAction')!) as { bindings: Array<{ target: string }> }).bindings[0]!.target;
+
+  it('A\'s stored pin collides with B\'s derivation and is dropped: B\'s token still names A, not B', async () => {
+    // Mutation: settle inside the first derive again (`deriveInstanceMemberGuids` before `dropCollidingPins` in the
+    // load) — the token resolves to A's pinned guid, which B holds once the pin is dropped: B's action targets itself.
+    install(tDoc());
+    await load(sceneWith());
+    const derivedB = getAllEntities().find((e) => e.id === one('B'))!.guid!;
+    expect(target()).toBe(getAllEntities().find((e) => e.id === one('A'))!.guid); // precondition: the token resolves
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await load(sceneWith({ [`/${gA}`]: { guid: derivedB, name: 'A' } })); // a damaged row: A pinned to B's derivation
+    const dropped = warn.mock.calls.some((c) => String(c[0]).includes('dropping the pin'));
+    warn.mockRestore();
+    expect(dropped).toBe(true); // precondition: the collision is real and the pin yields
+    const guidA = getAllEntities().find((e) => e.id === one('A'))!.guid;
+    expect(guidA).not.toBe(derivedB);
+    expect(target()).toBe(guidA);
+  });
+});
+
+describe('#1759: a Replace keeps every matched row\'s localId, and numbers a new row above the old document (owner option 1, Unity fileIDs)', () => {
+  const Y = 'cccccccc-0000-4000-8000-000000175901';
+  const YPATH = '/prefabs/Y.prefab.json';
+  const I0 = 'dddddddd-0000-4000-8000-000000175901';
+  const I1 = 'dddddddd-0000-4000-8000-000000175902';
+  const G = { R: 'eeeeeeee-0000-4000-8000-000000175901', A: 'eeeeeeee-0000-4000-8000-000000175902', B: 'eeeeeeee-0000-4000-8000-000000175903' };
+  /** Y: R → A (2), B (3). */
+  const yDoc = () => ({ id: Y, version: 5, name: 'Y', rootLocalId: 1, entities: [row(1, 'R', 0, G.R), row(2, 'A', 1, G.A), row(3, 'B', 1, G.B)] });
+  const inInst = (guid: string, name: string) => {
+    const all = getAllEntities();
+    const root = all.find((e) => e.guid === guid)!.id;
+    const hits = all.filter((e) => e.name === name && e.parentId === root);
+    if (hits.length !== 1) throw new Error(`fixture: ${hits.length} ${name} under ${guid}`);
+    return hits[0]!;
+  };
+  const twoInstances = async () => {
+    const doc = yDoc();
+    install(doc);
+    onDisk.set(YPATH, JSON.stringify(doc));
+    registerAsset(Y, YPATH, 'prefab');
+    await load({ id: 'r1759', version: 16, name: 'S', resources: [], entities: [
+      { id: 1, prefab: Y, guid: I0, traits: { EntityAttributes: { name: 'I0', parentId: 0 } } },
+      { id: 2, prefab: Y, guid: I1, traits: { EntityAttributes: { name: 'I1', parentId: 0 } } },
+    ] } as unknown as SceneData);
+  };
+
+  it('the #1759 repro: delete A and add X on I0, Replace — I1\'s B keeps its guid, X takes neither A\'s nor B\'s, and no pin is dropped', async () => {
+    // Mutation: return null from `replaceNumbering` (positional numbering) — B is written at 2 and X at 3, B derives A's
+    // old guid, its stored pin collides and is dropped ("dropping the pin"), and I1's B reloads under A's guid.
+    await twoInstances();
+    const before = { A: inInst(I1, 'A').guid, B: inInst(I1, 'B').guid };
+    const saved = await serializeScene() as unknown as SceneData; // I1's member rows pin A's and B's guids
+    deleteEntitiesWithUndo([inInst(I0, 'A').id]);
+    add('Add X', idOfGuid(I0), 'X');
+    const res = await createPrefabFromEntity(idOfGuid(I0), YPATH, 'Create Prefab "Y"', async () => true);
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(`fixture: ${JSON.stringify(res)}`);
+    const written = JSON.parse(onDisk.get(YPATH)!) as PrefabFile;
+    const lidOf = (name: string) => written.entities.find((e) => e.name === name)?.localId;
+    expect({ R: lidOf('R'), B: lidOf('B'), X: lidOf('X'), root: written.rootLocalId }).toEqual({ R: 1, B: 3, X: 4, root: 1 });
+    // The live tag names the same rows the file does (#1278's bar: the world after Create Prefab = after save + reload).
+    const piMeta = getTraitByName('PrefabInstance')!;
+    const liveLid = (name: string) => (readTraitData(inInst(I0, name).id, piMeta) as { localId: number }).localId;
+    expect({ B: liveLid('B'), X: liveLid('X') }).toEqual({ B: 3, X: 4 });
+
+    prefabs.set(Y, written);
+    const warn = vi.spyOn(console, 'warn');
+    await load(saved);
+    const dropped = warn.mock.calls.filter((c) => String(c[0]).includes('dropping the pin'));
+    warn.mockRestore();
+    expect(dropped).toEqual([]);
+    expect(inInst(I1, 'B').guid).toBe(before.B);
+    expect([before.A, before.B]).not.toContain(inInst(I1, 'X').guid);
+  });
+
+  it('a pre-v5 document (no nodeGuid anywhere) keeps its positional numbering — its numbers are its only identity', async () => {
+    // Mutation: drop the `!oldLocal.size` early-out — every non-root row of a same-tree Replace renumbers above 3, and
+    // each scene override keyed on the old numbers dangles.
+    await load({ id: 'legacy', version: 16, name: 'S', resources: [], entities: [] } as unknown as SceneData);
+    const root = add('Add R', 0, 'R');
+    add('Add A', root, 'A');
+    add('Add B', root, 'B');
+    const legacy = { rootLocalId: 1, entities: [{ name: 'R', localId: 1 }, { name: 'A', localId: 2 }, { name: 'B', localId: 3 }] };
+    const doc = serializePrefab(root, Y, { replacing: legacy })!;
+    expect(doc.entities.map((e) => [e.name, e.localId])).toEqual([['R', 1], ['A', 2], ['B', 3]]);
+  });
+
+  it('the tag REFUSES when the entity at a row is not the one written there — same count, same names (planMatchesFile)', async () => {
+    // Mutation: drop the recorded-plan check in `planMatchesFile` — the names match position by position, so d2 is tagged
+    // with d1's row and the newcomer with d2's.
+    const { tagEntityTreeAsInstance } = await import('../../packages/modoki/src/editor/scene/prefab');
+    await load({ id: 'swap', version: 16, name: 'S', resources: [], entities: [] } as unknown as SceneData);
+    const root = add('Add R', 0, 'R');
+    const d1 = add('Add Dup', root, 'Dup');
+    const d2 = add('Add Dup', root, 'Dup');
+    const file = serializePrefab(root, Y)!;
+    // While the write awaited, d1 was deleted and a new "Dup" added: the count and the names still match row for row,
+    // but d2 now sits where d1 was written, and the newcomer where d2 was.
+    deleteEntitiesWithUndo([d1]);
+    const d3 = add('Add Dup', root, 'Dup');
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const remap = tagEntityTreeAsInstance(root, Y, file);
+    const refused = err.mock.calls.some((c) => String(c[0]).includes('not tagging'));
+    err.mockRestore();
+    expect(refused).toBe(true);
+    expect(remap.size).toBe(0);
+    expect([d2, d3].map((id) => readTraitData(id, getTraitByName('PrefabInstance')!) ?? null)).toEqual([null, null]);
+  });
+
+  it('the human Create Prefab refuses to tag a tree changed during its write — it tags a COPY of the file (review F1)', async () => {
+    // `createPrefabFromEntity` tags `{ ...draft, id }`, not the object `serializePrefab` returned. Mutation: key
+    // `writtenRows` by the file object again — the record is never found on this path, and d2 is tagged with d1's row.
+    await load({ id: 'human', version: 16, name: 'S', resources: [], entities: [] } as unknown as SceneData);
+    const root = add('Add R', 0, 'R');
+    const d1 = add('Add Dup', root, 'Dup');
+    const d2 = add('Add Dup', root, 'Dup');
+    let d3 = 0;
+    duringWrite.fn = () => { deleteEntitiesWithUndo([d1]); d3 = add('Add Dup', root, 'Dup'); };
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = await createPrefabFromEntity(root, '/prefabs/Human.prefab.json', 'Create Prefab "Human"', async () => true);
+    const refused = err.mock.calls.some((c) => String(c[0]).includes('not tagging'));
+    err.mockRestore();
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(`fixture: ${JSON.stringify(res)}`);
+    expect(d3).toBeGreaterThan(0); // precondition: the tree changed inside the write
+    expect(refused).toBe(true);
+    expect([d2, d3].map((id) => readTraitData(id, getTraitByName('PrefabInstance')!) ?? null)).toEqual([null, null]);
+  });
+
+  it('a RENAME during the write still tags: it reorders nothing, and the file numbering is right (review F5)', async () => {
+    // Mutation: refuse in `planMatchesFile` when a row's name differs from the live one — the tree is left unlinked.
+    await load({ id: 'rename', version: 16, name: 'S', resources: [], entities: [] } as unknown as SceneData);
+    const root = add('Add R', 0, 'R');
+    const a = add('Add A', root, 'A');
+    const { writeTraitFieldWithUndo } = await import('@modoki/engine/editor');
+    duringWrite.fn = () => { writeTraitFieldWithUndo(a, getTraitByName('EntityAttributes')!, 'name', 'A renamed'); };
+    const res = await createPrefabFromEntity(root, '/prefabs/Rename.prefab.json', 'Create Prefab "Rename"', async () => true);
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(`fixture: ${JSON.stringify(res)}`);
+    expect(getAllEntities().find((e) => e.id === a)?.name).toBe('A renamed'); // precondition: renamed inside the write
+    expect((readTraitData(a, getTraitByName('PrefabInstance')!) as { localId?: number } | null)?.localId).toBe(2);
+  });
+
+  it('accept side: an unmoved tree is tagged with the FILE\'s numbering, kept ids included', async () => {
+    // Mutation: tag with the positional plan (`plan.ecsToLocal`) again — B is live-tagged 2 while its row is 3.
+    const { tagEntityTreeAsInstance } = await import('../../packages/modoki/src/editor/scene/prefab');
+    await load({ id: 'accept', version: 16, name: 'S', resources: [], entities: [] } as unknown as SceneData);
+    const root = add('Add R', 0, 'R');
+    const b = add('Add B', root, 'B');
+    const file = serializePrefab(root, Y, { replacing: { rootLocalId: 1, entities: [
+      { name: 'R', localId: 1, nodeGuid: G.R }, { name: 'A', localId: 2, nodeGuid: G.A }, { name: 'B', localId: 3, nodeGuid: G.B },
+    ] } })!;
+    expect(file.entities.find((e) => e.name === 'B')?.localId).toBe(3); // B carried by its unique name
+    tagEntityTreeAsInstance(root, Y, file);
+    expect((readTraitData(b, getTraitByName('PrefabInstance')!) as { localId: number }).localId).toBe(3);
+  });
+});
+
 describe('#1686 close-out: the Replace\'s second serialize, and the agent create op', () => {
   const X = 'cccccccc-0000-4000-8000-000000169151';
   const XPATH = '/prefabs/X2.prefab.json';

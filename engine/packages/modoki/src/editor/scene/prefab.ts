@@ -41,6 +41,7 @@ import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, NestedStru
 import { spawnUnresolvedReference, asAddedNode } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
+import { translateLocalIds, docRows } from '../../runtime/loaders/memberTranslation';
 import { foldMemberRowChannels, mergeTraitRemovals, descendStructureLayers, foldStructureLayers, type StructureLayer as StructLayer } from '../../runtime/loaders/prefabOverrides';
 import { frameBase, chainLayer, docChainLayer, layerAddedTraits, levelDoc, ownedRootAt, type FrameLayer, type FrameBase } from './prefabBase';
 import { templateValueWriter, type TemplateValueWriter } from './prefabTemplateValue';
@@ -615,10 +616,19 @@ function planMatchesFile(
   if (plan.flatTree.length !== written.entities.length) {
     return mismatch(`${plan.flatTree.length} rows now vs ${written.entities.length} written`);
   }
+  const record = writtenRows.get(written.entities);
   for (let i = 0; i < plan.flatTree.length; i++) {
-    if (plan.nestedRefs.has(plan.flatTree[i].id) !== !!written.entities[i].prefab) {
+    const e = plan.flatTree[i]!;
+    const row = written.entities[i]!;
+    if (plan.nestedRefs.has(e.id) !== !!row.prefab) {
       return mismatch(`row ${i + 1} changed between a nested reference and a plain member`);
     }
+    // The tag reads each entity's localId from the row at its position (#1759), so a tree that changed under the write
+    // (a delete and an add keep the count) hands one entity another's row. The recorded plan says which entity each row
+    // was written from. Not the NAME (close-out review F5): a rename during the write reorders nothing, and refusing it
+    // left a correctly numbered tree unlinked.
+    const was = e.guid ? record?.get(e.guid) : undefined;
+    if (was !== undefined && was !== row.localId) return mismatch(`"${e.name ?? ''}" was written at localId ${was}, but sits where row ${row.localId} was written`);
   }
   return true;
 }
@@ -953,7 +963,7 @@ function nodeGuidsFor(
   /** The document this write REPLACES (#1686), when it is a Replace: Create Prefab over an existing file, or the
    *  agent `create` op over an existing path. Never a prefab-edit save, whose rows are named by `preserved`. */
   replacing?: ReplacedRows,
-): (ecsId: number) => string {
+): ((ecsId: number) => string) & { carried: ReadonlyMap<number, string> } {
   const piMeta = getTraitByName('PrefabInstance');
   const carried = new Map<number, string>();
   const claimed = new Map<string, number>();
@@ -1016,7 +1026,7 @@ function nodeGuidsFor(
       take(e.id, r.nodeGuid);
     }
   }
-  return (ecsId) => carried.get(ecsId) ?? newGuid();
+  return Object.assign((ecsId: number) => carried.get(ecsId) ?? newGuid(), { carried: carried as ReadonlyMap<number, string> });
 }
 
 export function serializePrefab(
@@ -1106,6 +1116,11 @@ export function serializePrefab(
   const prefabEntities: PrefabEntity[] = [];
   const nestedRowIds = new Set(nestedRefs.keys());
   const nodeGuidOf = nodeGuidsFor(flatTree, existingId, opts?.preserveNodeGuids, selectedEntityId, nestedRowIds, opts?.replacing);
+  // A Replace keeps the numbering of every row it carries identity for (#1759): `planPrefabRows` numbered by position.
+  if (opts?.replacing && !opts.preserveLocalIds) {
+    const kept = replaceNumbering(flatTree, selectedEntityId, nodeGuidOf.carried, opts.replacing);
+    if (kept) { ecsToLocal.clear(); for (const [id, lid] of kept) ecsToLocal.set(id, lid); }
+  }
   const rowParent = rowParentsFor(selectedEntityId, flatTree, allEntities, ecsToLocal, opts?.rowParents, nestedRowIds);
   // A ref from one member of the written tree to another becomes a member TOKEN (#1352): the file is a
   // template, and the live guid it held names the SOURCE entity in every instance.
@@ -1276,8 +1291,52 @@ export function serializePrefab(
   };
   assertNoRuntimeGuids(file, 'a serialized prefab');
   opts?.onRows?.(ecsToLocal);
+  writtenRows.set(file.entities, new Map(flatTree.filter((e) => e.guid).map((e) => [e.guid!, ecsToLocal.get(e.id)!])));
   return file;
 }
+
+/** The localIds a Replace writes (#1759, owner option 1, Unity's fileIDs): a row the write carries identity for (its
+ *  live `nodeGuid`, else U22's unique name — `nodeGuidsFor`) keeps the localId that node had in the document being
+ *  replaced; the selection root keeps the old root's; every other row is numbered ABOVE the old document's highest
+ *  localId, never into a number the old document used.
+ *
+ *  Positional numbering (`planPrefabRows`) handed a surviving member's number to whichever node landed in its slot. The
+ *  derived member guid is a hash of the localId path, so that node took the survivor's guid; `dropCollidingPins` then
+ *  made the survivor's pin yield, and every cross-instance ref shifted one member along — and the next save persisted it.
+ *
+ *  Null (keep the positional plan) when the old document carries no identity at all: a pre-v5 document's numbers are
+ *  the only identity it has, and a Replace of the same tree numbers it exactly as it was. */
+function replaceNumbering(
+  flatTree: readonly EntityInfo[],
+  selectedEntityId: number,
+  carried: ReadonlyMap<number, string>,
+  replacing: ReplacedRows,
+): Map<number, number> | null {
+  const rows = replacing.entities ?? [];
+  const oldLocal = new Map<string, number>();
+  for (const r of rows) if (r.nodeGuid && isGuid(r.nodeGuid) && r.localId) oldLocal.set(r.nodeGuid, r.localId);
+  if (!oldLocal.size) return null;
+  const rootLid = replacing.rootLocalId ?? 1;
+  let next = Math.max(rootLid, ...rows.map((r) => r.localId ?? 0));
+  const out = new Map<number, number>([[selectedEntityId, rootLid]]);
+  const used = new Set<number>([rootLid]);
+  for (const e of flatTree) {
+    if (out.has(e.id)) continue;
+    const g = carried.get(e.id);
+    const lid = g ? oldLocal.get(g) : undefined;
+    if (lid && !used.has(lid)) { out.set(e.id, lid); used.add(lid); }
+  }
+  for (const e of flatTree) if (!out.has(e.id)) out.set(e.id, ++next);
+  return out;
+}
+
+/** The plan each serialized file was written from, by the live entity's durable guid (#1759): which entity went to
+ *  which localId. `tagEntityTreeAsInstance` reads its numbering from the FILE — the plan's record, and the only one a
+ *  Replace's kept numbering can be read back from — and checks with this that the entity at each position is still the
+ *  one written there. By guid, not ecs id: Create Prefab's redo re-tags after an undo that may have reloaded the world.
+ *  Keyed by the ROWS array, not the file object: Create Prefab tags a `{ ...draft, id }` copy, which shares it (close-out
+ *  review F1 — keyed by the object, the check never ran on the human path). */
+const writtenRows = new WeakMap<ReadonlyArray<PrefabEntity>, ReadonlyMap<string, number>>();
 
 /** Each written row's row parent: its live parent when that is a row (the ordinary case, a re-parent in the
  *  editor included). A row whose live parent is NOT one — it sits under a member of a nested instance, where
@@ -1560,16 +1619,21 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
   return mergeUnknownFields(known, collectUnknownFields(existing, Object.keys(known))) as unknown as PrefabFile;
 }
 
-/** The rows a Replace matches identity against (#1686): only each row's name, `nodeGuid` and nested `prefab`. */
-export type ReplacedRows = { entities?: ReadonlyArray<{ name?: string; nodeGuid?: string; prefab?: string }> };
+/** The rows a Replace matches identity against (#1686): each row's name, `nodeGuid` and nested `prefab`, and the
+ *  numbering a matched row keeps (#1759: its `localId`, and the document's `rootLocalId`). */
+export type ReplacedRows = {
+  entities?: ReadonlyArray<{ name?: string; nodeGuid?: string; prefab?: string; localId?: number }>;
+  rootLocalId?: number;
+};
 
 /** {@link ReplacedRows} from a replaced prefab's raw bytes — undefined for bytes that are not a prefab document. Read
  *  raw, unmigrated: a document too old to carry `nodeGuid` has nothing to carry anyway. */
 export function parsedPrefabRows(text: string | null): ReplacedRows | undefined {
   if (!text) return undefined;
   try {
-    const doc = JSON.parse(text) as { entities?: unknown };
-    return Array.isArray(doc?.entities) ? { entities: doc.entities as ReplacedRows['entities'] } : undefined;
+    const doc = JSON.parse(text) as { entities?: unknown; rootLocalId?: unknown };
+    if (!Array.isArray(doc?.entities)) return undefined;
+    return { entities: doc.entities as ReplacedRows['entities'], ...(typeof doc.rootLocalId === 'number' ? { rootLocalId: doc.rootLocalId } : {}) };
   } catch { return undefined; }
 }
 
@@ -4210,8 +4274,13 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
   // a cycle, which needs `existingId`; this call passes none, so that cannot fire here.)
   const plan = planPrefabRows(tree, rootEcsId)!;
   if (writtenPrefab && !planMatchesFile(plan, writtenPrefab, source)) return new Map();
+  // The numbering is the FILE's, row for row (#1759): a Replace keeps the replaced document's localIds, which the
+  // positional plan above cannot reproduce. Without the file there is only the positional plan, which is right only
+  // for a first create — said out loud, since a Replace tagged that way addresses rows the file numbered otherwise.
+  if (!writtenPrefab) console.warn(`[Prefab] tagging "${source}" without the file just written — numbering its rows by position, which matches only a first Create Prefab, never a Replace`);
+  const localIdOf = new Map(plan.flatTree.map((info, i) => [info.id, writtenPrefab ? writtenPrefab.entities[i]!.localId : plan.ecsToLocal.get(info.id)!]));
   for (const info of plan.flatTree) {
-    const localId = plan.ecsToLocal.get(info.id)!;
+    const localId = localIdOf.get(info.id)!;
     const nested = plan.nestedRefs.get(info.id);
     if (nested) {
       // Nested reference row — keep its link to its OWN prefab and stamp only which outer row
@@ -6541,7 +6610,15 @@ export async function applyToPrefab(selectedEntityId: number): Promise<void> {
  *  address that survives the id churn (the prefab structure is deterministic). */
 interface NestedInstanceCapture {
   chain: number[];
+  /** Each link of `chain` by identity: the row's `nodeGuid` in the frame above (`parentNodeGuid`), '' for a pre-v5 row.
+   *  The re-apply finds each link in the document that frame expands NOW (#1771 close-out review F3): a link read by
+   *  its number named whatever row inherited it once an outer row was re-pointed at another prefab. */
+  chainGuids: string[];
   source: string;
+  /** The document every localId below was read against: the frame's own record when captured (I3). The re-apply
+   *  translates from it to the document the frame at `chain` expands AFTER the rebuild, which can be a new version of
+   *  `source` or, when the template re-pointed that row at another prefab, a different prefab altogether (#1767). */
+  doc: PrefabFile;
   overrides: Record<number, Record<string, Record<string, unknown>>>;
   structure: InstanceStructure;
   /** Template-authored added nodes the scene EDITED: the fresh expansion spawns each one again, so the
@@ -6589,20 +6666,22 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
   // real row's expansion. Such an instance is not a row expansion of this outer at all — the outer
   // structure capture carries it whole, as a reference node under that plain node.
   const identity = worldIdentityParents(getCurrentWorld());
-  const chainOf = (n: number): number[] | null => {
+  const chainOf = (n: number): { chain: number[]; guids: string[] } | null => {
     const chain: number[] = [];
+    const guids: string[] = [];
     let cur = n, guard = 0;
     while (cur && cur !== outerRootId && guard++ < 64) {
       const pi = piOf(cur);
       if (!pi) break;
       chain.unshift((pi.parentLocalId as number) || 0);
+      guids.unshift(pi.parentLocalId ? (pi.parentNodeGuid as string) || '' : '');
       // Climb to the parent instance's root by IDENTITY: a nested root moved out of its frame (#1437) is still
       // that frame's row, and a chain read from its live parent addressed a different instance. An OWNED root
       // climbs to its owner — its template parent can be another nested ROOT (a nested row under a nested row),
       // whose own frame is not the one holding the row.
       cur = pi.parentLocalId ? identity.ownerOf(cur) : rootOf(identity.parentOf(cur));
     }
-    return cur === outerRootId ? chain : null;
+    return cur === outerRootId ? { chain, guids } : null;
   };
 
   // The chain's member tokens resolved to the live guids they name (`baseTokenResolver`: the nested
@@ -6617,10 +6696,11 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
   // and re-expanded at its row; walking live children never reached it, so its edits were lost. Shallowest first,
   // the order the live walk gave: a frame is re-applied before the frames inside it.
   const torn = [...rebuildTeardown(outerRootId).toDestroy]
-    .map((id) => ({ id, chain: isNestedRoot(id) ? chainOf(id) : null }))
-    .filter((t): t is { id: number; chain: number[] } => !!t.chain)
+    .map((id) => ({ id, at: isNestedRoot(id) ? chainOf(id) : null }))
+    .filter((t): t is { id: number; at: { chain: number[]; guids: string[] } } => !!t.at)
+    .map(({ id, at }) => ({ id, chain: at.chain, chainGuids: at.guids }))
     .sort((a, b) => a.chain.length - b.chain.length);
-  for (const { id, chain } of torn) {
+  for (const { id, chain, chainGuids } of torn) {
     // Only instances reached through a chain of ROW expansions. A `0` in the chain is a user-added
     // (reference-node) instance, and everything under one is carried BY that node: the outer capture's
     // `structure.added` holds it with its own overrides, structure and nested channels (#1369), and
@@ -6648,7 +6728,9 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
         const own = [...nodes.own].flatMap(([lid, list]) => list.map((n) => ({ ...n, parentLocalId: lid })));
         captures.push({
           chain,
+          chainGuids,
           source,
+          doc: childPrefab,
           overrides: subtractChainOverrides(
             captureInstanceOverrides(id, childPrefab), resolve(chainLayerHere.overrides) as Record<number, Record<string, Record<string, unknown>>>, childPrefab, memberTransforms(id)),
           structure: { ...structure, added: [...structure.added, ...own] },
@@ -6935,14 +7017,39 @@ function reapplyNestedInstanceOverrides(newOuterRootId: number, captures: Nested
       .map((e) => e.id);
   };
 
+  // The row a link names in the document frame `root` expands NOW — by its nodeGuid where it has one, since a number
+  // names whatever row inherited it. 0 when that document no longer holds the row: the capture then applies nowhere,
+  // as a reload applies the scene's row nowhere (R2 keeps it).
+  const linkIn = (root: number, lid: number, guid: string): number => {
+    if (!guid) return lid;
+    const src = (readTraitData(root, PrefabInstanceMeta)?.source as string) || '';
+    const doc = levelDoc(root, src).doc ?? getCachedPrefabSync(src);
+    const row = doc ? docRows(doc).get(guid) : undefined;
+    return row?.nested ? row.localId : 0;
+  };
   for (const cap of captures) {
     let cur = newOuterRootId;
-    for (const plid of cap.chain) { cur = findChildNestedRoot(cur, plid); if (!cur) break; }
+    for (let i = 0; i < cap.chain.length && cur; i++) {
+      const lid = linkIn(cur, cap.chain[i]!, cap.chainGuids[i] ?? '');
+      cur = lid ? findChildNestedRoot(cur, lid) : 0;
+    }
     if (!cur || cur === newOuterRootId) continue;
+    // The capture is keyed in the localIds of the document it was READ against; the frame now at its row expands
+    // whatever that row expands NOW (I4, #1767). A template row that kept its nodeGuid while its prefab changed puts
+    // another prefab here, and the old numbers named the new prefab's members one for one. Translated by nodeGuid, as
+    // a reload translates the scene's rows: an edit to a member the new document does not have is dropped (R2 keeps
+    // its row), and across two prefabs a number is never matched by position. ⚠️ One difference from a reload stays, and
+    // it is the rebuild's standing rule, not this translation's: a scene-ADDED node under a dropped member is
+    // re-anchored to the frame root (`translateCarried` → `applyStructureCore`), where a reload keeps it in the orphan row.
+    const nowSource = (readTraitData(cur, PrefabInstanceMeta)?.source as string) || cap.source;
+    const childPrefab = levelDoc(cur, nowSource).doc ?? getCachedPrefabSync(nowSource);
+    if (!childPrefab) continue;
+    let { overrides, structure } = cap;
+    const lid = translateLocalIds(cap.doc, childPrefab, { acrossPrefabs: nowSource !== cap.source });
+    if (lid) ({ overrides, structure } = translateCarried(lid, overrides, structure));
     if (cap.replace.length) deleteEntities(freshCopies(cur, cap.replace));
-    applyOverridesByRootInstance(cur, cap.overrides);
-    const childPrefab = getCachedPrefabSync(cap.source);
-    if (childPrefab) applyStructureByRootInstance(cur, childPrefab, cap.structure);
+    applyOverridesByRootInstance(cur, overrides);
+    applyStructureByRootInstance(cur, childPrefab, structure);
     // A row whose node the new template no longer adds applies nowhere here; `settleKeptOrphans` keeps it (fork 2).
     if (cap.nodeRows) applyNodeRowsLive(cur, cap.nodeRows);
     // The respawned node's key marker comes back with every other torn-down node's, by guid (`rebuildInstance`, #1567).
@@ -7302,32 +7409,6 @@ function rebuildTeardown(
   return { toDestroy, parked };
 }
 
-/** Old localId → new localId for every row two versions of one prefab document share, matched by the
- *  minted `nodeGuid` (#1468 Phase 4) — or null when nothing moved, which is every case where `from` and
- *  `to` are the same document or neither carries identity. A row `to` no longer has maps to 0, which no
- *  member holds: an edit to a member the template dropped is DROPPED, never handed to whichever member
- *  inherited its number. A row with no `nodeGuid` (a pre-v5 document) keeps its number — the only answer
- *  there is, and the behaviour this replaces. */
-function localIdTranslation(from: PrefabFile, to: PrefabFile): ((lid: number) => number) | null {
-  if (from === to) return null;
-  const toByGuid = new Map<string, number>();
-  // A `to` row with no identity of its own (a pre-v5 copy — a `git checkout` of an older file) can only be matched by
-  // its number, as `rowsMeanTheSame` matches it: a `from` row keeps its localId when `to` holds that localId unkeyed.
-  // Mapping it to 0 dropped every carried edit on it (#1665 close-out review).
-  const toUnkeyed = new Set<number>();
-  for (const pe of to.entities) {
-    if (pe.nodeGuid && isGuid(pe.nodeGuid)) toByGuid.set(pe.nodeGuid, pe.localId);
-    else toUnkeyed.add(pe.localId);
-  }
-  const map = new Map<number, number>([[from.rootLocalId ?? 1, to.rootLocalId ?? 1]]);
-  for (const pe of from.entities) {
-    if (!pe.nodeGuid || !isGuid(pe.nodeGuid) || pe.localId === (from.rootLocalId ?? 1)) continue;
-    map.set(pe.localId, toByGuid.get(pe.nodeGuid) ?? (toUnkeyed.has(pe.localId) ? pe.localId : 0));
-  }
-  if ([...map].every(([a, b]) => a === b)) return null;
-  return (lid) => map.get(lid) ?? lid;
-}
-
 /** The document a SAVE measures the top-level instance `rootId` (of `source`) against (#1685, I3): the one it was
  *  EXPANDED from — its frame record — never a cache that has moved on. Measured against a newer template, every row the
  *  instance was never built with read as REMOVED by the scene, and the save deleted the template's new members for good.
@@ -7336,12 +7417,12 @@ function localIdTranslation(from: PrefabFile, to: PrefabFile): ((lid: number) =>
  *  Nothing it writes needs translating onto `current`: every member edit goes on a member ROW, keyed by `nodeGuid`
  *  (the save's guid pass gives each member a durable guid first), and what stays in the localId channels is the root's
  *  own edits (the root's localId never renumbers) and a pre-v5 member's (no `nodeGuid`, so no translation could move it
- *  either — `localIdTranslation` keeps its number). */
+ *  either — `translateLocalIds` keeps its number). */
 export function savedFrameDoc(rootId: number, source: string, current: PrefabFile): PrefabFile {
   return levelDoc(rootId, source).doc ?? current;
 }
 
-/** {@link localIdTranslation} applied to everything a rebuild carries by localId. */
+/** {@link translateLocalIds} applied to everything a rebuild carries by localId. */
 function translateCarried<S extends { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> }>(
   lid: (n: number) => number,
   overrides: Record<number, Record<string, Record<string, unknown>>>,
@@ -7426,7 +7507,7 @@ export function rebuildInstance(
   // re-save that renumbered them would otherwise hand every edit to whichever member inherited the
   // number. Today's callers (Apply and its undo) are additive and never renumber, so this is the
   // function honouring its own contract — it accepts a baseline other than the document it rebuilds.
-  const lidOf = localIdTranslation(baseline, prefab);
+  const lidOf = translateLocalIds(baseline, prefab);
   if (lidOf) ({ overrides, structure } = translateCarried(lidOf, overrides, structure));
 
   // Preserve the instance root's scene placement (its parent is not a member, so
@@ -7444,10 +7525,14 @@ export function rebuildInstance(
   const carriedMembers = captureInstanceMembers(rootInstanceId);
   // Snapshot live per-copy overrides on nested children BEFORE the teardown
   // (they get cascade-destroyed with the outer members and re-expanded fresh).
-  const nestedCaptures = remapGuidValues(captureNestedInstanceOverrides(rootInstanceId, baseline), remap) as NestedInstanceCapture[];
-  // Only a chain's FIRST link is a row of `baseline`; the rest are rows of child documents this rebuild
-  // does not change. (`nestedMoves` keys carry the same first link, and only a Revert — same document
-  // on both sides — hands them in.)
+  // The documents stay out of the remap: they hold no instance guid, and a copy of each per rebuild is waste.
+  const rawCaptures = captureNestedInstanceOverrides(rootInstanceId, baseline);
+  const nestedCaptures = (remapGuidValues(rawCaptures.map(({ doc: _doc, ...cap }) => cap), remap) as Omit<NestedInstanceCapture, 'doc'>[])
+    .map((cap, i) => ({ ...cap, doc: rawCaptures[i]!.doc }));
+  // Only a chain's FIRST link is a row of `baseline`. ⚠️ The re-apply does NOT address by this number where the link has
+  // a nodeGuid: `linkIn` finds every link by identity in the document its frame expands now (#1771). What still reads
+  // the translated number is the `nestedMoves` match below (`cap.chain.join('.')`) and an unkeyed (pre-v5) link.
+  // (`nestedMoves` keys carry the same first link, and only a Revert — same document on both sides — hands them in.)
   if (lidOf) for (const cap of nestedCaptures) if (cap.chain.length) cap.chain = [lidOf(cap.chain[0]!), ...cap.chain.slice(1)];
   const nm = structure.nestedMoves;
   if (nm) {
@@ -7641,9 +7726,9 @@ export function rebuildInstanceFromCapture(
   const handle = findEntity(rootInstanceId);
   const rec = handle ? frameRootDoc(getCurrentWorld(), handle) : undefined;
   const live = rec && rec.source === source ? rec.doc as PrefabFile : now;
-  const toLive = localIdTranslation(capturedFrom, live);
+  const toLive = translateLocalIds(capturedFrom, live);
   if (toLive) ({ overrides, structure } = translateCarried(toLive, overrides, structure));
-  const toNow = localIdTranslation(capturedFrom, now);
+  const toNow = translateLocalIds(capturedFrom, now);
   if (toNow && structure.nestedMoves) structure = { ...structure, nestedMoves: translateNestedMoveKeys(structure.nestedMoves, toNow) };
   return rebuildInstance(rootInstanceId, source, now, overrides, structure, live);
 }

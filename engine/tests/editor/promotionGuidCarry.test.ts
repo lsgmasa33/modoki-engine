@@ -644,3 +644,24 @@ describe('#1682: Apply deletes the promoted node\'s IDENTITY subtree, not its li
     }
   });
 });
+
+describe('#1759: a promotion never takes a localId a removal in the SAME Apply frees', () => {
+  it('delete A (the highest row) and add X, Apply both: X is written above A\'s old number, not into it', async () => {
+    // A number freed by a removal handed to a new row gives that row the removed member's derived guid, and every ref
+    // still naming the removed member silently lands on it (the #1759 class). Apply's promotion counts from the
+    // document as it was BEFORE this Apply's removals (`nextLocalId` in `planApply`). Mutation: compute it after the
+    // removal is applied (from the filtered `newPrefab.entities`) — X is written at 2.
+    install(pDoc());
+    await load(scene());
+    const r1 = idOf(ROOT1);
+    const { deleteEntitiesWithUndo } = await import('@modoki/engine/editor');
+    deleteEntitiesWithUndo([under(ROOT1, 'A')]);
+    add('Add X', r1, [{ name: 'EntityAttributes', data: { name: 'X', parentId: r1 } }]);
+    const keys = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P) as PrefabFile);
+    expect(keys.removedEntities.length).toBe(1); // precondition: the removal is one of the keys applied
+    const res = await applyToPrefabSelective(r1, new Set([...keys.removedEntities, ...keys.added]));
+    expect(res.applied).toBe(true);
+    const written = takeWritten();
+    expect(written.entities.map((e) => [e.name, e.localId])).toEqual([['R', 1], ['X', 3]]);
+  });
+});

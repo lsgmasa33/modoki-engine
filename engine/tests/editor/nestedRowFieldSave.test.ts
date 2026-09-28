@@ -42,7 +42,7 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { clearKeptMemberOrphans, keptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo,
 } from '@modoki/engine/editor';
@@ -1504,6 +1504,10 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       expect(await rebaseStaleInstances()).toBe(1);
       warn.mockRestore();
       expect(rowOf((await saved()).entry, gA)?.traits).toEqual({ Transform: { x: 6 } });
+      // …and the edit is NOT re-applied onto P2's member that holds A's old number (#1767): this assertion was missing,
+      // and the case stayed green while the rebuild wrote A's x onto B2. Mutation: drop the translation in
+      // `reapplyNestedInstanceOverrides` — B2 shows 6.
+      expect(x(inInstance(ROOT1, 'B2'))).toBe(0);
     });
 
     it('a Refresh dropping a node from row N\'s nestedStructure SLOT keeps the scene edit to it (re-review 3)', async () => {
@@ -1571,5 +1575,167 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     await reloadUnder(oDoc());
     expect(readTraitData(inInstance(ROOT1, 'A'), meta('UIFocusable'))).toBeFalsy(); // the scene's removal wins
     expect(readTraitData(inInstance(ROOT1, 'A'), meta('UIAction'))).toBeTruthy(); // the row dropped its removal
+  });
+});
+
+describe('#1771: a saved member reference is read against the document its frame expands NOW (I4)', () => {
+  // The rare trigger both issues share: a template row keeps its nodeGuid (gN) while the prefab it expands changes.
+  const P2 = 'cccccccc-0000-4000-8000-000000001771';
+  const gB = 'eeeeeeee-0000-4000-8000-000000001772';
+  const gN2 = 'eeeeeeee-0000-4000-8000-000000001773';
+  /** P with a second member: R → A (2), B (3). */
+  const pAB = () => { const d = pDoc(); (d.entities as unknown[]).push(row(3, 'B', 1, gB)); return d; };
+  /** P2: R2 → B2 (2), C2 (3) — numbered like P, so reading P's localIds against it lands on B2 and C2 one for one. */
+  const p2 = () => ({ id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [
+    row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000001774'), row(2, 'B2', 1, 'eeeeeeee-0000-4000-8000-000000001775'),
+    row(3, 'C2', 1, 'eeeeeeee-0000-4000-8000-000000001776'),
+  ] });
+  /** O whose row N keeps gN but expands P2. `keepP`: a second row N2 (under Slot2) still expands P, so P's nodes are still
+   *  in O's tree — which is what the template-wide backed test read as "backed". */
+  const swapped = (keepP = false) => {
+    const d = oDoc();
+    (d.entities[3] as Record<string, unknown>).prefab = P2;
+    if (keepP) (d.entities as unknown[]).push({ localId: 5, name: 'N2', nodeGuid: gN2, prefab: P, traits: { EntityAttributes: { name: 'N2', parentId: 3, guid: '' } } });
+    return d;
+  };
+  const quiet = () => vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const rowKeys = (entry: Record<string, unknown>) => Object.keys((entry.members ?? {}) as Record<string, unknown>);
+  /** A's x in row N's frame (N2's A is under Slot2, so N's is the one under Slot). */
+  const nA = () => {
+    const slot = inInstance(ROOT1, 'Slot');
+    const all = getAllEntities();
+    const byId = new Map(all.map((e) => [e.id, e]));
+    const hit = all.filter((e) => e.name === 'A' && [...(function* () { for (let c = byId.get(e.parentId); c; c = byId.get(c.parentId)) yield c.id; })()].includes(slot));
+    if (hit.length !== 1) throw new Error(`fixture: ${hit.length} A under Slot`);
+    return x(hit[0]!.id);
+  };
+
+  it('#1767: a Refresh re-applies nothing of the old prefab onto the new one, and equals a reload of the same file', async () => {
+    // Mutation: drop the `translateLocalIds` call in `reapplyNestedInstanceOverrides` — B2 shows 6 and C2 is deleted,
+    // and the save persists both.
+    install(pAB(), p2(), oDoc());
+    await load(scene(O, [ROOT1]));
+    setTf(inInstance(ROOT1, 'A'), 'x', 6);
+    deleteEntitiesWithUndo([inInstance(ROOT1, 'B')]);
+    install(swapped());
+    const warn = quiet();
+    expect(await rebaseStaleInstances()).toBe(1);
+    const refreshed = [x(inInstance(ROOT1, 'B2')), getAllEntities().filter((e) => e.name === 'C2').length];
+    expect(refreshed).toEqual([0, 1]);
+    const { scene: sc, entry } = await saved();
+    // Every member keeps an identity row (its guid and name); what must not be there is an EDIT of B2 or C2.
+    const members = (entry.members ?? {}) as Record<string, Record<string, unknown>>;
+    expect(members[`/${gN}/eeeeeeee-0000-4000-8000-000000001775`]?.traits).toBeUndefined();
+    expect(members[`/${gN}/eeeeeeee-0000-4000-8000-000000001776`]?.removed).toBeUndefined();
+    await load(sc);
+    warn.mockRestore();
+    expect([x(inInstance(ROOT1, 'B2')), getAllEntities().filter((e) => e.name === 'C2').length]).toEqual(refreshed);
+  });
+
+  it('#1766 reload: a row whose chain is gone is KEPT although its node is still in the template elsewhere', async () => {
+    // Mutation: back a member-row key by the template-wide guid set again (`parts.every((c) => known.has(c))` in
+    // `rowBackedTest`) — the row reads as backed, applies nowhere, and the save drops it: A reloads at 0.
+    install(pAB(), p2(), oDoc());
+    await load(scene(O, [ROOT1]));
+    setTf(inInstance(ROOT1, 'A'), 'x', 6);
+    const { scene: first } = await saved();
+    install(swapped(true));
+    const warn = quiet();
+    await load(first);
+    const { scene: second, entry } = await saved();
+    expect(rowKeys(entry)).toContain(`/${gN}/${gA}`);
+    install(oDoc());
+    await load(second);
+    warn.mockRestore();
+    expect(nA()).toBe(6);
+  });
+
+  it('#1766 Refresh: the settle keeps the same row, as the reload does', async () => {
+    // Mutation: as above — the settle drops the row, and A comes back at 0.
+    install(pAB(), p2(), oDoc());
+    await load(scene(O, [ROOT1]));
+    setTf(inInstance(ROOT1, 'A'), 'x', 6);
+    install(swapped(true));
+    const warn = quiet();
+    expect(await rebaseStaleInstances()).toBe(1);
+    const { scene: sc, entry } = await saved();
+    expect(rowKeys(entry)).toContain(`/${gN}/${gA}`);
+    install(oDoc());
+    await load(sc);
+    warn.mockRestore();
+    expect(nA()).toBe(6);
+  });
+
+  it('#1767 one frame deeper: a capture inside a nested row of the re-pointed prefab finds its link by identity (review F3)', async () => {
+    // P: R → A, M (3, nests Q); P2: R2 → B2, M2 (3, nests Q, ANOTHER nodeGuid). The scene edits QA inside N/M. Mutation:
+    // follow the capture's chain by number again in `reapplyNestedInstanceOverrides` — M2 holds M's number, and its QA
+    // shows 6 after the Refresh while a reload of the same file shows 0.
+    const Q = 'cccccccc-0000-4000-8000-000000177110';
+    const q = { id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
+      row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000177111'), row(2, 'QA', 1, 'eeeeeeee-0000-4000-8000-000000177112')] };
+    const nestQ = <D extends { entities: unknown[] }>(d: D, name: string, nodeGuid: string): D => {
+      d.entities.push({ localId: 3, name, nodeGuid, prefab: Q, traits: { EntityAttributes: { name, parentId: 1, guid: '' } } });
+      return d;
+    };
+    // p2() has C2 at 3: dropped, so M2 takes that number — the collision this case is about.
+    const p2m = p2(); p2m.entities = p2m.entities.slice(0, 2);
+    install(q, nestQ(pDoc(), 'M', 'eeeeeeee-0000-4000-8000-000000177113'), nestQ(p2m, 'M2', 'eeeeeeee-0000-4000-8000-000000177114'), oDoc());
+    await load(scene(O, [ROOT1]));
+    setTf(inInstance(ROOT1, 'QA'), 'x', 6);
+    install(swapped());
+    const warn = quiet();
+    expect(await rebaseStaleInstances()).toBe(1);
+    const refreshed = x(inInstance(ROOT1, 'QA'));
+    const { scene: sc } = await saved();
+    await load(sc);
+    warn.mockRestore();
+    expect(refreshed).toBe(0);
+    expect(x(inInstance(ROOT1, 'QA'))).toBe(0);
+  });
+
+  it('#1767 into a PRE-v5 prefab: nothing is matched by number across two prefabs (review F4)', async () => {
+    // P2 with no nodeGuid anywhere. Mutation: drop `acrossPrefabs` at the re-apply — the unkeyed fallback matches A's 2
+    // onto B2's 2, and B2 shows 6.
+    const bare = p2();
+    for (const e of bare.entities) delete (e as { nodeGuid?: string }).nodeGuid;
+    install(pAB(), bare, oDoc());
+    await load(scene(O, [ROOT1]));
+    setTf(inInstance(ROOT1, 'A'), 'x', 6);
+    install(swapped());
+    const warn = quiet();
+    expect(await rebaseStaleInstances()).toBe(1);
+    warn.mockRestore();
+    expect(x(inInstance(ROOT1, 'B2'))).toBe(0);
+  });
+
+  it('#1767 accept side: across two prefabs that SHARE a nodeGuid, the edit carries — as a reload carries it (review)', async () => {
+    // A duplicated prefab keeps its nodeGuids; a template row re-pointed at the copy reaches the same members by identity.
+    // Mutation: map every keyed row to 0 under `acrossPrefabs` in `translateLocalIds` — A's x is dropped on the Refresh.
+    const COPY = 'cccccccc-0000-4000-8000-000000177120';
+    const copy = { ...pAB(), id: COPY, name: 'P copy' };
+    const toCopy = () => { const d = oDoc(); (d.entities[3] as Record<string, unknown>).prefab = COPY; return d; };
+    install(pAB(), copy, oDoc());
+    await load(scene(O, [ROOT1]));
+    setTf(inInstance(ROOT1, 'A'), 'x', 6);
+    install(toCopy());
+    const warn = quiet();
+    expect(await rebaseStaleInstances()).toBe(1);
+    const refreshed = x(inInstance(ROOT1, 'A'));
+    await load((await saved()).scene);
+    warn.mockRestore();
+    expect([refreshed, x(inInstance(ROOT1, 'A'))]).toEqual([6, 6]);
+  });
+
+  it('accept side: a row whose chain still exists through the new template is backed — not kept as an orphan', async () => {
+    // The fold applies a row whether or not it is backed, so the value alone cannot tell; the kept store can. Mutation:
+    // answer "not backed" for every member-row key in `rowBackedTest` — `/gN2/gA` is kept too, and a later Refresh
+    // would replay it over whatever the scene does to that member next.
+    install(pAB(), p2(), swapped(true));
+    await load(scene(O, [ROOT1]));
+    const sc = JSON.parse(JSON.stringify((await saved()).scene)) as { entities: Array<Record<string, unknown>> };
+    const entry = sc.entities.find((e) => e.prefab === O)!;
+    entry.members = { ...(entry.members as object), [`/${gN2}/${gA}`]: { traits: { Transform: { x: 6 } } } };
+    await load(sc as unknown as SceneData);
+    expect(Object.keys(keptMemberOrphans(ROOT1) ?? {})).not.toContain(`/${gN2}/${gA}`);
   });
 });

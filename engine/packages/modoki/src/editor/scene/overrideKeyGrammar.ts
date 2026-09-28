@@ -19,6 +19,7 @@
  *  contains `.` or `:`, which is what lets the key shapes keep their separators. */
 
 import { isGuid } from '../../runtime/core/assetRefRules';
+import { localIdOfMember } from '../../runtime/loaders/memberTranslation';
 
 /** What this module reads of a prefab document. */
 export interface KeyDoc {
@@ -36,9 +37,7 @@ export function memberRef(doc: KeyDoc, localId: number): string {
 /** The localId `ref` names in `doc`, or null when it names no row there. A numeric ref is taken at its
  *  word — the legacy spelling, and the only one a pre-v5 document has. */
 export function localIdOfRef(doc: KeyDoc, ref: string): number | null {
-  if (isGuid(ref)) return doc.entities.find((e) => e.nodeGuid === ref)?.localId ?? null;
-  const n = Number(ref);
-  return ref !== '' && Number.isInteger(n) ? n : null;
+  return localIdOfMember(doc, ref); // the one translation of a member reference (#1771, `memberTranslation.ts`)
 }
 
 /** The identity-form key for a move of member `lid` inside the nested instance reached by `chain` (row

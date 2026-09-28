@@ -20,6 +20,7 @@ import {
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 import { memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
+import { docRows, resolveMemberChain, type MemberDoc, type MemberRowAt } from './memberTranslation';
 import { keepUnresolvedEntry, spawnUnresolvedReference } from './unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../core/unresolvedPrefabRef';
 import { parseMemberRowKey, parseNodeRowKey, memberRowNodes } from '../core/assetRefRules';
@@ -1266,13 +1267,24 @@ type PrefabDocReader = (ref: string) => unknown;
  *  is absent from the world but still in the template, and its row is not an orphan. `complete` is false when a
  *  document on the way was not cached — the answer is then "cannot tell", which the load does not report. */
 export function rowBackedTest(source: string, read: PrefabDocReader = getCachedPrefab): { backed(key: string): boolean; complete: boolean } {
-  const { guids: known, complete } = templateNodeGuids(source, read);
+  const { complete, unread } = templateNodeGuids(source, read);
+  // One index per document for the whole test: a load asks it once per stored row.
+  const indexes = new Map<MemberDoc, Map<string, MemberRowAt>>();
+  const rowsOf = (doc: MemberDoc) => { let rows = indexes.get(doc); if (!rows) indexes.set(doc, rows = docRows(doc)); return rows; };
+  const readDoc = (ref: string) => read(ref) as MemberDoc | null | undefined;
   return {
     complete,
     backed: (key) => {
       const node = parseNodeRowKey(key);
       const parts = node?.frame ?? parseMemberRowKey(key);
-      return !!parts.length && parts.every((c) => known.has(c)) && (!node || !!templateFrameKeys(source, node.frame, read)?.has(node.nodeKey));
+      // Chained frame by frame through the documents those frames expand NOW (#1766): a component that is a node of
+      // some document in the tree, but not of the one its frame expands, names nothing — and a row naming nothing is
+      // R2's orphan, kept, where "backed" dropped it on the next save.
+      const at = resolveMemberChain(readDoc(source), parts, readDoc, rowsOf);
+      if (!at || at === 'unread') return false;
+      // A reference row whose child cannot be read expanded into NOTHING (#1699): not backed, as `templateNodeGuids` says.
+      if (at.row.prefab && at.row.nested && unread.has(at.row.prefab)) return false;
+      return !node || !!templateFrameKeys(source, node.frame, read)?.has(node.nodeKey);
     },
   };
 }
@@ -1282,7 +1294,7 @@ export function rowBackedTest(source: string, read: PrefabDocReader = getCachedP
  *  A membership SET, deliberately not a key walk: it answers "does this document still contain that
  *  node" and nothing else, so it cannot disagree with `memberRowKeysIn` about what a key IS. A third
  *  spelling of the identity walk is exactly what #1468 Phase 1 spent itself removing. */
-function templateNodeGuids(prefabRef: string, read: PrefabDocReader = getCachedPrefab): { guids: Set<string>; complete: boolean } {
+function templateNodeGuids(prefabRef: string, read: PrefabDocReader = getCachedPrefab): { guids: Set<string>; complete: boolean; unread: ReadonlySet<string> } {
   const guids = new Set<string>();
   const seen = new Set<string>();
   const unread = new Set<string>();
@@ -1305,7 +1317,7 @@ function templateNodeGuids(prefabRef: string, read: PrefabDocReader = getCachedP
     }
   };
   walk(prefabRef);
-  return { guids, complete };
+  return { guids, complete, unread };
 }
 
 /** The template keys of the nodes the template adds in ONE nested frame (#1516) — the frame `frame` names, one
@@ -1550,11 +1562,11 @@ function applyStoredMemberRows(
  *  because `cleared` only ever increments alongside `live.delete(id)` and the loop returns when a
  *  pass clears nothing, so `live` shrinks by at least one per pass and is bounded by `pinned`.
  *
- *  ⚠️ **Calling `deriveInstanceMemberGuids` more than once per load is safe, and this is the part
- *  worth checking before touching it.** Verified in the code, twice independently: `drainAfterDerive`
- *  does `afterDerive.delete(world)` on ENTRY, so the move queue drains exactly once and passes 2..N
- *  find nothing (`resolveTemplateFrames` has the same shape). The derive fills only EMPTY guids, so a
- *  later pass touches only what this one cleared. And a re-derived member gets the SAME guid the
+ *  ⚠️ **The re-derive here is the derive ALONE (`deriveMemberGuidsOnly`); the load settles tokens and moves
+ *  once, after this returns (#1761).** Both drain their queues exactly once (`drainAfterDerive` does
+ *  `afterDerive.delete(world)` on entry, `resolveTemplateFrames` the same), so a settle run inside the
+ *  first derive had already resolved every token against the pins this pass then drops. The derive
+ *  fills only EMPTY guids, so a later pass touches only what this one cleared. And a re-derived member gets the SAME guid the
  *  first pass would have given it even though the moves have since been applied — because the walk
  *  reads a moved member's TEMPLATE parent from the document (`core/ecs/identityParents.ts`), not where
  *  the move put it (#1468 Phase 6; it read a recorded home, `homeParent`, before). */
@@ -1589,8 +1601,8 @@ function dropCollidingPins(world: World, pinned: ReadonlySet<number>): void {
     }
     if (!cleared) return;
     // The derive fills EMPTY guids, so this is exactly the set just cleared — and the next pass asks
-    // whether what it filled collides with a pin that is still standing.
-    deriveInstanceMemberGuids(world);
+    // whether what it filled collides with a pin that is still standing. The settle waits for the caller (#1761).
+    deriveMemberGuidsOnly(world);
   }
 }
 
@@ -1623,7 +1635,7 @@ function dropCollidingPins(world: World, pinned: ReadonlySet<number>): void {
  *  FILE by `derivedMemberPaths` + `sceneAnchorOf` (engine/plugins/asset-fs-ops.ts, #1324/#1339), and
  *  over a live subtree by `planCopyGuids` (`core/copyIdentity.ts`: the editor's duplicate/paste and
  *  the device op, #1338) — change all three. Both mirrors step a keyed node by its key too (#1430). */
-export function deriveInstanceMemberGuids(world: World): void {
+function deriveMemberGuidsOnly(world: World): void {
   const piMeta = getTraitByName('PrefabInstance');
   const attrMeta = getTraitByName('EntityAttributes');
   if (!piMeta || !attrMeta) return;
@@ -1767,10 +1779,25 @@ export function deriveInstanceMemberGuids(world: World): void {
     }
   }
 
-  // Member tokens resolve against the guids just derived (#1352).
+}
+
+/** What waits on the derived guids being FINAL (#1761): member tokens resolve against them (#1352), and only then do
+ *  moved members leave their row parents (#1437). Both consume their queues once, so they run after the last derive —
+ *  the load's after `dropCollidingPins`, whose re-derive changes the guid of every member whose pin it drops. Resolved
+ *  before it, a template's `@member` token kept the dropped pin's guid, which the colliding member now holds: the token
+ *  named the wrong member, and nothing re-resolved it. */
+function settleDerivedGuids(world: World): void {
   resolveTemplateFrames(world);
-  // Only now do moved members leave their row parents (#1437).
   drainAfterDerive(world);
+}
+
+/** {@link deriveMemberGuidsOnly}, then {@link settleDerivedGuids} — for every caller that runs no `dropCollidingPins`
+ *  (an instantiate, a rebuild). The load runs the two halves itself, around it. ⚠️ A rebuild DOES pin guids first
+ *  (`restoreInstanceMembers`) and has no collision guard at all, so a pin colliding with a new derivation there is
+ *  neither dropped nor reported (#1777, a sibling of #1761 filed from its close-out review, not fixed by it). */
+export function deriveInstanceMemberGuids(world: World): void {
+  deriveMemberGuidsOnly(world);
+  settleDerivedGuids(world);
 }
 
 // ── Template member references (#1352) ──────────────────────────────────────
@@ -3139,7 +3166,9 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   // …then give every remaining member a stable, addressable GUID so entities can reference into
   // instances: a pre-v16 scene, a template that predates prefab v5, and every member a row did not
   // name all land here, deriving exactly what they always did.
-  deriveInstanceMemberGuids(world);
+  deriveMemberGuidsOnly(world);
   if (pinned.size) dropCollidingPins(world, pinned);
+  // Tokens and moves only once every guid is final (#1761): a dropped pin re-derives its member.
+  settleDerivedGuids(world);
   for (const [entryRootId, keyed] of templateNodeRows) keepTemplateNodeOrphans(world, entryRootId, keyed);
 }
