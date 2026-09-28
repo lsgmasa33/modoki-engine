@@ -2067,6 +2067,15 @@ await and acts on it afterwards (Play's startup, the hot reload, an Apply). It c
 study (2026-09-28). ⚠️ **R1 to R3 are the model, not yet the code.** The status line under each one says what
 enforces it today, and the fix is tracked on #1750.
 
+**The rule: when the world is not in a savable state, REFUSE. Don't wait, and don't guess** (owner,
+2026-09-28). A save, a prefab write or an Apply that finds the world mid-switch, mid-reload or otherwise
+not adopted stops, with a notice saying why and what to do ("a scene is still loading, save again once it's
+open", "the scene reloaded, open Apply again"). The agent op returns the same refusal with its reason. It
+does not queue the write until the world settles, and it does not re-find its target in the new world. Either
+would write something the user did not just see. A refusal loses nothing: the outgoing scene was already
+saved or discarded when the switch was chosen, and the user can simply retry. Applies to every new writer,
+not just #1750's members.
+
 A reader can ask four different questions, and each one has its own signal:
 
 | Question | Signal today | What it cannot see |
