@@ -28,6 +28,7 @@
  *  `moveFileToStatus` reports the status precisely so this need not be guessed. */
 
 import { useEditorStore } from '../store/editorStore';
+import { sha256OfWritten } from '../utils/contentHash';
 
 export type UndoDirection = 'Undo' | 'Redo';
 
@@ -66,6 +67,34 @@ export class UndoRefusedError extends Error {
     super(message);
     this.name = 'UndoRefusedError';
     this.toast = toast;
+  }
+}
+
+/** The refusal for an undo/redo step whose file precondition failed (#1679): a file it would overwrite or trash no
+ *  longer holds the bytes the step's other half wrote (a later save, an edit, or a different file at that path), or
+ *  a file it would re-create is already there. The ROUTE refused (`ifMatch`/`createOnly`/`ifEmpty`), so nothing was
+ *  written or trashed — which is what makes this a refusal rather than a failure. #1664's Apply undo has its own
+ *  wording in `installPrefabSnapshot`; every other asset-file step says it through here. */
+export function fileChangedRefusal(paths: readonly string[]): UndoRefusedError {
+  const one = paths.length === 1;
+  const name = one ? paths[0].split('/').pop() : `${paths.length} files`;
+  return new UndoRefusedError(
+    `${paths.join(', ')} ${one ? 'is' : 'are'} not what this step left there (changed on disk since, or another file now at that path), so nothing was written or trashed.`,
+    `${name} changed on disk since, and ${one ? 'was' : 'were'} left as ${one ? 'it is' : 'they are'}`,
+  );
+}
+
+/** The `ifMatch` for bytes a step wrote with `content`/`encoding` (`sha256OfWritten`), as a REFUSAL when they cannot
+ *  be hashed: `crypto.subtle` exists only in a secure context, and nothing has been written yet at this point — the
+ *  same reasoning `installPrefabSnapshot` applies to its own hash. */
+export async function expectedHash(path: string, content: string, encoding?: 'base64'): Promise<string> {
+  try {
+    return await sha256OfWritten(content, encoding);
+  } catch (e) {
+    throw new UndoRefusedError(
+      `${path} was left as it is: the bytes this step expects there could not be hashed (${e instanceof Error ? e.message : String(e)}).`,
+      `${path.split('/').pop()} could not be checked before changing it (see console)`,
+    );
   }
 }
 

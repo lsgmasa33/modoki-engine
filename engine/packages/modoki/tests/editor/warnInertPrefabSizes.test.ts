@@ -175,11 +175,13 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
       { in: 'createPrefabFromEntity', warned: true },
     ]);
     // The plain writes left are the action's restores, and must stay quiet for the reason above: UNDO of a Replace
-    // writes the REPLACED bytes back, REDO writes the same file again.
-    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'writeAssetFile').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
+    // writes the REPLACED bytes back, REDO writes the same file again. Each carries a precondition since #1679, through
+    // the one call each half makes, `replaceFileIfMatch`.
+    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'replaceFileIfMatch').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
       { in: 'undo', warned: false },
       { in: 'redo', warned: false },
     ]);
+    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'writeAssetFile'), 'no unguarded write is left in the action').toEqual([]);
   });
 
   it("the agent create op answers with the warnings it computed — the agent never reads the renderer console (#1251 close-out)", () => {

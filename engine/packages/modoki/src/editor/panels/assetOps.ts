@@ -13,13 +13,14 @@
  *  the logic is unit-testable without rendering a React panel. */
 
 import { whyWorldNotAuthored } from '../scene/authoredWorld';
-import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody } from '../backend/editorBackend';
 import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
-import { reportUndoFailure } from '../undo/undoFailure';
+import { reportUndoFailure, fileChangedRefusal, expectedHash } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
 import { dirtyAssetEditorHolds } from '../store/editorStore';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
+import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
 import { firstAssetRoot } from './assetRoots';
 import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
 import { isTextAsset } from './assetUndo';
@@ -292,6 +293,9 @@ export type DeleteFilesResult = {
    *  when `trash-put` is absent — CI, headless) reports per path, naming any whose subtree is not
    *  self-contained (#883); those files are still on disk, so the rule above applies in full. */
   failed: string[];
+  /** Paths whose precondition (`opts.ifMatch`/`opts.ifEmpty`) failed — present only on that refusal, which trashes
+   *  NOTHING: `ok:false`, every path still where it was (#1679). */
+  conflicts?: string[];
 };
 
 /** Trash MANY paths in a single request → ONE OS-trash invocation → one trash
@@ -299,7 +303,13 @@ export type DeleteFilesResult = {
  *  skips any path that no longer exists, so a list carrying maybe-absent
  *  sidecars is safe — and it REPORTS those in `missing`, which is the only way
  *  a caller can tell an absent sidecar from a file it failed to save. */
-export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResult> {
+export async function deleteAssetFiles(
+  paths: string[],
+  /** Preconditions the ROUTE checks atomically with the trash (#1679) — an undo/redo trashing files it created or
+   *  restored: `ifMatch` maps a path to the sha256 of the bytes it must still hold, `ifEmpty` lists folders that must
+   *  hold nothing. One failure trashes NOTHING and comes back as `conflicts`. Keys must be members of `paths`. */
+  opts?: { ifMatch?: Record<string, string>; ifEmpty?: string[] },
+): Promise<DeleteFilesResult> {
   if (paths.length === 0) return { ok: true, trashed: 0, missing: [], failed: [] };
   try {
     // `rendererWrite` (here and in `deleteAssetFile`): every caller is the editor's own flow — the
@@ -307,8 +317,21 @@ export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResu
     // route's unsaved-work gate is for the AGENT path, which cannot see the human's edit (#1215).
     const res = await backendFetch('/api/delete-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths, rendererWrite: true }),
+      body: JSON.stringify({
+        paths, rendererWrite: true,
+        ...(opts?.ifMatch && Object.keys(opts.ifMatch).length ? { ifMatch: opts.ifMatch } : {}),
+        ...(opts?.ifEmpty?.length ? { ifEmpty: opts.ifEmpty } : {}),
+      }),
     });
+    if (res.status === 409) {
+      const body = await res.json().catch(() => null) as { reason?: unknown; conflicts?: unknown } | null;
+      if (body?.reason === 'if-match') {
+        const conflicts = Array.isArray(body.conflicts) ? body.conflicts.filter((p): p is string => typeof p === 'string') : [];
+        // Never an empty list on a refusal — a caller branches on `conflicts?.length`, and an unparseable list must
+        // still read as "refused", or a trash that did not happen would look like one that did.
+        return { ok: false, trashed: 0, missing: [], failed: [], conflicts: conflicts.length ? conflicts : [...paths] };
+      }
+    }
     if (!res.ok) return { ok: false, trashed: 0, missing: [], failed: [] };
     // A body we cannot parse is not a failed delete — the trash already happened.
     // Fall back to "everything we asked for was trashed", which is what the old
@@ -332,6 +355,43 @@ export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResu
   } catch { return { ok: false, trashed: 0, missing: [], failed: [] }; }
 }
 
+/** What a document path holds before a step replaces it, for that step's undo to put back (#1679, #1264's shape):
+ *  the bytes of a JSON object document; `undefined` when nothing is there (a 404, or the dev server's SPA fallback
+ *  answering 200 with HTML for a missing path); `null` when something is there that is not a readable document — a
+ *  failed read, or a corrupt one, which is `parseAssetJson`'s rule too: a corrupt file is never an absent one. The
+ *  caller's undo then reports and leaves the file rather than trashing it as though it had created it. Decided by the
+ *  FILE, not the manifest — a manifest-known id can outlive its file, and an id-less file is there all the same. */
+export async function readPriorDocument(path: string): Promise<string | null | undefined> {
+  try {
+    const res = await fetch(path, { cache: 'no-store' });
+    if (res.status === 404) return undefined;
+    if (!res.ok) return null;
+    const text = await res.text();
+    if (isHtmlFallthrough(text)) return undefined;
+    try {
+      const d: unknown = JSON.parse(text);
+      return d && typeof d === 'object' && !Array.isArray(d) ? text : null;
+    } catch { return null; }
+  } catch { return null; }
+}
+
+/** Make `path` hold `next` (`null` = trash it), only while it holds `expected` (`null` = nothing may be there) —
+ *  checked by the ROUTE, atomically with the write or the trash (#1679). The ONE file call Create Prefab's and the
+ *  skin prefab's undo/redo make, so a later prefab-write owner (#1683's proposed `commitPrefabWrite`) replaces a single
+ *  call site in each. `'conflict'` means the precondition failed and nothing changed; `'failed'` is any other miss.
+ *  Throws `UndoRefusedError` only when `expected` cannot be hashed (`expectedHash`). */
+export async function replaceFileIfMatch(path: string, next: string | null, expected: string | null): Promise<'ok' | 'conflict' | 'failed'> {
+  if (next === null) {
+    if (expected === null) return 'ok';
+    const res = await deleteAssetFiles([path], { ifMatch: { [path]: await expectedHash(path, expected) } });
+    if (res.conflicts?.length) return 'conflict';
+    return res.ok && res.failed.length === 0 ? 'ok' : 'failed';
+  }
+  return expected === null
+    ? writeAssetFileGuarded(path, next, { createOnly: true })
+    : writeAssetFileGuarded(path, next, { ifMatch: await expectedHash(path, expected) });
+}
+
 /** Copy an asset to a new path; the backend regenerates the GUID so the
  *  duplicate doesn't collide with the original in the manifest.
  *
@@ -346,6 +406,13 @@ export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResu
  *  click is consent to persist their own edit — which an AGENT does not have, which is why the
  *  agent path keeps the refusal and `force`. */
 export async function duplicateAssetFile(from: string, to: string): Promise<boolean> {
+  return (await duplicateAssetFileReport(from, to)).ok;
+}
+
+/** `duplicateAssetFile`, plus the sha256 of the copy's bytes as the route wrote them (#1679) — what the undo of the
+ *  duplicate hands `deleteAssetFiles` as its `ifMatch`, so it trashes the copy only while nobody has edited it. The
+ *  route reports it because a JSON copy is re-minted server-side and its bytes are not knowable here. */
+export async function duplicateAssetFileReport(from: string, to: string): Promise<{ ok: boolean; sha256?: string }> {
   try {
     await flushPendingMetaFor(from);
     const res = await backendFetch('/api/duplicate-asset', {
@@ -357,9 +424,11 @@ export async function duplicateAssetFile(from: string, to: string): Promise<bool
       // failed with nothing said anywhere.
       const detail = await res.text().catch(() => '');
       console.error(`[Assets] duplicate ${from} → ${to} failed: ${res.status} ${detail.slice(0, 400)}`);
+      return { ok: false };
     }
-    return res.ok;
-  } catch { return false; }
+    const body = await res.json().catch(() => null) as { sha256?: unknown } | null;
+    return { ok: true, ...(typeof body?.sha256 === 'string' ? { sha256: body.sha256 } : {}) };
+  } catch { return { ok: false }; }
 }
 
 /** Create a (possibly empty) folder on disk under the asset roots. */
@@ -571,6 +640,10 @@ export async function createPrefabFromEntity(
   // still tagged, or `priorLinks` becomes this prefab's own links and the next undo re-links the tree
   // to the file it just trashed (#1264 close-out review).
   let tagged = true;
+  // Which bytes the FILE holds: `content` (as created, or as the last redo wrote it) or what the last undo put back.
+  // Its own flag, not `tagged`: a redo can write the file and then find no live tree to tag (the ref resolves to
+  // nothing), which leaves `tagged` false over a file holding `content` (#1679 close-out review).
+  let fileHoldsContent = true;
 
   /** Put the members' ORIGINAL guids back, and every ref with them (#1461). Runs ahead of the links:
    *  the `priorLinks` snapshot was taken one line before the tag and addresses each member by the guid it
@@ -591,19 +664,33 @@ export async function createPrefabFromEntity(
     // entities linked to it. Half-applying that leaves the user in a state that is
     // neither before nor after — entities un-linked from a prefab still on disk, or
     // linked to one that is not. Refusing cleanly and saying so is the honest answer.
+    // ⚠️ And both directions carry a PRECONDITION (#1679): the .prefab.json is global and this entry outlives edits
+    // made elsewhere — double-click the new prefab, edit it, Cmd+S, Back, and this scene's Cmd+Z used to trash or
+    // overwrite that save. Each half now changes the file only while it holds what the OTHER half left there
+    // (`content`, or `previousContent`; nothing at all before a create's redo), and otherwise refuses before
+    // anything moved (`fileChangedRefusal`, the #1664 shape). Same four preconditions as skinPrefab.ts.
     undo: async () => {
-      if (replaced) {
-        // ⚠️ RESTORE, never trash: the path held a prefab before this action, and deleting it is
-        // exactly how the original was lost (#1264). Same shape as skinPrefab.ts's update undo.
-        if (previousContent == null || !(await writeAssetFile(savePath, previousContent))) {
-          reportUndoFailure({
-            direction: 'Undo', label,
-            detail: previousContent == null
-              ? `the prefab this replaced could not be read before the replace, so it cannot be restored: ${savePath}. The file and the entities were left as they are.`
-              : `the replaced prefab was not restored: ${savePath}. The entities were left linked to it rather than half-undone.`,
-          });
-          return;
-        }
+      // ⚠️ A replace is RESTORED, never trashed: the path held a prefab before this action, and deleting it is
+      // exactly how the original was lost (#1264). Same shape as skinPrefab.ts's update undo.
+      if (replaced && previousContent == null) {
+        reportUndoFailure({
+          direction: 'Undo', label,
+          detail: `the prefab this replaced could not be read before the replace, so it cannot be restored: ${savePath}. The file and the entities were left as they are.`,
+        });
+        return;
+      }
+      const wrote = await replaceFileIfMatch(savePath, replaced ? previousContent : null, content);
+      if (wrote === 'conflict') throw fileChangedRefusal([savePath]);
+      if (wrote !== 'ok') {
+        reportUndoFailure({
+          direction: 'Undo', label,
+          detail: replaced
+            ? `the replaced prefab was not restored: ${savePath}. The entities were left linked to it rather than half-undone.`
+            : `the prefab file was not trashed and is still on disk: ${savePath}. The entities were left linked to it rather than half-undone.`,
+        });
+        return;
+      }
+      if (replaced && previousContent != null) {
         // Migrate before seeding the cache — getPrefabSource returns early on a cache hit, so an
         // un-migrated object here poisons override detection (skinPrefab.ts, same reason).
         try {
@@ -611,22 +698,12 @@ export async function createPrefabFromEntity(
           for (const entry of restored.entities ?? []) migrateUIAnchorZIndexStructured(entry);
           setPrefabCache(cacheKey, restored);
         } catch { setPrefabCache(cacheKey, null); }
-        unstamp();
-        const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath);
-        reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
-        tagged = false;
-        return;
+      } else {
+        setPrefabCache(cacheKey, null);
       }
-      if (!(await deleteAssetFile(savePath))) {
-        reportUndoFailure({
-          direction: 'Undo', label,
-          detail: `the prefab file was not trashed and is still on disk: ${savePath}. The entities were left linked to it rather than half-undone.`,
-        });
-        return;
-      }
-      setPrefabCache(cacheKey, null);
       unstamp();
       const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath);
+      fileHoldsContent = false;
       reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
       tagged = false;
     },
@@ -637,13 +714,19 @@ export async function createPrefabFromEntity(
       // from cache for the rest of the session and comes back missing on the next
       // scene load or a fresh editor launch, which read the FILE. That delay is what
       // makes the desync expensive — the failure surfaces far from its cause.
-      if (!(await writeAssetFile(savePath, content))) {
+      // Over exactly what the undo left there: the restored bytes after a replace, nothing after a create — a prefab
+      // created there since (by hand, or another Create Prefab) is somebody else's. An undo that did NOT apply (it
+      // reported and returned) left `content` itself, so the redo rewrites only that.
+      const wrote = await replaceFileIfMatch(savePath, content, fileHoldsContent ? content : replaced ? previousContent : null);
+      if (wrote === 'conflict') throw fileChangedRefusal([savePath]);
+      if (wrote !== 'ok') {
         reportUndoFailure({
           direction: 'Redo', label,
           detail: `the prefab file was not written: ${savePath}. The entities were left un-linked rather than pointed at a file that is not there.`,
         });
         return;
       }
+      fileHoldsContent = true;
       if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
       setPrefabCache(cacheKey, prefab);
       const id = ref.resolve();

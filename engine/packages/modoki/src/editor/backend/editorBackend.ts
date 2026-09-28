@@ -170,3 +170,23 @@ export async function writeAssetFile(filePath: string, content: string, encoding
     return (await postWriteFile(filePath, content, encoding)).ok;
   } catch { return false; }
 }
+
+/** `writeAssetFile` with a precondition on what the file holds NOW (#1679), for an undo/redo that rewrites a file
+ *  the editor wrote earlier: `ifMatch` (the sha256 of the bytes it must hold) or `createOnly` (nothing may be there).
+ *  A three-way answer rather than a boolean, because the caller does opposite things with the two misses: a
+ *  `'conflict'` means the file is someone else's now and the step must refuse, while `'failed'` is a transport or
+ *  server error. Only the precondition's own 409s are a conflict — the #1468 prefab format gate also answers 409,
+ *  and that one is a failed write, not a changed file. */
+export async function writeAssetFileGuarded(
+  filePath: string, content: string,
+  opts: { encoding?: 'base64' } & ({ ifMatch: string } | { createOnly: true }),
+): Promise<'ok' | 'conflict' | 'failed'> {
+  try {
+    const res = await postWriteFile(filePath, content, opts.encoding,
+      'ifMatch' in opts ? { ifMatch: opts.ifMatch } : { createOnly: true });
+    if (res.ok) return 'ok';
+    if (res.status !== 409) return 'failed';
+    const body = await res.json().catch(() => null) as { reason?: unknown } | null;
+    return body?.reason === 'if-match' || body?.reason === 'if-none-match' ? 'conflict' : 'failed';
+  } catch { return 'failed'; }
+}

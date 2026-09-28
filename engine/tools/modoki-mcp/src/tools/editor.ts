@@ -292,6 +292,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'PREVIOUS world (anything from before a scene hot-reload, which any file write triggers) ' +
       'undoes against entities that no longer exist. So verify with modoki_get_scene_state rather ' +
       'than trusting `did` — the same rule as every other mutation on this surface. ' +
+      'A step whose entry was popped but FAILED is an error, never did=false: REFUSED_BY_OP naming the entry when it ' +
+      'refused before changing anything (e.g. the file it would rewrite changed on disk since), PARTIAL when it threw ' +
+      'and may have applied partway. Either way that entry was DROPPED — it is on neither stack, so the next call ' +
+      'reaches the entry below it. ' +
       'REFUSES (REFUSED_BY_OP, stack untouched) during Play/Pause, and inside a scrub/preview envelope ' +
       '(runMode scrub|preview) when the entry is a SCENE edit made BEFORE that preview — that world reverts on ' +
       'Exit. Inside the envelope an asset-document edit (clip, timeline, rig, material), a selection step, and a ' +

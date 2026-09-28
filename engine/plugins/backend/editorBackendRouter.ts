@@ -624,6 +624,68 @@ function ifMatchRefusal(absPath: string, expected: string | undefined): { ok: fa
   return null;
 }
 
+/** What a `/api/delete-asset` caller expects at each path (#1679), keyed by the request string. `sha256` is the
+ *  hash of the bytes the file must hold (the `ifMatchRefusal` rule, BOM-stripped); `empty` is a folder that must
+ *  hold nothing but OS litter. Single `path`: `ifMatch: string`, `ifEmpty: true`. Batch `paths`:
+ *  `ifMatch: {[path]: sha}`, `ifEmpty: [path…]` — every key must be one of `paths`, or the request is refused,
+ *  because a precondition on a path the request does not trash is a caller bug that would otherwise pass silently. */
+type DeleteExpectation = { sha256?: string; empty?: true };
+
+function readDeleteExpectations(
+  body: unknown, inputs: readonly string[], batch: boolean,
+): { map: Map<string, DeleteExpectation> } | { error: string } {
+  const { ifMatch, ifEmpty } = (body ?? {}) as { ifMatch?: unknown; ifEmpty?: unknown };
+  const map = new Map<string, DeleteExpectation>();
+  const add = (p: string, e: DeleteExpectation) => map.set(p, { ...map.get(p), ...e });
+  if (ifMatch !== undefined) {
+    if (!batch) {
+      if (typeof ifMatch !== 'string') return { error: 'ifMatch must be a sha256 hex string for a single path' };
+      add(inputs[0], { sha256: ifMatch });
+    } else {
+      if (ifMatch === null || typeof ifMatch !== 'object' || Array.isArray(ifMatch)) return { error: 'ifMatch must be a {path: sha256} map for paths' };
+      for (const [p, sha] of Object.entries(ifMatch as Record<string, unknown>)) {
+        if (!inputs.includes(p)) return { error: `ifMatch names ${p}, which is not in paths` };
+        if (typeof sha !== 'string') return { error: `ifMatch[${p}] must be a sha256 hex string` };
+        add(p, { sha256: sha });
+      }
+    }
+  }
+  if (ifEmpty !== undefined) {
+    if (!batch) {
+      if (ifEmpty !== true) return { error: 'ifEmpty must be true for a single path' };
+      add(inputs[0], { empty: true });
+    } else {
+      if (!Array.isArray(ifEmpty)) return { error: 'ifEmpty must be a list of paths' };
+      for (const p of ifEmpty) {
+        if (typeof p !== 'string' || !inputs.includes(p)) return { error: `ifEmpty names ${String(p)}, which is not in paths` };
+        add(p, { empty: true });
+      }
+    }
+  }
+  return { map };
+}
+
+/** Files an OS drops into a folder on its own. A folder holding only these is EMPTY for `ifEmpty`: Finder writes a
+ *  `.DS_Store` the moment the folder is viewed, so counting it would refuse every undo of a New Folder someone looked
+ *  into. Anything else — a stray `.meta.json` included — is content somebody put there, and is not trashed. */
+const OS_LITTER = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
+
+/** The request strings whose precondition fails, in request order. Synchronous on purpose — see the call site. */
+function deletePreconditionConflicts(expect: ReadonlyMap<string, DeleteExpectation>, absOf: ReadonlyMap<string, string>): string[] {
+  const out: string[] = [];
+  for (const [input, e] of expect) {
+    const abs = absOf.get(input);
+    if (abs === undefined) { out.push(input); continue; }
+    if (e.sha256 !== undefined && ifMatchRefusal(abs, e.sha256)) { out.push(input); continue; }
+    if (e.empty) {
+      let entries: string[] | null;
+      try { entries = fs.statSync(abs).isDirectory() ? fs.readdirSync(abs) : null; } catch { entries = null; }
+      if (entries === null || entries.some((n) => !OS_LITTER.has(n))) out.push(input);
+    }
+  }
+  return out;
+}
+
 /** The EXACT bytes a JSON document write puts on disk — the single definition of that, used by
  *  every JSON write this backend (or its client counterpart) makes: scenes, prefabs, layouts,
  *  the AI-settings file, and every `ASSET_SCHEMA_TYPES` document alike (#831, converged with the
@@ -3284,19 +3346,24 @@ async function describeUnresolvedAgainstLiveWorld(
       const { path: assetPath, paths } = (body ?? {}) as { path?: string; paths?: string[] };
       const inputs = Array.isArray(paths) ? paths : (assetPath != null ? [assetPath] : []);
       if (inputs.length === 0) return json({ error: 'No path(s) provided' }, 400);
+      const expectations = readDeleteExpectations(body, inputs, Array.isArray(paths));
+      if ('error' in expectations) return json({ error: expectations.error }, 400);
       // The REQUEST string rides along with the abs path. `failed` below is reported back in the
       // caller's own strings, not canonicalised ones — see the comment on the reply. Keeping the
       // pair here is what makes that possible without a second lookup.
       const resolved: Array<{ input: string; abs: string }> = [];
       const missing: string[] = [];
+      const absOf = new Map<string, string>();
       for (const p of inputs) {
         const absPath = ctx.resolveAssetPath(p);
         if (!absPath) return outsideAssetRoots('Path outside allowed directories');
+        absOf.set(p, absPath);
         if (!fs.existsSync(absPath)) { missing.push(p); continue; }
         resolved.push({ input: p, abs: absPath });
       }
-      // Single-path back-compat: a lone non-existent target is still a 404.
-      if (resolved.length === 0 && !Array.isArray(paths)) return json({ error: 'File not found' }, 404);
+      // Single-path back-compat: a lone non-existent target is still a 404 — unless the caller stated what it
+      // expects there, and then a gone file is a failed precondition (409 below), as on `/api/write-file`.
+      if (resolved.length === 0 && !Array.isArray(paths) && expectations.map.size === 0) return json({ error: 'File not found' }, 404);
       // Which of them are FOLDERS — asked before the trash, while they still exist. Same reason
       // as /api/move-file: only the route can tell, and a folder needs `prefix` or the repair
       // reaches the folder and none of its contents.
@@ -3386,6 +3453,19 @@ async function describeUnresolvedAgainstLiveWorld(
       // "nothing was deleted" about N-1 files that were gone — with no undo, and a bound editor
       // still parked on them (the #186 resurrection the unbind below exists to prevent).
       // That is the same 500 the `manifestRebuilt` comment below forbids, for the same reason.
+      // ── The per-path precondition (#1679) ─────────────────────────────────────────────────────
+      // An undo/redo that trashes a file it created or restored says what it expects to find there, and a
+      // mismatch trashes NOTHING — the whole request, not just that path — so the caller's step can refuse
+      // before it changed anything. ⚠️ Checked HERE, after every gate that awaits and right before the trash,
+      // and nothing may `await` between the two: that synchronous span is what makes check-then-trash atomic
+      // (same rule, same reason, as `ifMatchRefusal` on `/api/write-file`).
+      const conflicts = deletePreconditionConflicts(expectations.map, absOf);
+      if (conflicts.length > 0) {
+        return json({
+          ok: false, conflict: true, reason: 'if-match', conflicts,
+          error: `Nothing was trashed: ${conflicts.join(', ')} ${conflicts.length === 1 ? 'is' : 'are'} not what the caller expected (changed, gone, or a folder that is no longer empty).`,
+        }, 409);
+      }
       const trashResult = resolved.length > 0 ? moveToTrash(resolved.map((r) => r.abs)) : { failed: [] as string[] };
       const trashFailed = trashResult.failed;
       // ⚠️ `samePath`, not `includes`/`===` (#881's shared helper, adopted here when main landed
@@ -4849,11 +4929,16 @@ async function describeUnresolvedAgainstLiveWorld(
       if (dupRefused) return json(dupRefused.body, dupRefused.status);
       // The prefab reader lets a copied scene's refs to prefab MEMBERS follow the reminted root (#1324).
       const newGuid = duplicateAssetFile(absFrom, absTo, undefined, makePrefabResolver(ctx));
+      // The hash of the copy's bytes as written (#1679), in `ifMatchRefusal`'s own terms: the undo of this duplicate
+      // trashes the copy only while it still holds them. Read back rather than predicted — a JSON copy gets a fresh id,
+      // so the client cannot know its bytes, and a prediction here would be a second serializer to keep in step.
+      const sha256 = crypto.createHash('sha256').update(stripUtf8Bom(fs.readFileSync(absTo))).digest('hex');
       const manifestRebuilt = rebuildManifestInline(ctx);
       return json({
         ok: true,
         saved: true,
         guid: newGuid,
+        sha256,
         manifestRebuilt,
         ...(dupGate.kind === 'held'
           ? {

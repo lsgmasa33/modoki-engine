@@ -508,15 +508,17 @@ export function pushSelectionChange(
  *  - The dirty signals fire. A closure that threw halfway HAS moved the world, and we cannot know
  *    how far, so marking dirty is the conservative direction — under-reporting loses the work.
  *
- *  Returns whether the step actually applied. `false` reaches the MCP `undo`/`redo` op as `did`
- *  (agentEditorOps.ts), which used to report success for a step that threw. */
+ *  Returns whether the step actually applied and, when it threw, what — as `failed` (#1681). Both reach the MCP
+ *  `undo`/`redo` op (agentEditorOps.ts): `did` used to report success for a step that threw, and then, once it did
+ *  not, a bare `did:false` that read as "the stack was empty" — the console line and the toast above are the human's,
+ *  and an agent reads neither. */
 async function runStep(
   direction: 'Undo' | 'Redo',
   action: UndoAction,
   run: () => void | Promise<void>,
   pushTo: UndoAction[],
   event: '!undo' | '!redo',
-): Promise<boolean> {
+): Promise<{ ok: boolean; failed: UndoStepFailure | null }> {
   _executing = true;
   let ok = false;
   let error: unknown;
@@ -562,7 +564,14 @@ async function runStep(
       console.error('[undo] failed to report a throwing undo/redo closure', e);
     }
   }
-  return ok;
+  return { ok, failed: ok ? null : describeStepFailure(action.label, error) };
+}
+
+/** What a throwing step's caller is told (#1681). A REFUSAL (`UndoRefusedError`) says why in its `toast` — the user's
+ *  words, and the ones that say nothing was applied; any other throw gives its message. */
+function describeStepFailure(label: string, error: unknown): UndoStepFailure {
+  if (error instanceof UndoRefusedError) return { label, refused: true, error: error.toast };
+  return { label, refused: false, error: error instanceof Error ? error.message : String(error) };
 }
 
 /** Why the next undo (or redo) is refused right now, or `null` when it may run (#1148).
@@ -641,9 +650,15 @@ export function dropPreviewSceneEdits(session: number): number {
 }
 
 /** What one undo/redo step did: `did` — an entry was popped and its closure ran; `refused` — the
- *  gate's reason when it refused (`did` is then false and neither stack moved). `did:false` with
- *  `refused:null` is an empty stack or a throwing closure (#310 reports that one itself). */
-export interface UndoStepResult { did: boolean; refused: string | null }
+ *  gate's reason when it refused (`did` is then false and neither stack moved); `failed` — the entry was popped and its
+ *  closure THREW (#310), so it was DROPPED from both stacks. `did:false` with both null is an empty stack, and only
+ *  that (#1681: a throwing step used to answer the same bare `did:false`). */
+export interface UndoStepResult { did: boolean; refused: string | null; failed: UndoStepFailure | null }
+
+/** A step whose closure threw (#1681). `refused`: an `UndoRefusedError` — nothing was applied, and `error` is its
+ *  user-facing reason; otherwise the step may have applied partway, and `error` is the thrown message. Either way the
+ *  entry is gone from both stacks (`runStep`). */
+export interface UndoStepFailure { label: string; refused: boolean; error: string }
 
 /** Undo or redo one step, reporting a refusal as DATA. Serialized: if another undo/redo is in
  *  flight, this one waits its turn and pops only when it actually runs.
@@ -659,14 +674,14 @@ export interface UndoStepResult { did: boolean; refused: string | null }
 export function undoStep(direction: 'undo' | 'redo'): Promise<UndoStepResult> {
   return serialize(async () => {
     const refused = undoRefusedReason(direction);
-    if (refused !== null) return { did: false, refused };
+    if (refused !== null) return { did: false, refused, failed: null };
     _coalesce = null; // any explicit undo/redo ends the current edit chain
     const action = (direction === 'undo' ? undoStack : redoStack).pop();
-    if (!action) return { did: false, refused: null };
-    const did = direction === 'undo'
+    if (!action) return { did: false, refused: null, failed: null };
+    const { ok, failed } = direction === 'undo'
       ? await runStep('Undo', action, () => action.undo(), redoStack, '!undo')
       : await runStep('Redo', action, () => action.redo(), undoStack, '!redo');
-    return { did, refused: null };
+    return { did: ok, refused: null, failed };
   });
 }
 

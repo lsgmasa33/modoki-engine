@@ -4082,7 +4082,12 @@ a future change picks, these do not change:
   how far, so marking dirty is the conservative direction — under-reporting loses the user's work.
 
 `undo()` and `redo()` now share one `runStep` helper, because they had the same bug twice.
-`runStep` returns whether the step applied; `false` reaches the MCP op as `did`. The reporter is
+`runStep` returns whether the step applied and, when it threw, what (`UndoStepResult.failed`, #1681).
+**The MCP `undo`/`redo` op answers a thrown step as an ERROR, never as `did:false`**: REFUSED_BY_OP for
+an `UndoRefusedError`, PARTIAL for any other throw, each naming the entry and saying it was DROPPED.
+`ok` with `did:false` means an empty stack and nothing else. Before #1681 a thrown step came back as that
+same bare `did:false`, and the op's own comment read it as "the stack was empty". The console line and
+the toast are the human's, and an agent reads neither. The reporter is
 `reportUndoThrew` (`undo/undoFailure.ts`), which **always** toasts — the two-level rule above
 distinguishes a failure the user can fix from one they cannot, and this is neither: it is history
 loss, worth interrupting for whatever caused it.
@@ -4090,9 +4095,107 @@ loss, worth interrupting for whatever caused it.
 **A step that refuses before it changes anything throws an `UndoRefusedError` (#1664).** The drop
 policy is the same. The report is not: the reporter logs that the step was *refused* and nothing was
 applied, and it toasts the error's own `toast` text in place of the generic "FAILED". It also skips the
-dirty signals, since nothing moved. Apply-to-Prefab's undo is the one user today. It throws one when the
-prefab changed on disk since the Apply, and when the write failed (#1668)
-([prefabs.md](prefabs.md) § Undoing an Apply).
+dirty signals, since nothing moved. Apply-to-Prefab's undo throws one when the prefab changed on disk
+since the Apply, and when the write failed (#1668) ([prefabs.md](prefabs.md) § Undoing an Apply). Every
+asset-file step in the next section throws one when its precondition fails (#1679).
+
+### An undo/redo that rewrites or trashes an asset file states what it expects there (#1679)
+
+**The mechanism.** An asset file is global, and an undo entry lives on one history and outlives edits
+made elsewhere. Entering prefab edit parks the scene's stack, and Back restores it. The Assets panel's
+history outlives any later save of the same file. So Create Prefab → double-click it → edit → Cmd+S →
+Back → Cmd+Z trashed the saved prefab. Restoring a deleted file overwrote one recreated at its path, and
+undoing a duplicate trashed a copy the user had since painted. #1664 fixed the same mechanism for
+Apply-to-Prefab alone. This is the rest of it.
+
+**The rule: each step changes the file only while it holds what the step's other half left there, and
+the ROUTE checks that in the same synchronous window as the write or the trash.** There is no client
+read-then-write, because that is not atomic (#469).
+
+| The step… | Precondition |
+|---|---|
+| overwrites a file it wrote | `ifMatch` = sha256 of the bytes it wrote (`writeAssetFileGuarded`, `/api/write-file`) |
+| re-creates a file it removed | `createOnly` (`ifNoneMatch:'*'`) |
+| trashes a file it created or restored | `ifMatch` on `/api/delete-asset` (`deleteAssetFiles(paths, {ifMatch})`) |
+| trashes a folder it created | `ifEmpty` on `/api/delete-asset`: only OS litter (`.DS_Store`, `Thumbs.db`, `desktop.ini`) may be in it, and a stray sidecar counts as content |
+
+`/api/delete-asset` checks every precondition before it trashes anything, and **one miss trashes
+nothing**: 409 `reason:'if-match'` with `conflicts`. A lone path that has a precondition but is gone is
+that 409, not the back-compat 404. `/api/duplicate-asset` reports the `sha256` of the copy it wrote,
+read back from disk. A JSON copy is re-minted server-side, so the client cannot know its bytes.
+
+**On a miss, the step refuses before anything moved** (`fileChangedRefusal` → `UndoRefusedError`,
+the #1664 shape above). There is one exception: a loop over N separate writes (the delete undo's
+restore, the file-import redo) cannot be atomic. It skips the file it finds taken, applies the rest, and
+reports the skip with a toast, because the user can clear the path. **Each such builder records where
+every path is now**, so the next step acts only on what this step actually did. A delete's redo trashes
+only what its undo restored, so a file recreated at a deleted path survives the undo AND the redo after
+it. An import's undo trashes only what its redo wrote.
+
+**Sidecars travel with their asset, all-or-nothing, and carry no hash of their own.** The scanner
+rewrites `.meta.local.json`, and on a cache miss `.meta.json` too, without anyone editing anything. A
+hash on either would refuse for nothing, and the file's own hash already decides for the asset.
+- The delete undo restores an asset's sidecars **first**, so the scanner never sees the file bare and
+  mints it a sidecar of its own.
+- A collision part-way through an asset's restore puts back what that asset had already written. So does a
+  write that **fails**, and the asset then stays in the trash so the next undo can retry. Carrying on would
+  have put the file on disk without its sidecar.
+- The one sidecar restored **over** what is there belongs to a file the OS refused to trash (#884's partial
+  refusal). The delete's inline manifest rebuild heals that file with a freshly minted sidecar, so that path
+  is never empty, and the snapshot is what brings back the file's original GUID. It is written **last** in its
+  asset. A put-back undoes a create by trashing it and cannot undo an overwrite, and trashing this sidecar
+  would leave the refused file bare.
+- An asset dropped on a collision is dropped whole, its refused file included. Otherwise the next redo would
+  retry trashing that file, and the undo after it would restore the file without its sidecar.
+- A redo that retries a refused file sends that file's sidecars with it. The one on disk is the heal's, and
+  left behind it would be an orphan that the next undo's restore collides with.
+- Each asset's restore list is filtered as the loop reaches it, not up front. Results share paths: a folder
+  delete lists a model with its generated files, and each generated file as an asset of its own. A path an
+  earlier asset just restored must drop out of the later asset's list.
+- Every hash for the whole undo is computed before its first write, so a hash that cannot be computed
+  refuses a step that has written nothing.
+- A text asset's delete snapshot stays text only while its bytes are UTF-8 (`snapshotFromBytes`). Anything
+  else goes byte-exact through base64, because `res.text()` would have corrupted it.
+- Duplicate and paste-copy undos trash the copy and its sidecars in one guarded request.
+- File import never touches sidecars in either direction. The one the forward conversion wrote stays
+  through the undo, so a redo re-links to the same GUID.
+
+**The baseline is the file as it SETTLED, not always the bytes written.** The scanner's GUID heal
+rewrites an imported JSON asset that has no `id`, or one that another asset holds. So `importFiles`
+takes each text file's baseline after an inline `/api/rescan-assets` (`settledHashes`), and the redo
+takes it again, because the heal re-stamps a re-written file. It hashes the BYTES read back, not
+`res.text()`, whose decoding would mangle a Latin-1 file. Binaries are never rewritten in place (every
+importer writes to the cache or a sibling), so their written bytes are the baseline: the DECODED bytes,
+`sha256OfWritten`, not the base64 text. **Every hash these steps send strips a leading UTF-8 BOM** (`sha256OfBytes`),
+because `ifMatchRefusal` does. Otherwise a `.mtl` or `.csv` saved by a Windows tool would get a precondition
+no route hash can meet.
+
+**Line endings cannot trip it.** Every expected hash is of bytes the editor itself wrote, or read back
+from disk: the forward write, a snapshot read off disk and written back verbatim, or the route's own
+read-back after a duplicate. None of them is a checkout's copy of a file, so a CRLF checkout on Windows
+hashes the same on both sides.
+
+**A model RE-import restores, never trashes** (found by this fix's sweep). Importing a model over a prefab
+that is already there replaces it and keeps its id (#1468), and the import's undo used to trash the file,
+losing the replaced prefab. That is #1264's shape. `importModelWithMeta` now reads the prior bytes from the
+FILE before writing (a manifest-`known` id can outlive the file, and a `no-id` file is there all the same),
+and the undo restores them through `replaceFileIfMatch`. If the prior bytes could not be read, or were not
+a readable document (a corrupt file is never an absent one), the undo reports that and leaves the file
+alone (`readPriorDocument`). The skin prefab's update undo reads its prior bytes the same way.
+
+**Create Prefab's and the skin prefab's undo/redo change the file through ONE call each,
+`replaceFileIfMatch(path, next, expected)`** (`assetOps.ts`: `next` null trashes, `expected` null means
+nothing may be there). That is the seam a single prefab-write owner takes over. #1683 proposes one,
+`commitPrefabWrite`, for the propagation rules (I9–I11) in [prefabs.md](prefabs.md) § Model and invariants. These undos add no cache or
+instance handling of their own beyond what they already did.
+
+**Not affected:** a rename or move (`/api/move-file` already 409s on an occupied destination, and a move
+destroys no bytes), and a duplicate's redo (the route already refuses `Destination exists`).
+
+Tests: `packages/modoki/tests/editor/undoFilePreconditions.test.ts` (every Assets-panel site, against
+`fakeAssetRoute.ts`, a disk that holds the bytes each write sent), the precondition cases in
+`createPrefabUndo.test.ts` and `skinPrefab.test.ts`, and `tests/plugins/deleteAssetPreconditions.test.ts`
+(the route itself, on a real scratch directory).
 
 ⚠️ **This was LATENT when fixed** — #308 closed the last live route (the base-scene field's
 `mutateScene` let a network-level rejection escape; it catches now), and every filesystem helper

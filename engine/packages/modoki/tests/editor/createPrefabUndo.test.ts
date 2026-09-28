@@ -67,27 +67,41 @@ vi.mock('../../src/runtime/loaders/assetManifest', () => ({
   newGuid: () => 'g-minted',
 }));
 
+/** Set to make the tree unresolvable (a world rebuild with the subtree gone), for the #1679 flag case. */
+const refState = vi.hoisted(() => ({ gone: false }));
 vi.mock('../../src/editor/undo/entityRef', () => ({
-  entityRef: (id: number) => ({ resolve: () => id, rawId: id }),
+  entityRef: (id: number) => ({ resolve: () => (refState.gone ? null : id), rawId: id }),
 }));
 
 import { createPrefabFromEntity } from '../../src/editor/panels/assetOps';
+import { UndoRefusedError } from '../../src/editor/undo/undoFailure';
+import { createHash } from 'node:crypto';
 
 // Which /api/* routes should fail this test. Everything else answers ok.
 let failing = new Set<string>();
 /** Files already on disk, path → text. `/api/write-file` honours `ifNoneMatch:'*'` against it the
  *  way the real route does (409, nothing written), and a plain GET of the asset serves the text. */
 let onDisk = new Map<string, string>();
+const sha = (t: string) => createHash('sha256').update(t).digest('hex');
 let written: Array<{ path: string; content: string; createOnly: boolean }> = [];
 const mockFetch = vi.fn(async (url: string, init?: { body?: string }) => {
   const bad = Array.from(failing).some((r) => String(url).includes(r));
   if (!bad && String(url).includes('/api/write-file')) {
-    const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
+    const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string; ifMatch?: string };
     // Matched case-insensitively and answered with the stored spelling, as APFS and the real route do (#1273).
     const existing = [...onDisk.keys()].find((k) => k.toLowerCase() === b.path.toLowerCase());
-    if (b.ifNoneMatch === '*' && existing) return { ok: false, status: 409, json: async () => ({ existingPath: existing }) } as any;
+    // The route's `ifMatch` rule (#1679), over the bytes this fake STORED — not a recomputation of them.
+    if (b.ifMatch !== undefined && (!existing || sha(onDisk.get(existing)!) !== b.ifMatch)) return { ok: false, status: 409, json: async () => ({ reason: 'if-match' }) } as any;
+    if (b.ifNoneMatch === '*' && existing) return { ok: false, status: 409, json: async () => ({ reason: 'if-none-match', existingPath: existing }) } as any;
     written.push({ path: b.path, content: b.content, createOnly: b.ifNoneMatch === '*' });
     onDisk.set(existing ?? b.path, b.content);
+  }
+  if (!bad && String(url).includes('/api/delete-asset')) {
+    const b = JSON.parse(init?.body ?? '{}') as { paths: string[]; ifMatch?: Record<string, string> };
+    const conflicts = Object.entries(b.ifMatch ?? {}).filter(([p, h]) => !onDisk.has(p) || sha(onDisk.get(p)!) !== h).map(([p]) => p);
+    if (conflicts.length) return { ok: false, status: 409, json: async () => ({ ok: false, reason: 'if-match', conflicts }) } as any;
+    for (const p of b.paths) onDisk.delete(p);
+    return { ok: true, status: 200, json: async () => ({ ok: true, trashed: b.paths.length, missing: [], failed: [] }) } as any;
   }
   const served = !String(url).includes('/api/') && [...onDisk.entries()].find(([p]) => String(url).endsWith(p));
   if (served) return { ok: true, status: 200, text: async () => served[1], json: async () => JSON.parse(served[1]) } as any;
@@ -111,6 +125,7 @@ beforeEach(() => {
   detachSpy.mockClear(); reattachSpy.mockClear(); calls.length = 0;
   reattachSpy.mockReturnValue(0); // links restored cleanly unless a test says otherwise
   runtimeExcludedFixture = 0;
+  refState.gone = false;
 });
 // Restored in afterEach, NOT inline: a failing assertion skips the rest of the body, so
 // an inline restore never runs and the stub leaks into every later test.
@@ -387,5 +402,79 @@ describe('createPrefabFromEntity — the runtime-exclusion count reaches the cal
   it('reports 0 when the selection lost nothing', async () => {
     const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
     expect(res && res !== 'declined' && !('refused' in res) ? res.runtimeExcluded : null).toBe(0);
+  });
+});
+
+/** #1679 — the .prefab.json is global and this entry outlives a later save of it (double-click the new prefab, edit,
+ *  Cmd+S, Back, Cmd+Z), so every half changes the file only while it holds what the other half left there, over the
+ *  bytes the fake stored. Mutations, each checked red on its own case: in `replaceFileIfMatch`, drop the trash's
+ *  `ifMatch` (create case), the overwrite's `ifMatch` (replace case) and the create's `createOnly` (redo case); at the
+ *  site, expect an empty path in the replace redo (accept case) and ignore an undo that did NOT apply (failed-undo case). */
+describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
+  const P = '/p/thing.prefab.json';
+
+  it('undo of a CREATE refuses to trash a prefab saved since, and changes nothing', async () => {
+    const action = await makeAction();
+    onDisk.set(P, '{"id":"g-new","edited":true}\n');
+    untagSpy.mockClear();
+    await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
+    expect(onDisk.get(P)).toContain('edited');
+    expect(untagSpy).not.toHaveBeenCalled(); // refused before anything moved
+  });
+
+  it('undo of a REPLACE refuses to overwrite a prefab saved since', async () => {
+    onDisk.set(P, '{"id":"g-old","before":true}\n');
+    const action = await makeAction();
+    onDisk.set(P, '{"id":"g-old","edited":true}\n');
+    await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
+    expect(onDisk.get(P)).toContain('edited');
+  });
+
+  it('redo of a CREATE refuses a prefab made at the path since', async () => {
+    const action = await makeAction();
+    await action.undo();
+    onDisk.set(P, '{"id":"someone-else"}\n');
+    await expect(action.redo()).rejects.toBeInstanceOf(UndoRefusedError);
+    expect(onDisk.get(P)).toBe('{"id":"someone-else"}\n');
+  });
+
+  it('accept side: create and replace both round-trip undo → redo → undo over the bytes really written', async () => {
+    const created = await makeAction();
+    const after = onDisk.get(P);
+    await created.undo(); expect(onDisk.has(P)).toBe(false);
+    await created.redo(); expect(onDisk.get(P)).toBe(after);
+    await created.undo(); expect(onDisk.has(P)).toBe(false);
+
+    onDisk.set(P, '{"id":"g-old","before":true}\n');
+    const replaced = await makeAction();
+    const applied = onDisk.get(P);
+    await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true}\n');
+    await replaced.redo(); expect(onDisk.get(P)).toBe(applied);
+    await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true}\n');
+  });
+
+  it('which bytes the FILE holds is its own flag: a redo that wrote but found no tree to tag, then a failed undo, does not refuse the next redo', async () => {
+    spyError();
+    const action = await makeAction();
+    await action.undo(); // trashed; the tree untagged
+    refState.gone = true;
+    await action.redo(); // the file is written, but there is no tree to tag — `tagged` stays false
+    refState.gone = false;
+    expect(onDisk.has(P)).toBe(true);
+    failing.add('/api/delete-asset');
+    await action.undo(); // reported, not applied: the file still holds what the redo wrote
+    failing = new Set();
+    await action.redo(); // must not refuse: it expects the bytes that are really there
+    expect(onDisk.has(P)).toBe(true);
+  });
+
+  it('a redo after an undo that FAILED expects the bytes still there, not an empty path', async () => {
+    spyError();
+    const action = await makeAction();
+    failing.add('/api/delete-asset');
+    await action.undo(); // reported, not applied: the prefab is still on disk as created
+    failing = new Set();
+    await action.redo(); // must not refuse
+    expect(onDisk.has(P)).toBe(true);
   });
 });

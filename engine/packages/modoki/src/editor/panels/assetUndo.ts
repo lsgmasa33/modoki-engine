@@ -17,13 +17,15 @@
 
 import type { UndoAction } from '../undo/undoManager';
 import {
-  writeAssetFile, deleteAssetFile, deleteAssetFiles, duplicateAssetFile,
+  writeAssetFile, deleteAssetFiles, duplicateAssetFileReport, replaceFileIfMatch,
   createFolderApi, moveFileToStatus,
 } from './assetOps';
+import { writeAssetFileGuarded, backendFetch } from '../backend/editorBackend';
+import { sha256OfBytes } from '../utils/contentHash';
 import type { AssetEntry } from '../utils/assetPaths';
 import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
 import type { PathMove } from '../utils/assetPaths';
-import { reportUndoFailure, COLLISION_STATUS } from '../undo/undoFailure';
+import { reportUndoFailure, COLLISION_STATUS, UndoRefusedError, fileChangedRefusal, expectedHash } from '../undo/undoFailure';
 
 // Extensions we know are UTF-8 text — everything else is treated as binary so
 // the delete-undo snapshot round-trips bytes through base64 instead of
@@ -38,13 +40,28 @@ export function isTextAsset(p: string): boolean {
 /** One restorable file captured before a delete. */
 export type Snapshot = { path: string; content: string; encoding?: 'base64' };
 
+/** The snapshot `collectDeletion` (Assets.tsx) takes of a file's bytes before a delete. A text asset stays text only
+ *  while its bytes ARE UTF-8: `res.text()` replaced anything else with U+FFFD, so a Latin-1 `.txt`/`.md`/`.svg` came
+ *  back from undo corrupted, and the redo's precondition could never match it (#1679 close-out re-review). Everything
+ *  else goes byte-exact through base64 — which is also why binaries never went through `.text()`. */
+export function snapshotFromBytes(path: string, bytes: Uint8Array): Snapshot {
+  if (isTextAsset(path)) {
+    try { return { path, content: new TextDecoder('utf-8', { fatal: true }).decode(bytes) }; } catch { /* not UTF-8 */ }
+  }
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return { path, content: btoa(bin), encoding: 'base64' };
+}
+
 /** The disk effect of deleting ONE asset: undo snapshots + the flat list of
  *  paths to trash (asset + sidecar + generated files + their sidecars).
  *  `deletePaths` is what we ASKED to trash, which is deliberately a superset of
  *  what existed — see DeleteFilesResult. */
 export type DeleteResult = { asset: AssetEntry; snapshots: Snapshot[]; deletePaths: string[] };
 
-export type DupResult = { asset: AssetEntry; toPath: string };
+/** `sha256`: the copy's bytes as `/api/duplicate-asset` wrote them (#1679) — the undo trashes the copy only while it
+ *  still holds them. Absent (a route that did not report one) → the undo REFUSES rather than trash unguarded. */
+export type DupResult = { asset: AssetEntry; toPath: string; sha256?: string };
 
 /** Build a single coalesced undo/redo for one or more completed deletes. Undo
  *  restores the FULL snapshot set (not just the GLB) so generated mesh/mat/
@@ -75,21 +92,88 @@ export function makeDeleteUndo(
   const neverExisted = new Set(notTrashed.missing ?? []);
   // Ages: a redo can succeed on a path that was refused. `let`, rewritten by redo only.
   let refused = new Set(notTrashed.failed ?? []);
-  const isNotTrashed = (p: string) => neverExisted.has(p) || refused.has(p);
+  const snapshotOf = new Map(results.flatMap((r) => r.snapshots).map((s) => [s.path, s] as const));
+  // ⚠️ WHERE EACH PATH IS NOW, per path, because each step acts only on what the step before it actually did (#1679).
+  // `inTrash`: this entry put it in the trash and nobody has put a file back at the path. `onDisk`: this entry's last
+  // undo restored it there. A path in neither is not this entry's any more — a group whose restore found another file
+  // at its path is dropped from both, so a redo cannot trash that file, and a later undo does not keep asking.
+  const inTrash = new Set(Array.from(new Set(results.flatMap((r) => r.deletePaths))).filter((p) => !neverExisted.has(p) && !refused.has(p)));
+  const onDisk = new Set<string>();
   return {
     label,
     undo: async () => {
       // Only what actually went. A file the OS refused is still on disk with the user's own
       // bytes in it; writing the snapshot back over it would clobber any edit made since.
-      const all = results.flatMap((r) => r.snapshots).filter((s) => !isNotTrashed(s.path));
+      //
+      // ⚠️ And only into an EMPTY path (`createOnly`, #1679): the file went to the trash, so anything at its path now
+      // was put there since — the user recreated it, or another import landed on the name — and restoring over it is
+      // exactly the overwrite this precondition stops. ONE ASSET AT A TIME, all-or-nothing: an asset is its file, its
+      // sidecars and (for a model) every generated file, and half of that on disk is a GUID-less asset or an orphan
+      // sidecar. Sidecars go FIRST, so the scanner never sees the file bare and mints it a sidecar of its own (which
+      // the restore would then collide with); a collision part-way puts back what this asset had written.
+      //
       // ⚠️ The WRITE's own result decides whether it was restored — #308's thesis, which this
       // builder never applied to itself. `writeAssetFile` catches and resolves `false`, so a
       // restore that 500'd used to be counted as restored: `lost` came out empty and the undo
       // reported "restored N of N" about a file still sitting in the trash. Exactly the false
       // success the shortfall report below exists to prevent, one level in from where it looked.
+      //
+      // ⚠️ One exception to `createOnly`: a SIDECAR whose file never left disk (the OS refused the file but took its
+      // sidecar — #884's partial refusal) is OVERWRITTEN. The delete's own inline manifest rebuild heals the bare file
+      // with a freshly minted sidecar, so something is always at that path — and it is that same file's, not somebody
+      // else's. Writing the snapshot back is what restores the file's original GUID; a `createOnly` there dropped the
+      // whole asset and left every ref to it dangling (close-out review). And a write that FAILS stops the asset too,
+      // exactly like a collision, except that it stays in the trash to retry: carrying on would put the file on disk
+      // without its sidecar, the heal would mint one, and the next undo would collide with it for good.
       const restoredPaths: string[] = [];
-      for (const s of all) {
-        if (await writeAssetFile(s.path, s.content, s.encoding)) restoredPaths.push(s.path);
+      const occupied: string[] = [];
+      const unrolled: string[] = [];
+      const isOwnSidecar = (p: string) => isSidecarPath(p) && refused.has(primaryOfSidecar(p));
+      // Write order inside an asset: its sidecars, then its files, then — LAST — an own sidecar (below). An own sidecar
+      // is an OVERWRITE of the healed one, which a put-back cannot undo by trashing: trashed, the refused file would be
+      // left bare and the heal would mint it yet another GUID (close-out re-review). Its file is on disk already, so
+      // the sidecar-first ordering buys nothing for it, and going last means it is written only once the rest landed.
+      const rank = (p: string) => (isOwnSidecar(p) ? 2 : isSidecarPath(p) ? 0 : 1);
+      // Hashed BEFORE the first write of the whole undo — every candidate, once: the put-back below needs them, and a
+      // hash that throws after a write would refuse a step that had already written (`expectedHash` throws a refusal:
+      // "nothing was applied").
+      const hashes = await ifMatchOf([...new Map(results.flatMap((r) => r.snapshots).filter((s) => inTrash.has(s.path)).map((s) => [s.path, s] as const)).values()]);
+      for (const r of results) {
+        // ⚠️ Filtered HERE, per asset, not once up front (close-out re-review): results can SHARE paths — a folder
+        // delete lists a model with its generated files, and each generated file as an asset of its own — and a path an
+        // earlier asset just restored must drop out of the later one's list, or the later one collides with it, reads
+        // it as somebody else's file, and drops itself whole.
+        const todo = r.snapshots.filter((s) => inTrash.has(s.path)).sort((a, b) => rank(a.path) - rank(b.path));
+        if (todo.length === 0) continue;
+        const wrote: Snapshot[] = [];
+        let stopped: { path: string; collided: boolean } | null = null;
+        for (const s of todo) {
+          const ownSidecar = isOwnSidecar(s.path);
+          const w = ownSidecar
+            ? ((await writeAssetFile(s.path, s.content, s.encoding)) ? 'ok' : 'failed')
+            : await writeAssetFileGuarded(s.path, s.content, { encoding: s.encoding, createOnly: true });
+          if (w === 'ok') wrote.push(s);
+          else { stopped = { path: s.path, collided: w === 'conflict' }; break; }
+        }
+        if (stopped === null) {
+          for (const s of wrote) { inTrash.delete(s.path); onDisk.add(s.path); restoredPaths.push(s.path); }
+          continue;
+        }
+        if (stopped.collided) {
+          // The asset is not this entry's any more, all of it: dropped from `refused` too, or the next redo would retry
+          // trashing its refused file and the undo after that would restore the file without its sidecar.
+          occupied.push(stopped.path);
+          for (const p of r.deletePaths) { inTrash.delete(p); refused.delete(p); }
+        }
+        if (wrote.length > 0) {
+          const back = await deleteAssetFiles(wrote.map((s) => s.path), { ifMatch: Object.fromEntries(wrote.map((s) => [s.path, hashes[s.path]])) });
+          if (!back.ok || back.failed.length > 0) {
+            // Could not take them back: they are on disk with this entry's bytes, so they are its to trash on redo.
+            for (const s of wrote) {
+              if (!back.ok || back.failed.includes(s.path)) { inTrash.delete(s.path); onDisk.add(s.path); restoredPaths.push(s.path); unrolled.push(s.path); }
+            }
+          }
+        }
       }
       // An undo that restores only SOME of what it trashed is a false success: the panel
       // refreshes, files reappear, and the ones whose snapshot read failed stay in the OS
@@ -101,25 +185,50 @@ export function makeDeleteUndo(
       // deletionPathsFor deliberately lists maybe-absent sidecars (`.meta.local.json` is
       // gitignored and usually not on disk), so a deletePaths-based diff would name files
       // that never existed and send the user hunting in the trash for them.
-      const restored = new Set(restoredPaths);
-      const lost = Array.from(new Set(results.flatMap((r) => r.deletePaths)))
-        .filter((p) => !restored.has(p) && !isNotTrashed(p));
+      const lost = Array.from(inTrash);
       if (lost.length > 0) {
         console.error(
-          `[Assets] Undo of "${label}" restored ${restored.size} of ${restored.size + lost.length} file(s). ` +
+          `[Assets] Undo of "${label}" restored ${restoredPaths.length} of ${restoredPaths.length + lost.length} file(s). ` +
           `Still in the trash, recover by hand: ${lost.join(', ')}`,
         );
+      }
+      if (unrolled.length > 0 && occupied.length === 0) {
+        // A write failed part-way and the put-back failed too: half an asset is on disk. Say which files, because the
+        // console shortfall above counts them as restored.
+        reportUndoFailure({ direction: 'Undo', label, detail: `an asset was only partly restored (a write failed), and these could not be taken back: ${unrolled.join(', ')}` });
+      }
+      if (occupied.length > 0) {
+        // Not restored, and left alone from here on: the file at that path is somebody else's (#1679).
+        reportUndoFailure({
+          direction: 'Undo', label, userFixable: true,
+          detail: `not restored, because another file is now at ${occupied.join(', ')} — that asset is still in the trash, and the file at its path was left as it is` +
+            (unrolled.length ? `. These were restored and could not be taken back: ${unrolled.join(', ')}` : ''),
+        });
       }
       // Refresh even on a partial restore — the files that DID come back must appear.
       refresh();
     },
     redo: async () => {
-      // Re-delete the whole set in ONE trash call (same as the original delete) — including any
-      // path the OS refused last time, which is the whole point of retrying.
-      const allPaths = Array.from(new Set(results.flatMap((r) => r.deletePaths)));
+      // Re-delete in ONE trash call (same as the original delete): what the last undo restored, plus any path the OS
+      // refused last time, which is the whole point of retrying. Never a path the undo did not put back (#1679).
+      //
+      // ⚠️ Each FILE only while it holds the snapshot's bytes — an edit made to a restored file since is the user's,
+      // and one mismatch trashes nothing at all (`fileChangedRefusal`). A retried refusal has a snapshot too: taken
+      // at the delete, so an edit made after the OS refused it is protected the same way. SIDECARS ride with their
+      // file and carry no hash of their own: the scanner rewrites `.meta.local.json` on its own, so a hash on it would
+      // refuse redo for nothing, and the file's hash already decides for the asset as a whole.
+      const retried = Array.from(refused).filter((p) => snapshotOf.has(p) && !onDisk.has(p));
+      // A retried file takes its sidecars along: the one on disk is the heal's (this entry's snapshot of it went to the
+      // trash with the delete), and left behind it would be an orphan the next undo's restore collides with — dropping
+      // the whole asset (close-out re-review). They ride unhashed, like every sidecar; a missing one is skipped.
+      const riders = retried.filter((p) => !isSidecarPath(p)).flatMap((p) => [`${p}.meta.json`, `${p}.meta.local.json`]);
+      const allPaths = [...new Set([...onDisk, ...retried, ...riders])];
+      if (allPaths.length === 0) { refresh(); return; }
+      const guarded = allPaths.map((p) => snapshotOf.get(p)).filter((s): s is Snapshot => s !== undefined && !isSidecarPath(s.path));
+      const res = await deleteAssetFiles(allPaths, { ifMatch: await ifMatchOf(guarded) });
+      if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
       // Same false-success shape on the other half: a failed re-delete left the files on
       // disk, refresh() re-listed them, and redo read as a no-op (#291).
-      const res = await deleteAssetFiles(allPaths);
       if (!res.ok) {
         console.error(`[Assets] Redo of "${label}" failed — the files are still on disk: ${allPaths.join(', ')}`);
       } else if (res.failed.length > 0) {
@@ -134,10 +243,38 @@ export function makeDeleteUndo(
       // which never ran has no business changing: the next undo would then name a never-existed
       // sidecar as "still in the trash" (#291's exact complaint) and, on win32, write a snapshot
       // back over a refused file the user may have edited since.
-      if (res.ok) refused = new Set(res.failed);
+      if (res.ok) {
+        const failed = new Set(res.failed);
+        const gone = new Set(res.missing);
+        for (const p of allPaths) {
+          if (failed.has(p)) continue;
+          onDisk.delete(p);
+          // A path that was not there (a sidecar the user removed) was not trashed by this redo, so no later undo
+          // may "restore" it — and neither is one this entry has no snapshot of (a rider's local stats file).
+          if (!gone.has(p) && snapshotOf.has(p)) inTrash.add(p);
+        }
+        refused = failed;
+      }
       refresh();
     },
   };
+}
+
+/** A `.meta.json` / `.meta.local.json` sidecar — it travels with its asset and carries no precondition of its own. */
+function isSidecarPath(p: string): boolean {
+  return p.endsWith('.meta.json') || p.endsWith('.meta.local.json');
+}
+
+/** The file a sidecar belongs to. */
+function primaryOfSidecar(p: string): string {
+  return p.replace(/\.meta(\.local)?\.json$/, '');
+}
+
+/** `{path: sha256 of the bytes written}` for a set of snapshots this step wrote (#1679). */
+async function ifMatchOf(written: ReadonlyArray<{ path: string; content: string; encoding?: 'base64' }>): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const w of written) out[w.path] = await expectedHash(w.path, w.content, w.encoding);
+  return out;
 }
 
 /** Build a single coalesced undo/redo for one or more completed duplicates.
@@ -153,28 +290,15 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
   // Copies currently NOT on disk (undo trashed them). Empty to start: the forward
   // duplicate just created every one of them.
   const undone = new Set<string>();
+  // The bytes each copy holds as this entry last wrote it — re-read from every redo, since a JSON copy is re-minted.
+  const shaOf = new Map(results.map((r) => [r.toPath, r.sha256] as const));
   return {
     label,
     undo: async () => {
-      const deleted: string[] = []; // primary files actually trashed — safe to unbind
-      const failed: string[] = [];
-      for (const { toPath } of results) {
-        if (undone.has(toPath)) continue; // already trashed by an earlier partial undo
-        const ok = await deleteAssetFile(toPath);
-        if (ok) { deleted.push(toPath); undone.add(toPath); } else failed.push(toPath);
-        // Drop BOTH halves of the duplicate's sidecar pair: the committed `.meta.json`
-        // (import settings + GUID the copy created) and the gitignored machine-local
-        // `.meta.local.json` (byte stats). Dropping only the committed half left the local
-        // one on disk after every undone duplicate — the QA-CTX-0005 leak, in the flow that
-        // sweep did not reach. deleteAssetFile no-ops on a path that is not there, and the
-        // backend can't distinguish that from a real failure — so only the PRIMARY file's
-        // result is checked; a missing sidecar is never reported as a failure (matches the
-        // existing best-effort comment above, now made explicit for #308).
-        if (!isTextAsset(toPath)) {
-          await deleteAssetFile(toPath + '.meta.json');
-          await deleteAssetFile(toPath + '.meta.local.json');
-        }
-      }
+      const copies = results.filter(({ toPath }) => !undone.has(toPath)).map(({ toPath }) => toPath);
+      const deleted = await trashCopies(copies, shaOf); // primary files actually trashed — safe to unbind
+      const failed = copies.filter((p) => !deleted.includes(p));
+      for (const p of deleted) undone.add(p);
       // The copy can be OPEN by now (duplicate → double-click the copy → ⌘Z), and a bound
       // editor would autosave it straight back (#186). makeDeleteUndo's `redo` needs no
       // such call: the forward delete already unbound, and `undo` restores the file
@@ -190,8 +314,10 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
       const failed: string[] = [];
       for (const { asset, toPath } of results) {
         if (!undone.has(toPath)) continue; // the copy is still on disk — nothing to redo
-        const ok = await duplicateAssetFile(asset.path, toPath);
-        if (ok) undone.delete(toPath); else failed.push(toPath);
+        // The route refuses a destination that is already occupied (409 "Destination exists"), so a redo never
+        // lands on a file made at that path since — that half needed no new precondition.
+        const r = await duplicateAssetFileReport(asset.path, toPath);
+        if (r.ok) { undone.delete(toPath); shaOf.set(toPath, r.sha256); } else failed.push(toPath);
       }
       if (failed.length > 0) {
         reportUndoFailure({ direction: 'Redo', label, detail: `not re-copied: ${failed.join(', ')}` });
@@ -199,6 +325,34 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
       refresh();
     },
   };
+}
+
+/** Trash the copies a Duplicate or a copy-Paste made, in ONE request, each only while it holds the bytes the route
+ *  reported writing (#1679) — a copy edited since (duplicate → open the copy → edit → save → Cmd+Z) is the user's
+ *  work now. One mismatch trashes nothing and REFUSES the step (`fileChangedRefusal`, the #1664 shape), so there is
+ *  no half-undone batch to describe. Resolves to the copies actually trashed.
+ *
+ *  Drops BOTH halves of each copy's sidecar pair: the committed `.meta.json` (import settings + the GUID the copy
+ *  created) and the gitignored machine-local `.meta.local.json` (byte stats) — dropping only the committed half left
+ *  the local one on disk after every undone duplicate (QA-CTX-0005). They ride in the same request, so a refusal
+ *  keeps them too: never an orphan sidecar, never a GUID-less copy. They carry no hash (the scanner rewrites the local
+ *  one on its own), and the route skips one that is not there, so a missing sidecar is never reported as a failure. */
+async function trashCopies(copies: string[], shaOf: ReadonlyMap<string, string | undefined>): Promise<string[]> {
+  if (copies.length === 0) return [];
+  const unknown = copies.filter((p) => shaOf.get(p) === undefined);
+  if (unknown.length > 0) {
+    throw new UndoRefusedError(
+      `${unknown.join(', ')} ${unknown.length === 1 ? 'was' : 'were'} not trashed: the copy's contents were never reported, so it cannot be told apart from an edit made since.`,
+      `${unknown.length === 1 ? unknown[0].split('/').pop() : `${unknown.length} copies`} could not be checked, and ${unknown.length === 1 ? 'was' : 'were'} left as ${unknown.length === 1 ? 'it is' : 'they are'}`,
+    );
+  }
+  const paths = copies.flatMap((p) => (isTextAsset(p) ? [p] : [p, p + '.meta.json', p + '.meta.local.json']));
+  const ifMatch = Object.fromEntries(copies.map((p) => [p, shaOf.get(p) as string]));
+  const res = await deleteAssetFiles(paths, { ifMatch });
+  if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
+  if (!res.ok) return [];
+  const failed = new Set(res.failed);
+  return copies.filter((p) => !failed.has(p));
 }
 
 /** Build the undo/redo for a single-asset rename (Assets.tsx `handleRename`, #308). The
@@ -265,11 +419,22 @@ export function makeEmptyFolderDeleteUndo(params: {
       refresh();
     },
     redo: async () => {
-      const ok = await deleteAssetFile(folderPath);
+      // Only while it is still EMPTY (#1679): the undo recreated a shell, and whatever was put in it since is not
+      // this entry's to trash. A refusal leaves the folder and everything in it (`fileChangedRefusal`).
+      const ok = await trashEmptyFolder(folderPath);
       if (!ok) reportUndoFailure({ direction: 'Redo', label, detail: `folder "${folderPath}" was not removed` });
       refresh();
     },
   };
+}
+
+/** Trash a folder this entry created, only while it holds nothing but OS litter (`ifEmpty`, #1679). A folder with
+ *  anything in it REFUSES the step (`fileChangedRefusal`) and stays, contents and all. Resolves `false` on a plain
+ *  failure, for the caller's #308 report. */
+async function trashEmptyFolder(folderPath: string): Promise<boolean> {
+  const res = await deleteAssetFiles([folderPath], { ifEmpty: [folderPath] });
+  if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
+  return res.ok && res.failed.length === 0;
 }
 
 /** Undo/redo for the "New Folder" action (Assets.tsx `createFolder`, #308 — found in
@@ -301,7 +466,9 @@ export function makeNewFolderUndo(params: {
   return {
     label,
     undo: async () => {
-      const ok = await deleteAssetFile(path);
+      // Only while it is still EMPTY (#1679): New Folder → drop files into it (Finder, or a copy that is not its own
+      // undo entry) → Cmd+Z here used to trash the folder with them inside.
+      const ok = await trashEmptyFolder(path);
       if (ok) { setPendingFolders(prune); setExpanded(prune); }
       else reportUndoFailure({ direction: 'Undo', label, detail: `folder "${path}" still exists on disk` });
       refresh();
@@ -361,14 +528,15 @@ export function makeFolderRenameUndo(params: {
 
 /** One item a cut/copy paste moved or copied — the panel's own destination-collision
  *  planning already happened, so `from`/`to` are the exact paths that landed. */
-export type PasteMove = { from: string; to: string };
+/** `sha256`: for a copy-paste, the copy's bytes as the route wrote them (`DupResult.sha256`, #1679). */
+export type PasteMove = { from: string; to: string; sha256?: string };
 
 /** Undo/redo for `pasteClipboard` (Assets.tsx, #308). The forward loop already skips any
  *  item whose move/copy failed (`done` only holds what actually landed) — this only needs to
  *  handle the REVERSE direction failing, which the old closures silently dropped one item at
  *  a time. Failures are collected and reported as ONE message naming every skipped path,
  *  not one console line per item. Only the cut branch can collide (`moveFileToStatus`); the
- *  copy branch's `deleteAssetFile`/`duplicateAssetFile` never distinguish a collision. */
+ *  copy branch refuses a copy edited since instead (`trashCopies`, #1679). */
 export function makePasteUndo(params: {
   op: 'cut' | 'copy';
   done: PasteMove[];
@@ -379,6 +547,8 @@ export function makePasteUndo(params: {
   // Items currently in the UNDONE state — moved back to `from` (cut), or trashed (copy).
   // See the note above makeDuplicateUndo for why replaying the whole list is wrong.
   const undone = new Set<string>();
+  // A copy-paste's copies, as makeDuplicateUndo's `shaOf` (#1679). Unused by a cut: a move destroys no bytes.
+  const shaOf = new Map(done.map((m) => [m.to, m.sha256] as const));
   return {
     label,
     undo: async () => {
@@ -389,6 +559,7 @@ export function makePasteUndo(params: {
       // error only because `string[]` has no `.has`. Keep these two distinct.
       const deletedCopies: string[] = []; // primary copies actually trashed — safe to unbind
       const failed: string[] = [];
+      const copies: string[] = [];
       let collision = false;
       for (const { from, to } of done) {
         if (undone.has(to)) continue; // already undone by an earlier partial pass
@@ -397,19 +568,14 @@ export function makePasteUndo(params: {
           if (ok) { back.push({ from: to, to: from }); undone.add(to); }
           else { failed.push(`${to} → ${from}`); if (status === COLLISION_STATUS) collision = true; }
         } else {
-          const ok = await deleteAssetFile(to);
-          if (ok) {
-            undone.add(to);
-            deletedCopies.push(to);
-            // Both sidecar halves — the committed `.meta.json` AND the gitignored
-            // `.meta.local.json` — or undoing a paste leaves the local one behind
-            // forever (QA-CTX-0005). Best-effort like makeDuplicateUndo: deleteAssetFile
-            // no-ops on a path that isn't there, and a missing sidecar is not itself a
-            // reportable failure — only the primary file's delete is checked above.
-            if (!isTextAsset(to)) { await deleteAssetFile(to + '.meta.json'); await deleteAssetFile(to + '.meta.local.json'); }
-          } else {
-            failed.push(to);
-          }
+          copies.push(to);
+        }
+      }
+      // The copies go in ONE guarded request, sidecars included — `trashCopies`, shared with makeDuplicateUndo (#1679).
+      if (copies.length > 0) {
+        const trashed = await trashCopies(copies, shaOf);
+        for (const to of copies) {
+          if (trashed.includes(to)) { undone.add(to); deletedCopies.push(to); } else failed.push(to);
         }
       }
       if (op === 'cut') applyAssetPathMoves(back);
@@ -433,8 +599,8 @@ export function makePasteUndo(params: {
           if (ok) { fwd.push({ from, to }); undone.delete(to); }
           else { failed.push(`${from} → ${to}`); if (status === COLLISION_STATUS) collision = true; }
         } else {
-          const ok = await duplicateAssetFile(from, to);
-          if (ok) undone.delete(to); else failed.push(`${from} → ${to}`);
+          const r = await duplicateAssetFileReport(from, to);
+          if (r.ok) { undone.delete(to); shaOf.set(to, r.sha256); } else failed.push(`${from} → ${to}`);
         }
       }
       if (op === 'cut') applyAssetPathMoves(fwd);
@@ -511,35 +677,79 @@ export function makeFilesDropUndo(params: {
 /** Undo/redo for `importModelWithMeta` (Assets.tsx, module-scope, #308 follow-up A —
  *  found in re-verification after the original sweep, not in the issue text). The
  *  forward path already writes the prefab before this is built, so undo trashes it and
- *  redo re-writes it; both directions used to discard the boolean. Neither
- *  `deleteAssetFile` nor `writeAssetFile` distinguishes a collision, so this is always
- *  console-only (never `userFixable`), matching `makeEmptyFolderDeleteUndo`. */
+ *  redo re-writes it; both directions used to discard the boolean. A plain failure is
+ *  console-only (never `userFixable`); a changed file refuses the step (#1679, below). */
 export function makeModelImportUndo(params: {
   assetName: string;
   prefabPath: string;
   content: string;
+  /** What the prefab path held BEFORE the import: absent for a fresh create; the bytes for a RE-import over an
+   *  existing prefab (it keeps that prefab's id, #1468); `null` when one was there but could not be read. A re-import's
+   *  undo RESTORES those bytes rather than trashing the file — trashing it is how #1264 lost a replaced prefab, and
+   *  the same shape was left standing here (#1679 close-out sweep). */
+  previousContent?: string | null;
   onDone?: () => void;
 }): UndoAction {
-  const { assetName, prefabPath, content, onDone } = params;
+  const { assetName, prefabPath, content, previousContent, onDone } = params;
   const label = `Import Model "${assetName}"`;
+  const replaced = previousContent !== undefined;
+  // Whether `content` is on disk as this entry left it — false once an undo landed. An undo that reported a failure
+  // left it there, so the redo after it must expect `content`, not what the undo would have put back.
+  let onDisk = true;
   return {
     label,
+    // ⚠️ Both halves carry a PRECONDITION (#1679): undo changes the prefab only while it holds the imported bytes
+    // (import → open the prefab → edit → Cmd+S → Cmd+Z used to trash that save), redo only while it holds what the undo
+    // left. Either miss REFUSES before anything moved (`fileChangedRefusal`). Same call as Create Prefab's.
     undo: async () => {
-      const ok = await deleteAssetFile(prefabPath);
-      if (!ok) reportUndoFailure({ direction: 'Undo', label, detail: `prefab "${prefabPath}" was not trashed` });
+      if (previousContent === null) {
+        reportUndoFailure({ direction: 'Undo', label, detail: `the prefab this import replaced could not be read before the import, so it cannot be restored: "${prefabPath}" was left as it is` });
+        onDone?.();
+        return;
+      }
+      const w = await replaceFileIfMatch(prefabPath, replaced ? previousContent! : null, content);
+      if (w === 'conflict') throw fileChangedRefusal([prefabPath]);
+      if (w === 'ok') onDisk = false;
+      else reportUndoFailure({ direction: 'Undo', label, detail: `prefab "${prefabPath}" was not ${replaced ? 'restored' : 'trashed'}` });
       onDone?.();
     },
     redo: async () => {
-      const ok = await writeAssetFile(prefabPath, content);
-      if (!ok) reportUndoFailure({ direction: 'Redo', label, detail: `prefab "${prefabPath}" was not recreated` });
+      const w = await replaceFileIfMatch(prefabPath, content, onDisk ? content : replaced ? previousContent! : null);
+      if (w === 'conflict') throw fileChangedRefusal([prefabPath]);
+      if (w === 'ok') onDisk = true;
+      else reportUndoFailure({ direction: 'Redo', label, detail: `prefab "${prefabPath}" was not recreated` });
       onDone?.();
     },
   };
 }
 
 /** One file `importFiles` (Assets.tsx) wrote to disk — content is base64 so redo can
- *  re-write it byte-for-byte. */
-export type ImportedFile = { path: string; content: string };
+ *  re-write it byte-for-byte. `sha256`, when set, is the hash of what the file holds once the import SETTLED
+ *  (`settledHashes`), which is what the undo's precondition expects instead of the written bytes (#1679). */
+export type ImportedFile = { path: string; content: string; sha256?: string };
+
+/** The hash of each TEXT file among `paths` as it stands once the scanner has had its say (#1679). The scanner
+ *  rewrites an imported JSON asset on its own when it has no `id`, or one another asset already holds (the GUID heal),
+ *  so the bytes an import wrote are not the bytes on disk a moment later — and an undo expecting the written bytes
+ *  would refuse, calling the scanner's stamp an edit. `/api/rescan-assets` runs that heal INLINE, so the read after it
+ *  is the settled file. A binary is never rewritten in place (every importer writes to the cache or a sibling), so
+ *  it is not read back: its written bytes are the baseline. A read that fails leaves the path out, and the caller
+ *  falls back to the written bytes — a refusal later, never an unguarded trash. */
+export async function settledHashes(paths: readonly string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const text = paths.filter(isTextAsset);
+  if (text.length === 0) return out;
+  try { await backendFetch('/api/rescan-assets', { method: 'POST' }); } catch { return out; }
+  for (const p of text) {
+    try {
+      // The BYTES, not `res.text()`: decoding replaces invalid UTF-8 with U+FFFD, so a Latin-1 or UTF-16 text file got
+      // a baseline no route hash could match, and its undo always refused (close-out review).
+      const res = await fetch(p, { cache: 'no-store' });
+      if (res.ok) out.set(p, await sha256OfBytes(new Uint8Array(await res.arrayBuffer())));
+    } catch { /* fall back to the written bytes */ }
+  }
+  return out;
+}
 
 /** Undo/redo for `importFiles`'s OS-file-drop import (Assets.tsx, #308 follow-up B).
  *  Same skip-every-item shape as `makePasteUndo`/`makeFilesDropUndo`: every result in
@@ -547,36 +757,58 @@ export type ImportedFile = { path: string; content: string };
  *  which deletes actually landed — a file whose delete failed is still on disk, so its
  *  editor binding (if any) is still valid and must not be dropped. Only the files that
  *  were really trashed are unbound; every failure in either direction is batch-reported
- *  as one message. Neither `deleteAssetFile` nor `writeAssetFile` distinguishes a
- *  collision, so this is always console-only. */
+ *  as one message.
+ *
+ *  #1679: undo trashes the files in ONE request, each only while it holds what the import left there — one edited
+ *  since REFUSES the step and nothing is trashed. Redo re-writes each only into an EMPTY path, and one it finds taken is
+ *  skipped and reported (a toast: the user can clear the path), the rest landing; `onDisk` then holds exactly the
+ *  files this entry wrote, so the next undo never trashes the one it skipped. Sidecars are not touched in either
+ *  direction, as before: the one the forward import's conversion wrote stays through an undo, so a redo re-links to
+ *  the same GUID instead of minting a new one. */
 export function makeFileImportUndo(params: {
   imported: ImportedFile[];
   refresh: () => void;
 }): UndoAction {
   const { imported, refresh } = params;
   const label = imported.length > 1 ? `Import ${imported.length} files` : `Import "${imported[0].path.split('/').pop()}"`;
+  // path → the hash its current bytes are expected to have; present = on disk as this entry left it.
+  const onDisk = new Map<string, string | undefined>(imported.map((f) => [f.path, f.sha256]));
   return {
     label,
     // Undoing an import DELETES the files, and you can have opened one in the meantime
     // (import a .particle.json → double-click it → ⌘Z), so it unbinds like any delete.
     undo: async () => {
-      const deleted: string[] = [];
-      const failed: string[] = [];
-      for (const f of imported) {
-        const ok = await deleteAssetFile(f.path);
-        if (ok) deleted.push(f.path); else failed.push(f.path);
-      }
+      const files = imported.filter((f) => onDisk.has(f.path));
+      if (files.length === 0) { refresh(); return; }
+      const ifMatch: Record<string, string> = {};
+      for (const f of files) ifMatch[f.path] = onDisk.get(f.path) ?? await expectedHash(f.path, f.content, 'base64');
+      const res = await deleteAssetFiles(files.map((f) => f.path), { ifMatch });
+      if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
+      const failed = res.ok ? new Set(res.failed) : new Set(files.map((f) => f.path));
+      const deleted = files.map((f) => f.path).filter((p) => !failed.has(p));
+      for (const p of deleted) onDisk.delete(p);
       unbindDeletedAssetEditors(deleted);
-      if (failed.length > 0) {
-        reportUndoFailure({ direction: 'Undo', label, detail: `still on disk, not trashed: ${failed.join(', ')}` });
+      if (failed.size > 0) {
+        reportUndoFailure({ direction: 'Undo', label, detail: `still on disk, not trashed: ${[...failed].join(', ')}` });
       }
       refresh();
     },
     redo: async () => {
       const failed: string[] = [];
+      const taken: string[] = [];
+      const wrote: string[] = [];
       for (const f of imported) {
-        const ok = await writeAssetFile(f.path, f.content, 'base64');
-        if (!ok) failed.push(f.path);
+        if (onDisk.has(f.path)) continue; // still on disk from before — nothing to redo
+        const w = await writeAssetFileGuarded(f.path, f.content, { encoding: 'base64', createOnly: true });
+        if (w === 'ok') wrote.push(f.path);
+        else if (w === 'conflict') taken.push(f.path);
+        else failed.push(f.path);
+      }
+      // Re-take the settled baseline: the scanner heals a re-written JSON again, and mints it a fresh id this time.
+      const settled = await settledHashes(wrote);
+      for (const p of wrote) onDisk.set(p, settled.get(p));
+      if (taken.length > 0) {
+        reportUndoFailure({ direction: 'Redo', label, userFixable: true, detail: `not re-imported, because another file is now at ${taken.join(', ')} — it was left as it is` });
       }
       if (failed.length > 0) {
         reportUndoFailure({ direction: 'Redo', label, detail: `not re-imported: ${failed.join(', ')}` });

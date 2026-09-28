@@ -2218,9 +2218,20 @@ export function registerEditorAgentOps(): void {
   // refusal is read from `undoStep` itself rather than pre-checked, because a step is decided when
   // it runs: a pre-check races a queued step (a clip undo ahead of it re-poses and opens an
   // envelope) and would report that refusal as `did:false`, i.e. "the stack was empty".
+  //
+  // ⚠️ A step that THREW is a failure too, and a different one (#1681): the entry WAS popped and is now on neither
+  // stack. It used to come back as the same bare `did:false` an empty stack gives, so an agent that applied, saved the
+  // prefab and undid (#1664's refusal) concluded the history was empty. `ok:true, did:false` now means EMPTY and only
+  // that. A refusal (`UndoRefusedError`: nothing applied) is REFUSED_BY_OP; any other throw is PARTIAL, because the
+  // closure may have applied part of itself before it threw.
   const undoOrRefuse = async (op: 'undo' | 'redo') => {
-    const { did, refused } = await undoStep(op);
+    const { did, refused, failed } = await undoStep(op);
     if (refused !== null) throw new OpRefusal('REFUSED_BY_OP', `${op}: ${refused} Nothing was undone or redone, and the stack is untouched.`);
+    if (failed !== null) {
+      throw failed.refused
+        ? new OpRefusal('REFUSED_BY_OP', `${op} of "${failed.label}" was refused: ${failed.error}. Nothing was applied, and the entry was DROPPED from the history — it is on neither stack, so the next ${op} reaches the entry below it.`)
+        : new OpRefusal('PARTIAL', `${op} of "${failed.label}" threw: ${failed.error}. The entry was DROPPED from the history (it is on neither stack), and part of it may have applied — read the state (modoki_get_scene_state) before continuing.`);
+    }
     return { did, ...editorStateFields('undo', 'unsavedChanges') };
   };
   registerAgentOp('undo', () => undoOrRefuse('undo'));

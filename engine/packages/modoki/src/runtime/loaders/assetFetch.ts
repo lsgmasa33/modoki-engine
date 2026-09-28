@@ -42,7 +42,7 @@ export const ASSET_FETCH_INIT: RequestInit = assetFetchInit(Boolean(import.meta.
 
 /** True when a response body is the dev server's SPA fallback (`index.html`) rather than the JSON
  *  asset that was asked for. */
-function isHtmlFallthrough(text: string): boolean {
+export function isHtmlFallthrough(text: string): boolean {
   return /^\s*(<!doctype html|<html\b)/i.test(text);
 }
 

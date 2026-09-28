@@ -8,6 +8,7 @@
  *  assert the requests. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import {
   makeDeleteUndo, makeDuplicateUndo, isTextAsset,
   makeRenameUndo, makeEmptyFolderDeleteUndo, makeNewFolderUndo, makeFolderRenameUndo,
@@ -123,9 +124,11 @@ describe('makeDeleteUndo', () => {
 
     await action.undo();
     // Every snapshot is re-written (restored), preserving its encoding so binary
-    // bytes round-trip via base64 (not UTF-8-corrupting fetch().text()).
+    // bytes round-trip via base64 (not UTF-8-corrupting fetch().text()) — sidecar FIRST, and
+    // each only into an empty path (#1679; the order and the collision are in undoFilePreconditions.test.ts).
     const writes = calls.filter((c) => c.url === '/api/write-file');
-    expect(writes.map((w) => w.body.path)).toEqual(result.snapshots.map((s) => s.path));
+    expect(writes.map((w) => w.body.path).sort()).toEqual(result.snapshots.map((s) => s.path).sort());
+    expect(writes.every((w) => w.body.ifNoneMatch === '*')).toBe(true);
     const glb = writes.find((w) => w.body.path.endsWith('.glb'))!;
     expect(glb.body.encoding).toBe('base64');
     expect(glb.body.content).toBe('QkFTRTY0');
@@ -142,10 +145,13 @@ describe('makeDeleteUndo', () => {
   });
 
   it('labels a multi-asset delete and de-dups shared paths in the redo batch', async () => {
-    const a: DeleteResult = { asset: A('/assets/a.glb'), snapshots: [], deletePaths: ['/assets/a.glb', '/assets/shared.tex'] };
-    const b: DeleteResult = { asset: A('/assets/b.glb'), snapshots: [], deletePaths: ['/assets/b.glb', '/assets/shared.tex'] };
+    const snap = (path: string) => ({ path, content: 'QQ==', encoding: 'base64' as const });
+    const a: DeleteResult = { asset: A('/assets/a.glb'), snapshots: [snap('/assets/a.glb'), snap('/assets/shared.tex')], deletePaths: ['/assets/a.glb', '/assets/shared.tex'] };
+    const b: DeleteResult = { asset: A('/assets/b.glb'), snapshots: [snap('/assets/b.glb'), snap('/assets/shared.tex')], deletePaths: ['/assets/b.glb', '/assets/shared.tex'] };
     const action = makeDeleteUndo([a, b], vi.fn());
     expect(action.label).toBe('Delete 2 items');
+    await action.undo(); // redo re-trashes what the undo restored (#1679), so there is something to redo
+    calls = [];
     await action.redo();
     const deletes = calls.filter((c) => c.url === '/api/delete-asset');
     expect(deletes).toHaveLength(1);
@@ -201,15 +207,15 @@ describe('makeDeleteUndo', () => {
   // left the files on disk while refresh() re-listed them, so redo read as a no-op.
   it('redo ERRORS when the re-delete fails instead of reporting a silent no-op', async () => {
     const error = spyConsole('error');
-    mockFetch.mockImplementationOnce(async (url: string, opts?: any) => {
-      calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : undefined });
-      return { ok: false, json: async () => ({}) } as any;
-    });
     const refresh = vi.fn();
-    await makeDeleteUndo(
-      [{ asset: A('/assets/x.glb'), snapshots: [], deletePaths: ['/assets/x.glb'] }],
+    const action = makeDeleteUndo(
+      [{ asset: A('/assets/x.glb'), snapshots: [{ path: '/assets/x.glb', content: 'QQ==', encoding: 'base64' }], deletePaths: ['/assets/x.glb'] }],
       refresh,
-    ).redo();
+    );
+    await action.undo();
+    refresh.mockClear();
+    failNext('/api/delete-asset', 500);
+    await action.redo();
     expect(error).toHaveBeenCalledTimes(1);
     expect(String(error.mock.calls[0][0])).toContain('/assets/x.glb');
     expect(refresh).toHaveBeenCalledTimes(1); // still refreshes — the panel must show reality
@@ -240,7 +246,7 @@ describe('makeDeleteUndo', () => {
 
 describe('makeDuplicateUndo', () => {
   it('undo trashes each copy + its sidecar (binary); redo re-copies', async () => {
-    const results: DupResult[] = [{ asset: A('/assets/island.glb'), toPath: '/assets/island copy.glb' }];
+    const results: DupResult[] = [{ asset: A('/assets/island.glb'), toPath: '/assets/island copy.glb', sha256: 'h-copy' }];
     const refresh = vi.fn();
     const action = makeDuplicateUndo(results, refresh);
     expect(action.label).toBe('Duplicate island.glb');
@@ -250,12 +256,13 @@ describe('makeDuplicateUndo', () => {
     // settings) and the gitignored machine-local `.meta.local.json` (byte stats). Dropping
     // only the committed half stranded the local one on disk after every undone duplicate —
     // the QA-CTX-0005 leak class, in the flow that fix's first sweep did not reach.
-    const deletes = calls.filter((c) => c.url === '/api/delete-asset').map((c) => c.body.path);
-    expect(deletes).toEqual([
-      '/assets/island copy.glb',
-      '/assets/island copy.glb.meta.json',
-      '/assets/island copy.glb.meta.local.json',
-    ]);
+    // ONE request (#1679): the copy guarded by the hash the duplicate reported, its sidecars riding along.
+    const deletes = calls.filter((c) => c.url === '/api/delete-asset').map((c) => c.body);
+    expect(deletes).toEqual([{
+      paths: ['/assets/island copy.glb', '/assets/island copy.glb.meta.json', '/assets/island copy.glb.meta.local.json'],
+      rendererWrite: true,
+      ifMatch: { '/assets/island copy.glb': 'h-copy' },
+    }]);
     expect(refresh).toHaveBeenCalledTimes(1);
 
     calls = [];
@@ -266,11 +273,11 @@ describe('makeDuplicateUndo', () => {
   });
 
   it('does NOT trash a sidecar for a text-asset duplicate (carries its id inline)', async () => {
-    const results: DupResult[] = [{ asset: A('/assets/x.prefab.json', 'prefab'), toPath: '/assets/x copy.prefab.json' }];
+    const results: DupResult[] = [{ asset: A('/assets/x.prefab.json', 'prefab'), toPath: '/assets/x copy.prefab.json', sha256: 'h' }];
     const action = makeDuplicateUndo(results, vi.fn());
     await action.undo();
-    const deletes = calls.filter((c) => c.url === '/api/delete-asset').map((c) => c.body.path);
-    expect(deletes).toEqual(['/assets/x copy.prefab.json']); // no sidecar
+    const deletes = calls.filter((c) => c.url === '/api/delete-asset').map((c) => c.body.paths);
+    expect(deletes).toEqual([['/assets/x copy.prefab.json']]); // no sidecar
   });
 
   it('labels a multi-asset duplicate', () => {
@@ -291,7 +298,7 @@ describe('makeDuplicateUndo', () => {
       return { ok: false, status: 500, json: async () => ({}) } as any;
     });
     const refresh = vi.fn();
-    await makeDuplicateUndo([{ asset: A('/assets/x.glb'), toPath: '/assets/x copy.glb' }], refresh).undo();
+    await makeDuplicateUndo([{ asset: A('/assets/x.glb'), toPath: '/assets/x copy.glb', sha256: 'h' }], refresh).undo();
     expect(error).toHaveBeenCalledTimes(1);
     expect(String(error.mock.calls[0][0])).toContain('/assets/x copy.glb');
     expect(useEditorStore.getState().toast).toBeNull();
@@ -307,7 +314,7 @@ describe('makeDuplicateUndo', () => {
   it('redo ERRORS when the re-copy fails', async () => {
     const error = spyConsole('error');
     const refresh = vi.fn();
-    const action = makeDuplicateUndo([{ asset: A('/assets/x.glb'), toPath: '/assets/x copy.glb' }], refresh);
+    const action = makeDuplicateUndo([{ asset: A('/assets/x.glb'), toPath: '/assets/x copy.glb', sha256: 'h' }], refresh);
     await action.undo(); // trashes the copy — now in the undone state, so redo has something to do
     error.mockClear();
     refresh.mockClear();
@@ -620,7 +627,7 @@ describe('makePasteUndo (#308 site 3)', () => {
   it('copy-redo: reports every path whose re-copy fails', async () => {
     const error = spyConsole('error');
     const refresh = vi.fn();
-    const action = makePasteUndo({ op: 'copy', done: [{ from: '/a.glb', to: '/b/a.glb' }], refresh });
+    const action = makePasteUndo({ op: 'copy', done: [{ from: '/a.glb', to: '/b/a.glb', sha256: 'h' }], refresh });
     await action.undo(); // trashes the copy — puts it in the undone state
     error.mockClear();
     refresh.mockClear();
@@ -637,7 +644,7 @@ describe('makePasteUndo (#308 site 3)', () => {
     const error = spyConsole('error');
     failNext('/api/delete-asset', 500);
     const refresh = vi.fn();
-    await makePasteUndo({ op: 'copy', done: [{ from: '/a.glb', to: '/b/a.glb' }], refresh }).undo();
+    await makePasteUndo({ op: 'copy', done: [{ from: '/a.glb', to: '/b/a.glb', sha256: 'h' }], refresh }).undo();
     expect(error).toHaveBeenCalledTimes(1);
     expect(String(error.mock.calls[0][0])).toContain('/b/a.glb');
     expect(refresh).toHaveBeenCalledTimes(1);
@@ -679,17 +686,15 @@ describe('makePasteUndo — partial-failure state tracking (#308 close-out)', ()
   it('copy: redo after a partial undo failure only re-copies the items that were actually deleted', async () => {
     const error = spyConsole('error');
     const refresh = vi.fn();
-    // Text-asset (.json) paths so undo's copy branch makes exactly ONE /api/delete-asset call
-    // per item (no binary sidecar deletes), keeping the per-item response queue simple.
+    // Text-asset (.json) paths so the copies carry no sidecars. The copies go in ONE request (#1679), so
+    // e's miss is the OS refusing it inside a 200 — `failed` — while a and c went.
     const done = [
-      { from: '/a.prefab.json', to: '/b/a.prefab.json' },
-      { from: '/c.prefab.json', to: '/b/c.prefab.json' },
-      { from: '/e.prefab.json', to: '/b/e.prefab.json' },
+      { from: '/a.prefab.json', to: '/b/a.prefab.json', sha256: 'ha' },
+      { from: '/c.prefab.json', to: '/b/c.prefab.json', sha256: 'hc' },
+      { from: '/e.prefab.json', to: '/b/e.prefab.json', sha256: 'he' },
     ];
     const action = makePasteUndo({ op: 'copy', done, refresh });
-    succeedNext('/api/delete-asset');
-    succeedNext('/api/delete-asset');
-    failNext('/api/delete-asset', 500);
+    respondNext('/api/delete-asset', { ok: true, trashed: 2, missing: [], failed: ['/b/e.prefab.json'] });
     await action.undo();
     expect(error).toHaveBeenCalledTimes(1);
     expect(String(error.mock.calls[0][0])).toContain('/b/e.prefab.json');
@@ -833,7 +838,9 @@ describe('makeModelImportUndo (#308 follow-up A)', () => {
     await build(onDone).undo();
     const deletes = calls.filter((c) => c.url === '/api/delete-asset');
     expect(deletes).toHaveLength(1);
-    expect(deletes[0].body.path).toBe('/assets/models/rig.prefab.json');
+    expect(deletes[0].body.paths).toEqual(['/assets/models/rig.prefab.json']);
+    // Only while it holds the imported bytes (#1679) — the hash of exactly `content`.
+    expect(deletes[0].body.ifMatch).toEqual({ '/assets/models/rig.prefab.json': createHash('sha256').update('{"id":"p1"}').digest('hex') });
     expect(onDone).toHaveBeenCalledTimes(1);
   });
 
@@ -851,18 +858,25 @@ describe('makeModelImportUndo (#308 follow-up A)', () => {
 
   it('redo re-writes the prefab and calls onDone on success', async () => {
     const onDone = vi.fn();
-    await build(onDone).redo();
+    const action = build(onDone);
+    await action.undo();
+    calls = []; onDone.mockClear();
+    await action.redo();
     const writes = calls.filter((c) => c.url === '/api/write-file');
     expect(writes).toHaveLength(1);
-    expect(writes[0].body).toEqual({ path: '/assets/models/rig.prefab.json', content: '{"id":"p1"}', encoding: undefined });
+    // Only into the path the undo emptied (#1679).
+    expect(writes[0].body).toEqual({ path: '/assets/models/rig.prefab.json', content: '{"id":"p1"}', ifNoneMatch: '*' });
     expect(onDone).toHaveBeenCalledTimes(1);
   });
 
   it('redo ERRORS when the re-write fails, but still calls onDone', async () => {
     const error = spyConsole('error');
-    failNext('/api/write-file', 500);
     const onDone = vi.fn();
-    await build(onDone).redo();
+    const action = build(onDone);
+    await action.undo();
+    onDone.mockClear();
+    failNext('/api/write-file', 500);
+    await action.redo();
     expect(error).toHaveBeenCalledTimes(1);
     expect(onDone).toHaveBeenCalledTimes(1);
   });
@@ -876,8 +890,14 @@ describe('makeFileImportUndo (#308 follow-up B)', () => {
       refresh,
     });
     await action.undo();
-    const deletes = calls.filter((c) => c.url === '/api/delete-asset').map((c) => c.body.path);
-    expect(deletes).toEqual(['/assets/a.png', '/assets/b.png']);
+    // ONE request (#1679), each file guarded by the hash of the BYTES it was written as (base64 decoded).
+    const deletes = calls.filter((c) => c.url === '/api/delete-asset').map((c) => c.body);
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0].paths).toEqual(['/assets/a.png', '/assets/b.png']);
+    expect(deletes[0].ifMatch).toEqual({
+      '/assets/a.png': createHash('sha256').update(Buffer.from('AA==', 'base64')).digest('hex'),
+      '/assets/b.png': createHash('sha256').update(Buffer.from('BB==', 'base64')).digest('hex'),
+    });
     expect(refresh).toHaveBeenCalledTimes(1);
   });
 
@@ -885,7 +905,8 @@ describe('makeFileImportUndo (#308 follow-up B)', () => {
   // a file whose delete failed is still on disk, so its editor binding is still valid.
   it('undo does NOT unbind a file whose delete failed, and batch-reports the failure', async () => {
     const error = spyConsole('error');
-    failNext('/api/delete-asset', 500); // the first delete (a.png) fails; b.png succeeds
+    // One request (#1679): the OS refused a.png inside a 200, and b.png went.
+    respondNext('/api/delete-asset', { ok: true, trashed: 1, missing: [], failed: ['/assets/a.png'] });
     // Bind a live editor to EACH imported path, so "does not unbind" is a real assertion on
     // the store rather than an inference from the console message.
     useEditorStore.setState({
@@ -913,22 +934,27 @@ describe('makeFileImportUndo (#308 follow-up B)', () => {
   it('redo re-writes every file on success', async () => {
     const refresh = vi.fn();
     const action = makeFileImportUndo({ imported: [{ path: '/assets/a.png', content: 'AA==' }], refresh });
+    await action.undo();
+    calls = [];
     await action.redo();
     const writes = calls.filter((c) => c.url === '/api/write-file');
     expect(writes).toHaveLength(1);
-    expect(writes[0].body).toEqual({ path: '/assets/a.png', content: 'AA==', encoding: 'base64' });
+    // Only into the path the undo emptied (#1679).
+    expect(writes[0].body).toEqual({ path: '/assets/a.png', content: 'AA==', encoding: 'base64', ifNoneMatch: '*' });
   });
 
   // #308: redo's re-write loop was entirely unchecked.
   it('redo batch-reports every path whose re-write fails', async () => {
     const error = spyConsole('error');
-    failNext('/api/write-file', 500);
-    failNext('/api/write-file', 500);
     const refresh = vi.fn();
     const action = makeFileImportUndo({
       imported: [{ path: '/assets/a.png', content: 'AA==' }, { path: '/assets/b.png', content: 'BB==' }],
       refresh,
     });
+    await action.undo();
+    refresh.mockClear();
+    failNext('/api/write-file', 500);
+    failNext('/api/write-file', 500);
     await action.redo();
     expect(error).toHaveBeenCalledTimes(1);
     const msg = String(error.mock.calls[0][0]);
@@ -1031,6 +1057,7 @@ describe('makeDeleteUndo — a refused file is not the undo\'s to restore (#884)
     // the redo re-listed the refused file and read as a no-op.
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     const undo = makeDeleteUndo([R('/assets/a.png'), R('/assets/b.png')], vi.fn(), {});
+    await undo.undo!();
     respondNext('/api/delete-asset', { ok: true, trashed: 1, missing: [], failed: ['/assets/b.png'] });
     await undo.redo!();
     expect(err).toHaveBeenCalledTimes(1);

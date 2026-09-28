@@ -22,16 +22,16 @@ import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 import {
   writeAssetFile as writeFile, deleteAssetFile as deleteAsset, deleteAssetFiles as deleteAssets,
   describeRefusedDeletes, planDeleteOutcome,
-  duplicateAssetFile as duplicateAsset, createFolderApi, moveFileTo, createPrefabFromEntity,
+  duplicateAssetFileReport as duplicateAsset, readPriorDocument, createFolderApi, moveFileTo, createPrefabFromEntity,
   reimportTargets, planImports, refreshHandlerTypes, HANDLER_TYPES,
   deletionPathsFor, planRename, assetEditorHoldMessage,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
 import { createStoreSelectionTracker, revealKeysFor } from './assetReveal';
 import {
-  isTextAsset, makeDeleteUndo, makeDuplicateUndo,
+  makeDeleteUndo, makeDuplicateUndo,
   makeRenameUndo, makeEmptyFolderDeleteUndo, makeNewFolderUndo, makeFolderRenameUndo,
-  makePasteUndo, makeFilesDropUndo, makeModelImportUndo, makeFileImportUndo,
+  makePasteUndo, makeFilesDropUndo, makeModelImportUndo, makeFileImportUndo, settledHashes, snapshotFromBytes,
   type Snapshot, type DeleteResult, type DupResult, type PasteMove, type DropMove,
 } from './assetUndo';
 import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
@@ -222,6 +222,10 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       setImportError(`Import of "${assetName}" was aborted — ${existing.reason}`);
       return;
     }
+    // A RE-import replaces the prefab already there, so its undo must put those bytes back rather than trash the file
+    // (#1264's shape, found by #1679's sweep). Read now, before anything is written, and decided by the FILE: a
+    // manifest-`known` id can outlive it, and a `no-id` file is there all the same (`readPriorDocument`).
+    const previousContent = await readPriorDocument(prefabPath);
 
     // Temporarily spawn entities to serialize as prefab, then clean up
     const rootId = await importModel(assetPath, prefix, postprocessorId, rootTransform);
@@ -274,7 +278,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
         console.log(`[Assets] Created prefab: ${prefabPath}`);
         // Builder in assetUndo.ts (#308) — both directions now check the write/delete
         // and report a failure instead of discarding it silently.
-        pushAction(makeModelImportUndo({ assetName, prefabPath, content, onDone }));
+        pushAction(makeModelImportUndo({ assetName, prefabPath, content, previousContent, onDone }));
       }
     }
 
@@ -1054,15 +1058,7 @@ export default function Assets() {
       try {
         const res = await fetch(filePath);
         if (!res.ok) return;
-        if (isTextAsset(filePath)) {
-          snapshots.push({ path: filePath, content: await res.text() });
-        } else {
-          const buf = await res.arrayBuffer();
-          const bytes = new Uint8Array(buf);
-          let bin = '';
-          for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-          snapshots.push({ path: filePath, content: btoa(bin), encoding: 'base64' });
-        }
+        snapshots.push(snapshotFromBytes(filePath, new Uint8Array(await res.arrayBuffer())));
       } catch { /* unreachable read — leave it out of the undo set */ }
     };
 
@@ -1170,11 +1166,12 @@ export default function Assets() {
   // can't pick the same target path twice. (DupResult in assetUndo.ts — F6.)
   const performDuplicate = useCallback(async (asset: AssetEntry, taken: Set<string>): Promise<DupResult | null> => {
     const toPath = duplicatePathFor(asset.path, taken);
-    const ok = await duplicateAsset(asset.path, toPath);
-    if (!ok) { console.error(`[Assets] Failed to duplicate ${asset.path}`); return null; }
+    const dup = await duplicateAsset(asset.path, toPath);
+    if (!dup.ok) { console.error(`[Assets] Failed to duplicate ${asset.path}`); return null; }
     taken.add(toPath);
     console.log(`[Assets] Duplicated ${asset.path} → ${toPath}`);
-    return { asset, toPath };
+    // The copy's hash rides into the undo, which trashes the copy only while it still holds these bytes (#1679).
+    return { asset, toPath, sha256: dup.sha256 };
   }, []);
 
   // Build + push the coalesced duplicate undo (builder in assetUndo.ts — F6).
@@ -1349,13 +1346,18 @@ export default function Assets() {
       const cutHeld = assetEditorHoldMessage(clipboard.paths);
       if (cutHeld) { useEditorStore.getState().showToast(cutHeld, 'warn'); return; }
     }
-    const done: { from: string; to: string }[] = [];
+    const done: PasteMove[] = [];
     for (const from of clipboard.paths) {
       const to = pastePathIn(targetFolder, from, taken);
       if (to === from) continue; // cut into same folder — no-op
       taken.add(to);
-      const ok = clipboard.op === 'cut' ? await moveFileTo(from, to) : await duplicateAsset(from, to);
-      if (ok) done.push({ from, to });
+      if (clipboard.op === 'cut') {
+        if (await moveFileTo(from, to)) done.push({ from, to });
+      } else {
+        // The copy's hash rides into the undo (`PasteMove.sha256`, #1679).
+        const dup = await duplicateAsset(from, to);
+        if (dup.ok) done.push({ from, to, sha256: dup.sha256 });
+      }
     }
     if (done.length === 0) return;
     const op = clipboard.op;
@@ -1367,8 +1369,7 @@ export default function Assets() {
     // Builder in assetUndo.ts (#308) — as in handleRename, only the moves that actually
     // landed may repoint a binding, and every skipped item is now reported as one message
     // (was silently dropped one at a time).
-    const doneMoves: PasteMove[] = done.map(({ from, to }) => ({ from, to }));
-    pushAction(makePasteUndo({ op, done: doneMoves, refresh }));
+    pushAction(makePasteUndo({ op, done, refresh }));
   }, [clipboard, selected, assets, refresh]);
 
   // ── New Folder + folder rename ──────────────────────────────────────
@@ -1582,12 +1583,15 @@ export default function Assets() {
         }).catch(() => {});
       }
     }
+    // The baseline the undo's precondition expects (#1679): a JSON file the scanner re-stamps is read back once that
+    // settles, so its undo does not mistake the stamp for an edit. Binaries keep their written bytes as the baseline.
+    const settled = await settledHashes(imported.map((f) => f.path));
     refresh();
     // Builder in assetUndo.ts (#308) — every result in both loops used to be discarded,
     // and undo unbound ALL N files regardless of which deletes actually landed; only the
     // files that were really trashed are unbound now, and every failure in either
     // direction is batch-reported as one message (like makePasteUndo/makeFilesDropUndo).
-    pushAction(makeFileImportUndo({ imported, refresh }));
+    pushAction(makeFileImportUndo({ imported: imported.map((f) => ({ path: f.path, content: f.content, sha256: settled.get(f.path) })), refresh }));
   }, [assets, refresh, setImportStatus]);
 
   const handleDrop = useCallback(async (e: React.DragEvent, targetFolder?: string) => {
