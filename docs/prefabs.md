@@ -153,7 +153,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | # | Behaviour | Unity | Modoki | Verdict |
 |---|---|---|---|---|
 | U26 | Object identity inside an instance | Objects in a prefab have fileIDs. A reference into an instance goes through a stripped placeholder: the source fileID plus the `PrefabInstance`. [M6 `yaml-prefab-serialization`] | `nodeGuid` names a template node. A member's guid is pinned on its member row (scene v16), so a scene reference survives a template renumber. § "Identity" (I4–I8). | match by design. Open breaks: #1659, #1680. |
-| U27 | Undo | Apply, Revert, Unpack and Replace record undo when run as a user action. Leaving Prefab Mode drops that prefab's undo history. [S6 `InteractionMode`, M22 `EditingInPrefabMode`] | Apply, Revert, Detach and Create Prefab are undoable (`applyToPrefabWithUndo`, `revertOverridesWithUndo`, `detachPrefabInstanceWithUndo`). The agent `create` op's undo relinks the tree but leaves the file. **Prefab edit keeps its history:** leaving parks the prefab world's undo stack under its key (`swapHistory`, unless unsaved edits were discarded), and re-opening that prefab restores it. So save, exit, re-open, then Cmd+Z undoes an edit from the earlier visit. After an Apply (or any outside write) changed the prefab in between, it does NOT stay valid (#1691 close-out, observed): an undone delete brings back an opened row whose number the Apply gave another row, and the save refuses the duplicate (§ "Prefab edit mode"). | match for the operations; **diverges** on the kept history. The owner rules on it. |
+| U27 | Undo | Apply, Revert, Unpack and Replace record undo when run as a user action. Leaving Prefab Mode drops that prefab's undo history. [S6 `InteractionMode`, M22 `EditingInPrefabMode`] | Apply, Revert, Detach and Create Prefab are undoable (`applyToPrefabWithUndo`, `revertOverridesWithUndo`, `detachPrefabInstanceWithUndo`). The agent `create` op's undo relinks the tree but leaves the file. **Leaving prefab edit drops its history** (owner, 2026-09-28, #1704): however the edit world is left (Exit, a scene load, opening another prefab, re-opening the same one from inside it), the adoption owner drops its stack instead of parking it (`sceneAdoption.ts`, S8), so a re-open starts with nothing to undo. It used to be kept, and after an outside write (an Apply, a Replace, a checkout) it replayed onto a changed document: an undone delete came back at a number the Apply had given another row. **One deliberate difference:** an asset-document entry recorded there (material, clip, particle…, `_isFileDirect`) survives, parked under the prefab's key as it is across any discard: it edits another file, and dropping it would strand an asset edit with no undo (#1409). ⚠️ Like every parked asset entry, its undo re-parks the whole old document with no precondition, so an edit made to that asset elsewhere since is reverted (#1710). Re-opening the prefab you are already editing also drops the history: that rebuilds the world from disk, which an outside write can have changed during the visit (the hot reload skips the edit world). | match, except the asset-document entries above. |
 | U28 | Runtime instantiate | `Object.Instantiate` makes no prefab connection. [S6 `Object.Instantiate`] | `spawnPrefabInstance` stamps `PrefabInstance` on every spawned entity, and nested rows expand at load, not at build. | **diverges**, deliberate: the runtime uses `PrefabInstance` for member guids and frame identity. The owner rules on whether it stays. |
 | U29 | Reordering children inside an instance | Not an override since 2022.3. Existing reorder overrides are discarded on upgrade. [M22 `UpgradeGuide2022LTS`] | A reorder is an `EntityAttributes.sortOrder` value override ([prefab-structural-overrides.md](./prefab-structural-overrides.md) § Edge cases). | **diverges**, deliberate: sits beside U7. The owner rules on it. |
 
@@ -371,16 +371,19 @@ The preserving mechanism, in `prefabEdit.ts`:
   (`serializePrefab`'s `localIdFloor`; Unity never reuses a fileID either). A save that would still put
   two rows at one localId is refused, not written.
   ⚠️ **The record is per PREFAB, for the editor process, not per edit world** — what an undo can bring
-  back outlives the world: Stop rebuilds it from a snapshot, and leaving + re-opening keeps the prefab's
-  undo history (U27). Kept per world, a Play/Stop re-minted every added member, and an undone delete from
-  an earlier visit met its own number on a later newcomer (close-out review). The cost past the undo
-  history's life is gaps in the numbering.
+  back outlives the world: Stop rebuilds it from a snapshot. Kept per world, a Play/Stop re-minted every
+  added member (close-out review). Since #1704 leaving prefab edit drops its undo history (U27), so nothing
+  from an earlier visit can be brought back into a later one, and what the record keeps across visits
+  costs only gaps in the numbering. It was kept per prefab when the history still outlived the visit, and
+  an undone delete from an earlier visit met its own number on a later newcomer.
   ⚠️ **A write OUTSIDE prefab edit between two visits** (an Apply appends at max+1, a Replace renumbers,
   a checkout) can give a remembered number to another row. A remembered added member yields: its number
   is trusted only where the current document has no row there, or that same row. A sentinel cannot tell,
-  because `__prefab_edit_local__<n>` names row n of whichever document its entity came from. An undo from
-  the kept history can bring back an opened row whose number such a write refilled, and the save then
-  REFUSES the duplicate rather than guess. That is U27's kept history outliving its document.
+  because `__prefab_edit_local__<n>` names row n of whichever document its entity came from. That was
+  reachable only through the kept undo history, which brought back an opened row whose number such a
+  write refilled (#1704, R2): the save refused the duplicate, and once the user deleted the other row to
+  get unstuck, it wrote the undone row with that row's `nodeGuid`. Leaving prefab edit now drops the
+  history (U27), which removes the case; the save still REFUSES a duplicate rather than guess.
 - **`savePrefabEdit` REFUSES to save — rather than falling back to renumbering — when the opened
   file is no longer in the editor's prefab cache** (`getCachedPrefabSync` returns null). That
   cache is where the previous numbering and name come from; silently renumbering instead would

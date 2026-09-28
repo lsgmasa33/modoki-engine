@@ -2,7 +2,8 @@
  *  scene load. Unsaved world edits the save cannot write (an untitled scene) are discarded by the
  *  swap and take their undo entries with them. The prefab world starts at a clean baseline, since
  *  it IS the prefab file. Before the baseline, the untitled scene's dirty flag rode into the prefab
- *  world, and leaving it later dropped a stack that was still valid.
+ *  world, which then read as unsaved. (Leaving it also dropped the prefab world's stack; since #1704
+ *  leaving prefab edit drops that stack anyway, `sceneAdoption.test.ts`.)
  *
  *  Drives the REAL `openPrefabForEditing` and the real undoManager. Only the SceneManager load is
  *  stubbed, the same way `prefabEditZIndexRoundTrip.test.ts` does it. */
@@ -84,7 +85,7 @@ describe('openPrefabForEditing and the undo history (#1409 review)', () => {
     expect(canUndo()).toBe(false);
   });
 
-  it('the prefab world starts CLEAN, so a clean exit keeps its own history', async () => {
+  it('the prefab world starts CLEAN: an untitled scene`s dirty flag does not ride into it', async () => {
     edit('Move');
     await openPrefabForEditing(OPEN);
     expect(hasUnsavedChanges()).toBe(false);

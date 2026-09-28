@@ -30,7 +30,8 @@ import { notifyListeners } from '../../runtime/core/notifyListeners';
 import { createTeardownToken, createSupersessionToken, type LivenessCheck } from '../../runtime/core/liveness';
 import { getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import { sceneManager } from '../../runtime/scene/SceneManager';
-import { swapHistory } from '../undo/undoManager';
+import { swapHistory, activeHistoryKey } from '../undo/undoManager';
+import { PREFAB_EDIT_SCENE_PREFIX } from '../../runtime/core/ecs/sceneLoaded';
 import { useEditorStore } from '../store/editorStore';
 import { editorEmit } from '../editorJournal';
 import { clearSceneDirtyExcept, dirtySceneGuidsSnapshot, hasDirtySceneOutside } from './sceneDirty';
@@ -241,11 +242,17 @@ function adopt(record: AdoptionRecord, dirt: TaggedDirt): boolean {
     // or a dirty base the swap did not keep. A kept base's edits survive live. ⚠️ The edit version is one global
     // counter that a base edit bumps too, so a kept base edit usually still drops the stack — the lesser loss next to
     // a stack replaying discarded primary work. Only a kept base keeps its dirty flag (#1417).
+    // ⚠️ A prefab-edit world's stack drops too, clean or not (U27, owner 2026-09-28, #1704): leaving prefab edit ends
+    // its history, as leaving Prefab Mode does in Unity. Parked, it replayed onto whatever the prefab had become by the
+    // re-open: an Apply between two visits refilled a number an undone delete then brought back. Read off the stack's
+    // KEY, not the edit flag: Exit with no return scene clears the flag and leaves the edit world and its stack live.
+    // A same-key swap (re-opening the prefab from inside its own edit world) drops it as well.
     const { key, keptBaseGuids, freshIncoming } = record.history;
     const before = dirt.baselineSeq === baselineSeq ? dirt : null;
     const discarded = s.worldEdited() || hasDirtySceneOutside(keptBaseGuids)
       || (before !== null && (before.edited || [...before.scenes].some((g) => !keptBaseGuids.has(g))));
-    swapHistory(key, { discardOutgoing: discarded, ...(freshIncoming ? { freshIncoming: true } : {}) });
+    const leavingPrefabEdit = activeHistoryKey().startsWith(PREFAB_EDIT_SCENE_PREFIX);
+    swapHistory(key, { discardOutgoing: discarded || leavingPrefabEdit, ...(freshIncoming ? { freshIncoming: true } : {}) });
     s.markSaved();
     clearSceneDirtyExcept(keptBaseGuids);
     baselineSeq += 1;

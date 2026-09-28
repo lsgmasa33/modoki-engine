@@ -845,6 +845,9 @@ export function swapHistory(
   notifyUndoChanged();
 }
 
+/** The key the live stacks belong to: the last {@link swapHistory}'s. */
+export function activeHistoryKey(): string { return _activeKey; }
+
 /** Park only the entries that outlive a discarded world: `_isFileDirect` ones (material, clip,
  *  particle, skin, timeline… edits), whose target is a file the swap does not touch. Dropping them
  *  with the world's entries would strand an asset edit with no undo (#1409 review). Relative order

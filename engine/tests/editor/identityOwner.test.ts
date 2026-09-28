@@ -408,7 +408,10 @@ describe('#1662: a prefab-edit save keeps the row and the nodeGuid of a member A
     row(1, 'R', 0, 'eeeeeeee-0000-4000-8000-000000169111'), row(2, 'A', 1, 'eeeeeeee-0000-4000-8000-000000169112'),
     row(3, 'B', 1, 'eeeeeeee-0000-4000-8000-000000169113'),
   ] });
-  /** Leave and re-open P: a NEW edit world built from the last save, with the undo history kept (U27, `swapHistory`). */
+  /** Leave and re-open P: a NEW edit world built from the last save, with the undo history KEPT. The real re-open no
+   *  longer keeps it (U27, #1704: the adoption owner drops a prefab-edit stack on leave, `sceneAdoption.test.ts`), and
+   *  this helper bypasses that owner, so the cases using it pin the record's OWN defence against a history that outlives
+   *  its world, should one ever do so again (Stop's rebuild inside one visit is the live case). */
   const reopen = async () => {
     const saved = JSON.parse(JSON.stringify(prefabs.get(P))) as PrefabFile;
     setPrefabCache(P, saved);
@@ -445,7 +448,7 @@ describe('#1662: a prefab-edit save keeps the row and the nodeGuid of a member A
     expect(y.split(':')[0]).toBe('4');
     root = await reopen();
     void root;
-    await undo(); // Add Y — recorded against Y's old guid, which the re-open replaced with a sentinel: a no-op (U27)
+    await undo(); // Add Y — recorded against Y's old guid, which the re-open replaced with a sentinel: a no-op
     await undo(); // delete B, from visit 1
     expect((await savePrefabEditReport()).saved).toBe(true);
     expect(uniqueIds()).toBe(true);
@@ -516,7 +519,7 @@ describe('#1662: a prefab-edit save keeps the row and the nodeGuid of a member A
     cur.entities.push(row(3, 'Z', 1, NZ) as never);
     prefabs.set(P, cur);
     await reopen();
-    await undo(); // the delete of X, from the kept history
+    await undo(); // the delete of X, from a history the helper kept (the real re-open drops it, #1704)
     deleteEntitiesWithUndo([one('Z')]);
     expect((await savePrefabEditReport()).saved).toBe(true);
     expect(rowsOf().X).not.toBe(`3:${NZ}`);

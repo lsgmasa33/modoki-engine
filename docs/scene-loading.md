@@ -2021,10 +2021,10 @@ Each invariant names the one function that owns it.
     run twice. A repair clears the debts it ran only if the world did not change under it, and a
     repair that throws is reported and stays owed.
 - **S8. The adopt decides discarded work against the OUTGOING world.** The dirt is read on both
-  sides of the swap's await. The undo stack drops iff work was discarded, and only a kept base
-  keeps its dirty flag. **Owner:** the owner's `history` write, one rule for every route (#1409,
+  sides of the swap's await. The undo stack drops iff work was discarded or the outgoing stack is a
+  prefab-edit world's (U27, #1704: § Per-scene undo history), and only a kept base keeps its dirty flag. **Owner:** the owner's `history` write, one rule for every route (#1409,
   #1417). The pre-swap read counts only while the baseline it was read against is still the current
-  one — the same number of adopts AND the same saved edit version: a newer route's read that
+  one — no adopt since (`baselineSeq`, bumped by each adopt's history write; a save does not bump it): a newer route's read that
   predates an older route's adopt describes a world that adopt already settled, and used anyway it
   dropped the older scene's CLEAN parked stack (#1689 review). ⚠️ A SAVE between the read and the
   adopt does NOT make the read stale, deliberately: dirt cleared mid-load still counts as discarded
@@ -2357,12 +2357,21 @@ Where it applies:
   load (a scene open, a Play restore) cannot be overtaken BY a hot reload, because the reload defers
   while the token is held (#1164). Prefab-edit entry and the prefab-undo restore take no token, so
   a hot reload can overtake them; the world check covers those too.
+- **Leaving prefab edit always drops its stack** (U27, owner 2026-09-28, #1704), clean or not.
+  Unlike a scene, the edit world is rebuilt from a prefab document that other routes write (an Apply
+  from a scene instance, a Replace, a checkout), so a parked stack replayed onto whatever the prefab
+  had become. The adopt reads the OUTGOING stack's key (`activeHistoryKey()` under
+  `PREFAB_EDIT_SCENE_PREFIX`), not the edit flag: Exit with no return scene clears the flag and leaves
+  the edit world and its stack live, and the next switch must still drop it. A same-key swap
+  (re-opening the prefab from inside its own edit world) drops it too. Unity drops a prefab's undo
+  history on leaving Prefab Mode.
 - **Asset-document edits survive the drop.** `_isFileDirect` entries (material, clip, particle,
   skin, timeline…) target a file the swap does not touch, so `parkSurvivors` keeps them, in order.
 - **`newScene` starts its key empty** (`freshIncoming`), apart from those asset entries, because a
   starter world matches no stack and every untitled scene shares the `''` key. Prefab-edit entry
-  also sets a clean baseline: before, an untitled scene's dirty flag rode into the prefab world, and
-  leaving it then dropped a valid stack.
+  also sets a clean baseline: before, an untitled scene's dirty flag rode into the prefab world, which
+  then read as unsaved. (It also dropped the prefab world's stack on leave, which since #1704 happens
+  anyway.)
 
 "Dirty" over-reports, deliberately: undo and redo bump the edit version, so a scene undone back to
 its saved state still reads dirty and its history is dropped rather than parked. That loses

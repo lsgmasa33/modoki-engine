@@ -21,7 +21,10 @@
  *    load landing before the call ends; `adopted` reads the outcome instead → the request that installs nothing.
  *  - `loadScene`'s `finally` drops its `settleLeaveDebts()` → the deferred repair's endings; `settleLeaveDebts` runs
  *    while a scene load is still in flight → the newer load still WAITING (its repair is cut in half, and runs twice);
- *    while another route is pending → the newer load that lands, the same way. */
+ *    while another route is pending → the newer load that lands, the same way.
+ *  - `adopt` parks a prefab-edit stack again (drop `leavingPrefabEdit`) → every #1704 case (the accept side through its
+ *    depth: the whole earlier visit comes back); read off the edit flag (`lastAdopted.edit !== null`) instead of the
+ *    stack's key → the Exit-in-place case; `parkSurvivors` keeps no `_isFileDirect` entry → the accept side only. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
@@ -160,7 +163,7 @@ import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManag
 import { enterPlay, stopPlay, type PlayOutcome } from '../../packages/modoki/src/editor/scene/playMode';
 import { getPlayState } from '../../packages/modoki/src/runtime/core/playState';
 import { worldHasUnsavedEdits } from '../../packages/modoki/src/editor/scene/serialize';
-import { pushAction, canUndo, undoLabel, swapHistory, undo, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
+import { pushAction, canUndo, undoLabel, undoDepth, swapHistory, undo, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 
 registerAllTraits();
 vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {}, clear: () => {} });
@@ -833,5 +836,65 @@ describe('#1703: Play is refused while a leave repair runs, whichever route runs
     await exitPrefabEditing();
     expect(adoptionsSettled()).toBeNull();
     expect((await enterPlay()).kind).toBe('started');
+  });
+});
+
+describe('#1704: leaving prefab edit drops that prefab`s undo history (U27, owner 2026-09-28)', () => {
+  const fileEdit = (label: string) => ({ ...action(label), _isFileDirect: true });
+  /** An edit recorded in `E1`'s edit world, then saved: a CLEAN leave, which used to park the stack. */
+  const editAndSave = () => { pushAction(action('Delete A')); markSceneSaved(); };
+  const reopenE1 = async () => {
+    await openPrefabForEditing({ path: E1.path, name: E1.name });
+    expect(editing(), 'premise: back in E1`s edit world').toBe(E1.path);
+  };
+
+  for (const [how, leave] of [
+    ['Exit', async () => { expect(await exitPrefabEditing()).toBe(SCENE); }],
+    ['a scene load', async () => { expect(await loadScene(OTHER)).toBe('loaded'); }],
+    ['opening another prefab', async () => { await openPrefabForEditing({ path: E2.path, name: E2.name }); expect(editing()).toBe(E2.path); }],
+  ] as const) {
+    it(`left by ${how}: the re-open has no entry from the earlier visit`, async () => {
+      // #1704 R2: the kept "Delete A" undone after an outside write brought A back at a number another row now held.
+      await editingPrefab(E1);
+      editAndSave();
+      await leave();
+      expect(isPrefabEditWorld() && editing() === E1.path, 'premise: E1 was left').toBe(false);
+      await reopenE1();
+      expect(canUndo(), `the earlier visit's "${undoLabel()}" replays onto a document that may have changed`).toBe(false);
+    });
+  }
+
+  it('re-opening the prefab from INSIDE its own edit world drops it too (a same-key swap)', async () => {
+    await editingPrefab(E1);
+    editAndSave();
+    await reopenE1();
+    expect(canUndo(), `got "${undoLabel()}"`).toBe(false);
+  });
+
+  it('Exit in place (no return scene) keeps the stack live, and the NEXT switch drops it: read off the key, not the flag', async () => {
+    await openPrefabForEditing({ path: E1.path, name: E1.name });
+    expect(useEditorStore.getState().prefabReturnScenePath ?? null, 'premise: Exit has no scene to load').toBeNull();
+    editAndSave();
+    expect(await exitPrefabEditing()).toBeNull();
+    expect(editing(), 'premise: the flag is cleared').toBeNull();
+    expect(isPrefabEditWorld(), 'premise: the edit world is still on screen').toBe(true);
+    expect(undoLabel(), 'nothing swapped yet: the live world still matches its stack').toBe('Delete A');
+    expect(await loadScene(SCENE)).toBe('loaded');
+    await reopenE1();
+    expect(canUndo(), `got "${undoLabel()}"`).toBe(false);
+  });
+
+  it('ACCEPT SIDE: a scene`s clean stack still parks across a prefab-edit round trip, and an asset-file entry survives', async () => {
+    await loadScene(SCENE);
+    pushAction(action('Move in SCENE'));
+    markSceneSaved();
+    await openPrefabForEditing({ path: E1.path, name: E1.name });
+    pushAction(fileEdit('Material tint')); // an `_isFileDirect` entry: its file is not the prefab, and outlives the swap
+    editAndSave();
+    expect(await exitPrefabEditing()).toBe(SCENE);
+    expect(undoLabel(), 'the scene the edit was entered from keeps its history').toBe('Move in SCENE');
+    await reopenE1();
+    expect(undoDepth()).toBe(1);
+    expect(undoLabel()).toBe('Material tint');
   });
 });

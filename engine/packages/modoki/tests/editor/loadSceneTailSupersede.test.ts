@@ -53,6 +53,7 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
 // reference under Vite/esbuild's ESM interop).
 vi.mock('../../src/editor/undo/undoManager', () => ({
   swapHistory: (path: string) => { h.swapHistoryCalls.push(path); },
+  activeHistoryKey: () => '', // the adopt's prefab-edit drop reads the outgoing key (#1704): no edit world here
   getEditVersion: () => 0,
   beginWorldSwitch: () => ({ idle: null, release: () => {} }),
   worldSwitchesSettled: () => null,

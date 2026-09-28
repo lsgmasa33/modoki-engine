@@ -502,9 +502,9 @@ async function openPrefabForEditingSwitching(
     // Adopted only while this edit world is still the one on screen: a switch that replaced it during the swap's tail
     // adopts its own world, and entering this session over it would name a prefab that is not loaded. The path is
     // null so a scene save cannot target a real file; the edit world never carries a base; its undo stack is its OWN,
-    // keyed by the synthetic path (the scene's is parked and restored when Exit reloads it through `loadScene`); and
-    // the world IS its file — a clean baseline, like a load (#1409 review): without it a dirty flag from an untitled
-    // scene rode into the prefab world, and leaving it then dropped a valid stack. The flag goes up before the owed
+    // keyed by the synthetic path and dropped when the world is left (U27, #1704; the scene's is parked and restored
+    // when Exit reloads it through `loadScene`); and the world IS its file — a clean baseline, like a load (#1409
+    // review): without it a dirty flag from an untitled scene rode into the prefab world, which then read as unsaved. The flag goes up before the owed
     // repair runs, since the refresh skips the prefab it names — re-opening the same prefab refreshes nothing, it was
     // just fetched above.
     if (!adoption.offer({
@@ -598,16 +598,15 @@ export function collectPreservedLocalIds(
  *    is never handed to another member while the deleted one can still come back (Unity never reuses a fileID either).
  *    Without it an undone delete met its own number on a newcomer: two rows at one localId.
  *  ⚠️ Keyed by the PREFAB, not the edit world, because what an undo can bring back outlives the world: Stop rebuilds it
- *  from a snapshot, and leaving + re-opening keeps the prefab's undo history (`swapHistory`, U27 in `docs/prefabs.md`),
- *  so an entity from an earlier world can be respawned into a later one. Per world, each rebuild forgot every number
- *  and identity (close-out review 2). It lives as long as the editor process, which is at least as long as any undo
- *  history that could need it; what it costs past that is gaps in the numbering.
+ *  from a snapshot, so an entity from an earlier world can be respawned into a later one. Per world, each rebuild forgot
+ *  every number and identity (close-out review 2). It lives as long as the editor process. Leaving prefab edit drops the
+ *  prefab's undo history (U27 in `docs/prefabs.md`, #1704), so what it keeps across visits costs only gaps in the
+ *  numbering.
  *  ⚠️ A write made OUTSIDE prefab edit between two visits (an Apply appends at max+1, a Replace renumbers, a checkout)
  *  can give a number this record remembers to another row. A remembered ADDED member then yields to the document
  *  (`collectPreservedLocalIds`' `current`). A SENTINEL cannot: `__prefab_edit_local__<n>` names row n of whichever
- *  document the entity came from, so an undo from the kept history can bring back an opened row whose number an
- *  outside write refilled, and the save then refuses the duplicate. That is U27's kept history outliving the document
- *  it was recorded against (Unity drops it on leaving Prefab Mode): the owner's ruling, not this record's. */
+ *  document the entity came from. Only an undo from an earlier visit could bring such a row back, and that history is
+ *  dropped on leave (#1704); the save still refuses a duplicate rather than guess. */
 interface SessionRows { rows: Map<string, { localId: number; nodeGuid: string }>; floor: number }
 const sessionRowsByPrefab = new Map<string, SessionRows>();
 /** The prefab each world has merged its opened rows into the record of. */
