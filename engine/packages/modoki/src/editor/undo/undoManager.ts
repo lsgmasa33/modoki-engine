@@ -6,6 +6,7 @@ import { reportUndoThrew, UndoRefusedError } from './undoFailure';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 import { canEdit, getRunMode } from '../../runtime/core/playState';
 import { createTeardownToken } from '../../runtime/core/liveness';
+import { normScenePath } from '../../runtime/scene/scenePathKey';
 
 /** Structured diff for a trait-field edit — the machine-readable companion to an
  *  action's human `label`, forwarded into the editor journal's `!edit` event so
@@ -814,7 +815,10 @@ export function truncateUndoTo(depth: number) {
 // Each logical scene (incl. the synthetic prefab-edit world) keeps its OWN undo
 // history. Navigating to a scene swaps in its stacks instead of dropping undo;
 // returning restores them. Play→Stop does NOT swap (same scene), so its history
-// is preserved + barrier-truncated. Keyed by scene path.
+// is preserved + barrier-truncated. Keyed by the scene's `normScenePath` key, not its raw path (#1786): the
+// scene-file debt that retires a stack is keyed that way, and a raw key parked `Empty.scene.json`'s stack beside
+// `empty.scene.json`'s — the same file on Windows/macOS — where the debt paid by one never reached the other.
+// Every entry point below takes the key through it, so a caller hands any path form.
 
 let _activeKey = '';
 /** Invalidated each time the live stacks are refilled or emptied for another world — every effective
@@ -841,6 +845,7 @@ export function swapHistory(
   key: string,
   { discardOutgoing = false, freshIncoming = false }: { discardOutgoing?: boolean; freshIncoming?: boolean } = {},
 ) {
+  key = normScenePath(key);
   if (key === _activeKey && !discardOutgoing && !freshIncoming) return;
   _historyLiveness.invalidateAll();
   _coalesce = null; // a context switch ends any in-flight edit chain
@@ -872,6 +877,7 @@ export function activeHistoryKey(): string { return _activeKey; }
  *  file (which adopts under `key`) swapped them out for `key`'s empty stack: Cmd+Z emptied by an outside write,
  *  where a loaded scene keeps its stack through the same reload. Only from '' — no other context is untitled. */
 export function rekeyUntitledHistory(key: string): void {
+  key = normScenePath(key);
   if (_activeKey !== '' || key === '') return;
   _histories.delete(key);
   _histories.delete('');
@@ -893,6 +899,7 @@ function parkSurvivors(key: string, undo: readonly UndoAction[], redo: readonly 
  *  replaced wholesale (an agent Save As over it, #1414): its old entries name guids the new
  *  content does not have. No-op for the active key — that history is the live one. */
 export function forgetHistory(key: string): void {
+  key = normScenePath(key);
   if (key !== _activeKey) _histories.delete(key);
 }
 

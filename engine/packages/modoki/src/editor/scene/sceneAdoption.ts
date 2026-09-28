@@ -235,7 +235,7 @@ export function adoptedWorld(): World | null { return lastAdopted.world; }
 
 /** A scene FILE changed on disk (#1744, #1750 S7): the undo stack recorded against it — open, or parked because the
  *  scene is not — is stale, so the next adopt that swaps history under this file's key drops it (owner fork 4: a
- *  parked clean stack too). Keyed by {@link normScenePath}, so any path form reaches it. */
+ *  parked clean stack too). Keyed by {@link normScenePath}, so every spelling it folds reaches it. */
 export function recordSceneFileChanged(path: string): void {
   const key = normScenePath(path);
   sceneFileDebts.set(key, [...(sceneFileDebts.get(key) ?? []), ++sceneChangeSeq]);

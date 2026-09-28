@@ -2175,8 +2175,22 @@ Two measured facts make a wrong answer expensive:
   raised (a route already loading read older bytes; the newer change stays owed to its own reload). A lost offer
   pays nothing. Leaving the scene pays nothing either: its stack parks, and the swap back drops it. Keys are
   `normScenePath` (`runtime/scene/scenePathKey.ts`), which normalises separators first, so a Windows `C:\…` path,
-  either drive-letter case under `/@fs/` and the `/assets/…` broadcast are one key. Was stranded by a scene open
-  that aborted or out-adopted the reload, and cleared by a reload whose offer lost.
+  either drive-letter case under `/@fs/` and the `/assets/…` broadcast are one key. The parked undo stacks are keyed
+  the same way (`undoManager.ts` takes every history key through it), so the stack a debt retires is the one that
+  debt names. Was stranded by a scene open that aborted or out-adopted the reload, and cleared by a reload whose
+  offer lost.
+  **The key case-folds its `/assets/…` suffix (#1786).** Observed on Windows (`games/3d-test`): both watchers
+  report the file by its ON-DISK name (`/assets/scenes/empty.scene.json`, through `absToAssetUrl`), and the Assets
+  panel and boot open the manifest spelling — those met with the case kept. But the filesystem resolves any case, so
+  `modoki_load_scene('/assets/scenes/Empty.scene.json')` opens the same file and keeps `Empty…` as the open path;
+  with a case-kept key the disk edit then matched no loaded scene, the reload was skipped silently, and the debt
+  went under the other spelling. A space arrives literal on both sides (`2D Animation.scene.json`), not `%20`. The
+  trade-off: on a case-SENSITIVE filesystem, which the editor does not ship on, two scenes whose names differ only
+  in case share a key, so a change to one reloads the other (the owner's #905 ruling accepted the same over-match
+  for `pathIdentity.mjs`'s fold). Tests: the two #1786 cases in `agentBridgeReloadHoldsWorld.test.ts`, with the observed strings.
+  The same review folded two more spellings the server resolves (an upper-case `Assets` folder, a percent-encoded
+  name — not observed live), left dot segments alone, and exempts the synthetic prefab-edit key, which can embed a
+  prefab's PATH; the docblock on `normScenePath` is the list.
 
 #### The #1750 members, classified
 
@@ -2450,7 +2464,8 @@ run starts from a clean slate.
 `sceneManager.loadScene`, then tracks the scene path and swaps to **this
 scene's own** per-scene undo history (`swapHistory(scenePath)` — empty on first
 visit, restored when you return to a previously-open scene), rather than
-dropping undo globally.
+dropping undo globally. The stacks are keyed by `normScenePath(scenePath)`, not the raw path, so every
+spelling of one file shares one stack (#1786, § Load supersession S7).
 **A parked stack is valid only if the scene was CLEAN when it was left** (#1409). The scene
 reloads from disk, so a stack recorded against unsaved edits describes a world that no longer
 exists. When the swap DISCARDED world work, the outgoing stack is **dropped** instead of parked.

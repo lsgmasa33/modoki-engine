@@ -244,6 +244,15 @@ describe('forgetHistory', () => {
     expect(undoDepth()).toBe(0);
   });
 
+  it('forgets the stack parked under another spelling of the same file (#1786: the history is keyed by normScenePath)', () => {
+    swapHistory('/assets/scenes/level.scene.json'); // the watcher / a lower-case open
+    pushAction({ label: 'edit on level', undo: () => {}, redo: () => {} });
+    swapHistory('/b.scene.json');
+    forgetHistory('/@fs/E:/proj/runtime/assets/scenes/Level.scene.json'); // the on-disk spelling, absolute form
+    swapHistory('/assets/scenes/Level.scene.json');
+    expect(undoDepth()).toBe(0);
+  });
+
   it('keeps the stack when not asked to (the control)', () => {
     swapHistory('/c.scene.json');
     pushAction({ label: 'edit on c', undo: () => {}, redo: () => {} });

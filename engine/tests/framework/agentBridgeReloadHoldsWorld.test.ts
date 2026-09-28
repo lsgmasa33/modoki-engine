@@ -23,6 +23,8 @@
  *  - the handler raises the debt only for a scene in the loaded chain (move the `sceneFileChanged(msg.urlPath)` below
  *    `matchedAny`) → the scene-left case.
  *  - `normScenePath` stops normalising separators → the Windows-form key case.
+ *  - `normScenePath` stops folding case → both #1786 cases; the undo manager keys its stacks by the raw path
+ *    (drop `normScenePath` from `swapHistory`) → the #1786 parked-stack case only.
  *  - drop the `onAdoptionsSettled` replay registration, or `notifySettled`'s listener call → the switch-tail replay case.
  *  - `refuseEditOfPosedWorld` ignores `notAuthoredExit` → the agent-edit case. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -285,8 +287,37 @@ describe('the debt KEY is one per scene file, whatever form its path arrives in 
     markSceneSaved();
     await adoptTo(OTHER);
     recordSceneFileChanged('C:\\proj\\runtime\\assets\\Win.scene.json');
-    await adoptTo(fsForm); // the parked stack is found by its exact key; the debt by the scene's
+    await adoptTo(fsForm);
     expect(owedSceneFileChanges()).toEqual([]);
     expect(canUndo()).toBe(false);
+  });
+
+  // #1786 — the RAW strings observed on Windows (games/3d-test, launch-editor.sh, 2026-09-29). Both sides arrive in the
+  // manifest's `/assets/…` form; they diverge only when the scene was OPENED under a spelling whose case differs from
+  // the file's, which Windows (and macOS) resolve anyway. The watcher always reports the on-disk name.
+  const OPENED_AS = '/assets/scenes/Empty.scene.json';
+  const WATCHER_SAYS = '/assets/scenes/empty.scene.json';
+
+  it('a scene opened under another case of its name reloads when the watcher reports its on-disk name (#1786)', async () => {
+    expect(normScenePath(OPENED_AS)).toBe(normScenePath(WATCHER_SAYS));
+    await adoptTo(OPENED_AS);
+    changed(WATCHER_SAYS);
+    await settle();
+    expect(loadScene, 'the disk edit matched no loaded scene — skipped silently').toHaveBeenCalledTimes(1);
+  });
+
+  it('the stack parked under one case of the name is the one the debt raised under the other retires (#1786)', async () => {
+    await adoptTo(OPENED_AS);
+    edit('Delete Entity');
+    markSceneSaved();
+    await adoptTo(OTHER); // parks OPENED_AS's clean stack
+    changed(WATCHER_SAYS); // not open: the change becomes the scene's debt
+    await settle();
+    await adoptTo(WATCHER_SAYS); // pays it
+    expect(owedSceneFileChanges()).toEqual([]);
+    expect(canUndo()).toBe(false);
+    await adoptTo(OTHER);
+    await adoptTo(OPENED_AS); // a stack parked under the raw spelling survived the payment and came back here
+    expect(canUndo(), 'the stack recorded over the old bytes came back under the other spelling').toBe(false);
   });
 });

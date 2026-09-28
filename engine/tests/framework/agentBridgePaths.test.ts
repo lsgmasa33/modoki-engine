@@ -23,12 +23,26 @@ describe('normScenePath', () => {
     const current = '/@fs/Users/me/Projects/modoki/games/space-console/runtime/assets/scenes/Warp.json';
     const broadcast = '/assets/scenes/Warp.json';
     expect(normScenePath(current)).toBe(normScenePath(broadcast));
-    expect(normScenePath(current)).toBe('/assets/scenes/Warp.json');
+    expect(normScenePath(current), 'a key, case-folded (#1786)').toBe('/assets/scenes/warp.json');
   });
 
   it('strips a ?url / query suffix and reduces to the /assets suffix', () => {
     expect(normScenePath('/games/x/assets/scenes/a.json?url')).toBe('/assets/scenes/a.json');
     expect(normScenePath('/games/x/assets/scenes/a.json?t=123')).toBe('/assets/scenes/a.json');
+  });
+
+  // #1786 review siblings — synthetic spellings the server resolves (not observed live, unlike the case fold's strings
+  // in agentBridgeReloadHoldsWorld.test.ts): an upper-case asset folder, a percent-encoded name, a malformed escape.
+  it('finds the /assets/ segment in any case, and decodes a percent-encoded name', () => {
+    const want = '/assets/scenes/2d animation.scene.json';
+    expect(normScenePath('/@fs/E:/Proj/Runtime/Assets/scenes/2D Animation.scene.json')).toBe(want);
+    expect(normScenePath('/assets/scenes/2D%20Animation.scene.json')).toBe(want);
+    expect(normScenePath('/assets/scenes/bad%E0.scene.json'), 'a malformed escape keeps its spelling').toBe('/assets/scenes/bad%e0.scene.json');
+  });
+
+  it('returns a prefab-edit key whole, even one built from a prefab PATH (it keeps the prefix adopt reads, U27)', () => {
+    const byPath = '/__prefab-edit__//assets/prefabs/X.prefab.json';
+    expect(normScenePath(byPath)).toBe(byPath);
   });
 
   it('is idempotent on the canonical /assets suffix', () => {

@@ -18,7 +18,7 @@
  *  the world after `serializeScene` instead of before — only the SERIALIZES case goes red (close-out review: the reload adopted under
  *  the file's key while the stacks were still under the untitled '', and Cmd+Z came back empty). */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { sceneManager, setRunMode, registerAsset, unregisterAsset, getTraitByName, getCurrentWorld } from '@modoki/engine/runtime';
+import { sceneManager, setRunMode, registerAsset, unregisterAsset, getTraitByName, getCurrentWorld, normScenePath } from '@modoki/engine/runtime';
 import { newScene, saveScene, getCurrentScenePath, setCurrentScenePath, adoptWorldReloadedFromDisk, pushAction, canUndo, undoLabel, hasUnsavedChanges } from '@modoki/engine/editor';
 import { _resetHistoryContexts, activeHistoryKey } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -150,7 +150,7 @@ describe('#1712: a newScene() world saved to a file is bound to that file', () =
     instantiate();
     pushAction({ label: 'Move Box', undo: () => {}, redo: () => {} });
     await saveScene({ path: SCENE_PATH, allowDialog: false });
-    expect(activeHistoryKey(), 'the untitled world\'s stacks moved to its file').toBe(SCENE_PATH);
+    expect(activeHistoryKey(), 'the untitled world\'s stacks moved to its file').toBe(normScenePath(SCENE_PATH));
     emit(PREFAB_PATH, 'prefab');
     await settle();
     expect(loadScene).toHaveBeenCalledTimes(1);
@@ -165,7 +165,7 @@ describe('#1712: a newScene() world saved to a file is bound to that file', () =
     pushAction({ label: 'Move Box', undo: () => {}, redo: () => {} });
     const r = await saveScene();
     expect(r).toMatchObject({ saved: true, path: SCENE_PATH });
-    expect(activeHistoryKey()).toBe(SCENE_PATH);
+    expect(activeHistoryKey()).toBe(normScenePath(SCENE_PATH));
     emit(PREFAB_PATH, 'prefab');
     await settle();
     expect(loadScene).toHaveBeenCalledTimes(1);
