@@ -37,7 +37,7 @@ import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/app
 import { buildPrefabEditScene, applyEditWorldMoves } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { recoverTemplateKey as recoverTemplateKeyFrom, type KeyRecoveryNode } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
-import { undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo, worldBoundOperationsHeld } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { legacyView, legacySceneView } from './memberRowView';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -1677,6 +1677,8 @@ describe('applying a move inside the instance re-parents the row and every ref f
   const refPaths = () => targetsOf(idAt('Holder')).map((g) => treePaths().get(g));
   const repairs: { prefab: string; before: PrefabFile }[] = [];
   let repairReply: { status: number; body: Record<string, unknown> } = { status: 200, body: { ok: true, rewritten: [], held: [] } };
+  /** How many world-bound operations were held while each repair ran (#1751, #1750's rule). */
+  const heldDuringRepair: number[] = [];
   /** Save, then reload with `doc` as the prefab on disk — what the next session sees. */
   const reloadWith = async (source: string, doc: PrefabFile): Promise<void> => {
     const saved = await serializeScene() as unknown as SceneData;
@@ -1687,11 +1689,13 @@ describe('applying a move inside the instance re-parents the row and every ref f
 
   beforeEach(() => {
     repairs.length = 0;
+    heldDuringRepair.length = 0;
     repairReply = { status: 200, body: { ok: true, rewritten: [], held: [] } };
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith('/api/prefab-member-paths')) {
         repairs.push(JSON.parse(String(init?.body)));
+        heldDuringRepair.push(worldBoundOperationsHeld());
         const reply = repairReply;
         return { ok: reply.status < 400, status: reply.status, json: async () => reply.body } as unknown as Response;
       }
@@ -1873,7 +1877,7 @@ describe('applying a move inside the instance re-parents the row and every ref f
       reparentEntity(idAt('Holder/OuterRoot/Panel/Button'), idAt('Holder/OuterRoot'));
       repairReply = { status: 200, body: { ok: true, rewritten: ['/s.scene.json'], held: ['/p.prefab.json'] } };
       const result = await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set(['~moved.3']));
-      expect(result.fileRepair).toEqual({ rewritten: ['/s.scene.json'], held: ['/p.prefab.json'] });
+      expect(result.fileRepair).toEqual({ rewritten: ['/s.scene.json'], held: ['/p.prefab.json'], changed: [] }); // no `written` bytes in the result
       expect(warn.mock.calls.some((c) => String(c[0]).includes('NOT repaired in /p.prefab.json'))).toBe(true);
       setPrefabCache(OUTER, outerDoc as never); // the apply above left its written prefab there
       await load(twoInstances([]));
@@ -1882,6 +1886,18 @@ describe('applying a move inside the instance re-parents the row and every ref f
       vi.spyOn(console, 'error').mockImplementation(() => {});
       expect((await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set(['~moved.3']))).fileRepair).toBeNull();
     } finally { vi.restoreAllMocks(); }
+  });
+
+  // #1751 (c), #1750's rule: the repair runs INSIDE the Apply's commit step, where world switches are held off, so the
+  // step is whole by itself. Driven UNHELD (`applyToPrefabSelective` alone): `applyToPrefabWithUndo` holds the whole
+  // Apply, which would hide where the call sits. Mutation: move Apply's `repairMemberPathsEverywhere` call back after
+  // `commitPrefabWrites` — the count is 0.
+  it('the file repair runs inside the commit step', async () => {
+    await loadedTwo();
+    reparentEntity(idAt('Holder/OuterRoot/Panel/Button'), idAt('Holder/OuterRoot'));
+    await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set(['~moved.3']));
+    expect(heldDuringRepair).toHaveLength(1);
+    expect(heldDuringRepair[0]).toBeGreaterThan(0);
   });
 
   // F4 (P3-a review): undo repairs the files back to the prefab it restores, and redo forward again — each
@@ -1905,6 +1921,10 @@ describe('applying a move inside the instance re-parents the row and every ref f
     expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: { rewritten: [], held: ['/p.prefab.json'] } }))
       .toContain('/p.prefab.json were not repaired');
     expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: null })).toContain('could NOT be repaired');
+    // #1784: a file the route left because it changed while the repair ran. Mutation: drop the `changed` line in
+    // applyOutcomeNotice — the notice is null.
+    expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: { rewritten: [], held: [], changed: ['/h.prefab.json'] } }))
+      .toContain('references in /h.prefab.json were not repaired: the file changed on disk');
   });
 
   // #1468 close-out review F4: a REFUSAL is not a partial outcome. `skipped` means "everything else

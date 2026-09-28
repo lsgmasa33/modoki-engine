@@ -4932,6 +4932,11 @@ async function describeUnresolvedAgainstLiveWorld(
   // that uses it, transitively, gets its stored member refs re-pointed: see `planMemberPathRepair`.
   // Marked as the editor's own writes, so the open scene is not reloaded under its live edits — the
   // editor repairs its live world itself.
+  // ⚠️ **The mark silences the watcher, and the watcher is ALSO what brings the client's caches up to date**
+  // (#1751). These bytes are the SERVER's, not ones the client sent, so the reply carries each file it wrote —
+  // `written` — and the client seats its caches and its per-file records from it (`adoptServerPrefabRewrites`,
+  // prefabCommit.ts). Without that, both prefab caches kept the old tokens and the next write of such a prefab was
+  // refused as a conflict against its own repair.
   if (urlPath === '/api/prefab-member-paths' && method === 'POST') {
     try {
       const { prefab, before } = (body ?? {}) as { prefab?: unknown; before?: unknown };
@@ -4946,23 +4951,40 @@ async function describeUnresolvedAgainstLiveWorld(
         files.push({ key: a.path, abs, type: a.type, guid: a.guid, text: fs.readFileSync(abs, 'utf-8') });
       }
       const plan = planMemberPathRepair(files, prefab, before, makePrefabResolver(ctx));
-      // A document an asset view holds unsaved would write its own copy back over this repair, so it is
-      // left alone and named. The LIVE scene is not asked about: the editor repairs its live world itself,
-      // and the next save writes that. A renderer that cannot answer is not "nothing held" — nothing is written.
+      // A document an asset view holds unsaved would write its own copy back over this repair, so it is left alone
+      // and named. The LIVE world is not asked about (the open scene, a loaded base, the prefab open in prefab edit):
+      // the editor repairs it itself, so its file is rewritten to agree with it, and the client moves its record of
+      // that file along (#1751). Nor is `pendingBaseScene`: it parks one field, not a document, and its flush
+      // (`/api/scene-mutate`) re-reads the file, so it lands on the repaired bytes (close-out review — asking it left a
+      // scene unrepaired for good). A renderer that cannot answer is not "nothing held" — nothing is written.
       const gate = await unsavedGate(ctx, plan.map((p) => p.key), { registries: ['dirtyAsset'] });
       if (gate.kind === 'unknown') return json({ ok: false, error: `could not ask the editor about unsaved documents: ${gate.reason}`, rewritten: [] }, 503);
       const held = new Set(gate.kind === 'held' ? gate.holds.map((h) => h.path) : []);
-      const byKey = new Map(files.map((f) => [f.key, f.abs]));
+      const byKey = new Map(files.map((f) => [f.key, f]));
       const rewritten: string[] = [];
+      const changed: string[] = [];
+      const written: { path: string; type: 'scene' | 'prefab'; guid?: string; text: string; prior: string }[] = [];
       for (const { key, doc } of plan) {
         if (held.has(key)) continue;
-        const abs = byKey.get(key)!;
+        const f = byKey.get(key)!;
+        // Conditional on the text the plan was computed from (#1784): the gate above awaited the renderer, and a
+        // prefab commit that landed meanwhile would otherwise be overwritten with the older bytes. The re-read and the
+        // write below have no await between them, so nothing on this server can land in between.
+        let now: string | null;
+        try { now = fs.readFileSync(f.abs, 'utf-8'); } catch { now = null; }
+        if (now !== f.text) { changed.push(key); continue; }
         const bytes = assetJsonBytes(doc);
-        ctx.markEditorWrite(abs, crypto.createHash('sha1').update(bytes).digest('hex'));
-        writeJsonAtomic(abs, bytes);
+        ctx.markEditorWrite(f.abs, crypto.createHash('sha1').update(bytes).digest('hex'));
+        writeJsonAtomic(f.abs, bytes);
         rewritten.push(key);
+        written.push({
+          path: key, type: f.type, ...(f.guid ? { guid: f.guid } : {}), text: bytes.toString('utf-8'),
+          // What the file held before: the client moves its own record of the file along only when that record still
+          // said these bytes (or, for a prefab-edit baseline, this document).
+          prior: f.text,
+        });
       }
-      return json({ ok: true, rewritten, held: [...held] });
+      return json({ ok: true, rewritten, held: [...held], ...(changed.length ? { changed } : {}), written });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -5106,11 +5128,14 @@ async function describeUnresolvedAgainstLiveWorld(
       // ⚠️ Suppressing that event also drops the two things `handleSceneChanged` does BESIDE the
       // discard: `ASSET_CACHE_INVALIDATORS[kind](from)` and `fireDirtyListeners()`. Deliberate,
       // and it leaves a residue worth naming rather than pretending away — the cache entry at the
-      // OLD path outlives the file. It self-heals: nothing resolves the old path afterwards (refs
-      // are GUIDs and the manifest is rebuilt), and if a NEW file is later created there its own
-      // `add` invalidates the entry before anything reads it. The destination has had exactly this
-      // property since the fingerprint was first added, so this is not new behaviour, only newly
-      // symmetrical.
+      // OLD path outlives the file. For most caches that is inert: nothing resolves the old path
+      // afterwards (refs are GUIDs and the manifest is rebuilt), and if a NEW file is later created
+      // there its own `add` invalidates the entry before anything reads it (an unmarked create: a
+      // marked one, like this route's own landings, raises no event at all).
+      // ⚠️ **Not for a prefab** (#1751 F6): the runtime prefab cache is keyed by path and read
+      // SYNCHRONOUSLY (a `UIEntries` pool), so once the guid resolves to the new path it read no
+      // entry and went blank. The renderer repair below re-keys both prefab caches
+      // (`applyAssetPathMoves` → `rekeyCachedPrefab` / `rekeyEditorPrefabCache`).
       ctx.markEditorWrite(absFrom, null);
       // The landings AFTER the source (#1702 close-out review): a case-only rename (`Crate` → `crate`) is ONE guard key
       // since `normalizeWriteGuardKey` folds case on macOS/Windows, and the source's TTL-only mark written second

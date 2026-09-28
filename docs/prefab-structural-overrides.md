@@ -998,7 +998,10 @@ say it, and always takes the member's live Transform with it (its pose relative 
   - every OTHER file: `/api/prefab-member-paths` runs `planMemberPathRepair` — scene guids through
     `memberGuidRemap`, prefab tokens through the token rewrite — over every file naming the prefab,
     transitively. A file an asset view holds unsaved is left and named (`ApplyResult.fileRepair`);
-    undo and redo run it back from the document the files were last repaired for.
+    undo and redo run it back from the document the files were last repaired for. It runs INSIDE the commit
+    step, only over the bytes it planned from, and the client adopts what it wrote: both prefab caches and the
+    live world's file records (prefabs.md § "A server-side prefab rewrite or move brings the client along",
+    #1751).
   Paths pair by IDENTITY (`memberPathRecords`: a localId per frame), so a row that goes from orphaned
   (parentId 0, hung off the instance's parent) to row-parented is followed across anchors.
 - **The new parent is a member of a NESTED instance** (ruling (i): Handle → Lock/Bolt writes

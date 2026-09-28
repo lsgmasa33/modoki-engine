@@ -318,7 +318,11 @@ export function applyOutcomeNotice(result: Pick<ApplyResult, 'skipped' | 'member
   if (skipped.length) parts.push(`${skipped.length} ${noun}${skipped.length === 1 ? ' was' : 's were'} not applied: ${skipped.map((x) => x.reason).join('; ')}`);
   if (result.memberPathsChanged) {
     if (result.fileRepair === null) parts.push('references to the moved members in other files could NOT be repaired — see the console');
-    else if (result.fileRepair?.held.length) parts.push(`references in ${result.fileRepair.held.join(', ')} were not repaired: open with unsaved edits`);
+    else {
+      if (result.fileRepair?.held.length) parts.push(`references in ${result.fileRepair.held.join(', ')} were not repaired: open with unsaved edits`);
+      // #1784: left rather than written over a change that landed while the repair ran.
+      if (result.fileRepair?.changed?.length) parts.push(`references in ${result.fileRepair.changed.join(', ')} were not repaired: the file changed on disk while the repair ran`);
+    }
   }
   return parts.length ? `Apply to Prefab: ${parts.join('. ')}.` : null;
 }

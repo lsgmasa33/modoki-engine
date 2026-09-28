@@ -14,7 +14,7 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { channelsOf } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { serializePrefab, warnInertPrefabSizes, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
-import { commitPrefabWrite } from './prefabCommit';
+import { commitPrefabWrite, prefabTextIsDocument } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { getEditVersion } from '../undo/undoManager';
@@ -686,6 +686,8 @@ function noteSessionRows(guid: string, written: ReadonlyMap<string, number>, doc
 }
 /** Test-only: forget every prefab's record, and the open session's baseline, as a fresh editor process has none. */
 export function _resetPrefabEditSessionRows(): void { sessionRowsByPrefab.clear(); editBaseline = null; }
+/** Test-only: seat the open session's baseline as `openPrefabForEditing` does once its world is adopted. */
+export function _seatEditBaselineForTest(guid: string, doc: PrefabFile): void { editBaseline = { guid, doc }; }
 
 /** The document the open prefab-edit session was expanded from, or last saved as (#1692) — what its save is conditional
  *  on, and what it numbers rows from. Set by `openPrefabForEditing` and by each save that lands; never by another
@@ -694,6 +696,19 @@ let editBaseline: { guid: string; doc: PrefabFile } | null = null;
 /** {@link editBaseline} for `guid`, or null when the session open is another prefab's (or none). */
 export function editBaselineFor(guid: string): PrefabFile | null {
   return editBaseline?.guid === guid ? editBaseline.doc : null;
+}
+
+/** A server route rewrote the prefab this edit has open, from `prior` to `doc` (#1751: `/api/prefab-member-paths`,
+ *  run inside an Apply or its undo made IN this edit world, whose live repair is already on screen). The one writer
+ *  other than this session's own saves that moves the baseline — and only while the session is open, and only when the
+ *  baseline still described `prior`. Otherwise the save was refused as "changed on disk" against a file that holds
+ *  exactly what the edit world shows. A baseline that described something else stays: that is a real outside change,
+ *  and the save must still refuse over it. True when it moved. */
+export function adoptRewrittenEditBaseline(guid: string, prior: string, doc: PrefabFile): boolean {
+  if (!editBaseline || editBaseline.guid !== guid || !isPrefabEditWorld() || useEditorStore.getState().editingPrefab?.guid !== guid) return false;
+  if (!prefabTextIsDocument(prior, editBaseline.doc)) return false;
+  editBaseline = { guid, doc: JSON.parse(JSON.stringify(doc)) as PrefabFile };
+  return true;
 }
 
 /** What a prefab edit-mode save did: whether the file was written, and every prefab validation warning

@@ -13,7 +13,7 @@
  *  the logic is unit-testable without rendering a React panel. */
 
 import { whyWorldNotAuthored, notAuthoredExit } from '../scene/authoredWorld';
-import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody } from '../backend/editorBackend';
 import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, warnInertPrefabSizes, classifyExistingDocumentId, parsedPrefabRows, missingPrefabPlaceholders, type PrefabFile } from '../scene/prefab';
 import { commitPrefabWrite, parsePrefabBytes } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
@@ -96,6 +96,15 @@ export function planImports(
     taken.add(dest);
     return { name, dest, convert: CONVERTIBLE_RE.test(dest) };
   });
+}
+
+/** Write one dropped file's bytes to the `dest` {@link planImports} chose — only into an EMPTY path (#1784), as the
+ *  import's redo already writes (`assetUndo.ts`). `dest` was planned against the panel's in-memory listing, not the
+ *  disk, so a file that landed there since (another import, an agent, a `git pull`) was otherwise overwritten with no
+ *  word. `'taken'` is that case: the file there is left as it is. */
+export async function writeDroppedImport(dest: string, base64: string): Promise<'ok' | 'taken' | 'failed'> {
+  const w = await writeAssetFileGuarded(dest, base64, { encoding: 'base64', createOnly: true });
+  return w === 'conflict' ? 'taken' : w;
 }
 
 // ── Delete / rename policy (pure — the IO lives in the panel) ─────────

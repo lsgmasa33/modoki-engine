@@ -19,6 +19,7 @@ import { SCENE_EXT, classifyExplicitSceneSave } from './sceneFileName';
 import { writeNewAssetDocument } from './createAssetDocument';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
+import { normScenePath } from '../../runtime/scene/scenePathKey';
 import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
 import { setPlayState } from '../../runtime/core/playState';
@@ -1235,6 +1236,21 @@ const lastWrittenScene = new Map<string, string>();
 /** {@link lastWrittenScene} for `path`: what the editor last wrote there, or undefined if it has not this session. */
 export function lastWrittenSceneBytes(path: string): string | undefined {
   return lastWrittenScene.get(path);
+}
+
+/** Test-only: record `content` as what the editor last wrote to `path`, as `writePrimaryScene` does after a save. */
+export function _recordWrittenSceneForTest(path: string, content: string): void { lastWrittenScene.set(path, content); }
+
+/** A server route rewrote `path` from `prior` to `text` on the editor's behalf — `/api/prefab-member-paths`, whose
+ *  repair the LIVE world already holds (#1751). The record follows only when it still said `prior`: then the file holds
+ *  what the editor wrote there, transformed as the live world already is, and Apply's undo must not read the repair as
+ *  an outside change. A record that said something else, or none, stays as it is. True when it moved. */
+export function adoptRewrittenSceneBytes(path: string, prior: string, text: string): boolean {
+  const key = [...lastWrittenScene.keys()].find((k) => normScenePath(k) === normScenePath(path));
+  const had = key === undefined ? undefined : lastWrittenScene.get(key);
+  if (key === undefined || had === undefined || had.replace(/^\uFEFF/, '') !== prior.replace(/^\uFEFF/, '')) return false;
+  lastWrittenScene.set(key, text);
+  return true;
 }
 
 async function writePrimaryScene(

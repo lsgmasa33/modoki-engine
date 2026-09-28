@@ -5,8 +5,8 @@
  *  pipeline (textures/models). Extracted to assetOps.ts (F6) so the policy is
  *  testable without rendering / reading bytes off disk. */
 
-import { describe, it, expect } from 'vitest';
-import { planImports, CONVERTIBLE_RE } from '../../src/editor/panels/assetOps';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { planImports, CONVERTIBLE_RE, writeDroppedImport } from '../../src/editor/panels/assetOps';
 
 describe('planImports', () => {
   it('assigns a plain destination when nothing collides', () => {
@@ -60,5 +60,34 @@ describe('planImports', () => {
     for (const ext of ['json', 'fbx', 'obj', 'mp3', 'txt']) {
       expect(CONVERTIBLE_RE.test(`/x/y.${ext}`)).toBe(false);
     }
+  });
+});
+
+// #1784: `dest` is planned against the panel's listing, not the disk, so the write itself must refuse a path that is
+// taken now. The fake route applies `/api/write-file`'s `ifNoneMatch:'*'` exactly (409, reason 'if-none-match').
+// Mutation: drop `createOnly` from `writeDroppedImport` — the existing file is overwritten.
+describe('writeDroppedImport (#1784)', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  const disk = new Map<string, string>();
+  const stubRoute = () => vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
+    const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
+    if (b.ifNoneMatch === '*' && disk.has(b.path)) return { ok: false, status: 409, json: async () => ({ reason: 'if-none-match' }) } as unknown as Response;
+    disk.set(b.path, b.content);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response;
+  }));
+
+  it('writes into an empty path', async () => {
+    disk.clear();
+    stubRoute();
+    expect(await writeDroppedImport('/assets/a.png', 'QUJD')).toBe('ok');
+    expect(disk.get('/assets/a.png')).toBe('QUJD');
+  });
+
+  it('leaves a file that appeared at the planned path since the listing, and says so', async () => {
+    disk.clear();
+    disk.set('/assets/a.png', 'already here');
+    stubRoute();
+    expect(await writeDroppedImport('/assets/a.png', 'QUJD')).toBe('taken');
+    expect(disk.get('/assets/a.png')).toBe('already here');
   });
 });

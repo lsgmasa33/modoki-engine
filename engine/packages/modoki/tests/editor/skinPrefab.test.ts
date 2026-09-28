@@ -12,7 +12,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const registerAssetSpy = vi.fn();
-vi.mock('../../src/runtime/loaders/assetManifest', () => ({
+// Spread over the real module, not an explicit list: a module this file's graph reaches later (#1751's move re-key put
+// the runtime cache under the Assets panel's) needs exports this test never names.
+vi.mock('../../src/runtime/loaders/assetManifest', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   registerAsset: (...args: unknown[]) => registerAssetSpy(...args),
   getGuidForPath: (path: string) => (path === '/rigs/existing.prefab.json' ? 'g-existing' : undefined),
 }));

@@ -49,6 +49,8 @@ import {
 import type { PathKeyedCause } from '../scene/serialize';
 import { applyMove, splitAssetPath, type PathMove } from '../utils/assetPaths';
 import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
+import { rekeyCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
+import { rekeyEditorPrefabCache } from '../scene/prefab';
 
 /** The display name a repaired item should carry after `move`.
  *
@@ -457,6 +459,14 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   notes.push(...applyMovesToSelection(list));
   // …and the folder-tree sets. Same argument again: three of thirteen sites remapped them by hand.
   remapFolderSets(list);
+  // …and both prefab caches, which are keyed by PATH (#1751 F6). `/api/move-file` marks the move as the editor's own,
+  // so the watcher never evicts the old entry, and the manifest's new path then names no entry at all: a pooled scroll
+  // view of a renamed prefab went blank. Both are idempotent, so the panel's own pass after the route's finds nothing.
+  for (const m of list) {
+    if (m.to === null) continue; // a delete: #1738
+    rekeyCachedPrefab(m.from, m.to, !!m.prefix);
+    rekeyEditorPrefabCache(m.from, m.to, !!m.prefix);
+  }
   // ⚠️ **Reported HERE, by the pass that did the work (#898).** The notes used to be logged at the
   // panel call sites — `logBindingChanges(applyAssetPathMoves(...))` — and #867 then moved the
   // repair to `/api/move-file`, which runs it FIRST from the backend. `applyMove` matches on

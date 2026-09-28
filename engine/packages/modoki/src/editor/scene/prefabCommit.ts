@@ -257,8 +257,15 @@ async function hashOrEmpty(text: string): Promise<string> {
  *  ⚠️ EVERY key, the prefab open in prefab edit included (close-out review, #1692). A first version skipped that one
  *  entry so the edit's save kept diffing against what it opened — and the rebase that follows, which rebuilds every
  *  frame against the cache, then put the live instances an Apply had just refreshed back onto the OLD document. The
- *  edit session keeps its own baseline instead (`prefabEdit.ts` `editBaselineFor`). */
-function seatCaches(path: string, source: string, guid: string | undefined, doc: PrefabFile | null): void {
+ *  edit session keeps its own baseline instead (`prefabEdit.ts` `editBaselineFor`).
+ *
+ *  ⚠️ **Exported for the server's own prefab rewrites (#1751), and it is deliberately THIS function, not the watcher's.**
+ *  A route that rewrites a prefab marks the write as the editor's own, so the watcher's refresh never runs, and
+ *  `adoptServerPrefabRewrites` seats the caches from the route's reply instead. The watcher's runtime half is
+ *  `invalidatePrefab`, an EVICTION, which is #1308's blank: a synchronous reader (a pooled scroll view) of a prefab the
+ *  open scene owns reads `undefined` until the next scene load. The route already hands over the bytes it wrote, so there
+ *  is nothing to refetch. Do not "align" that caller with the watcher by switching it to `invalidatePrefab`. */
+export function seatCaches(path: string, source: string, guid: string | undefined, doc: PrefabFile | null): void {
   if (doc?.id) registerAsset(doc.id, path, 'prefab');
   for (const key of new Set([source, path, ...(guid ? [guid] : [])])) seatEditorPrefabCache(key, doc);
   // REPLACE, not evict (#1308): an eviction strands every synchronous runtime reader (a pooled scroll view, a timeline
@@ -480,6 +487,12 @@ async function readState(path: string): Promise<'absent' | 'unreadable' | { byte
  *  mark (`contentFor` stamps a restore with the version that claims it), and only ever raises them, so a file that
  *  differs from what the caller read in those alone holds nobody's change to protect. An undo's redo is the case: it is
  *  conditional on the bytes the undo recorded, which predate the mark the undo's own write had to keep. */
+/** Does `text` (a prefab file's bytes) hold `doc` — byte for byte as the editor writes it, or as the same document parsed
+ *  the way every reader parses it ({@link sameDocument})? What a record of "the document this file held" is compared by. */
+export function prefabTextIsDocument(text: string, doc: PrefabFile): boolean {
+  return text.replace(/^\uFEFF/, '') === jsonFileBody(doc) || sameDocument(text, doc);
+}
+
 function sameDocument(text: string, expected: PrefabFile): boolean {
   try {
     const parsed = parsePrefabBytes(text) as PrefabFile & { nextLocalId?: unknown };

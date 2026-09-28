@@ -14,7 +14,7 @@ import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, rewrit
 import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { collectUnknownFields, mergeUnknownFields } from '../../runtime/core/formatVersion';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
-import { repairPrefabMemberPaths } from '../backend/editorBackend';
+import type { MemberPathRepair } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './authoringScope';
@@ -2234,6 +2234,22 @@ export function primeEditorPrefabCache(source: string, prefab: PrefabFile): void
 export function seatEditorPrefabCache(source: string, prefab: PrefabFile | null): void {
   if (prefab) prefabCache.set(source, prefab);
   else prefabCache.delete(source);
+}
+
+/** A prefab file moved from `from` to `to` (every file under it when `prefix`): its PATH key follows it (#1751 F6), so a
+ *  reader by the new path finds it and nothing reads a stale copy at a path a new file may later take. The guid key is
+ *  untouched — the file's identity did not change. As in the runtime cache's re-key (`rekeyCachedPrefab`), the old key
+ *  goes and the moved document wins at the new one: the file there IS the moved file, and an entry left there by a file
+ *  deleted earlier (#1738) must not answer for it. */
+export function rekeyEditorPrefabCache(from: string, to: string, prefix = false): void {
+  if (!from || !to || from === to) return;
+  const dir = from.endsWith('/') ? from : `${from}/`;
+  for (const [key, doc] of [...prefabCache]) {
+    if (key !== from && !(prefix && key.startsWith(dir))) continue;
+    const next = key === from ? to : `${to.endsWith('/') ? to : `${to}/`}${key.slice(dir.length)}`;
+    prefabCache.delete(key);
+    prefabCache.set(next, doc);
+  }
 }
 
 /** Is this source already in the editor cache? (`getCachedPrefabSync` answers the same
@@ -5058,8 +5074,9 @@ export interface ApplyResult {
    *  guids refs derive: the files on disk were repaired for it, and an undo/redo must repair them back. */
   memberPathsChanged?: boolean;
   /** What the repair of the OTHER files on disk did, when `memberPathsChanged`: the files rewritten, the ones
-   *  left because an asset view holds them unsaved, or `null` when the backend could not do it at all. */
-  fileRepair?: { rewritten: string[]; held: string[] } | null;
+   *  left because an asset view holds them unsaved, the ones left because they changed on disk while the repair ran
+   *  (`changed`, #1784), or `null` when the backend could not do it at all. */
+  fileRepair?: { rewritten: string[]; held: string[]; changed?: string[] } | null;
   /** Selected keys the apply could not write, each with the reason: a move it cannot express yet, a key
    *  naming no member, a tag it cannot add or a tag spelled as a field (#1491). Not every unwritable key
    *  lands here — a field the trait does not persist, or a key whose member or trait is gone, is still
@@ -6300,6 +6317,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   // DERIVED guid, and `carryPromotedGuids` below gives it back the one every ref names (#1660).
   const promotedGuids = snapshotPromotedGuids(promotedRows, promotedRefRows);
   const rootGuid = guidForEntityId(rootInstanceId);
+  let fileRepair: Omit<MemberPathRepair, 'written'> | null | undefined;
   // ONE step (#1692): the write only over the document this Apply read (I10), both caches, this refresh, then a rebase
   // of every other frame of the source still built from the old document — all in the world the Apply began in (I11).
   // Several files are ONE step (#1692's `commitPrefabWrites`): U13's second file, or an override on an enclosing prefab,
@@ -6341,6 +6359,22 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       if (remap.size) remapWorldGuidRefs(remap);
       rehangPromotionSurvivors(survivors, carryPromotedGuids(rootGuid, promotedGuids));
       }
+      // …and every other file that uses the prefab, the live world's own included: it is repaired above, so its file is
+      // rewritten to agree and the editor's record of it follows (#1751). HERE, inside the step, as the undo already runs
+      // it (#1750's rule): the step then holds world switches off by itself. `applyToPrefabWithUndo` holds the whole
+      // Apply too, so from the editor this changes nothing today; but called unheld (`applyToPrefabSelective` alone), a
+      // switch could land between the commit and the repair, and the route would rewrite a file whose new world was
+      // loaded from the old bytes. A world that has left never gets here: the commit returns `worldLeft` first.
+      // Imported here, not at the top: that module reads the prefab-edit session, the scene record and the adoption owner,
+      // and a static import from this file closes a load-time cycle back through `./prefab` (the one `adoptionGate.ts`
+      // exists to avoid) — a partial mock of this module then reached its importers unmocked.
+      if (rowsReparented && prefabId) {
+        const { repairMemberPathsEverywhere } = await import('./serverPrefabRewrites');
+        const repair = await repairMemberPathsEverywhere(prefabId, oldPrefab, { liveWorldRepaired: true });
+        // What was repaired, not the bytes: `written` is for the adopt above, and carried into the result it reached
+        // every MCP Apply reply as two full copies of each rewritten file (the live gate, #1751).
+        fileRepair = repair && { rewritten: repair.rewritten, held: repair.held, changed: repair.changed };
+      }
     },
   });
   if (!committed.ok) {
@@ -6360,9 +6394,6 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   if (committed.worldLeft) {
     return { ...NOOP_APPLY, refused: 'the scene changed while the Apply wrote the prefab: the prefab was written, but the instances and the undo history of the scene it began in were not updated.' };
   }
-  // …and every other file that uses the prefab. The open scene's own file too: its live world is already
-  // repaired, and the next save writes that.
-  const fileRepair = rowsReparented && prefabId ? await repairPrefabMemberPaths(prefabId, oldPrefab) : undefined;
 
   // Those promoted additions are now prefab members in the live world, but the
   // scene file on disk still lists them as `added` structural overrides. The

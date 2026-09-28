@@ -70,7 +70,7 @@ answer the same question for themselves. Each place in that column is a place th
 
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
-| I9 | The caches hold the current template for everything that reads them. A synchronous reader never runs over a cold cache: a miss there reads as "not a prefab". A prefab write is one step: once it lands, both caches hold the written bytes under every key they use, and every live frame expanded from the old document is rebuilt or refused. | Warming: `installEditorPrefabCacheWarm` (before a scene swap) and `instantiatePrefabInstance`, with `preloadNestedPrefabs` / `preloadNestedPrefabsForSubtree` at the call sites. **The write step: `commitPrefabWrite(source, doc, { expected })`** (`editor/scene/prefabCommit.ts`, #1692). It is the only function that changes a `.prefab.json`. Once the write lands it seats the editor cache under the guid, the path and the caller's ref, and the runtime cache under the resolved path. Then it runs the caller's own `rebuild` (Apply's refresh, Create Prefab's tag), then `rebaseStaleInstances({ sources })` for every other frame of the source. Every writer goes through it: Apply and its undo, the prefab-edit save, Create Prefab (Replace and its undo), the agent `create`, the skin rig and its undo, the model regenerate, and the Assets model import and its undo. **Several files are one step too** (`commitPrefabWrites`, for an Apply that writes an inner prefab and its enclosing one, #1693/U13). Every file's precondition is checked before any is written. Each file is then written only over the bytes checked. A miss part-way puts back what was already written, and names the file that missed (`failed`) and any file it could not put back (`stranded`); both refusals word themselves from those (#1732, § Undoing an Apply). Then both caches for each file, one rebuild and one rebase. | No writer. **An outside edit** reaches the editor as a watcher event: the hot reload evicts the runtime cache, refreshes the editor cache (except the prefab open in prefab edit, `refreshPrefabSourceForPath`), reloads, then rebases; leaving prefab edit refreshes that one and rebases (`repairLeftPrefabEdit`, #1666). ⚠️ The commit seats the open prefab's entry too: a first version skipped it so the edit's save kept its baseline, and its own rebase then put the instances an Apply had just refreshed back onto the old document (close-out review). The edit session keeps its OWN baseline (`editBaselineFor`, § Prefab edit mode). |
+| I9 | The caches hold the current template for everything that reads them. A synchronous reader never runs over a cold cache: a miss there reads as "not a prefab". A prefab write is one step: once it lands, both caches hold the written bytes under every key they use, and every live frame expanded from the old document is rebuilt or refused. | Warming: `installEditorPrefabCacheWarm` (before a scene swap) and `instantiatePrefabInstance`, with `preloadNestedPrefabs` / `preloadNestedPrefabsForSubtree` at the call sites. **The write step: `commitPrefabWrite(source, doc, { expected })`** (`editor/scene/prefabCommit.ts`, #1692). It is the only function that changes a `.prefab.json`. Once the write lands it seats the editor cache under the guid, the path and the caller's ref, and the runtime cache under the resolved path. Then it runs the caller's own `rebuild` (Apply's refresh, Create Prefab's tag), then `rebaseStaleInstances({ sources })` for every other frame of the source. Every writer goes through it: Apply and its undo, the prefab-edit save, Create Prefab (Replace and its undo), the agent `create`, the skin rig and its undo, the model regenerate, and the Assets model import and its undo. **Several files are one step too** (`commitPrefabWrites`, for an Apply that writes an inner prefab and its enclosing one, #1693/U13). Every file's precondition is checked before any is written. Each file is then written only over the bytes checked. A miss part-way puts back what was already written, and names the file that missed (`failed`) and any file it could not put back (`stranded`); both refusals word themselves from those (#1732, § Undoing an Apply). Then both caches for each file, one rebuild and one rebase. | No writer. **An outside edit** reaches the editor as a watcher event: the hot reload evicts the runtime cache, refreshes the editor cache (except the prefab open in prefab edit, `refreshPrefabSourceForPath`), reloads, then rebases; leaving prefab edit refreshes that one and rebases (`repairLeftPrefabEdit`, #1666). ⚠️ The commit seats the open prefab's entry too: a first version skipped it so the edit's save kept its baseline, and its own rebase then put the instances an Apply had just refreshed back onto the old document (close-out review). The edit session keeps its OWN baseline (`editBaselineFor`, § Prefab edit mode). **A server route's own rewrite or move** is marked as the editor's own, so no watcher event runs: the client adopts it instead (§ "A server-side prefab rewrite or move brings the client along", #1751). |
 | I10 | A write over content the caller did not read is conditional, and a write that does not land changes nothing. A read that began before a write cannot put the older bytes back. | `commitPrefabWrite`'s `expected`, required on every write (#1692). It is one of three things. A document the caller READ is matched by the editor's serialization of it, and when that is refused, by the file re-read and parsed as every reader parses it, then written with `ifMatch` on those bytes; so a hand-formatted, CRLF or BOM file still counts as the document read. Raw bytes are matched as they are. `null` means nothing may be there (`createOnly`). A trash carries `ifMatch` on `/api/delete-asset` (#1679). The Apply undo's SCENE half saves only over what the editor itself last wrote to that file (`saveScene({ ifMatch })` over `lastWrittenSceneBytes`, #1695). `getPrefabSource` carries the runtime cache's revision token across its fetch (#1669). The runtime cache refuses a stale in-flight fetch (#863). | One deliberate unconditional write: the prefab-edit save's **Overwrite**, after the conflict was shown to the human (or an agent's explicit `overwrite:true`). |
 | I11 | An operation that awaits between its steps lands whole, in the world it began in. | `beginWorldSwitch` / `prepareWorldSwitch`, which wait for what holds the world: an undo step (#1579), and a world-bound operation (`beginWorldBoundOperation`, #1667). The forward Apply holds it from its first line to its undo entry and refuses to start during a switch. Every `commitPrefabWrite` holds it from its write to its rebase. Nothing reachable from a write's rebuild may start a switch, or the two would wait on each other (`prefabCommit.test.ts` counts it). | A world swap that bypasses `beginWorldSwitch` (a hot reload) is read from #1698's adoption record instead. A write starts only once `adoptionsSettled()`, as does the forward Apply. After the write, a route mid-adoption (`pendingAdoptions()`) or a replaced world means it seats the caches and rebuilds nothing, since the new world's load builds from them. |
 
@@ -351,9 +351,11 @@ problem with random fileIDs instead; the owner kept sequential numbers, which ar
   editor's own writes never trip it.
 
 Server-side rewriters, the member-path repair, duplicate, the GUID heal and the migration scripts all
-parse and spread the document, so they carry the mark. None of them mints. The one open path is
-`/api/prefab-member-paths`: it reads, waits on the renderer, then writes with no precondition. A commit that
-lands in that window has its content reverted, mark included (#1784).
+parse and spread the document, so they carry the mark. None of them mints. `/api/prefab-member-paths` used to
+read, wait on the renderer, then write with no precondition, so a commit landing in that window had its content
+reverted, mark included. Since #1784 it re-reads each file after the wait and writes only over the text it planned
+from; a file that changed is left and returned as `changed` (§ "A server-side prefab rewrite or move brings the
+client along").
 
 Tests:
 - `tests/editor/localIdCounter.test.ts` covers the #1774 repro, one case per minting writer, and the
@@ -1442,6 +1444,83 @@ never evict it and the prefab outlives the game. Drop the holds wholesale when t
 unregisters — `releaseAllForScene(<sentinel>)`, not `releasePrefab` per guid, because a per-guid
 release leaks anything the acquire pulled in transitively (`games/sling` records this at its own
 call site, and `games/court` had to add it after missing it).
+
+## ⚠️ A server-side prefab rewrite or move brings the client along (#1751)
+
+> **Illustrates I9** (after a write, both caches hold the written bytes) and **I10** (a write is conditional on
+> what it read).
+
+A server route that changes a prefab or scene file marks the write as the editor's own (`markEditorWrite`), so the
+watcher does not hot-reload the open scene under its live edits. But the watcher event is ALSO what brings the
+client up to date. The mark means two things, "don't reload the world" and "the client already holds these bytes",
+and the second is true only for bytes the client sent. For a SERVER-computed rewrite or a move, something else has
+to take the watcher's place.
+
+A census of every `markEditorWrite` call site found three routes that change bytes or a path behind a prefab or scene
+cache:
+
+| Route | What it changes | Who brings the client along |
+|---|---|---|
+| `/api/prefab-member-paths` (#1437) | the member refs of every OTHER scene and prefab using a prefab whose member paths moved | the route returns `written` (each file's new bytes and `prior`); `repairMemberPathsEverywhere` → `adoptServerPrefabRewrites` (`editor/scene/serverPrefabRewrites.ts`) |
+| `/api/move-file` | a prefab's PATH | `applyAssetPathMoves` re-keys both prefab caches (`rekeyCachedPrefab`, `rekeyEditorPrefabCache`) |
+| `/api/delete-asset` | a prefab is gone | open: #1738 |
+
+**The member-path repair, end to end:**
+- **The route** asks the renderer which documents an asset view holds unsaved (`dirtyAsset`), and leaves those,
+  named in `held`. It does NOT ask `liveScene`: the live world's own files (the open scene, a loaded base, the prefab
+  open in prefab edit) are rewritten, because the live world already holds the repair (Apply's remap). Nor
+  `pendingBaseScene`: that parks one field, and its flush (`/api/scene-mutate`) re-reads the file, so it lands on the
+  repaired bytes. Holding a scene back for it left the scene unrepaired for good (close-out review).
+- **Each write is conditional on the text the plan read** (#1784). After the renderer wait, each file is re-read and
+  written with no await between them. A file that changed meanwhile is left and returned as `changed`.
+- **The route carries the whole parsed document** (`{ ...doc, entities, moved }`), so the localId mark and any field
+  no writer knows survive.
+- **The client, for a prefab:** both caches through the commit's own `seatCaches`, which REPLACES the runtime entry.
+  Not the watcher's `invalidatePrefab`: that evicts, which is #1308's blank for a pooled scroll view of a prefab the
+  open scene owns.
+- **The client, for the live world's files:** the editor's record moves with the file, but only when it held
+  `prior`:
+  - `lastWrittenSceneBytes` for the open scene (`adoptRewrittenSceneBytes`). Otherwise Apply undo's scene half is
+    refused as an outside change.
+  - The prefab-edit baseline (`adoptRewrittenEditBaseline`), only while that edit is open. Otherwise its save is
+    refused as "changed on disk" against a file that holds exactly what the edit world shows.
+  - A record that said something else stays: that is a real outside change, and the conditional write must still
+    refuse over it.
+- **The client, for any other rewritten scene:** its undo stack is marked stale (`recordSceneFileChanged`), as the
+  watcher would.
+- **The repair runs INSIDE the commit's `rebuild` step** (Apply, and Apply's undo), where world switches are held off
+  (#1750's rule), so the step is whole by itself. From the editor the forward Apply was already held
+  (`applyToPrefabWithUndo` holds it end to end); called unheld (`applyToPrefabSelective` alone), a switch could land
+  between the commit and the repair, and the route would rewrite a file whose new world was loaded from the old
+  bytes. A world that has left never reaches the step. Apply's undo asks whether its world is still live AFTER the route
+  returns (by the same test as its own "still THAT world?" check), and its `worldLeft` tail (a swap that bypassed the
+  #1579 barrier) still repairs the files so they follow the prefab on disk. Either way, when no live world holds the
+  repair, no record moves and every rewritten scene's stack is marked stale.
+
+**The prefab open in prefab edit is rewritten, not refused** (hub, 2026-09-29). Inside the Apply step its world is
+adopted and savable, and it holds the repair. Refusing its file would leave House on disk with dangling tokens if the
+edit were then discarded.
+
+**A move MOVES both cache entries.** The runtime cache is keyed by PATH and read synchronously, so once the manifest
+mapped the guid to the new path the entry was unreachable: a `UIEntries` pool went blank, and a later write's
+`replaceCachedPrefab(newPath)` found no owner and evicted. `rekeyCachedPrefab` moves the entry, the owners and the
+content revision to the new path. The moved entry always wins at the new key. The owners move with it, so the scene's
+`releaseAllForScene` drops them there. A load of the old path still in flight is refused, and when owners are left with
+no entry the file is fetched where it is now. The editor cache moves its path key too, the same way.
+- **The order on the route:** the manifest broadcast reaches the renderer BEFORE the move repair, so the re-key's own
+  `registerAsset` is only a backstop. For the frames between the two messages the guid already names the new path
+  while the entry is still at the old one. That window predates #1751; closing it means sending the repair first.
+- ⚠️ **A first version kept the old runtime key** to cover that window, and the kept entry then served stale content
+  (close-out review). Renaming back after an edit read the pre-edit document; the revision was carried, so a pool
+  never noticed. A swap (A→B, then C→A) read A's document for C. A marked create at the old path is never evicted by
+  a watcher `add`, so the stale entry stayed.
+
+Tests:
+- `engine/tests/plugins/prefabMemberPathsRoute.test.ts`: the route.
+- `engine/tests/editor/serverPrefabRewrites.test.ts`: the real route fed into the real adopt step, one case per
+  symptom, the discarded edit included.
+- `engine/tests/editor/duplicateCarriesRefs.test.ts`: "the file repair runs inside the commit step".
+- `engine/packages/modoki/tests/runtime/prefabCacheMoveRekey.test.ts`: the move.
 
 ## Mesh sharing
 

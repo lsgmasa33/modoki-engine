@@ -22,10 +22,10 @@ import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 // (editor-panels F6/F7) — single source of truth for the /api/* calls and the
 // "serialize entity → write prefab → tag instance → push undo" flow.
 import {
-  writeAssetFile as writeFile, deleteAssetFile as deleteAsset, deleteAssetFiles as deleteAssets,
+  deleteAssetFile as deleteAsset, deleteAssetFiles as deleteAssets,
   describeRefusedDeletes, planDeleteOutcome,
   duplicateAssetFileReport as duplicateAsset, readPriorDocument, createFolderApi, moveFileTo, createPrefabFromEntity,
-  reimportTargets, planImports, refreshHandlerTypes, HANDLER_TYPES,
+  reimportTargets, planImports, writeDroppedImport, refreshHandlerTypes, HANDLER_TYPES,
   deletionPathsFor, planRename, assetEditorHoldMessage,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
@@ -1581,8 +1581,10 @@ export default function Assets() {
         // are the bytes the redo re-writes, so it never brings the source's id back.
         const content = await importedFileContent(dest, await fileToBase64(file), claimed);
         if (content === null) continue; // said by importedFileContent
-        const ok = await writeFile(dest, content, 'base64');
-        if (!ok) { console.error(`[Assets] Failed to import ${file.name}`); continue; }
+        // Only into an EMPTY path (#1784): `dest` was planned against the listing, not the disk.
+        const wrote = await writeDroppedImport(dest, content);
+        if (wrote === 'taken') { console.error(`[Assets] ${file.name} was not imported: a file appeared at ${dest} since the panel listed the folder, and it was left as it is. Drop it again to import it as a copy.`); continue; }
+        if (wrote !== 'ok') { console.error(`[Assets] Failed to import ${file.name}`); continue; }
         imported.push({ path: dest, content, convert });
         setImportStatus(true, file.name, i + 1, list.length);
       }

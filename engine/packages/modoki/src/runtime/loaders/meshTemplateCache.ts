@@ -2488,6 +2488,57 @@ export function replaceCachedPrefab(prefabRef: string, data: unknown): void {
   if (typeof copy.id === 'string') registerAsset(copy.id, prefabPath, 'prefab');
 }
 
+/** A prefab FILE moved from `from` to `to` — every file under `from` when `prefix` (a folder move) — so its entry, owners
+ *  and content revision MOVE to the new path (#1751 F6). The cache is keyed by PATH, and once the manifest maps the guid
+ *  to the new path the old entry was unreachable: a synchronous reader of it (a `UIEntries` pool) read `undefined` and
+ *  went blank until the next scene load — #1308's blank, reached through a rename — and a later write's
+ *  `replaceCachedPrefab(newPath)` found no owner there and evicted instead.
+ *
+ *  ⚠️ A MOVE, and the guid is re-registered to the new path in the same step. A first version COPIED and kept the old key
+ *  to cover the window before the renderer's manifest learns the new path — but the kept entry then served stale
+ *  content (close-out review): renaming back after an edit, or a swap (A→B, C→A), read the pre-edit document from the
+ *  kept key, and a marked create at the old path is never evicted by a watcher `add`. The entry now exists under one
+ *  key only, and the moved entry always wins at the new key: the file there IS the moved file. The scene is still the
+ *  unit of release (CLAUDE.md § Resource Management): the owners move with the entry, so `releaseAllForScene` drops
+ *  them there.
+ *
+ *  The ORDER on the route (`/api/move-file`): the backend's manifest broadcast reaches the renderer BEFORE this repair,
+ *  so the `registerAsset` here is a backstop for a caller with no broadcast (the Assets panel's own pass, a test). The
+ *  window that remains is the reverse one — for the frames between the two messages the guid already names the new
+ *  path while the entry is still at the old one — and it predates this function; closing it means sending the repair
+ *  before the broadcast.
+ *
+ *  The revision is carried so a spawner's `guid@revision` signature does not change under it (the bytes did not).
+ *  Idempotent: every move repair pass may call it. Returns how many entries it moved. */
+export function rekeyCachedPrefab(from: string, to: string, prefix = false): number {
+  if (!from || !to || from === to) return 0;
+  const dir = from.endsWith('/') ? from : `${from}/`;
+  let n = 0;
+  for (const oldKey of [...prefabOwners.keys()]) {
+    if (oldKey !== from && !(prefix && oldKey.startsWith(dir))) continue;
+    const newKey = oldKey === from ? to : `${to.endsWith('/') ? to : `${to}/`}${oldKey.slice(dir.length)}`;
+    for (const sceneId of prefabOwners.get(oldKey) ?? []) addOwner(prefabOwners, newKey, sceneId);
+    prefabOwners.delete(oldKey);
+    const data = prefabCache.get(oldKey);
+    // Refuse an in-flight fetch of the OLD path: it would land an ownerless entry there, and its `registerAsset` would
+    // point the guid back at a path that no longer exists. A fetch of the NEW path can only carry the moved file, so it
+    // is left to land (close-out re-review).
+    prefabLoadPromises.delete(oldKey);
+    cacheToken.invalidateKey(oldKey);
+    for (const k of [oldKey, newKey]) prefabFailures.forget(k);
+    prefabCache.delete(oldKey);
+    if (data !== undefined) prefabCache.set(newKey, data);
+    prefabRevision.set(newKey, Math.max(prefabRevision.get(oldKey) ?? 0, prefabRevision.get(newKey) ?? 0));
+    const id = (data as { id?: unknown } | undefined)?.id;
+    if (typeof id === 'string') registerAsset(id, newKey, 'prefab');
+    // Owners with no entry and nothing in flight — the old path's load was just refused, or the entry had been evicted:
+    // fetch the file where it is now, or every synchronous reader stays blank until the next scene load (#1308).
+    if (!prefabCache.has(newKey) && prefabOwners.get(newKey)?.size && !prefabLoadPromises.has(newKey)) void fetchPrefab(newKey);
+    n++;
+  }
+  return n;
+}
+
 function fetchPrefab(prefabPath: string): Promise<void> {
   if (prefabCache.has(prefabPath)) return Promise.resolve();
   if (prefabLoadPromises.has(prefabPath)) return prefabLoadPromises.get(prefabPath)!;
