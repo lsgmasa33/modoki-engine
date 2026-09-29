@@ -55,7 +55,7 @@ import {
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo, detachRefusal,
-  applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, resolveInstanceContext, previewApply, describeEffect,
+  applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
   pushAction, makePrefabInstantiateAction, entityRef, isInstanceRootCheck, placeholderWriteRefusal, assetDocAction,
@@ -3433,7 +3433,7 @@ export function registerEditorAgentOps(): void {
         throw new Error(`prefab overrides: entity ${entityId} is not a prefab instance — it carries no PrefabInstance trait, so it has no overrides to discover.`);
       }
       const prefab = await getPrefabSource(ctx.source);
-      if (!prefab) throw new Error(`prefab overrides: could not load prefab source "${ctx.source}" for entity ${entityId}.`);
+      if (!prefab) throw new Error(`prefab overrides refused: ${missingSourceRefusal(ctx.rootInstanceId, ctx.source, 'apply or revert')}`);
       // collectInstanceOverrideKeys -> captureInstanceStructure reads nested children from the
       // editor cache SYNCHRONOUSLY; cold, a user-added nested instance is missing from `keys`
       // and the caller cannot address what it cannot see (#1284).
@@ -3489,7 +3489,8 @@ export function registerEditorAgentOps(): void {
         throw new Error(`prefab ${verb}: entity ${entityId} is not a prefab instance — nothing to ${verb}.`);
       }
       const prefab = await getPrefabSource(ctx.source);
-      if (!prefab) throw new Error(`prefab ${verb}: could not load prefab source "${ctx.source}" for entity ${entityId}.`);
+      // A frame kept live after its prefab was trashed (#1862): refused in the words Apply and Revert use, not a bare guid.
+      if (!prefab) throw new Error(`prefab ${verb} refused: ${missingSourceRefusal(ctx.rootInstanceId, ctx.source, verb)}`);
       // Same cold read as `overrides` above (#1284) — and here it decides what an explicit
       // `keys` list is validated against, so a cold miss turns a legitimate key into a refusal.
       await preloadNestedPrefabsForSubtree(ctx.rootInstanceId);
@@ -3608,8 +3609,10 @@ export function registerEditorAgentOps(): void {
           // instance" guess before appending the real reason sends the reader down the wrong path
           // (#1468 close-out review F4). That guess is right only when nothing else explains it.
           if (result.refused) throw new Error(`prefab apply refused: ${result.refused}`);
-          const why = notWritten.length ? ` Not applied: ${notWritten.map((x) => `${x.key} (${x.reason})`).join('; ')}.` : '';
-          throw new Error(`prefab apply: nothing was written — the apply produced no change for entity ${entityId} (it may have stopped being a prefab instance mid-call).${why}`);
+          // Keys not applied WITH a reason (a move the prefab cannot express, a key into a frame whose prefab is missing,
+          // #1831) are the cause: lead with them, and keep the guess for when nothing explains it.
+          if (notWritten.length) throw new Error(`prefab apply: nothing was written. Not applied: ${notWritten.map((x) => `${x.key} (${x.reason})`).join('; ')}.`);
+          throw new Error(`prefab apply: nothing was written — the apply produced no change for entity ${entityId} (it may have stopped being a prefab instance mid-call).`);
         }
         // apply WRITES the .prefab.json — say so honestly, mirroring how `create` reports `saved`.
         // `appliedKeys` excludes what the template cannot carry; `skippedKeys` names it rather

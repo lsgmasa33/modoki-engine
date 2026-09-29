@@ -5743,6 +5743,26 @@ async function planApply(
     const where = missing.node && missing.node !== missing.name ? ` (inside "${missing.node}")` : '';
     return { result: { ...NOOP_APPLY, refused: `"${missing.name}"${where} is a reference to a missing prefab, so it cannot be written into a template until that prefab resolves. Leave "${missing.node || missing.name}" unchecked, or restore the prefab first` } };
   }
+  // …and a live frame KEPT after its prefab was trashed (#1862), which is no placeholder: promoted, the same empty
+  // reference row was written, and the rebuild took the frame and its members out of the world (close-out review). That
+  // node's key is SKIPPED with the reason and the other keys land, as a key into a kept frame is below: refused whole,
+  // the dialog's default Apply All and the agent's key-less `apply` landed nothing (close-out re-review). The placeholder
+  // refusal above predates both and still refuses whole.
+  const keptAddedKeys = new Map<string, string>();
+  const piMeta = getTraitByName('PrefabInstance');
+  for (const key of selectedKeys) {
+    const g = /(?:^|:)\+added\.([^:]+)$/.exec(key)?.[1];
+    const node = g ? (findEntityByGuid(g) as { id(): number } | undefined)?.id() : undefined;
+    if (!node) continue;
+    for (const id of identitySubtree(getCurrentWorld(), [node], idParents)) {
+      const d = piMeta ? readTraitData(id, piMeta) as { source?: string; rootInstanceId?: number } | null : null;
+      if (!d?.source || d.rootInstanceId !== id || await getPrefabSource(d.source)) continue;
+      const nodeName = byName.get(node) ?? '';
+      const where = nodeName && nodeName !== byName.get(id) ? ` (inside "${nodeName}")` : '';
+      keptAddedKeys.set(key, `${missingPrefabInstance(id, d.source)}${where}, so it cannot be written into a template until that prefab is back`);
+      break;
+    }
+  }
   const ctx = resolveInstanceContext(rootInstanceId);
   if (!ctx) {
     if (!dryRun) console.warn('[Prefab] Selected entity is not a prefab instance');
@@ -5752,8 +5772,11 @@ async function planApply(
 
   const oldPrefab = await getPrefabSource(source);
   if (!oldPrefab) {
-    if (!dryRun) console.warn(`[Prefab] Cannot apply: source prefab not in cache: ${source}`);
-    return { result: NOOP_APPLY };
+    // A frame kept live after its prefab was trashed (#1862), a nested one or #1738's top-level one: there is no document
+    // to write into. Said, as Revert says it (`revertRefusal`), where this used to answer a bare `applied: false`.
+    const why = missingSourceRefusal(ctx.rootInstanceId, source, 'apply');
+    if (!dryRun) console.warn(`[Prefab] cannot apply: ${why}`);
+    return { result: { ...NOOP_APPLY, refused: why } };
   }
 
   if (selectedKeys.size === 0) {
@@ -5798,6 +5821,15 @@ async function planApply(
   // runs inside the capture at `const structure = ...`, and on a cold cache it returns null
   // and the user-added nested subtree is dropped from `added[]` entirely.
   await preloadNestedPrefabsForSubtree(rootInstanceId);
+
+  // A key into a nested frame whose prefab was trashed (#1862 keeps that frame live) cannot be translated against a
+  // document, and was reported as a stale key ("the template has changed since the key was listed"), which it is not.
+  // Each such key is skipped with the true reason and the rest still land: refusing the whole Apply turned the dialog's
+  // default Apply All (and the agent's `apply` with no `keys`) from a partial success into nothing (close-out review).
+  // A new set, never the caller's: the writing plan is handed the caller's own.
+  const missingFrameKeys = await missingNestedFrameKeys(rootInstanceId, oldPrefab, selectedKeys);
+  for (const [k, why] of keptAddedKeys) missingFrameKeys.set(k, why);
+  if (missingFrameKeys.size) selectedKeys = new Set([...selectedKeys].filter((k) => !missingFrameKeys.has(k)));
 
   // Deep-clone the old prefab and overlay selected live values onto it. A second
   // pristine clone is the `before` snapshot for undo (oldPrefab itself isn't mutated,
@@ -5872,7 +5904,7 @@ async function planApply(
   // mark. Taken before this Apply's removals, so it never hands out a number it frees itself either.
   const nextLocalId = { v: localIdCounter(newPrefab) };
   let rowsReparented = false;
-  const skipped: { key: string; reason: string }[] = [];
+  const skipped: { key: string; reason: string }[] = [...missingFrameKeys].map(([key, reason]) => ({ key, reason }));
   const innerTags: { key: string; lid: number; tag: string }[] = [];
   const innerRemovals: { key: string; lid: number; trait: string }[] = [];
   /** The frame's own field keys, each with the fields it took out of the instance (`appliedFields`): U13 per key. */
@@ -8718,12 +8750,69 @@ export async function revertRefusal(rootInstanceId: number): Promise<string | nu
   if (stale) return stale;
   const ctx = resolveInstanceContext(rootInstanceId);
   if (!ctx || await getPrefabSource(ctx.source)) return null;
-  const name = getAllEntities().find((e) => e.id === ctx.rootInstanceId)?.name ?? 'this instance';
-  // Named by the document the frame was built from: a delete prunes the guid from the manifest, so no path is left to show.
-  const prefabName = levelDoc(ctx.rootInstanceId, ctx.source).doc?.name;
+  return missingSourceRefusal(ctx.rootInstanceId, ctx.source, 'revert');
+}
+
+/** Why Apply and/or Revert cannot act on instance `rootInstanceId`, whose OWN prefab `source` does not load: a frame kept
+ *  live after its prefab was trashed (#1862), a nested one or #1738's top-level one. Every surface says it in these words:
+ *  `planApply`, {@link revertRefusal}, and the Apply dialog's and the agent op's own load checks, which stop before either
+ *  and used to show only the bare guid ("Could not load prefab <guid>"). */
+export function missingSourceRefusal(rootInstanceId: number, source: string, verb: 'apply' | 'revert' | 'apply or revert'): string {
+  const tail = verb === 'revert' ? 'so there is nothing to revert it to. Restore the prefab to revert it'
+    : verb === 'apply' ? 'so there is nothing to apply it to. Restore the prefab to apply to it'
+      : 'so there is nothing to apply it to or revert it to. Restore the prefab first';
+  return `${missingPrefabInstance(rootInstanceId, source)}, ${tail}, or Detach Prefab to keep it as plain entities.`;
+}
+
+/** `"QR" is an instance of "Q", a prefab that is missing (<ref>)`: how Revert and Apply name a live frame whose own prefab
+ *  no longer loads (#1862's kept frame). Named by the document the frame was built from: a delete prunes the guid from the
+ *  manifest, so no path is left to show. */
+function missingPrefabInstance(frameRoot: number, source: string): string {
+  const name = getAllEntities().find((e) => e.id === frameRoot)?.name ?? 'this instance';
+  const prefabName = levelDoc(frameRoot, source).doc?.name;
   return `"${name}" is an instance of ${prefabName ? `"${prefabName}", a prefab that is missing` : 'a prefab that is missing'} ` +
-    `(${resolveRef(ctx.source) || ctx.source}), so there is nothing to revert it to. Restore the prefab to revert it, or ` +
-    'Detach Prefab to keep it as plain entities.';
+    `(${resolveRef(source) || source})`;
+}
+
+/** Each selected Apply key that reaches into a nested frame whose prefab does not load, with the reason it is not applied,
+ *  worded by {@link missingPrefabInstance}. That is a frame kept live after its prefab was trashed (#1862): the key has no
+ *  document to be written into or translated against, and Unity offers no Apply on a missing-asset instance. Walked row by
+ *  row from `doc` through each reference row's prefab, read through the async read so a merely cold key is not taken for
+ *  a missing one; the live frame is found level by level under the one before, so a prefab nested twice names the frame
+ *  the key is about. A key whose chain names a row `doc` does not have is not this: it stays the stale-key report. */
+async function missingNestedFrameKeys(rootInstanceId: number, doc: PrefabFile, keys: Iterable<string>): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const pi = getTraitByName('PrefabInstance');
+  const idParents = worldIdentityParents(getCurrentWorld());
+  /** The live frame row `row` expanded into, under frame `scope`. */
+  const frameOf = (scope: number | undefined, row: PrefabEntity): number | undefined => {
+    if (scope === undefined || !pi) return undefined;
+    return identitySubtree(getCurrentWorld(), [scope], idParents).find((id) => {
+      const d = readTraitData(id, pi) as { source?: string; rootInstanceId?: number; parentNodeGuid?: string; parentLocalId?: number } | null;
+      if (!d || d.source !== row.prefab || d.rootInstanceId !== id || id === scope) return false;
+      return d.parentNodeGuid ? d.parentNodeGuid === row.nodeGuid : d.parentLocalId === row.localId;
+    });
+  };
+  for (const key of keys) {
+    const nested = splitNestedKey(key);
+    const moved = key.startsWith('~moved.') && key.includes(':') ? key.slice('~moved.'.length, key.indexOf(':')) : null;
+    const chain = nested?.chain ?? moved;
+    if (!chain) continue;
+    let cur: PrefabFile = doc;
+    let scope: number | undefined = rootInstanceId;
+    for (const ref of chain.split('.')) {
+      const row: PrefabEntity | undefined = cur.entities.find((e) => memberRef(cur, e.localId) === ref || String(e.localId) === ref);
+      if (!row?.prefab) break;
+      const src = row.prefab;
+      scope = frameOf(scope, row);
+      const child: PrefabFile | null = await getPrefabSource(src);
+      if (child) { cur = child; continue; }
+      out.set(key, scope !== undefined ? missingSourceRefusal(scope, src, 'apply')
+        : `"${row.name}" is an instance of a prefab that is missing (${resolveRef(src) || src}), so there is nothing to apply it to. Restore the prefab to apply to it.`);
+      break;
+    }
+  }
+  return out;
 }
 
 /** Rebuild every live instance FRAME — a stored root, or an owned nested root (#1493) — whose own record says

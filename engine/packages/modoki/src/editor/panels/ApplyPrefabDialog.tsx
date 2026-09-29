@@ -13,6 +13,7 @@ import {
   preloadNestedPrefabsForSubtree,
   ownInstanceStructure,
   revertRefusal,
+  missingSourceRefusal,
   previewApply,
   type PrefabFile,
   type ApplyPreview,
@@ -206,7 +207,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       }
       const prefab = await getPrefabSource(source);
       if (!prefab) {
-        if (!cancelled) setLoadState({ kind: 'error', message: `Could not load prefab ${source}` });
+        // A frame kept live after its prefab was trashed (#1862): say so, as Apply and Revert themselves do, not the bare guid.
+        if (!cancelled) setLoadState({ kind: 'error', message: missingSourceRefusal(rootInstanceId, source, mode) });
         return;
       }
       // `buildStructural` -> `ownInstanceStructure` -> `captureInstanceStructure` -> `captureNestedRef` reads nested

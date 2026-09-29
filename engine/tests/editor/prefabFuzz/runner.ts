@@ -5,7 +5,7 @@ import { undoDepth, canRedo, undoStep } from '../../../packages/modoki/src/edito
 import { serializeScene } from '../../../packages/modoki/src/editor/scene/serialize';
 import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/scene/prefab';
 import { getAllEntities, getCurrentWorld } from '@modoki/engine/runtime';
-import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, type Fixture } from './harness';
+import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, worldTree, type Fixture } from './harness';
 import { execute, describe as describeOp, type Op, type RunState } from './ops';
 import { checkWorld, checkFiles, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, nodeMoved, signature, type Failure, type LocalIdHistory, type Tolerate } from './checks';
 import type { FuzzBackend } from './backend';
@@ -254,8 +254,10 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     }
     // Read back through the declared type: the reset above narrows `st.roundTrip` to undefined, and `execute` sets it.
     const rt = st.roundTrip as RunState['roundTrip'];
-    if (rt) { dump(`step${i}-rt-before`, rt.before); dump(`step${i}-rt-after`, rt.after); dump(`step${i}-rt-bytes1`, rt.firstBytes); dump(`step${i}-rt-bytes2`, rt.secondBytes); }
+    if (rt) { dump(`step${i}-rt-before`, rt.before); dump(`step${i}-rt-after`, rt.after); dump(`step${i}-rt-bytes1`, rt.firstBytes); dump(`step${i}-rt-bytes2`, rt.secondBytes); if (rt.restored !== undefined) dump(`step${i}-rt-restored`, rt.restored); }
     if (process.env.MODOKI_PREFAB_FUZZ_DUMP && !editing()) dump(`step${i}-scene`, await serializeScene());
+    if (process.env.MODOKI_PREFAB_FUZZ_DUMP) dump(`step${i}-prefabs`, Object.fromEntries([...after].filter(([p]) => p.endsWith('.prefab.json')).map(([p, t]) => [p, JSON.parse(t) as unknown])));
+    if (process.env.MODOKI_PREFAB_FUZZ_DUMP && !editing()) dump(`step${i}-world`, worldTree());
     if (op.kind === 'outsideEdit') for (const [p, t] of after) if (before.get(p) !== t) handTexts.add(t);
     const handEdited = new Set([...after].filter(([, t]) => handTexts.has(t)).map(([p]) => p));
     // An outside edit numbers its own rows (it may take a freed number, as a hand edit or a merge does): I4 holds the

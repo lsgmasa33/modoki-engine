@@ -38,6 +38,7 @@ import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/
 import { reannounceRestoredFiles } from '../../packages/modoki/src/editor/panels/assetRestore';
 import { commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { readTraitData } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { runAgentOp } from '../../app/debug/agentBridge';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -348,5 +349,123 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(why).toMatch(/Restore the prefab to revert it, or Detach Prefab/);
     // …and the outer instance, whose own prefab loads, is not refused.
     expect(await revertRefusal(p1(f))).toBeNull();
+  });
+
+  /** Edit M's `Transform.x` inside P1's nested Q frame (and A's `Transform.y` when `alsoA`), optionally trash Q, and run the
+   *  dialog's Apply from P1 (default targets) over the M key, plus A's when `alsoA`. */
+  async function applyNestedKey(key: string, trash: boolean, alsoA = false): Promise<{ f: Fixture; preview: Awaited<ReturnType<typeof previewApply>>; result: Awaited<ReturnType<typeof applyToPrefabWithUndo>> }> {
+    const f = await startRun(be, noNest, key);
+    expect(writeTraitFieldWithUndo(nestedQ(f, p1(f)).m, getTraitByName('Transform')!, 'x', 42)).toBeFalsy();
+    if (alsoA) expect(writeTraitFieldWithUndo(member(p1(f), 'A'), getTraitByName('Transform')!, 'y', 9)).toBeFalsy();
+    await settle();
+    if (trash) await trashQ(f);
+    await preloadNestedPrefabsForSubtree(p1(f));
+    const prefab = getCachedPrefabSync(f.prefabs.P.guid)!;
+    const keys = collectInstanceOverrideKeys(p1(f), prefab);
+    const sel = new Set([...keys.all, ...keys.nested].filter((k) => /\.Transform\.x$/.test(k) || (alsoA && /\.Transform\.y$/.test(k))));
+    expect(sel.size).toBe(alsoA ? 2 : 1);
+    const targets = toApplyTargets(initialTargets(applyTargetOptions(p1(f), prefab, [...sel])), sel);
+    const preview = await previewApply(p1(f), new Set(sel), targets);
+    const result = await applyToPrefabWithUndo(p1(f), sel, targets, { expect: preview.fingerprint });
+    await settle();
+    return { f, preview, result };
+  }
+  const MISSING_Q = /^"QR" is an instance of "Q", a prefab that is missing \(.*\), so there is nothing to apply it to\. Restore the prefab to apply to it, or Detach Prefab to keep it as plain entities\.$/;
+
+  it('a nested key into the kept frame is not applied, with the true reason (not "the template has changed")', async () => {
+    // Mutation: drop the `missingNestedFrameKeys` filter in `planApply` — the key is skipped as "the template has changed
+    // since the key was listed" again.
+    const { preview, result } = await applyNestedKey('apply-nested-skip', true);
+    expect(result.applied).toBe(false);
+    expect(result.refused).toBeUndefined();
+    expect(result.skipped?.length).toBe(1);
+    expect(result.skipped![0]!.reason).toMatch(MISSING_Q);
+    // The dialog's row says it before the click: the preview's effect for that key.
+    expect(preview.effects.map((e) => e.effect)).toEqual([{ op: 'notApplied', reason: result.skipped![0]!.reason }]);
+  });
+
+  it('the agent\'s key-less apply over only a kept-frame key leads with that reason, not the "stopped being an instance" guess', async () => {
+    // Mutation: put back the op's single throw that led with the guess — the message starts with "the apply produced no change".
+    const f = await startRun(be, noNest, 'apply-nested-agent');
+    expect(writeTraitFieldWithUndo(nestedQ(f, p1(f)).m, getTraitByName('Transform')!, 'x', 42)).toBeFalsy();
+    await settle();
+    await trashQ(f);
+    const guid = getAllEntities().find((e) => e.id === p1(f))!.guid!;
+    const err = await runAgentOp('prefab', { prefabAction: 'apply', entityGuid: guid }).catch((e: Error) => e) as Error;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/^prefab apply: nothing was written\. Not applied: .*\("QR" is an instance of "Q", a prefab that is missing \(/);
+  });
+
+  it('Apply All with a kept-frame key still lands the other keys (the kept-frame key is skipped, not the whole Apply)', async () => {
+    // Mutation: refuse the whole Apply when any key reaches into the kept frame (the first version of this fix) — A.y is
+    // not written, and the dialog's default Apply All and the agent's key-less `apply` land nothing.
+    const { f, result } = await applyNestedKey('apply-nested-mixed', true, true);
+    expect(result.refused).toBeUndefined();
+    expect(result.applied).toBe(true);
+    expect(result.skipped?.map((x) => x.reason)).toEqual([expect.stringMatching(MISSING_Q)]);
+    const a = JSON.parse(be.read(f.prefabs.P.path)!).entities.find((r: { name: string }) => r.name === 'A');
+    expect(a.traits.Transform.y).toBe(9);
+  });
+
+  it('Apply All over a scene-added node that holds a kept frame skips that node with its reason and lands the rest — it used to write a reference to the trashed prefab and take the frame out of the world', async () => {
+    // Mutation: drop the `keptAddedKeys` check in `planApply` — the node is promoted: H's file gains a row naming the
+    // trashed Q, and QR and M leave the live world. Mutation: refuse the whole Apply for it — HR.y is not written.
+    const f = await startRun(be, noNest, 'apply-added-kept');
+    const hr = getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.H.guid && pi.rootInstanceId === e.id; })!.id;
+    expect(await instantiatePrefabInstance(JSON.parse(be.read(f.prefabs.Q.path)!), f.prefabs.Q.path, hr)).toBeTruthy();
+    await settle();
+    const node = nestedQ(f, hr);
+    const guids = [node.qr, node.m].map((id) => getAllEntities().find((e) => e.id === id)!.guid!);
+    await trashQ(f);
+    expect(writeTraitFieldWithUndo(hr, getTraitByName('Transform')!, 'y', 9)).toBeFalsy();
+    await settle();
+    const prefab = getCachedPrefabSync(f.prefabs.H.guid)!;
+    const keys = collectInstanceOverrideKeys(hr, prefab);
+    const sel = new Set([...keys.all, ...keys.nested]); // the dialog's default: every key
+    const added = [...sel].filter((k) => k.startsWith('+added.'));
+    expect(added.length).toBe(1);
+    const targets = toApplyTargets(initialTargets(applyTargetOptions(hr, prefab, [...sel])), sel);
+    const preview = await previewApply(hr, new Set(sel), targets);
+    expect(preview.refused).toBeUndefined();
+    const result = await applyToPrefabWithUndo(hr, sel, targets, { expect: preview.fingerprint });
+    await settle();
+    expect(result.refused).toBeUndefined();
+    expect(result.applied).toBe(true);
+    expect(result.skipped).toEqual([{ key: added[0], reason: expect.stringMatching(/^"QR" is an instance of "Q", a prefab that is missing \(.*\), so it cannot be written into a template until that prefab is back$/) }]);
+    const h = JSON.parse(be.read(f.prefabs.H.path)!) as { entities: { prefab?: string; name: string; traits: { Transform?: { y?: number } } }[] };
+    expect(h.entities.some((r) => r.prefab === f.prefabs.Q.guid)).toBe(false);
+    expect(h.entities.find((r) => r.name === 'HR')!.traits.Transform!.y).toBe(9);
+    for (const g of guids) expect(getAllEntities().some((e) => e.guid === g)).toBe(true);
+  });
+
+  it('the same nested key with Q present applies (the check is not a refusal of every nested key)', async () => {
+    const { f, preview, result } = await applyNestedKey('apply-nested-accept', false);
+    expect(preview.refused).toBeUndefined();
+    expect(result.refused).toBeUndefined();
+    expect(result.applied).toBe(true);
+    expect(tx(nestedQ(f, p1(f)).m, 'x')).toBe(42);
+  });
+
+  it('an Apply on the kept frame itself refuses, naming the missing prefab, where it answered a bare applied:false', async () => {
+    // Mutation: put back the bare `NOOP_APPLY` for a source that does not load — `refused` is undefined again.
+    const f = await editTrashApply('apply-kept-root', true);
+    const { qr, m } = nestedQ(f, p1(f));
+    expect(writeTraitFieldWithUndo(m, getTraitByName('Transform')!, 'x', 42)).toBeFalsy();
+    await settle();
+    const preview = await previewApply(qr, new Set(['x']));
+    expect(preview.refused).toContain('"QR" is an instance of "Q", a prefab that is missing (');
+    const result = await applyToPrefabWithUndo(qr, new Set(['x']));
+    expect(result.applied).toBe(false);
+    expect(result.refused).toBe(preview.refused);
+    expect(result.refused).toMatch(/nothing to apply it to\. Restore the prefab to apply to it, or Detach Prefab/);
+    // The agent op stops at its own load check, before either: it says the same, not a bare "could not load" guid.
+    // Mutation: put back the op's `could not load prefab source` throw — these two go red.
+    const guid = getAllEntities().find((e) => e.id === qr)!.guid!;
+    for (const [op, tail] of [['apply', /nothing to apply it to\./], ['revert', /nothing to revert it to\./], ['overrides', /nothing to apply it to or revert it to\./]] as const) {
+      const err = await runAgentOp('prefab', { prefabAction: op, entityGuid: guid }).catch((e: Error) => e) as Error;
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toContain(`prefab ${op} refused: "QR" is an instance of "Q", a prefab that is missing (`);
+      expect(err.message).toMatch(tail);
+    }
   });
 });
