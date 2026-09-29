@@ -12,7 +12,8 @@
 
 import type { FrameBase } from './prefabBase';
 import type { PrefabFile, PrefabEntity } from './prefab';
-import type { SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import { expandedPrefabRefs } from '../../runtime/loaders/prefabNesting';
 
 /** One outer place an edit of the frame can be written: level `level` of the chain, as its row `rowLid`. */
 export interface LevelSlot {
@@ -157,6 +158,23 @@ export function writeMemberRemoval(c: Carrier & Pick<PrefabEntity, 'removed'>, p
   return true;
 }
 
+/** State that `c` adds the template node `node` under member `lid` of the frame (#1715, U12 for an added node): the row's
+ *  own `added` where the row expands the frame, a member row's `own` deeper down — appended after what the chain puts
+ *  there, which a member row's `added` would replace (and pin). Where the row expands the frame but already holds a
+ *  member row for `lid`, that row's `own` too: its `added` REPLACES the row's own list under the member in the fold
+ *  (`foldMemberRowChannels`), and the node would not show (close-out review). False when no row can say it (a row on the
+ *  path, or the member, has no nodeGuid). */
+export function writeAddedNode(c: Carrier & Pick<PrefabEntity, 'added'>, path: readonly number[], key: string | null, lid: number, node: AddedEntity): boolean {
+  if (!path.length && !(key && c.members?.[key])) {
+    (c.added ??= []).push({ ...node, parentLocalId: lid });
+    return true;
+  }
+  if (!key) return false;
+  const row = ((c.members ??= {})[key] ??= {}) as SceneMemberRow;
+  row.own = [...(row.own ?? []), { ...node, parentLocalId: 0 }];
+  return true;
+}
+
 /** State that `c` removes `lid`'s `trait`: the row's own `removedTraits` where the row expands the frame, a member row's
  *  `traitRemovals` deeper down (a `nestedStructure` slot would own — and pin — the whole interior). False when no row
  *  can say it: deeper down, and a row on the path or the member has no `nodeGuid`. */
@@ -179,10 +197,26 @@ export interface ApplyTargets {
   perKey?: Readonly<Record<string, string>>;
 }
 
-/** The kinds of key an ENCLOSING level can take today (the rest are written to the frame's own template only). */
-const OUTER_KINDS = (key: string): 'field' | 'tag' | 'removedTrait' | 'removedMember' | null =>
+/** The kinds of key an ENCLOSING level can take (a move is written to the frame's own template only). */
+const OUTER_KINDS = (key: string): 'field' | 'tag' | 'removedTrait' | 'removedMember' | 'addedNode' | null =>
   key.startsWith('+trait.') ? 'tag' : key.startsWith('-trait.') ? 'removedTrait' : key.startsWith('-removed.') ? 'removedMember'
-    : /^[+\-~]/.test(key) ? null : 'field';
+    : key.startsWith('+added.') ? 'addedNode' : /^[+\-~]/.test(key) ? null : 'field';
+
+/** Why the added node `node` of the frame (document `frameDoc`) cannot be written as an override at `slot`, or null
+ *  (#1715). Unity offers one Apply target per nested level for an added GameObject; two are refused here:
+ *  - a subtree holding an added prefab INSTANCE (hub ruling on #1715, the Unity line): written into a row's `added` it
+ *    needs the template re-capture promotion does for a row, and it is where Unity's self-nesting target lives;
+ *  - an anchor the level cannot name: a row on the path, or the member, has no `nodeGuid` (a pre-v5 document). */
+export function addedNodeRefusal(slot: LevelSlot, frameDoc: PrefabFile, node: AddedEntity): string | null {
+  const frameName = frameDoc.name || 'this prefab';
+  if (expandedPrefabRefs([node]).length) {
+    return `it holds an added prefab instance, which can be applied to Prefab '${frameName}' itself only — apply it there, or unpack the added instance first`;
+  }
+  if (slot.path.length && !memberKeyAt(slot, frameDoc, node.parentLocalId)) {
+    return `Prefab '${slot.name}' cannot name the member it hangs under (a row on the way has no identity) — re-save it once`;
+  }
+  return null;
+}
 
 /** Does the frame's member `lid` get `trait` from inside level `level` — its own template, or a level below `level`
  *  (and, `inclusive`, level `level` itself)? A field written at a level that already gives the member the component is an
@@ -220,6 +254,8 @@ export function defaultKeyLevel(base: FrameBase, slots: readonly LevelSlot[], fr
 /** The level `asked` names for `key` (a canonical, localId-form key), or why it cannot be written there. */
 export function resolveKeyLevel(
   base: FrameBase, slots: readonly LevelSlot[], frameDoc: PrefabFile, key: string, asked: string | undefined, sameSource: (a: string, b: string) => boolean,
+  /** The frame's added node an `+added.` key names — what {@link addedNodeRefusal} reads at an enclosing level. */
+  addedNodeOf?: (key: string) => AddedEntity | undefined,
 ): number | { skip: string } {
   const n = base.levels.length - 1;
   if (!asked) return defaultKeyLevel(base, slots, frameDoc, key);
@@ -233,7 +269,14 @@ export function resolveKeyLevel(
     }
     return n;
   }
-  if (!slots.some((s) => s.level === level)) return { skip: `Prefab '${base.levels[level]!.doc?.name ?? asked}' holds this instance through a template node, which an Apply cannot write` };
-  if (!OUTER_KINDS(key)) return { skip: `an added node or a move can be applied to Prefab '${frameDoc.name}' only, not yet to an enclosing prefab` };
+  const slot = slots.find((s) => s.level === level);
+  if (!slot) return { skip: `Prefab '${base.levels[level]!.doc?.name ?? asked}' holds this instance through a template node, which an Apply cannot write` };
+  const kind = OUTER_KINDS(key);
+  if (!kind) return { skip: `a move can be applied to Prefab '${frameDoc.name}' only, not to an enclosing prefab` };
+  if (kind === 'addedNode') {
+    const node = addedNodeOf?.(key);
+    const why = node ? addedNodeRefusal(slot, frameDoc, node) : null;
+    if (why) return { skip: why };
+  }
   return level;
 }

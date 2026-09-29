@@ -646,6 +646,207 @@ describe('U12 for a removed NODE: a member the scene deleted inside a nested ins
   });
 });
 
+describe('#1715: a node the scene added inside a nested instance can be added by an ENCLOSING prefab, as an override on its row', () => {
+  const Q = 'cccccccc-0000-4000-8000-000000001715';
+  const qDoc = () => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001715')] });
+  const POINTER = 'dddddddd-0000-4000-8000-000000001715';
+  const written = (id: string) => writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === id).pop();
+  const guidOf = (id: number) => getAllEntities().find((e) => e.id === id)!.guid!;
+  const focus = (id: number) => readTraitData(id, meta('UIFocusable')) as { navDown?: string; navUp?: string } | null;
+  const addChild = (parent: number, name: string, focusData: Record<string, unknown>) => createEntityWithUndo(`Add ${name}`, parent, [
+    { name: 'EntityAttributes', data: { name, parentId: parent } }, { name: 'Transform', data: {} },
+    { name: 'UIFocusable', data: focusData },
+  ], () => {})!;
+  const count = (name: string) => getAllEntities().filter((e) => e.name === name).length;
+  /** O's instances ROOT1/ROOT2 (or the given scene), a scene entity `Pointer` whose nav names Extra, and under ROOT1's
+   *  nested A: Extra (nav → that A) → Extra2 (nav → Extra). Returns the `+added.` key of Extra, as the NESTED instance
+   *  lists it. */
+  const addExtra = async (data: SceneData = scene(O, [ROOT1, ROOT2]), outer = ROOT1) => {
+    await load(data);
+    const a = inInstance(outer, 'A');
+    const extra = addChild(a, 'Extra', { navDown: guidOf(a) });
+    addChild(extra, 'Extra2', { navUp: guidOf(extra) });
+    const pointer = addChild(rootOf(HOLDER), 'Pointer', { navDown: guidOf(extra) });
+    for (const e of getCurrentWorld().entities) {
+      if (e.id() === pointer) e.set(meta('EntityAttributes').trait, { ...(e.get(meta('EntityAttributes').trait) as object), guid: POINTER });
+    }
+    const keys = collectInstanceOverrideKeys(inInstance(outer, 'R'), getCachedPrefabSync(P) as PrefabFile).added;
+    expect(keys).toEqual([`+added.${guidOf(extra)}`]); // precondition: listed on the nested instance, Extra2 inside it
+    return keys[0]!;
+  };
+  const pointerNav = () => focus(getAllEntities().find((e) => e.guid === POINTER)!.id)?.navDown;
+
+  it('target O: row N adds it as a template node — P untouched, every O gains it, nothing duplicated', async () => {
+    // Mutation: drop the \`+added.\` branch of \`writeOuter\` — nothing is written to O, and ROOT2 has no Extra.
+    install(pDoc(), oDoc());
+    const key = await addExtra();
+    const res = await applyToPrefabSelective(inInstance(ROOT1, 'R'), new Set([key]), { perKey: { [key]: O } });
+    expect(res.targets).toEqual([{ key, target: O }]);
+    expect(written(P)).toBeUndefined();
+    const added = written(O)!.entities.find((e) => e.localId === 4)!.added!;
+    expect(added.map((n) => [n.name, n.parentLocalId, n.guid, !!n.key, n.children.map((c) => c.name)])).toEqual([['Extra', 2, '', true, ['Extra2']]]);
+    expect([count('Extra'), count('Extra2')]).toEqual([2, 2]);
+    inInstance(ROOT1, 'Extra'); inInstance(ROOT2, 'Extra'); // one in each (throws on zero or two)
+  });
+
+  it('its refs are tokens in O\'s terms: ROOT2\'s copy names ROOT2\'s A and ROOT2\'s Extra', async () => {
+    // Mutation: skip \`tokenize\` in the \`+added.\` branch — the template holds ROOT1's guids, and ROOT2's Extra points at
+    // ROOT1's A. (Skip only \`pathsFrom\`'s promote: ROOT2's Extra2 points at ROOT1's Extra.)
+    install(pDoc(), oDoc());
+    const key = await addExtra();
+    await applyToPrefabSelective(inInstance(ROOT1, 'R'), new Set([key]), { perKey: { [key]: O } });
+    for (const root of [ROOT1, ROOT2]) {
+      expect(focus(inInstance(root, 'Extra'))?.navDown).toBe(guidOf(inInstance(root, 'A')));
+      expect(focus(inInstance(root, 'Extra2'))?.navUp).toBe(guidOf(inInstance(root, 'Extra')));
+    }
+  });
+
+  it('a scene ref to the node follows it to the guid ROOT1 derives, and still resolves after a save and a reload', async () => {
+    // Mutation: drop the \`keyedPromotions\` carry in \`commitApplyPlan\` — Pointer still names the deleted node's guid.
+    install(pDoc(), oDoc());
+    const key = await addExtra();
+    await applyToPrefabSelective(inInstance(ROOT1, 'R'), new Set([key]), { perKey: { [key]: O } });
+    expect(pointerNav()).toBe(guidOf(inInstance(ROOT1, 'Extra')));
+    install(written(O)!);
+    const s = await serializeScene() as unknown as SceneData;
+    await load(s);
+    expect([count('Extra'), count('Extra2')]).toEqual([2, 2]);
+    expect(pointerNav()).toBe(guidOf(inInstance(ROOT1, 'Extra')));
+  });
+
+  it('three prefabs deep, target O2: a member row\'s `own` on row M carries it, appended after the chain', async () => {
+    // Mutation: \`writeAddedNode\` writes a member row's \`added\` — it then REPLACES what the chain puts under A, and the
+    // assertion on the written key fails. (Refuse a non-empty path: nothing is written to O2.)
+    install(pDoc(), oDoc(), o2Doc());
+    const key = await addExtra(scene(O2, [ROOT1]));
+    const res = await applyToPrefabSelective(inInstance(ROOT1, 'R'), new Set([key]), { perKey: { [key]: O2 } });
+    expect(res.targets).toEqual([{ key, target: O2 }]);
+    const r = (written(O2)!.entities.find((e) => e.localId === 2)!.members as Record<string, { own?: Array<{ name: string; parentLocalId: number }>; added?: unknown }>)[`/${gN}/${gA}`]!;
+    expect([r.own?.map((n) => [n.name, n.parentLocalId]), r.added]).toEqual([[['Extra', 0]], undefined]);
+    expect(count('Extra')).toBe(1);
+    expect(pointerNav()).toBe(guidOf(inInstance(ROOT1, 'Extra')));
+  });
+
+  it('the targets are every prefab on the chain, P the default; the effect says it is an override every O gains', async () => {
+    // Mutation: leave \`+added.\` out of \`OUTER_KINDS\` — O is not offered, and the Apply to O is skipped.
+    install(pDoc(), oDoc());
+    const key = await addExtra();
+    const r = inInstance(ROOT1, 'R');
+    const t = applyTargetOptions(r, getCachedPrefabSync(P) as PrefabFile, [key]).get(key)!;
+    expect([t.options.map((o) => o.name), t.defaultTarget]).toEqual([['O', 'P'], P]);
+    const pv = await previewApply(r, new Set([key]), { perKey: { [key]: O } });
+    expect(pv.effects.map((e) => describeEffect(e))).toEqual(['add Extra as an override in Prefab \'O\' — every O gains it']);
+  });
+
+  it('a subtree holding an added prefab INSTANCE is refused at O, with the way out; P is still offered', async () => {
+    // Mutation: drop the instance clause of \`addedNodeRefusal\` — O is offered, and the Apply writes the node into row N.
+    install(pDoc(), oDoc(), qDoc());
+    await load(scene(O, [ROOT1, ROOT2]));
+    const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, inInstance(ROOT1, 'A'))!;
+    setPrefabSource(qRoot, { id: Q });
+    for (const e of getCurrentWorld().entities) {
+      if (e.id() === qRoot) e.set(meta('EntityAttributes').trait, { ...(e.get(meta('EntityAttributes').trait) as object), guid: 'dddddddd-0000-4000-8000-000000001716' });
+    }
+    const r = inInstance(ROOT1, 'R');
+    const key = collectInstanceOverrideKeys(r, getCachedPrefabSync(P) as PrefabFile).added[0]!;
+    expect(key).toBe('+added.dddddddd-0000-4000-8000-000000001716'); // precondition
+    expect(applyTargetOptions(r, getCachedPrefabSync(P) as PrefabFile, [key]).get(key)!.options.map((o) => o.name)).toEqual(['P']);
+    const res = await applyToPrefabSelective(r, new Set([key]), { perKey: { [key]: O } });
+    expect(res.applied).toBe(false);
+    expect(res.skipped?.[0]?.reason).toBe('it holds an added prefab instance, which can be applied to Prefab \'P\' itself only — apply it there, or unpack the added instance first');
+    expect(written(O)).toBeUndefined();
+  });
+
+  it('close-out review: two SIBLING nodes applied by two keys name each other as tokens, in every instance', async () => {
+    // Mutation: build a fresh \`templateValueWriter\` per \`writeOuter\` call again (\`writerAt\` → \`templateValueWriter\`) — each
+    // key's node is promoted on its own writer, B1's ref to B2 stays ROOT1's live guid, and ROOT2's B1 names nothing.
+    install(pDoc(), oDoc());
+    await load(scene(O, [ROOT1, ROOT2]));
+    const a = inInstance(ROOT1, 'A');
+    const b1 = addChild(a, 'B1', {});
+    const b2 = addChild(a, 'B2', { navUp: guidOf(b1) });
+    writeTraitFieldWithUndo(b1, meta('UIFocusable'), 'navDown', guidOf(b2));
+    const keys = collectInstanceOverrideKeys(inInstance(ROOT1, 'R'), getCachedPrefabSync(P) as PrefabFile).added;
+    expect(keys.length).toBe(2); // precondition
+    await applyToPrefabSelective(inInstance(ROOT1, 'R'), new Set(keys), { default: O });
+    for (const root of [ROOT1, ROOT2]) {
+      expect(focus(inInstance(root, 'B1'))?.navDown).toBe(guidOf(inInstance(root, 'B2')));
+      expect(focus(inInstance(root, 'B2'))?.navUp).toBe(guidOf(inInstance(root, 'B1')));
+    }
+  });
+
+  it('close-out review: a row whose MEMBER ROW restates the anchor\'s list (`added`) still shows the node — it goes on that row\'s `own`', async () => {
+    // Mutation: \`writeAddedNode\` pushes into the row's legacy \`added\` whatever member row the anchor has — the member row's
+    // \`added: []\` replaces that list in the fold, and Extra is gone from both instances.
+    const o = oWith({});
+    delete (o.entities[3] as Record<string, unknown>).overrides;
+    (o.entities[3] as Record<string, unknown>).members = { [`/${gA}`]: { added: [] } };
+    install(pDoc(), o);
+    const key = await addExtra();
+    await applyToPrefabSelective(inInstance(ROOT1, 'R'), new Set([key]), { perKey: { [key]: O } });
+    const r = written(O)!.entities.find((e) => e.localId === 4)!;
+    expect((r.members as Record<string, { own?: Array<{ name: string }> }>)[`/${gA}`]?.own?.map((n) => n.name)).toEqual(['Extra']);
+    expect(r.added).toBeUndefined();
+    inInstance(ROOT1, 'Extra'); inInstance(ROOT2, 'Extra');
+    expect(pointerNav()).toBe(guidOf(inInstance(ROOT1, 'Extra')));
+  });
+
+  it('close-out review: another O instance the scene nested INSIDE the source instance does not take the carry from it', async () => {
+    // Mutation: pair by \`identitySubtree\` again — it reaches into the stored O root under Slot2, whose copy carries the same
+    // key, the pairing is not unique, and Pointer is left naming the deleted node.
+    install(pDoc(), oDoc());
+    await load(scene(O, [ROOT1]));
+    const inner = instantiatePrefab(getCachedPrefabSync(O) as PrefabFile, inInstance(ROOT1, 'Slot2'))!;
+    setPrefabSource(inner, { id: O });
+    for (const e of getCurrentWorld().entities) {
+      if (e.id() === inner) e.set(meta('EntityAttributes').trait, { ...(e.get(meta('EntityAttributes').trait) as object), guid: 'dddddddd-0000-4000-8000-000000001717' });
+    }
+    const outerA = getAllEntities().filter((e) => e.name === 'A').find((e) => {
+      const byId = new Map(getAllEntities().map((x) => [x.id, x]));
+      for (let c: typeof e | undefined = e; c; c = byId.get(c.parentId)) if (c.id === inner) return false;
+      return true;
+    })!.id;
+    const extra = addChild(outerA, 'Extra', {});
+    const pointer = addChild(rootOf(HOLDER), 'Pointer', { navDown: guidOf(extra) });
+    const r = getAllEntities().find((e) => e.id === outerA)!.parentId;
+    const key = collectInstanceOverrideKeys(r, getCachedPrefabSync(P) as PrefabFile).added[0]!;
+    await applyToPrefabSelective(r, new Set([key]), { perKey: { [key]: O } });
+    expect(count('Extra')).toBe(2); // the source instance's, and the nested O's
+    const now = focus(pointer)?.navDown;
+    const hit = getAllEntities().find((e) => e.guid === now);
+    expect(hit?.name).toBe('Extra');
+  });
+
+  it('close-out re-review: a U14 field naming a node this Apply promotes into O is a token on row N — ROOT2\'s A names ROOT2\'s X', async () => {
+    // Mutation: start \`levelWriters\` empty again — the U14 write at O's own level gets a fresh writer that never saw the
+    // promotion's \`promote\`, row N holds ROOT1's X guid, and ROOT2's A names ROOT1's X (#1659's cross-instance ref).
+    install(pDoc(), oDoc());
+    await load(scene(O, [ROOT1, ROOT2]));
+    const xNode = addChild(inInstance(ROOT1, 'Slot2'), 'X', {});
+    addTraitToEntitiesWithUndo([inInstance(ROOT1, 'A')], meta('UIFocusable'), { navDown: guidOf(xNode) });
+    const keys = collectInstanceOverrideKeys(rootOf(ROOT1), getCachedPrefabSync(O) as PrefabFile);
+    expect(keys.nested.length).toBeGreaterThan(0); // precondition: the nested A's component is listed on O
+    await applyToPrefabSelective(rootOf(ROOT1), new Set([...keys.all, ...keys.nested]));
+    const nav = (written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.UIFocusable as { navDown?: string } | undefined)?.navDown;
+    expect(nav && isMemberToken(nav)).toBe(true);
+    for (const root of [ROOT1, ROOT2]) expect(focus(inInstance(root, 'A'))?.navDown).toBe(guidOf(inInstance(root, 'X')));
+  });
+
+  it('an anchor the enclosing level cannot name is refused there: O2 through a row N with no identity', async () => {
+    // Mutation: drop the anchor clause of \`addedNodeRefusal\` — O2 is offered, and the write is skipped only by
+    // \`writeAddedNode\`'s own refusal, after the dialog offered it.
+    const o = oDoc() as ReturnType<typeof oDoc> & { entities: Array<Record<string, unknown>> };
+    delete (o.entities[3] as Record<string, unknown>).nodeGuid;
+    install(pDoc(), o, o2Doc());
+    const key = await addExtra(scene(O2, [ROOT1]));
+    const r = inInstance(ROOT1, 'R');
+    expect(applyTargetOptions(r, getCachedPrefabSync(P) as PrefabFile, [key]).get(key)!.options.map((x) => x.name)).toEqual(['O', 'P']);
+    const res = await applyToPrefabSelective(r, new Set([key]), { perKey: { [key]: O2 } });
+    expect(res.skipped?.[0]?.reason).toBe('Prefab \'O2\' cannot name the member it hangs under (a row on the way has no identity) — re-save it once');
+    expect(written(O2)).toBeUndefined();
+  });
+});
+
 describe('#1693 final close-out review: the cases it drove', () => {
   const written = (id: string) => writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === id).pop();
   const tfx = (id: number) => (readTraitData(id, meta('Transform')) as { x: number }).x;

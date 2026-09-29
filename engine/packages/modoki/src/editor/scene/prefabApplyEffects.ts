@@ -67,7 +67,7 @@ export function describeEffect(e: Pick<KeyEffect, 'effect' | 'targetName' | 'asO
     case 'stopAddingComponent': return `Prefab '${name}' stops adding ${x.trait} to ${x.member}`;
     case 'addTag': return `add tag ${x.tag} to ${x.member} ${at}${every('gains')}`;
     case 'removeMember': return e.asOverride ? `remove ${x.member} ${at}` : `remove ${x.member} from Prefab '${name}'${every('loses')}`;
-    case 'addNode': return `add ${x.name} to Prefab '${name}'${every('gains')}`;
+    case 'addNode': return e.asOverride ? `add ${x.name} ${at} — every ${name} gains it` : `add ${x.name} to Prefab '${name}'${every('gains')}`;
     case 'move': return `move ${x.member} in Prefab '${name}'`;
     case 'notApplied': return `not applied: ${x.reason}`;
     case 'conflict': {

@@ -16,6 +16,8 @@ import { chainSlots, resolveKeyLevel, defaultKeyLevel } from './prefabApplyTarge
 import { toLocalIdKey, splitNestedKey } from './overrideKeyGrammar';
 import { type PrefabFile } from './prefab';
 import { getCachedPrefabSync } from './prefabCache';
+import { ownInstanceStructure } from './prefabChain';
+import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 
 export interface ApplyTargetOption {
   /** The prefab's guid (its `PrefabInstance.source`): what `ApplyTargets` names it by. */
@@ -45,6 +47,12 @@ export function applyTargetOptions(rootInstanceId: number, prefab: PrefabFile, k
   const n = base ? base.levels.length - 1 : 0;
   const levelSource = (j: number) => (base ? base.levels[j]!.source : ownSource);
   const levelName = (j: number) => (base ? base.levels[j]!.doc?.name ?? base.levels[j]!.source : frameName);
+  // The instance's added nodes, for an `+added.` key's enclosing targets (#1715) — captured once, and only when asked.
+  let added: Map<string, AddedEntity> | undefined;
+  const addedNodeOf = (k: string): AddedEntity | undefined => {
+    added ??= new Map(ownInstanceStructure(rootInstanceId, prefab).added.map((n) => [n.guid, n]));
+    return added.get(k.slice('+added.'.length));
+  };
   for (const key of keys) {
     const canon = toLocalIdKey(key, prefab, getCachedPrefabSync);
     if (!canon) continue;
@@ -69,7 +77,7 @@ export function applyTargetOptions(rootInstanceId: number, prefab: PrefabFile, k
     }
     const options: ApplyTargetOption[] = [];
     for (let j = 0; j <= n; j++) {
-      const level = base ? resolveKeyLevel(base, slots, prefab, canon, levelSource(j), sameSource) : n;
+      const level = base ? resolveKeyLevel(base, slots, prefab, canon, levelSource(j), sameSource, addedNodeOf) : n;
       if (level !== j) continue;
       options.push({ target: levelSource(j), name: levelName(j) });
     }

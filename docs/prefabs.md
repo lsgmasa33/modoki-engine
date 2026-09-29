@@ -770,9 +770,9 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 |---|---|---|---|---|
 | U10 | Apply / Revert granularity | Per property (right-click), per component (cog menu), per added GameObject (Hierarchy menu), and All / Selected from the Overrides drop-down. [M22 `EditingPrefabViaInstance`] | One dialog (`PrefabOverridesDialog`), opened from the Inspector's "Apply to Prefab…" / "Revert Overrides…". It is a tri-state tree of entity → component → field, plus one row per structural edit, all checked to start. No right-click Apply / Revert on a field or component. | match in what can be selected; the context-menu shortcuts are **missing**, S |
 | U11 | What Revert does per kind | Removes an added component or GameObject (with its children); restores a removed component or GameObject. [S6 `PrefabUtility.RevertAddedGameObject`, `RevertRemovedGameObject`; M22 `EditingPrefabViaInstance`] | The same, and "move back" for a moved member. `revertOverridesSelective` tears down and re-expands minus the reverted keys. | match |
-| U12 | Apply target, per item on a nested instance | Offers every prefab on the chain: "Apply to Prefab 'Vase'" (the inner asset) or "Apply as Override in Prefab 'Table'" (an override on the nested instance inside the outer asset). [M22 `PrefabOverridesMultiLevel`] | Every field, added tag and removed component takes a target per key over the whole chain (#1693, § "Apply's targets"), in the dialog and the agent `apply` op. An ADDED node, and a move inside a nested frame, still take only the frame's own prefab; a move OUT of a nested frame only the outer one (#1437). | match for fields, components and removed members; **diverges** for added nodes and moves (#1715) |
+| U12 | Apply target, per item on a nested instance | Offers every prefab on the chain: "Apply to Prefab 'Vase'" (the inner asset) or "Apply as Override in Prefab 'Table'" (an override on the nested instance inside the outer asset). [M22 `PrefabOverridesMultiLevel`] | Every field, added tag, removed component, removed member and added node takes a target per key over the whole chain (#1693, #1715, § "Apply's targets"), in the dialog and the agent `apply` op. Two cuts: an added node holding an added prefab INSTANCE takes only the frame's own prefab (#1715), and a prefab object is never moved at all since #1869. | match, except an added node holding an added prefab instance (#1715, § "Apply's targets" → "Not done") |
 | U13 | Applying to the inner asset clears the outer's override | "If Apply to Prefab 'Vase' is chosen and the 'Table' Prefab has an override of the value, this override in the 'Table' Prefab is reverted at the same time." [M22 `PrefabOverridesMultiLevel`] | The same (#1693, owner 2026-09-28, superseding #1492 ruling b): every enclosing level's statement of the applied field, tag or removed component is dropped, its file written in the same step, and Apply's undo restores it. | match |
-| U14 | Apply All on the outermost root | Targets the outer prefab only. Nested edits become overrides on the nested instance inside it. [M22 `PrefabOverridesMultiLevel`] | The same for fields, added tags, removed components and removed members (#1693, owner 2026-09-28, superseding the 2026-09-19 ruling): the outer instance lists them (`keys.nested`) and writes them into the outer prefab by default; the nested prefab only when picked. A nested frame's added nodes and inner moves are still applied from the nested instance. | match for fields, components and removed members; **diverges** for added nodes and inner moves (#1715) |
+| U14 | Apply All on the outermost root | Targets the outer prefab only. Nested edits become overrides on the nested instance inside it. [M22 `PrefabOverridesMultiLevel`] | The same for fields, added tags, removed components and removed members (#1693, owner 2026-09-28, superseding the 2026-09-19 ruling): the outer instance lists them (`keys.nested`) and writes them into the outer prefab by default; the nested prefab only when picked. A nested frame's added nodes are still applied from the nested instance, which offers every target on the chain (U12); no listing on the outer one produces their key. | match for fields, components and removed members; **diverges** for added nodes (listed on the nested instance only) |
 | U15 | The instance after an Apply | The applied value now comes from the asset, so the override disappears. | The same: Apply takes what it applied out of the source instance's overrides (#1469), and nothing shadows it any more (U13). | match |
 
 ### Unpack, Prefab Mode, Replace, Create
@@ -1551,10 +1551,37 @@ so a value written under a member row that states the field would not show — i
   the added-component seed, both promotion branches (a promoted node's refs, and a promoted reference node's overrides
   in its own frame) and the move pose. It tokenizes a ref to a member (or to a node the same Apply promotes) and drops
   a template-excluded field and a blank asset ref.
-- **Not yet (#1715)**: an ADDED node, and a move inside a nested instance, go to the frame's own prefab only (a move OUT
-  of a nested frame goes to the outer one, `nestedFrameMoves`, #1437); the enclosing levels take fields, tags, removed
-  components and removed members (`writeMemberRemoval`). An added node is a live entity whose guid other refs name, so
-  writing it into another prefab's row needs #1660's guid carry across that prefab's rebuild — a different fix shape. A template reference node above the chain is not a place Apply writes, so U13 cannot drop its
+- **An ADDED node takes a target per level too (#1715, U12).** Unity offers one Apply target per nested level for an
+  added GameObject (`PrefabUtility.HandleAddedGameObjectOverridesMenuItems`); the default stays the frame's own prefab
+  (promotion, `insertAddedSubtree`). At an enclosing level the node is written as a TEMPLATE node (`guid: ''`, a fresh
+  `key` per node, `toTemplateNodes`) by `writeAddedNode`: into the row's own `added` where the row expands the frame, and
+  APPENDED to a member row's `own` deeper down — a member row's `added` would replace what the chain puts under the
+  member, and pin it. For the same reason, where the frame-expanding row already holds a member row for the anchor
+  (a prefab-edit save writes one whose `added` restates the list when it cannot diff node by node), the node goes on
+  that row's `own`: pushed into the row's own list, it was written, deleted live and shown nowhere. Its values go
+  through ONE writer per enclosing level (`writerAt`), applied in the frame the node hangs in, after every node of every
+  `+added.` key at that level is `promote`d to its `+key` path (`promoteOuterAdded`, before any key is written), so a
+  ref to a member, to another node of the subtree or to a node another key adds (two sibling buttons naming each
+  other) is a token. A writer per key left that last one as the source instance's live guid. The frame's OWN level is the
+  promotion's writer itself: a U14 key's default write lands in that document too, and a fresh writer there left a field
+  naming a node the same Apply promotes as the source instance's guid (#1659's cross-instance ref, since #1693).
+  **Identity:** a node in a row's `added`/`own` is template-keyed — every instance DERIVES its guid from its anchor and
+  its `+key` step (`templateIdentity.ts`), and no scene row can pin it — so the carry is `carryPromotedGuids`' follow
+  half: after the last refresh each key is paired with the one entity carrying it among what that level's instance can
+  name (`memberPathIndex`, which stops at a stored root — a scene-nested instance of the same prefab inside it carries
+  the same key, and the pairing was not unique), and every ref moves to the derived guid, which the reload derives
+  again. A ref in ANOTHER file to the node dangles (the gap
+  #1680 was closed on under the Unity rule). The live node is deleted before ANY refresh, not in the frame's turn: an
+  Apply writing only the enclosing prefab has no frame turn, and that prefab's capture re-spawned the node beside its
+  template twin. Refused at an enclosing level, the target not offered: an anchor that level cannot name (a pre-v5 row
+  on the path), and the cut below. Pinned by `nestedEnclosingLayer.test.ts` › #1715 and `applyTwoFileUndo.test.ts` ›
+  #1715.
+- **Not done (#1715, hub ruling 2026-09-30, the Unity line)**: an added node whose subtree holds an added prefab
+  INSTANCE is applied to the frame's own prefab only — "apply it there, or unpack the added instance first". Written
+  into a row's `added` it needs the template re-capture promotion does for a reference row (#1533, #1538, #1802, and
+  `toTemplateNodes` drops a node's `members`), and its carry the expansion walk (`promotionPathIndex`): the large half,
+  for low reach. It is also the only place Unity's disabled self-nesting target could arise, so with the cut it cannot.
+  A move inside a nested instance is not applied anywhere: no gesture moves a prefab object since #1869. A template reference node above the chain is not a place Apply writes, so U13 cannot drop its
   statement (#1731; Unity would — that needs the node as a write target, #1715's family). Where it states the applied
   field, the prefab IS written (every other instance takes the value), and THIS instance keeps the value it shows as
   its own edit — left out of the refresh's subtraction, still marked and still listed, since it differs from its base —

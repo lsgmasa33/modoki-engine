@@ -10,7 +10,7 @@ import { memberPathRecords, type PrefabReader } from '../../runtime/loaders/memb
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { newGuid, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
-import { memberPathSteps } from '../../runtime/core/assetRefRules';
+import { memberPathSteps, addedKeyStep } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { commitPrefabWrites } from './prefabCommit';
@@ -20,7 +20,10 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { frameBase, ownedRootAt, type FrameBase } from './prefabBase';
 import { templateValueWriter } from './prefabTemplateValue';
-import { chainSlots, memberKeyAt, writeStated, dropStated, writeRemoval, writeMemberRemoval, statedFields, traitInside, resolveKeyLevel, carrierOf, nodeSlot, type ApplyTargets, type LevelSlot } from './prefabApplyTargets';
+import {
+  chainSlots, memberKeyAt, writeStated, dropStated, writeRemoval, writeMemberRemoval, writeAddedNode, addedNodeRefusal, statedFields, traitInside,
+  resolveKeyLevel, carrierOf, nodeSlot, type ApplyTargets, type LevelSlot,
+} from './prefabApplyTargets';
 import { conflictRefusal, effectsFingerprint, prefabFileName, formatEffectValue, REMOVED_VALUE, type ApplyConflict, type EditEffect, type KeyEffect } from './prefabApplyEffects';
 import { parseMemberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
 import {
@@ -30,7 +33,7 @@ import {
 import { getCachedPrefabSync, getPrefabSource, preloadNestedPrefabsForSubtree, wouldCreateCycle } from './prefabCache';
 import { settleSwallowedKeptState } from './prefabTokens';
 import { collectComparableTraits } from './prefabInstanceOverrides';
-import { captureInstanceStructure } from './prefabCapture';
+import { captureInstanceStructure, toTemplateNodes } from './prefabCapture';
 import { layerAuthoredStructureKeys } from './prefabChain';
 import {
   collectInstanceRoots, framesBuiltFromOtherRows, missingNestedFrameKeys, missingPrefabInstance, missingSourceRefusal,
@@ -141,6 +144,9 @@ export interface ApplyPlan {
     liveAddedRootsToDelete: number[];
     promotedRows: Map<string, number>;
     promotedRefRows: Map<string, number>;
+    /** Added nodes written as overrides on an enclosing prefab's row (#1715), by the guid of that level's instance root:
+     *  each node's template key → its live guid, for the carry after that prefab's refresh. */
+    keyedPromotions: Map<string, Map<string, string>>;
   };
   skipped: { key: string; reason: string }[];
   /** Each applied key (the caller's spelling) and the prefab it was written to (#1693). */
@@ -405,6 +411,7 @@ async function planApply(
   const innerFields: { key: string; lid: number; trait: string; fields: string[] }[] = [];
   const promotedRows = new Map<string, number>(); // live guid of a promoted added node → its new row
   const promotedRefRows = new Map<string, number>(); // …and of a promoted reference node → its nested row (#1660)
+  const keyedPromotions = new Map<string, Map<string, string>>(); // …and of a node written on an enclosing row (#1715)
   // The row a live entity of THIS frame is: the root, a member, or an owned nested root (its row).
   const rowOfEcs = new Map<number, number>([[rootInstanceId, newPrefab.rootLocalId ?? 1]]);
   for (const [lid, ecs] of localToEcs) rowOfEcs.set(ecs, lid);
@@ -518,7 +525,7 @@ async function planApply(
     if (splitNestedKey(key)) { selectedKeys.delete(key); nestedKeys.push(key); continue; }
     const original = canon.original.get(key) ?? key;
     const asked = targets?.perKey?.[original] ?? targets?.perKey?.[key] ?? targets?.default;
-    const level = frame ? resolveKeyLevel(frame, slots, oldPrefab, key, asked, sameSource) : n;
+    const level = frame ? resolveKeyLevel(frame, slots, oldPrefab, key, asked, sameSource, (k) => addedByGuid.get(k.slice('+added.'.length))) : n;
     if (typeof level !== 'number') { selectedKeys.delete(key); skipped.push({ key, reason: level.skip }); continue; }
     if (level < n) { selectedKeys.delete(key); outerKeys.push({ key, slot: slots.find((sl) => sl.level === level)! }); }
   }
@@ -733,7 +740,40 @@ async function planApply(
     for (const r of innerRemovals) written.push({ key: r.key, ctx: ownCtx, level: n, lid: r.lid, trait: r.trait });
   }
 
-  /** Write `key` (a frame-local key: field, `+trait.`, `-trait.`) of frame `ctx` at enclosing level `level` < ctx.n, as
+  /** ONE template-value writer per enclosing level's instance root, shared by every key written there: a node this Apply
+   *  adds at that level is `promote`d on it before any value there is tokenized, so a ref to it from another key's node
+   *  is a token too (close-out review: a writer per key left sibling added nodes naming each other by live guid). The
+   *  frame's OWN level is `writer` itself — a U14 key's default write lands in this document, beside the promotion's rows,
+   *  and a fresh writer there never saw their `promote` (#1659's cross-instance ref, close-out re-review). */
+  const levelWriters = new Map<number, ReturnType<typeof templateValueWriter>>([[rootInstanceId, writer]]);
+  const writerAt = (root: number) => {
+    let w = levelWriters.get(root);
+    if (!w) levelWriters.set(root, (w = templateValueWriter(root)));
+    return w;
+  };
+  /** Each `+added.` key an enclosing level takes, as the template node it becomes (fresh keys, `toTemplateNodes`) and
+   *  each node's template key → live guid, for the carry. */
+  const outerAdded = new Map<string, { tpl: AddedEntity; keyed: Map<string, string> }>();
+  /** Promote the added node `key` names — every node of its subtree — at level `level`'s writer, at its `+key` path. */
+  const promoteOuterAdded = (key: string, ctx: ChainCtx, level: number): void => {
+    const node = addedByGuid.get(key.slice('+added.'.length));
+    const slot = ctx.slots.find((sl) => sl.level === level);
+    if (!node || !slot || addedNodeRefusal(slot, ctx.frameDoc, node)) return;
+    const levelWriter = writerAt(ctx.base.levels[level]!.root);
+    const tpl = toTemplateNodes([node])![0]!;
+    const keyed = new Map<string, string>();
+    const pathsFrom = (live: AddedEntity, t: AddedEntity, parent: MemberStep[] | undefined): void => {
+      const steps = parent && t.key ? [...parent, addedKeyStep(t.key)] : undefined;
+      if (live.guid && steps) levelWriter.promote(live.guid, steps);
+      if (live.guid && t.key) keyed.set(t.key, live.guid);
+      live.children.forEach((c, i) => { if (t.children[i]) pathsFrom(c, t.children[i]!, steps); });
+    };
+    const anchor = memberOf(ctx.frameRoot, node.parentLocalId);
+    pathsFrom(node, tpl, anchor ? levelWriter.pathOf(guidForEntityId(anchor)) : undefined);
+    outerAdded.set(key, { tpl, keyed });
+  };
+
+  /** Write `key` (a frame-local key: field, `+trait.`, `-trait.`, `-removed.`, `+added.`) of frame `ctx` at enclosing level `level` < ctx.n, as
    *  an override on the row that level holds for the frame. False when it was skipped (said in `skipped`). */
   const writeOuter = async (key: string, reportAs: string, ctx: ChainCtx, level: number): Promise<boolean> => {
     const slot = ctx.slots.find((sl) => sl.level === level)!;
@@ -741,10 +781,39 @@ async function planApply(
     if (!at) return false;
     const carrier = at.doc.entities.find((x) => x.localId === slot.rowLid && x.prefab);
     if (!carrier) { skipped.push({ key: reportAs, reason: `its row is no longer in Prefab '${at.doc.name}'` }); return false; }
-    const levelWriter = templateValueWriter(ctx.base.levels[level]!.root);
+    const levelWriter = writerAt(ctx.base.levels[level]!.root);
     const tName = at.doc.name || slot.source;
     const here = (lid: number, trait: string, field: string) => slotOf(at.doc, slot.rowLid, slot.path, lid, trait, field);
-    if (key.startsWith('-removed.')) {
+    if (key.startsWith('+added.')) {
+      // A node the scene added, added by this level (#1715, U12): a template node on the row — every instance of this
+      // prefab gains it — with a fresh template key per node, never the live guid (#1387).
+      const guid = key.slice('+added.'.length);
+      const node = addedByGuid.get(guid);
+      if (!node) return false;
+      const why = addedNodeRefusal(slot, ctx.frameDoc, node);
+      if (why) { skipped.push({ key: reportAs, reason: why }); return false; }
+      // Every node's path at this level is already known (`promoteOuterAdded`, before any key was written), so a ref to a
+      // node of this subtree or of another key's is a token; every value goes through this level's writer, applied in
+      // the frame the node hangs in (as a field written here is).
+      if (!outerAdded.has(key)) promoteOuterAdded(key, ctx, level);
+      const { tpl, keyed } = outerAdded.get(key)!;
+      const tokenize = (t: AddedEntity): void => {
+        for (const [name, bag] of Object.entries(t.traits)) if (typeof bag === 'object') t.traits[name] = levelWriter.bag(getTraitByName(name), bag, ctx.frameRoot);
+        t.children.forEach(tokenize);
+      };
+      tokenize(tpl);
+      if (!writeAddedNode(carrier, slot.path, memberKeyAt(slot, ctx.frameDoc, node.parentLocalId), node.parentLocalId, tpl)) {
+        skipped.push({ key: reportAs, reason: `Prefab '${at.doc.name}' cannot name the member it hangs under (a row on the way has no identity) — re-save it once` });
+        return false;
+      }
+      const levelRoot = guidForEntityId(ctx.base.levels[level]!.root);
+      const carried = keyedPromotions.get(levelRoot) ?? new Map<string, string>();
+      for (const [k, g] of keyed) carried.set(k, g);
+      keyedPromotions.set(levelRoot, carried);
+      const liveEcs = localToEcsGuid(guid);
+      if (liveEcs) liveAddedRootsToDelete.push(liveEcs);
+      setEffect(reportAs, slot.source, tName, true, { op: 'addNode', name: node.name });
+    } else if (key.startsWith('-removed.')) {
       // A member the scene deleted, removed by this level (U12): the row's own `removed`, or a member row deeper down.
       const lid = Number(key.slice('-removed.'.length));
       if (!writeMemberRemoval(carrier, slot.path, memberKeyAt(slot, ctx.frameDoc, lid), lid)) {
@@ -819,6 +888,7 @@ async function planApply(
     return found;
   }
 
+  if (ownCtx) for (const { key, slot } of outerKeys) if (key.startsWith('+added.')) promoteOuterAdded(key, ownCtx, slot.level);
   for (const { key, slot } of outerKeys) {
     if (!ownCtx) break;
     await writeOuter(key, key, ownCtx, slot.level);
@@ -1084,7 +1154,7 @@ async function planApply(
         ...(e.appliedFrom.size ? { appliedFrom: [...e.appliedFrom].map(([rootId, fields]) => ({ rootId, fields })) } : {}),
       } })),
     ], sameSource).map((x) => x.w),
-    rebuild: { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows },
+    rebuild: { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows, keyedPromotions },
     skipped,
     applied,
     alsoReverted: [...alsoReverted].map(([src, keys]) => ({ source: src, keys })),
@@ -1134,7 +1204,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   // single-file fields of the result.
   const frameWrite = plan.writes.find((w) => w.role === 'frame');
   const { source, expected: oldPrefab, before: prefabBefore, doc: newPrefab } = frameWrite ?? plan.writes[0]!;
-  const { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows } = plan.rebuild;
+  const { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows, keyedPromotions } = plan.rebuild;
   const { skipped } = plan;
 
   const warnings = plan.writes.flatMap((w) => warnInertPrefabSizes(w.doc, w.source));
@@ -1149,6 +1219,12 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   // lands with the frame's own or not at all.
   const committed = await commitPrefabWrites(plan.writes.map((w) => ({ source: w.source, doc: w.doc, expected: w.expected })), {
     rebuild: async () => {
+      // Delete the live plain entities for applied additions BEFORE any refresh, so the re-instantiated prefab member
+      // replaces them instead of duplicating. Before the loop, not in the frame's turn: an added node written only into an
+      // ENCLOSING prefab (#1715) has no frame turn, and that prefab's capture re-spawned it beside its template twin.
+      // Non-applied additions stay live and are re-captured + re-spawned by the refresh.
+      const survivors = deletePromotedNodes(liveAddedRootsToDelete);
+      const follow = new Map<string, string>();
       // Every written file's instances, in the plan's order — innermost first — so each capture reads frames already
       // rebuilt inside it.
       for (const w of plan.writes) {
@@ -1158,10 +1234,6 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
         refreshInstances(w.source, roots, w.expected, w.doc, new Map(), w.appliedFrom);
         continue;
       }
-      // Delete the live plain entities for applied additions BEFORE refresh, so the
-      // re-instantiated prefab member replaces them instead of duplicating. Non-applied
-      // additions stay live and are re-captured + re-spawned by the refresh.
-      const survivors = deletePromotedNodes(liveAddedRootsToDelete);
       // Every instance of this source, with NO exclusion — the clicked one goes through
       // capture/restore too. ⚠️ Matching the new base is NOT what takes an applied field out of its
       // override set (#1469): the field is still override-MARKED, the capture against the old document
@@ -1176,13 +1248,22 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       // warning at all (#1284).
       for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
       refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, new Map(), { rootId: rootInstanceId, fields: appliedFields });
-      rehangPromotionSurvivors(survivors, carryPromotedGuids(rootGuid, promotedGuids));
+      for (const [from, to] of carryPromotedGuids(rootGuid, promotedGuids)) follow.set(from, to);
+      rehangPromotionSurvivors(survivors, follow);
       // A promoted REFERENCE node's kept state went into its row (`insertAddedSubtree`'s bake); its identity stays in the
       // scene, on the stored root it is now a member of (#1802, owner ruling D) — the settle Create Prefab runs, which finds
       // each node by the guid `carryPromotedGuids` gave it back. Apply's undo reloads the scene from its snapshot.
       // By guid: the refresh rebuilt the instance, so `rootInstanceId` may name nothing now.
       const liveRoot = promotedRefRows.size && rootGuid ? localToEcsGuid(rootGuid) : 0;
       if (liveRoot) settleSwallowedKeptState(liveRoot);
+      }
+      // A node written on an ENCLOSING prefab's row (#1715) is a template-keyed node there: every instance derives its
+      // guid, and no row can pin it, so its refs follow it to the derived one — after the last refresh, which rebuilt it.
+      if (keyedPromotions.size) {
+        for (const [levelRoot, keyed] of keyedPromotions) {
+          for (const [from, to] of carryPromotedGuids(levelRoot, { plain: new Map(), refs: new Map(), keyed })) follow.set(from, to);
+        }
+        rehangPromotionSurvivors(survivors, follow);
       }
     },
   });

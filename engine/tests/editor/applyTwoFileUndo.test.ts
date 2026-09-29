@@ -82,7 +82,7 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, loadSceneFile, instantiatePrefabIntoWorld,
   destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { setActionCallback, pushAction } from '@modoki/engine/editor';
+import { setActionCallback, pushAction, createEntityWithUndo } from '@modoki/engine/editor';
 import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
@@ -239,6 +239,46 @@ describe('U13: a two-file Apply is undone and redone as one', () => {
     await quietly(() => undo());
     sameDoc(parked(P), pDoc());
     sameDoc(parked(O), oDoc());
+  });
+});
+
+describe('#1715: an added node applied as an override on O\'s row, beside a field applied to P, is undone as one', () => {
+  it('undo parks BOTH documents back and brings the live node back under its own guid; the files keep the Apply until Save', async () => {
+    // Mutation: drop the \`liveAddedRootsToDelete\` push in \`writeOuter\`'s \`+added.\` branch — the scene's own Extra
+    // stays beside its template twin after the Apply. (Restore no other file in the undo, \`others\` empty: O is not
+    // parked back, and still holds the node.)
+    const a = byName('A');
+    const extra = createEntityWithUndo('Add Extra', a, [
+      { name: 'EntityAttributes', data: { name: 'Extra', parentId: a } }, { name: 'Transform', data: {} },
+    ], () => {})!;
+    writeTraitFieldWithUndo(a, getTraitByName('Transform')!, 'x', 5);
+    const nested = byName('R');
+    const keys = collectInstanceOverrideKeys(nested, getCachedPrefabSync(P) as PrefabFile);
+    const addKey = keys.added[0]!;
+    const fieldKey = keys.fields.find((k) => k.endsWith('.Transform.x'))!;
+    const extraGuid = all().find((e) => e.id === extra)!.guid!;
+    expect(addKey).toBe(`+added.${extraGuid}`); // precondition
+    const res = await quietly(() => applyToPrefabWithUndo(nested, new Set([addKey, fieldKey]), { perKey: { [addKey]: O } }));
+    expect(res.applied).toBe(true);
+    expect(res.writes?.map((w) => w.source)).toEqual([P, O]);
+    expect(disk(O).entities[1]!.added?.map((n) => n.name)).toEqual(['Extra']);
+    const extras = () => all().filter((e) => e.name === 'Extra');
+    expect(extras().length).toBe(2); // one per O instance, the scene's own gone
+    expect(extras().some((e) => e.guid === extraGuid)).toBe(false);
+
+    const [pApplied, oApplied] = [fs.disk.get(P), fs.disk.get(O)];
+    await quietly(() => undo());
+    // #1868: both documents back IN MEMORY, parked for Save; the files keep the Apply until then.
+    sameDoc(parked(P), pDoc());
+    sameDoc(parked(O), oDoc());
+    expect([fs.disk.get(P), fs.disk.get(O)]).toEqual([pApplied, oApplied]);
+    // The scene's own node again, in ROOT only, under the guid every ref named.
+    expect(extras().map((e) => e.guid)).toEqual([extraGuid]);
+    expect(inO(ROOT, 'Extra')).toBe(extras()[0]!.id);
+
+    await quietly(() => redo());
+    expect([parked(P), parked(O)]).toEqual([undefined, undefined]);
+    expect(extras().length).toBe(2);
   });
 });
 

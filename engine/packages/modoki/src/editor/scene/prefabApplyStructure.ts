@@ -11,6 +11,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, writeTraitField } from '../../runtime/core/ecs/entityUtils';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { durableGuid, memberStepId, memberPathSteps, isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
+import { templateKeyOf } from '../../runtime/core/templateIdentity';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 import type { AddedEntity, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { memberPathIndex } from '../../runtime/loaders/loadSceneFile';
@@ -290,8 +291,9 @@ export function promoteReferenceMoves(
 
 /** A promotion's live entities, by where the refresh re-expands them (#1660): a plain node by the row it became
  *  (row localId → its guid), and a reference node's whole expansion by the nested row it became and the path of
- *  each entity inside it (row localId → path key → guid). */
-interface PromotedGuids { plain: Map<number, string>; refs: Map<number, Map<string, string>> }
+ *  each entity inside it (row localId → path key → guid). `keyed`: a node written as an override on an ENCLOSING
+ *  prefab's row (#1715), by the template key it was given (key → guid). */
+interface PromotedGuids { plain: Map<number, string>; refs: Map<number, Map<string, string>>; keyed?: ReadonlyMap<string, string> }
 
 /** `memberPathIndex` below `rootEcsId`, continued into every STORED root under it — an instance the author dropped
  *  inside a promoted reference node — where the index itself stops, with that frame's keys after the root's own
@@ -355,7 +357,7 @@ export function snapshotPromotedGuids(plain: ReadonlyMap<string, number>, refs: 
  *    row can hold that identity, and the reload would re-derive whatever this wrote live. */
 export function carryPromotedGuids(rootGuid: string, promoted: PromotedGuids): Map<string, string> {
   const none = new Map<string, string>();
-  if (!promoted.plain.size && !promoted.refs.size) return none;
+  if (!promoted.plain.size && !promoted.refs.size && !promoted.keyed?.size) return none;
   const piMeta = getTraitByName('PrefabInstance');
   const root = rootGuid ? localToEcsGuid(rootGuid) : 0;
   if (!piMeta || !root) return none;
@@ -378,6 +380,16 @@ export function carryPromotedGuids(rootGuid: string, promoted: PromotedGuids): M
         const g = old.get(key);
         if (g && ent) pairs.push([g, ent.id()]);
       }
+    }
+  }
+  // A node written on an enclosing row is a template node of THIS instance's expansion (#1715), found by the key it was
+  // given — minted fresh, so one entity per instance carries it — among what this instance's frames can name: never inside
+  // another STORED root under it (a scene-nested instance of the same prefab carries the same key, and the pairing was
+  // not unique — close-out review). No row can pin a template-keyed node, so it takes the follow branch below.
+  if (promoted.keyed?.size) {
+    for (const e of memberPathIndex(world, root, tree).values()) {
+      const old = e ? promoted.keyed.get(templateKeyOf(e)) : undefined;
+      if (old) pairs.push([old, e!.id()]);
     }
   }
   const writer = rowWritingRoot(root);
