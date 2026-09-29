@@ -89,6 +89,14 @@ export function engineLaneWorkers(
   budget: Pick<VerifyBudget, 'engineWorkers' | 'total'> | null | undefined,
   env?: NodeJS.ProcessEnv,
 ): number;
+/** The pool `verify.mjs` divides: `perfCores()`, cut to two thirds on Windows for memory (#1846). */
+export function verifyPoolSize(opts?: { platform?: NodeJS.Platform | string; cores?: number }): number;
+/** The APP lane's cap, or `undefined` to leave the lane to `testWorkers.ts` — capped on every
+ *  Windows run (#1846), elsewhere only when `peers > 1`. */
+export function appLaneWorkers(
+  budget: Pick<VerifyBudget, 'peers' | 'total' | 'appWorkers'> | null | undefined,
+  opts?: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform | string },
+): number | undefined;
 /** ⚠️ Takes only the fields it PRINTS, not a whole `VerifyBudget`. Widening it to the full budget
  *  made adding `group` a breaking change for every caller that builds the argument by hand — the
  *  line reports context and has no business requiring a group id it never renders. */

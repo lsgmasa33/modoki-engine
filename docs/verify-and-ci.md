@@ -473,7 +473,8 @@ process. The whole mechanism was **inert while looking healthy**: a plausible bu
 green gate, a correct-looking `context:` line, and 34 passing tests that all injected `dir` and so
 never touched the real resolution. `verifyRegistryDir()` honours `MODOKI_HOME` and nothing else. It intervenes **only when `peers > 1`**, so a solo
 gate is byte-identical to before — `testWorkers.ts` keeps deciding, which matters because it returns
-`{}` on a homogeneous CPU and halves on Windows. `MODOKI_VERIFY_NO_BUDGET=1` opts out;
+`{}` on a homogeneous CPU and halves on Windows (Windows itself is the exception: capped on every run,
+below). `MODOKI_VERIFY_NO_BUDGET=1` opts out;
 `MODOKI_TEST_MAX_WORKERS` still beats everything. It is advisory, not a mutex: serializing would make
 one clone wait on another's gate, and the goal is to stop the thrash, not the work.
 
@@ -482,9 +483,9 @@ one clone wait on another's gate, and the goal is to stop the thrash, not the wo
 engine lane has no per-platform fallback to fall through to: it used to be pinned to a Mac-sized
 `6`, which on the `win` box (12 logical → 6 perf cores) is the whole cap, so a solo gate overlapped
 6 + 6 = 12 workers on 6 cores while the line printed `engine=3`. Now it takes half of the app lane's
-pool everywhere: still 6 on a 12-P-core Mac, 3 on the `win` box. `MODOKI_VERIFY_ENGINE_WORKERS`, then
+pool everywhere: still 6 on a 12-P-core Mac, 2 on the `win` box (3 before #1846, below). `MODOKI_VERIFY_ENGINE_WORKERS`, then
 `MODOKI_TEST_MAX_WORKERS`, override it; `MODOKI_VERIFY_NO_BUDGET=1` stops the cross-clone division
-and takes the solo share (half the box) — deliberately NOT the old pin of 6, which on the `win` box
+and takes the solo share (half the pool) — deliberately NOT the old pin of 6, which on the `win` box
 would re-create the oversubscription.
 
 Measured on the `win` box (i5-11400) 2026-09-19, solo, the same tree, interleaved 3/6/3 (a fourth
@@ -499,6 +500,34 @@ run was killed for memory pressure; all three green):
 The app lane is the pole either way, so wall clock is unchanged; at 3 the engine lane still finishes
 ~80-110s before it, and both lanes do less contended work (app aggregate `tests` ~11% lower). Unlike
 the Mac, where 3 made the engine suite the pole, here 3 costs nothing. n=3: a trend, not a law.
+
+⚠️ **On Windows the whole gate runs TWO THIRDS of that pool, for MEMORY — `app=4 engine=2` on the
+`win` box** (#1846, owner rulings 2026-09-29). The table's 3/6/3 was CPU; memory is what then ran
+out. At `app=6 engine=3` the gate puts 9 vitest workers (roughly 500–700 MB each) on the 16 GB box:
+free RAM fell from 8.2 GB to 5.1 GB during one green run, and Claude Code's low-memory reaper killed
+two others (one above, one 2026-09-29). `verifyPoolSize()` cuts the pool `verify.mjs` registers on
+`win32` (never above the cores, so a tiny box is not capped UP), and `appLaneWorkers()` caps the app
+lane on EVERY Windows run — solo included, the exception to "only when `peers > 1`" above, because
+falling through to `testWorkers.ts` would put it back at 6. The opt-out keeps the cut pool and drops
+only the cross-clone division; a VALID `MODOKI_TEST_MAX_WORKERS` still beats both lanes (a junk one
+such as `0` is ignored, as `testWorkers.ts` ignores it). The `context:` line prints the BOX's cores
+(`perfCores()`) and the counts the lanes run with, not the cut pool. ⚠️ **`verify` only**:
+`testWorkers.ts` is unchanged, so a scoped run, a mutation check and the public CI's 4-thread
+`windows-latest` leg (which would drop to 1 worker) keep their sizing. Measured on the `win` box, one
+run each, 2026-09-29:
+
+| workers | app lane | checks + engine lane | free RAM while it ran |
+|---|---|---|---|
+| app=6 engine=3 | 779.4s | 477.1s | 5.1 GB (one spot reading) |
+| app=3 engine=2 | 967.4s | 372.1s | median 6.8 GB, lowest 5.5 GB (64 samples, 15 s apart) |
+| **app=4 engine=2** (shipped) | 832.9s | 406.5s | median 6.65 GB, lowest 4.5 GB (56 samples) |
+
+Halving made the app lane the only long pole: it ran alone on 3 of 6 cores for the last ~10 minutes.
+So the split is 4 + 2, six workers on six cores while both lanes run, which gave back two of the three
+minutes. ⚠️ The memory evidence is weak either way: the 3 + 2 run started at 5.75 GB free and its
+lowest sample came at about t = 30 s; the 4 + 2 run started at 7.9 GB and bottomed at 4.5 GB six
+minutes in, with both lanes running. The box's other load differed between the runs, so these show
+the gate stays above ~4.5 GB free, not how much each worker costs. n=1 each: a trend, not a law.
 
 ⚠️ **It divides by the PEER COUNT and never looks at the load — so it charges you for a peer that
 is not costing you anything.** Three runs of the hub gate on 2026-09-16, same tree modulo doc

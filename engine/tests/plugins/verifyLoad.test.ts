@@ -20,7 +20,7 @@ import {
   perfCores, budgetFor, isLiveRun, readRuns, registerVerifyRun, unregisterVerifyRun, benchLine,
   parseVitestAggregates, registryPath, MIN_WORKERS, VERIFY_TTL_MS,
   groupOf, countGroups, isTestRun, registerTestRun, VERIFY_GROUP_ENV, VERIFY_REGISTERED_ENV,
-  verifyRegistryDir, engineLaneWorkers, LEGACY_ENGINE_LANE_WORKERS,
+  verifyRegistryDir, engineLaneWorkers, LEGACY_ENGINE_LANE_WORKERS, verifyPoolSize, appLaneWorkers,
 } from '../../scripts/verifyLoad.mjs';
 
 let dir: string;
@@ -409,7 +409,90 @@ describe('engineLaneWorkers — the count the engine lane RUNS with (#1443)', ()
     // was exactly the two drifting apart: the line read the budget, the lane read a constant.
     const { code } = readScannedSource(fileURLToPath(new URL('../../scripts/verify.mjs', import.meta.url)));
     expect(code).toMatch(/MODOKI_TEST_MAX_WORKERS:\s*String\(engineLaneWorkers\(budget\)\)/);
-    expect(code).toMatch(/benchLine\(\{\s*\.\.\.budget,\s*engineWorkers:\s*engineLaneWorkers\(budget\)\s*\}\)/);
+    expect(code).toMatch(/benchLine\(\{\s*\.\.\.budget,[^}]*engineWorkers:\s*engineLaneWorkers\(budget\)\s*\}\)/);
     expect(code).not.toMatch(/ENGINE_LANE_WORKERS/);
+  });
+});
+
+describe('the Windows gate runs two thirds of the pool, for memory (#1846)', () => {
+  const solo = (total: number) => registerVerifyRun({ pid: 1, dir, alive, total, env: {} });
+  const shared = (total: number) => {
+    registerVerifyRun({ pid: 2, dir, alive, total, env: {} });
+    return registerVerifyRun({ pid: 3, dir, alive, total, env: {} });
+  };
+
+  it('cuts the pool to two thirds on Windows only, rounding up, floored at MIN_WORKERS, never above the cores', () => {
+    // 6 is the `win` box (12 logical, already halved for SMT by perfCores); the gate's pool is 4.
+    expect(verifyPoolSize({ platform: 'win32', cores: 6 })).toBe(4);
+    // A count where ceil and floor differ above the floor tells them apart (7 * 2/3 = 4.67: 5 vs 4).
+    expect(verifyPoolSize({ platform: 'win32', cores: 7 })).toBe(5);
+    expect(verifyPoolSize({ platform: 'win32', cores: 2 })).toBe(MIN_WORKERS);
+    // Review: MIN_WORKERS alone capped a 1-core box UP to 2, which testWorkers.ts refuses to do.
+    expect(verifyPoolSize({ platform: 'win32', cores: 1 })).toBe(1);
+    for (const platform of ['darwin', 'linux']) expect(verifyPoolSize({ platform, cores: 12 }), platform).toBe(12);
+    // The default reads perfCores for the SAME platform, so the SMT half and the memory cut compose.
+    const c = perfCores({ platform: 'win32' });
+    expect(verifyPoolSize({ platform: 'win32' })).toBe(Math.min(c, Math.max(MIN_WORKERS, Math.ceil((c * 2) / 3))));
+  });
+
+  it('gives the win box app=4 engine=2 on a SOLO run — the app lane is capped, not left to testWorkers.ts', () => {
+    // Left to testWorkers.ts (the rule everywhere else when solo), the app lane would run at its own 6.
+    const win = solo(verifyPoolSize({ platform: 'win32', cores: 6 }));
+    expect(win.peers).toBe(1);
+    expect(appLaneWorkers(win, { env: {}, platform: 'win32' })).toBe(4);
+    expect(engineLaneWorkers(win, {})).toBe(2);
+    // Shared, both lanes follow the budget down, still capped.
+    expect(appLaneWorkers(shared(4), { env: {}, platform: 'win32' })).toBe(MIN_WORKERS);
+  });
+
+  it('a JUNK MODOKI_TEST_MAX_WORKERS does not switch the Windows cap off (review)', () => {
+    // testWorkers.ts ignores `0`/`banana` and falls through to its own 6, so treating any string as an
+    // override put the app lane back at 6 while the engine lane (which validates) stayed at 2.
+    const win = solo(4);
+    for (const junk of ['0', '-3', 'banana']) {
+      expect(appLaneWorkers(win, { env: { MODOKI_TEST_MAX_WORKERS: junk }, platform: 'win32' }), junk).toBe(4);
+    }
+  });
+
+  it('leaves every other platform exactly where it was: solo falls through, shared takes its share', () => {
+    // Solo first: once `shared` registers its peers, no later run in this registry is solo.
+    const one = solo(12);
+    expect(one.peers).toBe(1);
+    const b = shared(12);
+    expect(b.appWorkers).toBeLessThan(12); // divided across the peers
+    for (const platform of ['darwin', 'linux']) {
+      expect(appLaneWorkers(one, { env: {}, platform }), platform).toBeUndefined();
+      expect(appLaneWorkers(one, { env: { MODOKI_VERIFY_NO_BUDGET: '1' }, platform }), platform).toBeUndefined();
+      expect(appLaneWorkers(b, { env: {}, platform }), platform).toBe(b.appWorkers);
+      // Review: the opt-out's only other assertion was on the SOLO budget, where `peers <= 1` returns
+      // undefined anyway, so deleting the opt-out stayed green. SHARED is where it decides.
+      expect(appLaneWorkers(b, { env: { MODOKI_VERIFY_NO_BUDGET: '1' }, platform }), platform).toBeUndefined();
+    }
+  });
+
+  it('under the opt-out, Windows keeps the cut pool and drops only the division across clones', () => {
+    // MODOKI_VERIFY_NO_BUDGET stops the CROSS-CLONE division; the memory cut is not that, so a shared
+    // win run opting out takes the whole cut pool (4), not the SMT-halved 6 testWorkers.ts would pick.
+    const b = shared(4);
+    expect(b.peers).toBeGreaterThan(1);
+    expect(appLaneWorkers(b, { env: { MODOKI_VERIFY_NO_BUDGET: '1' }, platform: 'win32' })).toBe(4);
+  });
+
+  it('lets MODOKI_TEST_MAX_WORKERS win on every platform, and does nothing without a budget', () => {
+    for (const platform of ['win32', 'darwin', 'linux']) {
+      expect(appLaneWorkers(shared(6), { env: { MODOKI_TEST_MAX_WORKERS: '4' }, platform }), platform).toBeUndefined();
+      expect(appLaneWorkers(null, { env: {}, platform }), platform).toBeUndefined();
+    }
+  });
+
+  it('is what verify.mjs registers, caps the APP lane with, and prints — the box, not the pool', () => {
+    const { code } = readScannedSource(fileURLToPath(new URL('../../scripts/verify.mjs', import.meta.url)));
+    expect(code).toMatch(/registerVerifyRun\(\{\s*total:\s*verifyPoolSize\(\)\s*\}\)/);
+    expect(code).toMatch(/appLaneWorkers\(budget\)/);
+    // On the app lane's entry specifically (review: a bare spread match stayed green moved to the engine lane).
+    expect(code).toMatch(/name:\s*'app tests',[^\n]*\.\.\.laneWorkerEnv\(\)/);
+    // The context line names the BOX's cores and the counts the lanes RUN with (review: it printed the
+    // cut pool as "3 perf core(s)", and `budget.appWorkers` rather than the app lane's cap).
+    expect(code).toMatch(/benchLine\(\{[^}]*total:\s*perfCores\(\),\s*appWorkers:\s*appLaneShown\(\)/);
   });
 });

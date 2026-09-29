@@ -78,7 +78,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
-  registerVerifyRun, unregisterVerifyRun, benchLine, parseVitestAggregates, engineLaneWorkers,
+  registerVerifyRun, unregisterVerifyRun, benchLine, parseVitestAggregates, engineLaneWorkers, appLaneWorkers,
+  verifyPoolSize, perfCores,
   VERIFY_GROUP_ENV, VERIFY_REGISTERED_ENV,
 } from './verifyLoad.mjs';
 
@@ -97,18 +98,6 @@ const repoRoot = path.resolve(__dirname, '..', '..');
  *  pool nobody used. */
 let budget = null;
 
-/** Extra env for a lane's worker cap — `{}` when this run should behave exactly as it did before
- *  the budget existed.
- *
- *  ⚠️ **It intervenes ONLY when the box is genuinely shared (`peers > 1`).** A solo run must fall
- *  through to `testWorkers.ts` untouched, because that module knows things this one deliberately
- *  does not: it returns `{}` on a homogeneous CPU so vitest keeps its own default, and it HALVES on
- *  Windows because SMT siblings are not cores. Setting a number here unconditionally would overwrite
- *  both — and the Windows case is measured to go RED, not merely slow, when over-subscribed.
- *
- *  ⚠️ `MODOKI_TEST_MAX_WORKERS` still beats everything, as `testWorkers.ts` documents: it is the
- *  lever for an unusual box and for bisecting a contention problem, so a deliberate human setting is
- *  never silently outvoted by this. */
 /** Env that makes a spawned lane JOIN this gate rather than count as another one.
  *
  *  ⚠️ **Load-bearing since registration moved into `testWorkers.ts` (#1285).** Both lanes are vitest
@@ -122,13 +111,19 @@ function laneGroupEnv() {
   return { [VERIFY_GROUP_ENV]: budget.group, [VERIFY_REGISTERED_ENV]: '1' };
 }
 
-// The APP lane's cap only. The engine lane is sized by `engineLaneWorkers()` on every run, solo
+// The APP lane's cap only — `{}` leaves the lane to `testWorkers.ts`. When it intervenes is
+// `appLaneWorkers()`'s call. The engine lane is sized by `engineLaneWorkers()` on every run, solo
 // included, because it has no per-platform fallback to fall through to (#1443).
-function laneWorkerEnv(share) {
-  if (process.env.MODOKI_TEST_MAX_WORKERS) return {};
-  if (process.env.MODOKI_VERIFY_NO_BUDGET) return {};
-  if (!budget || budget.peers <= 1) return {};
-  return { MODOKI_TEST_MAX_WORKERS: String(share) };
+/** The app lane's count as the lines print it: the cap it was handed, else a valid override it inherits,
+ *  else the budget. (Where the lane falls through to `testWorkers.ts` its own pick is not modelled.) */
+function appLaneShown() {
+  const override = Number(process.env.MODOKI_TEST_MAX_WORKERS);
+  return appLaneWorkers(budget) ?? (Number.isFinite(override) && override > 0 ? override : budget.appWorkers);
+}
+
+function laneWorkerEnv() {
+  const n = appLaneWorkers(budget);
+  return n === undefined ? {} : { MODOKI_TEST_MAX_WORKERS: String(n) };
 }
 
 function runCommand(cmd, extraEnv = {}) {
@@ -251,7 +246,7 @@ async function checksAndEngineLane() {
 const lanes = [
   // The app suite keeps the machine's full performance-core pool (`engine/testWorkers.ts` sizes it)
   // — it is the critical path, and starving it just moves the wall-clock onto this lane.
-  { name: 'app tests', run: () => runCommand('npm test', { ...laneGroupEnv(), ...laneWorkerEnv(budget?.appWorkers) }) },
+  { name: 'app tests', run: () => runCommand('npm test', { ...laneGroupEnv(), ...laneWorkerEnv() }) },
   { name: 'checks + engine tests', run: checksAndEngineLane },
 ];
 
@@ -323,14 +318,15 @@ async function main() {
   installGitHooks();
 
   // Registered BEFORE any lane spawns, so both lanes see the same share (#1285).
-  budget = registerVerifyRun();
+  // The pool is `verifyPoolSize()`, not the default `perfCores()`: cut on Windows, for memory (#1846).
+  budget = registerVerifyRun({ total: verifyPoolSize() });
 
   // Announce the lanes up front. Output is buffered per lane, so without this the terminal shows
   // NOTHING until the first lane finishes — on a gate people sit and watch, silence reads as a hang.
   console.log(`[verify] running ${lanes.length} lanes concurrently: ${lanes.map((l) => l.name).join(' · ')}`);
   if (budget.peers > 1) {
     console.log(`[verify] ${budget.peers} verify runs share this box — sizing pools to `
-      + `app=${budget.appWorkers} engine=${engineLaneWorkers(budget)} (MODOKI_VERIFY_NO_BUDGET=1 opts out)`);
+      + `app=${appLaneShown()} engine=${engineLaneWorkers(budget)} (MODOKI_VERIFY_NO_BUDGET=1 opts out)`);
   }
 
   const results = await Promise.all(
@@ -357,7 +353,9 @@ async function main() {
   // ⚠️ Printed on EVERY run, not behind a flag. A timing with no record of the contention it ran
   // under is not comparable to another one, and that is exactly how this script's header table came
   // to be quoted as current long after the box stopped being quiet (#1285).
-  console.log(benchLine({ ...budget, engineWorkers: engineLaneWorkers(budget) }));
+  // `total` is the BOX (`perfCores()`), not the pool: on Windows the pool is cut for memory (#1846), and
+  // printing it as "perf core(s)" would read as a different machine rather than a policy (review).
+  console.log(benchLine({ ...budget, total: perfCores(), appWorkers: appLaneShown(), engineWorkers: engineLaneWorkers(budget) }));
   for (const r of results) {
     const agg = parseVitestAggregates(r.output);
     if (!agg) continue;

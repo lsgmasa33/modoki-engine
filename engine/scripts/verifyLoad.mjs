@@ -330,6 +330,54 @@ export function unregisterVerifyRun({ pid = process.pid, dir = verifyRegistryDir
   }
 }
 
+/** The pool `verify.mjs` divides between its lanes and across clones: `perfCores()`, and on Windows
+ *  TWO THIRDS of that (#1846, owner rulings 2026-09-29) — `app=4 engine=2` on the `win` box.
+ *
+ *  The Windows cut is for MEMORY, not cores. `perfCores()` already halves Windows for SMT; this cuts
+ *  again because the gate's two lanes at `app=6 engine=3` put 9 vitest workers (roughly 500–700 MB
+ *  each) on the 16 GB `win` box, and Claude Code's low-memory reaper killed two gates. Halving first
+ *  (`app=3 engine=2`) made the app lane the only long pole (967s against the engine lane's 372s), with
+ *  half the box idle once the engine lane finished, so the owner moved it to 4 + 2: six workers on
+ *  six cores while both lanes run. Never more than `cores`, so a tiny box is never capped UP.
+ *
+ *  ⚠️ **`verify` only, never `testWorkers.ts`.** A single vitest pool (a scoped run, a mutation
+ *  check, the public CI's Windows leg) is one lane and was never the problem, and on a 4-thread
+ *  `windows-latest` runner a cut there would drop that leg to 1 worker. */
+export function verifyPoolSize({ platform = process.platform, cores = perfCores({ platform }) } = {}) {
+  if (platform !== 'win32') return cores;
+  return Math.min(cores, Math.max(MIN_WORKERS, Math.ceil((cores * 2) / 3)));
+}
+
+/** A worker-count env value a human set, or `undefined` for none or junk — the same acceptance
+ *  `engineLaneWorkers` and `testWorkers.ts` apply, so a junk value is ignored everywhere alike. */
+function workerOverride(env, knob) {
+  const n = Number(env[knob]);
+  return env[knob] && Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/** The APP lane's worker cap, or `undefined` to leave the lane to `testWorkers.ts`'s own sizing.
+ *  (The engine lane is `engineLaneWorkers()`, sized on every run.)
+ *
+ *  ⚠️ **Everywhere but Windows it intervenes ONLY when the box is genuinely shared (`peers > 1`).** A
+ *  solo run falls through to `testWorkers.ts` untouched, because that module knows things this one
+ *  deliberately does not: it returns `{}` on a homogeneous CPU so vitest keeps its own default, and
+ *  caps an Apple Silicon Mac at its performance cores.
+ *
+ *  **On Windows it caps EVERY run**, because the cut pool (`verifyPoolSize`, #1846) is smaller than
+ *  what `testWorkers.ts` would pick, and falling through would put the app lane back at 6. Under
+ *  `MODOKI_VERIFY_NO_BUDGET` it takes the solo share of that pool, as the engine lane does.
+ *
+ *  ⚠️ A valid `MODOKI_TEST_MAX_WORKERS` still beats everything, as `testWorkers.ts` documents: it is
+ *  the lever for an unusual box and for bisecting a contention problem, and the lane inherits it as
+ *  is. A JUNK value (`0`, `banana`) is not an override: `testWorkers.ts` would ignore it and fall
+ *  through to its own 6, so here it must not switch the cap off (review). */
+export function appLaneWorkers(budget, { env = process.env, platform = process.platform } = {}) {
+  if (workerOverride(env, 'MODOKI_TEST_MAX_WORKERS') !== undefined || !budget) return undefined;
+  if (platform === 'win32') return env.MODOKI_VERIFY_NO_BUDGET ? budgetFor(budget.total, 1) : budget.appWorkers;
+  if (env.MODOKI_VERIFY_NO_BUDGET || budget.peers <= 1) return undefined;
+  return budget.appWorkers;
+}
+
 /** The engine lane's pinned count from before the budget existed — what `MODOKI_VERIFY_NO_BUDGET`
  *  and a run with no budget fall back to. Sized on the Mac as half its 12 performance cores. */
 export const LEGACY_ENGINE_LANE_WORKERS = 6;
@@ -341,7 +389,8 @@ export const LEGACY_ENGINE_LANE_WORKERS = 6;
  *  to `testWorkers.ts` because that module sizes it per platform; the engine lane never could — it
  *  was pinned to a Mac-sized 6, which on a 6-core Windows box is the whole cap, so the two lanes
  *  overlapped at 12 workers on 6 cores while this line printed `engine=3`. `budget.engineWorkers`
- *  is half of `perfCores()`, which already halves on Windows, and on the Mac solo it is still 6.
+ *  is half of the pool `verify.mjs` registers (`verifyPoolSize()`: 4 on the `win` box, so 2 here),
+ *  and on the Mac solo it is still 6.
  *  (Half, not less: on the Mac, 3 workers took this suite from ~25s to 64-80s and made it the pole.)
  *
  *  Precedence, most deliberate first: the lane's own knob, then `MODOKI_TEST_MAX_WORKERS` (which
@@ -350,8 +399,8 @@ export const LEGACY_ENGINE_LANE_WORKERS = 6;
  *  solo share; only a run with no budget at all falls back to the legacy pin. */
 export function engineLaneWorkers(budget, env = process.env) {
   for (const knob of ['MODOKI_VERIFY_ENGINE_WORKERS', 'MODOKI_TEST_MAX_WORKERS']) {
-    const n = Number(env[knob]);
-    if (env[knob] && Number.isFinite(n) && n > 0) return n;
+    const n = workerOverride(env, knob);
+    if (n !== undefined) return n;
   }
   if (!budget) return LEGACY_ENGINE_LANE_WORKERS;
   // The opt-out stops the division ACROSS clones — it takes the solo share, never the Mac pin,

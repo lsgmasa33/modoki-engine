@@ -1764,9 +1764,11 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
   typecheck and given a budgeted `MODOKI_TEST_MAX_WORKERS`
   ([engine/scripts/verify.mjs](../engine/scripts/verify.mjs)). Use it rather than hand-rolling
   parallelism; use `MODOKI_TEST_MAX_WORKERS` to bisect a contention problem.
-  - ⚠️ **That budget covers the ENGINE lane only — the app lane sizes itself from the whole
+  - ⚠️ **That budget used to cover the ENGINE lane only — the app lane sized itself from the whole
     machine, and on an SMT box that alone was enough to fail the gate.** This is why the `win32`
-    cap above exists. Measured 2026-08-20 on this clone (i5-11400, 6 physical / 12 logical),
+    cap above exists. (Since #1846 `verify` caps the app lane on every Windows run too, at `app=4
+    engine=2` on this box, for memory:
+    [verify-and-ci.md](verify-and-ci.md), its #1846 paragraph.) Measured 2026-08-20 on this clone (i5-11400, 6 physical / 12 logical),
     one commit (`566d2af19`), both lanes:
 
     | workers | app lane | engine lane | outcome |
