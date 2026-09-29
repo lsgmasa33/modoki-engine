@@ -27,6 +27,7 @@ import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, deleteEntitiesWithUndo,
   duplicateEntity, createEntityWithUndo, addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, reparentEntity,
 } from '@modoki/engine/editor';
+import { planReparent } from '../../packages/modoki/src/editor/undo/entityActions';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
 import { writeTraitFieldMultiWithUndo, placeholderGestureRefusal, siblingDropRefusal } from '../../packages/modoki/src/editor/undo/entityActions';
 import { commitUIHandleDrag } from '../../packages/modoki/src/editor/scene/uiHandleCommit';
@@ -579,3 +580,58 @@ describe('siblingDropRefusal: the Hierarchy drop refused before its renumber wri
   });
 });
 
+describe('nothing new goes under a Missing Prefab placeholder (#1831, the G1 study\'s M2)', () => {
+  beforeEach(async () => { await swap(true); clearHistory(); });
+  const UNDER = /Nothing can be put under a Missing Prefab/;
+
+  // Mutation: drop the `under-missing-prefab` check at the top of `prefabEditRefusal` — each gesture lands a new child
+  // under the placeholder, which its save writes nowhere it belongs (seed 315's orphan).
+  // (A paste, a duplicate and a placement ask the same `add` gesture as the create: the fuzzer's verify seed 8 pastes
+  // under a placeholder and is refused.)
+  it('a create and a reparent under the placeholder are refused with the reason, and push nothing', () => {
+    const inst = idOf(INST);
+    expect(() => createEntityWithUndo('Create', inst, [{ name: 'EntityAttributes', data: { name: 'Kid', parentId: inst } }], () => {})).toThrow(UNDER);
+    expect(named('Kid')).toHaveLength(0);
+    const plan = planReparent(idOf(HOLDER), inst);
+    expect(plan.kind).toBe('refused');
+    expect(plan.kind === 'refused' && plan.reason).toBe('under-missing-prefab');
+    expect(reparentEntity(idOf(HOLDER), inst)).toBe(false);
+    expect(byGuid(HOLDER)!.parentId).toBe(0);
+    expect(undoDepth()).toBe(0);
+  });
+
+  it('a prefab dropped on it is refused, and nothing spawns', async () => {
+    install(); // P present again for the drop's own read; the placeholder stays a placeholder until a reload
+    registerAsset(P, P_PATH, 'prefab');
+    vi.stubGlobal('fetch', async (p: string) => (p === P_PATH
+      ? { ok: true, status: 200, json: async () => pDoc(), text: async () => JSON.stringify(pDoc()) }
+      : { ok: false, status: 404, json: async () => ({}), text: async () => '' }));
+    const before = getAllEntities().length;
+    const dropped = await placePrefabFromPath(P_PATH, { tag: 'test', parentId: idOf(INST) });
+    expect(dropped).toBeFalsy();
+    expect(getAllEntities().length).toBe(before);
+    expect(undoDepth()).toBe(0);
+  });
+
+  it('the agent create-entity and reparent-entity say why', async () => {
+    await expect(runAgentOp('create-entity', { spec: { kind: 'empty' }, name: 'Kid', parentGuid: INST })).rejects.toThrow(UNDER);
+    await expect(runAgentOp('reparent-entity', { guid: HOLDER, parentGuid: INST })).rejects.toThrow(UNDER);
+    expect(named('Kid')).toHaveLength(0);
+  });
+
+  // (accept) a child the placeholder already has (loaded with it) is not a new link: re-planned under its own parent (a
+  // sibling reorder) it passes. Mutation: drop the reorder exemption in `prefabEditRefusal` — refused.
+  it('(accept) a child already under the placeholder may be reordered there', () => {
+    const inst = idOf(INST);
+    const kid = spawnEntity(getCurrentWorld(), meta('EntityAttributes').trait({ name: 'Loaded', parentId: inst })).id();
+    expect(planReparent(kid, inst).kind).not.toBe('refused');
+    expect(planReparent(kid, 0).kind).not.toBe('refused'); // and moved out
+  });
+
+  // (accept) the refusal is about a NEW link under it: the placeholder itself still moves and reorders (I21), and a
+  // create beside it lands.
+  it('(accept) the placeholder itself still moves, and a create beside it lands', () => {
+    expect(reparentEntity(idOf(INST), idOf(HOLDER))).toBe(true);
+    expect(createEntityWithUndo('Create', 0, [{ name: 'EntityAttributes', data: { name: 'Beside', parentId: 0 } }], () => {})).toBeTruthy();
+  });
+});

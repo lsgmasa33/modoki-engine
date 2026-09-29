@@ -187,8 +187,12 @@ describe('#1789 prefab fuzz', () => {
 
   if (replay) {
     it('replays the given op list', async () => {
-      const r = await runOps(be, JSON.parse(replay) as Op[], OPTS);
+      const ops = JSON.parse(replay) as Op[];
+      const r = await runOps(be, ops, OPTS);
       realError(r.trace.join('\n'));
+      // Which open issue already claims this failure, as the hunt would say it (triage; the verdict is unchanged).
+      const known = r.failure ? knownStop(r.failure, ops) : undefined;
+      if (known) realError(`replay: stopped at KNOWN_OPEN #${known.issue} (${known.what})`);
       expect(r.failure, r.failure ? `${r.failure.check}: ${r.failure.detail}` : '').toBeUndefined();
     }, 600_000);
     return;
@@ -472,6 +476,42 @@ describe('#1789 prefab fuzz', () => {
     expect(lost[0]!.detail).toMatch(/\(with the deleted prefab restored\)$/);
     // No deletion: the plain comparison, as before.
     expect(checkRoundTrip({ before: live, after: placeholder, ...same }).map((f) => f.check)).toEqual(['save→reload is not the identity']);
+  });
+
+  // #1831 G1 M1: a live world can hold a KEPT frame of a deleted prefab beside one it could not expand (an unexpanded row,
+  // or a placeholder). The plain reload loses the kept frame, and the restored reload expands the other, so neither
+  // comparison held. The restored comparison now lets exactly that frame come back expanded. Mutation: in `checkRoundTrip`,
+  // compare against `rt.restored` raw — the first expectation goes red.
+  it('harness: the restored comparison lets an unexpanded row or a placeholder of a deleted prefab come back expanded, and nothing else (#1831)', () => {
+    const same = { firstBytes: '{}', secondBytes: '{}' };
+    const gone = (src: string) => src === 'P';
+    const ea = (name: string, parentId: string | number = 0) => ({ EntityAttributes: { name, parentId } });
+    const pi = (source: string, rootInstanceId: string, extra: Record<string, unknown> = {}) => ({ PrefabInstance: { source, rootInstanceId, ...extra } });
+    // Live: a kept P frame K (root k, member km), and O's instance o whose P row (localId 2) is unexpanded.
+    const live = {
+      k: { traits: { ...ea('R'), ...pi('P', 'k') } }, km: { traits: { ...ea('A', 'k'), ...pi('P', 'k') } },
+      o: { traits: { ...ea('OR'), ...pi('O', 'o') } },
+    };
+    const plain = { o: live.o, kp: { traits: ea('R'), unresolved: 'P' } }; // the plain reload: K a placeholder
+    const expandedRow = { n: { traits: { ...ea('R', 'o'), ...pi('P', 'n', { parentLocalId: 2 }) } }, nm: { traits: { ...ea('A', 'n'), ...pi('P', 'n') } }, extra: { traits: ea('Extra', 'nm') } };
+    const restored = { ...live, ...expandedRow };
+    const unexpanded = new Set(['o:2']);
+    expect(checkRoundTrip({ before: live, after: plain, restored, unexpanded, ...same }, {}, gone)).toEqual([]);
+    // Reject: the row was NOT recorded unexpanded, so a gained frame is a gained frame.
+    expect(checkRoundTrip({ before: live, after: plain, restored, unexpanded: new Set(), ...same }, {}, gone)[0]?.detail).toMatch(/an entity was gained/);
+    // Reject: a gained frame of a prefab that is NOT deleted.
+    const notGone = { ...live, n: { traits: { ...ea('R', 'o'), ...pi('Q', 'n', { parentLocalId: 2 }) } } };
+    expect(checkRoundTrip({ before: live, after: plain, restored: notGone, unexpanded, ...same }, {}, gone)).toHaveLength(1);
+    // Reject: the expansion forgiven, but a kept entity changed.
+    const changed = { ...restored, km: { traits: { ...ea('A2', 'k'), ...pi('P', 'k') } } };
+    expect(checkRoundTrip({ before: live, after: plain, restored: changed, unexpanded, ...same }, {}, gone)[0]?.detail).toMatch(/^\/km\//);
+    // A live placeholder of the deleted prefab comes back an instance root of it, with members: compared by placement.
+    const livePh = { ...live, ph: { traits: ea('H'), unresolved: 'P' } };
+    const back = { ...live, ph: { traits: { ...ea('H'), ...pi('P', 'ph') } }, phm: { traits: { ...ea('A', 'ph'), ...pi('P', 'ph') } } };
+    expect(checkRoundTrip({ before: livePh, after: plain, restored: back, unexpanded: new Set(), ...same }, {}, gone)).toEqual([]);
+    // Reject: it came back somewhere else (its placement differs).
+    const moved = { ...back, ph: { traits: { ...ea('H', 'o'), ...pi('P', 'ph') } } };
+    expect(checkRoundTrip({ before: livePh, after: plain, restored: moved, unexpanded: new Set(), ...same }, {}, gone)).toHaveLength(1);
   });
 
   it('harness: a prefab created and then deleted in one run passes the final round trip (#1805 route 2, allowed)', async () => {

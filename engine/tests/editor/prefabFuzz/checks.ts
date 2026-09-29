@@ -315,8 +315,53 @@ export function alignEqualOrientations(before: unknown, after: unknown): unknown
   return out ?? after;
 }
 
+/** `restored` made comparable with a live world that holds UNEXPANDED frames of a deleted prefab beside kept ones
+ *  (#1831 G1 M1). The restored reload expands every frame, and it is what the editor itself shows once the file is back
+ *  (an OS-Trash restore reloads the open scene; an asset delete has no undo since #1868). So a frame the
+ *  live world could not expand may come back expanded, and only that frame:
+ *  - an unexpanded row (`unexpanded`, keyed `<frame root guid>:<localId>`, read before the save): a gained frame root of a
+ *    deleted prefab whose outer frame recorded its row as unexpanded, with everything gained under it, is dropped;
+ *  - a Missing Prefab placeholder of a deleted prefab: it comes back an instance root of that prefab under the same guid,
+ *    its gained members are dropped, and it is compared by its placement (name, parent, order, active) as the live
+ *    placeholder shows it. The record's CONTENT is held by the second save's byte identity.
+ *  Everything else must still be identical. */
+export function forgiveExpandedFrames(
+  before: unknown, restored: unknown, unexpanded: ReadonlySet<string>, prefabGone: (source: string) => boolean,
+): unknown {
+  type Node = { traits?: { EntityAttributes?: Record<string, unknown>; PrefabInstance?: { source?: string; rootInstanceId?: unknown; parentLocalId?: number } }; unresolved?: string };
+  const b = before as Record<string, Node>;
+  const r = restored as Record<string, Node>;
+  if (!b || !r || typeof b !== 'object' || typeof r !== 'object') return restored;
+  const parentOf = (k: string) => { const p = r[k]?.traits?.EntityAttributes?.parentId; return typeof p === 'string' ? p : undefined; };
+  const placeholderOfGone = (k: string) => !!b[k]?.unresolved && prefabGone(b[k].unresolved!);
+  const expandedRoot = (k: string): boolean => {
+    const pi = r[k]?.traits?.PrefabInstance;
+    if (!pi?.source || pi.rootInstanceId !== k || !prefabGone(pi.source)) return false;
+    if (k in b) return placeholderOfGone(k) && b[k].unresolved === pi.source;
+    const parent = parentOf(k);
+    const outer = parent ? r[parent]?.traits?.PrefabInstance?.rootInstanceId : undefined;
+    return typeof outer === 'string' && unexpanded.has(`${outer}:${pi.parentLocalId}`);
+  };
+  const out: Record<string, Node> = { ...r };
+  for (const k of Object.keys(r)) {
+    if (k in b) continue;
+    // Up through the gained entities to the first one whose parent the live world holds.
+    let top = k;
+    for (let hops = 0, p = parentOf(top); p && !(p in b) && p in r && hops < 256; hops++, p = parentOf(top)) top = p;
+    const boundary = parentOf(top);
+    if (expandedRoot(top) || (boundary && expandedRoot(boundary))) delete out[k];
+  }
+  const PLACEMENT = ['name', 'parentId', 'sortOrder', 'isActive'] as const;
+  for (const k of Object.keys(b)) {
+    if (!placeholderOfGone(k) || !expandedRoot(k)) continue;
+    const ea = (n: Node) => n.traits?.EntityAttributes ?? {};
+    if (PLACEMENT.every((f) => JSON.stringify(ea(b[k])[f]) === JSON.stringify(ea(r[k])[f]))) out[k] = b[k];
+  }
+  return out;
+}
+
 export function checkRoundTrip(
-  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown }, tolerate: Tolerate = {},
+  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown; unexpanded?: ReadonlySet<string> }, tolerate: Tolerate = {},
   prefabGone: (source: string) => boolean = () => false,
 ): Failure[] {
   const out: Failure[] = [];
@@ -326,7 +371,7 @@ export function checkRoundTrip(
   // restored one alone would fail a correct run whose live world holds a frame the delete left unexpanded: restored, it
   // expands. Reported through the restored comparison, the stricter one for the case it exists for.
   const restoring = rt.restored !== undefined && firstDiff(rt.before, alignEqualOrientations(rt.before, rt.after)) !== null;
-  const reloaded = alignEqualOrientations(rt.before, restoring ? rt.restored : rt.after);
+  const reloaded = alignEqualOrientations(rt.before, restoring ? forgiveExpandedFrames(rt.before, rt.restored, rt.unexpanded ?? new Set(), prefabGone) : rt.after);
   const d = firstDiff(rt.before, reloaded);
   if (d) {
     // Whether a whole entity went missing, and if so whether one with its name took a NEW guid on the other side (a guid

@@ -20,7 +20,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 }));
 import { getTraitByName, getAllEntities } from '@modoki/engine/runtime';
 import { makeFuzzBackend } from './prefabFuzz/backend';
-import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, type Fixture } from './prefabFuzz/harness';
+import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, placeholderGuids, type Fixture } from './prefabFuzz/harness';
 import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/editor/panels/assetOps';
 import { unbindDeletedAssetEditors } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
 import { getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, revertRefusal, instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefab';
@@ -30,7 +30,7 @@ import { applyTargetOptions } from '../../packages/modoki/src/editor/scene/prefa
 import { initialTargets, toApplyTargets } from '../../packages/modoki/src/editor/panels/applyDialogModel';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';
-import { writeTraitFieldWithUndo, applyReparent } from '../../packages/modoki/src/editor/undo/entityActions';
+import { writeTraitFieldWithUndo, applyReparent, createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 import { commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
@@ -391,6 +391,42 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(h.entities.some((r) => r.prefab === f.prefabs.Q.guid)).toBe(false);
     expect(h.entities.find((r) => r.name === 'HR')!.traits.Transform!.y).toBe(9);
     for (const g of guids) expect(getAllEntities().some((e) => e.guid === g)).toBe(true);
+  });
+
+  // #1831 G1 M5's directed replay: seed 5104 turned a kept Q frame into a placeholder at an Apply, but only after a
+  // reparent of an owned nested root, which Unity forbids (U7, #1869). This is the Unity-legal route the study asked
+  // about: Q dropped under a scene-added PLAIN node, Q trashed, then Apply All. Mutation: drop the `keptAddedKeys` check
+  // in `planApply` — the node is promoted with a reference to the trashed Q, and QR and M leave the live world.
+  it('(M5) a Q frame under a scene-added plain node, Q trashed, Apply All: the node is skipped and the frame stays live, never a placeholder', async () => {
+    const f = await startRun(be, noNest, 'apply-added-plain-kept');
+    const hr = getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.H.guid && pi.rootInstanceId === e.id; })!.id;
+    const x = createEntityWithUndo('Create', hr, [{ name: 'EntityAttributes', data: { name: 'X', parentId: hr } }, { name: 'Transform' }], () => {});
+    expect(x).toBeTruthy();
+    expect(await instantiatePrefabInstance(JSON.parse(be.read(f.prefabs.Q.path)!), f.prefabs.Q.path, x!)).toBeTruthy();
+    await settle();
+    const node = nestedQ(f, x!);
+    const guids = [node.qr, node.m].map((id) => getAllEntities().find((e) => e.id === id)!.guid!);
+    await trashQ(f);
+    expect(writeTraitFieldWithUndo(hr, getTraitByName('Transform')!, 'y', 9)).toBeFalsy();
+    await settle();
+    const prefab = getCachedPrefabSync(f.prefabs.H.guid)!;
+    const keys = collectInstanceOverrideKeys(hr, prefab);
+    const sel = new Set([...keys.all, ...keys.nested]);
+    const targets = toApplyTargets(initialTargets(applyTargetOptions(hr, prefab, [...sel])), sel);
+    const preview = await previewApply(hr, new Set(sel), targets);
+    expect(preview.refused).toBeUndefined();
+    const result = await applyToPrefabWithUndo(hr, sel, targets, { expect: preview.fingerprint });
+    await settle();
+    expect(result.applied).toBe(true);
+    expect(result.skipped?.map((s) => s.reason)).toEqual([expect.stringMatching(/^"QR" is an instance of "Q", a prefab that is missing \(.*\), so it cannot be written into a template until that prefab is back$/)]);
+    const h = JSON.parse(be.read(f.prefabs.H.path)!) as { entities: { prefab?: string; name: string; traits: { Transform?: { y?: number } } }[] };
+    expect(h.entities.some((r) => r.prefab === f.prefabs.Q.guid)).toBe(false);
+    expect(h.entities.find((r) => r.name === 'HR')!.traits.Transform!.y).toBe(9);
+    for (const g of guids) {
+      const e = getAllEntities().find((y) => y.guid === g);
+      expect(e).toBeTruthy();
+      expect(placeholderGuids().has(g)).toBe(false);
+    }
   });
 
   it('the same nested key with Q present applies (the check is not a refusal of every nested key)', async () => {

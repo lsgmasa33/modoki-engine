@@ -33,6 +33,7 @@ import { templateKeysOf, recoverTemplateKey as recoverKeyFrom, type KeyRecoveryN
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { entityRef, type EntityRef } from '../undo/entityRef';
 import { UndoRefusedError } from '../undo/undoFailure';
+import { captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, type MarkCapture } from '../undo/overrideMarkWrites';
 import { commitPrefabWrites } from './prefabCommit';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { assetIsAbsent, parseAssetJson, ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
@@ -4886,8 +4887,10 @@ export function untagEntityTreeAsInstance(rootEcsId: number, source: string, doc
 /** A captured PrefabInstance trait, used to undo a detach. `ref`/`rootRef` are what reattach resolves
  *  through; `id` is the capture-time ECS id, kept for diagnostics only. `frame`, on a frame ROOT: the record of
  *  the document it was expanded from (`frameRootDoc`) — a reload in between leaves the tree plain and
- *  unrecorded, and without the record put back nothing could tell the restored frame is older than the cache. */
-export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: EntityRef; data: Record<string, unknown>; frame?: NonNullable<ReturnType<typeof frameRootDoc>>; }
+ *  unrecorded, and without the record put back nothing could tell the restored frame is older than the cache.
+ *  `marks`: the entity's override marks, for the same reason (#1794): the reload has nothing to mark a plain tree
+ *  from, and the save keeps only marked fields, so relinked without them the instance's overrides were not saved. */
+export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: EntityRef; data: Record<string, unknown>; frame?: NonNullable<ReturnType<typeof frameRootDoc>>; marks: MarkCapture; }
 
 /** What a detach undoes: the links it stripped off the tree, and the members OUTSIDE the tree it promoted or
  *  unlinked because their frame ended with it (#1453). */
@@ -4947,18 +4950,19 @@ export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean
     const entity = findEntity(info.id);
     if (!entity || !entity.has(PrefabInstanceMeta.trait)) continue;
     const pi = entity.get(PrefabInstanceMeta.trait) as Record<string, unknown>;
-    // Every field, `parentLocalId` included: it addresses a NESTED instance's per-instance overrides, and a
-    // snapshot that dropped it reattached a nested instance as top-level (0) on undo (#1264 close-out).
+    // Every field (`parentLocalId` among them: it addresses a NESTED instance's per-instance overrides, and a snapshot
+    // that dropped it reattached a nested instance as top-level (0) on undo, #1264 close-out). A named subset dropped
+    // any field added to the trait later; `DetachedMember` and reparent's snapshot spread it too.
     const frame = pi.rootInstanceId === info.id ? frameRootDoc(getCurrentWorld(), entity) : undefined;
     snapshot.push({
       ...(frame ? { frame } : {}),
       id: info.id, ref: entityRef(info.id), rootRef: entityRef(pi.rootInstanceId as number),
-      data: { source: pi.source, localId: pi.localId, nodeGuid: pi.nodeGuid ?? '', rootInstanceId: pi.rootInstanceId, parentLocalId: pi.parentLocalId, parentNodeGuid: pi.parentNodeGuid ?? '', ownerGuid: pi.ownerGuid ?? '' },
+      data: { ...pi }, marks: captureMarks(info.id),
     });
   }
   let orphans: DetachedMember[] = [];
   if (strip) {
-    orphans = endFrames(new Set(snapshot.map((s) => s.id))); // BEFORE the strip: the owner walk reads these links
+    orphans = recordDetachedMarks(endFrames(new Set(snapshot.map((s) => s.id)))); // BEFORE the strip: the owner walk reads these links
     for (const s of snapshot) findEntity(s.id)?.remove(PrefabInstanceMeta.trait);
   }
   if (snapshot.length) markStructureDirty();
@@ -4978,7 +4982,7 @@ export function reattachPrefabInstance(
   const { links: snapshot, orphans } = detached;
   if (!PrefabInstanceMeta || (!snapshot.length && !orphans.length)) return 0;
   // Orphans first: relinking reverses a promotion's member rename, and the refs below resolve by guid.
-  relinkDetachedMembers(orphans);
+  relinkDetachedMembersMarked(orphans);
   const unresolvedEntries: DetachedInstanceTrait[] = [];
   for (const entry of snapshot) {
     const live = entry.ref.resolve();
@@ -4993,6 +4997,8 @@ export function reattachPrefabInstance(
     const restored = { ...entry.data, rootInstanceId: root };
     if (entity.has(PrefabInstanceMeta.trait)) entity.set(PrefabInstanceMeta.trait, restored);
     else entity.add(PrefabInstanceMeta.trait(restored));
+    // Its marks with its links, before any rebase reads them through the save's gate (#1794).
+    restoreMarks(entity.id(), entry.marks);
     // The frame's record goes back with its links (#1665 close-out): the restored localIds index the document the
     // snapshot recorded, so any other record is wrong for them — none after a plain reload, another prefab's after a
     // retag, or the SAME prefab's newer document after Create Prefab's Replace (re-review: kept, it read v1 links
@@ -5726,40 +5732,33 @@ async function planApply(
   if (notAuthored) {
     return { result: { ...NOOP_APPLY, refused: `the live world is not authored (${notAuthored}) — ${notAuthoredExit(notAuthored) ?? 'exit the preview / stop Play first, or a pose would be written into the prefab'}` } };
   }
-  // A reference to a missing prefab inside the instance (#1699) holds its edits as a scene record, which a template
-  // cannot take (I8): promoting it wrote an empty reference row into the prefab and took the node out of the instance.
-  // What an `+added` key promotes is the node's IDENTITY subtree (I6), so that is what is asked, not the key's text (a
-  // placeholder under a plain added node is named by no key of its own) and not the live tree (a placeholder under a
-  // member moved into the node is that member's, and stays behind when the node is promoted).
+  // An `+added` node that holds something a template cannot take is SKIPPED with the reason, and the other keys land
+  // (refused whole, the dialog's default Apply All and the agent's key-less `apply` landed nothing, #1831 close-out
+  // re-review). What an `+added` key promotes is the node's IDENTITY subtree (I6), so that is what is asked, not the key's
+  // text (a placeholder under a plain added node is named by no key of its own) and not the live tree (a placeholder under
+  // a member moved into the node is that member's, and stays behind when the node is promoted). Two things it can hold:
+  // - a reference to a missing prefab (#1699): it holds its edits as a scene record, which a template cannot take (I8);
+  //   promoted, an empty reference row was written into the prefab and the node left the instance;
+  // - a live frame KEPT after its prefab was trashed (#1862), which is no placeholder: promoted, the same empty reference
+  //   row was written, and the rebuild took the frame and its members out of the world (close-out review).
   const idParents = worldIdentityParents(getCurrentWorld());
   const byName = new Map(getAllEntities().map((e) => [e.id, e.name] as const));
-  let missing: { name: string; node: string } | undefined;
-  for (const g of addedKeyGuids(selectedKeys)) {
-    const node = (findEntityByGuid(g) as { id(): number } | undefined)?.id();
-    const hit = node ? identitySubtree(getCurrentWorld(), [node], idParents).find((id) => !!unresolvedRefOf(findEntity(id))) : undefined;
-    if (node && hit) { missing = { name: byName.get(hit) ?? '', node: byName.get(node) ?? '' }; break; }
-  }
-  if (missing) {
-    const where = missing.node && missing.node !== missing.name ? ` (inside "${missing.node}")` : '';
-    return { result: { ...NOOP_APPLY, refused: `"${missing.name}"${where} is a reference to a missing prefab, so it cannot be written into a template until that prefab resolves. Leave "${missing.node || missing.name}" unchecked, or restore the prefab first` } };
-  }
-  // …and a live frame KEPT after its prefab was trashed (#1862), which is no placeholder: promoted, the same empty
-  // reference row was written, and the rebuild took the frame and its members out of the world (close-out review). That
-  // node's key is SKIPPED with the reason and the other keys land, as a key into a kept frame is below: refused whole,
-  // the dialog's default Apply All and the agent's key-less `apply` landed nothing (close-out re-review). The placeholder
-  // refusal above predates both and still refuses whole.
   const keptAddedKeys = new Map<string, string>();
   const piMeta = getTraitByName('PrefabInstance');
   for (const key of selectedKeys) {
     const g = /(?:^|:)\+added\.([^:]+)$/.exec(key)?.[1];
     const node = g ? (findEntityByGuid(g) as { id(): number } | undefined)?.id() : undefined;
     if (!node) continue;
+    const nodeName = byName.get(node) ?? '';
+    const inside = (id: number) => (nodeName && nodeName !== byName.get(id) ? ` (inside "${nodeName}")` : '');
     for (const id of identitySubtree(getCurrentWorld(), [node], idParents)) {
+      if (unresolvedRefOf(findEntity(id))) {
+        keptAddedKeys.set(key, `"${byName.get(id) ?? ''}"${inside(id)} is a reference to a missing prefab, so it cannot be written into a template until that prefab resolves. Leave "${nodeName || byName.get(id) || ''}" unchecked, or restore the prefab first`);
+        break;
+      }
       const d = piMeta ? readTraitData(id, piMeta) as { source?: string; rootInstanceId?: number } | null : null;
       if (!d?.source || d.rootInstanceId !== id || await getPrefabSource(d.source)) continue;
-      const nodeName = byName.get(node) ?? '';
-      const where = nodeName && nodeName !== byName.get(id) ? ` (inside "${nodeName}")` : '';
-      keptAddedKeys.set(key, `${missingPrefabInstance(id, d.source)}${where}, so it cannot be written into a template until that prefab is back`);
+      keptAddedKeys.set(key, `${missingPrefabInstance(id, d.source)}${inside(id)}, so it cannot be written into a template until that prefab is back`);
       break;
     }
   }
@@ -9609,15 +9608,4 @@ function settleSwallowedKeptState(rootId: number): () => void {
     restoreKeptState(rootGuid, { ...own, rows: { ...own?.rows, ...moved } });
   }
   return () => { for (const [g, st] of before) restoreKeptState(g, st ?? {}); };
-}
-
-/** The guids an Apply key selection promotes as added nodes: `+added.<guid>`, bare or behind a nested chain
- *  (`<chain>:+added.<guid>`), the only key form that names an added node (`prefabOverrideKeys.ts`). */
-function addedKeyGuids(keys: Iterable<string>): string[] {
-  const out: string[] = [];
-  for (const k of keys) {
-    const m = /(?:^|:)\+added\.([^:]+)$/.exec(k);
-    if (m) out.push(m[1]!);
-  }
-  return out;
 }

@@ -209,7 +209,7 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
   });
 
   // #1709 close-out review: reparentEntity took its undo's mark snapshot AFTER its own marked sortOrder write, so the
-  // undo put the new mark back and the old order was saved pinned. Mutation: move `const oldMarks = marksOf(entityId)`
+  // undo put the new mark back and the old order was saved pinned. Mutation: move `const oldMarks = captureMarks(entityId)`
   // in reparentEntity back below the writes — D stays marked at 30 and ignores the template's 40.
   it('an undone reorder is not saved as an override', async () => {
     reparentEntity(member('D'), rootId(), 5);

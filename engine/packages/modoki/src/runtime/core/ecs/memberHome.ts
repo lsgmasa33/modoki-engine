@@ -26,6 +26,9 @@ export type DetachedMember = {
   guid: string; rootGuid: string; data: Record<string, unknown>;
   /** A promoted owned root's member rename ({@link promoteOwnedRoots}), `[old, new]` — reversed by the undo. */
   renamed?: [string, string][];
+  /** Its override marks as they were, recorded by the editor's owner (`editor/undo/overrideMarkWrites.ts`,
+   *  `recordDetachedMarks`) and put back with its relink (#1794): the mark store is L3, so this module cannot. */
+  marks?: string[];
 };
 
 /** Before the entities in `gone` are destroyed (or stripped, #1453), detach every surviving member whose

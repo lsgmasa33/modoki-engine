@@ -653,23 +653,23 @@ see — a row the live world itself does not show — needs a regression repro, 
 each run's tag in a guid's last group as well as in its folder (its occurrence digits only), since an Apply that is a
 noop for a deleted prefab names it.
 
-**What the restored comparison cannot hold (#1831, the G1 study, 2026-09-29).** It asks that ONE reload equal the live
-world: the plain one (every frame of the deleted prefab a placeholder or an unexpanded row) or the restored one (every
-frame expanded). A live world can hold both kinds at once: a frame kept across the delete (#1738, #1862) beside one that
-never expanded, because it was instantiated, reloaded or rebuilt while the prefab was gone (ruling D's unexpanded row, or
-a placeholder). Then neither holds: the plain reload loses the kept frame, and the restored reload expands the other,
-reported as "an entity was gained" or as a gained `PrefabInstance`. Hunt seeds 6030 and 351 are two ops: trash P, then
-instantiate O, which nests P. That is the comparison's gap, not the editor's: the restored reload is what the editor
-itself shows once the file is back. An OS-Trash restore reaches it as a watcher event that reloads the open scene from
-disk (`handleSceneChanged`, `openSceneUsesPrefab` keeps a missing prefab's guid), and an undo of the delete re-expands
-every unexpanded row in place (#1864). The comparison's fix: in the restored reload, a frame that is an unexpanded row or
-a placeholder of a deleted prefab in the live world may come back expanded (its record compared, not its entities), and
-everything else must still be identical. Three other G1 seeds are editor mechanisms, recorded on #1831: a prefab-edit
-save writes a node dropped under a Missing Prefab placeholder as a row parented to the placeholder's row, which every
-expansion then spawns at the instance's own parent, with a runtime guid; the scene save writes that orphan as a new
-top-level entry under a newly minted guid, and each reload spawns the row's orphan again beside it (hunt seed 315); an undo
-of the delete re-expands unexpanded rows but not a placeholder (seed 254, #1860); and a first expansion's derived member
-guid wins over a pinned one on reload (seed 6302, reached only through a nested-root Detach, U17).
+**The restored comparison forgives exactly the frames the live world could not expand (#1831, the G1 study's M1).** It
+asks that ONE reload equal the live world: the plain one (every frame of the deleted prefab a placeholder or an
+unexpanded row) or the restored one (every frame expanded). A live world can hold both kinds at once: a frame kept across
+the delete (#1738, #1862) beside one that never expanded, because it was instantiated, reloaded or rebuilt while the
+prefab was gone (ruling D's unexpanded row, or a placeholder). Then neither held: the plain reload lost the kept frame,
+and the restored reload expanded the other (hunt seeds 351 and 6030: trash P, then instantiate O, which nests P). That
+was the comparison's gap, not the editor's: the restored reload is what the editor itself shows once the file is back.
+An OS-Trash restore reaches it as a watcher event that reloads the open scene from disk (`handleSceneChanged`,
+`openSceneUsesPrefab` keeps a missing prefab's guid); there is no delete undo since #1868. So `forgiveExpandedFrames` (`checks.ts`) drops, from the restored reload, a gained frame root of a deleted
+prefab whose outer frame recorded its row as unexpanded (`unexpandedRows()`, read before the save) and everything gained
+under it, and compares a live placeholder of a deleted prefab that came back an instance root by its placement (name,
+parent, order, active). Everything else must still be identical, and the second save's byte identity holds the
+record's content. The G1 study's editor mechanisms were ruled on #1831: a node dropped under a Missing Prefab
+placeholder is now refused (seed 315, § "A missing prefab keeps its record"); seed 254's placeholder that a delete's undo did not re-expand went with
+#1868's removal of delete-undo; seed 6302 needs a nested-root Detach, which #1869 refuses (Unity unpacks outermost roots
+only); seed 5104 (M5) needed a reparent Unity forbids (U7), and its Unity-legal route (a frame under a scene-added node,
+trashed, then Apply All) skips that node and keeps the frame live (`missingNestedFrameKeep.test.ts`).
 
 **KNOWN_OPEN** (`prefabFuzz/knownOpen.ts`) is how verify stays green while a found bug is open.
 - Each entry names its issue.
@@ -759,7 +759,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | U7 | Reparenting a member inside an instance | Not allowed: "you cannot reparent a GameObject that is part of a Prefab". [M22 `PrefabInstanceOverrides`. The same sentence's ban on removal is out of date (U6), and the Unity 6 page says nothing, so this citation is weak.] Since 2022.3 Unity even drops child REORDER overrides, and its suggested way to move a nested child is duplicate plus delete. [M22 `UpgradeGuide2022LTS`] | Allowed and stays linked: the member row records `parent`, and Apply re-parents the row (#1437). Dragging a plain member out of its instance unpacks it; an owned nested root dragged out becomes a standalone instance (`planMoveUnlinks`). A reorder inside an instance is saved as a `sortOrder` override, by value (#1709). | **diverges**, deliberate: a Modoki extension. The owner rules on whether it stays. |
 | U8 | Override indicators | Instance names in blue; a blue margin line in the Hierarchy on an instance that has overrides; + on added GameObjects; +/− on components; an **Overrides** drop-down on the outermost root, with an asset-vs-instance comparison per component. [M22 `EditingPrefabViaInstance`, `PrefabInstanceOverrides`] | The Hierarchy tints and badges every `PrefabInstance` entity ("P"), and the Inspector accents overridden fields. There is no Hierarchy mark on an edited instance, no + on an added node, no marker for a removed member or component, and no Overrides drop-down: the full list exists only inside the Apply / Revert dialog. | **missing**: badges S, drop-down with comparison M |
 | U9 | Missing prefab asset | The instance stays in the scene (`PrefabInstanceStatus.MissingAsset`), and its `PrefabInstance` data stays in the scene file. [S6 `PrefabAssetType.MissingAsset`, M6 `yaml-prefab-serialization`] | The same since #1699: a placeholder, labelled **Missing Prefab** in the Hierarchy, carries the record the file held, and every save writes it back until the prefab is back and re-expands it. A duplicate keeps the data too. § "A missing prefab keeps its record". | match (template-form captures of one are the gap named there) |
-| U9b | A prefab goes missing while its instances are live, and comes back | An instance merged before its asset was deleted keeps its objects: `MergeStatus.MergedAsMissingWithSceneBackup`, "Prefab source was missing, but Prefab data was found in the scene file - no merging was done"; such an instance "can be correctly restored only if CorrespondingObjects info is available", which it is "when a PrefabInstance with missing asset was merged before deleting the asset (kNormalMerge) or when it has a scene backup". [CS `Editor/Mono/Prefabs/PrefabUtility.cs`] Unity reconnects it when an asset with its GUID returns: INFERRED from the same comment and from instances naming their asset by GUID, not quoted from a document. | A live frame stays expanded (#1738's evicted state), a NESTED one too across every in-place rebuild (#1862): the teardown keeps a nested frame whose prefab the respawn cannot expand, and puts it back where it hung (`rebuildTeardown`'s kept set, `seatKeptFrames`); for a scene-added reference node it also skips the node's placeholder respawn from the structure (`withoutKeptNodes`). A Revert of the kept frame itself refuses, naming the prefab: there is no base to revert to (`revertRefusal`). On the kept frame's own root an Apply refuses in the same words, and so do the Apply dialog's and the agent `prefab` op's own load checks, which stop before either (`missingSourceRefusal`, #1831); they showed a bare guid, and Apply answered a bare `applied: false`. From an outer instance, a key reaching INTO the kept frame is skipped with that reason and the other keys still land (`missingNestedFrameKeys`); it was skipped as "the template has changed". Refusing the whole Apply instead was tried and dropped: it made the dialog's default Apply All, and the agent's `apply` with no `keys`, land nothing. A scene-added node that holds a kept frame is skipped the same way when an Apply would promote it: promoted, it wrote a reference row naming the trashed prefab, and its rebuild took the frame and its members out of the world. (A node holding a PLACEHOLDER still refuses the whole Apply, #1699, which predates this.) Unity offers no Apply on a missing-asset instance. A file put back from the OS Trash is an outside write: the watcher's reload re-expands the frames that recorded its row as unexpanded (the in-place re-expansion #1864 added ran only from the delete's undo, which #1868 removed). § "A missing prefab keeps its record". | match while live. **missing** across a reload: a nested frame of a prefab that is still missing reloads as an unexpanded row (#1790 ruling D) with its record kept, not its entities; Unity keeps a scene backup of them (#1867, a persisted-schema change for the owner's serialization gate). |
+| U9b | A prefab goes missing while its instances are live, and comes back | An instance merged before its asset was deleted keeps its objects: `MergeStatus.MergedAsMissingWithSceneBackup`, "Prefab source was missing, but Prefab data was found in the scene file - no merging was done"; such an instance "can be correctly restored only if CorrespondingObjects info is available", which it is "when a PrefabInstance with missing asset was merged before deleting the asset (kNormalMerge) or when it has a scene backup". [CS `Editor/Mono/Prefabs/PrefabUtility.cs`] Unity reconnects it when an asset with its GUID returns: INFERRED from the same comment and from instances naming their asset by GUID, not quoted from a document. | A live frame stays expanded (#1738's evicted state), a NESTED one too across every in-place rebuild (#1862): the teardown keeps a nested frame whose prefab the respawn cannot expand, and puts it back where it hung (`rebuildTeardown`'s kept set, `seatKeptFrames`); for a scene-added reference node it also skips the node's placeholder respawn from the structure (`withoutKeptNodes`). A Revert of the kept frame itself refuses, naming the prefab: there is no base to revert to (`revertRefusal`). On the kept frame's own root an Apply refuses in the same words, and so do the Apply dialog's and the agent `prefab` op's own load checks, which stop before either (`missingSourceRefusal`, #1831); they showed a bare guid, and Apply answered a bare `applied: false`. From an outer instance, a key reaching INTO the kept frame is skipped with that reason and the other keys still land (`missingNestedFrameKeys`); it was skipped as "the template has changed". Refusing the whole Apply instead was tried and dropped: it made the dialog's default Apply All, and the agent's `apply` with no `keys`, land nothing. A scene-added node that holds a kept frame is skipped the same way when an Apply would promote it: promoted, it wrote a reference row naming the trashed prefab, and its rebuild took the frame and its members out of the world. A node holding a Missing Prefab PLACEHOLDER is skipped the same way (#1699's refusal, which refused the whole Apply, became this per-key skip in #1831). Unity offers no Apply on a missing-asset instance. A file put back from the OS Trash is an outside write: the watcher's reload re-expands the frames that recorded its row as unexpanded (the in-place re-expansion #1864 added ran only from the delete's undo, which #1868 removed). § "A missing prefab keeps its record". | match while live. **missing** across a reload: a nested frame of a prefab that is still missing reloads as an unexpanded row (#1790 ruling D) with its record kept, not its entities; Unity keeps a scene backup of them (#1867, a persisted-schema change for the owner's serialization gate). |
 
 ### Apply, Revert and their targets
 
@@ -1182,7 +1182,7 @@ renumber, reparent, duplicate, paste, scene move) and in re-adding a trait the t
 (#1677). Undo had the opposite gap: it restored the value but kept the mark, so an undone edit was
 saved as an override pinned at the old value, and later template edits stopped reaching it.
 
-Every editor mark write now goes through `editor/undo/overrideMarkWrites.ts`, under three rules:
+Every editor mark write now goes through `editor/undo/overrideMarkWrites.ts`, under these rules:
 
 - **A deliberate field edit marks unconditionally** (`markOverrideIfInstance`): the Inspector, a
   gizmo commit, agent `setTrait`. The user typed that value, so it stays an override even when it
@@ -1193,14 +1193,54 @@ Every editor mark write now goes through `editor/undo/overrideMarkWrites.ts`, un
   sibling's `sortOrder`, and marking them all would pin the instance's whole child order against
   the template. The UI handle commit and a re-added trait use the same rule.
 - **Every undo puts back the marks it found** (`markStateOf` / `putMarkState`; a move's undo
-  restores the whole set with `putBackMarks`; a renumber's undo is built by `makeSortOrderRenumberAction`). The
+  restores the whole set with `restoreMarks`; a renumber's undo is built by `makeSortOrderRenumberAction`). The
   snapshot must be taken before the edit's FIRST write: `reparentEntity` once took it after its own
   marked `sortOrder` write, and its undo put the new mark back. The gizmos' marks belong to their one undo builder,
   `buildTransformUndoAction`'s `markFields` (`editor/scene/gizmoUndo.ts`).
-  ⚠️ **Not yet the undos that restore LINKS or a whole component.** Detach's undo and Remove Component's undo
-  (#1794, #1800) restore the values but capture no marks, so a rebuild in between (Play→Stop, a prefab-edit visit)
-  loses them, and the next save drops what the screen shows. Study and proposed owner:
-  [plans/override-mark-undo.md](./plans/override-mark-undo.md).
+- **An undo that re-links or re-adds takes the marks with its snapshot** (#1794, #1800). Detach's undo, Create
+  Prefab's undo (both through `reattachPrefabInstance`), Remove Component's undo, and the relink of members a
+  frame-ending unlinked (a delete's, Detach's and a reparent's undo), and the members a reparent itself unpacks
+  (#1450's root dropped under its own member, which #1869 keeps; a member it PROMOTES is saved as the standalone
+  instance it became, whose overrides mark it again on the reload) restore values from their own snapshot, so
+  they record the marks there too: `captureMarks` / `restoreMarks` (the whole set, or the one trait a step touches), and
+  `recordDetachedMarks` / `relinkDetachedMembersMarked` for the members outside the tree. `relinkDetachedMembers`
+  itself is L0 and cannot read the L3 store, so `DetachedMember.marks` is plain data the owner fills, and a member
+  that no longer resolves when it is recorded gets NO record rather than an empty one (a multi-select delete can
+  destroy a member an earlier target detached; its own snapshot restores its marks, and an empty record wiped them);
+  `relinkPutsMarksBack.test.ts` keeps editor code off the bare relink.
+
+#### Why an undo cannot trust the side store (#1794, #1800, #1853)
+
+The marks die with every world, and nothing carries them across a rebuild that keeps the undo stack: Play→Stop
+(reloaded from the authored snapshot), leaving prefab edit (the scene reloads from disk), returning to a scene left
+clean (its parked stack comes back), and a watcher reload for a prefab change. They come back only from the file
+being loaded, and the file has nothing to mark a DETACHED tree or a REMOVED component from. So an undo that restored
+the values and trusted the store for the marks held only while its forward step's world was still there: after the
+rebuild the screen showed the instance's overrides, and the next save wrote the template's values. It was silent
+data loss on an ordinary path (unpack by mistake, press Play, then Cmd+Z). #1853's three hunt seeds were the same
+defect, reached by the harness's own final save→reload between a Detach and the walk back.
+
+Unity has no gap here, because its override IS data. The `PrefabInstance`'s `m_Modifications` is serialized on an
+ordinary object, and Undo snapshots it like everything else (Unpack registers `RegisterFullObjectHierarchyUndo`,
+`PrefabUtility.cs`), and a removed component's overrides are kept as unused overrides, never dropped
+([UnusedOverrides](https://docs.unity3d.com/6000.0/Documentation/Manual/UnusedOverrides.html)). Edit-mode undo also
+survives Play mode (UUM-14824, closed As Designed). Modoki's FILE already has Unity's shape, since its override rows
+are the recorded list. Only the live side is a separate store, which is why each snapshot must carry it.
+
+**Two forward writers mark different fields for the same state, and that is left alone** (#1822, #1829, closed under
+the Unity rule): the loader marks every field a row states, `reconcileOverrideMarks` marks by value, and a rebuild
+marks what it captured. The saved bytes are identical, and nothing reads the difference (#1717 checked the listing).
+
+**The recorded direction, not scheduled (hub G2-3, 2026-09-29):** Unity's model. The instance root holds its recorded
+modification list as trait data (member guid → trait → field, the scene's own edits only), the save writes it
+verbatim, every editor write updates it through this owner, and undo snapshots it because it is data on the root. It
+would remove the side store and all its carriers, the by-value subtraction of layer values, the two-writer divergence
+above, and #1722's depth ≥ 2 loss (a deliberate equal edit of a field an enclosing row states, lost once the
+template changes). It is size L across the loader's seeding, the six re-apply callers, the save's capture, the
+listing, Apply, Revert and the nested capture, so it waits until the divergence gets a reader or Prefab Variants
+(U3), which need per-layer recorded lists anyway, are scheduled. A cheaper halfway (the marks as a runtime-only
+trait) was rejected: a snapshot of one trait (Remove Component) or of `PrefabInstance` (Detach) would still need
+this capture.
 
 ⚠️ **By value cannot keep a reorder local when the template's siblings TIE.** 651 of the 843
 sibling groups across the repo's 325 templates carry equal `sortOrder`s, mostly all 0
@@ -1999,12 +2039,23 @@ guid `parentId` it cannot resolve and asks again once the expansions and the der
 #1738). One that still misses stays at the scene root, as before.
 
 The TEMPLATE writers refuse rather than write a scene record into a template (I8): Create Prefab of a tree holding a
-placeholder (the human path and the agent `prefab create` op, over the live tree they write), and an Apply that would
-promote one. What an `+added` key promotes is the node's IDENTITY subtree (I6), so Apply asks that, not the key's text
-(a placeholder under a plain added node is named by no key of its own) and not the live tree (a placeholder under a
-member moved into the node stays behind with the member). Apply of anything else on the
-instance goes ahead. A rebuild's preload fetches a placeholder's source (`preloadNestedPrefabsForSubtree`), so a
+placeholder (the human path and the agent `prefab create` op, over the live tree they write). An Apply SKIPS the
+`+added` key that would promote one, naming it, and lands the other keys: refusing the whole Apply made the dialog's
+default Apply All, and the agent's key-less `apply`, land nothing (#1831, as for a kept frame). What an `+added` key
+promotes is the node's IDENTITY subtree (I6), so Apply asks that, not the key's text (a placeholder under a plain added
+node is named by no key of its own) and not the live tree (a placeholder under a member moved into the node stays
+behind with the member). A rebuild's preload fetches a placeholder's source (`preloadNestedPrefabsForSubtree`), so a
 prefab restored on disk re-expands on the next rebuild.
+
+**Nothing new goes UNDER a placeholder** (#1831, hunt seed 315, hub ruling): a create, paste, duplicate, prefab drop or
+reparent whose new parent is a placeholder or sits inside one is refused, in the scene and in prefab edit, through the
+one gesture refusal (`prefabEditRefusal`'s `under-missing-prefab`, asked inside every forward choke point, so the
+Hierarchy toasts it and every agent op answers `REFUSED_BY_OP`). The placeholder's save writes the record its file held
+and folds no live child into it. Before, a prefab-edit save wrote a node dropped there as a row parented to the
+placeholder's reference row, every expansion spawned it at the instance's OWN parent (outside it, under a runtime guid),
+and the scene save wrote that orphan as a new top-level entry, once more on every reload. A child the placeholder
+already has stays, and a reorder under its current parent is not a new link. Not covered: the device debug ops (no
+save) and the file-direct `/api/scene-mutate` (its file graph has no placeholder).
 
 **How a live frame's document stops resolving.** Not by an editor trash: `/api/delete-asset` marks the vanished paths as
 the editor's own writes, and nothing evicts either cache, so the deleted prefab stays readable until a reload, and the

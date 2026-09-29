@@ -589,9 +589,9 @@ describe('a placeholder is not an instance of the prefab once it resolves (#1699
     expect(x(inside(QINST, 'QX'))).toBe(20);
   });
 
-  it('Apply refuses a key naming a missing reference, and Create Prefab refuses a tree holding one', async () => {
-    // Mutations: drop the refusal in `planApply` — the node is taken out of the instance and promoted as nothing; drop
-    // the one in `createPrefabFromEntity` — the template gets an empty row where the reference was.
+  it('Apply skips a key naming a missing reference, and Create Prefab refuses a tree holding one', async () => {
+    // Mutations: drop the skip in `planApply` — the node is taken out of the instance and promoted as nothing; drop
+    // the refusal in `createPrefabFromEntity` — the template gets an empty row where the reference was.
     install(pDoc(), qDoc());
     await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
     reparentEntity(rootOf(QINST), inside(INST, 'A'));
@@ -602,9 +602,10 @@ describe('a placeholder is not an instance of the prefab once it resolves (#1699
     const all = keys.all;
     expect(all.some((k) => k.includes(QINST))).toBe(true); // precondition: the listing names the node
     const res = await applyToPrefabSelective(rootOf(INST), new Set(all));
-    expect(res.applied).toBe(false);
-    expect(res.refused).toMatch(/missing prefab/);
+    expect(res.applied).toBe(false); // the node was the only key: nothing is left to apply
+    expect(res.skipped?.find((x) => x.key.includes(QINST))?.reason).toMatch(/^"QR" is a reference to a missing prefab/);
     expect(written(P)).toBeUndefined();
+    expect(getAllEntities().some((e) => e.guid === QINST)).toBe(true); // it stays in the instance
     const created = await createPrefabFromEntity(rootOf(INST), 'prefabs/New.prefab.json', 'New', async () => true);
     expect(created && typeof created === 'object' && 'refused' in created ? created.refused : '').toMatch(/missing prefab/);
   });
@@ -629,15 +630,22 @@ describe('the template writers refuse a missing reference wherever it sits (#169
     return control;
   };
 
-  it('Apply refuses an added node whose subtree holds one', async () => {
+  it('Apply skips an added node whose subtree holds one, naming it, and lands the other keys (Apply All, #1831)', async () => {
     // Mutation: match the placeholder's guid in the key TEXT again — the key is `+added.<N>`, which names no
-    // placeholder, and Apply promotes an empty Q row into P and drops QINST.
+    // placeholder, and Apply promotes an empty Q row into P and drops QINST. Mutation: refuse the whole Apply for it
+    // again — the Transform edit on A is not written.
     await underPlainNode();
+    writeTraitFieldWithUndo(inside(INST, 'A'), meta('Transform'), 'y', 9);
     const keys = collectInstanceOverrideKeys(rootOf(INST), prefabs.get(P) as PrefabFile);
     expect(keys.all.some((k) => k.includes(N))).toBe(true); // precondition
     const res = await applyToPrefabSelective(rootOf(INST), new Set(keys.all));
-    expect(res.refused).toMatch(/missing prefab/);
-    expect(written(P)).toBeUndefined();
+    expect(res.refused).toBeUndefined();
+    expect(res.applied).toBe(true);
+    expect(res.skipped).toEqual([{ key: expect.stringContaining(N), reason: expect.stringMatching(/^"QR" \(inside "N"\) is a reference to a missing prefab/) }]);
+    const p = written(P)!;
+    expect(p.entities.some((r) => (r as { prefab?: string }).prefab === Q)).toBe(false);
+    expect((p.entities.find((r) => r.name === 'A')!.traits as { Transform?: { y?: number } }).Transform?.y).toBe(9);
+    expect(getAllEntities().some((e) => e.guid === QINST)).toBe(true);
   });
 
   it('the agent prefab create op refuses a tree holding one', async () => {

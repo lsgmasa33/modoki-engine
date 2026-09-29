@@ -325,7 +325,7 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
       expect(kitAdded).toEqual([expect.objectContaining({ prefab: 'c1436000-0000-4000-8000-000000000001', guid: attrs(coin).guid })]);
       expect((kitAdded[0] as { overrides?: Record<string, { Transform?: { x?: number } }> }).overrides?.['1']?.Transform?.x).toBeCloseTo(-10);
       expect(await namesIn()).not.toContain(attrs(coin).guid);
-      // Undo puts the coin's marks back as they were. Mutation: drop `putBackMarks` in moveEntityToScene's undo.
+      // Undo puts the coin's marks back as they were. Mutation: drop `restoreMarks` in moveEntityToScene's undo.
       const marks = () => [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === coin)!) ?? [])];
       expect(marks()).toContain('Transform.x');
       await undo();

@@ -18,11 +18,21 @@
  *    re-added trait use it too: the handle writes every axis of its field group, and a re-added trait is the
  *    template's defaults wherever the user did not set a value.
  *
- *  The base is {@link instanceBase}, the one the Inspector highlight and the override list diff against. */
+ *  The base is {@link instanceBase}, the one the Inspector highlight and the override list diff against.
+ *
+ *  An undo that RE-LINKS or RE-ADDS (Detach's, Remove Component's, a delete's relink of the members its frame-ending
+ *  unlinked) restores values from its own snapshot, so it takes the marks with them: {@link captureMarks} with the
+ *  snapshot, {@link restoreMarks} with the restore (#1794, #1800). Trusting the side store instead held only while the
+ *  world the forward step ran in was still there: a rebuild between the step and its undo (Play→Stop, a prefab-edit
+ *  visit, returning to the scene) re-seeds the marks from the FILE, which has none for a detached tree or a removed
+ *  component, and the next save dropped the values the screen still showed. Unity keeps its overrides as data on the
+ *  instance (`m_Modifications`), which its undo snapshots like any other; this is that rule for Modoki's side store. */
 
 import { getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { findEntity, writeTraitField } from '../../runtime/core/ecs/entityUtils';
-import { markOverride, unmarkOverride, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
+import { markOverride, unmarkOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
+import { findEntityByGuid } from '../../runtime/core/ecs/world';
+import { relinkDetachedMembers, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { collectComparableTraits, getOverrideValues, getCachedPrefabSync, instanceBase, baseTokenResolver } from '../scene/prefab';
 import { makeReorderSiblingsAction, type SiblingSortChange } from './reorderSiblingsUndo';
 import type { UndoAction } from './undoManager';
@@ -145,5 +155,50 @@ export function putMarkState(entityId: number, traitName: string, state: MarkSta
   for (const [f, marked] of Object.entries(state)) {
     if (marked) markOverride(e, traitName, f);
     else unmarkOverride(e, traitName, f);
+  }
+}
+
+/** An entity's override marks as plain data, taken WITH an undo snapshot: its whole set, or only `trait`'s keys when
+ *  the step touches one trait. Survives any world rebuild, since it holds no entity. */
+export interface MarkCapture { trait?: string; keys: string[] }
+export function captureMarks(entityId: number, trait?: string): MarkCapture {
+  const e = findEntity(entityId);
+  const all = e ? [...(getOverrideMarkSet(e) ?? [])] : [];
+  return trait ? { trait, keys: all.filter((k) => k.startsWith(`${trait}.`)) } : { keys: all };
+}
+/** Put a {@link captureMarks} back: the marks in its scope become exactly the captured ones. */
+export function restoreMarks(entityId: number, capture: MarkCapture): void {
+  const e = findEntity(entityId);
+  if (!e) return;
+  if (!capture.trait) clearOverrideMarks(e);
+  else for (const k of [...(getOverrideMarkSet(e) ?? [])]) if (k.startsWith(`${capture.trait}.`)) unmarkOverride(e, capture.trait, k.slice(capture.trait.length + 1));
+  restoreOverrideMarks(e, capture.keys);
+}
+
+/** Record each detached member's marks on it, right after the frame-ending that detached it (`endFrames`, or a
+ *  delete): the members outside the ended tree keep their marks in the side store only until a rebuild. By live guid,
+ *  through every rename a promotion made (a → b → c). (`memberHome` is L0 and cannot read the L3 store, so the record is
+ *  made here.)
+ *  ⚠️ A member that no longer resolves records NOTHING, not an empty set: a multi-select delete can destroy a member an
+ *  earlier target's frame-ending detached, and its own snapshot's respawn restores its marks. An empty record made the
+ *  relink below wipe them again, and the next save dropped its overrides (#1794 close-out review). */
+export function recordDetachedMarks(detached: DetachedMember[]): DetachedMember[] {
+  const renamed = new Map(detached.flatMap((d) => d.renamed ?? []));
+  for (const d of detached) {
+    let g = d.guid;
+    for (let hops = 0; renamed.has(g) && hops < renamed.size; hops++) g = renamed.get(g)!;
+    const e = findEntityByGuid(g) ?? findEntityByGuid(d.guid);
+    d.marks = e ? [...(getOverrideMarkSet(e) ?? [])] : undefined;
+  }
+  return detached;
+}
+
+/** THE relink of detached members for an editor undo: {@link relinkDetachedMembers}, then each member's recorded
+ *  marks back ({@link recordDetachedMarks}); a member with no record keeps the marks it has. */
+export function relinkDetachedMembersMarked(detached: readonly DetachedMember[]): void {
+  relinkDetachedMembers(detached);
+  for (const d of detached) {
+    const e = d.marks ? findEntityByGuid(d.guid) : undefined;
+    if (e) { clearOverrideMarks(e); restoreOverrideMarks(e, d.marks!); }
   }
 }

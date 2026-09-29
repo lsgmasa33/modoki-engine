@@ -35,7 +35,7 @@ import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scen
 import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
 import { getCachedPrefab, invalidatePrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
-import { authored, piOf, isInstanceRoot, editing, worldTree, settle, placeholderGuids, type Fixture } from './harness';
+import { authored, piOf, isInstanceRoot, editing, worldTree, settle, placeholderGuids, unexpandedRows, type Fixture } from './harness';
 import type { FuzzBackend } from './backend';
 
 export type OpKind =
@@ -103,7 +103,7 @@ export interface RunState {
   clip: EntityClipboard | null;
   /** What the round trip inside a save→reload op measured; the checks read it. `restored`: the same saved file reloaded
    *  with every deleted prefab put back, when the run deleted one (#1805). */
-  roundTrip?: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown };
+  roundTrip?: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown; unexpanded?: ReadonlySet<string> };
   /** The last bytes the run saw at every prefab path (the runner records them after each step): what a deleted prefab's
    *  restore puts back. */
   prefabBytes?: Map<string, string>;
@@ -164,8 +164,9 @@ async function editRefusable(gesture: () => Outcome | Promise<Outcome>, st: RunS
     return await gesture();
   } catch (e) {
     // Only in a prefab-edit WORLD, the refusal's own ground truth (not `editing()`, which also needs the session flag):
-    // outside one the refusal must never fire, and a gesture it refused there is a finding.
-    if (!(e instanceof PrefabEditRefusalError) || !isPrefabEditWorld()) throw e;
+    // outside one the refusal must never fire, and a gesture it refused there is a finding. The one reason that holds
+    // in the scene too is a new child under a Missing Prefab placeholder (#1831 M2).
+    if (!(e instanceof PrefabEditRefusalError) || (!isPrefabEditWorld() && e.reason !== 'under-missing-prefab')) throw e;
     st.note = e.message;
     return 'refused';
   }
@@ -412,6 +413,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
     case 'saveReload': {
       if (editing()) return 'noop';
       const before = worldTree();
+      const unexpanded = unexpandedRows(); // the frames the live world could not expand (#1831 G1 M1, `forgiveExpandedFrames`)
       const s1 = await saveScene({ allowDialog: false });
       if (!s1.saved) { st.note = `save: ${s1.reason}`; return 'refused'; }
       const firstBytes = st.be.read(st.f.scenePath) ?? '';
@@ -448,7 +450,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       if (gone.length) st.note = `${gone.length} deleted prefab(s) restored for the comparison; ${placeholderGuids().size} placeholder(s) on the plain reload`;
       const s2 = await saveScene({ allowDialog: false });
       if (!s2.saved) throw new Error(`second save: ${s2.reason}`);
-      st.roundTrip = { before, after, firstBytes, secondBytes: st.be.read(st.f.scenePath) ?? '', ...(gone.length ? { restored } : {}) };
+      st.roundTrip = { before, after, firstBytes, secondBytes: st.be.read(st.f.scenePath) ?? '', ...(gone.length ? { restored, unexpanded } : {}) };
       return 'done';
     }
     case 'trashPrefab': {

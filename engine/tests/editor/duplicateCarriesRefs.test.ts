@@ -495,7 +495,7 @@ describe('an owned nested instance that leaves its row stays gone after save + r
   // those values are overrides the save keeps only when marked. Unmarked, the root reloaded at the prefab's
   // x, under a parent at x=10: it jumped by the parent's offset. y carries a file override (marked at load)
   // and must keep it. Mutations: drop the markCompensatedTransform call in reparentEntity's apply, its
-  // `putBackMarks` on undo, or its re-mark on redo — each turns this red.
+  // `restoreMarks` on undo, or its re-mark on redo — each turns this red.
   it('a top-level instance dropped under a moved parent keeps its world pose through save + reload; undo drops the marks, redo restores them', async () => {
     const sc = withShelf() as unknown as { entities: Array<Record<string, unknown>> };
     sc.entities.push({ id: 4, prefab: INNER, guid: 'bbbbbbbb-0000-4000-8000-0000000000c5', overrides: { 1: { Transform: { y: 4 } } }, traits: { EntityAttributes: { name: 'InnerRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } });

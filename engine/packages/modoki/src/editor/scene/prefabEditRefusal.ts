@@ -23,12 +23,21 @@
  *  `instantiatePrefabInstance` and so meets it too; the undo wrapper drops that step with its notice
  *  (`prefabInstantiateUndo.ts`), as it drops a stale read.
  *
+ *  One refusal holds in the SCENE too, because it is the same rule, a gesture the save cannot keep: nothing new goes UNDER
+ *  a Missing Prefab placeholder, or anywhere inside one (#1831, the G1 study's M2, hub ruling). The placeholder's save
+ *  writes the record its file held, and nothing folds a live child into it: a prefab-edit save wrote a node dropped there
+ *  as a row parented to the placeholder's reference row, which every expansion then spawned at the instance's OWN
+ *  parent, outside it, with a runtime guid, and the scene save wrote that orphan as a new top-level entry, again on every
+ *  reload (hunt seed 315). A child the placeholder already has (loaded with it) stays, a reorder under its current parent
+ *  is not a new link, and an undo's restore is not a gesture, so none of those is refused.
+ *
  *  Ground truth is the WORLD, not the `editingPrefab` store flag (`prefabEditWorld.ts` says why): the edited prefab is
  *  the one the loaded synthetic scene names, and the root is the entity carrying `PREFAB_EDIT_ROOT_GUID`. Outside a
- *  prefab-edit world every gesture is allowed. A leaf: `prefab.ts` asks it too, so it reads the prefab cache through the
+ *  prefab-edit world every gesture is allowed except the placeholder one above. A leaf: `prefab.ts` asks it too, so it reads the prefab cache through the
  *  reader its caller hands in rather than importing `prefab.ts`. */
 
-import { getAllEntities, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { PREFAB_EDIT_ROOT_GUID, SCAFFOLD_PREFIX } from './prefabEditGuids';
 import { PREFAB_EDIT_SCENE_PREFIX, prefabEditWorldPath } from './prefabEditWorld';
 import { prefabNests, type NestingReader } from '../../runtime/loaders/prefabNesting';
@@ -53,18 +62,23 @@ export const PREFAB_EDIT_REFUSAL_TEXT: Record<PrefabEditRefusalReason, string> =
   'outside-root': 'Prefab edit keeps everything under the prefab root: the save writes only the root and what is under it, so an entity outside it would be silently lost. Put it under the root.',
   'self-nesting': 'A prefab cannot contain itself: this holds an instance of the prefab being edited.',
   'scaffold': 'The prefab-edit lights, environment and stage are editor scaffolding, not part of the prefab: they stay outside the root, where the save does not write them.',
+  'under-missing-prefab': 'Nothing can be put under a Missing Prefab: its save writes only what its file held for it, so a new child would be lost or saved in the wrong place. Restore the prefab (the reload re-expands it), then add to it.',
 };
 
-/** Why `gesture` is refused in the prefab-edit world, or null when it may run (or no prefab-edit world is loaded). */
+/** Why `gesture` is refused, or null when it may run: a new link under a Missing Prefab placeholder anywhere, and the rest
+ *  only in the prefab-edit world. */
 export function prefabEditRefusal(gesture: PrefabEditGesture): PrefabEditRefusal | null {
+  const all = getAllEntities();
+  const byId = new Map(all.map((e) => [e.id, e]));
+  const refuse = (reason: PrefabEditRefusalReason): PrefabEditRefusal => ({ reason, text: PREFAB_EDIT_REFUSAL_TEXT[reason] });
+  // In the scene and in prefab edit alike (the header): a NEW link under a placeholder. A reorder is not one.
+  if (gesture.kind !== 'delete' && gesture.parentId && underMissingPrefab(gesture.parentId, byId)
+    && !(gesture.kind === 'reparent' && byId.get(gesture.id)?.parentId === gesture.parentId)) return refuse('under-missing-prefab');
   const world = prefabEditWorldPath();
   if (!world) return null;
-  const all = getAllEntities();
   const root = all.find((e) => e.guid === PREFAB_EDIT_ROOT_GUID);
   // No root: the save already refuses ("prefab root not found"), and there is nothing left to protect.
   if (!root) return null;
-  const byId = new Map(all.map((e) => [e.id, e]));
-  const refuse = (reason: PrefabEditRefusalReason): PrefabEditRefusal => ({ reason, text: PREFAB_EDIT_REFUSAL_TEXT[reason] });
 
   switch (gesture.kind) {
     case 'delete': {
@@ -92,6 +106,16 @@ export function prefabEditRefusal(gesture: PrefabEditGesture): PrefabEditRefusal
       return null;
     }
   }
+}
+
+/** Is `id` a Missing Prefab placeholder, or inside one? */
+function underMissingPrefab(id: number, byId: ReadonlyMap<number, EntityInfo>): boolean {
+  const seen = new Set<number>();
+  for (let cur = byId.get(id); cur && !seen.has(cur.id); cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
+    seen.add(cur.id);
+    if (unresolvedRefOf(findEntity(cur.id) as Parameters<typeof unresolvedRefOf>[0])) return true;
+  }
+  return false;
 }
 
 /** Is `id` the root or inside its subtree? */

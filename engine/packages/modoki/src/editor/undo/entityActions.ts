@@ -15,10 +15,10 @@ import { newGuid } from '../../runtime/loaders/assetManifest';
 import { remapGuidValues } from '../../runtime/core/assetRefRules';
 import { planCopyGuids } from '../../runtime/core/copyIdentity';
 import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
-import { markOverrideIfInstance, reconcileOverrideMarks, writeTraitFieldMarked, markStateOf, putMarkState } from './overrideMarkWrites';
+import { markOverrideIfInstance, reconcileOverrideMarks, writeTraitFieldMarked, markStateOf, putMarkState, captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, type MarkCapture } from './overrideMarkWrites';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
-import { endFrames, relinkDetachedMembers, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
+import { endFrames, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader, frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../../runtime/core/ecs/identityParents';
 import { isStoredRoot, isOwnedRoot, durableGuid, type MemberPi } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
@@ -313,7 +313,7 @@ export function addTraitToEntitiesWithUndo(
   const affectedScenes = resolveAffectedScenes(targets);
   const initial = values ? filterToTraitSchema(meta, values) : undefined;
   const refs = targets.map((id) => entityRef(id));
-  const oldMarks = targets.map((id) => marksOf(id));
+  const oldMarks = targets.map((id) => captureMarks(id));
   const apply = () => {
     requireAll(refs).forEach((id) => { // I19: every target, before the first add
       // Clone per entity AND per apply: without it, redo would re-seat the same
@@ -327,7 +327,7 @@ export function addTraitToEntitiesWithUndo(
     markUIDirty(); markStructureDirty();
   };
   const revert = () => {
-    requireAll(refs).forEach((id, i) => { findEntity(id)?.remove(meta.trait); putBackMarks(id, oldMarks[i]!); });
+    requireAll(refs).forEach((id, i) => { findEntity(id)?.remove(meta.trait); restoreMarks(id, oldMarks[i]!); });
     markUIDirty(); markStructureDirty();
   };
   apply();
@@ -354,7 +354,7 @@ export function addTraitToEntitiesWithUndo(
 export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: TraitMeta): string | null {
   const refused = traitRemoveRefusal(meta.name); // #1454, as above
   if (refused) { console.error(`[entityActions] ${refused}`); return refused; }
-  const targets: { ref: EntityRef; data: Record<string, unknown> | null }[] = [];
+  const targets: { ref: EntityRef; data: Record<string, unknown> | null; marks: MarkCapture }[] = [];
   for (const id of entityIds) {
     const e = findEntity(id);
     // readTraitDataFull + clone, for the SAME reason snapshotEntity uses them: readTraitData
@@ -363,7 +363,9 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
     // captured. Sibling of QA-CTX-0003, found by its close-out sweep.
     if (e && e.has(meta.trait)) {
       const full = readTraitDataFull(id, meta);
-      targets.push({ ref: entityRef(id), data: full ? cloneTraitValues(full) : null });
+      // Its marks go with its data (#1800): a rebuild before the undo re-seeds them from the file, which records the
+      // component as removed, and the save keeps only marked fields.
+      targets.push({ ref: entityRef(id), data: full ? cloneTraitValues(full) : null, marks: captureMarks(id, meta.name) });
     }
   }
   if (targets.length === 0) return null;
@@ -375,7 +377,10 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
     markUIDirty(); markStructureDirty();
   };
   const revert = () => {
-    requireAll(targets.map((t) => t.ref)).forEach((id, i) => findEntity(id)?.add(meta.trait((targets[i].data ?? {}) as Record<string, unknown>)));
+    requireAll(targets.map((t) => t.ref)).forEach((id, i) => {
+      findEntity(id)?.add(meta.trait((targets[i].data ?? {}) as Record<string, unknown>));
+      restoreMarks(id, targets[i].marks);
+    });
     markUIDirty(); markStructureDirty();
   };
   apply();
@@ -1008,14 +1013,14 @@ export function deleteEntitiesWithUndo(
   const rootLinks = captureRootLinks(collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), snaps.map(s => s.snapshot.id)));
   const respawnedGuids = new Set<string>();
   for (const s of snaps) snapshotGuids(s.snapshot, respawnedGuids);
-  let detached: DetachedMember[] = snaps.flatMap(s => deleteEntity(s.snapshot.id));
+  let detached: DetachedMember[] = recordDetachedMarks(snaps.flatMap(s => deleteEntity(s.snapshot.id)));
   setSelection?.([]);
 
   _pushAction({
     label: snaps.length > 1 ? `Delete ${snaps.length} Entities` : 'Delete Entity',
     undo: () => {
       // Every ref first (I19): a parent or an instance root that is gone refuses before anything respawns. Through the
-      // rename the delete's frame-ending made (a promoted member keeps a new guid until `relinkDetachedMembers` below
+      // rename the delete's frame-ending made (a promoted member keeps a new guid until `relinkDetachedMembersMarked` below
       // takes it back), since the refs were taken before it.
       const idx = buildGuidIndex();
       const renames = renamesOf(detached);
@@ -1026,7 +1031,7 @@ export function deleteEntitiesWithUndo(
       // The relink FIRST: it reverses the frame-ending's guid rename, and `restoreRootLinks` finds each root by the guid
       // it had before that rename. The other way round a renamed root was skipped, and its respawned member kept the
       // snapshot's raw `rootInstanceId`, stale after a world swap (#1819 close-out re-review). The relink reads no link.
-      relinkDetachedMembers(detached);
+      relinkDetachedMembersMarked(detached);
       restoreRootLinks(rootLinks);
       setSelection?.(liveIds);
     },
@@ -1039,8 +1044,7 @@ export function deleteEntitiesWithUndo(
         if (id == null) throw new UndoRefusedError(`"${s.name}" (${journalRefOf(s.guid, s.snapshot.id)}) is no longer in the scene, so there is nothing to delete again.`, `"${s.name}" is no longer in the scene`);
         return id;
       });
-      detached = [];
-      ids.forEach(id => detached.push(...deleteEntity(id)));
+      detached = recordDetachedMarks(ids.flatMap(id => deleteEntity(id)));
       setSelection?.([]);
     },
     kind: '!delete',
@@ -1240,14 +1244,6 @@ function markCompensatedTransform(id: number, oldLocal: Record<string, unknown>,
     if (Math.abs(newLocal[f]! - Number(oldLocal[f] ?? 0)) > 1e-6) markOverride(entity, 'Transform', f);
   }
 }
-/** The entity's override marks, to put back on undo with {@link putBackMarks}. */
-const marksOf = (id: number): string[] => { const e = findEntity(id); return e ? [...(getOverrideMarkSet(e) ?? [])] : []; };
-function putBackMarks(id: number, keys: string[]): void {
-  const e = findEntity(id);
-  if (!e) return;
-  clearOverrideMarks(e);
-  restoreOverrideMarks(e, keys);
-}
 
 export function reparentEntity(entityId: number, newParentId: number, newSortOrder?: number): boolean {
   // Self-parent + cycle now live in runtime/core/ecs/hierarchy.ts, shared with the device's
@@ -1339,7 +1335,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // The marks an undo puts back: taken before ANY write here, since the sortOrder write below marks (#1709), and a
   // snapshot after it made the undo restore that mark, pinning the old order as an override.
   const keys = moveKeys(entityId, attrMeta); // before the parent write: read under the pre-move ancestry
-  const oldMarks = marksOf(entityId);
+  const oldMarks = captureMarks(entityId);
   if (parentChanged) linkOwnerBeforeMove(getCurrentWorld(), entityId);
   if (parentChanged) writeTraitField(entityId, attrMeta, 'parentId', newParentId);
   if (newSortOrder !== undefined) writeTraitFieldMarked(entityId, attrMeta, 'sortOrder', newSortOrder);
@@ -1358,13 +1354,16 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // `ownerRef` addresses the instance root by guid (null: the target IS the root): `data.rootInstanceId`
   // is a bare ecs id, which a world rebuild (Play→Stop) reassigns, and an undo restoring the stale id
   // left the instance naming a dead root — the next save wrote neither root nor members.
-  const detachTargets: { ref: EntityRef; ownerRef: EntityRef | null; data: Record<string, unknown> }[] = [];
+  // An unpacked member keeps its marks (#1794 close-out review): the undo re-links it, and a rebuild in between re-seeds the
+  // marks from a file that holds it plain, so the next save dropped its overrides. A PROMOTED root needs none: it is saved
+  // as the standalone instance it became, whose overrides mark it again on the reload (the second review, measured).
+  const detachTargets: { ref: EntityRef; ownerRef: EntityRef | null; data: Record<string, unknown>; marks: MarkCapture }[] = [];
   const promoteTargets: { ref: EntityRef; data: Record<string, unknown> }[] = [];
   if (piMeta && detachPlan) {
     for (const id of detachPlan.strip) {
       const pd = findEntity(id)!.get(piMeta.trait) as Record<string, unknown>;
       const owner = pd.rootInstanceId as number;
-      detachTargets.push({ ref: entityRef(id), ownerRef: owner === id ? null : entityRef(owner), data: { ...pd } });
+      detachTargets.push({ ref: entityRef(id), ownerRef: owner === id ? null : entityRef(owner), data: { ...pd }, marks: captureMarks(id) });
     }
     for (const id of detachPlan.promote) promoteTargets.push({ ref: entityRef(id), data: { ...(findEntity(id)!.get(piMeta.trait) as Record<string, unknown>) } });
   }
@@ -1379,7 +1378,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     const ids = detachTargets.map((t) => resolveWith(t.ref, idx)).filter((id): id is number => id != null);
     // A member moved away from an unpacked one keeps its path (#1437), and one still linked to an unpacked
     // owned root's frame is promoted or unlinked with it (#1453).
-    orphans = endFrames(new Set(ids));
+    orphans = recordDetachedMarks(endFrames(new Set(ids)));
     for (const id of ids) findEntity(id)?.remove(piMeta.trait);
     const roots = promoteTargets.map((t) => resolveWith(t.ref, idx)).filter((id): id is number => id != null);
     renamed = promoteOwnedRoots(roots);
@@ -1388,7 +1387,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     if (!piMeta) return;
     // Renames reversed last-applied first: the plan's promotions, then the orphans' (inside the relink).
     applyGuidRemap(new Map([...renamed].map(([a, b]) => [b, a])));
-    relinkDetachedMembers(orphans);
+    relinkDetachedMembersMarked(orphans);
     const idx = buildGuidIndex();
     for (const t of promoteTargets) {
       const id = resolveWith(t.ref, idx);
@@ -1404,6 +1403,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       // by the save, whereas a plain entity is written.
       if (owner == null) continue;
       findEntity(id)?.add(piMeta.trait({ ...t.data, rootInstanceId: owner }));
+      restoreMarks(id, t.marks);
     }
   };
   const detaching = detachTargets.length > 0 || promoteTargets.length > 0;
@@ -1448,7 +1448,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       writeTraitField(id, attrMeta!, 'sortOrder', oldSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', oldFolder);
       if (savedOldLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedOldLocal[f]); }
-      putBackMarks(id, oldMarks);
+      restoreMarks(id, oldMarks);
       markStructureDirty();
     },
     redo: () => {
@@ -1765,9 +1765,9 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     writeTraitField(rid, attrMeta, 'sortOrder', oldSortOrder);
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', oldFolder);
     if (oldLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, oldLocal[f]);
-    putBackMarks(rid, rootMarks);
+    restoreMarks(rid, rootMarks);
   };
-  const rootMarks = marksOf(entityId);
+  const rootMarks = captureMarks(entityId);
   const keys = moveKeys(entityId, attrMeta); // #1808/#1852, as `reparentEntity`: a scene move re-parents too
   applyStamps();
   keys.strip(); // after the parent write, before the rekey renames anything
