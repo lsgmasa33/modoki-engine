@@ -24,7 +24,8 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 }));
 
 import { getCurrentWorld, setCurrentWorld, setRunMode } from '@modoki/engine/runtime';
-import { setActionCallback, pushAction, clearHistory } from '@modoki/engine/editor';
+import { setActionCallback, pushAction, clearHistory, undoRefusedReason, getEditVersion } from '@modoki/engine/editor';
+import { swapHistory, undoLabel } from '../../packages/modoki/src/editor/undo/undoManager';
 import { makeRigPrefabAsset } from '../../packages/modoki/src/editor/scene/skinPrefab';
 import { setPrefabCache, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -122,5 +123,26 @@ describe('the skin-rig update keeps each bone\'s row by its path (#1782)', () =>
     expect(twinRows).toHaveLength(2);
     for (const r of twinRows) expect(r.localId).toBeGreaterThanOrEqual(mark);
     expect(new Set(twinRows.map((r) => r.nodeGuid)).size).toBe(2);
+  });
+});
+
+describe("the rig writer's undo entry is a FILE edit that rebuilds live frames (#1857)", () => {
+  // Both halves are one `commitPrefabWrite`, as a model import's: the file outlives a discarded world, and the rebase
+  // lands on the live world, so a preview must refuse it.
+  // Mutations: drop `_isFileDirect` from skinPrefab's entry — the discard drops it; drop `_rebasesLiveFrames` — the
+  // preview gate lets it through.
+  it('survives a discarding history swap, and is refused inside a preview envelope', async () => {
+    const v0 = getEditVersion();
+    await build([{ name: 'hips', parent: -1 }]);
+    // #1858, OBSERVED: Skin "Make prefab" marked the open scene unsaved. It changes a file, not the scene file.
+    expect(getEditVersion()).toBe(v0);
+    expect(undoLabel()).toBe('Make prefab "Rig"');
+    swapHistory('/other-1857.json', { discardOutgoing: true });
+    swapHistory('');
+    expect(undoLabel()).toBe('Make prefab "Rig"');
+    setRunMode('scrub');
+    try {
+      expect(undoRefusedReason('undo')).toMatch(/Exit the preview/);
+    } finally { setRunMode('stopped'); }
   });
 });

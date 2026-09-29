@@ -29,15 +29,15 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, spawnEntity, Transform, EntityAttributes,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, Transient as TransientTrait, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo, duplicateEntity, reparentEntity } from '@modoki/engine/editor';
-import { snapshotEntity, respawnFromSnapshot, copySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
+import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo, redo, duplicateEntity, reparentEntity } from '@modoki/engine/editor';
+import { snapshotEntity, respawnFromSnapshot, copySnapshot, moveEntityToScene } from '../../packages/modoki/src/editor/undo/entityActions';
 import {
   setPrefabCache, serializePrefab, applyToPrefabSelective, instantiatePrefabAsync, getOverrideValues, collectComparableTraits,
   baseTokenResolver, type PrefabFile,
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import type { AddedEntity } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
-import { setTemplateKey, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
+import { setTemplateKey, templateKeyOf, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { isRuntimeGuid, deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -961,5 +961,68 @@ describe('the heal caches its misses (#1426 close-out)', () => {
     const t0 = performance.now();
     deriveInstanceMemberGuids(world);
     expect(performance.now() - t0).toBeLessThan(150);
+  });
+});
+
+// ── #1808 / #1852: a keyed node's template key across a move ─────────────────────────────────────────
+describe("a reparent keeps a keyed node's template key exactly while the node stays in the frame that keys it (#1808, #1852)", () => {
+  const live = (id: number) => [...getCurrentWorld().entities].find((x) => x.id() === id)!;
+  const extra = () => getAllEntities().find((e) => e.name === 'Extra')!;
+  const keyOfExtra = () => templateKeyOf(live(extra().id));
+  const oneOuter = (): SceneData => ({ ...twoInstances(OUTER, 'OuterRoot'), entities: [twoInstances(OUTER, 'OuterRoot').entities[0]] } as unknown as SceneData);
+  const midRoot = () => getAllEntities().find((e) => e.name === 'MidRoot')!.id;
+
+  it("a key OUTER's row declares is dropped when MID's root leaves OUTER; the undo re-seats it after a save→reload, the redo drops it again", async () => {
+    // Mutations: drop the strip (`leftFrame`) — the key survives the move (#1808); drop the undo's re-seat — the key is gone
+    // after the reload's undo, so a redo's promotion would re-derive nothing (#1852).
+    install(outerDoc({ added: [keyed('Extra', 2)] }));
+    await load(oneOuter());
+    const keyedGuid = extra().guid;
+    expect(keyOfExtra()).toBe(KEY);
+    expect(reparentEntity(midRoot(), 0)).toBe(true);
+    expect(keyOfExtra(), 'left the frame that keys it').toBe('');
+    await load(await serializeScene() as unknown as SceneData); // a rebuild: the save states the node, unkeyed
+    expect(keyOfExtra()).toBe('');
+    expect(await undo()).toBe(true);
+    expect(keyOfExtra(), 'back in OUTER\'s frame').toBe(KEY);
+    expect(extra().guid).toBe(keyedGuid);
+    expect(await redo()).toBe(true);
+    expect(keyOfExtra()).toBe('');
+  });
+
+  it("a key MID's own template declares STAYS when MID's root leaves OUTER: its anchor moves with it", async () => {
+    // Mutation: strip every anchored key on a move that crosses an instance (the "outermost instance changed" rule, which
+    // #1808's design rejects) — this goes red, and the reload below restates the node beside the chain's own (I7).
+    install(midDoc({ added: [keyed('Extra', 1)] }));
+    await load(oneOuter());
+    expect(keyOfExtra()).toBe(KEY);
+    expect(reparentEntity(midRoot(), 0)).toBe(true);
+    expect(keyOfExtra()).toBe(KEY);
+    await load(await serializeScene() as unknown as SceneData);
+    expect(getAllEntities().filter((e) => e.name === 'Extra')).toHaveLength(1);
+    expect(keyOfExtra()).toBe(KEY);
+  });
+
+  it("the declaring document is the one the frame was EXPANDED from: a prefab evicted from both caches still strips (#1834)", async () => {
+    // Mutation: read the declarer's document from the editor cache (`getCachedPrefabSync`) — evicted, the key survives.
+    install(outerDoc({ added: [keyed('Extra', 2)] }));
+    await load(oneOuter());
+    prefabs.delete(OUTER);
+    setPrefabCache(OUTER, null as never);
+    expect(reparentEntity(midRoot(), 0)).toBe(true);
+    expect(keyOfExtra()).toBe('');
+  });
+
+  it('a SCENE move takes the same rule: a keyed node moved into another scene loses its key, its undo re-seats it', async () => {
+    // `moveEntityToScene` re-parents without `reparentEntity`. Mutation: drop its `keys.strip()` — Extra keeps OUTER's key
+    // in the other scene; drop its `keys.reseat()` — the undo brings it back unkeyed.
+    install(outerDoc({ added: [keyed('Extra', 2)] }));
+    await load(oneOuter());
+    expect(moveEntityToScene(extra().id, 'b1808000-0000-4000-8000-000000000001')).toMatchObject({ ok: true });
+    expect(keyOfExtra()).toBe('');
+    expect(await undo()).toBe(true);
+    expect(keyOfExtra()).toBe(KEY);
+    expect(await redo()).toBe(true);
+    expect(keyOfExtra()).toBe('');
   });
 });

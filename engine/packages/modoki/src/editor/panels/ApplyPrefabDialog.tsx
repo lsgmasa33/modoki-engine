@@ -6,7 +6,7 @@
  *  base; in `revert` mode they are reset back to the prefab base on this single
  *  instance (the prefab file is untouched). Same diff tree, opposite direction. */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import {
   getPrefabSource,
@@ -35,7 +35,7 @@ import { ModalShell } from '../components/ModalShell';
 import { applyTargetOptions, type KeyTargets } from '../scene/prefabApplyOptions';
 import {
   initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, filesWritten, toApplyTargets, rowView, applyBlocked,
-  previewRequestKey, staysOpen, type TargetChoice,
+  previewRequestKey, staysOpen, previewWorldKey, subscribePreviewWorld, type TargetChoice,
 } from './applyDialogModel';
 
 // The dialog's tree node is the shared shape exactly — aliased locally so the rest
@@ -174,6 +174,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   // the conflict line render. `request` is the selection it was computed for; a newer selection makes it stale.
   const [preview, setPreview] = useState<(ApplyPreview & { request: string }) | null>(null);
   const [previewEpoch, setPreviewEpoch] = useState(0);
+  // #1773: a world change (an edit, an undo, Play/Stop, a pose preview) re-plans the preview too.
+  const worldKey = useSyncExternalStore(subscribePreviewWorld, previewWorldKey, previewWorldKey);
 
   /** #868: when the instance root the dialog was opened for no longer exists, the dialog closes with a
    *  notice rather than acting on whatever entity now holds its index (see prefabDialogSubject.ts). */
@@ -252,7 +254,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
         });
     }, 120);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [active, mode, rootInstanceId, loadState.kind, checked, choice, previewEpoch]);
+  }, [active, mode, rootInstanceId, loadState.kind, checked, choice, previewEpoch, worldKey]);
 
   const totals = useMemo(() => {
     if (loadState.kind !== 'ready') return { total: 0, checked: 0 };

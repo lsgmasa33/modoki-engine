@@ -14,6 +14,7 @@ import { markSceneSaved, clearHistory, clearDirtyAssets, markAssetDirty, setCurr
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 
 /** Prefab-edit mode swaps in a synthetic world that `save-all` must not write. Entering it for real
  *  needs a mocked SceneManager (`prefabEditUnsavedProbe.test.ts`), so only the one predicate
@@ -308,7 +309,10 @@ describe('prefab revert — the override keys named', () => {
     setPrefabCache(PREFAB, doc as never);
     setPrefabCache(doc.id, doc as never);
     const r = await runAgentOp('prefab', { action: 'instantiate', path: PREFAB }) as { rootId: number };
+    // As an editor write does (#1709): the value AND its override mark. A bare value that differs with no mark is not an
+    // override, and is not listed (#1717).
     findEntity(r.rootId)!.set(Transform, { x: 5 });
+    markOverride(findEntity(r.rootId)!, 'Transform', 'x');
     // By guid: the instance root has one, so an `entityId` is refused (#1223 D2).
     const guid = (findEntity(r.rootId)!.get(EntityAttributes) as { guid: string }).guid;
     const o = await runAgentOp('prefab', { action: 'overrides', entityGuid: guid }) as { keys?: { all?: string[] } };

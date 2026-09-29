@@ -186,23 +186,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
       && (() => { const r = ops.findIndex((o) => o.kind === 'removeComponent'); return r >= 0 && ops.slice(r + 1).some((o) => o.kind === 'undo'); })(),
   },
   {
-    issue: 1808,
-    what: "a template-added node dragged into another instance of its template keeps its stale TemplateAddedKey",
-    repro: [
-      { kind: 'instantiate', u: [0.375, 0.1, 0, 0, 0, 0, 0, 0] },
-      { kind: 'reparent', u: [0.4375, 0.99, 0.8125, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'I7 duplicate guid' && /under one top-level root/.test(f.detail),
-    // Two instances of one template (a drop, a copy) and a move between them before the failure, which shows at a SAVE
-    // (never a revert: that is #1792). The reference-node variant (after a Create Prefab on the moved node) churns the
-    // nested list's bytes instead.
-    stops: (f, ops) => ops.some((o) => o.kind === 'reparent')
-      && ((f.check === 'I7 duplicate guid' && /under one top-level root/.test(f.detail) && /^(saveReload|final save→reload)/.test(f.op)
-        && ops.some((o) => o.kind === 'instantiate' || o.kind === 'duplicate' || o.kind === 'paste'))
-        || (f.check === 'save→reload→save is not byte-identical' && /\/members\/.*\/added$/.test(f.detail.split(': ')[0])
-          && ops.some((o) => o.kind === 'createPrefab'))),
-  },
-  {
     issue: 1809,
     what: "an Apply that drops a layer-added node's anchor row keeps its old derived guid live; the reload re-derives it",
     repro: [
@@ -372,6 +355,39 @@ export const KNOWN_OPEN: KnownOpen[] = [
 /** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
  *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test"). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
+  {
+    issue: 1795,
+    what: "(harness) Create Prefab's undo refused after a prefab-edit save, in its tree-check wording: expected, and forgiven in the tainted segment (hunt seed 6103)",
+    repro: [
+      { kind: 'createPrefab', u: [0.24430793477222323, 0.5578774318564683, 0.44810137269087136, 0.10805997927673161, 0.10153932473622262, 0.8677448665257543, 0.9063538603950292, 0.1537257907912135] },
+      { kind: 'prefabEdit', u: [0.21278736181557178, 0.1596795073710382, 0.2053778253030032, 0.339336343575269, 0.7885611937381327, 0.17296946281567216, 0.45481607667170465, 0.247781571932137], inner: [{ kind: 'addComponent', u: [0.2794236254412681, 0.437290902948007, 0.19698106171563268, 0.22118132980540395, 0.048200189135968685, 0.9753480581566691, 0.8320993515662849, 0.2162562918383628] }] },
+    ],
+  },
+  {
+    issue: 1808,
+    what: "a template-added node dragged into another instance of its template drops its key, so the save neither lets it claim that frame's own node nor restates the real one (I7)",
+    repro: [
+      { kind: 'instantiate', u: [0.375, 0.1, 0, 0, 0, 0, 0, 0] },
+      { kind: 'reparent', u: [0.4375, 0.99, 0.8125, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1808,
+    what: "the same, into a Duplicate of its instance (win's hunt seed 4906)",
+    repro: [
+      { kind: 'instantiate', u: [0.33546734880656004, 0.3447843382600695, 0.30051140766590834, 0.12782464898191392, 0.9830972701311111, 0.190639344509691, 0.4433795770164579, 0.5476007000543177] },
+      { kind: 'duplicate', u: [0.7372088129632175, 0.14683093107305467, 0.9046876113861799, 0.8760492680594325, 0.4298952512908727, 0.5522012941073626, 0.9785065127070993, 0.5436816818546504] },
+      { kind: 'reparent', u: [0.3311857592780143, 0.27454603649675846, 0.8415862247347832, 0.9143918077461421, 0.8354436776135117, 0.8086224568542093, 0.46160089829936624, 0.7940282034687698] },
+    ],
+  },
+  {
+    issue: 1852,
+    what: "a reparent's undo after a rebuild re-seats the template key the rebuild dropped, so its redo's promotion re-derives the guid the next step names (hunt seed 6079)",
+    repro: [
+      { kind: 'reparent', u: [0.3138674683868885, 0.10535246133804321, 0.6912389222998172, 0.5796298943459988, 0.24617210449650884, 0.7101706576067954, 0.21633561491034925, 0.08806159486994147] },
+      { kind: 'reparent', u: [0.591921912971884, 0.7589867576025426, 0.5511010221671313, 0.7398249786347151, 0.5937459345441312, 0.859238832257688, 0.8048971630632877, 0.5140114538371563] },
+    ],
+  },
   {
     issue: 1837,
     what: "a Replace over a prefab from a different tree keeps localId 1 bound to the old root's node (I4), and the walk back through it passes (hunt seed 4980, Mac; it was #1821 route 2's repro until #1795 left the create's file in place)",

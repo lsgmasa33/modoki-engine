@@ -1514,6 +1514,22 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     5000 entities × 20 keys. A world that expands no keyed prefab pays nothing. The prefab-edit world
     never notes the EDITED prefab's own keys — its rows are flattened, not expanded — so those nodes
     are not healed there; the editor's template write recovers them instead.
+  - **A move keeps the key exactly while the frame that DECLARES it still holds the node (#1808, #1852).** One owner,
+    `moveKeys` in `editor/undo/entityActions.ts`, shared by `reparentEntity` and `moveEntityToScene`:
+    - **The declaring frame** is the nearest instance-root ancestor whose OWN prefab document names the key
+      (`templateKeysOf`), read from the document the WORLD recorded that frame as expanded from (`frameDocReader`),
+      so a trashed and evicted prefab still answers. It is not the root the node's guid derives from: a nested
+      template node's guid derives from the OUTERMOST root, so that rule stripped a key a deeper template declares.
+    - **The move strips** the key from a node it takes out of that frame, right after the parent write and BEFORE the
+      detach. A stale key answered to that key in any other frame of the same template, so the save let the moved node
+      claim that frame's own node: it dropped the moved node and restated the real one as `own`, an I7 duplicate
+      (#1808). Before the detach, because a promotion re-derives a keyed node's guid through its key onto the new root,
+      and this load heal then re-keyed it at the next reload.
+    - **The undo re-seats every key the move saw.** It does not trust the world to still hold them: a save→reload
+      after the move drops the marker from a node the save states plainly, and without the re-seat the redo's promotion
+      re-derived nothing, so the next step named a guid nobody held (#1852). The redo strips the same nodes again.
+    - A move inside the declaring frame keeps the key. Whether the save then unlinks the node is decided by where it
+      sits (#1516), not by the marker.
   - **Write.** Every prefab-file writer captures in TEMPLATE form:
     - `planPrefabRows` passes `{ template: true }` to `captureInstanceReference` and
       `captureNestedChannels`;

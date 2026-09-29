@@ -117,6 +117,8 @@ export async function makeRigPrefabAsset(
   let applied = true;
   const action: UndoAction = {
     label,
+    // A FILE's edit that also rebuilds the live frames placed from it, as a model import's (#1857, undoManager.ts).
+    _isFileDirect: true, _rebasesLiveFrames: true,
     undo: async () => {
       // Restore the prior prefab verbatim, or delete a fresh create.
       const wrote = await commitPrefabWrite(savePath, prevContent != null ? restored() : null, {

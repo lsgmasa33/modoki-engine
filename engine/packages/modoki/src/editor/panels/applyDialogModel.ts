@@ -12,6 +12,8 @@ import type { KeyTargets, ApplyTargetOption } from '../scene/prefabApplyOptions'
 import type { ApplyTargets } from '../scene/prefabApplyTargets';
 import type { ApplyPreview, ApplyResult } from '../scene/prefab';
 import { describeEffect } from '../scene/prefabApplyEffects';
+import { getEditVersion, subscribeUndo } from '../undo/undoManager';
+import { getRunMode, onRunModeChange } from '../../runtime/core/playState';
 
 /** key → the chosen target (a prefab guid). */
 export type TargetChoice = Readonly<Record<string, string>>;
@@ -111,4 +113,21 @@ export function applyBlocked(preview: (Pick<ApplyPreview, 'conflicts' | 'refused
   const n = preview.conflicts.length;
   if (n) return `Cannot apply: ${n} conflict${n === 1 ? '' : 's'} — checked changes write the same field with different values (see the red lines)`;
   return null;
+}
+
+/** The world a preview was planned against (#1773): the edit version (an edit, or an undo/redo of one) and the run mode
+ *  (Play, Stop, a pose preview's begin and Exit). The preview re-plans when it changes, so a refusal the dialog shows
+ *  ("the live world is not authored") does not outlive the state that caused it, and the Apply button is not left
+ *  disabled until the user touches the list. A selection changes neither, so a click re-plans nothing. Correctness does
+ *  not rest on it: Apply hands the preview's fingerprint over and refuses a plan that differs (#1736). */
+export function previewWorldKey(): string {
+  return `${getEditVersion()}|${getRunMode()}`;
+}
+
+/** Subscribe to what {@link previewWorldKey} reads: the undo stacks (every edit, undo and redo moves them) and the run
+ *  mode. Returns the unsubscribe. */
+export function subscribePreviewWorld(fn: () => void): () => void {
+  const offUndo = subscribeUndo(fn);
+  const offMode = onRunModeChange(fn);
+  return () => { offUndo(); offMode(); };
 }

@@ -112,6 +112,14 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
       + 'still fails, as "undo/redo refused in a clean segment" (that is how #1821 is caught)',
   },
   {
+    pattern: /^\[undo\] Undo of "Save prefab "[^"]*"" was REFUSED — "[^"]*"( \([^)]*\))? was rebuilt from a changed \S+\.prefab\.json since/,
+    why: '#1795 route 1: Create Prefab\'s undo writes no file, so it asks the TREE — it refuses once a prefab-edit save or an '
+      + 'outside edit rebuilt the instance from a changed document (`createdFrameRebuiltRefusal`), since unlinking it would '
+      + 'keep that change in the scene. The same design as the file refusal above, in the wording b5aa811e3 gave it (hunt '
+      + 'seeds 6001 6053 6070 6103 6138). A refusal in a segment nothing outside the stack touched still fails, as "undo '
+      + 'refused in a clean segment"',
+  },
+  {
     pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — "[^"]*"( \([^)]*\))? (is a Missing Prefab now|is no longer in the scene|is not a Missing Prefab any more|is no longer an instance of|is no longer a prefab instance|is a prefab instance again)/,
     why: 'owner ruling R (#1819, #1827, #1793, 2026-09-29): an undo or redo whose target no longer resolves, or has become '
       + 'a Missing Prefab placeholder, refuses before any change and is dropped (`require`, entityRef.ts), and says so. A '

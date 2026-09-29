@@ -3778,8 +3778,29 @@ non-null:
 | Run mode | Refused | Why |
 |---|---|---|
 | `stopped` | nothing | the live world IS the authored scene |
-| `playing` (incl. paused) | **every** entry | Stop reverts the world and truncates the during-Play entries (`truncateUndoTo`) |
+| `playing` (incl. paused) | **every** entry | Stop reverts the world and truncates the during-Play entries (`truncateUndoTo`), except an asset-FILE edit, which Stop keeps (#1857, below) |
 | `scrub` / `preview` | a **scene edit from before the preview session** | Exit restores the snapshot. An asset-document edit (`_isFileDirect`) and a selection step are never touched by that restore, and a scene edit made *during* the session belongs to the posed world |
+
+**An asset-FILE edit is `_isFileDirect`; one that also rebuilds live frames adds `_rebasesLiveFrames` (#1857).** The
+ten Assets-panel builders (`editor/panels/assetUndo.ts`: delete, duplicate, rename, folder create/delete/rename, paste,
+files drop, file import, model import) set the flag. Untagged, each was treated as a scene edit: Exit dropped a delete
+made in a preview (the file stayed in the OS trash with no undo), Stop truncated it, its undo marked the scene unsaved
+(#1858, observed: Move to Trash, Skin "Make prefab" and a model import each made `load_scene` refuse with
+`REQUIRES_SAVE` over nothing to save), and a step spanning a scene switch was dropped. The undo manager asks three
+questions of the flags:
+- **Does it outlive a world?** `_isFileDirect`. This covers `runStep`'s `worldGone` and `parkSurvivors`.
+- **Does it leave the scene FILE as it was?** `_isFileDirect`, or a selection (`leavesSceneFile`). This covers the
+  edit-version bump and the scene dirty marks.
+- **Does it write no live world?** `_isFileDirect` without `_rebasesLiveFrames`, or a selection (`worldFree`). This
+  covers the preview gate, Exit's drop and Stop's truncation.
+- A model import is both, and so is the skin-rig prefab writer (`skinPrefab.ts`): each half is one `commitPrefabWrite`,
+  which rebases every live frame of the prefab. It survives a switch and marks nothing unsaved like any file edit (the
+  scene file holds the instances and their overrides, which a rebase does not change), but it counts as a scene edit
+  wherever a world is posed or thrown back: the gate refuses it in an envelope, Exit drops one pushed inside, and Stop
+  drops one pushed during Play.
+- **Stop keeps a world-free file edit pushed during Play** above the barrier, in order (`truncateUndoTo`). The asset file
+  keeps its Play-time change, as Unity's does, so its undo stays. Material, clip and other asset-document edits made
+  during Play are kept by the same rule.
 
 **Exit drops the session's own scene edits from the history.** The undo manager marks each entry with
 the preview session held when it was pushed. `timelinePreview.ts` calls `setPreviewUndoSession` at
@@ -4394,7 +4415,8 @@ The shape a game entry takes (`games/sling/editor/fileDocUndo.ts`, the reference
 - **Mark it `_isFileDirect`.** It changes a file, not a serialized scene entity, so it must not mark the scene
   unsaved, and it survives a history swap like the other asset entries. ⚠️ The flag has a SECOND role: it lets the
   entry undo inside a scrub/preview envelope (#1148, `undoManager.ts`). So a panel whose undo also writes a
-  serialized scene entity must NOT set it, or that edit is lost on Exit. Sling's only touches a `Transient` field.
+  serialized scene entity must NOT set it alone, or that edit is lost on Exit. Sling's only touches a `Transient` field.
+  An entry that edits a file AND rebuilds live frames sets `_rebasesLiveFrames` beside it (#1857, above).
 - **Refuse an edit while an undo/redo step is running** (`isExecutingUndoRedo()`). The step is async (a hash and a
   guarded write), and `pushAction` silently drops a push made during one. An edit landing in that window would be
   saved with no undo entry, and the step's late panel update would then show a document the disk does not hold.

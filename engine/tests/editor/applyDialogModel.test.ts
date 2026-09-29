@@ -7,7 +7,10 @@ import { describe, it, expect } from 'vitest';
 import {
   initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, filesWritten, toApplyTargets, rowView, applyBlocked,
   previewRequestKey, staysOpen,
+  previewWorldKey, subscribePreviewWorld,
 } from '../../packages/modoki/src/editor/panels/applyDialogModel';
+import { pushAction, clearHistory, undo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
 import type { KeyTargets } from '../../packages/modoki/src/editor/scene/prefabApplyOptions';
 import type { KeyEffect } from '../../packages/modoki/src/editor/scene/prefabApplyEffects';
 
@@ -108,5 +111,47 @@ describe('applyDialogModel', () => {
   it('the request carries the CHECKED keys\' targets only', () => {
     // Mutation: `toApplyTargets` walks every chosen key — an unchecked row's target is sent.
     expect(toApplyTargets(initialTargets(options), ['a.Rotate3D.speed'])).toEqual({ perKey: { 'a.Rotate3D.speed': DOOR } });
+  });
+});
+
+// ── #1773: the preview re-plans when the world moves ─────────────────────────────────────────────────────────────
+describe('previewWorldKey / subscribePreviewWorld (#1773)', () => {
+  // The dialog keys its preview effect on this, so a refusal it shows is re-asked once the world changes.
+  it('moves on an edit, an undo and a run-mode change, and NOT on a selection', async () => {
+    // Mutations: key on `getUndoVersion` instead of the edit version — a selection moves it; drop the run mode from the
+    // key — entering Play leaves it where it was.
+    setRunMode('stopped');
+    clearHistory();
+    const k0 = previewWorldKey();
+    pushAction({ label: 'select', _isSelection: true, undo: () => {}, redo: () => {} });
+    expect(previewWorldKey()).toBe(k0);
+    pushAction({ label: 'edit', undo: () => {}, redo: () => {} });
+    const k1 = previewWorldKey();
+    expect(k1).not.toBe(k0);
+    await undo(); // the edit, on top
+    expect(previewWorldKey()).not.toBe(k1);
+    const k2 = previewWorldKey();
+    setRunMode('playing');
+    expect(previewWorldKey()).not.toBe(k2);
+    setRunMode('stopped');
+    clearHistory();
+  });
+
+  // Mutation: drop either subscription from `subscribePreviewWorld` — its count stays short.
+  it('notifies on a push and on a run-mode change, and stops after the unsubscribe', () => {
+    setRunMode('stopped');
+    let n = 0;
+    const off = subscribePreviewWorld(() => { n++; });
+    pushAction({ label: 'edit', undo: () => {}, redo: () => {} });
+    const afterPush = n;
+    expect(afterPush).toBeGreaterThan(0);
+    setRunMode('playing');
+    expect(n).toBeGreaterThan(afterPush);
+    off();
+    const settled = n;
+    setRunMode('stopped');
+    pushAction({ label: 'edit 2', undo: () => {}, redo: () => {} });
+    expect(n).toBe(settled);
+    clearHistory();
   });
 });

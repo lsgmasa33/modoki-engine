@@ -15,7 +15,7 @@ import { geometryBoxHalfExtents, geometryBoundingRadius } from '../../runtime/ph
 import { getAnimSet } from '../../runtime/loaders/animSetCache';
 import { useEditorStore } from '../store/editorStore';
 import { withPrefabEditRefusalToast } from './prefabEditRefusalToast';
-import { getPrefabSource, getCachedPrefabSync, getOverrides, baseTokenResolver, instanceBase } from '../scene/prefab';
+import { getPrefabSource, getCachedPrefabSync, memberOverrideKeys } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { isSkippedByPrimarySave } from '../scene/serialize';
 import { placePrefabFromPath } from '../scene/prefabPlace';
@@ -1761,8 +1761,9 @@ export default function Inspector() {
       }
       // A base ref held as a member token compares against the guid it resolved to (#1352). A NESTED instance's base
       // is its template under the rows enclosing it (#1492): the outer row's value is not this instance's override.
+      // Through the save's mark gate (#1717): a value that differs with no mark is not an override, and is not highlighted.
       const root = (piNow?.['rootInstanceId'] as number) || 0;
-      setOverrides(getOverrides(lid, currentTraits, root ? instanceBase(root, prefab) : prefab, root ? baseTokenResolver(root) : undefined));
+      setOverrides(memberOverrideKeys(primaryId, lid, currentTraits, prefab, root));
     };
 
     // Capture selection at fetch time; on resolution, only apply the result if

@@ -49,6 +49,7 @@ import {
 import {
   setPrefabCache, rebaseStaleInstances, applyToPrefabSelective, revertOverridesSelective, getCachedPrefabSync, type PrefabFile,
   instantiatePrefab, setPrefabSource,
+  memberOverrideKeys, collectComparableTraits,
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { sameRotationScale } from '../../packages/modoki/src/runtime/scene/transformSpace';
@@ -1737,5 +1738,31 @@ describe('#1771: a saved member reference is read against the document its frame
     entry.members = { ...(entry.members as object), [`/${gN2}/${gA}`]: { traits: { Transform: { x: 6 } } } };
     await load(sc as unknown as SceneData);
     expect(Object.keys(keptMemberOrphans(ROOT1) ?? {})).not.toContain(`/${gN2}/${gA}`);
+  });
+});
+
+// ── #1717 close-out review: the fold-in is excluded PER FIELD under an enclosing row ─────────────────────────────────
+describe("a nested member's marked value equal to its base is listed unless the enclosing row states that field (#1717)", () => {
+  // The save folds a marked value in and subtracts a field the chain states, per field (`captureNestedSceneDelta` →
+  // `subtractChainOverrides`). The list skipped the whole fold-in whenever the row stated ANY field, so a pinned
+  // override on another field was saved and listed nowhere: it could be neither reverted nor applied.
+  // Mutation: skip the fold-in for the whole instance when the row states anything (the `base === prefab` rule) — A's x
+  // is not listed. Always fold (drop `layerStates`) — R's y, the row's own marked value, is listed as the instance's.
+  it('A.x (marked, equal to P) is listed and highlighted; R.y (the row states it) is not', async () => {
+    install(pDoc(), oWith({ 1: { Transform: { y: 4 } } }));
+    await load(scene(O, [ROOT1]));
+    const a = inInstance(ROOT1, 'A');
+    setTf(a, 'x', 7);
+    setTf(a, 'x', 0); // back to P's own value, and still marked: a recorded override
+    const nested = inInstance(ROOT1, 'R');
+    const fields = collectInstanceOverrideKeys(nested, getCachedPrefabSync(P) as PrefabFile).fields;
+    expect(fields.filter((k) => k.endsWith('Transform.x'))).toHaveLength(1);
+    expect(fields.some((k) => k.endsWith('Transform.y'))).toBe(false);
+    const tf = [meta('Transform')];
+    expect(memberOverrideKeys(a, 2, collectComparableTraits(a, tf), getCachedPrefabSync(P) as PrefabFile, nested).has('Transform.x')).toBe(true);
+    expect(memberOverrideKeys(nested, 1, collectComparableTraits(nested, tf), getCachedPrefabSync(P) as PrefabFile, nested).has('Transform.y')).toBe(false);
+    // …and the save keeps what the list shows.
+    const { entry } = await saved();
+    expect(JSON.stringify(entry)).toContain('"x":0');
   });
 });

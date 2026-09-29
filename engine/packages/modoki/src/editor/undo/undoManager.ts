@@ -83,8 +83,20 @@ export interface UndoAction {
    *  scrub/preview envelope", because a snapshot restore never touches what such an entry edits.
    *  That holds for every producer today (asset documents and the parked/editor-state base-scene
    *  ref) — so a new producer that sets this flag AND writes a scene entity would be let through
-   *  inside an envelope and lost on Exit. Such an action is not file-direct: leave the flag off. */
+   *  inside an envelope and lost on Exit. Such an action is not file-direct: leave the flag off — or, when it edits a
+   *  FILE whose undo must outlive a world like any asset edit's but ALSO rebuilds the live world, set
+   *  `_rebasesLiveFrames` beside it (#1857).
+   *  ⚠️ THIRD ROLE (#1857): Stop keeps it. `truncateUndoTo` removes the entries pushed during Play, since Stop reverts
+   *  what they edited, but an asset file keeps its Play-time edit (as Unity's does), so its entry stays undoable. */
   _isFileDirect?: boolean;
+  /** Only with `_isFileDirect`: the entry edits a file AND rebuilds the live frames placed from it (#1857 — a model
+   *  import's halves are one `commitPrefabWrite`, which rebases every live frame of the prefab). The file half is why it
+   *  outlives a world switch and a discard (`runStep`'s `worldGone`, `parkSurvivors`), and why it does not mark the scene
+   *  unsaved (#1858: the scene file holds the instance and its overrides, which a rebase does not change). The world
+   *  half is why it is treated as a scene edit wherever a world is posed or thrown back: the preview gate refuses it,
+   *  Exit drops one pushed in the envelope, and Stop drops one pushed during Play, since each of those restores a world
+   *  its rebuild landed on (see {@link worldFree}). */
+  _rebasesLiveFrames?: boolean;
   /** Scene guids this action's entities belong to (scene-loading.md
    *  Phase 12, M2) — resolved by the CALLER before the mutation runs (a delete/reparent
    *  can destroy the entity or is otherwise unsafe to re-resolve after the fact, so the
@@ -412,11 +424,23 @@ export function getUndoVersion(): number { return _version; }
 // reads as dirty. A spurious "save or pass force" is a nuisance; the reverse is data loss.
 let _editVersion = 0;
 function notifyEdited() { _editVersion++; }
+/** An entry that leaves the SCENE FILE as it was (#1857, #1858): a selection, or any file-direct edit — a rebase of the
+ *  live frames onto a changed prefab included, since the scene file holds the instance and its overrides, not the
+ *  prefab's rows. What the edit version and the scene dirty marks ask. */
+function leavesSceneFile(action: UndoAction): boolean {
+  return !!action._isSelection || !!action._isFileDirect;
+}
+/** An entry whose steps write no live world (#1857): a selection, or a file-direct edit that rebuilds nothing live. What
+ *  the preview gate, Exit's drop and Stop's truncation ask — each restores a posed world, which a rebase would have
+ *  landed on. */
+function worldFree(action: UndoAction): boolean {
+  return !!action._isSelection || (!!action._isFileDirect && !action._rebasesLiveFrames);
+}
 /** Mark every scene an action's entities belong to as dirty (Phase 12, M2) — the same
  *  skip condition as `notifyEdited()` (a selection or file-direct action has no
  *  live-world edit to attribute to a scene). */
 function markAffectedScenesDirty(action: UndoAction) {
-  if (action._isSelection || action._isFileDirect) return;
+  if (leavesSceneFile(action)) return;
   for (const guid of action.affectedScenes ?? []) markSceneDirty(guid);
 }
 /** Monotonic count of non-selection edits. Compare against a snapshot to detect unsaved work. */
@@ -547,7 +571,7 @@ export function pushAction(action: UndoAction) {
   // BEFORE notifyEdited/coalesce/emit: a captured sub-action is not yet a committed
   // edit — the composite that wraps it does all three exactly once, for the batch.
   if (_captureStack.length > 0) { _captureStack[_captureStack.length - 1].push(action); return; }
-  if (!action._isSelection && !action._isFileDirect) notifyEdited(); // a real edit → the world now differs from disk
+  if (!leavesSceneFile(action)) notifyEdited(); // a real edit → the world now differs from disk
   markAffectedScenesDirty(action);
   // Coalesce consecutive same-key edits (opt-in via coalesceKey) into the top
   // entry instead of stacking one per keystroke.
@@ -679,7 +703,7 @@ async function runStep(
   // world read as unsaved over a change that never happened (an agent's load then refuses on "unsaved work"). A step
   // that threw any other way may have moved the world partway, so it keeps the conservative marks (#310).
   const refused = !ok && error instanceof UndoRefusedError;
-  if (!worldGone && !refused && !action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
+  if (!worldGone && !refused && !leavesSceneFile(action)) notifyEdited(); // the world moved relative to disk
   if (!worldGone && !refused) markAffectedScenesDirty(action);
   notifyUndoChanged();
   const payload = buildEditorPayload(action);
@@ -763,7 +787,7 @@ export function undoRefusedReason(direction: 'undo' | 'redo' = 'undo'): string |
   if (canEdit()) return null;
   const mode = getRunMode();
   if (mode === 'playing') return `Stop the game to ${direction} — disabled during Play.`;
-  if (top._isFileDirect || top._isSelection) return null;
+  if (worldFree(top)) return null;
   if (_previewSession !== null && _pushedInPreview.get(top) === _previewSession) return null;
   return `Exit the preview to ${direction} "${top.label}" — it is a scene edit from before this ${mode} preview, and the previewed world reverts on Exit.`;
 }
@@ -777,7 +801,7 @@ export function undoRefusedReason(direction: 'undo' | 'redo' = 'undo'): string |
  *  back, duplicating its guid. Asset-document and selection entries from the envelope are KEPT —
  *  the restore does not touch what they edit. Returns how many entries were removed. */
 export function dropPreviewSceneEdits(session: number): number {
-  const dropped = (a: UndoAction) => _pushedInPreview.get(a) === session && !a._isFileDirect && !a._isSelection;
+  const dropped = (a: UndoAction) => _pushedInPreview.get(a) === session && !worldFree(a);
   let removed = 0;
   for (const stack of [undoStack, redoStack]) {
     const kept = stack.filter((a) => !dropped(a));
@@ -900,7 +924,11 @@ export function undoDepth(): number { return undoStack.length; }
  *  Clamped to [0, length]; a depth ≥ length is a no-op for undo. */
 export function truncateUndoTo(depth: number) {
   const d = Math.max(0, Math.min(depth, undoStack.length));
+  // An asset file's edit survives Stop (#1857), so its entry does too, in order, above the barrier. Not a selection
+  // (Stop's restore re-selects), and not an entry whose rebuild landed on the Play world (`_rebasesLiveFrames`).
+  const kept = undoStack.slice(d).filter((a) => a._isFileDirect && !a._rebasesLiveFrames);
   undoStack.length = d;
+  undoStack.push(...kept);
   redoStack.length = 0;
   _coalesce = null;
   notifyUndoChanged();

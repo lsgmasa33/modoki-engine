@@ -2774,8 +2774,9 @@ export function collectComparableTraits(
   return out;
 }
 
-/** Get overrides: fields that differ from the prefab source.
- *  Returns a set of "traitName.fieldName" strings for overridden fields. */
+/** The RAW by-value diff as "traitName.fieldName" strings: every field that differs from `prefab`, marked or not. Not
+ *  what any surface shows — the Inspector highlight and the override list pass the save's mark gate (#1717,
+ *  {@link memberOverrideKeys}, `gateOnMarks`); this stays as the unit under `getOverrideValues`' own tests. */
 export function getOverrides(
   entityLocalId: number,
   currentTraits: Record<string, Record<string, unknown>>,
@@ -2814,6 +2815,123 @@ export function getOverrides(
 //  profile on a scene with MANY large instances shows these scans dominating an
 //  interactive Apply. (Tag count, not world size, is the metric to watch.)
 //
+/** Which members of the instance rooted at `rootInstanceId` sit somewhere their own template does not put them: the one
+ *  question the mark gate's Transform exemption asks (#1437). Built once per instance; ask it per member, with whether
+ *  that member's Transform differs from its base (the root is judged only then, in its OWNER's frame).
+ *
+ *  ⚠️ This read `PrefabInstance.homeParent` until Phase 3 (#1468), and the gate is the reason that
+ *  field was the riskiest thing in that phase to delete: a re-imported prefab whose base changed under an un-edited
+ *  instance otherwise freezes spurious overrides and *"breaks the instance (mesh collapses)"*. Asking the same question
+ *  of the DOCUMENT instead of a remembered guid is what made the field retirable — `memberRowParents` already computes
+ *  exactly this for the save, base target (#1437 P3-b) included, so the gate and the capture cannot drift into two
+ *  answers.
+ *
+ *  The domain is every ROW of the document, owned nested roots included (#1481): a member whose template parent is
+ *  a nested row resolved no home in a members-only domain, so it read as moved and froze every Transform field
+ *  that differed from a re-imported base. And the frame root itself is judged in its OWNER's frame, where its row
+ *  is: a moved owned root's compensated pose is unmarked (`markCompensatedTransform`), and the gate dropped it. */
+export function instanceMovedMembers(rootInstanceId: number, prefab: PrefabFile): (entityId: number, transformDiffers: boolean) => boolean {
+  // Built on the FIRST question, not up front: it walks the world's identity, and `gateOnMarks` asks only for a member
+  // with an UNMARKED Transform diff — rare, whereas the Inspector recomputes on every dirty frame of a drag (close-out
+  // review: 10 ms a frame at 5k entities when it was eager).
+  let identity: ReturnType<typeof worldIdentityParents> | undefined;
+  let movedMembers: ReturnType<typeof memberRowParents> | undefined;
+  let rootMoved: boolean | undefined;
+  // A member at the place its PREFAB moves it to (P3-b) is at its base: not moved, for this purpose.
+  return (entityId, transformDiffers) => {
+    identity ??= worldIdentityParents(getCurrentWorld());
+    if (entityId === rootInstanceId) return (rootMoved ??= transformDiffers && ownedRootMoved(rootInstanceId, identity));
+    const moved = movedMembers ??= memberRowParents(rootInstanceId, prefab, rowParentDomain(rootInstanceId,
+      instanceRowDomain(rootInstanceId, prefab, identity)));
+    return moved.has(entityId);
+  };
+}
+
+/** The MARK GATE: of a member's value diffs (`getOverrideValues`), drop every prefab-DEFINED field that carries no
+ *  override mark. In place. The ONE rule the scene save and every override surface share — the Apply/Revert list, the
+ *  agent `overrides`, the Inspector's highlight (#1717: those diffed by value alone, so a value that differs with no mark
+ *  was listed and highlighted, and the file never held it). Unity's model: only a RECORDED modification is an override.
+ *
+ *  getOverrideValues reports every field whose live value differs from the prefab base — but a divergence alone is NOT
+ *  an override: when a prefab is RE-IMPORTED and its base changes under an un-edited instance (e.g. the FBX-wrapper bake
+ *  rewriting root-bone scale/rot), the instance's still-old values diverge from the new base and would be frozen as
+ *  spurious overrides, breaking the instance (mesh collapses) while a fresh instance renders. A real override is one the
+ *  user explicitly made, which is recorded as a mark (every editor instance write marks, #1709; scene load re-seeds marks
+ *  from stored overrides). Two kinds are kept whatever the marks say:
+ *  - an ADDED trait or tag (the base does not define it at this member): structural, captured whole;
+ *  - the Transform of a member `moved` inside its instance (#1437): its local pose is relative to a parent the prefab
+ *    never gave it, so every field that differs from the base is part of the move, and none of it needs a mark. Moved
+ *    back home, the gate applies again, so a round trip pins nothing. */
+export function gateOnMarks(
+  diffs: Record<string, Record<string, unknown>>,
+  markSet: ReadonlySet<string> | null | undefined,
+  baseEntity: { traits: Record<string, unknown> } | undefined,
+  /** Whether the member is moved inside its instance — asked only when a Transform field differs with no mark. */
+  moved: () => boolean,
+): void {
+  for (const [traitName, fields] of Object.entries(diffs)) {
+    const prefabData = baseEntity?.traits[traitName];
+    if (prefabData === undefined || prefabData === true) continue; // added trait/tag — keep
+    if (traitName === 'Transform' && Object.keys(fields).some((f) => !markSet?.has(`Transform.${f}`)) && moved()) continue;
+    for (const field of Object.keys(fields)) {
+      if (!markSet?.has(`${traitName}.${field}`)) delete fields[field];
+    }
+    if (Object.keys(fields).length === 0) delete diffs[traitName];
+  }
+}
+
+/** Fold into `diffs` every MARKED field whose value COINCIDES with the base, so the value diff did not report it (e.g.
+ *  after the base was edited to match): a marked field is a recorded override, whatever its value (#1709), and it is
+ *  given its current value. In place. The save's rule, and the listing's (#1717) — except, under an enclosing row, a
+ *  field that row states: the layer's values arrive marked as well (docs/prefabs.md I2), and would read as this
+ *  instance's own. */
+export function foldMarkedEqual(
+  diffs: Record<string, Record<string, unknown>>,
+  markSet: ReadonlySet<string> | null | undefined,
+  currentTraits: Record<string, Record<string, unknown>>,
+  /** What the layers enclosing the instance state on this member (`enclosingRowOverrides(root)[localId]`): a mark on a
+   *  field they state is theirs, not the instance's own, so it is not folded in. Per FIELD, as the save's subtraction
+   *  is (`subtractChainOverrides`) — a layer stating one field does not hide the instance's own mark on another. */
+  layerStates?: Record<string, Record<string, unknown>>,
+): void {
+  if (!markSet) return;
+  for (const markKey of markSet) {
+    const dot = markKey.indexOf('.');
+    const traitName = markKey.slice(0, dot);
+    const field = markKey.slice(dot + 1);
+    if (traitName === 'PrefabInstance') continue;
+    // A member's guid is per-instance identity, and since v16 it is a ROW (`captureInstanceMembers`)
+    // — so it must be written in exactly one place. Emitting it here too would put the same value
+    // in two channels with no rule for which wins, and an edit to one would be silently discarded
+    // by the other on the next load. #1468 asked for this line to be reconciled; the reconciliation
+    // is that it stays, with the reason upgraded from "it is nothing" to "it is a row".
+    if (traitName === 'EntityAttributes' && field === 'guid') continue;
+    if (diffs[traitName] && field in diffs[traitName]) continue; // already captured
+    const stated = layerStates?.[traitName];
+    if (stated && typeof stated === 'object' && field in stated) continue; // the enclosing layer's value (a tag's may be `true`)
+    const cur = currentTraits[traitName]?.[field];
+    if (cur === undefined) continue;
+    (diffs[traitName] ??= {})[field] = cur;
+  }
+}
+
+/** The overrides the Inspector highlights on member `entityId` (`"Trait.field"`): its value diffs against the instance's
+ *  base (a nested instance's template under the rows enclosing it, #1492), through the save's mark gate (#1717). */
+export function memberOverrideKeys(
+  entityId: number, localId: number, currentTraits: Record<string, Record<string, unknown>>, prefab: PrefabFile, rootInstanceId: number,
+): Set<string> {
+  const base = rootInstanceId ? instanceBase(rootInstanceId, prefab) : prefab;
+  const diffs = getOverrideValues(localId, currentTraits, base, rootInstanceId ? baseTokenResolver(rootInstanceId) : undefined);
+  const moved = () => !!rootInstanceId && instanceMovedMembers(rootInstanceId, prefab)(entityId, !!diffs['Transform']);
+  const entity = findEntity(entityId);
+  const marks = entity ? getOverrideMarkSet(entity) : null;
+  gateOnMarks(diffs, marks, base.entities.find((e) => e.localId === localId), moved);
+  foldMarkedEqual(diffs, marks, currentTraits, rootInstanceId ? enclosingRowOverrides(rootInstanceId)?.[localId] : undefined);
+  const out = new Set<string>();
+  for (const [traitName, fields] of Object.entries(diffs)) for (const field of Object.keys(fields)) out.add(`${traitName}.${field}`);
+  return out;
+}
+
 /** Capture all per-localId overrides for every entity in a prefab instance.
  *  Returns `{}` if the root has no overrides anywhere. */
 /** The guid of the parent the prefab moves (P3-b) place a live entity under, in the instance rooted at
@@ -3096,25 +3214,8 @@ export function captureInstanceOverrides(
   const result: Record<number, Record<string, Record<string, unknown>>> = {};
   const resolveBase = baseTokenResolver(rootInstanceId);
 
-  // Which members sit somewhere their own template does not put them — the Transform exception
-  // below, and the ONE question it needs answered.
-  //
-  // ⚠️ This read `PrefabInstance.homeParent` until Phase 3 (#1468), and the gate is the reason that
-  // field was the riskiest thing in this phase to delete: `prefab.ts`'s own note on the gate says a
-  // re-imported prefab whose base changed under an un-edited instance otherwise freezes spurious
-  // overrides and *"breaks the instance (mesh collapses)"*. Asking the same question of the DOCUMENT
-  // instead of a remembered guid is what makes the field retirable — `memberRowParents` already
-  // computes exactly this for the save, base target (#1437 P3-b) included, so the gate and the
-  // capture cannot drift into two answers.
-  //
-  // The domain is every ROW of the document, owned nested roots included (#1481): a member whose template parent is
-  // a nested row resolved no home in a members-only domain, so it read as moved and froze every Transform field
-  // that differed from a re-imported base. And the frame root itself is judged in its OWNER's frame, where its row
-  // is: a moved owned root's compensated pose is unmarked (`markCompensatedTransform`), and the gate dropped it.
-  const identity = worldIdentityParents(getCurrentWorld());
-  const movedMembers = memberRowParents(rootInstanceId, prefab, rowParentDomain(rootInstanceId,
-    instanceRowDomain(rootInstanceId, prefab, identity)));
-  let rootMoved: boolean | undefined;
+  // Which members sit somewhere their own template does not put them: the gate's Transform exemption (`instanceMovedMembers`).
+  const movedOf = instanceMovedMembers(rootInstanceId, prefab);
 
   // Walk every entity that belongs to this instance via PrefabInstance.rootInstanceId
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
@@ -3141,58 +3242,11 @@ export function captureInstanceOverrides(
     const diffs = getOverrideValues(localId, currentTraits, prefab, resolveBase);
     const markSet = getOverrideMarkSet(entity);
 
-    // Mark-gate prefab-DEFINED field diffs. getOverrideValues reports every field
-    // whose live value differs from the prefab base — but a divergence alone is NOT
-    // an override: when a prefab is RE-IMPORTED and its base changes under an
-    // un-edited instance (e.g. the FBX-wrapper bake rewriting root-bone scale/rot),
-    // the instance's still-old values diverge from the new base and would be frozen
-    // as spurious overrides, breaking the instance (mesh collapses) while a fresh
-    // instance renders. A real override is one the user explicitly made, which is
-    // recorded as a mark (inspector + gizmo edits mark; scene load re-seeds marks
-    // from stored overrides). So drop a diverged field that carries no mark. Added
-    // traits (prefab doesn't define them at this localId) are structural, not
-    // base-relative field diffs, so they're kept regardless.
-    //
-    // EXCEPT the Transform of a member moved inside its instance (#1437): its local pose is relative to a
-    // parent the prefab never gave it, so every field that differs from the base is part of the move, and
-    // none of it needs a mark. Moved back home, the stamp is gone and the gate applies again, so a round
-    // trip pins nothing.
-    // A member at the place its PREFAB moves it to (P3-b) is at its base: not moved, for this purpose.
-    const moved = entity.id() === rootInstanceId
-      ? (rootMoved ??= !!diffs['Transform'] && ownedRootMoved(rootInstanceId, identity))
-      : movedMembers.has(entity.id());
-    const prefabEntity = prefab.entities.find((e) => e.localId === localId);
-    for (const [traitName, fields] of Object.entries(diffs)) {
-      const prefabData = prefabEntity?.traits[traitName];
-      if (prefabData === undefined || prefabData === true) continue; // added trait/tag — keep
-      if (moved && traitName === 'Transform') continue;
-      for (const field of Object.keys(fields)) {
-        if (!markSet?.has(`${traitName}.${field}`)) delete (fields as Record<string, unknown>)[field];
-      }
-      if (Object.keys(fields).length === 0) delete diffs[traitName];
-    }
+    // The MARK GATE (`gateOnMarks`): a divergence alone is not an override, only a recorded (marked) one is.
+    gateOnMarks(diffs, markSet, prefab.entities.find((e) => e.localId === localId), () => movedOf(entity.id(), !!diffs['Transform']));
 
-    // Fold in EXPLICIT override marks whose value COINCIDES with the base (so the
-    // value-diff above didn't report them) — e.g. after the base was edited to
-    // match. A marked field is a recorded override; emit its current value.
-    if (markSet) {
-      for (const markKey of markSet) {
-        const dot = markKey.indexOf('.');
-        const traitName = markKey.slice(0, dot);
-        const field = markKey.slice(dot + 1);
-        if (traitName === 'PrefabInstance') continue;
-        // A member's guid is per-instance identity, and since v16 it is a ROW (`captureInstanceMembers`)
-        // — so it must be written in exactly one place. Emitting it here too would put the same value
-        // in two channels with no rule for which wins, and an edit to one would be silently discarded
-        // by the other on the next load. #1468 asked for this line to be reconciled; the reconciliation
-        // is that it stays, with the reason upgraded from "it is nothing" to "it is a row".
-        if (traitName === 'EntityAttributes' && field === 'guid') continue;
-        if (diffs[traitName] && field in diffs[traitName]) continue; // already captured
-        const cur = currentTraits[traitName]?.[field];
-        if (cur === undefined) continue;
-        (diffs[traitName] ??= {})[field] = cur;
-      }
-    }
+    // A MARKED value equal to its base is a recorded override too (`foldMarkedEqual`).
+    foldMarkedEqual(diffs, markSet, currentTraits);
 
     if (Object.keys(diffs).length > 0) {
       result[localId] = diffs;

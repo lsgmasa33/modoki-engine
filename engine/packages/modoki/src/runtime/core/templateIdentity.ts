@@ -36,6 +36,11 @@ export function templateKeyOf(entity: Handle | undefined | null): string {
   return (entity.get(TemplateAddedKey) as { key: string }).key || '';
 }
 
+/** Drop a live entity's template key: it left the frame whose template keyed it (#1808), so the key names nothing. */
+export function clearTemplateKey(entity: (Handle & { remove(...t: unknown[]): void }) | undefined | null): void {
+  if (entity?.has(TemplateAddedKey)) entity.remove(TemplateAddedKey);
+}
+
 /** Mark a live entity with its template key (replacing any it had). */
 export function setTemplateKey(entity: Handle | undefined | null, key: string): void {
   if (!entity || !key) return;

@@ -385,6 +385,36 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     expect(writes).toHaveLength(0);
   });
 
+  it('#1773: a DRY RUN prints nothing — the promotion\'s "names something outside this prefab" warn is the writing plan\'s alone', async () => {
+    // The dialog previews on every debounced checkbox change and the agent `overrides` runs one per call, so a dry plan
+    // must say nothing. Reached here: a member of the promoted Q moved under X, a plain added node the Apply does not
+    // promote, so the carry cannot name its target. Mutation: pass `false` for `quiet` to `promoteReferenceMoves` (drop
+    // `dryRun` at its call) — the preview warns.
+    install(pDoc(), qDoc());
+    await load(scene());
+    const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
+    setPrefabSource(qRoot, { id: Q });
+    const qRootGuid = ensureGuid(qRoot);
+    await load(await serializeScene() as unknown as SceneData);
+    const x = add('Add X', idOf(ROOT1), [{ name: 'EntityAttributes', data: { name: 'X', parentId: idOf(ROOT1) } }]);
+    expect(reparentEntity(under(qRootGuid, 'QB'), x)).toBe(true);
+    const r1 = idOf(ROOT1);
+    const qKey = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P) as PrefabFile).added.find((k) => k.includes(qRootGuid));
+    expect(qKey, 'fixture: the Q node is an added override').toBeDefined();
+    const said: string[] = [];
+    const spies = (['log', 'info', 'warn', 'error', 'debug'] as const)
+      .map((k) => vi.spyOn(console, k).mockImplementation((...a: unknown[]) => { said.push(`${k}: ${a.map(String).join(' ')}`); }));
+    try {
+      await previewApply(r1, new Set([qKey!]));
+      expect(said).toEqual([]);
+      // Accept side: the fixture does reach the warn — the writing plan says it.
+      await applyToPrefabSelective(r1, new Set([qKey!]));
+      expect(said.some((l) => /^warn: .*names something outside this prefab/.test(l)), said.join('\n')).toBe(true);
+    } finally {
+      for (const sp of spies) sp.mockRestore();
+    }
+  });
+
   it('#1736: a CONFLICT is refused on the dry plan — the promotion in the same Apply stamps nothing', async () => {
     // Mutation: drop \`if (dry.conflicts.length) return …\` in \`applyToPrefabSelective\` — the writing plan's own check still
     // refuses and writes nothing, but only after its promotion stamped a template key on Inner, which no undo records.

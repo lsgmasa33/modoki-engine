@@ -28,8 +28,9 @@
 import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import {
-  collectComparableTraits, getOverrideValues, ownInstanceStructure, baseTokenResolver, instanceBase,
+  collectComparableTraits, getOverrideValues, ownInstanceStructure, baseTokenResolver, instanceBase, gateOnMarks, instanceMovedMembers, foldMarkedEqual, enclosingRowOverrides,
   isTemplateExcludedField, nestedFrameMoves, getCachedPrefabSync, type PrefabFile, type ApplyResult,
 } from './prefab';
 import { memberRef, toLocalIdKey, nestedKeyRef } from './overrideKeyGrammar';
@@ -133,6 +134,8 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
   // of its own. Against the bare template, a field the outer row sets was listed as this instance's override, and a
   // value Apply kept because a row shadows it (equal to the template now) was not listed at all.
   const base = instanceBase(rootInstanceId, prefab);
+  const movedOf = instanceMovedMembers(rootInstanceId, prefab);
+  const layerRows = enclosingRowOverrides(rootInstanceId);
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
     const piData = pi as Record<string, unknown>;
     if (piData.rootInstanceId !== rootInstanceId) return;
@@ -148,6 +151,12 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
     // while the scene serializer stored it correctly. QA-CTX-0003 close-out sweep.
     const currentTraits = collectComparableTraits(ecsId, allTraits);
     const diffs = getOverrideValues(localId, currentTraits, base, resolveBase);
+    // Only what the save keeps (#1717): the save's mark gate, so a value that differs with no mark is neither listed nor
+    // applied, and a MARKED value equal to its base is listed, as the save keeps it — except a field an enclosing row
+    // states, whose value arrives marked too and would be listed as this instance's own.
+    const marks = getOverrideMarkSet(entity);
+    gateOnMarks(diffs, marks, base.entities.find((e) => e.localId === localId), () => movedOf(ecsId, !!diffs['Transform']));
+    foldMarkedEqual(diffs, marks, currentTraits, layerRows?.[localId]);
     if (Object.keys(diffs).length === 0) return;
 
     // Entity display name: prefer live EntityAttributes.name; fall back to prefab name.

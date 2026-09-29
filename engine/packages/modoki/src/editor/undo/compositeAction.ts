@@ -185,6 +185,8 @@ export function composeUndoActions(
   if (opts.coalesceKey != null) action.coalesceKey = opts.coalesceKey;
   if (subs.every((a) => a._isSelection)) action._isSelection = true;
   if (subs.every((a) => a._isFileDirect)) action._isFileDirect = true;
+  // One sub that rebuilt the live world makes the batch one that did (#1857).
+  if (action._isFileDirect && subs.some((a) => a._rebasesLiveFrames)) action._rebasesLiveFrames = true;
   const scenes = new Set<string>();
   for (const a of subs) {
     if (a._isSelection || a._isFileDirect) continue; // that sub would not have marked either

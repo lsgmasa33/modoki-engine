@@ -109,6 +109,7 @@ export function makeDeleteUndo(
   const onDisk = new Set<string>();
   return {
     label,
+    _isFileDirect: true, // a FILE's edit, no live entity (#1857): it outlives a preview, Stop and a world switch
     undo: async () => {
       // Only what actually went. A file the OS refused is still on disk with the user's own
       // bytes in it; writing the snapshot back over it would clobber any edit made since.
@@ -344,6 +345,7 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
   const sidecarOf = new Map(results.map((r) => [r.toPath, r.sidecar] as const));
   return {
     label,
+    _isFileDirect: true, // a FILE's edit, no live entity (#1857): it outlives a preview, Stop and a world switch
     undo: async () => {
       const copies = results.filter(({ toPath }) => !undone.has(toPath)).map(({ toPath }) => toPath);
       const trashed = await trashCopies(copies, shaOf, sidecarOf);
@@ -449,6 +451,7 @@ export function makeRenameUndo(params: {
   const label = `Rename ${originalName}`;
   return {
     label,
+    _isFileDirect: true, // a FILE's edit, no live entity (#1857): it outlives a preview, Stop and a world switch
     undo: async () => {
       const moved = await moveAsset(toPath, originalPath);
       if (!moved.ok && moved.status === COLLISION_STATUS) { refresh(); throw destinationTakenRefusal(`"${toPath}"`, originalPath); }
@@ -492,6 +495,7 @@ export function makeEmptyFolderDeleteUndo(params: {
   const label = `Delete folder ${folderName}`;
   return {
     label,
+    _isFileDirect: true, // a FILE's edit, no live entity (#1857): it outlives a preview, Stop and a world switch
     undo: async () => {
       const made = await createAssetFolder(folderPath);
       if (!made.ok) reportUndoFailure({ direction: 'Undo', label, detail: `folder "${folderPath}" was not recreated${because(made)}` });
@@ -545,6 +549,7 @@ export function makeNewFolderUndo(params: {
   };
   return {
     label,
+    _isFileDirect: true, // a FILE's edit, no live entity (#1857): it outlives a preview, Stop and a world switch
     undo: async () => {
       // Only while it is still EMPTY (#1679): New Folder → drop files into it (Finder, or a copy that is not its own
       // undo entry) → Cmd+Z here used to trash the folder with them inside.
@@ -578,6 +583,7 @@ export function makeFolderRenameUndo(params: {
   const label = `Rename folder ${folderName}`;
   return {
     label,
+    _isFileDirect: true, // a FILE's edit, no live entity (#1857): it outlives a preview, Stop and a world switch
     undo: async () => {
       const moved = await moveAsset(newPath, oldPath);
       if (!moved.ok && moved.status === COLLISION_STATUS) { refresh(); throw destinationTakenRefusal(`folder "${newPath}"`, oldPath); }
@@ -634,6 +640,7 @@ export function makePasteUndo(params: {
   const sidecarOf = new Map(done.map((m) => [m.to, m.sidecar] as const));
   return {
     label,
+    _isFileDirect: true, // a FILE's edit, no live entity (#1857): it outlives a preview, Stop and a world switch
     undo: async () => {
       const back: PathMove[] = [];
       // Named for what it is, NOT `undone` — that name belongs to the builder-scope Set
@@ -722,6 +729,7 @@ export function makeFilesDropUndo(params: {
   const undone = new Set<string>();
   return {
     label,
+    _isFileDirect: true, // a FILE's edit, no live entity (#1857): it outlives a preview, Stop and a world switch
     undo: async () => {
       const back: PathMove[] = [];
       const failed: string[] = [];
@@ -781,6 +789,8 @@ export function makeModelImportUndo(params: {
   let onDisk = true;
   return {
     label,
+    // A FILE's edit (#1857) that also rebuilds the live frames placed from it: one `commitPrefabWrite` per half.
+    _isFileDirect: true, _rebasesLiveFrames: true,
     // ⚠️ Both halves carry a PRECONDITION (#1679): undo changes the prefab only while it holds the imported bytes
     // (import → open the prefab → edit → Cmd+S → Cmd+Z used to trash that save), redo only while it holds what the undo
     // left. Either miss REFUSES before anything moved (`fileChangedRefusal`). Same call as Create Prefab's.
@@ -862,6 +872,7 @@ export function makeFileImportUndo(params: {
   const bytesOf = new Map<string, string>(imported.map((f) => [f.path, f.content]));
   return {
     label,
+    _isFileDirect: true, // a FILE's edit, no live entity (#1857): it outlives a preview, Stop and a world switch
     // Undoing an import DELETES the files, and you can have opened one in the meantime
     // (import a .particle.json → double-click it → ⌘Z), so it unbinds like any delete.
     undo: async () => {

@@ -22,6 +22,7 @@ import { endFrames, relinkDetachedMembers, captureRootLinks, restoreRootLinks, p
 import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader, frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../../runtime/core/ecs/identityParents';
 import { isStoredRoot, isOwnedRoot, durableGuid, type MemberPi } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
+import { templateKeyOf, setTemplateKey, clearTemplateKey } from '../../runtime/core/templateIdentity';
 import { copyUnresolvedRef, recordGuidMints, keptGuidMints } from './unresolvedRefCopy';
 import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
@@ -37,6 +38,7 @@ import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
 import { prefabNestingReader } from '../scene/prefab';
+import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
 export { markOverrideIfInstance };
@@ -1336,11 +1338,13 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // agree. (A plain member records nothing: its template parent is read from the document.)
   // The marks an undo puts back: taken before ANY write here, since the sortOrder write below marks (#1709), and a
   // snapshot after it made the undo restore that mark, pinning the old order as an override.
+  const keys = moveKeys(entityId, attrMeta); // before the parent write: read under the pre-move ancestry
   const oldMarks = marksOf(entityId);
   if (parentChanged) linkOwnerBeforeMove(getCurrentWorld(), entityId);
   if (parentChanged) writeTraitField(entityId, attrMeta, 'parentId', newParentId);
   if (newSortOrder !== undefined) writeTraitFieldMarked(entityId, attrMeta, 'sortOrder', newSortOrder);
   if (clearFolder) writeTraitField(entityId, attrMeta, 'editorFolder', '');
+  keys.strip(); // BEFORE the detach — see `moveKeys`
 
   // Leaving the OUTERMOST instance cuts exactly the links the move splits (#1447): a member carried away from its
   // instance root, or left behind by it, is unpacked into a plain entity that keeps its guid; an OWNED nested
@@ -1439,6 +1443,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       const id = requireWith(ref, idx, undefined, renames);
       const parent = oldParentRef ? requireWith(oldParentRef, idx, undefined, renames) : 0;
       if (detaching) undoDetach(); // re-tag the detached members first, and take back a promotion's rename
+      keys.reseat();
       writeTraitField(id, attrMeta!, 'parentId', parent);
       writeTraitField(id, attrMeta!, 'sortOrder', oldSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', oldFolder);
@@ -1454,6 +1459,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       if (newSortOrder !== undefined) writeTraitFieldMarked(id, attrMeta!, 'sortOrder', newSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', '');
       if (savedNewLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedNewLocal[f]); }
+      keys.restrip(); // before the detach, as the move did
       if (detaching) applyDetach(); // re-strip after the move
       if (savedOldLocal && savedNewLocal) markCompensatedTransform(id, savedOldLocal, savedNewLocal);
       markStructureDirty();
@@ -1466,6 +1472,68 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   });
 
   return true;
+}
+
+/** A move's template keys (#1808, #1852): every keyed node the moved subtree carries, with its key and the frame that
+ *  DECLARES it, read BEFORE the move under its pre-move ancestry. The one owner for a keyed node's marker across a move,
+ *  shared by `reparentEntity` and `moveEntityToScene`.
+ *  - `strip()`, the move's, right after its parent write and BEFORE a detach: a node the move took out of the frame that
+ *    declares its key keeps no key. A stale one answered to that key in any other frame of the same template, so the save
+ *    let it claim that frame's own node, dropped the moved node and restated the real one as own (#1808, I6/I7). Before
+ *    the detach, because a promotion re-derives a keyed node's guid through its key onto the new root, and the loader's
+ *    heal then re-keyed it at the next reload.
+ *  - `restrip()`, the redo's: the same nodes, by ref (a rebuild reassigns ids), before its detach as well.
+ *  - `reseat()`, the undo's: every key the move saw, back, once the undo has reversed any rename. It restates them rather
+ *    than trusting the world to still hold them: a rebuild after the move (a save→reload) drops the marker from a node the
+ *    save states plainly, and the undo brings the node back into the frame that keys it (#1852). */
+function moveKeys(entityId: number, attrMeta: TraitMeta) {
+  const piMeta = getTraitByName('PrefabInstance');
+  const keyed = subtreeIds(getAllEntities(), entityId)
+    .map((id) => ({ id, key: templateKeyOf(findEntity(id)) }))
+    .filter((k) => k.key)
+    .map((k) => ({ ...k, ref: entityRef(k.id), declarer: keyDeclarer(k.id, k.key, attrMeta, piMeta) }));
+  let left: typeof keyed = [];
+  const resolved = (list: typeof keyed) => { const at = buildGuidIndex(); return list.map((k) => ({ k, id: resolveWith(k.ref, at) })); };
+  return {
+    strip() {
+      left = keyed.filter((k) => k.declarer !== 0 && !isLiveAncestor(k.declarer, k.id, attrMeta));
+      for (const k of left) clearTemplateKey(findEntity(k.id));
+    },
+    restrip() { if (left.length) for (const { id } of resolved(left)) if (id != null) clearTemplateKey(findEntity(id)); },
+    reseat() { if (keyed.length) for (const { k, id } of resolved(keyed)) if (id != null) setTemplateKey(findEntity(id), k.key); },
+  };
+}
+
+/** The instance root whose OWN template declares `key` for the node `id` (#1808): the nearest live ancestor that is an
+ *  instance root (a scene instance or an owned nested one) and whose prefab document names the key — the same key set
+ *  the loader's heal recovers from (`templateKeysOf`).
+ *  The document is the one the WORLD recorded that frame as expanded from (`frameDocReader`), not the editor cache: a
+ *  live keyed node came from a live frame, so its document is known even once the prefab was trashed and evicted from
+ *  the caches (#1834); a root with no record of its own (a respawn) falls back to the source's last expansion in this
+ *  world, then the caches. 0 when no ancestor's document names the key: nothing is known, so nothing is stripped. */
+function keyDeclarer(id: number, key: string, attrMeta: TraitMeta, piMeta: TraitMeta | undefined): number {
+  if (!piMeta) return 0;
+  const readDoc = frameDocReader(getCurrentWorld());
+  const parentOf = (e: number) => (readTraitData(e, attrMeta)?.parentId as number) || 0;
+  const seen = new Set<number>([id]);
+  for (let cur = parentOf(id); cur && !seen.has(cur); cur = parentOf(cur)) {
+    seen.add(cur);
+    const pi = readTraitData(cur, piMeta) as { source?: string; rootInstanceId?: number } | null;
+    if (!pi?.source || pi.rootInstanceId !== cur) continue;
+    const doc = readDoc(pi.source, cur);
+    if (doc && templateKeysOf(doc as Parameters<typeof templateKeysOf>[0]).includes(key)) return cur;
+  }
+  return 0;
+}
+
+/** Whether `ancestor` is on `id`'s LIVE parent chain (#1808): the frame that declares a keyed node's key still holds it. */
+function isLiveAncestor(ancestor: number, id: number, attrMeta: TraitMeta): boolean {
+  const seen = new Set<number>();
+  for (let cur = id; cur && !seen.has(cur); cur = (readTraitData(cur, attrMeta)?.parentId as number) || 0) {
+    if (cur === ancestor) return true;
+    seen.add(cur);
+  }
+  return false;
 }
 
 // ── Move between scenes (scene-loading.md Phase 14) ──
@@ -1700,7 +1768,9 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     putBackMarks(rid, rootMarks);
   };
   const rootMarks = marksOf(entityId);
+  const keys = moveKeys(entityId, attrMeta); // #1808/#1852, as `reparentEntity`: a scene move re-parents too
   applyStamps();
+  keys.strip(); // after the parent write, before the rekey renames anything
 
   // Rekey (owner decision D: machinery built, not wired to the Hierarchy confirm
   // dialog yet). `rewriteEntityRefsForGuid` is symmetric under argument order, so
@@ -1747,12 +1817,14 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
       const target = requireMove(oldParentRef, new Map(rekeyPairs.map((p) => [p.oldGuid, p.newGuid])));
       undoRekeys();
       undoStamps(target);
+      keys.reseat();
       markStructureDirty(); markUIDirty();
       if (fromScene) markSceneDirty(fromScene);
       if (targetScene) markSceneDirty(targetScene);
     },
     redo: () => {
       applyStamps();
+      keys.restrip(); // by the refs the move took, before the rekey renames them
       applyRekeys();
       markStructureDirty(); markUIDirty();
       if (fromScene) markSceneDirty(fromScene);
