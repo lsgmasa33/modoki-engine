@@ -6,7 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, filesWritten, toApplyTargets, rowView, applyBlocked,
-  previewRequestKey, staysOpen,
+  applyPress, queuedPress, shownPlan, previewRequestKey, staysOpen,
   previewWorldKey, subscribePreviewWorld,
 } from '../../packages/modoki/src/editor/panels/applyDialogModel';
 import { pushAction, clearHistory, undo } from '../../packages/modoki/src/editor/undo/undoManager';
@@ -90,6 +90,49 @@ describe('applyDialogModel', () => {
     expect(previewRequestKey(7, choice, ['~moved.b', 'a.Transform.x'])).toBe(was);
     expect(previewRequestKey(7, setTarget(choice, options, 'a.Transform.x', DOOR), ['a.Transform.x'])).not.toBe(now);
     expect(previewRequestKey(8, choice, ['a.Transform.x'])).not.toBe(now);
+  });
+
+  // A press while the plan is worked out is KEPT, not dropped (the button was disabled then, and the first press after
+  // every checkbox change did nothing — 3 of 3 live tries), and it applies only a plan that says what the rows showed
+  // (#1736; close-out review: a kept press once committed a target change and the re-read after a refusal unseen).
+  // Mutations: make applyPress answer 'blocked' for a stale preview, or 'wait' for none, or drop its per-key check (either
+  // half) — the press cases fail; drop the selection check —
+  // a press made on one selection applies another; drop the shownPlan comparison — the changed cases apply; put the
+  // world back out of previewRequestKey — a preview planned before an edit reads as current.
+  it('a kept press waits for the plan and applies it only if it says what the rows showed', () => {
+    const at = (key: string, name: string) => effect(key, { op: 'setField', member: 'A', trait: 'Transform', field: 'x', to: 2 }, { target: name, targetName: name });
+    const choice = initialTargets(new Map([['a.Transform.x', rowAdded]]));
+    const sel = previewRequestKey(7, choice, ['a.Transform.x']);
+    const req = previewRequestKey(7, choice, ['a.Transform.x'], 'v1');
+    const was = previewRequestKey(7, choice, ['a.Transform.x', 'a.Transform.y'], 'v1');
+    // The world is part of the request: a preview planned before an edit is stale, not current.
+    expect(previewRequestKey(7, choice, ['a.Transform.x'], 'v2')).not.toBe(req);
+    const shownDoor = { effects: [at('a.Transform.x', 'Door')], conflicts: [], request: was };
+    const landed = (name: string) => ({ effects: [at('a.Transform.x', name)], conflicts: [], request: req });
+    // No plan shown yet (the open, the re-read after a refused Apply) → nothing a press could agree to: blocked.
+    const x = ['a.Transform.x'];
+    const atDoor = { 'a.Transform.x': 'Door' };
+    expect([applyPress(landed('Door'), req, x, atDoor), applyPress(shownDoor, req, x, atDoor), applyPress(null, req, x, atDoor)]).toEqual(['apply', 'wait', 'blocked']);
+    expect([applyPress({ ...landed('Door'), conflicts: [{ slot: 's', targetName: 'Hinge', keys: [] }] }, req, x, atDoor), applyPress({ ...landed('Door'), refused: 'no' }, req, x, atDoor)]).toEqual(['blocked', 'blocked']);
+    // Rows that show no plan for a checked key wait for one (close-out re-review: kept, the press was always refused as
+    // "changed"): a key just checked has no row in the stale plan, and a retargeted key's row names the old target.
+    expect(applyPress(shownDoor, req, [...x, 'a.Transform.y'], atDoor)).toBe('blocked');
+    expect(applyPress(shownDoor, req, x, { 'a.Transform.x': 'Hinge' })).toBe('blocked');
+    expect(applyPress({ ...shownDoor, effects: [] }, req, x, atDoor)).toBe('blocked');
+    // An uncheck: the rows showed Door for x, and the landed plan says Door → apply.
+    const kept = { selection: sel, keys: ['a.Transform.x'], shown: shownPlan(shownDoor, ['a.Transform.x']) };
+    expect(queuedPress(null, landed('Door'), req, sel)).toBeNull();
+    expect(queuedPress(kept, shownDoor, req, sel)).toBe('wait');
+    expect(queuedPress(kept, landed('Door'), req, sel)).toBe('apply');
+    // The plan landed saying something the rows did not (a target changed, a cross-key effect, an edit) → not applied.
+    expect(queuedPress(kept, landed('Hinge'), req, sel)).toBe('changed');
+    // A press recorded over rows that showed no effect (applyPress no longer keeps one; this is the backstop) → not applied.
+    expect(queuedPress({ ...kept, shown: shownPlan(null, ['a.Transform.x']) }, landed('Door'), req, sel)).toBe('changed');
+    // An edit while it waits does not drop it: it waits for the new plan and is held to the same test.
+    expect(queuedPress(kept, landed('Door'), previewRequestKey(7, choice, ['a.Transform.x'], 'v2'), sel)).toBe('wait');
+    // The selection changed after the press, or the plan came back blocked → dropped.
+    expect(queuedPress({ ...kept, selection: previewRequestKey(7, choice, ['a.Transform.x', 'a.Transform.y']) }, landed('Door'), req, sel)).toBe('drop');
+    expect(queuedPress(kept, { ...landed('Door'), refused: 'no' }, req, sel)).toBe('drop');
   });
 
   it('the dialog stays open only for a REFUSAL carrying its plan, never for an Apply that passed every key over', () => {

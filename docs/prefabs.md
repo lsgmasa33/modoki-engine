@@ -1471,6 +1471,24 @@ so a value written under a member row that states the field would not show — i
   cheaper shape (stamping in the commit, one plan for both) was not worth its restructure. A dry plan prints nothing
   (`quiet`; pinned in `promotionGuidCarry.test.ts`), and the dialog re-plans its preview when the world moves, not only
   when its checkboxes do (`previewWorldKey`: the edit version and the run mode).
+- **A press of Apply made while the plan is re-worked is kept, and applies only what the rows showed (2026-09-30).** A
+  checkbox change makes the preview stale for the 120 ms debounce plus the plan, and Apply used to be DISABLED for
+  that window: the first press after every uncheck did nothing, and the "Working out…" line that came and went moved
+  the button half a line under the pointer (3 of 3 directed tries). Now a press over a SHOWN but stale plan is kept
+  (`applyPress` → `wait`) with what the rows showed for the checked keys (`shownPlan`), and `queuedPress` applies it
+  only if the plan that lands says the same. Otherwise it is not applied, and `prefab.dialog.pressNote` says so. That
+  keeps the contract above: a press is never the go-ahead for a plan nobody saw (a target changed under it, a
+  cross-key effect, an edit that re-planned it — the close-out review's case against a first version that applied
+  whatever landed). So only an uncheck, or an edit re-planning the same rows, keeps a press: the stale rows must
+  state an effect for every checked key at the target now chosen, and a key just checked (no row yet), a retargeted
+  key (its row names the old target) or no plan at all (the open, the re-read after a refused Apply) leaves Apply
+  disabled until the plan lands. A changed
+  selection or a blocked plan drops a kept press; a world change alone does not, since the world is part of the
+  request key (`previewRequestKey`'s `world`), so a preview planned before an edit is stale, not current. The status
+  line's height is reserved, so the button does not move. A closed dialog also drops its whole session — kept press,
+  preview and listing — because the reopen's own commit ran the preview effect on the last session's listing: once
+  as a stale fingerprint the plan refused ("review it again"), once as an empty preview with Apply enabled at 1 ms.
+  Pinned by `applyDialogModel.test.ts` and, live, by QA-DLG-0008 step 8c.
 - **What each target does is said truthfully**: a field of a component the enclosing row ADDED, applied to the inner
   prefab, writes the whole component — "add component Rotate3D (axis x, speed 7) to A in Prefab 'P' — every P gains it"
   (#1658: it used to be listed as "speed 3 → 7" and written whole anyway). A component written at an enclosing level

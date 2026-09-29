@@ -17,9 +17,15 @@ import {
   parkMetaEdit, stampMetaReadPath, clearPendingMeta, clearMetaBaselines,
 } from '../../packages/modoki/src/editor/scene/pendingMeta';
 import {
-  decideUnsavedGate, describeLostWork, confirmDiscardUnsaved, answerUnsavedGateRequest,
-  type UnsavedGateDeps, type GateChoice,
+  decideUnsavedGate, describeLostWork, confirmDiscardUnsaved, answerUnsavedGateRequest, editingPrefabName,
+  confirmUnsavedBeforeBuild, type UnsavedGateDeps, type GateChoice,
 } from '../../packages/modoki/src/editor/scene/unsavedGate';
+import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
+import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
+
+// The modal is the human: only the default-deps tests below reach it, and they read what it was asked to show.
+const modal = vi.hoisted(() => ({ openChoiceModal: vi.fn(async () => 'cancel') }));
+vi.mock('../../packages/modoki/src/editor/components/choiceModal', () => modal);
 
 /** One driver per cause, and whether a WORLD SWAP destroys it. Hand-written on purpose: the gate
  *  derives the split from `writtenBy`, so a list derived the same way would test the derivation
@@ -138,6 +144,22 @@ describe('unsaved-work gate (#1419)', () => {
     expect(line).toMatch(/\+2 more$/);
   });
 
+  // In prefab edit the live world is the prefab, so its edits are the prefab's (Unity's Prefab Mode: "Prefab 'X' has
+  // been modified"). The dialog read "unsaved scene changes" there, naming the scene the open had already saved.
+  // Mutation: drop the `editingPrefab` branch in describeLostWork — the line reads "unsaved scene changes" again; stop
+  // passing `editing` to the re-read after Save — the warn names the scene.
+  it('in prefab edit the live world\'s edits name the prefab; a scene is named only when a scene is unsaved', async () => {
+    DRIVERS.sceneDirty.drive();
+    const d = { ...deps('save'), editingPrefab: () => 'Crate' };
+    expect(await decideUnsavedGate('leave prefab edit', 'world-swap', d)).toBe(false);
+    expect(d.ask.mock.calls[0][1]).toEqual(['unsaved changes to prefab "Crate"']);
+    expect(d.warn.mock.calls[0][0]).toBe('Not leave prefab edit: still unsaved after Save — unsaved changes to prefab "Crate".');
+    DRIVERS.dirtyScenes.drive();
+    expect(describeLostWork(unsavedChangeCauses(), 'world-swap', 'Crate')).toEqual(['unsaved changes to prefab "Crate"', '1 unsaved edit in another loaded scene']);
+    // Accept side: outside prefab edit the same cause still names the scene.
+    expect(describeLostWork(unsavedChangeCauses(), 'world-swap')[0]).toBe('unsaved scene changes');
+  });
+
   it('one prompt at a time: a second request while one is open answers false without asking', async () => {
     DRIVERS.sceneDirty.drive();
     let answer!: (c: GateChoice) => void;
@@ -180,5 +202,47 @@ describe('answerUnsavedGateRequest — the renderer end of main\'s close/quit qu
     const reply = vi.fn();
     await answerUnsavedGateRequest({ action: 'x' }, reply, async () => true);
     expect(reply).not.toHaveBeenCalled();
+  });
+});
+
+// The prefab-name BINDING (close-out review): the gate test above injects the name, so it could not see the default deps
+// or the Build gate drop it. Mutations: drop `editingPrefab: editingPrefabName` from DEFAULT_DEPS — the leave gate names
+// the scene; drop `editingPrefabName()` from confirmUnsavedBeforeBuild — so does the Build gate; answer from the store
+// flag alone in editingPrefabName — the stale-flag and other-session cases name a prefab.
+describe('the prefab-edit name, as the editor binds it', () => {
+  const GUID = 'c0a7e000-0000-4000-8000-000000000001';
+  const world = (path: string | null) => vi.spyOn(sceneManager, 'getCurrent').mockReturnValue((path === null ? null : { path }) as never);
+  const session = (s: { path: string; guid: string; name: string } | null) => {
+    if (s) useEditorStore.getState().openPrefabEditor(s, null); else useEditorStore.getState().closePrefabEditor();
+  };
+  beforeEach(() => { clearEverything(); modal.openChoiceModal.mockClear(); });
+  afterEach(() => { vi.restoreAllMocks(); session(null); });
+
+  it('names the session only while the live world is that session\'s', () => {
+    world(`/__prefab-edit__/${GUID}`);
+    session({ path: '/assets/prefabs/crate.prefab.json', guid: GUID, name: 'Crate' });
+    expect(editingPrefabName()).toBe('Crate');
+    session({ path: '/assets/prefabs/crate.prefab.json', guid: GUID, name: '' });
+    expect(editingPrefabName()).toBe('crate.prefab.json');
+    // A world that outlived its session, or another session's: a prefab world, with no name to give.
+    session({ path: '/assets/prefabs/other.prefab.json', guid: 'another', name: 'Other' });
+    expect(editingPrefabName()).toBe('');
+    session(null);
+    expect(editingPrefabName()).toBe('');
+    // A flag that outlived its world: a scene.
+    world('/assets/scenes/main.scene.json');
+    session({ path: '/assets/prefabs/crate.prefab.json', guid: GUID, name: 'Crate' });
+    expect(editingPrefabName()).toBeNull();
+    expect(describeLostWork({ ...unsavedChangeCauses(), sceneDirty: true }, 'world-swap', '')).toEqual(['unsaved changes to the prefab being edited']);
+  });
+
+  it('the leave gate and the Build gate both show the prefab\'s name', async () => {
+    world(`/__prefab-edit__/${GUID}`);
+    session({ path: '/assets/prefabs/crate.prefab.json', guid: GUID, name: 'Crate' });
+    DRIVERS.sceneDirty.drive();
+    expect(await confirmDiscardUnsaved('leave prefab edit', 'world-swap')).toBe(false);
+    expect(await confirmUnsavedBeforeBuild('build for web')).toBe(false);
+    const shown = modal.openChoiceModal.mock.calls.map((c) => (c as unknown as [{ details: string[] }])[0].details);
+    expect(shown).toEqual([['unsaved changes to prefab "Crate"'], ['unsaved changes to prefab "Crate"']]);
   });
 });

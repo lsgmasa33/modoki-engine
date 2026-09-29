@@ -64,8 +64,8 @@ export function toApplyTargets(choice: TargetChoice, checked: Iterable<string>):
 /** What a preview was computed FOR — the instance, the checked keys and their targets — so a result that arrives after
  *  the selection moved on is recognised as stale and never rendered or applied from. Order-free. The instance is part
  *  of it: two instances of one prefab list the same keys, and reopened on the other, the first one's preview passed. */
-export function previewRequestKey(root: number | null, choice: TargetChoice, checked: Iterable<string>): string {
-  return `${root ?? ''}\n${[...checked].sort().map((k) => `${k}→${choice[k] ?? ''}`).join('\n')}`;
+export function previewRequestKey(root: number | null, choice: TargetChoice, checked: Iterable<string>, world = ''): string {
+  return `${root ?? ''}\n${world}\n${[...checked].sort().map((k) => `${k}→${choice[k] ?? ''}`).join('\n')}`;
 }
 
 /** Does the dialog stay open after an Apply (#1736)? Only for a REFUSAL that carries the plan it refused — a conflict,
@@ -113,6 +113,60 @@ export function applyBlocked(preview: (Pick<ApplyPreview, 'conflicts' | 'refused
   const n = preview.conflicts.length;
   if (n) return `Cannot apply: ${n} conflict${n === 1 ? '' : 's'} — checked changes write the same field with different values (see the red lines)`;
   return null;
+}
+
+/** What a press of Apply does: 'apply' now; 'wait' while a plan the rows show is being re-worked for THIS request; or
+ *  'blocked' — a refusal or a conflict, which the dialog names, or rows that show no plan a press could agree to.
+ *
+ *  A stale plan keeps a press only while its rows state an effect for EVERY checked key, at the target now chosen: an
+ *  uncheck, or an edit re-planning the same rows. A key just checked has no row in it, and a retargeted one names the
+ *  old target, so for those (and with no plan at all: the open, the re-read after a refused Apply) the button waits, as
+ *  it always did — kept, such a press could only be refused as "changed" when nothing had (close-out re-review). The
+ *  button used to wait for the uncheck too, so the first press after one (inside the 120 ms debounce and the plan) was
+ *  dropped with no word — 3 of 3 directed tries, an uncheck and then an immediate press. */
+export function applyPress(
+  preview: (Pick<ApplyPreview, 'effects' | 'conflicts' | 'refused'> & { request: string }) | null,
+  current: string,
+  checked: Iterable<string>,
+  choice: TargetChoice,
+): 'apply' | 'wait' | 'blocked' {
+  if (applyBlocked(preview, current) === null) return 'apply';
+  if (!preview || preview.request === current) return 'blocked';
+  for (const key of checked) {
+    const shown = preview.effects.find((e) => e.key === key);
+    if (!shown || (choice[key] !== undefined && shown.target !== choice[key])) return 'blocked';
+  }
+  return 'wait';
+}
+
+/** What the rows show for `keys` — each key's effect as `rowView` renders it, from whatever preview is on screen (a stale
+ *  one included: the rows do not wait for the new plan). A press made while the plan is worked out records this. */
+export function shownPlan(preview: Pick<ApplyPreview, 'effects'> | null, keys: Iterable<string>): string {
+  return JSON.stringify([...keys].sort().map((k) => [k, rowView(preview, k)]));
+}
+
+/** A press kept while its plan was worked out: the selection it was made on (`previewRequestKey` without the world),
+ *  its keys, and what the rows showed for them (`shownPlan`). */
+export interface KeptPress { selection: string; keys: string[]; shown: string }
+
+/** A kept press as the preview changes, `request` being the current preview request and `selection` the same key without
+ *  the world: 'apply' it, keep it ('wait'), 'drop' it (the selection changed after the press, or the plan came back
+ *  blocked — the blocked line says why), or 'changed': the plan landed, and for the pressed keys it does not say what
+ *  the rows showed. An Apply commits the plan the rows SHOWED (#1736), so a press is never the go-ahead for one nobody
+ *  saw — a target changed under it, a cross-key effect, an edit that re-planned it, the re-read after a refused plan.
+ *  A world change alone does not drop it: the press waits for the new plan and is held to the same test. Null with no
+ *  press kept. */
+export function queuedPress(
+  kept: KeptPress | null,
+  preview: (Pick<ApplyPreview, 'effects' | 'conflicts' | 'refused'> & { request: string }) | null,
+  request: string,
+  selection: string,
+): 'apply' | 'wait' | 'drop' | 'changed' | null {
+  if (kept === null) return null;
+  if (kept.selection !== selection) return 'drop';
+  if (preview && preview.request !== request) return 'wait';
+  if (applyBlocked(preview, request) !== null) return 'drop';
+  return shownPlan(preview, kept.keys) === kept.shown ? 'apply' : 'changed';
 }
 
 /** The world a preview was planned against (#1773): the edit version (an edit, or an undo/redo of one) and the run mode

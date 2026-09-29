@@ -34,7 +34,7 @@ import { ModalShell } from '../components/ModalShell';
 import { applyTargetOptions, type KeyTargets } from '../scene/prefabApplyOptions';
 import {
   initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, filesWritten, toApplyTargets, rowView, applyBlocked,
-  previewRequestKey, staysOpen, previewWorldKey, subscribePreviewWorld, type TargetChoice,
+  applyPress, queuedPress, shownPlan, type KeptPress, previewRequestKey, staysOpen, previewWorldKey, subscribePreviewWorld, type TargetChoice,
 } from './applyDialogModel';
 
 // The dialog's tree node is the shared shape exactly — aliased locally so the rest
@@ -129,6 +129,11 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   // the conflict line render. `request` is the selection it was computed for; a newer selection makes it stale.
   const [preview, setPreview] = useState<(ApplyPreview & { request: string }) | null>(null);
   const [previewEpoch, setPreviewEpoch] = useState(0);
+  // An Apply pressed while the plan was still being worked out (`applyPress`), with what the rows showed, run when the plan
+  // lands if it says the same (`queuedPress`). A press dropped because it did not leaves a note, for the selection it was
+  // made on.
+  const [kept, setKept] = useState<KeptPress | null>(null);
+  const [pressNote, setPressNote] = useState<{ text: string; selection: string } | null>(null);
   // #1773: a world change (an edit, an undo, Play/Stop, a pose preview) re-plans the preview too.
   const worldKey = useSyncExternalStore(subscribePreviewWorld, previewWorldKey, previewWorldKey);
 
@@ -140,10 +145,19 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   };
 
   useEffect(() => {
+    // Nothing from the last session of the dialog carries into this one, so all of it is dropped on the close as well as
+    // the open. A kept press, closed while it waited and reopened on the same selection, would apply with no press; the
+    // last session's preview was planned on a listing this open reads again (it once read as current after an edit,
+    // before the world was part of its key); and its `ready` listing let the preview effect run in the reopen's own
+    // commit — an empty last selection is planned synchronously, so the rows came up under a preview with no effect in
+    // it, Apply enabled over it, and a press on them could only be refused as changed (measured live).
+    setKept(null);
+    setPressNote(null);
+    setPreview(null);
+    setLoadState({ kind: 'loading' });
     if (!active || rootInstanceId === null) return;
     if (livePinnedId(subject, findEntity, getCurrentWorld()) === null) { closeAsGone(subjectGoneNotice(mode)); return; }
     let cancelled = false;
-    setLoadState({ kind: 'loading' });
     (async () => {
       const PrefabInstanceMeta = getTraitByName('PrefabInstance');
       if (!PrefabInstanceMeta) {
@@ -189,7 +203,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
 
   useEffect(() => {
     if (!active || mode !== 'apply' || rootInstanceId === null || loadState.kind !== 'ready') return;
-    const request = previewRequestKey(rootInstanceId, choice, checked);
+    const request = previewRequestKey(rootInstanceId, choice, checked, worldKey);
     if (checked.size === 0) { setPreview({ effects: [], conflicts: [], skipped: [], files: [], fingerprint: '', request }); return; }
     let cancelled = false;
     // Debounced: a run of checkbox clicks asks once. A result for an older selection is dropped here, and the Apply
@@ -209,8 +223,6 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     const keys = listingKeys(loadState);
     return { total: keys.length, checked: keys.filter((k) => checked.has(k)).length };
   }, [loadState, checked]);
-
-  if (!active) return null;
 
   const toggleKey = (key: string, next: 'on' | 'off') => {
     setChecked((prev) => {
@@ -268,6 +280,26 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     }
   };
 
+  // The world is part of the request (#1773's `previewWorldKey`): a preview planned before an edit is stale, not current.
+  const currentSelection = previewRequestKey(rootInstanceId, choice, checked);
+  const currentRequest = previewRequestKey(rootInstanceId, choice, checked, worldKey);
+  const press = mode === 'apply' && checked.size > 0 ? applyPress(preview, currentRequest, checked, choice) : 'apply';
+  const pressApply = () => {
+    setPressNote(null);
+    if (press === 'wait') setKept({ selection: currentSelection, keys: [...checked], shown: shownPlan(preview, checked) });
+    else void handleApply();
+  };
+  // Every render: the kept press runs on the preview it waited for, with this render's handleApply.
+  useEffect(() => {
+    const next = queuedPress(kept, preview, currentRequest, currentSelection);
+    if (next === null || next === 'wait') return;
+    setKept(null);
+    if (next === 'apply') void handleApply();
+    if (next === 'changed') {
+      setPressNote({ text: 'Not applied: what this Apply does changed after you pressed it. Check the rows, then press Apply again.', selection: currentSelection });
+    }
+  });
+
   const handleRevert = async () => {
     if (rootInstanceId === null || checked.size === 0 || applying) return;
     setApplying(true);
@@ -323,13 +355,14 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     return [...seen];
   })();
   const writesFooter = mode === 'apply' ? filesWritten(preview) : [];
-  const blocked = mode === 'apply' && checked.size > 0 ? applyBlocked(preview, previewRequestKey(rootInstanceId, choice, checked)) : null;
+  const blocked = mode === 'apply' && checked.size > 0 ? applyBlocked(preview, currentRequest) : null;
+  const note = pressNote?.selection === currentSelection ? pressNote.text : null;
 
   const isRevert = mode === 'revert';
   const title = isRevert ? 'Revert Overrides' : 'Apply to Prefab';
   const emptyMsg = isRevert ? 'No overrides to revert on this instance.' : 'No overrides to apply on this instance.';
-  const confirmLabel = applying ? (isRevert ? 'Reverting…' : 'Applying…') : (isRevert ? 'Revert' : 'Apply');
-  const onConfirm = isRevert ? handleRevert : handleApply;
+  const confirmLabel = applying || kept !== null ? (isRevert ? 'Reverting…' : 'Applying…') : (isRevert ? 'Revert' : 'Apply');
+  const onConfirm = isRevert ? handleRevert : pressApply;
   const confirmBg = isRevert ? '#6a3a2d' : '#2d4a6a';
   const confirmBorder = isRevert ? '#7a4a3a' : '#3a4a5a';
 
@@ -337,6 +370,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   // so a child entity sits under its parent instead of as a flat sibling.
   // Collapsing an entity hides its traits AND its descendant subtree.
   const INDENT = 16;
+
+  if (!active) return null;
   const renderEntityNode = (fnode: ForestNode<EntityNode>): React.ReactElement => {
     const e = fnode.node;
     const d = fnode.depth;
@@ -578,8 +613,17 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             Writes: {writesFooter.join(', ')}
           </div>
         )}
-        {blocked && (
-          <div data-ui-id="prefab.dialog.blocked" style={{ color: blocked.startsWith('Cannot') ? '#e0605a' : '#888', fontSize: 11, marginTop: 4 }}>{blocked}</div>
+        {mode === 'apply' && (
+          // The status line's space is kept whether it shows or not, so the buttons under it stay put while a checkbox
+          // change re-plans: it came and went, and moved Apply half a line under a press aimed at it.
+          <div style={{ minHeight: 15, marginTop: 4 }}>
+            {blocked && (
+              <div data-ui-id="prefab.dialog.blocked" style={{ color: blocked.startsWith('Cannot') ? '#e0605a' : '#888', fontSize: 11, lineHeight: '15px' }}>{blocked}</div>
+            )}
+            {!blocked && note && (
+              <div data-ui-id="prefab.dialog.pressNote" style={{ color: '#c9a44a', fontSize: 11, lineHeight: '15px' }}>{note}</div>
+            )}
+          </div>
         )}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
           <button
@@ -594,13 +638,13 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
           >Cancel</button>
           <button
             onClick={onConfirm}
-            disabled={applying || totals.checked === 0 || loadState.kind !== 'ready' || !!blocked}
+            disabled={applying || kept !== null || totals.checked === 0 || loadState.kind !== 'ready' || press === 'blocked'}
             data-ui-id="prefab.dialog.confirm" data-ui-kind="button"
             style={{
               padding: '5px 16px', border: `1px solid ${confirmBorder}`, borderRadius: 3,
               background: confirmBg, color: '#fff', cursor: (applying || totals.checked === 0) ? 'default' : 'pointer',
               fontFamily: 'monospace', fontSize: 11,
-              opacity: (applying || totals.checked === 0 || loadState.kind !== 'ready' || blocked) ? 0.5 : 1,
+              opacity: (applying || kept !== null || totals.checked === 0 || loadState.kind !== 'ready' || press === 'blocked') ? 0.5 : 1,
             }}
           >{confirmLabel}</button>
         </div>

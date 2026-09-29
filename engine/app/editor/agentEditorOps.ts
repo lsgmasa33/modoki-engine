@@ -690,14 +690,16 @@ function loadedSceneName(sceneGuid: string): string {
   return sceneGuid || 'primary';
 }
 
-/** Why `planReparent` refused, in words an agent can act on (#1429). `op` names the op the agent called. */
+/** Why `planReparent` refused, in words an agent can act on (#1429). `op` names the op the agent called. The reason
+ *  only: each caller closes it with its own "Nothing was applied …" sentence, so it is said once (two cases used to say
+ *  it here too, and a field write's refusal read "…Nothing was applied. Nothing was applied to entity 13"). */
 function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>['reason'], id: number, parentId: number, op = 'reparent-entity'): string {
   // A prefab-edit refusal in the editor's own words, read off its table: a reason listed by hand here went stale the day
   // one was added (`scaffold` fell to the default and told the agent the target was a descendant, close-out review).
   if (reason in PREFAB_EDIT_REFUSAL_TEXT) return `${op}: refused to move ${id} under ${parentId} — ${PREFAB_EDIT_REFUSAL_TEXT[reason as keyof typeof PREFAB_EDIT_REFUSAL_TEXT]}`;
   switch (reason) {
-    case 'restructure': return `${op}: refused to move or reorder ${id} — ${RESTRUCTURE_REFUSAL_TEXT} ${id} is part of a prefab instance: the prefab supplies it (a member, a nested prefab, or a node the prefab added), and only objects the scene added move inside an instance. Nothing was applied.`;
-    case 'collapsed-parent': return `${op}: refused to move ${id} under ${parentId} — ${COLLAPSED_PARENT_REFUSAL_TEXT} Nothing was applied.`;
+    case 'restructure': return `${op}: refused to move or reorder ${id} — ${RESTRUCTURE_REFUSAL_TEXT} ${id} is part of a prefab instance: the prefab supplies it (a member, a nested prefab, or a node the prefab added), and only objects the scene added move inside an instance.`;
+    case 'collapsed-parent': return `${op}: refused to move ${id} under ${parentId} — ${COLLAPSED_PARENT_REFUSAL_TEXT}`;
     case 'resource': return `${op}: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
     case 'instance-member': return `${op}: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and a prefab instance would be split across two scene files: something in ${id}'s subtree (${id} itself, or an entity under it) belongs to an instance that would stay behind, or a member of an instance in it lives outside the subtree. Move that instance's root instead, or unpack that instance first.`;
     default: return `${op}: refused to move ${id} under ${parentId} — the move is illegal (${reason === 'self-parent' ? 'an entity cannot be its own parent' : `${parentId} is a descendant of ${id}`}).`;
@@ -782,12 +784,12 @@ function writeTraitAsEditor(op: string, id: number, meta: LiveTraitMeta, fields:
   // has no step to confirm one, so it is refused here with the op that can.
   const parentMove = typeof newParent === 'number';
   const refusedParent = parentMove ? fieldParentWriteRefusal(op, id, newParent as number, shown) : null;
-  if (refusedParent) return { ok: false, error: `${refusedParent} Nothing was applied to entity ${id}` };
+  if (refusedParent) return { ok: false, error: `${refusedParent} Nothing was applied to entity ${id}.` };
   // A new sortOrder is a reorder: an object a prefab supplies keeps the prefab's place (#1869), under the parent it has or
   // the one written beside it.
   if (meta.name === 'EntityAttributes' && 'sortOrder' in fields && fields.sortOrder !== current?.sortOrder) {
     const reordered = restructureRefusal({ id, parentId: parentMove ? newParent as number : Number(current?.parentId ?? 0), reorder: true });
-    if (reordered) return { ok: false, error: `${op}: refused to reorder ${id} — ${reordered} Nothing was applied to entity ${id}` };
+    if (reordered) return { ok: false, error: `${op}: refused to reorder ${id} — ${reordered} Nothing was applied to entity ${id}.` };
   }
 
   const rest = Object.entries(fields).filter(([field]) => !(parentMove && field === 'parentId'));
@@ -3128,7 +3130,7 @@ export function registerEditorAgentOps(): void {
     const parentId = resolveParentId(p, 'reparent-entity parent', { move: true });
     // The one decision every reparent entry point asks (#1429), so the refusal can name its rule.
     const plan = planReparent(id, parentId, p.sortOrder);
-    if (plan.kind === 'refused') throw new OpRefusal('REFUSED_BY_OP', reparentRefusalText(plan.reason, id, parentId));
+    if (plan.kind === 'refused') throw new OpRefusal('REFUSED_BY_OP', `${reparentRefusalText(plan.reason, id, parentId)} Nothing was applied.`);
     // A parent from another scene makes this a SCENE MOVE. A human answers the Hierarchy's prompt; the
     // agent answers it with `moveToScene: true`, after reading the same text the human reads. Refusing
     // first, rather than moving and reporting, is deliberate: the move changes what every level using

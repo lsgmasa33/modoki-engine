@@ -86,6 +86,26 @@ describe('set-traits parentId in the editor goes through planReparent (#1787)', 
     expect(link(slot)).toBe(root);
   });
 
+  // A refused member move says "Nothing was applied" ONCE on every agent route: `reparentRefusalText` gives the reason
+  // and each caller closes it. Mutation: put "Nothing was applied." back on the restructure case in
+  // reparentRefusalText — the two field-write routes say it twice; drop it from reparent-entity's throw — that one says
+  // it zero times.
+  it('a refused member move says "Nothing was applied" exactly once, on each route', async () => {
+    const { slot } = await instance();
+    const shelf = spawn('Shelf');
+    const once = (text: string) => expect(text.match(/Nothing was applied/g), text).toHaveLength(1);
+    const traits = await setParent(attrs(slot).guid, shelf);
+    expect(traits.error).toMatch(/^set-traits: refused to move or reorder \d+ — Can't restructure a prefab instance.*only objects the scene added move inside an instance\. Nothing was applied to any of the 1 target\.$/);
+    once(traits.error!);
+    const ops = await runAgentOp('apply-scene-ops', { ops: [{ op: 'setTrait', entity: { guid: attrs(slot).guid }, trait: 'EntityAttributes', fields: { parentId: shelf } }] }) as { errors: string[] };
+    expect(ops.errors).toHaveLength(1);
+    expect(ops.errors[0]).toMatch(/refused to move or reorder \d+ — .*inside an instance\. Nothing was applied to entity \d+\.$/);
+    once(ops.errors[0]);
+    const thrown = await runAgentOp('reparent-entity', { guid: attrs(slot).guid, parentGuid: attrs(shelf).guid }).then(() => '', (e: Error) => e.message);
+    expect(thrown).toMatch(/inside an instance\. Nothing was applied\.$/);
+    once(thrown);
+  });
+
   // #1869: a same-scene member move is refused like reparent-entity's, before anything is written — no entry, still
   // linked. So is a new sortOrder (a reorder), on its own or beside the parent. A node the SCENE added under the instance
   // takes both. Mutation: drop restructureRefusal in planReparent — the parent write lands; drop the sortOrder pre-check

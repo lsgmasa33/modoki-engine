@@ -26,6 +26,7 @@ import { unsavedChangeCauses, causeSpecs, type UnsavedCauses } from './serialize
 import { openChoiceModal } from '../components/choiceModal';
 import { useEditorStore } from '../store/editorStore';
 import { undoStepPending } from '../undo/undoManager';
+import { isPrefabEditWorld, prefabSessionWorldPath } from './prefabEditWorld';
 
 /** What the gesture is about to destroy: the live world only, or everything in the page. */
 export type UnsavedScope = 'world-swap' | 'page-unload';
@@ -39,10 +40,16 @@ type SpecView = Readonly<Record<string, { writtenBy: unknown; keying: string; la
 const MAX_NAMED = 3;
 
 /** The work `scope` would destroy, one human phrase per active cause — empty when there is none.
- *  Enumerated from the cause TABLE, so a sixth cause is named here the day it is added. */
+ *  Enumerated from the cause TABLE, so a sixth cause is named here the day it is added.
+ *
+ *  `editingPrefab` names the prefab when the live world is a prefab-edit world (`''` for one with no name to give).
+ *  There the live world's edits (`sceneDirty`) are the PREFAB's, so they are named as Unity's Prefab Mode names them
+ *  ("Prefab 'X' has been modified"); the table's "unsaved scene changes" named the scene, which the open had already
+ *  saved. The other causes keep their own words, so the scene is named only when a scene is what is unsaved. */
 export function describeLostWork(
   causes: UnsavedCauses,
   scope: UnsavedScope,
+  editingPrefab: string | null = null,
   specs: SpecView = causeSpecs() as SpecView,
 ): string[] {
   const out: string[] = [];
@@ -58,7 +65,8 @@ export function describeLostWork(
       const named = v.slice(0, MAX_NAMED).join(', ');
       out.push(`${phrase}: ${named}${v.length > MAX_NAMED ? `, +${v.length - MAX_NAMED} more` : ''}`);
     } else if (v) {
-      out.push(spec.label.bool ?? key);
+      out.push(key !== 'sceneDirty' || editingPrefab === null ? spec.label.bool ?? key
+        : editingPrefab ? `unsaved changes to prefab "${editingPrefab}"` : 'unsaved changes to the prefab being edited');
     }
   }
   return out;
@@ -71,12 +79,14 @@ export interface UnsavedGateDeps {
    *  causes it re-reads afterwards. */
   save: () => Promise<unknown>;
   warn: (message: string) => void;
+  /** The prefab being edited when the live world is a prefab-edit world, else null — see `describeLostWork`. */
+  editingPrefab?: () => string | null;
 }
 
 /** Proceed with `action`? True when nothing `scope` destroys is unsaved, when the human chose
  *  Discard, or when they chose Save and the save left nothing behind. */
 export async function decideUnsavedGate(action: string, scope: UnsavedScope, deps: UnsavedGateDeps): Promise<boolean> {
-  const lost = describeLostWork(deps.causes(), scope);
+  const lost = describeLostWork(deps.causes(), scope, deps.editingPrefab?.() ?? null);
   if (lost.length === 0) return true;
   const choice = await deps.ask(action, lost, scope);
   if (choice === 'discard') return true;
@@ -91,14 +101,25 @@ export async function decideUnsavedGate(action: string, scope: UnsavedScope, dep
   }
   // Re-read, never trust the save's own verdict: a cancelled Save As on an untitled scene, a
   // failed write, or a partial Save All all return without throwing.
-  const still = describeLostWork(deps.causes(), scope);
+  const still = describeLostWork(deps.causes(), scope, deps.editingPrefab?.() ?? null);
   if (still.length === 0) return true;
   deps.warn(`Not ${action}: still unsaved after Save — ${still.join('; ')}.`);
   return false;
 }
 
+/** What `describeLostWork` calls the live world's edits by: the prefab-edit session's name when the live world is THAT
+ *  session's (`prefabSessionWorldPath`: a stale store flag can outlive its world, and a world can outlive its session),
+ *  its file name when it has no name, `''` for a prefab world with no session (an exit whose return reload failed),
+ *  and null for a scene. */
+export function editingPrefabName(): string | null {
+  const session = useEditorStore.getState().editingPrefab;
+  if (prefabSessionWorldPath(session) !== null) return session!.name || session!.path.split('/').pop() || '';
+  return isPrefabEditWorld() ? '' : null;
+}
+
 const DEFAULT_DEPS: UnsavedGateDeps = {
   causes: unsavedChangeCauses,
+  editingPrefab: editingPrefabName,
   ask: (action, lost) => openChoiceModal<GateChoice>({
     kind: 'unsaved-gate',
     title: 'Save changes first?',
@@ -135,8 +156,9 @@ export async function decideUnsavedBeforeBuild(
   action: string,
   causes: () => UnsavedCauses,
   ask: (action: string, lost: string[]) => Promise<boolean>,
+  editingPrefab: string | null = null,
 ): Promise<boolean> {
-  const lost = describeLostWork(causes(), 'page-unload');
+  const lost = describeLostWork(causes(), 'page-unload', editingPrefab);
   return lost.length === 0 || ask(action, lost);
 }
 
@@ -154,7 +176,7 @@ export function confirmUnsavedBeforeBuild(action: string): Promise<boolean> {
     ],
     cancelValue: 'cancel',
     focus: 'cancel',
-  })) === 'build');
+  })) === 'build', editingPrefabName());
 }
 
 let _open: Promise<boolean> | null = null;

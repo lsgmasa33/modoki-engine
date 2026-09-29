@@ -2194,6 +2194,14 @@ without a word, and since #1409 the undo stack went with them.
   before a scene open would warn about work nothing is about to lose.
 - **`'page-unload'`** counts every cause.
 
+**In prefab edit the live world IS the prefab, so its edits are named as the prefab's**: `unsaved changes to prefab
+"<name>"`, as Unity's Prefab Mode says "…has been modified" (`describeLostWork`'s `editingPrefab`, read from the store
+only while `isPrefabEditWorld()` holds). The cause table's own words, "unsaved scene changes", named the scene there,
+which the open had already saved. The other causes keep their words, so a scene is named only when a scene is unsaved.
+The same phrase reaches the post-Save warning and the Build gate. ⚠️ Not yet the HMR reload banner
+(`app/debug/hmrStaleness.ts`), which keeps its own label table across a zone boundary and still says "unsaved scene
+changes" in prefab edit.
+
 | Gesture | Where it asks | Scope |
 |---|---|---|
 | Assets double-click on a scene, Inspector "Open Scene" | `openAssetInEditor` (both routes go through it) | world-swap |
