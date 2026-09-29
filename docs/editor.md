@@ -2198,9 +2198,11 @@ without a word, and since #1409 the undo stack went with them.
 "<name>"`, as Unity's Prefab Mode says "…has been modified" (`describeLostWork`'s `editingPrefab`, read from the store
 only while `isPrefabEditWorld()` holds). The cause table's own words, "unsaved scene changes", named the scene there,
 which the open had already saved. The other causes keep their words, so a scene is named only when a scene is unsaved.
-The same phrase reaches the post-Save warning and the Build gate. ⚠️ Not yet the HMR reload banner
-(`app/debug/hmrStaleness.ts`), which keeps its own label table across a zone boundary and still says "unsaved scene
-changes" in prefab edit.
+The same phrase reaches the post-Save warning, the Build gate and the HMR reload banner. The wording has one author,
+`prefabEditsPhrase` (`scene/unsavedGate.ts`); the banner (`app/debug/hmrStaleness.ts`) keeps its own label table across a
+zone boundary, so it reads the phrase with `editingPrefabName` through the editor barrel's dynamic import, in place of
+`sceneDirty`'s label only. Its discard record carries the phrase, re-read at discard, because the page that reports the
+loss has booted into a scene and cannot know which prefab the last one was editing.
 
 | Gesture | Where it asks | Scope |
 |---|---|---|

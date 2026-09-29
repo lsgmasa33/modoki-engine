@@ -290,7 +290,8 @@ is the worse failure — but the loss is always announced, and named for what it
   now** and **Cancel**. Doing nothing takes the loss.
 - **After** such a reload → an info banner plus `discardedUnsavedEdits: true` in `get_editor_state`
   and a `!hmr.discarded-unsaved` editor-journal event **whose payload carries the cause**, so a
-  post-hoc journal read can tell which kind of work was lost. The discard happens on a page that is
+  post-hoc journal read can tell which kind of work was lost — plus `liveWorld` (the prefab phrase)
+  when the live world was a prefab being edited, since `causes` alone says `sceneDirty`. The discard happens on a page that is
   about to die, so it is carried across the reload in `sessionStorage` — otherwise it could never be
   reported.
 - **Cancel** → `staleGameCode: true` and a persistent "Running STALE game code" banner. This is the
@@ -307,7 +308,9 @@ message, which was already wrong once #831/#845 added asset, base-scene, and imp
 that can be dirty while the scene itself is perfectly clean. So a SIXTH cause added to
 `unsavedChangeCauses()` shows up in the banner/console/journal with **no edit to
 `hmrStaleness.ts`** — a cause without a hand-authored entry in its `CAUSE_LABELS` map still renders,
-humanized from its key name, rather than being silently dropped.
+humanized from its key name, rather than being silently dropped. One label is not the table's: in prefab
+edit `sceneDirty` is the prefab's edits, and is named as the unsaved-work gate names it (a third probe,
+`LiveWorldLabelProbe` — [editor.md](editor.md) § the unsaved-work gate).
 
 **If you are an agent, you are usually the cause**: your write to a game `.ts` is what triggers the
 countdown, and the human may not be at the screen for it. Check `get_editor_state.unsavedChanges`

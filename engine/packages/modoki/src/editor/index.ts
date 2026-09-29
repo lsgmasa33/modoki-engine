@@ -130,7 +130,7 @@ export {
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors, type SceneLoadOutcome,
 } from './scene/serialize';
 export { SCENE_EXT, correctedScenePath, isAcceptableScenePath } from './scene/sceneFileName';
-export { confirmUnsavedBeforeBuild } from './scene/unsavedGate';
+export { confirmUnsavedBeforeBuild, editingPrefabName, prefabEditsPhrase } from './scene/unsavedGate';
 export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets, assetCacheDiverged, assetCacheMatchesFile,
   discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,

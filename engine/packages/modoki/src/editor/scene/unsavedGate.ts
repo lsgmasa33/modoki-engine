@@ -65,11 +65,19 @@ export function describeLostWork(
       const named = v.slice(0, MAX_NAMED).join(', ');
       out.push(`${phrase}: ${named}${v.length > MAX_NAMED ? `, +${v.length - MAX_NAMED} more` : ''}`);
     } else if (v) {
-      out.push(key !== 'sceneDirty' || editingPrefab === null ? spec.label.bool ?? key
-        : editingPrefab ? `unsaved changes to prefab "${editingPrefab}"` : 'unsaved changes to the prefab being edited');
+      out.push((key === 'sceneDirty' ? prefabEditsPhrase(editingPrefab) : null) ?? spec.label.bool ?? key);
     }
   }
   return out;
+}
+
+/** The phrase for the live world's edits (`sceneDirty`) when that world is a prefab-edit world — `editingPrefab` as
+ *  {@link describeLostWork} takes it — or null for a scene, whose edits keep the cause table's "unsaved scene changes".
+ *  The one author of this wording: the HMR reload banner (`app/debug/hmrStaleness.ts`) reads it through the editor
+ *  barrel, so a prefab edit is named the same way wherever its loss is announced. */
+export function prefabEditsPhrase(editingPrefab: string | null): string | null {
+  if (editingPrefab === null) return null;
+  return editingPrefab ? `unsaved changes to prefab "${editingPrefab}"` : 'unsaved changes to the prefab being edited';
 }
 
 export interface UnsavedGateDeps {

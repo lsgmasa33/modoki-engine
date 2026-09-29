@@ -158,6 +158,12 @@ export type UnsavedCauses = Record<string, boolean | string[]>;
  *  branching on truthiness exactly as they did when this returned a plain boolean. */
 export type DirtyProbe = () => UnsavedCauses | false | Promise<UnsavedCauses | false>;
 
+/** The phrase for the live world's own edits (`sceneDirty`) when that world is a prefab being edited — its edits are
+ *  the PREFAB's, and "unsaved scene changes" named a scene the open had already saved — or null for a scene. Injectable
+ *  for tests; defaults to the editor's own wording (`prefabEditsPhrase`, which the Save/Discard/Cancel gate uses too),
+ *  read through the same guarded dynamic import as the dirty probe, so the phrase is authored once. */
+export type LiveWorldLabelProbe = () => string | null | Promise<string | null>;
+
 function isAnyCauseDirty(causes: UnsavedCauses): boolean {
   return Object.values(causes).some((v) => (Array.isArray(v) ? v.length > 0 : v));
 }
@@ -173,6 +179,15 @@ const defaultDirtyProbe: DirtyProbe = async () => {
   } catch {
     // No editor on this route (plain game page in dev) — nothing to lose.
     return false;
+  }
+};
+
+const defaultLiveWorldLabel: LiveWorldLabelProbe = async () => {
+  try {
+    const { editingPrefabName, prefabEditsPhrase } = await import('@modoki/engine/editor');
+    return prefabEditsPhrase(editingPrefabName());
+  } catch {
+    return null;
   }
 };
 
@@ -204,7 +219,7 @@ function humanizeKey(key: string): string {
 /** One cause → a short human phrase, or null if this cause isn't active. `withPaths` names the
  *  actual paths (the console can afford the detail); without it, only a count — the banner is
  *  read under a 5s countdown, so it stays short. */
-function describeCause(key: string, value: boolean | string[], withPaths = false): string | null {
+function describeCause(key: string, value: boolean | string[], withPaths = false, liveWorld: string | null = null): string | null {
   const label = CAUSE_LABELS[key];
   if (Array.isArray(value)) {
     if (value.length === 0) return null;
@@ -213,14 +228,16 @@ function describeCause(key: string, value: boolean | string[], withPaths = false
     return withPaths ? `${phrase} (${value.join(', ')})` : phrase;
   }
   if (!value) return null;
+  // `sceneDirty` is the live world's edits, so it is named by what that world IS (`LiveWorldLabelProbe`).
+  if (key === 'sceneDirty' && liveWorld) return liveWorld;
   return label?.bool ?? humanizeKey(key);
 }
 
 /** Every active cause, joined into one readable phrase — enumerated from whatever `causes`
  *  actually carries, never a fixed list of keys (see `UnsavedCauses`'s doc comment). */
-function describeCauses(causes: UnsavedCauses, withPaths = false): string {
+function describeCauses(causes: UnsavedCauses, withPaths = false, liveWorld: string | null = null): string {
   const parts = Object.entries(causes)
-    .map(([k, v]) => describeCause(k, v, withPaths))
+    .map(([k, v]) => describeCause(k, v, withPaths, liveWorld))
     .filter((s): s is string => s !== null);
   return parts.length ? parts.join(' and ') : 'unsaved changes';
 }
@@ -234,6 +251,7 @@ function capitalize(s: string): string {
 export function initHmrStaleness(
   hot: HotLike | undefined = import.meta.hot as unknown as HotLike | undefined,
   isDirty: DirtyProbe = defaultDirtyProbe,
+  liveWorldLabel: LiveWorldLabelProbe = defaultLiveWorldLabel,
 ): void {
   if (!hot) return;
 
@@ -253,16 +271,19 @@ export function initHmrStaleness(
     const raw = sessionStorage.getItem(DISCARDED_KEY);
     if (raw) {
       sessionStorage.removeItem(DISCARDED_KEY);
-      const { file, causes } = JSON.parse(raw) as { file?: string; causes?: UnsavedCauses };
+      const { file, causes, liveWorld = null } = JSON.parse(raw) as { file?: string; causes?: UnsavedCauses; liveWorld?: string | null };
       status.discardedUnsavedEdits = true;
       // `causes` travels with the record (written at the moment of discard, below), so this —
       // the LAST thing a human reads before the loss — names what was ACTUALLY lost, instead
       // of the fixed "scene edits" this warning used to say when the scene was the only thing
-      // that could be unsaved (#850). Falls back for a record written by an older build.
-      const lostShort = causes ? describeCauses(causes) : 'unsaved changes';
-      const lostDetailed = causes ? describeCauses(causes, true) : 'unsaved changes';
+      // that could be unsaved (#850). Falls back for a record written by an older build. `liveWorld` travels too: this
+      // page may not be in the prefab edit the discarding page was in, so only the record can say what was lost.
+      const lostShort = causes ? describeCauses(causes, false, liveWorld) : 'unsaved changes';
+      const lostDetailed = causes ? describeCauses(causes, true, liveWorld) : 'unsaved changes';
       console.warn(`[modoki] ${lostDetailed} were DISCARDED to load changed game code (${file}).`);
-      journal('!hmr.discarded-unsaved', { file, causes });
+      // `liveWorld` rides along only when there is one: an agent reading the journal must learn the lost edits were a
+      // prefab's, not a scene's, and `causes` alone says `sceneDirty`.
+      journal('!hmr.discarded-unsaved', { file, causes, ...(liveWorld ? { liveWorld } : {}) });
       const b = showBanner(
         `${capitalize(lostShort)} discarded to load changed game code`,
         [{ id: 'dismiss', label: 'Dismiss', onClick: () => b.remove() }],
@@ -293,6 +314,10 @@ export function initHmrStaleness(
       return;
     }
 
+    // Read before the countdown is touched: an await between clearing one interval and setting the next would let an
+    // overlapping change leak the first.
+    const liveWorld = causes.sceneDirty ? await liveWorldLabel() : null;
+
     // Dirty: the reload WILL happen (that is the chosen policy — stale code is the worse
     // failure), but never as a surprise. A grace window makes the warning readable and
     // leaves an escape hatch; doing nothing takes the loss.
@@ -306,13 +331,14 @@ export function initHmrStaleness(
       // (`discardedUnsavedEdits` / `!hmr.discarded-unsaved`) that docs tell agents to trust.
       const recheck = await isDirty();
       if (recheck) {
-        try { sessionStorage.setItem(DISCARDED_KEY, JSON.stringify({ file, at: Date.now(), causes: recheck })); }
+        const lostWorld = recheck.sceneDirty ? await liveWorldLabel() : null; // re-read too: the edit may have been left during the countdown
+        try { sessionStorage.setItem(DISCARDED_KEY, JSON.stringify({ file, at: Date.now(), causes: recheck, liveWorld: lostWorld })); }
         catch { /* best effort — the reload still has to happen */ }
       }
       location.reload();
     };
     const capitalized = capitalize(label);
-    const lost = describeCauses(causes);
+    const lost = describeCauses(causes, false, liveWorld);
     const text = (msLeft: number) =>
       `${capitalized} changed — reloading in ${Math.ceil(msLeft / 1000)}s; ${lost} will be LOST`;
     const banner = showBanner(text(DISCARD_GRACE_MS), [
@@ -338,7 +364,7 @@ export function initHmrStaleness(
       },
     ]);
     console.warn(
-      `[modoki] ${label} changed (${file}) and the editor has UNSAVED WORK (${describeCauses(causes, true)}) — ` +
+      `[modoki] ${label} changed (${file}) and the editor has UNSAVED WORK (${describeCauses(causes, true, liveWorld)}) — ` +
       `reloading in ${DISCARD_GRACE_MS / 1000}s, which will discard it.`,
     );
     countdown = setInterval(() => {

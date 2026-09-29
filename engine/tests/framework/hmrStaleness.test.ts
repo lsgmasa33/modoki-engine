@@ -33,10 +33,14 @@ type UnsavedCauses = import('../../app/debug/hmrStaleness').UnsavedCauses;
 // instances under that reset (same class of bug as "an /@fs import gives a second module
 // instance" — see the engine memory notes). Holding the one mock outside the factory sidesteps
 // both: there is exactly one `editorEmitMock` for the whole file, cleared per test.
-const { editorEmitMock } = vi.hoisted(() => ({ editorEmitMock: vi.fn() }));
+// `editingPrefabName` is mocked the same way, so the default live-world probe can be driven into prefab edit without
+// building a prefab-edit world; `prefabEditsPhrase` stays REAL — the wording is what the default probe is for.
+const { editorEmitMock, editingPrefabNameMock } = vi.hoisted(() => ({
+  editorEmitMock: vi.fn(), editingPrefabNameMock: vi.fn((): string | null => null),
+}));
 vi.mock('@modoki/engine/editor', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@modoki/engine/editor')>();
-  return { ...actual, editorEmit: editorEmitMock };
+  return { ...actual, editorEmit: editorEmitMock, editingPrefabName: editingPrefabNameMock };
 });
 
 // `status` is module-level and deliberately STICKY for the life of a page (an agent reading
@@ -77,12 +81,17 @@ const clickButton = (id: string, label: string): void => {
   expect(btn.textContent).toBe(label);
   btn.click();
 };
+/** The live-world probe for a scene. Passed explicitly rather than left to the default, whose dynamic import of the
+ *  editor barrel is cold after each `vi.resetModules()` and outlasts `settle()`; re-warming it per test cost ~200 ms
+ *  each. The default's own wiring is pinned once, below. */
+const noPrefab = (): null => null;
 /** Let the handler's awaits settle — the dirty probe is async by design. */
 const settle = () => new Promise((r) => setTimeout(r, 0));
 
 beforeEach(async () => {
   vi.resetModules();
   editorEmitMock.mockClear();
+  editingPrefabNameMock.mockReset().mockReturnValue(null);
   ({ initHmrStaleness, getHmrStatus } = await import('../../app/debug/hmrStaleness'));
   vi.useFakeTimers({ shouldAdvanceTime: true });
   reload = vi.fn();
@@ -102,7 +111,7 @@ afterEach(() => {
 describe('game code changed — clean scene', () => {
   it('reloads immediately, with no banner and no discard record', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => false);
+    initHmrStaleness(hot, () => false, noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
     await settle();
 
@@ -116,7 +125,7 @@ describe('game code changed — clean scene', () => {
 describe('game code changed — dirty scene', () => {
   it('does NOT reload during the grace window, and warns that work will be lost', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => ({ sceneDirty: true }));
+    initHmrStaleness(hot, () => ({ sceneDirty: true }), noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
     await settle();
 
@@ -129,7 +138,7 @@ describe('game code changed — dirty scene', () => {
 
   it('takes the loss when the countdown expires, and records it for the next page', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => ({ sceneDirty: true }));
+    initHmrStaleness(hot, () => ({ sceneDirty: true }), noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
     await settle();
 
@@ -147,7 +156,7 @@ describe('game code changed — dirty scene', () => {
     // told to trust. The flag must be re-read at reload time, not captured 5s earlier.
     let dirty: UnsavedCauses | false = { sceneDirty: true };
     const hot = fakeHot();
-    initHmrStaleness(hot, () => dirty);
+    initHmrStaleness(hot, () => dirty, noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
     await settle();
 
@@ -162,7 +171,7 @@ describe('game code changed — dirty scene', () => {
 
   it('"Reload now" discards immediately', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => ({ sceneDirty: true }));
+    initHmrStaleness(hot, () => ({ sceneDirty: true }), noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
     await settle();
 
@@ -175,7 +184,7 @@ describe('game code changed — dirty scene', () => {
 
   it('"Cancel" keeps the edits, skips the reload, and marks the editor STALE', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => ({ sceneDirty: true }));
+    initHmrStaleness(hot, () => ({ sceneDirty: true }), noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
     await settle();
 
@@ -197,7 +206,7 @@ describe('reporting a discard the PREVIOUS page took', () => {
   it('consumes the record on boot, surfaces it, and does not re-report it', async () => {
     sessionStorage.setItem(DISCARDED_KEY, JSON.stringify({ file: '/g/x.ts', at: 1 }));
 
-    initHmrStaleness(fakeHot(), () => false);
+    initHmrStaleness(fakeHot(), () => false, noPrefab);
     await settle();
 
     expect(getHmrStatus().discardedUnsavedEdits).toBe(true);
@@ -209,7 +218,7 @@ describe('reporting a discard the PREVIOUS page took', () => {
   });
 
   it('stays silent when there is no record', async () => {
-    initHmrStaleness(fakeHot(), () => false);
+    initHmrStaleness(fakeHot(), () => false, noPrefab);
     await settle();
     expect(getHmrStatus().discardedUnsavedEdits).toBe(false);
     expect(banner()).toBeNull();
@@ -218,7 +227,7 @@ describe('reporting a discard the PREVIOUS page took', () => {
 
 describe('no hot context (a shipped game build)', () => {
   it('is completely inert', async () => {
-    initHmrStaleness(undefined, () => ({ sceneDirty: true }));
+    initHmrStaleness(undefined, () => ({ sceneDirty: true }), noPrefab);
     await settle();
     expect(reload).not.toHaveBeenCalled();
     expect(banner()).toBeNull();
@@ -232,7 +241,7 @@ describe('shader code changed (postfx/npr TSL)', () => {
    *  reload, but never silently at the cost of unsaved scene work. */
   it('reloads immediately when the scene is clean', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => false);
+    initHmrStaleness(hot, () => false, noPrefab);
     hot.emit('modoki:shader-code-changed', { file: '/e/runtime/rendering/postfx/dofViewZ.ts' });
     await settle();
 
@@ -243,7 +252,7 @@ describe('shader code changed (postfx/npr TSL)', () => {
 
   it('warns before discarding unsaved scene work, naming the shader edit', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => ({ sceneDirty: true }));
+    initHmrStaleness(hot, () => ({ sceneDirty: true }), noPrefab);
     hot.emit('modoki:shader-code-changed', { file: '/e/runtime/rendering/npr/edgeNodes.ts' });
     await settle();
 
@@ -260,7 +269,7 @@ describe('shader code changed (postfx/npr TSL)', () => {
 
   it('Cancel marks the editor STALE — measurements from it are not to be trusted', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => ({ sceneDirty: true }));
+    initHmrStaleness(hot, () => ({ sceneDirty: true }), noPrefab);
     hot.emit('modoki:shader-code-changed', { file: '/e/runtime/rendering/postfx/PostFXStack.ts' });
     await settle();
 
@@ -274,7 +283,7 @@ describe('shader code changed (postfx/npr TSL)', () => {
 
   it('still handles a game-code change — the two producers share one handler', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => false);
+    initHmrStaleness(hot, () => false, noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/runtime/systems.ts' });
     await settle();
     expect(reload).toHaveBeenCalledTimes(1);
@@ -292,7 +301,7 @@ describe('the countdown names the ACTUAL cause, not a fixed one (#850)', () => {
     // sceneDirty is false: only a parked asset edit (e.g. a material saved to the dirty-asset
     // registry, not disk) is pending. Mutating a careless fix's cause-check to `sceneDirty:
     // true` here would falsely turn this red — see the mutation-check note in the report.
-    initHmrStaleness(hot, () => ({ sceneDirty: false, dirtyAssetPaths: ['games/x/materials/foo.mat.json'] }));
+    initHmrStaleness(hot, () => ({ sceneDirty: false, dirtyAssetPaths: ['games/x/materials/foo.mat.json'] }), noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
     await settle();
 
@@ -304,7 +313,7 @@ describe('the countdown names the ACTUAL cause, not a fixed one (#850)', () => {
 
   it('names BOTH causes when the scene AND a parked asset edit are dirty', async () => {
     const hot = fakeHot();
-    initHmrStaleness(hot, () => ({ sceneDirty: true, dirtyAssetPaths: ['games/x/materials/foo.mat.json'] }));
+    initHmrStaleness(hot, () => ({ sceneDirty: true, dirtyAssetPaths: ['games/x/materials/foo.mat.json'] }), noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
     await settle();
 
@@ -326,7 +335,7 @@ describe('the countdown names the ACTUAL cause, not a fixed one (#850)', () => {
       file: '/g/a.ts', at: 1, causes: { dirtyAssetPaths: ['games/x/materials/foo.mat.json'] },
     }));
 
-    initHmrStaleness(fakeHot(), () => false);
+    initHmrStaleness(fakeHot(), () => false, noPrefab);
     await settle();
 
     expect(editorEmitMock).toHaveBeenCalledWith('!hmr.discarded-unsaved', {
@@ -340,7 +349,7 @@ describe('the countdown names the ACTUAL cause, not a fixed one (#850)', () => {
     // hmrStaleness.ts. This probe reports a key CAUSE_LABELS has no entry for — proving the
     // enumeration is real, not a longer hand-written list that happens to cover five keys today.
     const hot = fakeHot();
-    initHmrStaleness(hot, () => ({ aBrandNewFutureCause: true }));
+    initHmrStaleness(hot, () => ({ aBrandNewFutureCause: true }), noPrefab);
     hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
     await settle();
 
@@ -398,5 +407,85 @@ describe('layering — this module has no direct editor-state import (#850)', ()
       ],
       dynamicEditor: 1,
     });
+  });
+});
+
+// In prefab edit the live world IS the prefab, so `sceneDirty` is the prefab's edits and the banner names them as the
+// Save/Discard/Cancel gate does (`prefabEditsPhrase`) — "unsaved scene changes" named a scene the open had already saved.
+// Mutations, each run: drop the `sceneDirty` branch in `describeCause` — every test here but the null-phrase one goes
+// red; label every boolean cause with the phrase (`if (liveWorld)`) — the unseen-boolean test goes red; write
+// `liveWorld: null` into the discard record, reuse the countdown's phrase instead of re-reading it at discard, have the
+// next page describe with `null` instead of the record's phrase, or leave `liveWorld` out of the journal event — the
+// record test goes red; make the default probe ignore `editingPrefabName` — the default-wiring test goes red. Nothing
+// else goes red on any of them.
+describe('in prefab edit, the live world is named as the prefab', () => {
+  const PREFAB = 'unsaved changes to prefab "Crate"';
+
+  it('the countdown banner names the prefab, and only in place of the live world', async () => {
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => ({ sceneDirty: true, dirtyAssetPaths: ['games/x/materials/foo.mat.json'] }), () => PREFAB);
+    hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
+    await settle();
+
+    expect(bannerText()).toContain(`${PREFAB} and 1 unsaved asset edit will be LOST`);
+    expect(bannerText()).not.toContain('scene');
+  });
+
+  it('a scene keeps the table label — a null phrase changes nothing', async () => {
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => ({ sceneDirty: true }), () => null);
+    hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
+    await settle();
+
+    expect(bannerText()).toContain('unsaved scene changes will be LOST');
+  });
+
+  it('the discard record carries the phrase, re-read at discard, and the next page reports it', async () => {
+    let phrase: string | null = PREFAB;
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => ({ sceneDirty: true }), () => phrase);
+    hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
+    await settle();
+    phrase = 'unsaved changes to prefab "Barrel"'; // the human switched prefab during the countdown
+
+    clickButton('reload-now', 'Reload now');
+    await settle();
+    const rec = JSON.parse(sessionStorage.getItem(DISCARDED_KEY) ?? 'null');
+    expect(rec?.liveWorld).toBe('unsaved changes to prefab "Barrel"');
+
+    // The next page: its own probe says "scene" (it booted into one), so only the record can name the loss.
+    document.getElementById(BANNER_ID)?.remove();
+    vi.resetModules();
+    ({ initHmrStaleness } = await import('../../app/debug/hmrStaleness'));
+    await import('@modoki/engine/editor'); // pre-warm `journal()`'s import, as the journal test does
+    initHmrStaleness(fakeHot(), () => false, noPrefab);
+    await settle();
+    expect(bannerText()).toContain('Unsaved changes to prefab "Barrel" discarded');
+    // …and the journal, which is what an agent reads, says so too — `causes` alone says `sceneDirty`.
+    expect(editorEmitMock).toHaveBeenCalledWith('!hmr.discarded-unsaved', expect.objectContaining({
+      liveWorld: 'unsaved changes to prefab "Barrel"',
+    }));
+  });
+
+  it('the phrase names ONLY the live world — a boolean cause the table has never seen keeps its own name', async () => {
+    // Every cause but `sceneDirty` is a list today, so this is the input that separates "is it `sceneDirty`?" from
+    // "is there a phrase?": a sixth, boolean cause (#850's contract: it needs no edit here) must not become the prefab.
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => ({ sceneDirty: true, aBrandNewFlag: true }), () => PREFAB);
+    hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
+    await settle();
+
+    expect(bannerText()).toContain(`${PREFAB} and a brand new flag will be LOST`);
+  });
+
+  it('the default probe reads the editor: its prefab-edit name, in the gate\'s own wording', async () => {
+    await import('@modoki/engine/editor'); // pre-warm, as the journal test does — the probe imports it dynamically
+    editingPrefabNameMock.mockReturnValue('Crate');
+    const hot = fakeHot();
+    initHmrStaleness(hot, () => ({ sceneDirty: true }));
+    hot.emit('modoki:game-code-changed', { file: '/g/a.ts' });
+    await settle();
+
+    expect(bannerText()).toContain(`${PREFAB} will be LOST`);
   });
 });
