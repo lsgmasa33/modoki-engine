@@ -71,7 +71,9 @@ describe('applyToPrefabSelective', () => {
   it('writes only the selected fields to the new prefab; unselected stay at base', async () => {
     // Seed the prefab cache by instantiating it (getPrefabSource caches)
     const prefab = makePrefab();
-    const source = 'pkg/selective-test.prefab.json';
+    // A guid, as every instance's source is (I22, #1828): the manifest maps it to the file the Apply writes.
+    const source = (await import('@modoki/engine/runtime')).newGuid();
+    (await import('@modoki/engine/runtime')).registerAsset(source, 'pkg/selective-test.prefab.json', 'prefab');
 
     // Pre-populate cache by calling getPrefabSource — easiest via the public
     // applyToPrefabSelective path can't read cache before it's primed, so use
@@ -81,7 +83,7 @@ describe('applyToPrefabSelective', () => {
 
     // Instantiate and wire up the source
     const rootId = instantiatePrefab(prefab);
-    editorMod.setPrefabSource(rootId, source);
+    editorMod.setPrefabSource(rootId, { id: source });
 
     // Edit child fields: Transform.x AND Renderable3D.material
     const childId = findChildEcsId(rootId, 2);
@@ -147,10 +149,13 @@ describe('applyToPrefabSelective', () => {
         return { ok: true, json: async () => at(version) } as unknown as Response;
       });
       const editorMod = await import('@modoki/engine/editor');
-      const source = `pkg/too-new-${version}.prefab.json`;
+      // A guid, as every instance's source is (I22, #1828): the manifest maps it to the file the Apply writes.
+      const runtime = await import('@modoki/engine/runtime');
+      const source = runtime.newGuid();
+      runtime.registerAsset(source, `pkg/too-new-${version}.prefab.json`, 'prefab');
       await editorMod.getPrefabSource(source);
       const rootId = instantiatePrefab(at(version));
-      editorMod.setPrefabSource(rootId, source);
+      editorMod.setPrefabSource(rootId, { id: source });
       return rootId;
     };
     let wrote = false;
@@ -196,16 +201,18 @@ describe('applyToPrefabSelective', () => {
     const editorMod = await import('@modoki/engine/editor');
     // Its OWN source path: this suite shares one world across tests, so instances an earlier test
     // left behind would be counted by the refresh below and make the assertion say nothing.
-    const source = 'pkg/transient-fanout.prefab.json';
+    // A guid, as every instance's source is (I22, #1828): the manifest maps it to the file the Apply writes.
+    const source = (await import('@modoki/engine/runtime')).newGuid();
+    (await import('@modoki/engine/runtime')).registerAsset(source, 'pkg/transient-fanout.prefab.json', 'prefab');
     await editorMod.getPrefabSource(source);
 
     // The authored instance the user edits and applies from.
     const authoredRoot = instantiatePrefab(makePrefab());
-    editorMod.setPrefabSource(authoredRoot, source);
+    editorMod.setPrefabSource(authoredRoot, { id: source });
 
     // A second instance of the SAME source, tagged the way every runtime spawner tags one.
     const runtimeRoot = instantiatePrefab(makePrefab());
-    editorMod.setPrefabSource(runtimeRoot, source);
+    editorMod.setPrefabSource(runtimeRoot, { id: source });
     findEntity(runtimeRoot)!.add(Transient);
     // The fixture is only a fixture if the tag actually reads back through the shared predicate —
     // a mistagged or unregistered entity would make every assertion below pass for no reason.
@@ -247,11 +254,13 @@ describe('applyToPrefabSelective', () => {
 
   it('does nothing when the selected set is empty', async () => {
     const prefab = makePrefab();
-    const source = 'pkg/selective-empty.prefab.json';
+    // A guid, as every instance's source is (I22, #1828): the manifest maps it to the file the Apply writes.
+    const source = (await import('@modoki/engine/runtime')).newGuid();
+    (await import('@modoki/engine/runtime')).registerAsset(source, 'pkg/selective-empty.prefab.json', 'prefab');
     const editorMod = await import('@modoki/engine/editor');
     await editorMod.getPrefabSource(source);
     const rootId = instantiatePrefab(prefab);
-    editorMod.setPrefabSource(rootId, source);
+    editorMod.setPrefabSource(rootId, { id: source });
 
     let writeCount = 0;
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
@@ -303,7 +312,7 @@ describe('prefab source GUID resolution', () => {
 
     await getPrefabSource(guid); // prime cache (keyed by guid)
     const rootId = instantiatePrefab(makePrefab());
-    setPrefabSource(rootId, guid);
+    setPrefabSource(rootId, { id: guid });
 
     const childId = findChildEcsId(rootId, 2);
     const tfMeta = getTraitByName('Transform')!;

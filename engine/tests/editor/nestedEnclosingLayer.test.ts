@@ -351,7 +351,7 @@ describe('#1659: every value Apply writes into a template goes through ONE write
     install(pDoc(), qDoc());
     await load(scene(P, [ROOT1, ROOT2]));
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, rootOf(ROOT1))!;
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const ea = meta('EntityAttributes');
     const qa = getAllEntities().find((e) => e.name === 'QA' && e.parentId === qRoot)!.id;
     for (const [id, guid] of [[qRoot, 'dddddddd-0000-4000-8000-000000001659'], [qa, 'dddddddd-0000-4000-8000-000000001660']] as const) {
@@ -508,7 +508,7 @@ describe('#1693 P5–P6 close-out review: the cases the second review drove', ()
     install(pDoc(), qDoc);
     await load(scene(P, [ROOT1, ROOT2]));
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, rootOf(ROOT1))!;
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const ea = meta('EntityAttributes');
     for (const e of getCurrentWorld().entities) if (e.id() === qRoot) e.set(ea.trait, { ...(e.get(ea.trait) as object), guid: 'dddddddd-0000-4000-8000-000000001761' });
     addTraitToEntitiesWithUndo([qRoot], meta('UIFocusable'), { navDown: guidOf(inInstance(ROOT1, 'A')) });

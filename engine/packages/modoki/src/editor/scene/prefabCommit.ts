@@ -21,8 +21,9 @@
  *     write (`pendingAdoptions`). */
 
 import {
-  preloadNestedPrefabs, rebaseStaleInstances, seatEditorPrefabCache, type PrefabFile,
+  preloadNestedPrefabs, rebaseStaleInstances, seatEditorPrefabCache, getCachedPrefabSync, type PrefabFile,
 } from './prefab';
+import { expandedPrefabRefs, prefabNests } from '../../runtime/loaders/prefabNesting';
 import { postWriteFile, jsonFileBody, readBackendAnswer } from '../backend/editorBackend';
 import { deleteAssetFiles } from '../panels/assetOps';
 import { sha256OfWritten, sha256OfBytes } from '../utils/contentHash';
@@ -172,6 +173,20 @@ export async function commitPrefabWrites(
       const guid = w.doc?.id ?? (isGuid(w.source) ? w.source : getGuidForPath(asked) ?? idIn(w.expected));
       return { ...w, asked, guid };
     });
+    // I16 at the ONE door every editor prefab write passes (#1817): no document is written that contains itself, whoever
+    // built it — a prefab-edit save, Create Prefab's Replace, Apply's plan (which checks only the nodes it promotes), the
+    // agent's create. Read through this batch's own documents first, so a cycle across two files of one Apply is seen.
+    // A verbatim restore (`bytes`: an undo putting back what was on disk) is exempt — it writes no new shape.
+    const batch = new Map(plan.filter((w) => w.doc && w.guid).map((w) => [w.guid!, w.doc!]));
+    const read = (g: string) => batch.get(g) ?? getCachedPrefabSync(g);
+    for (const w of plan) {
+      if (!w.doc || w.bytes !== undefined || !w.guid) continue;
+      const cyclic = expandedPrefabRefs(w.doc.entities).find((ref) => prefabNests(w.guid!, ref, read));
+      if (cyclic) {
+        console.error(`[Prefab] refusing to save — nesting "${cyclic}" inside "${w.guid}" creates a cycle`);
+        return { ok: false, paths: plan.map((x) => x.asked), failed: w.asked, error: `"${w.doc.name ?? w.asked}" would contain itself (a prefab cannot contain itself), so nothing was written` };
+      }
+    }
     // 1. Every precondition before any write (N > 1).
     const exact = new Map<number, { ifMatch?: string; createOnly?: boolean; prior: string | null }>();
     if (plan.length > 1 && !opts.overwrite) {

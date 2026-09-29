@@ -227,7 +227,7 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     install(template(), outer(true));
     await load(scene(O));
     const refRoot = instantiatePrefab(prefabs.get(P) as PrefabFile, one('Slot').id);
-    setPrefabSource(refRoot, P);
+    setPrefabSource(refRoot, { id: P });
     writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
 
     const entry = await entryOf();
@@ -255,9 +255,9 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     install(template(), outer(true), q);
     await load(scene(O));
     const x = instantiatePrefab(q as unknown as PrefabFile, one('Slot').id);
-    setPrefabSource(x, Q);
+    setPrefabSource(x, { id: Q });
     const y = instantiatePrefab(prefabs.get(P) as PrefabFile, one('QSlot').id);
-    setPrefabSource(y, P);
+    setPrefabSource(y, { id: P });
     // A fresh editor spawn carries RUNTIME guids, which no row may state (#1210); one save and reload
     // gives every member the durable guid a session that has ever saved has.
     await load(await serializeScene());
@@ -672,7 +672,7 @@ describe('a live frame built from another version of its template (#1483)', () =
     writeTraitFieldWithUndo(under(orId(), 'A').id, meta('Transform'), 'x', 5);
     install(renumbered());
     const plainRoot = instantiatePrefab(getCachedPrefabSync(P)!, one('Holder').id);
-    setPrefabSource(plainRoot, P);
+    setPrefabSource(plainRoot, { id: P });
     expect(framesBuiltFromOtherRows(orId())).toEqual([P]);       // the premise: only the nested frame is stale
     expect(framesBuiltFromOtherRows(plainRoot)).toEqual([]);
     writeTraitFieldWithUndo(under(plainRoot, 'B').id, meta('Transform'), 'x', 7);
@@ -694,7 +694,7 @@ describe('a live frame built from another version of its template (#1483)', () =
     writeTraitFieldWithUndo(nestedA()[0]!.id, meta('Transform'), 'x', 5);
     install(renumbered());
     const r2 = instantiatePrefab(getCachedPrefabSync(O)!, one('Holder').id);
-    setPrefabSource(r2, O);
+    setPrefabSource(r2, { id: O });
     expect(framesBuiltFromOtherRows(r2)).toEqual([]);
     const slot2 = getAllEntities().find((e) => e.name === 'Slot' && e.parentId === r2)!.id;
     writeTraitFieldWithUndo(slot2, meta('Transform'), 'x', 3);

@@ -132,7 +132,7 @@ describe('scene serialization round-trip', () => {
 });
 
 describe('prefab instance round-trip', () => {
-  const SOURCE = 'test://round-trip.prefab.json';
+  const SOURCE = 'aaaaaaaa-0000-4000-8000-00000000a001'; // a guid, as every instance's source is (I22)
 
   function makePrefab(): PrefabFile {
     return {
@@ -170,7 +170,7 @@ describe('prefab instance round-trip', () => {
 
   it('serializes a prefab instance as a source ref plus only the changed fields', async () => {
     const rootId = instantiatePrefab(makePrefab());
-    setPrefabSource(rootId, SOURCE);
+    setPrefabSource(rootId, { id: SOURCE });
 
     // Override the child's x (prefab base is 5) — mark it as the editor does.
     const childId = childOfRoot(rootId);
@@ -196,7 +196,7 @@ describe('prefab instance round-trip', () => {
       getTraitByName('EntityAttributes')!.trait({ name: 'Holder', layer: '3d' }),
     );
     const rootId = instantiatePrefab(makePrefab());
-    setPrefabSource(rootId, SOURCE);
+    setPrefabSource(rootId, { id: SOURCE });
     // Drag the instance root under the plain Holder.
     writeTraitField(rootId, getTraitByName('EntityAttributes')!, 'parentId', holder.id());
 
@@ -220,7 +220,7 @@ describe('prefab instance round-trip', () => {
 
   it('reload re-instantiates the prefab and re-applies overrides', async () => {
     const rootId = instantiatePrefab(makePrefab());
-    setPrefabSource(rootId, SOURCE);
+    setPrefabSource(rootId, { id: SOURCE });
     const childId = childOfRoot(rootId);
     writeTraitField(childId, getTraitByName('Transform')!, 'x', 99);
     markOverride(findEntityById(childId)!, 'Transform', 'x');
@@ -250,7 +250,7 @@ describe('prefab instance round-trip', () => {
   it('an added Animator keeps its clips bank + active clip across TWO save→load hops', async () => {
     const BANK = '[{"name":"skin","clip":"f1cc3b85-2c23-457b-938a-3470ada21b36"}]';
     const rootId = instantiatePrefab(makePrefab());
-    setPrefabSource(rootId, SOURCE);
+    setPrefabSource(rootId, { id: SOURCE });
 
     // The prefab defines no Animator at localId 1 → this is an added-trait override.
     findEntity(rootId)!.add(getTraitByName('Animator')!.trait({ clips: BANK, clip: 'skin' }));
@@ -268,7 +268,7 @@ describe('prefab instance round-trip', () => {
     expect(live.clip).toBe('skin');
 
     // …and it still serializes, so the value is stable rather than decaying per save.
-    setPrefabSource(reloaded, SOURCE);
+    setPrefabSource(reloaded, { id: SOURCE });
     const scene2 = await serializeScene();
     expect(scene2.entities.find(e => e.name === 'PRoot')!.overrides?.[1]?.Animator)
       .toMatchObject({ clips: BANK, clip: 'skin' });
@@ -290,7 +290,7 @@ describe('prefab instance round-trip', () => {
  *  naming a real guid disappeared from the file on a load→save, and the instance
  *  came up with an EMPTY bank at runtime. See docs/prefabs.md. */
 describe('prefab override over a schema field with no Inspector row (integration)', () => {
-  const SOURCE = 'test://animator-override.prefab.json';
+  const SOURCE = 'aaaaaaaa-0000-4000-8000-00000000a002'; // a guid, as every instance's source is (I22)
   const BANK = JSON.stringify([{ name: 'skin', clip: 'f1cc3b85-2c23-457b-938a-3470ada21b36' }]);
 
   /** The prefab DEFINES an Animator with an empty bank, so the instance's populated
@@ -324,7 +324,7 @@ describe('prefab override over a schema field with no Inspector row (integration
 
   it('CAPTURES a clips/clip override into the scene file', async () => {
     const rootId = instantiatePrefab(makePrefab());
-    setPrefabSource(rootId, SOURCE);
+    setPrefabSource(rootId, { id: SOURCE });
     const animator = getTraitByName('Animator')!;
     writeTraitField(rootId, animator, 'clips', BANK);
     writeTraitField(rootId, animator, 'clip', 'skin');
@@ -339,7 +339,7 @@ describe('prefab override over a schema field with no Inspector row (integration
 
   it('RE-APPLIES it on load — the instance comes up with the populated bank', async () => {
     const rootId = instantiatePrefab(makePrefab());
-    setPrefabSource(rootId, SOURCE);
+    setPrefabSource(rootId, { id: SOURCE });
     const animator = getTraitByName('Animator')!;
     writeTraitField(rootId, animator, 'clips', BANK);
     writeTraitField(rootId, animator, 'clip', 'skin');
@@ -358,7 +358,7 @@ describe('prefab override over a schema field with no Inspector row (integration
 
   it('SURVIVES a second save — the load→save that deleted it from skinned-test.json', async () => {
     const rootId = instantiatePrefab(makePrefab());
-    setPrefabSource(rootId, SOURCE);
+    setPrefabSource(rootId, { id: SOURCE });
     const animator = getTraitByName('Animator')!;
     writeTraitField(rootId, animator, 'clips', BANK);
     writeTraitField(rootId, animator, 'clip', 'skin');
@@ -377,7 +377,7 @@ describe('prefab override over a schema field with no Inspector row (integration
 
   it('never writes a runtimeOnly read-back field into the file', async () => {
     const rootId = instantiatePrefab(makePrefab());
-    setPrefabSource(rootId, SOURCE);
+    setPrefabSource(rootId, { id: SOURCE });
     const animator = getTraitByName('Animator')!;
     // What a frame of playback leaves behind, plus a stray mark to prove the
     // exclusion is at the READ and no later path can resurrect it.

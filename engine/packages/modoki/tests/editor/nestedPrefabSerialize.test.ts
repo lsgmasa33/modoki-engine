@@ -114,7 +114,7 @@ describe('serializePrefab — nested prefabs', () => {
     setPrefabCache(OUTER, outerPrefab as any);
 
     const outerRoot = instantiatePrefab(outerPrefab as any);
-    setPrefabSource(outerRoot, OUTER);
+    setPrefabSource(outerRoot, { id: OUTER });
 
     const out = serializePrefab(outerRoot, OUTER)!;
     expect(out).not.toBeNull();
@@ -148,14 +148,14 @@ describe('serializePrefab — nested prefabs', () => {
     setPrefabCache(OUTER, outerPrefab as any);
 
     const root1 = instantiatePrefab(outerPrefab as any);
-    setPrefabSource(root1, OUTER);
+    setPrefabSource(root1, { id: OUTER });
     const out1 = serializePrefab(root1, OUTER)!;
 
     // Re-seed cache with the serialized outer + re-instantiate into a fresh world.
     testWorld = createWorld(); index.clear();
     setPrefabCache(OUTER, out1 as any);
     const root2 = instantiatePrefab(out1 as any);
-    setPrefabSource(root2, OUTER);
+    setPrefabSource(root2, { id: OUTER });
     const out2 = serializePrefab(root2, OUTER)!;
 
     expect(out2.entities).toHaveLength(out1.entities.length);

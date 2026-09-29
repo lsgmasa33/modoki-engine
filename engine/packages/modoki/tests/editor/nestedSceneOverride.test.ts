@@ -102,7 +102,7 @@ describe('captureNestedSceneDelta', () => {
 
     setPrefabCache(FLAME, flamePrefab as any);
     const root = instantiatePrefab(flamePrefab as any);
-    setPrefabSource(root, FLAME);
+    setPrefabSource(root, { id: FLAME });
 
     // Parent prefab's row override on this flame: position x=4.1 (marks it).
     applyOverridesByRootInstance(root, { 1: { Transform: { x: 4.1 } } });
@@ -125,7 +125,7 @@ describe('captureNestedSceneDelta', () => {
 
     setPrefabCache(FLAME, flamePrefab as any);
     const root = instantiatePrefab(flamePrefab as any);
-    setPrefabSource(root, FLAME);
+    setPrefabSource(root, { id: FLAME });
     writeTraitFieldImpl(root, TRAITS[1], 'idleScale', 0.5);
     markOverride(index.get(root), 'EngineFlame', 'idleScale');
 

@@ -31,6 +31,9 @@ import type { EditorJournalType } from '../editorJournal';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, journalRefOf, type EntityRef } from './entityRef';
 import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
+import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
+import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
+import { getCachedPrefabSync } from '../scene/prefab';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
 export { markOverrideIfInstance };
@@ -418,6 +421,28 @@ export interface EntitySnapshot {
   kept?: KeptState;
 }
 
+/** Is this a copy of the prefab-edit world's scaffolding (a `SCAFFOLD_PREFIX` entity)? */
+function isScaffoldSnapshot(snapshot: EntitySnapshot): boolean {
+  const ea = snapshot.traits.find((t) => t.meta.name === 'EntityAttributes')?.data;
+  const name = ea && ea !== true ? ea.name : undefined;
+  return typeof name === 'string' && name.startsWith(SCAFFOLD_PREFIX);
+}
+
+/** Every prefab a snapshot's subtree is an instance of (its `PrefabInstance.source`s, at any depth): what a paste or a
+ *  duplicate of it would expand, for the prefab-edit self-nesting refusal. */
+function snapshotPrefabs(snapshot: EntitySnapshot): string[] {
+  const out: string[] = [];
+  const walk = (s: EntitySnapshot) => {
+    for (const { meta, data } of s.traits) {
+      const source = meta.name === 'PrefabInstance' && data !== true ? data.source : undefined;
+      if (typeof source === 'string' && source) out.push(source);
+    }
+    s.children.forEach(walk);
+  };
+  walk(snapshot);
+  return out;
+}
+
 export function snapshotEntity(entityId: number): EntitySnapshot | null {
   const entity = findEntity(entityId);
   if (!entity) return null;
@@ -609,6 +634,8 @@ export function createEntityWithUndo(
   traitSpecs: TraitSpec[],
   selectEntity: (id: number | null) => void,
 ): number | null {
+  // Prefab edit keeps everything under the root (#1836): a create at the top level would be dropped by the save.
+  assertPrefabEditAllows({ kind: 'add', parentId });
   const allTraitsList = getAllTraits();
   // Auto-assign sortOrder to (max sibling sortOrder + 1) so new entities go to the end
   // and have unique values — required for drag-to-reorder to compute distinct positions.
@@ -733,7 +760,9 @@ export function duplicateEntity(
   const attrMeta = getAllTraits().find(m => m.name === 'EntityAttributes');
   const attrData = attrMeta ? readTraitData(entityId, attrMeta) : null;
   const parentId = (attrData?.parentId as number) || 0;
-
+  // Prefab edit (#1817, #1836): a duplicate of the root lands beside it, outside what the save writes, and a copy
+  // holding an instance of the edited prefab would nest it in itself. Asked before anything spawns.
+  assertPrefabEditAllows({ kind: 'add', parentId, prefabs: snapshotPrefabs(captured), read: getCachedPrefabSync });
 
   // copySnapshot already minted a fresh root guid; use it as the
   // stable handle so undo/redo survive a world rebuild. Parent resolved by ref.
@@ -802,6 +831,9 @@ export function pasteEntityCopy(
   parentId: number,
   selectEntity: (id: number | null) => void,
 ): number {
+  // Prefab edit (#1817, #1836): a paste outside the root is lost on save, and one holding an instance of the edited
+  // prefab nests it in itself — the clipboard outlives the world, so it can carry one copied from a scene.
+  assertPrefabEditAllows({ kind: 'add', parentId, prefabs: snapshotPrefabs(snapshot), read: getCachedPrefabSync, scaffold: isScaffoldSnapshot(snapshot) });
   const copy = copySnapshot(snapshot);
   const guid = rootGuidOf(copy);
   const parentRef = parentId ? entityRef(parentId) : null;
@@ -837,6 +869,8 @@ export function deleteEntitiesWithUndo(
   setSelection?: (ids: number[]) => void,
 ): void {
   if (entityIds.length === 0) return;
+  // The prefab-edit root, or the 2D stage above it: every later save would fail "prefab root not found" (#1836).
+  assertPrefabEditAllows({ kind: 'delete', ids: entityIds });
 
   // Keep only roots — an id whose parent chain hits another selected id is a
   // descendant and is captured by that ancestor's snapshot.
@@ -1126,6 +1160,8 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // Self-parent + cycle now live in runtime/core/ecs/hierarchy.ts, shared with the device's
   // set-traits guard — the same rule in two places is what #166 P7 found diverging (§9).
   if (reparentRefusal(entityId, newParentId)) return false;
+  // The prefab-edit root stays where it is, and nothing the save writes leaves it (#1836). `planReparent` asks the same.
+  if (prefabEditRefusal({ kind: 'reparent', id: entityId, parentId: newParentId })) return false;
 
   const allTraits = getAllTraits();
   const transformMeta = allTraits.find(m => m.name === 'Transform');
@@ -1651,13 +1687,17 @@ export function demoteEntityToScene(entityId: number, opts?: Omit<SceneMoveOptio
  *  A stored instance root dropped inside a base's instance is NOT refused: it becomes that instance's
  *  user-added nested instance, as it does in a same-scene reparent (#1436). */
 export type ReparentPlan =
-  | { kind: 'refused'; reason: ReparentRefusal | SceneMoveRefusal }
+  | { kind: 'refused'; reason: ReparentRefusal | SceneMoveRefusal | PrefabEditRefusalReason }
   | { kind: 'same-scene' }
   | { kind: 'scene-move'; from: string; to: string };
 
 export function planReparent(entityId: number, newParentId: number): ReparentPlan {
   const refusal = reparentRefusal(entityId, newParentId);
   if (refusal) return { kind: 'refused', reason: refusal };
+  // In prefab edit, the root does not move and nothing leaves it (#1836) — before the scene questions: that world is
+  // one synthetic scene.
+  const editRefusal = prefabEditRefusal({ kind: 'reparent', id: entityId, parentId: newParentId });
+  if (editRefusal) return { kind: 'refused', reason: editRefusal.reason };
   // Un-parenting keeps the entity's own scene: a root belongs to whichever file stamps it.
   if (newParentId === 0) return { kind: 'same-scene' };
   const from = rawSourceScene(entityId);

@@ -82,10 +82,10 @@ answer the same question for themselves. Each place in that column is a place th
 | I13 | Only an authored world (stopped, with nothing posed) is captured or written. | `whyWorldNotAuthored` (`editor/scene/authoredWorld.ts`). |
 | I14 | An entity is saved into exactly one scene file, the one its `sourceScene` names, and a rebuild keeps that. | `serializeScene`'s scene filter, `planReparent`, and `rebuildInstance`, which carries the stamp. |
 | I15 | A template's `version` is the writer's constant, and a build never overwrites a file written in a newer format. | `PREFAB_FORMAT_VERSION`, `engine/plugins/prefabWriteGuard.ts`, `classifyExistingDocumentId`, which reads a prefab before answering `known` even when the manifest indexes it (#1678, `docs/format-versioning.md`). |
-| I16 | A template never contains itself. | `wouldCreateCycle` / `expandedPrefabRefs` when writing; the loader's ancestor stack when loading. |
+| I16 | A template never contains itself. | The prefab-edit refusal at every gesture (`prefabEditRefusal.ts`, § Prefab edit mode); `wouldCreateCycle` / `expandedPrefabRefs` (member rows included) over the WHOLE document, when writing: in `serializePrefab`, and again at `commitPrefabWrites`, the one door every editor prefab write passes (Apply's plan included), reading the batch's own documents first; the expansion's ancestor stack, carried through reference nodes, when loading (#1817). A file that already contains itself loads with its self-referencing node refused and named (`[loadSceneFile] cycle: prefab "…" contains itself …`), not a stack overflow (both twins tested). The write check refuses to save such a document, so its repair is deleting the self-reference in prefab edit and saving. |
 | I17 | An editor write that changes an instance member's field leaves its override mark in the state the save needs, and its undo puts the mark back. | `editor/undo/overrideMarkWrites.ts`. See § "Editor writes and the override mark". |
 | I18 | A reference the load cannot expand is written back as the file held it, until an expansion replaces it. A reader never drops what it could not interpret. | The `UnresolvedPrefabRef` marker on the placeholder (`runtime/core/unresolvedPrefabRef.ts`) and its writers (`runtime/loaders/unresolvedPrefabRefs.ts`); a live frame whose document stopped resolving, its frame record (`captureDoc`); a template row a frame could not expand, the frame record's `unexpanded` list (#1812), so the row is not saved as removed once the cache holds its child; a legacy path-keyed channel no live frame reaches, R2's kept store (`keptOrphanRows.ts`). See § "A missing prefab keeps its record". |
-| I22 | A prefab reference is its DOCUMENT's guid. A path becomes a guid once, at the entry that received it (a drag payload, an agent's `{path}`, the Assets panel), spelled as the disk spells it; a reader that holds the document or a guid never re-derives identity from a path through the renderer's manifest, and nothing writes a path into `PrefabInstance.source`. | `instanceSourceRef` (`prefab.ts`, document first) for the Create Prefab tag and untag (#1807). ⚠️ **Partly missing** (study below): `setPrefabSource` resolves `getGuidForPath(path) ?? path` with no document, though all four of its callers hold one, and writes the raw path on any manifest miss. The route (`rebuildManifestInline` before `applyMovesInRenderer`) keeps the renderer's manifest current across a move. |
+| I22 | A prefab reference is its DOCUMENT's guid. A path becomes a guid once, at the entry that received it (a drag payload, an agent's `{path}`, the Assets panel), spelled as the disk spells it; a reader that holds the document or a guid never re-derives identity from a path through the renderer's manifest, and nothing writes a path into `PrefabInstance.source`. | `setPrefabSource(root, doc)` (`prefab.ts`) for every expansion's tag: the document's guid, or the guid ref a nested expansion reached an id-less document by, and never a path; a document with no guid is refused loudly (#1828). `instanceSourceRef` (document first) for the Create Prefab tag and untag (#1807). The route (`rebuildManifestInline` before `applyMovesInRenderer`) keeps the renderer's manifest current across a move. Tests: `prefabSourceWriter.test.ts`. |
 
 #### Undo across worlds
 
@@ -435,7 +435,9 @@ reference written or resolved as a PATH through the renderer's asset manifest, w
 whether #1801 shares the mechanism.
 
 **The invariants and their owners.**
-- **M1 — `PrefabInstance.source` is the document's guid, never a path** (I22). The owner is `instanceSourceRef`, which reads
+- **M1 — `PrefabInstance.source` is the document's guid, never a path** (I22). ✅ **Built (#1828, owner ruling "Build it"):**
+  `setPrefabSource` now takes the document, with no raw-path fallback. The rest of this bullet records the study's finding.
+  The owner is `instanceSourceRef`, which reads
   the document's id first. It serves the Create Prefab tag and untag. The other writer, `setPrefabSource`, takes no
   document and writes `getGuidForPath(path) ?? path`: a RAW PATH whenever the lookup misses, for any reason. Its four
   callers all hold the document: `instantiatePrefabInstance` (the Hierarchy drop, the Assets and Inspector Instantiate
@@ -474,6 +476,10 @@ whether #1801 shares the mechanism.
 - M2 needs no new owner. Its one real window is a failed inline rebuild, and the reader that meets it there (Apply's
   undo) refuses rather than corrupts.
 - M3's stale redo path is covered by M1 once the writer takes the document the redo re-read.
+- ✅ **Fixed (#1835):** the fuzzer backend's `rebuildManifest` now pushes the renderer's manifest before the route's repair,
+  and #1828's Apply-undo route stopped reproducing. The push is additive where the host's prunes: pruning surfaces undo
+  walks across a trashed prefab that the delete-undo's `/api/write-file` restore (no inline rebuild) leaves unresolved, which is
+  #1844. The finding as the study wrote it:
 - **Harness fidelity gap, not a product defect:** the fuzzer backend's `rebuildManifest` returns the manifest without
   pushing it before `applyMovesInRenderer` (#1835). Until that is fixed, the fuzzer's manifest-lag findings are harness-shaped.
 
@@ -483,8 +489,8 @@ whether #1801 shares the mechanism.
 - **#1801:** close it as not a defect.
 - **The comment** at `prefab.ts`'s `setPrefabSource` said a raw path makes `getPrefabSource` hit `resolveRef`'s hard
   rejection, which was stale: `fetchPrefabSource` sends a path to `assetUrl`. It was corrected ahead of the M1 fix, when
-  #1801 closed. It now says what a stored path runs into: the save writes it verbatim, and the next load's
-  `acquirePrefab` rejects it.
+  #1801 closed, to say what a stored path runs into (the save writes it verbatim, and the next load's `acquirePrefab`
+  rejects it). The M1 fix (#1828) then retired it: `setPrefabSource` stores no path at all, and its comment says so.
 
 ### The randomized round-trip test (#1789)
 
@@ -1127,7 +1133,7 @@ that was also losing `Animator.clips`.
 - **`instantiatePrefab(prefab, parentId?)`** — editor-side spawn into the current
   world: spawns entities, remaps `parentId`s, adds the `PrefabInstance` trait,
   sets `rootInstanceId`, returns the root ECS id. `setPrefabSource(rootEcsId,
-  source)` then stamps the `source` path on the instance. It is **synchronous**, so
+  doc)` then stamps the document's guid on the instance (I22). It is **synchronous**, so
   any nested (`v2`) child must already be cached — a nested row whose child file is
   not in the cache is silently skipped.
 - **`instantiatePrefabAsync(prefab, parentId?)`** — the preload-safe wrapper:
@@ -2173,6 +2179,30 @@ shows there in normal mode too.
   on you, and the agent op refuses in every non-stopped mode.
   Parked ASSET docs still flush in that state, because a `.particle.json` the panel owns is
   authored data in every run mode — see [mcp-persistence.md](./mcp-persistence.md) § 5.
+- **The edit world has exactly ONE top-level entity, the root, and nothing makes it unsavable (#1817, #1836).** The
+  save writes the root's subtree and nothing else, so one predicate (`editor/scene/prefabEditRefusal.ts`, asked inside
+  each forward choke point, never in an undo or redo closure, as Unity's Prefab Mode refuses the same) refuses:
+  - **the root deleted or moved.** A delete of the root, or of the 2D `__PrefabEditStage` scaffold above it, and any
+    parent change of the root. Every later save used to fail "prefab root not found";
+  - **an authored entity outside the root.** A create, paste, duplicate (the root's own too, which lands beside it) or
+    prefab placement at the top level or under a scaffold, and a move of one of the root's entities out of it. The save
+    silently dropped it. So the Assets and Inspector **Instantiate** buttons, which place at the top level, refuse in
+    prefab edit: drag the prefab onto the root instead. The agent's `create-entity` / `addEntity` with no parent refuse
+    the same way, with nothing defaulted to the root;
+  - **the edited prefab nested in itself.** A drop, paste or duplicate holding an instance of it, or of any prefab that
+    contains it, anywhere in the world (the save refuses such a file too, § Nested prefabs);
+  - **the scaffolding in the root.** The `__PrefabEdit*` lights, environment and 2D stage (`SCAFFOLD_PREFIX`) may move
+    among themselves but never into the root, moved or pasted: the save would write an editor-only light into the prefab
+    (close-out review). Recognised by name, so an authored entity stranded outside the root can still be moved in.
+
+  The choke points: `deleteEntitiesWithUndo`, `reparentEntity` / `planReparent` (reasons `root-moved`, `outside-root`,
+  `scaffold`), `createEntityWithUndo`, `duplicateEntity`, `pasteEntityCopy`, `instantiatePrefabInstance`. The panels
+  toast the refusal (`prefabEditRefusalToast.ts`), and every editor agent op answers it as `REFUSED_BY_OP` in the same
+  words. The agent's `delete-entities` and `apply-scene-ops removeEntity` ask it before they name or mint the
+  descendants they report. A placement's redo re-runs `instantiatePrefabInstance`, so it can meet the refusal too; the
+  undo wrapper drops that step as refused, as it drops a stale read. The ground truth is the world (the synthetic scene
+  path and the root's sentinel guid), never the `editingPrefab` flag.
+  Tests: `engine/tests/editor/prefabEditRefusal.test.ts`.
 - **It writes only over the document the edit was opened from, or last saved as (#1692, I10).** A file changed on
   disk under the open edit (a save from elsewhere, an Apply from a carried instance, an outside edit, a `git pull`)
   is not overwritten unasked: Cmd+S (and Exit's Save) asks *"<prefab> changed on disk"*, with **Overwrite** (the one
@@ -2260,8 +2290,8 @@ but leaves the world loaded. Nothing can persist an edit there (`edit-save` need
 - A stale handle therefore cannot edit whatever world happens to be live. That covers a handle left
   over after `edit-exit` (including the failed-reload exit above) and a handle for a different prefab.
 - **Parent new entities UNDER the prefab root.** `edit-save` serializes only the root's subtree
-  (`serializePrefab` → `collectTree(rootId)`), so an `addEntity` with `parentId: 0` succeeds live and
-  is silently absent from the saved file.
+  (`serializePrefab` → `collectTree(rootId)`), so an `addEntity` with `parentId: 0` is refused
+  (#1836). It used to succeed live and be silently absent from the saved file.
 - **Prefer `space: 'local'`.** A 2D template's root is re-parented under the editor-only
   `__PrefabEditStage` scaffold, so a `'world'` transform converts against the stage offset and
   `edit-save` bakes that offset into the template.
@@ -2356,22 +2386,31 @@ the file.**
   its overrides/structure, and parenting its root to the outer member. The outer
   pass sets `rootInstanceId` only on its *own* members so inner ids aren't
   stomped.
-- **Cycle safety** is two-layered: `wouldCreateCycle` rejects a *save* that would
-  nest a prefab inside one of its own descendants (A → B → A) — a prefab-edit save,
-  Create Prefab's Replace, and Apply's promotion of an added node (`addedNestsPrefab`,
-  #1446: it used to write the row, which expanded to nothing, so the user's instance
-  vanished on the refresh). Both read every prefab a file EXPANDS (`expandedPrefabRefs`:
-  rows, and the reference nodes rows add, in `added` or `nestedStructure`), never trait
-  data — a spawner trait's `prefab` field is not nesting. A SCENE may hold such a nesting; only a file may not. A `_stack` of
-  prefab GUIDs in the instantiate path is meant as the backstop. Because a prefab is meant never to contain itself
-  transitively, refreshing every instance of one source is order-independent. Both hold only once #1817 (below) is
-  fixed.
-  ⚠️ **Open, #1817 (a crash, found by #1789's fuzzer): neither layer reaches a reference node folded into a nested
-  row.** Drop the edited prefab under a member of a nested row, or under a layer-added node, in prefab edit, then save.
-  The save guard checks only self-rooted instance roots, `expandedPrefabRefs` does not walk `members`, and both
-  `spawnNestedInstance`s (editor and loader) drop `_stack`. So the file IS written with itself inside, and the save and
-  every later load of a scene holding it overflow the stack. Until that is fixed, "an on-disk cycle cannot hang the
-  loader" is false.
+- **Cycle safety** is three-layered (#1817):
+  1. **The gesture.** In prefab edit, `prefabEditRefusal` refuses a drop, paste or duplicate that would nest the edited
+     prefab, or any prefab that contains it, anywhere in the world (§ Prefab edit mode).
+  2. **The write.** `serializePrefab` checks EVERY prefab the document it is about to write expands (`expandedPrefabRefs`:
+     rows, the reference nodes rows add in `added` or `nestedStructure`, and member rows' `added` and `own`) with
+     `wouldCreateCycle`, and returns null ("refusing to save — nesting … creates a cycle"). That covers a prefab-edit save
+     and Create Prefab's Replace. `commitPrefabWrites` asks the same of every document it is handed, so a writer that
+     builds its document another way (Apply's plan, a skin write, the agent's create) cannot write one either; it reads
+     the batch's own documents first, so two files of one Apply holding each other are refused too. A verbatim restore
+     (an undo's `bytes`) is exempt. Apply's promotion of an added node asks the same (`addedNestsPrefab`, #1446: it used to
+     write the row, which expanded to nothing, so the user's instance vanished on the refresh). Never trait data: a
+     spawner trait's `prefab` field is not nesting. A SCENE may hold such a nesting; only a file may not.
+  3. **The load.** The expansion's ancestor stack reaches reference-node expansion in both twins (`spawnNestedInstance`,
+     editor and loader). A node is refused only when its prefab is being expanded ABOVE it **and that prefab's own
+     document contains itself** (`refuseCyclicReferenceNode`, `prefabRoot.ts`). That is the one shape that recurses
+     forever. Across a reference node the stack carries only such self-containing ancestors (`stackForReferenceNode`), so
+     a loop through two files still meets its start.
+  - ⚠️ **Not "the prefab is on the stack".** The first draft refused that, and 78 tests went red. A scene may nest a
+    prefab inside its own instance, and an outer layer's statement is applied under levels that did not state it, so a
+    plain repeat is legal and ends.
+  - Before #1817 neither layer reached a reference node folded into a nested row: the save guard asked only of
+    self-rooted instance roots, `expandedPrefabRefs` skipped `members`, and both spawners dropped the stack. So a
+    prefab-edit drop under a nested member wrote a file containing itself, and every load of it overflowed the stack.
+  - Because a prefab never contains itself transitively, refreshing every instance of one source is order-independent.
+  - Tests: `engine/tests/editor/prefabEditRefusal.test.ts`.
 - **Apply-to-prefab refresh preserves placement**: `refreshInstances` tears down
   and re-instantiates each instance under its *original* parent, so a nested
   instance (or any instance parented to a non-root entity) is not detached to the
@@ -2436,9 +2475,9 @@ the file.**
   rather than the mechanism** (#1295). Two things make it so, and they are what to keep working if
   this ever regresses:
   - **`instantiatePrefabInstance`** — every path that spawns a prefab from an asset path caches it
-    under the ref the new instance actually CARRIES. `setPrefabSource` resolves a path to a GUID
-    whenever the manifest can, and nothing used to cache under that guid, so a prefab dropped in
-    mid-session was unreachable however warm the scene load had been.
+    under the ref the new instance actually CARRIES. `setPrefabSource` tags it with the document's
+    guid (#1828; it resolved the path through the manifest before), and nothing used to cache under
+    that guid, so a prefab dropped in mid-session was unreachable however warm the scene load had been.
   - **`installEditorPrefabCacheWarm`** — a `beforeSwap` hook (the loader awaits it, so the swap
     cannot complete half-warm) that takes each prefab from the RUNTIME cache the loader has already
     filled. A `Map.get` plus a `Map.set`; it only fetches for a source the runtime cache cannot key.

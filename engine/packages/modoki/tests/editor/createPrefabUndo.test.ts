@@ -37,6 +37,8 @@ let runtimeExcludedFixture = 0;
 vi.mock('../../src/editor/scene/prefab', () => ({
   // No placeholder for a missing prefab in these trees (#1699): Create Prefab's refusal asks this first.
   missingPrefabPlaceholders: () => [],
+  // The commit's I16 check reads nested documents through this (#1817); these trees nest nothing it can read.
+  getCachedPrefabSync: () => null,
   // Reports whatever the current test asked for, so the propagation through
   // createPrefabFromEntity -> CreatePrefabResult.runtimeExcluded is asserted at the seam that
   // actually carries it (review F3: nothing downstream of the callback had a test).

@@ -90,6 +90,8 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     registerBeforeSwap: (...a: unknown[]) => registerSpy(...a),
     unregisterBeforeSwap: (...a: unknown[]) => unregisterSpy(...a),
+    // No scene loaded: the prefab-edit refusal a placement asks (#1817) reads this, and finds no edit world.
+    getCurrent: () => null,
   },
 }));
 

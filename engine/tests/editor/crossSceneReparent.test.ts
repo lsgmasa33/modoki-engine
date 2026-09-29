@@ -321,7 +321,8 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
       expect(live.has(PrefabInstance)).toBe(true);
       const base = (await serializeScene({ scene: BASE_FILE })).entities as Array<{ name?: string; added?: Array<{ name?: string; prefab?: string; guid?: string }> }>;
       const kitAdded = base.find((e) => e.name === 'Kit')?.added ?? [];
-      expect(kitAdded).toEqual([expect.objectContaining({ prefab: COIN, guid: attrs(coin).guid })]);
+      // The document's guid, never the path it was placed from (I22, #1828).
+      expect(kitAdded).toEqual([expect.objectContaining({ prefab: 'c1436000-0000-4000-8000-000000000001', guid: attrs(coin).guid })]);
       expect((kitAdded[0] as { overrides?: Record<string, { Transform?: { x?: number } }> }).overrides?.['1']?.Transform?.x).toBeCloseTo(-10);
       expect(await namesIn()).not.toContain(attrs(coin).guid);
       // Undo puts the coin's marks back as they were. Mutation: drop `putBackMarks` in moveEntityToScene's undo.

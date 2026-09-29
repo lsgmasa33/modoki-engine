@@ -135,7 +135,7 @@ async function setup() {
   const m = await import('../../src/editor/scene/prefab');
   m.setPrefabCache(SRC, shipPrefab as any);
   const root = m.instantiatePrefab(shipPrefab as any);
-  m.setPrefabSource(root, SRC);
+  m.setPrefabSource(root, { id: SRC });
   return { m, root };
 }
 

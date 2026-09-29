@@ -1,6 +1,7 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
-import { expandsToRoot, isPrefabDocument } from '../../runtime/loaders/prefabRoot';
+import { expandsToRoot, isPrefabDocument, refuseCyclicReferenceNode, stackForReferenceNode } from '../../runtime/loaders/prefabRoot';
+import { expandedPrefabRefs, prefabNests } from '../../runtime/loaders/prefabNesting';
 import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { whyWorldNotAuthored, notAuthoredExit } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
@@ -1412,6 +1413,16 @@ function serializePrefabBody(
 
   const moved = templateMoves(selectedEntityId, tree, ecsToLocal, tokens.pathOf, rowParent);
 
+  // I16 over the WHOLE document (#1817): `planPrefabRows` asks only of a self-rooted instance root, and an instance the
+  // plan folds into a nested row (under one of its members, or under a node a layer added) is written as a reference
+  // node in that row's `members[..].own` / `added`, where its check never looked. A prefab-edit save and Create Prefab's
+  // Replace then wrote a file containing itself, which every later load overflowed the stack on.
+  const cyclic = existingId ? expandedPrefabRefs(prefabEntities).find((ref) => wouldCreateCycle(existingId, ref)) : undefined;
+  if (cyclic) {
+    console.error(`[Prefab] refusing to save — nesting "${cyclic}" inside "${existingId}" creates a cycle`);
+    return null;
+  }
+
   const file: PrefabFile = {
     id: existingId ?? newGuid(),
     // The format version this serializer writes, unconditionally — see PREFAB_FORMAT_VERSION
@@ -2004,7 +2015,7 @@ export function instantiatePrefab(
       const childSegments = [...segments, rowPathInPrefab(prefab, pe.localId)];
       const childRoot = instantiatePrefab(child, 0, stack, childNested, structForward, childSegments, childLayers, childForwardRoots);
       if (!childRoot) { if (pe.localId) unexpanded.push(pe.localId); continue; } // expanded to no root (#1768)
-      setPrefabSource(childRoot, pe.prefab);
+      setPrefabSource(childRoot, child, pe.prefab);
       // Stamp parentLocalId so serialize knows which row produced this nested
       // instance (used to address scene-level overrides on it), and `parentNodeGuid` beside it so a
       // re-save of THIS prefab can carry the row's minted identity (#1468) — the nested root's own
@@ -2034,7 +2045,7 @@ export function instantiatePrefab(
         applyStructureByRootInstance(childRoot, child, {
           added: rebaseAddedMemberTokens(childStructure.added, childSegments), removed: childStructure.removed, removedTraits: childStructure.removedTraits,
           moved: structDirect?.moved, members,
-        });
+        }, stack);
       }
       localToEcs.set(pe.localId, childRoot);
       continue;
@@ -2143,23 +2154,28 @@ function rebaseAddedMemberTokens(nodes: AddedEntity[] | undefined, segments: Mem
   }));
 }
 
-/** Set the source path on all entities of a prefab instance */
-export function setPrefabSource(rootEcsId: number, source: string) {
+/** Tag every member of the instance rooted at `rootEcsId` with its prefab: `PrefabInstance.source` = the DOCUMENT's own
+ *  guid (I22, #1828). Every caller holds the document it just expanded, so identity is never re-derived from a path: a
+ *  lookup through the renderer's manifest misses whenever the manifest lags a move, cannot read a file (#1799's BOM) or
+ *  is asked in another spelling (#1753 F4), and the old `getGuidForPath(path) ?? path` then wrote the raw path, which
+ *  the loader and the scene validator reject. A document with no guid is refused loudly and nothing is written — the
+ *  instance keeps whatever source it had — rather than storing something no reader accepts. False when refused.
+ *  `reachedBy` is the GUID a nested expansion reached the document by (a row's or a reference node's `prefab`, a guid in
+ *  every file the loader accepts), for a document that states no `id` of its own. */
+export function setPrefabSource(rootEcsId: number, doc: { id?: string; name?: string }, reachedBy?: string): boolean {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  if (!PrefabInstanceMeta) return;
-
-  // Callers pass the prefab's asset PATH; store a GUID instead when one resolves, and fall back to the given ref only
-  // when the manifest cannot resolve it yet. A path left here lives on: the save writes it as the entry's `prefab`
-  // verbatim (`assertNoPathRefs` only logs it), and the next load hands it to the runtime cache (`acquirePrefab` /
-  // `getCachedPrefab` → `refToPath`), where `resolveRef` rejects it. `getPrefabSource` itself reads a path through
-  // `assetUrl`, so the live session works until then (#1801, #1828).
-  const ref = isGuid(source) ? source : (getGuidForPath(source) ?? source);
-
+  if (!PrefabInstanceMeta) return false;
+  const ref = doc.id ?? (reachedBy && isGuid(reachedBy) ? reachedBy : undefined);
+  if (!ref || !isGuid(ref)) {
+    console.error(`[Prefab] not tagging instance ${rootEcsId} of "${doc.name ?? '?'}": its document has no guid (id ${JSON.stringify(ref ?? null)}), and PrefabInstance.source is a guid only (I22)`);
+    return false;
+  }
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], _entity) => {
     if ((pi as Record<string, unknown>).rootInstanceId === rootEcsId) {
       (pi as Record<string, unknown>).source = ref;
     }
   });
+  return true;
 }
 
 // ── Override Detection ──────────────────────────────────
@@ -2395,8 +2411,19 @@ export async function instantiatePrefabInstance(
   /** From `capturePrefabRead(sourcePath)`, taken before the caller's read. Omitted, the window starts here. */
   readAt: () => boolean = capturePrefabRead(sourcePath),
 ): Promise<number> {
+  // Loaded here, not at the top: the refusal reads the loaded scene through `SceneManager`, and a static import put that
+  // whole module under every reader of this one. Before the read-token check, so check → spawn stays synchronous.
+  const { assertPrefabEditAllows } = await import('./prefabEditRefusal');
   await preloadNestedPrefabs(prefab);
   if (!readAt()) throw new StalePrefabRead(prefab.name ?? 'the prefab');
+  // In prefab edit (#1817, #1836): an instance outside the root is dropped by the save, and one of the edited prefab — or
+  // of any prefab that contains it — would make the save write a file containing itself. After the preload, so the
+  // nested documents it walks are cached; before the spawn, so a refusal adds nothing. Every placement (the Hierarchy
+  // drop, the Assets and Inspector Instantiate buttons, the agent `instantiate`) arrives here.
+  assertPrefabEditAllows({
+    kind: 'add', parentId, read: getCachedPrefabSync,
+    prefabs: [...(prefab.id ? [prefab.id] : []), ...expandedPrefabRefs(prefab.entities)],
+  });
   // SYNCHRONOUS from the check to the prime (close-out review): with an await between them, a commit whose cache seat was
   // already queued could land in the gap, and the prime put the older document back over it after all.
   const rootId = spawnPrefabInstance(prefab, parentId);
@@ -2404,9 +2431,8 @@ export async function instantiatePrefabInstance(
   // Under a base entity the new instance belongs to that base (#1429). Every caller's redo re-runs this
   // helper, so the stamp comes back with it.
   adoptParentScene(rootId);
-  setPrefabSource(rootId, sourcePath);
-  // Whatever ref setPrefabSource settled on — the guid when the manifest resolves it, the raw
-  // path when it cannot (a freshly-instantiated instance before its scene is saved).
+  setPrefabSource(rootId, prefab);
+  // The ref setPrefabSource wrote: the document's guid, or nothing when the document has none (refused, logged).
   const piMeta = getTraitByName('PrefabInstance');
   const live = piMeta ? (readTraitData(rootId, piMeta)?.source as string | undefined) : undefined;
   if (live) primeEditorPrefabCache(live, prefab);
@@ -2548,35 +2574,10 @@ function spawnPrefabInstance(prefab: PrefabFile, parentId: number): number {
 
 /** True if nesting `childGuid` inside `parentGuid` would create a reference cycle
  *  — i.e. the child transitively nests the parent (or IS the parent). Best-effort
- *  sync walk over the editor cache; the instantiate-time `_stack` guard backstops
+ *  sync walk over the editor cache (`prefabNests`); the instantiate-time `_stack` guard backstops
  *  any cycle this can't see (e.g. a child not yet cached). */
-export function wouldCreateCycle(parentGuid: string, childGuid: string, _seen = new Set<string>()): boolean {
-  if (!parentGuid || !childGuid) return false;
-  if (childGuid === parentGuid) return true;
-  if (_seen.has(childGuid)) return false;
-  _seen.add(childGuid);
-  const child = getCachedPrefabSync(childGuid);
-  if (!child) return false; // not cached — can't verify here; instantiate guard backstops
-  // Every prefab the file expands: its nested rows, and the reference nodes those rows add (#1446 close-out).
-  for (const ref of expandedPrefabRefs(child.entities)) {
-    if (wouldCreateCycle(parentGuid, ref, _seen)) return true;
-  }
-  return false;
-}
-
-/** Every prefab ref a list of rows or added nodes EXPANDS, at any depth: a node's own `prefab`, its `children`,
- *  a reference node's own `added`, and the `added` lists of its `nestedStructure` slots. Never `traits` — a trait
- *  field that happens to be called `prefab` (a spawner naming what it spawns) is data, not nesting. */
-function expandedPrefabRefs(nodes: readonly { prefab?: string; children?: AddedEntity[]; added?: AddedEntity[]; nestedStructure?: NestedStructurePaths }[]): string[] {
-  const out: string[] = [];
-  const walk = (n: (typeof nodes)[number]) => {
-    if (n.prefab) out.push(n.prefab);
-    for (const c of n.children ?? []) walk(c);
-    for (const c of n.added ?? []) walk(c);
-    for (const slot of Object.values(n.nestedStructure ?? {})) for (const c of slot.added ?? []) walk(c);
-  };
-  for (const n of nodes) walk(n);
-  return out;
+export function wouldCreateCycle(parentGuid: string, childGuid: string): boolean {
+  return prefabNests(parentGuid, childGuid, getCachedPrefabSync);
 }
 
 /** Does this added subtree hold an instance of `target` — a promotion that would make the prefab contain
@@ -4453,6 +4454,10 @@ export function applyStructureByRootInstance(
   rootInstanceId: number,
   prefab: PrefabFile,
   structure: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string>; members?: Record<string, SceneMemberRow> },
+  /** The expansion's ancestor prefab ids (I16), from a caller inside one (`instantiatePrefab`, a reference node's
+   *  spawn). `prefab` joins them here, so a reference node in this structure that contains any of them is refused
+   *  instead of recursing until the stack overflows (#1817). Omitted, the expansion starts at `prefab`. */
+  stack?: ReadonlySet<string>,
 ): void {
   if (!structure) return;
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
@@ -4469,17 +4474,19 @@ export function applyStructureByRootInstance(
 
   // Delegate to the world-parameterized shared core (F7) with editor-world ops, so
   // the runtime (applyStructureByLocalToEcs) and editor paths can never drift.
-  applyStructureCore(editorStructureOps(), localToEcs, prefab, structure);
+  const ancestors = new Set(stack);
+  if (prefab.id) ancestors.add(prefab.id);
+  applyStructureCore(editorStructureOps(), localToEcs, prefab, structure, ancestors);
 }
 
 /** Spawn scene-form `nodes` under the live entity `parentEcsId` — the editor spawn `applyStructureByRootInstance`
  *  uses, anchored at one entity instead of a member. For a v17 node row's `own` children (#1516), which hang under
  *  a template-added node rather than a member. */
-function spawnAddedUnder(parentEcsId: number, nodes: readonly AddedEntity[]): void {
+function spawnAddedUnder(parentEcsId: number, nodes: readonly AddedEntity[], stack?: ReadonlySet<string>): void {
   if (!nodes.length) return;
   const ANCHOR = 1;
   applyStructureCore(editorStructureOps(), new Map([[ANCHOR, parentEcsId]]), { entities: [], rootLocalId: ANCHOR } as never,
-    { added: nodes.map((n) => ({ ...n, parentLocalId: ANCHOR })) });
+    { added: nodes.map((n) => ({ ...n, parentLocalId: ANCHOR })) }, stack);
 }
 
 /** The editor-world ops `applyStructureCore` runs with. */
@@ -4496,7 +4503,9 @@ function editorStructureOps(): Parameters<typeof applyStructureCore>[0] {
       // Editor nested-instance expansion: instantiate → tag source → replay
       // overrides → recurse structure. parentLocalId stays 0 on the spawned root so
       // the next capture re-detects it as user-added.
-      spawnNestedInstance: (node, parentEcsId) => {
+      spawnNestedInstance: (node, parentEcsId, ancestors) => {
+        // A node re-entering a self-containing prefab above it is the one endless shape (I16, #1817): refused, and named.
+        if (refuseCyclicReferenceNode(ancestors, node, getCachedPrefabSync, '[Prefab]')) return;
         const child = getCachedPrefabSync(node.prefab!);
         // One that loads but expands to no root is kept the same way (#1768).
         if (!child || !expandsToRoot(child, getCachedPrefabSync)) {
@@ -4518,7 +4527,9 @@ function editorStructureOps(): Parameters<typeof applyStructureCore>[0] {
         const own = { overrides: node.overrides, added: node.added, removed: node.removed, removedTraits: node.removedTraits };
         const { channels, forwardRoots } = foldStructureLayers(child, layers, 0, own);
         // The node's nested channels expand with it, as the loader's twin does (#1369).
-        const childRoot = instantiatePrefab(child, parentEcsId, undefined, node.nestedOverrides, node.nestedStructure, undefined, layers, forwardRoots);
+        // The self-containing ancestors carried on, so a loop through two or more documents still meets its own start and
+        // is refused above (#1817).
+        const childRoot = instantiatePrefab(child, parentEcsId, stackForReferenceNode(ancestors, getCachedPrefabSync), node.nestedOverrides, node.nestedStructure, undefined, layers, forwardRoots);
         if (!childRoot) { closeTokenScope(scope); return; }
         if (closeTokenScope(scope)) registerTemplateFrame(getCurrentWorld(), childRoot);
         // RESTORE the node's own guid — the editor-side twin of the loader fix (QA-PREFAB-0004).
@@ -4537,7 +4548,7 @@ function editorStructureOps(): Parameters<typeof applyStructureCore>[0] {
         // A TEMPLATE reference node has no guid to restore; its root derives one from the key (#1387). A node carrying
         // both (a rebuild's kept row) keeps both: the key is its template identity, not a stand-in for the guid (#1567).
         if (node.key) setTemplateKey(findEntity(childRoot), node.key);
-        setPrefabSource(childRoot, node.prefab!);
+        setPrefabSource(childRoot, child, node.prefab);
         // The node's own moves, queued after its prefab's (`instantiatePrefab` just queued those), so they win (#1543).
         if (node.templateMoved) {
           queuePrefabMoves(getCurrentWorld(), childRoot, node.templateMoved, '[Prefab]');
@@ -4546,7 +4557,7 @@ function editorStructureOps(): Parameters<typeof applyStructureCore>[0] {
         }
         if (channels.overrides) applyOverridesByRootInstance(childRoot, channels.overrides);
         if (channels.added?.length || channels.removed?.length || channels.removedTraits || node.moved || node.members) {
-          applyStructureByRootInstance(childRoot, child, { added: channels.added, removed: channels.removed, removedTraits: channels.removedTraits, moved: node.moved, members: node.members });
+          applyStructureByRootInstance(childRoot, child, { added: channels.added, removed: channels.removed, removedTraits: channels.removedTraits, moved: node.moved, members: node.members }, ancestors);
         }
       },
       onComplete: () => {
@@ -8153,7 +8164,7 @@ export function rebuildInstance(
   // would leave the new root answering to nothing; the respawn's own runtime guid stands instead.
   if (eaMeta && durableGuid(oldRootEa?.guid as string)) writeTraitField(newRootId, eaMeta, 'guid', oldRootEa!.guid as string);
   if (wasTransient) findEntity(newRootId)?.add(Transient);
-  setPrefabSource(newRootId, source);
+  setPrefabSource(newRootId, prefab);
   if (oldParentLocalId) writeTraitField(newRootId, PrefabInstanceMeta, 'parentLocalId', oldParentLocalId);
   if (oldParentNodeGuid) writeTraitField(newRootId, PrefabInstanceMeta, 'parentNodeGuid', oldParentNodeGuid);
   if (oldOwnerGuid) writeTraitField(newRootId, PrefabInstanceMeta, 'ownerGuid', oldOwnerGuid);

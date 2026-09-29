@@ -139,12 +139,12 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
     setPrefabCache(P, pPrefab as any);
     setPrefabCache(Q, qPrefab as any);
 
-    const pRoot = instantiatePrefab(pPrefab as any); setPrefabSource(pRoot, P);
+    const pRoot = instantiatePrefab(pPrefab as any); setPrefabSource(pRoot, { id: P });
     const p2 = findByName('P2');
 
     // User drags Q under P2 (a member of P). instantiatePrefab does NOT stamp
     // parentLocalId, so Q's root has parentLocalId === 0 (user-added).
-    const qRoot = instantiatePrefab(qPrefab as any); setPrefabSource(qRoot, Q);
+    const qRoot = instantiatePrefab(qPrefab as any); setPrefabSource(qRoot, { id: Q });
     reparent(qRoot, p2);
     expect((index.get(qRoot).get(PrefabInstance) as any).parentLocalId).toBe(0);
 
@@ -167,7 +167,7 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
     setPrefabCache(P, pPrefab as any);
     setPrefabCache(Q, qPrefab as any);
 
-    const pRoot = instantiatePrefab(pPrefab as any); setPrefabSource(pRoot, P);
+    const pRoot = instantiatePrefab(pPrefab as any); setPrefabSource(pRoot, { id: P });
     reparent(instantiatePrefabSetSource(instantiatePrefab, setPrefabSource, qPrefab, Q), findByName('P2'));
 
     const scene = await serializeScene();
@@ -178,7 +178,7 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
     // (mirrors the runtime load path, editor side).
     testWorld = createWorld(); index.clear();
     const { applyStructureByRootInstance } = await import('../../src/editor/scene/prefab');
-    const pRoot2 = await instantiatePrefabAsync(pPrefab as any); setPrefabSource(pRoot2, P);
+    const pRoot2 = await instantiatePrefabAsync(pPrefab as any); setPrefabSource(pRoot2, { id: P });
     applyStructureByRootInstance(pRoot2, pPrefab as any, struct as any);
 
     // The dragged Q instance exists again, parented under the live P2 member.
@@ -206,5 +206,5 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
 
 /** tiny helper: instantiate Q and stamp its source, returning the root id. */
 function instantiatePrefabSetSource(inst: any, setSrc: any, prefab: any, src: string): number {
-  const root = inst(prefab); setSrc(root, src); return root;
+  const root = inst(prefab); setSrc(root, { id: src }); return root;
 }

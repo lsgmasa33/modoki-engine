@@ -733,7 +733,7 @@ describe('Detach strips the instance\'s IDENTITY subtree: a member of another fr
     await load({ id: 'detach', version: 16, name: 'S', resources: [],
       entities: [{ id: 1, prefab: O2, guid: INST, traits: { EntityAttributes: { name: 'Inst', parentId: 0 } } }] } as unknown as SceneData);
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, one('Slot'));
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     await load(await serializeScene() as unknown as SceneData);
     expect(reparentEntity(one('Keep'), one('QA'))).toBe(true);
     const or = idOfGuid(INST);

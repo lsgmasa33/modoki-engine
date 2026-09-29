@@ -125,7 +125,7 @@ async function instanceWithOverrides(overrides: Record<number, Record<string, Re
   const prefab = animatorPrefab();
   setPrefabCache(CHILD, prefab as any);
   const root = instantiatePrefab(prefab as any);
-  setPrefabSource(root, CHILD);
+  setPrefabSource(root, { id: CHILD });
   applyOverridesByRootInstance(root, overrides);
   return { root, prefab };
 }

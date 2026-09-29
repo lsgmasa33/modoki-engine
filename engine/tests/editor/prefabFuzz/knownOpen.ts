@@ -410,18 +410,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     })(),
   },
   {
-    issue: 1817,
-    what: "CRASH: a prefab-edit save of the edited prefab dropped under a nested member or an added node writes a self-containing file and overflows the stack",
-    repro: [
-      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'instantiate', u: [0.3, 0.5, 0.7, 0, 0, 0, 0, 0] }] },
-    ],
-    reproduces: (f) => f.check === 'op threw' && /Maximum call stack size exceeded/.test(f.detail),
-    // A prefab-edit op that drops a prefab and saves (u[1] < 0.65) throws the overflow itself. The ^ anchor keeps it off
-    // #1793, whose redo overflow is thrown as 'redo "…" threw: …'.
-    stops: (f, ops) => f.check === 'op threw' && /^Maximum call stack size exceeded/.test(f.detail) && f.op.startsWith('prefabEdit(')
-      && (() => { const o = ops[ops.length - 1]; return o?.kind === 'prefabEdit' && o.u[1] < 0.65 && !!o.inner?.some((i) => i.kind === 'instantiate'); })(),
-  },
-  {
     issue: 1818,
     what: "an Inspector edit on a Missing Prefab placeholder shows live, and the save writes the kept record verbatim",
     repro: [
@@ -503,17 +491,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     reproduces: (f) => f.check === 'undo to the start does not restore the scene' && /^\/entities\/[0-9a-f]{8}-[0-9a-f-]{27}: undefined vs \{/.test(f.detail),
     // No stop: a top-level entry gained by an undo says nothing about a placeholder parent by itself (the review of
     // entity-identity diffing found a generic gained entry claimable by the op shape alone). Self-tested repro only.
-  },
-  {
-    issue: 1819,
-    what: "the same, through Add Component's undo (the component stays in the kept record)",
-    repro: [
-      { kind: 'addComponent', u: [0.6427716070320457, 0.8639664901420474, 0.5031768959015608, 0.6599007654003799, 0.4345746631734073, 0.9000449238810688, 0.5381293753162026, 0.374259619275108] },
-      { kind: 'trashPrefab', u: [0.30492790788412094, 0.8365210755728185, 0.5132871367968619, 0.13930025370791554, 0.20630978257395327, 0.36985206860117614, 0.010625399881973863, 0.6315253779757768] },
-      { kind: 'prefabEdit', u: [0.9100218610838056, 0.6029162958730012, 0.5514063406735659, 0.06771880853921175, 0.005160580854862928, 0.6917043258436024, 0.3046174261253327, 0.3058516394812614], inner: [{ kind: 'instantiate', u: [0.7038765226025134, 0.5172761019784957, 0.15159959415905178, 0.6085920596960932, 0.70793516933918, 0.9555558916181326, 0.8827216704376042, 0.9631576612591743] }] },
-    ],
-    reproduces: (f) => f.check === 'undo to the start does not restore the scene' && PLACEHOLDER_KEPT_EDIT.test(f.detail),
-    stops: placeholderEditUndo,
   },
   {
     issue: 1819,
@@ -644,23 +621,7 @@ export const KNOWN_OPEN: KnownOpen[] = [
     // failure ties it to the undo that deleted it — keyed on the op shape it claimed any lost top-level entry (review).
     // Self-tested repro only; a hunt reports it by signature.
   },
-  {
-    issue: 1828,
-    what: "the Hierarchy drop's redo respawns by path through a manifest a Rename undo has not caught up with (#1807's mechanism)",
-    repro: [
-      { kind: 'instantiate', u: [0.12306458246894181, 0.659326083259657, 0.3238855139352381, 0.3017094286624342, 0.7389431328047067, 0.6331829989794642, 0.8944360001478344, 0.3325171605683863] },
-      { kind: 'createPrefab', u: [0.15510661457665265, 0.9943042399827391, 0.9856164292432368, 0.310858246171847, 0.6426518538501114, 0.3538553356193006, 0.2786709980573505, 0.9714844699483365] },
-      { kind: 'addChild', u: [0.5799607739318162, 0.2170702046714723, 0.5558724678121507, 0.6893410694319755, 0.011181237641721964, 0.44485651864670217, 0.8736847601830959, 0.8628021879121661] },
-      { kind: 'renamePrefab', u: [0.09707820601761341, 0.14232445927336812, 0.9031931138597429, 0.3121798960492015, 0.3815521625801921, 0.3378106460440904, 0.31110939756035805, 0.10088769742287695] },
-      { kind: 'prefabEdit', u: [0.5217692020814866, 0.24212318868376315, 0.6475640579592437, 0.7428316583391279, 0.8591179379727691, 0.2987568259704858, 0.37442863010801375, 0.12064710608683527], inner: [] },
-      { kind: 'revert', u: [0.4475659942254424, 0.4263928036671132, 0.892479837173596, 0.5712739205919206, 0.016539404401555657, 0.49129072832874954, 0.5349354806821793, 0.03838557889685035] },
-    ],
-    reproduces: (f) => f.check === 'scene validator' && /\.PrefabInstance\.source: internal asset path '[^']+\.prefab\.json' — references must be a GUID/.test(f.detail),
-    stops: (f, ops) => (f.op === 'undo/redo to the ends' || /^(undo|redo)\(/.test(f.op))
-      && ((f.check === 'scene validator' && /\.PrefabInstance\.source: internal asset path '[^']+\.prefab\.json' — references must be a GUID/.test(f.detail))
-        || (f.check === 'console.error' && /^\[serialize\] internal asset path in PrefabInstance\.source — references must be GUIDs: \S+\.prefab\.json/.test(f.detail)))
-      && (() => { const r = ops.findIndex((o) => o.kind === 'renamePrefab'); return r >= 0 && ops.slice(0, r).some((o) => o.kind === 'instantiate'); })(),
-  },
+
   {
     issue: 1827,
     what: "the same, where the swap is a prefab-edit save that deleted the drop's parent row (no trash)",
@@ -680,21 +641,7 @@ export const KNOWN_OPEN: KnownOpen[] = [
         return n >= 0 && ops.slice(n + 1).some((o) => o.kind === 'prefabEdit' && o.u[1] < 0.65 && !!o.inner?.some((x) => x.kind === 'delete'));
       })(),
   },
-  {
-    issue: 1828,
-    what: "the same lagging manifest, through Apply's undo: it resolves the source to the renamed path and refuses",
-    repro: [
-      { kind: 'apply', u: [0.3302737674675882, 0.2567235822789371, 0.6868790478911251, 0.7366894891019911, 0.12275128113105893, 0.10771414311602712, 0.646984655642882, 0.9300033883191645] },
-      { kind: 'renamePrefab', u: [0.2094005134422332, 0.4872707976028323, 0.2897710604593158, 0.9391268761828542, 0.4600680246949196, 0.9581016609445214, 0.701076986733824, 0.585580583428964] },
-      { kind: 'detach', u: [0.16811815183609724, 0.4063933831639588, 0.7856829706579447, 0.2869127383455634, 0.6659100251272321, 0.9365419009700418, 0.5917436527088284, 0.9570457476656884] },
-    ],
-    reproduces: (f) => f.check === 'undo refused in a clean segment' && /changed on disk since the Apply/.test(f.detail),
-    // Keyed on the refusal the walk logged naming a RENAMED path (the fuzzer's rename writes R<n>.prefab.json), which
-    // the file was moved back from — not on any Apply-undo refusal in a list that holds a rename.
-    stops: (f, ops) => f.check === 'undo refused in a clean segment' && f.op === 'undo/redo to the ends'
-      && !!f.console?.some((l) => /^\[undo\] Undo of "Apply to Prefab" was REFUSED — \S*\/R\d+\.prefab\.json changed on disk since the Apply/.test(l))
-      && (() => { const a = ops.findIndex((o) => o.kind === 'apply'); return a >= 0 && ops.slice(a + 1).some((o) => o.kind === 'renamePrefab'); })(),
-  },
+
   {
     issue: 1829,
     what: "an Apply that removes a component from a template row leaves a partial override of it marked on the overridden fields only",
@@ -730,6 +677,56 @@ export const KNOWN_OPEN: KnownOpen[] = [
 /** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
  *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test"). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
+  {
+    issue: 1835,
+    what: "Apply's undo after a Rename undo reads the prefab where it is: the move route pushes the renderer's manifest before its repair, as the editor's does (#1828's second route, harness-shaped)",
+    repro: [
+      { kind: 'apply', u: [0.3302737674675882, 0.2567235822789371, 0.6868790478911251, 0.7366894891019911, 0.12275128113105893, 0.10771414311602712, 0.646984655642882, 0.9300033883191645] },
+      { kind: 'renamePrefab', u: [0.2094005134422332, 0.4872707976028323, 0.2897710604593158, 0.9391268761828542, 0.4600680246949196, 0.9581016609445214, 0.701076986733824, 0.585580583428964] },
+      { kind: 'detach', u: [0.16811815183609724, 0.4063933831639588, 0.7856829706579447, 0.2869127383455634, 0.6659100251272321, 0.9365419009700418, 0.5917436527088284, 0.9570457476656884] },
+    ],
+  },
+  {
+    issue: 1828,
+    what: "the Hierarchy drop's redo after a Rename undo tags the instance by the document's guid, never a path (setPrefabSource takes the document)",
+    repro: [
+      { kind: 'instantiate', u: [0.12306458246894181, 0.659326083259657, 0.3238855139352381, 0.3017094286624342, 0.7389431328047067, 0.6331829989794642, 0.8944360001478344, 0.3325171605683863] },
+      { kind: 'createPrefab', u: [0.15510661457665265, 0.9943042399827391, 0.9856164292432368, 0.310858246171847, 0.6426518538501114, 0.3538553356193006, 0.2786709980573505, 0.9714844699483365] },
+      { kind: 'addChild', u: [0.5799607739318162, 0.2170702046714723, 0.5558724678121507, 0.6893410694319755, 0.011181237641721964, 0.44485651864670217, 0.8736847601830959, 0.8628021879121661] },
+      { kind: 'renamePrefab', u: [0.09707820601761341, 0.14232445927336812, 0.9031931138597429, 0.3121798960492015, 0.3815521625801921, 0.3378106460440904, 0.31110939756035805, 0.10088769742287695] },
+      { kind: 'prefabEdit', u: [0.5217692020814866, 0.24212318868376315, 0.6475640579592437, 0.7428316583391279, 0.8591179379727691, 0.2987568259704858, 0.37442863010801375, 0.12064710608683527], inner: [] },
+      { kind: 'revert', u: [0.4475659942254424, 0.4263928036671132, 0.892479837173596, 0.5712739205919206, 0.016539404401555657, 0.49129072832874954, 0.5349354806821793, 0.03838557889685035] },
+    ],
+  },
+  {
+    issue: 1817,
+    what: 'a prefab-edit drop of the edited prefab under a nested member is refused, and the save writes no self-containing file',
+    repro: [
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'instantiate', u: [0.3, 0.5, 0.7, 0, 0, 0, 0, 0] }] },
+    ],
+  },
+  {
+    issue: 1817,
+    what: 'the same, under a layer-added node',
+    repro: [
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'instantiate', u: [0.3, 0.5, 0.95, 0, 0, 0, 0, 0] }] },
+    ],
+  },
+  {
+    issue: 1836,
+    what: 'a prefab-edit reparent of the root is refused, so the delete after it cannot take the root out (seed 4535)',
+    repro: [
+      { kind: 'renamePrefab', u: [0.6519922227598727, 0.2114757765084505, 0.018607930978760123, 0.30942356470040977, 0.8359362620394677, 0.67055669776164, 0.9231131041888148, 0.44708462059497833] },
+      { kind: 'prefabEdit', u: [0.6905049616470933, 0.5051443385891616, 0.16762249427847564, 0.8142847665585577, 0.8068818023893982, 0.18743133172392845, 0.5548743580002338, 0.7678781691938639], inner: [{ kind: 'reparent', u: [0.08123077405616641, 0.6606571737211198, 0.837768564466387, 0.4680335680022836, 0.47950352635234594, 0.8769256870727986, 0.06606265692971647, 0.9000267873052508] }, { kind: 'delete', u: [0.08093803143128753, 0.029633563244715333, 0.4261932633817196, 0.4423936535604298, 0.4413971840403974, 0.8836731656920165, 0.1854370052460581, 0.35569544485770166] }] },
+    ],
+  },
+  {
+    issue: 1836,
+    what: 'the same in one prefab-edit op (seed 3884)',
+    repro: [
+      { kind: 'prefabEdit', u: [0.0952886319719255, 0.1324546616524458, 0.7667984003201127, 0.040486402809619904, 0.38836244866251945, 0.164681785274297, 0.0033743923995643854, 0.9235746308695525], inner: [{ kind: 'reparent', u: [0.11242076917551458, 0.3747843843884766, 0.34736537211574614, 0.746526314644143, 0.02761491690762341, 0.7988603033591062, 0.11750280298292637, 0.11291002365760505] }, { kind: 'delete', u: [0.056537609081715345, 0.7215519584715366, 0.9376734544057399, 0.17930406494997442, 0.7820167003665119, 0.6088943409267813, 0.12121632206253707, 0.8013442442752421] }] },
+    ],
+  },
   {
     issue: 1807,
     what: "Create Prefab's undo right after a Rename undo untags by path through a lagging manifest",

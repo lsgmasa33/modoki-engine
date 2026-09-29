@@ -14,6 +14,7 @@ import { resolveMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
 import { geometryBoxHalfExtents, geometryBoundingRadius } from '../../runtime/physics/meshColliderGeometry';
 import { getAnimSet } from '../../runtime/loaders/animSetCache';
 import { useEditorStore } from '../store/editorStore';
+import { withPrefabEditRefusalToast } from './prefabEditRefusalToast';
 import { getPrefabSource, getCachedPrefabSync, getOverrides, baseTokenResolver, instanceBase } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { isSkippedByPrimarySave } from '../scene/serialize';
@@ -1835,13 +1836,13 @@ export default function Inspector() {
     // Delete the whole selection as ONE undo entry; fold selection into it via a
     // raw setState (no separate selection-undo entry) so a single undo restores
     // every deleted entity and reselects them.
-    deleteEntitiesWithUndo(selectedIds, (ids) =>
+    withPrefabEditRefusalToast(() => deleteEntitiesWithUndo(selectedIds, (ids) =>
       useEditorStore.setState({
         selectedEntityId: ids.length > 0 ? ids[ids.length - 1] : null,
         selectedEntityIds: ids,
         selectedAsset: null,
       }),
-    );
+    ));
   }, [selectedIds]);
 
   // Asset mode — batch inspector when >1 asset selected, else single-asset.

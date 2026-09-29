@@ -52,7 +52,7 @@ beforeEach(() => {
   markSceneSaved();
   setPrefabCache(SHIP, ship());
   root = instantiatePrefab(ship());
-  setPrefabSource(root, SHIP);
+  setPrefabSource(root, { id: SHIP });
   flame = idOf('Flame');
   expect(linked(flame)).toBe(true); // precondition: Flame is a member of the Ship instance
 });

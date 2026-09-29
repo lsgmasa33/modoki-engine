@@ -13,6 +13,7 @@ import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { useEditorStore } from '../store/editorStore';
 import { instantiatePrefabInstance, type PrefabFile } from './prefab';
 import { capturePrefabRead, StalePrefabRead } from './prefabRead';
+import { PrefabEditRefusalError } from './prefabEditRefusal';
 
 /** The file at `path`, or null when it is gone. The read token is the caller's, taken before this fetch. */
 async function readPrefabFile(path: string): Promise<PrefabFile | null> {
@@ -60,7 +61,9 @@ export async function placePrefabFromPath(path: string, opts: {
     }));
     return rootId;
   } catch (e) {
-    if (e instanceof StalePrefabRead) {
+    // A prefab-edit refusal (#1817, #1836) reaches the user the same way: a placement outside the root, or of a prefab
+    // that contains the one being edited.
+    if (e instanceof StalePrefabRead || e instanceof PrefabEditRefusalError) {
       console.warn(`[${opts.tag}] ${e.message}`);
       useEditorStore.getState().showToast(e.message, 'warn');
       return null;

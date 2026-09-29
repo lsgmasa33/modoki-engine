@@ -13,7 +13,7 @@ import type { PrefabFile, PrefabEntity } from './prefab';
 import { localIdCounter } from '../../runtime/core/localIdCounter';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { channelsOf } from '../../runtime/loaders/unresolvedPrefabRefs';
-import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
+import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID, SCAFFOLD_PREFIX } from './prefabEditGuids';
 import { serializePrefab, warnInertPrefabSizes, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
 import { commitPrefabWrite, prefabTextIsDocument } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
@@ -57,8 +57,8 @@ export const PREFAB_EDIT_HDR_GUID = '984275f1-3ebd-4848-927f-012595c76500';
 export { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
 /** Scaffold entity ids — far above any prefab localId so they never collide. */
 const SCAFFOLD_BASE = 1_000_000;
-/** Name prefix marking transient edit-mode scaffolding (lights + HDR). */
-export const SCAFFOLD_PREFIX = '__PrefabEdit';
+/** Name prefix marking transient edit-mode scaffolding (lights + HDR) — defined in the leaf `prefabEditGuids.ts`. */
+export { SCAFFOLD_PREFIX };
 
 const scaffoldEntities = (): SceneEntityEntry[] => [
   {

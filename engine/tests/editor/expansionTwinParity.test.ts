@@ -135,7 +135,7 @@ function runtimeTop(): ReturnType<typeof tree> {
 }
 function editorTop(): ReturnType<typeof tree> {
   const id = instantiatePrefab(prefabs.get(O) as never);
-  setPrefabSource(id, O);
+  setPrefabSource(id, { id: O });
   stampGuid(id, ROOT);
   deriveInstanceMemberGuids(getCurrentWorld());
   return tree();
@@ -154,7 +154,7 @@ function runtimeNode(channels: NodeChannels): ReturnType<typeof tree> {
 }
 function editorNode(channels: NodeChannels): ReturnType<typeof tree> {
   const host = instantiatePrefab(prefabs.get(H) as never);
-  setPrefabSource(host, H);
+  setPrefabSource(host, { id: H });
   stampGuid(host, HOST);
   applyStructureByRootInstance(host, prefabs.get(H) as never, { added: [refNode(channels) as never] });
   deriveInstanceMemberGuids(getCurrentWorld());

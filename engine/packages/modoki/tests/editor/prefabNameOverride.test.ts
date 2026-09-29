@@ -90,7 +90,7 @@ describe('EntityAttributes.name override on a prefab instance', () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, captureInstanceOverrides } = await getModule();
     setPrefabCache(P, prefab as any);
     const root = instantiatePrefab(prefab as any);
-    setPrefabSource(root, P);
+    setPrefabSource(root, { id: P });
 
     // Rename the child member (localId 2) on the live instance — mark it, exactly
     // as the editor's Hierarchy rename does (writeTraitFieldWithUndo → mark). An
@@ -116,7 +116,7 @@ describe('EntityAttributes.name override on a prefab instance', () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, captureInstanceOverrides } = await getModule();
     setPrefabCache(P, prefab as any);
     const root = instantiatePrefab(prefab as any);
-    setPrefabSource(root, P);
+    setPrefabSource(root, { id: P });
 
     // The instance member (localId 2) inherits Transform.x = 1 from the prefab.
     // Simulate a re-import: the prefab base for localId 2 now has x = 99. The live
@@ -137,7 +137,7 @@ describe('EntityAttributes.name override on a prefab instance', () => {
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     setPrefabCache(P, prefab as any);
     const root = instantiatePrefab(prefab as any);
-    setPrefabSource(root, P);
+    setPrefabSource(root, { id: P });
 
     // User deliberately sets x = 7 on the instance member and marks it.
     const child = getAllEntitiesImpl().find((e) => e.name === 'Flame')!;
@@ -159,7 +159,7 @@ describe('EntityAttributes.name override on a prefab instance', () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, captureInstanceOverrides } = await getModule();
     setPrefabCache(P, prefab as any);
     const root = instantiatePrefab(prefab as any);
-    setPrefabSource(root, P);
+    setPrefabSource(root, { id: P });
     const ov = captureInstanceOverrides(root, prefab as any);
     expect(ov[2]?.EntityAttributes?.name).toBeUndefined();
     expect(ov[1]?.EntityAttributes?.name).toBeUndefined();

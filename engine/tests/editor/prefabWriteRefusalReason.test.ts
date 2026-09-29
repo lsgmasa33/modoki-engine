@@ -180,7 +180,7 @@ describe('every other Create Prefab refusal is said too (#1776 close-out review)
     registerAsset(X, INSIDE, 'prefab');
     setPrefabCache(X, xDoc);
     const inst = instantiatePrefab(xDoc);
-    setPrefabSource(inst, X);
+    setPrefabSource(inst, { id: X });
     const ea = getTraitByName('EntityAttributes')!;
     const e = findEntity(inst)!;
     e.set(ea.trait, { ...(e.get(ea.trait) as Record<string, unknown>), parentId: src }); // X's instance, under the selection

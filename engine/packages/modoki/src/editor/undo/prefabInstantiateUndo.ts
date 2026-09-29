@@ -19,6 +19,7 @@ import type { UndoAction } from './undoManager';
 import { entityRef, type EntityRef } from './entityRef';
 import { reportUndoFailure, UndoRefusedError } from './undoFailure';
 import { StalePrefabRead } from '../scene/stalePrefabRead';
+import { PrefabEditRefusalError } from '../scene/prefabEditRefusalError';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { getAllEntities, readTraitData, writeTraitField, findEntity, type EntityInfo }
   from '../../runtime/core/ecs/entityUtils';
@@ -140,7 +141,8 @@ export function makePrefabInstantiateAction(opts: {
       try {
         id = await opts.respawn();
       } catch (e) {
-        if (e instanceof StalePrefabRead) throw new UndoRefusedError(e.message, e.message);
+        // A prefab-edit refusal (#1817, #1836) is a refusal too: the redo would place what the edit world cannot save.
+        if (e instanceof StalePrefabRead || e instanceof PrefabEditRefusalError) throw new UndoRefusedError(e.message, e.message);
         throw e;
       }
       // Leaving the live id unchanged is the deliberate contract (see `respawn`

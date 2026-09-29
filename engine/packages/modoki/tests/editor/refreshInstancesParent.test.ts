@@ -103,7 +103,7 @@ describe('apply-to-prefab refresh preserves the instance parent', () => {
 
     // Instantiate the prefab UNDER the mount.
     const rootId = instantiatePrefab(prefab as any, mount.id());
-    setPrefabSource(rootId, SRC);
+    setPrefabSource(rootId, { id: SRC });
     expect((index.get(rootId)!.get(EntityAttributes) as Record<string, unknown>).parentId).toBe(mount.id());
 
     // Edit a field on the instance, then apply it back → triggers a full refresh.

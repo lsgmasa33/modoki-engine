@@ -200,7 +200,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     // derive their durable guids from that root — the state a ref to one of them is authored against.
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
     expect(qRoot).toBeTruthy();
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
     await load(await serializeScene() as unknown as SceneData);
     const r1 = idOf(ROOT1);
@@ -240,7 +240,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     install(pDoc(), q4 as never);
     await load(scene());
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
     await load(await serializeScene() as unknown as SceneData);
     const r1 = idOf(ROOT1);
@@ -364,7 +364,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     install(pDoc(), qDoc());
     await load(scene());
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
     await load(await serializeScene() as unknown as SceneData);
     const inner = add('Add Inner', idOf(qRootGuid), [{ name: 'EntityAttributes', data: { name: 'Inner', parentId: idOf(qRootGuid) } }]);
@@ -400,7 +400,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
       { id: 2, prefab: P2, guid: ROOT1, traits: { EntityAttributes: { name: 'Inst1', parentId: HOLDER } } },
     ] } as unknown as SceneData);
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
     await load(await serializeScene() as unknown as SceneData);
     const inner = add('Add Inner', idOf(qRootGuid), [{ name: 'EntityAttributes', data: { name: 'Inner', parentId: idOf(qRootGuid) } }]);
@@ -428,7 +428,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     install(pDoc(), qDoc());
     await load(scene());
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
     await load(await serializeScene() as unknown as SceneData);
     const inner = add('Add Inner', idOf(qRootGuid), [{ name: 'EntityAttributes', data: { name: 'Inner', parentId: idOf(qRootGuid) } }]);
@@ -466,10 +466,10 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     install(pDoc(), qDoc(), rDoc);
     await load(scene());
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
     const rRoot = instantiatePrefab(getCachedPrefabSync(R) as PrefabFile, under(qRootGuid, 'QA'));
-    setPrefabSource(rRoot, R);
+    setPrefabSource(rRoot, { id: R });
     const rRootGuid = ensureGuid(rRoot);
     await load(await serializeScene() as unknown as SceneData);
     const raGuid = guidOf(under(rRootGuid, 'RA'));
@@ -531,7 +531,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     install(pDoc(), qDoc());
     await load(scene());
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
     expect(isRuntimeGuid(guidOf(under(qRootGuid, 'QB')))).toBe(true); // precondition
     const r1 = idOf(ROOT1);
@@ -605,7 +605,7 @@ describe('#1682: Apply deletes the promoted node\'s IDENTITY subtree, not its li
     await load(scene());
     const r1 = idOf(ROOT1);
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, r1);
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
     reparentEntity(under(ROOT1, 'A'), under(qRootGuid, 'QA'));
     const keys = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P) as PrefabFile);
@@ -623,7 +623,7 @@ describe('#1682: Apply deletes the promoted node\'s IDENTITY subtree, not its li
     await load(scene());
     const extra = add('Add Extra', idOf(ROOT1), [{ name: 'EntityAttributes', data: { name: 'Extra', parentId: idOf(ROOT1) } }]);
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, extra);
-    setPrefabSource(qRoot, Q);
+    setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
     await load(await serializeScene() as unknown as SceneData);
     const qbGuid = guidOf(under(qRootGuid, 'QB'));

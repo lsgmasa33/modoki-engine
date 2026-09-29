@@ -810,7 +810,7 @@ describe('#1541/#1542 close-out review', () => {
     install(innerWith(leafRow()));
     const root = await openInEditor(outer2());
     const xr = await instantiatePrefabAsync(xDoc as never, inMid('N1')[0]!.id);
-    setPrefabSource(xr, X);
+    setPrefabSource(xr, { id: X });
     writeTraitFieldWithUndo(all().find((e) => e.name === 'XKid')!.id, getTraitByName('Transform')!, 'x', 9);
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'XNode', parentId: all().find((e) => e.name === 'XKid')!.id, guid: 'eeeeeeee-0000-4000-8000-0000000000d1' }));
     install(midDoc());
@@ -838,7 +838,7 @@ describe('#1567: a rebuild keeps a template-keyed node\'s key', () => {
     row(1, G(21), 'OuterRoot', 0), row(2, G(22), 'Panel', 1), row(5, G(25), 'InnerRow', 2, { prefab: INNER }),
   ] }) as unknown as PrefabFile;
   const innerRoot = () => all().find((e) => e.name === 'InnerRoot' && !under(e.id, 'MidRoot'))!;
-  const dropMid = async () => { const r = await instantiatePrefabAsync(midDoc() as never, innerRoot().id); setPrefabSource(r, MID); return r; };
+  const dropMid = async () => { const r = await instantiatePrefabAsync(midDoc() as never, innerRoot().id); setPrefabSource(r, { id: MID }); return r; };
   const midKey = (p: PrefabFile) => (p.entities.find((e) => e.prefab === INNER)!.added ?? []).find((n) => n.prefab === MID)?.key;
 
   // A5: a reference node the user dropped has a random guid, so nothing can recover its key from it once a rebuild has
@@ -861,7 +861,7 @@ describe('#1567: a rebuild keeps a template-keyed node\'s key', () => {
     install(midDoc({ added: [n1] }));
     const root = await openInEditor(bare());
     const r = await instantiatePrefabAsync(midDoc({ added: [n1] }) as never, innerRoot().id);
-    setPrefabSource(r, MID);
+    setPrefabSource(r, { id: MID });
     deriveInstanceMemberGuids(getCurrentWorld());
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Mine', parentId: inMid('N1')[0]!.id, guid: 'eeeeeeee-0000-4000-8000-000000001567' }));
     serializePrefab(root, OUTER2);
@@ -1074,7 +1074,7 @@ describe('#1543/#1567 close-out review', () => {
     install(midDoc());
     const root = await openInEditor(bare);
     const r = await instantiatePrefabAsync(midDoc() as never, innerRoot().id);
-    setPrefabSource(r, MID);
+    setPrefabSource(r, { id: MID });
     const first = midKey(serializePrefab(root, OUTER2)!);
     expect(first).toBeTruthy();
     const res = await revertOverridesSelective(innerRoot().id, new Set([`+added.${all().find((e) => e.name === 'MidRoot')!.guid}`]));
@@ -1095,7 +1095,7 @@ describe('#1543/#1567 close-out review', () => {
     install(midDoc());
     const root = await openInEditor(bare);
     const r = await instantiatePrefabAsync(midDoc() as never, innerRoot().id);
-    setPrefabSource(r, MID);
+    setPrefabSource(r, { id: MID });
     deriveInstanceMemberGuids(getCurrentWorld());
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'K', parentId: inMid('Slot')[0]!.id, guid: 'eeeeeeee-0000-4000-8000-00000000c567' }));
     const first = kKey(serializePrefab(root, OUTER2)!);
@@ -1126,7 +1126,7 @@ describe('#1568: prefab-edit Refresh R2 gaps', () => {
     install(midDoc({ added: [n1] }));
     const root = await openInEditor(bare());
     const r = await instantiatePrefabAsync(midDoc({ added: [n1] }) as never, all().find((e) => e.name === 'OuterRoot')!.id);
-    setPrefabSource(r, MID);
+    setPrefabSource(r, { id: MID });
     deriveInstanceMemberGuids(getCurrentWorld());
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Kid', parentId: all().find((e) => e.name === 'N1')!.id, guid: 'eeeeeeee-0000-4000-8000-000000001568' }));
     install(midDoc());

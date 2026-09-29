@@ -34,6 +34,8 @@ import { saveScene, loadSceneReporting } from '../../../packages/modoki/src/edit
 import { emptySpecs } from '../../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { parseAssetJson, isMissingAsset } from '../../../packages/modoki/src/runtime/loaders/assetFetch';
 import { deleteEntity } from '../../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scene/prefabEditRefusal';
+import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
 import { getCachedPrefab, invalidatePrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
 import { authored, piOf, isInstanceRoot, editing, worldTree, settle, placeholderGuids, type Fixture } from './harness';
@@ -151,12 +153,27 @@ function prefabFiles(st: RunState): string[] {
   return [...st.be.snapshot().keys()].filter((p) => p.endsWith('.prefab.json')).sort();
 }
 
+/** A gesture the editor may refuse in prefab edit (#1817, #1836): the panels toast the refusal, so here it is an outcome,
+ *  not a failure. Anything else it throws still is one. */
+async function editRefusable(gesture: () => Outcome | Promise<Outcome>, st: RunState): Promise<Outcome> {
+  try {
+    return await gesture();
+  } catch (e) {
+    // Only in a prefab-edit WORLD, the refusal's own ground truth (not `editing()`, which also needs the session flag):
+    // outside one the refusal must never fire, and a gesture it refused there is a finding.
+    if (!(e instanceof PrefabEditRefusalError) || !isPrefabEditWorld()) throw e;
+    st.note = e.message;
+    return 'refused';
+  }
+}
+
 /** A prefab dropped into the Hierarchy, as `Hierarchy.tsx`'s drop handler does it: read the file, instantiate, push. */
 async function dropPrefab(path: string, parentId: number): Promise<Outcome> {
   let prefab: PrefabFile;
   try { prefab = await parseAssetJson(await fetch(path), path) as PrefabFile; } catch (e) { if (isMissingAsset(e)) return 'noop'; throw e; }
+  // A prefab-edit refusal throws out of here before anything is pushed, as `placePrefabFromPath` toasts it.
   const currentId = await instantiatePrefabInstance(prefab, path, parentId);
-  // Pushed whatever the instantiate returned, as the Hierarchy's drop does (it has no refusal branch).
+  // Pushed whatever the instantiate returned, as the Hierarchy's drop does.
   pushAction(makePrefabInstantiateAction({
     label: `Instantiate "${prefab.name}"`,
     initialId: currentId,
@@ -227,12 +244,12 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       return 'done';
     }
     case 'instantiate': {
-      // Any prefab, the one being edited included: the Hierarchy's drop has no prefab-edit guard, so neither does this.
+      // Any prefab, the one being edited included, anywhere: the editor's prefab-edit refusal is part of what is tested.
       const path = pick(u[0], prefabFiles(st));
       if (!path) return 'noop';
       const parent = u[1] < 0.4 ? 0 : (pick(u[2], ents)?.id ?? 0);
       const pre = liveGuids();
-      const r = await dropPrefab(path, parent);
+      const r = await editRefusable(() => dropPrefab(path, parent), st);
       for (const g of liveGuids()) if (!pre.has(g)) st.touched.drop.add(g);
       return r;
     }
@@ -247,7 +264,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
     case 'duplicate': {
       const e = pick(u[0], ents);
       if (!e) return 'noop';
-      return duplicateEntity(e.id, noSelect) == null ? 'refused' : 'done';
+      return editRefusable(() => (duplicateEntity(e.id, noSelect) == null ? 'refused' : 'done'), st);
     }
     case 'copy':
     case 'cut': {
@@ -267,16 +284,16 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
         return r;
       }
       const pre = liveGuids();
-      pasteEntityCopy(st.clip.snapshot, parent, noSelect);
+      const clip = st.clip;
+      const r = await editRefusable(() => { pasteEntityCopy(clip.snapshot, parent, noSelect); return 'done'; }, st);
       for (const g of liveGuids()) if (!pre.has(g)) st.touched.paste.add(g);
-      return 'done';
+      return r;
     }
     case 'delete': {
       const e = pick(u[0], ents);
       if (!e) return 'noop';
-      if (editing() && e.parentId === 0) return 'noop'; // the edit world's root is the prefab itself
-      deleteEntitiesWithUndo([e.id]);
-      return 'done';
+      // The prefab-edit root included: the editor refuses its delete (#1836), and that refusal is part of what is tested.
+      return editRefusable(() => { deleteEntitiesWithUndo([e.id]); return 'done'; }, st);
     }
     case 'editField': {
       const e = pick(u[0], ents.filter((x) => x.traits.includes('Transform')));
@@ -309,7 +326,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       const { specs } = emptySpecs(parent);
       const name = `N${Math.floor(u[2] * 1000)}`;
       const named = specs.map((s) => (s.name === 'EntityAttributes' ? { ...s, data: { ...s.data, name } } : s));
-      return createEntityWithUndo(`Create ${name}`, parent, named, noSelect) == null ? 'refused' : 'done';
+      return editRefusable(() => (createEntityWithUndo(`Create ${name}`, parent, named, noSelect) == null ? 'refused' : 'done'), st);
     }
     case 'reparent': {
       const e = pick(u[0], ents);
@@ -419,10 +436,13 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
         const idOf = (t: string) => { try { return (JSON.parse(t) as { id?: string }).id; } catch { return undefined; } };
         const heldBefore = new Set(gone.filter(([, t]) => { const id = idOf(t); return !!id && getCachedPrefab(id) !== undefined; }).map(([p]) => p));
         for (const [p, t] of gone) st.be.write(p, t);
+        // The renderer's manifest learns of them, as the watcher's push would (#1835).
+        st.be.pushManifest();
         const back = await loadSceneReporting(st.f.scenePath);
         if (back.outcome !== 'loaded') throw new Error(`reload with the deleted prefabs restored: ${back.outcome}`);
         restored = worldTree();
         for (const [p] of gone) st.be.remove(p);
+        st.be.pushManifest();
         applyAssetPathMoves(gone.map(([from]) => ({ from, to: null })));
         for (const [p] of gone) if (!heldBefore.has(p)) invalidatePrefab(p);
       }

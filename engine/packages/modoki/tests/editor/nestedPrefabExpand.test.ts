@@ -148,7 +148,7 @@ describe('instantiatePrefab — 2-level nesting (rootInstanceId / parentId table
     setPrefabCache(MID, midPrefab as any);
 
     const midRoot = instantiatePrefab(midPrefab as any);
-    setPrefabSource(midRoot, MID);
+    setPrefabSource(midRoot, { id: MID });
 
     const M1 = findByName('M1'), M2 = findByName('M2'), I1 = findByName('I1'), I2 = findByName('I2');
     expect(midRoot).toBe(M1); // rootLocalId 1 → M1 is the instance root
@@ -179,7 +179,7 @@ describe('instantiatePrefab — 3-level nesting (nested-nested)', () => {
     setPrefabCache(TOP, topPrefab as any);
 
     const topRoot = instantiatePrefab(topPrefab as any);
-    setPrefabSource(topRoot, TOP);
+    setPrefabSource(topRoot, { id: TOP });
 
     const T1 = findByName('T1'), M1 = findByName('M1'), M2 = findByName('M2'), I1 = findByName('I1'), I2 = findByName('I2');
 

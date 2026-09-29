@@ -107,7 +107,7 @@ describe('captureInstanceStructure — nested-prefab rows', () => {
     setPrefabCache(shipPrefab.id, shipPrefab as any);
 
     const shipRoot = instantiatePrefab(shipPrefab as any);
-    setPrefabSource(shipRoot, shipPrefab.id);
+    setPrefabSource(shipRoot, { id: shipPrefab.id });
 
     const struct = captureInstanceStructure(shipRoot, shipPrefab as any);
 

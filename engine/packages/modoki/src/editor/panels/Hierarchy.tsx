@@ -22,6 +22,8 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { aSceneSwapIsHappening } from '../scene/playMode';
 import { assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
+import { withPrefabEditRefusalToast, toastIfPrefabEditReason } from './prefabEditRefusalToast';
+import { prefabEditRefusal } from '../scene/prefabEditRefusal';
 import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { pushAction } from '../undo/undoManager';
@@ -982,12 +984,12 @@ export default function Hierarchy() {
     const resourceIds = new Set(getAllEntities().filter(e => e.isResource).map(e => e.id));
     const ids = (selectedEntityIds.includes(entity.id) ? selectedEntityIds : [entity.id])
       .filter(id => id !== 0 && !resourceIds.has(id));
-    deleteEntitiesWithUndo(ids, setSelectionRaw);
+    withPrefabEditRefusalToast(() => deleteEntitiesWithUndo(ids, setSelectionRaw));
   }, [selectedEntityIds, setSelectionRaw]);
 
   const handleDuplicate = useCallback((entity: EntityInfo) => {
     if (entity.id === 0 || entity.isResource) return;
-    duplicateEntity(entity.id, selectEntity);
+    withPrefabEditRefusalToast(() => duplicateEntity(entity.id, selectEntity));
   }, [selectEntity]);
 
   const handleRename = useCallback((entity: EntityInfo) => {
@@ -1031,6 +1033,8 @@ export default function Hierarchy() {
       // Only the scene-move refusals toast. Self, cycle and resource refusals are refused silently,
       // as a same-scene drop always was.
       if (plan.reason === 'instance-member') useEditorStore.getState().showToast(SCENE_MOVE_REFUSAL_TEXT[plan.reason], 'warn');
+      // A prefab-edit refusal says why too (#1836): moving the root, or an entity out of it, is not a silent no-op.
+      else toastIfPrefabEditReason(plan.reason);
       return false;
     }
     if (plan.kind === 'scene-move') {
@@ -1082,7 +1086,7 @@ export default function Hierarchy() {
       void requestReparent(sourceId, parentId).then((moved) => { if (moved) setEntityClipboard(null); });
       return;
     }
-    pasteEntityCopy(entityClipboard.snapshot, parentId, selectEntity);
+    withPrefabEditRefusalToast(() => pasteEntityCopy(entityClipboard.snapshot, parentId, selectEntity));
   }, [entityClipboard, selectEntity, requestReparent]);
 
   // ── Focus (frame in SceneView orbit camera — see SceneView F-key) ──
@@ -1227,7 +1231,7 @@ export default function Hierarchy() {
       }),
       ...each('duplicate', 'mod+d',
         () => !!liveEntity(),
-        () => { const en = liveEntity(); if (en) duplicateEntity(en.id, kbdRef.current.selectEntity); }),
+        () => { const en = liveEntity(); if (en) withPrefabEditRefusalToast(() => duplicateEntity(en.id, kbdRef.current.selectEntity)); }),
       // Delete the whole multi-selection (falling back to the primary), minus
       // root/resource ids — one coalesced undo entry. Mac uses Cmd+Backspace, other
       // platforms use Delete; both are declared so neither platform's chord leaks.
@@ -1236,7 +1240,7 @@ export default function Hierarchy() {
         () => deletableIds().length > 0,
         () => {
           const ids = deletableIds();
-          if (ids.length > 0) deleteEntitiesWithUndo(ids, kbdRef.current.setSelectionRaw);
+          if (ids.length > 0) withPrefabEditRefusalToast(() => deleteEntitiesWithUndo(ids, kbdRef.current.setSelectionRaw));
         })),
     ]);
     function deletableIds(): number[] {
@@ -1259,14 +1263,14 @@ export default function Hierarchy() {
    *  entity shows under its parent and ignores the tag. */
   const createEntityWithUndo = useCallback(
     (label: string, parentId: number, traitSpecs: { name: string; data?: Record<string, any> }[], folder?: string) =>
-      createEntityAction(
+      withPrefabEditRefusalToast(() => createEntityAction(
         label,
         parentId,
         folder
           ? traitSpecs.map(s => (s.name === 'EntityAttributes' ? { ...s, data: { ...(s.data ?? {}), editorFolder: folder } } : s))
           : traitSpecs,
         selectEntity,
-      ),
+      )),
     [selectEntity],
   );
 
@@ -1392,6 +1396,9 @@ export default function Hierarchy() {
     if (!eaMeta) return;
     const target = normalizeFolderPath(folderPath);
     if (e.parentId !== 0) {
+      // Out to the top level: in prefab edit the root stays put and nothing leaves it (#1836) — say so, not a no-op.
+      const editRefusal = prefabEditRefusal({ kind: 'reparent', id: entityId, parentId: 0 });
+      if (editRefusal) { useEditorStore.getState().showToast(editRefusal.text, 'warn'); return; }
       if (!reparentEntity(entityId, 0)) return; // reparent(→root) never clears the tag
       if (target) writeTraitFieldWithUndo(entityId, eaMeta, 'editorFolder', target);
       return;

@@ -114,7 +114,7 @@ async function expandWithNestedAdd(guid: string) {
   const mod = await import('../../src/editor/scene/prefab');
   mod.setPrefabCache(ADDED, addedPrefab as never);
   const rootId = mod.instantiatePrefab(outerPrefab as never, 0);
-  mod.setPrefabSource(rootId, OUTER);
+  mod.setPrefabSource(rootId, { id: OUTER });
   mod.applyStructureByRootInstance(rootId, outerPrefab as never, {
     added: [{
       parentLocalId: 2, guid, name: 'A1', traits: {}, children: [], prefab: ADDED,

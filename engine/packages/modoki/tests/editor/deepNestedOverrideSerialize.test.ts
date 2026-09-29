@@ -127,7 +127,7 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, makeB() as any); setPrefabCache(D, dPrefab as any);
 
-    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, D);
+    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, { id: D });
     // Scene edit on A (two levels deep): x = 7.
     const a = aRoot();
     writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
@@ -148,7 +148,7 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
     // B overrides A.y = 5 (middle layer). Scene will edit only A.x.
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, makeB({ 1: { Transform: { y: 5 } } }) as any); setPrefabCache(D, dPrefab as any);
 
-    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, D);
+    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, { id: D });
     const a = aRoot();
     expect((index.get(a)!.get(Transform) as any).y).toBe(5); // B's override is live on A
     writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
@@ -166,7 +166,7 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, makeB() as any); setPrefabCache(D, dPrefab as any);
 
-    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, D);
+    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, { id: D });
     const a = aRoot();
     writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
     const scene = await serializeScene();
@@ -174,7 +174,7 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
 
     // Reload into a fresh world via the editor forwarder (mirrors runtime apply).
     testWorld = createWorld(); index.clear();
-    const root2 = instantiatePrefab(dPrefab as any, 0, undefined, deep); setPrefabSource(root2, D);
+    const root2 = instantiatePrefab(dPrefab as any, 0, undefined, deep); setPrefabSource(root2, { id: D });
     expect((index.get(aRoot())!.get(Transform) as any).x).toBe(7);
   });
 });

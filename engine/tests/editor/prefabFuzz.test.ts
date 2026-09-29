@@ -42,10 +42,9 @@
  *
  *  - A tainted segment's walk (after an outside edit, a prefab-edit save or a watcher reload) forgives every refusal, so
  *    a write whose #1774 mark-conflict recovery fails there is not caught; only a clean segment holds it.
- *  - The renderer's manifest is pushed only by the simulated watcher, never by a route: the backend's `rebuildManifest`
- *    returns the manifest without pushing it (#1835), while the host's pushes it before the route's renderer repair. So
- *    right after a route move, a path looked up through the manifest reads stale here and fresh in the editor (#1807's
- *    and #1828's routes need that lag; in the editor they need a failed inline rebuild).
+ *  - The renderer's manifest is pushed by a route's inline rebuild, before its renderer repair, as the host's is (#1835),
+ *    and by the simulated watcher — but ADDITIVELY, where the host's prunes: a deleted prefab's guid stays resolvable
+ *    here. Pruning surfaces #1844. `failManifestRebuilds` reproduces a failed inline rebuild, the editor's one lag window.
  *  - A deleted prefab's round trip is judged with it RESTORED as well as plainly (#1805, `saveReload`): a run fails only
  *    when neither holds. A loss the live world itself cannot show — a row a swap left unexpanded — needs a regression
  *    repro (#1812's), not the identity.
@@ -220,6 +219,18 @@ describe('#1789 prefab fuzz', () => {
       expect(res.failure, res.failure ? `${res.failure.check}: ${res.failure.detail}` : '').toBeUndefined();
     }, 60_000);
   }
+
+  // #1835: the one real window the renderer's manifest has — a route whose inline rebuild THROWS replies
+  // `manifestRebuilt: false`, and the move lands before any push. #1828's drop redo must still tag by the document's guid
+  // there (setPrefabSource takes the document). Mutation: tag from the path through the manifest again — this goes red.
+  it('regression #1828: with the inline manifest rebuild failing, the drop redo after a Rename undo still tags by guid', async () => {
+    const repro = REGRESSIONS.find((r) => r.issue === 1828)!.repro;
+    be.failManifestRebuilds = true;
+    try {
+      const res = await runOps(be, repro, OPTS);
+      expect(res.failure, res.failure ? `${res.failure.check}: ${res.failure.detail}` : '').toBeUndefined();
+    } finally { be.failManifestRebuilds = false; }
+  }, 60_000);
 
   for (const k of KNOWN_OPEN) {
     it(`KNOWN_OPEN #${k.issue} still reproduces — remove its entry once it is fixed (${k.what})`, async () => {

@@ -186,7 +186,7 @@ describe('nested override serialization', () => {
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
 
     const outerRoot = instantiatePrefab(outerPrefab as any);
-    setPrefabSource(outerRoot, OUTER);
+    setPrefabSource(outerRoot, { id: OUTER });
 
     // Override the nested child I2's Transform.x on THIS instance only.
     const innerRoot = innerRootUnder();
@@ -209,9 +209,9 @@ describe('inner-prefab edit refreshes all inner copies, preserving per-copy over
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
 
     // Two independent outer instances → two inner copies.
-    const outerA = instantiatePrefab(outerPrefab as any); setPrefabSource(outerA, OUTER);
+    const outerA = instantiatePrefab(outerPrefab as any); setPrefabSource(outerA, { id: OUTER });
     const m2A = memberByLocal(outerA, 2);
-    const outerB = instantiatePrefab(outerPrefab as any); setPrefabSource(outerB, OUTER);
+    const outerB = instantiatePrefab(outerPrefab as any); setPrefabSource(outerB, { id: OUTER });
 
     // Copy A: override the nested child I2.x = 5.
     const innerA = innerRootUnder(m2A);
@@ -245,7 +245,7 @@ describe('outer-prefab edit rebuilds the instance (risk R3: nested live override
     setPrefabCache(OUTER, outerPrefab as any);
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
 
-    const outerRoot = instantiatePrefab(outerPrefab as any); setPrefabSource(outerRoot, OUTER);
+    const outerRoot = instantiatePrefab(outerPrefab as any); setPrefabSource(outerRoot, { id: OUTER });
     const m2 = memberByLocal(outerRoot, 2);
 
     // Live per-copy override on the nested child, plus an outer-member edit to apply.

@@ -1,6 +1,6 @@
 /** Load a scene JSON file into an ECS world. Shared between editor and runtime. */
 
-import { expandsToRoot, fetchedExpandsToRoot } from './prefabRoot';
+import { expandsToRoot, fetchedExpandsToRoot, refuseCyclicReferenceNode, stackForReferenceNode } from './prefabRoot';
 import { type Entity, type World } from 'koota';
 import { getCurrentWorld, spawnEntity, destroyEntity, indexEntityGuid, findEntityById, findEntityByGuid } from '../core/ecs/world';
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
@@ -824,8 +824,10 @@ export interface StructureApplyOps {
   /** Spawn a plain added entity from trait args and return its new ECS id (the
    *  caller has already excluded PrefabInstance and stamped parentId/guid). */
   spawnAdded(traitArgs: unknown[]): number;
-  /** Expand a user-added nested-instance reference node under `parentEcsId`. */
-  spawnNestedInstance(node: AddedEntity, parentEcsId: number): void;
+  /** Expand a user-added nested-instance reference node under `parentEcsId`. `stack` is the expansion's ANCESTOR
+   *  prefab ids (I16), the prefab whose structure this is included: the impl hands a copy to the expansion, whose
+   *  cycle guard then refuses a node that contains an ancestor instead of recursing until the stack overflows (#1817). */
+  spawnNestedInstance(node: AddedEntity, parentEcsId: number, stack: ReadonlySet<string>): void;
   /** The world the structure is applied to — where a member move is queued (#1437). */
   world: World;
   /** Run after the whole structure is applied (editor marks dirty; runtime no-ops). */
@@ -847,6 +849,8 @@ export function applyStructureCore(
   localToEcs: Map<number, number>,
   prefab: PrefabLike,
   structure: InstanceStructureData,
+  /** The expansion's ancestor prefab ids, `prefab`'s own included — see `StructureApplyOps.spawnNestedInstance`. */
+  stack: ReadonlySet<string> = new Set(),
 ): void {
   // localIds intentionally deleted by THIS pass — an addition anchored to one of
   // these is skipped (deliberate removal), whereas an addition whose anchor is
@@ -960,7 +964,7 @@ export function applyStructureCore(
       // Reference node → expand the child prefab as a user-added nested instance
       // under the anchor (parentLocalId stays 0 so the next capture re-detects it).
       if (node.prefab) {
-        ops.spawnNestedInstance(node, parentEcsId);
+        ops.spawnNestedInstance(node, parentEcsId, stack);
         return;
       }
       const traitArgs: unknown[] = [];
@@ -1159,6 +1163,8 @@ export function applyStructureByLocalToEcs(
   localToEcs: Map<number, number>,
   prefab: PrefabLike,
   structure: InstanceStructureData,
+  /** `instantiatePrefabIntoWorld`'s cycle stack, holding `prefab` (I16, #1817). */
+  stack?: ReadonlySet<string>,
 ): void {
   // Lazily build an id → handle map only when a removal/component pass needs it.
   let byId: Map<number, EntityHandle> | null = null;
@@ -1196,7 +1202,9 @@ export function applyStructureByLocalToEcs(
         const entity = spawnEntity(world, ...(traitArgs as Parameters<typeof world.spawn>));
         return entity.id();
       },
-      spawnNestedInstance: (node, parentEcsId) => {
+      spawnNestedInstance: (node, parentEcsId, ancestors) => {
+        // A node re-entering a self-containing prefab above it is the one endless shape (I16, #1817): refused, and named.
+        if (refuseCyclicReferenceNode(ancestors, node, readRuntimeTemplateDoc, '[loadSceneFile]')) return;
         const child = getCachedPrefab(node.prefab!) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null;
         // One that loads but expands to no root is kept the same way (#1768).
         if (!child || !expandsToRoot(child, readRuntimeTemplateDoc)) {
@@ -1207,7 +1215,9 @@ export function applyStructureByLocalToEcs(
         }
         const rootEcsId = instantiatePrefabIntoWorld(
           world, child, parentEcsId, undefined, node.prefab, node.overrides,
-          { added: node.added, removed: node.removed, removedTraits: node.removedTraits, moved: node.moved, members: node.members }, undefined, node.nestedOverrides,
+          // The self-containing ancestors carried on, so a loop through two or more documents still meets its own start
+          // and is refused above, instead of recursing until the stack overflows.
+          { added: node.added, removed: node.removed, removedTraits: node.removedTraits, moved: node.moved, members: node.members }, stackForReferenceNode(ancestors, readRuntimeTemplateDoc), node.nestedOverrides,
           node.nestedStructure,
         );
         // RESTORE the node's own guid (QA-PREFAB-0004). A nested instance's root is
@@ -1236,6 +1246,7 @@ export function applyStructureByLocalToEcs(
     localToEcs,
     prefab,
     structure,
+    stack,
   );
 }
 
@@ -2233,7 +2244,7 @@ export function instantiatePrefabIntoWorld(
   // additions can resolve their anchor localId against the fully-built map and a
   // removal can't strand an override that ran before it.
   if (structure && (structure.added?.length || structure.removed?.length || structure.removedTraits || structure.moved || structure.members)) {
-    applyStructureByLocalToEcs(world, localToEcs, prefab, rebaseStructureTokens(structure, segments));
+    applyStructureByLocalToEcs(world, localToEcs, prefab, rebaseStructureTokens(structure, segments), stack);
   }
 
   // Pop this prefab off the cycle stack — the guard tracks ANCESTORS in the

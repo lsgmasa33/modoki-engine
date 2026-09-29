@@ -242,7 +242,7 @@ describe('copies and string refs under a real mint (#1210)', () => {
     tw = createTestWorld({});
     setPrefabCache(KIT, kit() as never);
     const rootId = instantiatePrefab(kit() as never);
-    setPrefabSource(rootId, KIT);
+    setPrefabSource(rootId, { id: KIT });
     const part = byName('Part');
     const added = spawnEntity(tw.world, Transform({ x: 3 }), EntityAttributes({ name: 'Spark', parentId: part.id() }));
     expect(isRuntimeGuid(guidOf(added))).toBe(true);
@@ -259,7 +259,7 @@ describe('copies and string refs under a real mint (#1210)', () => {
     tw = createTestWorld({});
     setPrefabCache(KIT, kit() as never);
     const rootId = instantiatePrefab(kit() as never);
-    setPrefabSource(rootId, KIT);
+    setPrefabSource(rootId, { id: KIT });
     const part = byName('Part');
     const added = spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Anchored', parentId: part.id() }));
     spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Grandchild', parentId: added.id() }));
@@ -280,7 +280,7 @@ describe('copies and string refs under a real mint (#1210)', () => {
     tw = createTestWorld({});
     setPrefabCache(KIT, kit() as never);
     const rootId = instantiatePrefab(kit() as never);
-    setPrefabSource(rootId, KIT);
+    setPrefabSource(rootId, { id: KIT });
     const part = byName('Part');
     // `sourceScene` is `runtimeOnly` in registerTraits.ts — SceneManager re-stamps it after a spawn.
     spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Stamped', parentId: part.id(), sourceScene: '/assets/scenes/a.scene.json' }));
@@ -341,7 +341,7 @@ describe('copies and string refs under a real mint (#1210)', () => {
     tw = createTestWorld({});
     setPrefabCache(KIT, kit() as never);
     const rootId = instantiatePrefab(kit() as never);
-    setPrefabSource(rootId, KIT);
+    setPrefabSource(rootId, { id: KIT });
     const added = spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Grip', parentId: byName('Part').id() }));
     spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Blade' }), BoneAttachment({ target: guidOf(added), bone: 'R' }));
     await expect(serializeScene()).rejects.toThrow(/runtime guid/);

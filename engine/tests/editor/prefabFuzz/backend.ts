@@ -8,13 +8,23 @@
  *  What the host would add and this does not (the harness-blind list in `prefabFuzz.test.ts` names these):
  *  - no file watcher. A write the route marks as the editor's own is recorded in `marked`; any other change to the
  *    directory is found by the harness's `flushWatcher` and reaches the editor only through the harness's hot-reload step.
- *  - the manifest is rebuilt from the directory on every read (the host keeps a watcher-fed cache), so it is never
- *    stale here. */
+ *  - the manifest is rebuilt from the directory on every read (the host keeps a watcher-fed cache), so the BACKEND's
+ *    copy is never stale here. The RENDERER's copy is another matter: `rebuildManifest` pushes it, as the host's does
+ *    (Vite's `asset-manifest-updated`, Electron's `modoki:bridge-manifest-updated`), so the routes that rebuild inline
+ *    (`/api/move-file`, `/api/delete-asset`) land the renderer's manifest before their `applyMovesInRenderer`, in the
+ *    editor's order (#1835). Before that it only returned the manifest, and the renderer's copy lagged every route move
+ *    until the harness's next watcher flush — a lag the editor has only when the inline rebuild throws, which
+ *    `failManifestRebuilds` reproduces on purpose.
+ *  - ⚠️ the push is ADDITIVE, where the host's loads with `prune`: a delete does not drop the trashed prefab's guid from
+ *    the renderer's copy here. Pruning is what the editor does, and turning it on surfaces undo walks that read a
+ *    trashed prefab's guid after the delete pruned it and before a restore's push lands: #1844 (a delete's undo restores
+ *    through `/api/write-file`, which does not rebuild inline). Turn `prune` on here when #1844 lands. */
 
 import fs from 'fs';
 import path from 'path';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../../plugins/backend/editorBackendRouter';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { loadManifestJson } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
 
 /** Asset URLs the fuzzer's project serves: `/fuzz/...` maps onto the scratch directory. */
 export const ROOT_URL = '/fuzz';
@@ -35,6 +45,12 @@ export interface FuzzBackend {
   routeCounts: Map<string, number>;
   /** The renderer relay. Set by the harness once the agent ops are registered. */
   relay: (op: string, params: unknown) => Promise<unknown>;
+  /** While true, `rebuildManifest` throws, as a host's rebuild can: the routes then reply `manifestRebuilt: false` and
+   *  the renderer's manifest lags the move until the watcher's push — the one real window of #1828's routes (#1835). */
+  failManifestRebuilds: boolean;
+  /** Rescan the directory and push the manifest to the renderer, as the host's watcher does when files appear or vanish
+   *  outside a route (the harness's own restore of a deleted prefab). Additive — see the docblock above. */
+  pushManifest(): void;
   reset(): void;
 }
 
@@ -67,6 +83,8 @@ export function makeFuzzBackend(): FuzzBackend {
     marked: new Set(),
     routeCounts: new Map(),
     relay: async () => { throw new Error('fuzz backend: no renderer relay installed'); },
+    failManifestRebuilds: false,
+    pushManifest() { loadManifestJson(manifest() as Parameters<typeof loadManifestJson>[0]); },
     write(url, text) { fs.mkdirSync(path.dirname(abs(url)), { recursive: true }); fs.writeFileSync(abs(url), text); },
     read(url) { try { return fs.readFileSync(abs(url), 'utf8'); } catch { return undefined; } },
     remove(url) { fs.rmSync(abs(url), { force: true }); },
@@ -104,7 +122,12 @@ export function makeFuzzBackend(): FuzzBackend {
     absToAssetUrl: (p: string) => toUrl(p),
     firstRootDir: () => dir,
     getManifest: manifest,
-    rebuildManifest: manifest,
+    // Pushed before the reply, as the host pushes it (`createEditor.tsx`'s `asset-manifest-updated`) — additively, above.
+    rebuildManifest: () => {
+      if (backend.failManifestRebuilds) throw new Error('fuzz backend: manifest rebuild failed (armed)');
+      backend.pushManifest();
+      return manifest();
+    },
     requestBrowser: (op: string, params: unknown) => backend.relay(op, params),
     getSchema: () => undefined,
     markEditorWrite: (p: string, hash?: string | null) => {

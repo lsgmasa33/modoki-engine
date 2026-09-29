@@ -106,7 +106,7 @@ describe('override mark survival across a base edit', () => {
     const oldChild = childAtX(0);
     setPrefabCache(CHILD, oldChild as any);
     const root = instantiatePrefab(oldChild as any);
-    setPrefabSource(root, CHILD);
+    setPrefabSource(root, { id: CHILD });
     const { applyOverridesByRootInstance } = await getModule();
     applyOverridesByRootInstance(root, { 1: { Transform: { x: -4.1 } } });
 
@@ -129,7 +129,7 @@ describe('override mark survival across a base edit', () => {
     const child = childAtX(0);
     setPrefabCache(CHILD, child as any);
     const root = instantiatePrefab(child as any);
-    setPrefabSource(root, CHILD);
+    setPrefabSource(root, { id: CHILD });
     // No override applied, no edit → no mark → nothing captured.
     const captured = captureInstanceOverrides(root, child as any);
     expect(captured[1]).toBeUndefined();
@@ -141,7 +141,7 @@ describe('override mark survival across a base edit', () => {
     const oldChild = childAtX(0);
     setPrefabCache(CHILD, oldChild as any);
     const root = instantiatePrefab(oldChild as any);
-    setPrefabSource(root, CHILD);
+    setPrefabSource(root, { id: CHILD });
 
     // Simulate a user edit: set the live value AND mark it (what entityActions does).
     writeTraitFieldImpl(root, TRAITS[0], 'x', 7);

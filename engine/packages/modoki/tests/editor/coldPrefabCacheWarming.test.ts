@@ -158,7 +158,7 @@ async function coldWorldHoldingOneInstance() {
   mod.setPrefabCache(INNER, innerPrefab as any);
   const innerRoot = mod.instantiatePrefab(innerPrefab as any, holder.id());
   expect(innerRoot, 'the fixture must actually spawn the nested instance').toBeGreaterThan(0);
-  mod.setPrefabSource(innerRoot, INNER);
+  mod.setPrefabSource(innerRoot, { id: INNER });
 
   mod.setPrefabCache(INNER, null);   // ← the scene-load state
   expect(mod.getCachedPrefabSync(INNER), 'fixture must start COLD or it tests nothing').toBeNull();
@@ -272,7 +272,7 @@ describe('preloadNestedPrefabsForSubtree — depth', () => {
     mod.setPrefabCache(INNER, innerPrefab as any);
     mod.setPrefabCache(MID, midPrefab as any);
     const midRoot = mod.instantiatePrefab(midPrefab as any, holder.id());
-    mod.setPrefabSource(midRoot, MID);
+    mod.setPrefabSource(midRoot, { id: MID });
     mod.setPrefabCache(INNER, null);
     mod.setPrefabCache(MID, null);
 

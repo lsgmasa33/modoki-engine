@@ -142,7 +142,7 @@ describe('remove a prefab component from an instance', () => {
   it('captures it as removedTraits', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, captureInstanceStructure } = await getModule();
     setPrefabCache(SHIP, shipPrefab as any);
-    const root = instantiatePrefab(shipPrefab as any); setPrefabSource(root, SHIP);
+    const root = instantiatePrefab(shipPrefab as any); setPrefabSource(root, { id: SHIP });
 
     rootMember(root, 1).remove(Spin); // user removes the prefab-defined Spin
     const struct = captureInstanceStructure(root, shipPrefab as any);
@@ -152,8 +152,8 @@ describe('remove a prefab component from an instance', () => {
   it('apply-to-prefab persists the removal to the file AND strips it from every instance', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, applyToPrefabSelective } = await getModule();
     setPrefabCache(SHIP, shipPrefab as any);
-    const a = instantiatePrefab(shipPrefab as any); setPrefabSource(a, SHIP);
-    const b = instantiatePrefab(shipPrefab as any); setPrefabSource(b, SHIP);
+    const a = instantiatePrefab(shipPrefab as any); setPrefabSource(a, { id: SHIP });
+    const b = instantiatePrefab(shipPrefab as any); setPrefabSource(b, { id: SHIP });
 
     rootMember(a, 1).remove(Spin);
     await applyToPrefabSelective(a, new Set(['-trait.1.Spin']));
@@ -169,7 +169,7 @@ describe('revert a removed component', () => {
   it('restores the prefab-defined component (with base values) on the instance', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, revertOverridesSelective } = await getModule();
     setPrefabCache(SHIP, shipPrefab as any);
-    const root = instantiatePrefab(shipPrefab as any); setPrefabSource(root, SHIP);
+    const root = instantiatePrefab(shipPrefab as any); setPrefabSource(root, { id: SHIP });
 
     rootMember(root, 1).remove(Spin); // instance drops Spin...
     const result = await revertOverridesSelective(root, new Set(['-trait.1.Spin']));
@@ -186,8 +186,8 @@ describe('add a component on an instance then apply', () => {
   it('promotes the new component to the prefab and a second instance gains it on refresh', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, applyToPrefabSelective } = await getModule();
     setPrefabCache(SHIP, shipPrefab as any);
-    const a = instantiatePrefab(shipPrefab as any); setPrefabSource(a, SHIP);
-    const b = instantiatePrefab(shipPrefab as any); setPrefabSource(b, SHIP);
+    const a = instantiatePrefab(shipPrefab as any); setPrefabSource(a, { id: SHIP });
+    const b = instantiatePrefab(shipPrefab as any); setPrefabSource(b, { id: SHIP });
 
     // Add Glow to instance A only.
     rootMember(a, 1).add(Glow({ intensity: 0.8, radius: 4 }));

@@ -642,7 +642,7 @@ describe('a nested instance\'s base is its enclosing layer WHOLE: structure, and
       await load(scene(O, [ROOT1]));
       const holder = inInstance(ROOT1, 'Holder2');
       const mine = instantiatePrefab(getCachedPrefabSync(P2) as PrefabFile, holder);
-      setPrefabSource(mine, P2);
+      setPrefabSource(mine, { id: P2 });
       const mineXa = getAllEntities().find((e) => e.name === 'XA' && e.parentId === mine)!.id;
       setTf(mineXa, 'x', 3);
       expect(keys(mine, P2)).toEqual([xaKey]);

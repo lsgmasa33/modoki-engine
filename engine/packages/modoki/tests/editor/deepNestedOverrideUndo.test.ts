@@ -141,7 +141,7 @@ describe('Missing Test 6 — deep-nested override + per-field edit + undo (real 
 
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, bPrefab as any); setPrefabCache(D, dPrefab as any);
 
-    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, D);
+    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, { id: D });
     const a = aRoot();
     expect(a).toBeGreaterThan(0);
     expect((index.get(a)!.get(Transform) as any).x).toBe(0); // base

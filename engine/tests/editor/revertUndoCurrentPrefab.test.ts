@@ -92,7 +92,7 @@ beforeEach(() => {
 async function revertedShip() {
   setPrefabCache(SHIP, shipV1());
   const root = instantiatePrefab(shipV1());
-  setPrefabSource(root, SHIP);
+  setPrefabSource(root, { id: SHIP });
   overrideX(root, 'Flame', 5);
   const flameKey = `${piOf(member(root, 'Flame'))!.localId}.Transform.x`;
   const result = await quietly(() => revertOverridesWithUndo(root, new Set([flameKey])));
@@ -151,7 +151,7 @@ describe('Revert undo/redo after the template changed (#1665)', () => {
     setPrefabCache(MID, midV1);
     setPrefabCache(SHIP, doc(SHIP, 'Ship', [row(1, G(1), 'Ship', 0), row(2, G(2), 'Flame', 1), row(3, G(4), 'Mid', 1, { prefab: MID })]));
     const root = instantiatePrefab(getCachedPrefabSync(SHIP)!);
-    setPrefabSource(root, SHIP);
+    setPrefabSource(root, { id: SHIP });
     overrideX(root, 'Flame', 5);
     const flameKey = `${piOf(member(root, 'Flame'))!.localId}.Transform.x`;
     expect(await quietly(() => revertOverridesWithUndo(root, new Set([flameKey])))).not.toBeNull();
@@ -180,7 +180,7 @@ describe('Detach undo after the template changed (#1665 sibling)', () => {
   it('the reattached instance is brought onto the current template — nothing is saved as removed', async () => {
     setPrefabCache(SHIP, shipV1());
     const root = instantiatePrefab(shipV1());
-    setPrefabSource(root, SHIP);
+    setPrefabSource(root, { id: SHIP });
     const snapshot = detachPrefabInstance(root);
     await templateChangesDetached(shipV2());
 
@@ -211,7 +211,7 @@ describe('the review cases (#1665 close-out)', () => {
     };
     setPrefabCache(SHIP, ship(false));
     const root = instantiatePrefab(getCachedPrefabSync(SHIP)!);
-    setPrefabSource(root, SHIP);
+    setPrefabSource(root, { id: SHIP });
     overrideX(root, 'Flame', 5);
     expect(await quietly(() => revertOverridesWithUndo(root, new Set([`${piOf(member(root, 'Flame'))!.localId}.Transform.x`])))).not.toBeNull();
     await templateChanges(ship(true));
@@ -228,7 +228,7 @@ describe('the review cases (#1665 close-out)', () => {
     setPrefabCache(MID, midDoc);
     setPrefabCache(SHIP, doc(SHIP, 'Ship', [row(1, G(1), 'Ship', 0), row(2, G(2), 'Flame', 1), row(3, G(4), 'Mid', 1, { prefab: MID })]));
     const root = instantiatePrefab(getCachedPrefabSync(SHIP)!);
-    setPrefabSource(root, SHIP);
+    setPrefabSource(root, { id: SHIP });
     const flame = member(root, 'Flame');
     const box = getAllEntities().find((e) => e.name === 'Box')!.id;
     // A move is recorded against the new parent's guid (`InstanceStructure.moved`), so both carry one.
@@ -260,7 +260,7 @@ describe('the review cases (#1665 close-out)', () => {
   it('Detach undo after the scene was RELOADED plain (the production route): brought onto the current template', async () => {
     setPrefabCache(SHIP, shipV1());
     const root = instantiatePrefab(shipV1());
-    setPrefabSource(root, SHIP);
+    setPrefabSource(root, { id: SHIP });
     detachPrefabInstanceWithUndo(root, 'Detach prefab "Ship"', '[test]');
     // The reload: the same plain entities, guids and parents, in a fresh world that recorded nothing.
     const plain = getAllEntities().map((e) => ({ id: e.id, name: e.name, parentId: e.parentId, guid: e.guid! }));
@@ -282,7 +282,7 @@ describe('the review cases (#1665 close-out)', () => {
   it('Detach undo → redo → undo: the member the first undo brought in is linked again, not left plain', async () => {
     setPrefabCache(SHIP, shipV1());
     const root = instantiatePrefab(shipV1());
-    setPrefabSource(root, SHIP);
+    setPrefabSource(root, { id: SHIP });
     detachPrefabInstanceWithUndo(root, 'Detach prefab "Ship"', '[test]');
     await templateChangesDetached(shipV2());
     await quietly(() => undo());
@@ -300,7 +300,7 @@ describe('the review cases (#1665 close-out)', () => {
   it('Create Prefab Replace undo: the restored links read their own document again, not the one that replaced it', async () => {
     setPrefabCache(SHIP, shipV1());
     const root = instantiatePrefab(shipV1());
-    setPrefabSource(root, SHIP);
+    setPrefabSource(root, { id: SHIP });
     const antenna = spawnEntity(getCurrentWorld(), EntityAttributes({ name: 'Antenna', parentId: root, guid: 'eeeeeeee-0000-4000-8000-000000011665' }), Transform({ x: 0, y: 0, z: 0 })).id();
     // Create Prefab → Replace Ship with this tree, the way assetOps does it: prior links snapshotted unstripped, the
     // new document cached, the tree retagged against it.

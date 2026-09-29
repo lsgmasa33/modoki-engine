@@ -45,7 +45,7 @@ import {
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
   isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEditReport, exitPrefabEditing, returnSceneTarget,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, ensureGuid, type TraitSpec,
-  planReparent, applyReparent, type ReparentPlan, preflightSceneMove, formatSceneMoveConfirm, createTargetScene,
+  planReparent, applyReparent, type ReparentPlan, preflightSceneMove, formatSceneMoveConfirm, createTargetScene, PREFAB_EDIT_REFUSAL_TEXT, PrefabEditRefusalError, assertPrefabEditAllows,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
@@ -691,6 +691,9 @@ function loadedSceneName(sceneGuid: string): string {
 
 /** Why `planReparent` refused, in words an agent can act on (#1429). `op` names the op the agent called. */
 function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>['reason'], id: number, parentId: number, op = 'reparent-entity'): string {
+  // A prefab-edit refusal in the editor's own words, read off its table: a reason listed by hand here went stale the day
+  // one was added (`scaffold` fell to the default and told the agent the target was a descendant, close-out review).
+  if (reason in PREFAB_EDIT_REFUSAL_TEXT) return `${op}: refused to move ${id} under ${parentId} — ${PREFAB_EDIT_REFUSAL_TEXT[reason as keyof typeof PREFAB_EDIT_REFUSAL_TEXT]}`;
   switch (reason) {
     case 'resource': return `${op}: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
     case 'instance-member': return `${op}: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and a prefab instance would be split across two scene files: something in ${id}'s subtree (${id} itself, or an entity under it) belongs to an instance that would stay behind, or a member of an instance in it lives outside the subtree. Move that instance's root instead, or unpack that instance first.`;
@@ -1108,6 +1111,9 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           const resolved = resolveLiveEntityRef(op.entity);
           if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) { code = resolved.code; first = resolved; } continue; }
           const id = resolved.id;
+          // Refused BEFORE anything is named or minted (#1836 close-out review): a refused root delete reported the
+          // root's live children as `alsoDeleted`, and minted guids into a world it did not change.
+          assertPrefabEditAllows({ kind: 'delete', ids: [id] });
           // The delete takes the subtree; name the rest BEFORE it runs (#1262), minted durable first for
           // delete-entities' reason: the guid named here must be the one undo brings back.
           const descendants = descendantsOf([id]);
@@ -1223,6 +1229,21 @@ function refusePrefsWriteInSession(): void {
     { options });
 }
 
+/** Run an op; a `PrefabEditRefusalError` it throws (sync or async) becomes `OpRefusal('REFUSED_BY_OP')`. A sync op stays
+ *  sync. Classified by CLASS, as `opReplyFor` classifies an `OpRefusal`. */
+function prefabEditRefusalAsOpRefusal(op: string, run: () => unknown): unknown {
+  const rethrow = (e: unknown): never => {
+    if (e instanceof PrefabEditRefusalError) throw new OpRefusal('REFUSED_BY_OP', `${op}: refused — ${e.message}`);
+    throw e;
+  };
+  try {
+    const result = run();
+    return result instanceof Promise ? result.catch(rethrow) : result;
+  } catch (e) {
+    return rethrow(e);
+  }
+}
+
 /** The gate `runAgentOp` asks before an op runs (#1832). An op that records an undo entry (`agentOpUndoClass.ts`) is
  *  REFUSED while an undo/redo step is queued or running: its push would land in the step's window and be dropped, so
  *  the edit would apply with no way back. Once it runs, it holds every new step off until it settles
@@ -1241,8 +1262,10 @@ export function registerEditorAgentOps(): void {
   // not these ops). Shadow registerAgentOp so any editor-activity events an op emits
   // are tagged source:'agent' — so Claude can tell its own edits from the human's in
   // the editor-journal (Phase 7 review). Reads emit nothing, so wrapping them is inert.
+  // And a prefab-edit refusal (#1817, #1836), thrown from inside the shared choke points every op reaches (create,
+  // duplicate, delete, a placement), is answered as the op's refusal with the editor's own words.
   const registerAgentOp = (name: string, handler: AgentOpHandler): void =>
-    _registerAgentOp(name, (params) => withEditorActor('agent', () => handler(params)));
+    _registerAgentOp(name, (params) => prefabEditRefusalAsOpRefusal(name, () => withEditorActor('agent', () => handler(params))));
   if (registered) return;
   setAgentOpGate(agentStepGate);
   registered = true;
@@ -2951,6 +2974,8 @@ export function registerEditorAgentOps(): void {
     // reply handed out a runtime guid the journal never mentioned and undo never restored (close-out
     // review). Every listed id, not only the roots it snapshots: a listed child's guid rides in its
     // ancestor's snapshot, so a durable one written now is the one an undo brings back.
+    // Refused before the mint and the naming (#1836 close-out review), not inside the delete after both.
+    assertPrefabEditAllows({ kind: 'delete', ids: deleted });
     for (const id of deleted) ensureGuid(id);
     const named = guidListFields('deleted', deleted);
     // The descendants the cascade takes too, which the reply never mentioned (#1216 C-6) — minted durable

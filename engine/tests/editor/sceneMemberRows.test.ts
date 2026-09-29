@@ -377,7 +377,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     // Drag an instance of CHILD under a member: a USER-ADDED nested instance, which both captures
     // treat as a reference node.
     const dragged = instantiatePrefab(childFile, idOf('Panel'));
-    setPrefabSource(dragged!, CHILD);   // the caller's job, as the nested-row path does it
+    setPrefabSource(dragged!, { id: CHILD });   // the caller's job, as the nested-row path does it
     // …and the derive pass the editor's own instantiate paths run, which is what gives the fresh
     // members guids to store. Without it they have none and there is nothing to capture.
     const { deriveInstanceMemberGuids } = await import('../../packages/modoki/src/runtime/loaders/loadSceneFile');

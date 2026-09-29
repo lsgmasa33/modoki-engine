@@ -57,7 +57,7 @@ afterEach(() => { game?.dispose(); game = undefined; setPrefabCache(P, null); se
 /** An O instance whose A under Slot has x = `x1` and whose A under Slot2 has x = `x2`, both marked. */
 function instance(x1: number, x2: number): string {
   const root = instantiatePrefab(oDoc as never, 0);
-  setPrefabSource(root, O);
+  setPrefabSource(root, { id: O });
   const all = getAllEntities();
   const byId = new Map(all.map((e) => [e.id, e]));
   const aUnder = (slot: string) => all.find((e) => {

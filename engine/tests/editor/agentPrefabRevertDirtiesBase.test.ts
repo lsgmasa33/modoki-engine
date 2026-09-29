@@ -48,7 +48,7 @@ afterEach(() => { game?.dispose(); game = undefined; setPrefabCache(KIT, null); 
 /** An instance of Kit whose Slot carries a marked `Transform.x` override, every entity stamped `scene`. */
 function instanceIn(scene: string): string {
   const root = instantiatePrefab(kit as never, 0);
-  setPrefabSource(root, KIT);
+  setPrefabSource(root, { id: KIT });
   const ea = getTraitByName('EntityAttributes')!;
   for (const e of getAllEntities()) writeTraitField(e.id, ea, 'sourceScene', scene);
   const slot = getAllEntities().find((e) => e.name === 'Slot')!.id;

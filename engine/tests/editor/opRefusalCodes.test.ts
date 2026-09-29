@@ -297,13 +297,16 @@ describe('prefab revert — the override keys named', () => {
   /** A real instance carrying ONE real override, so `available.all` is non-empty and both refusals
    *  are reached rather than the earlier "has no overrides" exit. */
   async function instanceWithOverride(): Promise<string> {
-    setPrefabCache(PREFAB, {
-      version: 1, name: 'opcodes-1012', rootLocalId: 1,
+    // With its guid, and seated under it too: the instance's source is the document's guid (I22, #1828).
+    const doc = {
+      id: 'aaaaaaaa-0000-4000-8000-000000001012', version: 1, name: 'opcodes-1012', rootLocalId: 1,
       entities: [{ localId: 1, name: 'Root', traits: {
         Transform: { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 },
         EntityAttributes: { name: 'Root', parentId: 0 },
       } }],
-    } as never);
+    };
+    setPrefabCache(PREFAB, doc as never);
+    setPrefabCache(doc.id, doc as never);
     const r = await runAgentOp('prefab', { action: 'instantiate', path: PREFAB }) as { rootId: number };
     findEntity(r.rootId)!.set(Transform, { x: 5 });
     // By guid: the instance root has one, so an `entityId` is refused (#1223 D2).
