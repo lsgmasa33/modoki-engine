@@ -46,8 +46,8 @@ import { spawnUnresolvedReference, asAddedNode } from '../../runtime/loaders/unr
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptMemberOrphans, keptLegacyChannels, setKeptMemberOrphans, rowBackedTest, mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, deriveMemberGuidsAfterPins, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
 import { translateLocalIds, docRows } from '../../runtime/loaders/memberTranslation';
-import { foldMemberRowChannels, mergeTraitRemovals, descendStructureLayers, foldStructureLayers, type StructureLayer as StructLayer } from '../../runtime/loaders/prefabOverrides';
-import { frameBase, frameForward, nodeForward, chainLayer, docChainLayer, layerAddedTraits, levelDoc, captureDoc, keptLegacyForward, settleKeptLegacy, withKeptLegacy, ownedRootAt, type FrameLayer, type FrameBase, type ForwardState } from './prefabBase';
+import { foldMemberRowChannels, mergeTraitRemovals, descendStructureLayers, foldStructureLayers, type StructureLayer as StructLayer, type OverrideMap } from '../../runtime/loaders/prefabOverrides';
+import { frameBase, frameForward, nodeForward, chainLayer, templateReferenceNode, docChainLayer, layerAddedTraits, levelDoc, captureDoc, keptLegacyForward, settleKeptLegacy, withKeptLegacy, ownedRootAt, type FrameLayer, type FrameBase, type ForwardState } from './prefabBase';
 import { templateValueWriter, type TemplateValueWriter } from './prefabTemplateValue';
 import {
   chainSlots, memberKeyAt, writeStated, dropStated, writeRemoval, writeMemberRemoval, statedFields, traitInside, resolveKeyLevel, carrierOf,
@@ -500,7 +500,7 @@ function declaredTemplateKeys(written: Parameters<typeof templateKeysOf>[0], sou
  *  `readOnly` (a comparison, not a write): read each node's template key, never mint or stamp one. */
 function finishTemplateReferenceNode(
   ecsId: number, source: string, childPrefab: PrefabFile, readOnly: boolean,
-): { ref: InstanceReference; consumedEcsIds: Set<number>; channels: Pick<AddedEntity, 'overrides' | 'added' | 'removed' | 'removedTraits' | 'moved' | 'templateMoved' | 'nestedOverrides' | 'nestedStructure' | 'members'> } {
+): { ref: InstanceReference; consumedEcsIds: Set<number>; chainName?: string; channels: Pick<AddedEntity, 'overrides' | 'added' | 'removed' | 'removedTraits' | 'moved' | 'templateMoved' | 'nestedOverrides' | 'nestedStructure' | 'members'> } {
   // The node's key before anything reads it: `keepsTemplateRows` and the climb out of the node (`templateFrameClimber`)
   // both ask it, and a Refresh respawns the node from a scene-form capture that carries none. The caller stamps it
   // anyway (`addedNodeIdentity`); after the capture was too late (#1541/#1542 close-out review).
@@ -512,6 +512,27 @@ function finishTemplateReferenceNode(
     ref, structureBaselines: rc.structureBaselines, nestedOverrides: rc.channels.nestedOverrides,
     nestedStructure: rc.nestedStructure, members: rc.members, frames: rc.channels.frames,
   });
+  // The node's own statement, when a template states it (#1804, #1781's writer twin): the capture above measured every frame
+  // against the bare documents, so a component the statement adds came out whole with every schema default, and a no-edit
+  // save rewrote the statement. Measured over the base the statement SEEDS instead — the subtraction the comparison uses.
+  // A write only: a comparison's capture (`readOnly`) is asked against a chain node of its own (`sameAddedNode`).
+  const chainNode = readOnly ? null : templateStatementOf(ecsId);
+  if (chainNode) {
+    const d = seededNodeDelta(ecsId, source, childPrefab, chainNode);
+    fin.overrides = keepNodeStated(fin.overrides, d.root, d.rootLayer, chainLayer(ecsId, source, [], childPrefab).overrides) ?? {};
+    if (fin.nestedOverrides) {
+      const nested: NestedOverridePaths = {};
+      for (const [key, map] of Object.entries(fin.nestedOverrides)) {
+        const steps = memberPathSteps(key);
+        // A nested path key is row localIds; one that is not is left as the capture wrote it.
+        if (!steps.every((st): st is number => typeof st === 'number')) { nested[key] = map; continue; }
+        const path = steps as number[];
+        const kept = keepNodeStated(map, d.nested[key], chainLayer(ecsId, source, path, childPrefab, d.seed).overrides, chainLayer(ecsId, source, path, childPrefab).overrides);
+        if (kept) nested[key] = kept;
+      }
+      fin.nestedOverrides = Object.keys(nested).length ? nested : undefined;
+    }
+  }
   // A token may name a keyed node only if some file declares that key (`serializePrefab`'s rule): what this node WRITES
   // — after the no-op drop, not the capture: a key minted for a node in a slot the drop omitted is declared nowhere,
   // and a token through it names nothing on reload (#1538 close-out review) — or the node's prefab and what it nests.
@@ -529,6 +550,9 @@ function finishTemplateReferenceNode(
   const templateMoved = templateMoves(ecsId, subtree, new Map(), (id) => pathById.get(id), new Map(), true);
   return {
     ref,
+    // A reference node's `name` is not applied on spawn (its root takes the child's root row name), so the live root's
+    // name is not the node's: the statement's is kept (#1804), and a node no template states yet takes the live one.
+    ...(chainNode?.name ? { chainName: chainNode.name } : {}),
     // What the node's expansion re-creates: the nested interiors' added subtrees AND every owned nested instance, at
     // any depth — the row writer's skip (#1382). Left out, `planPrefabRows` took MID's own INNER, inside a template
     // reference node, for a free-standing nested instance and wrote it again as a row at the prefab root (#1538
@@ -1055,19 +1079,65 @@ function nodeGuidsFor(
   return Object.assign((ecsId: number) => carried.get(ecsId) ?? newGuid(), { carried: carried as ReadonlyMap<number, string> });
 }
 
-/** Is the running `serializePrefab` a Create Prefab that bakes the swallowed roots' kept R2 state (#1790)? A scope, not a
- *  parameter: the row writer is reached at every depth of the capture (a row, a template reference node inside any
- *  nested frame), and only for the one write that asked. */
+/** Does the running template write BAKE the kept R2 state of the scene roots it swallows (#1790, owner ruling D)? A scope,
+ *  not a parameter: the row writer is reached at every depth of the capture (a row, a template reference node inside any
+ *  nested frame), and only for the one write that asked. Set only through {@link withKeptStateBake}. */
 let bakingKeptState = false;
+
+/** Run `fn` with the bake scope `on` (or off), restored however `fn` leaves — a throw included, or every later template
+ *  write would bake scene rows. The two writers that swallow a SCENE root: Create Prefab (`serializePrefab`'s
+ *  `bakeKeptState`) and Apply's promotion of a scene-added reference node (`insertAddedSubtree`, #1802). */
+export function withKeptStateBake<T>(on: boolean, fn: () => T): T {
+  const prev = bakingKeptState;
+  bakingKeptState = on;
+  try { return fn(); } finally { bakingKeptState = prev; }
+}
+/** For the guard that a throw inside the scope leaves it unset. */
+export const bakingKeptStateForTest = () => bakingKeptState;
+
+/** The prefab the running `serializePrefab` REWRITES (its `existingId`), for a template reference node's writer to find
+ *  the statement it is rewriting (#1804) — a scope, for the same reason as {@link bakingKeptState}. */
+let rewritingPrefab: string | undefined;
 
 export function serializePrefab(
   selectedEntityId: number,
   existingId?: string,
   opts?: Parameters<typeof serializePrefabBody>[2],
 ): PrefabFile | null {
-  const prev = bakingKeptState;
-  bakingKeptState = !!opts?.bakeKeptState;
-  try { return serializePrefabBody(selectedEntityId, existingId, opts); } finally { bakingKeptState = prev; }
+  const prev = rewritingPrefab;
+  rewritingPrefab = existingId;
+  try {
+    return withKeptStateBake(!!opts?.bakeKeptState, () => serializePrefabBody(selectedEntityId, existingId, opts));
+  } finally { rewritingPrefab = prev; }
+}
+
+/** The TEMPLATE statement that spawned the reference node rooted at `ecsId`: the node a prefab layer enclosing it states
+ *  (`templateReferenceNode` — a node inside another instance's frame), else the node with its key in the prefab being
+ *  rewritten (a prefab-edit world, where the row stating it is a top-level entry no prefab layer encloses). Keys are minted
+ *  guids, so a key names one node in a document. Null for a node no template states yet. */
+function templateStatementOf(ecsId: number): AddedEntity | null {
+  const enclosed = templateReferenceNode(ecsId, 0);
+  if (enclosed) return enclosed;
+  const doc = rewritingPrefab ? getCachedPrefabSync(rewritingPrefab) : null;
+  const key = doc ? templateKeyOf(findEntity(ecsId)) || recoverTemplateKey(ecsId) : '';
+  if (!doc || !key) return null;
+  let hit: AddedEntity | null = null;
+  const walk = (nodes: readonly AddedEntity[] | undefined): void => {
+    for (const n of nodes ?? []) {
+      if (hit) return;
+      if (n.prefab && n.key === key) { hit = n; return; }
+      walk(n.children);
+      walk(n.added);
+      for (const st of Object.values(n.nestedStructure ?? {})) walk(st.added);
+      for (const r of Object.values(n.members ?? {})) { walk(r.added); walk(r.own); }
+    }
+  };
+  for (const e of doc.entities) {
+    walk(e.added);
+    for (const st of Object.values(e.nestedStructure ?? {})) walk(st.added);
+    for (const r of Object.values(e.members ?? {})) { walk(r.added); walk(r.own); }
+  }
+  return hit;
 }
 
 function serializePrefabBody(
@@ -1847,6 +1917,8 @@ export function instantiatePrefab(
   // ECS ids of THIS prefab's own (non-nested) members. rootInstanceId is set only
   // on these — inner members already got their own rootInstanceId via recursion.
   const ownMemberIds: number[] = [];
+  // Nested rows this expansion could not expand — recorded on the frame, as the loader twin does (#1812).
+  const unexpanded: number[] = [];
 
   const allTraits = getAllTraits(); // hoisted out of the per-row loop
 
@@ -1869,6 +1941,7 @@ export function instantiatePrefab(
       const child = getCachedPrefabSync(pe.prefab);
       if (!child) {
         console.warn(`[Prefab] nested prefab not cached (call preloadNestedPrefabs): ${pe.prefab}`);
+        if (pe.localId) unexpanded.push(pe.localId);
         continue;
       }
       // Overrides an OUTER layer addressed at this nested row: `direct` hits this
@@ -1892,7 +1965,7 @@ export function instantiatePrefab(
       const { channels: childStructure, forwardRoots: childForwardRoots } = foldStructureLayers(child, childLayers, foldFrom, base);
       const childSegments = [...segments, rowPathInPrefab(prefab, pe.localId)];
       const childRoot = instantiatePrefab(child, 0, stack, childNested, structForward, childSegments, childLayers, childForwardRoots);
-      if (!childRoot) continue;
+      if (!childRoot) { if (pe.localId) unexpanded.push(pe.localId); continue; } // expanded to no root (#1768)
       setPrefabSource(childRoot, pe.prefab);
       // Stamp parentLocalId so serialize knows which row produced this nested
       // instance (used to address scene-level overrides on it), and `parentNodeGuid` beside it so a
@@ -1971,7 +2044,7 @@ export function instantiatePrefab(
   const rootEcsId = localToEcs.get(prefab.rootLocalId) || 0;
   // What this frame's localIds mean, recorded at its root — the loader twin does the same
   // (`identityParents.ts`). By the document's own id: `setPrefabSource` stamps that ref.
-  if (prefab.id && rootEcsId) noteFrameDoc(getCurrentWorld(), prefab.id, prefab, findEntity(rootEcsId) ?? undefined);
+  if (prefab.id && rootEcsId) noteFrameDoc(getCurrentWorld(), prefab.id, prefab, findEntity(rootEcsId) ?? undefined, unexpanded);
 
   // Second pass: remap EntityAttributes.parentId for every row (including the
   // nested-instance root). Every row reads its parent from the FILE entry — the
@@ -3396,6 +3469,19 @@ function ownedRootMoved(rootInstanceId: number, identity: ReturnType<typeof worl
   return memberRowParents(owner, doc, rowParentDomain(owner, domain)).has(rootInstanceId);
 }
 
+/** What the frame record of `rootId` says about its expansion of `doc` (#1812): the nested rows it could not expand and no
+ *  layer removed (`FrameRootRecord.unexpanded`). Undefined when the record answers nothing: no record, a record of
+ *  another document, or one no expansion wrote (a carry keeps the field; a Create Prefab tag writes none). */
+function unexpandedRowsOf(rootId: number, doc: PrefabFile): ReadonlySet<number> | undefined {
+  const entity = rootId ? findEntity(rootId) : undefined;
+  const rec = entity ? frameRootDoc(getCurrentWorld(), entity) : undefined;
+  // The same ROWS, not the same object (close-out review): the runtime cache and the editor's hold separate copies of
+  // one file (every editor write stores a clone in the runtime's), and the record keeps the loader's — an identity test
+  // answered nothing after any prefab write and reload, and Revert and Apply's key list still read the row as removed.
+  if (!rec?.unexpanded || !(rec.doc === doc || rowsMeanTheSame(rec.doc as RowDoc, doc as RowDoc))) return undefined;
+  return new Set(rec.unexpanded);
+}
+
 /** Compute the structural diff between a live prefab instance and its source:
  *  child entities the instance added, prefab members it deleted, and prefab
  *  components it removed from surviving members. (Added components are already
@@ -3492,12 +3578,19 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   // removal covers it), and one with no localId (unaddressable by `removed[]`).
   // The parent is looked up as a ROW, not as a member (#1484): under a nested row it is that row's owned root, and a
   // member-only lookup read every nested row under a nested row as "parent gone", so deleting one was never saved.
+  // Whether the row was EXPANDED is asked of the frame, not the cache (#1812, I3): the frame record lists the rows its
+  // expansion could not expand. A cache that holds the child NOW — restored mid-session, re-warmed, or stale after an
+  // Assets delete (#1805) — says nothing about that, and read as "expanded" it wrote a frame that never had the row as
+  // the scene's removal of it, lost for good once saved. A frame whose record answers nothing falls back to the cache.
+  const unexpanded = unexpandedRowsOf(rootInstanceId, prefab);
   const nestedRowPresent = (pe: PrefabFile['entities'][number]): boolean => {
     const parentLocal = prefabParent.get(pe.localId) ?? 0;
     const parentMember = rowEcs(parentLocal);
+    if (!pe.localId || !parentMember) return true;
+    if (unexpanded) return unexpanded.has(pe.localId) || claimedRows.has(pe.localId);
     // A child that loads but expands to no root expanded to nothing too (#1768): not a removal either.
     const child = getCachedPrefabSync(pe.prefab!);
-    if (!pe.localId || !parentMember || !child || !expandsToRoot(child, getCachedPrefabSync)) return true;
+    if (!child || !expandsToRoot(child, getCachedPrefabSync)) return true;
     return claimedRows.has(pe.localId);
   };
   const removedSet = new Set<number>();
@@ -3592,7 +3685,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       for (const c of t.ref.consumedEcsIds) consumedEcsIds.add(c);
       for (const c of t.consumedEcsIds) consumedEcsIds.add(c);
       return {
-        parentLocalId, ...addedNodeIdentity(ecsId, true, opts.readOnly), name: byId.get(ecsId)?.name || '', traits: {}, children: [],
+        parentLocalId, ...addedNodeIdentity(ecsId, true, opts.readOnly), name: t.chainName ?? (byId.get(ecsId)?.name || ''), traits: {}, children: [],
         prefab: source, ...t.channels,
       };
     }
@@ -4364,6 +4457,16 @@ function editorStructureOps(): Parameters<typeof applyStructureCore>[0] {
 
 // ── File I/O ────────────────────────────────────────────
 
+/** The `PrefabInstance.source` a tag or an untag of prefab `source` reads and writes (GUID-only): the DOCUMENT's own id
+ *  when the caller holds the file, else the manifest's guid for the path, else the given ref (a manifest that cannot
+ *  resolve it yet). The document first (#1807): the manifest follows a move only at its next push, debounced, so right
+ *  after a rename's undo a lookup by path answered nothing — and Create Prefab's undo then untagged by a raw path no
+ *  entity carries, leaving the tree linked to the prefab it had just trashed (a Missing Prefab on the next load). */
+function instanceSourceRef(source: string, doc?: Pick<PrefabFile, 'id'> | null): string {
+  if (doc?.id && isGuid(doc.id)) return doc.id;
+  return isGuid(source) ? source : (getGuidForPath(source) ?? source);
+}
+
 /** Tag every entity in the tree rooted at `rootEcsId` with a PrefabInstance
  *  trait pointing to `source`. localIds match the prefab's localId scheme
  *  (BFS order, root = 1) so per-localId overrides round-trip correctly.
@@ -4392,12 +4495,9 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return new Map();
 
-  // Callers pass the prefab's asset PATH; store a GUID instead when one resolves
-  // (callers register the new prefab before tagging). PrefabInstance.source is
-  // GUID-only — a raw path bakes a literal into the scene JSON on save and trips
-  // resolveRef's hard rejection on load. Mirrors setPrefabSource. Falls back to
-  // the given ref only when the manifest can't resolve it yet.
-  const ref = isGuid(source) ? source : (getGuidForPath(source) ?? source);
+  // PrefabInstance.source is GUID-only — a raw path bakes a literal into the scene JSON on save and trips resolveRef's
+  // hard rejection on load. The written file's own id first (#1807), then the manifest (`instanceSourceRef`).
+  const ref = instanceSourceRef(source, writtenPrefab);
 
   // Mirror serializePrefab's localId assignment (BFS, root = 1) — including WHICH entities it
   // selects, which is why both go through `authoringEntitiesFor`. A tree containing a runtime
@@ -4515,12 +4615,12 @@ export function unstampMemberGuids(remap: ReadonlyMap<string, string>): void {
  *  keeps the stamp this Create Prefab wrote (its ancestor was not stripped), and one owned by an
  *  OUTER prefab is zeroed rather than returned to that prefab's row id. Both need the pre-create
  *  value, which only the snapshot has — and reattach cannot reach it once the guid re-derives. */
-export function untagEntityTreeAsInstance(rootEcsId: number, source: string): void {
+export function untagEntityTreeAsInstance(rootEcsId: number, source: string, doc?: Pick<PrefabFile, 'id'> | null): void {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return;
 
-  // Callers pass the asset PATH; PrefabInstance.source is GUID-only. Mirrors tagEntityTreeAsInstance.
-  const ref = isGuid(source) ? source : (getGuidForPath(source) ?? source);
+  // PrefabInstance.source is GUID-only: the document's own id when the caller holds it (#1807), as the tag reads it.
+  const ref = instanceSourceRef(source, doc);
 
   const allEntities = getAllEntities();
   const tree = collectTree(rootEcsId, allEntities);
@@ -4864,7 +4964,10 @@ function insertAddedSubtree(
     let recaptured: { added?: AddedEntity[]; nestedStructure?: NestedStructurePaths; members?: Record<string, SceneMemberRow> } | undefined;
     if (liveChild) {
       const ref = captureInstanceReference(liveEcs, node.prefab, liveChild, { template: true, readOnly: tokens?.readOnly });
-      const rc = captureRowChannels(liveEcs, node.prefab, liveChild, ref, false, !!tokens?.readOnly);
+      // The node is a SCENE root, and what R2 kept for it (orphan member rows, legacy channels no frame reaches) is Unity's
+      // unused overrides, which travel into the template with it: baked as Create Prefab bakes them (#1802, owner ruling D).
+      // Their identity stays in the scene: `settleSwallowedKeptState`, after the Apply's refresh.
+      const rc = withKeptStateBake(true, () => captureRowChannels(liveEcs, node.prefab!, liveChild, ref, false, !!tokens?.readOnly));
       recaptured = { added: ref.added, nestedStructure: rc.nestedStructure, members: rc.members };
     }
     const refRow: PrefabFile['entities'][number] = {
@@ -6470,6 +6573,12 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap, { rootId: rootInstanceId, fields: appliedFields });
       if (remap.size) remapWorldGuidRefs(remap);
       rehangPromotionSurvivors(survivors, carryPromotedGuids(rootGuid, promotedGuids));
+      // A promoted REFERENCE node's kept state went into its row (`insertAddedSubtree`'s bake); its identity stays in the
+      // scene, on the stored root it is now a member of (#1802, owner ruling D) — the settle Create Prefab runs, which finds
+      // each node by the guid `carryPromotedGuids` gave it back. Apply's undo reloads the scene from its snapshot.
+      // By guid: the refresh rebuilt the instance, so `rootInstanceId` may name nothing now.
+      const liveRoot = promotedRefRows.size && rootGuid ? localToEcsGuid(rootGuid) : 0;
+      if (liveRoot) settleSwallowedKeptState(liveRoot);
       }
       // …and every other file that uses the prefab, the live world's own included: it is repaired above, so its file is
       // rewritten to agree and the editor's record of it follows (#1751). HERE, inside the step, as the undo already runs
@@ -7119,23 +7228,60 @@ function sameNodeValues(live: AddedEntity, chain: AddedEntity): boolean {
   const ecs = live.guid ? localToEcsGuid(live.guid) : 0;
   const doc = ecs ? captureDoc(ecs, live.prefab!) : null;
   if (!ecs || !doc) return false;
+  const d = seededNodeDelta(ecs, live.prefab!, doc, chain);
+  return !Object.keys(d.root).length && !Object.keys(d.nested).length && !d.removals;
+}
+
+/** What the live reference node `ecs` (an instance of `source`, expanded from `doc`) states beyond chain node `chain`'s
+ *  statement (#1781): each frame captured over the base the statement SEEDS (`nodeForward` → `chainLayer`), so the #1386
+ *  rule applies over the whole layer. `root`: the root frame's values, over the node's `overrides` with its member rows
+ *  folded in (`rootLayer`, the seed's fold at the empty path); `nested`: each nested frame's, path-keyed; `removals`: the
+ *  live node removed a component the statement adds, which no live field shows — the removed-components pass sees it only
+ *  over the layer that adds it (`layerTraits`, #1676), so it is measured over the seeded layer and over the bare one, and a
+ *  removal only the seeded capture finds is the node's own (#1790 close-out review F2). The ONE subtraction the comparison
+ *  (`sameNodeValues`) and the template writer (`finishTemplateReferenceNode`, #1804) share. */
+function seededNodeDelta(ecs: number, source: string, doc: PrefabFile, chain: AddedEntity): {
+  seed: ForwardState; rootLayer: OverrideMap; root: OverrideMap; nested: NestedOverridePaths; removals: boolean;
+} {
   const seed = nodeForward(chain, doc);
-  const rootChain = mergeOverrideMaps(chainLayer(ecs, live.prefab!, [], doc, seed).overrides, chain.overrides ?? {});
-  if (Object.keys(captureNestedSceneDelta(ecs, doc, rootChain)).length) return false;
+  const rootLayer = mergeOverrideMaps(chainLayer(ecs, source, [], doc, seed).overrides, chain.overrides ?? {});
+  const root = captureNestedSceneDelta(ecs, doc, rootLayer);
   const bareRoot = captureInstanceStructure(ecs, doc, { readOnly: true });
-  const seeded = captureNestedChannels(ecs, live.prefab!, bareRoot.ownedNested, { readOnly: true, seed });
-  if (Object.keys(seeded.nestedOverrides ?? {}).length) return false;
-  // …and a REMOVAL of a component the statement adds, which no live field shows: the removed-components pass sees it only
-  // over the layer that adds it (`layerTraits`, #1676). Measured over the seeded layer and over the bare one; a removal the
-  // seeded capture finds and the bare one does not is the scene's own (#1790 close-out review F2), and the structural
-  // compare below cannot see it, because the live node was captured bare.
-  const seededRoot = captureInstanceStructure(ecs, doc, { readOnly: true, layerTraits: layerAddedTraits({ overrides: rootChain }, doc) });
-  if (moreRemovals(seededRoot.removedTraits, bareRoot.removedTraits)) return false;
-  const bare = captureNestedChannels(ecs, live.prefab!, bareRoot.ownedNested, { readOnly: true });
-  for (const [path, st] of Object.entries(seeded.nestedStructure ?? {})) {
-    if (moreRemovals(st.removedTraits, bare.nestedStructure?.[path]?.removedTraits)) return false;
+  const seeded = captureNestedChannels(ecs, source, bareRoot.ownedNested, { readOnly: true, seed });
+  const seededRoot = captureInstanceStructure(ecs, doc, { readOnly: true, layerTraits: layerAddedTraits({ overrides: rootLayer }, doc) });
+  let removals = moreRemovals(seededRoot.removedTraits, bareRoot.removedTraits);
+  if (!removals) {
+    const bare = captureNestedChannels(ecs, source, bareRoot.ownedNested, { readOnly: true });
+    removals = Object.entries(seeded.nestedStructure ?? {}).some(([path, st]) => moreRemovals(st.removedTraits, bare.nestedStructure?.[path]?.removedTraits));
   }
-  return true;
+  return { seed, rootLayer, root, nested: seeded.nestedOverrides ?? {}, removals };
+}
+
+/** A template reference node's value channel as its writer states it over the node's own statement (#1804): of each field
+ *  the capture measured against the BARE documents, only one the live node changed over the seeded base (`changed`,
+ *  {@link seededNodeDelta}) or one the node's own layer states (`seeded`, where it differs from the layer without the node,
+ *  `bare`). A component the statement adds was captured whole, every schema default with it, and the default is the
+ *  layer's (#1386's rule): written, it rewrote the sparse statement on every no-edit save. A component the node removed is
+ *  simply not in the capture. Values stay the capture's, tokenized as the writer tokenized them. */
+function keepNodeStated(captured: OverrideMap | undefined, changed: OverrideMap | undefined, seeded: OverrideMap, bare: OverrideMap): OverrideMap | undefined {
+  if (!captured) return captured;
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const out: OverrideMap = {};
+  for (const [lidKey, traits] of Object.entries(captured)) {
+    const lid = Number(lidKey);
+    for (const [trait, fields] of Object.entries(traits)) {
+      const ch = changed?.[lid]?.[trait];
+      const st = seeded[lid]?.[trait];
+      const bt = bare[lid]?.[trait];
+      const stated = (f: string) => !!st && f in st && !(bt && f in bt && same(st[f], bt[f]));
+      const kept: Record<string, unknown> = {};
+      for (const [f, v] of Object.entries(fields)) if ((ch && f in ch) || stated(f)) kept[f] = v;
+      // A component the node's statement ADDS stays, fields or none: `{UIFocusable: {}}` adds it at its defaults, and a
+      // capture holding only defaults kept no field of it (close-out review). A tag the node changed stays too.
+      if (Object.keys(kept).length || (st && !bt) || (!Object.keys(fields).length && ch)) (out[lid] ??= {})[trait] = kept;
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** Does `seeded` list a removed component per localId that `bare` does not? */
@@ -8897,10 +9043,12 @@ export function unexpandedNestedRows(rootId: number): { instance: string; row: s
     const pi = readTraitData(id, piMeta) as { source?: string; rootInstanceId?: number } | null;
     if (!pi?.source || pi.rootInstanceId !== id) continue;
     const doc = captureDoc(id, pi.source);
+    // A row the frame never expanded is missing from the tree however the cache reads NOW (#1812).
+    const skipped = doc ? unexpandedRowsOf(id, doc) : undefined;
     for (const row of doc?.entities ?? []) {
       if (!row.prefab) continue;
       const child = getCachedPrefabSync(row.prefab);
-      if (child && expandsToRoot(child, getCachedPrefabSync)) continue;
+      if (!skipped?.has(row.localId) && child && expandsToRoot(child, getCachedPrefabSync)) continue;
       out.push({ instance: byId.get(id)?.name ?? '', row: row.name ?? '', prefab: resolveRef(row.prefab) ?? row.prefab });
     }
   }
@@ -8929,6 +9077,8 @@ export function tagCreatedPrefab(rootEcsId: number, source: string, writtenPrefa
  *  later template change. Its legacy channels are dropped: the template carries them, and a `moved` there is a scene
  *  guid no template form holds. A root the new instance's member rows do not name is left as it is (the rule and its two
  *  cases are at the test below); so is the selection root, whose own frame is not written as a row (`planPrefabRows`).
+ *  Apply's promotion runs it too (#1802), over the instance its reference nodes were promoted into: after the refresh they
+ *  are members of it, and the same rule leaves every root that is not — a stored one — alone.
  *  Returns the undo, which restores every entry it changed. */
 function settleSwallowedKeptState(rootId: number): () => void {
   const eaMeta = getTraitByName('EntityAttributes');

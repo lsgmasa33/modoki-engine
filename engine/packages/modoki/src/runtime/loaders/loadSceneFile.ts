@@ -40,7 +40,7 @@ import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
 import { keptOrphanRowsOf, setKeptOrphanRows, dropKeptOrphanRows, clearKeptOrphanRows, keptLegacyOf, setKeptLegacy, type KeptLegacy } from '../core/ecs/keptOrphanRows';
 import { memberPathIndex, identityTree } from '../core/ecs/memberHome';
-import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, noteNodeMoves, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
+import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, noteNodeMoves, noteRowsRemoved, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
 export { memberPathIndex } from '../core/ecs/memberHome';
 
 /** The structural delta an OUTER layer (a scene, or an ancestor prefab) applies INSIDE a nested
@@ -912,9 +912,14 @@ export function applyStructureCore(
       held.set(sub, holds);
       return holds;
     };
+    const frameRoot = localToEcs.get(prefab.rootLocalId ?? 1) ?? 0;
     for (const lid of structure.removed) cut(lid, true);
     if (toDelete.length) ops.deleteEntities(toDelete);
     if (deferred.length) afterDeriveQueue(ops.world).deletes.push({ ecsIds: deferred, ops });
+    // A row this frame could not expand and its layer removes is a REMOVAL, and the next save must state it again (#1812):
+    // it leaves the frame record's `unexpanded` list, which answers "present" only for a row nobody removed.
+    const rootHandle = frameRoot ? ops.findEntity(frameRoot) : undefined;
+    if (rootHandle) noteRowsRemoved(ops.world, rootHandle as Entity, removedLocals);
   }
 
   // 2. Component removals.
@@ -2054,13 +2059,15 @@ export function instantiatePrefabIntoWorld(
   // ECS ids of THIS prefab's own (non-nested) members — rootInstanceId is set only
   // on these; inner members keep their own (child) rootInstanceId from recursion.
   const ownMemberIds: number[] = [];
+  // Nested rows this expansion could not expand — recorded on the frame (#1812, `FrameRootRecord.unexpanded`).
+  const unexpanded: number[] = [];
 
   // First pass: spawn each row (nested rows recurse into the child prefab).
   for (const entry of prefab.entities) {
     if (entry.prefab) {
       const child = getCachedPrefab(entry.prefab) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null;
-      if (!child) { console.warn(`[loadSceneFile] nested prefab not cached: ${entry.prefab}`); continue; }
       const rowLocalId = entry.localId ?? 0;
+      if (!child) { console.warn(`[loadSceneFile] nested prefab not cached: ${entry.prefab}`); if (rowLocalId) unexpanded.push(rowLocalId); continue; }
       // Overrides an OUTER layer addressed at this nested row: `direct` hits this
       // child's own members (merged over the row's own overrides — outer wins);
       // `forward` reaches deeper and is threaded into the child's expansion. The
@@ -2118,6 +2125,7 @@ export function instantiatePrefabIntoWorld(
         }
       }
       if (childRoot && rowLocalId) localToEcs.set(rowLocalId, childRoot);
+      else if (rowLocalId) unexpanded.push(rowLocalId); // expanded to no root (#1768)
       continue;
     }
 
@@ -2187,7 +2195,7 @@ export function instantiatePrefabIntoWorld(
 
   // What this frame's localIds MEAN — the document it was expanded from, recorded at its root: every identity
   // walk reads its members' template parents from it (`core/ecs/identityParents.ts`, #1468 Phase 6).
-  if (source && rootEcsId) noteFrameDoc(world, source, prefab, handleById.get(rootEcsId) as Entity | undefined);
+  if (source && rootEcsId) noteFrameDoc(world, source, prefab, handleById.get(rootEcsId) as Entity | undefined, unexpanded);
 
   // Patch rootInstanceId on this prefab's OWN members only (never inner members).
   if (piMeta && source !== undefined && rootEcsId) {

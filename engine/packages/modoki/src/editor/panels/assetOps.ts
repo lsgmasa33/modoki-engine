@@ -776,7 +776,8 @@ export async function createPrefabFromEntity(
         ...(replaced ? { bytes: previousContent! } : {}),
         rebuild: () => {
           unstamp();
-          const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath);
+          // By the document's own guid (#1807): the manifest can still map it to a renamed path an undo just moved back.
+          const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath, prefab);
           if (priorLinks) reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
           tagged = false;
         },

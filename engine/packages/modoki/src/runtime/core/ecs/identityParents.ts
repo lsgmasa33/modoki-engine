@@ -83,7 +83,11 @@ export interface IdentityParents {
 /** A frame root's own record. `nodeMoved`: the moves the template REFERENCE node that spawned this root states in its
  *  frame (`AddedEntity.templateMoved`, #1543) — applied on top of `doc`'s own, and so part of where the template puts a
  *  member. Kept on the root's record, not the doc, so a stale-frame compare (#1483) still sees the document alone. */
-type FrameRootRecord = { source: string; doc: TemplateDoc; nodeMoved?: Record<string, string> };
+/** `unexpanded`: the nested rows of `doc` this expansion could NOT expand (the child prefab was not cached, or expanded to no
+ *  root) and that no layer removed (#1812) — a row the frame never had, which is not a removal whatever the cache holds
+ *  later. Written only by the two expansions; a record without it (a carry, a tag) answers nothing about expansion.
+ *  Runtime only: never serialized. */
+type FrameRootRecord = { source: string; doc: TemplateDoc; nodeMoved?: Record<string, string>; unexpanded?: readonly number[] };
 const rootDocsByWorld = new WeakMap<World, Map<PackedEntity, FrameRootRecord>>();
 /** …and per source, the document it was LAST expanded from: the answer for a frame whose root has no
  *  record of its own. */
@@ -91,7 +95,7 @@ const docsByWorld = new WeakMap<World, Map<string, TemplateDoc>>();
 
 /** Record that `world` expanded `source` from `doc` — at `root`, when the caller knows it. The loader
  *  calls it for every instance it spawns, the editor for every frame it makes itself. */
-export function noteFrameDoc(world: World, source: string, doc: TemplateDoc, root?: Entity): void {
+export function noteFrameDoc(world: World, source: string, doc: TemplateDoc, root?: Entity, unexpanded?: readonly number[]): void {
   if (!source) return;
   let docs = docsByWorld.get(world);
   if (!docs) { docs = new Map(); docsByWorld.set(world, docs); }
@@ -99,7 +103,7 @@ export function noteFrameDoc(world: World, source: string, doc: TemplateDoc, roo
   if (root === undefined) return;
   let roots = rootDocsByWorld.get(world);
   if (!roots) { roots = new Map(); rootDocsByWorld.set(world, roots); }
-  roots.set(packedOf(root), { source, doc });
+  roots.set(packedOf(root), unexpanded ? { source, doc, unexpanded } : { source, doc });
   // Every runtime spawn records its frames here and nothing removes one when its root dies, so sweep the
   // dead each time the map doubles: amortised O(1) a note, and the map stays bounded by the live roots.
   const floor = pruneFloor.get(roots) ?? 64;
@@ -123,6 +127,16 @@ export function noteFrameRootDoc(world: World, root: Entity, rec: FrameRootRecor
   let roots = rootDocsByWorld.get(world);
   if (!roots) { roots = new Map(); rootDocsByWorld.set(world, roots); }
   roots.set(packedOf(root), rec);
+}
+/** The layer applied to `root`'s frame REMOVED `rows` (#1812): a removed row is the frame's removal whether or not it could be
+ *  expanded, so it leaves the record's `unexpanded` list. Called by `applyStructureCore`, which both expansions run the
+ *  frame's structure through AFTER the spawn records the frame. */
+export function noteRowsRemoved(world: World, root: Entity, rows: Iterable<number>): void {
+  const rec = frameRootDoc(world, root);
+  if (!rec?.unexpanded?.length) return;
+  const gone = new Set(rows);
+  const left = rec.unexpanded.filter((lid) => !gone.has(lid));
+  if (left.length !== rec.unexpanded.length) noteFrameRootDoc(world, root, { ...rec, unexpanded: left });
 }
 /** Record the moves the template reference node that spawned `root` states in its frame (#1543), on the root's own
  *  record — which the spawn has just written (`noteFrameDoc`), or one made here for the document it expanded. */

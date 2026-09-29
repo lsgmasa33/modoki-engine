@@ -207,7 +207,8 @@ describe('createPrefabFromEntity — undo', () => {
   it('untags only the prefab it is undoing, naming it', async () => {
     const action = await makeAction();
     await action.undo();
-    expect(untagSpy).toHaveBeenCalledWith(7, '/p/thing.prefab.json');
+    // …by the prefab DOCUMENT it wrote (#1807): its own id resolves the link, not the manifest's view of the path.
+    expect(untagSpy).toHaveBeenCalledWith(7, '/p/thing.prefab.json', expect.objectContaining({ id: expect.any(String) }));
   });
 
   // #1272: undo no longer DEPENDS on the guid-keyed reattach resolving, but a miss must not be

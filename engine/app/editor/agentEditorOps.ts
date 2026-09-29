@@ -3166,7 +3166,7 @@ export function registerEditorAgentOps(): void {
             unstampMemberGuids(guidRemap);
             // Scoped to THIS prefab (#1272): a held nested instance keeps its own link rather
             // than being stripped and restored from a guid that a Play→Stop may have re-minted.
-            untagEntityTreeAsInstance(id, landedPath);
+            untagEntityTreeAsInstance(id, landedPath, prefab); // by the document's guid, not the manifest (#1807)
             const unresolved = reattachPrefabInstance(priorLinks, { rootEcsId: id });
             if (unresolved > 0) console.warn(`[prefab create] undo: ${unresolved} prior prefab link(s) could not be put back — no longer addressable.`);
           },

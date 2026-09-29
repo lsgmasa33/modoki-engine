@@ -37,6 +37,7 @@ import {
   setPrefabCache, instantiatePrefab, setPrefabSource, applyStructureByRootInstance, rebaseStaleInstances,
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { frameRootDoc } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -326,4 +327,51 @@ describe('#1707: a host Refresh keeps what the scene stated inside the reference
       expect(refreshed).toEqual(tree());
     });
   }
+});
+
+// ── #1812: the frame RECORD, which the tree comparison above cannot see ──────────────────────────
+describe('#1812: both expansions record the same rows they could not expand, on the same frames', () => {
+  // The save reads `FrameRootRecord.unexpanded` to tell a row the frame never had from one the user removed, so the two
+  // expansions must write it alike. Mutation: record `[]` in either twin's `noteFrameDoc` — the missing-Q cases differ.
+  /** Every frame root's record, by the root's guid: what it says it could not expand. */
+  const records = (): Record<string, readonly number[] | undefined> => {
+    const world = getCurrentWorld();
+    const out: Record<string, readonly number[] | undefined> = {};
+    for (const e of world.entities) {
+      const rec = frameRootDoc(world, e as never);
+      if (!rec) continue;
+      const guid = getAllEntities().find((x) => x.id === e.id())?.guid || `<no guid ${e.id()}>`;
+      out[guid] = rec.unexpanded;
+    }
+    return out;
+  };
+  const dropQ = () => { prefabs.delete(Q); setPrefabCache(Q, null); };
+  const recordsOf = (build: () => unknown) => { build(); return records(); };
+
+  it('TOP, Q missing: N\'s frame lists row C on both sides', () => {
+    dropQ();
+    const runtime = recordsOf(runtimeTop);
+    fresh();
+    const editor = recordsOf(editorTop);
+    expect(Object.values(runtime).some((u) => u?.includes(4))).toBe(true); // not inert: the runtime listed C
+    expect(editor).toEqual(runtime);
+  });
+
+  it('NODE, Q missing, and a member row removing C: the removal takes C off the list on both sides', () => {
+    dropQ();
+    const channels = { members: { [`/${gN}/${gC}`]: { removed: true } } };
+    const runtime = recordsOf(() => runtimeNode(channels));
+    fresh();
+    const editor = recordsOf(() => editorNode(channels));
+    expect(Object.values(runtime).some((u) => u?.includes(4))).toBe(false);
+    expect(editor).toEqual(runtime);
+  });
+
+  it('every prefab present: every record lists nothing', () => {
+    const runtime = recordsOf(runtimeTop);
+    fresh();
+    const editor = recordsOf(editorTop);
+    expect(Object.values(runtime).every((u) => u !== undefined && u.length === 0)).toBe(true);
+    expect(editor).toEqual(runtime);
+  });
 });

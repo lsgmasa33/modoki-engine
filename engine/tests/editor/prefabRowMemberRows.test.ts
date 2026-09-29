@@ -388,7 +388,9 @@ describe('#1533 close-out review', () => {
     expect(rows).not.toContain(GONE);
   });
 
-  it('Apply\'s promotion does not carry a reference node\'s kept orphan rows into the template', async () => {
+  // #1802 (owner ruling D) reverses the Apply half of this case: the promotion BAKES the node's kept rows, as Create Prefab
+  // with `bakeKeptState` does (#1790) — in template form, so #1293 still holds: no scene guid, no scene node's guid.
+  it('Apply\'s promotion bakes a reference node\'s kept orphan rows in TEMPLATE form: no scene identity enters the template (#1802)', async () => {
     const MID_GUID = 'bbbbbbbb-0000-4000-8000-000000021533';
     const HOST = 'aaaaaaaa-0000-4000-8000-000000061533';
     install(midDoc());
@@ -405,9 +407,13 @@ describe('#1533 close-out review', () => {
     writes.length = 0;
     await applyToPrefabSelective(getAllEntities().find((e) => e.name === 'HostRoot')!.id, new Set([`+added.${MID_GUID}`]));
     const written = writes.map((w) => JSON.parse(w.content) as PrefabFile).find((p) => p.id === HOST)!;
-    const rows = JSON.stringify(written.entities.find((e) => e.prefab === MID)!.members ?? {});
+    const members = written.entities.find((e) => e.prefab === MID)!.members ?? {};
+    const rows = JSON.stringify(members);
     expect(rows).not.toContain(SCENE_G);
     expect(rows).not.toContain(NODE_G);
-    expect(rows).not.toContain(GONE);
+    // The row itself IS there now, its scene node a template node: guid blanked, a key to derive one per instance from.
+    const own = (members as Record<string, { own?: Array<Record<string, unknown>> }>)[`/${GONE}`]?.own?.[0];
+    expect(own).toMatchObject({ name: 'SceneOwn', guid: '' });
+    expect(typeof own?.key).toBe('string');
   });
 });

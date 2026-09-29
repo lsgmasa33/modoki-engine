@@ -38,7 +38,8 @@ import {
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo, undo, duplicateEntity,
 } from '@modoki/engine/editor';
-import { setPrefabCache, applyToPrefabSelective, instantiatePrefab, rebuildInstance, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync, applyToPrefabSelective, revertOverridesSelective, instantiatePrefab, rebuildInstance, rebaseStaleInstances, withKeptStateBake, bakingKeptStateForTest, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { expandsToRoot } from '../../packages/modoki/src/runtime/loaders/prefabRoot';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
@@ -46,7 +47,7 @@ import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/
 import { snapshotEntity, respawnFromSnapshot, copySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
 import { redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { tagCreatedPrefab } from '../../packages/modoki/src/editor/scene/prefab';
-import { registerAsset, resolveRef } from '../../packages/modoki/src/runtime/loaders/assetManifest';
+import { registerAsset, resolveRef, resolveGuidToPath, getGuidForPath } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { asAddedNode } from '../../packages/modoki/src/runtime/loaders/unresolvedPrefabRefs';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -1268,3 +1269,309 @@ describe('Create Prefab over R2 kept state: refuse a missing nested frame, bake 
   });
 });
 const guidOfEntity = (id: number) => getAllEntities().find((e) => e.id === id)!.guid!;
+
+describe('a nested frame the load could not expand is not written as removed once the cache holds its prefab (#1812, #1805)', () => {
+  /** PQ with A moved (x 1): a template change that makes a Refresh rebuild the frame. */
+  const pqMovedA = () => ({ ...pqDoc(), entities: pqDoc().entities.map((e) => e.localId === 2 ? row(2, 'A', 1, gA, 1) : e) });
+  // The save asked the editor CACHE whether a nested row expanded. A frame built while its child was unreadable, saved once
+  // the cache held the child, read as unclaimed and wrote `removed: [3]`: after a reload the nested instance and its edits
+  // were gone for good. Now the frame record lists the rows its expansion could not expand (`FrameRootRecord.unexpanded`).
+  // Mutation for every case here: in `captureInstanceStructure`, drop the record read (`unexpandedRowsOf` → undefined).
+  /** Does the save state row 3 (Qrow) removed — as a member row (v8+) or in the legacy list? */
+  const qrowRemoved = (s: SceneData): boolean => {
+    const e = entryOf(s, INST)! as { removed?: number[]; members?: Record<string, { removed?: boolean }> };
+    return !!e.members?.[`/${gQrow}`]?.removed || !!e.removed?.includes(3);
+  };
+  /** A save of PQ's instance with QX edited, made with every prefab present. */
+  const controlSave = async () => {
+    install(qDoc(), pqDoc());
+    await load(scene(PQ));
+    writeTraitFieldWithUndo(inside(INST, 'QX'), meta('Transform'), 'x', 8);
+    return save();
+  };
+
+  it('Q restored mid-session, with nothing rebuilding the instance (#1812, 1)', async () => {
+    const control = await controlSave();
+    uninstall(Q);
+    await load(control);
+    expect(getAllEntities().filter((e) => e.name === 'QX')).toEqual([]); // precondition: row 3 did not expand
+    install(qDoc()); // back on disk and in both caches; the live frame is still the one built without it
+    const saved = await save();
+    expect(qrowRemoved(saved)).toBe(false);
+    expectSameBytes(entryOf(saved, INST), entryOf(control, INST));
+    await load(saved);
+    expect(x(inside(INST, 'QX'))).toBe(8);
+  });
+
+  it('a leftover EDITOR cache entry while the load could not fetch Q — #1805\'s stale entry after an Assets delete (#1812, 2)', async () => {
+    const control = await controlSave();
+    prefabs.delete(Q); // the loader's fetch fails; the editor's sync cache still answers (setPrefabCache is untouched)
+    await load(control);
+    expect(getAllEntities().filter((e) => e.name === 'QX')).toEqual([]); // precondition: row 3 did not expand
+    const saved = await save();
+    expect(qrowRemoved(saved)).toBe(false);
+    install(qDoc());
+    await load(saved);
+    expect(x(inside(INST, 'QX'))).toBe(8);
+  });
+
+  it('load cold, warm, save keeps the row; a Refresh then expands it, the record clears, and the save is still right', async () => {
+    const control = await controlSave();
+    uninstall(Q);
+    await load(control);
+    install(qDoc());
+    expect(qrowRemoved(await save())).toBe(false);
+    // A template change makes the frame stale, and the Refresh rebuilds it — now with Q readable, so row 3 expands.
+    install(pqMovedA());
+    await rebaseStaleInstances();
+    expect(x(inside(INST, 'A'))).toBe(1); // precondition: the Refresh did rebuild
+    expect(x(inside(INST, 'QX'))).toBe(8); // row 3 expanded, with the frame's kept edit
+    const saved = await save();
+    expect(qrowRemoved(saved)).toBe(false);
+    await load(saved);
+    expect(x(inside(INST, 'QX'))).toBe(8);
+  });
+
+  it('a row the user DID delete is still written removed, even once its prefab stops resolving (the control)', async () => {
+    // Mutation: answer "present" for every row the record knows (`unexpanded.has(...) || true`) — the removal is lost.
+    install(qDoc(), pqDoc());
+    await load(scene(PQ));
+    deleteEntitiesWithUndo([inside(INST, 'QR')]);
+    expect(qrowRemoved(await save())).toBe(true);
+    uninstall(Q); // evicted mid-session: the record still says the frame expanded row 3, so its absence is the user's
+    expect(qrowRemoved(await save())).toBe(true);
+  });
+
+  it('a scene removal of a row that could not expand is written again (a layer removal leaves the record\'s list)', async () => {
+    // Mutation: drop `noteRowsRemoved` from `applyStructureCore` — the row reads as unexpanded, and the save drops the
+    // scene's removal, so the row comes back once Q does.
+    install(qDoc(), pqDoc());
+    await load(scene(PQ));
+    deleteEntitiesWithUndo([inside(INST, 'QR')]);
+    const control = await save();
+    uninstall(Q);
+    await load(control);
+    const saved = await save();
+    expect(qrowRemoved(saved)).toBe(true);
+    install(qDoc());
+    await load(saved);
+    expect(getAllEntities().filter((e) => e.name === 'QX')).toEqual([]);
+  });
+
+  it('a LEGACY removal list naming a row that could not expand is written again (no member row keeps it)', async () => {
+    // A v8+ removal is a member row, which R2 keeps when it names nothing live; the legacy `removed` list has no such
+    // keeper, so only the record says the row was removed. Mutation: drop `noteRowsRemoved` from `applyStructureCore`.
+    install(pqDoc());
+    const sc = scene(PQ);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.removed = [3];
+    await load(sc); // Q missing: row 3 cannot expand, and the entry removes it
+    install(qDoc());
+    expect(qrowRemoved(await save())).toBe(true);
+  });
+
+  it('the EDITOR expansion records it too: a Refresh while Q is still missing, then Q comes back', async () => {
+    // Mutation: record `[]` in `instantiatePrefab`'s `noteFrameDoc` — the rebuilt frame lists nothing, and the save writes
+    // row 3 removed once Q is readable.
+    const control = await controlSave();
+    uninstall(Q);
+    await load(control);
+    install(pqMovedA());
+    await rebaseStaleInstances();
+    expect(x(inside(INST, 'A'))).toBe(1); // precondition: the Refresh rebuilt the frame, with Q still missing
+    install(qDoc());
+    expect(qrowRemoved(await save())).toBe(false);
+  });
+
+  it('Create Prefab refuses a frame that never expanded its row, though the cache holds the child now (#1790\'s refusal)', async () => {
+    // Mutation: drop the record read from `unexpandedNestedRows` (`skipped` → undefined) — the cache reads Q as fine, the
+    // create goes ahead, and the new template writes the instance with its frame's row missing.
+    const control = await controlSave();
+    uninstall(Q);
+    await load(control);
+    install(qDoc());
+    const created = await createPrefabFromEntity(rootOf(INST), 'prefabs/New1812.prefab.json', 'New', async () => true);
+    expect(created && typeof created === 'object' && 'refused' in created ? created.refused : '').toMatch(/could not be loaded/);
+  });
+
+  // Close-out review: the runtime cache and the editor's hold SEPARATE copies of one file (an editor write stores a clone
+  // in the runtime's), and the record keeps the loader's. Every case above installs ONE object in both, so none could see
+  // that a record read by object identity answered nothing here. Mutation: back to `rec.doc === doc` in `unexpandedRowsOf`.
+  describe('the runtime and editor caches holding separate copies of PQ', () => {
+    /** The control loaded with Q missing, then Q restored, the editor cache holding its OWN copy of PQ. */
+    const loadedApart = async () => {
+      const control = await controlSave();
+      uninstall(Q);
+      await load(control);
+      setPrefabCache(PQ, JSON.parse(JSON.stringify(pqDoc())) as never);
+      install(qDoc());
+      writeTraitFieldWithUndo(inside(INST, 'A'), meta('Transform'), 'x', 3); // an unrelated edit, for Revert and Apply
+    };
+    /** The editor cache's own copy — what the Apply dialog and the agent's key listing pass. */
+    const editorPq = () => getCachedPrefabSync(PQ) as PrefabFile;
+
+    it('Apply\'s key list offers no removal of the row, and Apply All leaves it in the template', async () => {
+      await loadedApart();
+      const keys = collectInstanceOverrideKeys(rootOf(INST), editorPq());
+      expect(keys.all.some((k) => k.includes(gQrow) || k.startsWith('-removed.'))).toBe(false);
+      writes.length = 0;
+      await applyToPrefabSelective(rootOf(INST), new Set(keys.all));
+      const pq = writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === PQ).pop();
+      expect(pq?.entities.some((e) => e.localId === 3)).toBe(true);
+    });
+
+    it('a Revert of an unrelated field does not write the row removed', async () => {
+      await loadedApart();
+      await revertOverridesSelective(rootOf(INST), new Set([`${gA}.Transform.x`]));
+      expect(qrowRemoved(await save())).toBe(false);
+    });
+
+    it('Create Prefab is refused', async () => {
+      await loadedApart();
+      const created = await createPrefabFromEntity(rootOf(INST), 'prefabs/Apart1812.prefab.json', 'Apart', async () => true);
+      expect(created && typeof created === 'object' && 'refused' in created ? created.refused : '').toMatch(/could not be loaded/);
+    });
+  });
+
+  it('the record is runtime-only: no save carries it', async () => {
+    const control = await controlSave();
+    uninstall(Q);
+    await load(control);
+    install(qDoc());
+    expect(JSON.stringify(await save())).not.toContain('unexpanded');
+  });
+});
+
+// #1802: Apply's promotion of a scene-added reference node follows owner ruling D as Create Prefab does (#1790): what R2
+// kept for the node (an orphan member row) is baked into the promoted row in template form, and its identity stays in the
+// scene, on the stored root the node is now a member of. Before, the row wrote no `members` and the scene lost the guid.
+describe('Apply\'s promotion of a scene-added reference node keeps its kept R2 state (#1802, owner ruling D)', () => {
+  const DEAD = 'eeeeeeee-0000-4000-8000-00000000a790';
+  const BEEF = 'eeeeeeee-0000-4000-8000-00000000a791';
+  const HOLDER = 'dddddddd-0000-4000-8000-000000001600';
+  const written = (id: string) => writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((p) => p.id === id).pop();
+  /** Q with a member Q never had until now, at the orphan row's node guid. */
+  const qBack = () => ({ ...qDoc(), entities: [...qDoc().entities, row(3, 'Gone', 1, DEAD)] });
+  /** P's instance with QINST, an instance of Q holding an orphan row, added under A. */
+  const setUp = async () => {
+    install(pDoc(), qDoc());
+    await load(scene(P, [{
+      id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: HOLDER } },
+      members: { [`/${DEAD}`]: { guid: BEEF, name: 'Gone', traits: { Transform: { x: 4 } } } },
+    }]));
+    reparentEntity(rootOf(QINST), inside(INST, 'A'));
+    const before = await save();
+    expect(JSON.stringify(entryOf(before, INST))).toContain(BEEF); // precondition: the node stores the orphan row
+    writes.length = 0;
+    const key = collectInstanceOverrideKeys(rootOf(INST), prefabs.get(P) as PrefabFile).all.find((k) => k.endsWith(`+added.${QINST}`));
+    expect(key).toBeTruthy();
+    return { before, key: key! };
+  };
+  /** The scene's member rows of INST whose key ends at the orphan node. */
+  const orphanRow = (sd: SceneData) => Object.entries((entryOf(sd, INST)!.members ?? {}) as Record<string, unknown>).find(([k]) => k.endsWith(`/${DEAD}`))?.[1];
+
+  it('the promoted row carries the edit in template form, and the scene keeps only its identity', async () => {
+    // Mutations: drop `withKeptStateBake` around the promotion's recapture — the row has no `members`; drop the settle after
+    // the refresh — the scene save no longer holds BEEF.
+    const { key } = await setUp();
+    expect((await applyToPrefabSelective(rootOf(INST), new Set([key]))).applied).toBe(true);
+    const promoted = written(P)!.entities.find((e) => e.prefab === Q)!;
+    expect(promoted.members).toEqual({ [`/${DEAD}`]: { traits: { Transform: { x: 4 } } } });
+    expect(JSON.stringify(promoted)).not.toContain(BEEF); // no scene identity in a template (#1293)
+    const saved = await save();
+    expect(orphanRow(saved)).toEqual({ guid: BEEF, name: 'Gone' });
+    // …and when Q gains the member, a reload gives it the scene's guid and the template's edit.
+    install(qBack(), written(P) as never);
+    await load(saved);
+    const gone = inside(INST, 'Gone');
+    expect(x(gone)).toBe(4);
+    expect(getAllEntities().find((e) => e.id === gone)!.guid).toBe(BEEF);
+  });
+
+  it('the undo gives the scene back as it was before the Apply (sceneBefore), orphan row and all', async () => {
+    const { before, key } = await setUp();
+    clearHistory();
+    const res = await applyToPrefabWithUndo(rootOf(INST), new Set([key]));
+    expect(res.applied).toBe(true);
+    await undo();
+    expect(entryOf(await save(), INST)).toEqual(entryOf(before, INST));
+  });
+
+  it('the bake scope is restored when the write inside it throws', () => {
+    // Mutation: set the flag without try/finally in `withKeptStateBake` — it stays set, and every later write bakes.
+    expect(() => withKeptStateBake(true, () => { throw new Error('boom'); })).toThrow('boom');
+    expect(bakingKeptStateForTest()).toBe(false);
+    withKeptStateBake(true, () => {
+      expect(() => withKeptStateBake(false, () => { throw new Error('inner'); })).toThrow('inner');
+      expect(bakingKeptStateForTest()).toBe(true); // a nested scope restores the outer one, not "off"
+    });
+    expect(bakingKeptStateForTest()).toBe(false);
+  });
+});
+
+// #1807: Create Prefab's undo right after a Rename's undo. The rename's undo moves the file back, but the manifest follows
+// only at its next push (debounced), so it still maps the prefab's guid to the RENAMED path. The undo untagged by resolving
+// its path through that manifest, got nothing, looked for the raw path no entity carries, and left the tree linked to the
+// prefab it had just trashed: a Missing Prefab on the next load. It now untags by the document's own guid.
+describe('Create Prefab\'s undo untags by the prefab document\'s guid, not through a manifest lagging a move (#1807)', () => {
+  const PLAIN = 'dddddddd-0000-4000-8000-000000001807';
+  const plainScene = (): SceneData => ({
+    id: 's1807', version: 16, name: 'S', resources: [],
+    entities: [
+      { id: 1, traits: { EntityAttributes: { name: 'Plain', parentId: 0, guid: PLAIN } } },
+      { id: 2, traits: { EntityAttributes: { name: 'Leaf', parentId: PLAIN, guid: 'dddddddd-0000-4000-8000-000000001808' } } },
+    ],
+  } as unknown as SceneData);
+  const piOf = (name: string) => readTraitData(getAllEntities().find((e) => e.name === name)!.id, meta('PrefabInstance')) as { source?: string } | null;
+  /** Serve the created file to the undo's precondition, and trash it on request. */
+  const serveCreated = () => vi.stubGlobal('fetch', async (url: string) => {
+    if (String(url).includes('/api/delete-asset')) return { ok: true, status: 200, json: async () => ({ ok: true, trashed: 1, missing: [], failed: [] }) };
+    const last = writes.filter((w) => w.path.endsWith('Plain.prefab.json')).pop();
+    return last && String(url).includes('Plain.prefab.json') ? new Response(last.content, { status: 200 }) : { ok: false, status: 404, json: async () => ({}), text: async () => '' };
+  });
+
+  it('the undo untags the tree while the manifest still names the renamed path, and a reload gives the plain tree', async () => {
+    // Mutation: drop the document in `instanceSourceRef` (resolve by path alone) — the untag matches nothing, logs
+    // "the tree was left tagged", and Plain and Leaf keep their link to the trashed prefab.
+    await load(plainScene());
+    clearHistory();
+    serveCreated();
+    const created = await createPrefabFromEntity(rootOf(PLAIN), 'prefabs/Plain.prefab.json', 'Plain', async () => true);
+    const doc = (created as { prefab: PrefabFile }).prefab;
+    pushAction((created as { action: Parameters<typeof pushAction>[0] }).action);
+    expect(piOf('Plain')?.source).toBe(doc.id); // precondition: tagged by its guid
+    // The rename's undo has moved the file back, and the manifest has not caught up: it names the renamed path.
+    const landed = resolveGuidToPath(doc.id!)!;
+    registerAsset(doc.id!, landed.replace('Plain.prefab.json', 'R56.prefab.json'), 'prefab');
+    expect(getGuidForPath(landed)).toBeUndefined(); // precondition: a lookup by the path answers nothing
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await undo();
+    const leftTagged = error.mock.calls.some((c) => String(c[0]).includes('untagEntityTreeAsInstance'));
+    error.mockRestore();
+    expect(leftTagged).toBe(false);
+    expect(piOf('Plain')).toBeNull();
+    expect(piOf('Leaf')).toBeNull();
+    const saved = await save();
+    uninstall(doc.id!);
+    await load(saved);
+    expect(getAllEntities().map((e) => e.name).sort()).toEqual(['Leaf', 'Plain']);
+    expect(piOf('Plain')).toBeNull();
+  });
+
+  it('the agent create\'s undo does the same (its link-only undo)', async () => {
+    // Mutation: as above, or drop the document from the agent undo's `untagEntityTreeAsInstance` call.
+    await load(plainScene());
+    clearHistory();
+    serveCreated();
+    await runAgentOp('prefab', { action: 'create', entityGuid: PLAIN, path: 'prefabs/Plain.prefab.json' });
+    const source = piOf('Plain')?.source;
+    expect(source).toBeTruthy(); // precondition: tagged
+    registerAsset(source!, resolveGuidToPath(source!)!.replace('Plain.prefab.json', 'R56.prefab.json'), 'prefab');
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await undo();
+    const leftTagged = error.mock.calls.some((c) => String(c[0]).includes('untagEntityTreeAsInstance'));
+    error.mockRestore();
+    expect(leftTagged).toBe(false);
+    expect(piOf('Plain')).toBeNull();
+    expect(piOf('Leaf')).toBeNull();
+  });
+});

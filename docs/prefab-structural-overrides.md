@@ -454,8 +454,18 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
       compacted against a lower row (E9).
 
     The seed is the chain node's, never the live frame's record, because on a Refresh the chain node is the
-    new template's. The template WRITER still writes the unseeded capture, so a prefab-edit save restates the
-    defaults (#1804). Tests: `nestedEnclosingLayer.test.ts` § #1781.
+    new template's.
+
+    **The template WRITER uses the same subtraction (#1804).** `finishTemplateReferenceNode` measured the node's
+    frames against the bare documents too, so a no-edit prefab-edit save rewrote a statement that adds a component
+    with every schema default. It now keeps, of each captured field, only one the live node changed over the seeded
+    base or one the node's own layer states (`keepNodeStated`, over `seededNodeDelta`, the helper `sameNodeValues`
+    asks too). Values stay the capture's, already tokenized, and a component the node removed is simply not in the
+    capture. The statement comes from the layer enclosing the node (`templateReferenceNode`), else by key from the
+    prefab being rewritten (a prefab-edit world, where the row stating the node is a top-level entry). The node's
+    `name` is the statement's: a reference node's name is not applied on spawn (its root takes the child's root row
+    name), so writing the live root's name renamed `T` to `QR` on every save. A node no template states yet is
+    written as before. Tests: `nestedEnclosingLayer.test.ts` § #1781 (the #1804 cases).
   - ⚠️ **A template node the scene DELETED still comes back.** With no live node there is nothing to
     match, and "deleted here" cannot be told from "added by the refresh" without the old live key set.
     A template node the scene MOVED below another added node also duplicates. Only nodes directly

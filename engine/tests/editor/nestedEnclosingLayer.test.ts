@@ -1747,6 +1747,68 @@ describe('#1781: a template reference node whose statement adds a component is n
     }
   });
 
+  // #1804, the WRITER twin: a prefab-edit save of O measured T's frames against the bare documents too, so a no-edit save
+  // rewrote T's statement with every schema default, and its name as the child root's (QR).
+  const nodeT = (o: PrefabFile) => (o.entities.flatMap((e) => (e as { added?: Array<Record<string, unknown>> }).added ?? []))
+    .find((n) => n.key === 'kT1781')!;
+  for (const [where, stmt] of [['a nested frame', { nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }], ['its root frame', { overrides: { 2: { UIFocusable: { focusOrder: 3 } } } }]] as const) {
+    it(`#1804: an untouched prefab-edit save of O rewrites T's statement into ${where} as it was, and its name`, async () => {
+      // Mutation: drop the chain node's seed in `finishTemplateReferenceNode` — the component is written whole.
+      const o = withT(stmt);
+      install(sDoc(), qDoc(), pDoc(), o);
+      await load(buildPrefabEditScene(o as never));
+      const first = serializePrefab(editRoot(), O) as PrefabFile;
+      const t = nodeT(first);
+      const want = nodeT(o as unknown as PrefabFile);
+      expect(t.name).toBe('T');
+      expect(t.nestedOverrides ?? {}).toEqual(want.nestedOverrides ?? {});
+      expect(t.overrides ?? {}).toEqual(want.overrides ?? {});
+      // …and a file the writer wrote rewrites byte for byte (the fixture above is hand-written, so its bytes are not the
+      // writer's: an empty `overrides`, no `traits` bag).
+      install(first);
+      await load(buildPrefabEditScene(first as never));
+      expect(JSON.stringify(nodeT(serializePrefab(editRoot(), O) as PrefabFile))).toBe(JSON.stringify(t));
+    });
+  }
+
+  for (const [where, stmt, who] of [['a nested frame', { nestedOverrides: { 3: { 2: { UIFocusable: {} } } } }, 'K'], ['its root frame', { overrides: { 2: { UIFocusable: {} } } }, 'M']] as const) {
+    it(`#1804: a statement adding a component at its DEFAULTS (\`{}\`) into ${where} survives a no-edit save and reopens`, async () => {
+      // Close-out review: a capture holding only defaults kept no field of the component, so the whole component went.
+      // Mutation: keep an added component only when the capture has no fields (the tag clause alone) — it is dropped.
+      const o = withT(stmt);
+      install(sDoc(), qDoc(), pDoc(), o);
+      await load(buildPrefabEditScene(o as never));
+      const first = serializePrefab(editRoot(), O) as PrefabFile;
+      expect({ overrides: nodeT(first).overrides ?? {}, nestedOverrides: nodeT(first).nestedOverrides ?? {} })
+        .toEqual({ overrides: nodeT(o as unknown as PrefabFile).overrides ?? {}, nestedOverrides: nodeT(o as unknown as PrefabFile).nestedOverrides ?? {} });
+      install(first);
+      await load(buildPrefabEditScene(first as never));
+      expect(focus(who)).toBeTruthy();
+    });
+  }
+
+  it('#1804: an edit to a field the statement set writes only that field', async () => {
+    const o = withT({ nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } });
+    install(sDoc(), qDoc(), pDoc(), o);
+    await load(buildPrefabEditScene(o as never));
+    writeTraitFieldWithUndo(named('K')[0]!.id, meta('UIFocusable'), 'focusOrder', 6);
+    const t = nodeT(serializePrefab(editRoot(), O) as PrefabFile);
+    expect(t.nestedOverrides).toEqual({ 3: { 2: { UIFocusable: { focusOrder: 6 } } } });
+  });
+
+  it('#1804: an edit to a field the statement does NOT set is written beside the statement, and reopens', async () => {
+    // Mutation: keep only the fields the node's layer states in `keepNodeStated` (drop the `changed` half) — the edit is lost.
+    const o = withT({ nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } });
+    install(sDoc(), qDoc(), pDoc(), o);
+    await load(buildPrefabEditScene(o as never));
+    writeTraitFieldWithUndo(named('K')[0]!.id, meta('UIFocusable'), 'focusable', false);
+    const first = serializePrefab(editRoot(), O) as PrefabFile;
+    expect(nodeT(first).nestedOverrides).toEqual({ 3: { 2: { UIFocusable: { focusOrder: 3, focusable: false } } } });
+    install(first);
+    await load(buildPrefabEditScene(first as never));
+    expect(focus('K')).toMatchObject({ focusable: false, focusOrder: 3 });
+  });
+
   it('E9: a component a lower ROW adds, restated by T, saves nothing from an untouched load', async () => {
     // The case #1386's rule already covered (the row is in the chain): kept as a regression beside the new one.
     install(sDoc(), qDoc({ 2: { UIFocusable: { focusOrder: 1 } } }), pDoc(), withT({ nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }));
