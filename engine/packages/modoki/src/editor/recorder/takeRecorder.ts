@@ -349,9 +349,9 @@ export async function finishTakeRecording(): Promise<string | null> {
     return null;
   }
   const file = `${identity.projectRoot}/recordings/${takeFileStem(take.game, new Date(take.epochMs))}.take.json`;
-  const ok = await writeAssetFile(`/@fs${file.startsWith('/') ? '' : '/'}${file}`, jsonFileBody(take));
-  if (!ok) {
-    console.error(`[takeRecorder] writing ${file} failed — the take was NOT saved:`, take);
+  const wrote = await writeAssetFile(`/@fs${file.startsWith('/') ? '' : '/'}${file}`, jsonFileBody(take));
+  if (!wrote.ok) {
+    console.error(`[takeRecorder] writing ${file} failed (${wrote.error}) — the take was NOT saved:`, take);
     return null;
   }
   console.info(`[takeRecorder] saved ${take.events.length} events, ${take.duration.toFixed(2)}s → ${file}`

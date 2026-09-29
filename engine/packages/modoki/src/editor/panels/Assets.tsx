@@ -1562,8 +1562,8 @@ export default function Assets() {
         if (content === null) continue; // said by importedFileContent
         // Only into an EMPTY path (#1784): `dest` was planned against the listing, not the disk.
         const wrote = await writeDroppedImport(dest, content);
-        if (wrote === 'taken') { console.error(`[Assets] ${file.name} was not imported: a file appeared at ${dest} since the panel listed the folder, and it was left as it is. Drop it again to import it as a copy.`); continue; }
-        if (wrote !== 'ok') { console.error(`[Assets] Failed to import ${file.name}`); continue; }
+        if (wrote.result === 'taken') { console.error(`[Assets] ${file.name} was not imported: a file appeared at ${dest} since the panel listed the folder, and it was left as it is. Drop it again to import it as a copy.`); continue; }
+        if (wrote.result === 'failed') { console.error(`[Assets] Failed to import ${file.name}: ${wrote.error}`); continue; }
         imported.push({ path: dest, content, convert });
         setImportStatus(true, file.name, i + 1, list.length);
       }

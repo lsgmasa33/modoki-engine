@@ -14,7 +14,7 @@ import { getAllTraits, getTraitByName } from './traitRegistry';
 import { deriveMemberGuid, remapGuidValues, durableGuid, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, type MemberStep, type MemberPi } from '../assetRefRules';
 import { templateKeyOf } from '../templateIdentity';
 import { memberRowsToWrite } from './memberRows';
-import { rekeyKeptOrphanRows } from './keptOrphanRows';
+import { notifyGuidRemap } from './guidRemap';
 import { memberPathKey } from '../templateRefs';
 import { worldIdentityParents, type IdentityParents, type TemplateDocReader } from './identityParents';
 
@@ -242,10 +242,10 @@ export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World 
     renamed.push(e);
   }
   remapWorldGuidRefs(remap, world);
-  // The rows R2 keeps for a renamed instance root follow it (#1778): Create Prefab's stamp renames a swallowed reference
-  // node, and its orphan rows, left under the old guid, were never written again.
-  rekeyKeptOrphanRows(remap);
   for (const e of renamed) indexEntityGuid(e, world);
+  // Every store keyed by an entity guid outside the world follows the rename (#1785): R2's kept orphan rows (#1778), the
+  // editor's gizmo/collapse/clip prefs and pointers, a pooled view's window, focus. Each registered from its own module.
+  notifyGuidRemap(remap, world);
 }
 
 /** Every entity below the frame root `rootEcsId` whose guid a RELOAD derives, with the guid it derives from `anchor`

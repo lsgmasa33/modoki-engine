@@ -10,7 +10,7 @@
  *  `tests/plugins/assetWritePreconditions.test.ts` pins the real route. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { writeNewAssetDocument, existingAssetPath, mayCreateOver, otherAssetKindAt } from '../../src/editor/scene/createAssetDocument';
+import { writeNewAssetDocument, existingAssetPath, mayCreateOver, otherAssetKindAt, newAssetRefusalText } from '../../src/editor/scene/createAssetDocument';
 import { registerAsset, unregisterAsset } from '../../src/runtime/loaders/assetManifest';
 import { markAssetDirty, getDirtyAssetPaths, clearDirtyAssets } from '../../src/editor/scene/dirtyAssets';
 
@@ -21,6 +21,8 @@ const PATH = '/assets/anims/Walk.anim.json';
 let onDisk = new Map<string, string>();
 let writes: Array<{ path: string; content: string; createOnly: boolean }> = [];
 let failWrites = false;
+/** The body a refused write answers with, when set. */
+let failBody: object | null = null;
 /** Off → the route answers as it did before #1273, with no `existingPath` / `path`. */
 let routeNamesExisting = true;
 /** The spelling the route reports for a write it made — a folder the filesystem folded, say. */
@@ -32,12 +34,13 @@ beforeEach(() => {
   onDisk = new Map();
   writes = [];
   failWrites = false;
+  failBody = null;
   routeNamesExisting = true;
   writtenAs = (p) => p;
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
     const u = String(url);
     if (u.endsWith('/api/write-file')) {
-      if (failWrites) return { ok: false, status: 403, json: async () => ({}) } as unknown as Response;
+      if (failWrites) return { ok: false, status: 403, json: async () => (failBody ?? {}) } as unknown as Response;
       const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
       const existing = storedAs(b.path);
       if (b.ifNoneMatch === '*' && existing) {
@@ -160,6 +163,22 @@ describe('failures', () => {
     const r = await writeNewAssetDocument(PATH, () => null);
     expect(r.outcome).toBe('failed');
     expect(writes).toEqual([]);
+  });
+
+  // #1811: the route's reason rides the failed outcome, and the panels say it. Mutation: drop `error` from the
+  // create-only failure in writeNewAssetDocument — the outcome has none and the panel text falls back.
+  it('a refused create carries the route\'s reason, which the panels\' text names', async () => {
+    failWrites = true;
+    failBody = { error: 'outside this project\'s asset roots' };
+    const r = await writeNewAssetDocument(PATH, doc);
+    expect(r).toMatchObject({ outcome: 'failed', status: 403, error: 'outside this project\'s asset roots' });
+    expect(newAssetRefusalText(r)).toBe(`${PATH.split('/').pop()} was not created: outside this project's asset roots`);
+  });
+
+  // Accept side. Mutation: have newAssetRefusalText answer for every outcome — a declined Replace is then toasted.
+  it('a declined Replace and a created asset say nothing', async () => {
+    expect(newAssetRefusalText({ outcome: 'declined', path: PATH })).toBeNull();
+    expect(newAssetRefusalText({ outcome: 'created', path: PATH, guid: FRESH })).toBeNull();
   });
 });
 

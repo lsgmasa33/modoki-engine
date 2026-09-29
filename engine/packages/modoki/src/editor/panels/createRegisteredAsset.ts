@@ -163,7 +163,8 @@ async function createRegistered(
   if (written.outcome === 'failed') {
     // A failed write that registered the guid anyway would leave the manifest pointing at a file
     // that is not there — resolvable, and dangling.
-    return { ok: false, code: 'REFUSED_BY_OP', error: `failed to write ${full} (path outside the asset roots, or the folder does not exist)` };
+    // The route's own reason (#1811), not a guess at one: it names an outside-the-roots path itself, with options.
+    return { ok: false, code: 'REFUSED_BY_OP', error: `failed to write ${full}: ${written.error ?? 'the document could not be built'}`, ...(written.options ? { options: written.options } : {}) };
   }
   // `writeNewAssetDocument` already dropped any parked panel edit for this path (a REPLACE would
   // otherwise have the next Cmd+S flush the old edited doc back over it — #1215 close-out review).

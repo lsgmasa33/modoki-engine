@@ -176,8 +176,11 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         const fields = op.fields ?? {};
         // A file never stores the stamp (the loader sets it), so any value but '' is a scene move (#1757).
         const stored = entity.traits[op.trait];
+        // An instance root keeps its guid at the entry's top level, not in its EntityAttributes (#1785 close-out re-review):
+        // asked of the trait alone, its guid read as absent and a rename passed that the live twin refuses.
         const fieldRefused = Object.entries(fields).map(([f, v]) => fieldWriteRefusal(op.trait!, f, v,
-          stored && typeof stored === 'object' ? (stored as Record<string, unknown>)[f] : undefined)).find((r) => r);
+          op.trait === 'EntityAttributes' && f === 'guid' ? entityGuid(entity)
+            : stored && typeof stored === 'object' ? (stored as Record<string, unknown>)[f] : undefined)).find((r) => r);
         if (fieldRefused) { errors.push(`${where}: ${fieldRefused}`); continue; }
         // Check `space` BEFORE the empty-fields (tag) branch. It used to sit in the `else if`
         // after it, so `{op:'setTrait', trait:'<non-Transform>', space:'world'}` with no fields was

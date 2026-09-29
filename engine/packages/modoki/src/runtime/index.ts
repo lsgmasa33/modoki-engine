@@ -23,6 +23,7 @@ export {
 export { emptyDocMap, hasDocKey, putOwn } from './core/docKeys';
 export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
+export { onGuidRemap, remapGuidKey, remapGuidSet, remapGuidMapKeys, type GuidRemapListener } from './core/ecs/guidRemap';
 // Module state that belongs to one world: keyed by it, so a world swap needs no reset list (#1315).
 export { worldScoped, type WorldScoped } from './core/ecs/worldScoped';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';

@@ -88,7 +88,7 @@ export function jsonFileBody(data: unknown): string {
 }
 
 /** POST to /api/write-file, returning the raw `Response` — the ONE place that composes this
- *  network call. Most callers want `writeAssetFile`'s boolean instead; this exists for the rare
+ *  network call. Most callers want `writeAssetFile`'s outcome instead; this exists for the rare
  *  caller that needs the HTTP status (`collisionMeshWrite.ts`'s write-then-register sequencing,
  *  which reports `write GLB failed (${res.status})`). `content` is passed through completely
  *  unchanged — compose a JSON document's bytes with `jsonFileBody` FIRST; this function does not
@@ -199,6 +199,43 @@ export async function repairPrefabMemberPaths(prefab: string, before: unknown): 
   }
 }
 
+/** Why `/api/write-file` refused a write, read the ONE way every client caller reads it (#1811).
+ *
+ *  The route states a reason for every refusal — `{error, options}` for a path outside the asset roots, the prefab
+ *  gates' 409 with `error`, a 500's `{error}`, the transport's 400/413/token 403 — and the precondition 409s carry only
+ *  `reason`. The two shared wrappers used to read `res.ok` (and a 409's `reason`) and nothing else, so ten callers
+ *  reported a bare "failed" to a person or an agent who could only guess why. `error` is the body's `error`, else its
+ *  `reason`, else the HTTP status; it is never empty.
+ *
+ *  `conflict`: the file is not the one the caller expected, so the step must refuse rather than report a failure —
+ *  an if-match or if-none-match precondition, or `prefab-mark-lowered` (#1774: the file's localId mark rose past what
+ *  this write was raised to, so it is not the file the caller read). The prefab FORMAT gate's 409 is a failed write,
+ *  not a conflict: nothing about the file changed, this build just may not write it. */
+export interface WriteRefusal { conflict: boolean; error: string; options?: string[] }
+
+const CONFLICT_REASONS: ReadonlySet<unknown> = new Set(['if-match', 'if-none-match', 'prefab-mark-lowered']);
+
+/** Read a refused `/api/write-file` answer (`res.ok` false). */
+export async function readWriteRefusal(res: Response): Promise<WriteRefusal> {
+  // Inside a `then`, so a body that cannot be read at all (no JSON, a stub without `json`) is a null body, not a throw.
+  const body = await Promise.resolve().then(() => res.json()).catch(() => null) as { error?: unknown; reason?: unknown; options?: unknown } | null;
+  const why = typeof body?.error === 'string' && body.error ? body.error : typeof body?.reason === 'string' ? body.reason : '';
+  const options = Array.isArray(body?.options) ? body.options.filter((o): o is string => typeof o === 'string') : [];
+  return {
+    conflict: res.status === 409 && CONFLICT_REASONS.has(body?.reason),
+    error: why || `the write was refused (HTTP ${res.status})`,
+    ...(options.length ? { options } : {}),
+  };
+}
+
+/** The refusal for a write that never got an answer (the fetch threw). */
+export function thrownWriteRefusal(e: unknown): WriteRefusal {
+  return { conflict: false, error: e instanceof Error ? e.message : String(e) };
+}
+
+/** What `writeAssetFile` answers: landed, or refused with the route's reason. */
+export type WriteOutcome = { ok: true } | { ok: false; error: string; options?: string[] };
+
 /** Write a text or base64-encoded file via /api/write-file — the ONE client write wrapper every
  *  JSON write in the editor now routes through (#835; collapses five near-identical copies —
  *  `serialize.ts`'s `writeFileToServer`, this module's own prior duplicate, a third copy in
@@ -207,29 +244,40 @@ export async function repairPrefabMemberPaths(prefab: string, before: unknown): 
  *  `postWriteFile` above — a JSON caller must produce its bytes with `jsonFileBody` first. Three
  *  BINARY (base64) sites deliberately keep their own raw `backendFetch` call instead of routing
  *  through here — see `tests/architecture/clientJsonWriteSeam.test.ts`'s EXEMPT ledger for which
- *  and why. */
-export async function writeAssetFile(filePath: string, content: string, encoding?: 'base64'): Promise<boolean> {
+ *  and why. A refusal carries the route's reason (#1811): the caller states it, never a bare "failed". */
+export async function writeAssetFile(filePath: string, content: string, encoding?: 'base64'): Promise<WriteOutcome> {
+  let r: WriteRefusal;
   try {
-    return (await postWriteFile(filePath, content, encoding)).ok;
-  } catch { return false; }
+    const res = await postWriteFile(filePath, content, encoding);
+    if (res.ok) return { ok: true };
+    r = await readWriteRefusal(res);
+  } catch (e) { r = thrownWriteRefusal(e); }
+  return { ok: false, error: r.error, ...(r.options ? { options: r.options } : {}) };
 }
+
+/** What `writeAssetFileGuarded` answers. */
+export type GuardedWriteOutcome =
+  | { result: 'ok' }
+  | { result: 'conflict'; error: string }
+  | { result: 'failed'; error: string; options?: string[] };
 
 /** `writeAssetFile` with a precondition on what the file holds NOW (#1679), for an undo/redo that rewrites a file
  *  the editor wrote earlier: `ifMatch` (the sha256 of the bytes it must hold) or `createOnly` (nothing may be there).
  *  A three-way answer rather than a boolean, because the caller does opposite things with the two misses: a
  *  `'conflict'` means the file is someone else's now and the step must refuse, while `'failed'` is a transport or
- *  server error. Only the precondition's own 409s are a conflict — the #1468 prefab format gate also answers 409,
- *  and that one is a failed write, not a changed file. */
+ *  server error, with the route's reason (#1811). What counts as a conflict is `readWriteRefusal`'s one answer, the
+ *  same one `prefabCommit`'s writes read. */
 export async function writeAssetFileGuarded(
   filePath: string, content: string,
   opts: { encoding?: 'base64' } & ({ ifMatch: string } | { createOnly: true }),
-): Promise<'ok' | 'conflict' | 'failed'> {
+): Promise<GuardedWriteOutcome> {
+  let r: WriteRefusal;
   try {
     const res = await postWriteFile(filePath, content, opts.encoding,
       'ifMatch' in opts ? { ifMatch: opts.ifMatch } : { createOnly: true });
-    if (res.ok) return 'ok';
-    if (res.status !== 409) return 'failed';
-    const body = await res.json().catch(() => null) as { reason?: unknown } | null;
-    return body?.reason === 'if-match' || body?.reason === 'if-none-match' ? 'conflict' : 'failed';
-  } catch { return 'failed'; }
+    if (res.ok) return { result: 'ok' };
+    r = await readWriteRefusal(res);
+  } catch (e) { r = thrownWriteRefusal(e); }
+  if (r.conflict) return { result: 'conflict', error: r.error };
+  return { result: 'failed', error: r.error, ...(r.options ? { options: r.options } : {}) };
 }

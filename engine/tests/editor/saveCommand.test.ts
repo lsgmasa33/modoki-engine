@@ -34,6 +34,12 @@ describe('toastForSave — the scene half', () => {
     expect(t.text).toMatch(/nothing written/i);
   });
 
+  // #1811: the human's toast carries the route's reason. Mutation: drop `r.error` from toastForSave's last branch.
+  it('a refused save names the route\'s reason when it gave one', () => {
+    const t = toastForSave(scene({ scene: { saved: false, path: '/s.json', reason: 'write-failed', error: 'EACCES: permission denied' } }));
+    expect(t.text).toBe('Save FAILED (write-failed: EACCES: permission denied) — nothing written to disk');
+  });
+
   it('a cancelled Save-As is INFO, not a failure — the user chose it', () => {
     const t = toastForSave(scene({ scene: { saved: false, path: null, reason: 'cancelled' } }));
     expect(t.kind).toBe('info');

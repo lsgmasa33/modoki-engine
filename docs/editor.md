@@ -2541,6 +2541,28 @@ file outside the wrapper reaches the route directly unless it is on that file's 
 scanned against the ROUTE STRING rather than the `JSON.stringify` pattern (which is exactly what
 let four real call sites hide from the original bug report's grep).
 
+**A refused write reaches every caller WITH the route's reason (#1811).** `/api/write-file` states
+one for every refusal: `{error, options}` for a path outside the asset roots, the prefab gates' 409s
+with `error`, a 500's `{error}`, the transport's 400/413/token 403, and the preconditions' 409s with
+`reason` only. The two wrappers used to read `res.ok` (and a 409's `reason`) and nothing else, so ten
+callers reported a bare "failed" that a human or an agent could only guess at. **`readWriteRefusal`**
+(same file) is the ONE reader: `error` is the body's `error`, else its `reason`, else
+`the write was refused (HTTP <status>)`, never empty; `conflict` is `if-match`, `if-none-match` or
+`prefab-mark-lowered` — the one answer `prefabCommit`'s `post()` and both wrappers share (the
+wrappers once called `prefab-mark-lowered` a failure while `post()` called it a conflict). The
+contracts are `writeAssetFile → {ok:true} | {ok:false, error, options?}` and
+`writeAssetFileGuarded → {result:'ok'} | {result:'conflict', error} | {result:'failed', error, options?}`.
+⚠️ **The old contract was a boolean, and an object is always truthy** — a caller still spelling
+`if (!await writeAssetFile(...))` would read every failure as success, so it was converted at every
+site and `npm run typecheck` is what holds it. Each caller STATES the reason where it already
+reported a failure: the scene save (`SaveResult.error` → the save toast, the agent's `save-all`
+refusal, Apply's undo report), the other-scene saves, the asset delete-undo and import-redo reports,
+the dropped-file import, the model import's abort toast, the take recorder, sling's save toast and
+undo refusal. The raw writers (`createAssetDocument`, the texture write, `convertToGLB`) read it too,
+`create_registered_asset` stopped guessing one, and the five New-asset panels toast
+`newAssetRefusalText` instead of returning silently. Still open: an asset undo that reports a
+shortfall without throwing reaches an agent's `undo` as `did:true` (#1823).
+
 `AtlasAssetView` is not on this seam at all — since #831 it parks an object through
 `/api/asset-write` and the server produces the bytes, same as the debounced asset-editor
 persistence below. It is the template for "hand the server an object" where that shape fits; the

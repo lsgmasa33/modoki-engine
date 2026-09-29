@@ -15,7 +15,7 @@
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
 import { jsonFileBody } from '../backend/editorBackend';
-import { writeNewAssetDocument } from '../scene/createAssetDocument';
+import { writeNewAssetDocument, newAssetRefusalText } from '../scene/createAssetDocument';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -687,7 +687,7 @@ export default function SkinEditor() {
     if (!pick) return;
     // Create-only, asking before a Replace, which keeps the replaced rig's guid (#1264).
     const r = await writeNewAssetDocument(pick.path, (guid) => jsonFileBody({ id: guid, ...defaultRig2DFile() } satisfies Rig2DFile), { confirmReplace: pick.confirmReplace });
-    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') { const said = newAssetRefusalText(r); if (said) useEditorStore.getState().showToast(said, 'warn'); return; }
     // `r.path`: a Replace lands on the existing file's on-disk spelling (#1273).
     const { path } = r;
     registerAsset(r.guid, path, 'rig2d');
@@ -726,7 +726,7 @@ export default function SkinEditor() {
     // 2026-09-15, #1264). The helper also drops any parked edit for the path, or the next save
     // would flush the old rig straight back over the regenerated one.
     const r = await writeNewAssetDocument(rigPath, (rigGuid) => jsonFileBody(autoRig2D({ id: rigGuid, sprite: guid, width: dims.width, height: dims.height, isInside })), { confirmReplace: confirmReplaceAsset });
-    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') { const said = newAssetRefusalText(r); if (said) useEditorStore.getState().showToast(said, 'warn'); return; }
     // `r.path`, not `rigPath`: a Replace lands on the existing file's on-disk spelling (#1273).
     registerAsset(r.guid, r.path, 'rig2d');
     const name = (r.path.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');

@@ -240,15 +240,18 @@ describe('save-all when the SCENE WRITE FAILS — the terminal exit, same rule',
     // Asset writes succeed, the scene write does not — the assetSaveAlwaysFlushes.test.ts shape.
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === 'string' ? input : input.toString();
-      if (url.includes('/api/write-file')) return { ok: false, json: async () => ({ ok: false }) } as unknown as Response;
+      if (url.includes('/api/write-file')) return { ok: false, status: 500, json: async () => ({ ok: false, error: 'EACCES: permission denied' }) } as unknown as Response;
       return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
     }));
   });
 
-  it('nothing parked → REFUSED_BY_OP', async () => {
+  // #1811: the refusal names the route's reason, not only `write-failed`. Mutation: drop `r.error` from save-all's
+  // refusal text (or from writePrimaryScene's SaveResult) — the reason is gone.
+  it('nothing parked → REFUSED_BY_OP, naming the route\'s reason', async () => {
     const err = await runAgentOp('save-all', {}).then(() => null, (e: unknown) => e as { code?: string; message?: string });
     expect(err?.message, 'precondition: this is the scene-write exit').toMatch(/SCENE was not written/);
     expect(err).toMatchObject({ code: 'REFUSED_BY_OP' });
+    expect(err?.message).toMatch(/save-all FAILED \(write-failed: EACCES: permission denied\)/);
   });
 
   it('a parked asset flushed → PARTIAL', async () => {

@@ -31,7 +31,7 @@ vi.mock('../../src/editor/backend/editorBackend', () => ({
     return h.fingerprint === null ? { ok: false, status: 500, json: async () => ({ error: 'boom' }) } : { ok: true, json: async () => h.fingerprint };
   },
   jsonFileBody: (x: unknown) => JSON.stringify(x),
-  writeAssetFile: async (url: string, body: string) => { h.written.push({ url, body }); return true; },
+  writeAssetFile: async (url: string, body: string) => { h.written.push({ url, body }); return { ok: true as const }; },
 }));
 
 import { startTakeRecording, finishTakeRecording, onTakeSaved, type SavedTake } from '../../src/editor/recorder/takeRecorder';

@@ -23,6 +23,7 @@ import { getCurrentScenePath } from '../scene/serialize';
 import { getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { clearUnscopedLegacyKey, projectScopedKey } from '../projectScopedKey';
+import { onGuidRemap } from '../../runtime/core/ecs/guidRemap';
 
 const KEY_BASE = 'editor:lastAnimationClip';
 
@@ -70,6 +71,17 @@ function animatorRootForGuid(guid: string): number | null {
   const ent = findEntity(id);
   return meta && ent?.has(meta.trait) ? id : null;
 }
+
+/** The remembered Animator root follows a guid rename (#1785). The payload is rewritten only when the open clip or its
+ *  root ID changes, and a rename changes neither, so the next launch looked the old guid up and reopened unbound. */
+onGuidRemap('editor:lastAnimationClip', (remap) => {
+  const key = projectScopedKey(KEY_BASE);
+  let p: PersistedClip;
+  try { p = JSON.parse(localStorage.getItem(key) ?? 'null'); } catch { return; }
+  const to = p?.animatorGuid ? remap.get(p.animatorGuid) : undefined;
+  if (to === undefined) return;
+  try { localStorage.setItem(key, JSON.stringify({ ...p, animatorGuid: durableGuid(to) ? to : null })); } catch { /* quota/private mode */ }
+});
 
 let registered = false;
 let unsubscribe: (() => void) | null = null;

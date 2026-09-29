@@ -81,7 +81,7 @@ answer the same question for themselves. Each place in that column is a place th
 | I12 | A runtime-generated (`Transient`) subtree is never authoring input. | `collectTransientSubtreeIds` / `filterAuthoringVisible` (`editor/scene/authoringScope.ts`); `authoringEntitiesFor` for Create Prefab. See § "Authoring scope — a runtime instance is not authoring input". |
 | I13 | Only an authored world (stopped, with nothing posed) is captured or written. | `whyWorldNotAuthored` (`editor/scene/authoredWorld.ts`). |
 | I14 | An entity is saved into exactly one scene file, the one its `sourceScene` names, and a rebuild keeps that. | `serializeScene`'s scene filter, `planReparent`, and `rebuildInstance`, which carries the stamp. |
-| I15 | A template's `version` is the writer's constant, and a build never overwrites a file written in a newer format. | `PREFAB_FORMAT_VERSION`, `engine/plugins/prefabWriteGuard.ts`, `classifyExistingDocumentId`. It answers `known` before it checks the version (#1678). |
+| I15 | A template's `version` is the writer's constant, and a build never overwrites a file written in a newer format. | `PREFAB_FORMAT_VERSION`, `engine/plugins/prefabWriteGuard.ts`, `classifyExistingDocumentId`, which reads a prefab before answering `known` even when the manifest indexes it (#1678, `docs/format-versioning.md`). |
 | I16 | A template never contains itself. | `wouldCreateCycle` / `expandedPrefabRefs` when writing; the loader's ancestor stack when loading. |
 | I17 | An editor write that changes an instance member's field leaves its override mark in the state the save needs, and its undo puts the mark back. | `editor/undo/overrideMarkWrites.ts`. See § "Editor writes and the override mark". |
 | I18 | A reference the load cannot expand is written back as the file held it, until an expansion replaces it. A reader never drops what it could not interpret. | The `UnresolvedPrefabRef` marker on the placeholder (`runtime/core/unresolvedPrefabRef.ts`) and its writers (`runtime/loaders/unresolvedPrefabRefs.ts`); a live frame whose document stopped resolving, its frame record (`captureDoc`); a template row a frame could not expand, the frame record's `unexpanded` list (#1812), so the row is not saved as removed once the cache holds its child; a legacy path-keyed channel no live frame reaches, R2's kept store (`keptOrphanRows.ts`). See § "A missing prefab keeps its record". |
@@ -562,7 +562,9 @@ distinct `sortOrder`s into templates is #1714.
 
 **Not marked, deliberately:** `set-traits` through `modoki_eval` (`app/debug/liveMutate.ts`) is a
 raw live write with no undo that also runs in play mode and on the device. A mark there would outlive
-Stop. Agent authoring goes through `setTrait`, which marks. Pose, timeline and preview writes, guid
+Stop. Agent authoring goes through `setTrait`, which marks. Its `parentId` write is the exception in
+the editor: a reparent, routed through `planReparent`/`applyReparent` (#1787, `docs/scene-loading.md`
+§ the reparent entry-point table). Every other field it writes in the editor is still raw, #1816. Pose, timeline and preview writes, guid
 mints, `parentId` and `sourceScene` are not mark-gated.
 
 A general "unmarked write fails" tripwire was measured at the gate over 3,503 tests: it tripped 28,

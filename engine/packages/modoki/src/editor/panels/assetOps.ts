@@ -101,10 +101,10 @@ export function planImports(
 /** Write one dropped file's bytes to the `dest` {@link planImports} chose — only into an EMPTY path (#1784), as the
  *  import's redo already writes (`assetUndo.ts`). `dest` was planned against the panel's in-memory listing, not the
  *  disk, so a file that landed there since (another import, an agent, a `git pull`) was otherwise overwritten with no
- *  word. `'taken'` is that case: the file there is left as it is. */
-export async function writeDroppedImport(dest: string, base64: string): Promise<'ok' | 'taken' | 'failed'> {
+ *  word. `'taken'` is that case: the file there is left as it is. A `'failed'` carries the route's reason (#1811). */
+export async function writeDroppedImport(dest: string, base64: string): Promise<{ result: 'ok' | 'taken' } | { result: 'failed'; error: string }> {
   const w = await writeAssetFileGuarded(dest, base64, { encoding: 'base64', createOnly: true });
-  return w === 'conflict' ? 'taken' : w;
+  return w.result === 'conflict' ? { result: 'taken' } : w;
 }
 
 // ── Delete / rename policy (pure — the IO lives in the panel) ─────────

@@ -109,7 +109,8 @@ describe('a resource entity holds no children (#1248)', () => {
     const r = await runAgentOp('apply-scene-ops', {
       ops: [{ op: 'setTrait', entity: { guid: guidOf(kid) }, trait: 'EntityAttributes', fields: { parentId: input.id() } }],
     }) as { errors: string[] };
-    expect(r.errors.join('\n')).toMatch(/refused \(resource\)/);
+    // The text is reparent-entity's, shared by every field-write parent change (#1787).
+    expect(r.errors.join('\n')).toMatch(/apply-scene-ops: refused to move \d+ under \d+ — a resource entity/);
     expect(parentOf(kid.id())).toBe(0);
   });
 

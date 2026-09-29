@@ -38,7 +38,7 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOri
 });
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
   ...await importOriginal<Record<string, unknown>>(),
-  writeAssetFile: async (path: string, content: string) => { writes.push({ path, content }); return true; },
+  writeAssetFile: async (path: string, content: string) => { writes.push({ path, content }); return { ok: true as const }; },
 }));
 vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) => ({
   ...await importOriginal<Record<string, unknown>>(),

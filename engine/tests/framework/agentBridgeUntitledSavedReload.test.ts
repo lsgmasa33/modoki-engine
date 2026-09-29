@@ -31,7 +31,7 @@ const serializeHook = vi.hoisted(() => ({ during: null as null | (() => Promise<
 const takeSerializeHook = async () => { const f = serializeHook.during; serializeHook.during = null; if (f) await f(); };
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  writeAssetFile: async (path: string) => { written.push(path); await takeHook(); return true; },
+  writeAssetFile: async (path: string) => { written.push(path); await takeHook(); return { ok: true as const }; },
 }));
 
 // A human's first Cmd+S: the Save-As panel answers, and the create-only write lands.

@@ -396,10 +396,12 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
   if (r.reason === 'prefab-edit') {
     return { text: `${savedPart}this is a prefab-edit world — re-open the prefab to save it${failSuffix}`, kind: 'warn' };
   }
+  // The route's own reason when it gave one (#1811): "write-failed" alone told the human nothing they could act on.
+  const why = r.error ? `${r.reason}: ${r.error}` : r.reason;
   return {
     text: savedPart
-      ? `${assetPhrase} — but the SCENE was not saved (${r.reason})${failSuffix}`
-      : `Save FAILED (${r.reason}) — nothing written to disk${failSuffix}`,
+      ? `${assetPhrase} — but the SCENE was not saved (${why})${failSuffix}`
+      : `Save FAILED (${why}) — nothing written to disk${failSuffix}`,
     kind: 'warn',
   };
 }

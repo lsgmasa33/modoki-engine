@@ -1108,6 +1108,8 @@ export interface SaveResult {
   /** `'switching'`: a scene switch is still landing, so the editor's path does not describe the world on screen yet
    *  (#1750) — refused, never waited for; saving again once the scene is open works. */
   reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'switching' | 'prefab-edit' | 'target-loaded' | 'superseded' | 'conflict';
+  /** Why the write was refused, in the route's words (#1811), when `reason` is `'write-failed'` for the primary. */
+  error?: string;
   /** The primary scene's bytes as written, when it was (#1695): what a later conditional save (`ifMatch`) of the same
    *  file expects — Apply's undo and redo save the scene only over what the other half saved. */
   content?: string;
@@ -1265,14 +1267,14 @@ async function writePrimaryScene(
   const openBefore = _currentScenePath;
   // `ifMatch` (#1695): only over the bytes the caller expects there, checked by the route atomically with the write.
   const guarded = ifMatch === undefined ? null : await writeAssetFileGuarded(path, content, { ifMatch });
-  if (guarded === 'conflict') {
+  if (guarded?.result === 'conflict') {
     console.warn(`[Editor] ${path} changed on disk since it was last saved here, so it was not overwritten`);
     return { saved: false, path, reason: 'conflict' };
   }
-  const ok = guarded === null ? await writeAssetFile(path, content) : guarded === 'ok';
-  if (!ok) {
-    console.error(`[Editor] Failed to save scene to ${path}`);
-    return { saved: false, path, reason: 'write-failed' };
+  const wrote = guarded === null ? await writeAssetFile(path, content) : guarded;
+  if ('error' in wrote) {
+    console.error(`[Editor] Failed to save scene to ${path}: ${wrote.error}`);
+    return { saved: false, path, reason: 'write-failed', error: wrote.error };
   }
   registerAsset(sceneId, path, 'scene');
   lastWrittenScene.set(path, content);
@@ -1433,8 +1435,9 @@ export async function saveScene(opts: {
     markSceneSaved(savedAtEditVersion);
     return { saved: true, path: saved, reason: 'ok' };
   }
-  console.error(`[Editor] Failed to save scene to ${target}`);
-  return { saved: false, path: target, reason: 'write-failed' };
+  const error = written.outcome === 'failed' ? written.error : undefined;
+  console.error(`[Editor] Failed to save scene to ${target}${error ? `: ${error}` : ''}`);
+  return { saved: false, path: target, reason: 'write-failed', ...(error ? { error } : {}) };
 }
 
 /** Monotonic load counter — the newest `loadScene` call owns the progress modal.
@@ -2090,10 +2093,10 @@ async function saveOtherLoadedScenes(): Promise<{ extraSaved: { path: string; gu
       failed.push({ path: entry.path, guid: entry.guid, reason: `serialize failed: ${(e as Error).message}` });
       continue;
     }
-    const ok = await writeAssetFile(entry.path, jsonFileBody(sceneFile));
-    if (!ok) {
-      console.error(`[Editor] Failed to save scene to ${entry.path}`);
-      failed.push({ path: entry.path, guid: entry.guid, reason: 'the write to disk was rejected' });
+    const wrote = await writeAssetFile(entry.path, jsonFileBody(sceneFile));
+    if (!wrote.ok) {
+      console.error(`[Editor] Failed to save scene to ${entry.path}: ${wrote.error}`);
+      failed.push({ path: entry.path, guid: entry.guid, reason: `the write was refused: ${wrote.error}` });
       continue;
     }
     registerAsset(entry.guid, entry.path, 'scene');

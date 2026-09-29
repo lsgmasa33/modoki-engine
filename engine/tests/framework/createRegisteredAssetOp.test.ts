@@ -206,8 +206,23 @@ describe('creating an ordinary document kind', () => {
     const r = await create({ kind: 'material', path: '/assets/materials/nope.mat.json' });
     expect(r.ok).toBe(false);
     expect(r.code).toBe('REFUSED_BY_OP');
-    expect(String(r.error)).toMatch(/failed to write/);
+    expect(String(r.error)).toMatch(/failed to write .*: the write was refused \(HTTP 403\)/);
     expect(r.guid).toBeUndefined();
+  });
+
+  // #1811: the route's reason, not a guess at one ("outside the asset roots, or the folder does not exist").
+  // Mutation: return the old guessed text in createRegisteredAsset's failed branch.
+  it('a FAILED write names the route\'s own reason', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, json: async () => ({ error: 'EROFS: read-only file system' }) } as unknown as Response)));
+    const r = await create({ kind: 'material', path: '/assets/materials/nope.mat.json' });
+    expect(String(r.error)).toBe('failed to write /assets/materials/nope.mat.json: EROFS: read-only file system');
+  });
+
+  // …with the route's options too (close-out review). Mutation: drop `options` from createAssetDocument's refusalFields.
+  it('a FAILED write passes the route\'s options to the agent', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 403, json: async () => ({ error: 'outside the roots', options: ['pass an asset-root URL'] }) } as unknown as Response)));
+    const r = await create({ kind: 'material', path: '/assets/materials/nope.mat.json' });
+    expect(r.options).toEqual(['pass an asset-root URL']);
   });
 });
 

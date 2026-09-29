@@ -129,6 +129,8 @@ export function makeDeleteUndo(
       const restoredPaths: string[] = [];
       const occupied: string[] = [];
       const unrolled: string[] = [];
+      /** Each refused write, with the route's reason (#1811): the shortfall below names why, not only which. */
+      const refusals: string[] = [];
       const isOwnSidecar = (p: string) => isSidecarPath(p) && refused.has(primaryOfSidecar(p));
       // Write order inside an asset: its sidecars, then its files, then — LAST — an own sidecar (below). An own sidecar
       // is an OVERWRITE of the healed one, which a put-back cannot undo by trashing: trashed, the refused file would be
@@ -151,10 +153,14 @@ export function makeDeleteUndo(
         for (const s of todo) {
           const ownSidecar = isOwnSidecar(s.path);
           const w = ownSidecar
-            ? ((await writeAssetFile(s.path, s.content, s.encoding)) ? 'ok' : 'failed')
+            ? await writeAssetFile(s.path, s.content, s.encoding).then((o) => (o.ok ? { result: 'ok' as const } : { result: 'failed' as const, error: o.error }))
             : await writeAssetFileGuarded(s.path, s.content, { encoding: s.encoding, createOnly: true });
-          if (w === 'ok') wrote.push(s);
-          else { stopped = { path: s.path, collided: w === 'conflict' }; break; }
+          if (w.result === 'ok') wrote.push(s);
+          else {
+            if (w.result === 'failed') refusals.push(`${s.path} (${w.error})`);
+            stopped = { path: s.path, collided: w.result === 'conflict' };
+            break;
+          }
         }
         if (stopped === null) {
           for (const s of wrote) { inTrash.delete(s.path); onDisk.add(s.path); restoredPaths.push(s.path); }
@@ -190,13 +196,13 @@ export function makeDeleteUndo(
       if (lost.length > 0) {
         console.error(
           `[Assets] Undo of "${label}" restored ${restoredPaths.length} of ${restoredPaths.length + lost.length} file(s). ` +
-          `Still in the trash, recover by hand: ${lost.join(', ')}`,
+          `Still in the trash, recover by hand: ${lost.join(', ')}` + (refusals.length ? `. Refused: ${refusals.join('; ')}` : ''),
         );
       }
       if (unrolled.length > 0 && occupied.length === 0) {
         // A write failed part-way and the put-back failed too: half an asset is on disk. Say which files, because the
         // console shortfall above counts them as restored.
-        reportUndoFailure({ direction: 'Undo', label, detail: `an asset was only partly restored (a write failed), and these could not be taken back: ${unrolled.join(', ')}` });
+        reportUndoFailure({ direction: 'Undo', label, detail: `an asset was only partly restored (a write failed${refusals.length ? `: ${refusals.join('; ')}` : ''}), and these could not be taken back: ${unrolled.join(', ')}` });
       }
       if (occupied.length > 0) {
         // Not restored, and left alone from here on: the file at that path is somebody else's (#1679).
@@ -845,9 +851,9 @@ export function makeFileImportUndo(params: {
         if (content === null) { failed.push(f.path); continue; }
         bytesOf.set(f.path, content);
         const w = await writeAssetFileGuarded(f.path, content, { encoding: 'base64', createOnly: true });
-        if (w === 'ok') wrote.push(f.path);
-        else if (w === 'conflict') taken.push(f.path);
-        else failed.push(f.path);
+        if (w.result === 'ok') wrote.push(f.path);
+        else if (w.result === 'conflict') taken.push(f.path);
+        else failed.push(`${f.path} (${w.error})`);
       }
       // Re-take the settled baseline, for a re-written JSON the scanner may still re-stamp (one with no GUID-shaped id).
       const settled = await settledHashes(wrote);

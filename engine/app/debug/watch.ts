@@ -25,6 +25,7 @@
 import {
   registerFrameCallback, unregisterFrameCallback, getCurrentWorld,
   findEntity, findEntityByGuid, getAllTraits, readTraitDataFull, getTime, entityRef, EntityAttributes,
+  onGuidRemap, remapGuidSet, remapGuidMapKeys,
 } from '@modoki/engine/runtime';
 import { describeFilter, emptyFilterHint } from '../../tools/shared/filterDisclosure';
 
@@ -58,6 +59,19 @@ interface Watch {
 }
 
 const watches = new Map<string, Watch>();
+
+/** A watch follows a guid rename of an entity it samples (#1785): its guid filter, its series (keyed `guid field`), and
+ *  the despawn bookkeeping. Otherwise a Create Prefab or unpack mid-watch reads as the entity despawning and a
+ *  stranger appearing, and a guid-scoped watch stops sampling it. */
+onGuidRemap('agentWatch', (remap, world) => {
+  if (world !== getCurrentWorld()) return;
+  for (const w of watches.values()) {
+    if (w.guids) remapGuidSet(w.guids, remap);
+    remapGuidMapKeys(w.series, remap, SEP);
+    remapGuidSet(w.seen, remap);
+    remapGuidSet(w.despawned, remap);
+  }
+});
 let hookInstalled = false;
 let watchSeq = 0;
 

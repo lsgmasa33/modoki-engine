@@ -12,10 +12,10 @@
  *  distinction is why the loader asks the DOCUMENT rather than the live world: every removed member is
  *  absent from the world and would otherwise be reported as a loss on every load.
  *
- *  ⚠️ **The key is the root's IDENTITY, so it follows a rename** ({@link rekeyKeptOrphanRows}, called by
- *  `applyGuidRemap`, #1778). Create Prefab's stamp renames a swallowed reference node to its derived guid (#1758); with
+ *  ⚠️ **The key is the root's IDENTITY, so it follows a rename** ({@link rekeyKeptOrphanRows}, registered with
+ *  `applyGuidRemap`'s registry, `guidRemap.ts` — #1778, #1785). Create Prefab's stamp renames a swallowed reference node to its derived guid (#1758); with
  *  the rows left under the old guid, the next save looked under the new one, found nothing, and dropped them for good.
- *  Lives in L0 for that reason: the rename is core (`memberHome.ts`), and core may not import the loaders that fill it.
+ *  It lives in L0 because the rename once called it directly, and core may not import the loaders that fill it.
  *
  *  ⚠️ Rows accumulate: nothing expires an orphan, so a template that churns members grows the map
  *  by ~150 bytes each time. Accepted for now — the alternative is dropping identity on a timer — but
@@ -30,6 +30,7 @@
  *
  *  Typed loosely here (L0 knows no scene row shape); `loadSceneFile.ts` owns the typed API over it. */
 import { remapGuidValues } from '../assetRefRules';
+import { onGuidRemap } from './guidRemap';
 
 const keptRows = new Map<string, Record<string, object>>();
 
@@ -106,6 +107,8 @@ export function rekeyKeptOrphanRows(remap: ReadonlyMap<string, string>): void {
     nestedStructure: { ...a.nestedStructure, ...b.nestedStructure },
   }));
 }
+
+onGuidRemap('keptOrphanRows', (remap) => rekeyKeptOrphanRows(remap));
 
 function rekey<V extends object>(store: Map<string, V>, remap: ReadonlyMap<string, string>, merge: (moved: V, own: V) => V): void {
   for (const [guid, value] of store) {

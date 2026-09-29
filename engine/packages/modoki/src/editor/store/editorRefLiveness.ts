@@ -45,6 +45,7 @@ import { onStructureDirty, onStructureDirtyCoalesced } from '../../runtime/core/
 import { useEditorStore } from './editorStore';
 import type { World } from 'koota';
 import { holdEntity, resolveHeld, type HeldEntity } from './heldEntity';
+import { onGuidRemap } from '../../runtime/core/ecs/guidRemap';
 
 /** One pointer: the id the store shows (null while parked), and its hold (null when the id named no
  *  registered entity when taken — such an id is passed through untouched). */
@@ -128,6 +129,37 @@ export function reconcileEditorRefs(world = getCurrentWorld(), opts: { rescan?: 
   }
   writing = true;
   try { useEditorStore.setState(patch); } finally { writing = false; }
+}
+
+/** A pointer whose entity was RENAMED keeps its hold under the NEW guid (#1785). A hold's guid is fixed when it is
+ *  taken and only consulted once its id stops matching — a respawn — so a hold taken before a Create Prefab or unpack
+ *  rename looked the respawned entity up by the old guid and dropped the selection or the Animator/Director root. The
+ *  hold is rewritten, not re-taken from its id: a PARKED pointer has no id to take from (its entity is gone for now),
+ *  and re-taking one put null into the selection (close-out review). The same pointer object is shared between
+ *  `primary` and `selection`, so each is rewritten once. Only holds of the renamed world are touched. */
+onGuidRemap('editor:refLiveness', (remap, world) => {
+  if (world !== getCurrentWorld()) return;
+  const moved = new Map<Pointer, Pointer>();
+  const rekey = (p: Pointer | null): Pointer | null => {
+    const to = p?.held && p.held.world === world ? remap.get(p.held.guid) : undefined;
+    if (!p || !p.held || to === undefined) return p;
+    let next = moved.get(p);
+    if (!next) { next = { id: p.id, held: { ...p.held, guid: to } }; moved.set(p, next); }
+    return next;
+  };
+  selection = selection.map((p) => rekey(p)!);
+  primary = rekey(primary);
+  animatorRoot = rekey(animatorRoot);
+  directorRoot = rekey(directorRoot);
+});
+
+/** Test-only: the guids the pointers are held by now. */
+export function _heldPointerGuids(): { selection: string[]; animatorRoot: string | null; directorRoot: string | null } {
+  return {
+    selection: selection.map((p) => p.held?.guid ?? ''),
+    animatorRoot: animatorRoot?.held?.guid ?? null,
+    directorRoot: directorRoot?.held?.guid ?? null,
+  };
 }
 
 let retakeTimer: ReturnType<typeof setTimeout> | null = null;

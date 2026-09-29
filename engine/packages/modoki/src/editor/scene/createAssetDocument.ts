@@ -23,7 +23,7 @@
 import { newGuid, getAssetEntry } from '../../runtime/loaders/assetManifest';
 import { classifyJsonAssetPath } from '../../runtime/loaders/assetTypeClassifier';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
-import { backendFetch, postWriteFile } from '../backend/editorBackend';
+import { backendFetch, postWriteFile, readWriteRefusal } from '../backend/editorBackend';
 import { classifyExistingDocumentId } from './prefab';
 import { assetWrittenToDisk } from './dirtyAssets';
 
@@ -38,8 +38,8 @@ export type NewAssetDocumentResult =
   | { outcome: 'declined'; path: string }
   /** The destination is a DIFFERENT kind of asset than `opts.kind`. Nothing was asked or written. */
   | { outcome: 'wrongKind'; path: string; existingType: string }
-  /** The write failed, or `build` refused (returned null). */
-  | { outcome: 'failed'; path: string; status?: number };
+  /** The write failed, or `build` refused (returned null). `error` is why, in the route's words when it answered (#1811). */
+  | { outcome: 'failed'; path: string; status?: number; error?: string; options?: string[] };
 
 export async function writeNewAssetDocument(
   path: string,
@@ -63,14 +63,15 @@ export async function writeNewAssetDocument(
   const firstBody = build(fresh, false, null);
   if (firstBody == null) return { outcome: 'failed', path };
   const first = await post(path, firstBody, true);
-  if (first?.ok) {
+  if (first instanceof Error) return { outcome: 'failed', path, error: first.message };
+  if (first.ok) {
     // The route's spelling of what it wrote: a create inside a folder typed in another case lands in
     // the folder that exists, and the caller registers `path` (#1273 close-out review).
     const written = (await answeredPath(first, 'path')) ?? path;
     assetWrittenToDisk(written);
     return { outcome: 'created', path: written, guid: fresh };
   }
-  if (first?.status !== 409) return { outcome: 'failed', path, status: first?.status };
+  if (first.status !== 409) return { outcome: 'failed', path, status: first.status, ...refusalFields(await readWriteRefusal(first)) };
   // ⚠️ From here on, the path is the one the ROUTE says is there, not the one we asked for (#1273).
   // The create-only check is case-insensitive wherever the filesystem is, so `enemy.prefab.json`
   // conflicts with `Enemy.prefab.json` — and every step below keys on an exact path: the kind check
@@ -92,7 +93,7 @@ export async function writeNewAssetDocument(
   // replacing the file; they did not confirm re-identifying it.
   if (existing.kind === 'refuse') {
     console.error(`[Asset] not replacing ${at} — ${existing.reason}`);
-    return { outcome: 'failed', path: at };
+    return { outcome: 'failed', path: at, error: existing.reason };
   }
   const keptId = existing.kind === 'known' ? existing.id : undefined;
   const previousContent = opts.keepPrevious ? await readText(at) : null;
@@ -100,9 +101,20 @@ export async function writeNewAssetDocument(
   const body = build(guid, keptId != null, previousContent);
   if (body == null) return { outcome: 'failed', path: at };
   const second = await post(at, body, false);
-  if (!second?.ok) return { outcome: 'failed', path: at, status: second?.status };
+  if (second instanceof Error) return { outcome: 'failed', path: at, error: second.message };
+  if (!second.ok) return { outcome: 'failed', path: at, status: second.status, ...refusalFields(await readWriteRefusal(second)) };
   assetWrittenToDisk(at);
   return { outcome: 'replaced', path: at, guid, previousContent };
+}
+
+/** What a panel's New-asset command tells the human when `writeNewAssetDocument` did not create or replace (#1811):
+ *  the route's reason for a failed write, or the kind clash. Null when there is nothing to say — the human declined the
+ *  Replace, or created/replaced it. The panels used to return silently on every one of these. */
+export function newAssetRefusalText(r: NewAssetDocumentResult): string | null {
+  const file = r.path.split('/').pop() || r.path;
+  if (r.outcome === 'failed') return `${file} was not created: ${r.error ?? 'the document could not be built'}`;
+  if (r.outcome === 'wrongKind') return `${file} was not replaced: it is a '${r.existingType}' asset, not this kind`;
+  return null;
 }
 
 /** For a create that must decide BEFORE it can write — Scene's override discards the live world
@@ -165,8 +177,14 @@ async function answeredPath(res: Response, field: 'path' | 'existingPath'): Prom
   } catch { return undefined; }
 }
 
-async function post(path: string, content: string, createOnly: boolean): Promise<Response | undefined> {
-  try { return await postWriteFile(path, content, undefined, { createOnly }); } catch { return undefined; }
+/** A refused write's reason and options, as a failed outcome carries them (#1811). */
+function refusalFields(r: { error: string; options?: string[] }): { error: string; options?: string[] } {
+  return { error: r.error, ...(r.options ? { options: r.options } : {}) };
+}
+
+/** The route's answer, or the error that stopped the request reaching it. */
+async function post(path: string, content: string, createOnly: boolean): Promise<Response | Error> {
+  try { return await postWriteFile(path, content, undefined, { createOnly }); } catch (e) { return e instanceof Error ? e : new Error(String(e)); }
 }
 
 async function readText(path: string): Promise<string | null> {

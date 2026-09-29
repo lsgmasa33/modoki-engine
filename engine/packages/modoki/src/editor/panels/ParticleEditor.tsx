@@ -10,7 +10,7 @@
 import { useEffect, useRef, useState, useCallback, useContext } from 'react';
 import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
 import { jsonFileBody } from '../backend/editorBackend';
-import { writeNewAssetDocument } from '../scene/createAssetDocument';
+import { writeNewAssetDocument, newAssetRefusalText } from '../scene/createAssetDocument';
 import { createPortal } from 'react-dom';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -486,7 +486,7 @@ export default function ParticleEditor() {
     if (!pick) return;
     // Create-only, asking before a Replace, which keeps the replaced effect's guid (#1264).
     const r = await writeNewAssetDocument(pick.path, (guid) => jsonFileBody({ ...defaultParticleEffect(), id: guid }), { confirmReplace: pick.confirmReplace });
-    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') { const said = newAssetRefusalText(r); if (said) useEditorStore.getState().showToast(said, 'warn'); return; }
     // `r.path`: a Replace lands on the existing file's on-disk spelling (#1273).
     const { path } = r;
     registerAsset(r.guid, path, 'particle');

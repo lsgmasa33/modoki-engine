@@ -23,7 +23,7 @@
 import {
   preloadNestedPrefabs, rebaseStaleInstances, seatEditorPrefabCache, type PrefabFile,
 } from './prefab';
-import { postWriteFile, jsonFileBody } from '../backend/editorBackend';
+import { postWriteFile, jsonFileBody, readWriteRefusal } from '../backend/editorBackend';
 import { deleteAssetFiles } from '../panels/assetOps';
 import { sha256OfWritten, sha256OfBytes } from '../utils/contentHash';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
@@ -433,19 +433,13 @@ async function post(path: string, content: string, pre: { createOnly?: boolean; 
       return { ok: true, path: written };
     }
     // READ THE BODY (#1468 close-out review F5): the format gate answers 409 with its reason in `error`, and it is the
-    // one thing only the human can act on. Only an if-match / if-none-match 409 is a conflict; the gate's is not.
-    const body = await res.json().catch(() => null) as { error?: unknown; reason?: unknown; options?: unknown } | null;
-    const why = typeof body?.error === 'string' ? body.error : typeof body?.reason === 'string' ? body.reason : '';
-    // `prefab-mark-lowered` (#1774) is a conflict too: the file's localId high-water mark rose past what this write was
-    // raised to, so it is not the file the caller read — and the fallback below re-reads it and raises from it.
-    const conflict = res.status === 409 && (body?.reason === 'if-match' || body?.reason === 'if-none-match' || body?.reason === 'prefab-mark-lowered');
-    // A refusal whose body names nothing still fails WITH a reason (#1776): the route's empty 403 reached the agent's
-    // create as a bare ok:false, and every caller only reports what `error` says.
-    const reason = why || `the write was refused (HTTP ${res.status})`;
+    // one thing only the human can act on. `readWriteRefusal` is the one reader (#1811): it says which 409s are a
+    // conflict (if-match, if-none-match, and `prefab-mark-lowered`, #1774 — the fallback re-reads the file and raises
+    // from it), and never answers without a reason (#1776: the route's empty 403 reached the agent as a bare ok:false).
     // Not logged here: every caller reports its own failure, once, in its own words (an undo's #308 report, Apply's
     // refusal, the prefab-edit save's warnings) — a second line here doubled each one.
-    const options = Array.isArray(body?.options) ? body.options.filter((o): o is string => typeof o === 'string') : [];
-    return { ok: false, ...(conflict ? { conflict } : { error: reason, ...(options.length ? { options } : {}) }) };
+    const r = await readWriteRefusal(res);
+    return { ok: false, ...(r.conflict ? { conflict: true } : { error: r.error, ...(r.options ? { options: r.options } : {}) }) };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }

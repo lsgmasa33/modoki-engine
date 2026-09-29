@@ -1433,17 +1433,54 @@ node the scene added inside a held instance to its derived guid, because the wri
 template. The node's orphan rows stayed under the old guid. The next save's `captureInstanceMembers`
 looked under the new guid, found nothing, and dropped the rows.
 
-**The fix is in `applyGuidRemap`, the one rename.** It re-keys the store (`rekeyKeptOrphanRows`). It also
+**The fix follows `applyGuidRemap`, the one rename.** The store re-keys itself (`rekeyKeptOrphanRows`, registered on
+the rename's registry, § below — it was a direct call until #1785). It also
 renames the guids the rows themselves name (a moved member's `parent`, a ref inside a restated trait),
 because `remapWorldGuidRefs` reaches live trait values only.
 - Every entry is taken out before any goes back, so a swap keeps both sets.
 - Create Prefab's undo (the reversed remap), its redo (the re-tag's stamp) and a promotion's rename all
   take their rows along through this one call.
-- The store lives in L0 because the rename does, and core may not import the loaders that fill it.
+- The store lives in L0 because the rename called it directly, and core may not import the loaders that fill it.
 
 The new prefab file still carries no row. #1293's gate keeps scene rows out of a template, and an
 identity-only orphan converts to nothing (`templateRowOf`), so the scene save is the carrier.
 Tests: `createPrefabMemberIdentity.test.ts` § #1778, `tests/ecs/keptOrphanRows.test.ts`.
+
+### Every store keyed by an entity guid follows the rename (#1785)
+
+R2's rows were the first store found stranded by a rename; #1778's sweep found the rest. Each keeps
+something by an entity's durable guid outside the world, so after Create Prefab's stamp, its undo or an
+unpack it was read under the new guid and missed: a CameraFrame's gizmo pref vanished (its old key left in
+localStorage for good), a collapsed Hierarchy node came back expanded after a save and reload, the Animation
+panel reopened unbound, a pooled `UIEntries` view reset its window and leaked the old entry.
+
+**One registry the rename walks, not a patch per store.** `runtime/core/ecs/guidRemap.ts`: `onGuidRemap(name,
+fn)`, and `applyGuidRemap` calls `notifyGuidRemap(remap, world)` after it has renamed the entities, their refs
+and the index. Three properties are load-bearing, each pinned in `engine/tests/editor/guidRemapStores.test.ts`:
+- **Each store registers from its OWN module, at load.** The stores span L0, L2, the editor and the app shell,
+  and core imports none of them. It is also enough: a store whose module never loaded holds nothing to re-key.
+- **By NAME, and a second registration replaces the first.** An HMR re-execution of a registering module would
+  otherwise leave the old closure, bound to the old module's state, running beside the new one.
+- **Isolated** (`notifyListeners`). The rename has already happened when the stores are told, so one that throws
+  must not starve the rest.
+
+Registered: R2's kept rows, `cameraGizmoShown`, the persisted Hierarchy collapse lists, the last clip's Animator
+root, `entriesSystem`'s view states (and its warn-once keys), UI focus and its scope stack, the editor's held
+pointers (selection, Animator and Director roots — the hold's guid rewritten, parked ones included, because a
+hold's guid is read only after a respawn),
+agent watches, and prefab edit's session rows (the nodeGuid a later save restores, so SAVED identity). A store
+holding one world's entities ignores a rename in another world. Each listener maps every key ONCE from the state
+as it was, so a remap that swaps two guids swaps them.
+
+A generic field write cannot go around the rename: `fieldWriteRefusal` (`traitEditPolicy.ts`) refuses a change of
+a DURABLE `EntityAttributes.guid` on every generic path (`set-traits`, `apply-scene-ops` `setTrait`, file-direct
+`scene-mutate`), as it refuses `sourceScene`. Writing back the current value, or giving an entity with no durable
+guid one, passes.
+
+**Deliberately NOT re-keyed: undo entries.** They address entities by guid (`EntityRef`), and each rename is
+itself an undo entry, so the stack reverses it before any older entry resolves (LIFO). Pinned by an edit made
+before Create Prefab still undoing after the create is undone. The guid index keeps the old key too, harmlessly:
+its lookups check `guidOf(entity) === guid`.
 
 ### R2's store rides in an entity snapshot (#1788)
 

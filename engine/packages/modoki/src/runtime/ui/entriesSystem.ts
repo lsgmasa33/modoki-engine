@@ -31,6 +31,7 @@ import type { World } from 'koota';
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { isRuntimeGuid } from '../core/assetRefRules';
 import { spawnEntity, destroyEntity, findEntityById, findEntityByGuid, onWorldSwap, getCurrentWorld } from '../core/ecs/world';
+import { onGuidRemap, remapGuidMapKeys, remapGuidSet } from '../core/ecs/guidRemap';
 import { beginSystemTick, endSystemTick } from '../core/systemTick';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { buildChildIndex } from '../core/ecs/memberPath';
@@ -266,11 +267,25 @@ const warnedOverridden = new Set<string>();
  *  views, and so the answer. */
 const warnedRefusedUnit = new Set<string>();
 
+/** A pooled view renamed to another DURABLE guid keeps its window (#1785). `adoptRuntimeGuidPool` covers only a runtime →
+ *  durable re-mint: after `applyGuidRemap` the rows' `UIEntry.viewGuid` already names the new guid, so it finds no old
+ *  one, and the state stayed under the old key — the view reset its scroll and pool, and the old entry leaked until the
+ *  world swapped. The warn-once keys (`viewGuid`, `viewGuid:…`) follow too, or the renamed view warns again. Only the
+ *  current world's views are held here. */
+onGuidRemap('entriesSystem', (remap, world) => {
+  if (world !== getCurrentWorld()) return;
+  remapGuidMapKeys(viewStates, remap);
+  for (const set of [warned, warnedUncached, warnedOverridden, warnedRefusedUnit]) remapGuidSet(set, remap);
+});
+
 /** How many consecutive pipeline ticks a prefab may stay uncached before the system says so.
  *  120 ticks is ~2s at 60fps, and matches the established `Canvas2DMount` precedent for exactly
  *  this shape of diagnostic ("canvas still 0x0 after 120 frames"). It is a WARN, not an error:
  *  a false positive on a very slow load costs one console line, a false negative costs #344. */
 const UNCACHED_WARN_TICKS = 120;
+
+/** Test-only: the live view-state map, keyed by view guid. */
+export function _viewStatesForTest(): Map<string, unknown> { return viewStates as Map<string, unknown>; }
 
 /** Reset module state — tests and teardown. */
 export function resetEntriesSystem(): void {

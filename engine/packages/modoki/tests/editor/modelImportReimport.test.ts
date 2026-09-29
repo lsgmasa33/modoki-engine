@@ -56,11 +56,15 @@ function url(u: string | URL): string {
   return typeof u === 'string' ? u : u.toString();
 }
 
+/** When set, a write whose path ends with it is refused by the route with this error (#1811). */
+let refuseWrite: { suffix: string; error: string } | null = null;
+
 const mockFetch = vi.fn(async (u: string | URL, opts?: any) => {
   const target = url(u);
 
   if (target === '/api/write-file') {
     const body = JSON.parse(opts.body);
+    if (refuseWrite && body.path.endsWith(refuseWrite.suffix)) return { ok: false, status: 500, async json() { return { error: refuseWrite!.error }; } };
     vfsFiles.set(body.path, body.content);
     return { ok: true, status: 200, async json() { return {}; } };
   }
@@ -435,6 +439,20 @@ describe('format-version REFUSAL on re-import (#784 phase C2b, items 3+4)', () =
     const toast = useEditorStore.getState().toast;
     expect(toast?.message).toMatch(/newer than this engine|refusing to read/i);
     expect(toast?.message).not.toMatch(/a file could not be written/i);
+  });
+
+  // #1811: a WRITE the route refuses aborts the import with the route's reason in the toast, not only the file name.
+  // Mutation: throw `new ImportWriteAborted(path)` again in writeAssetFileOrAbort (the default "failed to write <path>").
+  it('an abort on a refused write carries the route\'s reason to the toast', async () => {
+    const { importModel } = await getModule();
+    const { useEditorStore } = await import('../../src/editor/store/editorStore');
+    addTemplate('wall', mat('brick'));
+    refuseWrite = { suffix: '.mesh.json', error: 'ENOSPC: no space left on device' };
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(await importModel(GLB, 'level')).toBe(0);
+    } finally { refuseWrite = null; err.mockRestore(); }
+    expect(useEditorStore.getState().toast?.message).toMatch(/failed to write .*\.mesh\.json: ENOSPC: no space left on device/);
   });
 });
 

@@ -6,6 +6,7 @@ import { create } from 'zustand';
 import { pushSelectionChange, isExecutingUndoRedo } from '../undo/undoManager';
 import { entityRef, buildGuidIndex, resolveWith, type EntityRef } from '../undo/entityRef';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { onGuidRemap } from '../../runtime/core/ecs/guidRemap';
 import { holdEntity, resolveHeld, type HeldEntity } from './heldEntity';
 import { setParticleEffect } from '../../runtime/loaders/particleCache';
 import { setSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
@@ -1184,3 +1185,15 @@ export const useEditorStore = create<EditorState>((set, get) => {
 if (import.meta.env?.DEV && typeof window !== 'undefined') {
   (window as unknown as { __editorStore?: typeof useEditorStore }).__editorStore = useEditorStore;
 }
+
+// A CameraFrame's "show gizmo" pref follows its entity through a guid rename (Create Prefab's stamp, unpack, #1785):
+// read under the new guid, a pref left under the old one hid the gizmo and left the old key in localStorage for good.
+onGuidRemap('editor:cameraGizmoShown', (remap) => {
+  // Each member mapped ONCE, from the set as it was, so a remap that swaps two guids swaps them.
+  const before = [...useEditorStore.getState().cameraGizmoShown];
+  const after = before.map((g) => (remap.has(g) ? durableGuid(remap.get(g)) : g)).filter((g) => !!g);
+  if (after.length === before.length && after.every((g, i) => g === before[i])) return;
+  const next = new Set(after);
+  saveCamGizmoShown(next);
+  useEditorStore.setState({ cameraGizmoShown: next });
+});

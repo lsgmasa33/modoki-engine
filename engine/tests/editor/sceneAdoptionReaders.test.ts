@@ -92,8 +92,8 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
   const ok = (path: string, content: string) => { writes.push({ path, content }); };
   return {
     ...await importOriginal<Record<string, unknown>>(),
-    writeAssetFile: async (path: string, content: string) => { ok(path, content); return true; },
-    writeAssetFileGuarded: async (path: string, content: string) => { ok(path, content); return 'ok'; },
+    writeAssetFile: async (path: string, content: string) => { ok(path, content); return { ok: true as const }; },
+    writeAssetFileGuarded: async (path: string, content: string) => { ok(path, content); return { result: 'ok' as const }; },
     postWriteFile: async (path: string, content: string) => {
       ok(path, content);
       return { ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '{"ok":true}' } as Response;

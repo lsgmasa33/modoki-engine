@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { jsonFileBody } from '../backend/editorBackend';
-import { writeNewAssetDocument } from '../scene/createAssetDocument';
+import { writeNewAssetDocument, newAssetRefusalText } from '../scene/createAssetDocument';
 import { useEditorStore } from '../store/editorStore';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { register, registerBindings } from '../input/keymap';
@@ -1140,7 +1140,7 @@ export default function AnimationEditor() {
     const name = (pick.path.split('/').pop() || 'Clip').replace(/\.anim\.json$/i, '');
     // Create-only, asking before a Replace, which keeps the replaced clip's guid (#1264).
     const r = await writeNewAssetDocument(pick.path, (guid) => jsonFileBody(defaultAnimationClip(guid, name)), { confirmReplace: pick.confirmReplace });
-    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') { const said = newAssetRefusalText(r); if (said) useEditorStore.getState().showToast(said, 'warn'); return; }
     // `r.path`: a Replace lands on the existing file's on-disk spelling (#1273).
     const { path } = r;
     registerAsset(r.guid, path, 'animation');

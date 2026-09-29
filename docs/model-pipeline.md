@@ -359,7 +359,8 @@ Browser-side import (`editor/scene/modelImport.ts`) generates many files: a `.ma
 deduped material, a `.mesh.json` per mesh, extracted `.png` textures, `.meta.json` sidecars.
 
 **The defect.** Its local `writeAssetFile` wrapper **never throws** — like its `assetOps`
-siblings it catches and resolves `false` — and three call sites discarded that. Two of them ran
+siblings it catches and resolves a failure (a bare `false` then; since #1811 a refusal carrying the
+route's reason, which the abort message and its toast now name) — and three call sites discarded that. Two of them ran
 `registerAsset(...)` **first** and threw the write's result away, so a failed write left the asset
 manifest mapping a GUID to a path with no file behind it. Everything then resolves correctly for
 the rest of the session (the manifest is in memory); the dangling ref surfaces on the next scene

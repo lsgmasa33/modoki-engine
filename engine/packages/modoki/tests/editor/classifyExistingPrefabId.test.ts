@@ -39,14 +39,11 @@ async function load() {
 describe('classifyExistingPrefabId', () => {
   beforeEach(() => { vi.clearAllMocks(); vi.resetModules(); });
 
-  it('returns the manifest guid without fetching when the path is registered', async () => {
+  it('returns the manifest guid for a registered prefab, over the id the file carries', async () => {
     const { manifest, classifyExistingPrefabId } = await load();
     manifest.registerAsset(KNOWN_ID, PREFAB_PATH, 'prefab');
-    const fetchSpy = vi.fn();
-    global.fetch = fetchSpy as unknown as typeof fetch;
-
+    global.fetch = serve(200, { id: 'ffffffff-0000-4000-8000-000000000000', entities: [] });
     expect(await classifyExistingPrefabId(PREFAB_PATH)).toEqual({ kind: 'known', id: KNOWN_ID });
-    expect(fetchSpy).not.toHaveBeenCalled(); // manifest short-circuits the disk read
   });
 
   it('falls back to the on-disk file id when the manifest does not know the path', async () => {
@@ -123,6 +120,52 @@ describe('classifyExistingPrefabId', () => {
     const { classifyExistingPrefabId } = await load();
     global.fetch = serve(200, { id: KNOWN_ID, version: 2, entities: [] });
     expect(await classifyExistingPrefabId(PREFAB_PATH)).toEqual({ kind: 'known', id: KNOWN_ID });
+  });
+});
+
+// #1678: an existing prefab is always in the manifest, and the manifest used to answer BEFORE the read — so the
+// too-new refusal ran only for a path nothing had indexed, never for the file it protects, and the rigged re-import
+// rewrote its sidecars before the server refused the prefab write.
+// Mutation for the first and third: return `{kind:'known'}` from the manifest before the fetch for every document
+// (the old short-circuit). Both go red; the material case below stays green.
+describe('classifyExistingPrefabId — a REGISTERED prefab is still read before it is called known (#1678)', () => {
+  beforeEach(() => { vi.clearAllMocks(); vi.resetModules(); });
+
+  it('REFUSES a registered prefab a newer build wrote', async () => {
+    const { manifest, classifyExistingPrefabId, PREFAB_FORMAT_VERSION } = await load();
+    manifest.registerAsset(KNOWN_ID, PREFAB_PATH, 'prefab');
+    global.fetch = serve(200, { id: KNOWN_ID, version: PREFAB_FORMAT_VERSION + 3, entities: [] });
+    const v = await classifyExistingPrefabId(PREFAB_PATH);
+    expect(v.kind).toBe('refuse');
+    if (v.kind !== 'refuse') throw new Error('unreachable');
+    expect(v.reason).toContain(`prefab format ${PREFAB_FORMAT_VERSION + 3}`);
+  });
+
+  // The manifest names a file the disk no longer has: keep its id, never mint over the refs to it.
+  // Mutation: drop the `known ?` in the absent branch — it answers mintable.
+  it('keeps the manifest id when the registered prefab is absent on disk', async () => {
+    const { manifest, classifyExistingPrefabId } = await load();
+    manifest.registerAsset(KNOWN_ID, PREFAB_PATH, 'prefab');
+    global.fetch = serve(404, '');
+    expect(await classifyExistingPrefabId(PREFAB_PATH)).toEqual({ kind: 'known', id: KNOWN_ID });
+  });
+
+  it('REFUSES a registered prefab it cannot read — it cannot tell whether a newer build wrote it', async () => {
+    const { manifest, classifyExistingPrefabId } = await load();
+    manifest.registerAsset(KNOWN_ID, PREFAB_PATH, 'prefab');
+    global.fetch = serve(500, '');
+    expect((await classifyExistingPrefabId(PREFAB_PATH)).kind).toBe('refuse');
+  });
+
+  // Accept side. Mutation: drop the `!isPrefab` from the short-circuit, so a registered material is read
+  // too — the fetch spy is then called.
+  it('a registered MATERIAL is answered from the manifest without a read', async () => {
+    const { manifest, classifyExistingDocumentId } = await load();
+    manifest.registerAsset(KNOWN_ID, MAT_PATH, 'material');
+    const fetchSpy = vi.fn();
+    global.fetch = fetchSpy as unknown as typeof fetch;
+    expect(await classifyExistingDocumentId(MAT_PATH)).toEqual({ kind: 'known', id: KNOWN_ID });
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
 

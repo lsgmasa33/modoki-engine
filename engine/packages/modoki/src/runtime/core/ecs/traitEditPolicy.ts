@@ -10,6 +10,8 @@
  *    vanished on reload. Removed from one member, that member's row still expanded on reload beside it. Added or
  *    written by hand, it names a root and a row nothing derived. So no generic path touches it at all. */
 
+import { durableGuid, isGuid } from '../assetRefRules';
+
 const CORE_TRAITS: ReadonlySet<string> = new Set(['Transform', 'EntityAttributes']);
 
 const PREFAB_LINK = 'PrefabInstance';
@@ -40,6 +42,7 @@ export function traitWriteRefusal(name: string): string | null {
  *  trip still works. The file-direct path passes `current` as the file's own value, which is always '' there:
  *  a scene file never stores a stamp, the loader sets it from which file it read. */
 export function fieldWriteRefusal(trait: string, field: string, value: unknown, current: unknown): string | null {
+  if (trait === 'EntityAttributes' && field === 'guid') return guidWriteRefusal(value, current);
   if (trait !== 'EntityAttributes' || field !== 'sourceScene') return null;
   // Only a STRING equal to the current stamp passes: `null`/`0`/`false` read as '' downstream but would be stored.
   if (typeof value === 'string' && value === ((current as string) || '')) return null;
@@ -47,3 +50,22 @@ export function fieldWriteRefusal(trait: string, field: string, value: unknown, 
     + 'which carries the whole subtree with it: reparent-entity with moveToScene: true under a parent in that scene '
     + '(or, in the editor, drag the entity onto that scene\'s group in the Hierarchy)';
 }
+
+/** `EntityAttributes.guid` is the entity's identity, and a DURABLE one changes only through `applyGuidRemap`
+ *  (`memberHome.ts`), which renames every ref to it and tells every store keyed by it (#1785). A field write did
+ *  neither: refs named nothing, and the editor's guid-keyed state (gizmo prefs, collapse, pointers, R2's rows) kept
+ *  the old key. No human path edits a guid (the Inspector shows it read-only), so the agent's is refused too. Writing
+ *  back the current value passes, and so does giving an entity with no durable guid one — a mint, not a rename: no
+ *  store holds its old (empty or runtime) guid. The minted value must be guid-shaped. ⚠️ Not checked here: whether
+ *  another entity already carries it (this predicate sees one entity). */
+function guidWriteRefusal(value: unknown, current: unknown): string | null {
+  const held = durableGuid(typeof current === 'string' ? current : '');
+  if (!held) {
+    return typeof value === 'string' && isGuid(value) ? null
+      : `EntityAttributes.guid must be a guid string (got ${JSON.stringify(value)})`;
+  }
+  if (value === held) return null;
+  return `EntityAttributes.guid is the entity's identity (${held}), and a field write cannot rename it: the refs to it `
+    + 'and the editor state keyed by it would keep the old one. Guids are not edited; address the entity by the one it has';
+}
+

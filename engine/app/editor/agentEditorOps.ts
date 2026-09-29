@@ -20,6 +20,7 @@ import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { histogram } from '../../tools/shared/filterDisclosure';
 import { OpRefusal } from '../debug/opRefusal';
 import { liveGuidOf } from '../debug/liveLifecycle';
+import { setEditorParentWrite } from '../debug/liveMutate';
 import { describeTopModal, type ModalDescription } from '../debug/modalShells';
 import {
   resolveEntityAddress, guidListFields, descendantsOf, alsoDeletedFields, ALSO_DELETED_CAP,
@@ -686,13 +687,26 @@ function loadedSceneName(sceneGuid: string): string {
   return sceneGuid || 'primary';
 }
 
-/** Why `planReparent` refused, in words an agent can act on (#1429). */
-function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>['reason'], id: number, parentId: number): string {
+/** Why `planReparent` refused, in words an agent can act on (#1429). `op` names the op the agent called. */
+function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>['reason'], id: number, parentId: number, op = 'reparent-entity'): string {
   switch (reason) {
-    case 'resource': return `reparent-entity: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
-    case 'instance-member': return `reparent-entity: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and a prefab instance would be split across two scene files: something in ${id}'s subtree (${id} itself, or an entity under it) belongs to an instance that would stay behind, or a member of an instance in it lives outside the subtree. Move that instance's root instead, or unpack that instance first.`;
-    default: return `reparent-entity: refused to move ${id} under ${parentId} — the move is illegal (${reason === 'self-parent' ? 'an entity cannot be its own parent' : `${parentId} is a descendant of ${id}`}).`;
+    case 'resource': return `${op}: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
+    case 'instance-member': return `${op}: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and a prefab instance would be split across two scene files: something in ${id}'s subtree (${id} itself, or an entity under it) belongs to an instance that would stay behind, or a member of an instance in it lives outside the subtree. Move that instance's root instead, or unpack that instance first.`;
+    default: return `${op}: refused to move ${id} under ${parentId} — the move is illegal (${reason === 'self-parent' ? 'an entity cannot be its own parent' : `${parentId} is a descendant of ${id}`}).`;
   }
+}
+
+/** Why a parent change arriving as a FIELD write cannot be carried out by `op`, or null for a same-scene reparent the op
+ *  may apply itself through `applyReparent` (#1434, #1787). One answer for apply-scene-ops' setTrait and set-traits:
+ *  each refuses what `reparent-entity` refuses, and hands a scene move to `reparent-entity {moveToScene: true}`, because
+ *  a field write has no step at which a person or an agent confirms one. `shown` is the caller's own spelling. */
+function fieldParentWriteRefusal(op: string, id: number, parentId: number, shown = String(parentId)): string | null {
+  const plan = planReparent(id, parentId);
+  if (plan.kind === 'refused') return reparentRefusalText(plan.reason, id, parentId, op);
+  if (plan.kind === 'scene-move') {
+    return `${op}: EntityAttributes.parentId ${shown} belongs to another scene (${loadedSceneName(plan.to)}), so this parent change is a scene move — use reparent-entity with moveToScene: true.`;
+  }
+  return null;
 }
 
 /** The parent an entity should be created under / moved to, VALIDATED.
@@ -1001,15 +1015,15 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             }
             // Judged by the same plan as reparent-entity (#1429). A parent from another scene is a scene move,
             // and a batch has no step to confirm one, so it is refused here with the op that can.
-            const plan = typeof newParent === 'number' ? planReparent(id, newParent) : null;
-            if (plan?.kind === 'refused') { errors.push(`${where}: EntityAttributes.parentId ${shown} refused (${plan.reason}) for entity ${id} — nothing was applied to it`); continue; }
-            if (plan?.kind === 'scene-move') { errors.push(`${where}: EntityAttributes.parentId ${shown} belongs to another scene (${loadedSceneName(plan.to)}), so this parent change is a scene move — use reparent-entity with moveToScene: true. Nothing was applied to entity ${id}`); continue; }
+            const parentMove = typeof newParent === 'number';
+            const refusedParent = parentMove ? fieldParentWriteRefusal('apply-scene-ops', id, newParent as number, shown) : null;
+            if (refusedParent) { errors.push(`${where}: ${refusedParent} Nothing was applied to entity ${id}`); continue; }
             // A same-scene parent change goes through reparentEntity, like every other reparent (#1434). A bare
             // field write skipped its unpack on move, so a prefab member moved out of its instance stayed linked
             // and the next save dropped it; it also skipped the world-position compensation and the folder clear.
             // A parent equal to the current one moves nothing, and is not counted as a change.
-            const moved = plan ? applyReparent(id, newParent as number).ok : false;
-            const rest = Object.entries(fields).filter(([field]) => !(plan && field === 'parentId'));
+            const moved = parentMove ? applyReparent(id, newParent as number).ok : false;
+            const rest = Object.entries(fields).filter(([field]) => !(parentMove && field === 'parentId'));
             for (const [field, value] of rest) writeTraitFieldWithUndo(id, meta, field, value);
             if (moved || rest.length) changed++;
           }
@@ -1260,6 +1274,16 @@ export function registerEditorAgentOps(): void {
   // The editor's own prefab copy (the override diff base) is re-read with the runtime cache on an
   // external prefab write (#1169 review) — see `refreshPrefabSourceForPath`, and `refreshPrefabSourceAfterDiskChange` for the note (#1752).
   setPrefabSourceRefresher(refreshPrefabSourceAfterDiskChange);
+  // set-traits is the device's raw op, and the editor does not replace it; its `parentId` write goes through the
+  // editor's reparent rule instead (#1787). The posed-world refusal is reparent-entity's, and throws before any write.
+  setEditorParentWrite({
+    refusal: (id, parentId) => {
+      refuseEditOfPosedWorld('set-traits EntityAttributes.parentId');
+      return fieldParentWriteRefusal('set-traits', id, parentId);
+    },
+    apply: (id, parentId) => applyReparent(id, parentId).ok,
+    savedNote: 'live world only, not saved yet: each parent change went through the editor\'s reparent and is one undo entry (Cmd+Z / modoki_history undo).',
+  });
 
   // ── State read ──
   registerAgentOp('editor-state', () => readEditorState());
@@ -2681,7 +2705,7 @@ export function registerEditorAgentOps(): void {
     // three lists land on the far side of it.)
     throw new OpRefusal(
       partialOr('REFUSED_BY_OP'),
-      `save-all FAILED (${r.reason}) for ${r.path ?? '(no path)'} — the SCENE was not written to disk.`
+      `save-all FAILED (${r.error ? `${r.reason}: ${r.error}` : r.reason}) for ${r.path ?? '(no path)'} — the SCENE was not written to disk.`
       + (landed.length ? landedNote : ' Nothing was written.'),
     );
   });

@@ -15,6 +15,7 @@ import type { World } from 'koota';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { holdEntity, resolveHeld, type HeldEntity } from '../store/heldEntity';
 import { findEntityById } from '../../runtime/core/ecs/world';
+import { onGuidRemap, remapGuidKey } from '../../runtime/core/ecs/guidRemap';
 
 export type CollapseNode = { id: number; parentId?: number | null; guid?: string };
 
@@ -51,6 +52,20 @@ export function saveCollapsedGuids(scenePath: string, guids: string[]) {
     localStorage.setItem(ENTITY_COLLAPSE_LS_KEY, JSON.stringify(map));
   } catch { /* ignore */ }
 }
+
+/** The saved lists follow a guid rename (#1785). They are rewritten only on the next collapse change, so a node renamed
+ *  by Create Prefab or an unpack, then saved and reloaded, came back expanded: the list still named its old guid. */
+onGuidRemap('editor:hierarchyCollapse', (remap) => {
+  const map = loadCollapseMap();
+  let changed = false;
+  for (const [scene, guids] of Object.entries(map)) {
+    if (!Array.isArray(guids)) continue;
+    const next = guids.map((g) => (typeof g === 'string' ? remapGuidKey(g, remap) : g));
+    if (next.some((g, i) => g !== guids[i])) { map[scene] = next.filter((g) => typeof g === 'string' && !!durableKey(g)); changed = true; }
+  }
+  if (!changed) return;
+  try { localStorage.setItem(ENTITY_COLLAPSE_LS_KEY, JSON.stringify(map)); } catch { /* ignore */ }
+});
 
 /** Which ids the restore should mark collapsed, given the freshly-flattened tree and the
  *  saved guid list for this scene (`null` = never seen). Only nodes that HAVE a child can

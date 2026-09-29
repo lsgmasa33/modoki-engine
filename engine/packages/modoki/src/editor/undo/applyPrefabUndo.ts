@@ -222,7 +222,7 @@ async function saveSceneOverOtherHalf(path: string, label: string, direction: 'U
     direction, label, userFixable: saved.reason === 'conflict',
     detail: saved.reason === 'conflict'
       ? `${path} changed on disk since the editor last saved it (an outside edit, a scene tool, a git pull), so it was not overwritten. The scene is restored in the editor and unsaved; saving it will replace that change with this state.`
-      : `${path} was not saved (${saved.reason}). The scene is restored in the editor and unsaved.`,
+      : `${path} was not saved (${saved.error ? `${saved.reason}: ${saved.error}` : saved.reason}). The scene is restored in the editor and unsaved.`,
   });
 }
 

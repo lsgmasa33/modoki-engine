@@ -333,12 +333,12 @@ describe('the prior-bytes read and the hash (close-out review)', () => {
 
   it('writeAssetFileGuarded: only the precondition\'s own 409s are a conflict — the prefab format gate is a failure', async () => {
     const answer = (body: object) => vi.fn(async () => new Response(JSON.stringify(body), { status: 409 }));
-    vi.stubGlobal('fetch', answer({ ok: false, conflict: true, reason: 'prefab-format-too-new' }));
-    expect(await writeAssetFileGuarded('/assets/p.prefab.json', '{}', { ifMatch: 'h' })).toBe('failed');
+    vi.stubGlobal('fetch', answer({ ok: false, conflict: true, reason: 'prefab-format-too-new', error: 'written by a newer build' }));
+    expect(await writeAssetFileGuarded('/assets/p.prefab.json', '{}', { ifMatch: 'h' })).toEqual({ result: 'failed', error: 'written by a newer build' });
     vi.stubGlobal('fetch', answer({ ok: false, conflict: true, reason: 'if-match' }));
-    expect(await writeAssetFileGuarded('/assets/p.prefab.json', '{}', { ifMatch: 'h' })).toBe('conflict');
+    expect((await writeAssetFileGuarded('/assets/p.prefab.json', '{}', { ifMatch: 'h' })).result).toBe('conflict');
     vi.stubGlobal('fetch', answer({ ok: false, conflict: true, reason: 'if-none-match' }));
-    expect(await writeAssetFileGuarded('/assets/p.prefab.json', '{}', { createOnly: true })).toBe('conflict');
+    expect((await writeAssetFileGuarded('/assets/p.prefab.json', '{}', { createOnly: true })).result).toBe('conflict');
   });
 });
 

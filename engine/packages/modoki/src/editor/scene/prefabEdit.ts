@@ -7,6 +7,7 @@
  *  plus throwaway lights + an HDR environment so the prefab is visible. On save we
  *  serialize the prefab subtree back out, excluding the scaffold entities. */
 
+import { onGuidRemap, remapGuidMapKeys } from '../../runtime/core/ecs/guidRemap';
 import type { Entity, World } from 'koota';
 import type { PrefabFile, PrefabEntity } from './prefab';
 import { localIdCounter } from '../../runtime/core/localIdCounter';
@@ -683,6 +684,12 @@ export function collectPreservedLocalIds(
  *  dropped on leave (#1704); the save still refuses a duplicate rather than guess. */
 interface SessionRows { rows: Map<string, { localId: number; nodeGuid: string }>; floor: number }
 const sessionRowsByPrefab = new Map<string, SessionRows>();
+/** A row is keyed by the live entity's guid, and what it holds is WRITTEN — the nodeGuid a later save restores for a
+ *  member deleted and brought back by an undo. An unpack or a detach inside prefab edit renames the edit world's
+ *  entities (`applyGuidRemap`), so the record follows the rename or that restore misses (#1785). */
+onGuidRemap('prefabEdit:sessionRows', (remap) => {
+  for (const rec of sessionRowsByPrefab.values()) remapGuidMapKeys(rec.rows, remap);
+});
 /** The prefab each world has merged its opened rows into the record of. */
 const seededWorlds = new WeakMap<World, string>();
 /** The highest localId `doc` has ever used: below its high-water mark (#1774), which a file before v8 derives from its rows. */
@@ -710,6 +717,8 @@ function noteSessionRows(guid: string, written: ReadonlyMap<string, number>, doc
   for (const [g, localId] of written) rec.rows.set(g, { localId, nodeGuid: nodeGuidAt.get(localId) ?? '' });
   rec.floor = Math.max(rec.floor, usedUpTo(doc));
 }
+/** Test-only: the live session-row record, by prefab guid. */
+export function _sessionRowsForTest(): Map<string, { rows: Map<string, { localId: number; nodeGuid: string }>; floor: number }> { return sessionRowsByPrefab; }
 /** Test-only: forget every prefab's record, and the open session's baseline, as a fresh editor process has none. */
 export function _resetPrefabEditSessionRows(): void { sessionRowsByPrefab.clear(); editBaseline = null; }
 /** Test-only: seat the open session's baseline as `openPrefabForEditing` does once its world is adopted. */

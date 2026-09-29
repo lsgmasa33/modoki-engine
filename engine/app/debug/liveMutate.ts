@@ -304,6 +304,57 @@ function guardParentWrite(ids: number[], writes: ParsedWrite[]): LiveMutateFailu
   return null;
 }
 
+/** Editor-only (#1787): how a `parentId` write is judged and carried out when an editor is running, installed by
+ *  `agentEditorOps.ts` the way agentBridge's other editor hooks are. Unset on a device, where the raw write behind
+ *  `guardParentWrite` stays the whole story.
+ *
+ *  A parent change is a REPARENT, and the editor has one rule for that: `planReparent`, which a Hierarchy drop,
+ *  `reparent-entity` and apply-scene-ops' setTrait all ask. Written raw, the field put a primary entity under a
+ *  base scene's parent (#1429's state: baked into a base instance's `added`, or dropped from both files), and moved
+ *  a prefab member out of its instance with no unpack, no world-pose compensation and no undo (#1434's shape). */
+export interface EditorParentWrite {
+  /** Why moving `id` under `newParent` cannot be done by this op, in words for the reply, or null when it may. */
+  refusal(id: number, newParent: number): string | null;
+  /** Carry the move out through the editor's undoable reparent. False when nothing changed. */
+  apply(id: number, newParent: number): boolean;
+  /** What the reply says about persistence once a parent change went through `apply`. */
+  savedNote: string;
+}
+let _editorParentWrite: EditorParentWrite | null = null;
+
+/** Editor-only: install the parent-write hook. Called from `agentEditorOps.ts`. Returns the one it replaced. */
+export function setEditorParentWrite(hook: EditorParentWrite | null): EditorParentWrite | null {
+  const was = _editorParentWrite;
+  _editorParentWrite = hook;
+  return was;
+}
+
+/** Every target's parent change asked BEFORE any write (#1787): one refused target refuses the whole call, so a
+ *  batch never lands half-applied. */
+function guardEditorParentWrite(ids: number[], writes: ParsedWrite[]): LiveMutateFailure | null {
+  const write = writes.find((w) => w.trait === 'EntityAttributes' && w.field === 'parentId');
+  if (!write || !_editorParentWrite) return null;
+  // ALONE (#1787 close-out re-review): the reparent is one undo entry, and every other set-traits write is raw with no
+  // undo, so a call carrying both cannot be undone and redone to agree — `reparentEntity`'s redo restores the local
+  // transform it computed before any raw write, so a Transform written in the same call came back wrong on redo, and
+  // whichever order the two were applied in, one of call / undo / redo disagreed. apply-scene-ops' setTrait carries
+  // both, as undoable writes.
+  if (writes.length > 1) {
+    return {
+      ok: false,
+      error: 'set-traits: in the editor an EntityAttributes.parentId write is a reparent (one undo entry) and must be sent alone — '
+        + 'every other set-traits write is raw, with no undo, and the two cannot be undone together. Send the parent change and the '
+        + 'other fields as two calls, or use modoki_mutate_scene setTrait, which writes both undoably. Nothing was applied.',
+    };
+  }
+  const newParent = Number(write.value);   // guardParentWrite already refused a non-number
+  for (const id of ids) {
+    const refused = _editorParentWrite.refusal(id, newParent);
+    if (refused) return { ok: false, error: `${refused} Nothing was applied to any of the ${ids.length} target${ids.length === 1 ? '' : 's'}.` };
+  }
+  return null;
+}
+
 /** The per-field refusals every generic write path shares (`fieldWriteRefusal`, #1757): a write of
  *  `EntityAttributes.sourceScene` is a scene move, which a field write cannot carry. Judged per target
  *  against its own current value, so writing back what an entity already has still passes. */
@@ -371,6 +422,11 @@ export function applyLiveMutate(
   if (parentRefusal) return parentRefusal;
   const stampRefusal = guardFieldWrites(ids, writes);
   if (stampRefusal) return stampRefusal;
+  const editorParentRefusal = guardEditorParentWrite(ids, writes);
+  if (editorParentRefusal) return editorParentRefusal;
+  const parentHook = _editorParentWrite;
+  let reparented = false;
+  const isParent = (w: ParsedWrite) => w.trait === 'EntityAttributes' && w.field === 'parentId';
 
   if (ids.length === 0) {
     // Conventions §8: a no-op is a FAILURE when the caller asked for a change. `{ok:true,
@@ -414,6 +470,11 @@ export function applyLiveMutate(
         // the exact call that asked for a change. Seed the trait first (what the editor's live
         // path does via addTraitToEntitiesWithUndo) so the write lands.
         if (!entity.has(w.meta.trait)) entity.add(w.meta.trait);
+        if (parentHook && isParent(w)) {
+          // The editor's reparent, not the raw field (#1787): unpack on move, world pose kept, one undo entry.
+          if (parentHook.apply(id, Number(w.value))) reparented = true;
+          continue;
+        }
         writeTraitField(id, w.meta, w.field, w.value);
       }
     }
@@ -433,7 +494,9 @@ export function applyLiveMutate(
     matched: ids.length,
     changed,
     saved: false,
-    savedNote: 'live world only — a device has no project on disk, and a relaunch is the undo. There is no undo stack here.',
+    savedNote: reparented && parentHook
+      ? parentHook.savedNote
+      : 'live world only — a device has no project on disk, and a relaunch is the undo. There is no undo stack here.',
     entities: detail,
     ...(p.dryRun ? { dryRun: true as const } : {}),
     ...(detail.length < ids.length ? { detailTruncated: true as const } : {}),

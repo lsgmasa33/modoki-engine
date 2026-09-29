@@ -2,7 +2,7 @@
  *  Tracks generated files in the model's .meta.json for cleanup on delete. */
 
 import * as THREE from 'three';
-import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+import { backendFetch, writeAssetFile, jsonFileBody, readWriteRefusal } from '../backend/editorBackend';
 // The orphan-prune goes through the shared delete wrapper rather than a hand-rolled fetch (#884);
 // `skinPrefab.ts` already reaches into panels/assetOps for the same helper.
 import { deleteAssetFile } from '../panels/assetOps';
@@ -44,7 +44,7 @@ class ImportWriteAborted extends Error {
 
 /** Write a generated import artifact, or ABORT the whole import (#311, owner's policy
  *  2026-08-21). `writeAssetFile` (the shared client write wrapper, `editor/backend/
- *  editorBackend.ts`, #835) never throws — it resolves `false` — and three call sites used to
+ *  editorBackend.ts`, #835) never throws — it resolves a refusal — and three call sites used to
  *  discard that. Two of them registered the asset in the manifest FIRST, so a
  *  failed write left a GUID pointing at a path with no file: everything resolves for the rest
  *  of the session and it surfaces on the next scene load or a fresh editor launch, far from
@@ -57,7 +57,9 @@ class ImportWriteAborted extends Error {
  *  content-addressed regenerable outputs and a re-import overwrites them; what must not
  *  happen is registering a ref to a file that is not there. */
 async function writeAssetFileOrAbort(path: string, content: string): Promise<void> {
-  if (!await writeAssetFile(path, content)) throw new ImportWriteAborted(path);
+  const wrote = await writeAssetFile(path, content);
+  // The route's reason rides the abort (#1811), so the import's toast says WHY, not only which file.
+  if (!wrote.ok) throw new ImportWriteAborted(path, `failed to write ${path}: ${wrote.error}`);
 }
 
 // SHA-256 hex of a string, for stable content-addressed filenames of extracted textures — so
@@ -440,7 +442,7 @@ async function extractTextures(
         // model without it — no dangling ref (the `texturePaths.set` below is skipped too, so
         // registerExtractedTextures never sees it), but exactly the silently-incomplete import
         // the abort policy exists to prevent.
-        if (!writeRes.ok) throw new ImportWriteAborted(texPath);
+        if (!writeRes.ok) throw new ImportWriteAborted(texPath, `failed to write ${texPath}: ${(await readWriteRefusal(writeRes)).error}`);
         texturePaths.set(tex.uuid, texPath);
         textureFiles.push(texPath);
         textureSettings.set(texPath, seedTextureSettings(tex, suffix));

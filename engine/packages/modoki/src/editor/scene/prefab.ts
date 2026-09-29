@@ -1774,13 +1774,9 @@ export function parsedPrefabRows(text: string | null): ReplacedRows | undefined 
 /** Resolve the stable id a (re)written prefab at `prefabPath` must keep, so a
  *  model re-import never mints a fresh guid that orphans scenes whose
  *  PrefabInstance.source points at the old one (the tropical-island bug).
- *
- *  Order matters:
- *    1. the asset manifest's registered guid for this path — survives even a
- *       full file rewrite, and is the fast/offline path,
- *    2. the on-disk file's `id` — covers a freshly-scanned prefab the manifest
- *       hasn't indexed yet.
- *  Returns undefined only when neither knows it (a genuinely new prefab); the
+ *  `classifyExistingDocumentId` for a prefab: the file is always READ (the too-new
+ *  refusal, #1678), and the manifest's guid wins over the file's own `id` when both
+ *  exist. `mintable` only when nothing is there to orphan (a genuinely new prefab); the
  *  caller then mints a fresh guid via serializePrefab's `existingId ?? newGuid()`. */
 export async function classifyExistingPrefabId(prefabPath: string): Promise<ExistingDocumentId> {
   return classifyExistingDocumentId(prefabPath);
@@ -1805,7 +1801,7 @@ export type ExistingDocumentId =
 /** The id an existing JSON asset document at `docPath` already carries, by a two-step lookup:
  *
  *    1. the asset manifest's registered guid for this path — survives even a full file rewrite,
- *       and is the fast/offline path,
+ *       and for every document but a prefab is the fast/offline answer (a prefab is read anyway: ⚠️ below),
  *    2. the on-disk file's `id` — covers a freshly-scanned document the manifest hasn't indexed yet.
  *
  *  Nothing about the lookup is prefab-specific; the New-asset "Replace" path uses it for materials
@@ -1820,15 +1816,23 @@ export type ExistingDocumentId =
  *  and its own disposition — a scene REFUSES at load, `/api/asset-write` gates on
  *  `ASSET_WRITE_FORMAT_VERSION`, and a `.meta.json` sidecar has `assertSidecarWritable`. Comparing a
  *  material's `version` against `PREFAB_FORMAT_VERSION` would be a confident wrong answer, so this
- *  asks the question only where it knows which constant means anything. */
+ *  asks the question only where it knows which constant means anything.
+ *
+ *  ⚠️ So a PREFAB is read even when the manifest knows its path (#1678). The manifest answered first,
+ *  and an existing prefab is always indexed, so the too-new refusal ran only for a path nothing had
+ *  scanned yet — never for the file it exists to protect. The rigged re-import then baked and rewrote
+ *  every sidecar before the server's gate refused the prefab write. The manifest still supplies the id;
+ *  the read only decides whether this build may write over the file. A file the manifest names but the
+ *  disk no longer has keeps the manifest id: minting there would orphan every ref to it. */
 export async function classifyExistingDocumentId(docPath: string): Promise<ExistingDocumentId> {
   const known = getGuidForPath(docPath);
-  if (known) return { kind: 'known', id: known };
+  const isPrefab = docPath.endsWith('.prefab.json');
+  if (known && !isPrefab) return { kind: 'known', id: known };
   let data: unknown;
   try {
     data = await parseAssetJson(await fetch(assetUrl(docPath), ASSET_FETCH_INIT), docPath);
   } catch (e) {
-    if (assetIsAbsent(e)) return { kind: 'mintable', reason: 'absent' };
+    if (assetIsAbsent(e)) return known ? { kind: 'known', id: known } : { kind: 'mintable', reason: 'absent' };
     // ⚠️ The wording does NOT assert the file is there (#1468 close-out review F6). One caller —
     // Scene create — classifies a path that may legitimately be EMPTY, and a backend restart or a
     // mid-body drop lands here rather than on `absent`. "X exists but could not be read" was then a
@@ -1839,13 +1843,14 @@ export async function classifyExistingDocumentId(docPath: string): Promise<Exist
     return { kind: 'refuse', reason: `${docPath} is not a JSON object` };
   }
   const doc = data as { id?: unknown; version?: unknown };
-  if (docPath.endsWith('.prefab.json') && typeof doc.version === 'number' && doc.version > PREFAB_FORMAT_VERSION) {
+  if (isPrefab && typeof doc.version === 'number' && doc.version > PREFAB_FORMAT_VERSION) {
     return {
       kind: 'refuse',
       reason: `${docPath} was written by a newer build (prefab format ${doc.version}; this build writes `
         + `${PREFAB_FORMAT_VERSION}). Overwriting it would discard whatever the newer format added.`,
     };
   }
+  if (known) return { kind: 'known', id: known };
   return typeof doc.id === 'string' && doc.id ? { kind: 'known', id: doc.id } : { kind: 'mintable', reason: 'no-id' };
 }
 

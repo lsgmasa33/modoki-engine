@@ -17,7 +17,8 @@
 
 import { create } from 'zustand';
 import type { World } from 'koota';
-import { onWorldSwap, findEntityByGuid } from '../core/ecs/world';
+import { onWorldSwap, findEntityByGuid, getCurrentWorld } from '../core/ecs/world';
+import { onGuidRemap } from '../core/ecs/guidRemap';
 import { UIAction } from '../traits/UIAction';
 import { applyBindings, type UIActionBinding } from './bindings';
 import type { ScreenRect } from '../core/screenBounds';
@@ -163,6 +164,17 @@ export function pickInDirection(
   }
   return best;
 }
+
+// Focus, a queued activation and the scope stack follow a guid rename of the element they name (#1785).
+onGuidRemap('focusManager', (remap, world) => {
+  if (world !== getCurrentWorld()) return;
+  // Each guid mapped ONCE (a swap stays a swap), and focus with its queued activation in one write.
+  const s = useFocusStore.getState();
+  const map = (g: string) => (g ? remap.get(g) ?? g : g);
+  const next = { focusedGuid: map(s.focusedGuid), pendingActivateGuid: map(s.pendingActivateGuid), scopeStack: s.scopeStack.map(map) };
+  if (next.focusedGuid !== s.focusedGuid || next.pendingActivateGuid !== s.pendingActivateGuid
+    || next.scopeStack.some((g, i) => g !== s.scopeStack[i])) useFocusStore.setState(next);
+});
 
 // Reset focus whenever the scene/world changes so stale GUIDs never linger.
 let _worldSwapHooked = false;

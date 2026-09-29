@@ -79,7 +79,7 @@ describe('writeDroppedImport (#1784)', () => {
   it('writes into an empty path', async () => {
     disk.clear();
     stubRoute();
-    expect(await writeDroppedImport('/assets/a.png', 'QUJD')).toBe('ok');
+    expect(await writeDroppedImport('/assets/a.png', 'QUJD')).toEqual({ result: 'ok' });
     expect(disk.get('/assets/a.png')).toBe('QUJD');
   });
 
@@ -87,7 +87,7 @@ describe('writeDroppedImport (#1784)', () => {
     disk.clear();
     disk.set('/assets/a.png', 'already here');
     stubRoute();
-    expect(await writeDroppedImport('/assets/a.png', 'QUJD')).toBe('taken');
+    expect(await writeDroppedImport('/assets/a.png', 'QUJD')).toEqual({ result: 'taken' });
     expect(disk.get('/assets/a.png')).toBe('already here');
   });
 });
