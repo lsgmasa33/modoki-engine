@@ -152,6 +152,7 @@ export interface SceneFile {
 // importing this file's dependency graph. Re-exported here — this was its home, and
 // `@modoki/engine/editor` still surfaces it from this module.
 import { isTraitDefault, writtenTraitKeys } from './traitDefault';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 export { isTraitDefault };
 
 
@@ -791,8 +792,17 @@ export function getCurrentBaseScene() { return _currentBaseScene; }
 export function setCurrentBaseScene(baseScene: string | undefined) { _currentBaseScene = baseScene; }
 
 export function getCurrentScenePath() { return _currentScenePath; }
+const scenePathListeners = new Set<() => void>();
+/** Called whenever the editor's scene path changes — a save giving an untitled world a file swaps no world, and a
+ *  label reading `openScenePath()` must still follow it (#1718). Returns the unsubscribe. */
+export function onScenePathChange(fn: () => void): () => void {
+  scenePathListeners.add(fn);
+  return () => { scenePathListeners.delete(fn); };
+}
 export function setCurrentScenePath(path: string | null) {
+  const changed = path !== _currentScenePath;
   _currentScenePath = path;
+  if (changed) notifyListeners([...scenePathListeners], 'scene path', []);
   if (path) {
     // Per-project key: what createEditor restores on startup, AND what prefab-edit's
     // exit fallback reads (`exitPrefabEditing`, scene/prefabEdit.ts). Writing it HERE

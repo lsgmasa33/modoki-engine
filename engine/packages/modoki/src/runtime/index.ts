@@ -494,6 +494,7 @@ export { markOverride, getOverrideMarkSet, clearOverrideMarks, clearAllOverrideM
 export { resolveCanvas2DHost, type ResolveCanvas2DHostOptions } from './scene/canvas2DHost';
 export { loadedScenePath } from './core/ecs/sceneLoaded';
 export { normScenePath } from './scene/scenePathKey';
+export { openScenePath, setEditorScenePathReader } from './scene/openScenePath';
 export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneLoadResult, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
 export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult, type AssetRefVerdict, type AssetRefResolver, makeAssetRefResolver } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';

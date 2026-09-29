@@ -31,10 +31,10 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
-  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, getOverrideMarkSet, findEntityById, type SceneData,
 } from '@modoki/engine/runtime';
 import {
-  setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo,
+  setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, addTraitToEntitiesWithUndo,
 } from '@modoki/engine/editor';
 import {
   setPrefabCache, applyToPrefabSelective, revertOverridesSelective, type PrefabFile,
@@ -237,5 +237,59 @@ describe('an added TAG on a NESTED instance\'s member is kept (#1491 sibling)', 
     expect(hasTag(inInstance(ROOT1, 'A'), 'Paused')).toBe(true); // precondition: the row adds it
     const { entry } = await saved();
     expect(JSON.stringify(entry)).not.toContain('Paused');
+  });
+});
+
+/** #1663 — an ADDED component was listed as field overrides whose base is ∅, and a field's Revert reset it to the schema
+ *  default and left the component listed (and its marks out of step with what the save writes). It is ONE row now,
+ *  `+trait.<member>.<Component>`, as Unity lists an added component: Revert removes the component, and Apply writes it
+ *  whole, as applying its fields did. */
+describe('an ADDED component is one row (#1663)', () => {
+  const addFocusable = (id: number) => addTraitToEntitiesWithUndo([id], meta('UIFocusable'), { focusOrder: 2 });
+  const row = `+trait.${gA}.UIFocusable`;
+
+  it('the listing names it ONCE, as a row, with no field keys for it', async () => {
+    // Mutation: drop the added-component branch in `collectInstanceOverrideTree` — it is listed as eight field keys again.
+    install(pDoc());
+    await load(scene(P));
+    addFocusable(inInstance(ROOT1, 'A'));
+    const keys = collectInstanceOverrideKeys(rootOf(ROOT1), prefabs.get(P) as PrefabFile);
+    expect(keys.addedTags).toEqual([row]);
+    expect(keys.fields.filter((k) => k.includes('.UIFocusable.'))).toEqual([]);
+    const tree = collectInstanceOverrideTree(rootOf(ROOT1), prefabs.get(P) as PrefabFile);
+    expect(tree.addedTags.map((t) => [t.tag, t.entityName])).toEqual([['UIFocusable', 'A']]);
+    expect(tree.addedTags[0]!.fields).toContain('focusOrder');
+  });
+
+  it('Revert of the row REMOVES the component, its marks with it, and it is listed no more', async () => {
+    // Mutation: drop the `+trait.` branch in `subtractFieldOverrides` — the component stays, with its value.
+    install(pDoc());
+    await load(scene(P));
+    addFocusable(inInstance(ROOT1, 'A'));
+    addFocusable(inInstance(ROOT2, 'A'));
+    await revertOverridesSelective(rootOf(ROOT1), new Set([row]));
+    const a1 = inInstance(ROOT1, 'A');
+    expect(hasTag(a1, 'UIFocusable')).toBe(false);
+    expect([...(getOverrideMarkSet(findEntityById(a1)! as never) ?? [])].filter((m) => m.startsWith('UIFocusable.'))).toEqual([]);
+    expect(collectInstanceOverrideKeys(rootOf(ROOT1), prefabs.get(P) as PrefabFile).all).toEqual([]);
+    expect(hasTag(inInstance(ROOT2, 'A'), 'UIFocusable')).toBe(true); // the other instance is untouched
+    expect(writes).toEqual([]); // a revert never touches the prefab
+  });
+
+  it('Apply of the row writes the WHOLE component into the prefab, and reports the row once', async () => {
+    // Mutation: drop the expansion in `planApply` — the key falls to the tag branch and is skipped.
+    install(pDoc());
+    await load(scene(P));
+    addFocusable(inInstance(ROOT1, 'A'));
+    const result = await applyToPrefabSelective(rootOf(ROOT1), new Set([row]));
+    expect(result.applied).toBe(true);
+    expect(result.skipped ?? []).toEqual([]);
+    const bag = written(P)!.entities.find((e) => e.localId === 2)!.traits.UIFocusable as Record<string, unknown>;
+    expect(bag.focusOrder).toBe(2);
+    expect(Object.keys(bag).length).toBeGreaterThan(1); // every field, not the one that differs
+    expect(hasTag(inInstance(ROOT2, 'A'), 'UIFocusable')).toBe(true);
+    expect(result.effects?.filter((e) => e.key === row).length).toBe(1);
+    expect(result.effects?.find((e) => e.key === row)?.effect.op).toBe('addComponent');
+    expect(result.targets?.filter((t) => t.key === row).length).toBe(1);
   });
 });

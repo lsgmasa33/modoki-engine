@@ -27,7 +27,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, setEditorScenePathReader, applySetTraits, replaySuppressedSceneReloads, reloadPrefabFromDisk, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, reloadPrefabFromDisk, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
 import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
@@ -89,7 +89,7 @@ import {
   getAllTraits, readTraitData, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
-  sceneManager, assetUrl, type AssetSchemaType, collectHandles, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
+  sceneManager, setEditorScenePathReader, assetUrl, type AssetSchemaType, collectHandles, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -542,7 +542,7 @@ interface PrefabParams {
   entityGuid?: string;
   /** apply/revert: the override keys to act on (see `overrides`'s `keys.all` for the exact
    *  strings — `"<member>.trait.field"` / `"+added.<guid>"` / `"-removed.<member>"` /
-   *  `"-trait.<member>.<name>"` / `"+trait.<member>.<tag>"` / `"~moved.<member>"`, `<member>` a nodeGuid or, for a pre-v5
+   *  `"-trait.<member>.<name>"` / `"+trait.<member>.<name>"` (an added tag or component, one key, #1663) / `"~moved.<member>"`, `<member>` a nodeGuid or, for a pre-v5
    *  template, a localId; `prefabOverrideKeys.ts`). Omitted ⇒ ALL current overrides on the instance. */
   keys?: string[];
   /** apply: where EVERY key is written (#1693, owner ruling C) — a prefab on the instance's chain (its guid or path;

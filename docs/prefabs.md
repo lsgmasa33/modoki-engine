@@ -1788,11 +1788,20 @@ member's row: false overrides, and Apply wrote one member's value into another's
   create's rows describe, in shape or only in value, so its **redo refuses** before anything is written. Re-linked
   anyway, it tagged nothing while reporting success (a shape change) or its reload reverted the new value (a value
   change) — both OBSERVED by the close-out reviews.
-  ⚠️ **Still open (KNOWN_OPEN under #1820):** Delete's undo of a ROW of a frame that SURVIVES the delete (a member, an
-  owned nested root) after a saved edit of that frame's template. The rebase rebuilds frames whose OWN record is stale;
-  the enclosing frame was already rebased when prefab edit exited, so the respawned row follows the old document and
-  nothing sees it (16 of 528 review-grid draws: a value, a lost entity, a parent link). The fix is the snapshot
-  recording its enclosing frame's document, and the undo translating the row or refusing.
+  **A deleted ROW of a frame that SURVIVES the delete** (a member, or an owned nested root, whose frame root was not
+  deleted) is the case the rebase alone cannot see. It rebuilds frames whose OWN record is stale, and leaving prefab
+  edit has already rebased the surviving frame onto the saved document. Before this fix, the respawned row followed the
+  old document: a template value frozen as the row's own, a member the template dropped lost on reload, a nested
+  root's parent link reverted (16 of 528 review-grid draws). So the delete records each surviving frame's document
+  (`survivingFrameRows`, `entityActions.ts`). The undo's steps:
+  - **Before anything respawns (I19)**, it compares each surviving frame with its current record. It REFUSES when that
+    document dropped a row it would bring back, or that row's parent: a member the prefab no longer has.
+  - **After the respawn**, it renumbers the rows (`translateLocalIds`). It re-records the frame as the current document
+    holding those rows' OLD content, so the ordinary rebuild sees the frame as stale: it captures against that record,
+    where the mark gate carries only the rows' real overrides, and rebuilds onto the current document.
+  - The result is the template's new values plus the instance's own overrides, with no rebuild path of its own.
+  ⚠️ The check reads the world the UNDO runs in, not the one the delete was taken in. Leaving prefab edit swaps the
+  world, and the dead world still held the old record, so the first version saw nothing to translate.
 - **Written lists follow SIBLING order, never ECS query order** (#1796). `captureInstanceStructure`'s child
   lists (a scene's `added`/`own`/`children`) and `collectTree` (Create Prefab's writer and its redo's re-tag)
   sort children by `compareSiblings` — sortOrder, then guid — as the top-level `entities` list already did

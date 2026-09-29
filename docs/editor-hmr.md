@@ -105,10 +105,11 @@ Camera moved to y=42 came back at 2.417 with `canUndo:false`, the console naming
    - **An entry that does not know** (built without a load) counts as using everything: the old
      behavior, not a skipped reload.
 
-**Which scene is "the open scene" (#1712).** The handler, and `get_scene_state.scenePath`, ask
-`openScenePath()` in `engine/app/debug/agentBridge.ts`: `SceneManager`'s primary when it has one, else
+**Which scene is "the open scene" (#1712, #1718).** Every reader that NAMES the open scene's file asks
+`openScenePath()` (`runtime/scene/openScenePath.ts`): `SceneManager`'s primary when it has one, else
 the file the editor's next save writes (`getCurrentScenePath`, through a reader `agentEditorOps`
-installs). ⚠️ `sceneManager.getCurrent()` alone is not enough. A world made by `newScene()` (Assets →
+installs; the game runtime installs none). Those readers are the hot-reload handler, `get_scene_state.scenePath`,
+the take recorder, the SceneView label, the capture status and the runtime `load-scene` op. ⚠️ `sceneManager.getCurrent()` alone is not enough. A world made by `newScene()` (Assets →
 Create Scene, `modoki_new_scene`) goes through `replaceWorldContent`, which leaves it null by design, and
 a save that later gives the world a file (`save_all {path}`, a first Cmd+S, Create Scene's own save)
 tells only the editor. The handler used to return at `if (!current)` there, and every outside change to
@@ -119,11 +120,18 @@ move to the file at that first save** (`rekeyUntitledHistory`, from `writePrimar
 Save-As panel). They were keyed `''`, and the first reload, which adopts under the file's key, swapped
 in that key's empty stack. Cmd+Z was emptied by an outside write, where a loaded scene keeps its stack
 (found in the close-out review). Both first-save sites bind nothing if the world changed during their
-awaits, because a Create Scene landing there leaves the path null → null. The other readers of
-`getCurrent()?.path` (the take recorder's "no scene is open" refusal, the SceneView label, capture status, `load_scene`'s
-`previous`) still see null for such a scene: #1718. They were deliberately NOT given a `SceneManager`
-entry for a content world, because its id would become `getCurrentSceneId()`, and that moves font and
-texture ownership in the renderers for every untitled scene.
+awaits, because a Create Scene landing there leaves the path null → null.
+
+Until #1718 only the first two asked this. The rest asked `getCurrent()?.path` alone and saw null for a
+saved untitled scene: the take recorder refused ("no scene is open"), the SceneView label read
+"Untitled" and the capture status `scene: null`, until the scene was reopened (the last two OBSERVED
+live, and gone after the fix). The label also re-renders on a path change with no world swap
+(`onScenePathChange`, `serialize.ts`), since the save that names the file swaps nothing.
+⚠️ Such a world is deliberately NOT given a `SceneManager` entry: its id would become
+`getCurrentSceneId()`, which moves font and texture ownership in the renderers for every untitled scene.
+A reader that asks WHICH WORLD is loaded, rather than which file, keeps asking `SceneManager`: the
+prefab-edit prefix check, a supersede's winner in the editor's `load-scene`, and the capture's
+readiness hold.
 
 **`mesh` (`.mesh.json`, #1380) needs more than an eviction, and it is the one kind here that is not an
 `ASSET_SCHEMA_TYPE`.** Nothing agent-side writes one and it is never parked, so the only external

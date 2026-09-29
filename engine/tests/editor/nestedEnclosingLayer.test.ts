@@ -332,12 +332,13 @@ describe('#1659: every value Apply writes into a template goes through ONE write
     expect(focus(inInstance(ROOT2, 'Extra2'))?.navUp).toBe(guidOf(inInstance(ROOT2, 'Extra')));
   });
 
-  it('case 2: applying ONE field of an added component writes its other fields through the writer too', async () => {
+  it('case 2: applying an added component writes every field of it through the writer', async () => {
     // Mutation: seed the component from the raw live bag (the pre-#1659 loop) — `navDown` names instance 1's A.
+    // Its row is ONE key since #1663, `+trait.<member>.UIFocusable`, which Apply writes as the component's fields.
     install(pDoc());
     await load(scene(P, [ROOT1, ROOT2]));
     addTraitToEntitiesWithUndo([rootOf(ROOT1)], meta('UIFocusable'), { navDown: guidOf(inInstance(ROOT1, 'A')), focusOrder: 2 });
-    await applyKeys(rootOf(ROOT1), (k) => k.endsWith('.UIFocusable.focusOrder'));
+    await applyKeys(rootOf(ROOT1), (k) => k.startsWith('+trait.') && k.endsWith('.UIFocusable'));
     const rootRow = written(P)!.entities.find((e) => e.localId === 1)!;
     expect(isMemberToken((rootRow.traits.UIFocusable as { navDown: string }).navDown)).toBe(true);
     expect(focus(rootOf(ROOT2))?.navDown).toBe(guidOf(inInstance(ROOT2, 'A')));
@@ -574,6 +575,19 @@ describe('U14 (owner, 2026-09-28): Apply on the OUTER instance offers its nested
     expect(written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Transform).toEqual({ x: 5 });
     expect([tfx(inInstance(ROOT1, 'A')), tfx(inInstance(ROOT2, 'A'))]).toEqual([5, 5]);
     expect(outerKeys().nested).toEqual([]);
+  });
+
+  it('a component ADDED to the nested member is offered in its fields, and written into O as that bag on row N (#1663)', async () => {
+    // Mutation: offer it as its own listing's one `+trait.` row (whose Apply at an outer level writes a TAG, `{}`) — its
+    // field keys are gone from `nested`.
+    install(pDoc(), oDoc());
+    await load(scene(O, [ROOT1, ROOT2]));
+    addTraitToEntitiesWithUndo([inInstance(ROOT1, 'A')], meta('UIFocusable'), { focusOrder: 2 });
+    const keys = outerKeys();
+    expect(keys.nested).toContain(`${gN}:${gA}.UIFocusable.focusOrder`);
+    expect(keys.nested.some((k) => k.includes('+trait.'))).toBe(false);
+    await applyToPrefabSelective(rootOf(ROOT1), new Set(keys.nested));
+    expect((written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.UIFocusable as { focusOrder?: number } | undefined)?.focusOrder).toBe(2);
   });
 
   it('picked explicitly, "Apply to Prefab \'P\'" writes P\'s template instead', async () => {

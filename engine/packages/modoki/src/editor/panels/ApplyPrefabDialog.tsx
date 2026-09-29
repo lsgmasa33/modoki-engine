@@ -523,8 +523,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                 onChange={(next) => toggleKey(r.key, next)}
                 dataUiId={`prefab.dialog.item.${r.key}`} dataUiLabel={`${r.tag} on ${r.entityName}`}
                 title={isRevert
-                  ? 'Remove this tag from the instance'
-                  : 'Add this tag to the prefab base — affects all instances'}
+                  ? `Remove this ${r.fields ? 'component' : 'tag'} from the instance`
+                  : `Add this ${r.fields ? 'component' : 'tag'} to the prefab base — affects all instances`}
               />
               {isRevert
                 ? <span style={{ color: '#e74c3c' }}>− remove&nbsp;</span>
@@ -532,7 +532,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <span style={{ color: '#5dade2' }}>{r.tag}</span>
               <span style={{ color: '#888', margin: '0 6px' }}>on</span>
               <span style={{ color: '#ddd' }}>{r.entityName}</span>
-              <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId} · tag</span>
+              {/* An added COMPONENT rides this row too (#1663), as one row. */}
+              <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId} · {r.fields ? 'component' : 'tag'}</span>
             </div>
           )).flatMap((row, i) => [row, <div key={`${loadState.addedTags[i]!.key}:target`}>{targetCell(loadState.addedTags[i]!.key, 40)}</div>])}
 

@@ -67,43 +67,6 @@ const CHANGED_GUID = /\(an entity changed guid\)$/;
 
 export const KNOWN_OPEN: KnownOpen[] = [
   {
-    issue: 1820,
-    what: "(close-out review) Delete's undo of a ROW of a frame that survives the delete, after a saved edit of that frame's template: the row respawns on the old document",
-    // rebaseRespawned rebuilds frames whose OWN record is stale; a deleted member or owned nested root belongs to an enclosing
-    // frame that leaving prefab edit already rebased, so no stale frame is left to see. Three OBSERVED routes (a value, a lost
-    // entity, a parent link). Fix direction: the snapshot records the enclosing frame's document and the undo translates or
-    // refuses. Keyed off the guid-change shape, which is #1809's.
-    repro: [
-      { kind: 'delete', u: [0.7, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'editField', u: [0.15, 0.5, 0.9, 0, 0, 0, 0, 0] }] },
-      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/traits\/Transform\/z: /.test(f.detail),
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && !CHANGED_GUID.test(f.detail) && deleteThenSavedEditThenUndo(ops),
-  },
-  {
-    issue: 1820,
-    what: "the same, where the respawned row's template dropped a member: the entity is lost on reload",
-    repro: [
-      { kind: 'delete', u: [0.4, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
-      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\(an entity was lost\)$/.test(f.detail),
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && !CHANGED_GUID.test(f.detail) && deleteThenSavedEditThenUndo(ops),
-  },
-  {
-    issue: 1820,
-    what: "the same, where the respawned row is an owned nested root: its parent link reverts on reload",
-    repro: [
-      { kind: 'delete', u: [0.3, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
-      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/traits\/PrefabInstance\/parentLocalId: /.test(f.detail),
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && !CHANGED_GUID.test(f.detail) && deleteThenSavedEditThenUndo(ops),
-  },
-  {
     issue: 1809,
     what: "the anchor-row guid change, through Delete's undo after a saved prefab edit dropped the anchor row (close-out review)",
     repro: [
@@ -165,6 +128,42 @@ export const KNOWN_OPEN: KnownOpen[] = [
 /** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
  *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test"). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
+  {
+    issue: 1663,
+    what: "an ADDED component's Revert: it is one row and removes the component whole — a field's Revert used to drop that field's mark while the save wrote the component whole, so the reload re-seeded it (win hunt seed 4518)",
+    repro: [
+      { kind: 'instantiate', u: [0.6856837454251945, 0.6130752910394222, 0.9647802303079516, 0.5524996344465762, 0.20222525345161557, 0.6711691836826503, 0.9302660641260445, 0.7276771860197186] },
+      { kind: 'addComponent', u: [0.048257316928356886, 0.9017342755105346, 0.3389153329189867, 0.7868645421694964, 0.12486484530381858, 0.2077573158312589, 0.7518443982116878, 0.6349454706069082] },
+      { kind: 'revert', u: [0.18059522239491343, 0.795128625119105, 0.32536525279283524, 0.09314298769459128, 0.5334634217433631, 0.6214699102565646, 0.28351180418394506, 0.9262692916672677] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out review, residual) Delete's undo of a ROW of a frame that survives the delete, after a saved edit of that frame's template VALUE: the row is translated onto the current document (the template's new value, not the old one frozen as its own)",
+    repro: [
+      { kind: 'delete', u: [0.7, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'editField', u: [0.15, 0.5, 0.9, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out review, residual) the same, where the saved edit dropped the respawned member's row: the undo REFUSES before anything respawns (the entity was lost on reload)",
+    repro: [
+      { kind: 'delete', u: [0.4, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out review, residual) the same, where the respawned row is an owned nested root whose row the saved edit dropped: the undo REFUSES (its parent link reverted on reload)",
+    repro: [
+      { kind: 'delete', u: [0.3, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
   {
     issue: 1820,
     what: "(close-out review) Create Prefab, a saved edit of the tree's template (a member added), undo, redo: the redo is REFUSED, not a re-link to stale rows",

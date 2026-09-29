@@ -149,6 +149,13 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
     why: '#1820: Create Prefab\'s undo rebased the re-linked tree onto its template\'s changed document (a saved prefab edit '
       + 'since the create), so the redo refuses rather than re-link it to rows that no longer describe it, in shape or value',
   },
+  {
+    pattern: /^\[undo\] Undo of "Delete (Entity|\d+ Entities)" was REFUSED — "[^"]*" \(\S+\) is no longer where its prefab puts it: a prefab edit saved since the delete removed its row/,
+    why: '#1820 residual: Delete\'s undo translates the rows of a frame that survived the delete onto that frame\'s current '
+      + 'document, and refuses before anything respawns when a saved prefab edit dropped a row it would bring back (or that '
+      + 'row\'s parent) — a member the prefab no longer has (`survivingFrameRows`). A refusal in a segment nothing outside '
+      + 'the stack touched still fails, as "undo refused in a clean segment"',
+  },
 ];
 
 const realError = console.error;

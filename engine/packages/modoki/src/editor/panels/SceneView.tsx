@@ -83,6 +83,8 @@ import { withWarnFilter } from '../scene/warnFilter';
 import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys';
 import { computeUIModeNDC, computeFullNDC, viewportDrawRect, transformControlsViewport, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, syncOutlineFor, disposeEdgeOutline, resolveFocusTarget, discardOrbitMotion, applyOrbitPose, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
+import { openScenePath } from '../../runtime/scene/openScenePath';
+import { onScenePathChange } from '../scene/serialize';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID, exitPrefabEditing } from '../scene/prefabEdit';
 import { confirmDiscardUnsaved } from '../scene/unsavedGate';
 import { pushAction, subscribeUndo } from '../undo/undoManager';
@@ -367,10 +369,15 @@ function SceneBreadcrumb({ onExitPrefab }: { onExitPrefab: () => void }) {
   // re-read it on every world swap so the name tracks scene loads.
   const [, bump] = useState(0);
   useEffect(() => onWorldSwap(() => bump((n) => n + 1)), []);
-  // SceneManager holds the authoritative live-scene path (set on every load,
-  // including the editor's startup restore which bypasses serialize.ts's
-  // _currentScenePath). Use it so the name is correct regardless of load route.
-  const scenePath = sceneManager.getCurrent()?.path ?? null;
+  // …and on a path change with no swap: a save that gives an untitled world its file (#1718). Keyed on the HMR epoch: a
+  // hot-replaced serialize.ts holds a NEW listener set, and a `[]` effect stays subscribed to the old one.
+  const hmrEpoch = useHmrEpoch();
+  useEffect(() => onScenePathChange(() => bump((n) => n + 1)), [hmrEpoch]);
+  // The scene FILE (`openScenePath`, #1718): SceneManager's path (set on every load, including the editor's startup
+  // restore, which bypasses serialize.ts's _currentScenePath), else the file a `newScene()` world was saved to, which
+  // has no SceneManager entry and read "Untitled" until it was reopened. The prefab-edit check below reads the same
+  // value: the prefab-edit world always has a SceneManager path, which wins.
+  const scenePath = openScenePath();
 
   // Ground truth for prefab-edit mode is the LIVE scene being the synthetic
   // prefab-edit world — not just the editingPrefab flag, which can go stale if we

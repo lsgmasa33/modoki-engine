@@ -10,9 +10,10 @@
  *   - `"+added.<guid>"`                — an added child subtree.
  *   - `"-removed.<member>"`            — a deleted prefab member.
  *   - `"-trait.<member>.<name>"`       — a component removed from a surviving member.
- *   - `"+trait.<member>.<tag>"`        — a TAG added to a member (#1491). A tag has no fields, so it
- *                                        cannot ride a field key; an added COMPONENT still does, since
- *                                        Apply seeds its whole bag from them.
+ *   - `"+trait.<member>.<name>"`       — a TAG (#1491) or a COMPONENT (#1663) added to a member: ONE row,
+ *                                        as Unity lists an added component. Revert removes it whole; Apply
+ *                                        writes it whole (its field keys, `planApply`). Listed per field, a
+ *                                        field's Revert reset it to the schema default and left it listed.
  *   - `"~moved.<member>"`              — a member moved to another parent inside the instance (#1437).
  *   - `"~moved.<row>.<row>…:<member>"` — a NESTED instance's member moved out of it, the rows naming the
  *                                        nested instance frame by frame.
@@ -91,12 +92,16 @@ export interface TraitNode {
   trait: string;
   fields: FieldNode[];
 }
-/** A tag the instance's member has and its row does not (#1491) — keyed `+trait.<member>.<tag>`. */
+/** A tag (#1491) or a component (#1663) the instance's member has and its row does not — keyed
+ *  `+trait.<member>.<name>`, one row whatever its fields. */
 export interface AddedTagNode {
   localId: number;
   entityName: string;
+  /** The tag's or the component's name. */
   tag: string;
   key: string;
+  /** A component's overridden fields (a tag has none): what a nested instance's Apply key is spelled by. */
+  fields?: string[];
 }
 export interface EntityOverrideNode {
   ecsId: number;
@@ -179,6 +184,11 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
     for (const [traitName, fields] of Object.entries(diffs)) {
       if (getTraitByName(traitName)?.category === 'tag') {
         addedTags.push({ localId, entityName: name, tag: traitName, key: addedTagKey(refOf(localId), traitName) });
+        continue;
+      }
+      // A component the row lacks is the instance's ADDITION, one row (#1663).
+      if (!prefabEntity || !(traitName in prefabEntity.traits)) {
+        addedTags.push({ localId, entityName: name, tag: traitName, key: addedTagKey(refOf(localId), traitName), fields: Object.keys(fields) });
         continue;
       }
       const fieldNodes: FieldNode[] = [];
@@ -287,7 +297,13 @@ export function collectInstanceOverrideListing(rootInstanceId: number, prefab: P
     for (const e of inner.entities) for (const t of e.traits) for (const f of t.fields) {
       if (!isTemplateExcludedField(getTraitByName(t.trait)!, f.field)) own.push(f.key);
     }
-    for (const t of inner.addedTags) own.push(t.key);
+    // An added component's Apply here writes each field as an override on the row that holds the nested instance, which
+    // takes field keys: its row is spelled as them.
+    for (const t of inner.addedTags) {
+      if (!t.fields) { own.push(t.key); continue; }
+      const member = t.key.slice('+trait.'.length, -(t.tag.length + 1));
+      for (const f of t.fields) if (!isTemplateExcludedField(getTraitByName(t.tag)!, f)) own.push(fieldKey(member, t.tag, f));
+    }
     const ref = documentMemberRefs(doc);
     const st = ownInstanceStructure(frame, doc);
     for (const [lidStr, names] of Object.entries(st.removedTraits)) {
@@ -332,7 +348,7 @@ export interface InstanceOverrideKeys {
   removedEntities: string[];
   /** `"-trait.<member>.<name>"` keys. */
   removedTraits: string[];
-  /** `"+trait.<member>.<tag>"` keys — a tag added to a member (#1491). */
+  /** `"+trait.<member>.<name>"` keys — a tag (#1491) or a component (#1663) added to a member. */
   addedTags: string[];
   /** `"~moved.<member>"` keys — a member moved to another parent inside the instance (#1437) — and
    *  `"~moved.<nested row chain>:<member>"` for a NESTED instance's member moved out of it. Revert puts it

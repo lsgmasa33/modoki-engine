@@ -36,6 +36,7 @@ import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
 import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT } from '../scene/restructureRefusal';
 import { prefabNestingReader, rebaseStaleInstancesSoon } from '../scene/prefab';
+import { translateLocalIds } from '../../runtime/loaders/memberTranslation';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
 export { markOverrideIfInstance };
@@ -911,7 +912,7 @@ export function duplicateEntity(
       currentId = spawnCopy(parentRef ? parentRef.require() : 0);
       // The redo respawns the copy after a template change the stack does not hold (a saved prefab edit). The first spawn
       // needs none: its source is a live frame, which every such change already rebased.
-      rebaseRespawned(snapshot);
+      rebaseRespawned([snapshot]);
       currentId = liveIdOf(guid, currentId);
       selectEntity(currentId);
     },
@@ -955,9 +956,110 @@ export function cutSourceId(clip: EntityClipboard): number | null {
  *  from an older document; nothing else rebases them before a reload. Synchronous when every prefab is cached
  *  (`rebaseStaleInstancesSoon`). A rebuilt frame root is respawned at a NEW id, so a caller re-finds its entity by guid.
  *  (A create's redo does not call it: its snapshot is of an entity built from trait specs, which holds no prefab frame.) */
-function rebaseRespawned(...snapshots: EntitySnapshot[]): void {
-  const sources = new Set(snapshots.flatMap(snapshotPrefabs));
+function rebaseRespawned(snapshots: readonly EntitySnapshot[], alsoSources: Iterable<string> = []): void {
+  const sources = new Set([...snapshots.flatMap(snapshotPrefabs), ...alsoSources]);
   if (sources.size) rebaseStaleInstancesSoon({ sources });
+}
+
+/** The frames that SURVIVE a delete while rows of theirs go with it (#1820 residual): a member, or an owned nested root,
+ *  whose frame root is not among `snapshots`. Each with the document its record held at the delete.
+ *
+ *  `rebaseRespawned` rebuilds frames whose OWN record is stale, and a surviving frame's is not: leaving prefab edit rebased
+ *  it onto the saved document, so the rows Delete's undo respawns — expanded from the old one — were left on the old
+ *  document with nothing to see them (a template value frozen as the row's own, a row the template dropped, a nested
+ *  root's parent row). So the undo checks each frame BEFORE anything respawns (`prepare`), refusing a row the current
+ *  document dropped; and after the respawn re-records the frame as the current document holding the respawned rows'
+ *  OLD content (`rebase`), which makes it stale to the ordinary rebuild: captured against that record (the mark gate
+ *  carries only the rows' real overrides), rebuilt onto the current document. Unity's rule — an instance merges against
+ *  the CURRENT asset — with no rebuild path of its own. */
+function survivingFrameRows(snapshots: readonly EntitySnapshot[]) {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  const world = getCurrentWorld();
+  type Row = { guid: string; name: string; row: number; owned: boolean };
+  const frames = new Map<number, { rootGuid: string; source: string; doc: TemplateDoc; rows: Row[] }>();
+  if (piMeta && eaMeta) {
+    const deleted = new Set<number>();
+    const nodes: EntitySnapshot[] = [];
+    const walk = (s: EntitySnapshot) => { deleted.add(s.id); nodes.push(s); s.children.forEach(walk); };
+    snapshots.forEach(walk);
+    const identity = worldIdentityParents(world);
+    for (const s of nodes) {
+      const frame = identity.frameOf(s.id);
+      if (!frame || deleted.has(frame)) continue;
+      const pi = readTraitData(s.id, piMeta) as MemberPi | null;
+      const ea = readTraitData(s.id, eaMeta) as { guid?: string; name?: string } | null;
+      const handle = findEntity(frame);
+      const rec = handle ? frameRootDoc(world, handle) : undefined;
+      const rootGuid = (readTraitData(frame, eaMeta)?.guid as string | undefined) ?? '';
+      if (!pi || !ea?.guid || !rec || !rootGuid) continue;
+      const owned = isOwnedRoot(pi, s.id);
+      const row = (owned ? pi.parentLocalId : pi.localId) ?? 0;
+      if (!row) continue;
+      let f = frames.get(frame);
+      if (!f) frames.set(frame, f = { rootGuid, source: rec.source, doc: rec.doc, rows: [] });
+      f.rows.push({ guid: ea.guid, name: ea.name ?? '', row, owned });
+    }
+  }
+
+  /** Every check, before anything respawns (I19); a refusal throws. Returns the re-record to run after the respawn and
+   *  its relinks, which answers the sources the rebase must include. */
+  const prepare = (idx: Map<string, number>, renames: ReadonlyMap<string, string>): (() => string[]) => {
+    // The world the undo runs in: leaving prefab edit replaces the one the delete was taken in.
+    const world = getCurrentWorld();
+    const plans: { root: number; source: string; doc: TemplateDoc; rows: { guid: string; owned: boolean; to: number }[] }[] = [];
+    for (const f of frames.values()) {
+      let g = f.rootGuid;
+      for (let hops = 0; renames.has(g) && hops < renames.size; hops++) g = renames.get(g)!;
+      const root = idx.get(g);
+      const handle = root != null ? findEntity(root) : undefined;
+      const rec = handle ? frameRootDoc(world, handle) : undefined;
+      // A root that is gone or no longer this frame is `requireRootLinks`' refusal, not this one.
+      if (root == null || !rec || rec.source !== f.source || rec.doc === f.doc) continue;
+      const now = rec.doc;
+      const lid = translateLocalIds(f.doc, now) ?? ((n: number) => n);
+      const nowRows = new Set((now.entities ?? []).map((e) => e.localId));
+      const oldRows = new Map((f.doc.entities ?? []).map((e) => [e.localId, e]));
+      const replaced = new Map<number, NonNullable<TemplateDoc['entities']>[number]>();
+      const rows: { guid: string; owned: boolean; to: number }[] = [];
+      for (const r of f.rows) {
+        const to = lid(r.row);
+        const old = oldRows.get(r.row);
+        const ea = old?.traits?.EntityAttributes as { parentId?: number } | undefined;
+        const parent = ea?.parentId ? lid(ea.parentId) : 0;
+        if (!to || !nowRows.has(to) || (ea?.parentId && (!parent || !nowRows.has(parent)))) {
+          const name = r.name ? `"${r.name}"` : 'A deleted member';
+          throw new UndoRefusedError(
+            `${name} (${r.guid}) is no longer where its prefab puts it: a prefab edit saved since the delete removed its row` +
+            `${to && nowRows.has(to) ? "'s parent" : ''}, so undoing the delete would bring back a member the prefab does not have. Nothing was restored.`,
+            `${name} is no longer in its prefab`);
+        }
+        if (old) replaced.set(to, { ...old, localId: to, ...(old.traits ? { traits: { ...old.traits, ...(ea ? { EntityAttributes: { ...ea, parentId: parent } } : {}) } } : {}) });
+        rows.push({ guid: r.guid, owned: r.owned, to });
+      }
+      const doc: TemplateDoc = { ...now, entities: (now.entities ?? []).map((e) => (e.localId !== undefined && replaced.get(e.localId)) || e) };
+      plans.push({ root, source: f.source, doc, rows });
+    }
+    return () => {
+      if (!piMeta) return [];
+      for (const p of plans) {
+        for (const r of p.rows) {
+          const e = findEntityByGuid(r.guid);
+          const pi = e?.has(piMeta.trait) ? (e.get(piMeta.trait) as Record<string, unknown>) : null;
+          const field = r.owned ? 'parentLocalId' : 'localId';
+          // ⚠️ TRACED, NOT DRIVEN (close-out review): a renumber needs a template change the undo history survives, and
+          // neither kind renumbers — a prefab-edit save keeps every localId (`planPrefabRows`' preserve map), an outside
+          // edit clears the stack. Deleting this line leaves every test green; it keeps the row matching the composite.
+          if (e && pi && pi[field] !== r.to) e.set(piMeta.trait, { ...pi, [field]: r.to });
+        }
+        const handle = findEntity(p.root);
+        const rec = handle ? frameRootDoc(world, handle) : undefined;
+        if (handle && rec) noteFrameRootDoc(world, handle, { ...rec, doc: p.doc });
+      }
+      return plans.map((p) => p.source);
+    };
+  };
+  return { prepare };
 }
 
 /** The live id of the entity `guid` names, else `fallback` (an un-guidable entity keeps its respawned id). */
@@ -987,7 +1089,7 @@ export function pasteEntityCopy(
     adoptParentScene(id);
     assignFreshSortOrder(id, p);
     selfRef ??= entityRef(id);
-    rebaseRespawned(copy);
+    rebaseRespawned([copy]);
     return selfRef.resolve() ?? id;
   };
   let currentId = spawn(parentId);
@@ -1060,6 +1162,8 @@ export function deleteEntitiesWithUndo(
   const rootLinks = captureRootLinks(collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), snaps.map(s => s.snapshot.id)));
   const respawnedGuids = new Set<string>();
   for (const s of snaps) snapshotGuids(s.snapshot, respawnedGuids);
+  // Taken while the rows are still live: which surviving frame each one is a row of, and that frame's document (#1820).
+  const survivors = survivingFrameRows(snaps.map((s) => s.snapshot));
   let detached: DetachedMember[] = recordDetachedMarks(snaps.flatMap(s => deleteEntity(s.snapshot.id)));
   setSelection?.([]);
 
@@ -1074,6 +1178,7 @@ export function deleteEntitiesWithUndo(
       const parents = snaps.map(s => (s.parentRef ? requireWith(s.parentRef, idx, undefined, renames) : 0));
       requireRootLinks(rootLinks, respawnedGuids, renames);
       requireDetachedMembers(detached, idx, renames, respawnedGuids);
+      const rebaseRows = survivors.prepare(idx, renames);
       const liveIds = snaps.map((s, i) => respawnFromSnapshot(s.snapshot, parents[i]));
       // The relink FIRST: it reverses the frame-ending's guid rename, and `restoreRootLinks` finds each root by the guid
       // it had before that rename. The other way round a renamed root was skipped, and its respawned member kept the
@@ -1081,7 +1186,8 @@ export function deleteEntitiesWithUndo(
       relinkDetachedMembersMarked(detached);
       restoreRootLinks(rootLinks);
       // After the links are back: a prefab-edit save or an outside edit since the delete changed a template (#1820).
-      rebaseRespawned(...snaps.map((x) => x.snapshot));
+      // and the rows of a frame that survived the delete, whose own record that edit already moved on (`survivingFrameRows`).
+      rebaseRespawned(snaps.map((x) => x.snapshot), rebaseRows());
       setSelection?.(snaps.map((x, i) => liveIdOf(x.guid, liveIds[i]!)));
     },
     redo: () => {

@@ -5865,6 +5865,25 @@ async function planApply(
   const canon = toLocalIdKeys(selectedKeys, oldPrefab, getCachedPrefabSync);
   selectedKeys = canon.keys;
   for (const key of canon.unresolved) skipped.push({ key, reason: 'it names no member of this prefab — the template has changed since the key was listed' });
+  // An ADDED component is one row, `+trait.<member>.<Trait>` (#1663): written as every field of it, which is what applying
+  // its fields did (the first seeds the whole bag), and reported in the row's spelling.
+  for (const key of [...selectedKeys]) {
+    const m = /^\+trait\.(\d+)\.([^.:]+)$/.exec(key);
+    const meta = m ? getTraitByName(m[2]!) : undefined;
+    if (!m || !meta || meta.category === 'tag') continue;
+    const ecsId = localToEcs.get(Number(m[1]));
+    const bag = ecsId === undefined ? undefined : collectComparableTraits(ecsId, [meta])[meta.name];
+    selectedKeys.delete(key);
+    // Skipped HERE, never passed on (close-out review): sent to an enclosing prefab, a row left unexpanded reached that
+    // level's `+trait.` write, which states a TAG — it wrote `{}` and re-added the component the user had removed.
+    if (!bag) { skipped.push({ key, reason: ecsId === undefined ? 'its member is not part of this prefab instance' : `the member no longer has ${meta.name}` }); continue; }
+    const spelled = canon.original.get(key) ?? key;
+    for (const field of Object.keys(bag)) {
+      const k = `${m[1]}.${meta.name}.${field}`;
+      selectedKeys.add(k);
+      if (!canon.original.has(k)) canon.original.set(k, spelled);
+    }
+  }
   // Written into this prefab, an outer row's removal reaches every instance of it (#1506).
   for (const key of layerAuthoredStructureKeys(rootInstanceId, oldPrefab, structure)) {
     if (!selectedKeys.delete(key)) continue;
@@ -6472,7 +6491,8 @@ async function planApply(
     }
     e.effect = { op: 'conflict', slot: cs.map((c) => c.slot).join(', '), value: mine.value, with: withAll, wanted: e.effect };
   }
-  const effects = [...effectOf.values()].map((e) => ({ ...e, key: spell(e.key) }));
+  // Once per key as the caller spelled it: an added component's row is several field keys here (#1663).
+  const effects = [...new Map([...effectOf.values()].map((e) => [spell(e.key), { ...e, key: spell(e.key) }] as const)).values()];
 
   // Reported in the caller's own spelling, not the internal one it was turned into above.
   for (const x of skipped) x.key = spell(x.key);
@@ -6501,6 +6521,7 @@ async function planApply(
   // from its rows when the file had none (#1797).
   advanceLocalIdCounter(newPrefab, oldPrefab, nextLocalId.v);
   for (const x of appliedTargets) x.key = spell(x.key);
+  const applied = [...new Map(appliedTargets.map((x) => [x.key, x] as const)).values()];
   return {
     // Innermost first, and the commit refreshes in this order, so each capture reads frames already rebuilt inside it.
     writes: innermostFirst([
@@ -6512,7 +6533,7 @@ async function planApply(
     ], sameSource).map((x) => x.w),
     rebuild: { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows },
     skipped,
-    applied: appliedTargets,
+    applied,
     alsoReverted: [...alsoReverted].map(([src, keys]) => ({ source: src, keys })),
     effects,
     conflicts,

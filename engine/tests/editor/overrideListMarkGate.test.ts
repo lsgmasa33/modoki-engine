@@ -47,8 +47,12 @@ const setField = (id: number, trait: string, field: string, value: unknown) => {
 /** `Trait.field` for member `localId`: in the Apply/Revert list, in the Inspector's highlight, and in the save. */
 function surfaces(rootId: number, prefab: PrefabFile, localId: number) {
   const id = memberOf(rootId, localId);
-  const listed = new Set(collectInstanceOverrideTree(rootId, prefab).entities.filter((e) => e.localId === localId)
-    .flatMap((e) => e.traits.flatMap((t) => t.fields.map((f) => `${t.trait}.${f.field}`))));
+  const tree = collectInstanceOverrideTree(rootId, prefab);
+  // An added component is ONE row (#1663), listed with the fields it carries.
+  const listed = new Set([
+    ...tree.entities.filter((e) => e.localId === localId).flatMap((e) => e.traits.flatMap((t) => t.fields.map((f) => `${t.trait}.${f.field}`))),
+    ...tree.addedTags.filter((t) => t.localId === localId).flatMap((t) => (t.fields ?? []).map((f) => `${t.tag}.${f}`)),
+  ]);
   const highlighted = memberOverrideKeys(id, localId, collectComparableTraits(id, getAllTraitsList()), prefab, rootId);
   const saved = new Set(Object.entries(captureInstanceOverrides(rootId, prefab)[localId] ?? {})
     .flatMap(([t, fields]) => Object.keys(fields).map((f) => `${t}.${f}`)));

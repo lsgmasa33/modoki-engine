@@ -264,9 +264,21 @@ its `localId` for a pre-v5 template (#1468 Phase 4, § Member identity below):
   field key can carry it. The capture holds an added tag as `{Tag: {}}`, and the field walk used to
   drop that entry for having no fields. The scene save kept the tag, but no surface listed it, and
   Apply skipped a tag key with no `skipped` entry. `collectInstanceOverrideTree` is the one walk that
-  yields both field nodes and added tags, for the dialog and the agent op alike. An added COMPONENT
-  still rides field keys, because Apply seeds its whole bag from them. A tag key Apply cannot write
-  is named in `skipped`, and so is a tag spelled as a field key.
+  yields both field nodes and added tags, for the dialog and the agent op alike. A tag key Apply
+  cannot write is named in `skipped`, and so is a tag spelled as a field key.
+- `"+trait.<member>.<Component>"` — an added COMPONENT, also ONE row (#1663), as Unity lists one:
+  **Revert removes it whole** (`subtractFieldOverrides` drops its captured bag, and the rebuild does
+  not bring it back). **Apply writes it whole**: `planApply` expands the row into the component's
+  field keys, which is what applying its fields always did (the first one seeds the whole bag), and
+  reports the row once, in its own spelling. Listed per field before, with a base of `∅`, a field's
+  Revert reset that field to the schema default and left the component listed. It also dropped only
+  that field's mark while the save wrote the whole component, so the reload re-seeded the mark
+  (#1663, win hunt seed 4518). A row whose member no longer has the component (listed, then undone)
+  is SKIPPED in that expansion, with the reason. Passed on, it reached an enclosing level's `+trait.`
+  write, which states a tag, and O's row re-added the removed component as `{}` (close-out review,
+  `addedComponentStaleRow.test.ts`). ⚠️ A NESTED instance's added component (U14, `nested`) is still
+  offered as field keys: an outer level writes a `+trait.` row as a tag, `{}`, and its fields are
+  what land the bag on the enclosing row.
 
 ### Write (`applyToPrefabSelective`)
 

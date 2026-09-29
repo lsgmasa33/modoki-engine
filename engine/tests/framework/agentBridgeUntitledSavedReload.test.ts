@@ -64,8 +64,10 @@ const PREFAB_GUID = 'c0ffee00-0000-4000-8000-00000000d712';
 const PREFAB_PATH = '/games/g/runtime/assets/Box.prefab.json';
 
 const {
-  initAgentBridge, setWorldReloadedFromDiskHook, setEditorScenePathReader, setPrefabSourceRefresher, dumpSceneState,
+  initAgentBridge, setWorldReloadedFromDiskHook, setPrefabSourceRefresher, dumpSceneState,
 } = await import('../../app/debug/agentBridge');
+// #1718: the reader lives beside `openScenePath` in the runtime, where every reader of the open scene's file asks it.
+const { setEditorScenePathReader } = await import('../../packages/modoki/src/runtime/scene/openScenePath');
 
 let handlers: Map<string, Handler[]>;
 let loadScene: ReturnType<typeof vi.spyOn>;

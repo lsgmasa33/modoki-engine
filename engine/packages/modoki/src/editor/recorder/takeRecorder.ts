@@ -22,7 +22,7 @@ import { registerFrameCallback, unregisterFrameCallback } from '../../runtime/re
 import { PlayerPrefs } from '../../runtime/storage/playerPrefs';
 import { prefsKeyPrefix } from '../../runtime/storage/prefsKey';
 import { getActiveGameId } from '../../runtime/managers/managerRegistry';
-import { sceneManager } from '../../runtime/scene/SceneManager';
+import { openScenePath } from '../../runtime/scene/openScenePath';
 import { pressPlay, pressStop, playFeedback } from '../scene/playPressFeedback';
 import { useEditorStore } from '../store/editorStore';
 import { hasUnsavedChanges } from '../scene/serialize';
@@ -198,7 +198,8 @@ async function armAndPlay(safeArea: Take['safeArea']): Promise<string | null> {
   if (!game) return 'no game is active';
   const root = findGameRoot();
   if (!root) return 'no game UI root in the Game view';
-  const scenePath = sceneManager.getCurrent()?.path;
+  // The FILE (#1718): a `newScene()` world saved since has no SceneManager entry, and was refused here.
+  const scenePath = openScenePath();
   if (!scenePath) return 'no scene is open';
 
   // The save the game will read at Play, exactly as stored — flushed first, so a write still

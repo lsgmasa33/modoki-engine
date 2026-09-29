@@ -15,7 +15,7 @@
 import {
   setFrameLoopHeld, stepOneFrame, setManualNow, advanceManual, restoreRealClock, rawNow,
   resetTimeBaseline, pinFreshWorldSeed, seedRng, setCaptureMode, getCurrentWorld, getTime, takeClockDelta, isNextSceneLoading,
-  TakeJournalTap, appLifetimeEventTypes, isTimeHeldForLoading, sceneManager,
+  TakeJournalTap, appLifetimeEventTypes, isTimeHeldForLoading, sceneManager, openScenePath,
 } from '@modoki/engine/runtime';
 
 export interface CaptureState {
@@ -178,7 +178,7 @@ function readState(): CaptureState {
     takeTime: session?.takeTime ?? 0,
     frame: time?.frame ?? 0,
     loading: isTimeHeldForLoading(),
-    scene: sceneManager.getCurrent()?.path ?? null,
+    scene: openScenePath(), // the FILE (#1718): a `newScene()` world saved since has no SceneManager entry
     ready: isGameOnScreen(),
   };
 }
