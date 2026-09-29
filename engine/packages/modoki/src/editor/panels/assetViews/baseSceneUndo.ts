@@ -2,10 +2,9 @@
  *
  *  Extracted from `SceneAssetView`'s `commit` for one reason: the closures lived inside
  *  the component, so the only way to cover them was to mount the panel in jsdom — which
- *  this repo forbids, because that asserts the mock rather than the behaviour. Every
- *  other undo builder in this change is a framework-free factory for the same reason
- *  (see `panels/assetUndo.ts`); this makes the tenth site uniform with the other nine
- *  instead of being the one with no test.
+ *  this repo forbids, because that asserts the mock rather than the behaviour. The
+ *  Assets panel's undo builders were framework-free factories for the same reason
+ *  (they went with #1868, when file operations left undo).
  *
  *  `write` is injected rather than imported: it is the component's own state-setting
  *  writer, and keeping it a parameter is what makes this callable — and testable — with no React

@@ -10,14 +10,12 @@
  *  The issue filed this site as "unsure — partial skip only (the restore always
  *  runs)". It is not: it is the same confirmed cache-vs-disk desync as skinPrefab's.
  *
- *  Both directions are all-or-nothing. That differs from `makeDeleteUndo` (which
- *  restores what it can and reports the shortfall) because the unit of work differs:
- *  there it is N independent files, here it is ONE coupled operation — the
- *  .prefab.json plus the entities linked to it.
+ *  Both directions are all-or-nothing: the unit of work is ONE coupled operation —
+ *  the .prefab.json plus the entities linked to it.
  *
  *  `writeAssetFile`/`deleteAssetFile` live in the module under test, so they cannot
  *  be `vi.mock`ed out — we fail them at the seam they actually use, the global
- *  `fetch` behind `backendFetch`, exactly as assetUndo.test.ts does. */
+ *  `fetch` behind `backendFetch`. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { setRunMode as setRunModeForAuthoring } from '../../src/runtime/core/playState';

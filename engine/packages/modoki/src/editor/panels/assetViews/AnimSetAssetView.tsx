@@ -44,7 +44,7 @@ export function AnimSetAssetView({ path }: { path: string }) {
     // Built BEFORE the park, and its undo/redo check the asset still holds their side (#1710) — see MaterialAssetView.
     const action = assetDocAction({
       label, path, type: 'animset', before: old, after: () => updated,
-      apply: (doc) => persistAssetEdit(path, 'animset', doc, invalidateAnimSetFile),
+      apply: (doc, p) => persistAssetEdit(p, 'animset', doc, invalidateAnimSetFile),
     });
     persistAssetEdit(path, 'animset', updated, invalidateAnimSetFile);
     pushAction(action); // _isFileDirect: parked, not scene state (persistAssetEdit)

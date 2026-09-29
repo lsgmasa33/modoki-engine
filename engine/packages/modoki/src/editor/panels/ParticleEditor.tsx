@@ -461,7 +461,7 @@ export default function ParticleEditor() {
         // file still holds their side before moving it, park the result themselves (so an undo with this editor closed
         // is not written back by the next save), and read `_after` at step time, after any coalescing.
         path, type: 'particle', before, after: () => a._after,
-        apply: (d) => useEditorStore.getState().applyParticleDef(path, d),
+        apply: (d, p) => useEditorStore.getState().applyParticleDef(p, d),
       }), { _after: next });
       pushAction(a);
       lastAction.current = a;

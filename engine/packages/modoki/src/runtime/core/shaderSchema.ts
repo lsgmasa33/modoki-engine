@@ -72,7 +72,7 @@ export function shaderManifestPathForBody(bodyPath: string): string | null {
   // keeps a body file in a production build at all):
   //   engine/plugins/asset-tree-shaker.ts (`TYPEABLE_EXTS` and the kept extensions, `classify`, `processShader`'s sibling walk)
   //   engine/plugins/backend/staticAssets.ts (`MIME_TYPES`)
-  //   engine/packages/modoki/src/editor/panels/assetUndo.ts (`TEXT_ASSET_EXTS`)
+  //   engine/packages/modoki/src/editor/panels/assetOps.ts (`TEXT_ASSET_EXTS`)
   // Those cannot import this constant (plugin/runtime split), so a third extension is a sweep.
   const lower = bodyPath.toLowerCase();
   for (const ext of SHADER_BODY_EXTS) {

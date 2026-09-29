@@ -2540,8 +2540,8 @@ export function rekeyEditorPrefabCache(from: string, to: string, prefix = false)
  *  The LOADER's entry goes in the same pass (`evictDeletedPrefabs`, #1834), keeping the scene's ownership. It was held
  *  back until #1819 landed: evicted, a reload after the delete gives Missing Prefab placeholders, and an undo run against a
  *  placeholder was #1819's open class; it now REFUSES by ruling R (`require`). What this evicts is also TOMBSTONED
- *  (`editorPrefabDeleted`), so a swap's warm reads it from disk rather than seeding it back from the loader. An undo that
- *  puts the file back re-announces it (`reannounceRestoredFiles`: the manifest, and a refetch of the owned loader entry).
+ *  (`editorPrefabDeleted`), so a swap's warm reads it from disk rather than seeding it back from the loader. A delete is
+ *  not undoable (#1868, owner ruling D2); a file put back from the OS Trash is an outside write, which the watcher raises.
  *  Every save captures the live instance from its frame record (I18).
  *
  *  An entry answers for the deleted file when its key is the path, when its key is a guid the manifest still maps into the
@@ -8887,75 +8887,6 @@ export async function rebaseStaleInstances(
     const at = Math.max(next, 0);
     const [s] = pending.splice(at, 1);
     rebuilt += refreshInstances(s!.source, [roots[at]!], s!.from, s!.to);
-  }
-  return rebuilt;
-}
-
-/** Prefab files a step PUT BACK (`paths`, #1864): re-expand in place every live frame whose record says it could not expand
- *  a row naming one of them (#1790 ruling D's `unexpanded`). Unity reconnects a Missing Prefab instance when an asset with
- *  its GUID returns — INFERRED from `PrefabUtility.cs` (an instance with a missing asset "can be correctly restored only if
- *  CorrespondingObjects info is available"; instances name their asset by GUID and re-merge on import), not quoted from a
- *  document. Without it the row stayed empty for good: the restore brought the file back and nothing re-expanded it, so a
- *  later undo that `require`d one of that frame's members refused (hunt seed 246).
- *
- *  Each frame is rebuilt against the document it was expanded from, its own edits captured as any refresh captures them,
- *  and the scene's rows for the nested frame come back from the kept store (R2) once the row is backed, as a reload would
- *  bring them. A frame {@link rebaseStaleInstances} would rebuild anyway (built from other rows than the cache holds) is
- *  left to it. Nothing is rebuilt once the world was replaced while the documents loaded: the ids were collected in the
- *  world that is gone, and the new world's load expanded from disk (never re-target). Returns how many frames it rebuilt. */
-export async function reexpandRestoredRows(paths: readonly string[]): Promise<number> {
-  const piMeta = getTraitByName('PrefabInstance');
-  if (!piMeta || paths.length === 0) return 0;
-  // Each restored file by its path AND its document's own guid, read from the file itself: the manifest can lack the guid
-  // (a failed rescan, the delete having pruned it), and a v5+ row names its prefab by guid (close-out review). The read
-  // registers that guid (`registerRead`) and seats the editor cache under the path; seated here under the guid too, which
-  // the sync respawn reads.
-  const restored = new Set<string>();
-  for (const p of paths) {
-    if (!p.endsWith('.prefab.json')) continue;
-    restored.add(p);
-    const doc = await getPrefabSource(p);
-    const guid = doc?.id ?? getGuidForPath(p);
-    if (!guid) continue;
-    restored.add(guid);
-    if (doc && !getCachedPrefabSync(guid)) seatEditorPrefabCache(guid, doc);
-  }
-  if (restored.size === 0) return 0;
-  const names = (ref: string) => restored.has(ref) || restored.has(resolveRef(ref) ?? '');
-  const world = getCurrentWorld();
-  const frames: { root: number; source: string; doc: PrefabFile }[] = [];
-  world.query(piMeta.trait).updateEach(([data], entity) => {
-    const d = data as { source?: string; rootInstanceId?: number };
-    if (!d.source || d.rootInstanceId !== entity.id()) return;
-    const rec = frameRootDoc(world, entity);
-    if (!rec?.unexpanded?.length || rec.source !== d.source) return;
-    const rows = (rec.doc as PrefabFile).entities ?? [];
-    if (!rec.unexpanded.some((lid) => { const r = rows.find((x) => x.localId === lid); return !!r?.prefab && names(r.prefab); })) return;
-    frames.push({ root: entity.id(), source: d.source, doc: rec.doc as PrefabFile });
-  });
-  if (frames.length === 0) return 0;
-  for (const f of frames) await preloadNestedPrefabsForSubtree(f.root);
-  if (getCurrentWorld() !== world) return 0;
-  // As `rebaseStaleInstances` orders and re-checks its frames (close-out review): a frame is rebuilt only while its id is
-  // still a root of the same source holding the very record collected (an outer frame's rebuild respawns an inner one, and
-  // a freed id can come straight back as another source's root), and only once no other pending frame is in what its
-  // teardown destroys, so an inner frame is rebuilt before the outer one that respawns it.
-  const pending = frames.filter((f) => { const cached = prefabCache.get(f.source); return !!cached && sameDocument(f.doc, cached); });
-  const liveRoot = (f: (typeof pending)[number]): number => {
-    const e = findEntity(f.root);
-    if (!e) return 0;
-    const d = readTraitData(e.id(), piMeta) as { source?: string; rootInstanceId?: number } | null;
-    return d?.source === f.source && d.rootInstanceId === e.id() && frameRootDoc(world, e)?.doc === f.doc ? e.id() : 0;
-  };
-  let rebuilt = 0;
-  while (pending.length) {
-    const roots = pending.map(liveRoot);
-    for (let i = pending.length - 1; i >= 0; i--) if (!roots[i]) { pending.splice(i, 1); roots.splice(i, 1); }
-    if (!pending.length) break;
-    const next = roots.findIndex((r, i) => { const torn = rebuildTeardown(r).toDestroy; return roots.every((o, j) => j === i || !torn.has(o)); });
-    const at = Math.max(next, 0);
-    const [f] = pending.splice(at, 1);
-    rebuilt += refreshInstances(f!.source, [roots[at]!], f!.doc, f!.doc);
   }
   return rebuilt;
 }

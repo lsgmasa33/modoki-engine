@@ -75,16 +75,15 @@ export interface DomDndResult {
    *
    *  ⚠️ **Read these as what the counters MEASURE, not as a claim about scene entities.** The
    *  discriminator is `getEditVersion()` — "does this count as unsaved SCENE work against the
-   *  save baseline" — and an Assets **file move** lands on the `scene` side while touching no
-   *  entity, because its undo action (`panels/assetUndo.ts` `makeFilesDropUndo`) is a plain one
-   *  and that file sets `_isFileDirect` on nothing:
-   *  - `scene` — the edit bumped the scene-vs-disk baseline. Usually a real scene edit; also a
-   *    file move, which is not one.
-   *    (entity→Assets **prefab-create** is NOT an example: `tagEntityTreeAsInstance` writes a
-   *    `PrefabInstance` trait to every node in the subtree, so `scene` is simply correct there.)
+   *  save baseline":
+   *  - `scene` — the edit bumped the scene-vs-disk baseline.
+   *    (entity→Assets **prefab-create** is an example: `tagEntityTreeAsInstance` writes a
+   *    `PrefabInstance` trait to every node in the subtree, so `scene` is correct there.)
    *  - `asset-document` — a skin/particle/atlas/material document, parked in the dirty-asset
-   *    registry and flushed by save_all. */
-  committedTo?: 'scene' | 'asset-document';
+   *    registry and flushed by save_all.
+   *  - `asset-file` — an Assets file move: on disk already, nothing to save, and not undoable
+   *    (#1868, owner ruling D2). Only the file-op counter moved. */
+  committedTo?: 'scene' | 'asset-document' | 'asset-file';
   /** A modal APPEARED during the drop's settle window, and this is it (#1471). The case it exists
    *  for: a handler that asks first — the cross-scene reparent confirm (#1429) — is parked waiting
    *  on a person, so `committed:false` is CORRECT and the drop is not a no-op: answer the modal,
@@ -129,6 +128,9 @@ export type EditWitness = {
   /** Scene-world edits only (`getEditVersion`). No longer the commit signal — kept as the
    *  DISCRIMINATOR that says which world moved, so the reply can name it. */
   world: number;
+  /** Assets file moves and deletes (`getAssetFileOpVersion`). Needed because they push no undo entry and park nothing
+   *  (#1868, owner ruling D2): an Assets file drag is invisible to the other three. */
+  files: number;
 };
 
 export interface DomDndOptions {
@@ -196,8 +198,8 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     // EITHER world counts as a commit. The stack catches anything that pushed an undo entry
     // (scene edits and `_isFileDirect` asset edits alike); the registry catches a park that
     // pushed nothing.
-    committed = after.stack !== before.stack || after.assets !== before.assets;
-    // ⚠️ FIVE known imprecisions, stated rather than left to be rediscovered. All are "something
+    committed = after.stack !== before.stack || after.assets !== before.assets || after.files !== before.files;
+    // ⚠️ SIX known imprecisions, stated rather than left to be rediscovered. All are "something
     // moved that was not this drop", and all need an event inside the 400 ms window:
     //  1. `getDirtyAssetsVersion` bumps on park AND on flush/discard — a racing `save_all` reads
     //     as a commit.
@@ -211,9 +213,15 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     //     practice than (3); the list said "three" and stopped, which invited trusting the set.
     //  5. …and from `beginForwardEdit` taking and releasing its hold (#1832), so ANOTHER undo-recording agent op
     //     starting or ending mid-window reads as a commit. (This op's own hold brackets the whole call, so it does not.)
+    //  6. `getAssetFileOpVersion` bumps for ANY Assets move or delete, not only this drop's: an agent's
+    //     `modoki_move_asset`/`modoki_delete_asset`, a model re-import's orphan prune or a Cleanup landing in the window
+    //     reads as a commit (#1868).
     // The alternative — diffing the stack's top entry and the registry's contents — buys a
     // stronger signal than "did this drop do anything" needs.
-    if (committed) committedTo = after.world !== before.world ? 'scene' : 'asset-document';
+    if (committed) {
+      committedTo = after.world !== before.world ? 'scene'
+        : after.stack !== before.stack || after.assets !== before.assets ? 'asset-document' : 'asset-file';
+    }
     // The LAST new shell is the top-most: both forms append to <body>, so document order is stack
     // order.
     const raised = openModalShells().filter((el) => !modalsBefore.has(el)).pop();
@@ -284,7 +292,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     );
   } else if (types.length > 0 && accepted && committed === false) {
     warnings.push(
-      'the target accepted the payload TYPE but NEITHER the undo stack NOR the parked-asset registry moved and no modal opened, so the drop probably did nothing. Verify with get_scene_state/history before building on this. Legitimate drops can land here too — these are EXAMPLES, not the full set: a handler still running after 400ms (a prefab fetch with nested-prefab preloading, a Skin sprite drop reading back an alpha mask, or a confirm raised only after an await longer than that), and a drop that records in neither place (a Project Settings path field, which adopts the file server-side and holds the value in dialog state).',
+      'the target accepted the payload TYPE but NEITHER the undo stack NOR the parked-asset registry NOR the Assets file ops moved and no modal opened, so the drop probably did nothing. Verify with get_scene_state/history before building on this. Legitimate drops can land here too — these are EXAMPLES, not the full set: a handler still running after 400ms (a prefab fetch with nested-prefab preloading, a Skin sprite drop reading back an alpha mask, or a confirm raised only after an await longer than that), and a drop that records in neither place (a Project Settings path field, which adopts the file server-side and holds the value in dialog state).',
     );
   }
   // `ok` must reflect what ACTUALLY happened, not just "we fired the sequence". An empty

@@ -70,13 +70,14 @@ describe('an editor create writes through writeNewAssetDocument, never mint-then
     // `commitPrefabWrite`, which writes only conditionally — create-only for a new file, `ifMatch` over the bytes read
     // for a replace — and whose one heal-mint (`if (!doc.id) doc.id = newGuid()`, an id-less EXISTING template) sits in
     // a different function from its write. The prefab.ts row this ledger pardoned went with `writePrefabFileReport`.
-    expect(writes.length, 'the reader must see the editor\'s plain writes, or the ledger below is vacuous').toBeGreaterThanOrEqual(9);
+    // 8 since #1868: the Assets undo builders (`assetUndo.ts`) went, and their restore write with them.
+    expect(writes.length, 'the reader must see the editor\'s plain writes, or the ledger below is vacuous').toBeGreaterThanOrEqual(8);
     assertExemptionLedger({
       label: 'editor functions that mint a guid and write it with a plain write (#1264)',
       population: writes.filter((w) => w.mints).map(({ item, site }) => ({ item, site })),
       exempt: [],
       scanned: writes.length,
-      floor: 9,
+      floor: 8,
       fix: 'create the document with writeNewAssetDocument (scene/createAssetDocument.ts): it writes create-only, asks before replacing, and keeps the replaced asset\'s guid',
     });
   });

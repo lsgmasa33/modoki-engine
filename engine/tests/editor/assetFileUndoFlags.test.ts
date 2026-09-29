@@ -1,7 +1,8 @@
 /** #1857 / #1858: an asset-FILE undo entry is `_isFileDirect`, and one that also rebuilds the live frames is `_rebasesLiveFrames`.
  *
- *  None of the ten Assets-panel builders (`editor/panels/assetUndo.ts`) tagged its entry, so the undo manager treated a
- *  delete, a rename or an import as a SCENE edit: Exit from a preview dropped it (the probe on #1857: a delete pushed in
+ *  The undo manager's side of those flags, on synthetic entries. (The Assets-panel file operations that first carried
+ *  them push no undo entry since #1868, owner ruling D2; the asset-document edits and the rig-prefab writer still do.)
+ *  Untagged, such an entry was treated as a SCENE edit: Exit from a preview dropped it (the probe on #1857: a delete pushed in
  *  session 7, then `dropPreviewSceneEdits(7)` → `canUndo()` false, the file left in the OS trash with no undo), Stop
  *  truncated it, its undo marked the scene unsaved, and a step spanning a scene switch was dropped.
  *
@@ -18,44 +19,6 @@ import {
 } from '@modoki/engine/editor';
 import { truncateUndoTo, undoDepth, undoLabel } from '../../packages/modoki/src/editor/undo/undoManager';
 import { setRunMode } from '@modoki/engine/runtime';
-import {
-  makeDeleteUndo, makeDuplicateUndo, makeRenameUndo, makeEmptyFolderDeleteUndo, makeNewFolderUndo, makeFolderRenameUndo,
-  makePasteUndo, makeFilesDropUndo, makeModelImportUndo, makeFileImportUndo,
-} from '../../packages/modoki/src/editor/panels/assetUndo';
-import type { AssetEntry } from '../../packages/modoki/src/editor/utils/assetPaths';
-
-const asset = { name: 'Crate', path: '/assets/Crate.prefab.json' } as AssetEntry;
-const refresh = () => {};
-const keep = () => {};
-
-/** Every builder, built with the least it needs: the closures never run here, only the entry's flags are read. */
-const BUILDERS: Array<[string, () => UndoAction]> = [
-  ['makeDeleteUndo', () => makeDeleteUndo([{ asset, snapshots: [], deletePaths: [] }], refresh)],
-  ['makeDuplicateUndo', () => makeDuplicateUndo([{ asset, toPath: '/assets/Crate 1.prefab.json' }], refresh)],
-  ['makeRenameUndo', () => makeRenameUndo({ originalPath: asset.path, originalName: 'Crate', toPath: '/assets/Box.prefab.json', newName: 'Box', refresh })],
-  ['makeEmptyFolderDeleteUndo', () => makeEmptyFolderDeleteUndo({ folderPath: '/assets/Old', folderName: 'Old', refresh })],
-  ['makeNewFolderUndo', () => makeNewFolderUndo({ path: '/assets/New', refresh, setPendingFolders: keep, setExpanded: keep })],
-  ['makeFolderRenameUndo', () => makeFolderRenameUndo({ oldPath: '/assets/A', newPath: '/assets/B', folderName: 'B', refresh })],
-  ['makePasteUndo', () => makePasteUndo({ op: 'copy', done: [], refresh })],
-  ['makeFilesDropUndo', () => makeFilesDropUndo({ moves: [{ from: asset.path, to: '/assets/Sub/Crate.prefab.json' }], refresh })],
-  ['makeFileImportUndo', () => makeFileImportUndo({ imported: [{ path: '/assets/Tex.png', content: '' }], refresh })],
-];
-
-describe('the Assets panel builders (#1857)', () => {
-  // Mutation: drop `_isFileDirect` from any one builder — its row goes red.
-  it.each(BUILDERS)('%s is a file edit that rebuilds nothing live', (_name, build) => {
-    const a = build();
-    expect(a._isFileDirect).toBe(true);
-    expect(a._rebasesLiveFrames).toBeFalsy();
-  });
-
-  // Mutation: drop `_rebasesLiveFrames` from makeModelImportUndo, or its `_isFileDirect`.
-  it('makeModelImportUndo is a file edit that ALSO rebases the live frames (one commitPrefabWrite per half)', () => {
-    const a = makeModelImportUndo({ assetName: 'Crate', prefabPath: asset.path, content: '{}' });
-    expect(a._isFileDirect).toBe(true);
-    expect(a._rebasesLiveFrames).toBe(true);
-  });
-});
 
 let ran: string[];
 const entry = (label: string, flags: Partial<UndoAction> = {}): UndoAction =>
@@ -67,11 +30,11 @@ beforeEach(() => { ran = []; setRunMode('stopped'); setPreviewUndoSession(null);
 afterEach(() => { setPreviewUndoSession(null); setRunMode('stopped'); clearHistory(); });
 
 describe('a preview envelope (#1857 route 1)', () => {
-  // The issue's probe, with the real builder's entry. Mutation: untag makeDeleteUndo — Exit drops it, canUndo is false.
-  it("Exit keeps an asset delete made inside the envelope, so it is still undoable", () => {
+  // The issue's probe. Mutation: make `worldFree` ignore `_isFileDirect` — Exit drops it, canUndo is false.
+  it("Exit keeps an asset-file edit made inside the envelope, so it is still undoable", () => {
     setPreviewUndoSession(7);
     setRunMode('scrub');
-    pushAction(BUILDERS[0][1]());
+    pushAction(entry('Edit material', FILE));
     expect(dropPreviewSceneEdits(7)).toBe(0);
     expect(canUndo()).toBe(true);
   });
@@ -98,12 +61,12 @@ describe('the edit version (#1857 route 3, #1858)', () => {
   // import — so load_scene / open_project refused with REQUIRES_SAVE over nothing to save. None of them changes what the
   // scene file holds: a model import's rebase re-expands the instances from the new document, and the file holds the
   // instances and their overrides. (The rig's route is pinned in `prefabRebuildOver.test.ts`.)
-  // Mutations: untag makeDeleteUndo — the trash bumps; make the dirty question read `worldFree` (which excludes a
-  // rebasing entry) — the model import bumps.
-  it('a Move to Trash and a model import neither push nor undo a bump — the real builders', async () => {
+  // Mutations: make `leavesSceneFile` ignore `_isFileDirect` — the file edit bumps; make the dirty question read
+  // `worldFree` (which excludes a rebasing entry) — the rebasing one bumps.
+  it('a file edit and a rebasing file edit neither push a bump', async () => {
     const v0 = getEditVersion();
-    pushAction(BUILDERS[0][1]()); // makeDeleteUndo: Move to Trash
-    pushAction(makeModelImportUndo({ assetName: 'Crate', prefabPath: asset.path, content: '{}' }));
+    pushAction(entry('Edit material', FILE));
+    pushAction(entry('Update rig prefab', REBASING));
     expect(getEditVersion()).toBe(v0);
   });
 

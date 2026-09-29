@@ -117,7 +117,7 @@ export function MaterialAssetView({ path }: { path: string }) {
     // holds their side before moving it (#1710, assetDocUndo.ts).
     const action = assetDocAction({
       label, path, type: 'material', before: old, after: () => updated,
-      apply: (doc) => persistAssetEdit(path, 'material', doc, invalidateMaterialFile),
+      apply: (doc, p) => persistAssetEdit(p, 'material', doc, invalidateMaterialFile),
     });
     persistAssetEdit(path, 'material', updated, invalidateMaterialFile);
     pushAction(action);

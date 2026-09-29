@@ -18,7 +18,7 @@
  *
  *  ⚠️ **This header used to claim "the Assets panel already fixes its own SELECTION at every one
  *  of these sites".** It did not — exactly ONE of thirteen move sites repaired the selection
- *  (`handleRename`), and `assetUndo.ts` had zero selection references at all. That claim was the
+ *  (`handleRename`), and the Assets undo builders (gone with #1868) had zero selection references at all. That claim was the
  *  reason selection stayed out of this module for so long, so it is corrected rather than
  *  deleted: the repair is now `applyMovesToSelection`, below, inside the seam (#867).
  *
@@ -50,6 +50,7 @@ import type { PathKeyedCause } from '../scene/serialize';
 import { applyMove, splitAssetPath, type PathMove } from '../utils/assetPaths';
 import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
 import { rekeyCachedPrefab, evictDeletedPrefabs } from '../../runtime/loaders/meshTemplateCache';
+import { recordAssetMoves } from '../utils/assetMoveLog';
 import { rekeyEditorPrefabCache, evictDeletedEditorPrefabs } from '../scene/prefab';
 
 /** The display name a repaired item should carry after `move`.
@@ -366,11 +367,17 @@ export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
   return notes;
 }
 
+let fileOpVersion = 0;
+/** Bumps once per call of {@link applyAssetPathMoves} that carries a move or a delete — every Assets file move, rename
+ *  and trash runs it. Those push no undo entry and park nothing (#1868, owner ruling D2), so this is the only counter a
+ *  file drag moves: `modoki_dnd`'s commit witness reads it (`EditWitness.files`, `app/debug/domDnd.ts`). */
+export function getAssetFileOpVersion(): number { return fileOpVersion; }
+
 /** Apply `moves` to the ASSET SELECTION — the Inspector's lead asset and the multi-select set.
  *
  *  Both are path-keyed, and until #867 exactly ONE of the move sites repaired them: `handleRename`
- *  (`Assets.tsx`). `pasteClipboard`'s cut branch, `handleFilesDrop` and every one of `assetUndo.ts`'s
- *  eight seam calls left the Inspector aimed at a path the file had left — and nothing self-heals,
+ *  (`Assets.tsx`). `pasteClipboard`'s cut branch, `handleFilesDrop` and every one of the Assets undo
+ *  builders' eight seam calls (gone with #1868) left the Inspector aimed at a path the file had left — and nothing self-heals,
  *  because the panel's sync effect reacts to the STORE clearing the selection, never to the selected
  *  path vanishing from a refreshed listing.
  *
@@ -430,6 +437,7 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   // skipping two of the three repairs. Every caller passes an array today, so this is a trap
   // rather than a live bug — materialise once and it cannot become one.
   const list = [...moves];
+  if (list.length) { fileOpVersion++; recordAssetMoves(list); }
   const state = useEditorStore.getState();
   const bound = ASSET_EDITOR_BINDINGS.map((b) => ({ ...b, path: state[b.assetField]?.path }));
   const changes = resolveBindingMoves(bound, moves);
@@ -464,8 +472,9 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   // view of a renamed prefab went blank. Both are idempotent, so the panel's own pass after the route's finds nothing.
   // A DELETE evicts both (#1805, #1834, I9): the route marks it as the editor's own too, so no watcher evicted, and the
   // editor's sync readers kept expanding a prefab that no longer exists, and a reload of the owning scene re-expanded it
-  // from the loader's entry. The loader keeps the scene's ownership, so an undo that puts the file back refetches it
-  // (`reannounceRestoredFiles`). Live instances stay expanded (#1738's evicted state).
+  // from the loader's entry. The loader keeps the scene's ownership, so the scene's next load fetches the file again if it
+  // is back (a delete is not undoable, #1868; a hand restore from the OS Trash is an outside write). Live instances stay
+  // expanded (#1738's evicted state).
   for (const m of list) {
     if (m.to === null) {
       evictDeletedEditorPrefabs(m.from, !!m.prefix);

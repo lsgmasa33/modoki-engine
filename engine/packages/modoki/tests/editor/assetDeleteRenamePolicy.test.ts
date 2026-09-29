@@ -2,18 +2,79 @@
  *  and `planRename`, extracted from `Assets.tsx` into the existing `assetOps` seam.
  *
  *  The delete rule is the one with history: a binary asset's `.meta.json` used to
- *  be snapshotted for undo but never trashed, so every binary/model delete left an
+ *  be snapshotted but never trashed, so every binary/model delete left an
  *  orphaned sidecar on disk. It carries the asset's GUID and import settings, so
  *  losing track of it dangles both. That rule was only reachable through fetch +
  *  the backend; now it is a list. */
 
 import { describe, it, expect } from 'vitest';
 import {
-  deletionPathsFor, planRename, planDeleteOutcome, describeRefusedDeletes,
+  deletionPathsFor, planRename, planDeleteOutcome, describeRefusedDeletes, deleteConfirmText, deletionFootprint, isTextAsset,
 } from '../../src/editor/panels/assetOps';
 
+describe('isTextAsset — which assets carry their id inline (no sidecar)', () => {
+  it('classifies text vs binary by extension', () => {
+    expect(isTextAsset('/a/x.json')).toBe(true);
+    expect(isTextAsset('/a/x.PREFAB.JSON')).toBe(true); // case-insensitive
+    expect(isTextAsset('/a/x.glb')).toBe(false);
+    expect(isTextAsset('/a/x.png')).toBe(false);
+  });
+
+  // #857: the list had .glsl but not its sibling .wgsl shader body — both are UTF-8 text.
+  it('treats .wgsl as text, matching its .glsl sibling', () => {
+    expect(isTextAsset('/a/holo.wgsl')).toBe(true);
+    expect(isTextAsset('/a/holo.glsl')).toBe(true);
+  });
+});
+
+/** #1868, owner ruling D2: an Assets delete is not undoable, so every delete gesture asks first (Unity's
+ *  `ProjectWindowUtil.DeleteAssets`). The panel wires the dialog; the words and the listing are decided here. */
+describe('deleteConfirmText — the question a delete asks first', () => {
+  it('ends on Unity\'s own line, and says where the files go', () => {
+    const one = deleteConfirmText(['/a/hero.png']);
+    expect(one.title).toBe('Delete selected asset?');
+    expect(one.message).toBe('/a/hero.png\n\nIt goes to the Trash.\n\nYou cannot undo the delete assets action.');
+    expect(one.okLabel).toBe('Move to Trash');
+  });
+
+  it('counts a batch in the title and lists every path up to the cap, then says how many more', () => {
+    // Mutation: drop the `…and N more` tail — the 10-path case names only eight and says nothing of the other two.
+    const two = deleteConfirmText(['/a/x.png', '/a/y.png']);
+    expect(two.title).toBe('Delete 2 selected assets?');
+    expect(two.message.startsWith('/a/x.png\n/a/y.png\n\nThey go to the Trash.')).toBe(true);
+    const ten = deleteConfirmText(Array.from({ length: 10 }, (_, i) => `/a/f${i}.png`));
+    expect(ten.message.split('\n').filter((l) => l.startsWith('/a/'))).toHaveLength(8);
+    expect(ten.message).toContain('\n…and 2 more\n');
+    expect(ten.message).not.toContain('/a/f8.png');
+  });
+
+  it('says what goes with it: a folder\'s contents, generated files, and the unsaved edits it discards', () => {
+    // Mutations: drop the folder sentence, the generated clause or the unsaved clause — its expectation fails.
+    const folder = deleteConfirmText(['/a/sprites'], { folder: true, unsaved: ['/a/sprites/run.anim.json'] });
+    expect(folder.title).toBe('Delete selected folder?');
+    expect(folder.message).toContain('The folder and everything inside it go to the Trash.');
+    expect(folder.message).toContain('Unsaved edits to /a/sprites/run.anim.json are discarded.');
+    const model = deleteConfirmText(['/a/ship.glb'], { generated: 3 });
+    expect(model.message).toContain('It goes to the Trash. So do 3 files generated on import (meshes, materials, textures).');
+    expect(model.message.endsWith('You cannot undo the delete assets action.')).toBe(true);
+  });
+});
+
+describe('deletionFootprint — what a delete drags along', () => {
+  it('counts generated files (not the targets, not sidecars) and the parked edits under what goes', () => {
+    // Mutation: count sidecars as generated — 3 instead of 2.
+    const f = deletionFootprint(['/a/ship.glb'],
+      ['/a/ship.glb', '/a/ship.glb.meta.json', '/a/gen/ship.mesh.json', '/a/gen/ship.mat.json'],
+      ['/a/gen/ship.mat.json', '/a/other.mat.json']);
+    expect(f).toEqual({ generated: 2, unsaved: ['/a/gen/ship.mat.json'] });
+  });
+  it('for a folder, every parked edit under it — on a segment boundary', () => {
+    expect(deletionFootprint(['/a/s'], [], ['/a/s/x.anim.json', '/a/sprites/y.anim.json'], '/a/s').unsaved).toEqual(['/a/s/x.anim.json']);
+  });
+});
+
 describe('deletionPathsFor — the sidecar rule', () => {
-  it('puts the asset itself first, so an undo restores in the original order', () => {
+  it('puts the asset itself first', () => {
     expect(deletionPathsFor('/a/hero.png', 'texture')[0]).toBe('/a/hero.png');
   });
 

@@ -924,19 +924,21 @@ if (!action._isSelection && !action._isFileDirect) notifyEdited();
 `committed:false` plus "the drop probably did nothing", on edits that had demonstrably landed and
 were undoable. Two QA cases carried a paragraph telling runners to ignore it.
 
-The probe now samples **three** counters (`EditWitness` in `app/debug/domDnd.ts`), because the
-editor genuinely has three answers and no two of them are the same question:
+The probe now samples **four** counters (`EditWitness` in `app/debug/domDnd.ts`), because the
+editor genuinely has four answers and no two of them are the same question:
 
 | counter | what it sees | why it is needed |
 |---|---|---|
 | `getUndoVersion()` | every stack push, `_isFileDirect` included | catches a skin-bone reparent |
 | `getDirtyAssetsVersion()` | parked asset-document writes | catches an **atlas** member drop, which calls `persistAssetEdit` and pushes **no undo entry at all** (`AtlasAssetView.tsx`) — invisible to both other counters |
-| `getEditVersion()` | edits that count as unsaved SCENE work (everything not `_isSelection`/`_isFileDirect`) | no longer the verdict; kept as the DISCRIMINATOR behind the new `committedTo: 'scene' \| 'asset-document'` |
+| `getEditVersion()` | edits that count as unsaved SCENE work (everything not `_isSelection`/`_isFileDirect`) | no longer the verdict; kept as the DISCRIMINATOR behind `committedTo: 'scene' \| 'asset-document' \| 'asset-file'` |
+| `getAssetFileOpVersion()` | Assets file moves and deletes (bumped by `applyAssetPathMoves`) | catches an Assets **file drag**, which pushes no undo entry and parks nothing since #1868 (file ops are not undoable) — `committedTo:'asset-file'` |
 
-`committed` is now "the stack **or** the registry moved". Measured live on `games/skin-test`
+`committed` is now "the stack, the registry **or** the file ops moved". Measured live on `games/skin-test`
 (2026-09-13): a bone reparent gives `committed:true, committedTo:'asset-document'` with no warning,
 and `undoLabel` reads `rig2d reparent bone`; an atlas edit adds the atlas to `dirtyAssetPaths` while
-`undoLabel` does **not** change — which is exactly why the third counter exists.
+`undoLabel` does **not** change — which is exactly why the third counter exists. The fourth (#1868) is pinned at its producer
+(`assetFileOpVersion.test.ts`) and at the verdict (`domDnd.test.ts`); it was **not** measured live.
 
 ⚠️ **Do not "simplify" this by widening the `undoManager` guard instead.** That guard is correct:
 `hasUnsavedChanges()`, the title-bar dot and the scene-save baseline all read `_editVersion`, and
@@ -944,16 +946,10 @@ making it count selection or file-direct actions would make a bare click read as
 defect was the READER, not the guard.
 
 ⚠️ **`committedTo:'scene'` means "bumped the save baseline", NOT "touched a scene entity".** An
-Assets **file move** pushes a plain undo action (`panels/assetUndo.ts` sets `_isFileDirect` on
-nothing), so it counts as scene work and is labelled `scene` while touching no entity. That is the
-counter being reported honestly, not a bug in the label — but do not read `scene` as "an entity
-changed".
-
-⚠️ **entity→Assets prefab-create is NOT an example of that**, though an earlier version of this
-paragraph said it was: `createPrefabFromEntity` → `tagEntityTreeAsInstance` writes a
-`PrefabInstance` trait to every node in the subtree, so `scene` is simply the correct label. Stated
-because the wrong version would have told an agent its entities were untouched when a trait had
-just been written to each of them.
+Assets **file move** used to land there, because its undo action was a plain one; since #1868 it
+pushes none, and the fourth counter labels it `asset-file` instead. entity→Assets **prefab-create**
+does land on `scene`, and correctly: `createPrefabFromEntity` → `tagEntityTreeAsInstance` writes a
+`PrefabInstance` trait to every node in the subtree.
 
 #### A drop that opened a modal is `pendingModal`, not a no-op (#1471)
 

@@ -10,7 +10,6 @@ import { createWorld } from 'koota';
 import { getTraitByName, seedRng, rngNext } from '@modoki/engine/runtime';
 import { pushAction } from '@modoki/engine/editor';
 import { createPrefabFromEntity, deleteAssetFiles, deletionPathsFor, moveAsset, planDeleteOutcome, planRename } from '../../../packages/modoki/src/editor/panels/assetOps';
-import { makeDeleteUndo, makeRenameUndo, snapshotFromBytes, type DeleteResult } from '../../../packages/modoki/src/editor/panels/assetUndo';
 import { applyAssetPathMoves, unbindDeletedAssetEditors } from '../../../packages/modoki/src/editor/panels/assetEditorBindings';
 import {
   getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, revertRefusal,
@@ -119,6 +118,9 @@ export interface RunState {
    *  ruling (i)), so the walk to a segment's start may find it still there — holding exactly this document, at that path
    *  or wherever a Rename moved it. A list, not keyed by path: a later create can reuse the path a rename freed. */
   created?: string[];
+  /** Set by an Assets file op that landed (a trash: `to` null; a rename): it is not undoable (#1868, owner ruling D2), so
+   *  the runner carries it into the segment's baseline rather than expecting the walk to put it back. */
+  fileOp?: { from: string; to: string | null };
 }
 
 const liveGuids = () => new Set(authored().map((e) => e.guid).filter((g): g is string => !!g));
@@ -453,16 +455,13 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       if (editing()) return 'noop';
       const path = pick(u[0], prefabFiles(st));
       if (!path) return 'noop';
-      // `Assets.tsx`'s `executeDeletion` for one asset.
-      const bytes = st.be.read(path);
+      // `Assets.tsx`'s `executeDeletion` for one asset, confirmed: no undo entry (#1868, owner ruling D2).
       const deletePaths = deletionPathsFor(path, 'prefab', null);
-      const asset = { path, name: path.split('/').pop()!.replace(/\.prefab\.json$/, ''), type: 'prefab' };
-      const results: DeleteResult[] = [{ asset, snapshots: bytes === undefined ? [] : [snapshotFromBytes(path, new TextEncoder().encode(bytes))], deletePaths }];
       const del = await deleteAssetFiles(deletePaths);
       if (!del.ok) { st.note = 'delete did not complete'; return 'refused'; }
       const outcome = planDeleteOutcome(deletePaths, [path], del.failed);
       unbindDeletedAssetEditors(outcome.went);
-      pushAction(makeDeleteUndo(results, () => {}, { missing: del.missing, failed: del.failed }));
+      st.fileOp = { from: path, to: null };
       return 'done';
     }
     case 'renamePrefab': {
@@ -475,7 +474,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       const moved = await moveAsset(path, plan.toPath);
       if (!moved.ok) { st.note = `move refused: ${moved.error}`; return 'refused'; }
       applyAssetPathMoves([{ from: path, to: plan.toPath, name: plan.base }]);
-      pushAction(makeRenameUndo({ originalPath: path, originalName: path.split('/').pop()!.replace(/\.prefab\.json$/, ''), toPath: plan.toPath, newName: plan.base, refresh: () => {} }));
+      st.fileOp = { from: path, to: plan.toPath }; // no undo entry (#1868, owner ruling D2)
       return 'done';
     }
     case 'outsideEdit': {

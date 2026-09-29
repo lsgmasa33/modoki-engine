@@ -115,7 +115,7 @@ import { _resetSceneAdoptionForTests, beginWorldRequest } from '../../packages/m
 import { getPrefabRevision, invalidatePrefab } from '../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import { getGuidForPath } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
-import { undo, redo, canUndo, canRedo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo, canUndo, canRedo, undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -479,5 +479,33 @@ describe('the agent `prefab create` tags by the path the file LANDED on (#1753 F
     expect(r.ok).toBe(true);
     const under = getAllEntities().filter((e) => e.parentId === r.rootId).map((e) => e.name);
     expect(under, 'the new instance is v2').toContain('XV2');
+  });
+});
+
+/** #1868: an Assets Rename or delete is not undoable, so an Instantiate's redo can run after the file moved or went. */
+describe('an Instantiate\'s redo after an Assets Rename or delete (#1868)', () => {
+  const X2_PATH = '/assets/prefabs/X renamed.prefab.json';
+  it('after a Rename it finds the prefab by its guid and places it again', async () => {
+    // Mutation: `placedPrefabPath` returns the recorded path — the redo reads nothing there and places nothing.
+    expect(await quietly(() => placePrefabFromPath(X_PATH, { tag: 'T' }))).toBeTruthy();
+    expect(await quietly(() => undo())).toBe(true);
+    route.disk.set(X2_PATH, route.disk.get(X_PATH)!); route.disk.delete(X_PATH);
+    registerAsset(X, X2_PATH, 'prefab');
+    expect(await quietly(() => redo())).toBe(true);
+    expect(named('XR')).toHaveLength(1);
+  });
+
+  it('refuses when the name now holds ANOTHER prefab (the placed one deleted, another renamed onto it)', async () => {
+    // Mutation: drop `if (other) throw other;` from the respawn — an instance of the OTHER prefab is placed.
+    expect(await quietly(() => placePrefabFromPath(X_PATH, { tag: 'T' }))).toBeTruthy();
+    expect(await quietly(() => undo())).toBe(true);
+    const other = { ...xDoc(), id: 'cccccccc-0000-4000-8000-00000000f868', name: 'Other' } as PrefabFile;
+    (other.entities as Array<{ name: string }>)[0].name = 'OR';
+    route.disk.set(X_PATH, jsonFileBody(other));
+    unregisterAsset(X); // the delete's pruned manifest: X's guid names nothing now
+    const r = await quietly(() => undoStep('redo'));
+    expect(r.refused ?? r.failed?.error ?? '').toMatch(/holds another prefab now|was deleted/);
+    expect(named('OR')).toHaveLength(0);
+    expect(named('XR')).toHaveLength(0);
   });
 });

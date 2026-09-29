@@ -55,7 +55,7 @@ export function ShaderAssetView({ path }: { path: string }) {
     // Built BEFORE the park, and its undo/redo check the asset still holds their side (#1710) — see MaterialAssetView.
     const action = assetDocAction({
       label, path, type: 'shader', before: old, after: () => updated,
-      apply: (doc) => persistAssetEdit(path, 'shader', doc, invalidateShaderFile),
+      apply: (doc, p) => persistAssetEdit(p, 'shader', doc, invalidateShaderFile),
     });
     persistAssetEdit(path, 'shader', updated, invalidateShaderFile);
     pushAction(action); // _isFileDirect: parked, not scene state (persistAssetEdit)

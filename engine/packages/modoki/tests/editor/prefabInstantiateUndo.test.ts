@@ -28,7 +28,7 @@ beforeEach(() => { live.clear(); });
 
 // Console spies are restored in afterEach, NOT inline: a failing assertion skips the rest
 // of the body, so an inline restore never runs and console stays mocked for every later
-// test (the trap documented in assetUndo.test.ts).
+// test.
 let spies: Array<{ mockRestore: () => void }> = [];
 const spyError = () => {
   const s = vi.spyOn(console, 'error').mockImplementation(() => {});

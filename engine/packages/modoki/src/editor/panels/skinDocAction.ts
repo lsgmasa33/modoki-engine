@@ -14,7 +14,7 @@ export function skinDocAction(
 ): UndoAction {
   return assetDocAction<Rig2DFile>({
     label, path, type: 'rig2d', before, after: () => after, baseline,
-    apply: (d) => useEditorStore.getState().applySkinDef(path, d),
+    apply: (d, p) => useEditorStore.getState().applySkinDef(p, d),
   });
 }
 

@@ -1,7 +1,7 @@
 /** Assets — browse project assets by category or folder structure */
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { backendFetch, jsonFileBody, importedFileBytes } from '../backend/editorBackend';
+import { backendFetch, importedFileBytes } from '../backend/editorBackend';
 import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
@@ -11,7 +11,8 @@ import {
 import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { importModel } from '../scene/modelImport';
 import { needsGLBConversion, convertSourceToGLB } from '../scene/convertToGLB';
-import { readMetaPreferringPark } from '../scene/pendingMeta';
+import { readMetaPreferringPark, getPendingMetaPaths } from '../scene/pendingMeta';
+import { getDirtyAssetPaths } from '../scene/dirtyAssets';
 import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
 import { placePrefabFromPath } from '../scene/prefabPlace';
@@ -19,33 +20,32 @@ import { commitPrefabWrite } from '../scene/prefabCommit';
 import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 // Backend-IO wrappers + create-prefab flow shared with the Hierarchy panel
 // (editor-panels F6/F7) — single source of truth for the /api/* calls and the
-// "serialize entity → write prefab → tag instance → push undo" flow.
+// "serialize entity → write prefab → tag instance → push undo" flow. The FILE operations below push no undo
+// (#1868, owner ruling D2): a delete, rename, move, duplicate, paste, new folder or import changes disk at once and
+// Cmd+Z does not reach it — as in Unity, where a delete says "You cannot undo the delete assets action.".
 import {
   trashAssetFile, deleteAssetFiles as deleteAssets,
   describeRefusedDeletes, planDeleteOutcome,
   duplicateAssetFileReport as duplicateAsset, readPriorDocument, createAssetFolder, moveAsset, createPrefabFromEntity, readWritableAssetRoot,
   reimportTargets, planImports, writeDroppedImport, refreshHandlerTypes, HANDLER_TYPES,
-  deletionPathsFor, planRename, assetEditorHoldMessage,
+  deletionPathsFor, planRename, assetEditorHoldMessage, deleteConfirmText, deletionFootprint,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
 import { reportGestureRefusal, reportBackgroundRefusal, fileNameOf, refusedItemsText } from '../backend/refusalChannel';
 import { createStoreSelectionTracker, revealKeysFor } from './assetReveal';
-import {
-  makeDeleteUndo, makeDuplicateUndo,
-  makeRenameUndo, makeEmptyFolderDeleteUndo, makeNewFolderUndo, makeFolderRenameUndo,
-  makePasteUndo, makeFilesDropUndo, makeModelImportUndo, makeFileImportUndo, settledHashes, snapshotFromBytes,
-  type Snapshot, type DeleteResult, type DupResult, type PasteMove, type DropMove,
-} from './assetUndo';
 import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
 import { reimportAsset, reimportProblem } from './assetViews/reimportAsset';
 import { openAssetInEditor } from './openAssetInEditor';
-import { chooseNewAssetPath, confirmReplaceAsset } from '../utils/saveDialog';
+import { chooseNewAssetPath, confirmReplaceAsset, confirmInEditor } from '../utils/saveDialog';
 import { confirmDiscardUnsaved } from '../scene/unsavedGate';
 import { mayCreateOver } from '../scene/createAssetDocument';
 import { createRegisteredAssetAskingToReplace } from './createRegisteredAsset';
+
+/** Every path ONE asset's delete trashes — `collectDeletion`'s answer. */
+type DeleteTarget = { asset: AssetEntry; deletePaths: string[] };
 
 /** Display name from an asset path: last segment minus a known double/single extension. */
 function assetDisplayName(p: string, ext: string): string {
@@ -58,7 +58,7 @@ import { startDragGhost, endDragGhost, setAssetDragPayload, completeAssetDrop, a
 import {
   splitAssetPath, duplicatePathFor, pastePathIn, buildFolderTree, planAutoImports,
   effectiveAssetsRoot, collectFolderPaths, planFilesDropMoves, isFolderPath,
-  type AssetEntry, type FolderNode,
+  type AssetEntry, type FolderNode, type RelocateMove,
 } from '../utils/assetPaths';
 import { ASSET_TYPE_COLORS, AssetTypeGlyph, compareAssetTypes } from './assetTypeIcons';
 import {
@@ -256,10 +256,6 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     deleteEntity(rootId);
 
     if (prefab) {
-      const content = jsonFileBody(prefab);
-      // #308 follow-up A: the forward write was unchecked too (not just undo/redo) —
-      // pushing an undo entry for a prefab that was never actually written would make
-      // the resulting Cmd+Z trash a file that isn't there.
       // ONE step (#1692): only over what was read at the path, then both caches — so the instances placed from a
       // re-imported prefab are rebuilt from it now, not at the next reload.
       const committed = await commitPrefabWrite(prefabPath, prefab, { expected: previousContent ?? null });
@@ -268,10 +264,8 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
         // The commit's own reason when it has one (#1750: "a scene is still loading" refuses a write, and says so).
         console.error(`[Assets] Failed to create prefab ${prefabPath}${committed.error ? ` — ${committed.error}` : ''}`);
       } else {
+        // No undo entry (#1868, D2): an import is a file operation, and its prefab is a new asset saved on creation.
         console.log(`[Assets] Created prefab: ${prefabPath}`);
-        // Builder in assetUndo.ts (#308) — both directions now check the write/delete
-        // and report a failure instead of discarding it silently.
-        pushAction(makeModelImportUndo({ assetName, prefabPath, content, previousContent, onDone }));
       }
     }
 
@@ -298,7 +292,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 // re-checking "onto itself" / "into its own descendant" itself. #867 extracted those decisions
 // into `planFilesDropMoves`, which left two independent computations of one destination — they
 // agreed, but the day one grew a collision-suffix rule (as `pastePathIn` already has) the other
-// becomes a lie and `makeFilesDropUndo` moves back from a path the file is not at. Deleted; the
+// becomes a lie and the binding repair follows a path the file is not at. Deleted; the
 // drop loop calls `assetOps.moveAsset(from, to)` with the destination the planner derived.
 
 // Convertible model SOURCES (kept alongside the GLB they bake into). They share
@@ -1030,32 +1024,13 @@ export default function Assets() {
     setCtxMenu({ x: e.clientX, y: e.clientY, asset });
   }, [handleSelect, activate, selection]);
 
-  // Do all the disk work + optimistic UI removal for ONE asset, returning a
-  // descriptor (snapshots + generated set) so the caller can build undo/redo.
-  // No pushAction, no refresh here — callers coalesce those so a batch delete is
-  // a SINGLE undo entry and a SINGLE rescan, not one per file. Snapshot /
-  // DeleteResult / DupResult + the undo builders live in assetUndo.ts (F6).
-
   // Gather everything ONE asset's delete must touch — the file, its sidecar, and
-  // (for models) every generated mesh/material/texture + their sidecars — as
-  //   (a) undo snapshots, so undo restores the FULL set (not just the GLB);
-  //       otherwise a model delete + undo leaves every prefab/scene that
-  //       referenced the generated meshes/materials dangling, because the stable
-  //       guids lived inside JSON `id` fields and `.meta.json` sidecars the
-  //       delete also removed.
-  //   (b) a flat list of paths to trash.
+  // (for models) every generated mesh/material/texture + their sidecars — as a flat
+  // list of paths to trash.
   // Does NOT hit the trash backend or mutate UI — the caller aggregates across
   // the whole selection and fires a SINGLE trash request, so the OS plays one
   // trash sound, not one per file.
-  const collectDeletion = useCallback(async (asset: AssetEntry): Promise<DeleteResult | null> => {
-    const snapshots: Snapshot[] = [];
-    const snapshot = async (filePath: string): Promise<void> => {
-      try {
-        const res = await fetch(filePath);
-        if (!res.ok) return;
-        snapshots.push(snapshotFromBytes(filePath, new Uint8Array(await res.arrayBuffer())));
-      } catch { /* unreachable read — leave it out of the undo set */ }
-    };
+  const collectDeletion = useCallback(async (asset: AssetEntry): Promise<DeleteTarget> => {
 
     // For a model, the set also covers everything the import generated — read the
     // sidecar to find out what that was. A missing/unreadable meta just means the
@@ -1074,35 +1049,31 @@ export default function Assets() {
     }
 
     // WHICH paths a delete covers is decided by assetOps.deletionPathsFor (pure,
-    // unit-tested); this only performs the undo snapshots. The backend skips paths
-    // that no longer exist, so a maybe-absent sidecar in the list is harmless.
+    // unit-tested). The backend skips paths that no longer exist, so a maybe-absent
+    // sidecar in the list is harmless.
     const deletePaths = deletionPathsFor(asset.path, asset.type, generated);
     // Counts the generated FILES, not the sidecars they drag along — matches what
     // the meta actually lists.
     const generatedCount = (generated?.meshes?.length ?? 0) + (generated?.materials?.length ?? 0) + (generated?.textures?.length ?? 0);
     if (generatedCount > 0) console.log(`[Assets] Will clean up ${generatedCount} generated files for ${asset.name}`);
-    for (const p of deletePaths) await snapshot(p);
 
-    return { asset, snapshots, deletePaths };
+    return { asset, deletePaths };
   }, []);
 
-  // Build + push a single coalesced undo/redo for one or more completed
-  // deletes (builder in assetUndo.ts — F6).
-  const pushDeleteUndo = useCallback((results: DeleteResult[], notTrashed: { missing?: string[]; failed?: string[] } = {}) => {
-    pushAction(makeDeleteUndo(results, refresh, notTrashed));
-  }, [refresh]);
-
-  // Delete one or more assets in a SINGLE OS-trash call (one trash sound),
-  // coalesced into ONE undo entry (and, for batch, ONE rescan). `rescan` mirrors
-  // the original split: the single context-menu delete relies on the optimistic
-  // row removal below (no rescan), the batch path rescans to reconcile generated
-  // files the optimistic pass doesn't enumerate.
+  // Delete one or more assets in a SINGLE OS-trash call (one trash sound), and, for
+  // batch, ONE rescan. `rescan` mirrors the original split: the single context-menu
+  // delete relies on the optimistic row removal below (no rescan), the batch path
+  // rescans to reconcile generated files the optimistic pass doesn't enumerate.
+  // Asked first: a delete is not undoable (#1868, D2) — `deleteConfirmText`.
   const executeDeletion = useCallback(async (targets: AssetEntry[], rescan: boolean) => {
     if (targets.length === 0) return;
-    const results: DeleteResult[] = [];
-    for (const a of targets) { const r = await collectDeletion(a); if (r) results.push(r); }
-    if (results.length === 0) return;
+    // Collected BEFORE asking (reads only), so the question names what the delete drags along.
+    const results: DeleteTarget[] = [];
+    for (const a of targets) results.push(await collectDeletion(a));
     const allPaths = Array.from(new Set(results.flatMap((r) => r.deletePaths)));
+    const names = targets.map((a) => a.path);
+    const ask = deleteConfirmText(names, deletionFootprint(names, allPaths, [...getDirtyAssetPaths(), ...getPendingMetaPaths()]));
+    if (!await confirmInEditor(ask.title, ask.message, ask.okLabel)) return;
     const del = await deleteAssets(allPaths);
     // ⚠️ Report the refusal BEFORE branching on `ok` (#884). A total refusal is `ok:false` WITH
     // `failed` populated, so an early return that only logs "Delete failed" throws away the one
@@ -1127,8 +1098,7 @@ export default function Assets() {
     }
     if (!del.ok) return;
     // ⚠️ Everything below acts on what ACTUALLY went, not on what was requested. A file the OS
-    // refused is still on disk, so its row must stay, its editor must stay bound, and undo must
-    // not offer to restore it. The route already draws this line for its own half of the repair
+    // refused is still on disk, so its row must stay and its editor must stay bound. The route already draws this line for its own half of the repair
     // ("Unbinding an editor from a file that is still on disk would be the wrong direction") and
     // the panel used to undo that care by passing the full requested list to every step.
     const outcome = planDeleteOutcome(allPaths, results.map((r) => r.asset.path), del.failed);
@@ -1145,43 +1115,29 @@ export default function Assets() {
     // direction, which is the same call the route makes for its own half of this repair.
     unbindDeletedAssetEditors(outcome.went);
     console.log(`[Assets] Moved ${del.trashed} file(s) to trash`);
-    // `del.missing` is threaded into the undo so a later restore can tell a sidecar that was
-    // never on disk from a file it failed to bring back (#291). `del.failed` joins it for the
-    // same reason from the other side: those files never left, so an undo that "restores" them
-    // would report bringing back a file that never went away.
-    pushDeleteUndo(results, { missing: del.missing, failed: del.failed }); // ONE undo entry for the whole gesture
     if (rescan) refresh();   // ONE rescan, not one per file
-  }, [collectDeletion, pushDeleteUndo, refresh, selected, selectAsset]);
+  }, [collectDeletion, refresh, selected, selectAsset]);
 
   const handleDelete = useCallback(async (asset: AssetEntry) => {
     await executeDeletion([asset], false);
   }, [executeDeletion]);
 
-  // Do the disk work for ONE duplicate, returning a descriptor. No refresh /
-  // pushAction (callers coalesce). `taken` is threaded so a batch duplicate
-  // can't pick the same target path twice. (DupResult in assetUndo.ts — F6.)
-  const performDuplicate = useCallback(async (asset: AssetEntry, taken: Set<string>): Promise<DupResult | null> => {
+  // Do the disk work for ONE duplicate, answering whether it landed. No refresh
+  // (callers coalesce). `taken` is threaded so a batch duplicate can't pick the
+  // same target path twice.
+  const performDuplicate = useCallback(async (asset: AssetEntry, taken: Set<string>): Promise<boolean> => {
     const toPath = duplicatePathFor(asset.path, taken);
     const dup = await duplicateAsset(asset.path, toPath);
     // A human Duplicate of an asset with unsaved edits is refused by the route by design — say why (#1824, FA).
-    if (!dup.ok) { reportGestureRefusal(`Could not duplicate ${fileNameOf(asset.path)}: ${dup.error}`); return null; }
+    if (!dup.ok) { reportGestureRefusal(`Could not duplicate ${fileNameOf(asset.path)}: ${dup.error}`); return false; }
     taken.add(toPath);
     console.log(`[Assets] Duplicated ${asset.path} → ${toPath}`);
-    // The copy's hash rides into the undo, which trashes the copy only while it still holds these bytes (#1679).
-    return { asset, toPath, sha256: dup.sha256, sidecar: dup.sidecar };
+    return true;
   }, []);
 
-  // Build + push the coalesced duplicate undo (builder in assetUndo.ts — F6).
-  const pushDuplicateUndo = useCallback((results: DupResult[]) => {
-    pushAction(makeDuplicateUndo(results, refresh));
-  }, [refresh]);
-
   const handleDuplicate = useCallback(async (asset: AssetEntry) => {
-    const r = await performDuplicate(asset, new Set(assets.map((a) => a.path)));
-    if (!r) return;
-    refresh();
-    pushDuplicateUndo([r]);
-  }, [assets, performDuplicate, pushDuplicateUndo, refresh]);
+    if (await performDuplicate(asset, new Set(assets.map((a) => a.path)))) refresh();
+  }, [assets, performDuplicate, refresh]);
 
   // Rename an asset's file (keeps its folder + compound extension). The backend
   // moves the .meta.json sidecar alongside it, so the asset's GUID + import
@@ -1203,7 +1159,7 @@ export default function Assets() {
     console.log(`[Assets] Renamed ${asset.path} → ${toPath}`);
     // …and an open editor bound to it, or its next autosave FORKS the asset: the write goes
     // to the old path, re-creating the file you renamed away from, while the renamed file
-    // stops receiving edits (#186). Undo/redo remap back — they move the file too.
+    // stops receiving edits (#186).
     //
     // Repair the registry BEFORE selectAsset: selectAsset re-points the Inspector, and
     // AtlasAssetView's load effect is keyed on that path — it reads the parked entry to recover
@@ -1219,17 +1175,12 @@ export default function Assets() {
     // observed here either way. The reorder makes the invariant structural so it does not rest
     // on either.
     //
-    // ⚠️ This is also ONE move site of several. `pasteClipboard`'s cut branch, `handleFilesDrop`
-    // and `makeRenameUndo` all move files and never re-point the Inspector at all — see the
+    // ⚠️ This is also ONE move site of several. `pasteClipboard`'s cut branch and `handleFilesDrop`
+    // move files and never re-point the Inspector at all — see the
     // move-repair class issue #867. Ordering here does not make the selection correct there.
     applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]);
     if (selected === asset.path) { setSelected(toPath); selectAsset({ path: toPath, type: asset.type, name: safe }); }
     refresh();
-
-    // Undo/redo builder in assetUndo.ts (#308) — each direction gates the remap on the move
-    // actually happening AND reports a failure (toast only on a 409 collision) instead of
-    // discarding it silently.
-    pushAction(makeRenameUndo({ originalPath: asset.path, originalName: asset.name, toPath, newName: safe, refresh }));
   }, [assets, selected, selectAsset, refresh]);
 
   const commitRename = useCallback((asset: AssetEntry, newBase: string) => {
@@ -1252,14 +1203,12 @@ export default function Assets() {
     anchorRef.current = null;
   }, [selectAsset]);
 
-  // Delete a folder (to the OS trash) along with everything under it. Asset files in
-  // the subtree are snapshotted first so the delete is undoable (their restore recreates
-  // the dirs); an empty folder gets a simple recreate-on-undo. One trash call.
+  // Delete a folder (to the OS trash) along with everything under it, in one trash call. Asked
+  // first, like every delete: it is not undoable (#1868, D2).
   const handleDeleteFolder = useCallback(async (folderPath: string, folderName: string) => {
     if (folderPath === '/') return;
-    const inside = assets.filter((a) => a.path === folderPath || a.path.startsWith(folderPath + '/'));
-    const results: DeleteResult[] = [];
-    for (const a of inside) { const r = await collectDeletion(a); if (r) results.push(r); }
+    const ask = deleteConfirmText([folderPath], { folder: true, ...deletionFootprint([folderPath], [], [...getDirtyAssetPaths(), ...getPendingMetaPaths()], folderPath) });
+    if (!await confirmInEditor(ask.title, ask.message, ask.okLabel)) return;
     const trashed = await trashAssetFile(folderPath); // trashes files + the dir shell in one call
     // ⚠️ `ok` only became trustworthy in #884 — it was the HTTP status, and a folder the OS
     // refused answers 200, so this guard could not fire and the branch below pruned the tree,
@@ -1289,14 +1238,7 @@ export default function Assets() {
     applyAssetPathMoves([{ from: folderPath, to: null, prefix: true }]);
     clearSelection();
     refresh();
-    if (results.length > 0) {
-      pushDeleteUndo(results); // restoring the files recreates the folder
-    } else {
-      // Builder in assetUndo.ts (#308) — reports a failed recreate/re-delete instead of
-      // discarding it silently.
-      pushAction(makeEmptyFolderDeleteUndo({ folderPath, folderName, refresh }));
-    }
-  }, [assets, collectDeletion, pushDeleteUndo, clearSelection, refresh]);
+  }, [clearSelection, refresh]);
 
   // The AssetEntry objects currently selected (falls back to the active item).
   // Sprites are dropped — they have no file to act on (fileActionTargets, assetListing.ts).
@@ -1308,7 +1250,7 @@ export default function Assets() {
   }, [assets, selection, selected]);
 
   const deleteSelection = useCallback(async () => {
-    // ONE trash call → one trash sound; ONE undo entry; ONE rescan.
+    // ONE trash call → one trash sound; ONE rescan.
     await executeDeletion(selectedAssets(), true);
   }, [selectedAssets, executeDeletion]);
 
@@ -1316,12 +1258,10 @@ export default function Assets() {
     const targets = selectedAssets();
     if (targets.length === 0) return;
     const taken = new Set(assets.map((a) => a.path)); // grows as we go so targets stay unique
-    const results: DupResult[] = [];
-    for (const a of targets) { const r = await performDuplicate(a, taken); if (r) results.push(r); }
-    if (results.length === 0) return;
-    pushDuplicateUndo(results);
-    refresh();
-  }, [selectedAssets, assets, performDuplicate, pushDuplicateUndo, refresh]);
+    let landed = 0;
+    for (const a of targets) if (await performDuplicate(a, taken)) landed++;
+    if (landed > 0) refresh();
+  }, [selectedAssets, assets, performDuplicate, refresh]);
 
   // ── Cut / Copy / Paste ──────────────────────────────────────────────
   const copySelection = useCallback((op: 'copy' | 'cut') => {
@@ -1341,7 +1281,7 @@ export default function Assets() {
       const cutHeld = assetEditorHoldMessage(clipboard.paths);
       if (cutHeld) { useEditorStore.getState().showToast(cutHeld, 'warn'); return; }
     }
-    const done: PasteMove[] = [];
+    const done: RelocateMove[] = [];
     // Each item the route refused, with its reason (#1824): the loop used to skip them silently.
     const refused: string[] = [];
     for (const from of clipboard.paths) {
@@ -1352,9 +1292,8 @@ export default function Assets() {
         const moved = await moveAsset(from, to);
         if (moved.ok) done.push({ from, to }); else refused.push(`${fileNameOf(from)}: ${moved.error}`);
       } else {
-        // The copy's hash rides into the undo (`PasteMove.sha256`, #1679).
         const dup = await duplicateAsset(from, to);
-        if (dup.ok) done.push({ from, to, sha256: dup.sha256, sidecar: dup.sidecar });
+        if (dup.ok) done.push({ from, to });
         else refused.push(`${fileNameOf(from)}: ${dup.error}`);
       }
     }
@@ -1366,10 +1305,6 @@ export default function Assets() {
     // NEW file and leaves the original where it is, so nothing bound has moved.
     if (op === 'cut') applyAssetPathMoves(done.map(({ from, to }) => ({ from, to })));
     refresh();
-    // Builder in assetUndo.ts (#308) — as in handleRename, only the moves that actually
-    // landed may repoint a binding, and every skipped item is now reported as one message
-    // (was silently dropped one at a time).
-    pushAction(makePasteUndo({ op, done, refresh }));
   }, [clipboard, selected, assets, refresh]);
 
   // ── New Folder + folder rename ──────────────────────────────────────
@@ -1396,10 +1331,7 @@ export default function Assets() {
     });
     setViewMode('folder');
     setRenamingFolderPath(path); // immediately editable, Finder-style
-    // Builder in assetUndo.ts (#308) — setPendingFolders now only updates on success, and a
-    // failure is reported instead of discarded.
-    pushAction(makeNewFolderUndo({ path, refresh, setPendingFolders, setExpanded }));
-  }, [assets, pendingFolders, diskFolders, refresh]);
+  }, [assets, pendingFolders, diskFolders]);
 
   const commitFolderRename = useCallback(async (node: FolderNode, newName: string) => {
     setRenamingFolderPath(null);
@@ -1427,12 +1359,6 @@ export default function Assets() {
     applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]);
     clearSelection();
     refresh();
-    // Builder in assetUndo.ts (#308) — was the worst site: setPendingFolders ran
-    // UNCONDITIONALLY here, so a failed undo/redo desynced the client folder tree from disk
-    // (an active desync, not a no-op). Now gated on the move landing, `setExpanded` is
-    // remapped too (previously never remapped by undo/redo at all), and a failure is
-    // reported (toast only on a 409 collision).
-    pushAction(makeFolderRenameUndo({ oldPath, newPath, folderName: node.name, refresh }));
   }, [assets, pendingFolders, diskFolders, clearSelection, refresh]);
 
   // Smooth-scroll a path's row into view (after the tree commits).
@@ -1592,15 +1518,7 @@ export default function Assets() {
         if (problem) reportBackgroundRefusal(`[Assets] ${f.path} was imported but not converted: ${problem}`);
       }
     }
-    // The baseline the undo's precondition expects (#1679): a JSON file the scanner re-stamps is read back once that
-    // settles, so its undo does not mistake the stamp for an edit. Binaries keep their written bytes as the baseline.
-    const settled = await settledHashes(imported.map((f) => f.path));
     refresh();
-    // Builder in assetUndo.ts (#308) — every result in both loops used to be discarded,
-    // and undo unbound ALL N files regardless of which deletes actually landed; only the
-    // files that were really trashed are unbound now, and every failure in either
-    // direction is batch-reported as one message (like makePasteUndo/makeFilesDropUndo).
-    pushAction(makeFileImportUndo({ imported: imported.map((f) => ({ path: f.path, content: f.content, sha256: settled.get(f.path) })), refresh }));
   }, [assets, refresh, setImportStatus]);
 
   const handleDrop = useCallback(async (e: React.DragEvent, targetFolder?: string) => {
@@ -1647,8 +1565,7 @@ export default function Assets() {
 
   // File move handler: drag one or many assets (a multi-selection) between
   // folders. Illegal/no-op drops (onto its own folder, itself, or a subfolder)
-  // are skipped silently — they're mis-drops, not errors. Successful moves are
-  // bundled into a single undo entry.
+  // are skipped silently — they're mis-drops, not errors.
   const handleFilesDrop = useCallback(async (filePaths: string[], targetFolder: string) => {
     // The DECISION (which drops are skipped, where each lands, and whether it is a FOLDER move)
     // is pure and lives in `planFilesDropMoves`; only the awaited backend call stays here. A
@@ -1663,14 +1580,14 @@ export default function Assets() {
     // to undo than one that did not start. The backend refuses the move itself; this is the reason.
     const dropHeld = assetEditorHoldMessage(planned.map((m) => m.from));
     if (dropHeld) { useEditorStore.getState().showToast(dropHeld, 'warn'); return; }
-    const moves: DropMove[] = [];
+    const moves: RelocateMove[] = [];
     const refused: string[] = [];
     for (const m of planned) {
       // `moveAsset(from, TO)`, not `moveFile(from, FOLDER)`: the planner has already derived the
       // destination, and letting the mover derive its own would be two independent computations
       // of one value. They agree today; the day `moveFile` grows a collision-suffix rule (as
-      // `pastePathIn` already has) the planner's `to` silently becomes a lie, and
-      // `makeFilesDropUndo` would move back from a path the file is not at — the forking bug.
+      // `pastePathIn` already has) the planner's `to` silently becomes a lie, and the binding
+      // repair below would follow a path the file is not at — the forking bug.
       const moved = await moveAsset(m.from, m.to);
       if (!moved.ok) { refused.push(`${fileNameOf(m.from)}: ${moved.error}`); continue; }
       moves.push(m);
@@ -1683,12 +1600,6 @@ export default function Assets() {
     // (explicit-path) — which is exactly why the first sweep for this bug missed it.
     applyAssetPathMoves(moves);
     refresh();
-
-    // Builder in assetUndo.ts (#308) — same skip-every-item shape as pasteClipboard's cut
-    // branch, now reported as one message instead of dropped per-item. Explicit full paths
-    // (from/to) are already known, so the builder calls moveFileToStatus directly rather than
-    // re-deriving a destination from a folder.
-    pushAction(makeFilesDropUndo({ moves, refresh }));
   }, [refresh, pendingFolders, diskFolders, assets]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {

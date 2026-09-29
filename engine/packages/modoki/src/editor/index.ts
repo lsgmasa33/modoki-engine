@@ -159,7 +159,7 @@ export { createRegisteredAsset, ensureExt } from './panels/createRegisteredAsset
 /** The asset-move repair seam (#867). Exported so the agent op that the /api/move-file route
  *  calls back into can reach it — an out-of-process move (modoki_move_asset) has no other way
  *  to repair the renderer's path-keyed state. */
-export { applyAssetPathMoves, unbindDeletedAssetEditors } from './panels/assetEditorBindings';
+export { applyAssetPathMoves, unbindDeletedAssetEditors, getAssetFileOpVersion } from './panels/assetEditorBindings';
 export type { PathMove } from './utils/assetPaths';
 // The editor's own modals, for app-shell code that would otherwise reach for a native `alert`/`confirm` (#1594).
 export { alertInEditor, confirmInEditor } from './utils/saveDialog';
@@ -177,6 +177,7 @@ export { placeholderWriteRefusal, isMissingPrefabPlaceholder } from './undo/plac
 // prefab is live-only AND invisible to `hasUnsavedChanges()`, so the unsaved-work
 // guards let a later load_scene / scene-mutate hot-reload silently destroy it.
 export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
+export { placedPrefabPath, placedPrefabRefusal } from './scene/prefabPlace';
 
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
 export {

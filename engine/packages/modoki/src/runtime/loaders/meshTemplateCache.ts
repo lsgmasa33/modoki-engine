@@ -2545,7 +2545,7 @@ export function rekeyCachedPrefab(from: string, to: string, prefix = false): num
  *  Assets delete is the editor's own write, so the watcher never evicted, and a reload of the owning scene (which acquires
  *  before it releases) re-expanded the deleted prefab from this entry — the editor showed a live instance where a cold
  *  start shows a Missing Prefab placeholder. Owners stay, as `invalidatePrefab` leaves them: the scene still references
- *  the prefab, and an undo that puts the file back fetches it again ({@link refetchOwnedPrefab}). Idempotent: every
+ *  the prefab, so its next load fetches the file again if it is back. Idempotent: every
  *  repair pass may call it. Returns how many keys it evicted. */
 export function evictDeletedPrefabs(from: string, prefix = false): number {
   if (!from) return 0;
@@ -2557,17 +2557,6 @@ export function evictDeletedPrefabs(from: string, prefix = false): number {
     n++;
   }
   return n;
-}
-
-/** A prefab file an undo or redo PUT BACK at `path` (#1834): a scene that owns it, with no entry and nothing in flight,
- *  fetches it again now, or every synchronous reader (a `UIEntries` pool) stays blank until the next scene load (#1308).
- *  The delete evicted it ({@link evictDeletedPrefabs}), and the restore is the editor's own write, which no watcher
- *  refresh follows. Called by the one restore owner, `reannounceRestoredFiles`. */
-export function refetchOwnedPrefab(path: string): void {
-  // A load between the delete and the restore (a reload of the owning scene) remembered the 404, and a remembered failure
-  // blocks `fetchPrefab` until the prefab is invalidated: the file is back, so the memo is wrong now.
-  prefabFailures.forget(path);
-  if (!prefabCache.has(path) && prefabOwners.get(path)?.size && !prefabLoadPromises.has(path)) void fetchPrefab(path);
 }
 
 function fetchPrefab(prefabPath: string): Promise<void> {

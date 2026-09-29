@@ -14,7 +14,7 @@ import { clearOverlays } from '../../packages/modoki/src/editor/input/focusScope
  *  counters a drop moves — a fixture that moved all three together could not tell the fixed code
  *  from the broken code. */
 function counters() {
-  const n = { stack: 0, assets: 0, world: 0 };
+  const n = { stack: 0, assets: 0, world: 0, files: 0 };
   return {
     witness: ((): EditWitness => ({ ...n })) as () => EditWitness,
     bump(...which: (keyof typeof n)[]) { for (const k of which) n[k] += 1; },
@@ -174,7 +174,7 @@ describe('performDomDnd', () => {
       const res = await performDomDnd({ from: { selector: '#src' }, to: { selector: '#dst' } }, { witness });
       expect(res.accepted).toBe(true);      // the target WAS willing to take this type
       expect(res.committed).toBe(false);    // ...and then did nothing with it
-      expect(res.warning).toMatch(/NEITHER the undo stack NOR the parked-asset registry moved/i);
+      expect(res.warning).toMatch(/NEITHER the undo stack NOR the parked-asset registry NOR the Assets file ops moved/i);
       expect(res.warning).toMatch(/verify with get_scene_state/i); // tells the caller what to do next
     });
 
@@ -231,7 +231,7 @@ describe('performDomDnd', () => {
       const dst = document.createElement('div'); dst.id = 'd3';
       place(src, 0, 0); place(dst, 100, 0);
       let probed = 0;
-      const res = await performDomDnd({ from: { selector: '#s3' }, to: { selector: '#d3' } }, { witness: () => { probed++; return { stack: 0, assets: 0, world: 0 }; } });
+      const res = await performDomDnd({ from: { selector: '#s3' }, to: { selector: '#d3' } }, { witness: () => { probed++; return { stack: 0, assets: 0, world: 0, files: 0 }; } });
       expect(res.ok).toBe(false);
       expect(res.committed).toBeUndefined();
       expect(probed).toBe(1); // the "before" read only; never re-probed
@@ -375,6 +375,16 @@ describe('performDomDnd', () => {
       expect(res.committedTo).toBe('scene');
     });
 
+    it('an Assets FILE move commits — no undo entry, no park, only the file-op counter (#1868)', async () => {
+      // A file op is not undoable (owner ruling D2), so it moves neither the stack nor the registry: without the fourth
+      // counter a real file drag read as "probably did nothing". Mutation: drop `files` from `committed` — false.
+      const { witness } = scene(['files']);
+      const res = await drop(witness);
+      expect(res.committed).toBe(true);
+      expect(res.committedTo).toBe('asset-file');
+      expect(res.warning).toBeUndefined();
+    });
+
     it('still reports the no-op when NOTHING moves — the warning did not become unreachable', async () => {
       // The half that must survive: a fix that reports every drop as committed would silence the
       // real false-success this warning exists for (#260's texture-on-a-Hierarchy-row).
@@ -382,7 +392,7 @@ describe('performDomDnd', () => {
       const res = await drop(witness);
       expect(res.committed).toBe(false);
       expect(res.committedTo).toBeUndefined();
-      expect(res.warning).toMatch(/NEITHER the undo stack NOR the parked-asset registry moved/);
+      expect(res.warning).toMatch(/NEITHER the undo stack NOR the parked-asset registry NOR the Assets file ops moved/);
     });
   });
 
@@ -467,9 +477,9 @@ describe('performDomDnd', () => {
       const cover = document.createElement('div');
       cover.setAttribute('data-ui-id', 'modal.scrim');
       place(cover, 95, -5, 30, 30);
-      const res = await performDomDnd({ from: { selector: '#bs' }, to: { selector: '#bd' } }, { witness: () => ({ stack: 7, assets: 7, world: 7 }) });
+      const res = await performDomDnd({ from: { selector: '#bs' }, to: { selector: '#bd' } }, { witness: () => ({ stack: 7, assets: 7, world: 7, files: 7 }) });
       expect(res.warning).toMatch(/NOT ONE A HUMAN COULD PERFORM/);
-      expect(res.warning).toMatch(/NEITHER the undo stack NOR the parked-asset registry moved/);
+      expect(res.warning).toMatch(/NEITHER the undo stack NOR the parked-asset registry NOR the Assets file ops moved/);
     });
 
     /** A COORDINATE aim matched nothing by name, so there is nothing for it to be occluded
@@ -487,7 +497,7 @@ describe('performDomDnd', () => {
       placeInvisible(dst, 400, 0);          // resolves by selector; hit-test sees nothing there
       src.addEventListener('dragstart', (e) => (e as DragEvent).dataTransfer!.setData('application/editor-asset', '/p.prefab.json'));
       dst.addEventListener('dragover', (e) => e.preventDefault());
-      const res = await performDomDnd({ from: { selector: '#is' }, to: { selector: '#id2' } }, { witness: () => ({ stack: 1, assets: 1, world: 1 }) });
+      const res = await performDomDnd({ from: { selector: '#is' }, to: { selector: '#id2' } }, { witness: () => ({ stack: 1, assets: 1, world: 1, files: 1 }) });
       expect(res.to.occluded).toBe(true);
       expect(res.warning).toMatch(/off-window or clipped away/);
       expect(res.warning).not.toMatch(/covered by null/);

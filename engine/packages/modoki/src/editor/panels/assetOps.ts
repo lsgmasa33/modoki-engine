@@ -33,7 +33,6 @@ import { frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
 import { firstAssetRoot } from './assetRoots';
 import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
-import { isTextAsset } from './assetUndo';
 import { flushPendingMetaFor } from '../scene/pendingMeta';
 import { existingAssetPath } from '../scene/createAssetDocument';
 
@@ -104,8 +103,7 @@ export function planImports(
   });
 }
 
-/** Write one dropped file's bytes to the `dest` {@link planImports} chose — only into an EMPTY path (#1784), as the
- *  import's redo already writes (`assetUndo.ts`). `dest` was planned against the panel's in-memory listing, not the
+/** Write one dropped file's bytes to the `dest` {@link planImports} chose — only into an EMPTY path (#1784). `dest` was planned against the panel's in-memory listing, not the
  *  disk, so a file that landed there since (another import, an agent, a `git pull`) was otherwise overwritten with no
  *  word. `'taken'` is that case: the file there is left as it is. A `'failed'` carries the route's reason (#1811). */
 export async function writeDroppedImport(dest: string, base64: string): Promise<{ result: 'ok' | 'taken' } | { result: 'failed'; error: string }> {
@@ -115,17 +113,70 @@ export async function writeDroppedImport(dest: string, base64: string): Promise<
 
 // ── Delete / rename policy (pure — the IO lives in the panel) ─────────
 
-/** Every path a delete of `assetPath` must remove, in restore order.
+// Extensions we know are UTF-8 text, which carry their GUID inline and so have no `.meta.json` sidecar. Everything
+// else is a binary with a sidecar pair (`sidecarsFor`).
+const TEXT_ASSET_EXTS = ['.json', '.txt', '.md', '.ts', '.tsx', '.js', '.jsx', '.css', '.html', '.svg', '.glsl', '.wgsl'];
+
+export function isTextAsset(p: string): boolean {
+  const lower = p.toLowerCase();
+  return TEXT_ASSET_EXTS.some((ext) => lower.endsWith(ext));
+}
+
+/** How many paths the delete confirm names before it says "and N more" — the dialog is a question, not a listing. */
+const DELETE_CONFIRM_LISTED = 8;
+
+/** The question every Assets-panel delete asks FIRST, because a delete is not undoable (#1868, owner ruling D2).
+ *  Unity asks the same before `ProjectWindowUtil.DeleteAssets`, and its last line is Unity's own wording. The files
+ *  still go to the OS Trash, which is where a human gets one back — the dialog says so, since that is the only way.
+ *  `paths` are what the gesture names (the selection, or the folder). What it drags along is said too, since none of
+ *  it comes back from the editor either: a folder's contents (`folder`), a model's generated meshes, materials and
+ *  textures (`generated`, a count), and the unsaved edits parked for anything that goes (`unsaved`), which are
+ *  discarded. */
+export function deleteConfirmText(
+  paths: readonly string[],
+  opts: { folder?: boolean; generated?: number; unsaved?: readonly string[] } = {},
+): { title: string; message: string; okLabel: string } {
+  const many = paths.length !== 1;
+  const listed = paths.slice(0, DELETE_CONFIRM_LISTED);
+  const more = paths.length - listed.length;
+  const list = listed.join('\n') + (more > 0 ? `\n…and ${more} more` : '');
+  const goes = opts.folder ? 'The folder and everything inside it go to the Trash.' : `${many ? 'They go' : 'It goes'} to the Trash.`;
+  const generated = opts.generated
+    ? ` So ${opts.generated === 1 ? 'does 1 file' : `do ${opts.generated} files`} generated on import (meshes, materials, textures).`
+    : '';
+  const unsaved = opts.unsaved?.length
+    ? `\n\nUnsaved edits to ${opts.unsaved.length === 1 ? opts.unsaved[0] : `${opts.unsaved.length} assets (${opts.unsaved.slice(0, 3).join(', ')}${opts.unsaved.length > 3 ? ', …' : ''})`} are discarded.`
+    : '';
+  return {
+    title: opts.folder ? 'Delete selected folder?' : many ? `Delete ${paths.length} selected assets?` : 'Delete selected asset?',
+    message: `${list}\n\n${goes}${generated}${unsaved}\n\nYou cannot undo the delete assets action.`,
+    okLabel: 'Move to Trash',
+  };
+}
+
+/** What a delete of `targets` drags along that the confirm must name (#1868): the files it trashes beyond the targets
+ *  and their sidecars — a model's generated products — and the unsaved edits parked under anything it trashes. */
+export function deletionFootprint(
+  targets: readonly string[], trashed: readonly string[], parked: readonly string[], folder?: string,
+): { generated: number; unsaved: string[] } {
+  const own = new Set(targets);
+  const generated = trashed.filter((p) => !own.has(p) && !/\.meta(\.local)?\.json$/.test(p)).length;
+  const gone = new Set(trashed);
+  const under = (p: string) => gone.has(p) || own.has(p) || (!!folder && (p === folder || p.startsWith(`${folder}/`)));
+  return { generated, unsaved: [...new Set(parked)].filter(under) };
+}
+
+/** Every path a delete of `assetPath` must remove.
  *
  *  This is the sidecar rule, and it has already been wrong once: the `.meta.json`
- *  of a binary asset used to be snapshotted for undo but never trashed, leaving an
+ *  of a binary asset used to be snapshotted but never trashed, leaving an
  *  orphaned sidecar on disk after every binary/model delete. Extracted from
  *  `Assets.tsx`'s `collectDeletion` (#105 Phase 3) so the rule is checkable without
  *  standing up fetch + the backend.
  *
- *  - The asset itself always goes first, so an undo restores in the original order.
+ *  - The asset itself always goes first.
  *  - A BINARY asset also drops BOTH sidecar halves: the committed `.meta.json`
- *    (GUID + import settings — both dangle if lost across a delete/undo) and the
+ *    (GUID + import settings) and the
  *    gitignored `.meta.local.json` (this machine's byte-stats; see
  *    `engine/plugins/meta-sidecar.ts`). Missing the local half left a file on disk
  *    after every delete, forever — invisible to `git status` because it is
@@ -187,7 +238,7 @@ export function planRename(
 
 /** Write a text or base64-encoded file via /api/write-file. Re-exported from `editorBackend` —
  *  the ONE client write wrapper (#835) — so the many existing `from './assetOps'` importers
- *  (assetUndo.ts, createRegisteredAsset.ts, scene/skinPrefab.ts, Assets.tsx) need no change. */
+ *  (createRegisteredAsset.ts, scene/skinPrefab.ts, Assets.tsx) need no change. */
 export { writeAssetFile };
 
 /** Split a completed delete into what ACTUALLY went and what is still on disk (#884) — the
@@ -717,10 +768,7 @@ export async function createPrefabFromEntity(
     // cache + the live tree's instance tagging only follow if it landed (#308). A CREATE's undo writes no file at all
     // (#1795: it unlinks and leaves the prefab), and its redo writes one only where the file was deleted since.
     //
-    // That differs from makeDeleteUndo, which deliberately restores what it can and
-    // reports the shortfall — and the difference is the unit of work, not a
-    // disagreement. There, undo covers N INDEPENDENT files and partial progress is
-    // genuinely useful. Here it is ONE coupled operation: the .prefab.json and the
+    // It is ONE coupled operation: the .prefab.json and the
     // entities linked to it. Half-applying that leaves the user in a state that is
     // neither before nor after — entities un-linked from a prefab still on disk, or
     // linked to one that is not. Refusing cleanly and saying so is the honest answer.

@@ -123,7 +123,7 @@ export default function CleanupAssetsDialog() {
       // ⚠️ `.meta.local.json` is not optional here. It was omitted until 2026-08-22, so every
       // cleanup left the local sidecar orphaned on disk — the file the scan had just called
       // unreachable kept a companion nothing would ever collect again. `sidecarsFor()`
-      // (assetOps.ts) has always named both, and `assetUndo.ts` deletes both; this route was the
+      // (assetOps.ts) has always named both, and the Assets panel's delete trashes both; this route was the
       // one that hand-rolled its own list and drifted from them.
       // Deliberately NOT routed through `deletionPathsFor()` despite it owning this rule: that
       // helper skips sidecars for text assets (`isTextAsset`), and real `.json` assets DO carry a

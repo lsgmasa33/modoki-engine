@@ -66,25 +66,15 @@ async function setupNest(f: Fixture): Promise<void> {
  *    frame of a missing prefab unexpanded (#1790 ruling D: the loader records the row and spawns nothing under it), so
  *    the entities the stack recorded inside it are gone rather than placeholders: `require` refuses them the same way
  *    ("is no longer in the scene"), and it is the same ruling (#1849; work-ai3 hunt seeds 6191, 6356).
- *  - `renameCollision`: a Rename's undo or redo found its destination held by a document a Create Prefab wrote. Create
- *    Prefab's undo LEAVES its file (#1795, hub ruling (i), Unity), so a prefab created at the name a rename freed still
- *    holds that path when the rename is undone; the step REFUSES, naming the taken path, and moves nothing
- *    (`makeRenameUndo`, 409, `destinationTakenRefusal`), so the walk cannot restore the rename (hunt seed 6029). Only
- *    when the destination holds a create's document: a collision with anything else is not this cause, and fails as the
- *    refusal in a clean segment it is. */
-export type TaintCause = 'outsideEdit' | 'prefabEditSave' | 'rulingR' | 'renameCollision';
-
-/** A Rename step's collision refusal (`makeRenameUndo`'s `destinationTakenRefusal`): group 1 is the destination. */
-const RENAME_COLLISION = /^\[undo\] (?:Undo|Redo) of "Rename [^"]*" was REFUSED — .* was not moved: another file now holds "([^"]+)"/;
-/** Whether one of `lines` is a Rename collision whose destination holds a document a Create Prefab wrote (`created`). */
-export function collidedWithCreated(lines: readonly string[], be: Pick<FuzzBackend, 'snapshot'>, created: readonly string[]): boolean {
-  const files = be.snapshot();
-  return lines.some((l) => {
-    const dest = RENAME_COLLISION.exec(l)?.[1];
-    const text = dest ? files.get(dest) : undefined;
-    return text !== undefined && created.some((made) => prefabTextIsDocument(text, JSON.parse(made) as PrefabFile));
-  });
-}
+ *  - `assetDelete`: a Move to Trash of a prefab something the walk must restore still REFERENCES — the scene at the
+ *    segment's start or now, or a prefab file then or now (`trashedPrefabReferenced`). It is not undoable (#1868, owner
+ *    ruling D2; Unity: "You cannot undo the delete assets action."), so the file stays gone for the walk, and the stack's
+ *    entries recorded against it (a respawn from it, a rebuild onto it) refuse after it by the same rule as `rulingR`. A
+ *    trash of a prefab nothing references only leaves the baseline (`rebaseForFileOp`), and every check stays on. A
+ *    RENAME is never a taint: a scene names a prefab by guid, so the runner only moves the path in the baseline.
+ *    ⚠️ Known limit: a prefab only the undo/redo STACK names (placed, then undone, then trashed) is not seen, so its
+ *    redo's refusal reads as one in a clean segment — a false finding a hunt would show, never a hidden one. */
+export type TaintCause = 'outsideEdit' | 'prefabEditSave' | 'rulingR' | 'assetDelete';
 
 interface Segment { scene: unknown; prefabs: Map<string, string>; tainted: TaintCause | null }
 
@@ -105,6 +95,23 @@ const prefabBytes = (be: FuzzBackend) => new Map([...be.snapshot()].filter(([p])
 
 async function segmentHere(be: FuzzBackend): Promise<Segment> {
   return { scene: editing() ? null : await serializeScene(), prefabs: prefabBytes(be), tainted: null };
+}
+
+/** An Assets file op leaves undo (#1868, owner ruling D2), so the walk to the segment's start cannot put it back: the
+ *  baseline takes it instead. A trash drops the path, a rename moves the bytes to the new path. */
+/** Does anything the walk to the segment's start must restore name the trashed prefab — by its guid (the document's
+ *  `id`) or its path? `texts`: the scene at the segment's start and now, and every prefab file then and now. */
+export function trashedPrefabReferenced(bytes: string | undefined, path: string, texts: Iterable<string>): boolean {
+  let id: string | undefined;
+  try { id = bytes ? (JSON.parse(bytes) as { id?: string }).id : undefined; } catch { /* unreadable: by path only */ }
+  for (const t of texts) if (t.includes(path) || (id && t.includes(id))) return true;
+  return false;
+}
+
+export function rebaseForFileOp(prefabs: Map<string, string>, op: { from: string; to: string | null }): void {
+  const text = prefabs.get(op.from);
+  prefabs.delete(op.from);
+  if (op.to !== null && text !== undefined) prefabs.set(op.to, text);
 }
 
 /** A restored prefab file is the document it held, except for the localId high-water mark: a restore that must raise
@@ -135,11 +142,9 @@ async function undoIdentity(be: FuzzBackend, seg: Segment, tolerate: Tolerate, c
   if (editing()) return null;
   const end = { scene: await serializeScene(), prefabs: prefabBytes(be) };
   let steps = 0;
-  const collided = () => { if (!seg.tainted && collidedWithCreated(consoleErrors, be, created)) taint(seg, 'renameCollision'); };
   for (; steps < 400; steps++) {
     const r = await undoStep('undo');
     await settle();
-    collided();
     if (r.failed && !r.failed.refused) return { check: 'undo threw', detail: `${r.failed.label}: ${r.failed.error}` };
     if (r.refused || r.failed) {
       if (seg.tainted) { skipped(seg, 'undo refusal forgiven (rest of the walk not run)'); return null; }
@@ -160,7 +165,6 @@ async function undoIdentity(be: FuzzBackend, seg: Segment, tolerate: Tolerate, c
   for (let i = 0; i < steps; i++) {
     const r = await undoStep('redo');
     await settle();
-    collided();
     if (r.failed && !r.failed.refused) return { check: 'redo threw', detail: `${r.failed.label}: ${r.failed.error}` };
     if (r.refused || r.failed) {
       if (seg.tainted) { skipped(seg, 'redo refusal forgiven (rest of the walk not run)'); return null; }
@@ -216,6 +220,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     st.note = undefined;
     st.roundTrip = undefined;
     st.prefabEditSaved = undefined;
+    st.fileOp = undefined;
     let outcome: string;
     try {
       outcome = await execute(op, st);
@@ -239,8 +244,6 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     trace.push(`${i}: ${label} → ${outcome}${st.note ? ` (${st.note})` : ''}${raised.length ? ` [watcher: ${raised.join(', ')}]` : ''}`);
 
     const logged = consoleErrors.splice(0);
-    // Before the clean-segment refusal check below: the collision IS the refusal that check would report.
-    if (collidedWithCreated(logged, be, st.created!)) taint(seg, 'renameCollision');
     const errors = logged.filter((m, k, all) => !opts.expectedError(m, all[k - 1]));
     if (errors.length) return fail(i, label, { check: 'console.error', detail: errors[0].slice(0, 300) });
 
@@ -291,6 +294,17 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
 
     if (op.kind === 'outsideEdit' && outcome === 'done') taint(seg, 'outsideEdit');
     if (op.kind === 'prefabEdit' && outcome === 'done' && st.prefabEditSaved) taint(seg, 'prefabEditSave');
+    // Read back through the declared type, as `roundTrip` above: the reset narrows it to undefined, and `execute` sets it.
+    const fileOp = st.fileOp as RunState['fileOp'];
+    if (fileOp) {
+      const trashedBytes = fileOp.to === null ? (seg.prefabs.get(fileOp.from) ?? before.get(fileOp.from)) : undefined;
+      rebaseForFileOp(seg.prefabs, fileOp);
+      if (fileOp.to === null && !seg.tainted) {
+        const texts = [JSON.stringify(seg.scene ?? null), editing() ? '' : JSON.stringify(await serializeScene()),
+          ...seg.prefabs.values(), ...[...be.snapshot()].filter(([k]) => k.endsWith('.prefab.json')).map(([, t]) => t)];
+        if (trashedPrefabReferenced(trashedBytes, fileOp.from, texts)) taint(seg, 'assetDelete');
+      }
+    }
     // A raise got here only as the outside edit's own (checked above), which tainted the segment as `outsideEdit`.
     // The stack was reset (a reload, a scene open): a new segment starts here.
     if (op.kind !== 'undo' && undoDepth() === 0 && !canRedo()) seg = await segmentHere(be);

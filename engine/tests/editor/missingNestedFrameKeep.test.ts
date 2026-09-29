@@ -19,14 +19,12 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
   },
 }));
 import { getTraitByName, getAllEntities } from '@modoki/engine/runtime';
-import { pushAction } from '@modoki/engine/editor';
 import { makeFuzzBackend } from './prefabFuzz/backend';
-import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, type Fixture } from './prefabFuzz/harness';
+import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, type Fixture } from './prefabFuzz/harness';
 import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/editor/panels/assetOps';
-import { makeDeleteUndo, snapshotFromBytes, type DeleteResult } from '../../packages/modoki/src/editor/panels/assetUndo';
 import { unbindDeletedAssetEditors } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
-import { getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, revertRefusal, instantiatePrefabInstance, reexpandRestoredRows } from '../../packages/modoki/src/editor/scene/prefab';
-import { unregisterAsset, getGuidForPath } from '../../packages/modoki/src/runtime/loaders/assetManifest';
+import { getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, revertRefusal, instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefab';
+import { unregisterAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyTargetOptions } from '../../packages/modoki/src/editor/scene/prefabApplyOptions';
 import { initialTargets, toApplyTargets } from '../../packages/modoki/src/editor/panels/applyDialogModel';
@@ -35,7 +33,6 @@ import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/r
 import { writeTraitFieldWithUndo, applyReparent } from '../../packages/modoki/src/editor/undo/entityActions';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
-import { reannounceRestoredFiles } from '../../packages/modoki/src/editor/panels/assetRestore';
 import { commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { readTraitData } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -74,16 +71,17 @@ function nestedQ(f: Fixture, root: number): { qr: number; m: number } {
 }
 const tx = (id: number, field: string) => (readTraitData(id, getTraitByName('Transform')!) as Record<string, number> | null)?.[field];
 
-/** `Assets.tsx`'s `executeDeletion` of Q, as the fuzzer's `trashPrefab` op runs it. */
+/** `Assets.tsx`'s `executeDeletion` of Q, as the fuzzer's `trashPrefab` op runs it: no undo entry (#1868, D2). */
 async function trashQ(f: Fixture): Promise<void> {
   const path = f.prefabs.Q.path;
-  const bytes = be.read(path)!;
   const deletePaths = deletionPathsFor(path, 'prefab', null);
+  const before = be.snapshot();
   const del = await deleteAssetFiles(deletePaths);
   if (!del.ok) throw new Error('trash of Q did not complete');
   unbindDeletedAssetEditors([path]);
-  const results: DeleteResult[] = [{ asset: { path, name: 'Q', type: 'prefab' }, snapshots: [snapshotFromBytes(path, new TextEncoder().encode(bytes))], deletePaths }];
-  pushAction(makeDeleteUndo(results, () => {}, { missing: del.missing, failed: del.failed }));
+  // The watcher's pass after it, as the fuzzer runs one after every op: the delete is the editor's own, so it raises
+  // nothing, and a later outside write to the path (a hand restore) is then raised as one.
+  await flushWatcher(be, before);
   await settle();
 }
 
@@ -193,36 +191,15 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
       { localId: 1, name: 'QR', nodeGuid: `eeeeeeee-0000-4000-8001-${f.sceneGuid.split('-').pop()}`, traits: { EntityAttributes: { name: 'QR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },
       { localId: 2, name: 'M', nodeGuid: `eeeeeeee-0000-4000-8002-${f.sceneGuid.split('-').pop()}`, traits: { EntityAttributes: { name: 'M', parentId: 1, guid: '' }, Transform: { x: 1, y: 0, z: 0 } } },
     ] }, null, 2);
+    // Put back by hand (from the OS Trash — an Assets delete is not undoable, #1868 D2): an outside write, which the
+    // watcher raises.
+    const before = be.snapshot();
     be.write(f.prefabs.Q.path, `${bytes}\n`);
-    // The restore owner every undo that puts a file back runs (#1844): the manifest, and the loader forgetting the 404 the
-    // reload above remembered.
-    expect((await reannounceRestoredFiles([f.prefabs.Q.path])).ok).toBe(true);
+    await flushWatcher(be, before);
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
     expect(qFrameGuids(f).length).toBe(4);
     expect([...unexpandedRows()]).toEqual([]);
-    expect(tx(nestedQ(f, p1(f)).m, 'x')).toBe(4);
-  });
-
-  it('#1864: a restore re-expands in place, with no reload, every frame that recorded the prefab\'s row as unexpanded', async () => {
-    // Mutation: drop the `reexpandRestoredRows` call from `reannounceRestoredFiles` — the rows stay unexpanded and empty.
-    const f = await editTrashApply('reexpand-restore', true);
-    const saved = qFrameGuids(f);
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
-    await settle();
-    expect(qFrameGuids(f)).toEqual([]);
-    expect([...unexpandedRows()].length).toBe(2);
-    const tag = f.sceneGuid.split('-').pop();
-    be.write(f.prefabs.Q.path, `${JSON.stringify({ id: f.prefabs.Q.guid, version: 5, name: 'Q', rootLocalId: 1, entities: [
-      { localId: 1, name: 'QR', nodeGuid: `eeeeeeee-0000-4000-8001-${tag}`, traits: { EntityAttributes: { name: 'QR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },
-      { localId: 2, name: 'M', nodeGuid: `eeeeeeee-0000-4000-8002-${tag}`, traits: { EntityAttributes: { name: 'M', parentId: 1, guid: '' }, Transform: { x: 1, y: 0, z: 0 } } },
-    ] }, null, 2)}\n`);
-    expect((await reannounceRestoredFiles([f.prefabs.Q.path])).ok).toBe(true);
-    await settle();
-    expect([...unexpandedRows()]).toEqual([]);
-    // The same entities the save recorded, by guid: the scene's rows for the frame came back with it.
-    expect(qFrameGuids(f)).toEqual(saved);
     expect(tx(nestedQ(f, p1(f)).m, 'x')).toBe(4);
   });
 
@@ -300,28 +277,6 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
       expect(getAllEntities().find((e) => e.id === now.qr)!.parentId).toBe(back ? p1(f) : member(p1(f), 'B'));
     });
   }
-
-  it('#1864: the restore finds a guid-named row even when the manifest has no guid for the file (a failed rescan)', async () => {
-    // Mutation: drop the read by path in `reexpandRestoredRows` (`getPrefabSource(p)`, whose read registers the file's own guid)
-    // — the row names Q by a guid nothing maps, and nothing is found.
-    const f = await editTrashApply('reexpand-noguid', true);
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
-    await settle();
-    expect([...unexpandedRows()].length).toBe(2);
-    const tag = f.sceneGuid.split('-').pop();
-    be.write(f.prefabs.Q.path, `${JSON.stringify({ id: f.prefabs.Q.guid, version: 5, name: 'Q', rootLocalId: 1, entities: [
-      { localId: 1, name: 'QR', nodeGuid: `eeeeeeee-0000-4000-8001-${tag}`, traits: { EntityAttributes: { name: 'QR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },
-      { localId: 2, name: 'M', nodeGuid: `eeeeeeee-0000-4000-8002-${tag}`, traits: { EntityAttributes: { name: 'M', parentId: 1, guid: '' }, Transform: { x: 1, y: 0, z: 0 } } },
-    ] }, null, 2)}\n`);
-    // The manifest as a pruning rescan after the delete left it: no entry for Q, as when the restore's own rescan fails.
-    unregisterAsset(f.prefabs.Q.guid);
-    expect(getGuidForPath(f.prefabs.Q.path)).toBeFalsy(); // precondition
-    await reexpandRestoredRows([f.prefabs.Q.path]);
-    await settle();
-    expect([...unexpandedRows()]).toEqual([]);
-    expect(qFrameGuids(f).length).toBe(4);
-  });
 
   it('a kept frame goes when the rebuilt row now names ANOTHER missing prefab, even with both guids pruned', async () => {
     // Mutation: compare `resolveRef` of the two refs unguarded in `seatKeptFrames` — both pruned, `undefined === undefined`

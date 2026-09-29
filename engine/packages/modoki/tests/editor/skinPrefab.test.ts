@@ -127,7 +127,7 @@ beforeEach(() => {
 // Unstub in afterEach, NOT at the end of the test body: a failing assertion skips the
 // rest of the body, so an inline unstub never runs and `fetch` stays stubbed for every
 // later test — one real regression then cascades into several misleading failures. Same
-// reasoning as the console-spy restore in assetUndo.test.ts.
+// reasoning as any console-spy restore.
 afterEach(() => { vi.unstubAllGlobals(); });
 
 describe('makeRigPrefabAsset undo/redo — fresh create (no prior prefab)', () => {

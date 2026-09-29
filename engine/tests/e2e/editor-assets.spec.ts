@@ -193,8 +193,7 @@ test('context-menu Move to Trash posts ONE batched delete and drops the row', as
     deletes.push(route.request().postDataJSON());
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
   });
-  // collectDeletion also reads the asset (snapshot for undo) and, for models, its
-  // meta; stub those so the flow completes without real fetches.
+  // collectDeletion reads a model's meta for its generated files; stub it so the flow completes without real fetches.
   await page.route('**/api/read-meta**', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({}) }));
 
@@ -202,6 +201,11 @@ test('context-menu Move to Trash posts ONE batched delete and drops the row', as
   const targetPath = await first.getAttribute('data-asset-path');
   await first.click({ button: 'right' });
   await page.getByText(/^Move to Trash/).click();
+  // A delete is not undoable (#1868, owner ruling D2), so it asks first, in Unity's words. Nothing is sent until then.
+  const dialog = page.locator('[data-ui-id="save-dialog"]');
+  await expect(dialog).toContainText('You cannot undo the delete assets action.');
+  expect(deletes.length).toBe(0);
+  await page.locator('[data-ui-id="save-dialog.confirm"]').click();
 
   // The delete is now a SINGLE request carrying a `paths` list (one OS-trash
   // call → one trash sound), not one POST per file.
@@ -209,6 +213,23 @@ test('context-menu Move to Trash posts ONE batched delete and drops the row', as
   await expect.poll(() => deletes[0]?.paths).toContain(targetPath);
   // The deleted row is removed from the panel.
   await expect.poll(() => rowPaths(page)).not.toContain(targetPath);
+});
+
+test('context-menu Move to Trash → Cancel sends no delete and keeps the row (#1868)', async ({ page }) => {
+  await gotoEditorWithAssets(page);
+  const deletes: any[] = [];
+  await page.route('**/api/delete-asset', async (route) => {
+    deletes.push(route.request().postDataJSON());
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+  });
+  const first = page.locator('[data-asset-path]').first();
+  const targetPath = await first.getAttribute('data-asset-path');
+  await first.click({ button: 'right' });
+  await page.getByText(/^Move to Trash/).click();
+  await page.locator('[data-ui-id="save-dialog.cancel"]').click();
+  await expect(page.locator('[data-ui-id="save-dialog"]')).toHaveCount(0);
+  expect(deletes.length).toBe(0);
+  expect(await rowPaths(page)).toContain(targetPath);
 });
 
 test('context-menu Rename → type → Enter posts a move-file', async ({ page }) => {

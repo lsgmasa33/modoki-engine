@@ -16,6 +16,26 @@ import { entityRef } from '../undo/entityRef';
 import { capturePrefabRead, StalePrefabRead } from './prefabRead';
 import { PrefabEditRefusalError } from './prefabEditRefusal';
 import { UndoRefusedError } from '../undo/undoFailure';
+import { resolveGuidToPath } from '../../runtime/loaders/assetManifest';
+
+/** Where the placed prefab lives NOW, for a redo: by the document's own guid, as Unity's instance names its prefab
+ *  asset by GUID, and at the path it was placed from only when the manifest has no entry. A Rename in Assets is not
+ *  undoable (#1868, owner ruling D2), so a redo can run after the file moved, and the recorded path then names nothing
+ *  ("its file was most likely deleted" about a file that was only renamed). */
+export function placedPrefabPath(guid: string | undefined, path: string): string {
+  return (guid && resolveGuidToPath(guid)) || path;
+}
+
+/** The redo read ANOTHER prefab than the one placed: the recorded path (the fallback) now holds a different document —
+ *  the placed prefab was deleted and another renamed onto its name. Placing it would put a different prefab in the scene
+ *  under this step's label, so the redo refuses instead (the step is dropped with this notice, #1664's contract). */
+export function placedPrefabRefusal(placedId: string | undefined, read: { id?: string } | null, at: string): UndoRefusedError | null {
+  if (!placedId || !read || read.id === placedId) return null;
+  return new UndoRefusedError(
+    `${at} holds another prefab now (${read.id ?? 'no id'}, not ${placedId}): the one this step placed was deleted, so it was not placed again.`,
+    'the prefab this step placed was deleted — it was not placed again',
+  );
+}
 
 /** The file at `path`, or null when it is gone. The read token is the caller's, taken before this fetch. */
 async function readPrefabFile(path: string): Promise<PrefabFile | null> {
@@ -56,12 +76,15 @@ export async function placePrefabFromPath(path: string, opts: {
       initialId: rootId,
       // A refusal here throws out of the redo, which drops the step with its own notice (`prefabInstantiateUndo.ts`).
       respawn: async () => {
-        const again = capturePrefabRead(path);
-        const p = await readPrefabFile(path);
+        const at = placedPrefabPath(prefab.id, path);
+        const again = capturePrefabRead(at);
+        const p = await readPrefabFile(at);
         if (!p) return null;
+        const other = placedPrefabRefusal(prefab.id, p, at);
+        if (other) throw other;
         // Required after the read, right before the spawn: a parent that is gone, or is a placeholder now, refuses the
         // redo (owner ruling R) rather than landing the instance at the scene root or under another entity.
-        const id = await instantiatePrefabInstance(p, path, parentRef ? () => parentRef.require() : 0, again);
+        const id = await instantiatePrefabInstance(p, at, parentRef ? () => parentRef.require() : 0, again);
         opts.onPlaced?.(id);
         return id;
       },

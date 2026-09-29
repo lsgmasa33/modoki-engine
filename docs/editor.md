@@ -2631,8 +2631,8 @@ folder open is a property of that gesture, not of the repair.
 
 **⚠️ The call sites are NOT the contract any more (#867) — the MOVE carries the repair.**
 This section used to read *"six call sites, and they are the whole contract"*, and both halves
-of that were wrong by the time it was written: there are **13 direct call sites** (5 in
-`Assets.tsx`, 8 in `assetUndo.ts`) plus `unbindDeletedAssetEditors` wrapping it for 4 more, and
+of that were wrong by the time it was written: there were **13 direct call sites** (5 in
+`Assets.tsx`, 8 in the Assets undo builders that #1868 removed) plus `unbindDeletedAssetEditors` wrapping it for 4 more, and
 enumerating them was never going to hold. Three sites failing the same way is a **missing seam**,
 not a longer to-do list:
 
@@ -3782,10 +3782,9 @@ non-null:
 | `scrub` / `preview` | a **scene edit from before the preview session** | Exit restores the snapshot. An asset-document edit (`_isFileDirect`) and a selection step are never touched by that restore, and a scene edit made *during* the session belongs to the posed world |
 
 **An asset-FILE edit is `_isFileDirect`; one that also rebuilds live frames adds `_rebasesLiveFrames` (#1857).** The
-ten Assets-panel builders (`editor/panels/assetUndo.ts`: delete, duplicate, rename, folder create/delete/rename, paste,
-files drop, file import, model import) set the flag. Untagged, each was treated as a scene edit: Exit dropped a delete
-made in a preview (the file stayed in the OS trash with no undo), Stop truncated it, its undo marked the scene unsaved
-(#1858, observed: Move to Trash, Skin "Make prefab" and a model import each made `load_scene` refuse with
+asset-document edits carry the first, and the skin-rig prefab writer both. (The Assets-panel file operations carried
+them too until #1868, when they left undo.) Untagged, such an entry was treated as a scene edit: Exit dropped one made
+in a preview, Stop truncated it, its undo marked the scene unsaved (#1858, observed: `load_scene` refused with
 `REQUIRES_SAVE` over nothing to save), and a step spanning a scene switch was dropped. The undo manager asks three
 questions of the flags:
 - **Does it outlive a world?** `_isFileDirect`. This covers `runStep`'s `worldGone` and `parkSurvivors`.
@@ -3793,7 +3792,7 @@ questions of the flags:
   edit-version bump and the scene dirty marks.
 - **Does it write no live world?** `_isFileDirect` without `_rebasesLiveFrames`, or a selection (`worldFree`). This
   covers the preview gate, Exit's drop and Stop's truncation.
-- A model import is both, and so is the skin-rig prefab writer (`skinPrefab.ts`): each half is one `commitPrefabWrite`,
+- The skin-rig prefab writer (`skinPrefab.ts`) is both: each half is one `commitPrefabWrite`,
   which rebases every live frame of the prefab. It survives a switch and marks nothing unsaved like any file edit (the
   scene file holds the instances and their overrides, which a rebase does not change), but it counts as a scene edit
   wherever a world is posed or thrown back: the gate refuses it in an envelope, Exit drops one pushed inside, and Stop
@@ -3855,38 +3854,41 @@ pre-checking. A pre-check once reported such a refusal as `did:false`, i.e. "the
   `'stopped'` in editor code outside a reasoned allowlist, because that comparison is the defect's
   shape. It shipped three times: #1122, then twice in #1148.
 
-### Asset delete IS undoable — it is snapshot-backed, not a filesystem one-way door
+### Assets file operations are not undoable (#1868, owner ruling D2)
 
-`Assets` → **Move to Trash** looks irreversible and is not. `executeDeletion` calls
-`collectDeletion` FIRST, which `fetch`es every path the delete covers and keeps the bytes —
-text as text, **binaries base64-round-tripped** (`fetch().text()` would UTF-8-corrupt a `.glb`) —
-then `makeDeleteUndo` (`panels/assetUndo.ts`) writes the whole set back on undo. The set is
-`deletionPathsFor`'s output, so a model's generated meshes/materials/textures and their
-`.meta.json` sidecars come back too, GUIDs intact. Folder delete has its own undo entry.
+Delete, rename, move and drag-move, duplicate, cut/copy-paste, New Folder, folder rename, folder delete, an
+OS-drop import and Import Model change disk at once and push **no** undo entry. Cmd+Z does not reach them.
+Import Model writes its prefab at once: a new one stays, and a RE-import over an existing prefab replaces it (keeping
+its id, #1468) with no way back from the editor either.
 
-**This is written down because its absence caused a wrong bug report.** #291 was filed asserting
-*"Move to Trash is a filesystem operation and undo does not cover it"* and proposed confirmation
-dialogs on the strength of it. Nothing in `docs/` contradicted that. The dialogs were declined —
-see `docs/todo.md` § Deferred decisions for that call and for why the one surviving
-confirmation (the cross-scene move, including a reparent across scenes since #1429) is not an inconsistency.
+- **A delete asks first.** Every delete gesture (context menu, Delete key, batch, folder) opens the editor's
+  modal before anything is sent. The words are `deleteConfirmText` (`panels/assetOps.ts`), and the last line is
+  Unity's own: *"You cannot undo the delete assets action."* (`ProjectWindowUtil.DeleteAssets`). It names what goes
+  along (`deletionFootprint`): a folder's contents, a model's generated meshes, materials and textures, and the
+  unsaved edits parked for anything that goes, which are discarded. The files still go
+  to the OS Trash, which is where a human gets one back; putting a file back from there is an outside write,
+  which the watcher raises like any other.
+- **Why not undoable.** Every such undo was an ASYNC file step: 100–150 ms of backend round trips, during which
+  the rest of the editor kept running. That window is what needed the preconditions, the shortfall reports, the
+  restore owner and the rename-collision refusals, and it produced much of the #1789 campaign's findings. Unity does not undo
+  a delete either. The study, with Unity's behaviour cited per row: [plans/undo-memory-only.md](plans/undo-memory-only.md).
+- **What changed for the undo that remains.** A file op pushed an entry, which cleared the redo stack and unwound
+  before the steps below it. Now a step recorded before a Rename or a delete runs AFTER it, so a step keyed by a
+  PATH must find the asset where it is now, as Unity's undo follows the object:
+  - an **Instantiate's redo** resolves the placed document's guid (`placedPrefabPath`, `scene/prefabPlace.ts`; fuzz
+    seed 5: instantiate → detach → Rename → undo, redo), and REFUSES when the recorded path now holds another prefab
+    (`placedPrefabRefusal`: the placed one was deleted and another renamed onto its name);
+  - an **asset-document step** follows the session's moves (`currentAssetPath`, `utils/assetMoveLog.ts`, fed by
+    `applyAssetPathMoves`), applies at the new path, and refuses with "was deleted since" after a delete.
+  Create Prefab's redo is the one step that writes a deleted prefab back, on purpose (#1795).
+- **`modoki_dnd`'s commit witness** reads a fourth counter for these, `getAssetFileOpVersion`
+  (`panels/assetEditorBindings.ts`), bumped by `applyAssetPathMoves`: a file drag pushes no undo entry and parks
+  nothing, so without it a real move read as "probably did nothing". It answers `committedTo:'asset-file'`.
+- Guarded by `tests/architecture/assetFileOpsLeaveUndo.test.ts` (the panel pushes an undo entry only from the
+  entity drop's Create Prefab, whose undo is memory-only, #1795; both delete paths ask first).
 
 **What undo does NOT survive is an editor relaunch** — `undoStack`/`redoStack` are module state
 in `undo/undoManager.ts`. That is normal and is deliberately not treated as a defect.
-
-**The rule that came out of it: an undo that restores less than it trashed must SAY SO.** The
-empty case used to `console.warn` and return, so Cmd+Z read as working while the files sat in the
-OS trash; the partial case was not reported at all. `makeDeleteUndo` now restores what it can and
-`console.error`s the **shortfall**, which covers both. Two details are load-bearing:
-
-- **The shortfall is measured against what the backend ACTUALLY trashed, not against
-  `deletePaths`.** `deletionPathsFor` deliberately lists maybe-absent sidecars
-  (`.meta.local.json` is gitignored and usually not on disk), so a `deletePaths` diff would name
-  files that never existed and send the user hunting in the trash for them. `/api/delete-asset`
-  returns `{ok, trashed, missing}`; `deleteAssetFiles` surfaces that as `DeleteFilesResult` and
-  the caller threads `missing` into the undo action. It used to return a bare boolean and throw
-  the rest away.
-- **`redo` checks its re-delete too.** A failed re-trash left the files on disk while `refresh()`
-  re-listed them, so redo read as a no-op — the same false success on the other half of the pair.
 
 ### An undo/redo that discards a failed filesystem op — the whole class (#308)
 
@@ -3929,47 +3931,20 @@ stack pop, keep editor state consistent with disk:
   ran unconditionally while only the binding remap was gated, so a failed undo remapped the client
   tree to `/Old` while the folder was still physically at `/New`.
 
-**Partial-progress vs all-or-nothing is decided by the UNIT OF WORK, not by taste** — the two
-shapes in this codebase are not a disagreement:
-
-- `makeDeleteUndo` / `makePasteUndo` / `makeFilesDropUndo` cover **N independent files**, so they
-  do what they can, batch the shortfall into ONE message naming every skipped path, and always
-  `refresh()` — whatever *did* change must appear.
-- `createPrefabFromEntity` / `makeRigPrefabAsset` cover **ONE coupled operation** — a
-  `.prefab.json` plus the entities linked to it — so they are all-or-nothing. Half-applying that
-  leaves the user in a state which is neither before nor after (entities un-linked from a prefab
-  still on disk, or linked to one that is not).
-
-**A batch undo must track what it actually MOVED, not replay its list.** This is the trap the
-first fix walked into, and it is the same lie pointed the other way. After a partial failure the
-two directions are out of step: undo moves A and B back but C's move fails, so C is still at its
-forward location. Replaying the whole list on the next redo then asks the backend to move C from
-a path nothing is at — `/api/move-file` answers 404 "Source not found", `/api/duplicate-asset`
-answers 409 "Destination exists" — and that gets folded into the failure report as though C had
-been lost. It has not: C is sitting exactly where redo wanted to put it, and the user is sent
-hunting for a file that was never in danger. So each batch builder remembers which items are
-currently in the undone state and acts only on those. A skip happens ONLY when the item is
-already in the state that direction wants, so a genuine retry still retries.
-
-⚠️ Two things make that state safe to keep in the closure, and both were checked rather than
-assumed: `undoManager` puts an action on `redoStack` *only* via `undo()`, so `redo`-before-`undo`
-is a sequence production cannot produce; and undo actions are never serialized or cloned
-(`swapHistory` stores the same live objects, and the only `structuredClone` touches
-`journalPayload`). If either ever changes, this state is what breaks.
+**Partial-progress vs all-or-nothing is decided by the UNIT OF WORK, not by taste.**
+`createPrefabFromEntity` / `makeRigPrefabAsset` cover **ONE coupled operation** — a `.prefab.json` plus the
+entities linked to it — so they are all-or-nothing. Half-applying that leaves the user in a state which is
+neither before nor after (entities un-linked from a prefab still on disk, or linked to one that is not).
 
 **The delayed-desync case is why gating beats logging.** A `setPrefabCache` after a failed write
 leaves the editor believing in a file that is not on disk: it reads correctly from cache for the
 rest of the session and comes back missing on the next scene load or a fresh editor launch, which
 read the FILE. The failure surfaces far from its cause.
 
-**Every fixed site is now a framework-free FACTORY, and that is a testability constraint rather
-than tidiness.** Six of these lived inside `Assets.tsx` and one inside `SceneAssetView.tsx`, and a
-panel may not be mounted in jsdom to test it (§ Panels — that asserts the mock). So each undo
-builder moved to a plain `.ts` module beside its panel — `panels/assetUndo.ts`,
-`panels/assetViews/baseSceneUndo.ts` — taking `refresh`, the narrow React setters, or the
-component's own `write` as explicit parameters. The panel keeps a one-line
-`pushAction(makeXUndo({…}))`. `assetUndo.ts` already existed for exactly this reason (F6); this
-extended it rather than inventing a second home.
+**An undo builder is a framework-free FACTORY, and that is a testability constraint rather than
+tidiness.** A panel may not be mounted in jsdom to test it (§ Panels — that asserts the mock), so a
+builder lives in a plain `.ts` module beside its panel — `panels/assetViews/baseSceneUndo.ts` — taking the
+component's own `write` as an explicit parameter. The panel keeps a one-line `pushAction(makeXUndo({…}))`.
 
 **Deliberately left alone:** the ~15 closures in `undo/entityActions.ts` that no-op when
 `ref.resolve()` returns null. That is an entity which is genuinely gone, not a discarded
@@ -3991,7 +3966,7 @@ returned `res.ok`, and `deleteAssetFiles` hardcoded `ok: true` on any 200. A ref
 **200**. So every guard #308 had carefully installed was checking a value that could not be false,
 and three consumers went wrong at once:
 
-- the **Assets panel** dropped the row, unbound the editor and offered undo for a file still on
+- the **Assets panel** dropped the row and unbound the editor for a file still on
   disk — while the route, one process away, was carefully filtering its OWN half of the repair
   under the comment *"Unbinding an editor from a file that is still on disk would be the wrong
   direction"*;
@@ -4030,19 +4005,9 @@ that is the shape it exists for.
    encodes: a refused **sidecar** does NOT keep the asset's row, because the asset itself is gone
    and a row pointing at nothing is the mirror defect.
 
-**What the close-out review then found — the same class, three more times.** Worth recording
-because every one of them was in code the fix had already touched or should have:
+**What the close-out review then found — the same class again.** Worth recording because it was in
+code the fix should have touched:
 
-- **`makeDeleteUndo`'s REDO half had the identical defect**, one layer over. `if (!res.ok)` cannot
-  see a partial refusal, so a redo re-listed the refused file and read as a no-op — #291's
-  complaint, reintroduced by #875's new shape. Fixing a false success on the forward path does not
-  fix its twin on the undo path; they are separate call sites of the same wrapper.
-- **`failed` is NOT stable across a retry, and `missing` is.** They were merged into one
-  `notTrashed` set captured at construction — which is wrong precisely because the toast asks the
-  human to close the handle and try again. After a successful retry the second undo skipped that
-  file's write *and* dropped it from the shortfall report: a clean-looking Cmd+Z with the file
-  still in the OS trash. **A filter over a per-path outcome has to be recomputed by whatever
-  re-runs the operation.**
 - **The route had FIVE consumers, and two searches in a row undercounted them.** `CleanupAssetsDialog`
   posts to `/api/delete-asset` directly, so no search for `deleteAssetFiles` finds it; `modelImport`'s
   orphan-prune does too, behind a bare `.catch(() => {})` that read neither the status nor the body
@@ -4069,30 +4034,21 @@ back to `rmSync` — a PERMANENT delete — and names only the paths it refuses 
 `ok:true, failed:[]` there can mean "deleted, not trashed". **An empty `failed` is not evidence that
 anything went to a Trash — `ok` says whether the paths are gone.** The partial toast
 is therefore reachable only on Windows, pinned at the seam (`deleteAssetRouter.test.ts`,
-`assetUndo.test.ts`, `assetDeleteRenamePolicy.test.ts`), with end-to-end confirmation on the `win`
-clone.
+`assetDeleteRenamePolicy.test.ts`), with end-to-end confirmation on the `win` clone.
 
 ---
 
-### Undoable panel state cannot live in `useState` (#309)
+### Folder-tree state lives at module scope, not in `useState` (#309)
 
-The sibling of the class above, and it survived #308's sweep because it is not a discarded return
-value — the call *succeeds* and still does nothing.
-
-An undo builder's closures outlive the render that created them. So a builder handed a React
-`setState` from the panel is holding a setter bound to a **fiber that may be gone**: rename folder
-`/A` → `/B`, close the Assets panel, press ⌘Z. The file genuinely moves back, and that half reports
-correctly — but `setExpanded`/`setPendingFolders` are bound to an unmounted fiber and
-**silently no-op, with no warning** (React 19 here; the setState-on-unmounted warning was dropped
-in 18 and has not returned). The mounted `useEffect` that mirrored them to `localStorage`
-never re-runs either, so the stale `/B` value survives and the next mount reads it back: a phantom
-`/B` node, or `/A` rendering collapsed when it was expanded.
-
-**The fix is to move the state out of the component, not to make the setter lookup lazier.**
-`panels/assetFolderState.ts` owns `expanded` / `pendingFolders` / `typeFilter` / `viewMode` at
-module scope, persists on every mutation, and is read through `useSyncExternalStore`. An undo
-closure then holds a **stable module function**, so it is unmount-safe by construction rather than
-by discipline.
+`panels/assetFolderState.ts` owns `expanded` / `pendingFolders` / `typeFilter` / `viewMode` at module scope,
+persists on every mutation, and is read through `useSyncExternalStore`. The reason is a caller that outlives
+the panel: `applyAssetPathMoves` (the one seam every move and delete reaches, #867) remaps the folder sets
+itself (`remapFolderSets`), including for a move made with the Assets panel closed, such as an agent's
+`modoki_move_asset` through the route's renderer callback. A React setter held from outside the render is
+bound to a fiber that may be gone, and it **silently no-ops** (React 19; the setState-on-unmounted warning was
+dropped in 18). The mounted `useEffect` that mirrored the sets to `localStorage` never re-runs either, so a
+stale value survives and the next mount reads it back: a phantom node, or a folder rendering collapsed that was
+expanded. #309 found it through the folder-rename undo, which held such setters (undo is gone since #1868).
 
 ⚠️ **`assetViews/persist.ts`'s `_assetViewSetters` registry does NOT transfer here**, and the
 difference is the whole reason a second mechanism exists. There the FILE + CACHE are the source of
@@ -4101,22 +4057,6 @@ none registered the write still lands and a later re-select re-reads from disk. 
 no file: **the sets ARE the truth**, so a registry with nothing in it drops the update and leaves
 `localStorage` stale, i.e. the bug unchanged. Pick by asking *what is the source of truth* — a
 setter registry when it is the file, a store when it is the state itself.
-
-**What is NOT affected, and why it is worth knowing.** Every other Assets undo builder receives
-`refresh`, which is also panel-bound and also no-ops after unmount — harmlessly, because
-`Assets.tsx`'s mount effect calls `refresh()` and re-derives the listing from disk. `useExpandedSet`
-(the read-only Engine + Scripts trees) has the same `useState`-plus-mounted-persist shape and is
-also safe: no undo builder touches those trees. **The shape alone is not the defect** — it needs
-state that is its own source of truth AND a closure that outlives the panel.
-
-Undoing a folder *create* is a folder *delete*, so it prunes both sets, matching
-`handleDeleteFolder`. `makeNewFolderUndo` pruned only `pendingFolders` until #309: the forward
-`createFolder` never adds the new folder's own key to `expanded` (only its ancestor chain, so the
-inline rename input can mount), but `commitFolderRename` does (`.add(newPath)`) — so
-create → rename → undo → undo left a key for a folder that no longer exists. Inert, because
-`buildFolderTree` builds nodes from `pendingFolders`/`diskFolders`/assets and never from `expanded`
-— but persisted, so it accumulated forever. Redo deliberately does not re-add it: the forward path
-never put it there.
 
 
 ### A throwing undo/redo closure drops the action, loudly (#310)
@@ -4169,126 +4109,34 @@ dirty signals, since nothing moved. Apply-to-Prefab's undo throws one when the p
 since the Apply, and when the write failed (#1668) ([prefabs.md](prefabs.md) § Undoing an Apply). Every
 asset-file step in the next section throws one when its precondition fails (#1679).
 
-### An undo/redo that rewrites or trashes an asset file states what it expects there (#1679)
+### A prefab undo that rewrites its file states what it expects there (#1679)
 
-**The mechanism.** An asset file is global, and an undo entry lives on one history and outlives edits
-made elsewhere. Entering prefab edit parks the scene's stack, and Back restores it. The Assets panel's
-history outlives any later save of the same file. So Create Prefab → double-click it → edit → Cmd+S →
-Back → Cmd+Z trashed the saved prefab. Restoring a deleted file overwrote one recreated at its path, and
-undoing a duplicate trashed a copy the user had since painted. #1664 fixed the same mechanism for
-Apply-to-Prefab alone. This is the rest of it.
+**The mechanism.** A prefab file is global, and an undo entry lives on one history and outlives edits made
+elsewhere. Entering prefab edit parks the scene's stack, and Back restores it. So Create Prefab → double-click
+it → edit → Cmd+S → Back → Cmd+Z trashed the saved prefab. #1664 fixed the same mechanism for Apply-to-Prefab.
+(The Assets panel's file operations had the widest share of it — a delete's undo restoring over a file
+recreated at its path, a duplicate's undo trashing a painted copy — until #1868 took them out of undo.)
 
-**The rule: each step changes the file only while it holds what the step's other half left there, and
-the ROUTE checks that in the same synchronous window as the write or the trash.** There is no client
-read-then-write, because that is not atomic (#469).
+**The rule: each step changes the file only while it holds what the step's other half left there, and the
+ROUTE checks that in the same synchronous window as the write.** There is no client read-then-write, because
+that is not atomic (#469). The writer is ONE `commitPrefabWrite(path, doc | null, { expected })`
+(`scene/prefabCommit.ts`, #1692; `doc` null trashes, `expected` null means nothing may be there): `ifMatch` on
+the bytes the other half left, both caches under every key, and a rebuild of the prefab's other live instances
+([prefabs.md](prefabs.md) § Model and invariants, I9–I11). On a miss the step refuses before anything moved
+(`fileChangedRefusal` → `UndoRefusedError`, the #1664 shape).
 
-| The step… | Precondition |
-|---|---|
-| overwrites a file it wrote | `ifMatch` = sha256 of the bytes it wrote (`writeAssetFileGuarded`, `/api/write-file`) |
-| re-creates a file it removed | `createOnly` (`ifNoneMatch:'*'`) |
-| trashes a file it created or restored | `ifMatch` on `/api/delete-asset` (`deleteAssetFiles(paths, {ifMatch})`) |
-| trashes a folder it created | `ifEmpty` on `/api/delete-asset`: only OS litter (`.DS_Store`, `Thumbs.db`, `desktop.ini`) may be in it, and a stray sidecar counts as content |
-| trashes a binary's committed sidecar it created or restored | `ifSettings` on `/api/delete-asset`: its import settings must still be the expected ones (`sameImportSettings`, #1696, below) |
+**Every hash these steps send strips a leading UTF-8 BOM** (`sha256OfBytes`), because `ifMatchRefusal` does.
+Otherwise a file saved by a Windows tool would get a precondition no route hash can meet. **Line endings cannot
+trip it**: every expected hash is of bytes the editor itself wrote or read back from disk, never a checkout's copy.
 
-`/api/delete-asset` checks every precondition before it trashes anything, and **one miss trashes
-nothing**: 409 `reason:'if-match'` with `conflicts`. A lone path that has a precondition but is gone is
-that 409, not the back-compat 404. `/api/duplicate-asset` reports the `sha256` of the copy it wrote,
-read back from disk. A JSON copy is re-minted server-side, so the client cannot know its bytes.
+**A model RE-import keeps the replaced prefab's id** (#1468) and writes over what it READ from the file
+(`readPriorDocument`: a manifest-`known` id can outlive the file, and a `no-id` file is there all the same). If
+the prior bytes could not be read, or were not a readable document (a corrupt file is never an absent one), the
+import is refused (#1692): a write conditional on what it read cannot go over what it could not read. The
+import itself pushes no undo entry (#1868). The skin prefab's update reads its prior bytes the same way.
 
-**On a miss, the step refuses before anything moved** (`fileChangedRefusal` → `UndoRefusedError`,
-the #1664 shape above). There is one exception: a loop over N separate writes (the delete undo's
-restore, the file-import redo) cannot be atomic. It skips the file it finds taken, applies the rest, and
-reports the skip with a toast, because the user can clear the path. **Each such builder records where
-every path is now**, so the next step acts only on what this step actually did. A delete's redo trashes
-only what its undo restored, so a file recreated at a deleted path survives the undo AND the redo after
-it. An import's undo trashes only what its redo wrote.
-
-**Sidecars travel with their asset, all-or-nothing, and carry no BYTE hash of their own.** The scanner
-rewrites `.meta.local.json`, and on a cache miss `.meta.json` too, without anyone editing anything. A
-hash on either would refuse for nothing.
-
-**But the committed `.meta.json` carries a SETTINGS precondition (#1696).** For a binary asset it is where
-the import settings live, so the file's hash does not decide for the asset: delete a texture, Cmd+Z, change
-its import settings, save (only the sidecar is written), Cmd+Shift+Z trashed the edited sidecar. Duplicate →
-edit the copy's settings → Cmd+Z did the same. So `/api/delete-asset` takes `ifSettings: {[sidecar]: doc}`,
-checked in the same synchronous span as `ifMatch`, with the same 409 that trashes nothing:
-- **What "the same settings" means** is `sameImportSettings` (`runtime/loaders/sidecarSettings.ts`, re-exported by `plugins/meta-sidecar.ts`), and it is not a
-  raw compare either. It ignores what writes itself (`id`, `version`, the `CACHE_BLOCKS`). ⚠️ **Every bake also
-  rewrites its SETTINGS block with resolved defaults** (`meta.texture = resolveTextureSettings(meta)` plus
-  `type`, and likewise `model`/`audio`/`video`/`font`/`environment`). So each of those blocks is compared
-  through the resolver its bake uses. Otherwise duplicating a never-baked texture and merely looking at the
-  copy would refuse its undo. Every other key (sprites, border, postprocessor, rig, generated) is compared
-  as a document, with key order ignored. `metaSidecarSettings.test.ts` reads every `reimport-*.ts`'s
-  `meta.<key> =` writes and fails on a key the comparison does not know, so a new bake cannot silently
-  reintroduce the false refusal.
-- **The expectation.** The delete redo sends each `.meta.json` its last undo restored, as that snapshot.
-  `/api/duplicate-asset` reports the committed sidecar a binary copy got (`sidecar`, read back, like
-  `sha256`), and the duplicate/paste-copy undo sends that. A retry's rider (the heal's sidecar) and a copy
-  with no reported sidecar ride unguarded, as before.
-- **A gone sidecar passes** (nothing is lost). **One that does not parse refuses** (somebody wrote something
-  there). The machine-local half is never compared, because it holds only cache stats.
-- The delete undo restores an asset's sidecars **first**, so the scanner never sees the file bare and
-  mints it a sidecar of its own.
-- A collision part-way through an asset's restore puts back what that asset had already written. So does a
-  write that **fails**, and the asset then stays in the trash so the next undo can retry. Carrying on would
-  have put the file on disk without its sidecar.
-- The one sidecar restored **over** what is there belongs to a file the OS refused to trash (#884's partial
-  refusal). The delete's inline manifest rebuild heals that file with a freshly minted sidecar, so that path
-  is never empty, and the snapshot is what brings back the file's original GUID. It is written **last** in its
-  asset. A put-back undoes a create by trashing it and cannot undo an overwrite, and trashing this sidecar
-  would leave the refused file bare.
-- An asset dropped on a collision is dropped whole, its refused file included. Otherwise the next redo would
-  retry trashing that file, and the undo after it would restore the file without its sidecar.
-- A redo that retries a refused file sends that file's sidecars with it. The one on disk is the heal's, and
-  left behind it would be an orphan that the next undo's restore collides with.
-- Each asset's restore list is filtered as the loop reaches it, not up front. Results share paths: a folder
-  delete lists a model with its generated files, and each generated file as an asset of its own. A path an
-  earlier asset just restored must drop out of the later asset's list.
-- Every hash for the whole undo is computed before its first write, so a hash that cannot be computed
-  refuses a step that has written nothing.
-- A text asset's delete snapshot stays text only while its bytes are UTF-8 (`snapshotFromBytes`). Anything
-  else goes byte-exact through base64, because `res.text()` would have corrupted it.
-- Duplicate and paste-copy undos trash the copy and its sidecars in one guarded request.
-- File import never touches sidecars in either direction. The one the forward conversion wrote stays
-  through the undo, so a redo re-links to the same GUID.
-
-**The baseline is the file as it SETTLED, not always the bytes written.** The scanner's GUID heal
-rewrites an imported JSON asset that has no `id`, or one that another asset holds. So `importFiles`
-takes each text file's baseline after an inline `/api/rescan-assets` (`settledHashes`), and the redo
-takes it again, because the heal re-stamps a re-written file. It hashes the BYTES read back, not
-`res.text()`, whose decoding would mangle a Latin-1 file. Binaries are never rewritten in place (every
-importer writes to the cache or a sibling), so their written bytes are the baseline: the DECODED bytes,
-`sha256OfWritten`, not the base64 text. **Every hash these steps send strips a leading UTF-8 BOM** (`sha256OfBytes`),
-because `ifMatchRefusal` does. Otherwise a `.mtl` or `.csv` saved by a Windows tool would get a precondition
-no route hash can meet.
-
-**Line endings cannot trip it.** Every expected hash is of bytes the editor itself wrote, or read back
-from disk: the forward write, a snapshot read off disk and written back verbatim, or the route's own
-read-back after a duplicate. None of them is a checkout's copy of a file, so a CRLF checkout on Windows
-hashes the same on both sides.
-
-**A model RE-import restores, never trashes** (found by this fix's sweep). Importing a model over a prefab
-that is already there replaces it and keeps its id (#1468), and the import's undo used to trash the file,
-losing the replaced prefab. That is #1264's shape. `importModelWithMeta` now reads the prior bytes from the
-FILE before writing (a manifest-`known` id can outlive the file, and a `no-id` file is there all the same),
-and the undo restores them VERBATIM (a leading BOM included, #1684's note) through `commitPrefabWrite`. If the prior
-bytes could not be read, or were not a readable document (a corrupt file is never an absent one), the import itself is
-refused now (#1692): a write conditional on what it read cannot go over what it could not read (`readPriorDocument`).
-The skin prefab's update reads its prior bytes the same way.
-
-**Every prefab write, these undos included, is ONE `commitPrefabWrite(path, doc | null, { expected })`**
-(`scene/prefabCommit.ts`, #1692; `doc` null trashes, `expected` null means nothing may be there). It took over
-`replaceFileIfMatch`, the one call each undo made, and adds the rest of the step: both caches under every key and a
-rebuild of the prefab's other live instances ([prefabs.md](prefabs.md) § Model and invariants, I9–I11).
-
-**Not affected:** a rename or move (`/api/move-file` already 409s on an occupied destination, and a move
-destroys no bytes), and a duplicate's redo (the route already refuses `Destination exists`).
-
-Tests: `packages/modoki/tests/editor/undoFilePreconditions.test.ts` (every Assets-panel site, against
-`fakeAssetRoute.ts`, a disk that holds the bytes each write sent), the precondition cases in
-`createPrefabUndo.test.ts` and `skinPrefab.test.ts`, and `tests/plugins/deleteAssetPreconditions.test.ts`
-(the route itself, on a real scratch directory), plus `tests/plugins/metaSidecarSettings.test.ts` for the settings
-comparison (#1696).
+Tests: the precondition cases in `createPrefabUndo.test.ts` and `skinPrefab.test.ts`, the helpers in
+`priorDocumentRead.test.ts`, and `tests/plugins/deleteAssetPreconditions.test.ts` (the route itself).
 
 ### An asset-DOCUMENT undo checks the asset still holds its side, and its save is conditional (#1710)
 

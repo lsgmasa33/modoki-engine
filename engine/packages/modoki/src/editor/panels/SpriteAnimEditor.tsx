@@ -205,7 +205,7 @@ export default function SpriteAnimEditor() {
         // file still holds their side before moving it, park the result themselves (so an undo with this editor closed
         // is not written back by the next save), and read `_after` at step time, after any coalescing.
         path, type: 'spriteanim', before, after: () => a._after,
-        apply: (d) => useEditorStore.getState().applySpriteAnimDef(path, d),
+        apply: (d, p) => useEditorStore.getState().applySpriteAnimDef(p, d),
       }), { _after: next });
       pushAction(a);
       lastAction.current = a;

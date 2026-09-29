@@ -2,11 +2,12 @@
  *  mode, and the type filter — held at MODULE scope rather than in the panel, and persisted to
  *  localStorage on every mutation.
  *
- *  ⚠️ These MUST NOT go back into `useState` (#309). An undo builder's closures outlive the
- *  render, so a panel-bound setter silently no-ops once the panel unmounts and the mounted
- *  persist effect never re-runs — leaving localStorage stale for the next mount to read back.
- *  Why a store rather than `persist.ts`'s `_assetViewSetters` registry, and which other panel
- *  state is safe without this: docs/editor.md § "Undoable panel state cannot live in useState".
+ *  ⚠️ These MUST NOT go back into `useState` (#309). `applyAssetPathMoves` remaps them from outside
+ *  the panel (a move made with the panel closed), and a panel-bound setter held from outside the
+ *  render silently no-ops once the panel unmounts, and the mounted persist effect never re-runs —
+ *  leaving localStorage stale for the next mount to read back. Why a store rather than
+ *  `persist.ts`'s `_assetViewSetters` registry: docs/editor.md § "Folder-tree state lives at module
+ *  scope, not in useState".
  *
  *  Kept framework-light on purpose: plain functions + a listener set (unit-testable with no
  *  renderer), and React sees it only through the `use*` hooks below. */
@@ -127,8 +128,8 @@ export function remapCurrentFolder(from: string, to: string | null): void {
  *
  *  Both are keyed by folder path, so a folder rename/move/delete strands every entry under it: a
  *  collapsed tree on the next mount, and a `pendingFolders` entry naming a folder that no longer
- *  exists. Three sites did this by hand (`commitFolderRename`, and `makeFolderRenameUndo`'s undo
- *  AND redo) and the other ten seam callers did not — the same per-call-site wiring #867 removed
+ *  exists. Three sites did this by hand (`commitFolderRename`, and the folder-rename undo's undo AND
+ *  redo, gone with #1868) and the other ten seam callers did not — the same per-call-site wiring #867 removed
  *  for the bindings, the parked writes, `currentFolder` and the selection.
  *
  *  A delete drops the subtree rather than repointing it. Note `commitFolderRename` additionally

@@ -16,8 +16,6 @@ import {
 } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
 import { applyMove, planFilesDropMoves } from '../../packages/modoki/src/editor/utils/assetPaths';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
-import { makeFilesDropUndo } from '../../packages/modoki/src/editor/panels/assetUndo';
-import * as assetOps from '../../packages/modoki/src/editor/panels/assetOps';
 import { canUndo, undoLabel } from '../../packages/modoki/src/editor/undo/undoManager';
 import {
   markAssetDirty, clearDirtyAssets, getDirtyAssetPaths, peekDirtyAsset,
@@ -633,41 +631,6 @@ describe('applyMovesToSelection repairs the Inspector (#867)', () => {
     // The label is the sharp half: a pushed `Select walk.anim.json` would change it even where
     // canUndo() was already true for an unrelated reason.
     expect({ can: canUndo(), label: undoLabel() }).toEqual(historyBefore);
-  });
-});
-
-/** #867 — `prefix` has to survive UNDO, or a folder drag repairs its children on the way out and
- *  abandons them on the way back. That asymmetry is the same defect pointing the other way, and it
- *  is the shape `bb87c17bc` already shipped once for `currentFolder` (forward path right, undone
- *  path wrong), so it is worth pinning rather than assuming. */
-describe('makeFilesDropUndo carries prefix in BOTH directions (#867)', () => {
-  const FOLDER = { from: '/assets/anim', to: '/assets/archive/anim', prefix: true };
-  const CHILD_AT_DEST = '/assets/archive/anim/walk.anim.json';
-  const CHILD_AT_SRC = '/assets/anim/walk.anim.json';
-
-  beforeEach(() => {
-    clearDirtyAssets();
-    // The undo/redo closures move files through the backend; this suite is about the PathMoves
-    // they hand the repair, so the move itself is stubbed as succeeding.
-    vi.spyOn(assetOps, 'moveAsset').mockResolvedValue({ ok: true });
-  });
-  afterEach(() => { vi.restoreAllMocks(); clearDirtyAssets(); });
-
-  it('undo repairs a child of the moved folder, not just the folder', async () => {
-    const action = makeFilesDropUndo({ moves: [FOLDER], refresh: () => {} });
-    markAssetDirty(CHILD_AT_DEST, 'animation', { duration: 3 }, 'panel');
-    await action.undo();
-    // Without `prefix` on the reversed move, applyMove returns undefined for this path and the
-    // parked write is stranded at a location the file has left.
-    expect(getDirtyAssetPaths()).toEqual([CHILD_AT_SRC]);
-  });
-
-  it('redo repairs it back', async () => {
-    const action = makeFilesDropUndo({ moves: [FOLDER], refresh: () => {} });
-    markAssetDirty(CHILD_AT_DEST, 'animation', { duration: 3 }, 'panel');
-    await action.undo();
-    await action.redo();
-    expect(getDirtyAssetPaths()).toEqual([CHILD_AT_DEST]);
   });
 });
 

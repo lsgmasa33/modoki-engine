@@ -32,18 +32,12 @@ function installLocalStorage() {
 }
 installLocalStorage();
 
-// The undo builder posts to /api/move-file via the editor backendFetch → global fetch.
-let moveOk = true;
-const mockFetch = vi.fn(async () => ({ ok: moveOk, status: moveOk ? 200 : 500, json: async () => ({}) } as any));
-vi.stubGlobal('fetch', mockFetch);
-
 import {
   getExpanded, getPendingFolders, getTypeFilter, getViewMode,
   setExpanded, setPendingFolders, setTypeFilter, setViewMode,
   getCurrentFolder, setCurrentFolder,
   __resetAssetFolderStateForTest,
 } from '../../src/editor/panels/assetFolderState';
-import { makeFolderRenameUndo, makeNewFolderUndo } from '../../src/editor/panels/assetUndo';
 import { ASSETS_SECTION } from '../../src/editor/panels/assetListing';
 import { setEditorProjectScope, projectScopedKey } from '../../src/editor/projectScopedKey';
 
@@ -57,8 +51,6 @@ const readLS = (key: string): string[] => JSON.parse(localStorage.getItem(key) ?
 
 beforeEach(() => {
   localStorage.clear();
-  moveOk = true;
-  mockFetch.mockClear();
   setEditorProjectScope('Skin Test');
   __resetAssetFolderStateForTest();
 });
@@ -198,79 +190,5 @@ describe('snapshot identity — useSyncExternalStore compares by reference', () 
     const first = getExpanded();
     setExpanded((p) => new Set(p).add('/a'));
     expect(getExpanded()).not.toBe(first);
-  });
-});
-
-describe('the #309 scenario, driven through the real undo builder', () => {
-  // The panel is not mounted anywhere in this file — which is exactly the condition under
-  // which the old captured setters no-opped.
-  //
-  // ⚠️ This used to pass the store's module functions in, and said that was "what makes the same
-  // call land". It no longer takes them: #867 moved the remap into `applyAssetPathMoves` itself
-  // (`remapFolderSets`), which the builder already calls in both directions, so the wiring these
-  // assertions were said to prove is gone. They still measure the #309 property — a builder's
-  // closures outliving the panel must still reach the module-scope store — they just now prove it
-  // of the seam rather than of a passed-in setter. That is a STRONGER version of the same claim:
-  // there is no longer a setter to forget to pass.
-  const renameUndo = () => makeFolderRenameUndo({
-    oldPath: '/A', newPath: '/B', folderName: 'A',
-    refresh: () => {},
-  });
-
-  it('undo remaps the expanded set back to the old path and persists it', async () => {
-    setExpanded((p) => new Set(p).add('/B'));
-    setPendingFolders((p) => new Set(p).add('/B'));
-
-    await renameUndo().undo();
-
-    expect(getExpanded().has('/A')).toBe(true);
-    expect(getExpanded().has('/B')).toBe(false);
-    expect(getPendingFolders().has('/A')).toBe(true);
-    // The persisted value follows — the half that used to go stale and be read back at
-    // the next mount as a phantom node.
-    expect(readLS(LS_EXPANDED())).toContain('/A');
-    expect(readLS(LS_EXPANDED())).not.toContain('/B');
-    expect(readLS(LS_PENDING_FOLDERS())).toEqual(['/A']);
-  });
-
-  it('redo remaps forward again and persists', async () => {
-    setExpanded((p) => new Set(p).add('/B'));
-    const action = renameUndo();
-    await action.undo();
-    await action.redo();
-
-    expect(getExpanded().has('/B')).toBe(true);
-    expect(getExpanded().has('/A')).toBe(false);
-    expect(readLS(LS_EXPANDED())).toContain('/B');
-  });
-
-  it('a FAILED move leaves both the set and localStorage untouched', async () => {
-    setExpanded((p) => new Set(p).add('/B'));
-    moveOk = false;   // /api/move-file rejects
-
-    await renameUndo().undo();
-
-    // #308's bar: the client tree must not remap when the folder did not move.
-    expect(getExpanded().has('/B')).toBe(true);
-    expect(getExpanded().has('/A')).toBe(false);
-    expect(readLS(LS_EXPANDED())).toContain('/B');
-  });
-
-  // #309, second half: undoing a CREATE is a folder delete, so it must clear the folder out of
-  // BOTH sets. It used to prune only `pendingFolders`, leaving an `expanded` key — put there by
-  // a later rename's `.add(newPath)` — for a folder that no longer exists, persisted forever.
-  it('makeNewFolderUndo drops the folder from BOTH sets and persists both', async () => {
-    setPendingFolders((p) => new Set(p).add('/fresh'));
-    setExpanded((p) => new Set(p).add('/fresh').add('/fresh-sibling'));
-
-    await makeNewFolderUndo({ path: '/fresh', refresh: () => {}, setPendingFolders, setExpanded }).undo();
-
-    expect(getPendingFolders().has('/fresh')).toBe(false);
-    expect(readLS(LS_PENDING_FOLDERS())).toEqual([]);
-    expect(getExpanded().has('/fresh')).toBe(false);
-    expect(readLS(LS_EXPANDED())).not.toContain('/fresh');
-    // A sibling sharing the prefix is NOT swept up with it.
-    expect(getExpanded().has('/fresh-sibling')).toBe(true);
-    expect(readLS(LS_EXPANDED())).toContain('/fresh-sibling');
   });
 });

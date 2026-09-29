@@ -354,7 +354,7 @@ export default function TimelineEditor() {
         // is not written back by the next save), and read `_after` at step time, after any coalescing.
         path, type: 'timeline', before, after: () => a._after,
         // Re-pose only into our own held session — a pose OPENS the envelope (#1550; `undoMayRepose`).
-        apply: (d) => { useEditorStore.getState().applyTimelineDoc(path, d); if (undoMayRepose('timeline')) poseLatestRef.current(d); },
+        apply: (d, p) => { useEditorStore.getState().applyTimelineDoc(p, d); if (undoMayRepose('timeline')) poseLatestRef.current(d); },
       }), { _after: next });
       pushAction(a);
       lastAction.current = a;

@@ -74,7 +74,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op } from './prefabFuzz/ops';
-import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, diffFiles, collidedWithCreated, type RunResult, type StepFailure } from './prefabFuzz/runner';
+import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, diffFiles, rebaseForFileOp, trashedPrefabReferenced, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, KNOWN_TOLERANCES, REGRESSIONS } from './prefabFuzz/knownOpen';
 import { signature, checkRoundTrip, firstDiff, nodeMoved } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -129,13 +129,6 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
   {
     pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — The prefab instance \(\S+\) a deleted member belongs to is no longer in the scene/,
     why: 'the same ruling, for a delete\'s undo whose members\' instance root is gone (`requireRootLinks`)',
-  },
-  {
-    pattern: /^\[undo\] (Undo|Redo) of "Rename [^"]*" was REFUSED — "[^"]+\.prefab\.json" was not moved: another file now holds "[^"]+\.prefab\.json"/,
-    why: 'a Rename\'s undo or redo whose destination another file now holds REFUSES, naming it, and moves nothing '
-      + '(makeRenameUndo, 409). Create Prefab\'s undo LEAVES its file (#1795, hub ruling (i), Unity), so a prefab created '
-      + 'at the name a rename freed now holds that path when the walk undoes the rename (hunt seed 6029). Only the collision: '
-      + 'any other failed move is still a finding, and the refusal in a segment it does not taint (renameCollision) still fails',
   },
   {
     pattern: /^\[entityActions\] refused: "[^"]*" is a Missing Prefab now/,
@@ -266,7 +259,7 @@ describe('#1789 prefab fuzz', () => {
   // #1835: the one real window the renderer's manifest has — a route whose inline rebuild THROWS replies
   // `manifestRebuilt: false`, and the move lands before any push. #1828's drop redo must still tag by the document's guid
   // there (setPrefabSource takes the document). Mutation: tag from the path through the manifest again — this goes red.
-  it('regression #1828: with the inline manifest rebuild failing, the drop redo after a Rename undo still tags by guid', async () => {
+  it('regression #1828: with the inline manifest rebuild failing, the drop redo after a Rename still tags by guid', async () => {
     const repro = REGRESSIONS.find((r) => r.issue === 1828)!.repro;
     be.failManifestRebuilds = true;
     try {
@@ -344,16 +337,23 @@ describe('#1789 prefab fuzz', () => {
     // Reject side: other content at that path, and a file no create made.
     expect(diffFiles(start, new Map([[P, `${JSON.stringify({ ...doc, name: 'Other' }, null, 2)}\n`]]), created)).toMatch(/absent vs present/);
     expect(diffFiles(start, new Map([[P, wrote]]), [])).toMatch(/absent vs present/);
-    // The same document at another path: the new prefab renamed (the rename's own undo did not run in that walk).
+    // The same document at another path: the new prefab renamed (a rename is not undoable, #1868 D2).
     expect(diffFiles(start, new Map([['/fuzz/r0/prefabs/Renamed.prefab.json', wrote]]), created)).toBeNull();
 
-    // `renameCollision` (#1845's list): a Rename collision taints only where a create's document holds the destination.
-    const line = (dest: string) => `[undo] Undo of "Rename N" was REFUSED — "/fuzz/r0/prefabs/R83.prefab.json" was not moved: another file now holds "${dest}" (made there since). Nothing was moved.`;
-    const disk = (text: string) => ({ snapshot: () => new Map([[P, text]]) });
-    expect(collidedWithCreated([line(P)], disk(wrote), created)).toBe(true);
-    expect(collidedWithCreated([line(P)], disk(`${JSON.stringify({ ...doc, name: 'Other' }, null, 2)}\n`), created)).toBe(false);
-    expect(collidedWithCreated([line('/fuzz/r0/prefabs/Gone.prefab.json')], disk(wrote), created)).toBe(false);
-    expect(collidedWithCreated([line(P).replace('another file now holds', 'it could not reach')], disk(wrote), created)).toBe(false);
+    // #1868 D2: an Assets file op is not undoable, so the segment's baseline takes it — a rename moves the bytes to the new
+    // path, a trash drops the path. Mutation: make `rebaseForFileOp` a no-op — both expectations fail.
+    const base = new Map([[P, wrote], ['/fuzz/r0/prefabs/K.prefab.json', 'k']]);
+    rebaseForFileOp(base, { from: P, to: '/fuzz/r0/prefabs/R.prefab.json' });
+    expect([...base]).toEqual([['/fuzz/r0/prefabs/K.prefab.json', 'k'], ['/fuzz/r0/prefabs/R.prefab.json', wrote]]);
+    rebaseForFileOp(base, { from: '/fuzz/r0/prefabs/K.prefab.json', to: null });
+    expect([...base.keys()]).toEqual(['/fuzz/r0/prefabs/R.prefab.json']);
+
+    // …and a trash taints the segment only while something the walk restores names the prefab (review of #1868): by its
+    // guid, or by its path. Mutation: answer true unconditionally — the third expectation fails.
+    const Kbytes = JSON.stringify({ id: 'cccccccc-0000-4000-8000-00000000abcd', entities: [] });
+    expect(trashedPrefabReferenced(Kbytes, '/fuzz/r0/prefabs/K.prefab.json', ['{"source":"cccccccc-0000-4000-8000-00000000abcd"}'])).toBe(true);
+    expect(trashedPrefabReferenced(undefined, '/fuzz/r0/prefabs/K.prefab.json', ['{"prefab":"/fuzz/r0/prefabs/K.prefab.json"}'])).toBe(true);
+    expect(trashedPrefabReferenced(Kbytes, '/fuzz/r0/prefabs/K.prefab.json', ['{"source":"another"}', wrote])).toBe(false);
   });
 
   // #1838: the round trip holds a rotation as ONE value, an orientation (#1490's rule), not three numbers.

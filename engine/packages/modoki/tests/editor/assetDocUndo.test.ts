@@ -8,7 +8,7 @@
  *
  *  Each asset kind is driven through the entry its panel actually pushes: `assetDocAction` with that kind's real
  *  `apply` (`persistAssetEdit` for the Inspector views, the editor store's `apply*Def` for the editors), and the rig
- *  through `skinDocAction` itself. That every panel site IS built this way is `assetUndoIsFileDirect.test.ts`'s. */
+ *  through `skinDocAction` itself. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createHash } from 'node:crypto';
@@ -27,6 +27,8 @@ import { skinDocAction } from '../../src/editor/panels/skinDocAction';
 import type { AssetSchemaType } from '../../src/runtime/assets/assetSchemas';
 import type { UndoAction } from '../../src/editor/undo/undoManager';
 import { setRunMode } from '../../src/runtime/core/playState';
+import { applyAssetPathMoves } from '../../src/editor/panels/assetEditorBindings';
+import { clearAssetMoveLog } from '../../src/editor/utils/assetMoveLog';
 
 // ── The fake backend: path → bytes ──
 const disk = new Map<string, Uint8Array>();
@@ -80,7 +82,7 @@ const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 const holdNextRead = (path: string, stale = false) => { let release!: () => void; gates.set(path, { wait: new Promise<void>((r) => { release = r; }), stale }); return release; };
 
 const origFetch = globalThis.fetch;
-beforeEach(() => { setRunMode('stopped'); gates.clear(); readHooks.clear(); writeGates.clear(); disk.clear(); writes.length = 0; clearDirtyAssets(); clearHistory(); installBackend(); });
+beforeEach(() => { setRunMode('stopped'); clearAssetMoveLog(); gates.clear(); readHooks.clear(); writeGates.clear(); disk.clear(); writes.length = 0; clearDirtyAssets(); clearHistory(); installBackend(); });
 afterEach(() => { globalThis.fetch = origFetch; clearDirtyAssets(); clearHistory(); vi.restoreAllMocks(); });
 
 // ── One entry per asset kind, built the way its panel builds it ──
@@ -461,5 +463,37 @@ describe('sameAssetDoc — what "holds" compares', () => {
     expect(sameAssetDoc({ a: 1, u: undefined }, { a: 1 })).toBe(true);
     expect(sameAssetDoc({ a: [1, 2] }, { a: [2, 1] })).toBe(false);
     expect(sameAssetDoc({ a: 1 }, { a: '1' })).toBe(false);
+  });
+});
+
+/** #1868: an Assets Rename or delete is not undoable, so it no longer unwinds before an asset-document step recorded
+ *  before it — the step follows the asset to where it is now, as Unity's undo follows the object. */
+describe('an asset-document step after an Assets Rename or delete (#1868)', () => {
+  const p = '/assets/r.particle.json';
+  const p2 = '/assets/renamed.particle.json';
+  it('follows a Rename: the step checks and applies at the NEW path, and nothing is parked at the old one', async () => {
+    // Mutation: resolve `side.path` as recorded (drop `currentAssetPath`) — the step reads the old path, finds nothing
+    // parked and no file, and refuses "changed since".
+    disk.set(p, bytesOf(D0));
+    const seen: Array<[string, unknown]> = [];
+    const tint = assetDocAction({ label: 'tint', path: p, type: 'particle', before: D0, after: () => D1, apply: (d, at) => { seen.push([at, d]); } });
+    markAssetDirty(p, 'particle', D1, 'panel'); // the forward edit parks
+    await Promise.resolve();
+    disk.set(p2, disk.get(p)!); disk.delete(p); // the rename, on disk…
+    applyAssetPathMoves([{ from: p, to: p2 }]); // …and in the editor (the park moves with it)
+    await tint.undo();
+    expect(seen).toEqual([[p2, D0]]);
+    expect(peekDirtyAsset(p)).toBeNull();
+    expect(peekDirtyAsset(p2)).toBeNull(); // the file at the new path already holds D0: nothing to save
+  });
+
+  it('refuses after a delete, saying the asset was deleted — not "changed since"', async () => {
+    disk.set(p, bytesOf(D0));
+    const tint = assetDocAction({ label: 'tint', path: p, type: 'particle', before: D0, after: () => D1, apply: () => {} });
+    markAssetDirty(p, 'particle', D1, 'panel');
+    await Promise.resolve();
+    disk.delete(p);
+    applyAssetPathMoves([{ from: p, to: null }]);
+    await expect(tint.undo()).rejects.toThrow(/was deleted since/);
   });
 });

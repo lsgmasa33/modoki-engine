@@ -49,7 +49,7 @@ import {
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
-  applyAssetPathMoves, type PathMove,
+  applyAssetPathMoves, getAssetFileOpVersion, type PathMove,
   getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, prefabTextIsDocument, readPriorDocument, createdFrameRebuiltRefusal, primeEditorPrefabCache, isEditorPrefabCached, warnInertPrefabSizes, parsedPrefabRows,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
@@ -58,7 +58,7 @@ import {
   applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
-  pushAction, makePrefabInstantiateAction, entityRef, isInstanceRootCheck, placeholderWriteRefusal, assetDocAction,
+  pushAction, makePrefabInstantiateAction, placedPrefabPath, placedPrefabRefusal, entityRef, isInstanceRootCheck, placeholderWriteRefusal, assetDocAction,
   getEditorViewportCamera, focusEntityInSceneView, setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit,
   upsertKey, findTrack, encodeValue,
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
@@ -915,7 +915,7 @@ function refuseResourceParent(parentId: number, op: string): void {
  *  (`parkSurvivors`), so the asset can have been edited or saved from elsewhere since, and the old step reverted that
  *  too. A refusal throws `UndoRefusedError`, which the `undo` op reports as REFUSED_BY_OP. */
 function pushAssetUndo<T>(
-  label: string, before: T | null | undefined, after: T, apply: (def: T) => void,
+  label: string, before: T | null | undefined, after: T, apply: (def: T, path?: string) => void,
   path: string, type: AssetSchemaType,
 ): void {
   // No prior def means this is the FIRST write to that asset — there is no state to revert TO, so
@@ -1693,7 +1693,7 @@ export function registerEditorAgentOps(): void {
   // "the handler actually did something" — measured: a texture dropped on a Hierarchy entity
   // row reported ok:true/accepted:true and made no edit at all.
   registerAgentOp('dom-dnd', (params) => performDomDnd((params ?? {}) as DomDndParams, {
-    witness: () => ({ stack: getUndoVersion(), assets: getDirtyAssetsVersion(), world: getEditVersion() }),
+    witness: () => ({ stack: getUndoVersion(), assets: getDirtyAssetsVersion(), world: getEditVersion(), files: getAssetFileOpVersion() }),
   }));
 
   // ── Selection ──
@@ -3178,11 +3178,15 @@ export function registerEditorAgentOps(): void {
         label: `Instantiate "${(prefab as PrefabFile).name ?? path}"`,
         initialId: rootId,
         respawn: async () => {
-          const readAgain = capturePrefabRead(path);
-          const again = await getPrefabSource(path);
+          // By the document's guid (a Rename is not undoable, #1868 D2), as the human's placement does.
+          const at = placedPrefabPath((prefab as PrefabFile).id, path);
+          const readAgain = capturePrefabRead(at);
+          const again = await getPrefabSource(at);
           if (!again) return null;
+          const other = placedPrefabRefusal((prefab as PrefabFile).id, again as PrefabFile, at);
+          if (other) throw other;
           // Required, never the scene root (#1793's fork, owner ruling R): a parent that is gone refuses the redo.
-          const id = await instantiatePrefabInstance(again as PrefabFile, path, parentRef ? () => parentRef.require() : 0, readAgain);
+          const id = await instantiatePrefabInstance(again as PrefabFile, at, parentRef ? () => parentRef.require() : 0, readAgain);
           return id;
         },
         remove: (id) => { deleteEntity(id); },
@@ -4015,7 +4019,7 @@ export function registerEditorAgentOps(): void {
     const { errors, warnings } = validateAssetData('particle', def);
     if (errors.length) return { ok: false, errors, warnings };
     type ParticleDef = Parameters<ReturnType<typeof useEditorStore.getState>['applyParticleDef']>[1];
-    const applyParticle = (d: ParticleDef) => useEditorStore.getState().applyParticleDef(path, d);
+    const applyParticle = (d: ParticleDef, p = path) => useEditorStore.getState().applyParticleDef(p, d);
     const prevParticle = getParticleEffect(path) as ParticleDef | undefined;
     applyParticle(def as ParticleDef);
     pushAssetUndo(`Edit particle ${path.split('/').pop()}`, prevParticle, def as ParticleDef, applyParticle, path, 'particle');
@@ -4030,7 +4034,7 @@ export function registerEditorAgentOps(): void {
     const missingClip = requireExistingAsset(clipPath, 'anim-set-clip', 'animation');
     if (missingClip) return missingClip;
     const norm = normalizeAnimationClip(clip as Partial<AnimationClipDef>);
-    const applyClip = (c: typeof norm) => useEditorStore.getState().applyAnimationClip(clipPath, c);
+    const applyClip = (c: typeof norm, p = clipPath) => useEditorStore.getState().applyAnimationClip(p, c);
     const prevClip = getAnimationClip(clipPath) as typeof norm | undefined;
     applyClip(norm);
     pushAssetUndo(`Edit clip ${clipPath.split('/').pop()}`, prevClip, norm, applyClip, clipPath, 'animation');
@@ -4066,7 +4070,7 @@ export function registerEditorAgentOps(): void {
     if (!track) { track = { path: relPath, trait: p.trait, field: p.field, type: p.type ?? 'number', keys: [] }; next.tracks.push(track); }
     track.keys = upsertKey(track.keys, Number(p.time), encodeValue(track.type, p.value));
     const keyClipPath = String(p.clipPath);
-    const applyKeyClip = (c: typeof next) => useEditorStore.getState().applyAnimationClip(keyClipPath, c);
+    const applyKeyClip = (c: typeof next, p = keyClipPath) => useEditorStore.getState().applyAnimationClip(p, c);
     const prevKeyClip = getAnimationClip(keyClipPath) as typeof next | undefined;
     applyKeyClip(next);
     pushAssetUndo(`Add key ${keyClipPath.split('/').pop()}`, prevKeyClip, next, applyKeyClip, keyClipPath, 'animation');
@@ -4091,7 +4095,7 @@ export function registerEditorAgentOps(): void {
     if (after < before) {
       throw new Error(`timeline-set: ${before - after} of ${before} item(s) rejected by normalization (malformed — span end<=start, empty clip/action name, or missing audio clip GUID). Nothing was saved; fix the items and retry.`);
     }
-    const applyTl = (t: typeof norm) => useEditorStore.getState().applyTimelineDoc(timelinePath, t);
+    const applyTl = (t: typeof norm, p = timelinePath) => useEditorStore.getState().applyTimelineDoc(p, t);
     const prevTl = getTimeline(timelinePath) as typeof norm | undefined;
     applyTl(norm);
     pushAssetUndo(`Edit timeline ${timelinePath.split('/').pop()}`, prevTl, norm, applyTl, timelinePath, 'timeline');
@@ -4151,7 +4155,7 @@ export function registerEditorAgentOps(): void {
       throw new Error('timeline-add-clip: item rejected by normalization — malformed for a ' + p.trackType + ' track (need: animation clip name non-empty · signal action non-empty · audio clip GUID non-empty · activation end > start · control prefab GUID non-empty OR particle:true OR subdirector:true \u00b7 video clip GUID non-empty)');
     }
     const tlClipPath = String(p.timelinePath);
-    const applyTlClip = (t: typeof norm) => useEditorStore.getState().applyTimelineDoc(tlClipPath, t);
+    const applyTlClip = (t: typeof norm, p = tlClipPath) => useEditorStore.getState().applyTimelineDoc(p, t);
     const prevTlClip = getTimeline(tlClipPath) as typeof norm | undefined;
     applyTlClip(norm);
     pushAssetUndo(`Add timeline clip ${tlClipPath.split('/').pop()}`, prevTlClip, norm, applyTlClip, tlClipPath, 'timeline');

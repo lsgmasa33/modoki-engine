@@ -442,7 +442,7 @@ export default function AnimationEditor() {
         // is not written back by the next save), and read `_after` at step time, after any coalescing.
         path, type: 'animation', before, after: () => a._after,
         // Re-pose only into our own held session — a pose OPENS the envelope (#1550; `undoMayRepose`).
-        apply: (d) => { useEditorStore.getState().applyAnimationClip(path, d); if (undoMayRepose('animation')) poseLatestRef.current(d); },
+        apply: (d, p) => { useEditorStore.getState().applyAnimationClip(p, d); if (undoMayRepose('animation')) poseLatestRef.current(d); },
       }), { _after: next });
       pushAction(a);
       lastAction.current = a;

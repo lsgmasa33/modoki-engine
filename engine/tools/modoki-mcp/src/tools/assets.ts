@@ -130,10 +130,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     'Move asset FILES to the OS trash (recoverable from there, not from the editor). The cleanup ' +
       'half of modoki_create_asset / modoki_import_file — without it an agent that scaffolds a ' +
       'probe asset has no way to remove it and has to shell out to `rm`.\n\n' +
-      'IT IS NOT UNDOABLE, and it is NARROWER than the Assets panel\'s Delete. The panel sweeps a ' +
-      'model\'s GENERATED products — the .mesh.json / .mat.json / textures it produced on import, ' +
-      'plus every .meta.json sidecar — and records a restore snapshot so Cmd-Z brings them back. ' +
-      'This tool trashes EXACTLY the paths you name and records nothing. So deleting a .glb ' +
+      'IT IS NOT UNDOABLE (no Assets delete is), and it is NARROWER than the Assets panel\'s ' +
+      'Delete. The panel sweeps a model\'s GENERATED products — the .mesh.json / .mat.json / textures ' +
+      'it produced on import, plus every .meta.json sidecar. ' +
+      'This tool trashes EXACTLY the paths you name. So deleting a .glb ' +
       'through it ORPHANS every mesh and material generated from it, with no way back except the ' +
       'OS trash. Name the sidecars and generated files yourself, or delete through the panel.\n\n' +
       'It also does NOT evict the renderer\'s scene-scoped caches (mesh/material/prefab/particle): ' +

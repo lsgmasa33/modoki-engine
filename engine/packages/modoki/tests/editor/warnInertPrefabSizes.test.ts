@@ -118,7 +118,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
         // The one-file commit is the several-file one with one file: its CALLERS are this census's rows.
         { item: 'packages/modoki/src/editor/scene/prefabCommit.ts::commitPrefabWrite',
           reason: 'not a writer: the one-file commit hands its one file to commitPrefabWrites — every caller of it is in this census and warns (or is a restore) itself' },
-        ...(['assetOps.ts::undo', 'assetOps.ts::redo', 'assetUndo.ts::undo', 'assetUndo.ts::redo',
+        ...(['assetOps.ts::undo', 'assetOps.ts::redo',
           'skinPrefab.ts::undo', 'skinPrefab.ts::redo'].map((at) => ({
           item: `packages/modoki/src/editor/${at.startsWith('applyPrefabUndo') ? 'undo' : at.startsWith('skinPrefab') ? 'scene' : 'panels'}/${at}`,
           reason: 'an undo/redo restore: a warning there blames someone for the value they are reverting',

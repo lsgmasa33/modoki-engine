@@ -43,10 +43,15 @@ import type { AssetSchemaType } from '../../runtime/assets/assetSchemas';
 import { sha256OfBytes } from '../utils/contentHash';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
+import { currentAssetPath, assetMoveMark } from '../utils/assetMoveLog';
 
 /** What the file held when an entry was recorded: its hash, when nothing was parked for it — the file then holds the
  *  entry's `before`. Null when something was parked (the file is some older doc) or the read failed. */
-export interface AssetDocBaseline { path: string; before: unknown; diskHash: Promise<string | null> | null }
+export interface AssetDocBaseline {
+  path: string; before: unknown; diskHash: Promise<string | null> | null;
+  /** The Assets move log's length when this was taken (`assetMoveMark`): a step follows only the moves made after it. */
+  moveMark: number;
+}
 
 /** The file's current bytes as the route hashes them (`ifMatchRefusal`: BOM stripped), or null when it is absent, the
  *  SPA fallback, or unreadable. A hash that cannot be computed (no `crypto.subtle`) is a REFUSAL, not a null — the
@@ -72,11 +77,12 @@ async function currentFileHash(path: string): Promise<string | null> {
 /** Take `path`'s baseline. Call it BEFORE the forward edit parks, or `isAssetDirty` answers for the edit itself. */
 export function captureAssetDocBaseline(path: string, before: unknown): AssetDocBaseline {
   // Parked, or the cache kept a discarded edit: either way the file does not hold `before`.
-  if (isAssetDirty(path) || assetCacheDiverged(path)) return { path, before, diskHash: null };
+  const moveMark = assetMoveMark();
+  if (isAssetDirty(path) || assetCacheDiverged(path)) return { path, before, diskHash: null, moveMark };
   // A save of this path that STARTS before the read resolves may have been read instead of `before`'s bytes: drop it.
   const epoch = getAssetWriteEpoch(path);
   const diskHash = currentFileHash(path).then((h) => (getAssetWriteEpoch(path) === epoch ? h : null)).catch(() => null);
-  return { path, before, diskHash };
+  return { path, before, diskHash, moveMark };
 }
 
 /** Equality of two asset documents as their files would hold them: key order ignored, `undefined` members dropped
@@ -125,8 +131,19 @@ export interface AssetDocSide {
 /** Run one asset-doc step over every side: check them ALL (one mismatch refuses the whole step, so a batch edit is
  *  never half-undone), then `apply` each target to the live cache/panel and settle its park. */
 export async function runAssetDocStep(
-  sides: readonly AssetDocSide[], apply: (path: string, doc: unknown) => void, origin: AssetWriteOrigin,
+  recordedSides: readonly AssetDocSide[], apply: (path: string, doc: unknown) => void, origin: AssetWriteOrigin,
 ): Promise<void> {
+  // Where each asset is NOW (#1868): an Assets Rename or move is not undoable, so it no longer unwinds before this step,
+  // and the step follows the asset as Unity's does. A deleted one refuses, saying so — "changed since" would be false.
+  const now = (s: AssetDocSide) => currentAssetPath(s.path, s.baseline.moveMark);
+  const gone = recordedSides.filter((s) => now(s) === null).map((s) => s.path);
+  if (gone.length) {
+    throw new UndoRefusedError(
+      `${gone.join(', ')} ${gone.length === 1 ? 'was' : 'were'} deleted since, so nothing was applied.`,
+      `${gone.length === 1 ? gone[0].split('/').pop() : `${gone.length} assets`} ${gone.length === 1 ? 'was' : 'were'} deleted since`,
+    );
+  }
+  const sides = recordedSides.map((s) => ({ ...s, path: now(s)! }));
   // Every read first — the file's bytes and the recorded baseline's — so from the checks through the last apply there
   // is no await: nothing (a panel edit, another step) can land between "holds" and "moved".
   //
@@ -184,7 +201,9 @@ export async function runAssetDocStep(
  *  module's. */
 export function assetDocAction<T>(o: {
   label: string; path: string; type: AssetSchemaType; before: T; after: () => T;
-  apply: (doc: T) => void; origin?: AssetWriteOrigin; kind?: UndoAction['kind'];
+  /** Moves the live cache and panel to `doc` for the asset at `path` — where it is NOW, which a Rename since the edit
+   *  moved (#1868); use it, not a path captured at the edit. */
+  apply: (doc: T, path: string) => void; origin?: AssetWriteOrigin; kind?: UndoAction['kind'];
   /** A baseline taken EARLIER, for an edit whose document was parked before its entry could be pushed: a gesture that
    *  moves the live doc on every pointer move and pushes one entry at pointer-up (the rig canvas's drags). Taken at the
    *  gesture's start, where it names the same `before`; one for another path is ignored. */
@@ -194,7 +213,7 @@ export function assetDocAction<T>(o: {
     ? o.baseline : captureAssetDocBaseline(o.path, o.before);
   const origin = o.origin ?? 'panel';
   const step = (expected: () => T, target: () => T) => () => runAssetDocStep(
-    [{ path: o.path, type: o.type, baseline, expected, target }], (_p, d) => o.apply(d as T), origin,
+    [{ path: o.path, type: o.type, baseline, expected, target }], (p, d) => o.apply(d as T, p), origin,
   );
   return {
     label: o.label,

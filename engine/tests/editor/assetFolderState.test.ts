@@ -123,12 +123,11 @@ describe('remapCurrentFolder', () => {
 });
 
 /** The regression itself (#854's own fix, on the branch that added it): the two Assets.tsx call
- *  sites reached `remapCurrentFolder` directly, so `makeFolderRenameUndo`'s undo/redo — which
- *  moves the folder back on disk via `applyAssetPathMoves`, not via those call sites — never
- *  repaired `currentFolder`. Driven through the SEAM (`applyAssetPathMoves`), not the leaf
- *  function, because that is the entry point undo/redo actually uses and the one a per-site
- *  fix cannot reach. */
-describe('applyAssetPathMoves repairs currentFolder (the undo/redo path #854 missed)', () => {
+ *  sites reached `remapCurrentFolder` directly, so a move that did not go through them (the folder
+ *  rename's undo/redo then; a paste or a drag-move now) never repaired `currentFolder`. Driven
+ *  through the SEAM (`applyAssetPathMoves`), not the leaf function, because that is the one entry
+ *  point every move reaches and the one a per-site fix cannot. */
+describe('applyAssetPathMoves repairs currentFolder (the path #854 missed)', () => {
   afterEach(() => __resetAssetFolderStateForTest());
 
   it('follows a folder rename applied through the seam', () => {
@@ -138,9 +137,7 @@ describe('applyAssetPathMoves repairs currentFolder (the undo/redo path #854 mis
     applyAssetPathMoves([{ from: '/assets/anim', to: '/assets/clips', prefix: true }]);
     expect(getCurrentFolder()).toBe('/assets/clips');
 
-    // …and the REVERSE move, exactly as `makeFolderRenameUndo.undo` issues it — this is the
-    // move #854's per-call-site fix never reached, because undo does not go through
-    // Assets.tsx's rename/delete handlers at all.
+    // …and the REVERSE move, as a second rename back issues it.
     applyAssetPathMoves([{ from: '/assets/clips', to: '/assets/anim', prefix: true }]);
     expect(getCurrentFolder()).toBe('/assets/anim');
   });
