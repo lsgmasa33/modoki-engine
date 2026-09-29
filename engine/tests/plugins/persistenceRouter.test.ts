@@ -15,6 +15,7 @@ import {
   handleBackendRequest, type BackendContext, type Manifest, getPersistenceMode,
 } from '../../plugins/backend/editorBackendRouter';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 /** A PRIVATE temp dir per run, removed afterwards.
  *
@@ -115,6 +116,7 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
   function tempScene(): string {
     const p = path.join(TMP, `saved-${seq++}.json`);
     fs.writeFileSync(p, JSON.stringify({
+      version: SCENE_FORMAT_VERSION,
       entities: [{ id: 1, name: 'Box', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } }],
     }));
     return p;
@@ -217,6 +219,7 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
   function tempScene(): string {
     const p = path.join(TMP, `live-mutate-${seq++}.json`);
     fs.writeFileSync(p, JSON.stringify({
+      version: SCENE_FORMAT_VERSION,
       entities: [{ id: 1, name: 'Box', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } }],
     }));
     return p;
@@ -429,7 +432,7 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
   it('BOTH branches forward `alsoDeleted` for a removeEntity that took descendants', async () => {
     const withChild = () => {
       const p = tempScene();
-      fs.writeFileSync(p, JSON.stringify({ entities: [
+      fs.writeFileSync(p, JSON.stringify({ version: SCENE_FORMAT_VERSION, entities: [
         { id: 1, name: 'Box', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } },
         { id: 2, name: 'Kid', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Kid', guid: 'g-kid', parentId: 'g-box' } } },
         // Enough grandchildren to pass the cap, so the file branch has an `alsoDeletedTotal` to drop.

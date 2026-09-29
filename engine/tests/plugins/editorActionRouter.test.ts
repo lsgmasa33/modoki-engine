@@ -13,6 +13,7 @@ import { handleBackendRequest, type BackendContext, type Manifest } from '../../
 import { DEFAULT_PROJECT_CONFIG, PRIVATE_BUILD_FIELDS } from '../../project-config';
 import { readScannedSource } from '@modoki/engine/testing';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
   const base = {
@@ -715,6 +716,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     // Inside a scratch dir: a bare `os.tmpdir()` file here was never removed (32 per run, #1117).
     const p = path.join(makeScratchDir('modoki-mutate-guard-'), `scene-${seq++}.json`);
     fs.writeFileSync(p, JSON.stringify({
+      version: SCENE_FORMAT_VERSION,
       entities: [{ id: 1, name: 'Box', traits: { Transform: { x: 0, y: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } }],
     }));
     return p;

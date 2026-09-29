@@ -17,6 +17,7 @@ import path from 'path';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { defaultAssetData } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { resolveAssetPath } from '../../plugins/vite-asset-scanner';
 
 let projectRoot = '';
@@ -113,7 +114,7 @@ describe('/api/scene-mutate', () => {
   });
 
   it('still writes a real scene (the accept side)', async () => {
-    place('scenes/main.scene.json', doc('77777777-7777-4777-8777-777777777777'), 'scene');
+    place('scenes/main.scene.json', { ...doc('77777777-7777-4777-8777-777777777777'), version: SCENE_FORMAT_VERSION }, 'scene');
     const res = await post('/api/scene-mutate', { path: '/scenes/main.scene.json', ops: [moveX] });
     expect(res.body.ok).toBe(true);
     expect(res.body.saved).toBe(true);
@@ -121,7 +122,7 @@ describe('/api/scene-mutate', () => {
   });
 
   it('still writes a LEGACY scene — a plain .json the manifest types scene', async () => {
-    place('scenes/old.json', doc('88888888-8888-4888-8888-888888888888'), 'scene');
+    place('scenes/old.json', { ...doc('88888888-8888-4888-8888-888888888888'), version: SCENE_FORMAT_VERSION }, 'scene');
     const res = await post('/api/scene-mutate', { path: '/scenes/old.json', ops: [moveX] });
     expect(res.body.ok).toBe(true);
     expect(JSON.parse(read('scenes/old.json')).entities[0].traits.Transform.x).toBe(5);

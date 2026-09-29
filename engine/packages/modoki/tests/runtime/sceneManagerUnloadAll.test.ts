@@ -34,7 +34,9 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
 });
 
 const sceneOf = (name: string) => ({
-  version: 8, // current SCENE_FORMAT_VERSION → no in-place migration runs
+  // MIN_READABLE_SCENE_FORMAT_VERSION, NOT the current one: loading it runs the v8→current rungs and
+  // bumps `version`, the rewrite F3 below needs to see NOT reach the caller's object. Below 8 is refused.
+  version: 8,
   resources: [],
   entities: [{ id: 1, traits: { Transform: { x: 1 }, EntityAttributes: { name, parentId: 0 } } }],
 });

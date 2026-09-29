@@ -304,6 +304,7 @@ import {
   ASSET_SCHEMA_TYPES, ASSET_FORMAT_VERSION, type AssetSchemaType,
 } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { classifyJsonFormatVersion } from '../../packages/modoki/src/runtime/core/formatVersion';
+import { SceneFormatRefusedError, assertSceneFormatReadable } from '../../packages/modoki/src/runtime/loaders/sceneFormatGate';
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 // Type-only, and deliberately from the DOM-free `frameLoopStatus` LEAF, not `frameDriver.ts`
 // itself: this router is reachable from `engine/electron/backendServer.ts`, compiled under
@@ -3266,7 +3267,31 @@ async function describeUnresolvedAgainstLiveWorld(
           ],
         }, 409);
       }
-      const scene = readJsonFile(absPath) as MutableScene;
+      // ── The format gate: the SAME one every scene load runs (`assertSceneFormatReadable`). ──
+      // This path edits the raw JSON, so nothing else here asks what version it is. A too-new file
+      // would be edited through shapes this build does not know. A too-old, versionless or
+      // unreadable one keeps its version (nothing here writes it), so every reader still refuses it —
+      // refusing HERE tells the caller now, instead of reporting an edit to a file nobody can open.
+      // An unparsable file (merge markers) is the same `unreadable` answer the loader gives, not a 500.
+      const refuseFormat = (reason: string, message: string) => json({
+        ok: false, changed: 0, errors: [message], saved: false,
+        code: 'REFUSED_BY_OP' satisfies ErrorCode,
+        reason: `scene-format-${reason}`,
+        error: `scene-mutate refused ${scenePath}: ${message} Nothing was applied and nothing was written.`,
+      }, 409);
+      let scene: MutableScene;
+      try {
+        scene = readJsonFile(absPath) as MutableScene;
+      } catch (e) {
+        if (!(e instanceof SyntaxError)) throw e;
+        return refuseFormat('unreadable', `Scene not loaded: it is not valid JSON (${e.message}). The file may be corrupt or hand-edited incorrectly (e.g. unresolved merge markers).`);
+      }
+      try {
+        assertSceneFormatReadable(scene);
+      } catch (e) {
+        if (!(e instanceof SceneFormatRefusedError)) throw e;
+        return refuseFormat(e.reason, e.message);
+      }
       // Phase 3, scene-loading.md — a v12+ file has no entity ids; this
       // module still addresses entities by numeric id internally, so backfill one per
       // entry for the duration of this call. Stripped back off (stripBackfilledEntityIds,
