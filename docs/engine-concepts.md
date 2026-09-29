@@ -276,9 +276,11 @@ Three rules follow:
   no children. Every entity now has a Hierarchy row, the Transient Time and Input singletons included,
   and a child under one of those is dropped from every save and Play snapshot with it. A resource moved
   under an entity is deleted with that entity's subtree.
-  - **The rule lives in `runtime/core/ecs/hierarchy.ts`.** `reparentRefusal` judges moves: the editor
-    reparent, the agent `reparent-entity` op, device `set-traits`, and `apply-scene-ops`' `parentId`
-    write. `parentRefusal` / `parentOrRootFor` judge the paths that CREATE a link.
+  - **The rule lives in `runtime/core/ecs/parentLink.ts`** (`parentLinkRefusal`, over any hierarchy), and
+    `hierarchy.ts`'s `reparentRefusal` asks it of the live world for moves: the editor reparent, the agent
+    `reparent-entity` op, device `set-traits`, and `apply-scene-ops`' `parentId` write. The file-direct
+    scene-mutate asks the same rule of a scene file's entries (#1825). `parentRefusal` / `parentOrRootFor`
+    judge the paths that CREATE a link.
   - **Agent create and instantiate are refused:** `create-entity` (editor and device) and prefab
     instantiate.
   - **Editor gestures re-root instead:** paste, a prefab dropped on a row, `apply-scene-ops`

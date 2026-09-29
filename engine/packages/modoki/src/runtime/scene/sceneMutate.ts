@@ -12,7 +12,8 @@
 
 import { newGuid, durableGuid, findRuntimeGuids } from '../core/assetRefRules';
 import { traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal } from '../core/ecs/traitEditPolicy';
-import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './transformSpace';
+import { parentLinkRefusal, type ParentGraph } from '../core/ecs/parentLink';
+import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, worldTrsOf, storedTransformOf, templatePlacedEntry, sameTrsMatrix, type TRS } from './transformSpace';
 
 /** Minimal on-disk entity shape (matches editor SerializedEntity / runtime
  *  SceneEntityEntry — kept structural to avoid a cross-layer import). */
@@ -146,9 +147,20 @@ export function alsoDeletedTally() {
   };
 }
 
+/** What `applyOps` knows about the project that the file alone cannot say. */
+export interface ApplyOptions {
+  /** Trait names whose category is `resource`, from the editor's trait schema — a scene file carries no categories.
+   *  Absent (no renderer has pushed a schema — the headless route, which already says no editor was checked): the
+   *  resource half of the parent rule is not asked; self, cycle and a dead parent still are (#1825). */
+  resourceTraits?: ReadonlySet<string>;
+  /** The entries `assignSyntheticEntityIds` gave a TEMPORARY id, which the caller strips before writing: a parent named
+   *  by one of those ids would name nothing once stored, so it is treated as naming nothing (#1825 close-out review). */
+  syntheticIds?: ReadonlySet<MutableEntity>;
+}
+
 /** Apply a list of mutation ops to a scene object. Mutates `scene` in place and
  *  also returns it. `mint` is injectable so tests get deterministic ids. */
-export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => string = newGuid): ApplyResult {
+export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => string = newGuid, opts: ApplyOptions = {}): ApplyResult {
   const errors: string[] = [];
   const warnings: string[] = [];
   const unresolved: EntityRef[] = [];
@@ -191,6 +203,20 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
           errors.push(`${where}: 'space' applies only to trait 'Transform' (got '${op.trait}').`);
           continue;
         }
+        // A parent change is judged by the one parent rule, against this file's own entries (#1825).
+        const parentGiven = op.trait === 'EntityAttributes' && fields.parentId !== undefined;
+        // Taken BEFORE any write: the pose is read under the parent the entry has now.
+        let pose: Record<string, number> | null = null;
+        if (parentGiven) {
+          const judged = judgeFileParent(scene, entity, fields.parentId, opts);
+          if ('error' in judged) { errors.push(`${where}: ${judged.error} — nothing was applied`); continue; }
+          if (judged.moves) {
+            const kept = keepWorldPose(scene, entity, judged.parent);
+            if ('error' in kept) { errors.push(`${where}: ${kept.error} — nothing was applied`); continue; }
+            if (kept.warning) warnings.push(`${where}: ${kept.warning}`);
+            pose = kept.write;
+          }
+        }
         // Prefab-instance roots route trait writes into their overrides (see helper).
         const container = traitWriteContainer(entity);
         if (Object.keys(fields).length === 0) {
@@ -209,6 +235,21 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
             const converted = worldFieldsToLocal(scene, entity, base as Record<string, unknown>, fields);
             if ('error' in converted) { errors.push(`${where}: ${converted.error}`); continue; }
             write = converted.fields;
+          }
+          if (pose) {
+            // The world-pose compensation lands where the entry keeps its Transform: an instance root's in its
+            // overrides (`container`), anything else's in its traits (#1847).
+            const tf = container.Transform;
+            container.Transform = { ...(tf && typeof tf === 'object' ? tf : {}), ...pose };
+          }
+          if (parentGiven && container !== entity.traits) {
+            // An instance root's parent is the ENTRY's own, read by the loader from `traits` (where a Hierarchy drop and
+            // a save put it). In the overrides it moved nothing, and Apply would carry it into the template (#1825).
+            const { parentId, ...rest } = write;
+            const own = entity.traits.EntityAttributes;
+            entity.traits.EntityAttributes = { ...(own && typeof own === 'object' ? own : {}), parentId };
+            write = rest;
+            if (Object.keys(write).length === 0) { changed++; continue; }
           }
           if (existing === undefined && container === entity.traits) addedTraits.push({ op: i, id: entity.id, guid: entityGuid(entity), trait: op.trait });
           container[op.trait] = { ...base, ...write };
@@ -237,15 +278,22 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         const stampRefused = authoredEa && typeof authoredEa === 'object' && 'sourceScene' in authoredEa
           ? fieldWriteRefusal('EntityAttributes', 'sourceScene', (authoredEa as Record<string, unknown>).sourceScene, '') : null;
         if (stampRefused) { errors.push(`${where}: ${stampRefused}`); continue; }
-        // Warn if the requested parent doesn't exist yet (ops apply in order, so a
-        // parent added by an earlier op IS present here). An orphan won't render
-        // under the expected parent and the agent gets no other signal. (F5)
-        const pid = op.parentId;
-        if (pid != null && pid !== 0 && pid !== '') {
-          const parentExists = scene.entities.some((e) =>
-            typeof pid === 'number' ? e.id === pid : entityGuid(e) === pid);
-          if (!parentExists) {
-            warnings.push(`${where}: parentId '${pid}' matches no existing entity — '${op.name ?? 'new entity'}' will be orphaned`);
+        // The parent may arrive as `op.parentId` OR inside the authored EntityAttributes; both answer to the same rule,
+        // as in the live addEntity (#1248). A parent that names no entity of this file (ops apply in order, so one an
+        // earlier op added IS present) or a resource goes to the scene root with a warning, as the live create does
+        // (#1825): the entity is still created somewhere that is saved, never stored as an orphan.
+        const authoredParent = authoredEa && typeof authoredEa === 'object' ? (authoredEa as { parentId?: unknown }).parentId : undefined;
+        const askedParent: unknown = op.parentId ?? authoredParent;
+        let parentRef: string | number = 0;
+        if (askedParent !== undefined && askedParent !== 0 && askedParent !== '') {
+          const graph = fileParentGraph(scene, opts);
+          const parent = graph.find(askedParent);
+          if (!parent) {
+            warnings.push(`${where}: parentId ${JSON.stringify(askedParent)} matches no entity in this scene file — '${op.name ?? 'new entity'}' was parented to the scene root instead`);
+          } else if (graph.isResource(parent)) {
+            warnings.push(`${where}: parent ${JSON.stringify(askedParent)} is a resource and holds no children — '${op.name ?? 'new entity'}' was parented to the scene root instead`);
+          } else {
+            parentRef = askedParent as string | number;
           }
         }
         const id = nextId(scene);
@@ -257,15 +305,14 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
           : {};
         traits.EntityAttributes = {
           name: op.name ?? existingAttrs.name ?? `Entity ${id}`,
-          parentId: op.parentId ?? existingAttrs.parentId ?? 0,
           ...existingAttrs,
           // After the spread, so a caller's guid cannot override it: an EMPTY one would leave the
           // entity unaddressable, and a RUNTIME one (#1210) — copied from a live-world read — is
           // valid only until reload and must never reach a file.
           guid: durableGuid(existingAttrs.guid as string) || mint(),
-          // re-apply the canonical name/parentId in case existingAttrs lacked them
           ...(op.name ? { name: op.name } : {}),
-          ...(op.parentId != null ? { parentId: op.parentId } : {}),
+          // Always the JUDGED parent: the authored data may name a dead entity or a resource, re-rooted above.
+          parentId: parentRef,
         };
         // EntityAttributes.name is canonical (the loader reads only that). The
         // top-level `name` is decorative (serialize parity / labels) — derive it
@@ -496,6 +543,86 @@ function parentKeyOf(e: MutableEntity): string | number {
   }
   return 0;
 }
+
+/** The file's hierarchy, for the one parent rule (`parentLinkRefusal`, #1825): its nodes are the file's entries, and a
+ *  parent is the entry a stored `parentId` names — a guid (current files, an instance root's top-level one included)
+ *  or a numeric file id (legacy). `find` answers null for the root (0 / ''), undefined for a ref that names nothing. */
+function fileParentGraph(scene: MutableScene, opts: ApplyOptions):
+  ParentGraph<MutableEntity> & { find(ref: unknown): MutableEntity | null | undefined } {
+  const { resourceTraits, syntheticIds } = opts;
+  const byGuid = new Map<string, MutableEntity>();
+  const byId = new Map<number, MutableEntity>();
+  for (const e of scene.entities) {
+    const g = entityGuid(e);
+    if (g) byGuid.set(g, e);
+    // Only an id the FILE stores is a parent reference; a backfilled one is stripped before the write.
+    if (typeof e.id === 'number' && !syntheticIds?.has(e)) byId.set(e.id, e);
+  }
+  const find = (ref: unknown): MutableEntity | null | undefined =>
+    ref === 0 || ref === '' ? null : typeof ref === 'string' ? byGuid.get(ref) : typeof ref === 'number' ? byId.get(ref) : undefined;
+  return {
+    find,
+    parentOf: (e) => find(parentKeyOf(e)) ?? null,
+    isResource: (e) => !!resourceTraits && Object.keys(e.traits ?? {}).some((t) => resourceTraits.has(t)),
+    size: scene.entities.length,
+  };
+}
+
+/** Judge a `parentId` written to an EXISTING entry: the file twin of the live setTrait's parent check. A parent that
+ *  names no entry of this file is REFUSED, never stored (the loader would re-root or orphan it): this moves an entity
+ *  the caller named, and a wrong-place success is worse than a refusal. A prefab member is not an entry, so a member
+ *  parent is reached through the live editor's reparent, which can split and unpack an instance. */
+function judgeFileParent(scene: MutableScene, entity: MutableEntity, raw: unknown, opts: ApplyOptions):
+  { ok: true; parent: MutableEntity | null; moves: boolean } | { error: string } {
+  const shown = JSON.stringify(raw);
+  if (typeof raw !== 'string' && typeof raw !== 'number') return { error: `EntityAttributes.parentId must be a guid string, an entity id, or 0 for the root (got ${shown})` };
+  const graph = fileParentGraph(scene, opts);
+  const parent = graph.find(raw);
+  if (parent === undefined) {
+    return { error: `EntityAttributes.parentId ${shown} names no entity in this scene file. A parent here must be an entity of this file (a prefab member is not one: move under a member with modoki_reparent_entity while the scene is open in the editor)` };
+  }
+  const refusal = parentLinkRefusal(graph, entity, parent);
+  if (refusal === 'self-parent') return { error: `EntityAttributes.parentId ${shown} is the entity itself — an entity cannot be its own parent` };
+  if (refusal === 'cycle') return { error: `EntityAttributes.parentId ${shown} is a descendant of this entity — the move would close a cycle, which makes the hierarchy untraversable` };
+  if (refusal === 'resource') return { error: `EntityAttributes.parentId ${shown} would put a resource entity into the hierarchy (this entity or the parent carries a resource trait such as a game config) — resources stay at the root and hold no children` };
+  return { ok: true, parent, moves: parent !== graph.parentOf(entity) };
+}
+
+/** The local Transform that keeps `entity`'s WORLD pose once `newParent` (null = the root) holds it — the file twin of
+ *  the live reparent's compensation (#1847; Unity's editor reparent keeps the world pose too). Only the persisted groups
+ *  that actually change are returned, and a move between two parents with the SAME world pose writes nothing — a
+ *  compose/decompose round trip would otherwise rewrite authored numbers into an equivalent pose (`{sy:-1}` becomes
+ *  `{sx:-1, rz:π}`), which is not equivalent to a game reading the sign of `sy`. An entry that stores no Transform has
+ *  no pose to keep. When a pose on EITHER side is not fully readable here — the entity, or any entry up either parent
+ *  chain, is an instance root whose placement is partly in its template (`templatePlacedEntry`) — the entity keeps its
+ *  local transform and the reply says so, rather than computing against an identity it guessed. A ZERO-scale new
+ *  ancestor cannot hold any pose, so the move is refused, as `space:'world'` refuses it. */
+function keepWorldPose(scene: MutableScene, entity: MutableEntity, newParent: MutableEntity | null):
+  { write: Record<string, number> | null; warning?: string } | { error: string } {
+  const stored = storedTransformOf(entity);
+  if (!stored && !entity.prefab) return { write: null };
+  const unknown = templatePlacedEntry(scene.entities, entity) ?? templatePlacedEntry(scene.entities, newParent);
+  if (unknown) {
+    const who = unknown === entity ? 'this instance root' : `'${unknown.name ?? entityGuid(unknown) ?? unknown.id}' (a prefab instance root on the parent chain)`;
+    return { write: null, warning: `${who} takes part of its placement from its prefab, which this route does not read, so the world pose cannot be kept: the entity kept its LOCAL transform and its world position follows the new parent. modoki_reparent_entity with the scene open keeps it` };
+  }
+  const oldParentWorld = parentWorldTrs(scene.entities, entity);
+  const newParentWorld = newParent ? worldTrsOf(scene.entities, newParent) : null;
+  if (sameTrsMatrix(oldParentWorld, newParentWorld)) return { write: null };
+  const collapsed = collapsedParentAxes(newParentWorld);
+  if (collapsed) {
+    return { error: `the new parent's chain has ZERO scale on ${collapsed.join('/')}, which collapses every child onto its origin, so no local transform keeps this entity's world pose. Give that ancestor a non-zero scale first` };
+  }
+  const local = mergeTrs(IDENTITY_LOCAL, stored ?? {});
+  const next = worldToLocalTrs(localToWorldTrs(local, oldParentWorld), newParentWorld);
+  const changed = (Object.keys(local) as (keyof TRS)[]).filter((k) => Math.abs(next[k] - local[k]) > 1e-9);
+  if (!changed.length) return { write: null };
+  const write: Record<string, number> = {};
+  for (const k of persistedTrsKeys(Object.fromEntries(changed.map((k) => [k, next[k]])))) write[k] = next[k];
+  return { write };
+}
+
+const IDENTITY_LOCAL: TRS = { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };
 
 /** Collect an entity id plus all descendants (by EntityAttributes.parentId).
  *  Works whether parentId is a GUID (current) or a numeric file id (legacy), and

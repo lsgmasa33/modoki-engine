@@ -5,6 +5,8 @@ import { describe, it, expect } from 'vitest';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, ALSO_DELETED_CAP, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
 import { validateSceneData, type SceneSchema } from '../../src/runtime/loaders/sceneValidation';
 import { formatRuntimeGuid } from '../../src/runtime/core/assetRefRules';
+import { worldTrsOf } from '../../src/runtime/scene/transformSpace';
+import * as THREE from 'three';
 
 let guidN = 0;
 const mint = () => `guid-${++guidN}`;
@@ -261,12 +263,15 @@ describe('applyOps — addEntity', () => {
   });
 
   // F5 — orphan-parent warning.
-  it('warns when parentId matches no existing entity (orphan), but still adds', () => {
+  // #1825: the file create re-roots as the live one does, never stores the orphan. Mutation: store `askedParent` when
+  // `graph.find` misses — the entity is saved with parentId 999.
+  it('a parentId that names no entity creates the entity at the ROOT, with a warning — never an orphan', () => {
     const scene = freshScene();
     const res = applyOps(scene, [{ op: 'addEntity', name: 'Orphan', parentId: 999 }], mint);
     expect(res.errors).toEqual([]);
     expect(res.changed).toBe(1); // still added
-    expect(res.warnings.join('\n')).toMatch(/parentId '999' matches no existing entity/);
+    expect(res.warnings.join('\n')).toMatch(/parentId 999 matches no entity in this scene file — 'Orphan' was parented to the scene root instead/);
+    expect((scene.entities[2].traits.EntityAttributes as { parentId: unknown }).parentId).toBe(0);
   });
 
   it('does NOT warn when parentId matches an existing entity (numeric or guid)', () => {
@@ -782,5 +787,208 @@ describe('applyOps — runtime guids never reach the file (#1210)', () => {
     ], mint);
     expect(res.changed).toBe(0);
     expect(res.created ?? []).toEqual([]);
+  });
+});
+
+/** #1825 — the file-direct parent write answers to the one parent rule (`parentLinkRefusal`, shared with the live
+ *  `reparentRefusal`), judged against this file's own entries. It used to store any value. */
+describe('applyOps — setTrait EntityAttributes.parentId is judged (#1825)', () => {
+  const setParent = (scene: MutableScene, entity: Record<string, unknown>, parentId: unknown, opts = {}) =>
+    applyOps(scene, [{ op: 'setTrait', entity, trait: 'EntityAttributes', fields: { parentId } } as MutateOp], mint, opts);
+  const parentOf = (scene: MutableScene, i: number) => (scene.entities[i].traits.EntityAttributes as { parentId: unknown }).parentId;
+  /** Root(1) > Child(2) > Grand(3); Config(4) is a resource at the root. */
+  const tree = (): MutableScene => {
+    const s = freshScene();
+    s.entities.push(
+      { id: 3, name: 'Grand', traits: { EntityAttributes: { name: 'Grand', guid: 'g-grand', parentId: 'g-child' } } },
+      { id: 4, name: 'Config', traits: { EntityAttributes: { name: 'Config', guid: 'g-config', parentId: 0 }, GameConfig: { speed: 1 } } },
+    );
+    return s;
+  };
+
+  // Mutation: return { ok: true } when `graph.find` misses — the dead guid is stored.
+  it('a parent that names no entity of this file is refused, and nothing is written', () => {
+    const scene = tree();
+    const res = setParent(scene, { guid: 'g-child' }, 'g-nowhere');
+    expect(res.errors[0]).toMatch(/names no entity in this scene file.*nothing was applied/);
+    expect(res.changed).toBe(0);
+    expect(parentOf(scene, 1)).toBe(1);
+  });
+
+  // Mutation: return null from parentLinkRefusal for 'self-parent' / 'cycle' — each is stored.
+  it('a self-parent and a cycle are refused', () => {
+    const scene = tree();
+    expect(setParent(scene, { guid: 'g-child' }, 'g-child').errors[0]).toMatch(/is the entity itself/);
+    expect(setParent(scene, { guid: 'g-root' }, 'g-grand').errors[0]).toMatch(/is a descendant of this entity/);
+    expect(parentOf(scene, 0)).toBe(0);
+    expect(parentOf(scene, 1)).toBe(1);
+  });
+
+  // The resource half needs the schema's categories, which the route passes. Mutation: `isResource` always false.
+  it('a resource parent, or a resource moved under an entity, is refused when the resource traits are known', () => {
+    const scene = tree();
+    const opts = { resourceTraits: new Set(['GameConfig']) };
+    expect(setParent(scene, { guid: 'g-child' }, 'g-config', opts).errors[0]).toMatch(/would put a resource entity into the hierarchy/);
+    expect(setParent(scene, { guid: 'g-config' }, 'g-root', opts).errors[0]).toMatch(/would put a resource entity/);
+    expect(parentOf(scene, 3)).toBe(0);
+  });
+
+  // Accept side: a legal move is stored, by guid or legacy numeric id, and 0 re-roots.
+  it('a legal move is written', () => {
+    const scene = tree();
+    expect(setParent(scene, { guid: 'g-grand' }, 'g-root').errors).toEqual([]);
+    expect(parentOf(scene, 2)).toBe('g-root');
+    expect(setParent(scene, { guid: 'g-grand' }, 2).errors).toEqual([]);
+    expect(parentOf(scene, 2)).toBe(2);
+    expect(setParent(scene, { guid: 'g-grand' }, 0).errors).toEqual([]);
+    expect(parentOf(scene, 2)).toBe(0);
+  });
+
+  // An instance root's parent is the entry's own `traits.EntityAttributes.parentId`, which the loader reads; in the
+  // overrides it moved nothing and would ride an Apply into the template. Mutation: drop the `container !==
+  // entity.traits` branch — the parent lands in overrides[1].
+  it('on an instance root the parent goes to the entry\'s own traits, and the other fields to its overrides', () => {
+    const scene = prefabInstanceScene();
+    const res = applyOps(scene, [{ op: 'setTrait', entity: { guid: 'g-inst' }, trait: 'EntityAttributes', fields: { parentId: 'g-group', name: 'Renamed' } }], mint);
+    expect(res.errors).toEqual([]);
+    expect(res.changed).toBe(1);
+    const inst = scene.entities[1];
+    expect((inst.traits.EntityAttributes as { parentId: unknown }).parentId).toBe('g-group');
+    expect(inst.overrides![1].EntityAttributes).toEqual({ name: 'Renamed' });
+  });
+
+  // Mutation: in addEntity, keep a resource `parent` — the new entity is stored under the resource.
+  it('addEntity: an authored EntityAttributes.parentId is judged too, and a resource parent re-roots with a warning', () => {
+    const scene = tree();
+    const res = applyOps(scene, [{ op: 'addEntity', name: 'N', traits: { EntityAttributes: { parentId: 'g-config' } } }], mint, { resourceTraits: new Set(['GameConfig']) });
+    expect(res.errors).toEqual([]);
+    expect(res.warnings.join('\n')).toMatch(/is a resource and holds no children — 'N' was parented to the scene root instead/);
+    expect(parentOf(scene, 4)).toBe(0);
+    const dead = applyOps(scene, [{ op: 'addEntity', name: 'M', traits: { EntityAttributes: { parentId: 'g-nowhere' } } }], mint);
+    expect(dead.warnings.join('\n')).toMatch(/matches no entity in this scene file/);
+    expect(parentOf(scene, 5)).toBe(0);
+  });
+
+  // The route backfills a temporary id into every entry of a v12 file and strips it before writing, so a numeric parent
+  // naming one would be stored pointing at nothing. Mutation: index backfilled ids in fileParentGraph — the write passes.
+  it('a numeric parent naming a BACKFILLED id is refused (setTrait) or re-rooted (addEntity) — it names nothing on disk', () => {
+    const scene: MutableScene = { version: 13, entities: [
+      { name: 'A', traits: { EntityAttributes: { name: 'A', guid: 'g-a', parentId: 0 } } },
+      { name: 'B', traits: { EntityAttributes: { name: 'B', guid: 'g-b', parentId: 0 } } },
+      { name: 'C', traits: { EntityAttributes: { name: 'C', guid: 'g-c', parentId: 0 } } },
+    ] } as unknown as MutableScene;
+    const syntheticIds = assignSyntheticEntityIds(scene);
+    const res = applyOps(scene, [{ op: 'setTrait', entity: { guid: 'g-b' }, trait: 'EntityAttributes', fields: { parentId: 2 } }], mint, { syntheticIds });
+    expect(res.errors[0]).toMatch(/names no entity in this scene file/);
+    expect(parentOf(scene, 1)).toBe(0);
+    const add = applyOps(scene, [{ op: 'addEntity', name: 'N', parentId: 2 }], mint, { syntheticIds });
+    expect(add.warnings.join('\n')).toMatch(/matches no entity in this scene file/);
+    expect(parentOf(scene, 3)).toBe(0);
+    // Accept side: the guid form of the same parent passes.
+    expect(applyOps(scene, [{ op: 'setTrait', entity: { guid: 'g-b' }, trait: 'EntityAttributes', fields: { parentId: 'g-c' } }], mint, { syntheticIds }).errors).toEqual([]);
+  });
+});
+
+/** #1847 — a file-direct parent change keeps the WORLD pose, as every live reparent does (Unity's editor reparent too). It
+ *  kept the stored LOCAL transform, so the entity jumped by the new parent's transform on the next load. */
+describe('applyOps — setTrait parentId keeps the world pose (#1847)', () => {
+  const tf = (x: number, extra: Record<string, number> = {}) => ({ x, y: 0, z: 0, ...extra });
+  /** P is translated, rotated and scaled; Q is at the root; C sits under Q. Z is a zero-scale parent. */
+  const scene = (): MutableScene => ({ version: 13, entities: [
+    { id: 1, name: 'P', traits: { EntityAttributes: { name: 'P', guid: 'g-p', parentId: 0 }, Transform: tf(10, { ry: Math.PI / 2, sx: 2, sy: 2, sz: 2 }) } },
+    { id: 2, name: 'Q', traits: { EntityAttributes: { name: 'Q', guid: 'g-q', parentId: 0 }, Transform: tf(-3, { y: 4 }) } },
+    { id: 3, name: 'C', traits: { EntityAttributes: { name: 'C', guid: 'g-c', parentId: 'g-q' }, Transform: tf(1, { z: 2, rx: 0.3 }) } },
+    { id: 4, name: 'Z', traits: { EntityAttributes: { name: 'Z', guid: 'g-z', parentId: 0 }, Transform: tf(0, { sx: 0 }) } },
+    { id: 5, name: 'Bare', traits: { EntityAttributes: { name: 'Bare', guid: 'g-bare', parentId: 0 } } },
+  ] } as MutableScene);
+  const byName = (s: MutableScene, n: string) => s.entities.find((e) => e.name === n)!;
+  /** Same world pose: position and scale per axis, orientation by quaternion angle (Euler angles are not unique). */
+  const close = (a: Record<string, number>, b: Record<string, number>) => {
+    for (const k of ['x', 'y', 'z', 'sx', 'sy', 'sz']) expect(a[k], k).toBeCloseTo(b[k]!, 6);
+    const q = (t: Record<string, number>) => new THREE.Quaternion().setFromEuler(new THREE.Euler(t.rx, t.ry, t.rz));
+    expect(q(a).angleTo(q(b)), 'orientation').toBeLessThan(1e-6);
+  };
+
+  // Mutation: skip keepWorldPose (pose = null) — C keeps its local x=1 under P and lands somewhere else. Filtering the
+  // rotation keys out of the write turns the orientation check red.
+  it('under a translated, rotated, scaled parent the world pose is unchanged', () => {
+    const s = scene();
+    const before = worldTrsOf(s.entities, byName(s, 'C'));
+    const res = applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-c' }, trait: 'EntityAttributes', fields: { parentId: 'g-p' } }], mint);
+    expect(res.errors).toEqual([]);
+    close(worldTrsOf(s.entities, byName(s, 'C')) as never, before as never);
+    // …and to the root: the world pose becomes the local one.
+    applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-c' }, trait: 'EntityAttributes', fields: { parentId: 0 } }], mint);
+    close(byName(s, 'C').traits.Transform as never, before as never);
+  });
+
+  // Only the persisted groups that change are written: a position-only move adds no rotation or scale keys, and an entity
+  // storing no Transform gets none. Mutation: write every key of `next` in keepWorldPose — K gains rx..sz.
+  it('a move writes only the Transform groups it changes', () => {
+    const s = scene();
+    s.entities.push({ id: 6, name: 'K', traits: { EntityAttributes: { name: 'K', guid: 'g-k', parentId: 0 }, Transform: { x: 1 } } });
+    expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-k' }, trait: 'EntityAttributes', fields: { parentId: 'g-q' } }], mint).errors).toEqual([]);
+    expect(Object.keys(byName(s, 'K').traits.Transform as object).sort()).toEqual(['x', 'y', 'z']);
+    expect((byName(s, 'K').traits.Transform as { x: number }).x).toBeCloseTo(4, 9);
+    expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-bare' }, trait: 'EntityAttributes', fields: { parentId: 'g-q' } }], mint).errors).toEqual([]);
+    expect(byName(s, 'Bare').traits.Transform).toBeUndefined();
+  });
+
+  // Mutation: drop the collapsedParentAxes refusal — C is written with a degenerate transform.
+  it('a zero-scale new parent is refused: no local transform keeps the pose', () => {
+    const s = scene();
+    const res = applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-c' }, trait: 'EntityAttributes', fields: { parentId: 'g-z' } }], mint);
+    expect(res.errors[0]).toMatch(/ZERO scale on x.*nothing was applied/);
+    expect((byName(s, 'C').traits.EntityAttributes as { parentId: unknown }).parentId).toBe('g-q');
+  });
+
+  // An instance root is compensated in its OVERRIDES when they store its whole placement. Mutation: write the
+  // compensation into `entity.traits` — the override keeps the old pose and the loader ignores the top-level Transform.
+  it('an instance root whose override stores its whole Transform is compensated in its overrides', () => {
+    const s = prefabInstanceScene();
+    (s.entities[0].traits as Record<string, unknown>).Transform = tf(5);
+    s.entities[1].overrides![1].Transform = { x: 2, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };
+    expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-inst' }, trait: 'EntityAttributes', fields: { parentId: 'g-group' } }], mint).errors).toEqual([]);
+    expect((s.entities[1].overrides![1].Transform as { x: number }).x).toBeCloseTo(-3, 9);
+    expect(s.entities[1].traits.Transform).toBeUndefined();
+  });
+
+  // A PARTIAL override (only the marked fields are written — the normal shape) or none takes the rest from the
+  // template, which this route cannot read: guessing identity moved the entity (review: a template y=3 landed at 0).
+  // So it keeps its local transform and says so. Mutation: make templatePlacedEntry return undefined — the partial
+  // override is rewritten with identity-filled values.
+  it('an instance root placed partly by its template keeps its local transform, with a warning', () => {
+    for (const over of [{ x: 2 }, undefined]) {
+      const s = prefabInstanceScene();
+      (s.entities[0].traits as Record<string, unknown>).Transform = tf(5, { rz: Math.PI / 2 });
+      if (over) s.entities[1].overrides![1].Transform = over; else delete s.entities[1].overrides;
+      const res = applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-inst' }, trait: 'EntityAttributes', fields: { parentId: 'g-group' } }], mint);
+      expect(res.errors).toEqual([]);
+      expect(res.warnings.join('\n')).toMatch(/this instance root takes part of its placement from its prefab.*kept its LOCAL transform/);
+      expect(s.entities[1].overrides?.[1]?.Transform).toEqual(over);
+    }
+  });
+
+  // The same holds for a PARENT placed by its template: its world pose is unknown here. Same mutation.
+  it('a new parent placed by its template: the entity keeps its local transform, with a warning naming the parent', () => {
+    const s = prefabInstanceScene();
+    s.entities.push({ id: 3, name: 'K', traits: { EntityAttributes: { name: 'K', guid: 'g-k', parentId: 0 }, Transform: { x: 1 } } });
+    const res = applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-k' }, trait: 'EntityAttributes', fields: { parentId: 'g-inst' } }], mint);
+    expect(res.errors).toEqual([]);
+    expect(res.warnings.join('\n')).toMatch(/'PadInst' \(a prefab instance root on the parent chain\) takes part of its placement/);
+    expect(s.entities[2].traits.Transform).toEqual({ x: 1 });
+  });
+
+  // Between two parents with the same world pose nothing is rewritten: the round trip turned `{sy:-1}` into the
+  // equivalent `{sx:-1, rz:π}`, which a game reading the sign of `sy` does not treat as equivalent. Mutation: drop the
+  // sameTrsMatrix early return — K's Transform is rewritten.
+  it('a move between parents with the same world pose leaves the authored numbers alone', () => {
+    const s = scene();
+    s.entities.push(
+      { id: 6, name: 'G', traits: { EntityAttributes: { name: 'G', guid: 'g-g', parentId: 0 }, Transform: tf(0) } },
+      { id: 7, name: 'K', traits: { EntityAttributes: { name: 'K', guid: 'g-k', parentId: 0 }, Transform: { x: 1, sy: -1, rz: 3.5 } } },
+    );
+    expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-k' }, trait: 'EntityAttributes', fields: { parentId: 'g-g' } }], mint).errors).toEqual([]);
+    expect(byName(s, 'K').traits.Transform).toEqual({ x: 1, sy: -1, rz: 3.5 });
   });
 });

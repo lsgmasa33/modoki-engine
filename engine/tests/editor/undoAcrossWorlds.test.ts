@@ -419,7 +419,8 @@ describe('the placeholder gate: an edit the save would drop is refused where it 
     expect(first).not.toMatch(/"sortOrder"|"isActive"/);
   });
 
-  // Mutation: remove `setEditorWriteGate(...)` from agentEditorOps — set-traits writes the placeholder raw.
+  // Mutation: remove the placeholder ask from BOTH layers of the editor's trait writer (`editorTraitWriter.refusal` and
+  // `writeTraitAsEditor`, #1816's one writer) — the shared helpers' own gate then throws mid-call instead of refusing.
   it('the agent surface refuses with the reason: apply-scene-ops and set-traits', async () => {
     const r1 = await runAgentOp('apply-scene-ops', { ops: [{ op: 'setTrait', entity: { guid: INST }, trait: 'Transform', fields: { x: 2 } }] }) as { errors: string[] };
     expect(r1.errors.join('\n')).toMatch(/Missing Prefab now/);

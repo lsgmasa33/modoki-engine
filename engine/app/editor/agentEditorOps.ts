@@ -20,14 +20,14 @@ import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { histogram } from '../../tools/shared/filterDisclosure';
 import { OpRefusal } from '../debug/opRefusal';
 import { liveGuidOf } from '../debug/liveLifecycle';
-import { setEditorParentWrite, setEditorWriteGate } from '../debug/liveMutate';
+import type { LiveTraitWriter } from '../debug/liveMutate';
 import { describeTopModal, type ModalDescription } from '../debug/modalShells';
 import {
   resolveEntityAddress, guidListFields, descendantsOf, alsoDeletedFields, ALSO_DELETED_CAP,
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, setEditorScenePathReader, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, setEditorScenePathReader, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
 import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
@@ -714,6 +714,148 @@ function fieldParentWriteRefusal(op: string, id: number, parentId: number, shown
   return null;
 }
 
+type LiveTraitMeta = ReturnType<typeof getAllTraits>[number];
+
+/** What `writeTraitAsEditor` did, or why it wrote nothing. A refusal carries the resolver's code, options and stale
+ *  reason when a parent guid missed, so the op's reply keeps them (#1223 D4). */
+type EditorTraitWrite =
+  | { ok: true; changed: boolean; added: boolean }
+  | { ok: false; error: string; code?: ErrorCode; options?: string[]; stale?: string; unresolved?: MutateEntityRef };
+
+/** THE editor write of one trait's fields on one live entity (#1816) — every agent op that writes a trait generically
+ *  (apply-scene-ops' setTrait, the editor's set-traits) comes here, so an agent write lands the way a human Inspector
+ *  edit does: each field through `writeTraitFieldWithUndo` (an undo entry, the dirty mark, a prefab instance's override
+ *  mark), an absent trait through `addTraitToEntitiesWithUndo`, and `EntityAttributes.parentId` through the editor's
+ *  reparent (`planReparent` → `applyReparent`, #1434 #1787), which asks the prefab-edit refusal too (#1836). Empty
+ *  `fields` means a tag: add it when absent.
+ *
+ *  Every refusal is judged BEFORE the first write, so a refused call leaves the entity as it was. A parent change on an
+ *  entity that lacks EntityAttributes is still a reparent (#1825): the trait is seeded without the parent, then moved. */
+function writeTraitAsEditor(op: string, id: number, meta: LiveTraitMeta, fields: Record<string, unknown>): EditorTraitWrite {
+  const entity = findEntity(id);
+  if (!entity) return { ok: false, error: `entity ${id} is no longer in the world — nothing was applied` };
+  // A sourceScene write is a scene move, which a field write cannot carry (#1757) — the file path's refusal, live.
+  const current = readTraitData(id, meta);
+  const fieldRefused = Object.entries(fields).map(([f, v]) => fieldWriteRefusal(meta.name, f, v, current?.[f])).find((r) => r);
+  if (fieldRefused) return { ok: false, error: `${fieldRefused} — nothing was applied to entity ${id}` };
+  const had = entity.has(meta.trait);
+  // A Missing Prefab placeholder keeps only its placement through a save (#1818, I21): an add, or a field its writer
+  // does not carry, is refused with the reason before anything is applied.
+  const onPlaceholder = !had
+    ? placeholderWriteRefusal(id, meta.name)
+    : Object.keys(fields).map((f) => placeholderWriteRefusal(id, meta.name, f)).find((r) => r) ?? null;
+  if (onPlaceholder) return { ok: false, error: `${onPlaceholder} — nothing was applied to entity ${id}` };
+  if (Object.keys(fields).length === 0) {
+    // No fields → tag presence, mirroring sceneMutate.ts (don't clobber existing data; re-tagging an existing trait is
+    // a genuine no-op, not a change). Adding is what was asked, so it is not reported as an added trait.
+    if (had) return { ok: true, changed: false, added: false };
+    addTraitToEntitiesWithUndo([id], meta);
+    return { ok: true, changed: true, added: false };
+  }
+
+  // A parentId write is a reparent in all but name, so it answers to the same rule (#1248). It used to go straight to
+  // the trait, past the resource AND the cycle check.
+  const rawParent = meta.name === 'EntityAttributes' ? fields.parentId : undefined;
+  let newParent = rawParent;
+  const shown = typeof rawParent === 'string' ? `"${rawParent}"` : String(rawParent); // the caller's own input, in errors
+  // A string parent is a guid, as in addEntity. Unlike addEntity, a parent that matches nothing is refused rather than
+  // re-rooted: this moves an EXISTING entity, and a string written raw into the numeric field skipped every check below
+  // (#1434 review).
+  if (newParent !== undefined && typeof newParent !== 'string' && typeof newParent !== 'number') {
+    return { ok: false, error: `EntityAttributes.parentId must be a guid string or an entity id (got ${JSON.stringify(newParent)}) — nothing was applied to entity ${id}` };
+  }
+  if (typeof newParent === 'string') {
+    const pr = resolveLiveEntityRef({ guid: newParent });
+    if (!('id' in pr)) {
+      return { ok: false, error: `EntityAttributes.parentId ${shown} matched no live entity (${pr.error}) — nothing was applied to entity ${id}`,
+        unresolved: { guid: newParent }, code: pr.code, options: pr.options, stale: pr.stale };
+    }
+    newParent = pr.id;
+  }
+  if (typeof newParent === 'number' && newParent !== 0 && !findEntity(newParent)) {
+    return { ok: false, error: `EntityAttributes.parentId ${newParent} matched no live entity (runtime ids are reassigned on every scene reload — prefer a guid) — nothing was applied to entity ${id}` };
+  }
+  // Judged by the same plan as reparent-entity (#1429). A parent from another scene is a scene move, and a field write
+  // has no step to confirm one, so it is refused here with the op that can.
+  const parentMove = typeof newParent === 'number';
+  const refusedParent = parentMove ? fieldParentWriteRefusal(op, id, newParent as number, shown) : null;
+  if (refusedParent) return { ok: false, error: `${refusedParent} Nothing was applied to entity ${id}` };
+
+  const rest = Object.entries(fields).filter(([field]) => !(parentMove && field === 'parentId'));
+  if (!had) {
+    // Seeded with the fields, mirroring sceneMutate.ts's setTrait (merge onto an empty base when absent) — but never with
+    // the parent, which is moved below like any other (#1825). `writeTraitFieldWithUndo` requires the trait, so without
+    // the seed it no-oped while the reply said changed:1.
+    addTraitToEntitiesWithUndo([id], meta, Object.fromEntries(rest));
+  }
+  // A same-scene parent change goes through reparentEntity, like every other reparent (#1434). A bare field write skipped
+  // its unpack on move, so a prefab member moved out of its instance stayed linked and the next save dropped it; it also
+  // skipped the world-position compensation and the folder clear. A parent equal to the current one moves nothing.
+  // The parent goes first, so a Transform written beside it is the one that stands (and undo/redo replay that order).
+  const moved = parentMove ? applyReparent(id, newParent as number).ok : false;
+  if (had) for (const [field, value] of rest) writeTraitFieldWithUndo(id, meta, field, value);
+  return { ok: true, changed: !had || moved || rest.length > 0, added: !had };
+}
+
+/** A write `writeTraitAsEditor` refused mid-call, although `editorTraitWriter.refusal` passed it — the set-traits handler
+ *  answers it as the call's refusal, after the composite rolled back what the call had written. A BACKSTOP: no known
+ *  input reaches it (the pre-check asks the same rules first, for every target), and no test drives it; the rollback it
+ *  relies on is `runAsCompositeAction`'s own, tested there. It exists so a rule the pre-check misses one day refuses
+ *  the whole call rather than leaving it half-applied. */
+class TraitWriteRefused extends Error {}
+
+const isParentWrite = (w: { trait: string; field: string | null }) => w.trait === 'EntityAttributes' && w.field === 'parentId';
+
+/** The editor's set-traits writer (#1816): every write through `writeTraitAsEditor`, grouped per trait, the parent first
+ *  (as apply-scene-ops' setTrait moves before it writes the rest, and undo/redo replay that order). A tag is added or
+ *  removed through the undoable helpers. */
+const editorTraitWriter: LiveTraitWriter = {
+  refusal(ids, writes) {
+    // The placeholder gate (#1818), every target and write before any write — a write that ADDS the trait is asked as
+    // an add, as `writeTraitAsEditor` asks it.
+    for (const id of ids) {
+      const entity = findEntity(id);
+      for (const w of writes) {
+        const adds = w.field === null || !entity?.has(w.meta.trait);
+        const refused = placeholderWriteRefusal(id, w.trait, adds ? undefined : w.field ?? undefined);
+        if (refused) return `set key "${w.field === null ? w.trait : `${w.trait}.${w.field}`}" on entity ${id}: ${refused} — nothing was applied.`;
+      }
+    }
+    const parent = writes.find(isParentWrite);
+    if (!parent) return null;
+    const newParent = Number(parent.value);   // guardParentWrite already refused a non-number and a dead id
+    for (const id of ids) {
+      const refused = fieldParentWriteRefusal('set-traits', id, newParent);
+      if (refused) return `${refused} Nothing was applied to any of the ${ids.length} target${ids.length === 1 ? '' : 's'}.`;
+    }
+    return null;
+  },
+  write(id, writes) {
+    const byTrait = new Map<string, { meta: LiveTraitMeta; fields: Record<string, unknown> }>();
+    for (const w of [...writes.filter(isParentWrite), ...writes.filter((x) => !isParentWrite(x))]) {
+      if (w.field === null) {
+        if (w.value === true) addTraitToEntitiesWithUndo([id], w.meta);
+        else removeTraitFromEntitiesWithUndo([id], w.meta);
+        continue;
+      }
+      let group = byTrait.get(w.trait);
+      if (!group) byTrait.set(w.trait, group = { meta: w.meta, fields: {} });
+      group.fields[w.field] = w.value;
+    }
+    for (const { meta, fields } of byTrait.values()) {
+      const wrote = writeTraitAsEditor('set-traits', id, meta, fields);
+      if (!wrote.ok) throw new TraitWriteRefused(`set-traits: ${wrote.error} (the whole call was rolled back).`);
+    }
+  },
+  // In Play the write lands in the Play world, which Stop reverts along with its undo entry and its dirty mark
+  // (`restoreWorldDirtyBaseline`), so the edit-mode note would be false there (#1816 close-out review).
+  get savedNote() {
+    return getRunMode() === 'playing'
+      ? 'Play world only: Stop reverts this write and drops its undo entry — nothing reaches the scene file.'
+      : 'live world only, not saved yet: the scene is marked unsaved (Save All writes it), and the whole call is one undo entry (Cmd+Z / modoki_history undo).';
+  },
+};
+
 /** The parent an entity should be created under / moved to, VALIDATED.
  *
  *  `parentGuid` was checked and `parentId` was not, so a stale or invented id sailed through as a
@@ -963,81 +1105,22 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             continue;
           }
           let fields = op.fields ?? {};
-          // A sourceScene write is a scene move, which a field write cannot carry (#1757) — the file path's refusal, live.
-          const current = readTraitData(id, meta);
-          const fieldRefused = Object.entries(fields).map(([f, v]) => fieldWriteRefusal(meta.name, f, v, current?.[f])).find((r) => r);
-          if (fieldRefused) { errors.push(`${where}: ${fieldRefused} — nothing was applied to entity ${id}`); continue; }
           if (op.space === 'world') {
             const converted = worldFieldsToLocalLive(id, fields);
             if ('error' in converted) { errors.push(`${where}: ${converted.error}`); continue; }
             fields = converted.fields;
           }
-          const entity = findEntity(id);
-          // A Missing Prefab placeholder keeps only its placement through a save (#1818, I21): an add, or a field its
-          // writer does not carry, is refused here with the reason, before anything in this op is applied.
-          const onPlaceholder = entity && !entity.has(meta.trait)
-            ? placeholderWriteRefusal(id, meta.name)
-            : Object.keys(fields).map((f) => placeholderWriteRefusal(id, meta.name, f)).find((r) => r) ?? null;
-          if (onPlaceholder) { errors.push(`${where}: ${onPlaceholder} — nothing was applied to entity ${id}`); continue; }
-          if (Object.keys(fields).length === 0) {
-            // No fields → tag presence, mirroring sceneMutate.ts (don't clobber existing data;
-            // re-tagging an existing trait is a genuine no-op, not a change).
-            if (entity && !entity.has(meta.trait)) { addTraitToEntitiesWithUndo([id], meta); changed++; }
-          } else if (entity && !entity.has(meta.trait)) {
-            // The entity doesn't have this trait yet — ADD it seeded with `fields`, mirroring
-            // sceneMutate.ts's setTrait (merge onto an empty base when absent). Without this,
-            // writeTraitFieldWithUndo below silently no-ops on a missing trait (it requires the
-            // entity to already have it) while still reporting changed:1 and pushing an inert
-            // undo entry — a live-path-only regression from file-direct parity, found while
-            // testing the composite-batch removeTrait+removeEntity case.
-            addTraitToEntitiesWithUndo([id], meta, fields);
-            // Already durable here: the undo action's `entityRef` minted it (a test pins that). ensureGuid reads it
-            // back typed non-null; it is not what makes it durable.
-            addedTraits.push({ op: i, id, guid: ensureGuid(id), trait: meta.name });
-            changed++;
-          } else {
-            // writeTraitFieldWithUndo already routes into prefab-INSTANCE overrides
-            // (markFieldOverrideIfInstance) — the live-world equivalent of sceneMutate.ts's
-            // traitWriteContainer comes for free from the existing helper, not reimplemented here.
-            // A parentId write is a reparent in all but name, so it answers to the same rule (#1248). It
-            // used to go straight to the trait, past the resource AND the cycle check.
-            const rawParent = meta.name === 'EntityAttributes' ? (fields as Record<string, unknown>).parentId : undefined;
-            let newParent = rawParent;
-            const shown = typeof rawParent === 'string' ? `"${rawParent}"` : String(rawParent); // the caller's own input, in errors
-            // A string parent is a guid, as in addEntity. Unlike addEntity, a parent that matches nothing is
-            // refused rather than re-rooted: this moves an EXISTING entity, and a string written raw into the
-            // numeric field skipped every check below (#1434 review).
-            if (newParent !== undefined && typeof newParent !== 'string' && typeof newParent !== 'number') {
-              errors.push(`${where}: EntityAttributes.parentId must be a guid string or an entity id (got ${JSON.stringify(newParent)}) — nothing was applied to entity ${id}`);
-              continue;
-            }
-            if (typeof newParent === 'string') {
-              const pr = resolveLiveEntityRef({ guid: newParent });
-              if (!('id' in pr)) {
-                errors.push(`${where}: EntityAttributes.parentId ${shown} matched no live entity (${pr.error}) — nothing was applied to entity ${id}`);
-                unresolved.push({ guid: newParent }); if (code === undefined) { code = pr.code; first = pr; }
-                continue;
-              }
-              newParent = pr.id;
-            }
-            if (typeof newParent === 'number' && newParent !== 0 && !findEntity(newParent)) {
-              errors.push(`${where}: EntityAttributes.parentId ${newParent} matched no live entity (runtime ids are reassigned on every scene reload — prefer a guid) — nothing was applied to entity ${id}`);
-              continue;
-            }
-            // Judged by the same plan as reparent-entity (#1429). A parent from another scene is a scene move,
-            // and a batch has no step to confirm one, so it is refused here with the op that can.
-            const parentMove = typeof newParent === 'number';
-            const refusedParent = parentMove ? fieldParentWriteRefusal('apply-scene-ops', id, newParent as number, shown) : null;
-            if (refusedParent) { errors.push(`${where}: ${refusedParent} Nothing was applied to entity ${id}`); continue; }
-            // A same-scene parent change goes through reparentEntity, like every other reparent (#1434). A bare
-            // field write skipped its unpack on move, so a prefab member moved out of its instance stayed linked
-            // and the next save dropped it; it also skipped the world-position compensation and the folder clear.
-            // A parent equal to the current one moves nothing, and is not counted as a change.
-            const moved = parentMove ? applyReparent(id, newParent as number).ok : false;
-            const rest = Object.entries(fields).filter(([field]) => !(parentMove && field === 'parentId'));
-            for (const [field, value] of rest) writeTraitFieldWithUndo(id, meta, field, value);
-            if (moved || rest.length) changed++;
+          const wrote = writeTraitAsEditor('apply-scene-ops', id, meta, fields);
+          if (!wrote.ok) {
+            errors.push(`${where}: ${wrote.error}`);
+            if (wrote.unresolved) unresolved.push(wrote.unresolved);
+            if (wrote.code && code === undefined) { code = wrote.code; first = wrote; }
+            continue;
           }
+          // Already durable here: the undo action's `entityRef` minted it (a test pins that). ensureGuid reads it
+          // back typed non-null; it is not what makes it durable.
+          if (wrote.added) addedTraits.push({ op: i, id, guid: ensureGuid(id), trait: meta.name });
+          if (wrote.changed) changed++;
         } else if (op.op === 'removeTrait') {
           const resolved = resolveLiveEntityRef(op.entity);
           if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) { code = resolved.code; first = resolved; } continue; }
@@ -1321,19 +1404,20 @@ export function registerEditorAgentOps(): void {
   // The editor's own prefab copy (the override diff base) is re-read with the runtime cache on an
   // external prefab write (#1169 review) — see `refreshPrefabSourceForPath`, and `refreshPrefabSourceAfterDiskChange` for the note (#1752).
   setPrefabSourceRefresher(refreshPrefabSourceAfterDiskChange);
-  // set-traits is the device's raw op, and the editor does not replace it; its `parentId` write goes through the
-  // editor's reparent rule instead (#1787). The posed-world refusal is reparent-entity's, and throws before any write.
-  setEditorParentWrite({
-    refusal: (id, parentId) => {
-      refuseEditOfPosedWorld('set-traits EntityAttributes.parentId');
-      return fieldParentWriteRefusal('set-traits', id, parentId);
-    },
-    apply: (id, parentId) => applyReparent(id, parentId).ok,
-    savedNote: 'live world only, not saved yet: each parent change went through the editor\'s reparent and is one undo entry (Cmd+Z / modoki_history undo).',
+  // set-traits is the device's raw op; the editor replaces it (#1816), as it replaces create/duplicate/delete, so an
+  // agent's write lands the way a human's Inspector edit does (`editorTraitWriter`). The whole call is ONE undo entry.
+  // A posed world refuses it before any write, as it refuses every other editor write (a dry run writes nothing).
+  registerAgentOp('set-traits', async (params) => {
+    if ((params as { dryRun?: unknown } | null)?.dryRun === true) return applySetTraits(params, editorTraitWriter);
+    refuseEditOfPosedWorld('set-traits');
+    try {
+      return await runAsCompositeAction({ label: 'Set Traits', kind: '!mutate' }, () => applySetTraits(params, editorTraitWriter));
+    } catch (e) {
+      // The composite rolled every write of the call back before rethrowing.
+      if (e instanceof TraitWriteRefused) return { ok: false, error: e.message };
+      throw e;
+    }
   });
-  // …and every set-traits write asks the placeholder gate first (#1818): a raw write on a Missing Prefab placeholder
-  // showed live and was dropped by the next save.
-  setEditorWriteGate((id, trait, field) => placeholderWriteRefusal(id, trait, field ?? undefined));
 
   // ── State read ──
   registerAgentOp('editor-state', () => readEditorState());

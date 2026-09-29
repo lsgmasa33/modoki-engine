@@ -38,6 +38,8 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   sceneLoadGeneration: () => loadGeneration,
   isSceneLoadInFlight: () => false,
   bootSceneWalkPending: () => null,
+  captureWorldDirtyBaseline: () => ({ primaryClean: false, scenes: new Set(), savedAt: 0 }),
+  restoreWorldDirtyBaseline: () => {},
 }));
 vi.mock('../../src/editor/scene/timelinePreview', () => ({
   hasTimelinePreviewSession: () => false,

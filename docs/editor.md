@@ -1779,12 +1779,19 @@ enter-play / revert-on-stop:
 - **Play** (`enterPlay`) snapshots the live world **in memory** — the primary AND every base in
   the chain, through `editor/scene/authoredSnapshot.ts`, the same capture the preview session uses —
   deliberately **without** `assignGuids`, so Play never writes authored data. It records the scene
-  key and the current undo depth (the "barrier"), then flips to `'playing'`. Resuming from Pause
+  key, the current undo depth (the "barrier") and the world's dirty state (`captureWorldDirtyBaseline`), then flips
+  to `'playing'`. Resuming from Pause
   does **not** re-snapshot.
 - **Pause** (`pausePlay`) freezes the sim but keeps the mutated play world.
 - **Stop** (`stopPlay`) reverts by reloading that snapshot through `SceneManager`
   (`preloaded:` — no disk fetch; resources reused via the scene refcount), discarding every
-  play-mode mutation, then `truncateUndoTo(barrier)` drops the during-play edits. The reload
+  play-mode mutation, then `truncateUndoTo(barrier)` drops the during-play edits and
+  `restoreWorldDirtyBaseline` puts the dirty state back as it was at the press: an undoable edit made in Play (the
+  Inspector, an agent's `setTrait` or `set-traits`) dirtied the scene, and that mark used to survive Stop, so the
+  editor read "unsaved" with nothing to undo or save (#1816 close-out review; Unity does not dirty a scene for Play
+  changes). It only clears — work unsaved at the press stays unsaved — and asset-shaped causes are untouched. A save
+  made after the press (Play's startup awaits allow one) wrote a world the snapshot does not hold, so then it clears
+  nothing: the restored world differs from disk, and dirty is the safe answer. The reload
   **carries** kept bases and the primary's `Persistent` roots instead of rebuilding them, so
   `restoreAuthoredSnapshot` replays their authored fields afterwards (#1547). ⚠️ A snapshot is
   SPARSE — the serializer omits every field at its trait default — so the replay fills schema

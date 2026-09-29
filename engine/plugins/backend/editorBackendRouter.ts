@@ -3323,10 +3323,12 @@ async function describeUnresolvedAgainstLiveWorld(
       // below) before writing — otherwise every setTrait through this route would
       // reintroduce an `id` field on EVERY entity, the exact diff noise Phase 3 removed.
       const backfilledIds = assignSyntheticEntityIds(scene);
-      const { changed, errors, warnings: opWarnings, unresolved, created, addedTraits, alsoDeleted, alsoDeletedNoGuidIds, alsoDeletedTotal, code: applyCode } = applyOps(scene, ops);
-      // Surface BOTH the op-level warnings (dangling refs / orphaned parents from F5)
-      // and the post-apply schema validation warnings.
+      // The schema carries each trait's category, which a file does not: the parent rule's resource half needs it (#1825).
       const schema = ctx.getSchema();
+      const resourceTraits = schema ? new Set(Object.entries(schema.traits).filter(([, t]) => t.category === 'resource').map(([name]) => name)) : undefined;
+      const { changed, errors, warnings: opWarnings, unresolved, created, addedTraits, alsoDeleted, alsoDeletedNoGuidIds, alsoDeletedTotal, code: applyCode } = applyOps(scene, ops, undefined, { resourceTraits, syntheticIds: backfilledIds });
+      // Surface BOTH the op-level warnings (dangling refs / re-rooted parents)
+      // and the post-apply schema validation warnings.
       const { warnings: schemaWarnings } = validateSceneData(scene, schema, makePrefabResolver(ctx), makeAssetResolver(ctx));
       const warnings = [...opWarnings, ...schemaWarnings, ...preflightWarnings];
       // ── The `absent` case: no renderer EXISTS, so nothing can be in the way. ──

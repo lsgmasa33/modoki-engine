@@ -58,6 +58,8 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   // A load already in flight when Play is pressed is the other half of the guard (#573).
   isSceneLoadInFlight: () => loadInFlight,
   bootSceneWalkPending: () => null,
+  captureWorldDirtyBaseline: () => ({ primaryClean: false, scenes: new Set(), savedAt: 0 }),
+  restoreWorldDirtyBaseline: () => {},
 }));
 
 vi.mock('../../src/editor/scene/timelinePreview', () => ({

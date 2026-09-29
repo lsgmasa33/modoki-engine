@@ -129,7 +129,7 @@ import {
   isUnresolvedPress,
 } from '@modoki/engine/runtime';
 import { classifyWorldAbsence } from './sceneQueryAbsence';
-import { applyLiveMutate } from './liveMutate';
+import { applyLiveMutate, type LiveTraitWriter, type LiveMutateResult } from './liveMutate';
 import { createEntityLive, duplicateEntityLive, deleteEntitiesLive, liveGuidOf } from './liveLifecycle';
 import { resolveEntityAddress, type EntityAddress } from './entityRef';
 import { ERROR_CODES, codeFromBody, isFailureBody, type ErrorCode } from '../../tools/shared/errorCodes';
@@ -2962,11 +2962,12 @@ registerAgentOp('create-entity', createEntityLive);
 registerAgentOp('duplicate-entity', duplicateEntityLive);
 registerAgentOp('delete-entities', deleteEntitiesLive);
 
-registerAgentOp('set-traits', (params) =>
-  applyLiveMutate(params, {
-    parseWhere,
-    guidOf: liveGuidOf,
-  }));
+/** `set-traits` with this bridge's selector grammar and guid reader. The device registers it raw; the editor replaces
+ *  the op with one that passes its own `writer` (#1816), as it replaces the lifecycle ops above. */
+export function applySetTraits(params: unknown, writer?: LiveTraitWriter): LiveMutateResult {
+  return applyLiveMutate(params, { parseWhere, guidOf: liveGuidOf, writer });
+}
+registerAgentOp('set-traits', (params) => applySetTraits(params));
 
 /** Dispatch a server request op to a result via the registry.
  *

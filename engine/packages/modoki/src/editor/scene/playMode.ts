@@ -16,7 +16,7 @@
 
 import { getPlayState, setPlayState, getRunMode, setRunMode, onRunModeChange } from '../../runtime/core/playState';
 import { sceneManager } from '../../runtime/scene/SceneManager';
-import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad, bootSceneWalkPending } from './serialize';
+import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad, bootSceneWalkPending, captureWorldDirtyBaseline, restoreWorldDirtyBaseline, type WorldDirtyBaseline } from './serialize';
 import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
 import { beginWorldReplacement } from './authoringSettle';
 import { adoptionsSettled, captureAdoption } from './sceneAdoption';
@@ -41,6 +41,8 @@ let _snapshot: AuthoredSnapshot | null = null;
  *  undo entries — while ALL pre-Play history is preserved (guid-resolved undo
  *  survives the world rebuild). */
 let _undoBarrier = 0;
+/** The world's dirty state at the Play press, put back when Stop reverts the world (`restoreWorldDirtyBaseline`). */
+let _dirtyAtPlay: WorldDirtyBaseline | null = null;
 /** True when THIS Play press auto-opened the Tier-2 @contact capture (via the AI-panel flag),
  *  so Stop closes only what we opened — never a capture a human/MCP opened manually. Without
  *  this, the process-global capture would leak past Stop into edit mode + later worlds. */
@@ -204,6 +206,7 @@ export async function enterPlay(): Promise<PlayOutcome> {
     // awaits below is not in the snapshot, so Stop's revert discards it in the world and its undo entry
     // must go with it (#1574 close-out re-review — the settings fetch moved ahead of the re-check).
     const barrier = undoDepth();
+    const dirtyAtBarrier = captureWorldDirtyBaseline();
     // A body added since the scene loaded (the load itself already awaited Rapier) would otherwise
     // run Play's first frames with no physics (#1175). Awaited BEFORE the generation re-check below,
     // so a scene load landing during the WASM fetch is refused exactly like one landing mid-snapshot.
@@ -227,6 +230,7 @@ export async function enterPlay(): Promise<PlayOutcome> {
     // Mark the undo barrier at the real Play press (not the paused→playing resume
     // above) so Stop can drop only during-Play edits — taken at the snapshot, above.
     _undoBarrier = barrier;
+    _dirtyAtPlay = dirtyAtBarrier;
     // AI-panel opt-in: open the Tier-2 @contact journal watch BEFORE the sim starts, so a
     // physics trace is captured from the first frame (no agent journal action:start needed).
     // Open it ONLY when it isn't already active — so we don't take ownership of (and later close) a
@@ -334,6 +338,8 @@ export async function stopPlay(): Promise<StopOutcome> {
     editorEmit('!stop', {});
     const snap = _snapshot;
     _snapshot = null;
+    const dirtyAtPlay = _dirtyAtPlay;
+    _dirtyAtPlay = null;
     if (!snap) return { kind: 'stopped', reverted: false, reason: 'Play held no authored snapshot, so there was nothing to restore — the live world is the Play world' };
     // Guard: if the active scene changed since Play, the snapshot is for a
     // different scene — reverting it would clobber the current one. Skip.
@@ -345,6 +351,8 @@ export async function stopPlay(): Promise<StopOutcome> {
     await restoreAuthoredSnapshot(snap);
     truncateUndoTo(_undoBarrier);
     _undoBarrier = 0;
+    // The during-Play edits are gone from the world and the stack, so their dirty marks go too.
+    if (dirtyAtPlay) restoreWorldDirtyBaseline(dirtyAtPlay);
     return { kind: 'stopped', reverted: true };
   } finally {
     releaseReplacement();
@@ -550,6 +558,7 @@ function closeAutoContactCapture(): void {
 export function resetPlayMode(): void {
   _snapshot = null;
   _undoBarrier = 0;
+  _dirtyAtPlay = null;
   setModeOwner(null);
   closeAutoContactCapture();
   setPlayState('stopped');

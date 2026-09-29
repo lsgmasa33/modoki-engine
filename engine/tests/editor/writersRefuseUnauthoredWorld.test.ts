@@ -141,7 +141,7 @@ describe('whyWorldNotAuthored — the sources, and the Stop reload window (#1548
 });
 
 describe('the live-world agent ops refuse an envelope instead of replying ok (#1552)', () => {
-  it('create / duplicate / delete / reparent / prefab instantiate each refuse, change nothing, and name the exit', async () => {
+  it('create / duplicate / delete / reparent / set-traits / prefab instantiate each refuse, change nothing, and name the exit', async () => {
     const g = createTestWorld({});
     try {
       const a = g.spawn(EntityAttributes({ name: 'A', guid: 'g-a-1552' } as never), Transform({} as never));
@@ -157,6 +157,8 @@ describe('the live-world agent ops refuse an envelope instead of replying ok (#1
         ['duplicate-entity', { guid: 'g-a-1552' }],
         ['delete-entities', { guids: ['g-a-1552'] }],
         ['reparent-entity', { guid: 'g-b-1552', parentGuid: 'g-a-1552' }],
+        // Every set-traits write, not only a parent change (#1816): the envelope reverts a plain field too.
+        ['set-traits', { guid: 'g-a-1552', set: { 'Transform.x': 3 } }],
         ['prefab', { action: 'instantiate', path: '/assets/prefabs/none.prefab.json' }],
         ['prefab', { action: 'detach', entityGuid: 'g-a-1552' }],
         ['prefab', { action: 'revert', entityGuid: 'g-a-1552' }],
@@ -168,6 +170,12 @@ describe('the live-world agent ops refuse an envelope instead of replying ok (#1
       }
       expect(count()).toBe(before);
       expect(b.get(EntityAttributes)!.parentId).not.toBe(a.id());
+      expect((a.get(Transform) as { x: number }).x).toBe(0);
+      // A dry run writes nothing, so a posed world does not refuse it: it is how an agent previews a write it cannot
+      // make yet. Mutation: drop the handler's dry-run early return — the posed-world refusal throws.
+      const dry = await runAgentOp('set-traits', { guid: 'g-a-1552', set: { 'Transform.x': 3 }, dryRun: true }) as { ok?: boolean; dryRun?: boolean };
+      expect(dry).toMatchObject({ ok: true, dryRun: true });
+      expect((a.get(Transform) as { x: number }).x).toBe(0);
 
       // ACCEPT SIDE: out of the envelope the same create goes through.
       exitPreviewMode('animation');

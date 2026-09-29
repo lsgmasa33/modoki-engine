@@ -173,6 +173,41 @@ export function parentWorldTrs(entities: MutableEntity[], entity: MutableEntity)
   return decompose(_acc);
 }
 
+/** An entry's WORLD pose: its own local transform under its whole parent chain. */
+export function worldTrsOf(entities: MutableEntity[], entity: MutableEntity): TRS {
+  return localToWorldTrs(trsOf(entity), parentWorldTrs(entities, entity));
+}
+
+/** The Transform an entry STORES — an instance root's in its overrides, anything else's in its traits — or undefined
+ *  when it stores none. `trsOf` reads the same place and substitutes identity for a missing one, which is right for an
+ *  ancestor chain but not for a writer deciding whether there is a pose to keep. */
+export function storedTransformOf(entity: MutableEntity): Record<string, unknown> | undefined {
+  const t = instanceOverrideTraits(entity)?.Transform ?? (entity.prefab ? undefined : entity.traits?.Transform);
+  return t && typeof t === 'object' ? (t as Record<string, unknown>) : undefined;
+}
+
+/** The first entry — `entity` itself, then its ancestors nearest-first — whose LOCAL pose this file cannot fully read: a
+ *  prefab instance root whose override Transform does not store all nine fields, so the rest come from a template the
+ *  file does not hold. `trsOf` reads identity there, which is right only by luck. Undefined when the chain is fully
+ *  known (a plain entry's omitted field IS its default: the serializer omits exactly those). */
+export function templatePlacedEntry(entities: MutableEntity[], entity: MutableEntity | null): MutableEntity | undefined {
+  if (!entity) return undefined;
+  for (const e of [entity, ...ancestors(entities, entity).reverse()]) {
+    if (!e.prefab) continue;
+    const t = instanceOverrideTraits(e)?.Transform as Record<string, unknown> | undefined;
+    if (!t || !TRS_KEYS.every((k) => typeof t[k] === 'number')) return e;
+  }
+  return undefined;
+}
+
+/** Do two poses compose to the same matrix (null = identity)? Unlike comparing fields, this sees `{sy:-1}` and
+ *  `{sx:-1, rz:π}` as the same pose — the ambiguity a compose/decompose round trip introduces. */
+export function sameTrsMatrix(a: TRS | null, b: TRS | null): boolean {
+  const ma = matrixOf(a ?? IDENTITY_TRS, new THREE.Matrix4()).elements;
+  const mb = matrixOf(b ?? IDENTITY_TRS, new THREE.Matrix4()).elements;
+  return ma.every((v, i) => Math.abs(v - mb[i]!) <= 1e-9);
+}
+
 /** world = parentWorld · local. */
 export function localToWorldTrs(local: TRS, parent: TRS | null): TRS {
   if (!parent) return { ...local };
@@ -232,6 +267,7 @@ export function collapsedParentAxes(parent: TRS | null): ('x' | 'y' | 'z')[] | n
  *  internally coupled by the parent's rotation, and mutually independent for this purpose.
  *
  *  Shared by the live and file conversions so the two cannot answer differently. */
+const TRS_KEYS: readonly (keyof TRS)[] = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'];
 const TRS_GROUPS: readonly (readonly (keyof TRS)[])[] = [
   ['x', 'y', 'z'],
   ['rx', 'ry', 'rz'],

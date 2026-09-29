@@ -134,7 +134,7 @@ function wrongType(meta: TraitMeta, field: string, value: unknown): string | nul
   return `expected a ${expected}, got ${value === null ? 'null' : got} (${JSON.stringify(value)}). Values are stored RAW — a "${got}" here would survive into the world and break code that compares or computes with it.`;
 }
 
-interface ParsedWrite { trait: string; meta: TraitMeta; field: string | null; value: unknown }
+type ParsedWrite = LiveTraitWrite;
 
 /** Validate every `set` key BEFORE touching the world. An unknown trait, or an unknown field on a
  *  known trait, is provable from the registry alone — so conventions §8 requires the WHOLE call be
@@ -304,84 +304,21 @@ function guardParentWrite(ids: number[], writes: ParsedWrite[]): LiveMutateFailu
   return null;
 }
 
-/** Editor-only (#1787): how a `parentId` write is judged and carried out when an editor is running, installed by
- *  `agentEditorOps.ts` the way agentBridge's other editor hooks are. Unset on a device, where the raw write behind
- *  `guardParentWrite` stays the whole story.
- *
- *  A parent change is a REPARENT, and the editor has one rule for that: `planReparent`, which a Hierarchy drop,
- *  `reparent-entity` and apply-scene-ops' setTrait all ask. Written raw, the field put a primary entity under a
- *  base scene's parent (#1429's state: baked into a base instance's `added`, or dropped from both files), and moved
- *  a prefab member out of its instance with no unpack, no world-pose compensation and no undo (#1434's shape). */
-export interface EditorParentWrite {
-  /** Why moving `id` under `newParent` cannot be done by this op, in words for the reply, or null when it may. */
-  refusal(id: number, newParent: number): string | null;
-  /** Carry the move out through the editor's undoable reparent. False when nothing changed. */
-  apply(id: number, newParent: number): boolean;
-  /** What the reply says about persistence once a parent change went through `apply`. */
+/** One call's parsed write — `field` null is a tag trait, whose value is presence. */
+export interface LiveTraitWrite { readonly trait: string; readonly meta: TraitMeta; readonly field: string | null; readonly value: unknown }
+
+/** Who writes the world, when it is not the device's raw `writeTraitField` (#1816). The editor passes its own: an agent
+ *  write must land the way a human Inspector edit does (an undo entry, the dirty mark, a prefab override mark, a parent
+ *  change through the editor's reparent), and on a device there is no undo stack and no project, so the raw write
+ *  behind `guardParentWrite` stays the whole story there. */
+export interface LiveTraitWriter {
+  /** Why this call cannot be carried out, asked for EVERY target before any write (one refused target refuses the
+   *  whole call, so a batch never lands half-applied), or null when it may. */
+  refusal(ids: readonly number[], writes: readonly LiveTraitWrite[]): string | null;
+  /** Write one entity's whole `set`. Throws when a write is refused after all; the caller rolls the call back. */
+  write(id: number, writes: readonly LiveTraitWrite[]): void;
+  /** What the reply says about persistence. */
   savedNote: string;
-}
-let _editorParentWrite: EditorParentWrite | null = null;
-
-/** Editor-only: install the parent-write hook. Called from `agentEditorOps.ts`. Returns the one it replaced. */
-export function setEditorParentWrite(hook: EditorParentWrite | null): EditorParentWrite | null {
-  const was = _editorParentWrite;
-  _editorParentWrite = hook;
-  return was;
-}
-
-/** Every target's parent change asked BEFORE any write (#1787): one refused target refuses the whole call, so a
- *  batch never lands half-applied. */
-function guardEditorParentWrite(ids: number[], writes: ParsedWrite[]): LiveMutateFailure | null {
-  const write = writes.find((w) => w.trait === 'EntityAttributes' && w.field === 'parentId');
-  if (!write || !_editorParentWrite) return null;
-  // ALONE (#1787 close-out re-review): the reparent is one undo entry, and every other set-traits write is raw with no
-  // undo, so a call carrying both cannot be undone and redone to agree — `reparentEntity`'s redo restores the local
-  // transform it computed before any raw write, so a Transform written in the same call came back wrong on redo, and
-  // whichever order the two were applied in, one of call / undo / redo disagreed. apply-scene-ops' setTrait carries
-  // both, as undoable writes.
-  if (writes.length > 1) {
-    return {
-      ok: false,
-      error: 'set-traits: in the editor an EntityAttributes.parentId write is a reparent (one undo entry) and must be sent alone — '
-        + 'every other set-traits write is raw, with no undo, and the two cannot be undone together. Send the parent change and the '
-        + 'other fields as two calls, or use modoki_mutate_scene setTrait, which writes both undoably. Nothing was applied.',
-    };
-  }
-  const newParent = Number(write.value);   // guardParentWrite already refused a non-number
-  for (const id of ids) {
-    const refused = _editorParentWrite.refusal(id, newParent);
-    if (refused) return { ok: false, error: `${refused} Nothing was applied to any of the ${ids.length} target${ids.length === 1 ? '' : 's'}.` };
-  }
-  return null;
-}
-
-/** Editor-only (#1818): why writing `trait` (`field`, or the whole trait when null: a tag, or an add) on entity `id`
- *  would be dropped by the next save, or null. Installed by `agentEditorOps.ts` as the editor's placeholder gate
- *  (`placeholderWriteRefusal`): a Missing Prefab placeholder saves only its kept record and its placement, so a raw
- *  write here showed live and was gone on reload. Unset on a device, which saves nothing. */
-export type EditorWriteGate = (id: number, trait: string, field: string | null) => string | null;
-let _editorWriteGate: EditorWriteGate | null = null;
-
-/** Editor-only: install the write gate. Returns the one it replaced. */
-export function setEditorWriteGate(gate: EditorWriteGate | null): EditorWriteGate | null {
-  const was = _editorWriteGate;
-  _editorWriteGate = gate;
-  return was;
-}
-
-/** Every target and write asked BEFORE any write, so a refused one refuses the whole call. A write that ADDS the trait
- *  (the entity lacks it) is asked as an add. */
-function guardEditorWriteGate(ids: number[], writes: ParsedWrite[]): LiveMutateFailure | null {
-  if (!_editorWriteGate) return null;
-  for (const id of ids) {
-    const entity = findEntity(id);
-    for (const w of writes) {
-      const adds = w.field === null || !entity?.has(w.meta.trait);
-      const refused = _editorWriteGate(id, w.trait, adds ? null : w.field);
-      if (refused) return { ok: false, error: `set key "${w.field === null ? w.trait : `${w.trait}.${w.field}`}" on entity ${id}: ${refused} — nothing was applied.` };
-    }
-  }
-  return null;
 }
 
 /** The per-field refusals every generic write path shares (`fieldWriteRefusal`, #1757): a write of
@@ -427,6 +364,8 @@ export function applyLiveMutate(
   deps: {
     parseWhere: (expr: string, m: Map<string, TraitMeta>) => { pred: WherePredicate } | { error: string };
     guidOf: (id: number) => string | null;
+    /** The editor's writer (#1816); absent on a device, which writes raw. */
+    writer?: LiveTraitWriter;
   },
 ): LiveMutateResult {
   const p = (params ?? {}) as LiveMutateParams;
@@ -451,13 +390,8 @@ export function applyLiveMutate(
   if (parentRefusal) return parentRefusal;
   const stampRefusal = guardFieldWrites(ids, writes);
   if (stampRefusal) return stampRefusal;
-  const editorParentRefusal = guardEditorParentWrite(ids, writes);
-  if (editorParentRefusal) return editorParentRefusal;
-  const gateRefusal = guardEditorWriteGate(ids, writes);
-  if (gateRefusal) return gateRefusal;
-  const parentHook = _editorParentWrite;
-  let reparented = false;
-  const isParent = (w: ParsedWrite) => w.trait === 'EntityAttributes' && w.field === 'parentId';
+  const writerRefusal = deps.writer?.refusal(ids, writes) ?? null;
+  if (writerRefusal) return { ok: false, error: writerRefusal };
 
   if (ids.length === 0) {
     // Conventions §8: a no-op is a FAILURE when the caller asked for a change. `{ok:true,
@@ -489,7 +423,9 @@ export function applyLiveMutate(
       if (added.length < limit) added.push({ id, guid: deps.guidOf(id), trait });
     }
 
-    if (!p.dryRun) {
+    if (!p.dryRun && deps.writer) {
+      deps.writer.write(id, writes);
+    } else if (!p.dryRun) {
       for (const w of writes) {
         if (w.field === null) {
           // Tag trait: presence IS the value. writeTraitField handles add/remove for category
@@ -498,14 +434,9 @@ export function applyLiveMutate(
           continue;
         }
         // writeTraitField returns SILENTLY when the entity lacks the trait — a false success on
-        // the exact call that asked for a change. Seed the trait first (what the editor's live
-        // path does via addTraitToEntitiesWithUndo) so the write lands.
+        // the exact call that asked for a change. Seed the trait first (what the editor's writer
+        // does via addTraitToEntitiesWithUndo) so the write lands.
         if (!entity.has(w.meta.trait)) entity.add(w.meta.trait);
-        if (parentHook && isParent(w)) {
-          // The editor's reparent, not the raw field (#1787): unpack on move, world pose kept, one undo entry.
-          if (parentHook.apply(id, Number(w.value))) reparented = true;
-          continue;
-        }
         writeTraitField(id, w.meta, w.field, w.value);
       }
     }
@@ -525,8 +456,8 @@ export function applyLiveMutate(
     matched: ids.length,
     changed,
     saved: false,
-    savedNote: reparented && parentHook
-      ? parentHook.savedNote
+    savedNote: deps.writer
+      ? deps.writer.savedNote
       : 'live world only — a device has no project on disk, and a relaunch is the undo. There is no undo stack here.',
     entities: detail,
     ...(p.dryRun ? { dryRun: true as const } : {}),

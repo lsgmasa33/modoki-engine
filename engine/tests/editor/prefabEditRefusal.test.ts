@@ -346,6 +346,24 @@ describe('the agent ops answer the refusal as REFUSED_BY_OP, in the editor\'s wo
     await expect(runAgentOp('reparent-entity', { guid: PREFAB_EDIT_ROOT_GUID, parentGuid: LIGHT_GUID })).rejects.toThrow(PREFAB_EDIT_REFUSAL_TEXT['root-moved']);
     await expect(runAgentOp('reparent-entity', { guid: CHILD_GUID, parentId: 0 })).rejects.toThrow(PREFAB_EDIT_REFUSAL_TEXT['outside-root']);
   });
+
+  // #1816: set-traits' parent write reaches the same refusal through `planReparent`, with no check of its own.
+  // Two layers ask it (the writer's pre-check, and `writeTraitAsEditor` per trait), so the mutation is both: null
+  // `editorTraitWriter.refusal` AND write the parent as a plain field in `writeTraitAsEditor` — the root moves.
+  it('set-traits of the root\'s parent, and of a child to the top level', async () => {
+    const w = editWorld();
+    const root = await runAgentOp('set-traits', { guid: PREFAB_EDIT_ROOT_GUID, set: { 'EntityAttributes.parentId': w.light } }) as { ok: boolean; error?: string };
+    expect(root.ok).toBe(false);
+    expect(root.error).toContain(PREFAB_EDIT_REFUSAL_TEXT['root-moved']);
+    const child = await runAgentOp('set-traits', { guid: CHILD_GUID, set: { 'EntityAttributes.parentId': 0 } }) as { ok: boolean; error?: string };
+    expect(child.ok).toBe(false);
+    expect(child.error).toContain(PREFAB_EDIT_REFUSAL_TEXT['outside-root']);
+    expect(getAllEntities().find((e) => e.id === w.root)!.parentId).toBe(0);
+    expect(getAllEntities().find((e) => e.id === w.child)!.parentId).toBe(w.root);
+    // Accept side: a field write inside the root lands.
+    const ok = await runAgentOp('set-traits', { guid: CHILD_GUID, set: { 'Transform.x': 2 } }) as { ok: boolean };
+    expect(ok.ok).toBe(true);
+  });
 });
 
 describe('a placement\'s redo that meets the refusal is dropped as refused, not reported as a throw (close-out review)', () => {

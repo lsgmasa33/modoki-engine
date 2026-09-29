@@ -38,7 +38,7 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
-import { clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty } from './sceneDirty';
+import { clearSceneDirty, clearSceneDirtyExcept, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
@@ -838,6 +838,30 @@ let _savedAtEditVersion = 0;
  *  editor and discarding the live world. See docs/async-lifetime.md. */
 export function markSceneSaved(atEditVersion?: number): void {
   _savedAtEditVersion = atEditVersion ?? getEditVersion();
+}
+
+/** The WORLD-shaped dirty state (the two world causes of `worldHasUnsavedEdits`) as a baseline a revert can put back. */
+export interface WorldDirtyBaseline { readonly primaryClean: boolean; readonly scenes: ReadonlySet<string>; readonly savedAt: number }
+
+/** Taken at the Play press, with Play's undo barrier (`playMode.ts`). */
+export function captureWorldDirtyBaseline(): WorldDirtyBaseline {
+  return { primaryClean: getEditVersion() === _savedAtEditVersion, scenes: dirtySceneGuidsSnapshot(), savedAt: _savedAtEditVersion };
+}
+
+/** Put the world's dirty state back to `baseline`, once Stop has reverted the world and cut the undo stack to Play's
+ *  barrier: an edit made DURING Play is gone from both, so it must not stay behind as "unsaved" (Unity: Play-mode
+ *  changes are reverted and do not dirty the scene). Without this, one undoable write in Play — an Inspector edit, an
+ *  agent's setTrait or set-traits (#1816 close-out) — left `hasUnsavedChanges()` true after Stop with nothing to undo
+ *  and nothing on screen to save, so load_scene refused and a file-direct mutate answered REQUIRES_SAVE. Only clears:
+ *  work that was unsaved at the Play press stays unsaved. Asset-shaped causes are not touched — Stop does not revert
+ *  them. */
+export function restoreWorldDirtyBaseline(baseline: WorldDirtyBaseline): void {
+  // A save since the capture (one landing during Play's startup awaits, before `'playing'` refuses saves) wrote a
+  // world the snapshot does not hold: disk and the restored world differ, so nothing is cleared — dirty is the safe
+  // answer (#1816 close-out re-review).
+  if (_savedAtEditVersion !== baseline.savedAt) return;
+  if (baseline.primaryClean) markSceneSaved();
+  clearSceneDirtyExcept(baseline.scenes);
 }
 /** Is there live-world work not on disk? Used to stop load_scene/new_scene silently
  *  DESTROYING it — that reported {ok:true} while the entity you just created was gone from

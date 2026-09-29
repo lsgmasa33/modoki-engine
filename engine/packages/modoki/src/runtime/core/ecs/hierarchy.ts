@@ -14,6 +14,8 @@
 
 import { getAllEntities, findEntity, readTraitData } from './entityUtils';
 import { getAllTraits, getTraitByName } from './traitRegistry';
+import { parentLinkRefusal, type ReparentRefusal } from './parentLink';
+export type { ReparentRefusal };
 
 /** The entity's current `EntityAttributes.parentId`, read through the registry: L0 core imports no trait. */
 function currentParentOf(entityId: number): number {
@@ -34,8 +36,6 @@ export function isAncestorOf(ancestorId: number, entityId: number): boolean {
   }
   return false;
 }
-
-export type ReparentRefusal = 'self-parent' | 'cycle' | 'resource';
 
 /** True if `entityId` carries a `resource`-category trait (Time, Input, Physics2D, a game config…) —
  *  the same category test behind the Hierarchy's `R` badge (`EntityInfo.isResource`), read off the one
@@ -74,12 +74,13 @@ export function parentOrRootFor(parentId: number): number {
  *  is what lets each caller phrase its own refusal: the agent surface must say what to do instead
  *  (conventions §5), while the editor's drag-drop just declines the drop. */
 export function reparentRefusal(entityId: number, newParentId: number): ReparentRefusal | null {
-  if (entityId === newParentId) return 'self-parent';
-  // A resource neither goes under an entity (it would be deleted with that subtree) nor holds one
-  // (`parentRefusal`). Only a NEW link is judged: a reorder under the parent the entity already has
-  // changes no link, and the root is always legal, so a resource a scene file DID parent can be moved out.
-  if (newParentId !== 0 && newParentId !== currentParentOf(entityId)
-      && (isResourceEntity(entityId) || parentRefusal(newParentId))) return 'resource';
-  if (newParentId !== 0 && isAncestorOf(entityId, newParentId)) return 'cycle';
-  return null;
+  // The rule itself is `parentLinkRefusal` (parentLink.ts), shared with the file-direct scene-mutate (#1825); this is
+  // the live world's graph. `currentParentOf` reads through the registry, as the rule's "a reorder is not a new link"
+  // must, rather than the EntityInfo snapshot.
+  const byId = new Map(getAllEntities().map((e) => [e.id, e]));
+  return parentLinkRefusal<number>({
+    parentOf: (id) => (id === entityId ? currentParentOf(id) : byId.get(id)?.parentId) || null,
+    isResource: isResourceEntity,
+    size: byId.size,
+  }, entityId, newParentId || null);
 }

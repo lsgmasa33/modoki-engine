@@ -26,8 +26,8 @@ export function stepRunningRefusal(what: string): OpRefusal {
 }
 
 /** Reaches a push, or runs code that can (`eval`: `modoki.composite`, `modoki.import`). `create-registered-asset`
- *  selects the new asset for some kinds, which pushes a selection entry. `set-traits` pushes through the reparent
- *  hook when it writes `EntityAttributes.parentId`. The asset-document ops push through `pushAssetUndo`. `dom-dnd`
+ *  selects the new asset for some kinds, which pushes a selection entry. `set-traits` writes through the editor's
+ *  trait writer, one composite entry per call (#1816). The asset-document ops push through `pushAssetUndo`. `dom-dnd`
  *  synthesizes a drop that the Hierarchy and the Assets panel turn into undoable edits. */
 export const UNDO_RECORDING_OPS: ReadonlySet<string> = new Set([
   'apply-scene-ops', 'create-entity', 'duplicate-entity', 'delete-entities', 'reparent-entity', 'set-traits',

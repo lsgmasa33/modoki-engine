@@ -32,6 +32,8 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   sceneLoadGeneration: () => h.generation,
   isSceneLoadInFlight: () => h.loadInFlight,
   bootSceneWalkPending: () => null,
+  captureWorldDirtyBaseline: () => ({ primaryClean: false, scenes: new Set(), savedAt: 0 }),
+  restoreWorldDirtyBaseline: () => {},
 }));
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {

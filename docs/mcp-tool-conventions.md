@@ -959,6 +959,16 @@ An op registered in `agentEditorOps.ts` whose handler reaches nothing from `edit
 in `agentBridge.ts` and the editor REPLACES that registration with the editor-only readers added —
 the same shape `player-prefs-write` uses.
 
+**An editor write goes through the editor's write OWNER, whatever surface registered the op (#1816).**
+`set-traits` is a runtime op, so it registers in `agentBridge.ts` — and the editor ran
+that raw device write: no undo entry, no dirty mark (the next hot reload dropped the edit with nothing
+refusing), no prefab override mark (the save did not write a member's field). Registering by what the op
+NEEDS is right, but in the editor the write is not the same capability: there it must land the way the
+Inspector's does. So the editor REPLACES `set-traits`, passing its writer (`editorTraitWriter` →
+`writeTraitAsEditor`, the one live editor trait write apply-scene-ops' `setTrait` uses too), and the device
+keeps the raw write. The test for a new write op: *does a human make this edit somewhere in the editor?*
+If so, the agent's edit goes through the same helper, and the reply's `savedNote` says so.
+
 **Twin PARAMETERS are compared too, and the param rules run on both surfaces (#1559).** Each server
 declares its own zod shapes, so a param added on one twin is silently absent from the other.
 `twinParamParity.test.ts` fails on any unrecorded difference (a param, a stated default, a device tool
