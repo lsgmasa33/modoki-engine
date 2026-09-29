@@ -39,7 +39,7 @@ the live instances (**propagation**). The rules below are grouped by those three
 | **Member guid** | A member's `EntityAttributes.guid`: the member row's pin, else the template's, else derived from its anchor through identity parents. | `deriveInstanceMemberGuids` (`runtime/loaders/loadSceneFile.ts`) |
 | **Identity parent** | Where an entity sits in its TEMPLATE, as opposed to where it hangs live. A move (#1437) separates the two. | `worldIdentityParents` (`runtime/core/ecs/identityParents.ts`) |
 | **Frame record** | Per world, the document each frame root was actually expanded from. | `noteFrameDoc`, `frameRootDoc` (same file) |
-| **The two caches** | The editor cache is read synchronously by capture, the save and Apply. The runtime cache is refcounted, read by spawners, and keeps a per-key revision. | `getCachedPrefabSync` (`prefab.ts`); `getCachedPrefab`, `getPrefabRevision` (`runtime/loaders/meshTemplateCache.ts`) |
+| **The two caches** | The editor cache is read synchronously by capture, the save and Apply. The runtime cache is refcounted, read by spawners, and keeps a per-key revision. ⚠️ `getCachedPrefab` takes a GUID. Given an asset path, it resolves it through `resolveRef`, which logs `[assetManifest] path reference no longer supported` as an ERROR and returns nothing. A verification probe that reads the runtime cache by path produces that line itself, and `modoki_diagnose` goes `ok:false` over it. That is how #1801 was filed as an engine bug. Probe by GUID. | `getCachedPrefabSync` (`prefab.ts`); `getCachedPrefab`, `getPrefabRevision` (`runtime/loaders/meshTemplateCache.ts`) |
 | **Promotion** | Apply turning a node the scene added into a template row. | `insertAddedSubtree` |
 | **Override mark** | A runtime flag on a field that makes a value difference count as an edit. It does not record which layer set the value. | `runtime/loaders/overrideMarks.ts` |
 
@@ -481,8 +481,10 @@ whether #1801 shares the mechanism.
 - **#1828:** downgrade it to low and re-scope it to M1's writer (`setPrefabSource`), or close it in favour of a fix issue
   for that owner. Neither of its routes exists in the editor without a failed inline rebuild, and route 2 refuses safely.
 - **#1801:** close it as not a defect.
-- **The comment** at `prefab.ts`'s `setPrefabSource` ("a raw path here makes `getPrefabSource` … hit `resolveRef`'s hard
-  rejection") is stale, because `fetchPrefabSource` sends a path to `assetUrl`. Correct it with the M1 fix.
+- **The comment** at `prefab.ts`'s `setPrefabSource` said a raw path makes `getPrefabSource` hit `resolveRef`'s hard
+  rejection, which was stale: `fetchPrefabSource` sends a path to `assetUrl`. It was corrected ahead of the M1 fix, when
+  #1801 closed. It now says what a stored path runs into: the save writes it verbatim, and the next load's
+  `acquirePrefab` rejects it.
 
 ### The randomized round-trip test (#1789)
 
@@ -504,6 +506,14 @@ concluding that an area is covered.
 - **`npm run verify`** runs fixed seeds, in a few seconds.
 - **`MODOKI_PREFAB_FUZZ=<n>`** hunts n seeds (optional `_SEED`, `_LEN`). It shrinks each distinct failure to a minimal op
   list, prints it as a paste-ready `MODOKI_PREFAB_FUZZ_REPLAY='…'`, and ends with an op/route coverage tally.
+  ⚠️ Run it with **`--disableConsoleIntercept`**:
+  `MODOKI_PREFAB_FUZZ=1000 MODOKI_PREFAB_FUZZ_SEED=3000 npx vitest run --config engine/vite.config.ts engine/tests/editor/prefabFuzz.test.ts --disableConsoleIntercept`.
+  Without the flag, vitest swallows everything the hunt prints (the findings, their replays and the tally), and a
+  passing hunt shows nothing at all (measured on Windows, 2026-09-29). A hunt that finds anything ends red, since it
+  expects no unclaimed signature, so read its output rather than its exit code. The signature includes the prefab's
+  name, so a single mechanism can be listed once per prefab it hit.
+  - **Cost:** a clean seed takes well under a second, but shrinking a failing one takes 16–180 replays. On Windows,
+    1000 seeds at `_LEN=40` took 28 and 53 minutes in two parallel runs.
 - **`MODOKI_PREFAB_FUZZ_DUMP=<dir>`** writes every compared state while a replay runs.
 - An op's choices resolve against the world when it runs, so a list stays runnable as the shrinker drops ops.
 - The shrinker keeps only a list that fails with the same signature. A replay can still slide onto a different bug with the

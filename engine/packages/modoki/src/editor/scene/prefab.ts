@@ -2148,10 +2148,11 @@ export function setPrefabSource(rootEcsId: number, source: string) {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return;
 
-  // Callers pass the prefab's asset PATH; store a GUID instead when one resolves.
-  // The runtime + serializer are GUID-only — a raw path here makes getPrefabSource
-  // (used for live override detection) hit resolveRef's hard rejection. Fall back
-  // to the given ref only when the manifest can't resolve it yet.
+  // Callers pass the prefab's asset PATH; store a GUID instead when one resolves, and fall back to the given ref only
+  // when the manifest cannot resolve it yet. A path left here lives on: the save writes it as the entry's `prefab`
+  // verbatim (`assertNoPathRefs` only logs it), and the next load hands it to the runtime cache (`acquirePrefab` /
+  // `getCachedPrefab` → `refToPath`), where `resolveRef` rejects it. `getPrefabSource` itself reads a path through
+  // `assetUrl`, so the live session works until then (#1801, #1828).
   const ref = isGuid(source) ? source : (getGuidForPath(source) ?? source);
 
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], _entity) => {
