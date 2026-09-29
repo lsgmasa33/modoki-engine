@@ -25,6 +25,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import type { TakeAssets } from '../packages/modoki/src/editor/recorder/take';
+import { parseJsonText } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** The project folder a fingerprint covers, relative to the project root — where every game keeps
  *  its assets (`findAssetRoots`' flat one-game root). */
@@ -94,7 +95,7 @@ export function guidIndex(rels: readonly string[], read: (rel: string) => string
     const text = read(rel);
     if (text === null) continue;
     let doc: unknown;
-    try { doc = JSON.parse(text); } catch { continue; }
+    try { doc = parseJsonText(text); } catch { continue; }
     if (!doc || typeof doc !== 'object') continue;
     const id = (doc as { id?: unknown }).id;
     if (rel.endsWith(META_SUFFIX)) {

@@ -113,6 +113,7 @@ import path from 'node:path';
 import { claimsDir, isFullyQualified } from './deviceClaimsStore.mjs';
 // The ONE 'same directory?' comparison (#869).
 import { samePath } from './pathIdentity.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 function claimsFile() {
   return path.join(claimsDir(), 'build-claims.json');
@@ -192,7 +193,7 @@ function readClaimsResult() {
   }
   let parsed;
   try {
-    parsed = JSON.parse(raw);
+    parsed = parseJsonText(raw);
   } catch (e) {
     return { ok: false, error: e };
   }

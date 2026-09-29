@@ -22,6 +22,7 @@ import { getFontCacheDir, hashKey, atlasCachePath, metricsCachePath, instanceCac
 import { instanceFont, hasAxes } from './font-instance';
 import { pinnedConversionCli } from './pinned-cli';
 import { forgetDetection } from '../toolchain';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** For tests — forget the cached msdf-atlas-gen detection. */
 export function __resetMsdfCheck(): void { forgetDetection('msdf-atlas-gen'); }
@@ -107,7 +108,7 @@ function readAtlasStats(metricsPath: string, atlasPath: string): Pick<FontConver
   let atlasHeight: number | undefined;
   let glyphCount: number | undefined;
   try {
-    const json = JSON.parse(fs.readFileSync(metricsPath, 'utf-8'));
+    const json = readJsonFile(metricsPath);
     atlasWidth = json?.atlas?.width;
     atlasHeight = json?.atlas?.height;
     glyphCount = Array.isArray(json?.glyphs) ? json.glyphs.length : undefined;

@@ -18,13 +18,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
 import { claimProjectOrExit } from './cliBuildClaim.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const project = process.argv[2] || 'games/space-invader';
 const artifact = path.join(REPO_ROOT, project, 'ads', 'index.html');
 // Read from the project rather than hardcoded: this script already takes a project argument, and a
 // second game (games/wordweave, #934) made the space-invader-shaped constant wrong for it.
-const projectCfg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, project, 'project.config.json'), 'utf8'));
+const projectCfg = readJsonFile(path.join(REPO_ROOT, project, 'project.config.json'));
 const CLICK_URL = projectCfg.build?.playableClickUrl ?? '';
 const MAX_BYTES = projectCfg.build?.playableMaxBytes ?? 5 * 1024 * 1024;
 

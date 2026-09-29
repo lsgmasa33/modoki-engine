@@ -47,7 +47,7 @@
  * through `loadVendorPlugins.mjs` (not a direct import) because this is a plain `.mjs` script and
  * `vendorPlugins.ts` is TypeScript — same seam `build-web.mjs`/`add-native-targets.mjs` already use.
  */
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,6 +56,7 @@ import { projectNeedsInstall } from './projectNeedsInstall.mjs';
 import { loadVendorPlugins } from './loadVendorPlugins.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
 import { toSpawn } from './winSpawn.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -91,7 +92,7 @@ for (const proj of projects) {
 
   let pkg;
   try {
-    pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    pkg = readJsonFile(pkgPath);
   } catch (e) {
     console.warn(`[bootstrap-game-deps] skip ${label}: unreadable package.json (${e.message})`);
     continue;

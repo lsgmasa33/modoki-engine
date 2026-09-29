@@ -25,7 +25,7 @@ function makeScratchRepo(): string {
   fs.cpSync(path.join(engineRoot, 'scripts', 'ota-embed-manifest.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-embed-manifest.mjs'));
   fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
   // ota-embed-manifest takes the project's build claim (#1160), through this import chain.
-  for (const dep of ['cliBuildClaim.mjs', 'buildClaimsStore.mjs', 'deviceClaimsStore.mjs', 'pathIdentity.mjs']) {
+  for (const dep of ['cliBuildClaim.mjs', 'buildClaimsStore.mjs', 'deviceClaimsStore.mjs', 'pathIdentity.mjs', 'jsonFile.mjs']) {
     fs.cpSync(path.join(engineRoot, 'scripts', dep), path.join(repoRoot, 'engine', 'scripts', dep));
   }
   return repoRoot;

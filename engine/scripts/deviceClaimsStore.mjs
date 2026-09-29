@@ -96,6 +96,7 @@ import os from 'node:os';
 import path from 'node:path';
 // The ONE 'same directory?' comparison (#869).
 import { canonicalPath, samePath } from './pathIdentity.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Where the claims live: beside `editor-launches.log`, machine-wide by design (see the header).
  *
@@ -271,7 +272,7 @@ export function isStale(claim, opts = {}) {
 
 function readClaims() {
   try {
-    const parsed = JSON.parse(fs.readFileSync(claimsFile(), 'utf8'));
+    const parsed = readJsonFile(claimsFile());
     return Array.isArray(parsed?.claims) ? parsed.claims.filter((c) => c && typeof c.deviceId === 'string') : [];
   } catch {
     return []; // not created yet, or corrupt — an unreadable claims file must never block hardware

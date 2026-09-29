@@ -2199,8 +2199,17 @@ Two measured facts make a wrong answer expensive:
   in case share a key, so a change to one reloads the other (the owner's #905 ruling accepted the same over-match
   for `pathIdentity.mjs`'s fold). Tests: the two #1786 cases in `agentBridgeReloadHoldsWorld.test.ts`, with the observed strings.
   The same review folded two more spellings the server resolves (an upper-case `Assets` folder, a percent-encoded
-  name — not observed live), left dot segments alone, and exempts the synthetic prefab-edit key, which can embed a
-  prefab's PATH; the docblock on `normScenePath` is the list.
+  name — not observed live), and exempts the synthetic prefab-edit key, which can embed a prefab's PATH; the docblock
+  on `normScenePath` is the list.
+  **The key is the path under the asset ROOT, found by anchoring, and dot segments collapse (#1791).** Both observed
+  on Windows (`games/scroll-demo`). The key used to be the suffix from the LAST `/assets/`, so a folder named `Assets`
+  inside the root (nothing refuses the name) gave `/assets/scenes/Assets/nest.scene.json` the key of
+  `/assets/nest.scene.json`: a disk edit of that other file hot-reloaded the open nested scene and discarded its
+  unsaved edits, on a case-INSENSITIVE disk — a collision the case-fold trade-off above did not account for. And
+  MCP `load_scene`, an agent `save_all {path}` on an untitled scene and the in-app Save prompt store a path as TYPED:
+  a scene opened as `/assets/scenes/./x.scene.json` matched no broadcast, and its disk edit was skipped silently.
+  Every OTHER producer (the watcher, the manifest, the Assets panel, the server's replies) emits a clean path. Tests:
+  the two #1791 cases in `agentBridgeReloadHoldsWorld.test.ts` and `agentBridgePaths.test.ts`, with the observed strings.
 
 #### The #1750 members, classified
 

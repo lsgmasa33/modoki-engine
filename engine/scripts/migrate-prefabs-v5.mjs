@@ -48,6 +48,7 @@ import { randomUUID } from 'node:crypto';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { repoFiles } from './repoCorpus.mjs';
 import { repoRoot } from './repoCorpus.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const ROOT = repoRoot();
 const WRITE = process.argv.includes('--write');
@@ -111,7 +112,7 @@ const seen = new Map(); // node guid → "file#localId", across the whole corpus
 
 for (const { rel, abs } of targets) {
   const raw = readFileSync(abs, 'utf8');
-  const doc = JSON.parse(raw);
+  const doc = parseJsonText(raw);
   const rows = Array.isArray(doc.entities) ? doc.entities : [];
   const needs = rows.filter((r) => !r.nodeGuid).length;
   if (needs === 0 && (doc.version ?? 0) >= PREFAB_FORMAT_VERSION) { alreadyDone++; continue; }
@@ -146,7 +147,7 @@ for (const { rel, abs } of targets) {
   // ⚠️ The surgery is not trusted — it is PROVEN, per file, before anything is written.
   // `JSON.stringify` compares values AND key order, which is the half a deep-equality check would
   // miss and the half that decides whether `nodeGuid` landed in the serializer's slot.
-  const verify = () => { try { return JSON.stringify(JSON.parse(text)) === JSON.stringify(intended); } catch { return false; } };
+  const verify = () => { try { return JSON.stringify(parseJsonText(text)) === JSON.stringify(intended); } catch { return false; } };
   if (!ok || !verify()) { failed.push(rel); continue; }
 
   for (const [localId, nodeGuid] of minted) {

@@ -89,6 +89,7 @@ import fs from 'node:fs';
 import { PREFAB_FORMAT_VERSION } from '../packages/modoki/src/runtime/core/version';
 import { classifyJsonFormatVersion } from '../packages/modoki/src/runtime/core/formatVersion';
 import { localIdCounter, type CountedDoc } from '../packages/modoki/src/runtime/core/localIdCounter';
+import { parseJsonText } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Is this a prefab document, by path? The gate is keyed on the suffix because `/api/write-file` is
  *  byte-opaque by design and has no other way to know what it is writing. */
@@ -100,7 +101,7 @@ export function isPrefabPath(p: string): boolean {
  *  numerically-newer NON-INTEGER version refusing (see the docblock). */
 function rawPrefabVersion(text: string): unknown {
   try {
-    const parsed: unknown = JSON.parse(text);
+    const parsed: unknown = parseJsonText(text);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
     return (parsed as Record<string, unknown>).version;
   } catch {
@@ -172,7 +173,7 @@ export function classifyPrefabMarkWrite(absPath: string, incoming: string): Pref
   try { onDisk = fs.readFileSync(absPath, 'utf8'); } catch { return null; }
   const parse = (t: string): CountedDoc | null => {
     try {
-      const v: unknown = JSON.parse(t.replace(/^\uFEFF/, ''));
+      const v: unknown = parseJsonText(t);
       return v && typeof v === 'object' && !Array.isArray(v) ? v as CountedDoc : null;
     } catch { return null; }
   };

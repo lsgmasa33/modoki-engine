@@ -23,6 +23,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import { safeBox, overlayRect, badgeRect } from './splashLayout.mjs';
 import { GENERATED_PNG } from './iconAssets.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Where each platform's generated splashes live, relative to the project root. */
 const IOS_SPLASH_DIR = path.join('ios', 'App', 'App', 'Assets.xcassets', 'Splash.imageset');
@@ -45,7 +46,7 @@ export function splashOutputs(projectRoot, platform) {
     // overlaying would only make look authored.
     let referenced = new Set();
     try {
-      const contents = JSON.parse(fs.readFileSync(path.join(dir, 'Contents.json'), 'utf8'));
+      const contents = readJsonFile(path.join(dir, 'Contents.json'));
       referenced = new Set((contents.images ?? []).map((i) => i.filename).filter(Boolean));
     } catch { /* no catalog → fall through to the extension filter below */ }
     for (const n of names) {

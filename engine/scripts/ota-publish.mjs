@@ -71,6 +71,7 @@ import { BUILD_STAMP_FILENAME, otaBuildProvenance } from './ota/buildStamp.mjs';
 import { pruneBundleVersions } from './ota/pruneBundle.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
 import { samePath } from './pathIdentity.mjs';
+import { parseJsonText, readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -189,7 +190,7 @@ async function main() {
     const subgameJsonPath = path.join(distDir, 'subgame.json');
     let subgameMeta;
     try {
-      subgameMeta = JSON.parse(readFileSync(subgameJsonPath, 'utf8'));
+      subgameMeta = readJsonFile(subgameJsonPath);
     } catch (e) {
       fail(`${subgameJsonPath} could not be parsed as JSON (${e.message}) — cannot tell which engine API this sub-game was built against.`);
     }
@@ -258,7 +259,7 @@ async function main() {
         'no-stamp': () => `${rel} has no ${BUILD_STAMP_FILENAME}, so nothing records which source tree built it. Rebuild it (build-web.mjs --target native, or build-subgame.mjs) — a build stamps its own dist.`,
         'bad-stamp': () => `${stampPath} is not a valid build stamp ({ commit, dirty }). Rebuild the dist.`,
         'unknown-tree': () => `${rel} was built where git could not report the tree (not a repository, or git unavailable), so this publish cannot say which source it ships.`,
-        dirty: () => `${rel} was built from a tree with uncommitted changes (at commit ${JSON.parse(stampText).commit}), so no commit reproduces what this publish would ship. Commit, rebuild, and publish that.`,
+        dirty: () => `${rel} was built from a tree with uncommitted changes (at commit ${parseJsonText(stampText).commit}), so no commit reproduces what this publish would ship. Commit, rebuild, and publish that.`,
       }[provenance.refusal];
       fail(`${why ? why() : `refused: ${provenance.refusal}.`} To publish it anyway, run this script by hand with --allow-unclean-build: the manifest then records forced: true.`);
     }

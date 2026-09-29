@@ -479,6 +479,7 @@ export class TcpLeaseTransport implements LeaseTransport {
 // Moved to a leaf module so `wdaLauncher` can record its agent's pid per clone without importing this file
 // (#1077); re-exported so existing importers keep working. The packaged-editor rule is documented there.
 import { modokiStateDir } from './deviceStateDir';
+import { readJsonFile } from '../../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 export { modokiStateDir };
 
 /** Load the clone's persistent device GUID, minting + saving one on first use. Keyed on the
@@ -520,7 +521,7 @@ function lastTargetFile(dir: string): string {
 
 export function loadLastTarget(dir: string = modokiStateDir()): LastTarget | null {
   try {
-    const t = JSON.parse(fs.readFileSync(lastTargetFile(dir), 'utf8'));
+    const t = readJsonFile(lastTargetFile(dir));
     if (typeof t?.ip === 'string' || typeof t?.useAdb === 'boolean') {
       // `serial` round-trips too, or the picker's remembered phone is written and never read back
       // (#149): `saveLastTarget` persists it, so dropping it here made the memory die with the

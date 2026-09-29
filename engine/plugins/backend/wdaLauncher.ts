@@ -35,6 +35,7 @@ import { findXctestrun, wdaDerivedDataDir } from '../../toolchain/wdaProvision';
 import { randomUUID } from 'node:crypto';
 import { modokiStateDir } from './deviceStateDir';
 import { reapDeps } from './iosUsbForward';
+import { readJsonFile } from '../../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** One iOS device `xcodebuild` could target. `connected` = a live tunnel right now.
  *
@@ -740,7 +741,7 @@ function clearWdaRecord(dir: string | null, pid: number | undefined): void {
   if (!dir) return;
   const file = path.join(dir, WDA_RECORD_FILE);
   try {
-    const rec = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<WdaAgentRecord>;
+    const rec = readJsonFile(file) as Partial<WdaAgentRecord>;
     if (rec.pid === pid) fs.rmSync(file, { force: true });
   } catch { /* no record */ }
 }
@@ -769,7 +770,7 @@ function installWdaExitHook(): void {
 export function reapRecordedWdaAgent(dir: string): string | null {
   const file = path.join(dir, WDA_RECORD_FILE);
   let rec: Partial<WdaAgentRecord>;
-  try { rec = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<WdaAgentRecord>; } catch { return null; }
+  try { rec = readJsonFile(file) as Partial<WdaAgentRecord>; } catch { return null; }
   const liveElsewhere = typeof rec.owner === 'number' && rec.owner !== process.pid && reapDeps.isAlive(rec.owner);
   const liveHere = rec.owner === process.pid && rec.instance === OWNER_INSTANCE;
   if (liveElsewhere || liveHere) return null;

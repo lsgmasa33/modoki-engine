@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { parseJsonText, readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Chromium's conventional remote-debugging port. Overridable via MODOKI_CDP_PORT. */
 export const DEFAULT_CDP_PORT = 9222;
@@ -71,7 +72,7 @@ export function readCdpEnabled(userDataDir: string): boolean {
   try {
     const raw = fs.readFileSync(path.join(userDataDir, CDP_PREF_FILE), 'utf8');
     // Only an explicit boolean `false` disables — everything else is ON (opt-out model).
-    return (JSON.parse(raw) as { enabled?: unknown })?.enabled !== false;
+    return (parseJsonText(raw) as { enabled?: unknown })?.enabled !== false;
   } catch {
     return true; // absent/corrupt → default ON
   }
@@ -107,7 +108,7 @@ export interface CdpPortMemo {
 /** Read the last CDP port memo from userData, or null if unknown/corrupt. */
 export function readCdpPortMemo(userDataDir: string): CdpPortMemo | null {
   try {
-    const raw = JSON.parse(fs.readFileSync(path.join(userDataDir, CDP_PORT_PREF_FILE), 'utf8')) as { port?: unknown; ours?: unknown };
+    const raw = readJsonFile(path.join(userDataDir, CDP_PORT_PREF_FILE)) as { port?: unknown; ours?: unknown };
     if (isValidCdpPort(raw?.port) && typeof raw.ours === 'boolean') return { port: Number(raw.port), ours: raw.ours };
     return null;
   } catch {

@@ -24,6 +24,7 @@ export { derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, type
 // the OS trash, which moves rather than unlinks and so cannot orphan a link's payload.
 import { findDeleteBoundaries } from '../scripts/deleteBoundary.mjs';
 import { classifyJsonAssetPath, ID_BEARING_TYPES } from './assetTypes';
+import { parseJsonText, readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** The sidecars an asset carries, as SUFFIXES. Spelled once: `moveAssetFile` renames them and
  *  `moveToTrash`'s refusal predicate must hold them back, and a second hand-kept copy of the list
@@ -514,7 +515,7 @@ export function planMemberPathRepair(
   for (const f of files) {
     if (!names(f)) continue;
     let doc: Record<string, unknown>;
-    try { doc = JSON.parse(f.text.replace(/^\uFEFF/, '')); } catch { continue; }
+    try { doc = parseJsonText(f.text); } catch { continue; }
     if (!doc || typeof doc !== 'object') continue;
     if (f.type === 'prefab') {
       const next = f.guid ? rewritePrefabMemberTokens(doc, f.guid, readOld, readNew) : null;
@@ -544,7 +545,7 @@ export function withFreshJsonIdentity(
   readPrefab?: PrefabReader,
 ): Record<string, unknown> | null {
   let json: unknown;
-  try { json = JSON.parse(text.replace(/^\uFEFF/, '')); } catch { return null; }
+  try { json = parseJsonText(text); } catch { return null; }
   if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
   const doc = { ...(json as Record<string, unknown>), id: guid };
   return isScene ? remintSceneEntityGuids(doc, genGuid, readPrefab) : doc;
@@ -582,7 +583,7 @@ export function importedAssetBytes(
   const { guidTaken, genGuid = randomUUID, readPrefab } = opts;
   const text = bytes.toString('utf-8');
   let own: unknown;
-  try { own = (JSON.parse(text.replace(/^\uFEFF/, '')) as { id?: unknown } | null)?.id; } catch { return { bytes }; }
+  try { own = (parseJsonText(text) as { id?: unknown } | null)?.id; } catch { return { bytes }; }
   if (typeof own === 'string' && own && !guidTaken(own)) return { bytes, id: own };
   const guid = genGuid();
   const json = withFreshJsonIdentity(text, guid, type === 'scene', genGuid, readPrefab);
@@ -627,7 +628,7 @@ export function duplicateAssetFile(
     const metaFrom = absFrom + '.meta.json';
     if (fs.existsSync(metaFrom)) {
       try {
-        const meta = JSON.parse(fs.readFileSync(metaFrom, 'utf-8'));
+        const meta = readJsonFile(metaFrom);
         meta.id = newGuid;
         // Don't carry the parent's `generated` list — derived files belong to
         // the original, not the copy.

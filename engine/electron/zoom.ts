@@ -12,10 +12,10 @@
 // (userData is scoped per clone/identity — see userDataDir.ts — which is exactly right
 // for a UI pref, unlike recents which deliberately avoid userData).
 
-import fs from 'node:fs';
 import path from 'node:path';
 import { app, type BrowserWindow } from 'electron';
 import { atomicWriteFileSync } from './atomicWrite';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 export const ZOOM_MIN = -3;   // factor ≈ 0.58×
 export const ZOOM_MAX = 4;    // factor ≈ 2.07×
@@ -49,7 +49,7 @@ const prefsFile = (): string => path.join(uiPrefsDir ?? app.getPath('userData'),
 /** Best-effort read of the persisted zoom level (clamped). Defaults to 0. */
 export function loadZoomLevel(): number {
   try {
-    const raw = JSON.parse(fs.readFileSync(prefsFile(), 'utf8')) as { zoomLevel?: unknown };
+    const raw = readJsonFile(prefsFile()) as { zoomLevel?: unknown };
     if (typeof raw.zoomLevel === 'number' && Number.isFinite(raw.zoomLevel)) return clamp(raw.zoomLevel);
   } catch { /* no file / unreadable → default */ }
   return 0;
@@ -59,7 +59,7 @@ function persist(): void {
   try {
     // Merge onto any existing prefs so future keys aren't clobbered.
     let prefs: Record<string, unknown> = {};
-    try { prefs = JSON.parse(fs.readFileSync(prefsFile(), 'utf8')) as Record<string, unknown>; } catch { /* fresh */ }
+    try { prefs = readJsonFile(prefsFile()) as Record<string, unknown>; } catch { /* fresh */ }
     prefs.zoomLevel = currentLevel;
     atomicWriteFileSync(prefsFile(), JSON.stringify(prefs, null, 2));
   } catch { /* best-effort — a failed pref write must never crash the editor */ }

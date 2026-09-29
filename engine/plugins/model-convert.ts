@@ -34,6 +34,7 @@ import {
 } from './model-convert/threeAdapter';
 import { gltfTransformInvocation, gltfpackInvocation, toSpawn } from '../toolchain';
 import { nativeDynamicImport } from './native-dynamic-import';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 const GLTF_TRANSFORM_MISSING_MSG =
   '@gltf-transform/cli not found. Install it from the editor\'s Build Support dialog, or `npm i -D @gltf-transform/cli`.';
@@ -74,7 +75,7 @@ async function loadMeshoptVersion(): Promise<string> {
     const req = createRequire(import.meta.url);
     const mainEntry = req.resolve('meshoptimizer'); // .../meshoptimizer/index.js
     const pkgPath = path.join(path.dirname(mainEntry), 'package.json');
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as { version?: string };
+    const pkg = readJsonFile(pkgPath) as { version?: string };
     meshoptVersion = pkg.version ?? '';
   } catch {
     meshoptVersion = '';

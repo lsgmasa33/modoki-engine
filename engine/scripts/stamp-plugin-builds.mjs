@@ -30,11 +30,11 @@
  * NEVER fails the install. A missing stamp costs one redundant rebuild; a postinstall
  * that exits non-zero costs the whole `npm install`.
  */
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadVendorPlugins } from './loadVendorPlugins.mjs';
 import { isEntryPoint } from './entryPoint.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
@@ -84,7 +84,7 @@ if (isEntryPoint(import.meta.url)) {
   }
 
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    const pkg = readJsonFile(path.join(repoRoot, 'package.json'));
     const workspaces = buildPluginsWorkspaces(pkg);
     if (!workspaces.length) {
       console.warn('[stamp] could not read any --workspace from build:plugins — stamping nothing. Plugin dists will be rebuilt once on first use.');

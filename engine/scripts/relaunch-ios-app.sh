@@ -37,12 +37,14 @@ read_ids() {
   # one — an empty devicectlId (every iOS <= 16 device) then shifted the UDID into that slot and the
   # script confidently ran `devicectl --device <hardware-udid>`, which fails with CoreDeviceError
   # 1000. A non-whitespace delimiter keeps the empty field empty. Neither id can contain `|`.
-  node -e '
+  # The helper strips a BOM a Windows tool wrote (#1799); its path is an ARGUMENT, which Git Bash converts.
+  node --input-type=module -e '
+    const { readJsonFile } = await import((await import("node:url")).pathToFileURL(process.argv[1]).href);
     let j = {};
-    try { j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); } catch {}
+    try { j = readJsonFile(process.argv[2]); } catch {}
     const d = j.device ?? {};
     process.stdout.write(`${String(d.iosDevicectlId || "").trim()}|${String(d.iosDeviceId || "").trim()}`);
-  ' "$1" 2>/dev/null || true
+  ' "$HERE/engine/scripts/jsonFile.mjs" "$1" 2>/dev/null || true
 }
 
 DEVICECTL_ID=""
@@ -78,11 +80,12 @@ else
       [[ -f "$f" ]] || continue
       cfg="${f%/project.user.json}/project.config.json"
       [[ -f "$cfg" ]] || continue
-      appId="$(node -e '
+      appId="$(node --input-type=module -e '
+        const { readJsonFile } = await import((await import("node:url")).pathToFileURL(process.argv[1]).href);
         let j = {};
-        try { j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); } catch {}
+        try { j = readJsonFile(process.argv[2]); } catch {}
         process.stdout.write(String(j.app?.appId ?? "").trim());
-      ' "$cfg" 2>/dev/null || true)"
+      ' "$HERE/engine/scripts/jsonFile.mjs" "$cfg" 2>/dev/null || true)"
       [[ "$appId" == "$BUNDLE_ID" ]] && CANDIDATES+=("$f")
     done
     # No project claims that bundle id (an app installed from elsewhere) → fall back to every

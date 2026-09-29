@@ -40,6 +40,35 @@ describe('normScenePath', () => {
     expect(normScenePath('/assets/scenes/bad%E0.scene.json'), 'a malformed escape keeps its spelling').toBe('/assets/scenes/bad%e0.scene.json');
   });
 
+  // #1791 — strings OBSERVED on Windows (games/scroll-demo, launch-editor.sh, 2026-09-29).
+  it('keys a scene in a folder named Assets by its whole path under the root, not from the last /assets/ (#1791)', () => {
+    const nested = '/assets/scenes/Assets/nest1791.scene.json';
+    const top = '/assets/nest1791.scene.json';
+    expect(normScenePath(nested), 'two files, one key: a change to one reloaded the other').not.toBe(normScenePath(top));
+    expect(normScenePath(nested)).toBe('/assets/scenes/assets/nest1791.scene.json');
+    // The same file in the other forms still meets it: the game app's, the broadcast's, and Vite's /@fs.
+    expect(normScenePath('/games/scroll-demo/runtime/assets/scenes/Assets/nest1791.scene.json')).toBe(normScenePath(nested));
+    expect(normScenePath('/games/scroll-demo/assets/scenes/Assets/nest1791.scene.json')).toBe(normScenePath(nested));
+    expect(normScenePath('/@fs/E:/Projects/modoki/games/scroll-demo/runtime/assets/scenes/Assets/nest1791.scene.json')).toBe(normScenePath(nested));
+  });
+
+  it('collapses a dot segment and a doubled slash, as the server does when it resolves the file (#1791)', () => {
+    const want = normScenePath('/assets/scenes/win1791.scene.json');
+    expect(normScenePath('/assets/scenes/./win1791.scene.json'), 'observed: MCP load_scene stored this spelling').toBe(want);
+    expect(normScenePath('/assets/prefabs/../scenes/win1791.scene.json')).toBe(want);
+    expect(normScenePath('/assets/scenes//win1791.scene.json')).toBe(want);
+    // A relative typed path is rooted first, as the server roots it (close-out review: `./assets/…` met the broadcast
+    // before the collapse, and dropping its leading `.` without rooting it would have lost that).
+    expect(normScenePath('./assets/scenes/win1791.scene.json')).toBe(want);
+    expect(normScenePath('assets/scenes/win1791.scene.json')).toBe(want);
+    expect(normScenePath(''), 'the untitled history key').toBe('');
+  });
+
+  it('anchors every URL root form, so a folder named Assets under any of them keeps its place (#1791)', () => {
+    expect(normScenePath('/demos/forest-camp/assets/scenes/Assets/x.scene.json')).toBe('/assets/scenes/assets/x.scene.json');
+    expect(normScenePath('/modoki/assets/scenes/Assets/x.scene.json')).toBe('/assets/scenes/assets/x.scene.json');
+  });
+
   it('returns a prefab-edit key whole, even one built from a prefab PATH (it keeps the prefix adopt reads, U27)', () => {
     const byPath = '/__prefab-edit__//assets/prefabs/X.prefab.json';
     expect(normScenePath(byPath)).toBe(byPath);

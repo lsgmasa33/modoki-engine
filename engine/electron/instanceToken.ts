@@ -39,6 +39,7 @@ import { randomUUID } from 'node:crypto';
 import { atomicWriteFileSync } from './atomicWrite';
 // The ONE path-identity normalisation (#869) — see engine/scripts/pathIdentity.mjs.
 import { canonicalPath, pathCaseKey } from '../scripts/pathIdentity.mjs';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** The request header the `modoki` MCP sends. Lowercase — Node lowercases inbound
  *  header names, and this constant is compared against `req.headers[...]` directly. */
@@ -112,7 +113,7 @@ function readAll(userDataDir: string, fresh = false): Record<string, string> {
   if (!fresh && _cache && _cache.dir === userDataDir) return _cache.map;
   let map: Record<string, string> = {};
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(path.join(userDataDir, TOKEN_FILE), 'utf8'));
+    const parsed: unknown = readJsonFile(path.join(userDataDir, TOKEN_FILE));
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       // Keep only string values — a hand-mangled file must not put a non-string into a
       // header comparison.

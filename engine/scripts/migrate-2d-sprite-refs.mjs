@@ -25,6 +25,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { extname, basename } from 'node:path';
 import { repoFiles } from './repoCorpus.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 // No ROOT constant here on purpose (#849): every path this script reports now comes from
 // `repoFiles()`'s own repo-relative `rel`. A second, independently derived repo root is exactly
@@ -78,7 +79,7 @@ async function main() {
   const texByGuid = new Map();
   const metas = gameAssetFiles((rel) => rel.endsWith('.meta.json') && TEX_EXT.has(extname(rel.slice(0, -'.meta.json'.length)).toLowerCase()));
   for (const { rel: metaRel, abs: metaPath } of metas) {
-    const meta = JSON.parse(await readFile(metaPath, 'utf-8'));
+    const meta = parseJsonText(await readFile(metaPath, 'utf-8'));
     if (!isGuid(meta.id)) continue;
     texByGuid.set(meta.id, {
       metaPath, srcPath: metaPath.slice(0, -'.meta.json'.length),
@@ -134,7 +135,7 @@ async function main() {
   });
 
   for (const { rel, abs: file } of contentFiles) {
-    const json = JSON.parse(await readFile(file, 'utf-8'));
+    const json = parseJsonText(await readFile(file, 'utf-8'));
     const changes = [];
     if (file.endsWith('.rig2d.json') && Array.isArray(json.parts)) {
       json.parts.forEach((part, i) => {

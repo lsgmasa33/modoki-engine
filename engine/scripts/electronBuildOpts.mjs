@@ -17,8 +17,9 @@
  * package.json. That is the property that makes it importable from a test.
  */
 import path from 'node:path';
-import { readFileSync } from 'node:fs';
+
 import { fileURLToPath } from 'node:url';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 /** `engine/electron` — resolved from THIS file, so the build works from any CWD. */
 export const electronDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'electron');
@@ -39,7 +40,7 @@ export const electronMainOutfile = path.join(electronDir, 'dist', 'main.cjs');
  * version instead.
  */
 export function appVersion() {
-  return JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
+  return readJsonFile(path.join(repoRoot, 'package.json')).version;
 }
 
 /**

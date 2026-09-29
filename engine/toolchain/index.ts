@@ -80,7 +80,7 @@ export function readToolchainSettings(): ToolchainSettings {
   const p = toolchainSettingsPath()
   if (p) {
     try {
-      const j = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ToolchainSettings>
+      const j = readJsonFile(p) as Partial<ToolchainSettings>
       return { allowSystemToolchain: !!j.allowSystemToolchain, wdaTeamId: j.wdaTeamId || undefined }
     } catch { /* no file / unreadable → default below */ }
   }
@@ -435,6 +435,7 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
  *  the one copy. */
 export { needsWinShell, toSpawn, whichSync } from '../scripts/winSpawn.mjs'
 import { toSpawn, whichSync } from '../scripts/winSpawn.mjs'
+import { parseJsonText, readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** A candidate command → the absolute path to spawn, or null when it can't be found. A candidate that
  *  already carries a directory is taken as-is (the caller built it); a BARE name is resolved on PATH. */
@@ -1052,7 +1053,7 @@ export function planSharpOverride(existingText: string | null): SharpOverridePla
   }
   let parsed: Record<string, unknown>
   try {
-    parsed = JSON.parse(existingText) as Record<string, unknown>
+    parsed = parseJsonText(existingText) as Record<string, unknown> // #1799: the file text is passed in; its twin reader strips too
   } catch {
     return { action: 'unreadable' }
   }
@@ -1071,7 +1072,7 @@ function npmToolsSharpOverrideMissing(toolchainDir: string): boolean {
   const pkgJson = path.join(npmToolsDir(toolchainDir), 'package.json')
   if (!fs.existsSync(pkgJson)) return false
   try {
-    const parsed = JSON.parse(fs.readFileSync(pkgJson, 'utf8')) as { overrides?: { sharp?: string } }
+    const parsed = readJsonFile(pkgJson) as { overrides?: { sharp?: string } }
     return parsed.overrides?.sharp !== PINNED_SHARP_OVERRIDE
   } catch {
     return false // an unreadable/corrupt file isn't THIS check's problem to flag
@@ -1811,7 +1812,7 @@ type NpmBinaryToolId = keyof typeof NPM_BINARY_PINS
 /** The `version` of an npm package installed in the toolchain's `npm-tools` tree, or null. */
 export function installedNpmToolVersion(toolchainDir: string, pkg: string): string | null {
   try {
-    const json = JSON.parse(fs.readFileSync(path.join(npmToolsDir(toolchainDir), 'node_modules', pkg, 'package.json'), 'utf8')) as { version?: unknown }
+    const json = readJsonFile(path.join(npmToolsDir(toolchainDir), 'node_modules', pkg, 'package.json')) as { version?: unknown }
     return typeof json.version === 'string' ? json.version : null
   } catch {
     return null

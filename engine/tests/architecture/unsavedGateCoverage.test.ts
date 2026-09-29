@@ -48,7 +48,7 @@ const ROUTER = 'engine/plugins/backend/editorBackendRouter.ts';
  *  This nets routes that legitimately do not care (`/api/read-file` serving bytes). That is the
  *  intended trade: `EXEMPT` is the honest home for those, and a declaration a reader can check
  *  beats a trigger tuned until nothing inconvenient matches. */
-const CONTENT_CALLS = /\b(writeMetaSidecar|readMetaSidecar|duplicateAssetFile|getReimportHandler|readFileSync|computeUnused|computeRefEdges|validateSceneData|validatePrefabData|moveToTrash|moveAssetFile|writeFileSync)\s*\(/;
+const CONTENT_CALLS = /\b(writeMetaSidecar|readMetaSidecar|duplicateAssetFile|getReimportHandler|readFileSync|readJsonFile|tryReadJsonFile|computeUnused|computeRefEdges|validateSceneData|validatePrefabData|moveToTrash|moveAssetFile|writeFileSync)\s*\(/;
 
 /** Every registry name in the vocabulary, and the subset that holds an unsaved DOCUMENT. The split
  *  exists because `openAssetEditor` (#1362) is not a registry of parked documents — it is "a modal
@@ -78,6 +78,10 @@ const HELPER_REGISTRIES: Record<string, readonly string[]> = {
   // gated or exempt. Narrowing this by guessing at the filename would be a trigger tuned to
   // pass.
   readFileSync: [],
+  // #1799: a JSON file read goes through engine/scripts/jsonFile.mjs now — the same raw read, so the
+  // same (empty) declaration. Without these the trigger lost every route that migrated off readFileSync.
+  readJsonFile: [],
+  tryReadJsonFile: [],
   // ⚠️ Added in phase 2 so the two validators are checked rather than merely counted. Both routes
   // trigger on `readFileSync` too, and that maps to `[]` — so without these rows the superset
   // check is VACUOUS for them and the guard degrades to "does the word unsavedGate appear",

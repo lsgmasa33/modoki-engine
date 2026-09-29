@@ -88,6 +88,10 @@ one of:
 | `absent` | no `version` field | legacy or freshly created — readable |
 | `unreadable` | did not parse, not an object, non-integer version | corrupt — replace only after preserving it |
 
+`classifyJsonFormatVersion` strips a leading UTF-8 BOM before it parses (#1799): a BOM is what a
+Windows tool writes, not damage, and read as `unreadable` it sent a good sidecar to
+`quarantineCorruptSidecar`. See docs/windows.md § "A BOM is a Windows fact, not corruption".
+
 ⚠️ **`too-old` is a fifth verdict, and it is not a refinement.** A `MIN_READABLE_*` floor is a
 *decision not to read* something this build understands the shape of; `unreadable` is *damaged
 bytes*. They call for opposite handling — one is policy, the other is corruption — and folding them

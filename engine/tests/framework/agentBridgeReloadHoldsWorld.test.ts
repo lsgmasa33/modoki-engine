@@ -306,6 +306,25 @@ describe('the debt KEY is one per scene file, whatever form its path arrives in 
     expect(loadScene, 'the disk edit matched no loaded scene — skipped silently').toHaveBeenCalledTimes(1);
   });
 
+  // #1791 — the strings observed on Windows (games/scroll-demo, 2026-09-29): a scene in a folder named `Assets` shared
+  // its key with a top-level scene of the same name, and a scene opened through a `./` segment matched no broadcast.
+  it('a change to a same-named scene outside the Assets folder does not reload the open nested one (#1791)', async () => {
+    await adoptTo('/assets/scenes/Assets/nest1791.scene.json');
+    changed('/assets/nest1791.scene.json');
+    await settle();
+    expect(loadScene, 'a different file reloaded the open scene — disk-wins over its unsaved edits').not.toHaveBeenCalled();
+    changed('/assets/scenes/Assets/nest1791.scene.json');
+    await settle();
+    expect(loadScene, 'its own change still reloads it').toHaveBeenCalledTimes(1);
+  });
+
+  it('a scene opened through a ./ segment reloads when the watcher reports its clean path (#1791)', async () => {
+    await adoptTo('/assets/scenes/./win1791.scene.json');
+    changed('/assets/scenes/win1791.scene.json');
+    await settle();
+    expect(loadScene, 'the disk edit matched no loaded scene — skipped silently').toHaveBeenCalledTimes(1);
+  });
+
   it('the stack parked under one case of the name is the one the debt raised under the other retires (#1786)', async () => {
     await adoptTo(OPENED_AS);
     edit('Delete Entity');

@@ -29,6 +29,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
 import { claimProjectOrExit } from './cliBuildClaim.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const project = process.argv[2] || 'games/sling';
@@ -91,7 +92,7 @@ const ok = (name, cond, detail = '') => {
 
 /** Build `project` with `build.debugBuild = flag` and return every marker's hit count in dist/. */
 function buildAndCount(flag) {
-  const cfg = JSON.parse(original);
+  const cfg = parseJsonText(original);
   cfg.build = { ...(cfg.build ?? {}), debugBuild: flag };
   fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + '\n');
 

@@ -29,6 +29,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseFontFilename } from '../packages/modoki/src/runtime/loaders/fontNaming.ts';
 import { repoFiles } from './repoCorpus.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
@@ -57,7 +58,7 @@ async function buildFamilyIndex(projectRel) {
   const index = new Map();
   for (const meta of metas) {
     let json;
-    try { json = JSON.parse(await readFile(meta, 'utf-8')); } catch { continue; }
+    try { json = parseJsonText(await readFile(meta, 'utf-8')); } catch { continue; }
     if (!json?.id) continue;
     const family = parseFontFilename(meta.replace(/\.meta\.json$/i, '')).family;
     // A family with several variants (Regular + Bold) resolves to whichever asset comes
@@ -80,7 +81,7 @@ for (const rootDir of ['games', 'demos']) {
 
     for (const file of files) {
       let json;
-      try { json = JSON.parse(await readFile(file, 'utf-8')); } catch { continue; }
+      try { json = parseJsonText(await readFile(file, 'utf-8')); } catch { continue; }
       let dirty = false;
       const migratedFamilies = new Set();
 

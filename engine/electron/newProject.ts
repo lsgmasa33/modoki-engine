@@ -13,6 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { parseJsonText } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 export interface ScaffoldOptions {
   /** Human-readable project name (drives id/appId/title). */
@@ -80,7 +81,7 @@ export function scaffoldProject(targetDir: string, opts: ScaffoldOptions): Scaff
   const scenePath = path.join(dest, 'runtime', 'assets', 'scenes', 'main.scene.json');
   if (fs.existsSync(scenePath)) {
     let sceneText = fs.readFileSync(scenePath, 'utf8');
-    const scene = JSON.parse(sceneText) as {
+    const scene = parseJsonText(sceneText) as {
       id?: string;
       entities?: { traits?: { EntityAttributes?: { guid?: string } } }[];
     };

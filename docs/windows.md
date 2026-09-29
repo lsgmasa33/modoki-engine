@@ -242,6 +242,53 @@ LF — while the 4 unpinned `.gitignore` files **did** convert to CRLF. That las
 without a file that converts, an all-LF result cannot distinguish "the pin works" from "the
 conversion never engaged".
 
+### A BOM is a Windows fact, not corruption (#1799)
+
+**Every Node-side parse of a JSON file goes through
+[engine/scripts/jsonFile.mjs](../engine/scripts/jsonFile.mjs)** — `readJsonFile(p)`,
+`tryReadJsonFile(p)` (which tells a MISSING file from a damaged one, #731's rule), or
+`parseJsonText(text)` when the site keeps its own read (an injected `fs`, a Buffer it decodes).
+`engine/tests/architecture/jsonFileReadsStripBom.test.ts` fails a `JSON.parse(` of a raw
+`readFileSync`/`readFile`, directly or through a binding the file assigns from one.
+
+**Why:** Node's `fs.readFileSync(p, 'utf8')` keeps a leading UTF-8 BOM (U+FEFF), and `JSON.parse`
+throws on it. Windows tools write one — Notepad's "UTF-8 with BOM", PowerShell 5.1's
+`Set-Content`/`Out-File -Encoding utf8` (this repo's own Windows shell) — and so does the editor's
+verbatim undo (#1774 restores the exact bytes a file had). Before #1799, 151 Node-side reads parsed
+the raw text, and each read a good file as unreadable in its own way:
+- **OBSERVED on Windows:** a BOM'd prefab had NO guid in the asset manifest (`readAssetGuid`), so its
+  instances and a UIEntries pool went blank, a new instance stored a raw path in
+  `PrefabInstance.source`, and the member-path repair (#1437) skipped the scene that held it.
+- A BOM'd `.meta.json` classified `unreadable` and `quarantineCorruptSidecar` moved it aside — the
+  texture's import settings and slice guids left the asset.
+- The publish leak scans skipped a config they could not parse, so its Team ID and device ids were
+  never looked for. They now also **fail closed**: a config that is there and cannot be read stops the
+  publish, whatever the cause (`scripts/lib/leakScanConfigs.mjs`).
+
+**Where the rule reaches, and how:**
+- `engine/{plugins,electron,scripts,toolchain,tools}`, `scripts/`, `site/`, `wordbank/`: the helper.
+- A `node -e` body in a `.sh` imports it by an ARGUMENT path —
+  `node --input-type=module -e '…await import(pathToFileURL(process.argv[1]).href)…' "$HERE/engine/scripts/jsonFile.mjs" …`
+  — because Git Bash converts a `/e/…` argument to `E:/…` but leaves a path inside the `-e` string alone.
+- `games/*/tools` strip inline (`.replace(/^\uFEFF/, '')`): a project cannot import `engine/` (#29).
+- `runtime/core/formatVersion.ts` strips inline: `runtime/` cannot import `engine/scripts`, and the
+  version classifier is the chokepoint three Node callers pass raw text through.
+- **The browser side needs nothing**: a fetch's `text()`/`json()` and a default `TextDecoder` drop the
+  BOM themselves; the two readers that keep it on purpose (`ignoreBOM: true`, for a byte-exact restore)
+  strip before parsing. Pinned by `packages/modoki/tests/runtime/bomTolerantAssetFetch.test.ts`.
+- **Not reached** (the guard's stated limit): text that arrives at `JSON.parse` as a function
+  parameter or property. Three were found and fixed by hand — `ota/buildStamp.mjs` (a BOM'd stamp
+  refused the OTA publish as `bad-stamp`), `toolchain/index.ts`'s `planSharpOverride` (its twin
+  reader stripped, so a BOM'd `npm-tools/package.json` read as stale forever and the heal never
+  wrote the pin) — and text from a CHILD PROCESS, which it cannot see either: `migrate-legacy-scenes.mjs`'s
+  `git show` of a committed file (git's eol normalisation keeps a BOM). So a new parse of a PASSED or
+  captured file text must strip too. The guard's one reviewed exemption is a GLB's embedded JSON chunk
+  (`gen-collision-mesh.mjs`), a byte range of a binary file.
+
+**Writers are unchanged:** a save writes no BOM (see [mcp-persistence.md](mcp-persistence.md)
+§ "The bytes a save writes"), and a verbatim restore keeps the one the file had — inert now that
+every reader takes it.
+
 ## Paths
 
 - ⚠️ **A native Windows path can fail a validator written for POSIX paths.** `BUILD_FIELD_RULES`

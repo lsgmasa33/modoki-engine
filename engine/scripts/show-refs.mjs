@@ -33,6 +33,7 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve, relative } from 'node:path';
 import { repoRoot, repoFiles } from './repoCorpus.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const ROOT = repoRoot();
 const args = process.argv.slice(2);
@@ -58,7 +59,7 @@ async function loadManifest() {
   ];
   for (const p of candidates) {
     if (!existsSync(p)) continue;
-    const data = JSON.parse(await readFile(p, 'utf-8'));
+    const data = parseJsonText(await readFile(p, 'utf-8'));
     const byGuid = new Map();
     for (const a of (data.assets ?? [])) {
       if (a.guid) byGuid.set(a.guid, a);
@@ -118,7 +119,7 @@ function walkRefs(obj, manifest, out, breadcrumb) {
 async function showFile(filePath, manifest) {
   const txt = await readFile(filePath, 'utf-8');
   let json;
-  try { json = JSON.parse(txt); } catch (e) { console.warn(`[skip] ${filePath}: ${e.message}`); return; }
+  try { json = parseJsonText(txt); } catch (e) { console.warn(`[skip] ${filePath}: ${e.message}`); return; }
 
   const out = [];
   walkRefs(json, manifest, out, 'root');

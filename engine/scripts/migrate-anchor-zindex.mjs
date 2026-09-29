@@ -34,6 +34,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { repoFiles } from './repoCorpus.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
@@ -210,7 +211,7 @@ function visitEntry(entry, filePath, dirtyRef) {
 
 async function migrateFile(file) {
   let json;
-  try { json = JSON.parse(await readFile(file, 'utf-8')); } catch (e) {
+  try { json = parseJsonText(await readFile(file, 'utf-8')); } catch (e) {
     console.log(`PARSE ERROR ${file.slice(ROOT.length + 1)}: ${e.message}`);
     return;
   }

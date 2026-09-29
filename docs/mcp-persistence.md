@@ -1024,6 +1024,14 @@ actually landed **fails OPEN** — the change event returns ~150 ms later, is re
 edit, and `dropParkedWriteFor` discards whatever the human had parked. Getting the newline right at
 two of three sites would have been worse than leaving the bug.
 
+**A save writes no BOM; a verbatim restore keeps the one the file had (#1799).** `assetJsonBytes`,
+`jsonFileBody`, the sidecar writers and the migrate scripts all `JSON.stringify` with no BOM, so the
+first save of a file a Windows tool wrote drops it — by design, and unchanged. The undo that puts a
+file's recorded bytes back (#1679's `readPriorDocument`, #1774's `withTopLevelNumbers` splice) puts a
+BOM back with them, because "these exact bytes again" is its whole contract. That is safe only
+because every Node-side READER strips it: docs/windows.md § "A BOM is a Windows fact, not
+corruption" is the rule and its guard.
+
 Two sibling writers share it (both fixed in #831 after the live check caught them): the asset
 scanner's guid **heal**, which rewrites any doc written without an `id` ~150 ms later, and
 `asset-fs-ops.ts`'s asset **copy**. `scripts/migrate-assets.mjs` carries the same byte as a literal

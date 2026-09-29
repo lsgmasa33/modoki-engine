@@ -26,6 +26,7 @@ import {
   ANDROID_VERSION_CODE_INIT_SCRIPT_PATH, ANDROID_BUILD_NUMBER_ARGS_PATH, IOS_BUILD_NUMBER_ARGS_PATH,
   renderAndroidVersionCodeInitScript, gradleBuildNumberArg, xcodeBuildNumberArg,
 } from './releaseBuild';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 export interface HealResult {
   /** Human-readable notes on what was healed (for the console / status). */
@@ -423,7 +424,7 @@ const ANDROID_SIGNING_BLOCK = [
  *  doesn't use it stays untouched. */
 function usesGameDebug(projectRoot: string): boolean {
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
+    const pkg = readJsonFile(path.join(projectRoot, 'package.json'));
     return !!(pkg.dependencies?.['capacitor-game-debug'] || pkg.devDependencies?.['capacitor-game-debug']);
   } catch {
     return false;
@@ -963,7 +964,7 @@ function insertArchiveWarnPhase(pbx: string): string | undefined {
  *  "no run script found" warning in builds that never wanted symbol upload. */
 function usesCrashlytics(projectRoot: string): boolean {
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')) as
+    const pkg = readJsonFile(path.join(projectRoot, 'package.json')) as
       { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
     const deps = { ...pkg.dependencies, ...pkg.devDependencies };
     return Boolean(deps['@capacitor-firebase/crashlytics']);
@@ -1771,7 +1772,7 @@ function healIncludePluginsGameDebug(projectRoot: string, debugBuild: boolean): 
   if (!fs.existsSync(capPath)) return undefined;
   let json: Record<string, unknown>;
   try {
-    json = JSON.parse(fs.readFileSync(capPath, 'utf8')) as Record<string, unknown>;
+    json = readJsonFile(capPath) as Record<string, unknown>;
   } catch {
     return undefined; // the identity heal already reports an unparseable file
   }
@@ -2511,7 +2512,7 @@ export function healAppIdentity(projectRoot: string, appId: unknown, appName: un
   guarded('capacitor.config.json', () => {
     if (!fs.existsSync(capPath)) return;
     try {
-      const json = JSON.parse(fs.readFileSync(capPath, 'utf8')) as Record<string, unknown>;
+      const json = readJsonFile(capPath) as Record<string, unknown>;
       if (typeof json.appId === 'string' && json.appId) oldId = json.appId;
       capJson = json;
     } catch {

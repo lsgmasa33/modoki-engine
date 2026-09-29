@@ -28,6 +28,7 @@
 import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { parseJsonText } from '../jsonFile.mjs';
 
 /** The stamp's file name inside a dist. */
 export const BUILD_STAMP_FILENAME = 'modoki-build.json';
@@ -109,7 +110,7 @@ export function otaBuildProvenance({ stampText, allowUnclean }) {
   if (stampText === null) return decide('no-stamp', { commit: null, dirty: null });
   let stamp;
   try {
-    stamp = JSON.parse(stampText);
+    stamp = parseJsonText(stampText); // #1799: a BOM'd stamp is a stamp, not a bad one
   } catch {
     return decide('bad-stamp', { commit: null, dirty: null });
   }

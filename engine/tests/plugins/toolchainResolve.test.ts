@@ -1434,4 +1434,12 @@ describe('planSharpOverride', () => {
     // node_modules — the silent tool-loss this case exists to prevent.
     expect((plan as { pkg?: unknown }).pkg).toBeUndefined();
   });
+
+  it('a BOM-prefixed file is READ, not unreadable (#1799) — its twin reader strips, so the two must agree', () => {
+    // Before: npmToolsSharpOverrideMissing (readJsonFile) saw the missing pin and flagged the tools
+    // stale on every probe, while this parse threw → 'unreadable' → the heal never wrote it.
+    const bom = `\uFEFF${JSON.stringify({ name: 'modoki-toolchain-tools', dependencies: { x: '1' } }, null, 2)}\r\n`;
+    expect(planSharpOverride(bom).action).toBe('patch');
+    expect(planSharpOverride(`\uFEFF${JSON.stringify({ overrides: { sharp: PINNED_SHARP_OVERRIDE } })}`).action).toBe('ok');
+  });
 });

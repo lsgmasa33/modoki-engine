@@ -67,7 +67,7 @@ import { classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
 function parseForValidation(absPath: string, urlPath: string): { data: unknown } | { warning: string } {
   const text = fs.readFileSync(absPath, 'utf-8');
   try {
-    return { data: JSON.parse(text) };
+    return { data: parseJsonText(text) };
   } catch (e) {
     return { warning: `${urlPath} is not valid JSON (${e instanceof Error ? e.message : String(e)}) — nothing else was checked; fix the file and validate again.` };
   }
@@ -343,6 +343,7 @@ import { buildRefGraph, resolveTarget, findReferences, type FindReferencesRespon
 import { isUnderOrSame, samePath } from '../../scripts/pathIdentity.mjs';
 import type { ModuleUrlResolution, ModuleUrlError } from './moduleUrl';
 import { checkOpenProjectRequest, openProjectReply, sameRootVerdict, inFlightReply, withExpectedToken, type ProjectSwitchHost } from './openProjectRoute';
+import { parseJsonText, readJsonFile } from '../../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -884,7 +885,7 @@ function makePrefabResolver(ctx: BackendContext): PrefabResolver {
       // A leading BOM is stripped as the loader's `res.text()` strips it, so a prefab that loads in
       // the editor also resolves here (#1324 review — a duplicated scene's member refs did not follow).
       result = absPath && fs.existsSync(absPath)
-        ? JSON.parse(fs.readFileSync(absPath, 'utf-8').replace(/^\uFEFF/, ''))
+        ? readJsonFile(absPath)
         : undefined;
     } catch {
       result = undefined;
@@ -3306,7 +3307,7 @@ async function describeUnresolvedAgainstLiveWorld(
           ],
         }, 409);
       }
-      const scene = JSON.parse(fs.readFileSync(absPath, 'utf-8')) as MutableScene;
+      const scene = readJsonFile(absPath) as MutableScene;
       // Phase 3, scene-loading.md — a v12+ file has no entity ids; this
       // module still addresses entities by numeric id internally, so backfill one per
       // entry for the duration of this call. Stripped back off (stripBackfilledEntityIds,
@@ -4914,7 +4915,7 @@ async function describeUnresolvedAgainstLiveWorld(
         return json({ error: 'a new scene file must be named <name>.scene.json', wrongKind: true }, 409);
       }
       let scene: Record<string, unknown>;
-      try { scene = JSON.parse(String(content).replace(/^\uFEFF/, '')); } catch { return json({ error: 'content is not valid JSON' }, 400); }
+      try { scene = parseJsonText(String(content)); } catch { return json({ error: 'content is not valid JSON' }, 400); }
       // Never cross kinds (#1264): the client only sends a `.scene.json` name or a file the manifest
       // already types `scene`, so this is the backstop for a manifest that disagrees — or that does
       // not list the file at all, which the manifest-only check this replaced let through (#1472).
@@ -5632,7 +5633,7 @@ async function describeUnresolvedAgainstLiveWorld(
   //    journal watch when the GameView enters Play — see setVerboseCapture / journal tiers).
   const aiSettingsFile = () => path.join(ctx.projectRoot, '.modoki', 'ai-settings.json');
   const readAiSettings = (): Record<string, unknown> => {
-    try { return JSON.parse(fs.readFileSync(aiSettingsFile(), 'utf8')) as Record<string, unknown>; }
+    try { return readJsonFile(aiSettingsFile()) as Record<string, unknown>; }
     catch { return {}; }
   };
 
@@ -6054,7 +6055,7 @@ async function describeUnresolvedAgainstLiveWorld(
     const keyPath = path.join(ctx.editorRoot || ctx.projectRoot, 'build', 'ota-keys', `${name}.json`);
     if (!fs.existsSync(keyPath)) return json({ ok: true, name, exists: false, publicKey: null });
     try {
-      const { publicKey } = JSON.parse(fs.readFileSync(keyPath, 'utf8')) as { publicKey?: string };
+      const { publicKey } = readJsonFile(keyPath) as { publicKey?: string };
       return json({ ok: true, name, exists: true, publicKey: publicKey ?? null });
     } catch (e) {
       return json({ ok: false, error: `could not read ${path.relative(ctx.projectRoot, keyPath)}: ${e instanceof Error ? e.message : String(e)}` }, 500);

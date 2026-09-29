@@ -37,6 +37,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { resolveGoIos } from './deviceSyslog';
+import { readJsonFile } from '../../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 const execFileAsync = promisify(execFile);
 
@@ -391,7 +392,7 @@ export function recordIosForward(dir: string, rec: Omit<ForwardRecord, 'owner' |
 export function clearIosForwardRecord(dir: string, pid: number | undefined): void {
   const file = path.join(dir, RECORD_FILE);
   try {
-    const rec = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<ForwardRecord>;
+    const rec = readJsonFile(file) as Partial<ForwardRecord>;
     if (rec.pid === pid) fs.rmSync(file, { force: true });
   } catch { /* no record */ }
 }
@@ -422,7 +423,7 @@ export const reapDeps = {
 export function reapRecordedIosForward(dir: string): string | null {
   const file = path.join(dir, RECORD_FILE);
   let rec: Partial<ForwardRecord>;
-  try { rec = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<ForwardRecord>; } catch { return null; }
+  try { rec = readJsonFile(file) as Partial<ForwardRecord>; } catch { return null; }
   // A LIVE owner means a live lease's forward: leave the child AND its record, or that lease loses its
   // tunnel now and its crash evidence later. "Live" is another process that is still running, or THIS
   // module load. The same pid through an EARLIER load (a standalone Vite config restart) is an abandoned

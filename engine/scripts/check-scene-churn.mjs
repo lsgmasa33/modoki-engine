@@ -40,6 +40,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { diffResources, sceneBodyText } from './lib/resourceDiff.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const key = (e) => e.traits?.EntityAttributes?.guid ?? 'name:' + e.name;
@@ -99,7 +100,7 @@ for (const proj of process.argv.slice(2)) {
     if (old === cur) continue;
     totalChanged++;
 
-    const a = JSON.parse(old), b = JSON.parse(cur);
+    const a = parseJsonText(old), b = parseJsonText(cur);
     const A = new Map((a.entities || []).map((e) => [key(e), e]));
     const B = new Map((b.entities || []).map((e) => [key(e), e]));
     const notes = [];

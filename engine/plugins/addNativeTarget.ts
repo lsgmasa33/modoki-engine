@@ -25,6 +25,7 @@ import type { ProjectConfig } from '../project-config';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { healNativeConfig } from './healNativeConfig';
 import { holdsBuildClaim } from '../scripts/buildClaimsStore.mjs';
+import { parseJsonText, readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 export type NativePlatform = 'ios' | 'android';
 
@@ -96,7 +97,7 @@ function platformPkg(platform: NativePlatform): string {
  *  Falls back to a sane default if not found. */
 function capacitorRange(editorRoot: string): string {
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(editorRoot, 'package.json'), 'utf8'));
+    const pkg = readJsonFile(path.join(editorRoot, 'package.json'));
     const v = pkg.dependencies?.['@capacitor/core'] || pkg.devDependencies?.['@capacitor/core'];
     if (typeof v === 'string' && v) return v;
   } catch { /* fall through */ }
@@ -111,7 +112,7 @@ function capacitorRange(editorRoot: string): string {
  *  pin it explicitly. */
 function capDepRange(editorRoot: string, name: string, coreRange: string): string {
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(editorRoot, 'package.json'), 'utf8'));
+    const pkg = readJsonFile(path.join(editorRoot, 'package.json'));
     const v = pkg.dependencies?.[name] || pkg.devDependencies?.[name];
     if (typeof v === 'string' && v) return v;
   } catch { /* fall through */ }
@@ -186,7 +187,7 @@ export function ensureCapacitorDeps(projectRoot: string, platform: NativePlatfor
     raw = JSON.stringify(seed, null, 2) + '\n';
     notesPre.push('created package.json');
   }
-  const pkg = JSON.parse(raw) as { dependencies?: Record<string, string>; overrides?: Record<string, unknown> };
+  const pkg = parseJsonText(raw) as { dependencies?: Record<string, string>; overrides?: Record<string, unknown> };
   pkg.dependencies ??= {};
   const range = capacitorRange(editorRoot);
   const notes: string[] = [...notesPre];
@@ -297,7 +298,7 @@ export function detectMissingFirebaseResult(
 ): { warnings: string[]; reason: null | 'unreadable-package-json' } {
   let deps: Record<string, string>;
   try {
-    deps = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')).dependencies ?? {};
+    deps = readJsonFile(path.join(projectRoot, 'package.json')).dependencies ?? {};
   } catch (e) {
     if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { warnings: [], reason: null };
     return { warnings: [], reason: 'unreadable-package-json' };

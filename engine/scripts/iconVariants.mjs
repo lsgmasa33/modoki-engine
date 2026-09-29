@@ -35,6 +35,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
 import { GENERATED_PNG } from './iconAssets.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const IOS_APPICON_DIR = path.join('ios', 'App', 'App', 'Assets.xcassets', 'AppIcon.appiconset');
 const ANDROID_RES_DIR = path.join('android', 'app', 'src', 'main', 'res');
@@ -141,7 +142,7 @@ export async function writeIosIconVariants({ projectRoot, iconSrcAbs, darkSrcAbs
   fs.writeFileSync(path.join(dir, IOS_TINTED_FILE), tinted);
   written.push(IOS_DARK_FILE, IOS_TINTED_FILE);
 
-  const contents = JSON.parse(fs.readFileSync(contentsPath, 'utf8'));
+  const contents = readJsonFile(contentsPath);
   const images = Array.isArray(contents.images) ? contents.images : [];
   const base = images.find((i) => !i.appearances) ?? { idiom: 'universal', size: '1024x1024', platform: 'ios' };
   const entry = (filename, value) => ({

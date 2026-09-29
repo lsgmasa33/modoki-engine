@@ -28,6 +28,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects, PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { loadEnginePluginModule } from './loadVendorPlugins.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 // MODOKI_MIGRATE_REPO_ROOT overrides the repo root — test-only, so a vitest suite can point this
 // at a throwaway temp directory (with its own games/demos/engine/project-config.ts) instead of
@@ -54,7 +55,7 @@ const { PRIVATE_BUILD_FIELDS, PROJECT_CONFIG_FILENAME, PROJECT_USER_CONFIG_FILEN
 function readJson(file) {
   if (!fs.existsSync(file)) return null;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    return readJsonFile(file);
   } catch (e) {
     console.error(`  ✖ ${file} is not valid JSON (${e.message}) — skipped`);
     return undefined;

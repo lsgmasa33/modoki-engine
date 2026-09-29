@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_DIR = path.resolve(__dirname, '..', 'templates', 'starter');
@@ -67,7 +68,7 @@ for (const file of walk(targetDir)) {
 const scenePath = path.join(targetDir, 'runtime', 'assets', 'scenes', 'main.scene.json');
 if (fs.existsSync(scenePath)) {
   let sceneText = fs.readFileSync(scenePath, 'utf8');
-  const scene = JSON.parse(sceneText);
+  const scene = parseJsonText(sceneText);
   const olds = new Set();
   if (typeof scene.id === 'string') olds.add(scene.id);
   for (const e of scene.entities ?? []) {

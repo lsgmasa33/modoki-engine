@@ -15,6 +15,7 @@ import {
   type ProjectUserConfig,
   type RawProjectConfig,
 } from '../project-config';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Thrown by the raw readers when a config file EXISTS but does not parse. The
  *  loaders treat that as "use defaults" and carry on, which is right for reading —
@@ -48,7 +49,7 @@ function readRawConfig(root: string, filename: string): RawProjectConfig {
   if (!fs.existsSync(file)) return {};
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    parsed = readJsonFile(file);
   } catch (e) {
     throw new MalformedProjectConfigError(file, e);
   }
@@ -109,7 +110,7 @@ export function loadProjectConfig(root: string = process.cwd()): ProjectConfig {
   let config: ProjectConfig;
   try {
     config = fs.existsSync(file)
-      ? mergeProjectConfig(JSON.parse(fs.readFileSync(file, 'utf8')))
+      ? mergeProjectConfig(readJsonFile(file))
       : mergeProjectConfig(null);
   } catch (e) {
     console.warn(`[project-config] Failed to read ${file}, using defaults:`, e);
@@ -136,7 +137,7 @@ export function projectConfigUnionErrors(root: string = process.cwd()): string[]
   let raw: unknown;
   try {
     if (!fs.existsSync(file)) return [];
-    raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    raw = readJsonFile(file);
   } catch {
     // An unparseable file is not THIS check's business — loadProjectConfig already warns and
     // falls back, and reporting it here would duplicate that as a build error with worse wording.
@@ -163,7 +164,7 @@ export function loadProjectUserConfig(root: string = process.cwd()): ProjectUser
   const file = path.join(root, PROJECT_USER_CONFIG_FILENAME);
   try {
     if (fs.existsSync(file)) {
-      return mergeProjectUserConfig(JSON.parse(fs.readFileSync(file, 'utf8')));
+      return mergeProjectUserConfig(readJsonFile(file));
     }
   } catch (e) {
     console.warn(`[project-config] Failed to read ${file}, using defaults:`, e);

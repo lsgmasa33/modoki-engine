@@ -37,6 +37,7 @@ import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { canonicalPath } from './pathIdentity.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Below this, Read's own truncation (or the file simply being small) means the call is cheap enough
  *  not to warn about. Matches the ~50k-token outlier measured in the 2026-08-30 audit scaled down to
@@ -74,7 +75,7 @@ function statePath(sid, transcript) {
 
 function loadState(sid, tr) {
   try {
-    return JSON.parse(fs.readFileSync(statePath(sid, tr), 'utf8'));
+    return readJsonFile(statePath(sid, tr));
   } catch {
     return {};
   }
@@ -179,7 +180,7 @@ function warn(systemMessage, additionalContext) {
 
 let payload;
 try {
-  payload = JSON.parse(fs.readFileSync(0, 'utf8'));
+  payload = readJsonFile(0);
 } catch {
   quiet();
 }

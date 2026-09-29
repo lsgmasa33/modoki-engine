@@ -20,12 +20,13 @@
  * sidesteps npm #4828; npm.cmd on Windows through winSpawn's toSpawn, never shell:true — #1537).
  */
 
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { readdirSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { projectNeedsInstall } from './projectNeedsInstall.mjs';
 import { toSpawn } from './winSpawn.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const toolsDir = path.join(repoRoot, 'engine', 'tools');
@@ -46,7 +47,7 @@ for (const dir of readdirSync(toolsDir, { withFileTypes: true })) {
   // Same rule the projects use (#215) — deps to INSTALL or sub-packages to LINK.
   let pkg;
   try {
-    pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    pkg = readJsonFile(pkgPath);
   } catch (e) {
     console.warn(`[bootstrap-mcp-deps] skip engine/tools/${dir.name}: unreadable package.json (${e.message})`);
     continue;

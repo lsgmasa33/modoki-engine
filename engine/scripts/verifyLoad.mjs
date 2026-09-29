@@ -56,6 +56,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { isPidAlive } from './deviceClaimsStore.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Registry of in-flight test runs, machine-wide. Sits beside the device claims in `~/.modoki`.
  *
@@ -217,7 +218,7 @@ export function readRuns({ dir = verifyRegistryDir(), now = Date.now(), alive = 
   }
   let parsed;
   try {
-    parsed = JSON.parse(raw);
+    parsed = parseJsonText(raw);
   } catch {
     // A truncated or hand-mangled registry is not a reason to refuse to run the gate. Treat it as
     // empty; the next write replaces it wholesale.

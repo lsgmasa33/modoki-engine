@@ -37,12 +37,12 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { backendUrlForClone } from './editorPorts.mjs';
 import { repoFiles } from './repoCorpus.mjs';
 import { toPosix } from './pathPosix.mjs';
 import { isEntryPoint } from './entryPoint.mjs';
+import { parseJsonText, readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 // ⚠️ `maxBuffer`: `git show HEAD:<scene>` below reads whole scene blobs — 369,684 B for the
 // largest on 2026-09-12, 35% of Node's 1 MiB default. This helper has no catch, so overflowing
@@ -219,8 +219,8 @@ export function checkMigration(old, next, schema) {
 const isLegacy = (doc) =>
   (doc.version ?? 0) < 12 || (doc.entities ?? []).some((e) => 'id' in e);
 
-const read = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
-const committed = (p) => JSON.parse(git('show', `HEAD:${p}`));
+const read = (p) => readJsonFile(p);
+const committed = (p) => parseJsonText(git('show', `HEAD:${p}`)); // #1799: a BOM survives git's eol normalisation
 
 /** The CLI. Kept behind a direct-execution check so `checkMigration` can be imported and tested —
  *  it is the safety-critical half, and a guard nobody has watched fail is not known to work

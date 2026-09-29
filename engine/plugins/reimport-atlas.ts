@@ -27,6 +27,7 @@ import { atlasHashKey, atlasPageUrlPath, type AtlasHashMember } from './atlas-ca
 import { readMetaSidecar, writeMetaSidecar } from './meta-sidecar';
 import type { ReimportHandler, ReimportAsset } from './reimport-registry';
 import { nativeDynamicImport } from './native-dynamic-import';
+import { parseJsonText } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 export { readMetaSidecar } from './meta-sidecar';
 
@@ -83,7 +84,7 @@ function readAtlasSource(absPath: string): AtlasSource {
       `unresolved merge-conflict markers or truncated JSON before reimporting.`,
     );
   }
-  const raw = JSON.parse(text) as Partial<AtlasSource>;
+  const raw = parseJsonText(text) as Partial<AtlasSource>;
   const defaults = defaultAtlasSource();
   return {
     id: typeof raw.id === 'string' ? raw.id : '',

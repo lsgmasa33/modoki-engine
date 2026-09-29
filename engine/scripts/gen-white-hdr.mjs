@@ -17,6 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SIDECAR_FORMAT_VERSION, assertSidecarWritable } from '../plugins/meta-sidecar.ts';
 import { WHITE_HDR_GUID as FALLBACK_GUID } from '../packages/modoki/src/runtime/assets/builtinAssets.ts';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = path.join(HERE, '../packages/modoki/src/runtime/assets');
@@ -31,7 +32,7 @@ const OUT_META = path.join(OUT_DIR, 'white.hdr.meta.json');
 // generation. whiteHdr.test.ts asserts the on-disk sidecar equals the runtime const,
 // catching any drift.
 const WHITE_HDR_GUID = (() => {
-  try { return JSON.parse(fs.readFileSync(OUT_META, 'utf8')).id || FALLBACK_GUID; }
+  try { return readJsonFile(OUT_META).id || FALLBACK_GUID; }
   catch { return FALLBACK_GUID; }
 })();
 

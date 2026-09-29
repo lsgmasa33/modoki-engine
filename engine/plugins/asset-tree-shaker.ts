@@ -22,6 +22,7 @@ import { deriveGuid, memberRowNodes } from '../packages/modoki/src/runtime/core/
 import { parseAnimClipBankResult } from '../packages/modoki/src/runtime/animation/animClipBank';
 import { parseClipBankResult } from '../packages/modoki/src/runtime/audio/clipBank';
 import { entityGuid } from '../packages/modoki/src/runtime/scene/sceneMutate';
+import { parseJsonText, readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** UUID v4 shape — matches the runtime assetManifest GUID_RE. */
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -435,7 +436,7 @@ function buildGuidIndex(
       // shared `state.warnings` channel instead (same template every OTHER parse failure in this
       // file already uses) and keep going with no members, exactly the previous fallback.
       const src = (() => {
-        try { return JSON.parse(fs.readFileSync(abs, 'utf-8')) as { members?: unknown[] }; }
+        try { return readJsonFile(abs) as { members?: unknown[] }; }
         catch (e) {
           warnings.push(`failed to parse atlas members: ${virtual} — ${e instanceof Error ? e.message : String(e)}`);
           return {};
@@ -946,7 +947,7 @@ function processShader(virtualPath: string, state: WalkState, roots: AssetRoot[]
   const abs = virtualToAbs(virtualPath, roots);
   if (!abs || !fs.existsSync(abs)) return;
   try {
-    const json = JSON.parse(fs.readFileSync(abs, 'utf-8')) as { params?: Record<string, unknown> };
+    const json = readJsonFile(abs) as { params?: Record<string, unknown> };
     for (const [key, p] of Object.entries(json.params ?? {})) {
       const param = p as { type?: string; default?: unknown };
       if (param?.type === 'texture' && typeof param.default === 'string') {
@@ -1079,7 +1080,7 @@ function loadKeepList(projectRoot: string, roots: AssetRoot[], target?: AssetTar
   const raw = fs.readFileSync(keepPath, 'utf-8');
   let parsed: KeepListFile;
   try {
-    parsed = JSON.parse(raw);
+    parsed = parseJsonText(raw);
   } catch (e) {
     throw new Error(`asset-keep.json is not valid JSON: ${(e as Error).message}`, { cause: e });
   }
@@ -1237,21 +1238,21 @@ export function computeKeptAssets(
     // uncategorized is 'unknown-json', not guessed as a scene.
     if (type === 'scene' || type === 'prefab') {
       try {
-        const json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
+        const json = readJsonFile(abs);
         processSceneOrPrefab(json, state, src);
       } catch (e) {
         state.warnings.push(`failed to parse ${type}: ${virtualPath} — ${(e as Error).message}`);
       }
     } else if (type === 'mesh') {
       try {
-        const json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
+        const json = readJsonFile(abs);
         processMesh(json, state, src);
       } catch (e) {
         state.warnings.push(`failed to parse mesh: ${virtualPath} — ${(e as Error).message}`);
       }
     } else if (type === 'material') {
       try {
-        const json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
+        const json = readJsonFile(abs);
         processMaterial(json, state, src);
       } catch (e) {
         state.warnings.push(`failed to parse material: ${virtualPath} — ${(e as Error).message}`);
@@ -1260,35 +1261,35 @@ export function computeKeptAssets(
       processShader(virtualPath, state, roots);
     } else if (type === 'particle') {
       try {
-        const json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
+        const json = readJsonFile(abs);
         processParticle(json, state, src);
       } catch (e) {
         state.warnings.push(`failed to parse particle: ${virtualPath} — ${(e as Error).message}`);
       }
     } else if (type === 'animset') {
       try {
-        const json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
+        const json = readJsonFile(abs);
         processAnimSet(json, state, src);
       } catch (e) {
         state.warnings.push(`failed to parse animset: ${virtualPath} — ${(e as Error).message}`);
       }
     } else if (type === 'spriteanim') {
       try {
-        const json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
+        const json = readJsonFile(abs);
         processSpriteAnim(json, state, src);
       } catch (e) {
         state.warnings.push(`failed to parse spriteanim: ${virtualPath} — ${(e as Error).message}`);
       }
     } else if (type === 'rig2d') {
       try {
-        const json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
+        const json = readJsonFile(abs);
         processRig2D(json, state, src);
       } catch (e) {
         state.warnings.push(`failed to parse rig2d: ${virtualPath} — ${(e as Error).message}`);
       }
     } else if (type === 'timeline') {
       try {
-        const json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
+        const json = readJsonFile(abs);
         processTimeline(json, state, src);
       } catch (e) {
         state.warnings.push(`failed to parse timeline: ${virtualPath} — ${(e as Error).message}`);

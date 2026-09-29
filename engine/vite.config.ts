@@ -21,6 +21,7 @@ import { projectLockfilesHash } from './plugins/projectLockfileHash'
 import { projectScanEntries } from './plugins/projectScanEntries'
 import { perfCoreWorkers } from './testWorkers'
 import { transcoderDefine } from './plugins/transcoders'
+import { readJsonFile } from './scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 // C3: engine/ is the vite root (this config + index.html + app/ live here). The
 // npm root + node_modules stay at the repo root (Capacitor needs them there), so
@@ -142,7 +143,7 @@ const projectNativeSdkDeps: { name: string; resolvedPath: string }[] = (() => {
   if (!fs.existsSync(pkgPath)) return []
   const appServicesDir = path.dirname(pkgPath)
   try {
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { dependencies?: Record<string, string> }
+    const pkg = readJsonFile(pkgPath) as { dependencies?: Record<string, string> }
     const names = Object.entries(pkg.dependencies ?? {})
       .filter(([, spec]) => !/^(file:|link:|workspace:)/.test(spec))
       .map(([name]) => name)

@@ -132,7 +132,9 @@ export function classifyJsonFormatVersion(
 ): FormatVerdict {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    // A leading BOM is a Windows tool's, not damage (#1799): unstripped, a BOM'd sidecar read 'unreadable' and
+    // quarantineCorruptSidecar moved it aside. Inline, because runtime/ cannot import engine/scripts/jsonFile.mjs.
+    parsed = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
   } catch {
     return { kind: 'unreadable', reason: 'unparsable' };
   }

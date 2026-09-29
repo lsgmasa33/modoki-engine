@@ -21,6 +21,7 @@ import { findGamesEntry } from './findGamesEntry';
 // The leaf module, not './subgameBuild': that file's shared-key list would reach the Electron main bundle (#1035).
 import { subgameOutDir } from './subgameOutDir';
 import { samePath, canonicalPath, pathCaseKey } from '../scripts/pathIdentity.mjs';
+import { readJsonFile, parseJsonText } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
 import { projectAssetRoots, discoverProjects, PROJECT_ROOT_DIRS } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
@@ -245,7 +246,7 @@ const isStampableObject = (json: unknown): json is Record<string, unknown> =>
 export function readAssetGuid(absPath: string, type: string): string | undefined {
   try {
     if (ID_BEARING_TYPES.has(type)) {
-      const json = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
+      const json = readJsonFile(absPath);
       if (isStampableObject(json)) return isGuidShape(json?.id) ? json.id : undefined;
       // Top-level array (or other non-object shape, e.g. a level-index manifest) —
       // falls through to the sidecar below, mirroring writeAssetGuid's fallback.
@@ -255,7 +256,7 @@ export function readAssetGuid(absPath: string, type: string): string | undefined
     if (!fs.existsSync(sidecar)) return undefined;
     const text = fs.readFileSync(sidecar, 'utf-8');
     try {
-      const meta = JSON.parse(text);
+      const meta = parseJsonText(text);
       return isGuidShape(meta?.id) ? meta.id : undefined;
     } catch {
       // ⚠️ The sidecar does not parse (merge-conflict markers — #778). Returning `undefined` here
@@ -309,7 +310,7 @@ export function writeAssetGuid(absPath: string, type: string, guid: string): boo
         console.warn(`[assets] not stamping a GUID into ${absPath}: ${prefabRefusal.message}`);
         return false;
       }
-      const json = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
+      const json = readJsonFile(absPath);
       if (isStampableObject(json)) {
         json.id = guid;
         writeJsonAtomic(absPath, json);
@@ -353,7 +354,7 @@ export function writeAssetGuid(absPath: string, type: string, guid: string): boo
     let meta: Record<string, unknown> = {};
     if (fs.existsSync(sidecar)) {
       // Parses by construction now — anything that did not was just quarantined away.
-      try { meta = JSON.parse(fs.readFileSync(sidecar, 'utf-8')); } catch { /* recreate */ }
+      try { meta = readJsonFile(sidecar); } catch { /* recreate */ }
     }
     meta.id = guid;
     // This writer does not route through `writeMetaSidecar`, so it must stamp
@@ -3572,7 +3573,7 @@ export function assetScannerPlugin(): Plugin {
             if (target.kind === 'subgame') {
               let stamped: unknown = '<unreadable>';
               try {
-                stamped = (JSON.parse(fs.readFileSync(path.join(steps.distDir, 'subgame.json'), 'utf8')) as { engineApi?: unknown }).engineApi;
+                stamped = (readJsonFile(path.join(steps.distDir, 'subgame.json')) as { engineApi?: unknown }).engineApi;
               } catch { /* shown as unreadable; ota-publish.mjs refuses an unreadable subgame.json */ }
               send(`Sub-game "${target.id}" engine API: ${JSON.stringify(stamped)} (stamped by its build from its own ota.engineApi). This shell's ota.engineApi: ${cfg.ota.engineApi}. A mismatch is refused before anything is uploaded.`);
             }

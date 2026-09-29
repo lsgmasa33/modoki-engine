@@ -28,6 +28,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
 import { npmSpawnSpec, spawnSpecCall } from '../toolchain';
+import { parseJsonText, readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 export interface VendorOptions {
   /** May this process BUILD a plugin whose dist/ is missing or stale? True in a
@@ -64,7 +65,7 @@ const VENDOR_MARKER = path.join('node_modules', '.modoki-vendored.json');
 
 function readVendorMarker(projectRoot: string): Record<string, string> {
   try {
-    return JSON.parse(fs.readFileSync(path.join(projectRoot, VENDOR_MARKER), 'utf8'));
+    return readJsonFile(path.join(projectRoot, VENDOR_MARKER));
   } catch {
     return {};
   }
@@ -167,7 +168,7 @@ export function listEnginePlugins(engineRoot: string): EnginePlugin[] {
     const pj = path.join(dir, 'package.json');
     if (!fs.existsSync(pj)) continue;
     try {
-      const pkg = JSON.parse(fs.readFileSync(pj, 'utf8'));
+      const pkg = readJsonFile(pj);
       if (pkg && pkg.capacitor && typeof pkg.name === 'string') {
         // baseVersion is defensive, not routine: the committed version is always bare (#685),
         // but a killed packInto could leave a hash-suffixed one on disk mid-rewrite, and
@@ -270,7 +271,7 @@ function hasGlobMeta(entry: string): boolean {
  *  which triggers the "hash all source inputs" fallback in pluginHashInputs. */
 function readPackageFiles(pluginDir: string): string[] | null {
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(pluginDir, 'package.json'), 'utf8'));
+    const pkg = readJsonFile(path.join(pluginDir, 'package.json'));
     if (!Array.isArray(pkg.files)) return null;
     const files = pkg.files.filter((f: unknown): f is string => typeof f === 'string');
     return files.length ? files : null;
@@ -637,7 +638,7 @@ export function verifyInstalledMatchesTarballResult(
   const pkgPath = path.join(projectRoot, 'package.json');
   let deps: Record<string, string> | undefined;
   try {
-    deps = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).dependencies;
+    deps = readJsonFile(pkgPath).dependencies;
   } catch (e) {
     // ENOENT — no package.json at all — is ABSENT, not unknown: several real projects (games with
     // native targets but no npm-managed deps of their own, e.g. 2d-physics-demo/3d-physics-demo/
@@ -952,7 +953,7 @@ function invalidateLockfileEntry(projectRoot: string, name: string): void {
   }
   let lock: { packages?: Record<string, unknown>; dependencies?: Record<string, unknown> };
   try {
-    lock = JSON.parse(raw);
+    lock = parseJsonText(raw);
   } catch {
     return; // unparseable — don't risk writing back garbage
   }
@@ -1020,7 +1021,7 @@ function packInto(plugin: EnginePlugin, projectRoot: string, hash: string, canBu
   const pkgJsonPath = path.join(plugin.dir, 'package.json');
   const originalBytes = fs.readFileSync(pkgJsonPath);
   try {
-    const pkg = JSON.parse(originalBytes.toString('utf8'));
+    const pkg = parseJsonText(originalBytes.toString('utf8'));
     // Defensive: a killed process may have left a hash-suffixed version on disk from a pack
     // that never reached the restore below. Treat its BASE as the truth rather than
     // compounding it into a double-suffixed version.
@@ -1094,7 +1095,7 @@ export function vendorEnginePlugins(
   let raw: string;
   try {
     raw = fs.readFileSync(pkgPath, 'utf8');
-    pkg = JSON.parse(raw);
+    pkg = parseJsonText(raw);
   } catch {
     return empty;
   }

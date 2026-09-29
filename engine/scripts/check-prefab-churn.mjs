@@ -53,6 +53,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { repoFiles } from './repoCorpus.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -117,7 +118,7 @@ for (const proj of process.argv.slice(2)) {
     totalChanged++;
 
     let a, b;
-    try { a = JSON.parse(old); b = JSON.parse(cur); }
+    try { a = parseJsonText(old); b = parseJsonText(cur); }
     catch (e) { console.log(`  ${rel}: UNPARSEABLE (${e.message})`); problems++; regressions++; continue; }
 
     const notes = [];

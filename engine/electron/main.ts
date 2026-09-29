@@ -296,6 +296,7 @@ import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneVa
 import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
 import { notifyListeners } from '../packages/modoki/src/runtime/core/notifyListeners';
 import { createUnsavedGateClient } from './unsavedGateClient';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /**
  * Find the enclosing git repo/worktree root for a project path by walking up
@@ -327,7 +328,7 @@ const repoRootOf = (start: string): string | null => {
  *  or malformed config just falls back, never throws into Connect. */
 function projectDisplayName(root: string): string {
   try {
-    const cfg = JSON.parse(fs.readFileSync(path.join(root, 'project.config.json'), 'utf8')) as { app?: { appName?: unknown } };
+    const cfg = readJsonFile(path.join(root, 'project.config.json')) as { app?: { appName?: unknown } };
     const name = cfg.app?.appName;
     if (typeof name === 'string' && name.trim() && !name.includes('__')) return name.trim();
   } catch { /* fall back */ }
@@ -467,7 +468,7 @@ async function ensureProjectDeps(projectRoot: string, opts: { forceInstall?: boo
 
   let pkg: { dependencies?: object; devDependencies?: object; workspaces?: unknown; scripts?: Record<string, string> };
   try {
-    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    pkg = readJsonFile(pkgPath);
   } catch {
     return; // unreadable — let Vite surface the real error
   }

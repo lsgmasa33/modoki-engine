@@ -68,6 +68,7 @@ import {
 } from '../packages/modoki/src/runtime/core/formatVersion';
 // The one GUID validator — not a third copy of the regex (CLAUDE.md § single source of truth).
 import { isGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 // The cache-block list and the import-settings comparison live beside the resolvers they use, in the engine package, so
 // the client's test fakes can share them (#1696). Re-exported: this file stays where a sidecar's format is defined.
 import { CACHE_BLOCKS, type CacheBlock } from '../packages/modoki/src/runtime/loaders/sidecarSettings';
@@ -234,14 +235,14 @@ export function blocksMissingLocalHalf(absPath: string): CacheBlock[] {
   const sidecar = sidecarPath(absPath);
   if (!fs.existsSync(sidecar)) return [];
   let committed: Record<string, unknown>;
-  try { committed = JSON.parse(fs.readFileSync(sidecar, 'utf-8')); } catch { return []; }
+  try { committed = readJsonFile(sidecar); } catch { return []; }
 
   let local: Record<string, Record<string, unknown> | undefined> = {};
   const localPath = localSidecarPath(absPath);
   if (fs.existsSync(localPath)) {
     // An unreadable local half is treated as an ABSENT one — the peeled values are equally
     // unavailable either way, and re-deriving them is also how a corrupt one gets rewritten.
-    try { local = JSON.parse(fs.readFileSync(localPath, 'utf-8')); } catch { local = {}; }
+    try { local = readJsonFile(localPath); } catch { local = {}; }
   }
 
   // A local half written under a DIFFERENT peel table cannot be judged key-by-key: it holds
@@ -294,11 +295,11 @@ export function readMetaSidecar(absPath: string): Record<string, unknown> {
   const sidecar = sidecarPath(absPath);
   if (!fs.existsSync(sidecar)) return {};
   let meta: Record<string, unknown>;
-  try { meta = JSON.parse(fs.readFileSync(sidecar, 'utf-8')); } catch { return {}; }
+  try { meta = readJsonFile(sidecar); } catch { return {}; }
   const localPath = localSidecarPath(absPath);
   if (fs.existsSync(localPath)) {
     try {
-      const local = JSON.parse(fs.readFileSync(localPath, 'utf-8')) as Record<string, Record<string, unknown>>;
+      const local = readJsonFile(localPath) as Record<string, Record<string, unknown>>;
       for (const block of CACHE_BLOCKS) {
         const localBlock = local[block];
         if (!localBlock || typeof localBlock !== 'object') continue;
@@ -344,7 +345,7 @@ export function classifySidecarOnDisk(absPath: string): FormatVerdict {
  *  `undefined` when the file is missing, unparsable, or has no `version`. */
 function rawSidecarVersion(absPath: string): unknown {
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(sidecarPath(absPath), 'utf-8'));
+    const parsed: unknown = readJsonFile(sidecarPath(absPath));
     if (!parsed || typeof parsed !== 'object') return undefined;
     return (parsed as Record<string, unknown>).version;
   } catch {
@@ -462,7 +463,7 @@ export function existingSidecarId(absPath: string): string | undefined {
   const salvaged = salvageIdIfCorrupt(absPath);
   if (salvaged) return salvaged;
   try {
-    const id = (JSON.parse(fs.readFileSync(sidecarPath(absPath), 'utf-8')) as { id?: unknown }).id;
+    const id = (readJsonFile(sidecarPath(absPath)) as { id?: unknown }).id;
     return typeof id === 'string' && isGuid(id) ? id : undefined;
   } catch {
     return undefined;

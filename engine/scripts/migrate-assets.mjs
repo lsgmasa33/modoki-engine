@@ -21,6 +21,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { repoFiles } from './repoCorpus.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..');
 const DRY = process.argv.includes('--dry');
@@ -102,7 +103,7 @@ let rewritten = 0, bumped = 0, skippedTooNew = 0;
 for (const rel of [...files].sort()) {
   const abs = path.join(REPO_ROOT, rel);
   let json;
-  try { json = JSON.parse(readFileSync(abs, 'utf8')); } catch (e) { console.warn(`skip (parse): ${rel} — ${e.message}`); continue; }
+  try { json = readJsonFile(abs); } catch (e) { console.warn(`skip (parse): ${rel} — ${e.message}`); continue; }
 
   let changed = false;
   for (const t of TRANSFORMS) changed = t(json) || changed;

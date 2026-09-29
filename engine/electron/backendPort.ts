@@ -15,6 +15,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { parseJsonText } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** The conventional backend port — the first choice when we have no memory. */
 export const DEFAULT_BACKEND_PORT = 5179;
@@ -50,7 +51,7 @@ export function parseBackendPort(raw: string | undefined | null): number | null 
 export function readLastPort(userDataDir: string): number | null {
   try {
     const raw = fs.readFileSync(path.join(userDataDir, PORT_PREF_FILE), 'utf8');
-    const port = (JSON.parse(raw) as { port?: unknown })?.port;
+    const port = (parseJsonText(raw) as { port?: unknown })?.port;
     return typeof port === 'number' && Number.isInteger(port) && port > 0 && port < 65536 ? port : null;
   } catch {
     return null;

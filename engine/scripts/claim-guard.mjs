@@ -46,11 +46,11 @@
  * misses those is worse than the ~40 ms it saves, because the gap is invisible.
  */
 
-import { readFileSync } from 'node:fs';
 import { listClaims, sameClone } from './deviceClaimsStore.mjs';
 import { canonicalPath } from './pathIdentity.mjs';
 import { parseDeviceCommand } from './deviceCommandTargets.mjs';
 import { iosClaimKeys, onceLoader } from './iosDeviceIdentity.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Cheap pre-filter: does this command even mention a tool that can touch a phone? Deliberately
  *  broader than the parser (it may match a command the parser then dismisses) — being wrong in the
@@ -79,7 +79,7 @@ function deny(reason) {
 
 function readStdin() {
   try {
-    return JSON.parse(readFileSync(0, 'utf8'));
+    return readJsonFile(0);
   } catch {
     return null; // unreadable payload — not ours to block on
   }

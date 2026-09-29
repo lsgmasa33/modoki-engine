@@ -19,6 +19,7 @@ import crypto from 'node:crypto';
 // The ONE 'same directory?' comparison (#869) — see engine/scripts/pathIdentity.mjs.
 import { samePath } from '../scripts/pathIdentity.mjs';
 import { isProjectFolder } from '../plugins/backend/openProjectRoute';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 const MAX_RECENTS = 10;
 // All recents live under a FIXED "modoki-app" dir (via the app-support root), NOT
@@ -84,7 +85,7 @@ function getLastFolder(kind: 'open' | 'new'): string | undefined {
   const file = lastFoldersFile();
   if (!file) return undefined;
   try {
-    const j = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    const j = readJsonFile(file);
     const p = j?.[kind];
     return typeof p === 'string' && fs.existsSync(p) ? p : undefined;
   } catch { return undefined; }
@@ -95,7 +96,7 @@ function setLastFolder(kind: 'open' | 'new', dir: string): void {
   if (!file) return;
   try {
     let j: Record<string, string> = {};
-    try { j = JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { /* fresh */ }
+    try { j = readJsonFile(file); } catch { /* fresh */ }
     j[kind] = dir;
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(j, null, 2));
@@ -104,7 +105,7 @@ function setLastFolder(kind: 'open' | 'new', dir: string): void {
 
 function readRecentsRaw(file: string): string[] {
   try {
-    const j = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    const j = readJsonFile(file);
     return Array.isArray(j) ? j.filter((p): p is string => typeof p === 'string') : [];
   } catch { return []; }
 }

@@ -46,6 +46,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects } from './projectRoots.mjs';
 import { isEntryPoint } from './entryPoint.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -154,7 +155,7 @@ function main() {
     const file = path.join(proj.dir, 'project.config.json');
     if (!fs.existsSync(file)) { skipped.push(`${proj.name} (no project.config.json)`); continue; }
     const raw = fs.readFileSync(file, 'utf8');
-    const cfg = JSON.parse(raw);
+    const cfg = parseJsonText(raw);
 
     if (needsSeed(cfg)) {
       // Create the path when the project omits it — those projects inherit `qualityTier: 'auto'`

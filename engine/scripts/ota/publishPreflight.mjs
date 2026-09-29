@@ -30,6 +30,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './otaSafeTokens.mjs';
 import { OTA_DEFAULT_BUNDLE_NAME, otaRetainVersions, otaSigningKeyRefusal } from './publishGuards.mjs';
+import { readJsonFile } from '../jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Every refusal {@link otaPublishPreflight} can return, in the order it checks them. */
 export const OTA_PUBLISH_REFUSALS = Object.freeze([
@@ -66,7 +67,7 @@ export function readRawOtaBlock(projectRoot) {
   const file = path.join(projectRoot, 'project.config.json');
   if (!fs.existsSync(file)) return { ok: false, file, reason: 'missing' };
   try {
-    return { ok: true, file, ota: JSON.parse(fs.readFileSync(file, 'utf8'))?.ota };
+    return { ok: true, file, ota: readJsonFile(file)?.ota };
   } catch (e) {
     return { ok: false, file, reason: 'unparseable', error: e instanceof Error ? e.message : String(e) };
   }
@@ -133,7 +134,7 @@ export function otaPublishPreflight({ ota, name, version, keyName, bucket, repoR
   if (!fs.existsSync(keyPath)) return { ok: false, refusal: 'key-missing', bundleName, subgames, keyPath };
   let keypair;
   try {
-    keypair = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
+    keypair = readJsonFile(keyPath);
   } catch {
     return { ok: false, refusal: 'key-unparseable', bundleName, subgames, keyPath };
   }

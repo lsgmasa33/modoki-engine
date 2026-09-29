@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url'
 import libCoverage from 'istanbul-lib-coverage'
 import libReport from 'istanbul-lib-report'
 import reports from 'istanbul-reports'
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const engineDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const coverageDir = path.join(engineDir, 'coverage')
@@ -37,7 +38,7 @@ for (const leg of legs) {
     console.error(`[merge-coverage] MISSING leg: ${leg.name}\n  expected ${leg.file}\n  Run \`npm run coverage\`, which produces both legs before merging.`)
     process.exit(1)
   }
-  const data = JSON.parse(fs.readFileSync(leg.file, 'utf8'))
+  const data = readJsonFile(leg.file)
   const files = Object.keys(data).length
   map.merge(data)
   merged += files

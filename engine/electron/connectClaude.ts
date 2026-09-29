@@ -19,6 +19,9 @@ import { checkToken } from './instanceToken';
 import { loginShellCommandPath, spawnTimedOut, type LoginShellAnswer } from '../plugins/backend/loginShellProbe';
 // The ONE 'same directory?' comparison (#869) — this file donated its body.
 import { samePath } from '../scripts/pathIdentity.mjs';
+// A leading UTF-8 BOM is stripped by the ONE helper (#1799): Windows editors (Notepad, PowerShell `Out-File`) write
+// one, and JSON.parse rejects it — so a perfectly valid .mcp.json would be misread as corrupt.
+import { parseJsonText, stripBom } from '../scripts/jsonFile.mjs';
 
 export interface McpServerEntry {
   command: string;
@@ -29,13 +32,6 @@ export interface McpServerEntry {
 }
 
 export const MCP_FILE = '.mcp.json';
-
-/** Strip a leading UTF-8 BOM. Windows editors (Notepad, PowerShell `Out-File`) write
- *  one, and JSON.parse rejects it — so a perfectly valid .mcp.json would be misread as
- *  corrupt. String.trim() strips U+FEFF but we parse the raw text, so strip explicitly. */
-function stripBom(s: string): string {
-  return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
-}
 
 export { atomicWriteFileSync };
 
@@ -116,7 +112,7 @@ export function mergeMcpConfig(
   if (existing != null && existing.trim() !== '') {
     let parsed: unknown;
     try {
-      parsed = JSON.parse(existing);
+      parsed = parseJsonText(existing);
     } catch (e) {
       throw new Error(`existing .mcp.json is not valid JSON (${e instanceof Error ? e.message : e}) — not overwriting it`, { cause: e });
     }
@@ -145,7 +141,7 @@ export function mergeMcpConfig(
 function parseMcp(mcpText: string | null): McpConfig | null {
   if (!mcpText) return null;
   try {
-    const cfg = JSON.parse(stripBom(mcpText));
+    const cfg = parseJsonText(mcpText);
     return cfg && typeof cfg === 'object' && !Array.isArray(cfg) ? (cfg as McpConfig) : null;
   } catch {
     return null;
@@ -577,7 +573,7 @@ export function healMcpPort(opts: {
 
   let config: McpConfig;
   try {
-    const parsed: unknown = JSON.parse(stripBom(existing));
+    const parsed: unknown = parseJsonText(existing);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
     config = parsed as McpConfig;
   } catch {

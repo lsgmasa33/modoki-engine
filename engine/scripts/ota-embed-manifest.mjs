@@ -46,12 +46,13 @@
  *  field is always the fixed sentinel `EMBEDDED_BASE_VERSION` from otaClient.ts ("embedded")
  *  since it isn't a real published version and `diffManifests` never compares version
  *  strings, only per-file path+hash. */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { buildManifestFiles } from './ota/buildManifest.mjs';
 import { OTA_DEFAULT_BUNDLE_NAME } from './ota/publishGuards.mjs';
 import { createManifest, validateManifest } from './ota/schema.mjs';
 import { claimProjectOrExit } from './cliBuildClaim.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const EMBEDDED_BASE_VERSION = 'embedded'; // keep in sync with otaClient.ts's exported constant
 
@@ -89,7 +90,7 @@ async function main() {
   if (!existsSync(projectConfigPath)) fail(`--project's project.config.json not found: ${projectConfigPath}`);
   let projectConfig;
   try {
-    projectConfig = JSON.parse(readFileSync(projectConfigPath, 'utf8'));
+    projectConfig = readJsonFile(projectConfigPath);
   } catch (e) {
     fail(`--project's project.config.json (${projectConfigPath}) could not be parsed as JSON: ${e.message}`);
   }

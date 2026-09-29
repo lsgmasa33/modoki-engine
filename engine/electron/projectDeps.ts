@@ -5,6 +5,7 @@
  * Electron — the same posture as `fitToMaxSide` (rendererOps) and `isAdhocSignature`
  * (autoUpdate): the surrounding I/O stays in main.ts, the decision lives here.
  */
+import { parseJsonText } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through (the read stays injectable)
 
 /** Injectable fs surface for `hasStaleWorkspaceLink` — real `node:fs` in main.ts, a fake in tests. */
 export interface WorkspaceLinkFs {
@@ -66,7 +67,7 @@ export function hasStaleWorkspaceLink(
       if (entry.name.startsWith('.')) continue; // npm's own glob doesn't match dotfiles either
       let name: string | undefined;
       try {
-        name = JSON.parse(fsOps.readFileSync(`${parentDir}/${entry.name}/package.json`, 'utf8')).name;
+        name = parseJsonText(fsOps.readFileSync(`${parentDir}/${entry.name}/package.json`, 'utf8')).name;
       } catch {
         continue; // no/unreadable package.json — not a real workspace package
       }
@@ -99,7 +100,7 @@ export function hasStaleWorkspaceLink(
 export function projectDepsMissing(projectRoot: string, fsOps: WorkspaceLinkFs, opts: { completedInstall?: boolean } = {}): boolean {
   let pkg: { dependencies?: object; devDependencies?: object; workspaces?: unknown };
   try {
-    pkg = JSON.parse(fsOps.readFileSync(`${projectRoot}/package.json`, 'utf8'));
+    pkg = parseJsonText(fsOps.readFileSync(`${projectRoot}/package.json`, 'utf8'));
   } catch {
     return false;
   }

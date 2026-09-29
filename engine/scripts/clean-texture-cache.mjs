@@ -21,6 +21,7 @@ import { existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { projectAssetRoots } from './projectRoots.mjs';
+import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // engine/scripts/ → repo root (node_modules + games live at the repo root; the
@@ -112,7 +113,7 @@ for await (const { sourceDir, hashDirs } of walkSourceDirs(CACHE_DIR)) {
   const metaPath = absSource + '.meta.json';
   if (existsSync(metaPath)) {
     try {
-      const meta = JSON.parse(await readFile(metaPath, 'utf-8'));
+      const meta = parseJsonText(await readFile(metaPath, 'utf-8'));
       currentHash = meta?.textureCache?.hash ?? null;
     } catch (e) {
       warnings.push(`unparseable meta ${metaPath}: ${e.message}`);

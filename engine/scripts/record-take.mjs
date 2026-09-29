@@ -46,6 +46,7 @@ import fs from 'node:fs';
 import { loadRequiredEngineModules } from './loadVendorPlugins.mjs';
 import { defaultToolchainDir } from './toolchainHome.mjs';
 import { bootWithReloadRetry, failedAttemptReloaded, pageReloaded } from './recordTakeBoot.mjs';
+import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TAG = '[record-take]';
@@ -127,7 +128,7 @@ if (!(opts.fps >= RENDER_FPS_MIN && opts.fps <= RENDER_FPS_MAX)) fail(`--fps mus
 if (!(opts.scale > 0 && opts.scale <= RENDER_SCALE_MAX)) fail(`--scale must be in (0, ${RENDER_SCALE_MAX}] (got ${opts.scale})`);
 
 const takePath = path.resolve(positional[0]);
-const take = takeMod.parseTake(JSON.parse(fs.readFileSync(takePath, 'utf8')));
+const take = takeMod.parseTake(readJsonFile(takePath));
 const project = opts.project ?? findProject(take.game);
 const takeStem = path.basename(takePath).replace(/\.take\.json$|\.json$/, '');
 const outDir = path.join(path.resolve(opts.out ?? path.dirname(takePath)), takeStem);

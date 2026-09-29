@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { BuildModules, ModuleKey } from '../project-config';
 import { hasDocKey } from '../packages/modoki/src/runtime/core/docKeys';
+import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 export type { ModuleKey };
 
@@ -85,7 +86,7 @@ export function detectModules(projectRoot: string): DetectResult {
   for (const file of files) {
     let json: unknown;
     try {
-      json = JSON.parse(fs.readFileSync(file, 'utf8'));
+      json = readJsonFile(file);
     } catch {
       continue; // a malformed scene shouldn't crash a build's module scan
     }
