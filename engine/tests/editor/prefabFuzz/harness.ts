@@ -197,7 +197,7 @@ export async function flushWatcher(be: FuzzBackend, before: Map<string, string>)
   bridge.emit('manifest-updated', { assets });
   const raised: string[] = [];
   for (const url of changed.sort()) {
-    if (be.marked.has(be.dir + url.slice(ROOT_URL.length))) continue;
+    if (be.marked.has(url)) continue;
     raised.push(url);
     bridge.emit('scene-changed', { urlPath: url, kind: url.endsWith('.prefab.json') ? 'prefab' : 'scene' });
   }

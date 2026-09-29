@@ -51,7 +51,8 @@ export function signature(f: Failure): string {
     // An absolute path (a route's message names the scratch file) and the per-run folder first: they differ on every
     // replay, and a signature that carries them can never match, so the shrinker could not shrink (review).
     .replace(/(?:\/[^\s'",)]*)?\/fuzz\/[^\s'",)]+/g, 'PATH')
-    .replace(/\/[^\s'",)]*modoki-prefab-fuzz-[^\s'",)]*/g, 'PATH')
+    // Either OS's form: on Windows the route names `E:\…\modoki-prefab-fuzz-x\r…\H.prefab.json` (#1840).
+    .replace(/(?:[A-Za-z]:)?[\\/][^\s'",)]*modoki-prefab-fuzz-[^\s'",)]*/g, 'PATH')
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, 'G')
     .replace(/\b[0-9a-f]*\d[0-9a-f]*\b/gi, 'N')
     .slice(0, 100);

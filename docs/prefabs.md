@@ -521,6 +521,19 @@ concluding that an area is covered.
 - A run's guids come from a hash of its op list, so a list's first run is the same guid for guid in any process, and a
   fresh-process replay reproduces the hunt's run.
 
+**The simulated watcher tells the editor's own writes apart by URL (#1840).** After each op the harness raises
+`scene-changed` for every changed file the router did NOT mark as the editor's own, and a raised file taints the segment:
+the file reloads under the op, and the undo-to-start identity and the clean-segment refusal checks are skipped. Until
+#1840 the mark was looked up by `be.dir + url`, a string that never equals the router's `\`-separated path on Windows. So
+on Windows every editor write was raised and every segment with a write was tainted. The reload rebuilt the world from
+the file, which wiped the in-memory loss (marks, links) the KNOWN_OPEN repros need. On the public CI's Windows leg that
+was 33 red tests: 32 KNOWN_OPEN repros ran clean, and #1805 route 2 lost its reach (its plain reload showed no
+placeholder). Undo and redo were never inert there; the check that would have seen their bugs was switched off. The mark set is now keyed by the asset URL (`toUrl`, the same conversion the snapshot uses), and a harness
+self-test holds both sides: a routed write is not raised, and an outside write is. ⚠️ **Windows hunts before `win`'s
+#1840 fix found no undo-class failures because of this, not because there were none.** The reloads also changed which
+routes a run reached (#1805 route 2 above), so re-run a finding from such a hunt on a fixed tree before relying on it,
+and read the cost figures above as measured with the extra reloads.
+
 **A deleted prefab's round trip (#1805).** A live instance of a prefab whose file was deleted stays expanded, while a
 reload gives its Missing Prefab placeholder, as in Unity. So when the run has deleted a prefab (a document that is in no
 file now, by id: a rename is not a delete), `saveReload` also reloads the same save with the deleted prefabs put back, and

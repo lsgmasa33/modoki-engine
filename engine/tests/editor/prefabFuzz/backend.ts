@@ -7,7 +7,7 @@
  *
  *  What the host would add and this does not (the harness-blind list in `prefabFuzz.test.ts` names these):
  *  - no file watcher. A write the route marks as the editor's own is recorded in `marked`; any other change to the
- *    directory is found by `unmarkedChanges` and reaches the editor only through the harness's hot-reload step.
+ *    directory is found by the harness's `flushWatcher` and reaches the editor only through the harness's hot-reload step.
  *  - the manifest is rebuilt from the directory on every read (the host keeps a watcher-fed cache), so it is never
  *    stale here. */
 
@@ -21,7 +21,9 @@ export const ROOT_URL = '/fuzz';
 
 export interface FuzzBackend {
   dir: string;
-  /** Absolute paths the router marked as the editor's own write, since the last `takeMarked`. */
+  /** The asset urls (`/fuzz/...`) the router marked as the editor's own write, since the watcher last ran. Keyed by url, as
+   *  the watcher finds changes, not by the absolute path the route passes: on Windows that path has `\` separators no
+   *  url-built string matches, so every editor write was raised as an outside edit and tainted its segment (#1840). */
   marked: Set<string>;
   fetch: (url: string | URL, init?: { method?: string; body?: string }) => Promise<Response>;
   write(url: string, text: string): void;
@@ -106,7 +108,8 @@ export function makeFuzzBackend(): FuzzBackend {
     requestBrowser: (op: string, params: unknown) => backend.relay(op, params),
     getSchema: () => undefined,
     markEditorWrite: (p: string, hash?: string | null) => {
-      backend.marked.add(p);
+      const url = toUrl(p);
+      if (url) backend.marked.add(url);
       void hash;
     },
     ssrLoadModule: async () => { throw new Error('fuzz backend: no SSR'); },

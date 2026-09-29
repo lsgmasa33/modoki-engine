@@ -70,13 +70,14 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
     return { failed: [] };
   },
 }));
-import { makeFuzzBackend } from './prefabFuzz/backend';
-import { boot, bridge, memoryStorage } from './prefabFuzz/harness';
+import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
+import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op } from './prefabFuzz/ops';
 import { runOps, shrink, consoleErrors, opOutcomes, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, KNOWN_TOLERANCES, REGRESSIONS } from './prefabFuzz/knownOpen';
 import { signature, checkRoundTrip, firstDiff, nodeMoved } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { setRunMode } from '@modoki/engine/runtime';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -235,10 +236,32 @@ describe('#1789 prefab fuzz', () => {
     }, 60_000);
   }
 
+  // #1840: the watcher looked marks up by a string it built from the url, which on Windows never matched the route's
+  // `\`-separated path, so every editor write reloaded under the op and tainted its segment — the undo identity and the
+  // clean-segment refusal checks never ran there: 32 KNOWN_OPEN repros ran clean, and #1805 route 2 lost its reach.
+  it('harness: the editor\'s own write is not raised as an outside edit, and an outside write is (#1840)', async () => {
+    const own = `${ROOT_URL}/watcher-selftest/own.txt`; const outside = `${ROOT_URL}/watcher-selftest/outside.txt`;
+    // Stopped, as `startRun` leaves it. Until then the editor's reload suppressor (agentEditorOps.ts) defers the outside
+    // write's reload and the flush never settles: run alone, with no fuzz run before it, this test failed there (review).
+    setRunMode('stopped');
+    const before = be.snapshot();
+    try {
+      const r = await be.fetch('/api/write-file', { method: 'POST', body: JSON.stringify({ path: own, content: 'x' }) });
+      expect(r.status, await r.clone().text()).toBe(200);
+      be.write(outside, 'x');
+      expect(await flushWatcher(be, before)).toEqual([outside]);
+    } finally {
+      be.remove(own); be.remove(outside);
+    }
+  });
+
   it('harness: a signature drops what differs between replays (scratch paths, the run folder, guids) and keeps the message', () => {
     const a = signature({ check: 'console.error', detail: '[Prefab] /var/folders/x/modoki-prefab-fuzz-lVa3m1/r0a1b2c3d4e5f6/prefabs/H.prefab.json holds a mark of 6' });
     const b = signature({ check: 'console.error', detail: '[Prefab] /var/folders/x/modoki-prefab-fuzz-Q9zz/r00ffee001234/prefabs/H.prefab.json holds a mark of 4' });
     expect(a).toBe(b);
+    // The Windows form of the same line (#1840): a drive letter and `\` separators, printed as a real run did.
+    const w = signature({ check: 'console.error', detail: '[Prefab] E:\\dev-temp\\modoki-prefab-fuzz-n3srxX\\r31f1810d0000\\prefabs\\H.prefab.json holds a mark of 5' });
+    expect(w).toBe(a);
     expect(signature({ check: 'op threw', detail: 'reload: superseded | at x' })).not.toBe(signature({ check: 'op threw', detail: 'Cannot read x | at y' }));
   });
 
