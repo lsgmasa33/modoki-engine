@@ -140,7 +140,7 @@ function currentRoot(): number {
 }
 
 async function setup() {
-  const m = await import('../../src/editor/scene/prefab');
+  const m = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate'), import('../../src/editor/scene/prefabLink'), import('../../src/editor/scene/prefabRebuild'), import('../../src/editor/scene/prefabSerialize')]).then(([m0, m1, m2, m3, m4]) => ({ ...m0, ...m1, ...m2, ...m3, ...m4 }));
   m.setPrefabCache(SRC, shipPrefab as any);
   const root = m.instantiatePrefab(shipPrefab as any);
   m.setPrefabSource(root, { id: SRC });
@@ -273,7 +273,7 @@ describe('nested generated subtrees — whose rows are whose', () => {
    *    then written into the file as an authored member and tagged as an instance member, silently,
    *    with the report suppressed. Found by the close-out re-review, measured. */
   async function nested() {
-    const m = await import('../../src/editor/scene/prefab');
+    const m = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate'), import('../../src/editor/scene/prefabLink'), import('../../src/editor/scene/prefabRebuild'), import('../../src/editor/scene/prefabSerialize')]).then(([m0, m1, m2, m3, m4]) => ({ ...m0, ...m1, ...m2, ...m3, ...m4 }));
     const { Transient } = await import('../../src/runtime/core/traits/Transient');
     const spawn = (name: string, parentId: number, guid: string) => {
       const e = testWorld.spawn(EntityAttributes({ name, parentId, guid }), Transform({ x: 0, y: 0, z: 0 }));
@@ -331,7 +331,7 @@ describe('tagEntityTreeAsInstance — the SECOND read of the same tree', () => {
    *  a "root has PrefabInstance" assertion over that fixture is true before the call and cannot
    *  fail. The first cut of this test did exactly that and passed against the unfixed code. */
   it('selects the same entities as serializePrefab, so the tag is not refused', async () => {
-    const m = await import('../../src/editor/scene/prefab');
+    const m = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate'), import('../../src/editor/scene/prefabLink'), import('../../src/editor/scene/prefabRebuild'), import('../../src/editor/scene/prefabSerialize')]).then(([m0, m1, m2, m3, m4]) => ({ ...m0, ...m1, ...m2, ...m3, ...m4 }));
     const { Transient } = await import('../../src/runtime/core/traits/Transient');
     const root = testWorld.spawn(EntityAttributes({ name: 'Widget', parentId: 0, guid: 'widget-guid' }), Transform({ x: 0, y: 0, z: 0 }));
     index.set(root.id(), root);

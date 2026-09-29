@@ -37,7 +37,14 @@ import {
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo, undo, duplicateEntity,
 } from '@modoki/engine/editor';
-import { serializePrefab, setPrefabCache, getCachedPrefabSync, applyToPrefabSelective, revertOverridesSelective, instantiatePrefab, rebuildInstance, rebaseStaleInstances, withKeptStateBake, bakingKeptStateForTest, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { withKeptStateBake, bakingKeptStateForTest } from '../../packages/modoki/src/editor/scene/prefabTokens';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { rebuildInstance, rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { expandsToRoot } from '../../packages/modoki/src/runtime/loaders/prefabRoot';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
@@ -46,7 +53,7 @@ import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/
 import { applyAssetPathMoves } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
 import { snapshotEntity, respawnFromSnapshot, copySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
 import { redo } from '../../packages/modoki/src/editor/undo/undoManager';
-import { tagCreatedPrefab } from '../../packages/modoki/src/editor/scene/prefab';
+import { tagCreatedPrefab } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { registerAsset, resolveRef, resolveGuidToPath, getGuidForPath } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { asAddedNode } from '../../packages/modoki/src/runtime/loaders/unresolvedPrefabRefs';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';

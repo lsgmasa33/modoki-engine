@@ -39,7 +39,7 @@ the live instances (**propagation**). The rules below are grouped by those three
 | **Member guid** | A member's `EntityAttributes.guid`: the member row's pin, else the template's, else derived from its anchor through identity parents. | `deriveInstanceMemberGuids` (`runtime/loaders/loadSceneFile.ts`) |
 | **Identity parent** | Where an entity sits in its TEMPLATE, as opposed to where it hangs live. A move (#1437) separates the two. | `worldIdentityParents` (`runtime/core/ecs/identityParents.ts`) |
 | **Frame record** | Per world, the document each frame root was actually expanded from. | `noteFrameDoc`, `frameRootDoc` (same file) |
-| **The two caches** | The editor cache is read synchronously by capture, the save and Apply. The runtime cache is refcounted, read by spawners, and keeps a per-key revision. ⚠️ `getCachedPrefab` takes a GUID. Given an asset path, it resolves it through `resolveRef`, which logs `[assetManifest] path reference no longer supported` as an ERROR and returns nothing. A verification probe that reads the runtime cache by path produces that line itself, and `modoki_diagnose` goes `ok:false` over it. That is how #1801 was filed as an engine bug. Probe by GUID. | `getCachedPrefabSync` (`prefab.ts`); `getCachedPrefab`, `getPrefabRevision` (`runtime/loaders/meshTemplateCache.ts`) |
+| **The two caches** | The editor cache is read synchronously by capture, the save and Apply. The runtime cache is refcounted, read by spawners, and keeps a per-key revision. ⚠️ `getCachedPrefab` takes a GUID. Given an asset path, it resolves it through `resolveRef`, which logs `[assetManifest] path reference no longer supported` as an ERROR and returns nothing. A verification probe that reads the runtime cache by path produces that line itself, and `modoki_diagnose` goes `ok:false` over it. That is how #1801 was filed as an engine bug. Probe by GUID. | `getCachedPrefabSync` (`prefabCache.ts`); `getCachedPrefab`, `getPrefabRevision` (`runtime/loaders/meshTemplateCache.ts`) |
 | **Promotion** | Apply turning a node the scene added into a template row. | `insertAddedSubtree` |
 | **Override mark** | A runtime flag on a field that makes a value difference count as an edit. It does not record which layer set the value. | `runtime/loaders/overrideMarks.ts` |
 
@@ -85,7 +85,7 @@ answer the same question for themselves. Each place in that column is a place th
 | I16 | A template never contains itself. | The prefab-edit refusal at every gesture (`prefabEditRefusal.ts`, § Prefab edit mode); `wouldCreateCycle` / `expandedPrefabRefs` (member rows included) over the WHOLE document, when writing: in `serializePrefab`, and again at `commitPrefabWrites`, the one door every editor prefab write passes (Apply's plan included), reading the batch's own documents first, then the editor cache, then the document the live world last EXPANDED each prefab from (`prefabNestingReader`, #1866): a prefab trashed mid-session is in no cache (#1805, #1834), and read as nesting nothing, an Apply promoting a live instance of trashed P into Q (which P nests) wrote Q → P → Q, which surfaced as "P nests itself" once P was restored (hunt seed 6031; with the manifest pruned the plan's own check had caught it only through a stale guid key, the window I9 records as closed); the expansion's ancestor stack, carried through reference nodes, when loading (#1817). A file that already contains itself loads with its self-referencing node refused and named (`[loadSceneFile] cycle: prefab "…" contains itself …`), not a stack overflow (both twins tested). The write check refuses to save such a document, so its repair is deleting the self-reference in prefab edit and saving. |
 | I17 | An editor write that changes an instance member's field leaves its override mark in the state the save needs, and its undo puts the mark back. | `editor/undo/overrideMarkWrites.ts`. See § "Editor writes and the override mark". |
 | I18 | A reference the load cannot expand is written back as the file held it, until an expansion replaces it. A reader never drops what it could not interpret. | The `UnresolvedPrefabRef` marker on the placeholder (`runtime/core/unresolvedPrefabRef.ts`) and its writers (`runtime/loaders/unresolvedPrefabRefs.ts`); a live frame whose document stopped resolving, its frame record (`captureDoc`); a template row a frame could not expand, the frame record's `unexpanded` list (#1812), so the row is not saved as removed once the cache holds its child; a legacy path-keyed channel no live frame reaches, R2's kept store (`keptOrphanRows.ts`). See § "A missing prefab keeps its record". |
-| I22 | A prefab reference is its DOCUMENT's guid. A path becomes a guid once, at the entry that received it (a drag payload, an agent's `{path}`, the Assets panel), spelled as the disk spells it; a reader that holds the document or a guid never re-derives identity from a path through the renderer's manifest, and nothing writes a path into `PrefabInstance.source`. | `setPrefabSource(root, doc)` (`prefab.ts`) for every expansion's tag: the document's guid, or the guid ref a nested expansion reached an id-less document by, and never a path; a document with no guid is refused loudly (#1828). `instanceSourceRef` (document first) for the Create Prefab tag and untag (#1807). The route (`rebuildManifestInline` before `applyMovesInRenderer`) keeps the renderer's manifest current across a move. Tests: `prefabSourceWriter.test.ts`. |
+| I22 | A prefab reference is its DOCUMENT's guid. A path becomes a guid once, at the entry that received it (a drag payload, an agent's `{path}`, the Assets panel), spelled as the disk spells it; a reader that holds the document or a guid never re-derives identity from a path through the renderer's manifest, and nothing writes a path into `PrefabInstance.source`. | `setPrefabSource(root, doc)` (`prefabCache.ts`) for every expansion's tag: the document's guid, or the guid ref a nested expansion reached an id-less document by, and never a path; a document with no guid is refused loudly (#1828). `instanceSourceRef` (document first) for the Create Prefab tag and untag (#1807). The route (`rebuildManifestInline` before `applyMovesInRenderer`) keeps the renderer's manifest current across a move. Tests: `prefabSourceWriter.test.ts`. |
 
 #### Undo across worlds
 
@@ -542,7 +542,7 @@ whether #1801 shares the mechanism.
 - **#1828:** downgrade it to low and re-scope it to M1's writer (`setPrefabSource`), or close it in favour of a fix issue
   for that owner. Neither of its routes exists in the editor without a failed inline rebuild, and route 2 refuses safely.
 - **#1801:** close it as not a defect.
-- **The comment** at `prefab.ts`'s `setPrefabSource` said a raw path makes `getPrefabSource` hit `resolveRef`'s hard
+- **The comment** at `setPrefabSource` (then in `prefab.ts`, now `prefabCache.ts`) said a raw path makes `getPrefabSource` hit `resolveRef`'s hard
   rejection, which was stale: `fetchPrefabSource` sends a path to `assetUrl`. It was corrected ahead of the M1 fix, when
   #1801 closed, to say what a stored path runs into (the save writes it verbatim, and the next load's `acquirePrefab`
   rejects it). The M1 fix (#1828) then retired it: `setPrefabSource` stores no path at all, and its comment says so.
@@ -880,7 +880,7 @@ consumer below resolves a member BY localId, and each is a place a renumber goes
   `overrides[localId]` rather than its `traits`.
 - **`editor/panels/ApplyPrefabDialog.tsx`** — pairs a live instance entity to its template row.
 - The live **`PrefabInstance.localId`** trait, which carries the id on every spawned entity.
-- **`editor/scene/prefab.ts`'s `tagEntityTreeAsInstance`** — stamps that trait after a Create
+- **`editor/scene/prefabLink.ts`'s `tagEntityTreeAsInstance`** — stamps that trait after a Create
   Prefab, so it must assign the SAME ids the file just got.
 
 ⚠️ **That last one had its own numbering and they disagreed (#1278).** `serializePrefab` collapses
@@ -1309,7 +1309,31 @@ added subtree whose live root has no durable guid is not listed at all, only cou
 editor create/duplicate path mints a durable guid (`ensureGuid`), so this is a code- or
 runtime-spawned child, addressable once the scene is saved.
 
-## Core operations (`editor/scene/prefab.ts`)
+## Core operations (`editor/scene/prefab*.ts`)
+
+The editor's prefab system was one 9.3k-line `prefab.ts` until the split before the third review pass (#1656 § Plan
+step 5, a pure move). It is now one module per concern, in dependency order (a module imports only from those above it;
+no value-import cycle runs through any of them):
+
+| Module | Owns |
+|---|---|
+| `prefab.ts` | The document model: `PrefabEntity`, `PrefabFile`, `isTemplateExcludedField`, `collectTree`, the guid ↔ entity-id helpers |
+| `prefabCache.ts` | The one editor `prefabCache` and file reads: `getPrefabSource`/`getCachedPrefabSync`, parked reads, refresh, nested preload, the editor-cache seat/prime/rekey/evict, `setPrefabSource`, `wouldCreateCycle`, `classifyExisting*Id`; it registers the frame-doc fallback (`setFrameDocFallback`) |
+| `prefabTokens.ts` | The write-side token scope: the template tokenizer and its node exits, `baseTokenResolver`, the kept-state bake and the rewriting-prefab scope (`withKeptStateBake`, `withNodeExits`, `withRewritingPrefab`) |
+| `prefabMembers.ts` | Member rows and moves: the row domain, `memberRowParents`, the prefab's own moves, `captureInstanceMembers`, `instanceMovedMembers` |
+| `prefabInstanceOverrides.ts` | Field overrides: `getOverrideValues`, `gateOnMarks`, `captureInstanceOverrides`, `applyOverridesByRootInstance` |
+| `prefabCapture.ts` | The capture core: `captureInstanceStructure`, `captureNestedChannels`, `moveChannelsOntoRows`, `captureInstanceReference`, the template rows, the chain subtraction. One mutual recursion, so it is the largest module |
+| `prefabFrames.ts` | Frame state: `rebuildTeardown`, `framesBuiltFromOtherRows`/`staleFrames`, the missing/stale/unexpanded refusals |
+| `prefabInstantiate.ts` | Editor instantiate: `instantiatePrefab`, `instantiatePrefabInstance`, `instantiatePrefabAsync`, `applyStructureByRootInstance` |
+| `prefabChain.ts` | An instance's own layer against its enclosing chain: `instanceBase`, `enclosingRowOverrides`, `ownInstanceStructure`, `memberOverrideKeys`, `nestedFrameMoves` |
+| `prefabRebuild.ts` | Rebuild, refresh and rebase: `rebuildInstance`, `refreshInstances`, `rebaseStaleInstances`, the nested frames carried across an outer rebuild |
+| `prefabSerialize.ts` | `serializePrefab`, row planning and numbering, `mergeRiggedPrefab`, `serializeRebuildOver` |
+| `prefabApplyStructure.ts` | Apply's structural writes: `insertAddedSubtree`, promotion, the promoted-guid carry |
+| `prefabApply.ts` | Apply's orchestrators: `previewApply`, `applyToPrefabSelective`, `planApply`, `commitApplyPlan` |
+| `prefabLink.ts` | The instance link: `tagEntityTreeAsInstance`, `tagCreatedPrefab`, Detach/Reattach |
+| `prefabRevert.ts` | `revertOverridesSelective`, `revertRefusal` |
+
+Only the orchestrators await (Apply, Revert, the rebase); the capture and rebuild core stays synchronous.
 
 - **`serializePrefab(selectedEntityId, existingId?, opts?)`** — collects the selected
   tree (`collectTree`, BFS), assigns `localId`s, snapshots each trait, remaps
@@ -2745,7 +2769,7 @@ the file.**
   the census's one uncovered job, recorded here rather than left implicit.
 
   ⚠️ **Do not trust a census that anchors on ONE reader — this paragraph shipped a wrong count
-  three times doing exactly that.** The sync reads are not three; in `prefab.ts` alone there are
+  three times doing exactly that.** The sync reads are not three; in the prefab modules alone (one `prefab.ts` then) there are
   **seven** (`planPrefabRows`, `instantiatePrefab`, `wouldCreateCycle`, `captureNestedRef`,
   `applyStructureByRootInstance`, and two inside the nested-override capture/replay pair), plus
   `Inspector.tsx` and the prefab-edit save. They are reached by different call chains, so a sweep
@@ -2834,7 +2858,7 @@ the file.**
   root reported a 0 size and no authored `UIElement`, silencing every pooled-row
   authoring warning. **Latent, and not a shape the editor writes** — no prefab in
   `games/` or `demos/` has a nested-instance root, and the prefab serializer never
-  collapses the selection root into a reference row (`editor/scene/prefab.ts`), so it
+  collapses the selection root into a reference row (`editor/scene/prefabSerialize.ts`), so it
   arises only from hand- or agent-written JSON. That is why it was fixed by
   construction rather than observed. Its cycle guard is keyed on each level's `id` AND the ref it was reached
   by, registered once on entry: a first draft registered the child's ref in the

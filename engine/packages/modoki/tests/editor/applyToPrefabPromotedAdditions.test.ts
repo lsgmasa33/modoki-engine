@@ -94,7 +94,7 @@ global.fetch = vi.fn(async (url: string, init?: { body?: string }) => {
   return { ok: true, json: async () => ({}) } as Response;
 });
 
-async function getModule() { return import('../../src/editor/scene/prefab'); }
+async function getModule() { return Promise.all([import('../../src/editor/scene/prefabApply'), import('../../src/editor/scene/prefabCache')]).then(([m0, m1]) => ({ ...m0, ...m1 })); }
 
 const SRC = 'aaaaaaaa-0000-4000-8000-000000000002';
 

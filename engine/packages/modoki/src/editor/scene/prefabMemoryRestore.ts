@@ -10,7 +10,9 @@
  *  written and no scene is saved. */
 
 import { seatCaches, prefabPathOf, prefabTextIsDocument } from './prefabCommit';
-import { preloadNestedPrefabs, rebaseStaleInstances, getCachedPrefabSync, type PrefabFile } from './prefab';
+import { type PrefabFile } from './prefab';
+import { preloadNestedPrefabs, getCachedPrefabSync } from './prefabCache';
+import { rebaseStaleInstances } from './prefabRebuild';
 import { parkPrefab, parkedPrefab, parkedPrefabEntry, discardDirtyAssets, assetWritesSettled } from './dirtyAssets';
 import { jsonFileBody } from '../backend/editorBackend';
 import { UndoRefusedError } from '../undo/undoFailure';

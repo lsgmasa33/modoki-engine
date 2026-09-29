@@ -48,15 +48,31 @@ vi.mock('../../src/editor/scene/prefabMemoryRestore', () => ({
 }));
 
 vi.mock('../../src/editor/scene/prefab', () => ({
-  applyToPrefabSelective: vi.fn(async () => applyResult),
   guidForEntityId: (id: number) => (id === 1 ? 'g-root' : ''),
   entityIdForGuid: (guid: string) => (guid === 'g-root' ? 1 : 0),
+}));
+vi.mock('../../src/editor/scene/prefabCache', () => ({}));
+vi.mock('../../src/editor/scene/prefabTokens', () => ({}));
+vi.mock('../../src/editor/scene/prefabMembers', () => ({}));
+vi.mock('../../src/editor/scene/prefabInstanceOverrides', () => ({}));
+vi.mock('../../src/editor/scene/prefabCapture', () => ({}));
+vi.mock('../../src/editor/scene/prefabFrames', () => ({}));
+vi.mock('../../src/editor/scene/prefabInstantiate', () => ({}));
+vi.mock('../../src/editor/scene/prefabChain', () => ({}));
+vi.mock('../../src/editor/scene/prefabRebuild', () => ({
   // #1431: undo/redo re-derive carried BASE instances; this suite's instance is primary, and its
   // subject is the prefab + primary scene pair — pinned in engine/tests/editor/applyPrefabDirtiesBase.test.ts.
   refreshBaseInstances: vi.fn(),
   // #1483: the restore rebases carried roots; nothing here is carried.
   rebaseStaleInstances: vi.fn(async () => 0),
 }));
+vi.mock('../../src/editor/scene/prefabSerialize', () => ({}));
+vi.mock('../../src/editor/scene/prefabApplyStructure', () => ({}));
+vi.mock('../../src/editor/scene/prefabApply', () => ({
+  applyToPrefabSelective: vi.fn(async () => applyResult),
+}));
+vi.mock('../../src/editor/scene/prefabLink', () => ({}));
+vi.mock('../../src/editor/scene/prefabRevert', () => ({}));
 
 let currentBaseScene: string | undefined;
 vi.mock('../../src/runtime/scene/SceneManager', () => ({

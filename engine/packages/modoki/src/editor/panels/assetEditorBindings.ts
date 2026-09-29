@@ -51,7 +51,7 @@ import { applyMove, splitAssetPath, type PathMove } from '../utils/assetPaths';
 import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
 import { rekeyCachedPrefab, evictDeletedPrefabs } from '../../runtime/loaders/meshTemplateCache';
 import { recordAssetMoves } from '../utils/assetMoveLog';
-import { rekeyEditorPrefabCache, evictDeletedEditorPrefabs } from '../scene/prefab';
+import { rekeyEditorPrefabCache, evictDeletedEditorPrefabs } from '../scene/prefabCache';
 
 /** The display name a repaired item should carry after `move`.
  *

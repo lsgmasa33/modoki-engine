@@ -100,7 +100,7 @@ beforeEach(async () => {
   clearAllOverrideMarks();
 });
 
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstanceOverrides'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
 
 const CHILD = 'cccccccc-0000-4000-8000-00000000c0e8';
 const CLIP_GUID = 'f1cc3b85-2c23-457b-938a-3470ada21b36';

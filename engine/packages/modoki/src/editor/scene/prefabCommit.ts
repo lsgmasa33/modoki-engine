@@ -20,9 +20,9 @@
  *     `adoptionsSettled`), and rebuilds nothing when the world it began in is gone or a route is mid-adoption after the
  *     write (`pendingAdoptions`). */
 
-import {
-  preloadNestedPrefabs, rebaseStaleInstances, seatEditorPrefabCache, prefabNestingReader, type PrefabFile,
-} from './prefab';
+import { type PrefabFile } from './prefab';
+import { preloadNestedPrefabs, seatEditorPrefabCache, prefabNestingReader } from './prefabCache';
+import { rebaseStaleInstances } from './prefabRebuild';
 import { expandedPrefabRefs, prefabNests } from '../../runtime/loaders/prefabNesting';
 import { postWriteFile, jsonFileBody, readBackendAnswer } from '../backend/editorBackend';
 import { deleteAssetFiles } from '../panels/assetOps';

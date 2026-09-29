@@ -35,7 +35,7 @@ function fnName(call: ts.CallExpression): string {
 /** The one call pardoned, keyed `file#function`. */
 const EXEMPT = [
   {
-    item: 'packages/modoki/src/editor/scene/prefab.ts#rebuildInstance',
+    item: 'packages/modoki/src/editor/scene/prefabRebuild.ts#rebuildInstance',
     count: 1,
     reason: 'the in-place rebuild relinks the members inside a kept frame straight after its own delete, in the same '
       + 'world and the same call, so nothing between the frame-ending and the relink can drop their marks.',

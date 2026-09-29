@@ -9,7 +9,7 @@
 import { pushAction } from './undoManager';
 import { reportUndoFailure } from './undoFailure';
 import { entityRef, buildGuidIndex, requireWith, renamesOf, requireDetachedMembers, isInstanceRootCheck } from './entityRef';
-import { detachPrefabInstance, reattachDetachedInstance, type DetachSnapshot } from '../scene/prefab';
+import { detachPrefabInstance, reattachDetachedInstance, type DetachSnapshot } from '../scene/prefabLink';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { isSuppliedByPrefab, outermostPrefabRoot } from '../scene/restructureRefusal';

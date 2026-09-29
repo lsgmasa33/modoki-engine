@@ -42,7 +42,9 @@ import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/
 import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { relay } from '../plugins/backendRelay';
-import { setPrefabCache, instantiatePrefab, setPrefabSource, PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { getTraitByName } from '@modoki/engine/runtime';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';

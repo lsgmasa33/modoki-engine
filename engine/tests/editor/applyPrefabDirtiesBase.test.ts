@@ -46,8 +46,8 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabCommit', async (importOrig
 // The restore's path write goes through the adoption owner (#1698), which writes through `serialize.ts`'s own setter —
 // not the mocked export above — and that persists the path.
 vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
-vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefab')>();
+vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabRebuild')>();
   return {
     ...real,
     // The restore rebases carried stale roots (#1483). In production the world restore re-expands the primary
@@ -55,6 +55,12 @@ vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) 
     // primary built from the prefab being undone, and a real rebase would rebuild it — masking the
     // `refreshBaseInstances` filter this file pins. No root here is carried, so the stub loses nothing.
     rebaseStaleInstances: async () => 0,
+  };
+});
+vi.mock('../../packages/modoki/src/editor/scene/prefabApply', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabApply')>();
+  return {
+    ...real,
     // The real apply promotes `Mine` into the prefab (here: member `Promoted`), deletes the live node,
     // installs the new prefab and REFRESHES every instance of it from the old one. Modelled so.
     applyToPrefabSelective: async () => {
@@ -68,7 +74,7 @@ vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) 
       const pi = getTraitByName('PrefabInstance')!;
       const roots = getAllEntities().filter((e) => (readTraitData(e.id, pi)?.rootInstanceId as number) === e.id && readTraitData(e.id, pi)?.source === KIT).map((e) => e.id);
       for (const id of roots) {
-        real.rebuildInstance(id, KIT, kitAfter as never, real.captureInstanceOverrides(id, kitDoc as never), real.captureInstanceStructure(id, kitDoc as never), kitDoc as never);
+        rebuildInstance(id, KIT, kitAfter as never, captureInstanceOverrides(id, kitDoc as never), captureInstanceStructure(id, kitDoc as never), kitDoc as never);
       }
       return { applied: true, source: KIT, prefabBefore: kitDoc, prefabAfter: kitAfter, promotedAdditions: 0 };
     },
@@ -79,7 +85,10 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, findEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { clearHistory, setActionCallback, pushAction, undo, redo } from '@modoki/engine/editor';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
+import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
+import { rebuildInstance } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { isSceneDirty, clearSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';

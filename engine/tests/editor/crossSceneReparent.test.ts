@@ -16,7 +16,7 @@ import {
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, serializeScene, undo, redo, planReparent } from '@modoki/engine/editor';
 import { getOverrideMarkSet } from '@modoki/engine/runtime';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { sceneMoveRefusal } from '../../packages/modoki/src/editor/undo/entityActions';
 import { detachRefusal } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { isSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';

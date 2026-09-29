@@ -12,7 +12,7 @@ import {
   parentOrRootFor, reparentRefusal,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, serializeScene } from '@modoki/engine/editor';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { Transient } from '../../packages/modoki/src/runtime/core/traits/Transient';
 import { moveEntityToScene } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';

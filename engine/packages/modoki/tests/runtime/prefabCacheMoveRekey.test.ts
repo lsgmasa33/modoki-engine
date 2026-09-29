@@ -17,7 +17,7 @@ import {
   rekeyCachedPrefab, disposeAllCachedResources, invalidatePrefab,
 } from '../../src/runtime/loaders/meshTemplateCache';
 import { applyAssetPathMoves } from '../../src/editor/panels/assetEditorBindings';
-import { setPrefabCache, getCachedPrefabSync, primeEditorPrefabCache } from '../../src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync, primeEditorPrefabCache } from '../../src/editor/scene/prefabCache';
 
 const GUID = '55555555-2222-4333-8444-000000001751';
 const OLD = '/games/g/assets/ui/Row.prefab.json';

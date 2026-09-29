@@ -15,10 +15,9 @@ import { entityRef } from './entityRef';
 import { useEditorStore } from '../store/editorStore';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import {
-  revertOverridesSelective, rebuildInstanceFromCapture, preloadNestedPrefabsForSubtree,
-  type RevertResult,
-} from '../scene/prefab';
+import { preloadNestedPrefabsForSubtree } from '../scene/prefabCache';
+import { rebuildInstanceFromCapture } from '../scene/prefabRebuild';
+import { revertOverridesSelective, type RevertResult } from '../scene/prefabRevert';
 
 /** Revert the selected overrides on instance `rootInstanceId` AND record one undo entry. Resolves the Revert's result,
  *  or null when nothing was reverted (see `revertOverridesSelective`). Selects the rebuilt root. The caller gives a

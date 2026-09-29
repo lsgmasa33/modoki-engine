@@ -3,7 +3,7 @@
 
 import { undoDepth, canRedo, undoStep } from '../../../packages/modoki/src/editor/undo/undoManager';
 import { serializeScene } from '../../../packages/modoki/src/editor/scene/serialize';
-import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/scene/prefab';
+import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { getAllEntities, getCurrentWorld } from '@modoki/engine/runtime';
 import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, worldTree, type Fixture } from './harness';
 import { execute, describe as describeOp, type Op, type RunState } from './ops';

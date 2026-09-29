@@ -4,7 +4,8 @@
  *  case (`nestedEnclosingLayer.test.ts` #1736 › #1715) is ordered right by EITHER rule, so this pins each one alone. */
 
 import { describe, it, expect } from 'vitest';
-import { innermostFirst, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { innermostFirst } from '../../packages/modoki/src/editor/scene/prefabApply';
 
 const P = 'aaaaaaaa-0000-4000-8000-000000001715';
 const Q = 'aaaaaaaa-0000-4000-8000-000000001716';

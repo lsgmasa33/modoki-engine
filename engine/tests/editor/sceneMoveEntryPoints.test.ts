@@ -14,7 +14,7 @@ import {
   createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, getCurrentWorld, applyOps, type MutableScene,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, serializeScene, canUndo, undo, redo, writeTraitFieldWithUndo } from '@modoki/engine/editor';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { isSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import {
   moveEntityToScene, sceneMoveRefusal, planReparent, pasteEntityCopy, clipEntity, cutSourceId, planSceneDrop, sceneDropTarget,

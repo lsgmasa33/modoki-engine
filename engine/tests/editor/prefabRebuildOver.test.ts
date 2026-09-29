@@ -27,7 +27,8 @@ import { getCurrentWorld, setCurrentWorld, setRunMode } from '@modoki/engine/run
 import { setActionCallback, pushAction, clearHistory, undoRefusedReason, getEditVersion, undo } from '@modoki/engine/editor';
 import { swapHistory, undoLabel } from '../../packages/modoki/src/editor/undo/undoManager';
 import { makeRigPrefabAsset } from '../../packages/modoki/src/editor/scene/skinPrefab';
-import { setPrefabCache, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { clearDirtyAssets, peekDirtyAsset } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 import { applyAssetPathMoves } from '../../packages/modoki/src/editor/panels/assetEditorBindings';

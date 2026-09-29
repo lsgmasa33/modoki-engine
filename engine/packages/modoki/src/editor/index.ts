@@ -77,22 +77,29 @@ export {
   type DeviceListReply, type AndroidDeviceRow, type IosDeviceRow, type DeviceClaim,
 } from './panels/deviceConnectModel';
 export { installEditorPrefabCacheWarm, warmEditorPrefabCacheFor } from './scene/prefabCacheWarm';
+export { PREFAB_FORMAT_VERSION, warnInertPrefabSizes, resolveInstanceContext, type PrefabFile } from './scene/prefab';
 export {
-  PREFAB_FORMAT_VERSION,
-  serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab,
-  instantiatePrefabInstance,
-  primeEditorPrefabCache, isEditorPrefabCached,
-  getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, refreshPrefabSourceAfterDiskChange, getOverrides, getOverrideValues,
-  preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
-  captureInstanceOverrides, applyOverridesByRootInstance,
-  applyToPrefabSelective, staleInstanceRefusal, revertRefusal, missingSourceRefusal,
-  revertOverridesSelective, rebuildInstance, rebuildInstanceFromCapture,
-  warnInertPrefabSizes, classifyExistingPrefabId, parsedPrefabRows,
-  tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
-  detachPrefabInstance, reattachPrefabInstance, reattachDetachedInstance,
-  captureInstanceStructure, resolveInstanceContext, previewApply,
-  type PrefabFile, type RevertResult, type ApplyPreview,
-} from './scene/prefab';
+  setPrefabSource, primeEditorPrefabCache, isEditorPrefabCached, getPrefabSource, setPrefabCache,
+  refreshPrefabSourceForPath, refreshPrefabSourceAfterDiskChange, preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
+  classifyExistingPrefabId,
+} from './scene/prefabCache';
+export {
+  getOverrides, getOverrideValues, captureInstanceOverrides, applyOverridesByRootInstance,
+} from './scene/prefabInstanceOverrides';
+export { captureInstanceStructure } from './scene/prefabCapture';
+export {
+  missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, staleInstanceRefusal,
+  missingSourceRefusal,
+} from './scene/prefabFrames';
+export { instantiatePrefab, instantiatePrefabAsync, instantiatePrefabInstance } from './scene/prefabInstantiate';
+export { rebuildInstance, rebuildInstanceFromCapture } from './scene/prefabRebuild';
+export { serializePrefab, parsedPrefabRows } from './scene/prefabSerialize';
+export { applyToPrefabSelective, previewApply, type ApplyPreview } from './scene/prefabApply';
+export {
+  tagCreatedPrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance,
+  reattachPrefabInstance, reattachDetachedInstance,
+} from './scene/prefabLink';
+export { revertRefusal, revertOverridesSelective, type RevertResult } from './scene/prefabRevert';
 export { capturePrefabRead, StalePrefabRead } from './scene/prefabRead';
 export { existingAssetPath } from './scene/createAssetDocument';
 export { describeEffect, type KeyEffect, type EditEffect, type ApplyConflict } from './scene/prefabApplyEffects';

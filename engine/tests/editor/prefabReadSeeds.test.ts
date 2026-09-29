@@ -104,10 +104,11 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, registerAsset, unregisterAsset, resolveRef, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory, createEntityWithUndo } from '@modoki/engine/editor';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
-  setPrefabCache, getCachedPrefabSync, getPrefabSource, instantiatePrefabInstance, refreshPrefabSourceForPath,
-  refreshPrefabSourceAfterDiskChange, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+  setPrefabCache, getCachedPrefabSync, getPrefabSource, refreshPrefabSourceForPath, refreshPrefabSourceAfterDiskChange,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/prefabPlace';
 import { openPrefabForEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { commitPrefabWrite, seatCaches } from '../../packages/modoki/src/editor/scene/prefabCommit';

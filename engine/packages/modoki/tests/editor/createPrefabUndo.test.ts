@@ -43,15 +43,49 @@ vi.mock('../../src/editor/scene/prefabMemoryRestore', () => ({
   restorePrefabsInMemory: async (restores: unknown, opts?: { rebuild?: () => void | Promise<void> }) => { restoreSpy(restores); await opts?.rebuild?.(); },
 }));
 vi.mock('../../src/editor/scene/prefab', () => ({
+  warnInertPrefabSizes: () => undefined,
+}));
+vi.mock('../../src/editor/scene/prefabCache', () => ({
   // Nothing is parked in these trees (#1868): a Replace reads the file.
   parkedPrefabRead: () => null,
-  // No placeholder for a missing prefab in these trees (#1699): Create Prefab's refusal asks this first.
-  missingPrefabPlaceholders: () => [],
   // The commit's I16 check reads nested documents through these (#1817, #1866); these trees nest nothing it can read.
   getCachedPrefabSync: () => null,
   prefabNestingReader: () => () => null,
   // The no-write redo seats a cold key (I9); these trees read nothing back from it.
   primeEditorPrefabCache: () => {},
+  // createPrefabFromEntity awaits this before serializing (#1284). A no-op here is safe
+  // precisely because this file asserts the undo/redo closures and mocks serializePrefab
+  // anyway — and since #1295 the cache is populated by construction, so the warm is
+  // belt-and-braces rather than the thing under test (prefabCacheWarm.test.ts covers that).
+  // #1750: `duringPreload` runs inside it — a cold warm is a real fetch, where a hot reload can renumber the world.
+  preloadNestedPrefabsForSubtree: async () => { const f = preload.during; preload.during = null; await f?.(); },
+  // The real guard, reduced to its direct case: the child IS the parent.
+  wouldCreateCycle: (parent: string, child: string) => parent === child,
+  classifyExistingDocumentId: async () => ({ kind: 'known', id: OLD_ID }),
+  // The editor-cache half of `commitPrefabWrite` (#1692), which every write here now goes through.
+  seatEditorPrefabCache: (...a: unknown[]) => setPrefabCacheSpy(...a),
+  preloadNestedPrefabs: async () => {},
+}));
+vi.mock('../../src/editor/scene/prefabTokens', () => ({}));
+vi.mock('../../src/editor/scene/prefabMembers', () => ({}));
+vi.mock('../../src/editor/scene/prefabInstanceOverrides', () => ({}));
+vi.mock('../../src/editor/scene/prefabCapture', () => ({}));
+vi.mock('../../src/editor/scene/prefabFrames', () => ({
+  // No placeholder for a missing prefab in these trees (#1699): Create Prefab's refusal asks this first.
+  missingPrefabPlaceholders: () => [],
+  // Create Prefab's refusal of an unexpandable nested frame and its tag (#1790): nothing to refuse in these trees, and the
+  // tag is the one in the prefabLink mock below (its kept-state settle has nothing to settle here).
+  unexpandedNestedRefusal: () => null,
+  staleFramesInTreeRefusal: () => null,
+}));
+vi.mock('../../src/editor/scene/prefabInstantiate', () => ({}));
+vi.mock('../../src/editor/scene/prefabChain', () => ({}));
+vi.mock('../../src/editor/scene/prefabRebuild', () => ({
+  rebaseStaleInstances: async () => 0,
+  // #1820: the re-link's rebase (nothing stale here) — not what this file tests (the file and cache half).
+  rebaseStaleInstancesSoon: () => false,
+}));
+vi.mock('../../src/editor/scene/prefabSerialize', () => ({
   // Reports whatever the current test asked for, so the propagation through
   // createPrefabFromEntity -> CreatePrefabResult.runtimeExcluded is asserted at the seam that
   // actually carries it (review F3: nothing downstream of the callback had a test).
@@ -62,26 +96,13 @@ vi.mock('../../src/editor/scene/prefab', () => ({
     if (existing === 'g-child') { console.error('[Prefab] refusing: it would nest "g-child" inside itself'); return null; }
     return { id: 'g-new', root: {}, entities: [{ localId: 1, prefab: 'g-child' }] };
   },
-  // createPrefabFromEntity awaits this before serializing (#1284). A no-op here is safe
-  // precisely because this file asserts the undo/redo closures and mocks serializePrefab
-  // anyway — and since #1295 the cache is populated by construction, so the warm is
-  // belt-and-braces rather than the thing under test (prefabCacheWarm.test.ts covers that).
-  // #1750: `duringPreload` runs inside it — a cold warm is a real fetch, where a hot reload can renumber the world.
-  preloadNestedPrefabsForSubtree: async () => { const f = preload.during; preload.during = null; await f?.(); },
-  // The real guard, reduced to its direct case: the child IS the parent.
-  wouldCreateCycle: (parent: string, child: string) => parent === child,
   // A Replace hands the replaced bytes to the matcher (#1686); what they parse to does not matter to this mocked serialize.
   parsedPrefabRows: () => undefined,
-  classifyExistingDocumentId: async () => ({ kind: 'known', id: OLD_ID }),
-  // The editor-cache half of `commitPrefabWrite` (#1692), which every write here now goes through.
-  seatEditorPrefabCache: (...a: unknown[]) => setPrefabCacheSpy(...a),
-  preloadNestedPrefabs: async () => {},
-  rebaseStaleInstances: async () => 0,
+}));
+vi.mock('../../src/editor/scene/prefabApplyStructure', () => ({}));
+vi.mock('../../src/editor/scene/prefabApply', () => ({}));
+vi.mock('../../src/editor/scene/prefabLink', () => ({
   tagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return new Map([['g-old', 'g-derived']]); },
-  // Create Prefab's refusal of an unexpandable nested frame and its tag (#1790): nothing to refuse in these trees, and the
-  // tag is the one above (its kept-state settle has nothing to settle here).
-  unexpandedNestedRefusal: () => null,
-  staleFramesInTreeRefusal: () => null,
   tagCreatedPrefab: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return { guidRemap: new Map([['g-old', 'g-derived']]), undoKept: () => {} }; },
   // #1461: the tag stamps the members with the guid the reload derives, and undo reverses it. Recorded
   // here because this file is the only place the undo's call ORDER is asserted — see the sequences below.
@@ -89,10 +110,8 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   untagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('untag'); return untagSpy(...a); },
   detachPrefabInstance: (...a: unknown[]) => { calls.push('detach'); return (detachSpy as (...x: unknown[]) => unknown)(...a); },
   reattachPrefabInstance: (...a: unknown[]) => { calls.push('reattach'); return reattachSpy(...a); },
-  // #1820: the re-link's rebase (nothing stale here) — not what this file tests (the file and cache half).
-  rebaseStaleInstancesSoon: () => false,
-  warnInertPrefabSizes: () => undefined,
 }));
+vi.mock('../../src/editor/scene/prefabRevert', () => ({}));
 
 const registerAssetSpy = vi.fn();
 // The real module under the spies: the write step's imports (the adoption owner, #1698) reach exports this file never

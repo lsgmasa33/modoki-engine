@@ -5,9 +5,8 @@ import { backendFetch, importedFileBytes } from '../backend/editorBackend';
 import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
-import {
-  serializeRebuildOver, classifyExistingPrefabId,
-} from '../scene/prefab';
+import { classifyExistingPrefabId } from '../scene/prefabCache';
+import { serializeRebuildOver } from '../scene/prefabSerialize';
 import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { importModel } from '../scene/modelImport';
 import { needsGLBConversion, convertSourceToGLB } from '../scene/convertToGLB';

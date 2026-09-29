@@ -35,7 +35,11 @@ import {
   destroyEntity, collectResourceRefsFromEntities, spawnEntity, Transform, EntityAttributes, type SceneData,
 } from '@modoki/engine/runtime';
 import { serializeScene, deleteEntitiesWithUndo, writeTraitFieldWithUndo, setActionCallback, pushAction } from '@modoki/engine/editor';
-import { setPrefabCache, instantiatePrefab, serializePrefab, applyToPrefabSelective, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { removeTraitFromEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { templateKeysOf } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';

@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, UIEntry, getCurrentWorld, destroyEntity } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved } from '@modoki/engine/editor';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';

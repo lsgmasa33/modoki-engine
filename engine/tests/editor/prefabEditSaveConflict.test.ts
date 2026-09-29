@@ -92,7 +92,7 @@ vi.mock('../../packages/modoki/src/editor/utils/saveDialog', async (importOrigin
 import { registerAsset, setRunMode } from '@modoki/engine/runtime';
 import type { PrefabFile } from '@modoki/engine/editor';
 import { openPrefabForEditing, savePrefabEditReport } from '../../packages/modoki/src/editor/scene/prefabEdit';
-import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefab';
+import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { runSaveAll } from '../../packages/modoki/src/editor/scene/saveCommand';
 import { setCurrentScenePath, hasUnsavedChanges } from '../../packages/modoki/src/editor/scene/serialize';

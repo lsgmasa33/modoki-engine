@@ -15,7 +15,9 @@ import { getTraitByName } from '@modoki/engine/runtime';
 import { clearManifest, registerAsset, loadManifestJson, getGuidForPath } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { acquirePrefab, getCachedPrefab, replaceCachedPrefab, disposeAllCachedResources } from '../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import { applyAssetPathMoves } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
-import { getCachedPrefabSync, primeEditorPrefabCache, seatEditorPrefabCache, editorPrefabDeleted } from '../../packages/modoki/src/editor/scene/prefab';
+import {
+  getCachedPrefabSync, primeEditorPrefabCache, seatEditorPrefabCache, editorPrefabDeleted,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
 import { warmEditorPrefabCacheFor } from '../../packages/modoki/src/editor/scene/prefabCacheWarm';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 

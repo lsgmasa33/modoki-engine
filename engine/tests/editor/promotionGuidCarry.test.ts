@@ -39,10 +39,13 @@ import { markOverride } from '../../packages/modoki/src/runtime/loaders/override
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, createEntityWithUndo, ensureGuid } from '@modoki/engine/editor';
 import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
-  setPrefabCache, applyToPrefabSelective, getCachedPrefabSync, instantiatePrefab, setPrefabSource, carryPromotedGuidsForTest,
-  previewApply, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+  setPrefabCache, getCachedPrefabSync, setPrefabSource,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { applyToPrefabSelective, previewApply } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { carryPromotedGuidsForTest } from '../../packages/modoki/src/editor/scene/prefabApplyStructure';
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';

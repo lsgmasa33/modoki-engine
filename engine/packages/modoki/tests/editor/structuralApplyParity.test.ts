@@ -108,7 +108,7 @@ vi.mock('../../src/runtime/loaders/assetManifest', () => ({
 }));
 vi.mock('../../src/runtime/loaders/assetUrl', () => ({ assetUrl: (p: string) => p }));
 
-const getEditor = () => import('../../src/editor/scene/prefab');
+const getEditor = () => Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
 const getRuntime = () => import('../../src/runtime/loaders/loadSceneFile');
 
 // Prefab: Root(1) → Branch(2, carries Rotate3D) → Leaf(3).

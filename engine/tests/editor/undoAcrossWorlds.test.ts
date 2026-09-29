@@ -28,7 +28,7 @@ import {
   duplicateEntity, createEntityWithUndo, addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, reparentEntity,
 } from '@modoki/engine/editor';
 import { planReparent } from '../../packages/modoki/src/editor/undo/entityActions';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { writeTraitFieldMultiWithUndo, placeholderGestureRefusal, siblingDropRefusal } from '../../packages/modoki/src/editor/undo/entityActions';
 import { commitUIHandleDrag } from '../../packages/modoki/src/editor/scene/uiHandleCommit';
 import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';

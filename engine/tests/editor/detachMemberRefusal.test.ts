@@ -23,7 +23,9 @@ import { markSceneSaved, clearHistory, clearDirtyAssets } from '@modoki/engine/e
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
-import { setPrefabCache, instantiatePrefab, setPrefabSource, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { detachRefusal, detachPrefabMenuItem, detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
 import { readTraitData, findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';

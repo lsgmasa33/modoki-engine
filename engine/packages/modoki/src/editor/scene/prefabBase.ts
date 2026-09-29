@@ -11,10 +11,7 @@
  *  level was expanded from — and folds with the runtime's own folds (`prefabOverrides.ts`), exactly as the editor's
  *  expansion does (`instantiatePrefab`): a row's fields under the outer layer's forwarded ones, then every layer's member
  *  rows over those. {@link chainLayer} is the same fold from a stored root the caller names, for the writers that walk
- *  down from one (the save, the rebuild).
- *
- *  ⚠️ This module and `prefab.ts` import each other. Neither may touch the other at module-evaluation time: every
- *  cross call is inside a function body. */
+ *  down from one (the save, the rebuild). */
 
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
@@ -28,7 +25,8 @@ import {
 } from '../../runtime/loaders/prefabOverrides';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, NestedStructureDelta, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { keptLegacyChannels, setKeptLegacyChannels, legacyPathReached } from '../../runtime/loaders/loadSceneFile';
-import { getCachedPrefabSync, recoverTemplateKey, type PrefabFile } from './prefab';
+import { type PrefabFile } from './prefab';
+import { getCachedPrefabSync, recoverTemplateKey } from './prefabCache';
 
 /** A layer's structural lists, as the fold leaves them for the frame it reaches. `moved` only when an outer layer's
  *  whole-frame slot addressed the frame (it owns the frame's moves then). */

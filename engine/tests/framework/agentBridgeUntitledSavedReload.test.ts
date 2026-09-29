@@ -36,7 +36,7 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 
 // A human's first Cmd+S: the Save-As panel answers, and the create-only write lands.
 // `serializeScene` awaits the prefab source of every instance — the earlier window a Create Scene can land in.
-vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) => {
+vi.mock('../../packages/modoki/src/editor/scene/prefabCache', async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown> & { getPrefabSource: (src: string) => Promise<unknown> }>();
   return { ...real, getPrefabSource: async (src: string) => { await takeSerializeHook(); return real.getPrefabSource(src); } };
 });

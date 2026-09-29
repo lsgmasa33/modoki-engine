@@ -35,9 +35,12 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { serializeScene, deleteEntitiesWithUndo, writeTraitFieldWithUndo, clearHistory, setActionCallback, pushAction } from '@modoki/engine/editor';
-import {
-  setPrefabCache, instantiatePrefab, serializePrefab, applyToPrefabSelective, tagEntityTreeAsInstance, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { tagEntityTreeAsInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { noteFrameRootDoc } from '../../packages/modoki/src/runtime/core/ecs/identityParents';

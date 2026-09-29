@@ -45,7 +45,7 @@ beforeEach(() => { world = createWorld(); setCurrentWorld(world); });
 afterEach(() => { world.destroy(); });
 
 async function collect(entityId: number, metas: TraitMeta[]) {
-  const { collectComparableTraits } = await import('../../src/editor/scene/prefab');
+  const { collectComparableTraits } = await import('../../src/editor/scene/prefabInstanceOverrides');
   return collectComparableTraits(entityId, metas);
 }
 

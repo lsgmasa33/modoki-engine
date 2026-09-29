@@ -118,8 +118,8 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOri
 
 const calls = vi.hoisted(() => [] as { call: 'refresh' | 'rebase'; path?: string; editing: string | null }[]);
 const rebaseWorlds = vi.hoisted(() => [] as unknown[]);
-vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefab')>();
+vi.mock('../../packages/modoki/src/editor/scene/prefabCache', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabCache')>();
   const editing = async () => (await import('../../packages/modoki/src/editor/store/editorStore')).useEditorStore.getState().editingPrefab?.path ?? null;
   return {
     ...actual,
@@ -129,6 +129,13 @@ vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) 
       const f = sm.duringRefresh; sm.duringRefresh = null;
       if (f) await f();
     },
+  };
+});
+vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabRebuild')>();
+  const editing = async () => (await import('../../packages/modoki/src/editor/store/editorStore')).useEditorStore.getState().editingPrefab?.path ?? null;
+  return {
+    ...actual,
     rebaseStaleInstances: async () => {
       calls.push({ call: 'rebase', editing: await editing() });
       rebaseWorlds.push((await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld());

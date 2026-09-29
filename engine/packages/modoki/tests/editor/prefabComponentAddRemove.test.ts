@@ -118,7 +118,7 @@ beforeEach(async () => {
   const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
   clearAllOverrideMarks();
 });
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => Promise.all([import('../../src/editor/scene/prefabApply'), import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstantiate'), import('../../src/editor/scene/prefabRevert')]).then(([m0, m1, m2, m3, m4]) => ({ ...m0, ...m1, ...m2, ...m3, ...m4 }));
 
 const SHIP = 'dddddddd-0000-4000-8000-00000000ship';
 // Single-member prefab whose root has Transform + Spin (no Glow).

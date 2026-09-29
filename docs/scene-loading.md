@@ -610,7 +610,7 @@ defect and were fixed; that test file now also pins the present-at-default case 
 
 - **Scene entities** — compacted, as above.
 - **A prefab instance's `added` children** (structural overrides, `snapshotAddedTraits` in
-  `prefab.ts`) — **also compacted**, and for the same reason: an added child has no prefab base
+  `prefabCapture.ts`) — **also compacted**, and for the same reason: an added child has no prefab base
   to diff against, it is a whole new entity, and `spawnNode` rebuilds it with `meta.trait(d)`
   so koota refills every absent key. It used to be written FULL while its own comment claimed
   to mirror `serialize.ts`, which made every added subtree track whatever fields the schema
@@ -884,7 +884,7 @@ a SoA trait is written in **schema key order** (`Object.keys` of the object pass
 `trait({...})`), and a **scalar at its schema default is omitted**. Hand-edited JSON, or a migration
 that appends a key, breaks the first. Both rules live in ONE place, `writtenTraitKeys` /
 `isFieldWritten` / `traitKeyOrder` in `editor/scene/traitDefault.ts`: `serializeScene` calls it for
-scene entities, prefab.ts's `compactAddedTraitData` for `added[]` children, and
+scene entities, prefabCapture.ts's `compactAddedTraitData` for `added[]` children, and
 `sceneFormatCanonical.test.ts` checks every committed scene's `entities[].traits` against it. So the
 guard cannot pass a writer whose rule moved, which a restated `Object.keys(schema)` in the test
 could (mutation-checked: reversing `traitKeyOrder` turns the corpus guard red). Sharing it also
@@ -1208,7 +1208,7 @@ Two consumers:
 ⚠️ **Anything that RESPAWNS a base entity must carry the stamp, because a fresh spawn reads `''`,
 which means primary.** Losing it is silent data loss, not a cosmetic slip: the next Save All
 writes the entity into the primary and drops it from the base file, so it vanishes from every other
-level using that base. `rebuildInstance` (`editor/scene/prefab.ts`) is the case that shipped
+level using that base. `rebuildInstance` (`editor/scene/prefabRebuild.ts`) is the case that shipped
 (#1431). Refreshing after a prefab save, Revert, and Apply to Prefab all rebuild, and all three
 brought a base's instance back primary-owned. It now reads the old ROOT's stamp before the
 teardown and writes it onto the whole new subtree (members, nested expansions, restored `added`

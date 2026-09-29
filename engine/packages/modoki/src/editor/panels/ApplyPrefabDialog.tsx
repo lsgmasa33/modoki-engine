@@ -8,14 +8,10 @@
 
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { useEditorStore } from '../store/editorStore';
-import {
-  getPrefabSource,
-  preloadNestedPrefabsForSubtree,
-  revertRefusal,
-  missingSourceRefusal,
-  previewApply,
-  type ApplyPreview,
-} from '../scene/prefab';
+import { getPrefabSource, preloadNestedPrefabsForSubtree } from '../scene/prefabCache';
+import { missingSourceRefusal } from '../scene/prefabFrames';
+import { previewApply, type ApplyPreview } from '../scene/prefabApply';
+import { revertRefusal } from '../scene/prefabRevert';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
 import { revertOverridesWithUndo } from '../undo/revertPrefabUndo';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';

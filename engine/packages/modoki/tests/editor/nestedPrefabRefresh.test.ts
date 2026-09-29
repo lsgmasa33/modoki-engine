@@ -122,7 +122,7 @@ beforeEach(async () => {
   const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
   clearAllOverrideMarks();
 });
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => Promise.all([import('../../src/editor/scene/prefabApply'), import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate'), import('../../src/editor/scene/prefabSerialize')]).then(([m0, m1, m2, m3]) => ({ ...m0, ...m1, ...m2, ...m3 }));
 
 const INNER = 'bbbbbbbb-0000-4000-8000-0000000inner';
 const OUTER = 'bbbbbbbb-0000-4000-8000-0000000outer';

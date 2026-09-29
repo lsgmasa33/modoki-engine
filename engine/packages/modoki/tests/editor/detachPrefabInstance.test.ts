@@ -76,7 +76,7 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
 
 beforeEach(() => { testWorld = createWorld(); index.clear(); });
 
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => import('../../src/editor/scene/prefabLink');
 
 const SRC = 'aaaaaaaa-0000-4000-8000-00000000 src1'.replace(' src1', '0001');
 const INNER_SRC = 'aaaaaaaa-0000-4000-8000-00000000 src2'.replace(' src2', '0002');

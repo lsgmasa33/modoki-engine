@@ -20,7 +20,9 @@ import {
   deriveInstanceMemberGuids, getCurrentWorld, Transient, UIAction,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, undo, redo } from '@modoki/engine/editor';
-import { setPrefabCache, evictDeletedEditorPrefabs, isEditorPrefabCached } from '../../packages/modoki/src/editor/scene/prefab';
+import {
+  setPrefabCache, evictDeletedEditorPrefabs, isEditorPrefabCached,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';

@@ -84,7 +84,8 @@ import {
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
-import { setPrefabCache, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
 import { setCurrentScenePath } from '../../packages/modoki/src/editor/scene/serialize';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';

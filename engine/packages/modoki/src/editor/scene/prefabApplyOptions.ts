@@ -14,7 +14,8 @@ import { frameBase, ownedRootAt, levelDoc } from './prefabBase';
 import { memberPathSteps } from '../../runtime/core/assetRefRules';
 import { chainSlots, resolveKeyLevel, defaultKeyLevel } from './prefabApplyTargets';
 import { toLocalIdKey, splitNestedKey } from './overrideKeyGrammar';
-import { getCachedPrefabSync, type PrefabFile } from './prefab';
+import { type PrefabFile } from './prefab';
+import { getCachedPrefabSync } from './prefabCache';
 
 export interface ApplyTargetOption {
   /** The prefab's guid (its `PrefabInstance.source`): what `ApplyTargets` names it by. */

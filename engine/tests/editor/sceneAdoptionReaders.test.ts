@@ -101,9 +101,12 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
   };
 });
 
-vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) => ({
+vi.mock('../../packages/modoki/src/editor/scene/prefabCache', async (importOriginal) => ({
   ...await importOriginal<Record<string, unknown>>(),
   refreshPrefabSourceForPath: async () => {},
+}));
+vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (importOriginal) => ({
+  ...await importOriginal<Record<string, unknown>>(),
   rebaseStaleInstances: async () => 0,
 }));
 

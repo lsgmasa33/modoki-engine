@@ -33,7 +33,10 @@ import { findEntity, writeTraitField } from '../../runtime/core/ecs/entityUtils'
 import { markOverride, unmarkOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { findEntityByGuid } from '../../runtime/core/ecs/world';
 import { relinkDetachedMembers, type DetachedMember } from '../../runtime/core/ecs/memberHome';
-import { collectComparableTraits, getOverrideValues, getCachedPrefabSync, instanceBase, baseTokenResolver } from '../scene/prefab';
+import { getCachedPrefabSync } from '../scene/prefabCache';
+import { baseTokenResolver } from '../scene/prefabTokens';
+import { collectComparableTraits, getOverrideValues } from '../scene/prefabInstanceOverrides';
+import { instanceBase } from '../scene/prefabChain';
 import { makeReorderSiblingsAction, type SiblingSortChange } from './reorderSiblingsUndo';
 import type { UndoAction } from './undoManager';
 import { entityRef, buildGuidIndex, requireWith } from './entityRef';

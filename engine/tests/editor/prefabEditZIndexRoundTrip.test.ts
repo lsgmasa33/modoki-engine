@@ -95,7 +95,8 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { setRunMode } from '@modoki/engine/runtime';
 import type { PrefabFile } from '@modoki/engine/editor';
 import { openPrefabForEditing, savePrefabEdit, savePrefabEditReport, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
-import { getCachedPrefabSync, warnInertPrefabSizes } from '../../packages/modoki/src/editor/scene/prefab';
+import { warnInertPrefabSizes } from '../../packages/modoki/src/editor/scene/prefab';
+import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { setCurrentScenePath } from '../../packages/modoki/src/editor/scene/serialize';
 
 registerAllTraits();

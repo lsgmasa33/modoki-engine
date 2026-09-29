@@ -83,7 +83,7 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
 
 beforeEach(() => { testWorld = createWorld(); index.clear(); });
 
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => Promise.all([import('../../src/editor/scene/prefab'), import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate'), import('../../src/editor/scene/prefabLink'), import('../../src/editor/scene/prefabSerialize')]).then(([m0, m1, m2, m3, m4]) => ({ ...m0, ...m1, ...m2, ...m3, ...m4 }));
 
 const INNER = 'aaaaaaaa-0000-4000-8000-00000000inner'.replace('inner', '0001');
 const OUTER = 'aaaaaaaa-0000-4000-8000-00000000outer'.replace('outer', '0002');

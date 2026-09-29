@@ -24,7 +24,8 @@ import { addTraitToEntitiesWithUndo } from '../../packages/modoki/src/editor/und
 import { findEntityByGuid } from '../../packages/modoki/src/runtime/core/ecs/world';
 import { getTraitByName } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
-import { getCachedPrefabSync, applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefab';
+import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);

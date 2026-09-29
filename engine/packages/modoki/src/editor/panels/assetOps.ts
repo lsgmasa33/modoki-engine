@@ -14,7 +14,18 @@
 
 import { whyWorldNotAuthored, notAuthoredExit } from '../scene/authoredWorld';
 import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody, callBackend, postBackend, type BackendAnswer } from '../backend/editorBackend';
-import { serializePrefab, preloadNestedPrefabsForSubtree, getCachedPrefabSync, primeEditorPrefabCache, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, rebaseStaleInstancesSoon, warnInertPrefabSizes, classifyExistingDocumentId, parsedPrefabRows, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, parkedPrefabRead, type PrefabFile } from '../scene/prefab';
+import { warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
+import {
+  preloadNestedPrefabsForSubtree, getCachedPrefabSync, primeEditorPrefabCache, classifyExistingDocumentId,
+  parkedPrefabRead,
+} from '../scene/prefabCache';
+import { missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal } from '../scene/prefabFrames';
+import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
+import { serializePrefab, parsedPrefabRows } from '../scene/prefabSerialize';
+import {
+  tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance,
+  tagCreatedPrefab,
+} from '../scene/prefabLink';
 import { partOfInstanceRefusal } from '../scene/restructureRefusal';
 import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';

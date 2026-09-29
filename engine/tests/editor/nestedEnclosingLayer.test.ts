@@ -34,10 +34,15 @@ import {
   setActionCallback, pushAction, clearHistory, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo,
   addTraitToEntitiesWithUndo, createEntityWithUndo, writeTraitFieldWithUndo, duplicateEntity,
 } from '@modoki/engine/editor';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
-  setPrefabCache, rebaseStaleInstances, serializePrefab, applyToPrefabSelective, revertOverridesSelective, getCachedPrefabSync, instantiatePrefab, setPrefabSource,
-  previewApply, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+  setPrefabCache, getCachedPrefabSync, setPrefabSource,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { applyToPrefabSelective, previewApply } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { describeEffect } from '../../packages/modoki/src/editor/scene/prefabApplyEffects';
 import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';

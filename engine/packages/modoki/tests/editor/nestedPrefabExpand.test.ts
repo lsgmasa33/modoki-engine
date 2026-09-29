@@ -99,7 +99,7 @@ global.fetch = vi.fn(async (url: string) => {
 });
 
 beforeEach(() => { testWorld = createWorld(); index.clear(); fileServer.clear(); });
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
 
 // ── Fixtures ───────────────────────────────────────────────────────────
 const INNER = 'aaaaaaaa-0000-4000-8000-0000000inner';

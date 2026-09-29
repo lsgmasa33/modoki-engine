@@ -111,7 +111,7 @@ function guidOf(id: number): string {
 }
 
 async function expandWithNestedAdd(guid: string) {
-  const mod = await import('../../src/editor/scene/prefab');
+  const mod = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
   mod.setPrefabCache(ADDED, addedPrefab as never);
   const rootId = mod.instantiatePrefab(outerPrefab as never, 0);
   mod.setPrefabSource(rootId, { id: OUTER });

@@ -130,7 +130,7 @@ beforeEach(() => {
 });
 afterEach(() => { vi.unstubAllGlobals(); });
 
-const mod = () => import('../../src/editor/scene/prefab');
+const mod = () => Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
 const warm = () => import('../../src/editor/scene/prefabCacheWarm');
 
 /** A staging world holding one instance of GUID, with the editor cache cold. */
@@ -224,15 +224,20 @@ describe('instantiatePrefabInstance — cache keyed by what the INSTANCE carries
  *  It is here because the close-out sweep found precisely that: `modoki_prefab instantiate` and its
  *  undo respawn, which the deleted census could never have caught either (it anchored on
  *  serializePrefab / captureInstanceStructure / tagEntityTreeAsInstance, and that path calls none). */
-describe('#1295 — setPrefabSource is prefab.ts\'s to pair with an instantiate', () => {
-  it('has no production caller outside prefab.ts', () => {
+/** The modules prefab.ts was split into (#1656 § Plan step 5): together they are what "prefab.ts" named here. */
+const PREFAB_MODULES = new Set(['prefab', 'prefabCache', 'prefabTokens', 'prefabMembers', 'prefabInstanceOverrides', 'prefabCapture',
+  'prefabFrames', 'prefabInstantiate', 'prefabChain', 'prefabRebuild', 'prefabSerialize', 'prefabApplyStructure', 'prefabApply',
+  'prefabLink', 'prefabRevert'].map((m) => `editor${path.sep}scene${path.sep}${m}.ts`));
+
+describe('#1295 — setPrefabSource is the prefab modules\' to pair with an instantiate', () => {
+  it('has no production caller outside the prefab modules', () => {
     const roots = [path.resolve(__dirname, '../../src/editor'), path.resolve(__dirname, '../../../../app')];
     const offenders: string[] = [];
     for (const root of roots) {
       for (const rel of fs.readdirSync(root, { recursive: true }) as string[]) {
         if (!/\.tsx?$/.test(rel)) continue;
         const abs = path.join(root, rel);
-        if (abs.endsWith(`editor${path.sep}scene${path.sep}prefab.ts`)) continue;
+        if ([...PREFAB_MODULES].some((m) => abs.endsWith(m))) continue;
         // ⚠️ Through the stripping reader, never raw text (#812): a COMMENT naming
         // `setPrefabSource(` would otherwise be reported as an offender, and this file's own
         // fix commentary does exactly that. `setPrefabSourceRefresher` is a different symbol,

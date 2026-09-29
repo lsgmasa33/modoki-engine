@@ -14,7 +14,8 @@ import { getCurrentWorld, markOverride, findEntityById, getTraitByName } from '@
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { instantiatePrefab, captureInstanceOverrides, type PrefabFile } from '@modoki/engine/editor';
 import { collectInstanceOverrideTree } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
-import { memberOverrideKeys, collectComparableTraits } from '../../packages/modoki/src/editor/scene/prefab';
+import { collectComparableTraits } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
+import { memberOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabChain';
 
 registerAllTraits();
 

@@ -27,13 +27,14 @@ import { repoFiles } from '../../scripts/repoCorpus.mjs';
 const PRESERVE = 'preserveLocalIds';
 const TAG = 'tagEntityTreeAsInstance';
 
-/** Every editor source file, minus tests, the module that DEFINES the numbering (it legitimately
- *  names both) and the barrel (it re-exports, calls nothing). The floor is the corpus guard: a
- *  scan that silently matches nothing would make every assertion below vacuous. */
+/** Every editor source file, minus tests and the barrel (it re-exports, calls nothing). The module
+ *  that defines the numbering used to be excluded too, as it named both; since the prefab.ts split
+ *  (#1656 § Plan step 5) the numbering (`prefabSerialize.ts`) and the tag (`prefabLink.ts`) live
+ *  apart, neither names both, and both are scanned. The floor is the corpus guard: a scan that
+ *  silently matches nothing would make every assertion below vacuous. */
 function editorSources(): { rel: string; abs: string }[] {
   return repoFiles({ under: 'engine', match: /\.tsx?$/, floor: 500 })
     .filter(({ rel }: { rel: string }) => !/[\\/]tests?[\\/]|\.test\.tsx?$/.test(rel))
-    .filter(({ rel }: { rel: string }) => !rel.endsWith('editor/scene/prefab.ts'))
     .filter(({ rel }: { rel: string }) => !rel.endsWith('editor/index.ts'));
 }
 
@@ -42,10 +43,10 @@ function editorSources(): { rel: string; abs: string }[] {
  *  Through `readScannedSource`, the shared entry point `commentStripperIsShared.test.ts` exists to
  *  enforce, so a comment naming both symbols cannot fail this guard.
  *
- *  ⚠️ Honest scope: no file in the CURRENT corpus is saved by the strip — `tagEntityTreeAsInstance`'s
- *  own docblock does name `preserveLocalIds`, but it lives in `editor/scene/prefab.ts`, which
- *  `editorSources()` excludes anyway, and reverting to a raw read leaves both tests green today.
- *  This is the convention, not a live save. */
+ *  ⚠️ Honest scope: since the prefab.ts split (#1656 § Plan step 5) this is a live save, not only the
+ *  convention. `prefab.ts` and `prefabSerialize.ts` both name `tagEntityTreeAsInstance` in COMMENTS
+ *  beside a `preserveLocalIds` mention, and a raw read would flag both (measured when the exclusion of
+ *  `prefab.ts` was retired). */
 function filesMentioning(symbol: string): string[] {
   return editorSources()
     .filter(({ abs }) => readScannedSource(abs).code.includes(symbol))

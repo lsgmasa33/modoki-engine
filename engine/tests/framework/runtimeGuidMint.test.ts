@@ -30,7 +30,7 @@ import { _getRuntimeGuidGeneration, _runtimeAddressRows, getGuidIndex, rebuildGu
 import { setActiveCameraFrame } from '../../packages/modoki/src/runtime/rendering/scene3DSync';
 import { computeLayoutBounds } from '../../app/debug/layoutDump';
 import { runAgentOp } from '../../app/debug/agentBridge';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { isSkippedByPrimarySave } from '../../packages/modoki/src/editor/scene/serialize';
 import { Transient } from '../../packages/modoki/src/runtime/core/traits/Transient';
 

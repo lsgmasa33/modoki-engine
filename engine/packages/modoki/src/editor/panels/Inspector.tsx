@@ -15,7 +15,8 @@ import { geometryBoxHalfExtents, geometryBoundingRadius } from '../../runtime/ph
 import { getAnimSet } from '../../runtime/loaders/animSetCache';
 import { useEditorStore } from '../store/editorStore';
 import { withPrefabEditRefusalToast } from './prefabEditRefusalToast';
-import { getPrefabSource, getCachedPrefabSync, memberOverrideKeys } from '../scene/prefab';
+import { getPrefabSource, getCachedPrefabSync } from '../scene/prefabCache';
+import { memberOverrideKeys } from '../scene/prefabChain';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { isSkippedByPrimarySave } from '../scene/serialize';
 import { placePrefabFromPath } from '../scene/prefabPlace';

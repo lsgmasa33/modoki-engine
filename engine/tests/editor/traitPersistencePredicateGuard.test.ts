@@ -15,7 +15,7 @@
  *  and stays legal — that asks about presentation, which is what the list is for. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { accessPath, findNodes, lineOf, parseSource, ts } from '@modoki/engine/testing/sourceAst';
@@ -25,8 +25,11 @@ const SRC = join(__dirname, '..', '..', 'packages', 'modoki', 'src');
 
 /** The persistence-deciding surfaces: everything that writes a scene/prefab file
  *  or restores one into the world. */
+const SCENE = join(SRC, 'editor', 'scene');
 const GUARDED = [
-  join(SRC, 'editor', 'scene', 'prefab.ts'),
+  // Every prefab module, by glob — prefab.ts was split into one module per concern (#1656 § Plan step 5), and a new
+  // function in the old file was guarded automatically; a new `prefab*.ts` module is guarded the same way.
+  ...readdirSync(SCENE).filter((f) => /^prefab\w*\.ts$/.test(f)).sort().map((f) => join(SCENE, f)),
   join(SRC, 'editor', 'scene', 'serialize.ts'),
   join(SRC, 'runtime', 'loaders', 'loadSceneFile.ts'),
   join(SRC, 'runtime', 'scene', 'SceneManager.ts'),
@@ -76,5 +79,7 @@ describe('meta.fields is never used as a persistence predicate', () => {
 
   it('every guarded file exists (a renamed file must not silently drop its guard)', () => {
     for (const file of GUARDED) expect(() => readFileSync(file, 'utf8')).not.toThrow();
+    // The glob's floor: the 15 modules prefab.ts was split into, so a glob that matches nothing cannot pass vacuously.
+    expect(GUARDED.filter((f) => /[\\/]prefab\w*\.ts$/.test(f)).length).toBeGreaterThanOrEqual(15);
   });
 });

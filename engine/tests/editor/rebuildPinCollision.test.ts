@@ -16,7 +16,11 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory } from '@modoki/engine/editor';
-import { setPrefabCache, rebuildInstance, captureInstanceOverrides, captureInstanceStructure, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
+import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
+import { rebuildInstance } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { registerAllTraits } from '../../app/ecs/registerTraits';

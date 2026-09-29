@@ -51,7 +51,7 @@ function productionSources(): { rel: string; abs: string }[] {
   return repoFiles({ under: 'engine', match: /\.tsx?$/, floor: 500 })
     .filter(({ rel }: { rel: string }) => !/[\\/]tests?[\\/]|\.test\.tsx?$/.test(rel))
     // The module that DEFINES it, and the barrel that re-exports it, call nothing.
-    .filter(({ rel }: { rel: string }) => !rel.endsWith('editor/scene/prefab.ts'))
+    .filter(({ rel }: { rel: string }) => !rel.endsWith('editor/scene/prefabSerialize.ts'))
     .filter(({ rel }: { rel: string }) => !rel.endsWith('editor/index.ts'));
 }
 

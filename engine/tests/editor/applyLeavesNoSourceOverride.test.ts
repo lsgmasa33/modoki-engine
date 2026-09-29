@@ -27,7 +27,9 @@ import {
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { setActionCallback, pushAction, writeTraitFieldWithUndo } from '@modoki/engine/editor';
-import { setPrefabCache, applyToPrefabSelective, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 

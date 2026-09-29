@@ -33,7 +33,7 @@ import { registerEditorRefLiveness, _heldPointerGuids } from '../../packages/mod
 import { _sessionRowsForTest } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { getTraitByName } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';

@@ -30,12 +30,15 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
 import { serializeScene, isSceneLoadSwapping } from '../scene/serialize';
 import { withAdoption, adoptionsSettled, captureAdoption } from '../scene/sceneAdoption';
+import { guidForEntityId, entityIdForGuid, resolveInstanceContext, type PrefabFile } from '../scene/prefab';
+import { getPrefabSource, preloadNestedPrefabsForSubtree } from '../scene/prefabCache';
+import { captureInstanceOverrides } from '../scene/prefabInstanceOverrides';
+import { captureInstanceStructure } from '../scene/prefabCapture';
 import {
-  applyToPrefabSelective, guidForEntityId, entityIdForGuid,
-  resolveInstanceContext, getPrefabSource, captureInstanceOverrides, captureInstanceStructure,
-  rebuildInstanceFromCapture, preloadNestedPrefabsForSubtree, refreshBaseInstances, rebaseStaleInstances,
-  captureNestedFrames, type ApplyResult, type PrefabFile, type NestedInstanceCapture,
-} from '../scene/prefab';
+  rebuildInstanceFromCapture, refreshBaseInstances, rebaseStaleInstances, captureNestedFrames,
+  type NestedInstanceCapture,
+} from '../scene/prefabRebuild';
+import { applyToPrefabSelective, type ApplyResult } from '../scene/prefabApply';
 import type { ApplyTargets } from '../scene/prefabApplyTargets';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { useEditorStore } from '../store/editorStore';

@@ -11,10 +11,12 @@ import { getTraitByName, seedRng, rngNext, findEntity } from '@modoki/engine/run
 import { pushAction } from '@modoki/engine/editor';
 import { createPrefabFromEntity, deleteAssetFiles, deletionPathsFor, moveAsset, planDeleteOutcome, planRename } from '../../../packages/modoki/src/editor/panels/assetOps';
 import { applyAssetPathMoves, unbindDeletedAssetEditors } from '../../../packages/modoki/src/editor/panels/assetEditorBindings';
+import { type PrefabFile } from '../../../packages/modoki/src/editor/scene/prefab';
 import {
-  getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, revertRefusal,
-  type PrefabFile,
-} from '../../../packages/modoki/src/editor/scene/prefab';
+  getCachedPrefabSync, preloadNestedPrefabsForSubtree,
+} from '../../../packages/modoki/src/editor/scene/prefabCache';
+import { previewApply } from '../../../packages/modoki/src/editor/scene/prefabApply';
+import { revertRefusal } from '../../../packages/modoki/src/editor/scene/prefabRevert';
 import { placePrefabFromPath } from '../../../packages/modoki/src/editor/scene/prefabPlace';
 import { suppliedByPrefabChecker } from '../../../packages/modoki/src/editor/scene/restructureRefusal';
 import { detachPrefabInstanceWithUndo, detachRefusal } from '../../../packages/modoki/src/editor/undo/detachPrefabUndo';

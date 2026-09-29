@@ -25,9 +25,10 @@ import {
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
-import {
-  setPrefabCache, serializePrefab, tagEntityTreeAsInstance, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { tagEntityTreeAsInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -145,7 +146,7 @@ describe('gesture: REFRESH (rebuildInstance) — the instance re-expands from a 
     // The template loses its first child, so Badge inherits Panel's localId — and a rebuild that
     // re-derived would hand Badge the guid PANEL used to answer to.
     const second = templateWithout('Panel');
-    const { rebuildInstance } = await import('../../packages/modoki/src/editor/scene/prefab');
+    const { rebuildInstance } = await Promise.all([import('../../packages/modoki/src/editor/scene/prefabLink'), import('../../packages/modoki/src/editor/scene/prefabRebuild'), import('../../packages/modoki/src/editor/scene/prefabSerialize')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
     rebuildInstance(idOf('Root'), PREFAB, second, {}, {});
 
     expect(guidOf('Badge')).toBe(badgeGuid);
@@ -166,7 +167,7 @@ describe('gesture: REFRESH (rebuildInstance) — the instance re-expands from a 
     const badgeGuid = guidOf('Badge');
     const badgeNode = rowOf(template, 'Badge').nodeGuid!;
     const second = templateWithout('Panel');
-    const { rebuildInstance } = await import('../../packages/modoki/src/editor/scene/prefab');
+    const { rebuildInstance } = await Promise.all([import('../../packages/modoki/src/editor/scene/prefabLink'), import('../../packages/modoki/src/editor/scene/prefabRebuild'), import('../../packages/modoki/src/editor/scene/prefabSerialize')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
     rebuildInstance(idOf('Root'), PREFAB, second, {}, {});
 
     const resaved = await serializeScene() as unknown as { entities: unknown[] };
@@ -208,7 +209,7 @@ describe('gesture: DETACH — the members stop being members', () => {
     await load(scene as unknown as SceneData);
     const badgeGuid = guidOf('Badge');
 
-    const { detachPrefabInstance } = await import('../../packages/modoki/src/editor/scene/prefab');
+    const { detachPrefabInstance } = await Promise.all([import('../../packages/modoki/src/editor/scene/prefabLink'), import('../../packages/modoki/src/editor/scene/prefabRebuild'), import('../../packages/modoki/src/editor/scene/prefabSerialize')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
     detachPrefabInstance(idOf('Root'), { strip: true });
 
     expect(guidOf('Badge')).toBe(badgeGuid);
@@ -303,7 +304,7 @@ describe('gesture: RIGGED MODEL RE-IMPORT — the prefab is regenerated from the
   });
 
   it('carries the node guid through a re-import that MATCHES, so the scene rows still name the member', async () => {
-    const { mergeRiggedPrefab } = await import('../../packages/modoki/src/editor/scene/prefab');
+    const { mergeRiggedPrefab } = await Promise.all([import('../../packages/modoki/src/editor/scene/prefabLink'), import('../../packages/modoki/src/editor/scene/prefabRebuild'), import('../../packages/modoki/src/editor/scene/prefabSerialize')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
     // The regenerated side comes from the GLB and carries no modoki identity — that is the honest
     // limit the #1468 design record states (nothing survives a DCC rename). The merge is what puts it back, matched by bone NAME.
     const merged = mergeRiggedPrefab(rigged('Spine', FRESH_NODE), rigged('Spine', BONE_NODE));
@@ -311,7 +312,7 @@ describe('gesture: RIGGED MODEL RE-IMPORT — the prefab is regenerated from the
   });
 
   it('lets the FRESH identity stand on a rename, so the row dangles rather than naming another node', async () => {
-    const { mergeRiggedPrefab } = await import('../../packages/modoki/src/editor/scene/prefab');
+    const { mergeRiggedPrefab } = await Promise.all([import('../../packages/modoki/src/editor/scene/prefabLink'), import('../../packages/modoki/src/editor/scene/prefabRebuild'), import('../../packages/modoki/src/editor/scene/prefabSerialize')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
     // An artist renames a bone. Neither part of the design survives that and nothing can (#1468 design record, the node guid) —
     // the containment is that the renamed node keeps the identity the fresh import minted for it, so
     // the old row matches nothing instead of naming whichever node inherited the localId.

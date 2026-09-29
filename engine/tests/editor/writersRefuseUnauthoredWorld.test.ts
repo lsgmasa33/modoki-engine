@@ -16,7 +16,7 @@ import * as tp from '../../packages/modoki/src/editor/scene/timelinePreview';
 import { enterScrubMode, exitPreviewMode } from '../../packages/modoki/src/editor/scene/playMode';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { setCurrentScenePath } from '../../packages/modoki/src/editor/scene/serialize';
-import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefab';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { restoreAuthoredSnapshot } from '../../packages/modoki/src/editor/scene/authoredSnapshot';
 import { isWorldAuthored, whyWorldNotAuthored, registerPosedWorldSource } from '../../packages/modoki/src/editor/scene/authoredWorld';

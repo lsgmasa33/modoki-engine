@@ -113,7 +113,7 @@ const shipPrefab = {
 };
 
 async function setup() {
-  const m = await import('../../src/editor/scene/prefab');
+  const m = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
   m.setPrefabCache(SRC, shipPrefab as any);
   const root = m.instantiatePrefab(shipPrefab as any);
   m.setPrefabSource(root, { id: SRC });

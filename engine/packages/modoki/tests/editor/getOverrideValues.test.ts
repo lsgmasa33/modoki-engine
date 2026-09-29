@@ -6,7 +6,7 @@ import { trait } from 'koota';
 import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 
 async function getModule() {
-  return import('../../src/editor/scene/prefab');
+  return import('../../src/editor/scene/prefabInstanceOverrides');
 }
 
 function makePrefab(entities: { localId: number; traits: Record<string, Record<string, unknown> | boolean> }[]) {

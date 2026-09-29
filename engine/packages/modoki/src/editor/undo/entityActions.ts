@@ -35,7 +35,8 @@ import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
 import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT } from '../scene/restructureRefusal';
-import { prefabNestingReader, rebaseStaleInstancesSoon } from '../scene/prefab';
+import { prefabNestingReader } from '../scene/prefabCache';
+import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
 import { translateLocalIds } from '../../runtime/loaders/memberTranslation';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.

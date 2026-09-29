@@ -26,15 +26,22 @@ import {
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
 import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
-  setPrefabCache, instantiatePrefab, setPrefabSource, rebaseStaleInstances, captureInstanceStructure,
-  framesBuiltFromOtherRows, getCachedPrefabSync, detachPrefabInstance, reattachDetachedInstance, reattachPrefabInstance,
-  tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+  setPrefabCache, setPrefabSource, getCachedPrefabSync,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
+import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
+import { framesBuiltFromOtherRows } from '../../packages/modoki/src/editor/scene/prefabFrames';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import {
+  detachPrefabInstance, reattachDetachedInstance, reattachPrefabInstance, tagEntityTreeAsInstance,
+  untagEntityTreeAsInstance, unstampMemberGuids,
+} from '../../packages/modoki/src/editor/scene/prefabLink';
 import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';
 import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
-import { nestedFrameMoves } from '../../packages/modoki/src/editor/scene/prefab';
+import { nestedFrameMoves } from '../../packages/modoki/src/editor/scene/prefabChain';
 import { undo, redo, canUndo, canRedo, swapHistory, _resetHistoryContexts, getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { registerAllTraits } from '../../app/ecs/registerTraits';

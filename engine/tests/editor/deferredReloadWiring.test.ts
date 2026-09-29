@@ -12,7 +12,7 @@ import { sceneManager, setRunMode, registerAsset, unregisterAsset } from '@modok
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { initAgentBridge, peekSuppressedSceneReloads, replaySuppressedSceneReloads } from '../../app/debug/agentBridge';
 import { beginWorldReplacement } from '../../packages/modoki/src/editor/scene/authoringSettle';
-import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { pushAction, canUndo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { markSceneSaved, hasUnsavedChanges } from '../../packages/modoki/src/editor/scene/serialize';

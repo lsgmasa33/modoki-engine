@@ -23,9 +23,10 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { writeTraitFieldWithUndo, clearHistory, setActionCallback, pushAction } from '@modoki/engine/editor';
-import {
-  setPrefabCache, instantiatePrefab, rebuildInstance, captureInstanceStructure,
-} from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { rebuildInstance } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { templateKeyOf, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 

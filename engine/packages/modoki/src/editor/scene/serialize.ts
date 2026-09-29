@@ -26,10 +26,14 @@ import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
 import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceMembers, captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, moveChannelsOntoRows, preloadNestedPrefabs, rebaseStaleInstances, savedFrameDoc } from './prefab';
+import { getPrefabSource, preloadNestedPrefabs } from './prefabCache';
+import { captureInstanceOverrides } from './prefabInstanceOverrides';
+import { captureInstanceMembers } from './prefabMembers';
+import { captureInstanceStructure, captureNestedChannels, moveChannelsOntoRows } from './prefabCapture';
+import { rebaseStaleInstances, savedFrameDoc } from './prefabRebuild';
 import { levelDoc, withKeptLegacy } from './prefabBase';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
-export { captureNestedSceneDelta } from './prefab';
+export { captureNestedSceneDelta } from './prefabCapture';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { asSceneEntry } from '../../runtime/loaders/unresolvedPrefabRefs';

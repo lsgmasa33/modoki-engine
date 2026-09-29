@@ -32,7 +32,7 @@ import {
 import {
   pasteTraitAsNewWithUndo, pasteTraitValuesWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo,
 } from '../../packages/modoki/src/editor/undo/entityActions';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { writeUIHandleValues, commitUIHandleDrag } from '../../packages/modoki/src/editor/scene/uiHandleCommit';
 import { makeSortOrderRenumberAction } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';

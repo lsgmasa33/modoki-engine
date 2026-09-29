@@ -11,7 +11,7 @@ import {
 } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { parkPrefab } from '../../packages/modoki/src/editor/scene/dirtyAssets';
-import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
 

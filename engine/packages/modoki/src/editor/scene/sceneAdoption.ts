@@ -35,7 +35,8 @@ import { PREFAB_EDIT_SCENE_PREFIX } from '../../runtime/core/ecs/sceneLoaded';
 import { useEditorStore } from '../store/editorStore';
 import { editorEmit } from '../editorJournal';
 import { clearSceneDirtyExcept, dirtySceneGuidsSnapshot, hasDirtySceneOutside } from './sceneDirty';
-import { refreshPrefabSourceForPath, rebaseStaleInstances } from './prefab';
+import { refreshPrefabSourceForPath } from './prefabCache';
+import { rebaseStaleInstances } from './prefabRebuild';
 import { registerPosedWorldSource } from './authoredWorld';
 import { normScenePath } from '../../runtime/scene/scenePathKey';
 

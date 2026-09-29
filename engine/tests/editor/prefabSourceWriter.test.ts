@@ -13,7 +13,9 @@ import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { createWorld } from 'koota';
 import { getCurrentWorld, setCurrentWorld, getTraitByName, clearManifest, registerAsset } from '@modoki/engine/runtime';
 import { readScannedSource } from '@modoki/engine/testing';
-import { setPrefabCache, instantiatePrefab, instantiatePrefabInstance, setPrefabSource, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefab, instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -90,8 +92,8 @@ describe('guard: setPrefabSource is the only editor writer of PrefabInstance.sou
     // The one: inside setPrefabSource. The Create Prefab tag writes `{ source: ref }` through `instanceSourceRef`, the
     // document-first owner (#1807), as a trait init rather than an assignment.
     expect(hits).toHaveLength(1);
-    expect(hits[0]).toMatch(/^engine\/packages\/modoki\/src\/editor\/scene\/prefab\.ts:/);
-    const src = readScannedSource(repoFiles({ under: 'engine/packages/modoki/src/editor/scene', match: /\/prefab\.ts$/, floor: 1 })[0]!.abs).code;
+    expect(hits[0]).toMatch(/^engine\/packages\/modoki\/src\/editor\/scene\/prefabCache\.ts:/);
+    const src = readScannedSource(repoFiles({ under: 'engine/packages/modoki/src/editor/scene', match: /\/prefabCache\.ts$/, floor: 1 })[0]!.abs).code;
     const fn = src.slice(src.indexOf('export function setPrefabSource('), src.indexOf('export function setPrefabSource(') + 1500);
     expect(fn).toContain('.source = ref');
     expect(fn).not.toMatch(/getGuidForPath/);

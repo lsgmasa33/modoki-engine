@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, getCurrentWorld, transformPropagationSystem } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, canUndo, undo, redo } from '@modoki/engine/editor';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { getTraitByName } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 import { registerAllTraits } from '../../app/ecs/registerTraits';

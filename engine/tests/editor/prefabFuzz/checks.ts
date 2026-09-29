@@ -10,7 +10,7 @@ import { validatePrefabData, validateSceneData } from '../../../packages/modoki/
 import { buildSceneSchema } from '../../../packages/modoki/src/runtime/scene/sceneSchema';
 import { assertNoRuntimeGuids } from '../../../packages/modoki/src/editor/scene/runtimeGuidTripwire';
 import { PREFAB_FORMAT_VERSION } from '../../../packages/modoki/src/runtime/core/version';
-import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefab';
+import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
 import { findEntity } from '@modoki/engine/runtime';
 import { unresolvedRefOf, UnresolvedPrefabRef } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { piOf } from './harness';

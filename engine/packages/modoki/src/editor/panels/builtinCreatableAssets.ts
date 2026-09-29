@@ -15,7 +15,7 @@ import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newScene, saveScene, NewSceneRefusedError } from '../scene/serialize';
 import { SCENE_EXT } from '../scene/sceneFileName';
-import { classifyExistingDocumentId } from '../scene/prefab';
+import { classifyExistingDocumentId } from '../scene/prefabCache';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { useEditorStore } from '../store/editorStore';
 

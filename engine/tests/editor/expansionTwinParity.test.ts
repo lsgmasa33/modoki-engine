@@ -33,9 +33,11 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, getAllTraits, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, deriveInstanceMemberGuids, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
+import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import {
-  setPrefabCache, instantiatePrefab, setPrefabSource, applyStructureByRootInstance, rebaseStaleInstances,
-} from '../../packages/modoki/src/editor/scene/prefab';
+  instantiatePrefab, applyStructureByRootInstance,
+} from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { frameRootDoc } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { registerAllTraits } from '../../app/ecs/registerTraits';

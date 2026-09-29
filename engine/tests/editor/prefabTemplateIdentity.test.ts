@@ -38,10 +38,15 @@ import { getEditVersion } from '../../packages/modoki/src/editor/undo/undoManage
 import { restructureRefusal, RESTRUCTURE_REFUSAL_TEXT, partOfInstanceRefusal, PART_OF_INSTANCE_TEXT } from '../../packages/modoki/src/editor/scene/restructureRefusal';
 import { detachRefusal, detachPrefabMenuItem, detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { baseTokenResolver } from '../../packages/modoki/src/editor/scene/prefabTokens';
 import {
-  setPrefabCache, serializePrefab, applyToPrefabSelective, instantiatePrefabAsync, getOverrideValues, collectComparableTraits,
-  baseTokenResolver, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+  getOverrideValues, collectComparableTraits,
+} from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
+import { instantiatePrefabAsync } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import type { AddedEntity } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setTemplateKey, templateKeyOf, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';

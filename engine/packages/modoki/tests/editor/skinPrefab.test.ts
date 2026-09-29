@@ -41,9 +41,9 @@ const landedSpy = vi.fn((..._args: unknown[]) => undefined);
 const serializePrefabSpy = vi.fn((..._args: unknown[]) => ({ id: 'g-new', root: {} }));
 /** Prefabs parked for Save (#1868), by path — what `parkedPrefabRead` answers. */
 const parked = vi.hoisted(() => new Map<string, unknown>());
-vi.mock('../../src/editor/scene/prefab', () => ({
+vi.mock('../../src/editor/scene/prefab', () => ({}));
+vi.mock('../../src/editor/scene/prefabCache', () => ({
   parkedPrefabRead: (path: string) => (parked.has(path) ? JSON.parse(JSON.stringify(parked.get(path))) : null),
-  serializeRebuildOver: (...args: unknown[]) => serializePrefabSpy(...args),
   setPrefabCache: (...args: unknown[]) => setPrefabCacheSpy(...args),
   // #1468: the existing-id lookup moved off `getGuidForPath` (manifest only, so it minted a fresh
   // guid over a prefab the scanner had not indexed yet) onto the shared classifier. Mirrored here
@@ -55,6 +55,21 @@ vi.mock('../../src/editor/scene/prefab', () => ({
       : { kind: 'mintable', reason: 'absent' }
   ),
 }));
+vi.mock('../../src/editor/scene/prefabTokens', () => ({}));
+vi.mock('../../src/editor/scene/prefabMembers', () => ({}));
+vi.mock('../../src/editor/scene/prefabInstanceOverrides', () => ({}));
+vi.mock('../../src/editor/scene/prefabCapture', () => ({}));
+vi.mock('../../src/editor/scene/prefabFrames', () => ({}));
+vi.mock('../../src/editor/scene/prefabInstantiate', () => ({}));
+vi.mock('../../src/editor/scene/prefabChain', () => ({}));
+vi.mock('../../src/editor/scene/prefabRebuild', () => ({}));
+vi.mock('../../src/editor/scene/prefabSerialize', () => ({
+  serializeRebuildOver: (...args: unknown[]) => serializePrefabSpy(...args),
+}));
+vi.mock('../../src/editor/scene/prefabApplyStructure', () => ({}));
+vi.mock('../../src/editor/scene/prefabApply', () => ({}));
+vi.mock('../../src/editor/scene/prefabLink', () => ({}));
+vi.mock('../../src/editor/scene/prefabRevert', () => ({}));
 
 let writeResult = true;
 let deleteResult = true;

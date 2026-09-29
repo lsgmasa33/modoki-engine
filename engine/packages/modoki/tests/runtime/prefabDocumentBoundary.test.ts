@@ -12,10 +12,11 @@ import {
   acquirePrefab, getCachedPrefab, replaceCachedPrefab, disposeAllCachedResources,
 } from '../../src/runtime/loaders/meshTemplateCache';
 import { isPrefabDocument } from '../../src/runtime/loaders/prefabRoot';
+import { type PrefabFile } from '../../src/editor/scene/prefab';
 import {
-  getCachedPrefabSync, getPrefabSource, preloadNestedPrefabs, primeEditorPrefabCache, seatEditorPrefabCache, setPrefabCache,
-  type PrefabFile,
-} from '../../src/editor/scene/prefab';
+  getCachedPrefabSync, getPrefabSource, preloadNestedPrefabs, primeEditorPrefabCache, seatEditorPrefabCache,
+  setPrefabCache,
+} from '../../src/editor/scene/prefabCache';
 
 const P = '55555555-2222-4333-8444-000000001813';
 const Q = '55555555-2222-4333-8444-000000001814';

@@ -45,11 +45,16 @@ import { clearKeptMemberOrphans, keptMemberOrphans } from '../../packages/modoki
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo,
 } from '@modoki/engine/editor';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
-  setPrefabCache, rebaseStaleInstances, applyToPrefabSelective, revertOverridesSelective, getCachedPrefabSync, type PrefabFile,
-  instantiatePrefab, setPrefabSource,
-  memberOverrideKeys, collectComparableTraits,
-} from '../../packages/modoki/src/editor/scene/prefab';
+  setPrefabCache, getCachedPrefabSync, setPrefabSource,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
+import { collectComparableTraits } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
+import { memberOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabChain';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { sameRotationScale } from '../../packages/modoki/src/runtime/scene/transformSpace';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';

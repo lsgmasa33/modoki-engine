@@ -10,7 +10,7 @@
 
 import type { KeyTargets, ApplyTargetOption } from '../scene/prefabApplyOptions';
 import type { ApplyTargets } from '../scene/prefabApplyTargets';
-import type { ApplyPreview, ApplyResult } from '../scene/prefab';
+import type { ApplyPreview, ApplyResult } from '../scene/prefabApply';
 import { describeEffect } from '../scene/prefabApplyEffects';
 import { getEditVersion, subscribeUndo } from '../undo/undoManager';
 import { getRunMode, onRunModeChange } from '../../runtime/core/playState';

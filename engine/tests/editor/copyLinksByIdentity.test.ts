@@ -30,7 +30,7 @@ import {
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, duplicateEntity,
 } from '@modoki/engine/editor';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 

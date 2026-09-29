@@ -122,7 +122,7 @@ function aRoot(): number {
 
 describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
   it('writes the deep edit as a path-keyed nestedOverrides on the top instance', async () => {
-    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await import('../../src/editor/scene/prefab');
+    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, makeB() as any); setPrefabCache(D, dPrefab as any);
@@ -142,7 +142,7 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
   });
 
   it('stores only the scene DELTA — fields the prefab chain already provides are subtracted', async () => {
-    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await import('../../src/editor/scene/prefab');
+    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     // B overrides A.y = 5 (middle layer). Scene will edit only A.x.
@@ -161,7 +161,7 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
   });
 
   it('round-trips: re-instantiating with the serialized nestedOverrides reproduces the value', async () => {
-    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await import('../../src/editor/scene/prefab');
+    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, makeB() as any); setPrefabCache(D, dPrefab as any);

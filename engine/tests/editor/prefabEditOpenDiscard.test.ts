@@ -40,9 +40,13 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
   ...await importOriginal<Record<string, unknown>>(),
   writeAssetFile: async (path: string, content: string) => { writes.push({ path, content }); return { ok: true as const }; },
 }));
-vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) => ({
+vi.mock('../../packages/modoki/src/editor/scene/prefabCache', async (importOriginal) => ({
   ...await importOriginal<Record<string, unknown>>(),
-  refreshPrefabSourceForPath: async () => {}, rebaseStaleInstances: async () => 0,
+  refreshPrefabSourceForPath: async () => {},
+}));
+vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (importOriginal) => ({
+  ...await importOriginal<Record<string, unknown>>(),
+  rebaseStaleInstances: async () => 0,
 }));
 
 import { setRunMode } from '@modoki/engine/runtime';

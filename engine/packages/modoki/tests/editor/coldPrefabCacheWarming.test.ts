@@ -143,7 +143,7 @@ beforeEach(() => {
 });
 afterEach(() => { vi.unstubAllGlobals(); });
 
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate'), import('../../src/editor/scene/prefabSerialize')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
 
 /** Build the observed shape: a plain entity holding a live instance of INNER, with the
  *  editor cache COLD — exactly what an ordinary scene load leaves behind (the loader

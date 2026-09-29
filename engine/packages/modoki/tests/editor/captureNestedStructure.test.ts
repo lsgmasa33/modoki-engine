@@ -83,7 +83,7 @@ beforeEach(async () => {
   clearAllOverrideMarks();
 });
 
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
 
 const FLAME = 'cccccccc-0000-4000-8000-00000000c0e8';
 // Spaceship-like outer prefab: root 'Ship' (localId 1) with a nested flame row

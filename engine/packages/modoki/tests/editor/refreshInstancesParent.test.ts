@@ -84,7 +84,7 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
 global.fetch = vi.fn(async () => ({ ok: true, json: async () => ({}) }));
 
 beforeEach(() => { testWorld = createWorld(); index.clear(); });
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => Promise.all([import('../../src/editor/scene/prefabApply'), import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
 
 const SRC = 'aaaaaaaa-0000-4000-8000-000000000abc';
 const prefab = {

@@ -98,7 +98,7 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOri
 /** The rederive after the restore rebuilds every base instance of the prefab in the live world — counted, so a
  *  skipped restore can be seen to skip it too. */
 const refreshes = vi.hoisted(() => ({ n: 0 }));
-vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) => {
+vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
   return {
     ...real,
@@ -128,7 +128,8 @@ import {
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
-import { setPrefabCache, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import {
   serializeScene, getCurrentScenePath, setCurrentScenePath, loadScene, newScene, NewSceneRefusedError, markSceneSaved,
   unsavedChangeCauses, worldHasUnsavedEdits,

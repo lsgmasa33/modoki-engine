@@ -49,7 +49,10 @@ import {
   deleteEntitiesWithUndo, duplicateEntity, reparentEntity, planReparent, createEntityWithUndo, clearHistory, canUndo,
 } from '@modoki/engine/editor';
 import { pasteEntityCopy, clipEntity } from '../../packages/modoki/src/editor/undo/entityActions';
-import { setPrefabCache, instantiatePrefab, instantiatePrefabInstance, serializePrefab, setPrefabSource, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefab, instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { PrefabEditRefusalError, PREFAB_EDIT_REFUSAL_TEXT, prefabEditRefusal } from '../../packages/modoki/src/editor/scene/prefabEditRefusal';
 import { PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEditGuids';
 import { commitPrefabWrite, commitPrefabWrites } from '../../packages/modoki/src/editor/scene/prefabCommit';

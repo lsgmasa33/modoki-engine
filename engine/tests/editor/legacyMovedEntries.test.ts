@@ -35,10 +35,13 @@ import {
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, deleteEntitiesWithUndo, reparentEntity } from '@modoki/engine/editor';
 import { spawnEntity, Transform, EntityAttributes } from '@modoki/engine/runtime';
-import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefab';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { restructureRefusal } from '../../packages/modoki/src/editor/scene/restructureRefusal';
-import { setPrefabCache, applyToPrefabSelective, revertOverridesSelective, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { planReparent } from '../../packages/modoki/src/editor/undo/entityActions';

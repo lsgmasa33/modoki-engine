@@ -15,7 +15,8 @@ import {
   createTestWorld, type TestWorld, setPlayState, getTraitByName, writeTraitField, findEntity, getAllEntities,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved } from '@modoki/engine/editor';
-import { setPrefabCache, instantiatePrefab, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';

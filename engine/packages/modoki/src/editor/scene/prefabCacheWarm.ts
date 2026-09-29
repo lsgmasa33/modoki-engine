@@ -34,7 +34,8 @@ import { getCachedPrefab, setPrefabReadOverride } from '../../runtime/loaders/me
 import { parkedPrefab } from './dirtyAssets';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { isGuid } from '../../runtime/loaders/assetManifest';
-import { getPrefabSource, isEditorPrefabCached, primeEditorPrefabCache, editorPrefabDeleted, type PrefabFile } from './prefab';
+import { type PrefabFile } from './prefab';
+import { getPrefabSource, isEditorPrefabCached, primeEditorPrefabCache, editorPrefabDeleted } from './prefabCache';
 
 /** Every distinct `PrefabInstance.source` in `world`. Read off the STAGING world the hook is
  *  handed — `getAllEntities()` would read the world being replaced. */

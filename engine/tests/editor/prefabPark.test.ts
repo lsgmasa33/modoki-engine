@@ -59,7 +59,10 @@ import {
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { acquirePrefab, getCachedPrefab, releaseAllForScene } from '../../packages/modoki/src/runtime/loaders/meshTemplateCache';
-import { setPrefabCache, getCachedPrefabSync, getPrefabSource, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import {
+  setPrefabCache, getCachedPrefabSync, getPrefabSource,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
 import { commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import {
   parkPrefab, peekDirtyAsset, clearDirtyAssets, flushDirtyAssets, getDirtyAssetPaths, keepParkedPrefabOverFileChange,

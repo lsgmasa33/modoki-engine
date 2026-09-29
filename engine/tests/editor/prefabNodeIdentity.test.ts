@@ -26,9 +26,10 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
-import {
-  setPrefabCache, serializePrefab, tagEntityTreeAsInstance, PREFAB_FORMAT_VERSION, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+import { PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { tagEntityTreeAsInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();

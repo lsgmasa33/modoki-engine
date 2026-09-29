@@ -81,7 +81,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 }));
 
 async function getModule() {
-  return import('../../src/editor/scene/prefab');
+  return import('../../src/editor/scene/prefabCapture');
 }
 
 const ROOT = 1000; // rootInstanceId

@@ -24,7 +24,7 @@ import { newGuid, getAssetEntry } from '../../runtime/loaders/assetManifest';
 import { classifyJsonAssetPath } from '../../runtime/loaders/assetTypeClassifier';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { backendFetch, postWriteFile, readBackendAnswer, thrownRefusal, type BackendAnswer } from '../backend/editorBackend';
-import { classifyExistingDocumentId } from './prefab';
+import { classifyExistingDocumentId } from './prefabCache';
 import { assetWrittenToDisk } from './dirtyAssets';
 
 export type NewAssetDocumentResult =

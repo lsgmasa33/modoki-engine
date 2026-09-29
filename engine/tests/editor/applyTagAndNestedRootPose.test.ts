@@ -36,9 +36,10 @@ import {
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, addTraitToEntitiesWithUndo,
 } from '@modoki/engine/editor';
-import {
-  setPrefabCache, applyToPrefabSelective, revertOverridesSelective, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import {
   collectInstanceOverrideKeys, collectInstanceOverrideTree, applyOutcomeNotice,
 } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';

@@ -26,7 +26,7 @@ import {
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, deleteEntitiesWithUndo, removeTraitFromEntitiesWithUndo, reparentEntity,
 } from '@modoki/engine/editor';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';

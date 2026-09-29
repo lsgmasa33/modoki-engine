@@ -26,7 +26,8 @@ vi.mock('../../packages/modoki/src/runtime/loaders/uiAnchorZIndexMigration', asy
 
 import { getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData, writeTraitField, destroyEntity, spawnEntity } from '@modoki/engine/runtime';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
-import { instantiatePrefab, instantiatePrefabInstance, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { instantiatePrefab, instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { makePrefabInstantiateAction } from '../../packages/modoki/src/editor/undo/prefabInstantiateUndo';
 import { UndoRefusedError } from '../../packages/modoki/src/editor/undo/undoFailure';
 import { registerAllTraits } from '../../app/ecs/registerTraits';

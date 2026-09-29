@@ -35,7 +35,9 @@ import {
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, createEntityWithUndo } from '@modoki/engine/editor';
-import { setPrefabCache, serializePrefab, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { buildPrefabEditScene, savePrefabEditReport, PREFAB_EDIT_ROOT_GUID, _resetPrefabEditSessionRows } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
@@ -415,7 +417,7 @@ describe('#1759: a Replace keeps every matched row\'s localId, and numbers a new
   it('the tag REFUSES when the entity at a row is not the one written there — same count, same names (planMatchesFile)', async () => {
     // Mutation: drop the recorded-plan check in `planMatchesFile` — the names match position by position, so d2 is tagged
     // with d1's row and the newcomer with d2's.
-    const { tagEntityTreeAsInstance } = await import('../../packages/modoki/src/editor/scene/prefab');
+    const { tagEntityTreeAsInstance } = await import('../../packages/modoki/src/editor/scene/prefabLink');
     await load({ id: 'swap', version: 16, name: 'S', resources: [], entities: [] } as unknown as SceneData);
     const root = add('Add R', 0, 'R');
     const d1 = add('Add Dup', root, 'Dup');
@@ -468,7 +470,7 @@ describe('#1759: a Replace keeps every matched row\'s localId, and numbers a new
 
   it('accept side: an unmoved tree is tagged with the FILE\'s numbering, kept ids included', async () => {
     // Mutation: tag with the positional plan (`plan.ecsToLocal`) again — B is live-tagged 2 while its row is 3.
-    const { tagEntityTreeAsInstance } = await import('../../packages/modoki/src/editor/scene/prefab');
+    const { tagEntityTreeAsInstance } = await import('../../packages/modoki/src/editor/scene/prefabLink');
     await load({ id: 'accept', version: 16, name: 'S', resources: [], entities: [] } as unknown as SceneData);
     const root = add('Add R', 0, 'R');
     const b = add('Add B', root, 'B');

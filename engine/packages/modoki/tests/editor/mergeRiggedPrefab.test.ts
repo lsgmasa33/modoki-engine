@@ -5,7 +5,8 @@
  *  bone was removed is re-anchored to the model root. Pure function — no world/backend. */
 
 import { describe, it, expect } from 'vitest';
-import { mergeRiggedPrefab } from '../../src/editor/scene/prefab';
+import { PREFAB_FORMAT_VERSION } from '../../src/editor/scene/prefab';
+import { mergeRiggedPrefab } from '../../src/editor/scene/prefabSerialize';
 import type { PrefabFile, PrefabEntity } from '../../src/editor/scene/prefab';
 
 type Traits = PrefabEntity['traits'];
@@ -140,6 +141,23 @@ describe('mergeRiggedPrefab', () => {
     existing.futureField = { some: 'v6 thing' };
     const merged = mergeRiggedPrefab(freshPrefab(), existing) as PrefabFile & { futureField?: unknown };
     expect(merged.futureField).toEqual({ some: 'v6 thing' });
+  });
+
+  // ── The version stamp: max(this serializer's, the file's) (#379) ─────────────────────────────
+  //
+  // The merge output is written by this serializer, so an older file is stamped up to its version;
+  // a file from a NEWER build is never stamped down, or a later migration would re-migrate it.
+
+  it('stamps this serializer\'s version over a file an older serializer wrote', () => {
+    const merged = mergeRiggedPrefab(freshPrefab(), existingPrefab()); // `file()` writes version 1
+    expect(merged.version).toBe(PREFAB_FORMAT_VERSION);
+  });
+
+  it('keeps a newer file\'s version rather than stamping it down', () => {
+    const existing = existingPrefab();
+    existing.version = (PREFAB_FORMAT_VERSION + 1) as PrefabFile['version'];
+    const merged = mergeRiggedPrefab(freshPrefab(), existing);
+    expect(merged.version).toBe(PREFAB_FORMAT_VERSION + 1);
   });
 
   // ── Node identity across a regeneration (#1468 design record: the node guid, part 2) ─────────────────────────────

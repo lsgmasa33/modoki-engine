@@ -134,7 +134,7 @@ function aRoot(): number {
 
 describe('Missing Test 6 — deep-nested override + per-field edit + undo (real async undoManager)', () => {
   it('undo restores the deep member to base (override gone); redo re-applies it', async () => {
-    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await import('../../src/editor/scene/prefab');
+    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
     const { markOverride, clearOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
     const { pushAction, undo, redo } = await import('../../src/editor/undo/undoManager');

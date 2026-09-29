@@ -24,9 +24,10 @@ import {
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
-import {
-  setPrefabCache, serializePrefab, tagEntityTreeAsInstance, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { tagEntityTreeAsInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 

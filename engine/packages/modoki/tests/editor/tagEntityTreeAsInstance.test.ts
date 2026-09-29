@@ -73,7 +73,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 }));
 
 async function getModule() {
-  return import('../../src/editor/scene/prefab');
+  return import('../../src/editor/scene/prefabLink');
 }
 async function getManifest() {
   return import('../../src/runtime/loaders/assetManifest');

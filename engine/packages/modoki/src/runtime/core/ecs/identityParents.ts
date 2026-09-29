@@ -151,7 +151,7 @@ export function frameDocRootCount(world: World): number {
 }
 
 /** The reader consulted when a world never expanded a source: the editor registers its prefab cache
- *  here (`editor/scene/prefab.ts`), for a frame it tagged live (Create Prefab), expanded through its own
+ *  here (`editor/scene/prefabCache.ts`), for a frame it tagged live (Create Prefab), expanded through its own
  *  `instantiatePrefab`, or respawned into a world that never expanded that source. A runtime build has
  *  none; the runtime cache below stands under it in both. */
 let defaultFallback: TemplateDocReader | undefined;

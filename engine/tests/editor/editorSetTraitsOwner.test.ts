@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState, getPlayState, Transform, EntityAttributes, getCurrentWorld } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, canUndo, undo, hasUnsavedChanges, pushAction, undoStep, undoLabel } from '@modoki/engine/editor';
 import { _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { markStateOf } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
 import { getTraitByName } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';

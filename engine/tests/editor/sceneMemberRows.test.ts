@@ -25,9 +25,12 @@ import {
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
-import {
-  setPrefabCache, serializePrefab, tagEntityTreeAsInstance, instantiatePrefab, setPrefabSource, captureInstanceStructure, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
+import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { tagEntityTreeAsInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import type { AddedEntity } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { parseMemberRowKey } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -396,7 +399,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     // `captureInstanceStructure({template:true}) ` — and its `{ ...n }` spread carried `members`
     // straight into the template until the Phase 2B close-out review found it. Two converters, one
     // invariant, so both are asserted here.
-    const { toTemplateNodesForTest } = await import('../../packages/modoki/src/editor/scene/prefab');
+    const { toTemplateNodesForTest } = await Promise.all([import('../../packages/modoki/src/editor/scene/prefabCapture'), import('../../packages/modoki/src/editor/scene/prefabInstantiate'), import('../../packages/modoki/src/editor/scene/prefabLink'), import('../../packages/modoki/src/editor/scene/prefabSerialize')]).then(([m0, m1, m2, m3]) => ({ ...m0, ...m1, ...m2, ...m3 }));
     // ⚠️ `moved` is the OTHER per-instance field the spread carried — `Record<localId, live parent
     // GUID>`, which names nothing in a template's own space. `captureInstanceStructure` already
     // refuses to write one into a template, and this converter was the way one got in anyway.

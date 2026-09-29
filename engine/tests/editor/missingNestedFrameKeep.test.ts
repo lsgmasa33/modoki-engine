@@ -23,7 +23,12 @@ import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, placeholderGuids, type Fixture } from './prefabFuzz/harness';
 import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/editor/panels/assetOps';
 import { unbindDeletedAssetEditors } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
-import { getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, revertRefusal, instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefab';
+import {
+  getCachedPrefabSync, preloadNestedPrefabsForSubtree,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { previewApply } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { revertRefusal } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { unregisterAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyTargetOptions } from '../../packages/modoki/src/editor/scene/prefabApplyOptions';

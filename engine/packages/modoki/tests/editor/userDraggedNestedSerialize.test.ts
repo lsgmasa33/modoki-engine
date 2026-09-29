@@ -134,7 +134,7 @@ function reparent(id: number, parentEcs: number) {
 
 describe('user-dragged nested instance (no parentLocalId) round-trips under its member', () => {
   it('captures it as a reference `added` node on the owner (not a stray top-level entry)', async () => {
-    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await import('../../src/editor/scene/prefab');
+    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
     setPrefabCache(P, pPrefab as any);
     setPrefabCache(Q, qPrefab as any);
@@ -162,7 +162,7 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
   });
 
   it('re-expands the dragged instance under the SAME member on reload (exact placement)', async () => {
-    const { instantiatePrefab, instantiatePrefabAsync, setPrefabCache, setPrefabSource } = await import('../../src/editor/scene/prefab');
+    const { instantiatePrefab, instantiatePrefabAsync, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
     setPrefabCache(P, pPrefab as any);
     setPrefabCache(Q, qPrefab as any);
@@ -177,7 +177,7 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
     // Reload into a fresh world: re-instantiate P, then re-apply its structure
     // (mirrors the runtime load path, editor side).
     testWorld = createWorld(); index.clear();
-    const { applyStructureByRootInstance } = await import('../../src/editor/scene/prefab');
+    const { applyStructureByRootInstance } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const pRoot2 = await instantiatePrefabAsync(pPrefab as any); setPrefabSource(pRoot2, { id: P });
     applyStructureByRootInstance(pRoot2, pPrefab as any, struct as any);
 
@@ -190,7 +190,7 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
   });
 
   it('mints a guid on a freshly instantiated prefab root so it is referenceable on drop', async () => {
-    const { instantiatePrefabAsync, setPrefabCache } = await import('../../src/editor/scene/prefab');
+    const { instantiatePrefabAsync, setPrefabCache } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     setPrefabCache(P, pPrefab as any);
 
     // The prefab template carries an EMPTY guid (templates have no per-instance

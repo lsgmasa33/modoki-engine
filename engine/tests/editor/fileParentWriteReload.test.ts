@@ -23,7 +23,8 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, loadSceneFile, instantiatePrefabIntoWorld,
   destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { setPrefabCache, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyOps, type MutableScene } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { registerAllTraits } from '../../app/ecs/registerTraits';

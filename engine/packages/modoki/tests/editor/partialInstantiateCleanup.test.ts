@@ -78,7 +78,7 @@ vi.mock('../../src/runtime/loaders/assetManifest', () => ({
 vi.mock('../../src/runtime/loaders/assetUrl', () => ({ assetUrl: (p: string) => p }));
 
 beforeEach(() => { testWorld = createWorld(); index.clear(); });
-const getModule = () => import('../../src/editor/scene/prefab');
+const getModule = () => Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
 
 const findByName = (name: string): number => {
   let id = 0;

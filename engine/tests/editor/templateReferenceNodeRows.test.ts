@@ -32,10 +32,14 @@ import {
   destroyEntity, spawnEntity, Transform, EntityAttributes, type SceneData,
 } from '@modoki/engine/runtime';
 import { serializeScene, deleteEntitiesWithUndo, writeTraitFieldWithUndo, setActionCallback, pushAction } from '@modoki/engine/editor';
-import {
-  setPrefabCache, instantiatePrefab, instantiatePrefabAsync, setPrefabSource, serializePrefab, applyToPrefabSelective, ownInstanceStructure,
-  rebaseStaleInstances, revertOverridesSelective, rebuildInstance, type PrefabFile,
-} from '../../packages/modoki/src/editor/scene/prefab';
+import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { ownInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabChain';
+import { instantiatePrefab, instantiatePrefabAsync } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { rebaseStaleInstances, rebuildInstance } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
+import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { collectInstanceOverrideFields } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { templateKeysOf } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';

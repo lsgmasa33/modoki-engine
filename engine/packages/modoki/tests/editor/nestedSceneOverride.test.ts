@@ -96,7 +96,7 @@ const flamePrefab = {
 
 describe('captureNestedSceneDelta', () => {
   it('returns only the scene-changed field; row-owned fields are subtracted', async () => {
-    const { instantiatePrefab, setPrefabCache, setPrefabSource, applyOverridesByRootInstance } = await import('../../src/editor/scene/prefab');
+    const { instantiatePrefab, setPrefabCache, setPrefabSource, applyOverridesByRootInstance } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstanceOverrides'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2, m3]) => ({ ...m0, ...m1, ...m2, ...m3 }));
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { captureNestedSceneDelta } = await import('../../src/editor/scene/serialize');
 
@@ -119,7 +119,7 @@ describe('captureNestedSceneDelta', () => {
   });
 
   it('survives a child-prefab base edit that matches the scene override', async () => {
-    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await import('../../src/editor/scene/prefab');
+    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstanceOverrides'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2, m3]) => ({ ...m0, ...m1, ...m2, ...m3 }));
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { captureNestedSceneDelta } = await import('../../src/editor/scene/serialize');
 

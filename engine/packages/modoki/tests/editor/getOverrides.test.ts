@@ -3,7 +3,7 @@
 import { describe, it, expect } from 'vitest';
 
 async function getModule() {
-  return import('../../src/editor/scene/prefab');
+  return import('../../src/editor/scene/prefabInstanceOverrides');
 }
 
 function makePrefab(entities: { localId: number; traits: Record<string, Record<string, unknown> | boolean> }[]) {

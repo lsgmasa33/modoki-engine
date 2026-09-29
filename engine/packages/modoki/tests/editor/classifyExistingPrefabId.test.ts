@@ -31,7 +31,7 @@ const serve = (status: number, body: unknown) => vi.fn(async () => ({
 
 async function load() {
   const manifest = await import('../../src/runtime/loaders/assetManifest');
-  const prefab = await import('../../src/editor/scene/prefab');
+  const prefab = await Promise.all([import('../../src/editor/scene/prefab'), import('../../src/editor/scene/prefabCache')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
   manifest.clearManifest();
   return { manifest, ...prefab };
 }

@@ -20,7 +20,7 @@ See also: [Prefabs](./prefabs.md) · [Scene Loading](./scene-loading.md) · [Vis
 | | Add | Remove |
 |---|---|---|
 | **Child entity** | **new** — `added` list | **new** — `removed` list |
-| **Component (trait)** | already works — captured as an *added-trait override* in `overrides` (`getOverrideValues` in `prefab.ts`) | **new** — `removedTraits` map |
+| **Component (trait)** | already works — captured as an *added-trait override* in `overrides` (`getOverrideValues` in `prefabInstanceOverrides.ts`) | **new** — `removedTraits` map |
 
 Adding a component to an instance already round-trips (whole-trait override) and
 already appears in the Apply dialog as that trait's fields. The three **new**
@@ -39,10 +39,10 @@ nothing happens, because the new child falls through every stage:
 
 | Stage | File / fn | Why the added child is invisible |
 |---|---|---|
-| Capture | `prefab.ts` `captureInstanceOverrides` | Walks members by `PrefabInstance.rootInstanceId`. A freshly-created child has **no `PrefabInstance` trait** (`createEntityWithUndo` spawns only `EntityAttributes`+`Transform`), so it's never visited. |
-| Diff | `prefab.ts` `getOverrideValues` | `prefab.entities.find(e => e.localId === id)` is `undefined` for a localId the prefab lacks → returns `{}`. |
+| Capture | `prefabInstanceOverrides.ts` `captureInstanceOverrides` | Walks members by `PrefabInstance.rootInstanceId`. A freshly-created child has **no `PrefabInstance` trait** (`createEntityWithUndo` spawns only `EntityAttributes`+`Transform`), so it's never visited. |
+| Diff | `prefabInstanceOverrides.ts` `getOverrideValues` | `prefab.entities.find(e => e.localId === id)` is `undefined` for a localId the prefab lacks → returns `{}`. |
 | Dialog | `ApplyPrefabDialog.tsx` | Renders only entities from that same member walk (and skips tags). Nothing to check off. |
-| Apply | `prefab.ts` `applyToPrefabSelective` | Overlays values onto `newPrefab.entities.find(...)`; it can't **insert** an entity. |
+| Apply | `prefabApply.ts` `applyToPrefabSelective` | Overlays values onto `newPrefab.entities.find(...)`; it can't **insert** an entity. |
 
 There is also a **silent round-trip bug** independent of *Apply*: an added child
 *is* serialized today (it isn't in `prefabChildIds` since it has no
@@ -136,7 +136,7 @@ Add a companion to `captureInstanceOverrides` (leave that one alone so the
 value-diff path and its tests don't churn):
 
 ```ts
-// prefab.ts
+// prefabCapture.ts
 function captureInstanceStructure(rootInstanceId, prefab):
   { added: AddedEntity[]; removed: number[];
     removedTraits: Record<number, string[]>;
@@ -658,7 +658,7 @@ descend in `resolveEffectivePrefabStructure` (now `prefabBase.ts`'s `foldPath`) 
 in #1381 with their producers; before that, promotion dropped the slot and a prefab-edit save lost a
 row's file-authored `nestedOverrides` too.
 
-**One walk, `captureNestedChannels(source, ownedNested)`** (`editor/scene/prefab.ts`), produces both
+**One walk, `captureNestedChannels(source, ownedNested)`** (`editor/scene/prefabCapture.ts`), produces both
 channels for all three carriers. It descends top-down through the row partition at every level
 (`captureInstanceStructure(…).ownedNested`). It replaced a bottom-up walk in `serializeScene` that
 resolved each owned instance UP to a top-level root, which was why a chain through a reference node
@@ -790,7 +790,7 @@ the FALLBACK, for a member no row names.
 | the row | `SceneMemberRow` (`runtime/loaders/loadSceneFile.ts`) — `guid`, `name`, `parent` (a move, below), and the member's EDITS: `traits`, `removedTraits`, `removed`, `added` (Phase 4, below) |
 | the key | a `/`-joined chain of minted node guids, ONE per instance FRAME, flat within a frame |
 | who decides the key | `memberRowKeysIn` (`runtime/core/ecs/memberRows.ts`) — one spelling, used by the save AND the load |
-| the writer | `captureInstanceMembers` (`editor/scene/prefab.ts`) for identity; `moveChannelsOntoRows` for the edits — on the entry and on a reference node |
+| the writer | `captureInstanceMembers` (`editor/scene/prefabMembers.ts`) for identity; `moveChannelsOntoRows` for the edits — on the entry and on a reference node |
 | the reader | `applyStoredMemberRows` (the guids), before `deriveInstanceMemberGuids`; `applyStructureCore` queues the moves; `foldMemberRowChannels` (`runtime/loaders/prefabOverrides.ts`) folds the edits in |
 
 **The frame chain follows IDENTITY, not the ECS tree.** A member's frame is the instance it BELONGS to
@@ -1926,7 +1926,8 @@ capture format.
 ## Files touched
 
 - `packages/modoki/src/editor/scene/prefab.ts` — `captureInstanceStructure`,
-  apply-side insert/delete, refresh reconcile.
+  apply-side insert/delete, refresh reconcile. (Since the prefab.ts split these live in
+  `prefabCapture.ts`, `prefabApplyStructure.ts` and `prefabRebuild.ts`.)
 - `packages/modoki/src/editor/scene/serialize.ts` — write `added`/`removed`,
   skip consumed added entities, scan added subtrees in `collectResourceRefs`.
 - `packages/modoki/src/runtime/loaders/loadSceneFile.ts` — re-expand additions,

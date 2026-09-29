@@ -100,7 +100,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     const census = prefabWriteCensus();
     // The reader must SEE the authoring writes, or an empty census would pass everything below.
     expect(census).toEqual(expect.arrayContaining([
-      { file: 'packages/modoki/src/editor/scene/prefab.ts', in: 'commitApplyPlan', warned: true }, // Apply's writing half (#1693)
+      { file: 'packages/modoki/src/editor/scene/prefabApply.ts', in: 'commitApplyPlan', warned: true }, // Apply's writing half (#1693)
       { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true },
       { file: 'app/editor/agentEditorOps.ts', in: 'registerEditorAgentOps', warned: true }, // prefabAction:'create'
       { file: 'packages/modoki/src/editor/panels/assetOps.ts', in: 'createPrefabFromEntity', warned: true }, // Save-as-Prefab
@@ -394,7 +394,7 @@ const GENERATED_PREFAB_WRITERS = [
 /** Functions that serialize a prefab for a CALLER and write nothing themselves: whether it is written, and so warned,
  *  is the caller's, which the write census above holds to it. */
 const SERIALIZE_FOR_A_CALLER = [
-  { item: 'packages/modoki/src/editor/scene/prefab.ts::serializeRebuildOver', reason: 'the rebuild entry point (#1782): it serializes for its two callers, Import Model and the skin-rig update, which are GENERATED_PREFAB_WRITERS rows' },
+  { item: 'packages/modoki/src/editor/scene/prefabSerialize.ts::serializeRebuildOver', reason: 'the rebuild entry point (#1782): it serializes for its two callers, Import Model and the skin-rig update, which are GENERATED_PREFAB_WRITERS rows' },
   { item: 'packages/modoki/src/editor/scene/prefabEdit.ts::serializePrefabEditWorld', reason: 'the prefab-edit world as a document: savePrefabEditReport warns what it writes (the write census row for it), and the tests read it as what a Save would write' },
 ];
 

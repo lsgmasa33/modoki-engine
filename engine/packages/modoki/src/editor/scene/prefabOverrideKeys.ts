@@ -31,10 +31,13 @@ import { readTraitData, getAllEntities } from '../../runtime/core/ecs/entityUtil
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
-import {
-  collectComparableTraits, getOverrideValues, ownInstanceStructure, baseTokenResolver, instanceBase, gateOnMarks, instanceMovedMembers, foldMarkedEqual, enclosingRowOverrides,
-  isTemplateExcludedField, nestedFrameMoves, getCachedPrefabSync, type PrefabFile, type ApplyResult,
-} from './prefab';
+import { isTemplateExcludedField, type PrefabFile } from './prefab';
+import { getCachedPrefabSync } from './prefabCache';
+import { baseTokenResolver } from './prefabTokens';
+import { collectComparableTraits, getOverrideValues, gateOnMarks, foldMarkedEqual } from './prefabInstanceOverrides';
+import { instanceMovedMembers } from './prefabMembers';
+import { ownInstanceStructure, instanceBase, enclosingRowOverrides, nestedFrameMoves } from './prefabChain';
+import { type ApplyResult } from './prefabApply';
 import { memberRef, toLocalIdKey, nestedKeyRef } from './overrideKeyGrammar';
 import { ownedFrames, levelDoc } from './prefabBase';
 

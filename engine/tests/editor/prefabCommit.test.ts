@@ -106,7 +106,10 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, registerAsset, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory, deleteEntityWithUndo, createEntityWithUndo } from '@modoki/engine/editor';
-import { setPrefabCache, getCachedPrefabSync, getPrefabSource, evictDeletedEditorPrefabs, PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import {
+  setPrefabCache, getCachedPrefabSync, getPrefabSource, evictDeletedEditorPrefabs,
+} from '../../packages/modoki/src/editor/scene/prefabCache';
 import { commitPrefabWrite, commitPrefabWrites } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { localIdCounter, markUnstated } from '../../packages/modoki/src/runtime/core/localIdCounter';
 import { withAdoption, _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';

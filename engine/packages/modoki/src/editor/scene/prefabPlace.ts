@@ -11,7 +11,9 @@ import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { useEditorStore } from '../store/editorStore';
-import { instantiatePrefabInstance, parkedPrefabRead, type PrefabFile } from './prefab';
+import { type PrefabFile } from './prefab';
+import { parkedPrefabRead } from './prefabCache';
+import { instantiatePrefabInstance } from './prefabInstantiate';
 import { entityRef } from '../undo/entityRef';
 import { capturePrefabRead, StalePrefabRead } from './prefabRead';
 import { PrefabEditRefusalError } from './prefabEditRefusal';

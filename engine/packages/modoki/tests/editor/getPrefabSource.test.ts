@@ -30,7 +30,7 @@ describe('getPrefabSource ref handling', () => {
 
   it('fetches a PATH source via assetUrl, never resolveRef (no GUID-rejection)', async () => {
     const manifest = await import('../../src/runtime/loaders/assetManifest');
-    const { getPrefabSource } = await import('../../src/editor/scene/prefab');
+    const { getPrefabSource } = await import('../../src/editor/scene/prefabCache');
     const path = '/games/x/assets/planets/mars/MarsPlanet.prefab.json';
     global.fetch = vi.fn(async () => prefabJson('Mars')) as unknown as typeof fetch;
 
@@ -44,7 +44,7 @@ describe('getPrefabSource ref handling', () => {
 
   it('resolves a GUID source through resolveRef', async () => {
     const manifest = await import('../../src/runtime/loaders/assetManifest');
-    const { getPrefabSource } = await import('../../src/editor/scene/prefab');
+    const { getPrefabSource } = await import('../../src/editor/scene/prefabCache');
     const guid = '11111111-2222-4333-8444-555555555555';
     global.fetch = vi.fn(async () => prefabJson('ByGuid')) as unknown as typeof fetch;
 
