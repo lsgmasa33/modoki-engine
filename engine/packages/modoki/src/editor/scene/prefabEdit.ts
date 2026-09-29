@@ -30,6 +30,7 @@ import { canEdit } from '../../runtime/core/playState';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
+import { capturePrefabRead } from './prefabRead';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { deriveMemberGuid, durableGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
@@ -436,6 +437,9 @@ async function openPrefabForEditingSwitching(
   switchReady: () => Promise<void> | null,
   stillNewest: () => boolean,
 ): Promise<EditOpenRefusal | undefined> {
+  // The read's token, taken before the fetch (#1752, `prefabRead.ts`): a write landing during it seats the newer document,
+  // and seeding this one after it put the older bytes back in both caches — then built the edit world from them.
+  const readAt = capturePrefabRead(asset.path);
   let prefab: PrefabFile;
   try {
     const res = await fetch(asset.path);
@@ -451,11 +455,23 @@ async function openPrefabForEditingSwitching(
   // rest of the session.
   for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
   const guid = prefab.id ?? getGuidForPath(asset.path) ?? asset.path;
+  // Nothing is seeded by a request that no longer owns the switch (#1752): `setPrefabCache` rewrites the runtime cache
+  // too, bumping the prefab's revision and re-spawning every pool built from it, for an open that will never happen.
+  if (!stillNewest()) {
+    console.warn(`[PrefabEdit] "${asset.name}" was not entered: a newer scene request was made while it waited`);
+    return;
+  }
+  // …nor from bytes older than the file: refused, never re-read (owner, 2026-09-28) — the human opened this prefab, and
+  // opening a version they did not see is not the answer to a write they may not know about either.
+  if (!readAt()) return changedWhileOpening(asset.name);
   // Seed the editor prefab cache so override/apply paths resolve without a refetch,
   // and preload any nested children into the SAME (editor) cache — serializePrefab's
   // sync nested-instance detection reads it, so without this a nested instance would
   // flatten on save instead of round-tripping as a reference row.
   setPrefabCache(guid, prefab);
+  // From here the token is the seed's own — the seed bumped the revision itself — and it is asked once more after the
+  // save and the human's dialog below: a write landing there made `prefab` older than the file this world would edit.
+  const seeded = capturePrefabRead(asset.path);
   // …and the session's OWN copy of what it opened (#1692): the save's precondition and its row numbering. Not the
   // cache entry — every prefab write re-seats that — and a COPY: the edit scene is built from `prefab`'s trait bags, and
   // the loader edits them in place (a legacy `CameraFrame.showGizmo` is stripped), which would make every save of such a
@@ -506,6 +522,7 @@ async function openPrefabForEditingSwitching(
   // route's swap, is found here, with nothing from here to the swap that awaits.
   const late = refuseUnsavable(asset.name, opts);
   if (late) return late;
+  if (!seeded()) return changedWhileOpening(asset.name);
 
   const returnScene = resolveReturnScene(
     sceneManager.getCurrent()?.path ?? null,
@@ -551,6 +568,15 @@ async function openPrefabForEditingSwitching(
 /** An edit-open refused because the world was not in a state to leave (#1750): `refused` is the reason, for a toast or an
  *  agent refusal. Nothing was written and nothing was swapped. */
 export interface EditOpenRefusal { readonly refused: string }
+
+/** The prefab was written while it was being opened (#1752): the copy in hand is older than the file. Worded for either
+ *  writer — an outside change, or the human's own Save from the discard dialog when they re-open the prefab they are
+ *  editing (close-out review), where "changed on disk" would blame someone else for their save. */
+function changedWhileOpening(name: string): EditOpenRefusal {
+  const refused = `"${name}" was saved while it was opening (by this editor or outside it), so it was not entered — open it again to edit the saved version`;
+  console.warn(`[PrefabEdit] ${refused}`);
+  return { refused };
+}
 
 /** Why an edit-open must not leave the world now, or null. A switch still landing (any route — a Stop's or a preview's
  *  restore included, whose own reason outranks the switch reason in `whyWorldNotAuthored`) and a run mode other than

@@ -81,7 +81,7 @@ export {
   serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource, missingPrefabPlaceholders,
   instantiatePrefabInstance,
   primeEditorPrefabCache, isEditorPrefabCached,
-  getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, getOverrides, getOverrideValues,
+  getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, refreshPrefabSourceAfterDiskChange, getOverrides, getOverrideValues,
   preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
   captureInstanceOverrides, applyOverridesByRootInstance,
   applyToPrefab, applyToPrefabSelective, staleInstanceRefusal,
@@ -92,6 +92,8 @@ export {
   captureInstanceStructure, resolveInstanceContext, previewApply,
   type PrefabFile, type RevertResult, type ApplyPreview,
 } from './scene/prefab';
+export { capturePrefabRead, StalePrefabRead } from './scene/prefabRead';
+export { existingAssetPath } from './scene/createAssetDocument';
 export { describeEffect, type KeyEffect, type EditEffect, type ApplyConflict } from './scene/prefabApplyEffects';
 export { commitPrefabWrite, commitPrefabWrites, type PrefabCommitResult, type PrefabCommitsResult, type PrefabWrite, type PrefabExpectation } from './scene/prefabCommit';
 // Shared override-key enumeration for the Apply-to-Prefab / Revert-Overrides surfaces —

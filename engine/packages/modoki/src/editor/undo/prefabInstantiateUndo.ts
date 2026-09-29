@@ -17,7 +17,8 @@
  *  captured guids are stamped back over the respawned subtree below. */
 import type { UndoAction } from './undoManager';
 import { entityRef, type EntityRef } from './entityRef';
-import { reportUndoFailure } from './undoFailure';
+import { reportUndoFailure, UndoRefusedError } from './undoFailure';
+import { StalePrefabRead } from '../scene/stalePrefabRead';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { getAllEntities, readTraitData, writeTraitField, findEntity, type EntityInfo }
   from '../../runtime/core/ecs/entityUtils';
@@ -130,7 +131,18 @@ export function makePrefabInstantiateAction(opts: {
     // to call on a stale/dead id — a no-op — matching the original contract).
     undo: () => { opts.remove(currentRef.resolve() ?? currentRef.rawId); },
     redo: async () => {
-      const id = await opts.respawn();
+      // A respawn REFUSED because the prefab was written while it was read (#1752): nothing was spawned, and the step is
+      // DROPPED with its notice (`UndoRefusedError`, #1664's contract) rather than left on the redo stack. The file it
+      // would re-read is the newer one now, so a retry is the user placing it again — and a redo that silently placed
+      // a DIFFERENT version than the one undone would be a re-target. The undo below it is unaffected: the next Cmd+Z
+      // undoes the step before this one, as it would after any dropped entry.
+      let id: number | null;
+      try {
+        id = await opts.respawn();
+      } catch (e) {
+        if (e instanceof StalePrefabRead) throw new UndoRefusedError(e.message, e.message);
+        throw e;
+      }
       // Leaving the live id unchanged is the deliberate contract (see `respawn`
       // above) and stays that way — but the SILENCE was not deliberate (#308).
       // The documented cause is that the prefab file was deleted between the undo

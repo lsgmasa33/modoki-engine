@@ -33,7 +33,8 @@ import { entityRef, type EntityRef } from '../undo/entityRef';
 import { commitPrefabWrites } from './prefabCommit';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { assetIsAbsent, parseAssetJson, ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
-import { invalidatePrefab, replaceCachedPrefab, getPrefabRevision } from '../../runtime/loaders/meshTemplateCache';
+import { invalidatePrefab, replaceCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
+import { capturePrefabRead, notePrefabFileChanged, StalePrefabRead } from './prefabRead';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
@@ -2035,21 +2036,30 @@ export async function getPrefabSource(source: string): Promise<PrefabFile | null
   // just seated. So the read carries the runtime cache's revision token, which every prefab write and eviction bumps
   // (`replaceCachedPrefab`/`invalidatePrefab`), and is discarded when the token moved or a writer filled the key
   // meanwhile. One re-read, then the last fetch is returned uncached rather than looping on a file that keeps changing.
+  // The token is `capturePrefabRead` (prefabRead.ts), the one every read-side seed asks (#1752).
   let prefab: PrefabFile | null = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (prefabCache.has(source)) return prefabCache.get(source)!;
-    const revision = getPrefabRevision(source);
+    const unchanged = capturePrefabRead(source);
     prefab = await fetchPrefabSource(source);
     if (prefabCache.has(source)) return prefabCache.get(source)!;
-    if (getPrefabRevision(source) !== revision) continue;
-    if (prefab) prefabCache.set(source, prefab);
+    if (!unchanged()) continue;
+    if (prefab) { prefabCache.set(source, prefab); registerRead(source, prefab); }
     return prefab;
   }
   return prefab;
 }
 
+/** Name the file a read that was ACCEPTED came from, in the manifest (#1752 close-out review). Not done by the fetch
+ *  itself: a stale read — one a write or a trash overtook — re-registered its guid at the path the trash had just emptied,
+ *  so a trashed prefab resolved again until the next manifest broadcast. */
+function registerRead(source: string, prefab: PrefabFile): void {
+  const url = isGuid(source) ? resolveRef(source) : assetUrl(source);
+  if (prefab.id && url) registerAsset(prefab.id, url, 'prefab');
+}
+
 /** Read a prefab file from disk, uncached — `getPrefabSource`'s fetch half, shared with
- *  `refreshPrefabSourceForPath`. */
+ *  `refreshPrefabSourceForPath`. It registers nothing: its callers do, for a read they keep (`registerRead`). */
 async function fetchPrefabSource(source: string, init?: RequestInit): Promise<PrefabFile | null> {
   // Normally a GUID (resolve via manifest). A freshly-instantiated instance can
   // still carry a path before its owning scene is saved + normalized; resolveRef
@@ -2068,7 +2078,6 @@ async function fetchPrefabSource(source: string, init?: RequestInit): Promise<Pr
     // nestedOverrides paths too (including this prefab FILE's own nested rows), not just
     // entry.traits.
     for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
-    if (prefab.id) registerAsset(prefab.id, url, 'prefab');
     return prefab;
   } catch { return null; }
 }
@@ -2107,8 +2116,18 @@ export async function refreshPrefabSourceForPath(path: string): Promise<void> {
     const before = prefabCache.get(key);
     if (before === undefined || key === editing) continue;
     const fresh = await fetchPrefabSource(key, { cache: 'no-store' });
-    if (fresh && prefabCache.get(key) === before) prefabCache.set(key, fresh);
+    if (fresh && prefabCache.get(key) === before) { prefabCache.set(key, fresh); registerRead(key, fresh); }
   }
+}
+
+/** The watcher's refresh (`agentBridge.ts`, via `setPrefabSourceRefresher`): the file at `path` CHANGED on disk, so every
+ *  read of it in flight is older than the file (`notePrefabFileChanged`, #1752) — noted BEFORE the refresh's own fetch,
+ *  since a placement resuming during that fetch would otherwise pass its check and prime the old bytes, and the refresh
+ *  would then skip the key as replaced. Only here: the leave-edit repair refreshes a prefab whose file did not change,
+ *  and noting it there refused a placement in flight for a write nobody made (close-out review). */
+export async function refreshPrefabSourceAfterDiskChange(path: string): Promise<void> {
+  notePrefabFileChanged(path);
+  await refreshPrefabSourceForPath(path);
 }
 
 /** Synchronous cache lookup — returns the prefab if already loaded, else null.
@@ -2211,11 +2230,25 @@ export async function preloadNestedPrefabsForSubtree(selectedEntityId: number): 
  *  ⚠️ Sets the map DIRECTLY rather than calling `setPrefabCache`, deliberately: that helper also
  *  rewrites the runtime cache entry (and bumps its revision, re-spawning every pool built from it —
  *  #1308), because every one of its callers follows a prefab FILE WRITE. This one follows a READ,
- *  and churning the runtime cache on every drag-drop would be pure cost. */
+ *  and churning the runtime cache on every drag-drop would be pure cost.
+ *
+ *  ⚠️ A READ, so it carries the read's token (#1752, `prefabRead.ts`). `prefab` is what the caller read BEFORE the
+ *  nested preload's await; a write landing in that await (or in the caller's own fetch — which is why a caller that
+ *  fetches captures `readAt` before it) seats the newer document, and priming after it put the older one back: the
+ *  instance was spawned from the old rows, and every frame expanded from the new ones read as stale, so the next rebase
+ *  rebuilt them onto the old document. Now a moved token REFUSES — {@link StalePrefabRead}, thrown after the preload
+ *  and BEFORE the spawn, so nothing is added and nothing is primed. Never a re-read: the caller asked to place the
+ *  copy it read, and placing another one silently is a re-target. */
 export async function instantiatePrefabInstance(
   prefab: PrefabFile, sourcePath: string, parentId: number = 0,
+  /** From `capturePrefabRead(sourcePath)`, taken before the caller's read. Omitted, the window starts here. */
+  readAt: () => boolean = capturePrefabRead(sourcePath),
 ): Promise<number> {
-  const rootId = await instantiatePrefabAsync(prefab, parentId);
+  await preloadNestedPrefabs(prefab);
+  if (!readAt()) throw new StalePrefabRead(prefab.name ?? 'the prefab');
+  // SYNCHRONOUS from the check to the prime (close-out review): with an await between them, a commit whose cache seat was
+  // already queued could land in the gap, and the prime put the older document back over it after all.
+  const rootId = spawnPrefabInstance(prefab, parentId);
   if (!rootId) return rootId;
   // Under a base entity the new instance belongs to that base (#1429). Every caller's redo re-runs this
   // helper, so the stamp comes back with it.
@@ -2276,6 +2309,11 @@ export function isEditorPrefabCached(source: string): boolean {
  *  preload contract un-missable for the common case. */
 export async function instantiatePrefabAsync(prefab: PrefabFile, parentId: number = 0): Promise<number> {
   await preloadNestedPrefabs(prefab);
+  return spawnPrefabInstance(prefab, parentId);
+}
+
+/** `instantiatePrefabAsync`'s synchronous half: the nested prefabs are already in the cache. */
+function spawnPrefabInstance(prefab: PrefabFile, parentId: number): number {
   const rootId = instantiatePrefab(prefab, parentId);
   // The prefab file clears EntityAttributes.guid (templates carry no per-instance
   // identity), so a freshly-instantiated root has an empty guid until the next

@@ -5,7 +5,7 @@ import { onWorldSwap, getCurrentWorld } from '../../runtime/core/ecs/world';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
 import { parentOrRootFor } from '../../runtime/core/ecs/hierarchy';
-import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, readTraitData, subtreeIds, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, buildEntityTree, onStructureDirtyCoalesced, getStructureVersion, readTraitData, subtreeIds, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { pinEntityAt, livePinnedId, type EntityPin } from '../../runtime/core/ecs/entityPin';
 import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
@@ -14,9 +14,8 @@ import { makeSortOrderRenumberAction } from '../undo/overrideMarkWrites';
 import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, type EntityClipboard } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
-import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
+import { placePrefabFromPath } from '../scene/prefabPlace';
 import { detachPrefabInstanceWithUndo } from '../undo/detachPrefabUndo';
-import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { focusEntityInSceneView, canFrameSelected } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -26,7 +25,6 @@ import { useEditorStore } from '../store/editorStore';
 import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { pushAction } from '../undo/undoManager';
-import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { diffSiblingSorts } from '../undo/reorderSiblingsUndo';
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
@@ -1598,42 +1596,12 @@ export default function Hierarchy() {
     // the agent needs is the `accepted:false` domDnd already returns.
     if (type !== 'prefab') return;
 
-    try {
-      const res = await fetch(path);
-      let prefab: PrefabFile;
-      try {
-        prefab = await parseAssetJson(res, path) as PrefabFile;
-      } catch (e) {
-        if (isMissingAsset(e)) return;
-        throw e;
-      }
-      // Preload nested children before the sync expand — otherwise a nested (v2)
-      // prefab's children are silently dropped.
-      const currentId = await instantiatePrefabInstance(prefab, path, parentId);
-      selectEntity(currentId);
-      console.log(`[Hierarchy] Instantiated prefab "${prefab.name}" under parent ${parentId}`);
-
-      pushAction(makePrefabInstantiateAction({
-        label: `Instantiate "${prefab.name}"`,
-        initialId: currentId,
-        respawn: async () => {
-          const r = await fetch(path);
-          let p: PrefabFile;
-          try {
-            p = await parseAssetJson(r, path) as PrefabFile;
-          } catch (e) {
-            if (isMissingAsset(e)) return null;
-            throw e;
-          }
-          const id = await instantiatePrefabInstance(p, path, parentId);
-          selectEntity(id);
-          return id;
-        },
-        remove: (id) => { deleteEntity(id); selectEntity(null); },
-      }));
-    } catch (err) {
-      console.error('[Hierarchy] Drop instantiate failed:', err);
-    }
+    // The shared flow (`prefabPlace.ts`): it toasts a refused placement (#1752) and never rejects.
+    await placePrefabFromPath(path, {
+      tag: 'Hierarchy', parentId,
+      onPlaced: (id) => selectEntity(id),
+      onRemoved: () => selectEntity(null),
+    });
   }, [selectEntity]);
 
   // Toolbar '+' — creates into the SELECTED folder when one is highlighted, matching

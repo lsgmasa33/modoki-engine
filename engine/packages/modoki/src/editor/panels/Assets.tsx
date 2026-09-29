@@ -6,7 +6,7 @@ import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
 import {
-  instantiatePrefabInstance, type PrefabFile, serializePrefab, classifyExistingPrefabId,
+  serializePrefab, classifyExistingPrefabId,
 } from '../scene/prefab';
 import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { importModel } from '../scene/modelImport';
@@ -14,7 +14,7 @@ import { needsGLBConversion, convertSourceToGLB } from '../scene/convertToGLB';
 import { readMetaPreferringPark } from '../scene/pendingMeta';
 import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
-import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
+import { placePrefabFromPath } from '../scene/prefabPlace';
 import { commitPrefabWrite } from '../scene/prefabCommit';
 import { priorLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
@@ -76,30 +76,9 @@ import {
 import { ModalShell } from '../components/ModalShell';
 
 
+/** The Assets panel's "Instantiate" (the shared flow, `prefabPlace.ts`). */
 async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
-  try {
-    const res = await fetch(prefabPath);
-    if (!res.ok) { console.error(`[Assets] Failed to fetch ${prefabPath}`); return; }
-    const prefab: PrefabFile = await res.json();
-    const rootId = await instantiatePrefabInstance(prefab, prefabPath);
-    console.log(`[Assets] Instantiated prefab "${prefab.name}"`);
-
-    const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');
-    pushAction(makePrefabInstantiateAction({
-      label: `Instantiate "${prefab.name}"`,
-      initialId: rootId,
-      respawn: async () => {
-        const r = await fetch(prefabPath);
-        if (!r.ok) return null;
-        const p: PrefabFile = await r.json();
-        const id = await instantiatePrefabInstance(p, prefabPath);
-        return id;
-      },
-      remove: (id) => { deleteEntity(id); },
-    }));
-  } catch (e) {
-    console.error('[Assets] Instantiate failed:', e);
-  }
+  await placePrefabFromPath(prefabPath, { tag: 'Assets' });
 }
 
 /** Show a path in the OS file manager. The three "Reveal in Finder" menu items used

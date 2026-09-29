@@ -391,7 +391,7 @@ function SceneBreadcrumb({ onExitPrefab }: { onExitPrefab: () => void }) {
   if (inPrefabEdit) {
     return (
       <div style={{ display: 'flex', alignItems: 'center' }}>
-        <button onClick={onExitPrefab} title="Back to scene" style={{
+        <button onClick={onExitPrefab} title="Back to scene" data-ui-id="sceneView.breadcrumb.back" style={{
           ...segStyle, background: 'none', border: '1px solid #444', borderRadius: 3,
           color: '#aaa', cursor: 'pointer',
         }}>← {sceneDisplayName(returnScenePath)}</button>

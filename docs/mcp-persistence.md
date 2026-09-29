@@ -981,7 +981,11 @@ and `writeNewAssetDocument` / `mayCreateOver` switch to it for every step after 
 check, the Replace question, the kept guid, the replacing write, the parked-edit drop, and the path the
 caller registers. That last one is why each create caller reads `result.path` rather than the path it
 asked for — registering the typed spelling would give the manifest a second key for one file. The
-spelling comes from `absToAssetUrl`; see "Asset urls take the disk's spelling" below.
+spelling comes from `absToAssetUrl`; see "Asset urls take the disk's spelling" below. A prefab create
+TAGS by it too: Create Prefab and the agent `prefab create` stamp `PrefabInstance.source` from the
+commit's landed path (`rebuild(landed)`), and the agent's undo, redo and reply key on it (#1753 F4). With
+the typed spelling the manifest found no guid, so the tag stored the raw path, which the next load
+rejects (GUID-only), and the instance went missing.
 
 **Not verified: stale live display.** A Replace keeps the guid, and `/api/write-file` skips the
 watcher for the editor's own writes. So an entity already showing a replaced particle, clip or rig

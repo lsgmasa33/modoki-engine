@@ -12,15 +12,12 @@ import { useTraitClipboard, setTraitClipboard, isTraitCopyable } from './traitCl
 import { type TraitMeta, type FieldHint, getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { resolveMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
 import { geometryBoxHalfExtents, geometryBoundingRadius } from '../../runtime/physics/meshColliderGeometry';
-import { pushAction } from '../undo/undoManager';
-import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { getAnimSet } from '../../runtime/loaders/animSetCache';
 import { useEditorStore } from '../store/editorStore';
 import { getPrefabSource, getCachedPrefabSync, getOverrides, baseTokenResolver, instanceBase } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { isSkippedByPrimarySave } from '../scene/serialize';
-import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
-import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
+import { placePrefabFromPath } from '../scene/prefabPlace';
 import { getModelPostprocessorIds } from '../../runtime/loaders/modelPostprocessorRegistry';
 import { isGuid, resolveGuidToPath, getAssetEntry } from '../../runtime/loaders/assetManifest';
 import { durableGuid } from '../../runtime/core/assetRefRules';
@@ -1544,35 +1541,8 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
         {asset.type === 'prefab' && (
           <>
             <button
-              onClick={async () => {
-                try {
-                  const res = await fetch(asset.path);
-                  const prefab = await parseAssetJson(res, asset.path) as PrefabFile;
-                  // Preload nested children before the sync expand (nested prefabs).
-                  const rootId = await instantiatePrefabInstance(prefab, asset.path);
-                  // Make it undoable via the shared helper (prefab F4) — same
-                  // reassign-on-redo semantics as Hierarchy/Assets so Cmd+Z removes
-                  // the instance and redo respawns + retracks the new id.
-                  const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');
-                  pushAction(makePrefabInstantiateAction({
-                    label: `Instantiate "${prefab.name}"`,
-                    initialId: rootId,
-                    respawn: async () => {
-                      const r = await fetch(asset.path);
-                      let p: PrefabFile;
-                      try {
-                        p = await parseAssetJson(r, asset.path) as PrefabFile;
-                      } catch (e) {
-                        if (isMissingAsset(e)) return null;
-                        throw e;
-                      }
-                      const id = await instantiatePrefabInstance(p, asset.path);
-                      return id;
-                    },
-                    remove: (id) => { deleteEntity(id); },
-                  }));
-                } catch (e) { console.error('[Inspector] Instantiate failed:', e); }
-              }}
+              // The shared flow (`prefabPlace.ts`): it toasts a refused placement (#1752) and never rejects.
+              onClick={() => { void placePrefabFromPath(asset.path, { tag: 'Inspector' }); }}
               style={{ ...reimportBtnStyle, marginBottom: 6 }}
             >
               Instantiate Prefab
