@@ -735,6 +735,7 @@ export function knownUiIds(sources: string[]): {
     for (const id of moduleToggleIds(src)) ids.add(id);
     for (const id of projectSettingsFieldIds(src)) ids.add(id);
     for (const id of contextMenuItemIds(src)) ids.add(id);
+    for (const id of choiceModalIds(src)) ids.add(id);
   }
   // `qualityTierIds` needs TWO files' content at once (see its docblock), so it takes the whole
   // array rather than being called once per file like every deriver above.
@@ -1276,6 +1277,36 @@ export function contextMenuItemIds(source: string): string[] {
     if (label !== undefined && (keys.includes('onClick') || keys.includes('children'))) out.add(label);
   }
   return [...out].map((label) => `contextmenu.item.${label}`);
+}
+
+/**
+ * The ids `openChoiceModal` (`editor/components/choiceModal.ts`) stamps on its dialog: the box gets
+ * `<kind>` and each button `<kind>.<value>`. They are assigned through `dataset.uiId` from the
+ * caller's options, a spelling none of the regexes in `knownUiIds` read, so before this every
+ * choice-modal id was unknown to the guard although it resolves live (`unsaved-gate.cancel`,
+ * observed 2026-09-30 writing QA-BUILD-0007). Derived from each call's own literal `kind` and its
+ * `choices: [{ value: '…' }]`, so a typo'd value (`unsaved-gate.cancle`) stays red. A call whose
+ * `kind` is not a string literal contributes nothing: there is no finite vocabulary to read.
+ */
+export function choiceModalIds(source: string): string[] {
+  if (!source.includes('openChoiceModal')) return [];
+  const out = new Set<string>();
+  for (const call of findNodes(parsedSource(source), ts.isCallExpression)) {
+    if (!ts.isIdentifier(call.expression) || call.expression.text !== 'openChoiceModal') continue;
+    const arg = call.arguments[0] && unwrapValue(call.arguments[0]);
+    if (!arg || !ts.isObjectLiteralExpression(arg)) continue;
+    const kind = ownString(arg, 'kind');
+    if (kind === undefined) continue;
+    out.add(kind);
+    const choices = propertyValue(arg, 'choices');
+    const arr = choices && ts.isExpression(choices) ? unwrapValue(choices) : undefined;
+    if (!arr || !ts.isArrayLiteralExpression(arr)) continue;
+    for (const c of arrayObjects(arr)) {
+      const value = ownString(c, 'value');
+      if (value !== undefined) out.add(`${kind}.${value}`);
+    }
+  }
+  return [...out];
 }
 
 /**
@@ -2105,6 +2136,13 @@ describe('qa case guard helpers', () => {
 
       expect(contextMenuItemIds("const items: ContextMenuItem[] = [{ onClick: f, label: 'Paste' }, { label: 'Undo', undo: g }];"))
         .toEqual(['contextmenu.item.Paste']);
+
+      expect(choiceModalIds([
+        "const a = openChoiceModal<'build' | 'cancel'>({ kind: 'unsaved-gate', title: 't',",
+        "  choices: [{ value: 'cancel', label: 'Cancel' }, { value: 'build', label: 'Build anyway' }] });",
+        "const b = openChoiceModal({ kind: someKind, choices: [{ value: 'x', label: 'X' }] });",
+        "const c = notAModal({ kind: 'decoy', choices: [{ value: 'y', label: 'Y' }] });",
+      ].join('\n'))).toEqual(['unsaved-gate', 'unsaved-gate.cancel', 'unsaved-gate.build']);
 
       expect(particleFieldIds([
         'const p = <SectionIdContext.Provider value={x}><Section title="Emission">',
@@ -3052,9 +3090,10 @@ describeCases('QA case references', () => {
   it('no case names a scene format version — both numbers move on their own (#1462)', () => {
     // Reach: the cases that talk about the scene's `version` line are the population this guards,
     // and this floor proves only that the population is still THERE (measured 2026-09-23: 41
-    // cases). It says nothing about whether the detector works; the helper tests above carry that.
+    // cases; 33 on 2026-09-30, after #1869 retired six prefab cases whose moves it refuses). It says
+    // nothing about whether the detector works; the helper tests above carry that.
     const reach = cases.filter((c) => /`"?version"?` lines?/.test(c.body)).length;
-    expect(reach).toBeGreaterThanOrEqual(35);
+    expect(reach).toBeGreaterThanOrEqual(30);
     const sites = cases.flatMap((c) => sceneFormatVersionLiterals(c.body).map((lit) => `${c.rel} — "${lit}"`));
     expect(
       sites,
